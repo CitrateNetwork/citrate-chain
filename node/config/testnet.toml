@@ -1,0 +1,30 @@
+# Citrate v3 Testnet Configuration
+
+[chain]
+chain_id = 42069
+genesis_hash = ""
+block_time = 2
+ghostdag_k = 18
+
+[network]
+listen_addr = "0.0.0.0:30303"
+bootstrap_nodes = []
+max_peers = 50
+
+[rpc]
+enabled = true
+listen_addr = "0.0.0.0:8545"
+ws_addr = "0.0.0.0:8546"
+
+[storage]
+data_dir = ".citrate-testnet"
+pruning = false
+keep_blocks = 100000
+
+[mining]
+# Disabled to let GUI users mine and earn all rewards
+# Re-enable this if you want the testnet node to also compete for blocks
+enabled = false
+coinbase = "4E2380b2f63B2Af3B270611cE779e1Db4CcA64c6000000000000000000000000"
+target_block_time = 2
+min_gas_price = 1000000000
