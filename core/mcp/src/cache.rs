@@ -198,3 +198,198 @@ pub struct CacheStats {
     pub utilization: f64,
     pub total_accesses: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ModelId;
+
+    fn create_test_model(id: [u8; 32], size: usize) -> Model {
+        Model {
+            id: ModelId(id),
+            architecture: vec![1; 100],
+            weights: vec![2; size],
+            metadata: vec![3; 50],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_new() {
+        let cache = ModelCache::new(1024 * 1024);
+        let stats = cache.stats().await;
+        assert_eq!(stats.total_models, 0);
+        assert_eq!(stats.current_size, 0);
+        assert_eq!(stats.max_size, 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_cache_put_and_get() {
+        let cache = ModelCache::new(1024 * 1024);
+        let model_id = ModelId([1u8; 32]);
+        let model = create_test_model([1u8; 32], 500);
+
+        cache.put(model_id, model.clone()).await.unwrap();
+
+        let retrieved = cache.get(&model_id).await;
+        assert!(retrieved.is_some());
+        let retrieved_model = retrieved.unwrap();
+        assert_eq!(retrieved_model.id, model_id);
+    }
+
+    #[tokio::test]
+    async fn test_cache_get_nonexistent() {
+        let cache = ModelCache::new(1024 * 1024);
+        let model_id = ModelId([99u8; 32]);
+
+        let retrieved = cache.get(&model_id).await;
+        assert!(retrieved.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_remove() {
+        let cache = ModelCache::new(1024 * 1024);
+        let model_id = ModelId([1u8; 32]);
+        let model = create_test_model([1u8; 32], 500);
+
+        cache.put(model_id, model).await.unwrap();
+        assert!(cache.get(&model_id).await.is_some());
+
+        let removed = cache.remove(&model_id).await;
+        assert!(removed.is_some());
+        assert!(cache.get(&model_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_remove_nonexistent() {
+        let cache = ModelCache::new(1024 * 1024);
+        let model_id = ModelId([99u8; 32]);
+
+        let removed = cache.remove(&model_id).await;
+        assert!(removed.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_clear() {
+        let cache = ModelCache::new(1024 * 1024);
+
+        // Add multiple models
+        for i in 0..5u8 {
+            let model_id = ModelId([i; 32]);
+            let model = create_test_model([i; 32], 100);
+            cache.put(model_id, model).await.unwrap();
+        }
+
+        let stats = cache.stats().await;
+        assert_eq!(stats.total_models, 5);
+
+        cache.clear().await;
+
+        let stats = cache.stats().await;
+        assert_eq!(stats.total_models, 0);
+        assert_eq!(stats.current_size, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_stats() {
+        let cache = ModelCache::new(10000);
+        let model = create_test_model([1u8; 32], 500);
+        let model_id = ModelId([1u8; 32]);
+
+        cache.put(model_id, model).await.unwrap();
+
+        let stats = cache.stats().await;
+        assert_eq!(stats.total_models, 1);
+        assert!(stats.current_size > 0);
+        assert!(stats.utilization > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_lru_eviction() {
+        // Create cache with small size to force eviction
+        let cache = ModelCache::new(1000); // 1KB
+
+        // Add first model (should fit)
+        let model1 = create_test_model([1u8; 32], 300);
+        cache.put(ModelId([1u8; 32]), model1).await.unwrap();
+
+        // Add second model (should fit)
+        let model2 = create_test_model([2u8; 32], 300);
+        cache.put(ModelId([2u8; 32]), model2).await.unwrap();
+
+        // Add third model - should evict first model (LRU)
+        let model3 = create_test_model([3u8; 32], 300);
+        cache.put(ModelId([3u8; 32]), model3).await.unwrap();
+
+        // First model should be evicted
+        assert!(cache.get(&ModelId([1u8; 32])).await.is_none());
+        // Third model should exist
+        assert!(cache.get(&ModelId([3u8; 32])).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cache_model_too_large() {
+        let cache = ModelCache::new(100); // Very small cache
+
+        let large_model = create_test_model([1u8; 32], 200); // Larger than cache
+
+        let result = cache.put(ModelId([1u8; 32]), large_model).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn test_cache_access_count() {
+        let cache = ModelCache::new(1024 * 1024);
+        let model_id = ModelId([1u8; 32]);
+        let model = create_test_model([1u8; 32], 500);
+
+        cache.put(model_id, model).await.unwrap();
+
+        // Access multiple times
+        cache.get(&model_id).await;
+        cache.get(&model_id).await;
+        cache.get(&model_id).await;
+
+        let stats = cache.stats().await;
+        // Initial put counts as 1, plus 3 gets = 4 total
+        assert!(stats.total_accesses >= 3);
+    }
+
+    #[tokio::test]
+    async fn test_cache_preload() {
+        let cache = ModelCache::new(1024 * 1024);
+
+        let models: Vec<(ModelId, Model)> = (0..3u8)
+            .map(|i| {
+                let id = ModelId([i; 32]);
+                let model = create_test_model([i; 32], 100);
+                (id, model)
+            })
+            .collect();
+
+        cache.preload(models).await.unwrap();
+
+        let stats = cache.stats().await;
+        assert_eq!(stats.total_models, 3);
+
+        // Verify all models are accessible
+        for i in 0..3u8 {
+            assert!(cache.get(&ModelId([i; 32])).await.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_utilization_calculation() {
+        let cache = ModelCache::new(10000);
+
+        let stats_empty = cache.stats().await;
+        assert_eq!(stats_empty.utilization, 0.0);
+
+        let model = create_test_model([1u8; 32], 500);
+        cache.put(ModelId([1u8; 32]), model).await.unwrap();
+
+        let stats = cache.stats().await;
+        assert!(stats.utilization > 0.0);
+        assert!(stats.utilization < 100.0);
+    }
+}

@@ -259,3 +259,294 @@ impl ProviderRegistry {
         self.providers.read().await.values().cloned().collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ComputeRequirements;
+
+    fn create_test_provider(id: u8, memory_gb: u64, compute: u64) -> ProviderInfo {
+        let mut addr = [0u8; 20];
+        addr[0] = id;
+        ProviderInfo {
+            address: Address(addr),
+            name: format!("Provider {}", id),
+            endpoint: format!("http://provider{}.example.com", id),
+            capacity: ComputeCapacity {
+                total_memory: memory_gb * 1024 * 1024 * 1024,
+                available_memory: memory_gb * 1024 * 1024 * 1024 / 2,
+                total_compute: compute,
+                available_compute: compute / 2,
+                hardware: vec![HardwareType::CPU],
+            },
+            reputation: 100,
+            total_executions: 0,
+        }
+    }
+
+    fn create_test_provider_with_gpu(id: u8, memory_gb: u64, compute: u64) -> ProviderInfo {
+        let mut info = create_test_provider(id, memory_gb, compute);
+        info.capacity.hardware = vec![
+            HardwareType::CPU,
+            HardwareType::GPU("NVIDIA A100".to_string()),
+        ];
+        info
+    }
+
+    #[tokio::test]
+    async fn test_provider_registry_new() {
+        let registry = ProviderRegistry::new();
+        let providers = registry.list_providers().await;
+        assert!(providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_provider_registry_default() {
+        let registry = ProviderRegistry::default();
+        let providers = registry.list_providers().await;
+        assert!(providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_register_provider() {
+        let registry = ProviderRegistry::new();
+        let provider = create_test_provider(1, 16, 100);
+
+        registry.register_provider(provider.clone()).await.unwrap();
+
+        let providers = registry.list_providers().await;
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "Provider 1");
+    }
+
+    #[tokio::test]
+    async fn test_get_provider() {
+        let registry = ProviderRegistry::new();
+        let provider = create_test_provider(1, 16, 100);
+        let address = provider.address;
+
+        registry.register_provider(provider).await.unwrap();
+
+        let retrieved = registry.get_provider(&address).await.unwrap();
+        assert_eq!(retrieved.name, "Provider 1");
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_provider() {
+        let registry = ProviderRegistry::new();
+        let address = Address([99u8; 20]);
+
+        let result = registry.get_provider(&address).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_register_model_provider() {
+        let registry = ProviderRegistry::new();
+        let provider = create_test_provider(1, 16, 100);
+        let address = provider.address;
+        let model_id = ModelId([1u8; 32]);
+
+        registry.register_provider(provider).await.unwrap();
+        registry
+            .register_model_provider(address, model_id)
+            .await
+            .unwrap();
+
+        // Provider should be registered for the model
+        let requirements = ComputeRequirements {
+            min_memory: 1000,
+            min_compute: 10,
+            gpu_required: false,
+            supported_hardware: vec![HardwareType::CPU],
+        };
+
+        let selected = registry.select_provider(&model_id, &requirements).await;
+        assert!(selected.is_ok());
+        assert_eq!(selected.unwrap(), address);
+    }
+
+    #[tokio::test]
+    async fn test_register_model_provider_unregistered() {
+        let registry = ProviderRegistry::new();
+        let address = Address([1u8; 20]);
+        let model_id = ModelId([1u8; 32]);
+
+        let result = registry.register_model_provider(address, model_id).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not registered"));
+    }
+
+    #[tokio::test]
+    async fn test_select_provider_no_providers() {
+        let registry = ProviderRegistry::new();
+        let model_id = ModelId([1u8; 32]);
+
+        let requirements = ComputeRequirements {
+            min_memory: 1000,
+            min_compute: 10,
+            gpu_required: false,
+            supported_hardware: vec![HardwareType::CPU],
+        };
+
+        let result = registry.select_provider(&model_id, &requirements).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_select_provider_gpu_required() {
+        let registry = ProviderRegistry::new();
+        let model_id = ModelId([1u8; 32]);
+
+        // Register CPU-only provider
+        let cpu_provider = create_test_provider(1, 32, 200);
+        registry.register_provider(cpu_provider.clone()).await.unwrap();
+        registry
+            .register_model_provider(cpu_provider.address, model_id)
+            .await
+            .unwrap();
+
+        // Request with GPU requirement
+        let requirements = ComputeRequirements {
+            min_memory: 1000,
+            min_compute: 10,
+            gpu_required: true,
+            supported_hardware: vec![HardwareType::GPU("any".to_string())],
+        };
+
+        // Should fail - no GPU provider
+        let result = registry.select_provider(&model_id, &requirements).await;
+        assert!(result.is_err());
+
+        // Now register a GPU provider
+        let gpu_provider = create_test_provider_with_gpu(2, 32, 200);
+        registry.register_provider(gpu_provider.clone()).await.unwrap();
+        registry
+            .register_model_provider(gpu_provider.address, model_id)
+            .await
+            .unwrap();
+
+        // Should succeed
+        let result = registry.select_provider(&model_id, &requirements).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), gpu_provider.address);
+    }
+
+    #[tokio::test]
+    async fn test_select_provider_memory_requirement() {
+        let registry = ProviderRegistry::new();
+        let model_id = ModelId([1u8; 32]);
+
+        // Register provider with 8GB memory (4GB available)
+        let provider = create_test_provider(1, 8, 100);
+        registry.register_provider(provider.clone()).await.unwrap();
+        registry
+            .register_model_provider(provider.address, model_id)
+            .await
+            .unwrap();
+
+        // Request requiring more memory than available
+        let requirements = ComputeRequirements {
+            min_memory: 10 * 1024 * 1024 * 1024, // 10GB
+            min_compute: 10,
+            gpu_required: false,
+            supported_hardware: vec![HardwareType::CPU],
+        };
+
+        let result = registry.select_provider(&model_id, &requirements).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_reputation_success() {
+        let registry = ProviderRegistry::new();
+        let provider = create_test_provider(1, 16, 100);
+        let address = provider.address;
+
+        registry.register_provider(provider).await.unwrap();
+
+        // Successful job with 100ms latency
+        registry.update_reputation(address, true, 100).await.unwrap();
+
+        let info = registry.get_provider(&address).await.unwrap();
+        assert_eq!(info.total_executions, 1);
+        assert_eq!(info.reputation, 100); // 1/1 success = 100%
+    }
+
+    #[tokio::test]
+    async fn test_update_reputation_failure() {
+        let registry = ProviderRegistry::new();
+        let provider = create_test_provider(1, 16, 100);
+        let address = provider.address;
+
+        registry.register_provider(provider).await.unwrap();
+
+        // One success, one failure
+        registry.update_reputation(address, true, 100).await.unwrap();
+        registry.update_reputation(address, false, 200).await.unwrap();
+
+        let info = registry.get_provider(&address).await.unwrap();
+        assert_eq!(info.total_executions, 2);
+        assert_eq!(info.reputation, 50); // 1/2 success = 50%
+    }
+
+    #[tokio::test]
+    async fn test_update_reputation_unknown_provider() {
+        let registry = ProviderRegistry::new();
+        let address = Address([99u8; 20]);
+
+        let result = registry.update_reputation(address, true, 100).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_multiple_providers_scoring() {
+        let registry = ProviderRegistry::new();
+        let model_id = ModelId([1u8; 32]);
+
+        // Register provider 1 with lower specs
+        let provider1 = create_test_provider(1, 8, 50);
+        registry.register_provider(provider1.clone()).await.unwrap();
+        registry
+            .register_model_provider(provider1.address, model_id)
+            .await
+            .unwrap();
+
+        // Register provider 2 with higher specs
+        let provider2 = create_test_provider(2, 32, 200);
+        registry.register_provider(provider2.clone()).await.unwrap();
+        registry
+            .register_model_provider(provider2.address, model_id)
+            .await
+            .unwrap();
+
+        // Give provider2 good reputation
+        registry.update_reputation(provider2.address, true, 50).await.unwrap();
+        registry.update_reputation(provider2.address, true, 50).await.unwrap();
+
+        let requirements = ComputeRequirements {
+            min_memory: 1000,
+            min_compute: 10,
+            gpu_required: false,
+            supported_hardware: vec![HardwareType::CPU],
+        };
+
+        // Should select provider with better score
+        let selected = registry.select_provider(&model_id, &requirements).await.unwrap();
+        // Provider 2 should have higher score due to more capacity and good reputation
+        assert_eq!(selected, provider2.address);
+    }
+
+    #[tokio::test]
+    async fn test_list_providers() {
+        let registry = ProviderRegistry::new();
+
+        for i in 1..=5u8 {
+            let provider = create_test_provider(i, 16, 100);
+            registry.register_provider(provider).await.unwrap();
+        }
+
+        let providers = registry.list_providers().await;
+        assert_eq!(providers.len(), 5);
+    }
+}

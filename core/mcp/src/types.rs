@@ -130,3 +130,151 @@ pub struct ExecutionProof {
     pub timestamp: u64,
     pub provider: Address,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_model_id_from_hash() {
+        let hash = Hash::new([42u8; 32]);
+        let model_id = ModelId::from_hash(&hash);
+        assert_eq!(model_id.0, [42u8; 32]);
+    }
+
+    #[test]
+    fn test_model_id_as_bytes() {
+        let model_id = ModelId([1u8; 32]);
+        let bytes = model_id.as_bytes();
+        assert_eq!(bytes, &[1u8; 32]);
+    }
+
+    #[test]
+    fn test_model_id_equality() {
+        let id1 = ModelId([1u8; 32]);
+        let id2 = ModelId([1u8; 32]);
+        let id3 = ModelId([2u8; 32]);
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_model_id_hash_trait() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ModelId([1u8; 32]));
+        set.insert(ModelId([2u8; 32]));
+        set.insert(ModelId([1u8; 32])); // Duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_request_id_equality() {
+        let id1 = RequestId([1u8; 32]);
+        let id2 = RequestId([1u8; 32]);
+        let id3 = RequestId([2u8; 32]);
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_hardware_type_variants() {
+        let cpu = HardwareType::CPU;
+        let gpu = HardwareType::GPU("NVIDIA A100".to_string());
+        let tpu = HardwareType::TPU("v4".to_string());
+        let custom = HardwareType::Custom("FPGA".to_string());
+
+        // Just test they can be created and debug-printed
+        assert!(format!("{:?}", cpu).contains("CPU"));
+        assert!(format!("{:?}", gpu).contains("NVIDIA"));
+        assert!(format!("{:?}", tpu).contains("v4"));
+        assert!(format!("{:?}", custom).contains("FPGA"));
+    }
+
+    #[test]
+    fn test_currency_variants() {
+        let salt = Currency::SALT;
+        let eth = Currency::ETH;
+        let usdc = Currency::USDC;
+
+        assert!(format!("{:?}", salt).contains("SALT"));
+        assert!(format!("{:?}", eth).contains("ETH"));
+        assert!(format!("{:?}", usdc).contains("USDC"));
+    }
+
+    #[test]
+    fn test_request_status_variants() {
+        let pending = RequestStatus::Pending;
+        let assigned = RequestStatus::Assigned(Address([0u8; 20]));
+        let executing = RequestStatus::Executing;
+        let completed = RequestStatus::Completed(Hash::default());
+        let failed = RequestStatus::Failed("error".to_string());
+        let cancelled = RequestStatus::Cancelled;
+
+        assert!(format!("{:?}", pending).contains("Pending"));
+        assert!(format!("{:?}", assigned).contains("Assigned"));
+        assert!(format!("{:?}", executing).contains("Executing"));
+        assert!(format!("{:?}", completed).contains("Completed"));
+        assert!(format!("{:?}", failed).contains("error"));
+        assert!(format!("{:?}", cancelled).contains("Cancelled"));
+    }
+
+    #[test]
+    fn test_compute_requirements_serialization() {
+        let req = ComputeRequirements {
+            min_memory: 1024 * 1024 * 1024, // 1GB
+            min_compute: 100,
+            gpu_required: true,
+            supported_hardware: vec![HardwareType::GPU("RTX 4090".to_string())],
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: ComputeRequirements = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.min_memory, req.min_memory);
+        assert_eq!(deserialized.gpu_required, true);
+    }
+
+    #[test]
+    fn test_pricing_model_serialization() {
+        let pricing = PricingModel {
+            base_price: U256::from(100),
+            per_token_price: U256::from(1),
+            per_second_price: U256::from(10),
+            currency: Currency::SALT,
+        };
+
+        let json = serde_json::to_string(&pricing).unwrap();
+        let deserialized: PricingModel = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.base_price, U256::from(100));
+    }
+
+    #[test]
+    fn test_model_metadata_creation() {
+        let metadata = ModelMetadata {
+            id: ModelId([0u8; 32]),
+            owner: Address([1u8; 20]),
+            name: "test-model".to_string(),
+            version: "1.0.0".to_string(),
+            hash: Hash::default(),
+            size: 1000,
+            compute_requirements: ComputeRequirements {
+                min_memory: 1000,
+                min_compute: 10,
+                gpu_required: false,
+                supported_hardware: vec![HardwareType::CPU],
+            },
+            pricing: PricingModel {
+                base_price: U256::from(100),
+                per_token_price: U256::from(1),
+                per_second_price: U256::from(10),
+                currency: Currency::SALT,
+            },
+        };
+
+        assert_eq!(metadata.name, "test-model");
+        assert_eq!(metadata.version, "1.0.0");
+        assert_eq!(metadata.size, 1000);
+    }
+}
