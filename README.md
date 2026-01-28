@@ -920,8 +920,7 @@ citrate/
 │   ├── core/mcp/                # Model Context Protocol
 │   └── core/sequencer/          # Transaction ordering
 ├── 🌐 Frontend Applications
-│   ├── explorer/                # Next.js block explorer
-│   └── gui/citrate-core/        # Tauri desktop wallet
+│   └── gui/citrate-core/        # Tauri desktop wallet (includes block explorer)
 ├── 📱 Node Applications
 │   ├── node/                    # Main blockchain node
 │   ├── wallet/                  # CLI wallet application
@@ -946,8 +945,7 @@ cargo run --bin citrate-node             # Start node
 cargo run --bin citrate-wallet           # CLI wallet
 
 # 🌐 Frontend Development
-cd explorer && npm run dev                # Start block explorer
-cd gui/citrate-core && npm run tauri dev # Desktop wallet
+cd gui/citrate-core && npm run tauri dev # Desktop wallet (includes explorer)
 
 # 📦 Smart Contracts
 cd contracts && forge build              # Compile contracts
