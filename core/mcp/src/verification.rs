@@ -229,17 +229,62 @@ impl ExecutionVerifier {
     }
 
     /// Generate verification key (for setup phase)
+    ///
+    /// Generates a unique verification key for a model based on its content hash.
+    /// The key is derived using SHA3-256 with domain separation to ensure uniqueness.
+    ///
+    /// In production with a full ZK proving system, this would generate circuit-specific
+    /// proving/verification key pairs using arkworks or similar libraries.
     pub fn generate_verification_key(&self, model: &Model) -> Result<VerificationKey> {
-        // Placeholder for verification key generation
-        // In production, this would generate circuit-specific keys
-
         let model_hash = self.hash_model(model);
+
+        // Derive verification key from model hash using domain separation
+        // This ensures each model gets a unique key based on its content
+        let key_data = self.derive_verification_key_data(&model_hash, model);
 
         Ok(VerificationKey {
             model_hash,
-            key_data: vec![1, 2, 3, 4], // Placeholder
+            key_data,
             created_at: chrono::Utc::now().timestamp() as u64,
         })
+    }
+
+    /// Derive verification key data from model hash
+    ///
+    /// Uses a multi-round key derivation to produce a unique verification key
+    /// for each model. The key incorporates:
+    /// - Model content hash
+    /// - Model size
+    /// - Architecture hash
+    fn derive_verification_key_data(&self, model_hash: &Hash, model: &Model) -> Vec<u8> {
+        // Domain separation prefix for verification keys
+        const VK_DOMAIN: &[u8] = b"citrate_verification_key_v1";
+
+        // Round 1: Derive base key from model hash with domain separation
+        let mut hasher = Sha3_256::new();
+        hasher.update(VK_DOMAIN);
+        hasher.update(model_hash.as_bytes());
+        let base_key = hasher.finalize();
+
+        // Round 2: Mix in architecture information for uniqueness
+        let mut hasher = Sha3_256::new();
+        hasher.update(&base_key);
+        hasher.update(&model.architecture);
+        hasher.update(&(model.weights.len() as u64).to_le_bytes());
+        let arch_key = hasher.finalize();
+
+        // Round 3: Final key derivation with additional entropy
+        let mut hasher = Sha3_256::new();
+        hasher.update(&arch_key);
+        hasher.update(&model.metadata);
+        hasher.update(b"final_key_derivation");
+        let final_key = hasher.finalize();
+
+        // Return 64 bytes of key material (two 32-byte hashes concatenated)
+        let mut key_data = base_key.to_vec();
+        key_data.extend_from_slice(&final_key);
+
+        key_data
     }
 }
 
@@ -593,5 +638,91 @@ mod tests {
         let result = verifier.verify_execution(&model, input, output, &proof);
         assert!(result.is_ok());
         assert!(!result.unwrap()); // IO commitment mismatch should fail
+    }
+
+    #[test]
+    fn test_verification_key_unique_per_model() {
+        let verifier = ExecutionVerifier::new();
+
+        // Create two different models
+        let model1 = create_test_model(b"arch1", b"weights1", b"meta1");
+        let model2 = create_test_model(b"arch2", b"weights2", b"meta2");
+
+        let vk1 = verifier.generate_verification_key(&model1).unwrap();
+        let vk2 = verifier.generate_verification_key(&model2).unwrap();
+
+        // Different models should have different hashes
+        assert_ne!(vk1.model_hash, vk2.model_hash);
+
+        // Different models should have different key data
+        assert_ne!(vk1.key_data, vk2.key_data);
+    }
+
+    #[test]
+    fn test_verification_key_deterministic_key_data() {
+        let verifier = ExecutionVerifier::new();
+        let model = create_test_model(b"arch", b"weights", b"meta");
+
+        let vk1 = verifier.generate_verification_key(&model).unwrap();
+        let vk2 = verifier.generate_verification_key(&model).unwrap();
+
+        // Same model should produce same key data
+        assert_eq!(vk1.key_data, vk2.key_data);
+    }
+
+    #[test]
+    fn test_verification_key_sufficient_length() {
+        let verifier = ExecutionVerifier::new();
+        let model = create_test_model(b"arch", b"weights", b"meta");
+
+        let vk = verifier.generate_verification_key(&model).unwrap();
+
+        // Key data should be at least 64 bytes (two SHA3-256 hashes)
+        assert!(vk.key_data.len() >= 64);
+    }
+
+    #[test]
+    fn test_verification_key_sensitive_to_weights() {
+        let verifier = ExecutionVerifier::new();
+
+        // Same architecture, different weights
+        let model1 = create_test_model(b"arch", b"weights_a", b"meta");
+        let model2 = create_test_model(b"arch", b"weights_b", b"meta");
+
+        let vk1 = verifier.generate_verification_key(&model1).unwrap();
+        let vk2 = verifier.generate_verification_key(&model2).unwrap();
+
+        // Different weights should produce different keys
+        assert_ne!(vk1.key_data, vk2.key_data);
+    }
+
+    #[test]
+    fn test_verification_key_sensitive_to_architecture() {
+        let verifier = ExecutionVerifier::new();
+
+        // Same weights, different architecture
+        let model1 = create_test_model(b"transformer", b"weights", b"meta");
+        let model2 = create_test_model(b"cnn", b"weights", b"meta");
+
+        let vk1 = verifier.generate_verification_key(&model1).unwrap();
+        let vk2 = verifier.generate_verification_key(&model2).unwrap();
+
+        // Different architecture should produce different keys
+        assert_ne!(vk1.key_data, vk2.key_data);
+    }
+
+    #[test]
+    fn test_verification_key_sensitive_to_metadata() {
+        let verifier = ExecutionVerifier::new();
+
+        // Same architecture and weights, different metadata
+        let model1 = create_test_model(b"arch", b"weights", b"meta_v1");
+        let model2 = create_test_model(b"arch", b"weights", b"meta_v2");
+
+        let vk1 = verifier.generate_verification_key(&model1).unwrap();
+        let vk2 = verifier.generate_verification_key(&model2).unwrap();
+
+        // Different metadata should produce different keys
+        assert_ne!(vk1.key_data, vk2.key_data);
     }
 }
