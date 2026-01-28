@@ -418,3 +418,242 @@ impl SearchEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn create_test_model(id: u8, name: &str, category: ModelCategory, framework: &str, tags: Vec<&str>) -> MarketplaceModel {
+        let mut model_id = [0u8; 32];
+        model_id[0] = id;
+
+        MarketplaceModel {
+            model_id,
+            owner: [1u8; 20],
+            name: name.to_string(),
+            description: format!("A test model for {}", name),
+            category,
+            base_price: (id as u64) * 100,
+            discount_price: (id as u64) * 90,
+            minimum_bulk_size: 10,
+            framework: framework.to_string(),
+            version: "1.0.0".to_string(),
+            license: "MIT".to_string(),
+            tags: tags.into_iter().map(|s| s.to_string()).collect(),
+            input_shape: vec!["batch".to_string(), "512".to_string()],
+            output_shape: vec!["batch".to_string(), "768".to_string()],
+            parameters: 1_000_000,
+            size_bytes: 100_000_000,
+            model_cid: "QmTest".to_string(),
+            metadata_uri: "QmMeta".to_string(),
+            total_sales: 0,
+            total_revenue: 0,
+            rating: 4.5,
+            review_count: 10,
+            featured: false,
+            active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_sale_at: None,
+        }
+    }
+
+    #[test]
+    fn test_search_query_default() {
+        let query = SearchQuery::default();
+        assert!(query.text.is_empty());
+        assert!(query.category.is_none());
+        assert_eq!(query.limit, 20);
+        assert_eq!(query.offset, 0);
+    }
+
+    #[tokio::test]
+    async fn test_search_engine_creation() {
+        let engine = SearchEngine::new("/tmp/test_index").await;
+        assert!(engine.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_index_and_search_model() {
+        let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
+        let model = create_test_model(1, "Language Model Clone", ModelCategory::LanguageModel, "PyTorch", vec!["nlp", "llm"]);
+
+        engine.index_model(&model).await.unwrap();
+
+        let query = SearchQuery {
+            text: "language model".to_string(),
+            ..Default::default()
+        };
+
+        let results = engine.search(&query).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].model.name, "Language Model Clone");
+    }
+
+    #[tokio::test]
+    async fn test_search_by_category() {
+        let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
+
+        let model1 = create_test_model(1, "LLM Model", ModelCategory::LanguageModel, "PyTorch", vec!["nlp"]);
+        let model2 = create_test_model(2, "Image Model", ModelCategory::ImageGeneration, "TensorFlow", vec!["vision"]);
+
+        engine.index_model(&model1).await.unwrap();
+        engine.index_model(&model2).await.unwrap();
+
+        let query = SearchQuery {
+            category: Some(ModelCategory::LanguageModel),
+            ..Default::default()
+        };
+
+        let results = engine.search(&query).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].model.category, ModelCategory::LanguageModel);
+    }
+
+    #[tokio::test]
+    async fn test_search_by_price_range() {
+        let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
+
+        let model1 = create_test_model(1, "Cheap Model", ModelCategory::Embedding, "PyTorch", vec![]);
+        let model2 = create_test_model(5, "Expensive Model", ModelCategory::Embedding, "PyTorch", vec![]);
+
+        engine.index_model(&model1).await.unwrap();
+        engine.index_model(&model2).await.unwrap();
+
+        let query = SearchQuery {
+            max_price: Some(200),
+            ..Default::default()
+        };
+
+        let results = engine.search(&query).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].model.base_price <= 200);
+    }
+
+    #[tokio::test]
+    async fn test_search_by_tags() {
+        let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
+
+        let model1 = create_test_model(1, "NLP Model", ModelCategory::LanguageModel, "PyTorch", vec!["nlp", "transformer"]);
+        let model2 = create_test_model(2, "Vision Model", ModelCategory::ImageClassification, "TensorFlow", vec!["cnn", "vision"]);
+
+        engine.index_model(&model1).await.unwrap();
+        engine.index_model(&model2).await.unwrap();
+
+        let query = SearchQuery {
+            tags: vec!["nlp".to_string()],
+            ..Default::default()
+        };
+
+        let results = engine.search(&query).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].model.tags.contains(&"nlp".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_remove_model() {
+        let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
+
+        let model = create_test_model(1, "Test Model", ModelCategory::Embedding, "PyTorch", vec![]);
+        engine.index_model(&model).await.unwrap();
+
+        // Verify it's indexed
+        let (count, _) = engine.get_stats().await.unwrap();
+        assert_eq!(count, 1);
+
+        // Remove it
+        engine.remove_model(&model.model_id).await.unwrap();
+
+        // Verify it's removed
+        let (count, _) = engine.get_stats().await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_similar_models() {
+        let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
+
+        let model1 = create_test_model(1, "PyTorch LLM", ModelCategory::LanguageModel, "PyTorch", vec!["nlp", "llm"]);
+        let model2 = create_test_model(2, "Another PyTorch LLM", ModelCategory::LanguageModel, "PyTorch", vec!["nlp", "transformer"]);
+        let model3 = create_test_model(3, "TensorFlow Vision", ModelCategory::ImageGeneration, "TensorFlow", vec!["vision"]);
+
+        engine.index_model(&model1).await.unwrap();
+        engine.index_model(&model2).await.unwrap();
+        engine.index_model(&model3).await.unwrap();
+
+        let similar = engine.get_similar_models(&model1.model_id, 5).await.unwrap();
+
+        // Model 2 should be more similar to Model 1 than Model 3
+        assert!(!similar.is_empty());
+        // First result should be Model 2 (same category, same framework, overlapping tags)
+        if similar.len() >= 2 {
+            assert_eq!(similar[0].model_id[0], 2); // Model 2 is most similar
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_trending_models() {
+        let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
+
+        let model1 = create_test_model(1, "Alpha Model", ModelCategory::Embedding, "PyTorch", vec![]);
+        let model2 = create_test_model(2, "Beta Model", ModelCategory::Embedding, "PyTorch", vec![]);
+
+        engine.index_model(&model1).await.unwrap();
+        engine.index_model(&model2).await.unwrap();
+
+        let trending = engine.get_trending_models(10).await.unwrap();
+        assert_eq!(trending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_search_pagination() {
+        let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
+
+        // Add 5 models with different prices for deterministic sorting
+        for i in 1..=5 {
+            let mut model = create_test_model(i, &format!("Model {}", i), ModelCategory::Embedding, "PyTorch", vec![]);
+            model.base_price = (i as u64) * 100; // Prices: 100, 200, 300, 400, 500
+            engine.index_model(&model).await.unwrap();
+        }
+
+        // Get first page (2 items) sorted by price
+        let query1 = SearchQuery {
+            limit: 2,
+            offset: 0,
+            sort_by: Some(SortOrder::Price),
+            ..Default::default()
+        };
+        let results1 = engine.search(&query1).await.unwrap();
+        assert_eq!(results1.len(), 2);
+
+        // Get second page sorted by price
+        let query2 = SearchQuery {
+            limit: 2,
+            offset: 2,
+            sort_by: Some(SortOrder::Price),
+            ..Default::default()
+        };
+        let results2 = engine.search(&query2).await.unwrap();
+        assert_eq!(results2.len(), 2);
+
+        // First page should have cheaper models than second page
+        assert!(results1[0].model.base_price < results2[0].model.base_price);
+    }
+
+    #[tokio::test]
+    async fn test_search_empty_results() {
+        let engine = SearchEngine::new("/tmp/test_index").await.unwrap();
+
+        let model = create_test_model(1, "Test Model", ModelCategory::Embedding, "PyTorch", vec![]);
+        engine.index_model(&model).await.unwrap();
+
+        let query = SearchQuery {
+            text: "nonexistent_term_xyz123".to_string(),
+            ..Default::default()
+        };
+
+        let results = engine.search(&query).await.unwrap();
+        assert!(results.is_empty());
+    }
+}

@@ -280,3 +280,98 @@ impl From<reqwest::Error> for MarketplaceError {
 }
 
 // Tantivy error conversion removed for simplified implementation
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_model_category_from_u8() {
+        assert_eq!(ModelCategory::from(0), ModelCategory::LanguageModel);
+        assert_eq!(ModelCategory::from(1), ModelCategory::ImageGeneration);
+        assert_eq!(ModelCategory::from(5), ModelCategory::Embedding);
+        assert_eq!(ModelCategory::from(10), ModelCategory::Other);
+        assert_eq!(ModelCategory::from(255), ModelCategory::Other); // Unknown maps to Other
+    }
+
+    #[test]
+    fn test_model_category_as_str() {
+        assert_eq!(ModelCategory::LanguageModel.as_str(), "Language Model");
+        assert_eq!(ModelCategory::ImageGeneration.as_str(), "Image Generation");
+        assert_eq!(ModelCategory::Embedding.as_str(), "Embedding");
+        assert_eq!(ModelCategory::Other.as_str(), "Other");
+    }
+
+    #[test]
+    fn test_model_category_all() {
+        let all = ModelCategory::all();
+        assert_eq!(all.len(), 11);
+        assert!(all.contains(&ModelCategory::LanguageModel));
+        assert!(all.contains(&ModelCategory::Other));
+    }
+
+    #[test]
+    fn test_search_filters_default() {
+        let filters = SearchFilters::default();
+        assert!(filters.categories.is_none());
+        assert!(filters.min_price.is_none());
+        assert!(filters.max_price.is_none());
+        assert!(!filters.featured_only);
+    }
+
+    #[test]
+    fn test_marketplace_stats_default() {
+        let stats = MarketplaceStats::default();
+        assert_eq!(stats.total_models, 0);
+        assert_eq!(stats.total_interactions, 0);
+        assert!(stats.top_models.is_empty());
+    }
+
+    #[test]
+    fn test_marketplace_error_display() {
+        let err = MarketplaceError::ModelNotFound([1u8; 32]);
+        assert!(err.to_string().contains("Model not found"));
+
+        let err = MarketplaceError::IpfsError("connection failed".to_string());
+        assert!(err.to_string().contains("connection failed"));
+    }
+
+    #[test]
+    fn test_marketplace_error_from_serde() {
+        let json_err: Result<ModelCategory, _> = serde_json::from_str("invalid");
+        if let Err(e) = json_err {
+            let marketplace_err: MarketplaceError = e.into();
+            assert!(matches!(marketplace_err, MarketplaceError::SerializationError(_)));
+        }
+    }
+
+    #[test]
+    fn test_model_category_serialization() {
+        let category = ModelCategory::ImageGeneration;
+        let json = serde_json::to_string(&category).unwrap();
+        let deserialized: ModelCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(category, deserialized);
+    }
+
+    #[test]
+    fn test_sort_by_variants() {
+        let variants = vec![
+            SortBy::Relevance,
+            SortBy::Rating,
+            SortBy::Price,
+            SortBy::Sales,
+            SortBy::Newest,
+            SortBy::MostReviewed,
+            SortBy::Popularity,
+        ];
+        assert_eq!(variants.len(), 7);
+    }
+
+    #[test]
+    fn test_interaction_type_serialization() {
+        let interaction = InteractionType::Purchase;
+        let json = serde_json::to_string(&interaction).unwrap();
+        let deserialized: InteractionType = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, InteractionType::Purchase));
+    }
+}

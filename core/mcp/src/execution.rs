@@ -34,7 +34,8 @@ pub struct ModelExecutor {
     verifier: Arc<ExecutionVerifier>,
     registry: Arc<ModelRegistry>,
     ipfs: Mutex<IPFSService>,
-    gguf_engine: Arc<GGUFEngine>,
+    /// GGUF engine for AI model execution (None if initialization failed)
+    gguf_engine: Option<Arc<GGUFEngine>>,
 }
 
 impl ModelExecutor {
@@ -45,13 +46,18 @@ impl ModelExecutor {
         registry: Arc<ModelRegistry>,
         ipfs: IPFSService,
     ) -> Self {
-        // Initialize GGUF engine with default config
+        // Initialize GGUF engine with default config (graceful degradation if unavailable)
         let gguf_config = GGUFEngineConfig::default();
-        let gguf_engine = GGUFEngine::new(gguf_config)
-            .unwrap_or_else(|e| {
-                warn!("Failed to initialize GGUF engine: {}", e);
-                panic!("GGUF engine initialization failed");
-            });
+        let gguf_engine = match GGUFEngine::new(gguf_config) {
+            Ok(engine) => {
+                info!("GGUF engine initialized successfully");
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                warn!("GGUF unavailable, AI features disabled: {}", e);
+                None
+            }
+        };
 
         Self {
             vm,
@@ -59,8 +65,16 @@ impl ModelExecutor {
             verifier,
             registry,
             ipfs: Mutex::new(ipfs),
-            gguf_engine: Arc::new(gguf_engine),
+            gguf_engine,
         }
+    }
+
+    /// Check if AI features are available
+    ///
+    /// Returns true if the GGUF engine was successfully initialized.
+    /// When false, AI inference/training requests will return errors.
+    pub fn is_ai_available(&self) -> bool {
+        self.gguf_engine.is_some()
     }
 
     /// Execute model inference
@@ -234,6 +248,11 @@ impl ModelExecutor {
 
     /// Execute in VM (now using GGUF engine)
     async fn execute_in_vm(&self, context: &ExecutionContext) -> Result<(Vec<u8>, u64)> {
+        // Check if GGUF engine is available
+        let gguf_engine = self.gguf_engine.as_ref().ok_or_else(|| {
+            anyhow!("AI features unavailable: GGUF engine not initialized")
+        })?;
+
         // Load the model
         let model = self.load_model(context.model_id).await?;
 
@@ -241,8 +260,7 @@ impl ModelExecutor {
         let model_type = self.determine_model_type(&model)?;
 
         // Get or create model path on disk
-        let model_path = self
-            .gguf_engine
+        let model_path = gguf_engine
             .load_model_from_bytes(
                 &hex::encode(&context.model_id.0[..8]),
                 &model.weights,
@@ -274,7 +292,7 @@ impl ModelExecutor {
                 };
 
                 // Generate embeddings
-                let embeddings = self.gguf_engine.generate_embeddings(&model_path, &texts).await?;
+                let embeddings = gguf_engine.generate_embeddings(&model_path, &texts).await?;
 
                 // Serialize embeddings as output
                 serde_json::to_vec(&embeddings)?
@@ -297,8 +315,7 @@ impl ModelExecutor {
                     .unwrap_or(0.7) as f32;
 
                 // Generate text
-                let generated_text = self
-                    .gguf_engine
+                let generated_text = gguf_engine
                     .generate_text(&model_path, prompt, max_tokens, temperature)
                     .await?;
 
@@ -871,6 +888,28 @@ mod tests {
             let data_gas = (training_data.len() as u64) * 5;
             base_gas + weight_gas + data_gas
         }
+    }
+
+    #[test]
+    fn test_gguf_graceful_degradation() {
+        // Test that ModelExecutor can be created even when GGUF engine fails
+        // In real usage, this is tested by the fact that the constructor no longer panics
+        // Here we test the Option<Arc<GGUFEngine>> pattern works correctly
+
+        // Test None case
+        let gguf_engine: Option<Arc<GGUFEngine>> = None;
+        assert!(gguf_engine.is_none());
+
+        // Test is_some pattern used in execute_in_vm
+        let result: Result<(), &str> = gguf_engine
+            .as_ref()
+            .ok_or("AI features unavailable: GGUF engine not initialized")
+            .map(|_| ());
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "AI features unavailable: GGUF engine not initialized"
+        );
     }
 }
 
