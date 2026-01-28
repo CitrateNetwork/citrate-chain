@@ -1455,7 +1455,7 @@ impl EVMExecutor {
 
         let value = U256::from_big_endian(&bytes);
         state.stack_push(value)?;
-        state.pc += n; // Skip the data bytes
+        state.pc += n + 1; // Skip opcode + data bytes (since loop won't add 1 when PC changed)
 
         Ok(())
     }
