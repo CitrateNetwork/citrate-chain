@@ -144,8 +144,12 @@ impl EncryptedIPFSStore {
         owner: H160,
         access_list: Vec<H160>,
     ) -> Result<Cid> {
-        // Derive encryption key for this model
-        let key_path = format!("m/model/{}", hex::encode(model_id));
+        // Derive encryption key for this model using BIP-44 style path
+        // m/44'/60'/0'/1/{model_index} where model_index is derived from model_id
+        let model_index = u32::from_be_bytes([
+            model_id.0[0], model_id.0[1], model_id.0[2], model_id.0[3]
+        ]) % 0x80000000; // Ensure non-hardened range
+        let key_path = format!("m/44'/60'/0'/1/{}", model_index);
         let derived_key = self.key_manager.derive_key(
             &key_path,
             KeyPurpose::ModelEncryption,
@@ -572,8 +576,10 @@ mod tests {
         let data = b"This is a test of chunking functionality";
         let chunks = store.chunk_model_data(data).unwrap();
 
-        assert_eq!(chunks.len(), 5); // 41 bytes / 10 = 5 chunks
+        // "This is a test of chunking functionality" = 40 bytes
+        // 40 bytes / 10 = 4 chunks of 10 bytes each
+        assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0].len(), 10);
-        assert_eq!(chunks[4].len(), 1); // Last chunk has 1 byte
+        assert_eq!(chunks[3].len(), 10); // Last chunk also 10 bytes (exactly divisible)
     }
 }

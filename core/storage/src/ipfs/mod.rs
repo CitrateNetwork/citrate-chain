@@ -12,8 +12,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub mod chunking;
+pub mod daemon;
 pub mod pinning;
 pub mod encrypted_store;
+
+pub use daemon::{IpfsDaemon, DaemonConfig, DaemonStatus, HealthStatus, NodeInfo};
 
 /// IPFS Content Identifier
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]

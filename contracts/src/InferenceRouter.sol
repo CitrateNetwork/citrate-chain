@@ -103,7 +103,17 @@ contract InferenceRouter is AccessControl {
         bytes32 indexed modelHash,
         bytes32 inputHash
     );
-    
+
+    event MinProviderStakeUpdated(
+        uint256 oldStake,
+        uint256 newStake
+    );
+
+    event PlatformFeeUpdated(
+        uint256 oldFee,
+        uint256 newFee
+    );
+
     constructor(address _modelRegistry) {
         modelRegistry = IModelRegistry(_modelRegistry);
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
@@ -355,15 +365,19 @@ contract InferenceRouter is AccessControl {
      */
     function setPlatformFee(uint256 newFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(newFee <= 1000, "Fee too high"); // Max 10%
+        uint256 oldFee = platformFee;
         platformFee = newFee;
+        emit PlatformFeeUpdated(oldFee, newFee);
     }
-    
+
     /**
      * @notice Set minimum provider stake
      * @param newStake New minimum stake amount
      */
     function setMinProviderStake(uint256 newStake) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        uint256 oldStake = minProviderStake;
         minProviderStake = newStake;
+        emit MinProviderStakeUpdated(oldStake, newStake);
     }
     
     // View functions

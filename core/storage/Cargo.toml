@@ -37,6 +37,19 @@ chrono = "0.4"
 aes-gcm = "0.10"
 rand = { workspace = true }
 
+# Quantum-Safe Storage Protocol (QSSP)
+# Real post-quantum and classical cryptography
+pqcrypto-kyber = "0.8"          # CRYSTALS-Kyber (ML-KEM) - NIST PQC standard
+pqcrypto-traits = "0.3"         # Common traits for pqcrypto
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }  # X25519 ECDH
+zeroize = "1.7"                 # Secure memory zeroing
+
+# IPFS daemon management
+dirs = "5.0"                    # Platform-specific directories
+flate2 = "1.0"                  # Gzip decompression for tar.gz
+tar = "0.4"                     # Tar archive extraction
+zip = "2.0"                     # ZIP archive extraction (Windows)
+
 [dev-dependencies]
 tempfile = "3.8"
 tokio-test = "0.4"

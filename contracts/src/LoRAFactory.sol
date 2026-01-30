@@ -95,7 +95,17 @@ contract LoRAFactory is AccessControl {
         bytes32 indexed loraHash,
         address indexed user
     );
-    
+
+    event TrainingFeeUpdated(
+        uint256 oldFee,
+        uint256 newFee
+    );
+
+    event MergeFeeUpdated(
+        uint256 oldFee,
+        uint256 newFee
+    );
+
     constructor(address _modelRegistry) {
         modelRegistry = IModelRegistry(_modelRegistry);
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
@@ -226,10 +236,12 @@ contract LoRAFactory is AccessControl {
         }
         
         require(totalWeight == 1e18, "Weights must sum to 1");
-        
+
         // Create merge request
+        // Use abi.encode instead of abi.encodePacked to prevent hash collisions
+        // with dynamic arrays (loraHashes, weights)
         bytes32 requestHash = keccak256(
-            abi.encodePacked(
+            abi.encode(
                 msg.sender,
                 loraHashes,
                 weights,
@@ -468,11 +480,15 @@ contract LoRAFactory is AccessControl {
     // Admin functions
     
     function setTrainingFee(uint256 newFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        uint256 oldFee = trainingFeePerEpoch;
         trainingFeePerEpoch = newFee;
+        emit TrainingFeeUpdated(oldFee, newFee);
     }
-    
+
     function setMergeFee(uint256 newFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        uint256 oldFee = mergeFee;
         mergeFee = newFee;
+        emit MergeFeeUpdated(oldFee, newFee);
     }
     
     function withdrawFees() external onlyRole(DEFAULT_ADMIN_ROLE) {

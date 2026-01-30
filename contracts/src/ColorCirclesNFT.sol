@@ -5,12 +5,14 @@ import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Base64.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title ColorCirclesNFT
  * @dev On-chain SVG NFT with 256 colorful circles
+ * @notice Uses ReentrancyGuard to protect against reentrancy attacks during minting
  */
-contract ColorCirclesNFT is ERC721, Ownable {
+contract ColorCirclesNFT is ERC721, Ownable, ReentrancyGuard {
     using Strings for uint256;
 
     uint256 public constant MAX_SUPPLY = 256;
@@ -34,8 +36,9 @@ contract ColorCirclesNFT is ERC721, Ownable {
 
     /**
      * @dev Batch mint multiple NFTs
+     * @notice Protected by nonReentrant to prevent reentrancy via onERC721Received
      */
-    function mintBatch(uint256 amount) external {
+    function mintBatch(uint256 amount) external nonReentrant {
         require(_currentTokenId + amount <= MAX_SUPPLY, "Exceeds max supply");
 
         for (uint256 i = 0; i < amount; i++) {

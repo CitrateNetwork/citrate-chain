@@ -367,6 +367,7 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
 
     /**
      * @notice Execute encrypted inference
+     * @dev Uses Checks-Effects-Interactions pattern: state updates before external call
      */
     function executeEncryptedInference(
         bytes32 modelId,
@@ -380,7 +381,11 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
     {
         require(models[modelId].isEncrypted, "Model not encrypted");
 
-        // Call encryption precompile for decryption and inference
+        // Effects: Update state BEFORE external call (Checks-Effects-Interactions pattern)
+        accessGrants[modelId][msg.sender].usageCount++;
+        models[modelId].totalInferences++;
+
+        // Interactions: Call encryption precompile for decryption and inference
         (bool success, bytes memory result) = MODEL_ENCRYPTION.call(
             abi.encodePacked(
                 uint8(1), // Decrypt operation
@@ -391,10 +396,6 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
             )
         );
         require(success, "Encrypted inference failed");
-
-        // Update metrics
-        accessGrants[modelId][msg.sender].usageCount++;
-        models[modelId].totalInferences++;
 
         return result;
     }
@@ -501,11 +502,11 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
      * @notice Get model details
      */
     function getModel(bytes32 modelId) external view returns (
-        address owner,
+        address modelOwner,
         string memory ipfsCid,
         bool isEncrypted,
         uint256 accessPrice,
-        uint256 totalInferences
+        uint256 inferenceCount
     ) {
         ModelInfo memory model = models[modelId];
         return (
