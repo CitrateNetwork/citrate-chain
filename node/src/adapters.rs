@@ -73,6 +73,7 @@ impl MCPRegistryBridge {
                 per_second_price: Default::default(),
                 currency: Currency::SALT,
             },
+            architecture: Vec::new(),
         }
     }
 }

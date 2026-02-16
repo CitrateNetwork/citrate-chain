@@ -954,6 +954,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 pending_retries = remaining;
             }
         });
+        let ai_handler = Arc::new(citrate_network::ai_handler::AINetworkHandler::new(
+            state_manager.clone(),
+            peer_manager.clone(),
+        ));
+        let ai_handler_for_rx = ai_handler.clone();
+
         tokio::spawn(async move {
             use citrate_consensus::types::Hash;
             use citrate_network::NetworkMessage;
@@ -1139,8 +1145,32 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 .await;
                         }
                     }
+                    // AI network messages: route through AINetworkHandler
+                    NetworkMessage::ModelAnnounce { .. }
+                    | NetworkMessage::InferenceRequest { .. }
+                    | NetworkMessage::InferenceResponse { .. }
+                    | NetworkMessage::TrainingJobAnnounce { .. }
+                    | NetworkMessage::GradientSubmission { .. }
+                    | NetworkMessage::WeightSync { .. }
+                    | NetworkMessage::GetModel { .. }
+                    | NetworkMessage::ModelData { .. } => {
+                        match ai_handler_for_rx.handle_message(&pid, &msg).await {
+                            Ok(Some(response)) => {
+                                let _ = pm_for_rx
+                                    .send_to_peers(&[pid.clone()], &response)
+                                    .await;
+                            }
+                            Ok(None) => {} // No response needed
+                            Err(e) => {
+                                tracing::warn!(
+                                    "AI handler error for message from {}: {}",
+                                    pid.0, e
+                                );
+                            }
+                        }
+                    }
                     _ => {
-                        // Other messages not handled yet
+                        tracing::debug!("Unhandled message variant from peer {}", pid.0);
                     }
                 }
             }

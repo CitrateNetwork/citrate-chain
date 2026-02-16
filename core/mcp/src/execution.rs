@@ -205,9 +205,25 @@ impl ModelExecutor {
         };
 
         let metadata_bytes = serde_json::to_vec(&record.metadata)?;
+
+        // Populate architecture from record metadata; fall back to GGUF magic header
+        let architecture = if !record.metadata.architecture.is_empty() {
+            record.metadata.architecture.clone()
+        } else if weights.len() >= 4 && &weights[0..4] == b"GGUF" {
+            // Extract GGUF header as architecture descriptor (first 64 bytes or less)
+            let header_len = std::cmp::min(64, weights.len());
+            weights[..header_len].to_vec()
+        } else {
+            warn!(
+                "Model {:?} has no architecture descriptor and no GGUF header",
+                hex::encode(&model_id.0[..8])
+            );
+            Vec::new()
+        };
+
         let model = Model {
             id: model_id,
-            architecture: Vec::new(),
+            architecture,
             weights,
             metadata: metadata_bytes,
         };
@@ -582,7 +598,11 @@ impl ModelExecutor {
         })
     }
 
-    /// Generate ZK proof data using commitment scheme
+    /// Generate proof data.
+    ///
+    /// When the `zkp_production` feature is enabled, this should generate a
+    /// Groth16 proof via arkworks (not yet implemented — see ADR-003).
+    /// Currently uses a commitment-based scheme as an interim measure.
     ///
     /// Creates a commitment-based proof that binds the statement to the execution.
     /// The proof follows a simple Schnorr-like protocol:

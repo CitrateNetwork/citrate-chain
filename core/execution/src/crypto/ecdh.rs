@@ -1,18 +1,31 @@
 // citrate/core/execution/src/crypto/ecdh.rs
 
-//! Proper ECDH key exchange implementation
-//! Replaces the insecure XOR-based key exchange with real ECIES
+//! ECDH key exchange using secp256k1 (k256 crate)
+//!
+//! Implements ECIES (Elliptic Curve Integrated Encryption Scheme) with:
+//! - k256 for real secp256k1 EC point multiplication
+//! - HKDF-SHA256 for key derivation
+//! - AES-256-GCM for authenticated encryption
+//!
+//! Migration note: This replaces the previous XOR-based placeholder.
+//! Any data encrypted with the old scheme is unrecoverable and must be re-encrypted.
 
-use anyhow::{Result, anyhow};
-use rand::RngCore;
-use sha3::{Sha3_256, Digest};
-use hmac::{Hmac, Mac};
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
+use anyhow::{anyhow, Result};
+use hmac::{Hmac, Mac};
+use k256::{
+    ecdh::EphemeralSecret,
+    elliptic_curve::sec1::ToEncodedPoint,
+    PublicKey, SecretKey,
+};
+use rand::rngs::OsRng;
+use rand::RngCore;
+use sha2::Sha256;
 
-type HmacSha256 = Hmac<Sha3_256>;
+type HmacSha256 = Hmac<Sha256>;
 
 /// ECIES (Elliptic Curve Integrated Encryption Scheme) implementation
 /// Uses secp256k1 curve for compatibility with Ethereum
@@ -37,19 +50,17 @@ pub struct ECIESMessage {
 }
 
 impl ECIES {
-    /// Generate new ECIES keypair
+    /// Generate new ECIES keypair using k256
     pub fn generate() -> Result<Self> {
+        let secret_key = SecretKey::random(&mut OsRng);
+        let public_key_point = secret_key.public_key();
+
         let mut private_key = [0u8; 32];
-        let mut rng = rand::thread_rng();
-        rng.fill_bytes(&mut private_key);
+        private_key.copy_from_slice(&secret_key.to_bytes());
 
-        // Ensure private key is valid for secp256k1
-        // In production, use proper curve arithmetic
-        if private_key[0] == 0 {
-            private_key[0] = 1;
-        }
-
-        let public_key = Self::derive_public_key(&private_key)?;
+        let compressed = public_key_point.to_encoded_point(true);
+        let mut public_key = [0u8; 33];
+        public_key.copy_from_slice(compressed.as_bytes());
 
         Ok(Self {
             private_key,
@@ -73,31 +84,34 @@ impl ECIES {
 
     /// Encrypt data for a recipient
     pub fn encrypt(&self, data: &[u8], recipient_pubkey: &[u8; 33]) -> Result<ECIESMessage> {
-        // Generate ephemeral keypair
+        // Generate ephemeral keypair for this message
         let ephemeral = Self::generate()?;
 
         // Perform ECDH to get shared secret
-        let shared_secret = self.ecdh(&ephemeral.private_key, recipient_pubkey)?;
+        let shared_secret = Self::ecdh(&ephemeral.private_key, recipient_pubkey)?;
 
         // Derive encryption key using HKDF
-        let (enc_key, mac_key) = self.derive_keys(&shared_secret)?;
+        let (enc_key, _mac_key) = Self::derive_keys(&shared_secret)?;
 
         // Generate random nonce
         let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        OsRng.fill_bytes(&mut nonce);
 
         // Encrypt with AES-256-GCM
-        let cipher = Aes256Gcm::new(&Key::from_slice(&enc_key));
+        let cipher = Aes256Gcm::new(Key::from_slice(&enc_key));
         let aes_nonce = Nonce::from_slice(&nonce);
 
         // Add associated data for authentication
         let associated_data = [&ephemeral.public_key[..], recipient_pubkey].concat();
 
         let encrypted_data = cipher
-            .encrypt(aes_nonce, aes_gcm::aead::Payload {
-                msg: data,
-                aad: &associated_data,
-            })
+            .encrypt(
+                aes_nonce,
+                aes_gcm::aead::Payload {
+                    msg: data,
+                    aad: &associated_data,
+                },
+            )
             .map_err(|e| anyhow!("AES encryption failed: {:?}", e))?;
 
         // Split ciphertext and auth tag
@@ -120,75 +134,68 @@ impl ECIES {
     /// Decrypt data from sender
     pub fn decrypt(&self, message: &ECIESMessage) -> Result<Vec<u8>> {
         // Perform ECDH with ephemeral public key
-        let shared_secret = self.ecdh(&self.private_key, &message.ephemeral_pubkey)?;
+        let shared_secret = Self::ecdh(&self.private_key, &message.ephemeral_pubkey)?;
 
         // Derive same keys
-        let (enc_key, _mac_key) = self.derive_keys(&shared_secret)?;
+        let (enc_key, _mac_key) = Self::derive_keys(&shared_secret)?;
 
         // Reconstruct full ciphertext with auth tag
         let mut full_ciphertext = message.ciphertext.clone();
         full_ciphertext.extend_from_slice(&message.auth_tag);
 
         // Decrypt with AES-256-GCM
-        let cipher = Aes256Gcm::new(&Key::from_slice(&enc_key));
+        let cipher = Aes256Gcm::new(Key::from_slice(&enc_key));
         let aes_nonce = Nonce::from_slice(&message.nonce);
 
         // Reconstruct associated data
         let associated_data = [&message.ephemeral_pubkey[..], &self.public_key[..]].concat();
 
         let decrypted = cipher
-            .decrypt(aes_nonce, aes_gcm::aead::Payload {
-                msg: &full_ciphertext,
-                aad: &associated_data,
-            })
+            .decrypt(
+                aes_nonce,
+                aes_gcm::aead::Payload {
+                    msg: &full_ciphertext,
+                    aad: &associated_data,
+                },
+            )
             .map_err(|e| anyhow!("AES decryption failed: {:?}", e))?;
 
         Ok(decrypted)
     }
 
-    /// Perform ECDH key exchange (simplified implementation)
-    fn ecdh(&self, private_key: &[u8; 32], public_key: &[u8; 33]) -> Result<[u8; 32]> {
-        // In production, use proper secp256k1 ECDH
-        // This is a simplified version for demonstration
+    /// Perform real ECDH key exchange using k256 (secp256k1)
+    fn ecdh(private_key: &[u8; 32], public_key: &[u8; 33]) -> Result<[u8; 32]> {
+        let sk = SecretKey::from_slice(private_key)
+            .map_err(|e| anyhow!("Invalid private key: {}", e))?;
+        let pk = PublicKey::from_sec1_bytes(public_key)
+            .map_err(|e| anyhow!("Invalid public key: {}", e))?;
 
-        // Validate public key format
-        if public_key[0] != 0x02 && public_key[0] != 0x03 {
-            return Err(anyhow!("Invalid compressed public key format"));
-        }
-
-        // Simplified point multiplication
-        // In production: shared_point = private_key * public_key
-        let mut shared_secret = [0u8; 32];
-        for i in 0..32 {
-            shared_secret[i] = private_key[i] ^ public_key[i + 1];
-        }
-
-        // Hash the result for additional security
-        let mut hasher = Sha3_256::new();
-        hasher.update(&shared_secret);
-        hasher.update(b"ECDH_CITRATE");
-        let final_secret = hasher.finalize();
+        // Real elliptic curve Diffie-Hellman: shared_point = sk * pk
+        let shared_secret = k256::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
 
         let mut result = [0u8; 32];
-        result.copy_from_slice(&final_secret);
+        result.copy_from_slice(shared_secret.raw_secret_bytes().as_slice());
         Ok(result)
     }
 
-    /// Derive encryption and MAC keys from shared secret using HKDF
-    fn derive_keys(&self, shared_secret: &[u8; 32]) -> Result<([u8; 32], [u8; 32])> {
+    /// Derive encryption and MAC keys from shared secret using HKDF-SHA256
+    fn derive_keys(shared_secret: &[u8; 32]) -> Result<([u8; 32], [u8; 32])> {
         // HKDF-Extract
-        let mut mac = HmacSha256::new_from_slice(b"CITRATE_ECIES_SALT")?;
+        let mut mac = HmacSha256::new_from_slice(b"CITRATE_ECIES_SALT")
+            .map_err(|e| anyhow!("HMAC init failed: {}", e))?;
         mac.update(shared_secret);
         let prk = mac.finalize().into_bytes();
 
         // HKDF-Expand for encryption key
-        let mut mac_enc = HmacSha256::new_from_slice(&prk)?;
+        let mut mac_enc = HmacSha256::new_from_slice(&prk)
+            .map_err(|e| anyhow!("HMAC init failed: {}", e))?;
         mac_enc.update(b"CITRATE_ENC_KEY");
         mac_enc.update(&[0x01]);
         let enc_key_bytes = mac_enc.finalize().into_bytes();
 
         // HKDF-Expand for MAC key
-        let mut mac_auth = HmacSha256::new_from_slice(&prk)?;
+        let mut mac_auth = HmacSha256::new_from_slice(&prk)
+            .map_err(|e| anyhow!("HMAC init failed: {}", e))?;
         mac_auth.update(b"CITRATE_MAC_KEY");
         mac_auth.update(&[0x02]);
         let mac_key_bytes = mac_auth.finalize().into_bytes();
@@ -201,28 +208,20 @@ impl ECIES {
         Ok((enc_key, mac_key))
     }
 
-    /// Derive public key from private key (simplified)
+    /// Derive public key from private key using real secp256k1 point multiplication
     fn derive_public_key(private_key: &[u8; 32]) -> Result<[u8; 33]> {
-        // In production, use proper secp256k1 point multiplication
-        // public_key = private_key * G (generator point)
-
+        let sk = SecretKey::from_slice(private_key)
+            .map_err(|e| anyhow!("Invalid private key for pubkey derivation: {}", e))?;
+        let pk = sk.public_key();
+        let compressed = pk.to_encoded_point(true);
         let mut public_key = [0u8; 33];
-        public_key[0] = 0x02; // Compressed format prefix
-
-        // Simplified derivation (not cryptographically secure)
-        let mut hasher = Sha3_256::new();
-        hasher.update(private_key);
-        hasher.update(b"SECP256K1_G");
-        let hash = hasher.finalize();
-
-        public_key[1..].copy_from_slice(&hash);
+        public_key.copy_from_slice(compressed.as_bytes());
         Ok(public_key)
     }
 
-    /// Verify public key format
+    /// Validate public key by attempting to decode it on the secp256k1 curve
     pub fn validate_public_key(pubkey: &[u8; 33]) -> bool {
-        // Check compressed format
-        pubkey[0] == 0x02 || pubkey[0] == 0x03
+        PublicKey::from_sec1_bytes(pubkey).is_ok()
     }
 
     /// Convert to hex string for debugging
@@ -292,6 +291,70 @@ mod tests {
     }
 
     #[test]
+    fn test_cross_party_shared_secret() {
+        // Verify that alice(priv) * bob(pub) == bob(priv) * alice(pub)
+        let alice = ECIES::generate().unwrap();
+        let bob = ECIES::generate().unwrap();
+
+        let secret_ab = ECIES::ecdh(&alice.private_key, &bob.public_key()).unwrap();
+        let secret_ba = ECIES::ecdh(&bob.private_key, &alice.public_key()).unwrap();
+
+        assert_eq!(
+            secret_ab, secret_ba,
+            "ECDH shared secrets must be identical regardless of direction"
+        );
+    }
+
+    #[test]
+    fn test_different_keys_different_secrets() {
+        let alice = ECIES::generate().unwrap();
+        let bob = ECIES::generate().unwrap();
+        let charlie = ECIES::generate().unwrap();
+
+        let secret_ab = ECIES::ecdh(&alice.private_key, &bob.public_key()).unwrap();
+        let secret_ac = ECIES::ecdh(&alice.private_key, &charlie.public_key()).unwrap();
+
+        assert_ne!(
+            secret_ab, secret_ac,
+            "Different key pairs must produce different shared secrets"
+        );
+    }
+
+    #[test]
+    fn test_invalid_key_rejection() {
+        let alice = ECIES::generate().unwrap();
+
+        // Invalid public key (all zeros with 0x02 prefix is not a valid curve point)
+        let mut invalid_pubkey = [0u8; 33];
+        invalid_pubkey[0] = 0x02;
+        let result = ECIES::ecdh(&alice.private_key, &invalid_pubkey);
+        assert!(result.is_err(), "Should reject invalid public key");
+
+        // Invalid prefix
+        let mut bad_prefix_key = [0x05; 33];
+        bad_prefix_key[0] = 0x05;
+        let result = ECIES::ecdh(&alice.private_key, &bad_prefix_key);
+        assert!(result.is_err(), "Should reject key with invalid prefix");
+    }
+
+    #[test]
+    fn test_validate_public_key_real_curve() {
+        let ecies = ECIES::generate().unwrap();
+        assert!(
+            ECIES::validate_public_key(&ecies.public_key()),
+            "Generated public key must validate"
+        );
+
+        // Random bytes with valid prefix are NOT valid curve points
+        let mut fake_key = [0x42; 33];
+        fake_key[0] = 0x02;
+        assert!(
+            !ECIES::validate_public_key(&fake_key),
+            "Random bytes should not be valid curve points"
+        );
+    }
+
+    #[test]
     fn test_key_exchange() {
         let alice_kx = ModelKeyExchange::new().unwrap();
         let bob_kx = ModelKeyExchange::new().unwrap();
@@ -310,12 +373,15 @@ mod tests {
     }
 
     #[test]
-    fn test_public_key_validation() {
-        let valid_key = [0x02; 33];
-        assert!(ECIES::validate_public_key(&valid_key));
+    fn test_from_private_key_roundtrip() {
+        let original = ECIES::generate().unwrap();
+        let restored = ECIES::from_private_key(original.private_key).unwrap();
 
-        let invalid_key = [0x04; 33]; // Uncompressed format
-        assert!(!ECIES::validate_public_key(&invalid_key));
+        assert_eq!(
+            original.public_key(),
+            restored.public_key(),
+            "Restoring from private key must produce same public key"
+        );
     }
 
     #[test]
@@ -331,5 +397,19 @@ mod tests {
 
         let result = bob.decrypt(&malformed_message);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_large_message_encryption() {
+        let alice = ECIES::generate().unwrap();
+        let bob = ECIES::generate().unwrap();
+
+        // Test with a larger payload (simulating model key material)
+        let large_message = vec![0xAB; 1024];
+
+        let encrypted = alice.encrypt(&large_message, &bob.public_key()).unwrap();
+        let decrypted = bob.decrypt(&encrypted).unwrap();
+
+        assert_eq!(large_message, decrypted);
     }
 }

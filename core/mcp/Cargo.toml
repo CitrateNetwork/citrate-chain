@@ -32,6 +32,13 @@ chrono = "0.4"
 dirs = "5.0"
 num_cpus = "1.16"
 
+[features]
+default = []
+# Enable full ZK proof verification (Groth16 via arkworks).
+# Without this feature, commitment-based proofs are used instead.
+# See core/execution/Cargo.toml lines 44-54 for arkworks dependencies.
+zkp_production = []
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.8"

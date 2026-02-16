@@ -778,7 +778,13 @@ impl AiApi {
         let gguf_config = GGUFEngineConfig {
             llama_cpp_path: PathBuf::from(
                 std::env::var("LLAMA_CPP_PATH")
-                    .unwrap_or_else(|_| "/Users/soleilklosowski/llama.cpp".to_string())
+                    .unwrap_or_else(|_| {
+                        dirs::home_dir()
+                            .unwrap_or_else(|| PathBuf::from("."))
+                            .join("llama.cpp")
+                            .to_string_lossy()
+                            .to_string()
+                    })
             ),
             models_dir: PathBuf::from(".citrate/models"),
             context_size: 4096,

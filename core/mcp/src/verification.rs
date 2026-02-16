@@ -20,9 +20,18 @@ impl ExecutionVerifier {
 
     /// Verify model integrity
     pub fn verify_model(&self, model: &Model) -> Result<()> {
-        // Basic validation
+        // Architecture check: warn if empty but weights present (legacy records),
+        // reject only when BOTH architecture and weights are empty.
         if model.architecture.is_empty() {
-            return Err(anyhow::anyhow!("Model architecture is empty"));
+            if model.weights.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Model has neither architecture nor weights"
+                ));
+            }
+            warn!(
+                "Model {:?} has empty architecture descriptor; proceeding with weights only",
+                hex::encode(&model.id.0[..8])
+            );
         }
 
         if model.weights.is_empty() {
@@ -147,17 +156,40 @@ impl ExecutionVerifier {
         Hash::new(hash.into())
     }
 
-    /// Verify ZK proof
+    /// Verify ZK proof using commitment-based scheme.
     ///
-    /// This implements a commitment-based verification scheme.
-    /// In production, this should be replaced with proper ZK verification using:
-    /// - arkworks for zkSNARKs
-    /// - bulletproofs for range proofs
-    /// - PLONK for general-purpose proofs
-    ///
-    /// Current implementation verifies that the proof contains a valid
-    /// commitment to the statement using a hash-based scheme.
+    /// When the `zkp_production` feature is enabled, this should dispatch to
+    /// `verify_groth16_proof` (not yet implemented — see ADR-003).
+    /// The arkworks crates (ark-groth16, ark-r1cs-std, ark-bls12-381) are
+    /// already available in `core/execution/Cargo.toml:44-54`.
     fn verify_zk_proof(&self, statement: &[u8], proof_data: &[u8]) -> Result<bool> {
+        #[cfg(feature = "zkp_production")]
+        {
+            return self.verify_groth16_proof(statement, proof_data);
+        }
+
+        #[cfg(not(feature = "zkp_production"))]
+        {
+            return self.verify_commitment_proof(statement, proof_data);
+        }
+    }
+
+    /// Placeholder for Groth16 verification via arkworks.
+    /// Gated behind `zkp_production` feature flag.
+    #[cfg(feature = "zkp_production")]
+    fn verify_groth16_proof(&self, _statement: &[u8], _proof_data: &[u8]) -> Result<bool> {
+        // TODO: Implement using ark-groth16 + ark-bls12-381 from core/execution
+        // 1. Deserialize proof from proof_data
+        // 2. Deserialize verification key
+        // 3. Prepare public inputs from statement
+        // 4. Call Groth16::verify(&vk, &public_inputs, &proof)
+        Err(anyhow::anyhow!(
+            "Groth16 verification not yet implemented; enable arkworks integration"
+        ))
+    }
+
+    /// Commitment-based proof verification (interim scheme).
+    fn verify_commitment_proof(&self, statement: &[u8], proof_data: &[u8]) -> Result<bool> {
         use sha3::{Digest, Sha3_256};
 
         // Reject empty inputs - this is a security requirement

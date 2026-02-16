@@ -1496,49 +1496,43 @@ impl EVMExecutor {
         Ok(())
     }
     fn op_create(&mut self, state: &mut EVMState) -> Result<(), ExecutionError> {
-        let value = state.stack_pop()?;
-        let offset = state.stack_pop()?.as_usize();
-        let size = state.stack_pop()?.as_usize();
+        let _value = state.stack_pop()?;
+        let _offset = state.stack_pop()?.as_usize();
+        let _size = state.stack_pop()?.as_usize();
 
-        state.consume_gas(self.gas_schedule.create)?;
-
-        let expansion_cost = state.memory_expand(offset, size)?;
-        state.consume_gas(expansion_cost)?;
-
-        // For now, return zero address - would need contract creation logic
-        let address = U256::zero();
-        state.stack_push(address)
+        // CREATE is handled by REVM at the executor level.
+        // If execution reaches the custom VM, the call was not routed through REVM.
+        Err(ExecutionError::Reverted(
+            "CREATE opcode not supported in custom VM; use REVM execution path".to_string(),
+        ))
     }
     fn op_call(&mut self, state: &mut EVMState) -> Result<(), ExecutionError> {
-        let gas = state.stack_pop()?;
-        let address = state.stack_pop()?;
-        let value = state.stack_pop()?;
-        let args_offset = state.stack_pop()?.as_usize();
-        let args_size = state.stack_pop()?.as_usize();
-        let ret_offset = state.stack_pop()?.as_usize();
-        let ret_size = state.stack_pop()?.as_usize();
+        let _gas = state.stack_pop()?;
+        let _address = state.stack_pop()?;
+        let _value = state.stack_pop()?;
+        let _args_offset = state.stack_pop()?.as_usize();
+        let _args_size = state.stack_pop()?.as_usize();
+        let _ret_offset = state.stack_pop()?.as_usize();
+        let _ret_size = state.stack_pop()?.as_usize();
 
-        state.consume_gas(self.gas_schedule.call)?;
-
-        // For now, return success (1) - would need actual call logic
-        let success = U256::one();
-        state.stack_push(success)
+        // CALL is handled by REVM at the executor level.
+        Err(ExecutionError::Reverted(
+            "CALL opcode not supported in custom VM; use REVM execution path".to_string(),
+        ))
     }
     fn op_callcode(&mut self, state: &mut EVMState) -> Result<(), ExecutionError> {
-        // Similar to CALL but runs code in current context
-        let gas = state.stack_pop()?;
-        let address = state.stack_pop()?;
-        let value = state.stack_pop()?;
-        let args_offset = state.stack_pop()?.as_usize();
-        let args_size = state.stack_pop()?.as_usize();
-        let ret_offset = state.stack_pop()?.as_usize();
-        let ret_size = state.stack_pop()?.as_usize();
+        let _gas = state.stack_pop()?;
+        let _address = state.stack_pop()?;
+        let _value = state.stack_pop()?;
+        let _args_offset = state.stack_pop()?.as_usize();
+        let _args_size = state.stack_pop()?.as_usize();
+        let _ret_offset = state.stack_pop()?.as_usize();
+        let _ret_size = state.stack_pop()?.as_usize();
 
-        state.consume_gas(self.gas_schedule.callcode)?;
-
-        // For now, return success (1)
-        let success = U256::one();
-        state.stack_push(success)
+        // CALLCODE is handled by REVM at the executor level.
+        Err(ExecutionError::Reverted(
+            "CALLCODE opcode not supported in custom VM; use REVM execution path".to_string(),
+        ))
     }
     fn op_return(&mut self, state: &mut EVMState) -> Result<(), ExecutionError> {
         let offset = state.stack_pop()?.as_usize();
@@ -1554,47 +1548,41 @@ impl EVMExecutor {
         Ok(())
     }
     fn op_delegatecall(&mut self, state: &mut EVMState) -> Result<(), ExecutionError> {
-        let gas = state.stack_pop()?;
-        let address = state.stack_pop()?;
-        let args_offset = state.stack_pop()?.as_usize();
-        let args_size = state.stack_pop()?.as_usize();
-        let ret_offset = state.stack_pop()?.as_usize();
-        let ret_size = state.stack_pop()?.as_usize();
+        let _gas = state.stack_pop()?;
+        let _address = state.stack_pop()?;
+        let _args_offset = state.stack_pop()?.as_usize();
+        let _args_size = state.stack_pop()?.as_usize();
+        let _ret_offset = state.stack_pop()?.as_usize();
+        let _ret_size = state.stack_pop()?.as_usize();
 
-        state.consume_gas(self.gas_schedule.delegatecall)?;
-
-        // For now, return success (1)
-        let success = U256::one();
-        state.stack_push(success)
+        // DELEGATECALL is handled by REVM at the executor level.
+        Err(ExecutionError::Reverted(
+            "DELEGATECALL opcode not supported in custom VM; use REVM execution path".to_string(),
+        ))
     }
     fn op_create2(&mut self, state: &mut EVMState) -> Result<(), ExecutionError> {
-        let value = state.stack_pop()?;
-        let offset = state.stack_pop()?.as_usize();
-        let size = state.stack_pop()?.as_usize();
-        let salt = state.stack_pop()?;
+        let _value = state.stack_pop()?;
+        let _offset = state.stack_pop()?.as_usize();
+        let _size = state.stack_pop()?.as_usize();
+        let _salt = state.stack_pop()?;
 
-        state.consume_gas(self.gas_schedule.create2)?;
-
-        let expansion_cost = state.memory_expand(offset, size)?;
-        state.consume_gas(expansion_cost)?;
-
-        // For now, return zero address
-        let address = U256::zero();
-        state.stack_push(address)
+        // CREATE2 is handled by REVM at the executor level.
+        Err(ExecutionError::Reverted(
+            "CREATE2 opcode not supported in custom VM; use REVM execution path".to_string(),
+        ))
     }
     fn op_staticcall(&mut self, state: &mut EVMState) -> Result<(), ExecutionError> {
-        let gas = state.stack_pop()?;
-        let address = state.stack_pop()?;
-        let args_offset = state.stack_pop()?.as_usize();
-        let args_size = state.stack_pop()?.as_usize();
-        let ret_offset = state.stack_pop()?.as_usize();
-        let ret_size = state.stack_pop()?.as_usize();
+        let _gas = state.stack_pop()?;
+        let _address = state.stack_pop()?;
+        let _args_offset = state.stack_pop()?.as_usize();
+        let _args_size = state.stack_pop()?.as_usize();
+        let _ret_offset = state.stack_pop()?.as_usize();
+        let _ret_size = state.stack_pop()?.as_usize();
 
-        state.consume_gas(self.gas_schedule.staticcall)?;
-
-        // For now, return success (1)
-        let success = U256::one();
-        state.stack_push(success)
+        // STATICCALL is handled by REVM at the executor level.
+        Err(ExecutionError::Reverted(
+            "STATICCALL opcode not supported in custom VM; use REVM execution path".to_string(),
+        ))
     }
     fn op_revert(&mut self, state: &mut EVMState) -> Result<(), ExecutionError> {
         let offset = state.stack_pop()?.as_usize();

@@ -12,7 +12,7 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 /// Pruning configuration
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PruningConfig {
     /// Number of blocks to keep
     pub keep_blocks: u64,

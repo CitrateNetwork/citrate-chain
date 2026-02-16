@@ -4,14 +4,56 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Subcommand;
 use colored::Colorize;
+use serde::Deserialize;
 use serde_json::json;
-use sha3::Digest;
+use sha2::Digest as Sha2Digest;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::config::Config;
+
+/// HuggingFace API base URL
+const HF_API_BASE: &str = "https://huggingface.co/api";
+
+/// Default models directory (~/.citrate/models)
+fn default_models_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+        .join("citrate")
+        .join("models")
+}
+
+/// Minimal model info from HuggingFace search API
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct HFSearchResult {
+    #[serde(rename = "modelId")]
+    model_id: Option<String>,
+    id: String,
+    author: Option<String>,
+    downloads: Option<u64>,
+    likes: Option<u64>,
+    pipeline_tag: Option<String>,
+    tags: Option<Vec<String>>,
+    siblings: Option<Vec<HFSibling>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HFSibling {
+    rfilename: String,
+    size: Option<u64>,
+    lfs: Option<HFLfs>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct HFLfs {
+    size: u64,
+    sha256: Option<String>,
+}
 
 #[derive(Subcommand)]
 pub enum ModelCommands {
@@ -115,6 +157,38 @@ pub enum ModelCommands {
         #[arg(long)]
         output_hash: Option<String>,
     },
+
+    /// Search for models on HuggingFace Hub
+    Search {
+        /// Search query (e.g. "code llama GGUF", "mistral instruct")
+        query: String,
+
+        /// Maximum number of results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+
+        /// Only show models with GGUF files
+        #[arg(long, default_value = "true")]
+        gguf: bool,
+    },
+
+    /// Download a model from HuggingFace Hub
+    Download {
+        /// HuggingFace repo ID (e.g. "TheBloke/CodeLlama-7B-GGUF")
+        repo_id: String,
+
+        /// Specific filename to download (if omitted, lists available GGUF files)
+        #[arg(short, long)]
+        file: Option<String>,
+
+        /// Output directory (default: ~/.citrate/models)
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+
+        /// HuggingFace API token for gated models
+        #[arg(long, env = "HF_TOKEN")]
+        token: Option<String>,
+    },
 }
 
 pub async fn execute(cmd: ModelCommands, config: &Config) -> Result<()> {
@@ -169,6 +243,21 @@ pub async fn execute(cmd: ModelCommands, config: &Config) -> Result<()> {
         }
         ModelCommands::Verify { proof, output_hash } => {
             verify_proof(config, proof, output_hash).await?;
+        }
+        ModelCommands::Search {
+            query,
+            limit,
+            gguf,
+        } => {
+            search_hf_models(&query, limit, gguf).await?;
+        }
+        ModelCommands::Download {
+            repo_id,
+            file,
+            output_dir,
+            token,
+        } => {
+            download_hf_model(&repo_id, file, output_dir, token).await?;
         }
     }
     Ok(())
@@ -727,6 +816,434 @@ async fn verify_proof(
     }
 
     Ok(())
+}
+
+// =============================================================================
+// HuggingFace Hub Integration
+// =============================================================================
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.1} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Extract GGUF quantization from filename (e.g. "model.Q4_K_M.gguf" -> "Q4_K_M")
+fn extract_quantization(filename: &str) -> Option<String> {
+    let lower = filename.to_lowercase();
+    let patterns = [
+        "q4_k_m", "q4_k_s", "q5_k_m", "q5_k_s", "q6_k", "q8_0",
+        "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k_s", "q3_k_m",
+        "q3_k_l", "iq2_xs", "iq2_s", "iq3_xs", "iq3_s", "f16", "f32",
+    ];
+    for pattern in &patterns {
+        if lower.contains(pattern) {
+            return Some(pattern.to_uppercase());
+        }
+    }
+    None
+}
+
+async fn search_hf_models(query: &str, limit: usize, gguf_only: bool) -> Result<()> {
+    println!(
+        "{}",
+        format!("Searching HuggingFace for \"{}\"...", query).cyan()
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let search_query = if gguf_only && !query.to_lowercase().contains("gguf") {
+        format!("{} gguf", query)
+    } else {
+        query.to_string()
+    };
+
+    let response = client
+        .get(format!("{}/models", HF_API_BASE))
+        .query(&[
+            ("search", search_query.as_str()),
+            ("limit", &limit.to_string()),
+            ("sort", "downloads"),
+            ("direction", "-1"),
+        ])
+        .header("User-Agent", "citrate-cli/0.1.0")
+        .send()
+        .await
+        .context("Failed to connect to HuggingFace API")?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("HuggingFace API error: {}", response.status());
+    }
+
+    let models: Vec<HFSearchResult> = response
+        .json()
+        .await
+        .context("Failed to parse HuggingFace response")?;
+
+    if models.is_empty() {
+        println!("{}", "No models found".yellow());
+        return Ok(());
+    }
+
+    // Filter to only models with GGUF tag if requested
+    let filtered: Vec<&HFSearchResult> = if gguf_only {
+        models
+            .iter()
+            .filter(|m| {
+                m.tags.as_ref().map_or(false, |tags| {
+                    tags.iter().any(|t| t.eq_ignore_ascii_case("gguf"))
+                })
+            })
+            .collect()
+    } else {
+        models.iter().collect()
+    };
+
+    if filtered.is_empty() {
+        println!(
+            "{}",
+            "No GGUF models found. Try a different query or use --gguf false.".yellow()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        format!("Found {} model(s):", filtered.len()).bold()
+    );
+    println!();
+
+    for model in &filtered {
+        let id = model.model_id.as_deref().unwrap_or(&model.id);
+        println!("  {} {}", "Repo:".bold(), id.cyan());
+        if let Some(author) = &model.author {
+            println!("  {} {}", "Author:".bold(), author);
+        }
+        if let Some(tag) = &model.pipeline_tag {
+            println!("  {} {}", "Type:".bold(), tag);
+        }
+        println!(
+            "  {} {}  {} {}",
+            "Downloads:".bold(),
+            model.downloads.unwrap_or(0),
+            "Likes:".bold(),
+            model.likes.unwrap_or(0)
+        );
+        println!(
+            "  {} citrate model download {}",
+            "Download:".bold(),
+            id
+        );
+        println!();
+    }
+
+    Ok(())
+}
+
+async fn download_hf_model(
+    repo_id: &str,
+    filename: Option<String>,
+    output_dir: Option<PathBuf>,
+    token: Option<String>,
+) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3600)) // 1 hour for large models
+        .build()?;
+
+    let models_dir = output_dir.unwrap_or_else(default_models_dir);
+
+    // If no filename specified, fetch model info and list available GGUF files
+    if filename.is_none() {
+        println!(
+            "{}",
+            format!("Fetching file list for {}...", repo_id).cyan()
+        );
+
+        let mut request = client
+            .get(format!("{}/models/{}", HF_API_BASE, repo_id))
+            .header("User-Agent", "citrate-cli/0.1.0");
+
+        if let Some(ref tok) = token {
+            request = request.bearer_auth(tok);
+        }
+
+        let response = request
+            .send()
+            .await
+            .context("Failed to connect to HuggingFace API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                anyhow::bail!(
+                    "Access denied. This model may be gated. Use --token <HF_TOKEN> to authenticate."
+                );
+            }
+            anyhow::bail!("HuggingFace API error: {}", status);
+        }
+
+        let model: HFSearchResult = response
+            .json()
+            .await
+            .context("Failed to parse model info")?;
+
+        let gguf_files: Vec<&HFSibling> = model
+            .siblings
+            .as_ref()
+            .map(|s| s.iter().filter(|f| f.rfilename.ends_with(".gguf")).collect())
+            .unwrap_or_default();
+
+        if gguf_files.is_empty() {
+            println!("{}", "No GGUF files found in this repository.".yellow());
+            println!(
+                "Available files (showing first 20):"
+            );
+            if let Some(siblings) = &model.siblings {
+                for f in siblings.iter().take(20) {
+                    let size = f
+                        .lfs
+                        .as_ref()
+                        .map(|l| l.size)
+                        .or(f.size)
+                        .map(format_size)
+                        .unwrap_or_else(|| "?".to_string());
+                    println!("  {} ({})", f.rfilename, size);
+                }
+            }
+        } else {
+            println!(
+                "{}",
+                format!("Available GGUF files for {}:", repo_id).bold()
+            );
+            println!();
+            for (i, file) in gguf_files.iter().enumerate() {
+                let size = file
+                    .lfs
+                    .as_ref()
+                    .map(|l| l.size)
+                    .or(file.size)
+                    .map(format_size)
+                    .unwrap_or_else(|| "?".to_string());
+                let quant = extract_quantization(&file.rfilename)
+                    .map(|q| format!(" [{}]", q))
+                    .unwrap_or_default();
+                let recommended = if quant.contains("Q4_K_M") {
+                    " (recommended)".green().to_string()
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  {} {} ({}){}{}",
+                    format!("{}.", i + 1).bold(),
+                    file.rfilename.cyan(),
+                    size,
+                    quant.green(),
+                    recommended
+                );
+            }
+            println!();
+            println!(
+                "{}",
+                "To download, run:".bold()
+            );
+            println!(
+                "  citrate model download {} --file <FILENAME>",
+                repo_id
+            );
+        }
+
+        return Ok(());
+    }
+
+    let filename = filename.unwrap();
+
+    // Create output directory
+    let model_dir = models_dir.join(repo_id.replace('/', "__"));
+    fs::create_dir_all(&model_dir)
+        .with_context(|| format!("Failed to create directory {:?}", model_dir))?;
+
+    let file_path = model_dir.join(&filename);
+
+    // Check if already downloaded
+    if file_path.exists() {
+        let metadata = fs::metadata(&file_path)?;
+        println!(
+            "{}",
+            format!(
+                "File already exists: {} ({})",
+                file_path.display(),
+                format_size(metadata.len())
+            )
+            .yellow()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        format!("Downloading {}/{}...", repo_id, filename).cyan()
+    );
+    println!("  Saving to: {}", file_path.display());
+
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        repo_id, filename
+    );
+
+    let mut request = client
+        .get(&url)
+        .header("User-Agent", "citrate-cli/0.1.0");
+
+    if let Some(ref tok) = token {
+        request = request.bearer_auth(tok);
+    }
+
+    let response = request
+        .send()
+        .await
+        .context("Failed to start download")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            anyhow::bail!(
+                "Access denied. Use --token <HF_TOKEN> for gated models."
+            );
+        }
+        anyhow::bail!("Download failed: HTTP {}", status);
+    }
+
+    let total_size = response.content_length().unwrap_or(0);
+    if total_size > 0 {
+        println!("  Total size: {}", format_size(total_size));
+    }
+
+    // Stream to temporary file, then rename
+    let temp_path = file_path.with_extension("part");
+    let mut file = fs::File::create(&temp_path)
+        .with_context(|| format!("Failed to create {:?}", temp_path))?;
+
+    let mut hasher = sha2::Sha256::new();
+    let mut downloaded: u64 = 0;
+    let mut last_report: u64 = 0;
+    let mut stream = response.bytes_stream();
+
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Download interrupted")?;
+        file.write_all(&chunk)
+            .context("Failed to write to disk")?;
+        hasher.update(&chunk);
+
+        downloaded += chunk.len() as u64;
+
+        // Report progress every 10MB
+        if downloaded - last_report >= 10_000_000 || downloaded == total_size {
+            if total_size > 0 {
+                let pct = (downloaded as f64 / total_size as f64 * 100.0) as u64;
+                print!(
+                    "\r  Progress: {} / {} ({}%)",
+                    format_size(downloaded),
+                    format_size(total_size),
+                    pct
+                );
+            } else {
+                print!("\r  Downloaded: {}", format_size(downloaded));
+            }
+            std::io::stdout().flush().ok();
+            last_report = downloaded;
+        }
+    }
+    println!();
+
+    drop(file); // Close file before rename
+
+    // Rename temp file to final path
+    fs::rename(&temp_path, &file_path)
+        .with_context(|| format!("Failed to finalize download at {:?}", file_path))?;
+
+    let hash = hex::encode(hasher.finalize());
+    println!("{}", "Download complete!".green().bold());
+    println!("  File: {}", file_path.display());
+    println!("  Size: {}", format_size(downloaded));
+    println!("  SHA256: {}", &hash[..16]);
+
+    // Try to auto-pin to IPFS if daemon is running
+    if let Ok(ipfs_response) = client
+        .post("http://127.0.0.1:5001/api/v0/id")
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
+        if ipfs_response.status().is_success() {
+            println!("{}", "IPFS daemon detected, pinning model...".cyan());
+            match auto_pin_to_ipfs(&client, &file_path).await {
+                Ok(cid) => {
+                    println!(
+                        "{}",
+                        format!("Pinned to IPFS: {}", cid).green()
+                    );
+                }
+                Err(e) => {
+                    println!(
+                        "{}",
+                        format!("IPFS pin failed (non-fatal): {}", e).yellow()
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn auto_pin_to_ipfs(client: &reqwest::Client, file_path: &PathBuf) -> Result<String> {
+    let file_data = fs::read(file_path)
+        .with_context(|| format!("Failed to read file for IPFS pin: {:?}", file_path))?;
+
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("model.gguf");
+
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(file_data)
+            .file_name(file_name.to_string()),
+    );
+
+    let response = client
+        .post("http://127.0.0.1:5001/api/v0/add?pin=true")
+        .multipart(form)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+        .context("IPFS add request failed")?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("IPFS returned status {}", response.status());
+    }
+
+    let result: serde_json::Value = response
+        .json()
+        .await
+        .context("Failed to parse IPFS response")?;
+
+    let cid = result
+        .get("Hash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No CID in IPFS response"))?
+        .to_string();
+
+    Ok(cid)
 }
 
 async fn wait_for_receipt(config: &Config, tx_hash: &str) -> Result<serde_json::Value> {

@@ -30,6 +30,10 @@ pub struct ModelMetadata {
     pub version: String,
     pub hash: Hash,
     pub size: u64,
+    /// Model architecture descriptor (e.g. GGUF header bytes, layer config).
+    /// Empty for legacy records; populated on model load from GGUF or metadata.
+    #[serde(default)]
+    pub architecture: Vec<u8>,
     pub compute_requirements: ComputeRequirements,
     pub pricing: PricingModel,
 }
@@ -259,6 +263,7 @@ mod tests {
             version: "1.0.0".to_string(),
             hash: Hash::default(),
             size: 1000,
+            architecture: vec![0x47, 0x47, 0x55, 0x46], // "GGUF" magic
             compute_requirements: ComputeRequirements {
                 min_memory: 1000,
                 min_compute: 10,

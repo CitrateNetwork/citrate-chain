@@ -934,29 +934,38 @@ impl Executor {
                 return Ok(());
             }
 
+            // Route standard EVM calls through REVM for correct CALL/CREATE/DELEGATECALL
             debug!(
-                "Executing contract at {} with {} bytes of code via VM",
+                "Executing contract at {} with {} bytes of code via REVM",
                 to,
                 code.len()
             );
             let available_gas = context.gas_limit.saturating_sub(context.gas_used);
-            let mut vm = VM::new(available_gas);
-            let vm_output = match vm.execute_with_input(&code, &data) {
-                Ok(out) => {
+            match crate::revm_adapter::execute_contract_call(
+                self.state_db.clone(),
+                from,
+                to,
+                data.clone(),
+                value,
+                available_gas,
+                U256::from(context.gas_price),
+                self.chain_id,
+                context.block_number,
+                context.timestamp,
+            ) {
+                Ok((output, gas_used)) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["ok"]).inc();
-                    out
+                    if gas_used > 0 {
+                        context.use_gas(gas_used)?;
+                    }
+                    VM_GAS_USED.observe(gas_used as f64);
+                    context.output = output;
                 }
                 Err(e) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["err"]).inc();
                     return Err(e);
                 }
-            };
-            let gas_spent = available_gas.saturating_sub(vm.gas_remaining);
-            if gas_spent > 0 {
-                context.use_gas(gas_spent)?;
             }
-            VM_GAS_USED.observe(gas_spent as f64);
-            context.output = vm_output;
 
             // Add execution log
             context.add_log(Log {
