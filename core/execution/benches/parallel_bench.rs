@@ -19,6 +19,7 @@ fn mk_tx(sender: u8, nonce: u64) -> Transaction {
         data: vec![],
         signature: Signature::new([1; 64]),
         tx_type: None,
+        ..Default::default()
     }
 }
 

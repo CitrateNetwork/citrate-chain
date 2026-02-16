@@ -475,6 +475,8 @@ impl Executor {
             status,
             logs: context.logs,
             output: context.output,
+            eth_tx_type: tx.eth_tx_type,
+            effective_gas_price: tx.gas_price,
         };
 
         info!(
@@ -2203,6 +2205,7 @@ mod tests {
             data: vec![],
             signature: Signature::new([0; 64]),
             tx_type: None,
+            ..Default::default()
         }
     }
 
@@ -2286,6 +2289,7 @@ mod tests {
             data,
             signature: Signature::new([0; 64]),
             tx_type: None,
+            ..Default::default()
         };
 
         let receipt = executor.execute_transaction(&block, &tx).await.unwrap();
@@ -2357,6 +2361,7 @@ mod tests {
             data: reg_data,
             signature: Signature::new([0; 64]),
             tx_type: None,
+            ..Default::default()
         };
         let _ = executor.execute_transaction(&block, &tx_reg).await.unwrap();
 
@@ -2389,6 +2394,7 @@ mod tests {
             data: inf_data,
             signature: Signature::new([0; 64]),
             tx_type: None,
+            ..Default::default()
         };
         let receipt = executor.execute_transaction(&block, &tx_inf).await.unwrap();
         assert!(receipt.status);
@@ -2444,6 +2450,7 @@ mod tests {
             data: set_admin,
             signature: Signature::new([0; 64]),
             tx_type: None,
+            ..Default::default()
         };
         let _ = executor.execute_transaction(&block, &tx_set).await.unwrap();
 
@@ -2484,6 +2491,7 @@ mod tests {
             data: queue,
             signature: Signature::new([0; 64]),
             tx_type: None,
+            ..Default::default()
         };
         let _ = executor.execute_transaction(&block, &tx_q).await.unwrap();
 
@@ -2503,6 +2511,7 @@ mod tests {
             data: exec.clone(),
             signature: Signature::new([0; 64]),
             tx_type: None,
+            ..Default::default()
         };
         let res = executor.execute_transaction(&block, &tx_e_early).await;
         assert!(res.is_ok());
@@ -2537,6 +2546,7 @@ mod tests {
             data: getp,
             signature: Signature::new([0; 64]),
             tx_type: None,
+            ..Default::default()
         };
         let rcpt_get = executor.execute_transaction(&block, &tx_g).await.unwrap();
         assert!(rcpt_get.status);

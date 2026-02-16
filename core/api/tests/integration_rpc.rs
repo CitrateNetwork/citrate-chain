@@ -153,6 +153,7 @@ async fn test_eth_get_tx_and_receipt_by_hash() {
         data: vec![1, 2, 3],
         signature: Signature::new([1; 64]),
         tx_type: None,
+        ..Default::default()
     };
     storage.transactions.put_transaction(&tx).unwrap();
 
@@ -168,6 +169,8 @@ async fn test_eth_get_tx_and_receipt_by_hash() {
         status: true,
         logs: vec![],
         output: vec![],
+        eth_tx_type: 0,
+        effective_gas_price: 0,
     };
     storage.transactions.put_receipt(&tx.hash, &rcpt).unwrap();
 
@@ -271,6 +274,7 @@ async fn test_eth_get_transaction_count_latest_vs_pending() {
         data: vec![],
         signature: Signature::new([1; 64]),
         tx_type: None,
+        ..Default::default()
     };
     let tx1 = Transaction {
         nonce: 1,

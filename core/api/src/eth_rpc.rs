@@ -15,6 +15,48 @@ use primitive_types::U256;
 use serde_json::json;
 use std::sync::Arc;
 
+/// Build EIP-typed fields for a transaction JSON response.
+/// Appends `type`, `chainId`, and optionally `accessList`, `maxFeePerGas`,
+/// `maxPriorityFeePerGas` to the given serde_json::Map.
+fn append_eip_fields(
+    map: &mut serde_json::Map<String, Value>,
+    eth_tx_type: u8,
+    chain_id: Option<u64>,
+    max_fee_per_gas: Option<u64>,
+    max_priority_fee_per_gas: Option<u64>,
+    access_list: &Option<Vec<(Vec<u8>, Vec<Vec<u8>>)>>,
+) {
+    map.insert("type".into(), json!(format!("0x{:x}", eth_tx_type)));
+    if let Some(cid) = chain_id {
+        map.insert("chainId".into(), json!(format!("0x{:x}", cid)));
+    }
+    if eth_tx_type >= 1 {
+        // Serialize access list as array of {address, storageKeys}
+        let al_json: Vec<Value> = access_list
+            .as_ref()
+            .map(|al| {
+                al.iter()
+                    .map(|(addr, keys)| {
+                        json!({
+                            "address": format!("0x{}", hex::encode(addr)),
+                            "storageKeys": keys.iter().map(|k| format!("0x{}", hex::encode(k))).collect::<Vec<_>>()
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        map.insert("accessList".into(), json!(al_json));
+    }
+    if eth_tx_type == 2 {
+        if let Some(mf) = max_fee_per_gas {
+            map.insert("maxFeePerGas".into(), json!(format!("0x{:x}", mf)));
+        }
+        if let Some(mp) = max_priority_fee_per_gas {
+            map.insert("maxPriorityFeePerGas".into(), json!(format!("0x{:x}", mp)));
+        }
+    }
+}
+
 /// Add Ethereum-compatible RPC methods to the IoHandler
 pub fn register_eth_methods(
     io_handler: &mut IoHandler,
@@ -256,46 +298,60 @@ pub fn register_eth_methods(
             Ok(tx) => {
                 let from_hex = format!("0x{}", tx.from);
                 let to_hex_opt = tx.to.as_ref().map(|s| format!("0x{}", s));
-                Ok(json!({
-                    "hash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
-                    "nonce": format!("0x{:x}", tx.nonce),
-                    "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                    "blockNumber": "0x0",
-                    "transactionIndex": "0x0",
-                    "from": from_hex,
-                    "to": to_hex_opt,
-                    "value": format!("0x{:x}", tx.value),
-                    "gasPrice": format!("0x{:x}", tx.gas_price),
-                    "gas": format!("0x{:x}", tx.gas_limit),
-                    "input": format!("0x{}", hex::encode(&tx.data)),
-                    "v": "0x1b",
-                    "r": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                    "s": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                    "type": "0x0"
-                }))
+                let mut obj = serde_json::Map::new();
+                obj.insert("hash".into(), json!(format!("0x{}", hex::encode(tx.hash.as_bytes()))));
+                obj.insert("nonce".into(), json!(format!("0x{:x}", tx.nonce)));
+                obj.insert("blockHash".into(), json!("0x0000000000000000000000000000000000000000000000000000000000000000"));
+                obj.insert("blockNumber".into(), json!("0x0"));
+                obj.insert("transactionIndex".into(), json!("0x0"));
+                obj.insert("from".into(), json!(from_hex));
+                obj.insert("to".into(), json!(to_hex_opt));
+                obj.insert("value".into(), json!(format!("0x{:x}", tx.value)));
+                obj.insert("gasPrice".into(), json!(format!("0x{:x}", tx.gas_price)));
+                obj.insert("gas".into(), json!(format!("0x{:x}", tx.gas_limit)));
+                obj.insert("input".into(), json!(format!("0x{}", hex::encode(&tx.data))));
+                obj.insert("v".into(), json!("0x1b"));
+                obj.insert("r".into(), json!("0x0000000000000000000000000000000000000000000000000000000000000000"));
+                obj.insert("s".into(), json!("0x0000000000000000000000000000000000000000000000000000000000000000"));
+                append_eip_fields(
+                    &mut obj,
+                    tx.eth_tx_type,
+                    tx.chain_id,
+                    tx.max_fee_per_gas,
+                    tx.max_priority_fee_per_gas,
+                    &tx.access_list,
+                );
+                Ok(Value::Object(obj))
             },
             Err(_) => {
                 // Fallback: check mempool for pending transaction
                 if let Some(tx) = block_on(mempool_tx_lookup.get_transaction(&h)) {
                     let from_addr = citrate_execution::address_utils::normalize_address(&tx.from);
                     let to_addr_opt = tx.to.as_ref().map(citrate_execution::address_utils::normalize_address);
-                    Ok(json!({
-                        "hash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
-                        "nonce": format!("0x{:x}", tx.nonce),
-                        "blockHash": Value::Null,
-                        "blockNumber": Value::Null,
-                        "transactionIndex": Value::Null,
-                        "from": format!("0x{}", hex::encode(from_addr.0)),
-                        "to": to_addr_opt.map(|a| format!("0x{}", hex::encode(a.0))),
-                        "value": format!("0x{:x}", tx.value),
-                        "gasPrice": format!("0x{:x}", tx.gas_price),
-                        "gas": format!("0x{:x}", tx.gas_limit),
-                        "input": format!("0x{}", hex::encode(&tx.data)),
-                        "v": "0x1b",
-                        "r": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                        "s": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                        "type": "0x0"
-                    }))
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("hash".into(), json!(format!("0x{}", hex::encode(tx.hash.as_bytes()))));
+                    obj.insert("nonce".into(), json!(format!("0x{:x}", tx.nonce)));
+                    obj.insert("blockHash".into(), Value::Null);
+                    obj.insert("blockNumber".into(), Value::Null);
+                    obj.insert("transactionIndex".into(), Value::Null);
+                    obj.insert("from".into(), json!(format!("0x{}", hex::encode(from_addr.0))));
+                    obj.insert("to".into(), json!(to_addr_opt.map(|a| format!("0x{}", hex::encode(a.0)))));
+                    obj.insert("value".into(), json!(format!("0x{:x}", tx.value)));
+                    obj.insert("gasPrice".into(), json!(format!("0x{:x}", tx.gas_price)));
+                    obj.insert("gas".into(), json!(format!("0x{:x}", tx.gas_limit)));
+                    obj.insert("input".into(), json!(format!("0x{}", hex::encode(&tx.data))));
+                    obj.insert("v".into(), json!("0x1b"));
+                    obj.insert("r".into(), json!("0x0000000000000000000000000000000000000000000000000000000000000000"));
+                    obj.insert("s".into(), json!("0x0000000000000000000000000000000000000000000000000000000000000000"));
+                    append_eip_fields(
+                        &mut obj,
+                        tx.eth_tx_type,
+                        tx.chain_id,
+                        tx.max_fee_per_gas,
+                        tx.max_priority_fee_per_gas,
+                        &tx.access_list,
+                    );
+                    Ok(Value::Object(obj))
                 } else {
                     Ok(Value::Null)
                 }
@@ -366,8 +422,8 @@ pub fn register_eth_methods(
                     })).collect::<Vec<_>>(),
                     "status": if receipt.status { "0x1" } else { "0x0" },
                     "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                    "type": "0x0",
-                    "effectiveGasPrice": "0x0"
+                    "type": format!("0x{:x}", receipt.eth_tx_type),
+                    "effectiveGasPrice": format!("0x{:x}", receipt.effective_gas_price)
                 }))
             },
             Err(_) => Ok(Value::Null),
@@ -667,8 +723,11 @@ pub fn register_eth_methods(
 
     // eth_sendRawTransaction - Submit signed transaction
     let mempool_send = mempool.clone();
+    let executor_raw_tx = executor.clone();
+    let raw_tx_chain_id = chain_id;
     io_handler.add_sync_method("eth_sendRawTransaction", move |params: Params| {
         let mempool = mempool_send.clone();
+        let exec = executor_raw_tx.clone();
 
         tracing::info!("eth_sendRawTransaction called");
 
@@ -727,6 +786,43 @@ pub fn register_eth_methods(
                 )));
             }
         };
+
+        // Validate chain ID if the transaction includes one
+        if let Some(tx_chain_id) = tx.chain_id {
+            if tx_chain_id != raw_tx_chain_id {
+                tracing::error!(
+                    "Chain ID mismatch: tx has {}, node expects {}",
+                    tx_chain_id, raw_tx_chain_id
+                );
+                return Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::InvalidParams,
+                    message: format!(
+                        "Invalid chain ID: transaction has {}, expected {}",
+                        tx_chain_id, raw_tx_chain_id
+                    ),
+                    data: None,
+                });
+            }
+        }
+
+        // Check sender has sufficient balance for value + gas cost
+        {
+            let sender_addr = citrate_execution::address_utils::normalize_address(&tx.from);
+            let sender_balance = exec.get_balance(&sender_addr);
+            let tx_cost = U256::from(tx.value)
+                .saturating_add(U256::from(tx.gas_limit).saturating_mul(U256::from(tx.gas_price)));
+            if sender_balance < tx_cost {
+                tracing::error!(
+                    "Insufficient balance: sender has {}, tx requires {}",
+                    sender_balance, tx_cost
+                );
+                return Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::InvalidParams,
+                    message: "insufficient funds for gas * price + value".to_string(),
+                    data: None,
+                });
+            }
+        }
 
         // Get transaction hash (now always properly set by decoder)
         let tx_hash = tx.hash;
@@ -899,13 +995,19 @@ pub fn register_eth_methods(
             data,
             signature: Signature::new([0u8; 64]),
             tx_type: None,
+            ..Default::default()
         };
 
         // Determine transaction type from data
         tx.determine_type();
 
-        // Snapshot state, execute, then restore
+        // Snapshot state, set sender balance to max for read-only simulation, execute, restore
         let snapshot = exec.state_db().snapshot();
+
+        // For eth_call, give sender unlimited balance so read-only calls don't fail
+        let sender_addr = citrate_execution::address_utils::normalize_address(&from_pk);
+        exec.set_balance(&sender_addr, U256::from(u128::MAX));
+
         let res = block_on(exec.execute_transaction(&blk, &tx));
         exec.state_db().restore(snapshot);
 
@@ -1069,13 +1171,17 @@ pub fn register_eth_methods(
             data,
             signature: Signature::new([0u8; 64]),
             tx_type: None,
+            ..Default::default()
         };
 
         // Determine transaction type from data
         tx.determine_type();
 
-        // Snapshot state, execute, then restore
+        // Snapshot state, set sender balance to max for simulation, execute, restore
         let snapshot = exec.state_db().snapshot();
+        let sender_addr = citrate_execution::address_utils::normalize_address(&from_pk);
+        exec.set_balance(&sender_addr, U256::from(u128::MAX));
+
         let res = block_on(exec.execute_transaction(&blk, &tx));
         exec.state_db().restore(snapshot);
 

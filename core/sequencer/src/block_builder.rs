@@ -731,6 +731,7 @@ mod tests {
             data: vec![],
             signature: Signature::new([1; 64]), // Non-zero signature for tests
             tx_type: None,
+            ..Default::default()
         }
     }
 

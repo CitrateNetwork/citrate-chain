@@ -63,6 +63,7 @@ fn create_test_transaction(
         data: vec![],
         signature: Signature::new([nonce as u8; 64]),
         tx_type: None,
+        ..Default::default()
     }
 }
 

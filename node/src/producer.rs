@@ -616,6 +616,8 @@ impl BlockProducer {
                         status: false,
                         logs: vec![],
                         output: vec![],
+                        eth_tx_type: 0,
+                        effective_gas_price: 0,
                     });
                 }
             }

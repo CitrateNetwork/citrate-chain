@@ -632,6 +632,7 @@ mod tests {
             data: vec![],
             signature: Signature::new([0; 64]),
             tx_type: Some(TransactionType::Standard),
+            ..Default::default()
         };
 
         let tx2 = Transaction {
@@ -645,6 +646,7 @@ mod tests {
             data: vec![],
             signature: Signature::new([0; 64]),
             tx_type: Some(TransactionType::Standard),
+            ..Default::default()
         };
 
         let mut genesis = create_test_block([0xFF; 32], Hash::default(), vec![], 0, 1);

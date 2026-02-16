@@ -17,6 +17,21 @@ members = [
     "faucet",
     "gui/citrate-core/src-tauri",
 ]
+# Default build targets: unified node binary (includes wallet + CLI).
+# Standalone wallet/cli/faucet can still be built with `cargo build -p citrate-wallet` etc.
+default-members = [
+    "core/consensus",
+    "core/sequencer",
+    "core/execution",
+    "core/storage",
+    "core/primitives",
+    "core/api",
+    "core/network",
+    "core/mcp",
+    "core/economics",
+    "core/marketplace",
+    "node",
+]
 resolver = "2"
 
 [workspace.package]

@@ -361,6 +361,12 @@ pub struct TransactionReceipt {
     pub status: bool,
     pub logs: Vec<Log>,
     pub output: Vec<u8>,
+    /// EIP-2718 transaction type (0=legacy, 1=EIP-2930, 2=EIP-1559)
+    #[serde(default)]
+    pub eth_tx_type: u8,
+    /// Effective gas price actually paid (gas_price for legacy, computed for EIP-1559)
+    #[serde(default)]
+    pub effective_gas_price: u64,
 }
 
 /// Event log

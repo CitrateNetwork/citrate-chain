@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 
 mod adapters;
 mod artifact;
+mod commands;
 mod config;
 mod genesis;
 mod inference;
@@ -109,6 +110,48 @@ enum Commands {
 
     /// Show genesis block information
     GenesisInfo,
+
+    /// Wallet management (accounts, balances, transfers)
+    Wallet {
+        /// Wallet keystore path
+        #[arg(short, long)]
+        keystore: Option<PathBuf>,
+
+        /// RPC URL
+        #[arg(short, long, default_value = "http://localhost:8545")]
+        rpc: String,
+
+        /// Chain ID
+        #[arg(long, default_value = "1337")]
+        wallet_chain_id: u64,
+
+        #[command(subcommand)]
+        command: commands::wallet::WalletCommands,
+    },
+
+    /// Account management (CLI tools)
+    #[command(subcommand)]
+    Account(citrate_cli::commands::account::AccountCommands),
+
+    /// Smart contract deployment and interaction
+    #[command(subcommand)]
+    Contract(citrate_cli::commands::contract::ContractCommands),
+
+    /// Network and node operations
+    #[command(subcommand)]
+    Network(citrate_cli::commands::network::NetworkCommands),
+
+    /// Governance parameter management
+    #[command(subcommand)]
+    Governance(citrate_cli::commands::governance::GovernanceCommands),
+
+    /// Advanced network monitoring and debugging
+    #[command(subcommand)]
+    Advanced(citrate_cli::commands::advanced::AdvancedCommands),
+
+    /// Interactive wizards for setup and deployment
+    #[command(subcommand)]
+    Wizard(citrate_cli::commands::wizard::WizardCommands),
 }
 
 #[derive(Subcommand)]
@@ -182,6 +225,40 @@ async fn main() -> Result<()> {
         }
         Some(Commands::GenesisInfo) => {
             show_genesis_info()?;
+            return Ok(());
+        }
+        Some(Commands::Wallet { keystore, rpc, wallet_chain_id, command }) => {
+            commands::wallet::execute(command, keystore, rpc, wallet_chain_id).await?;
+            return Ok(());
+        }
+        Some(Commands::Account(cmd)) => {
+            let config = citrate_cli::config::Config::load(None, cli.rpc_addr.as_deref())?;
+            citrate_cli::commands::account::execute(cmd, &config).await?;
+            return Ok(());
+        }
+        Some(Commands::Contract(cmd)) => {
+            let config = citrate_cli::config::Config::load(None, cli.rpc_addr.as_deref())?;
+            citrate_cli::commands::contract::execute(cmd, &config).await?;
+            return Ok(());
+        }
+        Some(Commands::Network(cmd)) => {
+            let config = citrate_cli::config::Config::load(None, cli.rpc_addr.as_deref())?;
+            citrate_cli::commands::network::execute(cmd, &config).await?;
+            return Ok(());
+        }
+        Some(Commands::Governance(cmd)) => {
+            let config = citrate_cli::config::Config::load(None, cli.rpc_addr.as_deref())?;
+            citrate_cli::commands::governance::execute(cmd, &config).await?;
+            return Ok(());
+        }
+        Some(Commands::Advanced(cmd)) => {
+            let config = citrate_cli::config::Config::load(None, cli.rpc_addr.as_deref())?;
+            citrate_cli::commands::advanced::execute(cmd, &config).await?;
+            return Ok(());
+        }
+        Some(Commands::Wizard(cmd)) => {
+            let config = citrate_cli::config::Config::load(None, cli.rpc_addr.as_deref())?;
+            citrate_cli::commands::wizard::execute(cmd, &config).await?;
             return Ok(());
         }
         None => {

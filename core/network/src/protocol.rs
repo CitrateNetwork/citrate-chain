@@ -391,6 +391,7 @@ mod tests {
                 data: vec![],
                 signature: citrate_consensus::types::Signature::new([0; 64]),
                 tx_type: None,
+                ..Default::default()
             },
         };
 

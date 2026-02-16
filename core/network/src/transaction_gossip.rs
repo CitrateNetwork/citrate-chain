@@ -361,6 +361,7 @@ mod tests {
             data: vec![],
             signature: Signature::new([0; 64]),
             tx_type: Some(TransactionType::Standard),
+            ..Default::default()
         };
 
         // Test broadcasting

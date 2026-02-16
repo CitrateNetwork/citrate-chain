@@ -140,6 +140,7 @@ mod tests {
             data: vec![],
             signature: Signature::default(),
             tx_type: None,
+            ..Default::default()
         }
     }
 

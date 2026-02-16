@@ -119,6 +119,7 @@ impl TransactionBuilder {
             gas_limit: self.gas_limit,
             signature: Signature::new([0; 64]), // Will be replaced
             tx_type: None,                      // Will be determined if needed
+            ..Default::default()
         };
 
         // Calculate transaction hash (UI/display). Consensus verification uses canonical bytes.

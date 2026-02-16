@@ -207,6 +207,7 @@ mod tests {
             data: vec![],
             signature: Signature::new([1; 64]),
             tx_type: None,
+            ..Default::default()
         }
     }
 
@@ -221,6 +222,8 @@ mod tests {
             status: true,
             logs: vec![],
             output: vec![],
+            eth_tx_type: 0,
+            effective_gas_price: 0,
         }
     }
 

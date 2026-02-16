@@ -80,6 +80,7 @@ impl TransactionApi {
             data: request.data.unwrap_or_default(),
             signature: Signature::new([1; 64]), // Devnet: unsigned transaction accepted
             tx_type: None,
+            ..Default::default()
         };
 
         // Determine transaction type from data

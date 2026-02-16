@@ -66,6 +66,7 @@ fn create_test_transaction(nonce: u64) -> Transaction {
         data: vec![],
         signature: Signature::new(sig_bytes),
         tx_type: None,
+        ..Default::default()
     }
 }
 
@@ -330,6 +331,7 @@ mod storage_tests {
                 data: vec![],
                 signature: Signature::new([i as u8; 64]),
                 tx_type: None, // Explicitly None to avoid enum serialization issues
+                ..Default::default()
             };
             block.transactions.push(tx);
         }

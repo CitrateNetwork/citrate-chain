@@ -1595,6 +1595,7 @@ impl RpcServer {
                 data,
                 signature: citrate_consensus::types::Signature::new([0; 64]),
                 tx_type: None,
+                ..Default::default()
             };
 
             match block_on(exec.execute_transaction(&blk, &tx)) {

@@ -131,6 +131,7 @@ mod storage_manager_tests {
             data: vec![],
             signature: Signature::new([0u8; 64]),
             tx_type: None,
+            ..Default::default()
         };
 
         storage

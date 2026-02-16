@@ -649,6 +649,7 @@ impl EnhancedTransactionDecoder {
             gas_limit: tx.gas_limit,
             signature: Signature::new(sig_bytes),
             tx_type: None,
+            ..Default::default()
         };
 
         citrate_tx.determine_type();
@@ -686,6 +687,7 @@ impl EnhancedTransactionDecoder {
             gas_limit: tx.gas_limit,
             signature: Signature::new(sig_bytes),
             tx_type: None,
+            ..Default::default()
         };
 
         citrate_tx.determine_type();

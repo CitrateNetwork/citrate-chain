@@ -43,6 +43,7 @@ fn make_tx(nonce: u64, gas_price: u64, from: [u8; 32], to: [u8; 32], data: Vec<u
         data,
         signature: Signature::new([1; 64]),
         tx_type: None,
+        ..Default::default()
     }
 }
 

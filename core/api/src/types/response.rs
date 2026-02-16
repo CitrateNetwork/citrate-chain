@@ -45,6 +45,21 @@ pub struct TransactionResponse {
     pub gas_limit: u64,
     pub gas_price: u64,
     pub data: Vec<u8>,
+    /// EIP-2718 transaction type (0=legacy, 1=EIP-2930, 2=EIP-1559)
+    #[serde(default)]
+    pub eth_tx_type: u8,
+    /// EIP-1559 max fee per gas
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fee_per_gas: Option<u64>,
+    /// EIP-1559 max priority fee per gas
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_priority_fee_per_gas: Option<u64>,
+    /// EIP-2930/1559 access list
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_list: Option<Vec<(Vec<u8>, Vec<Vec<u8>>)>>,
+    /// Chain ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<u64>,
 }
 
 impl From<Transaction> for TransactionResponse {
@@ -58,6 +73,11 @@ impl From<Transaction> for TransactionResponse {
             gas_limit: tx.gas_limit,
             gas_price: tx.gas_price,
             data: tx.data,
+            eth_tx_type: tx.eth_tx_type,
+            max_fee_per_gas: tx.max_fee_per_gas,
+            max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
+            access_list: tx.access_list,
+            chain_id: tx.chain_id,
         }
     }
 }

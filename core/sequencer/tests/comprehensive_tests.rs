@@ -25,6 +25,7 @@ fn create_test_transaction(nonce: u64, gas_price: u64) -> Transaction {
         data: vec![],
         signature: Signature::new([1; 64]), // Valid non-zero signature
         tx_type: None,
+        ..Default::default()
     }
 }
 

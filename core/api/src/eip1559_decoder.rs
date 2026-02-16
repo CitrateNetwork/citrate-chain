@@ -485,6 +485,7 @@ impl Eip1559Decoder {
             gas_limit: tx.gas_limit,
             signature: Signature::new(sig_bytes),
             tx_type: None,
+            ..Default::default()
         };
 
         // Determine transaction type from data

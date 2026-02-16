@@ -37,7 +37,7 @@ impl fmt::Display for Hash {
 }
 
 /// Public key type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct PublicKey(pub [u8; 32]);
 
 impl PublicKey {
@@ -258,7 +258,7 @@ impl TransactionType {
 }
 
 /// Transaction structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Transaction {
     pub hash: Hash,
     pub nonce: u64,
@@ -271,6 +271,26 @@ pub struct Transaction {
     pub signature: Signature,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_type: Option<TransactionType>,
+
+    /// EIP-2718 transaction type: 0=legacy, 1=EIP-2930, 2=EIP-1559
+    #[serde(default)]
+    pub eth_tx_type: u8,
+
+    /// EIP-1559 max fee per gas (in wei)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fee_per_gas: Option<u64>,
+
+    /// EIP-1559 max priority fee per gas (in wei)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_priority_fee_per_gas: Option<u64>,
+
+    /// EIP-2930/1559 access list: Vec of (address_bytes, Vec<storage_key_bytes>)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_list: Option<Vec<(Vec<u8>, Vec<Vec<u8>>)>>,
+
+    /// Chain ID decoded from the transaction signature
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<u64>,
 }
 
 impl Transaction {

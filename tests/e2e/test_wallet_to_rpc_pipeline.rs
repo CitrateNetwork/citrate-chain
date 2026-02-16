@@ -47,6 +47,7 @@ mod wallet_rpc_pipeline_e2e {
             gas_limit,
             signature: Signature::new([0; 64]),
             tx_type: None,
+            ..Default::default()
         };
 
         // Hash computation (matches wallet/src/transaction.rs)

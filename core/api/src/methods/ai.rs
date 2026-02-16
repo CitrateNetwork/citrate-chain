@@ -233,6 +233,7 @@ impl AiApi {
             data: vec![], // Serialized transaction type would go here
             signature: Signature::new([0u8; 64]), // Placeholder - needs proper signing
             tx_type: None, // Will be determined from data
+            ..Default::default()
         };
 
         // Clone tx hash before moving tx to mempool
@@ -286,6 +287,7 @@ impl AiApi {
             data: vec![],
             signature: Signature::new([0u8; 64]),
             tx_type: None, // Will be determined from data
+            ..Default::default()
         };
 
         // Clone tx hash before moving tx to mempool
@@ -406,6 +408,7 @@ impl AiApi {
             data: vec![],
             signature: Signature::new([0u8; 64]),
             tx_type: None,
+            ..Default::default()
         };
 
         // Clone tx hash before moving tx to mempool

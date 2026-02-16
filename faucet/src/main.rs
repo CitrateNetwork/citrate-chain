@@ -151,6 +151,7 @@ async fn request_tokens(
         gas_limit: 21000,
         signature: Signature::new([0; 64]),
         tx_type: None,
+        ..Default::default()
     };
 
     // Calculate transaction hash

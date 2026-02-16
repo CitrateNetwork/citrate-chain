@@ -145,6 +145,7 @@ mod tests {
             data: vec![1, 2, 3],
             signature: Signature::new([0; 64]), // Will be updated by sign
             tx_type: None,
+            ..Default::default()
         };
 
         // Sign it
@@ -173,6 +174,7 @@ mod tests {
             data: vec![5, 6, 7],
             signature: Signature::new([8; 64]),
             tx_type: None,
+            ..Default::default()
         };
 
         // Should produce same bytes every time

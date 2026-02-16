@@ -5,6 +5,10 @@ edition = "2021"
 authors = ["Citrate Team"]
 license = "MIT"
 
+[lib]
+name = "citrate_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "citrate-cli"
 path = "src/main.rs"

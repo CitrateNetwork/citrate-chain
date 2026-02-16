@@ -273,6 +273,9 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
                     gas_limit: legacy_tx.gas_limit,
                     signature: Signature::new(sig_bytes),
                     tx_type: None,
+                    eth_tx_type: 0,
+                    chain_id: chain_id_opt,
+                    ..Default::default()
                 };
 
                 // Determine transaction type from data
@@ -434,6 +437,20 @@ fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
     sig_bytes[..32].copy_from_slice(r_h.as_bytes());
     sig_bytes[32..].copy_from_slice(s_h.as_bytes());
 
+    // Convert access list to Transaction field format
+    let al: Vec<(Vec<u8>, Vec<Vec<u8>>)> = access_list
+        .iter()
+        .map(|e| {
+            let addr = e.address.as_bytes().to_vec();
+            let keys = e.storage_keys.iter().map(|k| k.as_bytes().to_vec()).collect();
+            (addr, keys)
+        })
+        .collect();
+
+    let max_fee_val = if max_fee > EthU256::from(u64::MAX) { u64::MAX } else { max_fee.as_u64() };
+    let max_prio_val = if max_priority_fee > EthU256::from(u64::MAX) { u64::MAX } else { max_priority_fee.as_u64() };
+    let decoded_chain_id = if chain_id_u256 > EthU256::from(u64::MAX) { None } else { Some(chain_id_u256.as_u64()) };
+
     let mut tx = Transaction {
         hash: Hash::new(hash_bytes),
         from: from_pk,
@@ -445,6 +462,11 @@ fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
         nonce,
         signature: Signature::new(sig_bytes),
         tx_type: None,
+        eth_tx_type: 2,
+        max_fee_per_gas: Some(max_fee_val),
+        max_priority_fee_per_gas: Some(max_prio_val),
+        access_list: if al.is_empty() { None } else { Some(al) },
+        chain_id: decoded_chain_id,
     };
     tx.determine_type();
     Ok(tx)
@@ -634,6 +656,18 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
     sig_bytes[..32].copy_from_slice(r_h.as_bytes());
     sig_bytes[32..].copy_from_slice(s_h.as_bytes());
 
+    // Convert access list to Transaction field format
+    let al: Vec<(Vec<u8>, Vec<Vec<u8>>)> = access_list
+        .iter()
+        .map(|e| {
+            let addr = e.address.as_bytes().to_vec();
+            let keys = e.storage_keys.iter().map(|k| k.as_bytes().to_vec()).collect();
+            (addr, keys)
+        })
+        .collect();
+
+    let decoded_chain_id = if chain_id_u256 > EthU256::from(u64::MAX) { None } else { Some(chain_id_u256.as_u64()) };
+
     let mut tx = Transaction {
         hash: Hash::new(hash_bytes),
         from: from_pk,
@@ -645,6 +679,10 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
         nonce,
         signature: Signature::new(sig_bytes),
         tx_type: None,
+        eth_tx_type: 1,
+        access_list: if al.is_empty() { None } else { Some(al) },
+        chain_id: decoded_chain_id,
+        ..Default::default()
     };
     tx.determine_type();
 

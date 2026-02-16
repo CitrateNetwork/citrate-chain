@@ -79,6 +79,7 @@ mod tests {
             gas_limit: 21000,
             signature: citrate_consensus::types::Signature::new([4u8; 64]),
             tx_type: None,
+            ..Default::default()
         };
 
         // Serialize it
