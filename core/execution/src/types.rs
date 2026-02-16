@@ -37,6 +37,18 @@ impl Address {
         Address([0u8; 20])
     }
 
+    /// Parse an address from a "0x..." hex string (Ethereum JSON-RPC format)
+    pub fn from_hex(s: &str) -> Result<Self, String> {
+        let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+        let bytes = hex::decode(s).map_err(|e| format!("invalid hex: {}", e))?;
+        if bytes.len() != 20 {
+            return Err(format!("expected 20 bytes, got {}", bytes.len()));
+        }
+        let mut arr = [0u8; 20];
+        arr.copy_from_slice(&bytes);
+        Ok(Address(arr))
+    }
+
     /// Get the underlying bytes
     pub fn as_bytes(&self) -> &[u8; 20] {
         &self.0

@@ -44,25 +44,41 @@ impl TransactionApi {
             None => self.executor.get_nonce(&request.from),
         };
 
-        // Create transaction hash
+        // Create transaction hash from nonce + from + to + timestamp
         let mut hash_data = [0u8; 32];
         hash_data[0..8].copy_from_slice(&nonce.to_le_bytes());
         hash_data[8..16].copy_from_slice(&request.from.0[0..8]);
         if let Some(to) = &request.to {
             hash_data[16..24].copy_from_slice(&to.0[0..8]);
         }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        hash_data[24..32].copy_from_slice(&ts.to_le_bytes());
+
+        // Embed 20-byte EVM addresses into 32-byte PublicKey fields (padded with trailing zeros)
+        // This matches the "embedded EVM address" convention used by Address::from_public_key
+        let mut from_bytes = [0u8; 32];
+        from_bytes[..20].copy_from_slice(&request.from.0);
+
+        let to_pubkey = request.to.map(|addr| {
+            let mut to_bytes = [0u8; 32];
+            to_bytes[..20].copy_from_slice(&addr.0);
+            PublicKey::new(to_bytes)
+        });
 
         // Create transaction
         let mut tx = Transaction {
             hash: Hash::new(hash_data),
             nonce,
-            from: PublicKey::new([0; 32]), // Would need proper key derivation
-            to: request.to.map(|_| PublicKey::new([0; 32])),
+            from: PublicKey::new(from_bytes),
+            to: to_pubkey,
             value: request.value.unwrap_or_default().as_u128(),
             gas_limit: request.gas.unwrap_or(21000),
             gas_price: request.gas_price.unwrap_or(1_000_000_000),
             data: request.data.unwrap_or_default(),
-            signature: Signature::new([1; 64]), // Would need proper signing
+            signature: Signature::new([1; 64]), // Devnet: unsigned transaction accepted
             tx_type: None,
         };
 

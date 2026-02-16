@@ -791,23 +791,82 @@ impl RpcServer {
             }
         });
 
-        // Override eth_sendTransaction: enqueue via TransactionApi, then broadcast the tx if retrievable
+        // Override eth_sendTransaction: parse standard Ethereum JSON-RPC format with hex addresses,
+        // enqueue via TransactionApi, then broadcast the tx if retrievable
         let mempool_send_broadcast = mempool.clone();
         let executor_send_broadcast = executor.clone();
         let peer_mgr_send_broadcast = peer_manager.clone();
         io_handler.add_sync_method("eth_sendTransaction", move |params: Params| {
             rpc_request("eth_sendTransaction");
             use crate::types::request::TransactionRequest;
+            use citrate_execution::types::Address;
             use citrate_network::NetworkMessage;
+
+            // Parse as generic JSON first, then manually extract fields
+            // (Address serde uses byte arrays for bincode compat, but JSON-RPC uses hex strings)
+            let raw: Vec<Value> = match params.parse() {
+                Ok(r) => r,
+                Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
+            };
+            let obj = raw.first()
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("Expected transaction object"))?;
+
+            let from_str = obj.get("from")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing 'from' field"))?;
+            let from = Address::from_hex(from_str)
+                .map_err(|e| jsonrpc_core::Error::invalid_params(format!("Invalid 'from' address: {}", e)))?;
+
+            let to = if let Some(to_val) = obj.get("to") {
+                let to_str = to_val.as_str()
+                    .ok_or_else(|| jsonrpc_core::Error::invalid_params("'to' must be a hex string"))?;
+                Some(Address::from_hex(to_str)
+                    .map_err(|e| jsonrpc_core::Error::invalid_params(format!("Invalid 'to' address: {}", e)))?)
+            } else {
+                None
+            };
+
+            let value = obj.get("value")
+                .and_then(|v| v.as_str())
+                .and_then(|s| {
+                    let s = s.trim_start_matches("0x").trim_start_matches("0X");
+                    primitive_types::U256::from_str_radix(s, 16).ok()
+                });
+
+            let gas = obj.get("gas")
+                .and_then(|v| v.as_str())
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .or_else(|| obj.get("gas").and_then(|v| v.as_u64()));
+
+            let gas_price = obj.get("gasPrice")
+                .and_then(|v| v.as_str())
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .or_else(|| obj.get("gasPrice").and_then(|v| v.as_u64()));
+
+            let nonce = obj.get("nonce")
+                .and_then(|v| v.as_str())
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .or_else(|| obj.get("nonce").and_then(|v| v.as_u64()));
+
+            let data = obj.get("data")
+                .and_then(|v| v.as_str())
+                .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok());
+
+            let req = TransactionRequest {
+                from,
+                to,
+                value,
+                gas,
+                gas_price,
+                nonce,
+                data,
+            };
 
             let api = TransactionApi::new(
                 mempool_send_broadcast.clone(),
                 executor_send_broadcast.clone(),
             );
-            let req: TransactionRequest = match params.parse() {
-                Ok(r) => r,
-                Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
-            };
             match block_on(api.send_transaction(req)) {
                 Ok(hash) => {
                     // Try to fetch and broadcast
