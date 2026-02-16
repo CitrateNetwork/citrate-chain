@@ -39,9 +39,9 @@ cleanup() {
 trap cleanup EXIT
 
 # Check if binary exists
-if [ ! -f "target/release/lattice" ]; then
-    echo -e "${YELLOW}Building lattice in release mode...${NC}"
-    cargo build --release --bin lattice
+if [ ! -f "target/release/citrate" ]; then
+    echo -e "${YELLOW}Building citrate in release mode...${NC}"
+    cargo build --release --bin citrate
 fi
 
 # Clean up previous testnet data
@@ -148,13 +148,10 @@ EOF
     LOG_FILE="$NODE_DIR/node.log"
 
     # Start the node in background
-    nohup target/release/lattice \
+    RUST_LOG=$LOG_LEVEL nohup target/release/citrate \
         --config "$NODE_DIR/config.toml" \
         --data-dir "$NODE_DIR" \
-        --rpc-port $RPC_PORT \
-        --p2p-port $P2P_PORT \
-        --ws-port $WS_PORT \
-        --log-level $LOG_LEVEL \
+        --rpc-addr "127.0.0.1:$RPC_PORT" \
         $BOOTSTRAP_NODES \
         > "$LOG_FILE" 2>&1 &
 

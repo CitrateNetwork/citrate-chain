@@ -1722,29 +1722,136 @@ impl RpcServer {
             Ok(serde_json::to_value(ids).unwrap_or(Value::Array(vec![])))
         });
 
-        // citrate_requestInference
-        let storage_ai_inf = storage.clone();
-        let mempool_ai_inf = mempool.clone();
+        // citrate_requestInference — full implementation using Executor inference service
         let executor_ai_inf = executor.clone();
-        io_handler.add_sync_method("citrate_requestInference", move |_params: Params| {
+        io_handler.add_sync_method("citrate_requestInference", move |params: Params| {
             rpc_request("citrate_requestInference");
-            let _api = AiApi::new(
-                storage_ai_inf.clone(),
-                mempool_ai_inf.clone(),
-                executor_ai_inf.clone(),
-            );
 
-            // Parse inference request (simplified)
-            match block_on(async {
-                // Placeholder - would parse actual InferenceRequest
-                Ok::<serde_json::Value, ApiError>(serde_json::json!({
-                    "status": "success",
-                    "message": "Inference request not fully implemented yet"
-                }))
-            }) {
-                Ok(result) => Ok(result),
-                Err(_e) => Err(jsonrpc_core::Error::internal_error()),
+            let value: serde_json::Value = match params.parse() {
+                Ok(v) => v,
+                Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
+            };
+            let obj = match value.as_object() {
+                Some(m) => m,
+                None => {
+                    return Err(jsonrpc_core::Error::invalid_params(
+                        "Expected params object",
+                    ))
+                }
+            };
+
+            // model_id (hex, 32 bytes)
+            let model_id_str = obj
+                .get("model_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing 'model_id'"))?;
+            let model_id_bytes = hex::decode(model_id_str.trim_start_matches("0x"))
+                .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid 'model_id'"))?;
+            if model_id_bytes.len() != 32 {
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "'model_id' must be 32 bytes",
+                ));
             }
+            let mut model_arr = [0u8; 32];
+            model_arr.copy_from_slice(&model_id_bytes);
+            let model_id = citrate_execution::types::ModelId(Hash::new(model_arr));
+
+            // input (any JSON → bytes)
+            let input_val = obj
+                .get("input")
+                .cloned()
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing 'input'"))?;
+            let input_bytes = serde_json::to_vec(&input_val)
+                .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid 'input' JSON"))?;
+
+            // optional from (hex 20-byte)
+            let from_addr = if let Some(s) = obj.get("from").and_then(|v| v.as_str()) {
+                let b = hex::decode(s.trim_start_matches("0x"))
+                    .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid 'from'"))?;
+                if b.len() != 20 {
+                    return Err(jsonrpc_core::Error::invalid_params(
+                        "'from' must be 20 bytes",
+                    ));
+                }
+                let mut a = [0u8; 20];
+                a.copy_from_slice(&b);
+                Address(a)
+            } else {
+                Address([0u8; 20])
+            };
+
+            // optional max_gas
+            let max_gas = parse_optional_u64_field(obj.get("max_gas"), "max_gas")?
+                .unwrap_or(1_000_000);
+
+            let res = match block_on(executor_ai_inf.run_inference_preview(
+                from_addr,
+                model_id,
+                input_bytes,
+                max_gas,
+            )) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(jsonrpc_core::Error::invalid_params(format!(
+                        "Inference failed: {}",
+                        e
+                    )))
+                }
+            };
+
+            // Try to decode output as JSON; fallback to base64
+            let (output_val, encoding) = match serde_json::from_slice::<serde_json::Value>(&res.output)
+            {
+                Ok(v) => (v, "json"),
+                Err(_) => (
+                    json!(STANDARD.encode(&res.output)),
+                    "base64",
+                ),
+            };
+
+            Ok(json!({
+                "status": "success",
+                "output": output_val,
+                "encoding": encoding,
+                "execution_time_ms": res.latency_ms,
+                "gas_used": res.gas_used,
+                "provider": format!("0x{}", hex::encode(res.provider.0)),
+                "provider_fee": res.provider_fee.to_string(),
+                "proof": res.proof.map(|p| format!("0x{}", hex::encode(p))),
+            }))
+        });
+
+        // citrate_getAIStatus — reports model count, GGUF availability, inference readiness
+        let executor_ai_status = executor.clone();
+        io_handler.add_sync_method("citrate_getAIStatus", move |_params: Params| {
+            rpc_request("citrate_getAIStatus");
+
+            let all_models = executor_ai_status.state_db().all_models();
+            let model_count = all_models.len();
+
+            // Check if llama.cpp binary is reachable
+            let gguf_available = std::process::Command::new("llama-cli")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            let has_inference_service = executor_ai_status.has_inference_service();
+
+            Ok(json!({
+                "model_count": model_count,
+                "gguf_engine_available": gguf_available,
+                "inference_service_ready": has_inference_service,
+                "models": all_models.iter().take(50).map(|(id, state)| {
+                    json!({
+                        "id": hex::encode(id.0.as_bytes()),
+                        "name": state.metadata.name,
+                        "owner": format!("0x{}", hex::encode(state.owner.0)),
+                    })
+                }).collect::<Vec<_>>(),
+            }))
         });
 
         // citrate_runInference (synchronous preview via Executor)

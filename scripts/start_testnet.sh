@@ -78,7 +78,7 @@ EOF
 fi
 
 # Step 3: Build if needed
-if [ ! -f "$PROJECT_ROOT/target/release/lattice" ]; then
+if [ ! -f "$PROJECT_ROOT/target/release/citrate" ]; then
     echo "🔨 Building node..."
     cd "$PROJECT_ROOT"
     cargo build --release -p citrate-node
@@ -106,7 +106,7 @@ echo ""
 
 # Start the node
 CITRATE_REQUIRE_VALID_SIGNATURE=0 \
-exec "$PROJECT_ROOT/target/release/lattice" \
+exec "$PROJECT_ROOT/target/release/citrate" \
     --config "$CONFIG_FILE" \
     --data-dir "$DATA_DIR" \
     --mine

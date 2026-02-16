@@ -12,7 +12,7 @@ pub mod transaction_gossip;
 pub mod types;
 pub mod transport;
 
-pub use ai_handler::AINetworkHandler;
+pub use ai_handler::{AINetworkHandler, NetworkInferenceExecutor, NetworkInferenceResult};
 pub use block_propagation::BlockPropagation;
 pub use discovery::{Discovery, DiscoveryConfig};
 pub use gossip::{GossipConfig, GossipProtocol};

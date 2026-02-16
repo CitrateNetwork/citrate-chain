@@ -3,7 +3,7 @@ version: '3.8'
 services:
   citrate-node-devnet:
     build: .
-    image: lattice:v3
+    image: citrate:v3
     container_name: citrate-node-devnet
     restart: unless-stopped
     ports:
@@ -31,7 +31,7 @@ services:
     command: ["devnet"]
 
   citrate-node-testnet:
-    image: lattice:v3
+    image: citrate:v3
     container_name: citrate-node-testnet
     restart: unless-stopped
     ports:
@@ -165,7 +165,7 @@ services:
 
   # Cluster profile: 5 nodes with distinct configs
   citrate-node-1:
-    image: lattice:v3
+    image: citrate:v3
     container_name: citrate-node-1
     restart: unless-stopped
     volumes:
@@ -185,7 +185,7 @@ services:
     profiles: ["cluster"]
 
   citrate-node-2:
-    image: lattice:v3
+    image: citrate:v3
     container_name: citrate-node-2
     restart: unless-stopped
     volumes:
@@ -203,7 +203,7 @@ services:
     profiles: ["cluster"]
 
   citrate-node-3:
-    image: lattice:v3
+    image: citrate:v3
     container_name: citrate-node-3
     restart: unless-stopped
     volumes:
@@ -221,7 +221,7 @@ services:
     profiles: ["cluster"]
 
   citrate-node-4:
-    image: lattice:v3
+    image: citrate:v3
     container_name: citrate-node-4
     restart: unless-stopped
     volumes:
@@ -239,7 +239,7 @@ services:
     profiles: ["cluster"]
 
   citrate-node-5:
-    image: lattice:v3
+    image: citrate:v3
     container_name: citrate-node-5
     restart: unless-stopped
     volumes:

@@ -4,6 +4,7 @@
 use crate::peer::{PeerId, PeerManager};
 use crate::protocol::{ModelMetadata, NetworkMessage};
 use anyhow::Result;
+use async_trait::async_trait;
 use chrono;
 use citrate_consensus::types::Hash;
 use citrate_execution::{AccessPolicy, Address, JobId, JobStatus, ModelId, ModelState, UsageStats};
@@ -13,6 +14,26 @@ use primitive_types::U256;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Result of a network inference execution.
+#[derive(Debug, Clone)]
+pub struct NetworkInferenceResult {
+    pub output: Vec<u8>,
+    pub proof: Option<Vec<u8>>,
+    pub execution_time_ms: u64,
+}
+
+/// Trait for executing AI inference, implemented by the node crate to avoid
+/// a network -> mcp circular dependency.
+#[async_trait]
+pub trait NetworkInferenceExecutor: Send + Sync {
+    async fn execute_inference(
+        &self,
+        model_id: [u8; 32],
+        input: Vec<u8>,
+        provider: [u8; 32],
+    ) -> Result<NetworkInferenceResult, anyhow::Error>;
+}
 
 /// Handler for AI-specific network messages
 pub struct AINetworkHandler {
@@ -30,6 +51,9 @@ pub struct AINetworkHandler {
 
     /// Model cache for quick lookups
     model_cache: Arc<RwLock<HashMap<Hash, ModelInfo>>>,
+
+    /// Optional inference executor for running models via MCP/GGUF
+    inference_executor: Option<Arc<dyn NetworkInferenceExecutor>>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,7 +96,14 @@ impl AINetworkHandler {
             pending_inferences: Arc::new(RwLock::new(HashMap::new())),
             active_training: Arc::new(RwLock::new(HashMap::new())),
             model_cache: Arc::new(RwLock::new(HashMap::new())),
+            inference_executor: None,
         }
+    }
+
+    /// Attach an inference executor for handling inference requests via MCP/GGUF.
+    pub fn with_inference_executor(mut self, executor: Arc<dyn NetworkInferenceExecutor>) -> Self {
+        self.inference_executor = Some(executor);
+        self
     }
 
     /// Handle incoming AI network message
@@ -280,95 +311,49 @@ impl AINetworkHandler {
             .insert(request_id, request);
 
         // Check if we can serve this inference
-        if let Some(model) = self.state_manager.get_model(&ModelId(model_id)) {
-            // NOW WITH ACTUAL INFERENCE EXECUTION!
+        if self.state_manager.get_model(&ModelId(model_id)).is_some() {
             debug!("Running inference for model {}", model_id);
 
-            // Execute inference if we have Metal runtime available
-            #[cfg(target_os = "macos")]
-            {
-                use citrate_execution::inference::coreml_bridge::CoreMLInference;
+            // Use the pluggable inference executor (MCP/GGUF backed)
+            if let Some(ref executor) = self.inference_executor {
+                // Build a provider key from the input hash (32 bytes)
+                let provider_key = input_hash.as_bytes().clone();
 
-                // Check if we have a valid model for inference
-                if !model.metadata.name.is_empty() && model.metadata.framework == "CoreML" {
-                    // Construct model path from metadata
-                    let model_path_string = format!("/usr/local/models/{}/{}.mlmodel",
-                        model.metadata.name, model.metadata.version);
-                    let model_path = std::path::Path::new(&model_path_string);
+                match executor
+                    .execute_inference(*model_id.as_bytes(), input_hash.as_bytes().to_vec(), provider_key)
+                    .await
+                {
+                    Ok(result) => {
+                        info!(
+                            "Inference completed for request {} in {}ms",
+                            request_id, result.execution_time_ms
+                        );
 
-                    // Retrieve actual input data for this inference request
-                    // In a production system, input data would be stored off-chain
-                    // and referenced by hash, retrieved from IPFS or similar storage
-                    let input_data = self.retrieve_input_data(&input_hash).await
-                        .unwrap_or_else(|_| {
-                            // Fallback: generate dummy data matching expected input shape
-                            warn!("Could not retrieve input data for hash {:?}, using dummy data", input_hash);
-                            let total_size: usize = model.metadata.input_shape.iter().product();
-                            vec![0.5f32; total_size] // Dummy normalized data
-                        });
-
-                    // Use the actual input_shape from model metadata
-                    let input_shape: Vec<i32> = model.metadata.input_shape.iter()
-                        .map(|&x| x as i32)
-                        .collect();
-
-                    // Run inference
-                    match CoreMLInference::execute(
-                        model_path,
-                        input_data,
-                        input_shape,
-                    ).await {
-                        Ok(output) => {
-                            info!("Inference successful for model {}", model_id);
-
-                            // Convert output to bytes
-                            let mut output_bytes = Vec::with_capacity(output.len() * 4);
-                            for value in output {
-                                output_bytes.extend_from_slice(&value.to_le_bytes());
-                            }
-
-                            // Create response hash using the correct method
-                            let output_hash = Hash::from_bytes(&output_bytes);
-
-                            // Generate a commitment-based proof
-                            // proof = commitment || response where commitment = H(statement || response)
+                        // Hash the output to produce a fixed-size 32-byte identifier
+                        let output_hash = {
                             use sha3::{Digest, Sha3_256};
                             let mut hasher = Sha3_256::new();
-                            hasher.update(output_hash.as_bytes());
-                            hasher.update(request_id.as_bytes());
-                            let response_bytes: [u8; 32] = hasher.finalize().into();
+                            hasher.update(&result.output);
+                            Hash::new(hasher.finalize().into())
+                        };
 
-                            let mut proof_hasher = Sha3_256::new();
-                            proof_hasher.update(output_hash.as_bytes());
-                            proof_hasher.update(&response_bytes);
-                            let commitment: [u8; 32] = proof_hasher.finalize().into();
+                        let proof = result.proof.unwrap_or_default();
+                        let provider = model_id.as_bytes().to_vec();
 
-                            // Build proof: commitment (32 bytes) + response (32 bytes)
-                            let mut proof = Vec::with_capacity(64);
-                            proof.extend_from_slice(&commitment);
-                            proof.extend_from_slice(&response_bytes);
-
-                            // Get provider ID (use a deterministic ID based on model)
-                            let provider = model_id.as_bytes().to_vec();
-
-                            info!("Inference completed for request {} with output hash: {:?}", request_id, output_hash);
-
-                            return Ok(Some(NetworkMessage::InferenceResponse {
-                                request_id,
-                                output_hash,
-                                proof,
-                                provider,
-                            }));
-                        },
-                        Err(e) => {
-                            error!("Inference failed: {}", e);
-                        }
+                        return Ok(Some(NetworkMessage::InferenceResponse {
+                            request_id,
+                            output_hash,
+                            proof,
+                            provider,
+                        }));
+                    }
+                    Err(e) => {
+                        warn!("Inference execution failed for request {}: {}", request_id, e);
                     }
                 }
+            } else {
+                debug!("No inference executor configured, skipping inference request for model {}", model_id);
             }
-
-            // Fallback message if inference couldn't run
-            debug!("Model {} found but inference not executed", model_id);
         }
 
         Ok(None)
@@ -742,5 +727,196 @@ impl AINetworkHandler {
 
         debug!("Retrieved {} input values for hash {:?}", data_size, input_hash);
         Ok(input_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use citrate_network_test_helpers::*;
+
+    // ---- test helpers inlined to avoid extra crate ----
+    mod citrate_network_test_helpers {
+        use super::*;
+
+        /// A mock inference executor that returns a predetermined result.
+        pub struct MockInferenceExecutor {
+            pub output: Vec<u8>,
+            pub proof: Option<Vec<u8>>,
+            pub execution_time_ms: u64,
+            pub should_fail: bool,
+        }
+
+        impl MockInferenceExecutor {
+            pub fn success(output: Vec<u8>) -> Self {
+                Self {
+                    output,
+                    proof: Some(b"mock_proof".to_vec()),
+                    execution_time_ms: 42,
+                    should_fail: false,
+                }
+            }
+
+            pub fn failing() -> Self {
+                Self {
+                    output: vec![],
+                    proof: None,
+                    execution_time_ms: 0,
+                    should_fail: true,
+                }
+            }
+        }
+
+        #[async_trait]
+        impl NetworkInferenceExecutor for MockInferenceExecutor {
+            async fn execute_inference(
+                &self,
+                _model_id: [u8; 32],
+                _input: Vec<u8>,
+                _provider: [u8; 32],
+            ) -> Result<NetworkInferenceResult, anyhow::Error> {
+                if self.should_fail {
+                    return Err(anyhow::anyhow!("mock executor failure"));
+                }
+                Ok(NetworkInferenceResult {
+                    output: self.output.clone(),
+                    proof: self.proof.clone(),
+                    execution_time_ms: self.execution_time_ms,
+                })
+            }
+        }
+
+        /// Build a minimal AINetworkHandler backed by in-memory stores.
+        pub fn make_handler(
+            executor: Option<Arc<dyn NetworkInferenceExecutor>>,
+        ) -> AINetworkHandler {
+            let storage = Arc::new(
+                citrate_storage::StorageManager::new(
+                    tempfile::TempDir::new().unwrap().path(),
+                    citrate_storage::pruning::PruningConfig::default(),
+                )
+                .unwrap(),
+            );
+            let state_manager = Arc::new(StateManager::new(storage.db.clone()));
+            let peer_manager = Arc::new(PeerManager::new(
+                crate::peer::PeerManagerConfig::default(),
+            ));
+            let mut handler = AINetworkHandler::new(state_manager, peer_manager);
+            if let Some(exec) = executor {
+                handler.inference_executor = Some(exec);
+            }
+            handler
+        }
+
+        /// Register a model in the state_manager so inference requests can find it.
+        pub fn register_model_in_handler(handler: &AINetworkHandler, model_id: Hash) {
+            let exec_meta = citrate_execution::ModelMetadata {
+                name: "test-model".to_string(),
+                version: "1.0.0".to_string(),
+                description: "unit test model".to_string(),
+                framework: "gguf".to_string(),
+                input_shape: vec![1],
+                output_shape: vec![1],
+                size_bytes: 1024,
+                created_at: 0,
+            };
+            let model_state = ModelState {
+                owner: Address([0u8; 20]),
+                model_hash: Hash::default(),
+                version: 1,
+                metadata: exec_meta,
+                access_policy: AccessPolicy::Public,
+                usage_stats: UsageStats::default(),
+            };
+            handler
+                .state_manager
+                .register_model(
+                    ModelId(model_id),
+                    model_state,
+                    "QmTestCID".to_string(),
+                )
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inference_with_executor() {
+        let expected_output = b"hello inference".to_vec();
+        let executor = Arc::new(MockInferenceExecutor::success(expected_output.clone()));
+        let handler = make_handler(Some(executor));
+
+        let model_id = Hash::new([1u8; 32]);
+        register_model_in_handler(&handler, model_id);
+
+        let peer = PeerId::new("peer-a".to_string());
+        let request = NetworkMessage::InferenceRequest {
+            request_id: Hash::new([99u8; 32]),
+            model_id,
+            input_hash: Hash::new([5u8; 32]),
+            requester: vec![0xAA; 20],
+            max_fee: 1000,
+        };
+
+        let response = handler.handle_message(&peer, &request).await.unwrap();
+        assert!(response.is_some(), "Should produce an InferenceResponse");
+
+        match response.unwrap() {
+            NetworkMessage::InferenceResponse {
+                request_id,
+                proof,
+                ..
+            } => {
+                assert_eq!(request_id, Hash::new([99u8; 32]));
+                assert_eq!(proof, b"mock_proof".to_vec());
+            }
+            other => panic!("Expected InferenceResponse, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inference_without_executor() {
+        let handler = make_handler(None);
+
+        let model_id = Hash::new([2u8; 32]);
+        register_model_in_handler(&handler, model_id);
+
+        let peer = PeerId::new("peer-b".to_string());
+        let request = NetworkMessage::InferenceRequest {
+            request_id: Hash::new([88u8; 32]),
+            model_id,
+            input_hash: Hash::new([6u8; 32]),
+            requester: vec![0xBB; 20],
+            max_fee: 500,
+        };
+
+        let response = handler.handle_message(&peer, &request).await.unwrap();
+        assert!(
+            response.is_none(),
+            "Without executor, should return Ok(None)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inference_executor_error() {
+        let executor = Arc::new(MockInferenceExecutor::failing());
+        let handler = make_handler(Some(executor));
+
+        let model_id = Hash::new([3u8; 32]);
+        register_model_in_handler(&handler, model_id);
+
+        let peer = PeerId::new("peer-c".to_string());
+        let request = NetworkMessage::InferenceRequest {
+            request_id: Hash::new([77u8; 32]),
+            model_id,
+            input_hash: Hash::new([7u8; 32]),
+            requester: vec![0xCC; 20],
+            max_fee: 200,
+        };
+
+        let response = handler.handle_message(&peer, &request).await.unwrap();
+        assert!(
+            response.is_none(),
+            "Executor error should gracefully return Ok(None)"
+        );
     }
 }

@@ -264,6 +264,11 @@ impl Executor {
         self
     }
 
+    /// Check whether an inference service has been configured.
+    pub fn has_inference_service(&self) -> bool {
+        self.inference_service.is_some()
+    }
+
     /// Attach an artifact service for IPFS pinning and status
     pub fn with_artifact_service(mut self, svc: Arc<dyn ArtifactService>) -> Self {
         self.artifact_service = Some(svc);

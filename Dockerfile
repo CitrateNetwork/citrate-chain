@@ -4,7 +4,7 @@
 # Build stage
 FROM rust:latest as builder
 
-WORKDIR /usr/src/lattice
+WORKDIR /usr/src/citrate
 
 # System build dependencies for native crates (bindgen, rocksdb, zstd, etc.)
 RUN apt-get update && apt-get install -y \
@@ -45,17 +45,17 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Create user for running the node
-RUN useradd -m -u 1000 -s /bin/bash lattice
+RUN useradd -m -u 1000 -s /bin/bash citrate
 
 # Copy binary from builder
-COPY --from=builder /usr/src/lattice/target/release/lattice /usr/local/bin/lattice
+COPY --from=builder /usr/src/citrate/target/release/citrate /usr/local/bin/citrate
 
 # Create data directories
 RUN mkdir -p /data/chain /data/state /data/models /data/logs && \
-    chown -R lattice:lattice /data
+    chown -R citrate:citrate /data
 
 # Switch to non-root user
-USER lattice
+USER citrate
 
 # Expose ports
 # JSON-RPC

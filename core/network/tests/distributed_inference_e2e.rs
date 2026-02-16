@@ -7,9 +7,8 @@
 // 4. Message round-trips produce valid responses
 
 use citrate_consensus::types::*;
-use citrate_consensus::{DagStore, GhostDag, GhostDagParams};
 use citrate_network::ai_handler::AINetworkHandler;
-use citrate_network::peer::{PeerId, PeerManager};
+use citrate_network::peer::{PeerId, PeerManager, PeerManagerConfig};
 use citrate_network::protocol::{ModelMetadata as NetModelMetadata, NetworkMessage};
 use citrate_storage::pruning::PruningConfig;
 use citrate_storage::state_manager::StateManager;
@@ -37,6 +36,9 @@ fn create_test_block(num: u8, height: u64) -> Block {
                 proof: vec![0u8; 80],
                 output: Hash::default(),
             },
+            base_fee_per_gas: 0,
+            gas_used: 0,
+            gas_limit: 30_000_000,
         },
         state_root: Hash::default(),
         tx_root: Hash::default(),
@@ -45,6 +47,8 @@ fn create_test_block(num: u8, height: u64) -> Block {
         ghostdag_params: GhostDagParams::default(),
         transactions: vec![],
         signature: Signature::new([0u8; 64]),
+        embedded_models: vec![],
+        required_pins: vec![],
     }
 }
 
@@ -53,9 +57,7 @@ mod distributed_inference {
     use super::*;
 
     /// Helper to create a node-like setup (storage + state manager + peer manager + AI handler)
-    async fn setup_node(
-        port: u16,
-    ) -> (
+    async fn setup_node() -> (
         Arc<StorageManager>,
         Arc<StateManager>,
         Arc<PeerManager>,
@@ -65,7 +67,7 @@ mod distributed_inference {
         let config = PruningConfig::default();
         let storage = Arc::new(StorageManager::new(temp_dir.path(), config).unwrap());
         let state_manager = Arc::new(StateManager::new(storage.db.clone()));
-        let peer_manager = Arc::new(PeerManager::new(port).unwrap());
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
         let ai_handler = Arc::new(AINetworkHandler::new(
             state_manager.clone(),
             peer_manager.clone(),
@@ -80,11 +82,10 @@ mod distributed_inference {
 
     #[tokio::test]
     async fn test_model_announce_round_trip() {
-        let (_storage_a, _sm_a, _pm_a, handler_a) = setup_node(19100).await;
-        let (_storage_b, _sm_b, _pm_b, handler_b) = setup_node(19101).await;
+        let (_storage_a, _sm_a, _pm_a, _handler_a) = setup_node().await;
+        let (_storage_b, _sm_b, _pm_b, handler_b) = setup_node().await;
 
         let peer_a = PeerId("node-a".to_string());
-        let peer_b = PeerId("node-b".to_string());
 
         // Node A announces a model
         let model_id = Hash::new([1u8; 32]);
@@ -96,9 +97,12 @@ mod distributed_inference {
             metadata: NetModelMetadata {
                 name: "test-model".to_string(),
                 version: "1.0.0".to_string(),
-                model_type: "text_generation".to_string(),
+                description: "A test text generation model".to_string(),
                 framework: "gguf".to_string(),
-                parameters: 500_000_000,
+                input_shape: vec![1, 512],
+                output_shape: vec![1, 512],
+                size_bytes: 500_000_000,
+                created_at: 1700000000,
             },
             weight_cid: "QmTestCID12345".to_string(),
         };
@@ -118,7 +122,7 @@ mod distributed_inference {
 
     #[tokio::test]
     async fn test_inference_request_response_flow() {
-        let (_storage_a, _sm_a, _pm_a, handler_a) = setup_node(19200).await;
+        let (_storage_a, _sm_a, _pm_a, handler_a) = setup_node().await;
 
         let peer_b = PeerId("node-b".to_string());
 
@@ -131,9 +135,12 @@ mod distributed_inference {
             metadata: NetModelMetadata {
                 name: "inference-model".to_string(),
                 version: "1.0.0".to_string(),
-                model_type: "text_generation".to_string(),
+                description: "Model for inference testing".to_string(),
                 framework: "gguf".to_string(),
-                parameters: 1_000_000,
+                input_shape: vec![1, 256],
+                output_shape: vec![1, 256],
+                size_bytes: 1_000_000,
+                created_at: 1700000000,
             },
             weight_cid: "QmInferenceModelCID".to_string(),
         };
@@ -152,7 +159,7 @@ mod distributed_inference {
             max_fee: 1000,
         };
 
-        let response = handler_a
+        let _response = handler_a
             .handle_message(&peer_b, &request)
             .await
             .expect("handler should not error on inference request");
@@ -164,7 +171,7 @@ mod distributed_inference {
 
     #[tokio::test]
     async fn test_weight_sync_versioning() {
-        let (_storage, _sm, _pm, handler) = setup_node(19300).await;
+        let (_storage, _sm, _pm, handler) = setup_node().await;
 
         let peer = PeerId("sync-peer".to_string());
 
@@ -177,9 +184,12 @@ mod distributed_inference {
             metadata: NetModelMetadata {
                 name: "sync-model".to_string(),
                 version: "1.0.0".to_string(),
-                model_type: "embedding".to_string(),
+                description: "Model for weight sync testing".to_string(),
                 framework: "gguf".to_string(),
-                parameters: 100_000,
+                input_shape: vec![1, 128],
+                output_shape: vec![1, 128],
+                size_bytes: 100_000,
+                created_at: 1700000000,
             },
             weight_cid: "QmSyncModelCID".to_string(),
         };
@@ -198,7 +208,7 @@ mod distributed_inference {
 
     #[tokio::test]
     async fn test_non_ai_message_passthrough() {
-        let (_storage, _sm, _pm, handler) = setup_node(19400).await;
+        let (_storage, _sm, _pm, handler) = setup_node().await;
 
         let peer = PeerId("other-peer".to_string());
 
@@ -211,7 +221,7 @@ mod distributed_inference {
 
     #[tokio::test]
     async fn test_training_job_announce() {
-        let (_storage, _sm, _pm, handler) = setup_node(19500).await;
+        let (_storage, _sm, _pm, handler) = setup_node().await;
 
         let peer = PeerId("trainer".to_string());
 
@@ -221,7 +231,7 @@ mod distributed_inference {
             dataset_hash: Hash::new([62u8; 32]),
             participants_needed: 5,
             reward_per_gradient: 100,
-            owner: Hash::new([0xEE; 32]),
+            owner: [0xEE; 20],
         };
 
         let result = handler.handle_message(&peer, &training_msg).await;

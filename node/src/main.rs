@@ -24,6 +24,7 @@ pub mod logging;
 pub mod metrics;
 mod model_manager;
 mod model_verifier;
+mod network_inference;
 mod producer;
 mod sync;
 
@@ -954,10 +955,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 pending_retries = remaining;
             }
         });
-        let ai_handler = Arc::new(citrate_network::ai_handler::AINetworkHandler::new(
-            state_manager.clone(),
-            peer_manager.clone(),
-        ));
+        let network_inf_executor = Arc::new(
+            crate::network_inference::NodeNetworkInferenceExecutor::new(
+                mcp.clone(),
+                provider_addr,
+            ),
+        );
+        let ai_handler = Arc::new(
+            citrate_network::ai_handler::AINetworkHandler::new(
+                state_manager.clone(),
+                peer_manager.clone(),
+            )
+            .with_inference_executor(network_inf_executor),
+        );
         let ai_handler_for_rx = ai_handler.clone();
 
         tokio::spawn(async move {
