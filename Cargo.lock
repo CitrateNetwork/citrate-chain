@@ -1513,6 +1513,7 @@ dependencies = [
  "citrate-network",
  "citrate-sequencer",
  "citrate-storage",
+ "dashmap",
  "dirs 5.0.1",
  "ethereum-types",
  "ethers-solc",

@@ -699,7 +699,7 @@ pub fn register_eth_methods(
         let value_u256 = if let Some(vs) = obj.get("value").and_then(|v| v.as_str()) {
             let s = vs.trim();
             let s = s.strip_prefix("0x").unwrap_or(s);
-            U256::from_str_radix(s, 16).unwrap_or_else(|_| U256::from(0u64))
+            U256::from_str_radix(s, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex value: {}", vs)))?
         } else {
             U256::from(0u64)
         };
@@ -708,14 +708,14 @@ pub fn register_eth_methods(
         let gas = if let Some(gs) = obj.get("gas").and_then(|v| v.as_str()) {
             let s = gs.trim();
             let s = s.strip_prefix("0x").unwrap_or(s);
-            u64::from_str_radix(s, 16).unwrap_or(21000)
+            u64::from_str_radix(s, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex gas: {}", gs)))?
         } else {
             21000
         };
         let gas_price = if let Some(gps) = obj.get("gasPrice").and_then(|v| v.as_str()) {
             let s = gps.trim();
             let s = s.strip_prefix("0x").unwrap_or(s);
-            u64::from_str_radix(s, 16).unwrap_or(1_000_000_000)
+            u64::from_str_radix(s, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex gasPrice: {}", gps)))?
         } else {
             1_000_000_000
         };
@@ -724,7 +724,7 @@ pub fn register_eth_methods(
         let nonce_opt = if let Some(ns) = obj.get("nonce").and_then(|v| v.as_str()) {
             let s = ns.trim();
             let s = s.strip_prefix("0x").unwrap_or(s);
-            Some(u64::from_str_radix(s, 16).unwrap_or(0))
+            Some(u64::from_str_radix(s, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex nonce: {}", ns)))?)
         } else {
             None
         };
@@ -733,7 +733,7 @@ pub fn register_eth_methods(
         let data = if let Some(ds) = obj.get("data").and_then(|v| v.as_str()) {
             let s = ds.trim();
             let s = s.strip_prefix("0x").unwrap_or(s);
-            hex::decode(s).unwrap_or_default()
+            hex::decode(s).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex data: {}", ds)))?
         } else {
             Vec::new()
         };
@@ -954,9 +954,9 @@ pub fn register_eth_methods(
         let value_u128: u128 = if let Some(vs) = obj.get("value").and_then(|v| v.as_str()) {
             let s = vs.trim();
             if let Some(hexs) = s.strip_prefix("0x") {
-                u128::from_str_radix(hexs, 16).unwrap_or(0u128)
+                u128::from_str_radix(hexs, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex value: {}", vs)))?
             } else {
-                s.parse::<u128>().unwrap_or(0u128)
+                s.parse::<u128>().map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid value: {}", vs)))?
             }
         } else {
             0u128
@@ -966,9 +966,9 @@ pub fn register_eth_methods(
         let gas_limit: u64 = if let Some(gs) = obj.get("gas").and_then(|v| v.as_str()) {
             let s = gs.trim();
             if let Some(hexs) = s.strip_prefix("0x") {
-                u64::from_str_radix(hexs, 16).unwrap_or(1_000_000)
+                u64::from_str_radix(hexs, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex gas: {}", gs)))?
             } else {
-                s.parse::<u64>().unwrap_or(1_000_000)
+                s.parse::<u64>().map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid gas: {}", gs)))?
             }
         } else {
             1_000_000
@@ -977,9 +977,9 @@ pub fn register_eth_methods(
         let gas_price: u64 = if let Some(gps) = obj.get("gasPrice").and_then(|v| v.as_str()) {
             let s = gps.trim();
             if let Some(hexs) = s.strip_prefix("0x") {
-                u64::from_str_radix(hexs, 16).unwrap_or(1)
+                u64::from_str_radix(hexs, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex gasPrice: {}", gps)))?
             } else {
-                s.parse::<u64>().unwrap_or(1)
+                s.parse::<u64>().map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid gasPrice: {}", gps)))?
             }
         } else {
             1
@@ -1127,7 +1127,7 @@ pub fn register_eth_methods(
         // data (optional)
         let data = if let Some(d) = obj.get("data").and_then(|v| v.as_str()) {
             let ds = d.trim().trim_start_matches("0x");
-            hex::decode(ds).unwrap_or_default()
+            hex::decode(ds).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex data: {}", d)))?
         } else {
             Vec::new()
         };
@@ -1136,9 +1136,9 @@ pub fn register_eth_methods(
         let value_u128: u128 = if let Some(vs) = obj.get("value").and_then(|v| v.as_str()) {
             let s = vs.trim();
             if let Some(hexs) = s.strip_prefix("0x") {
-                u128::from_str_radix(hexs, 16).unwrap_or(0)
+                u128::from_str_radix(hexs, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex value: {}", vs)))?
             } else {
-                s.parse::<u128>().unwrap_or(0)
+                s.parse::<u128>().map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid value: {}", vs)))?
             }
         } else {
             0
@@ -1148,9 +1148,9 @@ pub fn register_eth_methods(
         let gas_limit: u64 = if let Some(gs) = obj.get("gas").and_then(|v| v.as_str()) {
             let s = gs.trim();
             if let Some(hexs) = s.strip_prefix("0x") {
-                u64::from_str_radix(hexs, 16).unwrap_or(15_000_000)
+                u64::from_str_radix(hexs, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex gas: {}", gs)))?
             } else {
-                s.parse::<u64>().unwrap_or(15_000_000)
+                s.parse::<u64>().map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid gas: {}", gs)))?
             }
         } else {
             15_000_000 // Default to block gas limit for estimation
@@ -1436,10 +1436,10 @@ pub fn register_eth_methods(
             Some("latest") | Some("pending") => current_height,
             Some("earliest") => 0,
             Some(hex_str) if hex_str.starts_with("0x") => {
-                u64::from_str_radix(&hex_str[2..], 16).unwrap_or(0)
+                u64::from_str_radix(&hex_str[2..], 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex fromBlock: {}", hex_str)))?
             }
             None => 0,
-            _ => 0,
+            Some(other) => return Err(jsonrpc_core::Error::invalid_params(format!("Invalid fromBlock: {}", other))),
         };
 
         // Parse toBlock (default to latest)
@@ -1447,10 +1447,10 @@ pub fn register_eth_methods(
             Some("latest") | Some("pending") => current_height,
             Some("earliest") => 0,
             Some(hex_str) if hex_str.starts_with("0x") => {
-                u64::from_str_radix(&hex_str[2..], 16).unwrap_or(current_height)
+                u64::from_str_radix(&hex_str[2..], 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex toBlock: {}", hex_str)))?
             }
             None => current_height,
-            _ => current_height,
+            Some(other) => return Err(jsonrpc_core::Error::invalid_params(format!("Invalid toBlock: {}", other))),
         };
 
         // Limit block range to prevent excessive queries
@@ -1784,7 +1784,7 @@ pub fn register_eth_methods(
         let filter_id = match params[0].as_str() {
             Some(hex_str) => {
                 let hex = hex_str.trim_start_matches("0x");
-                u64::from_str_radix(hex, 16).unwrap_or(0)
+                u64::from_str_radix(hex, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex filter ID: {}", hex_str)))?
             }
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid filter ID")),
         };
@@ -1809,7 +1809,7 @@ pub fn register_eth_methods(
         let filter_id = match params[0].as_str() {
             Some(hex_str) => {
                 let hex = hex_str.trim_start_matches("0x");
-                u64::from_str_radix(hex, 16).unwrap_or(0)
+                u64::from_str_radix(hex, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex filter ID: {}", hex_str)))?
             }
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid filter ID")),
         };
@@ -1943,7 +1943,7 @@ pub fn register_eth_methods(
         let filter_id = match params[0].as_str() {
             Some(hex_str) => {
                 let hex = hex_str.trim_start_matches("0x");
-                u64::from_str_radix(hex, 16).unwrap_or(0)
+                u64::from_str_radix(hex, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex filter ID: {}", hex_str)))?
             }
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid filter ID")),
         };

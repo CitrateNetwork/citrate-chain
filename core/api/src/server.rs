@@ -1,6 +1,7 @@
 // citrate/core/api/src/server.rs
 
 use crate::filter::FilterRegistry;
+use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::{ai_rpc, economics_rpc, eth_rpc};
 use crate::methods::{AiApi, ChainApi, MempoolApi, NetworkApi, StateApi, TransactionApi};
 use crate::metrics::rpc_request;
@@ -366,6 +367,7 @@ pub struct RpcConfig {
     pub max_connections: u32,
     pub cors_domains: Vec<String>,
     pub threads: usize,
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Default for RpcConfig {
@@ -375,6 +377,7 @@ impl Default for RpcConfig {
             max_connections: 100,
             cors_domains: vec!["*".to_string()],
             threads: 4,
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -2334,6 +2337,7 @@ impl RpcServer {
         let listen_addr = self.config.listen_addr;
         let threads = self.config.threads;
         let cors_any = !self.config.cors_domains.is_empty();
+        let rate_limit_config = self.config.rate_limit.clone();
         let io = self.io_handler;
 
         // Channel to report startup result (CloseHandle or error string)
@@ -2341,12 +2345,15 @@ impl RpcServer {
             std::sync::mpsc::sync_channel::<Result<CloseHandle, String>>(1);
 
         let join_handle = std::thread::spawn(move || {
-            let mut builder = ServerBuilder::new(io);
+            let mut builder = ServerBuilder::new(io)
+                .request_middleware(RateLimiter::new(rate_limit_config));
             if cors_any {
                 builder = builder.cors(DomainsValidation::AllowOnly(vec![
                     AccessControlAllowOrigin::Any,
                 ]));
             }
+            info!("RPC rate limiting enabled: {} req/{}s per IP",
+                  100, 1); // defaults
             match builder
                 .max_request_body_size(10 * 1024 * 1024)
                 .threads(threads)

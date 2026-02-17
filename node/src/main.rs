@@ -1330,6 +1330,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             max_connections: 100,
             cors_domains: vec!["*".to_string()],
             threads: 4,
+            ..Default::default()
         };
 
         let rpc_server = RpcServer::with_economics(

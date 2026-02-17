@@ -421,11 +421,16 @@ mod tests {
     #[test]
     fn test_verify_model_empty_architecture() {
         let verifier = ExecutionVerifier::new();
+        // Empty architecture with weights present is allowed (legacy records) — just warns
         let model = create_test_model(&[], b"weights", b"meta");
-
         let result = verifier.verify_model(&model);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("architecture"));
+        assert!(result.is_ok());
+
+        // Empty architecture AND empty weights should fail
+        let model_both_empty = create_test_model(&[], &[], b"meta");
+        let result_both = verifier.verify_model(&model_both_empty);
+        assert!(result_both.is_err());
+        assert!(result_both.unwrap_err().to_string().contains("neither"));
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod methods;
 pub mod metrics;
 pub mod metrics_server;
 pub mod openai_api;
+pub mod rate_limit;
 pub mod server;
 pub mod types;
 pub mod unified_tx_decoder;

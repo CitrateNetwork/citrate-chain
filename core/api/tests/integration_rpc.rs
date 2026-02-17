@@ -449,6 +449,7 @@ async fn test_eth_estimate_gas_minimal() {
 }
 
 #[tokio::test]
+#[ignore = "AI opcodes (0xf0-0xf4) disabled — collide with EVM CREATE/CALL/RETURN"]
 async fn test_eth_call_ai_tensor_opcode() {
     use primitive_types::U256;
     // Storage/executor/mempool setup
@@ -530,11 +531,12 @@ async fn test_eth_call_invalid_to_address_and_insufficient_balance() {
     let v_bad: serde_json::Value = serde_json::from_str(&bad_to_resp).unwrap();
     assert!(v_bad.get("error").is_some());
 
-    // Insufficient balance: gasPrice*gas > balance
+    // eth_call with insufficient balance should still succeed (optional_balance_check
+    // is enabled per EVM spec — eth_call is a simulation, not a real transaction)
     let from = Address([0x33; 20]);
     executor.set_balance(&from, U256::from(1u64)); // tiny balance
     let to = Address([0x44; 20]);
-    // Any code is fine; call will fail on balance check
+    // STOP opcode — execution completes immediately
     executor.set_code(&to, vec![0x00]);
     let req_low_bal = serde_json::json!({
         "jsonrpc":"2.0","id":12,"method":"eth_call",
@@ -552,7 +554,8 @@ async fn test_eth_call_invalid_to_address_and_insufficient_balance() {
     .to_string();
     let resp_low_bal = io.handle_request(&req_low_bal).await.unwrap();
     let v_low: serde_json::Value = serde_json::from_str(&resp_low_bal).unwrap();
-    assert!(v_low.get("error").is_some());
+    // With optional_balance_check, eth_call succeeds even with insufficient balance
+    assert!(v_low.get("result").is_some());
 }
 
 #[tokio::test]
@@ -584,6 +587,7 @@ async fn test_eth_estimate_gas_with_object_returns_constant() {
 }
 
 #[tokio::test]
+#[ignore = "AI opcodes (0xf0-0xf4) disabled — collide with EVM CREATE/CALL/RETURN"]
 async fn test_eth_call_ai_zk_verify_valid_proof() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -633,6 +637,7 @@ async fn test_eth_call_ai_zk_verify_valid_proof() {
 }
 
 #[tokio::test]
+#[ignore = "AI opcodes (0xf0-0xf4) disabled — collide with EVM CREATE/CALL/RETURN"]
 async fn test_eth_call_ai_zk_verify_invalid_proof() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -682,6 +687,7 @@ async fn test_eth_call_ai_zk_verify_invalid_proof() {
 }
 
 #[tokio::test]
+#[ignore = "AI opcodes (0xf0-0xf4) disabled — collide with EVM CREATE/CALL/RETURN"]
 async fn test_eth_call_ai_zk_prove_output_length() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -820,6 +826,7 @@ async fn test_eth_call_invalid_data_shapes_error() {
 }
 
 #[tokio::test]
+#[ignore = "AI opcodes (0xf0-0xf4) disabled — collide with EVM CREATE/CALL/RETURN"]
 async fn test_eth_call_ai_model_load_path() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
