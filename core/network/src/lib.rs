@@ -11,6 +11,7 @@ pub mod sync;
 pub mod transaction_gossip;
 pub mod types;
 pub mod transport;
+pub mod noise;
 
 pub use ai_handler::{AINetworkHandler, NetworkInferenceExecutor, NetworkInferenceResult};
 pub use block_propagation::BlockPropagation;
@@ -22,3 +23,4 @@ pub use sync::{SyncConfig, SyncManager, SyncState};
 pub use transaction_gossip::{GossipConfig as TxGossipConfig, TransactionGossip};
 pub use types::{NetworkConfig, NetworkError};
 pub use transport::NetworkTransport;
+pub use noise::NoiseKeypair;

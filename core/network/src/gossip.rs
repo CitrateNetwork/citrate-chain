@@ -12,6 +12,27 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+// ---------------------------------------------------------------------------
+// Peer scoring penalties / rewards applied during gossip validation.
+// When a peer's cumulative score drops below score_threshold (-100 default),
+// the peer is banned and disconnected.
+// ---------------------------------------------------------------------------
+
+/// Peer sent a block that failed validation (e.g. bad header, oversized).
+const SCORE_INVALID_BLOCK: i32 = -25;
+
+/// Peer sent a transaction that failed validation.
+const SCORE_INVALID_TX: i32 = -10;
+
+/// Peer relayed a valid new block (small reward to offset incidental penalties).
+const SCORE_VALID_BLOCK: i32 = 1;
+
+/// Peer relayed a valid new transaction.
+const SCORE_VALID_TX: i32 = 1;
+
+/// Peer sent excessive duplicate messages (spamming).
+const SCORE_EXCESSIVE_DUPLICATES: i32 = -5;
+
 #[derive(Debug, Clone)]
 pub struct GossipConfig {
     /// Maximum items in seen cache
@@ -115,8 +136,17 @@ impl GossipProtocol {
         // Validate block (basic checks)
         if !self.validate_block(&block).await {
             warn!("Invalid block received from {}: {}", from_peer, hash);
+            // Penalize peer for sending invalid block
+            self.peer_manager
+                .update_peer_score(from_peer, SCORE_INVALID_BLOCK)
+                .await;
             return Err(NetworkError::InvalidMessage("Invalid block".to_string()));
         }
+
+        // Reward peer for valid block relay
+        self.peer_manager
+            .update_peer_score(from_peer, SCORE_VALID_BLOCK)
+            .await;
 
         // Propagate to other peers
         self.propagate_block(block.clone(), from_peer).await?;
@@ -155,10 +185,19 @@ impl GossipProtocol {
         // Validate transaction (basic checks)
         if !self.validate_transaction(&tx).await {
             warn!("Invalid transaction received from {}: {}", from_peer, hash);
+            // Penalize peer for sending invalid transaction
+            self.peer_manager
+                .update_peer_score(from_peer, SCORE_INVALID_TX)
+                .await;
             return Err(NetworkError::InvalidMessage(
                 "Invalid transaction".to_string(),
             ));
         }
+
+        // Reward peer for valid transaction relay
+        self.peer_manager
+            .update_peer_score(from_peer, SCORE_VALID_TX)
+            .await;
 
         // Propagate to other peers
         self.propagate_transaction(tx.clone(), from_peer).await?;

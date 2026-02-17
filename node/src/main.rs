@@ -932,6 +932,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
 
         // Start transport listener and connect to bootstrap nodes
         let local_peer_id = load_or_create_peer_id(&config.storage.data_dir)?;
+        let noise_keypair = citrate_network::NoiseKeypair::generate();
+        info!("Noise identity: {}...", &noise_keypair.public_key_hex()[..16]);
         let transport = NetworkTransport::new(
             peer_manager.clone(),
             local_peer_id,
@@ -941,7 +943,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 head_height,
                 head_hash,
             },
-        );
+        )
+        .with_noise(noise_keypair);
         let listen_addr = config.network.listen_addr;
         transport
             .start_listener(listen_addr)

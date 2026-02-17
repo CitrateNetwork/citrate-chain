@@ -149,7 +149,8 @@ type IncomingTx = mpsc::Sender<(PeerId, NetworkMessage)>;
 pub struct PeerManager {
     config: PeerManagerConfig,
     peers: Arc<DashMap<PeerId, Arc<Peer>>>,
-    banned_peers: Arc<RwLock<Vec<SocketAddr>>>,
+    /// Map of banned addresses to ban expiry time.
+    banned_peers: Arc<DashMap<SocketAddr, Instant>>,
     stats: Arc<RwLock<PeerStats>>,
     pub(crate) incoming: Arc<RwLock<Option<IncomingTx>>>,
 }
@@ -189,7 +190,7 @@ impl PeerManager {
         Self {
             config,
             peers: Arc::new(DashMap::new()),
-            banned_peers: Arc::new(RwLock::new(Vec::new())),
+            banned_peers: Arc::new(DashMap::new()),
             stats: Arc::new(RwLock::new(PeerStats::default())),
             incoming: Arc::new(RwLock::new(None)),
         }
@@ -329,18 +330,30 @@ impl PeerManager {
         )
     }
 
-    /// Ban a peer
+    /// Ban a peer for the configured ban duration.
     pub async fn ban_peer(&self, addr: SocketAddr) {
-        let mut banned = self.banned_peers.write().await;
-        if !banned.contains(&addr) {
-            banned.push(addr);
-            warn!("Banned peer: {}", addr);
-        }
+        let expires = Instant::now() + self.config.ban_duration;
+        self.banned_peers.insert(addr, expires);
+        warn!("Banned peer {} until {:?} ({:?} from now)", addr, expires, self.config.ban_duration);
     }
 
-    /// Check if an address is banned
+    /// Check if an address is currently banned (expired bans are removed).
     pub async fn is_banned(&self, addr: &SocketAddr) -> bool {
-        self.banned_peers.read().await.contains(addr)
+        if let Some(entry) = self.banned_peers.get(addr) {
+            if Instant::now() < *entry.value() {
+                return true;
+            }
+            // Ban expired — remove it
+            drop(entry);
+            self.banned_peers.remove(addr);
+        }
+        false
+    }
+
+    /// Remove expired bans (call periodically from maintenance loop).
+    pub fn cleanup_expired_bans(&self) {
+        let now = Instant::now();
+        self.banned_peers.retain(|_addr, expires| now < *expires);
     }
 
     /// Update peer score

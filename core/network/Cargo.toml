@@ -31,6 +31,8 @@ rand = { workspace = true }
 chrono = { workspace = true }
 sha3 = { workspace = true }
 parking_lot = { workspace = true }
+snow = "0.9"
+hex = "0.4"
 
 [dev-dependencies]
 tokio-test = "0.4"
