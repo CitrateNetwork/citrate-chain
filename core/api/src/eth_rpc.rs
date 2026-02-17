@@ -57,6 +57,25 @@ fn append_eip_fields(
     }
 }
 
+/// Convert a 32-byte pubkey hex (64 chars) to a 20-byte EVM address (40 chars).
+/// If the last 12 bytes are zeros (EVM-style embedded address), returns first 20 bytes.
+/// Otherwise returns first 20 bytes as well (truncated pubkey-derived address).
+fn pubkey_hex_to_evm_address(hex_str: &str) -> String {
+    if hex_str.len() == 64 && hex_str[40..].chars().all(|c| c == '0') {
+        // EVM address embedded in first 20 bytes
+        format!("0x{}", &hex_str[..40])
+    } else if hex_str.len() >= 40 {
+        format!("0x{}", &hex_str[..40])
+    } else {
+        format!("0x{}", hex_str)
+    }
+}
+
+/// Same as pubkey_hex_to_evm_address but returns None when input is None (for `to` field).
+fn pubkey_hex_opt_to_evm_address(hex_opt: Option<&String>) -> Option<String> {
+    hex_opt.map(|s| pubkey_hex_to_evm_address(s))
+}
+
 /// Add Ethereum-compatible RPC methods to the IoHandler
 pub fn register_eth_methods(
     io_handler: &mut IoHandler,
@@ -140,8 +159,8 @@ pub fn register_eth_methods(
                     block.transactions.iter().enumerate().map(|(index, tx)| {
                         json!({
                             "hash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
-                            "from": format!("0x{}", tx.from),
-                            "to": tx.to.as_ref().map(|addr| format!("0x{}", addr)),
+                            "from": pubkey_hex_to_evm_address(&tx.from),
+                            "to": pubkey_hex_opt_to_evm_address(tx.to.as_ref()),
                             "value": format!("0x{:x}", tx.value),
                             "gas": format!("0x{:x}", tx.gas_limit),
                             "gasPrice": format!("0x{:x}", tx.gas_price),
@@ -231,8 +250,8 @@ pub fn register_eth_methods(
                     block.transactions.iter().enumerate().map(|(index, tx)| {
                         json!({
                             "hash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
-                            "from": format!("0x{}", tx.from),
-                            "to": tx.to.as_ref().map(|addr| format!("0x{}", addr)),
+                            "from": pubkey_hex_to_evm_address(&tx.from),
+                            "to": pubkey_hex_opt_to_evm_address(tx.to.as_ref()),
                             "value": format!("0x{:x}", tx.value),
                             "gas": format!("0x{:x}", tx.gas_limit),
                             "gasPrice": format!("0x{:x}", tx.gas_price),
@@ -311,8 +330,8 @@ pub fn register_eth_methods(
         let h = Hash::new(hash_bytes);
         match block_on(api.get_transaction(h)) {
             Ok(tx) => {
-                let from_hex = format!("0x{}", tx.from);
-                let to_hex_opt = tx.to.as_ref().map(|s| format!("0x{}", s));
+                let from_hex = pubkey_hex_to_evm_address(&tx.from);
+                let to_hex_opt = pubkey_hex_opt_to_evm_address(tx.to.as_ref());
                 let mut obj = serde_json::Map::new();
                 obj.insert("hash".into(), json!(format!("0x{}", hex::encode(tx.hash.as_bytes()))));
                 obj.insert("nonce".into(), json!(format!("0x{:x}", tx.nonce)));
@@ -998,10 +1017,15 @@ pub fn register_eth_methods(
             required_pins: vec![],
         };
 
+        // For eth_call, use the sender's current nonce so execution doesn't fail
+        // on nonce validation (both in executor and REVM).
+        let sender_addr = citrate_execution::address_utils::normalize_address(&from_pk);
+        let sender_nonce = exec.get_nonce(&sender_addr);
+
         // Create a pseudo-transaction
         let mut tx = citrate_consensus::types::Transaction {
             hash: citrate_consensus::types::Hash::default(),
-            nonce: 0,
+            nonce: sender_nonce,
             from: from_pk,
             to: to_pk,
             value: value_u128,
@@ -1020,7 +1044,6 @@ pub fn register_eth_methods(
         let snapshot = exec.state_db().snapshot();
 
         // For eth_call, give sender unlimited balance so read-only calls don't fail
-        let sender_addr = citrate_execution::address_utils::normalize_address(&from_pk);
         exec.set_balance(&sender_addr, U256::from(u128::MAX));
 
         let res = block_on(exec.execute_transaction(&blk, &tx));
@@ -1174,10 +1197,14 @@ pub fn register_eth_methods(
             required_pins: vec![],
         };
 
+        // For gas estimation, use sender's current nonce to pass nonce validation
+        let sender_addr = citrate_execution::address_utils::normalize_address(&from_pk);
+        let sender_nonce = exec.get_nonce(&sender_addr);
+
         // Create a pseudo-transaction for estimation
         let mut tx = citrate_consensus::types::Transaction {
             hash: citrate_consensus::types::Hash::default(),
-            nonce: 0,
+            nonce: sender_nonce,
             from: from_pk,
             to: to_pk,
             value: value_u128,
@@ -1194,7 +1221,6 @@ pub fn register_eth_methods(
 
         // Snapshot state, set sender balance to max for simulation, execute, restore
         let snapshot = exec.state_db().snapshot();
-        let sender_addr = citrate_execution::address_utils::normalize_address(&from_pk);
         exec.set_balance(&sender_addr, U256::from(u128::MAX));
 
         let res = block_on(exec.execute_transaction(&blk, &tx));

@@ -925,21 +925,11 @@ impl Executor {
             .state_db
             .get_code(&self.state_db.accounts.get_code_hash(&to))
         {
-            // Fast path: scan for AI opcodes (TENSOR_OP, MODEL_LOAD/EXEC, ZK_*). If present,
-            // execute them directly and return their output to align with API expectations.
-            if let Ok(Some(ai_out)) = self
-                .scan_and_execute_ai_opcodes(&code, &data, context)
-                .await
-            {
-                context.output = ai_out;
-                // Add execution log similar to VM path
-                context.add_log(Log {
-                    address: to,
-                    topics: vec![Hash::new(*b"ContractExecuted0000000000000000")],
-                    data: data.clone(),
-                });
-                return Ok(());
-            }
+            // AI opcode scanning is DISABLED for standard EVM contracts because
+            // AI opcodes (0xf0-0xf4) collide with EVM opcodes (CREATE, CALL,
+            // CALLCODE, RETURN, DELEGATECALL). Scanning normal EVM bytecode
+            // triggers false matches and breaks contract execution.
+            // TODO: Re-enable with a proper prefix/marker to distinguish AI contracts.
 
             // Route standard EVM calls through REVM for correct CALL/CREATE/DELEGATECALL
             debug!(

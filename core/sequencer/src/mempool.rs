@@ -370,6 +370,20 @@ impl Mempool {
             });
         }
 
+        // Check chain ID
+        if let Some(tx_chain_id) = tx.chain_id {
+            if tx_chain_id != self.config.chain_id {
+                tracing::warn!(
+                    "Transaction chain ID mismatch: expected {}, got {}",
+                    self.config.chain_id,
+                    tx_chain_id
+                );
+                return Err(MempoolError::InvalidTransaction(
+                    format!("Wrong chain ID: expected {}, got {}", self.config.chain_id, tx_chain_id),
+                ));
+            }
+        }
+
         // Check nonce
         if let Some(&expected_nonce) = self.nonces.read().await.get(&tx.from) {
             if tx.nonce < expected_nonce {

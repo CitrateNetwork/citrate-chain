@@ -54,8 +54,27 @@ impl TransactionStore {
     /// Get a transaction by hash
     pub fn get_transaction(&self, hash: &Hash) -> Result<Option<Transaction>> {
         match self.db.get_cf(CF_TRANSACTIONS, hash.as_bytes()) {
-            Ok(Some(bytes)) => Ok(Some(bincode::deserialize(&bytes)?)),
-            Ok(None) => Ok(None),
+            Ok(Some(bytes)) => {
+                match bincode::deserialize::<Transaction>(&bytes) {
+                    Ok(tx) => Ok(Some(tx)),
+                    Err(e) => {
+                        tracing::error!(
+                            "bincode deserialize failed for tx 0x{}: {} (data len={})",
+                            hex::encode(hash.as_bytes()),
+                            e,
+                            bytes.len()
+                        );
+                        Err(e.into())
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    "tx 0x{} not found in CF_TRANSACTIONS",
+                    hex::encode(hash.as_bytes())
+                );
+                Ok(None)
+            }
             Err(_e) => {
                 // Fallback: iterate CF to find the key (workaround for rare I/O errors)
                 for (k, v) in self.db.iter_cf(CF_TRANSACTIONS)? {

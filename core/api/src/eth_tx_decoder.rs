@@ -72,17 +72,9 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
 
     eprintln!("Calculated transaction hash: 0x{}", hex::encode(hash_bytes));
 
-    // Try to parse as bincode first (for Citrate native transactions)
-    if let Ok(mut tx) = bincode::deserialize::<Transaction>(tx_bytes) {
-        eprintln!("Successfully decoded as Citrate native transaction");
-        // Ensure the transaction has a proper hash
-        if tx.hash == Hash::default() {
-            tx.hash = Hash::new(hash_bytes);
-        }
-        return Ok(tx);
-    }
-
     // Handle typed transactions (EIP-2718). 0x02 = EIP-1559, 0x01 = EIP-2930
+    // Try these BEFORE bincode to prevent RLP bytes from accidentally
+    // passing bincode::deserialize (which would bypass chain ID validation).
     if tx_bytes[0] == 0x02 {
         return decode_eip1559_transaction(&tx_bytes[1..]);
     }
@@ -90,7 +82,7 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
         return decode_eip2930_transaction(&tx_bytes[1..]);
     }
 
-    // Try to decode as legacy RLP
+    // Try to decode as legacy RLP (before bincode, same reason)
     let rlp = Rlp::new(tx_bytes);
 
     // Check if this is a valid RLP list
@@ -294,6 +286,16 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
             }
         }
     } else {
+        // Last resort: try bincode for Citrate native transactions.
+        // This is done AFTER RLP to prevent Ethereum RLP bytes from
+        // accidentally deserializing as bincode (which would skip chain ID validation).
+        if let Ok(mut tx) = bincode::deserialize::<Transaction>(tx_bytes) {
+            eprintln!("Successfully decoded as Citrate native transaction (bincode fallback)");
+            if tx.hash == Hash::default() {
+                tx.hash = Hash::new(hash_bytes);
+            }
+            return Ok(tx);
+        }
         eprintln!("Not a valid RLP list, cannot decode transaction");
         Err("Invalid RLP: expected a list for legacy transaction".to_string())
     }

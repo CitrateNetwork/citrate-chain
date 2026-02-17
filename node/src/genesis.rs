@@ -66,7 +66,7 @@ impl Default for GenesisConfig {
                     0xF4, 0xce, 0x6a, 0xB8, 0x82, 0x72, 0x79, 0xcf,
                     0xfF, 0xb9, 0x22, 0x66, 0x00, 0x00, 0x00, 0x00,
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                ]), 100_000_000_000_000_000_000), // 100 ETH for testing
+                ]), 10_000_000_000_000_000_000_000), // 10000 ETH for testing
 
                 // Recovered deployer from failed transaction
                 // Address: 0xfcad0b19bb29d4674531d6f115237e16afce377c
@@ -75,7 +75,7 @@ impl Default for GenesisConfig {
                     0x45, 0x31, 0xd6, 0xf1, 0x15, 0x23, 0x7e, 0x16,
                     0xaf, 0xce, 0x37, 0x7c, 0x00, 0x00, 0x00, 0x00,
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                ]), 100_000_000_000_000_000_000), // 100 ETH for testing
+                ]), 10_000_000_000_000_000_000_000), // 10000 ETH for testing
             ],
         }
     }

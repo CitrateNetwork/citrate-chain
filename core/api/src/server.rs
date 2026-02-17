@@ -760,6 +760,7 @@ impl RpcServer {
         // Override eth_sendRawTransaction to also broadcast via P2P when available
         let mempool_raw_broadcast = mempool.clone();
         let peer_mgr_raw_broadcast = peer_manager.clone();
+        let executor_raw_broadcast = executor.clone();
         io_handler.add_sync_method("eth_sendRawTransaction", move |params: Params| {
             rpc_request("eth_sendRawTransaction");
             use crate::eth_tx_decoder;
@@ -767,6 +768,7 @@ impl RpcServer {
 
             let mempool = mempool_raw_broadcast.clone();
             let peer_mgr = peer_mgr_raw_broadcast.clone();
+            let exec = executor_raw_broadcast.clone();
 
             let params: Vec<Value> = match params.parse() {
                 Ok(p) => p,
@@ -793,6 +795,18 @@ impl RpcServer {
                     )))
                 }
             };
+
+            // Check sender balance covers value + gas
+            let sender_addr = citrate_execution::address_utils::normalize_address(&tx.from);
+            let balance = exec.get_balance(&sender_addr);
+            let gas_cost = primitive_types::U256::from(tx.gas_limit) * primitive_types::U256::from(tx.gas_price);
+            let total_cost = gas_cost + primitive_types::U256::from(tx.value);
+            if balance < total_cost {
+                return Err(jsonrpc_core::Error::invalid_params(
+                    format!("Insufficient funds: account balance {} < required {}", balance, total_cost),
+                ));
+            }
+
             let hash = tx.hash;
             match block_on(
                 mempool.add_transaction(tx.clone(), citrate_sequencer::mempool::TxClass::Standard),
@@ -2199,9 +2213,15 @@ impl RpcServer {
                 let _ = tx.send(result);
             });
             match rx.recv_timeout(std::time::Duration::from_secs(8)) {
-                Ok(Ok(s)) => Ok(serde_json::from_str::<serde_json::Value>(&s)
-                    .unwrap_or(serde_json::json!({"status":s}))),
-                _ => Ok(serde_json::json!({"status":"unknown"})),
+                Ok(Ok(s)) => {
+                    let parsed = serde_json::from_str::<serde_json::Value>(&s);
+                    match parsed {
+                        Ok(v) if v.is_array() => Ok(v),
+                        Ok(v) => Ok(serde_json::json!([{"provider":"local","status": v.get("status").and_then(|s| s.as_str()).unwrap_or("unknown")}])),
+                        Err(_) => Ok(serde_json::json!([{"provider":"local","status": s}])),
+                    }
+                }
+                _ => Ok(serde_json::json!([{"provider":"local","status":"unknown"}])),
             }
         });
 
@@ -2213,7 +2233,8 @@ impl RpcServer {
                 Ok(s) => s,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
-            match hex::decode(&model_id_str) {
+            let model_id_hex = model_id_str.trim_start_matches("0x");
+            match hex::decode(model_id_hex) {
                 Ok(bytes) if bytes.len() == 32 => {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&bytes);
@@ -2235,7 +2256,8 @@ impl RpcServer {
                 Ok(s) => s,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
-            match hex::decode(&model_id_str) {
+            let model_id_hex = model_id_str.trim_start_matches("0x");
+            match hex::decode(model_id_hex) {
                 Ok(bytes) if bytes.len() == 32 => {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&bytes);
