@@ -329,20 +329,29 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!("{}", e));
     }
 
-    // Initialize chain if data directory doesn't exist (first run)
-    if !config.storage.data_dir.exists() {
-        info!("Data directory doesn't exist, initializing genesis...");
-        std::fs::create_dir_all(&config.storage.data_dir)?;
+    // Initialize chain if genesis block doesn't exist in storage
+    // C1 fix: Check for genesis block existence, not directory existence.
+    // Pre-created dirs or partial state no longer bypass genesis init.
+    std::fs::create_dir_all(&config.storage.data_dir)?;
 
-        let storage = Arc::new(StorageManager::new(
-            &config.storage.data_dir,
-            PruningConfig::default(),
-        )?);
+    let probe_storage = Arc::new(StorageManager::new(
+        &config.storage.data_dir,
+        PruningConfig::default(),
+    )?);
+
+    let has_genesis = probe_storage.blocks.get_block_by_height(0)
+        .ok()
+        .flatten()
+        .and_then(|hash| probe_storage.blocks.get_block(&hash).ok().flatten())
+        .is_some();
+
+    if !has_genesis {
+        info!("No genesis block found, initializing genesis...");
 
         let state_db = Arc::new(StateDB::new());
         let executor = Arc::new(Executor::with_storage(
             state_db,
-            Some(storage.state.clone()),
+            Some(probe_storage.state.clone()),
         ));
 
         let genesis_config = genesis::GenesisConfig {
@@ -350,8 +359,11 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
 
-        genesis::initialize_genesis_state(storage, executor, &genesis_config).await?;
+        genesis::initialize_genesis_state(probe_storage, executor, &genesis_config).await?;
         info!("Genesis state initialized for chain ID {}", config.chain.chain_id);
+    } else {
+        info!("Genesis block found in storage, skipping initialization");
+        drop(probe_storage);
     }
 
     // Start node
@@ -1211,16 +1223,29 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await;
                     }
                     NetworkMessage::NewBlock { block } => {
-                        // Store block if we don't have it
+                        // C3 fix: validate BEFORE persisting to prevent
+                        // invalid blocks from polluting local storage.
                         let have = storage_for_handler
                             .blocks
                             .has_block(&block.header.block_hash)
                             .unwrap_or(false);
                         if !have {
-                            let _ = storage_for_handler.blocks.put_block(&block);
+                            // Let gossip validate and propagate first
+                            match gossip_for_rx.handle_new_block(block.clone(), &pid).await {
+                                Ok(_) => {
+                                    // Block passed validation — persist it
+                                    let _ = storage_for_handler.blocks.put_block(&block);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Rejected invalid block {} from {}: {}",
+                                        hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                        pid,
+                                        e
+                                    );
+                                }
+                            }
                         }
-                        // Let gossip propagate
-                        let _ = gossip_for_rx.handle_new_block(block, &pid).await;
                     }
                     NetworkMessage::Blocks { blocks } => {
                         let _ = sync_for_rx.handle_blocks(blocks).await;
@@ -1355,7 +1380,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             citrate_consensus::PublicKey::new(coinbase),
             config.mining.target_block_time,
             economics_manager,
-        ));
+        ).await);
 
         tokio::spawn(async move {
             producer.start().await;

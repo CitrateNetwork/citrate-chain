@@ -50,11 +50,16 @@ pub struct GenesisConfig {
     pub initial_accounts: Vec<(PublicKey, u128)>, // (address, balance)
 }
 
+/// Canonical genesis timestamp: 2026-01-01T00:00:00Z (UTC).
+/// C2 fix: All nodes MUST use this same timestamp so the genesis block hash
+/// is deterministic and identical across independent node startups.
+pub const CANONICAL_GENESIS_TIMESTAMP: u64 = 1_767_225_600;
+
 impl Default for GenesisConfig {
     fn default() -> Self {
         Self {
             chain_id: 1337,
-            timestamp: chrono::Utc::now().timestamp() as u64,
+            timestamp: CANONICAL_GENESIS_TIMESTAMP,
             initial_accounts: vec![
                 // Dev account with initial balance (ed25519)
                 (PublicKey::new([1; 32]), 1_000_000_000_000_000_000), // 1 ETH worth
