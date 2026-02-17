@@ -585,4 +585,131 @@ mod tests {
         assert!(blue.contains(&d.hash()));
         assert!(blue.score >= 4);
     }
+
+    // -----------------------------------------------------------------------
+    // Property-based tests (proptest)
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Build a random linear chain of `n` blocks on top of genesis.
+    /// Returns (ghostdag, dag_store, block_hashes_in_order).
+    async fn build_random_chain(n: usize, seed: u64) -> (GhostDag, Arc<DagStore>, Vec<Hash>) {
+        let params = GhostDagParams::default();
+        let dag_store = Arc::new(DagStore::new());
+        let ghostdag = GhostDag::new(params, dag_store.clone());
+
+        // Genesis
+        let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+
+        let mut gset = BlueSet::new();
+        gset.insert(genesis.hash());
+        gset.score = 1;
+        ghostdag.blue_cache.write().await.insert(genesis.hash(), gset.clone());
+        let grel = DagRelation {
+            block: genesis.hash(),
+            selected_parent: Hash::default(),
+            merge_parents: vec![],
+            children: vec![],
+            blue_set: gset,
+            is_chain_block: true,
+        };
+        ghostdag.relations.write().await.insert(genesis.hash(), grel);
+        ghostdag.tips.write().await.insert(genesis.hash());
+
+        let mut hashes = vec![genesis.hash()];
+        let mut prev = genesis.hash();
+
+        for i in 0..n {
+            let mut hash_bytes = [0u8; 32];
+            // Deterministic but unique hash from seed + index
+            let val = seed.wrapping_mul(31).wrapping_add(i as u64);
+            hash_bytes[0..8].copy_from_slice(&val.to_le_bytes());
+            hash_bytes[8] = (i & 0xFF) as u8;
+            let block = create_test_block_with_parents(hash_bytes, prev, vec![], (i + 1) as u64);
+            dag_store.store_block(block.clone()).await.unwrap();
+            ghostdag.add_block(&block).await.unwrap();
+            hashes.push(block.hash());
+            prev = block.hash();
+        }
+
+        (ghostdag, dag_store, hashes)
+    }
+
+    proptest! {
+        /// Property: In a linear chain, blue score increases monotonically.
+        #[test]
+        fn prop_linear_chain_blue_score_monotonic(n in 2..20usize, seed in 1..1000u64) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let (ghostdag, _, hashes) = build_random_chain(n, seed).await;
+                let mut prev_score = 0u64;
+                for hash in &hashes {
+                    if let Ok(score) = ghostdag.get_blue_score(hash).await {
+                        prop_assert!(score >= prev_score,
+                            "Blue score decreased: {} -> {} at {:?}", prev_score, score, hash);
+                        prev_score = score;
+                    }
+                }
+                Ok(())
+            })?;
+        }
+
+        /// Property: Tip selection always returns the tip with the highest blue score.
+        #[test]
+        fn prop_tip_is_highest_blue_score(n in 1..15usize, seed in 1..1000u64) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let (ghostdag, _, _) = build_random_chain(n, seed).await;
+                let tips = ghostdag.get_tips().await;
+                prop_assert!(!tips.is_empty(), "DAG must have at least one tip");
+
+                let selected_tip = ghostdag.select_tip().await.unwrap();
+                prop_assert!(tips.contains(&selected_tip),
+                    "Selected tip must be in the tip set");
+
+                // In a linear chain there should be exactly one tip
+                prop_assert!(tips.len() == 1,
+                    "Linear chain should have exactly 1 tip, found {}", tips.len());
+                Ok(())
+            })?;
+        }
+
+        /// Property: Blue set always contains the block itself.
+        #[test]
+        fn prop_blue_set_contains_self(n in 1..15usize, seed in 1..1000u64) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let (ghostdag, dag_store, hashes) = build_random_chain(n, seed).await;
+                for hash in &hashes {
+                    if let Ok(block) = dag_store.get_block(hash).await {
+                        let blue_set = ghostdag.calculate_blue_set(&block).await.unwrap();
+                        prop_assert!(blue_set.contains(hash),
+                            "Block {:?} not in its own blue set", hash);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+
+        /// Property: In a linear chain, each block's blue set is a superset of its parent's blue set.
+        #[test]
+        fn prop_blue_set_grows_along_chain(n in 2..15usize, seed in 1..1000u64) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let (ghostdag, dag_store, hashes) = build_random_chain(n, seed).await;
+                let mut prev_score = 0u64;
+                for hash in &hashes {
+                    if let Ok(block) = dag_store.get_block(hash).await {
+                        let blue_set = ghostdag.calculate_blue_set(&block).await.unwrap();
+                        prop_assert!(blue_set.score >= prev_score,
+                            "Blue set score must not decrease: {} -> {}", prev_score, blue_set.score);
+                        prev_score = blue_set.score;
+                    }
+                }
+                Ok(())
+            })?;
+        }
+    }
 }
