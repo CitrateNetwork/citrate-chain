@@ -114,6 +114,20 @@ impl BlockStore {
                 max_height = max_height.max(height);
             }
         }
+        // Verify the block at max_height actually exists in CF_BLOCKS.
+        // The height key and block data are written in the same batch, but if
+        // the producer crashed or the block hash is stale, fall back to the
+        // highest height whose block data is actually retrievable.
+        while max_height > 0 {
+            let hk = height_to_key(max_height);
+            if let Ok(Some(hash_bytes)) = self.db.get_cf(CF_METADATA, &hk) {
+                let hash = Hash::from_bytes(&hash_bytes);
+                if self.db.exists_cf(CF_BLOCKS, hash.as_bytes()).unwrap_or(false) {
+                    return Ok(max_height);
+                }
+            }
+            max_height -= 1;
+        }
         Ok(max_height)
     }
 

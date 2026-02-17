@@ -441,13 +441,33 @@ impl RpcServer {
             let artifact_cid = if let Some(cid) = map.get("ipfs_cid").and_then(|v| v.as_str()) {
                 cid.to_string()
             } else if let Some(bytes) = model_bytes.as_ref() {
-                match block_on(executor_ai_update.add_artifact(bytes)) {
-                    Ok(cid) => cid,
-                    Err(e) => {
+                let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                    jsonrpc_core::Error::internal_error()
+                })?;
+                let exec = executor_ai_update.clone();
+                let data = bytes.clone();
+                match std::thread::spawn(move || {
+                    handle.block_on(async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            exec.add_artifact(&data),
+                        ).await
+                    })
+                }).join() {
+                    Ok(Ok(Ok(cid))) => cid,
+                    Ok(Ok(Err(e))) => {
                         return Err(jsonrpc_core::Error::invalid_params(format!(
                             "Failed to add artifact: {}",
                             e
                         )))
+                    }
+                    Ok(Err(_)) => {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "IPFS upload timed out",
+                        ))
+                    }
+                    Err(_) => {
+                        return Err(jsonrpc_core::Error::internal_error())
                     }
                 }
             } else {
@@ -1436,13 +1456,33 @@ impl RpcServer {
             let cid = if let Some(existing) = ipfs_cid_param {
                 existing.to_string()
             } else if let Some(bytes) = model_bytes.as_ref() {
-                match block_on(executor_ai_deploy.add_artifact(bytes)) {
-                    Ok(cid) => cid,
-                    Err(e) => {
+                let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                    jsonrpc_core::Error::internal_error()
+                })?;
+                let exec = executor_ai_deploy.clone();
+                let data = bytes.clone();
+                match std::thread::spawn(move || {
+                    handle.block_on(async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            exec.add_artifact(&data),
+                        ).await
+                    })
+                }).join() {
+                    Ok(Ok(Ok(cid))) => cid,
+                    Ok(Ok(Err(e))) => {
                         return Err(jsonrpc_core::Error::invalid_params(format!(
                             "Failed to add artifact: {}",
                             e
                         )))
+                    }
+                    Ok(Err(_)) => {
+                        return Err(jsonrpc_core::Error::invalid_params(
+                            "IPFS upload timed out",
+                        ))
+                    }
+                    Err(_) => {
+                        return Err(jsonrpc_core::Error::internal_error())
                     }
                 }
             } else {
@@ -1744,7 +1784,7 @@ impl RpcServer {
                 .map(|(id, _)| hex::encode(id.0.as_bytes()))
                 .collect();
             if let Some(l) = limit { ids.truncate(l); }
-            Ok(serde_json::to_value(ids).unwrap_or(Value::Array(vec![])))
+            Ok(serde_json::json!({ "models": ids }))
         });
 
         // citrate_getModels (alias for citrate_listModels)
@@ -1779,7 +1819,7 @@ impl RpcServer {
                 .map(|(id, _)| hex::encode(id.0.as_bytes()))
                 .collect();
             if let Some(l) = limit { ids.truncate(l); }
-            Ok(serde_json::to_value(ids).unwrap_or(Value::Array(vec![])))
+            Ok(serde_json::json!({ "models": ids }))
         });
 
         // citrate_requestInference — full implementation using Executor inference service
@@ -2117,9 +2157,23 @@ impl RpcServer {
                 Ok(t) => t,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
-            match block_on(executor_art_pin.artifact_pin(&cid, replicas as usize)) {
-                Ok(()) => Ok(serde_json::json!({"status":"ok"})),
-                Err(e) => Ok(serde_json::json!({"status":"error","message":format!("{}", e)})),
+            let handle = match tokio::runtime::Handle::try_current() {
+                Ok(h) => h,
+                Err(_) => return Ok(serde_json::json!({"status":"error","message":"No tokio runtime"})),
+            };
+            let executor_clone = executor_art_pin.clone();
+            let cid_owned = cid.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = handle.block_on(
+                    executor_clone.artifact_pin(&cid_owned, replicas as usize),
+                );
+                let _ = tx.send(result);
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(8)) {
+                Ok(Ok(())) => Ok(serde_json::json!({"status":"ok"})),
+                Ok(Err(e)) => Ok(serde_json::json!({"status":"error","message":format!("{}", e)})),
+                Err(_) => Ok(serde_json::json!({"status":"error","message":"IPFS pin request timed out"})),
             }
         });
 
@@ -2127,14 +2181,27 @@ impl RpcServer {
         let executor_art_status = executor.clone();
         io_handler.add_sync_method("citrate_getArtifactStatus", move |params: Params| {
             rpc_request("citrate_getArtifactStatus");
-            let cid: String = match params.parse() {
+            let (cid,): (String,) = match params.parse() {
                 Ok(c) => c,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
-            match block_on(executor_art_status.artifact_status(&cid)) {
-                Ok(s) => Ok(serde_json::from_str::<serde_json::Value>(&s)
+            let handle = match tokio::runtime::Handle::try_current() {
+                Ok(h) => h,
+                Err(_) => return Ok(serde_json::json!({"status":"unknown"})),
+            };
+            let executor_clone = executor_art_status.clone();
+            let cid_owned = cid.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = handle.block_on(
+                    executor_clone.artifact_status(&cid_owned),
+                );
+                let _ = tx.send(result);
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(8)) {
+                Ok(Ok(s)) => Ok(serde_json::from_str::<serde_json::Value>(&s)
                     .unwrap_or(serde_json::json!({"status":s}))),
-                Err(_) => Ok(serde_json::json!({"status":"unknown"})),
+                _ => Ok(serde_json::json!({"status":"unknown"})),
             }
         });
 
@@ -2142,7 +2209,7 @@ impl RpcServer {
         let executor_art_list = executor.clone();
         io_handler.add_sync_method("citrate_listModelArtifacts", move |params: Params| {
             rpc_request("citrate_listModelArtifacts");
-            let model_id_str: String = match params.parse() {
+            let (model_id_str,): (String,) = match params.parse() {
                 Ok(s) => s,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
@@ -2164,7 +2231,7 @@ impl RpcServer {
         let executor_proof_list = executor.clone();
         io_handler.add_sync_method("citrate_listProofArtifacts", move |params: Params| {
             rpc_request("citrate_listProofArtifacts");
-            let model_id_str: String = match params.parse() {
+            let (model_id_str,): (String,) = match params.parse() {
                 Ok(s) => s,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };

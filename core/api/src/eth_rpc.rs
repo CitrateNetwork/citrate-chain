@@ -100,13 +100,15 @@ pub fn register_eth_methods(
             .unwrap_or(false);
         
         // Parse block number from hex string or "latest"
+        let is_latest = params[0].as_str() == Some("latest");
         let block_number = match params[0].as_str() {
-            Some("latest") => {
+            Some("latest") | Some("pending") => {
                 match block_on(api.get_height()) {
                     Ok(h) => h,
                     Err(_) => return Ok(Value::Null),
                 }
             },
+            Some("earliest") => 0,
             Some(hex_str) if hex_str.starts_with("0x") => {
                 match u64::from_str_radix(&hex_str[2..], 16) {
                     Ok(n) => n,
@@ -115,9 +117,22 @@ pub fn register_eth_methods(
             },
             _ => return Err(jsonrpc_core::Error::invalid_params("Invalid block number format")),
         };
-        
-        // Get block from storage
-        match block_on(api.get_block(crate::types::request::BlockId::Number(block_number))) {
+
+        // Get block from storage.
+        // For "latest", if the block at the reported height is missing (race
+        // between height bookkeeping and block storage), fall back to height-1.
+        let mut try_height = block_number;
+        let block_result = loop {
+            match block_on(api.get_block(crate::types::request::BlockId::Number(try_height))) {
+                Ok(block) => break Ok(block),
+                Err(_) if is_latest && try_height > 0 => {
+                    try_height -= 1;
+                    continue;
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        match block_result {
             Ok(block) => {
                 // Build transactions array based on includeTransactions flag
                 let transactions = if include_transactions {
