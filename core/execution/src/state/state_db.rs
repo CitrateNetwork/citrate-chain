@@ -3,7 +3,7 @@
 // State database managing all state
 use crate::state::{AccountManager, Trie};
 use crate::types::{Address, ExecutionError, JobId, ModelId, ModelState, TrainingJob};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use citrate_consensus::types::Hash;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -30,6 +30,10 @@ pub struct StateDB {
 
     /// Global state trie
     state_trie: Arc<parking_lot::RwLock<Trie>>,
+
+    /// C6 fix: Track dirty storage slots for persistence.
+    /// Stores (address, key) pairs that have been modified since last commit.
+    dirty_storage: Arc<DashSet<(Address, Vec<u8>)>>,
 }
 
 impl StateDB {
@@ -41,6 +45,7 @@ impl StateDB {
             models: Arc::new(DashMap::new()),
             training_jobs: Arc::new(DashMap::new()),
             state_trie: Arc::new(parking_lot::RwLock::new(Trie::new())),
+            dirty_storage: Arc::new(DashSet::new()),
         }
     }
 
@@ -53,6 +58,7 @@ impl StateDB {
 
     /// Set storage value
     pub fn set_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
+        self.dirty_storage.insert((address, key.clone()));
         self.storage_tries
             .entry(address)
             .or_default()
@@ -61,9 +67,17 @@ impl StateDB {
 
     /// Delete storage value
     pub fn delete_storage(&self, address: Address, key: &[u8]) {
+        self.dirty_storage.insert((address, key.to_vec()));
         if let Some(mut trie) = self.storage_tries.get_mut(&address) {
             trie.remove(key);
         }
+    }
+
+    /// Get all dirty storage slots and clear dirty tracking
+    pub fn take_dirty_storage(&self) -> Vec<(Address, Vec<u8>)> {
+        let entries: Vec<_> = self.dirty_storage.iter().map(|r| r.clone()).collect();
+        self.dirty_storage.clear();
+        entries
     }
 
     /// Get contract code

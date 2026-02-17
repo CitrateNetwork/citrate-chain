@@ -88,6 +88,10 @@ pub trait StateStoreTrait: Send + Sync {
     ) -> anyhow::Result<()>;
     fn get_account(&self, address: &Address) -> anyhow::Result<Option<crate::types::AccountState>>;
     fn put_code(&self, code_hash: &Hash, code: &[u8]) -> anyhow::Result<()>;
+    /// C6: Persist a contract storage slot
+    fn put_storage(&self, address: &Address, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
+    /// C6: Delete a contract storage slot
+    fn delete_storage(&self, address: &Address, key: &[u8]) -> anyhow::Result<()>;
 }
 
 /// Bridge trait to persist AI model metadata & artifacts in external storage layers.
@@ -292,15 +296,27 @@ impl Executor {
         &self.state_db
     }
 
-    /// Persist all dirty accounts from state_db to state_store
+    /// Persist all dirty accounts and storage slots from state_db to state_store
     pub fn persist_state_changes(&self) -> anyhow::Result<usize> {
         if let Some(store) = &self.state_store {
             let dirty_accounts = self.state_db.accounts.get_dirty_accounts();
-            let count = dirty_accounts.len();
+            let mut count = dirty_accounts.len();
 
             for address in dirty_accounts {
                 let account = self.state_db.accounts.get_account(&address);
                 store.put_account(&address, &account)?;
+            }
+
+            // C6 fix: Also persist dirty contract storage slots
+            let dirty_storage = self.state_db.take_dirty_storage();
+            count += dirty_storage.len();
+            for (address, key) in &dirty_storage {
+                if let Some(value) = self.state_db.get_storage(address, key) {
+                    store.put_storage(address, key, &value)?;
+                } else {
+                    // Slot was deleted — remove from persistent store too
+                    store.delete_storage(address, key)?;
+                }
             }
 
             // Commit state DB (clears dirty tracking)

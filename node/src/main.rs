@@ -687,6 +687,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             warn!("Failed to load accounts from storage: {}", e);
         }
     }
+
+    // C6 fix: Also load contract storage slots from persistent storage
+    match storage.state.get_all_storage() {
+        Ok(storage_slots) => {
+            info!("Found {} storage slots in storage, loading into memory...", storage_slots.len());
+            for ((address, storage_key), storage_value) in storage_slots {
+                state_db.set_storage(address, storage_key.as_bytes().to_vec(), storage_value.as_bytes().to_vec());
+            }
+            // Clear dirty flags since these are loaded from storage, not new writes
+            let _ = state_db.take_dirty_storage();
+            info!("Storage slots loaded successfully");
+        }
+        Err(e) => {
+            warn!("Failed to load storage slots from storage: {}", e);
+        }
+    }
+
     // MCP + inference service
     let vm_for_mcp = Arc::new(citrate_execution::vm::VM::new(10_000_000));
     let mcp = Arc::new(citrate_mcp::MCPService::new(

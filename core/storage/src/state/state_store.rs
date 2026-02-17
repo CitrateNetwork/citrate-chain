@@ -33,6 +33,18 @@ impl StateStoreTrait for StateStore {
         debug!("Stored contract code with hash {}", code_hash);
         Ok(())
     }
+
+    fn put_storage(&self, address: &Address, key: &[u8], value: &[u8]) -> Result<()> {
+        let storage_key = storage_key(address, key);
+        self.db.put_cf(CF_STORAGE, &storage_key, value)?;
+        Ok(())
+    }
+
+    fn delete_storage(&self, address: &Address, key: &[u8]) -> Result<()> {
+        let storage_key = storage_key(address, key);
+        self.db.delete_cf(CF_STORAGE, &storage_key)?;
+        Ok(())
+    }
 }
 
 impl StateStore {
