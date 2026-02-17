@@ -438,6 +438,7 @@ impl RpcServer {
             executor.clone(),
             chain_id,
             filter_registry,
+            None, // No pause flag for basic server
         );
 
         // Register economics-related RPC methods

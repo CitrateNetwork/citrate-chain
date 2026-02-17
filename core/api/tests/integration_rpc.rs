@@ -72,6 +72,7 @@ async fn test_eth_block_number_and_get_block() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // eth_blockNumber (hex string)
@@ -120,6 +121,7 @@ async fn test_eth_get_block_by_hash() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // eth_getBlockByHash [hash, false]
@@ -188,6 +190,7 @@ async fn test_eth_get_tx_and_receipt_by_hash() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // eth_getTransactionByHash
@@ -251,6 +254,7 @@ async fn test_eth_get_transaction_count_latest_vs_pending() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // Latest nonce initially 0
@@ -326,6 +330,7 @@ async fn test_eth_get_balance_and_code_smoke() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // eth_getBalance
@@ -364,6 +369,7 @@ async fn test_eth_send_raw_transaction_error_path() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // Invalid hex string should produce an error
@@ -400,6 +406,7 @@ async fn test_eth_call_smoke() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // Call object: zero-value transfer with minimal gas, empty data
@@ -436,6 +443,7 @@ async fn test_eth_estimate_gas_minimal() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     let req = serde_json::json!({
@@ -475,6 +483,7 @@ async fn test_eth_call_ai_tensor_opcode() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // Data for tensor operation: op_type=0x01, dimensions=0x00000010 (16, little endian), plus padding
@@ -519,6 +528,7 @@ async fn test_eth_call_invalid_to_address_and_insufficient_balance() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // Invalid 'to' address length
@@ -574,6 +584,7 @@ async fn test_eth_estimate_gas_with_object_returns_constant() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     let req = serde_json::json!({
@@ -611,6 +622,7 @@ async fn test_eth_call_ai_zk_verify_valid_proof() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // Input: 64-byte proof of 0xF3 values → valid, expect 0x01
@@ -661,6 +673,7 @@ async fn test_eth_call_ai_zk_verify_invalid_proof() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // Input: 64-byte proof of 0x00 values → invalid, expect 0x00
@@ -711,6 +724,7 @@ async fn test_eth_call_ai_zk_prove_output_length() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // Input: arbitrary payload; expect 64-byte proof output
@@ -767,6 +781,7 @@ async fn test_eth_call_invalid_data_shapes_error() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // Tensor op requires at least 8 bytes of data; send too short
@@ -873,6 +888,7 @@ async fn test_eth_call_ai_model_load_path() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // Data: 32-byte model hash
@@ -938,7 +954,7 @@ async fn test_eth_call_ai_model_exec_path() {
     executor.set_balance(&from, U256::from(1_000_000u64));
 
     let mut io = jsonrpc_core::IoHandler::new();
-    citrate_api::eth_rpc::register_eth_methods(&mut io, storage.clone(), mempool, executor, 1, Arc::new(FilterRegistry::new()));
+    citrate_api::eth_rpc::register_eth_methods(&mut io, storage.clone(), mempool, executor, 1, Arc::new(FilterRegistry::new()), None);
 
     // Data: 32-byte model hash + some inference bytes
     let mut data = model_hash.as_bytes().to_vec();
@@ -982,7 +998,7 @@ async fn test_eth_call_ai_model_exec_missing_model_errors() {
     executor.set_balance(&from, primitive_types::U256::from(1_000_000u64));
 
     let mut io = jsonrpc_core::IoHandler::new();
-    citrate_api::eth_rpc::register_eth_methods(&mut io, storage.clone(), mempool, executor, 1, Arc::new(FilterRegistry::new()));
+    citrate_api::eth_rpc::register_eth_methods(&mut io, storage.clone(), mempool, executor, 1, Arc::new(FilterRegistry::new()), None);
 
     // Data: 32-byte model hash that is not registered
     let missing_hash = citrate_consensus::types::Hash::new([0xEE; 32]);
@@ -1027,6 +1043,7 @@ async fn test_eth_chain_id_is_configurable() {
         executor.clone(),
         42069,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]})
@@ -1044,6 +1061,7 @@ async fn test_eth_chain_id_is_configurable() {
         executor.clone(),
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     let resp2 = io2.handle_request(&req).await.unwrap();
@@ -1059,6 +1077,7 @@ async fn test_eth_chain_id_is_configurable() {
         executor,
         1337,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     let resp3 = io3.handle_request(&req).await.unwrap();
@@ -1095,6 +1114,7 @@ async fn test_eth_estimate_gas_real_execution() {
         executor,
         1,
         Arc::new(FilterRegistry::new()),
+        None,
     );
 
     // Test 1: Simple transfer (no data) should return 21000

@@ -14,9 +14,10 @@ use citrate_sequencer::mempool::Mempool;
 use citrate_storage::{state_manager::StateManager as AIStateManager, StorageManager};
 use primitive_types::U256;
 use sha3::{Digest, Sha3_256};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Calculate block header hash using SHA3-256
 fn calculate_block_hash_header(header: &BlockHeader) -> Hash {
@@ -80,6 +81,8 @@ pub struct BlockProducer {
     target_block_time: u64,
     reward_calculator: RewardCalculator,
     economics_manager: Option<Arc<UnifiedEconomicsManager>>,
+    /// Emergency pause flag — when true, block production stops.
+    paused: AtomicBool,
 }
 
 impl BlockProducer {
@@ -136,6 +139,7 @@ impl BlockProducer {
             target_block_time,
             reward_calculator,
             economics_manager: None,
+            paused: AtomicBool::new(false),
         }
     }
 
@@ -193,6 +197,7 @@ impl BlockProducer {
             target_block_time,
             reward_calculator,
             economics_manager: None,
+            paused: AtomicBool::new(false),
         }
     }
 
@@ -241,6 +246,7 @@ impl BlockProducer {
             target_block_time,
             reward_calculator,
             economics_manager: None,
+            paused: AtomicBool::new(false),
         }
     }
 
@@ -313,7 +319,25 @@ impl BlockProducer {
             target_block_time,
             reward_calculator,
             economics_manager: Some(economics_manager),
+            paused: AtomicBool::new(false),
         }
+    }
+
+    /// Pause block production (emergency stop).
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+        warn!("EMERGENCY: Block production PAUSED");
+    }
+
+    /// Resume block production after emergency pause.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
+        info!("Block production RESUMED");
+    }
+
+    /// Check if block production is paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
     }
 
     /// Start block production loop
@@ -323,6 +347,10 @@ impl BlockProducer {
 
         loop {
             interval.tick().await;
+
+            if self.is_paused() {
+                continue;
+            }
 
             match self.produce_block().await {
                 Ok(block_hash) => {

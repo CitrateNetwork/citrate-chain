@@ -13,6 +13,7 @@ use citrate_sequencer::mempool::{Mempool, TxClass};
 use citrate_storage::StorageManager;
 use primitive_types::U256;
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Build EIP-typed fields for a transaction JSON response.
@@ -84,6 +85,7 @@ pub fn register_eth_methods(
     executor: Arc<Executor>,
     chain_id: u64,
     filter_registry: Arc<FilterRegistry>,
+    pause_flag: Option<Arc<AtomicBool>>,
 ) {
     // eth_blockNumber - Returns the latest block number
     let storage_bn = storage.clone();
@@ -2233,4 +2235,27 @@ pub fn register_eth_methods(
             }
         }))
     });
+
+    // citrate_emergencyPause - Pause block production
+    if let Some(ref flag) = pause_flag {
+        let pause_flag_pause = flag.clone();
+        io_handler.add_sync_method("citrate_emergencyPause", move |_params: Params| {
+            pause_flag_pause.store(true, Ordering::Relaxed);
+            tracing::warn!("EMERGENCY: Block production PAUSED via RPC");
+            Ok(json!({"status": "paused", "message": "Block production paused"}))
+        });
+
+        let pause_flag_resume = flag.clone();
+        io_handler.add_sync_method("citrate_emergencyResume", move |_params: Params| {
+            pause_flag_resume.store(false, Ordering::Relaxed);
+            tracing::info!("Block production RESUMED via RPC");
+            Ok(json!({"status": "resumed", "message": "Block production resumed"}))
+        });
+
+        let pause_flag_status = flag.clone();
+        io_handler.add_sync_method("citrate_emergencyStatus", move |_params: Params| {
+            let paused = pause_flag_status.load(Ordering::Relaxed);
+            Ok(json!({"paused": paused}))
+        });
+    }
 }
