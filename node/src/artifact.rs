@@ -86,9 +86,15 @@ impl NodeArtifactService {
 
     fn check_available(&self) -> Result<(), ExecutionError> {
         if !self.ipfs_available.load(Ordering::Relaxed) {
-            return Err(ExecutionError::Reverted(
-                "IPFS daemon not available".into(),
-            ));
+            // Re-probe: IPFS may have started since last check
+            if Self::probe_ipfs_sync(&self.apis) {
+                self.ipfs_available.store(true, Ordering::Relaxed);
+                eprintln!("[artifact] IPFS now reachable — re-enabled artifact operations");
+            } else {
+                return Err(ExecutionError::Reverted(
+                    "IPFS daemon not available".into(),
+                ));
+            }
         }
         Ok(())
     }

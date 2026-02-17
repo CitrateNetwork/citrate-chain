@@ -1419,7 +1419,7 @@ impl Executor {
         k
     }
 
-    fn add_model_artifact(&self, model_hash: &Hash, cid: &str) {
+    pub fn add_model_artifact(&self, model_hash: &Hash, cid: &str) {
         let addr = Self::artifact_precompile_address();
         let key = Self::artifact_index_key(model_hash);
         let mut list: Vec<String> = if let Some(bytes) = self.state_db.get_storage(&addr, &key) {
@@ -1790,12 +1790,10 @@ impl Executor {
                 .set_storage(art_addr, key, cid.clone().into_bytes());
 
             self.add_model_artifact(&model_hash, &cid);
-            if let Some(art) = &self.artifact_service {
-                let replicas = self.default_artifact_replicas();
-                if let Err(err) = art.pin(&cid, replicas).await {
-                    warn!("Failed to pin model artifact {}: {}", cid, err);
-                }
-            }
+            // Note: artifact pinning is handled by the IPFS add call (add?pin=true)
+            // or by the caller. We skip explicit pin here to avoid deadlocking
+            // when execute_register_model is called via futures::executor::block_on
+            // (which lacks tokio's I/O driver needed for async reqwest operations).
 
             if let Some(storage) = &self.ai_storage {
                 if let Err(err) = storage.register_model(model_id, &persisted_state, &cid) {

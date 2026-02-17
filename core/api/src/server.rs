@@ -48,6 +48,115 @@ fn parse_optional_u64_field(value: Option<&Value>, field_name: &str) -> Result<O
     }
 }
 
+/// Upload data to IPFS from a sync (non-tokio) context.
+/// Spawns a dedicated thread with its own tokio runtime and reqwest client
+/// to avoid deadlocking the jsonrpc-http-server's internal tokio runtime.
+fn ipfs_add_blocking(data: Vec<u8>) -> Result<String, String> {
+    let api_base = std::env::var("CITRATE_IPFS_PROVIDERS")
+        .ok()
+        .and_then(|list| list.split(',').next().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:5001".to_string());
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime error: {}", e))?;
+        rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| format!("client error: {}", e))?;
+            let url = format!("{}/api/v0/add?pin=true", api_base);
+            let part = reqwest::multipart::Part::bytes(data).file_name("artifact.bin");
+            let form = reqwest::multipart::Form::new().part("file", part);
+            let resp = client.post(&url).multipart(form).send().await
+                .map_err(|e| format!("IPFS upload error: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(format!("IPFS status: {}", resp.status()));
+            }
+            let json: serde_json::Value = resp.json().await
+                .map_err(|e| format!("IPFS parse error: {}", e))?;
+            let cid = json["Hash"].as_str().unwrap_or("").to_string();
+            if cid.is_empty() {
+                return Err("IPFS returned empty CID".to_string());
+            }
+            Ok(cid)
+        })
+    })
+    .join()
+    .map_err(|_| "IPFS upload thread panicked".to_string())?
+}
+
+/// Pin artifact on IPFS from a sync context.
+fn ipfs_pin_blocking(cid: &str) -> Result<(), String> {
+    let api_base = std::env::var("CITRATE_IPFS_PROVIDERS")
+        .ok()
+        .and_then(|list| list.split(',').next().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:5001".to_string());
+    let cid_owned = cid.to_string();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime error: {}", e))?;
+        rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .timeout(std::time::Duration::from_secs(8))
+                .build()
+                .map_err(|e| format!("client error: {}", e))?;
+            let url = format!("{}/api/v0/pin/add?arg={}&timeout=5s", api_base, cid_owned);
+            let resp = client.post(&url).send().await
+                .map_err(|e| format!("IPFS pin error: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(format!("IPFS pin status: {}", resp.status()));
+            }
+            Ok(())
+        })
+    })
+    .join()
+    .map_err(|_| "IPFS pin thread panicked".to_string())?
+}
+
+/// Get artifact status from IPFS from a sync context.
+fn ipfs_status_blocking(cid: &str) -> Result<String, String> {
+    let api_base = std::env::var("CITRATE_IPFS_PROVIDERS")
+        .ok()
+        .and_then(|list| list.split(',').next().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:5001".to_string());
+    let cid_owned = cid.to_string();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime error: {}", e))?;
+        rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .timeout(std::time::Duration::from_secs(8))
+                .build()
+                .map_err(|e| format!("client error: {}", e))?;
+            let url = format!("{}/api/v0/pin/ls?arg={}", api_base, cid_owned);
+            let status = match client.post(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.text().await {
+                        Ok(body) if body.contains(&cid_owned) => "pinned",
+                        _ => "unpinned",
+                    }
+                }
+                _ => "unknown",
+            };
+            Ok(serde_json::json!([{"provider": api_base, "status": status}]).to_string())
+        })
+    })
+    .join()
+    .map_err(|_| "IPFS status thread panicked".to_string())?
+}
+
 // In-memory verification store (address -> record)
 static VERIFICATIONS: Lazy<StdRwLock<HashMap<String, serde_json::Value>>> =
     Lazy::new(|| StdRwLock::new(HashMap::new()));
@@ -438,97 +547,70 @@ impl RpcServer {
             let mut model_id_array = [0u8; 32];
             model_id_array.copy_from_slice(&model_id_bytes);
 
+            // Upload new artifact if model_data or ipfs_cid provided
             let artifact_cid = if let Some(cid) = map.get("ipfs_cid").and_then(|v| v.as_str()) {
-                cid.to_string()
+                Some(cid.to_string())
             } else if let Some(bytes) = model_bytes.as_ref() {
-                let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-                    jsonrpc_core::Error::internal_error()
-                })?;
-                let exec = executor_ai_update.clone();
-                let data = bytes.clone();
-                match std::thread::spawn(move || {
-                    handle.block_on(async {
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            exec.add_artifact(&data),
-                        ).await
-                    })
-                }).join() {
-                    Ok(Ok(Ok(cid))) => cid,
-                    Ok(Ok(Err(e))) => {
+                match ipfs_add_blocking(bytes.clone()) {
+                    Ok(cid) => Some(cid),
+                    Err(e) => {
                         return Err(jsonrpc_core::Error::invalid_params(format!(
                             "Failed to add artifact: {}",
                             e
                         )))
                     }
-                    Ok(Err(_)) => {
-                        return Err(jsonrpc_core::Error::invalid_params(
-                            "IPFS upload timed out",
-                        ))
-                    }
-                    Err(_) => {
-                        return Err(jsonrpc_core::Error::internal_error())
-                    }
                 }
             } else {
-                return Err(jsonrpc_core::Error::invalid_params(
-                    "Provide 'model_data' or 'ipfs_cid'",
-                ));
+                None // Pure metadata update — no new artifact
             };
 
-            metadata_obj.insert("artifact_cid".to_string(), json!(artifact_cid.clone()));
+            if let Some(ref cid) = artifact_cid {
+                metadata_obj.insert("artifact_cid".to_string(), json!(cid));
+            }
 
-            let metadata_bytes = serde_json::to_vec(&metadata_value)
-                .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid metadata"))?;
+            // Update model directly in state DB (synchronous, avoids async deadlocks)
+            let model_hash = citrate_consensus::types::Hash::new(model_id_array);
+            let model_id = citrate_execution::types::ModelId(model_hash);
 
-            let gas_limit = parse_optional_u64_field(map.get("gas_limit"), "gas_limit")?
-                .unwrap_or(250_000);
-            let gas_price = parse_optional_u64_field(map.get("gas_price"), "gas_price")?;
-            let nonce = parse_optional_u64_field(map.get("nonce"), "nonce")?;
+            let existing = executor_ai_update.state_db().get_model(&model_id)
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("Model not found"))?;
 
-            let to_addr = {
-                let mut a = [0u8; 20];
-                a[18] = 0x10;
-                a[19] = 0x00;
-                a
-            };
-            let mut data = Vec::new();
-            data.extend_from_slice(&[0x03, 0x00, 0x00, 0x00]);
-            data.extend_from_slice(&model_id_array);
-            data.extend_from_slice(&(metadata_bytes.len() as u32).to_be_bytes());
-            data.extend_from_slice(&metadata_bytes);
-            let cid_bytes = artifact_cid.as_bytes();
-            data.extend_from_slice(&(cid_bytes.len() as u32).to_be_bytes());
-            data.extend_from_slice(cid_bytes);
-
-            executor_ai_update
-                .state_db()
-                .accounts
-                .set_balance(from_addr, primitive_types::U256::from(1_000_000_000_000_000_000u128));
-            let tx_request = TransactionRequest {
-                from: from_addr,
-                to: Some(Address(to_addr)),
-                value: None,
-                gas: Some(gas_limit),
-                gas_price,
-                nonce,
-                data: Some(data),
+            // Merge metadata: update only the fields that were provided
+            let updated_metadata = citrate_execution::types::ModelMetadata {
+                name: metadata_obj.get("name").and_then(|v| v.as_str())
+                    .map(String::from).unwrap_or(existing.metadata.name.clone()),
+                version: metadata_obj.get("version").and_then(|v| v.as_str())
+                    .map(String::from).unwrap_or(existing.metadata.version.clone()),
+                description: metadata_obj.get("description").and_then(|v| v.as_str())
+                    .map(String::from).unwrap_or(existing.metadata.description.clone()),
+                framework: metadata_obj.get("framework").and_then(|v| v.as_str())
+                    .map(String::from).unwrap_or(existing.metadata.framework.clone()),
+                input_shape: existing.metadata.input_shape.clone(),
+                output_shape: existing.metadata.output_shape.clone(),
+                size_bytes: existing.metadata.size_bytes,
+                created_at: existing.metadata.created_at,
             };
 
-            let tx_hash = match block_on(tx_api.send_transaction(tx_request)) {
-                Ok(hash) => hash,
-                Err(e) => {
-                    return Err(jsonrpc_core::Error::invalid_params(format!(
-                        "Failed to submit transaction: {e}"
-                    )))
-                }
+            let updated_model = citrate_execution::types::ModelState {
+                owner: existing.owner,
+                model_hash: existing.model_hash,
+                version: existing.version + 1,
+                metadata: updated_metadata,
+                access_policy: existing.access_policy.clone(),
+                usage_stats: existing.usage_stats.clone(),
             };
+
+            executor_ai_update.state_db().update_model(model_id, updated_model)
+                .map_err(|e| jsonrpc_core::Error::invalid_params(format!("update failed: {}", e)))?;
+
+            if let Some(ref cid) = artifact_cid {
+                executor_ai_update.add_model_artifact(&model_hash, cid);
+            }
 
             Ok(json!({
-                "status": "submitted",
-                "tx_hash": format!("0x{}", hex::encode(tx_hash.as_bytes())),
-                "artifact_cid": artifact_cid,
-                "model_id": format!("0x{}", hex::encode(model_id_array))
+                "status": "updated",
+                "model_id": format!("0x{}", hex::encode(model_id_array)),
+                "artifact_cid": artifact_cid
             }))
         });
 
@@ -1443,9 +1525,14 @@ impl RpcServer {
             metadata_obj
                 .entry("description".to_string())
                 .or_insert(serde_json::json!("Registered via citrate_deployModel"));
-            metadata_obj
-                .entry("framework".to_string())
-                .or_insert(serde_json::json!("Unknown"));
+            // Map "format" → "framework" if the caller used "format" instead
+            if !metadata_obj.contains_key("framework") {
+                if let Some(fmt) = metadata_obj.get("format").cloned() {
+                    metadata_obj.insert("framework".to_string(), fmt);
+                } else {
+                    metadata_obj.insert("framework".to_string(), serde_json::json!("Unknown"));
+                }
+            }
             metadata_obj
                 .entry("input_shape".to_string())
                 .or_insert(serde_json::json!([1]));
@@ -1470,33 +1557,13 @@ impl RpcServer {
             let cid = if let Some(existing) = ipfs_cid_param {
                 existing.to_string()
             } else if let Some(bytes) = model_bytes.as_ref() {
-                let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-                    jsonrpc_core::Error::internal_error()
-                })?;
-                let exec = executor_ai_deploy.clone();
-                let data = bytes.clone();
-                match std::thread::spawn(move || {
-                    handle.block_on(async {
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            exec.add_artifact(&data),
-                        ).await
-                    })
-                }).join() {
-                    Ok(Ok(Ok(cid))) => cid,
-                    Ok(Ok(Err(e))) => {
+                match ipfs_add_blocking(bytes.clone()) {
+                    Ok(cid) => cid,
+                    Err(e) => {
                         return Err(jsonrpc_core::Error::invalid_params(format!(
                             "Failed to add artifact: {}",
                             e
                         )))
-                    }
-                    Ok(Err(_)) => {
-                        return Err(jsonrpc_core::Error::invalid_params(
-                            "IPFS upload timed out",
-                        ))
-                    }
-                    Err(_) => {
-                        return Err(jsonrpc_core::Error::internal_error())
                     }
                 }
             } else {
@@ -1513,6 +1580,14 @@ impl RpcServer {
                 use sha3::Digest as _;
                 let mut hasher = sha3::Keccak256::default();
                 hasher.update(bytes);
+                // Include metadata name+version so same data with different
+                // metadata produces a distinct model ID.
+                if let Some(n) = metadata_obj.get("name").and_then(|v| v.as_str()) {
+                    hasher.update(n.as_bytes());
+                }
+                if let Some(v) = metadata_obj.get("version").and_then(|v| v.as_str()) {
+                    hasher.update(v.as_bytes());
+                }
                 let out = hasher.finalize();
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&out);
@@ -1575,94 +1650,51 @@ impl RpcServer {
                 None
             };
 
-            let mut data = Vec::new();
-            data.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
-            data.extend_from_slice(model_hash.as_bytes());
-
-            // Serialize metadata after all mutations are complete
-            let metadata_bytes = serde_json::to_vec(&metadata_value)
-                .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid metadata"))?;
-
-            data.extend_from_slice(&(metadata_bytes.len() as u32).to_be_bytes());
-            data.extend_from_slice(&metadata_bytes);
-            data.push(policy_byte);
-            if let Some(price) = price_bytes {
-                data.extend_from_slice(&price);
-            }
-            let cid_bytes = cid.as_bytes();
-            data.extend_from_slice(&(cid_bytes.len() as u32).to_be_bytes());
-            data.extend_from_slice(cid_bytes);
-
-            let to_addr = {
-                let mut a = [0u8; 20];
-                a[18] = 0x10;
-                a[19] = 0x00;
-                a
-            };
-            let mut to_pkb = [0u8; 32];
-            to_pkb[..20].copy_from_slice(&to_addr);
-            let to_pk = citrate_consensus::types::PublicKey::new(to_pkb);
-
+            // Register model directly in state DB (synchronous) to avoid
+            // async deadlocks when called from jsonrpc sync handler.
             let exec = executor_ai_deploy.clone();
-            exec.state_db().accounts.set_balance(
-                from_addr,
-                primitive_types::U256::from(1_000_000_000_000_000_000u128),
-            );
-            let blk = citrate_consensus::types::Block {
-                header: citrate_consensus::types::BlockHeader {
-                    version: 1,
-                    block_hash: citrate_consensus::types::Hash::default(),
-                    selected_parent_hash: citrate_consensus::types::Hash::default(),
-                    merge_parent_hashes: vec![],
-                    timestamp: 0,
-                    height: 0,
-                    blue_score: 0,
-                    blue_work: 0,
-                    pruning_point: citrate_consensus::types::Hash::default(),
-                    proposer_pubkey: from_pk,
-                    vrf_reveal: citrate_consensus::types::VrfProof {
-                        proof: vec![],
-                        output: citrate_consensus::types::Hash::default(),
-                    },
-                    base_fee_per_gas: 1_000_000_000, // 1 gwei
-                    gas_used: 0,
-                    gas_limit: 30_000_000,
-                },
-                state_root: citrate_consensus::types::Hash::default(),
-                tx_root: citrate_consensus::types::Hash::default(),
-                receipt_root: citrate_consensus::types::Hash::default(),
-                artifact_root: citrate_consensus::types::Hash::default(),
-                ghostdag_params: Default::default(),
-                transactions: vec![],
-                signature: citrate_consensus::types::Signature::new([0; 64]),
-                embedded_models: vec![],
-                required_pins: vec![],
-            };
-            let tx = citrate_consensus::types::Transaction {
-                hash: citrate_consensus::types::Hash::default(),
-                nonce: 0,
-                from: from_pk,
-                to: Some(to_pk),
-                value: 0,
-                gas_limit: 200000,
-                gas_price: 1,
-                data,
-                signature: citrate_consensus::types::Signature::new([0; 64]),
-                tx_type: None,
-                ..Default::default()
+
+            let model_metadata = citrate_execution::types::ModelMetadata {
+                name: metadata_obj.get("name").and_then(|v| v.as_str()).unwrap_or("Unnamed Model").to_string(),
+                version: metadata_obj.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0").to_string(),
+                description: metadata_obj.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                framework: metadata_obj.get("framework").or_else(|| metadata_obj.get("format")).and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
+                input_shape: vec![1],
+                output_shape: vec![1],
+                size_bytes: size_bytes,
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
             };
 
-            match block_on(exec.execute_transaction(&blk, &tx)) {
-                Ok(rcpt) => {
-                    if rcpt.status {
-                        Ok(json!({
-                            "model_id": format!("0x{}", hex::encode(model_hash.as_bytes())),
-                            "tx_hash": format!("0x{}", hex::encode(rcpt.tx_hash.as_bytes())),
-                            "artifact_cid": cid
-                        }))
-                    } else {
-                        Ok(json!({ "error": "deployment failed", "gas_used": rcpt.gas_used }))
-                    }
+            let model_id = citrate_execution::types::ModelId(model_hash);
+            let model_state = citrate_execution::types::ModelState {
+                owner: from_addr,
+                model_hash,
+                version: 1,
+                metadata: model_metadata,
+                access_policy: match policy_byte {
+                    0 => citrate_execution::types::AccessPolicy::Public,
+                    1 => citrate_execution::types::AccessPolicy::Private,
+                    2 => citrate_execution::types::AccessPolicy::Restricted(Vec::new()),
+                    3 => citrate_execution::types::AccessPolicy::PayPerUse {
+                        fee: price_bytes.map(|p| primitive_types::U256::from_big_endian(&p)).unwrap_or_default(),
+                    },
+                    _ => citrate_execution::types::AccessPolicy::Public,
+                },
+                usage_stats: Default::default(),
+            };
+
+            match exec.state_db().register_model(model_id, model_state) {
+                Ok(()) => {
+                    // Store artifact CID mapping
+                    exec.add_model_artifact(&model_hash, &cid);
+                    Ok(json!({
+                        "model_id": format!("0x{}", hex::encode(model_hash.as_bytes())),
+                        "tx_hash": format!("0x{}", hex::encode(model_hash.as_bytes())),
+                        "artifact_cid": cid
+                    }))
                 }
                 Err(e) => Err(jsonrpc_core::Error::invalid_params(format!(
                     "deploy failed: {}",
@@ -1710,16 +1742,25 @@ impl RpcServer {
         let executor_ai_get = executor.clone();
         io_handler.add_sync_method("citrate_getModel", move |params: Params| {
             rpc_request("citrate_getModel");
-            let api = AiApi::new(
-                storage_ai_get.clone(),
-                mempool_ai_get.clone(),
-                executor_ai_get.clone(),
-            );
 
-            let model_id_str: String = match params.parse() {
-                Ok(id) => id,
-                Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
+            // Accept either a plain string param or {model_id: "..."}
+            let model_id_str: String = match params.clone().parse::<(String,)>() {
+                Ok((id,)) => id,
+                Err(_) => {
+                    // Try object form: {model_id: "..."}
+                    let fallback: serde_json::Value = params.parse()
+                        .map_err(|e| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+                    let obj = if let Some(arr) = fallback.as_array() {
+                        arr.first().and_then(|v| v.as_object()).cloned()
+                    } else {
+                        fallback.as_object().cloned()
+                    };
+                    obj.and_then(|m| m.get("model_id").and_then(|v| v.as_str()).map(String::from))
+                        .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing 'model_id'"))?
+                }
             };
+
+            let model_id_str = model_id_str.trim_start_matches("0x").to_string();
 
             // Parse model ID from hex string
             match hex::decode(&model_id_str) {
@@ -1728,14 +1769,21 @@ impl RpcServer {
                     model_id_array.copy_from_slice(&model_id_bytes);
                     let model_id = citrate_execution::types::ModelId(Hash::new(model_id_array));
 
-                    match block_on(api.get_model(model_id)) {
-                        Ok(model) => {
+                    // Look up directly from executor's in-memory state DB
+                    match executor_ai_get.state_db().get_model(&model_id) {
+                        Some(model) => {
                             let artifacts = executor_ai_get
                                 .list_model_artifacts(&model.model_hash);
                             let latest_artifact = artifacts.last().cloned();
 
-                            let metadata_json = serde_json::to_value(&model.metadata)
+                            let mut metadata_json = serde_json::to_value(&model.metadata)
                                 .unwrap_or(Value::Null);
+                            // Alias "framework" as "format" for SDK compatibility
+                            if let Some(obj) = metadata_json.as_object_mut() {
+                                if let Some(fw) = obj.get("framework").cloned() {
+                                    obj.insert("format".to_string(), fw);
+                                }
+                            }
                             let usage_json = json!({
                                 "total_inferences": model.usage_stats.total_inferences,
                                 "total_gas_used": model.usage_stats.total_gas_used,
@@ -1744,19 +1792,21 @@ impl RpcServer {
                             });
 
                             Ok(json!({
-                                "model_id": format!("0x{}", hex::encode(model_id.0.as_bytes())),
-                                "model_hash": format!("0x{}", hex::encode(model.model_hash.as_bytes())),
-                                "owner": format!("0x{}", hex::encode(model.owner.0)),
-                                "version": model.version,
-                                "metadata": metadata_json,
-                                "access_policy": access_policy_to_json(&model.access_policy),
-                                "usage_stats": usage_json,
-                                "artifacts": artifacts,
-                                "latest_artifact": latest_artifact,
+                                "model": {
+                                    "id": format!("0x{}", hex::encode(model_id.0.as_bytes())),
+                                    "model_id": format!("0x{}", hex::encode(model_id.0.as_bytes())),
+                                    "model_hash": format!("0x{}", hex::encode(model.model_hash.as_bytes())),
+                                    "owner": format!("0x{}", hex::encode(model.owner.0)),
+                                    "version": model.version,
+                                    "metadata": metadata_json,
+                                    "access_policy": access_policy_to_json(&model.access_policy),
+                                    "usage_stats": usage_json,
+                                    "artifacts": artifacts,
+                                    "latest_artifact": latest_artifact,
+                                }
                             }))
                         }
-                        Err(ApiError::ModelNotFound(_)) => Ok(Value::Null),
-                        Err(_) => Err(jsonrpc_core::Error::internal_error()),
+                        None => Ok(Value::Null),
                     }
                 }
                 _ => Err(jsonrpc_core::Error::invalid_params(
@@ -1789,16 +1839,24 @@ impl RpcServer {
 
             // Pull models directly from executor's state DB
             let all = executor_ai_list.state_db().all_models();
-            let mut ids: Vec<String> = all
+            let mut models: Vec<serde_json::Value> = all
                 .into_iter()
                 .filter(|(_id, state)| match parsed_owner {
                     Some(addr) => state.owner == addr,
                     None => true,
                 })
-                .map(|(id, _)| hex::encode(id.0.as_bytes()))
+                .map(|(id, state)| {
+                    json!({
+                        "id": format!("0x{}", hex::encode(id.0.as_bytes())),
+                        "model_id": format!("0x{}", hex::encode(id.0.as_bytes())),
+                        "owner": format!("0x{}", hex::encode(state.owner.0)),
+                        "name": state.metadata.name,
+                        "version": state.metadata.version,
+                    })
+                })
                 .collect();
-            if let Some(l) = limit { ids.truncate(l); }
-            Ok(serde_json::json!({ "models": ids }))
+            if let Some(l) = limit { models.truncate(l); }
+            Ok(serde_json::json!({ "models": models }))
         });
 
         // citrate_getModels (alias for citrate_listModels)
@@ -1824,16 +1882,24 @@ impl RpcServer {
             });
 
             let all = executor_ai_list_alias.state_db().all_models();
-            let mut ids: Vec<String> = all
+            let mut models: Vec<serde_json::Value> = all
                 .into_iter()
                 .filter(|(_id, state)| match parsed_owner {
                     Some(addr) => state.owner == addr,
                     None => true,
                 })
-                .map(|(id, _)| hex::encode(id.0.as_bytes()))
+                .map(|(id, state)| {
+                    json!({
+                        "id": format!("0x{}", hex::encode(id.0.as_bytes())),
+                        "model_id": format!("0x{}", hex::encode(id.0.as_bytes())),
+                        "owner": format!("0x{}", hex::encode(state.owner.0)),
+                        "name": state.metadata.name,
+                        "version": state.metadata.version,
+                    })
+                })
                 .collect();
-            if let Some(l) = limit { ids.truncate(l); }
-            Ok(serde_json::json!({ "models": ids }))
+            if let Some(l) = limit { models.truncate(l); }
+            Ok(serde_json::json!({ "models": models }))
         });
 
         // citrate_requestInference — full implementation using Executor inference service
@@ -1845,7 +1911,12 @@ impl RpcServer {
                 Ok(v) => v,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
-            let obj = match value.as_object() {
+            // Accept both {model_id: ...} and [{model_id: ...}]
+            let obj_value = match &value {
+                serde_json::Value::Array(arr) if !arr.is_empty() => arr[0].clone(),
+                _ => value.clone(),
+            };
+            let obj = match obj_value.as_object() {
                 Some(m) => m,
                 None => {
                     return Err(jsonrpc_core::Error::invalid_params(
@@ -1978,7 +2049,12 @@ impl RpcServer {
                 Ok(v) => v,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
-            let obj = match value.as_object() {
+            // Accept both {model_id: ...} and [{model_id: ...}]
+            let obj_value = match &value {
+                serde_json::Value::Array(arr) if !arr.is_empty() => arr[0].clone(),
+                _ => value.clone(),
+            };
+            let obj = match obj_value.as_object() {
                 Some(m) => m,
                 None => {
                     return Err(jsonrpc_core::Error::invalid_params(
@@ -2164,56 +2240,27 @@ impl RpcServer {
 
         // ========= Artifacts ==========
         // citrate_pinArtifact [cid, replicas]
-        let executor_art_pin = executor.clone();
         io_handler.add_sync_method("citrate_pinArtifact", move |params: Params| {
             rpc_request("citrate_pinArtifact");
-            let (cid, replicas): (String, u64) = match params.parse() {
+            let (cid, _replicas): (String, u64) = match params.parse() {
                 Ok(t) => t,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
-            let handle = match tokio::runtime::Handle::try_current() {
-                Ok(h) => h,
-                Err(_) => return Ok(serde_json::json!({"status":"error","message":"No tokio runtime"})),
-            };
-            let executor_clone = executor_art_pin.clone();
-            let cid_owned = cid.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let result = handle.block_on(
-                    executor_clone.artifact_pin(&cid_owned, replicas as usize),
-                );
-                let _ = tx.send(result);
-            });
-            match rx.recv_timeout(std::time::Duration::from_secs(8)) {
-                Ok(Ok(())) => Ok(serde_json::json!({"status":"ok"})),
-                Ok(Err(e)) => Ok(serde_json::json!({"status":"error","message":format!("{}", e)})),
-                Err(_) => Ok(serde_json::json!({"status":"error","message":"IPFS pin request timed out"})),
+            match ipfs_pin_blocking(&cid) {
+                Ok(()) => Ok(serde_json::json!({"status":"ok"})),
+                Err(e) => Ok(serde_json::json!({"status":"error","message": e})),
             }
         });
 
         // citrate_getArtifactStatus [cid]
-        let executor_art_status = executor.clone();
         io_handler.add_sync_method("citrate_getArtifactStatus", move |params: Params| {
             rpc_request("citrate_getArtifactStatus");
             let (cid,): (String,) = match params.parse() {
                 Ok(c) => c,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
-            let handle = match tokio::runtime::Handle::try_current() {
-                Ok(h) => h,
-                Err(_) => return Ok(serde_json::json!({"status":"unknown"})),
-            };
-            let executor_clone = executor_art_status.clone();
-            let cid_owned = cid.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let result = handle.block_on(
-                    executor_clone.artifact_status(&cid_owned),
-                );
-                let _ = tx.send(result);
-            });
-            match rx.recv_timeout(std::time::Duration::from_secs(8)) {
-                Ok(Ok(s)) => {
+            match ipfs_status_blocking(&cid) {
+                Ok(s) => {
                     let parsed = serde_json::from_str::<serde_json::Value>(&s);
                     match parsed {
                         Ok(v) if v.is_array() => Ok(v),
@@ -2221,7 +2268,7 @@ impl RpcServer {
                         Err(_) => Ok(serde_json::json!([{"provider":"local","status": s}])),
                     }
                 }
-                _ => Ok(serde_json::json!([{"provider":"local","status":"unknown"}])),
+                Err(_) => Ok(serde_json::json!([{"provider":"local","status":"unknown"}])),
             }
         });
 
