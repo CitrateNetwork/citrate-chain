@@ -42,12 +42,15 @@ impl ExecutionVerifier {
         }
 
         // Additional sanity checks
-        // - Enforce an upper bound on model size to prevent abuse in dev environments
+        // - Enforce a configurable upper bound on model size (default 10GB)
         // - Compute and log a stable model hash for reproducibility
-        let max_size_bytes: usize = 500 * 1024 * 1024; // 500 MB
+        let max_size_bytes: usize = std::env::var("CITRATE_MAX_MODEL_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10 * 1024 * 1024 * 1024); // 10GB default (was 500MB)
         if model.weights.len() > max_size_bytes {
             return Err(anyhow::anyhow!(
-                "Model weights too large: {} bytes (max {})",
+                "Model weights too large: {} bytes (max {}). Set CITRATE_MAX_MODEL_SIZE to increase.",
                 model.weights.len(),
                 max_size_bytes
             ));
@@ -455,11 +458,14 @@ mod tests {
 
     #[test]
     fn test_verify_model_weights_too_large() {
+        // Temporarily lower the limit so we don't allocate 10GB+ in tests
+        std::env::set_var("CITRATE_MAX_MODEL_SIZE", "1048576"); // 1 MB
         let verifier = ExecutionVerifier::new();
-        let large_weights = vec![0u8; 501 * 1024 * 1024]; // 501 MB
+        let large_weights = vec![0u8; 2 * 1024 * 1024]; // 2 MB (exceeds 1 MB limit)
         let model = create_test_model(b"arch", &large_weights, b"meta");
 
         let result = verifier.verify_model(&model);
+        std::env::remove_var("CITRATE_MAX_MODEL_SIZE");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too large"));
     }

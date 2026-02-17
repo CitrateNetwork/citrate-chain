@@ -41,7 +41,8 @@ revm-primitives = "5"
 ndarray = "0.15"
 ndarray-rand = "0.14"
 
-# Zero-knowledge proofs
+# Zero-knowledge proofs (experimental — circuits are placeholder implementations)
+# Production Groth16 verification gated behind `zkp_production` in core/mcp
 ark-std = "0.4"
 ark-ff = "0.4"
 ark-ec = "0.4"

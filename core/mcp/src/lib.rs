@@ -30,7 +30,11 @@ impl MCPService {
     ) -> Self {
         let model_registry = Arc::new(registry::ModelRegistry::new(storage.clone()));
         let provider_registry = Arc::new(provider::ProviderRegistry::new());
-        let cache = Arc::new(cache::ModelCache::new(1024 * 1024 * 1024)); // 1GB cache
+        let cache_size: u64 = std::env::var("CITRATE_MODEL_CACHE_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10 * 1024 * 1024 * 1024); // 10GB default (was 1GB)
+        let cache = Arc::new(cache::ModelCache::new(cache_size));
         let verifier = Arc::new(verification::ExecutionVerifier::new());
         let ipfs_endpoint = std::env::var("CITRATE_IPFS_API")
             .unwrap_or_else(|_| "http://127.0.0.1:5001".to_string());

@@ -13,6 +13,14 @@ pub mod state;
 pub mod tensor;
 pub mod types;
 pub mod vm;
+/// ZK proof circuits (Groth16 + arkworks).
+///
+/// **EXPERIMENTAL**: Circuit implementations use simplified/placeholder logic.
+/// Production Groth16 verification is gated behind the `zkp_production` feature
+/// in `core/mcp`. The circuits here (inference proof, state transition, gradient
+/// proof) use hardcoded parameters and placeholder commitments.
+///
+/// See `core/mcp/src/verification.rs` for the feature-gated dispatch.
 pub mod zkp;
 
 // Integration tests

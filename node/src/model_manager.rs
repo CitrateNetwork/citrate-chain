@@ -191,7 +191,7 @@ impl ModelManager {
         info!("Downloading model from IPFS: {}", model.ipfs_cid);
         let url = format!("{}/api/v0/cat?arg={}", self.config.ipfs_api_url, model.ipfs_cid);
 
-        let response = self
+        let mut response = self
             .ipfs_client
             .post(&url)
             .timeout(Duration::from_secs(self.config.download_timeout_secs))
@@ -209,21 +209,43 @@ impl ModelManager {
             .map_err(|e| format!("Failed to create file: {}", e))?;
 
         let mut hasher = Sha256::new();
+        let mut downloaded: u64 = 0;
+        let mut last_log = std::time::Instant::now();
 
-        let bytes = response
-            .bytes()
+        // Stream response chunks to disk instead of loading full file into memory
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| format!("Failed to read response: {}", e))?;
+            .map_err(|e| format!("Failed to read chunk: {}", e))?
+        {
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("Failed to write chunk: {}", e))?;
+            hasher.update(&chunk);
+            downloaded += chunk.len() as u64;
 
-        file.write_all(&bytes)
+            // Log progress every 5 seconds
+            if last_log.elapsed() > std::time::Duration::from_secs(5) {
+                info!(
+                    "Downloading model: {} MB / {} MB ({:.0}%)",
+                    downloaded / 1_000_000,
+                    model.size_bytes / 1_000_000,
+                    if model.size_bytes > 0 {
+                        (downloaded as f64 / model.size_bytes as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                );
+                last_log = std::time::Instant::now();
+            }
+        }
+
+        file.flush()
             .await
-            .map_err(|e| format!("Failed to write file: {}", e))?;
-
-        hasher.update(&bytes);
-        let downloaded = bytes.len() as u64;
+            .map_err(|e| format!("Failed to flush file: {}", e))?;
 
         info!(
-            "Downloaded {} MB / {} MB",
+            "Download complete: {} MB / {} MB",
             downloaded / 1_000_000,
             model.size_bytes / 1_000_000
         );
@@ -235,12 +257,18 @@ impl ModelManager {
         let computed_hash = hasher.finalize();
         let computed_hash_bytes: [u8; 32] = computed_hash.into();
 
-        if Hash::new(computed_hash_bytes) != model.sha256_hash {
+        // Skip hash verification for manual pins (unknown expected hash)
+        let expected_is_zero = model.sha256_hash == Hash::new([0u8; 32]);
+        if !expected_is_zero && Hash::new(computed_hash_bytes) != model.sha256_hash {
             fs::remove_file(&file_path).await.ok();
             return Err("SHA256 hash mismatch - file corrupted".to_string());
         }
 
-        info!("Model integrity verified successfully");
+        if expected_is_zero {
+            info!("Model downloaded (hash verification skipped — manual pin)");
+        } else {
+            info!("Model integrity verified successfully");
+        }
 
         // Pin in IPFS
         info!("Pinning model in IPFS: {}", model.ipfs_cid);

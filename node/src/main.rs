@@ -426,8 +426,31 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
         }
 
         ModelCommands::Pin { cid } => {
-            println!("Manually pinning model {} is not yet implemented.", cid);
-            println!("Please use 'citrate model auto-pin' to pin required models from genesis.");
+            println!("Pinning model from IPFS: {}", cid);
+
+            // Check IPFS daemon first
+            if let Err(e) = manager.check_ipfs_daemon().await {
+                eprintln!("Error: {}", e);
+                println!("\nPlease ensure IPFS is running: ipfs daemon");
+                return Err(anyhow::anyhow!("IPFS daemon not available"));
+            }
+
+            // Create a RequiredModel entry for the manual pin (unknown size, no hash verification)
+            let model = citrate_consensus::types::RequiredModel::new(
+                citrate_consensus::types::ModelId(format!("manual-pin-{}", &cid[..8.min(cid.len())])),
+                cid.clone(),
+                citrate_consensus::types::Hash::new([0u8; 32]), // skip hash verification
+                0, // unknown size
+                0, // no slash penalty
+            );
+
+            match manager.download_and_pin_model(&model).await {
+                Ok(()) => println!("Successfully pinned model {}", cid),
+                Err(e) => {
+                    eprintln!("Failed to pin model: {}", e);
+                    return Err(anyhow::anyhow!("Pin failed: {}", e));
+                }
+            }
         }
 
         ModelCommands::Unpin { cid } => {
