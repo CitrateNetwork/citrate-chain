@@ -1,0 +1,41 @@
+name: Fuzz Testing
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'  # Weekly Monday 3am UTC
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_tx_decoder, fuzz_block_deser, fuzz_rpc_hex]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Run fuzzer (5 minutes)
+        working-directory: citrate_v0.01.1/fuzz
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=300 \
+            -max_len=4096
+        env:
+          RUSTFLAGS: "-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=edge -Cllvm-args=-sanitizer-coverage-trace-compares -Cllvm-args=-sanitizer-coverage-inline-8bit-counters -Cllvm-args=-sanitizer-coverage-pc-table -Clink-dead-code -Cllvm-args=-sanitizer-coverage-stack-depth -C codegen-units=1"
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: citrate_v0.01.1/fuzz/artifacts/${{ matrix.target }}/
