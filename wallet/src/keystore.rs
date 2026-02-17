@@ -100,7 +100,10 @@ impl KeyStore {
         password: &str,
         alias: Option<String>,
     ) -> Result<VerifyingKey, WalletError> {
-        let private_bytes = hex::decode(private_key_hex)?;
+        let hex_str = private_key_hex.strip_prefix("0x")
+            .or_else(|| private_key_hex.strip_prefix("0X"))
+            .unwrap_or(private_key_hex);
+        let private_bytes = hex::decode(hex_str)?;
 
         if private_bytes.len() != 32 {
             return Err(WalletError::Other("Invalid private key length".to_string()));

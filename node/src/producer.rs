@@ -546,6 +546,11 @@ impl BlockProducer {
         // Persist block and related data
         self.storage.blocks.put_block(&block)?;
 
+        // Persist state root separately for fast startup verification
+        if let Err(e) = self.storage.state.put_state_root(&block.header.block_hash, &block.state_root) {
+            warn!("Failed to persist state root for block {}: {}", block.header.height, e);
+        }
+
         // Broadcast block to connected peers
         if let Some(peer_manager) = &self.peer_manager {
             let block_msg = NetworkMessage::NewBlock {

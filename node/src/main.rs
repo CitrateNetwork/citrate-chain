@@ -704,6 +704,45 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     }
 
+    // Verify state root: compare in-memory trie root against last persisted state root
+    {
+        let memory_root = state_db.calculate_state_root();
+        let latest_height = storage.blocks.get_latest_height().unwrap_or(0);
+        if latest_height > 0 {
+            if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(latest_height) {
+                // Try dedicated state root store first, fall back to reading from block
+                let persisted_root = storage.state.get_state_root(&block_hash)
+                    .ok()
+                    .flatten()
+                    .or_else(|| {
+                        storage.blocks.get_block(&block_hash)
+                            .ok()
+                            .flatten()
+                            .map(|b| b.state_root)
+                    });
+
+                match persisted_root {
+                    Some(root) if root != citrate_consensus::types::Hash::default() => {
+                        if memory_root == root {
+                            info!("State root verification PASSED (height {}, root={})",
+                                latest_height, hex::encode(&memory_root.as_bytes()[..8]));
+                        } else {
+                            warn!("State root MISMATCH at height {}: memory={} persisted={}",
+                                latest_height,
+                                hex::encode(memory_root.as_bytes()),
+                                hex::encode(root.as_bytes()));
+                        }
+                    }
+                    _ => {
+                        debug!("No persisted state root for height {} — skipping verification", latest_height);
+                    }
+                }
+            }
+        }
+        // Clear dirty flags from state root calculation
+        state_db.accounts.clear_dirty();
+    }
+
     // MCP + inference service
     let vm_for_mcp = Arc::new(citrate_execution::vm::VM::new(10_000_000));
     let mcp = Arc::new(citrate_mcp::MCPService::new(
