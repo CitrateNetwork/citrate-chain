@@ -954,9 +954,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let sync_for_rx = sync.clone();
 
         // Start transport listener and connect to bootstrap nodes
-        let local_peer_id = load_or_create_peer_id(&config.storage.data_dir)?;
+        // WP-H.1: Derive PeerId from Noise static key so identity is cryptographically
+        // bound. The old random `peer_{u64}` approach allowed identity spoofing.
         let noise_keypair = citrate_network::NoiseKeypair::generate();
-        info!("Noise identity: {}...", &noise_keypair.public_key_hex()[..16]);
+        let local_peer_id = noise_keypair.derive_peer_id();
+        info!(
+            "Noise identity: {}... (peer_id={})",
+            &noise_keypair.public_key_hex()[..16],
+            local_peer_id
+        );
         let transport = NetworkTransport::new(
             peer_manager.clone(),
             local_peer_id,
@@ -974,10 +980,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!(format!("Failed to start P2P listener: {}", e)))?;
 
-        // Dial configured bootstrap nodes (ip:port or peer@ip:port)
+        // Dial configured bootstrap nodes (ip:port or noise_<hex>@ip:port)
+        // WP-H.2: When a bootnode declares its Noise identity, use connect_to_trusted
+        // to verify the remote's Noise key matches the declared trust root.
         for s in &config.network.bootstrap_nodes {
-            if let Some((_pid, addr)) = parse_bootnode(s) {
-                let _ = transport.connect_to(addr).await;
+            if let Some((pid, addr)) = parse_bootnode(s) {
+                if pid.0.starts_with("noise_") {
+                    info!("Connecting to trusted bootnode {} (identity={})", addr, pid);
+                    let _ = transport.connect_to_trusted(addr, pid).await;
+                } else {
+                    warn!("Bootnode {} has no Noise identity — cannot verify trust root", addr);
+                    let _ = transport.connect_to(addr).await;
+                }
                 continue;
             }
             // Try numeric IP:port
@@ -1330,7 +1344,28 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::Blocks { blocks } => {
+                        // WP-H.4: handle_blocks now validates each block
                         let _ = sync_for_rx.handle_blocks(blocks).await;
+                        // WP-H.5: Drain validated blocks and persist to chain store.
+                        // Without this, synced blocks live only in SyncManager memory
+                        // and are never integrated into the DAG.
+                        let validated = sync_for_rx.drain_validated_blocks().await;
+                        for block in validated {
+                            let hash = block.header.block_hash;
+                            let have = storage_for_handler
+                                .blocks
+                                .has_block(&hash)
+                                .unwrap_or(false);
+                            if !have {
+                                if let Err(e) = storage_for_handler.blocks.put_block(&block) {
+                                    tracing::warn!(
+                                        "Failed to persist synced block {}: {}",
+                                        hex::encode(&hash.as_bytes()[..8]),
+                                        e
+                                    );
+                                }
+                            }
+                        }
                     }
                     NetworkMessage::Transactions { transactions } => {
                         for tx in transactions {

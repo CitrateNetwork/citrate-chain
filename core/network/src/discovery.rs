@@ -126,6 +126,9 @@ impl Discovery {
     }
 
     /// Get peers for exchange
+    ///
+    /// WP-H.3: Outgoing peer exchange always sends score=0 to prevent leaking
+    /// internal scoring heuristics to remote peers.
     pub async fn get_peers_for_exchange(&self) -> Vec<PeerAddress> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -146,7 +149,7 @@ impl Discovery {
                 id: p.value().id.clone(),
                 addr: p.value().addr.to_string(),
                 last_seen: p.value().last_seen,
-                score: p.value().score,
+                score: 0, // Never leak internal scores
             })
             .collect();
 
@@ -157,7 +160,14 @@ impl Discovery {
     }
 
     /// Handle peer exchange
+    ///
+    /// WP-H.3: Remote-provided scores are IGNORED. An attacker could inject
+    /// peers with score=100 via peer exchange to get priority in `find_peers()`,
+    /// enabling eclipse attacks. All remotely-discovered peers start at score 0
+    /// and earn score only through successful local interactions.
     pub async fn handle_peer_exchange(&self, peers: Vec<PeerAddress>) {
+        const INITIAL_DISCOVERED_SCORE: i32 = 0;
+
         for peer in peers {
             if let Ok(addr) = peer.addr.parse::<SocketAddr>() {
                 // Skip if already connected or banned
@@ -169,7 +179,8 @@ impl Discovery {
                     continue;
                 }
 
-                self.add_peer(peer.id, addr, peer.score).await;
+                // Ignore remote-provided score — use neutral initial score
+                self.add_peer(peer.id, addr, INITIAL_DISCOVERED_SCORE).await;
             }
         }
     }

@@ -76,27 +76,35 @@ impl VrfProposerSelector {
     }
 
     /// Generate VRF proof for proposer eligibility
+    ///
+    /// WP-H.6: The output hash includes the proposer's public key, previous VRF,
+    /// and slot, binding the proof to the proposer's identity AND the chain state.
+    /// Without this, the same proof would validate under any proposer/slot/vrf
+    /// (key substitution / replay attack).
     pub fn generate_vrf_proof(
         &self,
         secret_key: &[u8; 32],
+        proposer_pubkey: &PublicKey,
         previous_vrf: &Hash,
         slot: u64,
     ) -> Result<VrfProof, VrfError> {
-        // Create input for VRF
+        // Create input for VRF — includes proposer identity to prevent key substitution
         let mut hasher = Sha3_256::new();
+        hasher.update(proposer_pubkey.as_bytes()); // H.6: bind to proposer
         hasher.update(previous_vrf.as_bytes());
         hasher.update(slot.to_le_bytes());
         let input = hasher.finalize();
 
-        // Generate VRF proof (simplified - in production use proper VRF like ECVRF)
+        // Generate VRF proof (simplified — in production use proper VRF like ECVRF)
         let mut proof_hasher = Sha3_256::new();
         proof_hasher.update(secret_key);
-        proof_hasher.update(input);
+        proof_hasher.update(&input);
         let proof_bytes = proof_hasher.finalize();
 
-        // Generate VRF output
+        // Generate VRF output — includes input so verifier can check binding
         let mut output_hasher = Sha3_256::new();
-        output_hasher.update(proof_bytes);
+        output_hasher.update(&proof_bytes);
+        output_hasher.update(&input); // H.6: bind output to (proposer, slot, prev_vrf)
         let output_bytes = output_hasher.finalize();
 
         Ok(VrfProof {
@@ -105,29 +113,39 @@ impl VrfProposerSelector {
         })
     }
 
-    /// Verify VRF proof
+    /// Verify VRF proof is bound to the claimed proposer.
+    ///
+    /// WP-H.6: The old implementation ignored the `pubkey` parameter entirely
+    /// (it was `_pubkey`), meaning ANY proposer key validated ANY proof. Now
+    /// the output hash includes (proof || input) where input = SHA3(pubkey ||
+    /// prev_vrf || slot). Changing any of these parameters causes the output
+    /// check to fail. This prevents:
+    ///   - Key substitution: proof valid under proposer A fails under proposer B
+    ///   - Slot replay: proof from slot N fails at slot M
+    ///   - Chain replay: proof from chain state X fails at chain state Y
     pub fn verify_vrf_proof(
         &self,
-        _pubkey: &PublicKey,
+        pubkey: &PublicKey,
         proof: &VrfProof,
         previous_vrf: &Hash,
         slot: u64,
     ) -> Result<bool, VrfError> {
-        // Create expected input
-        let mut hasher = Sha3_256::new();
-        hasher.update(previous_vrf.as_bytes());
-        hasher.update(slot.to_le_bytes());
-        let _input = hasher.finalize();
-
         // Verify proof matches expected format
-        // In production, use proper VRF verification
         if proof.proof.len() != 32 {
             return Ok(false);
         }
 
-        // Verify output matches proof
+        // Reconstruct expected input with proposer identity bound
+        let mut hasher = Sha3_256::new();
+        hasher.update(pubkey.as_bytes()); // H.6: bind to proposer
+        hasher.update(previous_vrf.as_bytes());
+        hasher.update(slot.to_le_bytes());
+        let input = hasher.finalize();
+
+        // Verify output matches SHA3(proof || input)
         let mut output_hasher = Sha3_256::new();
         output_hasher.update(&proof.proof);
+        output_hasher.update(&input); // H.6: verifier checks same binding
         let expected_output = Hash::from_bytes(&output_hasher.finalize());
 
         Ok(proof.output == expected_output)
@@ -342,11 +360,12 @@ mod tests {
     async fn test_vrf_proof_generation() {
         let selector = VrfProposerSelector::new();
         let secret_key = [42; 32];
+        let proposer = PublicKey::new([1; 32]);
         let previous_vrf = Hash::new([1; 32]);
         let slot = 100;
 
         let proof = selector
-            .generate_vrf_proof(&secret_key, &previous_vrf, slot)
+            .generate_vrf_proof(&secret_key, &proposer, &previous_vrf, slot)
             .unwrap();
 
         assert_eq!(proof.proof.len(), 32);

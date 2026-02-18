@@ -24,21 +24,25 @@ use tracing::{error, info, warn};
 // This ensures a single canonical hash function used by both producer and validator.
 
 /// Generate a simplified VRF proof for block production.
-/// C4 fix: Produces a non-empty 32-byte proof that passes gossip validation.
-/// Uses SHA3(coinbase ++ SHA3(prev_vrf ++ slot)) — matches consensus/vrf.rs format.
-fn generate_block_vrf(coinbase: &PublicKey, prev_vrf: &Hash, slot: u64) -> VrfProof {
+///
+/// WP-H.6: The input hash includes the proposer's public key and the output
+/// hash includes the input, binding the proof to the proposer's identity.
+/// This prevents key substitution attacks and slot/chain replay.
+fn generate_block_vrf(proposer_pubkey: &PublicKey, coinbase: &PublicKey, prev_vrf: &Hash, slot: u64) -> VrfProof {
     let mut input_hasher = Sha3_256::new();
+    input_hasher.update(proposer_pubkey.as_bytes()); // H.6: bind to proposer identity
     input_hasher.update(prev_vrf.as_bytes());
     input_hasher.update(slot.to_le_bytes());
     let input = input_hasher.finalize();
 
     let mut proof_hasher = Sha3_256::new();
     proof_hasher.update(coinbase.as_bytes());
-    proof_hasher.update(input);
+    proof_hasher.update(&input);
     let proof_bytes = proof_hasher.finalize();
 
     let mut output_hasher = Sha3_256::new();
     output_hasher.update(&proof_bytes);
+    output_hasher.update(&input); // H.6: bind output to (proposer, slot, prev_vrf)
     let output_bytes = output_hasher.finalize();
 
     VrfProof {
@@ -389,7 +393,7 @@ impl BlockProducer {
                 blue_work: 0,  // Will be calculated
                 pruning_point: Hash::default(),
                 proposer_pubkey: PublicKey::new(self.signing_key.verifying_key().to_bytes()),
-                vrf_reveal: generate_block_vrf(&self.coinbase, &selected_parent, 0),
+                vrf_reveal: generate_block_vrf(&PublicKey::new(self.signing_key.verifying_key().to_bytes()), &self.coinbase, &selected_parent, 0),
                 base_fee_per_gas: 1_000_000_000, // 1 gwei
                 gas_used: 0,
                 gas_limit: 30_000_000,
@@ -439,7 +443,7 @@ impl BlockProducer {
             blue_work,
             pruning_point: Hash::default(),
             proposer_pubkey: PublicKey::new(self.signing_key.verifying_key().to_bytes()),
-            vrf_reveal: generate_block_vrf(&self.coinbase, &selected_parent, last_height + 1),
+            vrf_reveal: generate_block_vrf(&PublicKey::new(self.signing_key.verifying_key().to_bytes()), &self.coinbase, &selected_parent, last_height + 1),
             base_fee_per_gas: 1_000_000_000, // 1 gwei - TODO: calculate from parent
             gas_used: 0, // Will be updated after execution
             gas_limit: 30_000_000, // 30M gas default

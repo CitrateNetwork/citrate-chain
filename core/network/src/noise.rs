@@ -37,6 +37,14 @@ impl NoiseKeypair {
     pub fn public_key_hex(&self) -> String {
         hex::encode(&self.public)
     }
+
+    /// Derive a canonical PeerId from this keypair's public key.
+    ///
+    /// WP-H.1: The PeerId is cryptographically bound to the Noise static key.
+    /// Format: `noise_{hex(public_key)}` — deterministic and verifiable.
+    pub fn derive_peer_id(&self) -> crate::peer::PeerId {
+        crate::peer::PeerId::new(format!("noise_{}", self.public_key_hex()))
+    }
 }
 
 /// Encrypted session established after the Noise handshake.
@@ -75,6 +83,15 @@ impl NoiseSession {
     /// Remote peer's static X25519 public key.
     pub fn remote_public_key(&self) -> &[u8] {
         &self.remote_static
+    }
+
+    /// Derive the expected PeerId from the remote peer's Noise static key.
+    ///
+    /// WP-H.1: Used after Noise handshake to verify the claimed peer_id in
+    /// Hello/HelloAck messages. If the claimed id doesn't match, the peer is
+    /// impersonating another identity and the connection must be rejected.
+    pub fn expected_remote_peer_id(&self) -> crate::peer::PeerId {
+        crate::peer::PeerId::new(format!("noise_{}", hex::encode(&self.remote_static)))
     }
 }
 

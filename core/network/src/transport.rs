@@ -99,6 +99,20 @@ impl NetworkTransport {
 
     /// Dial an outbound peer
     pub async fn connect_to(&self, addr: SocketAddr) -> Result<(), NetworkError> {
+        self.connect_to_inner(addr, None).await
+    }
+
+    /// Dial an outbound peer and verify its Noise identity matches `expected_id`.
+    ///
+    /// WP-H.2: Bootnode trust root enforcement. When a bootnode declares its
+    /// Noise public key (e.g. `noise_<hex>@ip:port`), we verify the remote's
+    /// Noise static key produces the expected PeerId. This prevents DNS/IP
+    /// hijack attacks from impersonating trusted bootnodes.
+    pub async fn connect_to_trusted(&self, addr: SocketAddr, expected_id: PeerId) -> Result<(), NetworkError> {
+        self.connect_to_inner(addr, Some(expected_id)).await
+    }
+
+    async fn connect_to_inner(&self, addr: SocketAddr, expected_id: Option<PeerId>) -> Result<(), NetworkError> {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| NetworkError::TransportError(format!("connect {}: {}", addr, e)))?;
@@ -108,7 +122,7 @@ impl NetworkTransport {
         let noise_kp = self.noise_keypair.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_outbound(stream, addr, pm, local_id, params, noise_kp).await
+                handle_outbound(stream, addr, pm, local_id, params, noise_kp, expected_id).await
             {
                 warn!("outbound error to {}: {}", addr, e);
             }
@@ -175,7 +189,26 @@ async fn handle_inbound(
             if network_id != params.network_id || genesis_hash != params.genesis_hash {
                 return Err(NetworkError::ProtocolError("network mismatch".into()));
             }
-            (PeerId::new(peer_id), head_height, head_hash)
+            // WP-H.1: Verify claimed peer_id matches Noise static key identity.
+            // Without this check, an attacker can claim any peer_id in their Hello
+            // message while the Noise handshake proves a completely different key.
+            let verified_id = if let Some(ref ns) = noise_session {
+                let expected = ns.expected_remote_peer_id();
+                let claimed = PeerId::new(peer_id);
+                if claimed != expected {
+                    warn!(
+                        "IDENTITY_MISMATCH from {}: claimed={}, noise_key={}",
+                        addr, claimed, expected
+                    );
+                    return Err(NetworkError::ProtocolError(
+                        "peer_id does not match Noise static key".into(),
+                    ));
+                }
+                expected
+            } else {
+                PeerId::new(peer_id)
+            };
+            (verified_id, head_height, head_hash)
         }
         _ => return Err(NetworkError::ProtocolError("expected Hello".into())),
     };
@@ -308,6 +341,7 @@ async fn handle_outbound(
     local_id: PeerId,
     params: HandshakeParams,
     noise_keypair: Option<Arc<NoiseKeypair>>,
+    expected_id: Option<PeerId>,
 ) -> Result<(), NetworkError> {
     // Noise handshake (if enabled)
     let noise_session = if let Some(ref kp) = noise_keypair {
@@ -317,6 +351,31 @@ async fn handle_outbound(
     };
 
     let noise_session = noise_session.map(Arc::new);
+
+    // WP-H.2: Bootnode trust root enforcement.
+    // If an expected_id was provided (e.g. from `noise_<hex>@ip:port` bootnode config),
+    // verify the remote Noise static key produces that PeerId. This catches DNS/IP
+    // hijack attacks where an attacker redirects traffic to their own Noise key.
+    if let Some(ref expected) = expected_id {
+        if let Some(ref ns) = noise_session {
+            let actual = ns.expected_remote_peer_id();
+            if &actual != expected {
+                warn!(
+                    "BOOTNODE_TRUST_VIOLATION at {}: expected={}, actual={}",
+                    addr, expected, actual
+                );
+                return Err(NetworkError::ProtocolError(
+                    "bootnode Noise key does not match expected trust root".into(),
+                ));
+            }
+            info!("Bootnode trust root verified for {}", addr);
+        } else {
+            warn!(
+                "Bootnode trust root configured for {} but Noise is disabled — cannot verify",
+                addr
+            );
+        }
+    }
 
     let codec = LengthDelimitedCodec::builder()
         .max_frame_length(MAX_FRAME_LEN)
@@ -370,12 +429,29 @@ async fn handle_outbound(
         if !version.is_compatible(&ProtocolVersion::CURRENT) {
             return Err(NetworkError::ProtocolError("incompatible ack".into()));
         }
-        let rid = if peer_id.is_empty() {
-            format!("tcp_{}", addr)
+        // WP-H.1: Verify claimed peer_id matches Noise static key identity.
+        // Without this check, a MITM could impersonate a bootnode by claiming
+        // its peer_id in the HelloAck while holding a different Noise key.
+        let remote_id = if let Some(ref ns) = noise_session {
+            let expected = ns.expected_remote_peer_id();
+            if !peer_id.is_empty() {
+                let claimed = PeerId::new(peer_id);
+                if claimed != expected {
+                    warn!(
+                        "IDENTITY_MISMATCH from {}: claimed={}, noise_key={}",
+                        addr, claimed, expected
+                    );
+                    return Err(NetworkError::ProtocolError(
+                        "peer_id does not match Noise static key".into(),
+                    ));
+                }
+            }
+            expected
+        } else if peer_id.is_empty() {
+            PeerId::new(format!("tcp_{}", addr))
         } else {
-            peer_id
+            PeerId::new(peer_id)
         };
-        let remote_id = PeerId::new(rid);
         // Create peer channels
         let (to_wire_tx, mut to_wire_rx) = mpsc::channel::<NetworkMessage>(256);
         let (_from_wire_tx, from_wire_rx) = mpsc::channel::<NetworkMessage>(256);

@@ -5,7 +5,9 @@ use crate::{
     peer::{Peer, PeerId},
     NetworkError, NetworkMessage,
 };
+use citrate_consensus::crypto;
 use citrate_consensus::types::{Block, BlockHeader, Hash};
+use sha3::{Digest, Sha3_256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -251,9 +253,24 @@ impl SyncManager {
     }
 
     /// Handle received headers
+    ///
+    /// WP-H.4: Headers are validated for height monotonicity before storage.
     pub async fn handle_headers(&self, headers: Vec<BlockHeader>) -> Result<(), NetworkError> {
         if headers.is_empty() {
             return Ok(());
+        }
+
+        // Validate header height monotonicity
+        for window in headers.windows(2) {
+            if window[1].height <= window[0].height {
+                warn!(
+                    "SYNC_REJECT: non-monotonic header heights ({} -> {})",
+                    window[0].height, window[1].height
+                );
+                return Err(NetworkError::ProtocolError(
+                    "non-monotonic header heights in sync response".into(),
+                ));
+            }
         }
 
         let count = headers.len();
@@ -262,7 +279,7 @@ impl SyncManager {
         let first_hash = headers.first().map(|h| h.block_hash).unwrap_or_default();
         let last_hash = headers.last().map(|h| h.block_hash).unwrap_or_default();
 
-        // Store headers
+        // Store validated headers
         self.downloaded_headers.write().await.extend(headers);
 
         // Update progress
@@ -292,23 +309,106 @@ impl SyncManager {
         Ok(())
     }
 
-    /// Handle received blocks
+    /// Handle received blocks with full validation before import.
+    ///
+    /// WP-H.4: The old implementation stored blocks in memory without any
+    /// validation and marked Synced based on height alone. An attacker could
+    /// feed garbage blocks to a syncing node, making it believe it was synced
+    /// while holding no valid chain data. Now each block is validated:
+    ///   1. Hash integrity (covers header + commitment roots)
+    ///   2. Signature verification (proposer key bound to block hash)
+    ///   3. tx_root consistency (recomputed from transactions)
+    /// Only validated blocks are stored and count toward progress.
     pub async fn handle_blocks(&self, blocks: Vec<Block>) -> Result<(), NetworkError> {
         if blocks.is_empty() {
             return Ok(());
         }
 
-        let count = blocks.len();
+        let total = blocks.len();
         let first_height = blocks.first().unwrap().header.height;
-        let last_height = blocks.last().unwrap().header.height;
+        let mut validated = Vec::with_capacity(total);
+        let mut rejected = 0usize;
 
-        // Store blocks
-        self.downloaded_blocks.write().await.extend(blocks);
+        for block in blocks {
+            // 1. Verify canonical hash integrity
+            if !block.verify_hash() {
+                warn!(
+                    "SYNC_REJECT: block height={} hash mismatch (tampered commitment roots)",
+                    block.header.height
+                );
+                rejected += 1;
+                continue;
+            }
+
+            // 2. Verify block signature
+            match crypto::verify_block_signature(&block) {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        "SYNC_REJECT: block height={} invalid signature",
+                        block.header.height
+                    );
+                    rejected += 1;
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "SYNC_REJECT: block height={} signature error: {}",
+                        block.header.height, e
+                    );
+                    rejected += 1;
+                    continue;
+                }
+            }
+
+            // 3. Verify tx_root consistency
+            let computed_tx_root = {
+                let mut hasher = Sha3_256::new();
+                for tx in &block.transactions {
+                    hasher.update(tx.hash.as_bytes());
+                }
+                let bytes = hasher.finalize();
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes[..32]);
+                Hash::new(arr)
+            };
+            if block.tx_root != computed_tx_root {
+                warn!(
+                    "SYNC_REJECT: block height={} tx_root mismatch",
+                    block.header.height
+                );
+                rejected += 1;
+                continue;
+            }
+
+            validated.push(block);
+        }
+
+        if rejected > 0 {
+            warn!(
+                "Sync validation: {}/{} blocks rejected",
+                rejected, total
+            );
+        }
+
+        if validated.is_empty() {
+            return Ok(());
+        }
+
+        let last_height = validated.last().unwrap().header.height;
+        let accepted = validated.len();
+
+        // Store only validated blocks
+        self.downloaded_blocks.write().await.extend(validated);
 
         // Update progress
         let current = *self.current_height.read().await;
         let target = *self.target_height.read().await;
-        let progress = ((last_height - current) as f32 / (target - current) as f32) * 100.0;
+        let progress = if target > current {
+            ((last_height - current) as f32 / (target - current) as f32) * 100.0
+        } else {
+            100.0
+        };
 
         *self.state.write().await = SyncState::DownloadingBlocks {
             from_height: current,
@@ -316,12 +416,12 @@ impl SyncManager {
             progress,
         };
 
-        // Update current height
+        // Only advance height based on validated blocks
         *self.current_height.write().await = last_height;
 
         info!(
-            "Downloaded {} blocks (height {}-{}), progress: {:.1}%",
-            count, first_height, last_height, progress
+            "Validated and imported {}/{} blocks (height {}-{}), progress: {:.1}%",
+            accepted, total, first_height, last_height, progress
         );
 
         // Check if sync complete
@@ -440,6 +540,17 @@ impl SyncManager {
     /// Current pending counts (headers, blocks)
     pub async fn pending_counts(&self) -> (usize, usize) {
         (self.pending_headers.read().await.len(), self.pending_blocks.read().await.len())
+    }
+
+    /// Drain all validated blocks that have been downloaded and verified.
+    ///
+    /// WP-H.5: The sync manager validates blocks on receipt (WP-H.4) but
+    /// stores them in memory. The node must periodically drain these and
+    /// persist them to the chain store / DAG. This method returns all
+    /// validated blocks and clears the internal buffer.
+    pub async fn drain_validated_blocks(&self) -> Vec<Block> {
+        let mut blocks = self.downloaded_blocks.write().await;
+        std::mem::take(&mut *blocks)
     }
 }
 
