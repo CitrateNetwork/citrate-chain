@@ -4834,6 +4834,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-core"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "argon2",
+ "async-trait",
+ "base64 0.21.7",
+ "bincode",
+ "bip39",
+ "chrono",
+ "citrate-api",
+ "citrate-consensus",
+ "citrate-economics",
+ "citrate-execution",
+ "citrate-mcp",
+ "citrate-network",
+ "citrate-sequencer",
+ "citrate-storage",
+ "citrate-wallet",
+ "dashmap",
+ "dirs 5.0.1",
+ "ed25519-dalek",
+ "futures",
+ "hex",
+ "hmac",
+ "jsonrpc-core",
+ "keyring",
+ "llama-cpp-2",
+ "num_cpus",
+ "once_cell",
+ "parking_lot 0.12.4",
+ "portable-pty",
+ "primitive-types",
+ "primitives",
+ "rand 0.8.5",
+ "regex",
+ "reqwest 0.11.27",
+ "rocksdb",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3",
+ "shellexpand",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.20",
+ "tungstenite",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
