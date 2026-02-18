@@ -370,9 +370,12 @@ impl Mempool {
             });
         }
 
-        // Check chain ID
-        if let Some(tx_chain_id) = tx.chain_id {
-            if tx_chain_id != self.config.chain_id {
+        // Check chain ID (M-01: mandatory — reject transactions without chain domain binding)
+        match tx.chain_id {
+            Some(tx_chain_id) if tx_chain_id == self.config.chain_id => {
+                // Chain ID matches — ok
+            }
+            Some(tx_chain_id) => {
                 tracing::warn!(
                     "Transaction chain ID mismatch: expected {}, got {}",
                     self.config.chain_id,
@@ -380,6 +383,14 @@ impl Mempool {
                 );
                 return Err(MempoolError::InvalidTransaction(
                     format!("Wrong chain ID: expected {}, got {}", self.config.chain_id, tx_chain_id),
+                ));
+            }
+            None => {
+                tracing::warn!(
+                    "Transaction missing chain ID (pre-EIP-155 not accepted)"
+                );
+                return Err(MempoolError::InvalidTransaction(
+                    format!("Missing chain ID: all transactions must specify chain_id={}", self.config.chain_id),
                 ));
             }
         }
@@ -947,6 +958,7 @@ mod tests {
             data: vec![],
             signature: Signature::new([1; 64]), // Non-zero signature for tests
             tx_type: None,
+            chain_id: Some(1337), // M-01: chain domain binding required
             ..Default::default()
         }
     }

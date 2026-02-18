@@ -31,23 +31,23 @@ fn is_ecdsa_transaction(tx: &Transaction) -> bool {
     is_evm_address
 }
 
-/// Verify a transaction's signature
-/// Supports both ECDSA (Ethereum) and ed25519 (native) signatures
+/// Verify a transaction's signature.
+/// Supports both ECDSA (Ethereum) and ed25519 (native) signatures.
+///
+/// SECURITY: ECDSA transactions must have `ecdsa_verified == true`, which is
+/// set only during successful cryptographic recovery in eth_tx_decoder.rs.
+/// We never trust address shape alone — that was a bypass vulnerability (C-01).
 pub fn verify_transaction(tx: &Transaction) -> Result<bool, CryptoError> {
     if is_ecdsa_transaction(tx) {
-        // For ECDSA transactions, the signature was already verified during
-        // address recovery in the ETH RPC decoder (eth_tx_decoder.rs)
-        // The fact that we have a valid address means the signature was valid
-        //
-        // SECURITY NOTE: The ECDSA verification happens in eth_tx_decoder.rs
-        // using secp256k1::recover_ecdsa() which only succeeds with valid signatures.
-        // The recovered address is derived from the public key that successfully
-        // verified the signature, so if the address is present, the signature is valid.
-        //
-        // For additional security, we could re-verify here, but that would require
-        // reconstructing the original signing message which varies by transaction type
-        // (legacy, EIP-2930, EIP-1559) and is already done in the decoder.
-        Ok(true)
+        // ECDSA-shaped address: require that the decoder already performed
+        // cryptographic signature verification and set the flag.
+        // This prevents forged transactions with embedded addresses from
+        // bypassing signature checks (fixes audit finding C-01).
+        if tx.ecdsa_verified {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     } else {
         // ed25519 native transaction verification
         verify_ed25519_transaction(tx)
@@ -181,5 +181,59 @@ mod tests {
         let bytes1 = canonical_tx_bytes(&tx).unwrap();
         let bytes2 = canonical_tx_bytes(&tx).unwrap();
         assert_eq!(bytes1, bytes2);
+    }
+
+    /// C-01 regression: embedded 20-byte EVM address without ecdsa_verified must be rejected
+    #[test]
+    fn test_forged_embedded_address_rejected() {
+        // Create a transaction with an embedded EVM address (20 bytes + 12 zeros)
+        // but WITHOUT ecdsa_verified set — simulates a forged sender
+        let mut from_bytes = [0u8; 32];
+        from_bytes[..20].copy_from_slice(&[0xAA; 20]); // Fake EVM address
+
+        let tx = Transaction {
+            hash: Hash::new([1; 32]),
+            nonce: 0,
+            from: PublicKey::new(from_bytes),
+            to: Some(PublicKey::new([2; 32])),
+            value: 1000,
+            gas_limit: 21000,
+            gas_price: 1_000_000_000,
+            data: vec![],
+            signature: Signature::new([1; 64]), // Dummy signature
+            tx_type: None,
+            ecdsa_verified: false, // NOT cryptographically verified
+            ..Default::default()
+        };
+
+        // Must be detected as ECDSA-shaped
+        assert!(is_ecdsa_transaction(&tx));
+        // Must FAIL verification — no cryptographic proof
+        assert!(!verify_transaction(&tx).unwrap());
+    }
+
+    /// Verify that ecdsa_verified=true allows ECDSA-shaped tx through
+    #[test]
+    fn test_verified_ecdsa_transaction_accepted() {
+        let mut from_bytes = [0u8; 32];
+        from_bytes[..20].copy_from_slice(&[0xBB; 20]);
+
+        let tx = Transaction {
+            hash: Hash::new([1; 32]),
+            nonce: 0,
+            from: PublicKey::new(from_bytes),
+            to: Some(PublicKey::new([2; 32])),
+            value: 1000,
+            gas_limit: 21000,
+            gas_price: 1_000_000_000,
+            data: vec![],
+            signature: Signature::new([1; 64]),
+            tx_type: None,
+            ecdsa_verified: true, // Decoder cryptographically verified this
+            ..Default::default()
+        };
+
+        assert!(is_ecdsa_transaction(&tx));
+        assert!(verify_transaction(&tx).unwrap());
     }
 }

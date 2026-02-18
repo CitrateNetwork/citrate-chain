@@ -641,120 +641,16 @@ pub fn register_eth_methods(
         Ok(Value::String(format!("0x{:x}", base_nonce)))
     });
 
-    // eth_sendTransaction - Submit transaction (object form)
-    let mempool_send_tx = mempool.clone();
-    let executor_send_tx = executor.clone();
-    io_handler.add_sync_method("eth_sendTransaction", move |params: Params| {
-        let api = TransactionApi::new(mempool_send_tx.clone(), executor_send_tx.clone());
-
-        // Expect params: [txObject]
-        let params: Vec<Value> = match params.parse() {
-            Ok(p) => p,
-            Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
-        };
-        if params.is_empty() {
-            return Err(jsonrpc_core::Error::invalid_params(
-                "Missing transaction object",
-            ));
-        }
-        let obj = match &params[0] {
-            Value::Object(map) => map,
-            _ => {
-                return Err(jsonrpc_core::Error::invalid_params(
-                    "Invalid transaction object",
-                ))
-            }
-        };
-
-        // from (required)
-        let from_s = obj
-            .get("from")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing 'from'"))?;
-        let from_hex = from_s.trim().trim_start_matches("0x");
-        let from_bytes = hex::decode(from_hex)
-            .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid 'from' hex"))?;
-        if from_bytes.len() != 20 {
-            return Err(jsonrpc_core::Error::invalid_params(
-                "'from' must be 20 bytes",
-            ));
-        }
-        let mut from20 = [0u8; 20];
-        from20.copy_from_slice(&from_bytes);
-
-        // to (optional)
-        let to20_opt = if let Some(to_s) = obj.get("to").and_then(|v| v.as_str()) {
-            let to_hex = to_s.trim().trim_start_matches("0x");
-            let to_bytes = hex::decode(to_hex)
-                .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid 'to' hex"))?;
-            if to_bytes.len() != 20 {
-                return Err(jsonrpc_core::Error::invalid_params("'to' must be 20 bytes"));
-            }
-            let mut to20 = [0u8; 20];
-            to20.copy_from_slice(&to_bytes);
-            Some(to20)
-        } else {
-            None
-        };
-
-        // value (hex string) optional
-        let value_u256 = if let Some(vs) = obj.get("value").and_then(|v| v.as_str()) {
-            let s = vs.trim();
-            let s = s.strip_prefix("0x").unwrap_or(s);
-            U256::from_str_radix(s, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex value: {}", vs)))?
-        } else {
-            U256::from(0u64)
-        };
-
-        // gas and gasPrice (hex strings) optional
-        let gas = if let Some(gs) = obj.get("gas").and_then(|v| v.as_str()) {
-            let s = gs.trim();
-            let s = s.strip_prefix("0x").unwrap_or(s);
-            u64::from_str_radix(s, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex gas: {}", gs)))?
-        } else {
-            21000
-        };
-        let gas_price = if let Some(gps) = obj.get("gasPrice").and_then(|v| v.as_str()) {
-            let s = gps.trim();
-            let s = s.strip_prefix("0x").unwrap_or(s);
-            u64::from_str_radix(s, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex gasPrice: {}", gps)))?
-        } else {
-            1_000_000_000
-        };
-
-        // nonce (hex string) optional
-        let nonce_opt = if let Some(ns) = obj.get("nonce").and_then(|v| v.as_str()) {
-            let s = ns.trim();
-            let s = s.strip_prefix("0x").unwrap_or(s);
-            Some(u64::from_str_radix(s, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex nonce: {}", ns)))?)
-        } else {
-            None
-        };
-
-        // data (hex string) optional
-        let data = if let Some(ds) = obj.get("data").and_then(|v| v.as_str()) {
-            let s = ds.trim();
-            let s = s.strip_prefix("0x").unwrap_or(s);
-            hex::decode(s).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex data: {}", ds)))?
-        } else {
-            Vec::new()
-        };
-
-        // Build TransactionRequest
-        let req = crate::types::request::TransactionRequest {
-            from: Address(from20),
-            to: to20_opt.map(Address),
-            value: Some(value_u256),
-            gas: Some(gas),
-            gas_price: Some(gas_price),
-            nonce: nonce_opt,
-            data: Some(data),
-        };
-
-        match block_on(api.send_transaction(req)) {
-            Ok(hash) => Ok(Value::String(format!("0x{}", hex::encode(hash.as_bytes())))),
-            Err(e) => Err(jsonrpc_core::Error::invalid_params(e.to_string())),
-        }
+    // eth_sendTransaction - DISABLED by default (C-02 defense-in-depth).
+    // The server.rs handler overrides this with a config-gated version for devnet.
+    // This stub ensures that if the override is ever removed, unsigned tx creation
+    // is still rejected rather than silently re-enabled.
+    io_handler.add_sync_method("eth_sendTransaction", move |_params: Params| {
+        Err(jsonrpc_core::Error {
+            code: jsonrpc_core::ErrorCode::MethodNotFound,
+            message: "eth_sendTransaction is disabled. Use eth_sendRawTransaction with a signed transaction.".into(),
+            data: None,
+        })
     });
 
     // eth_sendRawTransaction - Submit signed transaction

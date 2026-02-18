@@ -164,64 +164,33 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
                 eprintln!("  Signature R: 0x{}", hex::encode(&rs_bytes[..32]));
                 eprintln!("  Signature S: 0x{}", hex::encode(&rs_bytes[32..]));
 
-                // Try to recover the public key
-                let from_addr = match RecoveryId::from_i32(recovery_id) {
-                    Ok(recid) => {
-                        match RecoverableSignature::from_compact(&rs_bytes, recid) {
-                            Ok(recsig) => {
-                                match Message::from_slice(&sighash) {
-                                    Ok(msg) => {
-                                        match secp.recover_ecdsa(&msg, &recsig) {
-                                            Ok(pubkey) => {
-                                                // Get uncompressed public key (65 bytes: 0x04 + x + y)
-                                                let uncompressed = pubkey.serialize_uncompressed();
+                // Recover the sender address from signature (fail-closed: C-03).
+                // Any failure in the recovery chain returns Err — never fabricate fallback addresses.
+                let recid = RecoveryId::from_i32(recovery_id)
+                    .map_err(|e| format!("Invalid recovery ID {}: {}", recovery_id, e))?;
+                let recsig = RecoverableSignature::from_compact(&rs_bytes, recid)
+                    .map_err(|e| format!("Invalid recoverable signature: {}", e))?;
+                let msg = Message::from_slice(&sighash)
+                    .map_err(|e| format!("Invalid signature hash: {}", e))?;
+                let pubkey = secp.recover_ecdsa(&msg, &recsig)
+                    .map_err(|e| format!("ECDSA recovery failed: {}", e))?;
 
-                                                // Hash the public key (excluding the 0x04 prefix)
-                                                let mut hasher = Keccak256::new();
-                                                hasher.update(&uncompressed[1..]);
-                                                let hash = hasher.finalize();
+                // Get uncompressed public key (65 bytes: 0x04 + x + y)
+                let uncompressed = pubkey.serialize_uncompressed();
 
-                                                // Take the last 20 bytes as the address
-                                                let mut addr_bytes = [0u8; 20];
-                                                addr_bytes.copy_from_slice(&hash[12..]);
-                                                let addr = H160::from_slice(&addr_bytes);
-                                                eprintln!(
-                                                    "  Recovered address: 0x{}",
-                                                    hex::encode(addr.as_bytes())
-                                                );
-                                                addr
-                                            }
-                                            Err(e) => {
-                                                eprintln!("  Failed to recover public key: {}", e);
-                                                // For testing, use a deterministic test address based on nonce
-                                                let test_addr = H160::from_low_u64_be(
-                                                    0x3333333333333333 + legacy_tx.nonce,
-                                                );
-                                                eprintln!(
-                                                    "  Using test address: 0x{}",
-                                                    hex::encode(test_addr.as_bytes())
-                                                );
-                                                test_addr
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("  Failed to create message: {}", e);
-                                        H160::from_low_u64_be(0x3333333333333333)
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("  Failed to create recoverable signature: {}", e);
-                                H160::from_low_u64_be(0x3333333333333333)
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("  Invalid recovery ID {}: {}", recovery_id, e);
-                        H160::from_low_u64_be(0x3333333333333333)
-                    }
-                };
+                // Hash the public key (excluding the 0x04 prefix)
+                let mut hasher = Keccak256::new();
+                hasher.update(&uncompressed[1..]);
+                let hash = hasher.finalize();
+
+                // Take the last 20 bytes as the address
+                let mut addr_bytes = [0u8; 20];
+                addr_bytes.copy_from_slice(&hash[12..]);
+                let from_addr = H160::from_slice(&addr_bytes);
+                eprintln!(
+                    "  Recovered address: 0x{}",
+                    hex::encode(from_addr.as_bytes())
+                );
                 eprintln!("  From address: 0x{}", hex::encode(from_addr.as_bytes()));
 
                 // Convert addresses to PublicKey format by embedding 20 bytes in 32-byte field
@@ -267,6 +236,7 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
                     tx_type: None,
                     eth_tx_type: 0,
                     chain_id: chain_id_opt,
+                    ecdsa_verified: true, // ECDSA signature was cryptographically verified during recovery above
                     ..Default::default()
                 };
 
@@ -469,6 +439,7 @@ fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
         max_priority_fee_per_gas: Some(max_prio_val),
         access_list: if al.is_empty() { None } else { Some(al) },
         chain_id: decoded_chain_id,
+        ecdsa_verified: true, // ECDSA signature was cryptographically verified during recovery above
     };
     tx.determine_type();
     Ok(tx)
@@ -684,6 +655,7 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
         eth_tx_type: 1,
         access_list: if al.is_empty() { None } else { Some(al) },
         chain_id: decoded_chain_id,
+        ecdsa_verified: true, // ECDSA signature was cryptographically verified during recovery above
         ..Default::default()
     };
     tx.determine_type();

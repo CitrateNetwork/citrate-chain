@@ -434,10 +434,10 @@ impl Executor {
         // Create snapshot for potential rollback
         let snapshot = self.state_db.snapshot();
 
-        // Update nonce (mempool already validated it)
-        // During block production, we trust the mempool's ordering and just increment
-        let current_nonce = self.state_db.accounts.get_nonce(&from);
-        self.state_db.accounts.set_nonce(from, current_nonce + 1);
+        // Verify and increment nonce (C-04: enforce equality, don't blindly increment).
+        // Even though the mempool validates ordering, the executor is the last line of
+        // defense against out-of-order or replayed transactions.
+        self.state_db.accounts.check_and_increment_nonce(&from, tx.nonce)?;
 
         // Check balance for gas
         let gas_cost = U256::from(tx.gas_limit) * U256::from(tx.gas_price);

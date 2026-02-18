@@ -1395,6 +1395,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             max_connections: 100,
             cors_domains: vec!["*".to_string()],
             threads: 4,
+            // C-02: Only allow eth_sendTransaction in devnet/dev mode
+            allow_eth_send_transaction: config.rpc.allow_eth_send_transaction,
             ..Default::default()
         };
 

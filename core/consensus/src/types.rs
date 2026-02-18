@@ -291,6 +291,11 @@ pub struct Transaction {
     /// Chain ID decoded from the transaction signature
     #[serde(default)]
     pub chain_id: Option<u64>,
+
+    /// Set to true only when ECDSA signature was cryptographically verified
+    /// during decode (eth_tx_decoder). Never trust address shape alone.
+    #[serde(default)]
+    pub ecdsa_verified: bool,
 }
 
 impl Transaction {

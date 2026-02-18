@@ -368,6 +368,10 @@ pub struct RpcConfig {
     pub cors_domains: Vec<String>,
     pub threads: usize,
     pub rate_limit: RateLimitConfig,
+    /// Allow eth_sendTransaction (unsigned, arbitrary-from transactions).
+    /// SECURITY: Must only be true in devnet/dev mode. In production, clients
+    /// must use eth_sendRawTransaction with a proper signature. (C-02)
+    pub allow_eth_send_transaction: bool,
 }
 
 impl Default for RpcConfig {
@@ -378,6 +382,7 @@ impl Default for RpcConfig {
             cors_domains: vec!["*".to_string()],
             threads: 4,
             rate_limit: RateLimitConfig::default(),
+            allow_eth_send_transaction: false, // Secure default: reject unsigned tx
         }
     }
 }
@@ -471,7 +476,7 @@ impl RpcServer {
         io_handler.add_sync_method("citrate_updateModel", move |params: Params| {
             rpc_request("citrate_updateModel");
             let tx_api =
-                TransactionApi::new(mempool_ai_update.clone(), executor_ai_update.clone());
+                TransactionApi::new(mempool_ai_update.clone(), executor_ai_update.clone(), chain_id);
             let value: serde_json::Value = match params.parse() {
                 Ok(v) => v,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
@@ -730,7 +735,7 @@ impl RpcServer {
         let executor_raw = executor.clone();
         io_handler.add_sync_method("tx_sendRawTransaction", move |params: Params| {
             rpc_request("tx_sendRawTransaction");
-            let api = TransactionApi::new(mempool_raw.clone(), executor_raw.clone());
+            let api = TransactionApi::new(mempool_raw.clone(), executor_raw.clone(), chain_id);
 
             let raw_hex: String = match params.parse() {
                 Ok(hex) => hex,
@@ -758,7 +763,7 @@ impl RpcServer {
         let executor_gas = executor.clone();
         io_handler.add_sync_method("tx_estimateGas", move |params: Params| {
             rpc_request("tx_estimateGas");
-            let api = TransactionApi::new(mempool_gas.clone(), executor_gas.clone());
+            let api = TransactionApi::new(mempool_gas.clone(), executor_gas.clone(), chain_id);
 
             let request: CallRequest = match params.parse() {
                 Ok(req) => req,
@@ -776,7 +781,7 @@ impl RpcServer {
         let executor_price = executor.clone();
         io_handler.add_sync_method("tx_getGasPrice", move |_params: Params| {
             rpc_request("tx_getGasPrice");
-            let api = TransactionApi::new(mempool_price.clone(), executor_price.clone());
+            let api = TransactionApi::new(mempool_price.clone(), executor_price.clone(), chain_id);
 
             match block_on(api.get_gas_price()) {
                 Ok(price) => Ok(Value::String(format!("0x{:x}", price))),
@@ -912,12 +917,26 @@ impl RpcServer {
         });
 
         // Override eth_sendTransaction: parse standard Ethereum JSON-RPC format with hex addresses,
-        // enqueue via TransactionApi, then broadcast the tx if retrievable
+        // enqueue via TransactionApi, then broadcast the tx if retrievable.
+        // SECURITY (C-02): This method creates unsigned transactions from arbitrary `from`
+        // addresses. It is ONLY available when allow_eth_send_transaction is true (devnet mode).
+        // In production, clients must use eth_sendRawTransaction with a real signature.
         let mempool_send_broadcast = mempool.clone();
         let executor_send_broadcast = executor.clone();
         let peer_mgr_send_broadcast = peer_manager.clone();
+        let allow_send_tx = config.allow_eth_send_transaction;
         io_handler.add_sync_method("eth_sendTransaction", move |params: Params| {
             rpc_request("eth_sendTransaction");
+
+            // C-02 gate: reject if not in devnet/dev mode
+            if !allow_send_tx {
+                return Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::MethodNotFound,
+                    message: "eth_sendTransaction is disabled. Use eth_sendRawTransaction with a signed transaction.".into(),
+                    data: None,
+                });
+            }
+
             use crate::types::request::TransactionRequest;
             use citrate_execution::types::Address;
             use citrate_network::NetworkMessage;
@@ -986,6 +1005,7 @@ impl RpcServer {
             let api = TransactionApi::new(
                 mempool_send_broadcast.clone(),
                 executor_send_broadcast.clone(),
+                chain_id,
             );
             match block_on(api.send_transaction(req)) {
                 Ok(hash) => {

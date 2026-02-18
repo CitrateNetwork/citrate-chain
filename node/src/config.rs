@@ -137,6 +137,11 @@ pub struct RpcConfig {
 
     /// WebSocket listen address
     pub ws_addr: SocketAddr,
+
+    /// Allow eth_sendTransaction (unsigned, arbitrary-from transactions).
+    /// SECURITY (C-02): Must only be true in devnet/dev mode.
+    #[serde(default)]
+    pub allow_eth_send_transaction: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +195,7 @@ impl Default for NodeConfig {
                 enabled: true,
                 listen_addr: "127.0.0.1:8545".parse().unwrap(),
                 ws_addr: "127.0.0.1:8546".parse().unwrap(),
+                allow_eth_send_transaction: false, // Secure default
             },
             storage: StorageConfig {
                 data_dir: dirs::home_dir()
@@ -228,6 +234,8 @@ impl NodeConfig {
         }
         config.mining.enabled = true;
         config.mining.target_block_time = 2; // Fast blocks for testing
+        // C-02: Allow eth_sendTransaction only in devnet mode
+        config.rpc.allow_eth_send_transaction = true;
         config
     }
 

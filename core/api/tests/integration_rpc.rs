@@ -278,6 +278,8 @@ async fn test_eth_get_transaction_count_latest_vs_pending() {
         data: vec![],
         signature: Signature::new([1; 64]),
         tx_type: None,
+        chain_id: Some(1337),   // M-01: chain domain binding required
+        ecdsa_verified: true,   // C-01: embedded EVM address needs this flag
         ..Default::default()
     };
     let tx1 = Transaction {

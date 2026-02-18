@@ -12,11 +12,12 @@ use std::sync::Arc;
 pub struct TransactionApi {
     mempool: Arc<Mempool>,
     executor: Arc<Executor>,
+    chain_id: u64,
 }
 
 impl TransactionApi {
-    pub fn new(mempool: Arc<Mempool>, executor: Arc<Executor>) -> Self {
-        Self { mempool, executor }
+    pub fn new(mempool: Arc<Mempool>, executor: Arc<Executor>, chain_id: u64) -> Self {
+        Self { mempool, executor, chain_id }
     }
 
     /// Send raw transaction
@@ -69,6 +70,9 @@ impl TransactionApi {
         });
 
         // Create transaction
+        // SECURITY (C-02): This method is only reachable when allow_eth_send_transaction
+        // is true (devnet mode). The dummy signature is acceptable because the RPC server
+        // gates access; ecdsa_verified is set so the verifier accepts this trusted local tx.
         let mut tx = Transaction {
             hash: Hash::new(hash_data),
             nonce,
@@ -78,8 +82,10 @@ impl TransactionApi {
             gas_limit: request.gas.unwrap_or(21000),
             gas_price: request.gas_price.unwrap_or(1_000_000_000),
             data: request.data.unwrap_or_default(),
-            signature: Signature::new([1; 64]), // Devnet: unsigned transaction accepted
+            signature: Signature::new([1; 64]), // Devnet-only: unsigned transaction
             tx_type: None,
+            ecdsa_verified: true, // Trusted: devnet mode gated by RPC config
+            chain_id: Some(self.chain_id), // M-01: always bind to chain domain
             ..Default::default()
         };
 
