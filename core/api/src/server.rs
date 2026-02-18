@@ -430,12 +430,38 @@ impl RpcServer {
         chain_id: u64,
         economics_manager: Option<Arc<citrate_economics::UnifiedEconomicsManager>>,
     ) -> Self {
+        Self::with_economics_and_pause(
+            config,
+            storage,
+            mempool,
+            peer_manager,
+            executor,
+            chain_id,
+            economics_manager,
+            None,
+        )
+    }
+
+    /// WP-I.3: Full constructor with pause_flag support.
+    /// When pause_flag is Some, emergency pause/resume/status RPC methods
+    /// are registered and can halt block production.
+    pub fn with_economics_and_pause(
+        config: RpcConfig,
+        storage: Arc<StorageManager>,
+        mempool: Arc<Mempool>,
+        peer_manager: Arc<PeerManager>,
+        executor: Arc<Executor>,
+        chain_id: u64,
+        economics_manager: Option<Arc<citrate_economics::UnifiedEconomicsManager>>,
+        pause_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
         let mut io_handler = IoHandler::new();
 
         // Create filter registry for eth_newFilter/eth_getFilterChanges
         let filter_registry = Arc::new(FilterRegistry::new());
 
         // Register Ethereum-compatible RPC methods
+        // WP-I.3: Pass pause_flag so emergency methods are actually registered
         eth_rpc::register_eth_methods(
             &mut io_handler,
             storage.clone(),
@@ -443,7 +469,7 @@ impl RpcServer {
             executor.clone(),
             chain_id,
             filter_registry,
-            None, // No pause flag for basic server
+            pause_flag,
         );
 
         // Register economics-related RPC methods

@@ -71,7 +71,9 @@ pub struct BlockProducer {
     reward_calculator: RewardCalculator,
     economics_manager: Option<Arc<UnifiedEconomicsManager>>,
     /// Emergency pause flag — when true, block production stops.
-    paused: AtomicBool,
+    /// WP-I.3: Shared with the RPC server so citrate_emergencyPause
+    /// can halt block production remotely.
+    paused: Arc<AtomicBool>,
 }
 
 impl BlockProducer {
@@ -130,7 +132,7 @@ impl BlockProducer {
             target_block_time,
             reward_calculator,
             economics_manager: None,
-            paused: AtomicBool::new(false),
+            paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -190,7 +192,7 @@ impl BlockProducer {
             target_block_time,
             reward_calculator,
             economics_manager: None,
-            paused: AtomicBool::new(false),
+            paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -241,7 +243,7 @@ impl BlockProducer {
             target_block_time,
             reward_calculator,
             economics_manager: None,
-            paused: AtomicBool::new(false),
+            paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -316,8 +318,15 @@ impl BlockProducer {
             target_block_time,
             reward_calculator,
             economics_manager: Some(economics_manager),
-            paused: AtomicBool::new(false),
+            paused: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Set an external pause flag (shared with the RPC server).
+    /// WP-I.3: This allows the RPC citrate_emergencyPause method to
+    /// directly control block production.
+    pub fn set_pause_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.paused = flag;
     }
 
     /// Pause block production (emergency stop).

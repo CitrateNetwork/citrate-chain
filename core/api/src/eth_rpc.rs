@@ -785,6 +785,9 @@ pub fn register_eth_methods(
     // eth_call - Execute call without creating transaction
     let executor_call = executor.clone();
     io_handler.add_sync_method("eth_call", move |params: Params| {
+        // WP-I.4: eth_call costs 10 budget units
+        crate::rate_limit::check_method_budget(10)?;
+
         use citrate_consensus::types::{Block, BlockHeader, PublicKey, Signature, VrfProof};
 
         let exec = executor_call.clone();
@@ -959,6 +962,9 @@ pub fn register_eth_methods(
     // eth_estimateGas - Estimate gas for transaction by dry-running execution
     let executor_estimate = executor.clone();
     io_handler.add_sync_method("eth_estimateGas", move |params: Params| {
+        // WP-I.4: eth_estimateGas costs 10 budget units
+        crate::rate_limit::check_method_budget(10)?;
+
         use citrate_consensus::types::{Block, BlockHeader, PublicKey, Signature, VrfProof};
 
         let exec = executor_estimate.clone();
@@ -1315,6 +1321,9 @@ pub fn register_eth_methods(
     // eth_getLogs - Get logs matching filter criteria
     let storage_logs = storage.clone();
     io_handler.add_sync_method("eth_getLogs", move |params: Params| {
+        // WP-I.4: eth_getLogs costs 10 budget units
+        crate::rate_limit::check_method_budget(10)?;
+
         let params: Vec<Value> = match params.parse() {
             Ok(p) => p,
             Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
@@ -2133,9 +2142,17 @@ pub fn register_eth_methods(
     });
 
     // citrate_emergencyPause - Pause block production
+    // WP-I.2: These methods require operator authentication via Bearer token.
     if let Some(ref flag) = pause_flag {
         let pause_flag_pause = flag.clone();
         io_handler.add_sync_method("citrate_emergencyPause", move |_params: Params| {
+            if !crate::rate_limit::is_operator_authenticated() {
+                return Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::ServerError(-32600),
+                    message: "Operator authentication required".into(),
+                    data: None,
+                });
+            }
             pause_flag_pause.store(true, Ordering::Relaxed);
             tracing::warn!("EMERGENCY: Block production PAUSED via RPC");
             Ok(json!({"status": "paused", "message": "Block production paused"}))
@@ -2143,6 +2160,13 @@ pub fn register_eth_methods(
 
         let pause_flag_resume = flag.clone();
         io_handler.add_sync_method("citrate_emergencyResume", move |_params: Params| {
+            if !crate::rate_limit::is_operator_authenticated() {
+                return Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::ServerError(-32600),
+                    message: "Operator authentication required".into(),
+                    data: None,
+                });
+            }
             pause_flag_resume.store(false, Ordering::Relaxed);
             tracing::info!("Block production RESUMED via RPC");
             Ok(json!({"status": "resumed", "message": "Block production resumed"}))
@@ -2150,6 +2174,13 @@ pub fn register_eth_methods(
 
         let pause_flag_status = flag.clone();
         io_handler.add_sync_method("citrate_emergencyStatus", move |_params: Params| {
+            if !crate::rate_limit::is_operator_authenticated() {
+                return Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::ServerError(-32600),
+                    message: "Operator authentication required".into(),
+                    data: None,
+                });
+            }
             let paused = pause_flag_status.load(Ordering::Relaxed);
             Ok(json!({"paused": paused}))
         });

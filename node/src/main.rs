@@ -11,6 +11,7 @@ use citrate_sequencer::mempool::{Mempool, MempoolConfig};
 use citrate_storage::{pruning::PruningConfig, StorageManager};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -1421,9 +1422,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
 
     let economics_manager = Arc::new(economics_manager_temp);
 
+    // WP-I.3: Create pause_flag shared between RPC server and block producer.
+    // When citrate_emergencyPause is called via RPC, the producer sees the
+    // flag and stops producing blocks.
+    let pause_flag = Arc::new(AtomicBool::new(false));
+
     // Start RPC server if enabled
     let rpc_handle = if config.rpc.enabled {
         info!("Starting RPC server on {}", config.rpc.listen_addr);
+
+        // WP-I.2: Read operator token from env for privileged RPC gating
+        let operator_token = std::env::var("CITRATE_OPERATOR_TOKEN").ok()
+            .filter(|t| !t.is_empty());
 
         let rpc_config = RpcConfig {
             listen_addr: config.rpc.listen_addr,
@@ -1432,10 +1442,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             threads: 4,
             // C-02: Only allow eth_sendTransaction in devnet/dev mode
             allow_eth_send_transaction: config.rpc.allow_eth_send_transaction,
+            rate_limit: citrate_api::rate_limit::RateLimitConfig {
+                operator_token,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
-        let rpc_server = RpcServer::with_economics(
+        let rpc_server = RpcServer::with_economics_and_pause(
             rpc_config,
             storage.clone(),
             mempool.clone(),
@@ -1443,6 +1457,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             executor.clone(),
             config.chain.chain_id,
             Some(economics_manager.clone()),
+            Some(pause_flag.clone()),
         );
 
         Some(tokio::spawn(async move {
@@ -1510,7 +1525,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
 
         // Use the economics manager created earlier
-        let producer = Arc::new(BlockProducer::with_economics(
+        let mut producer_instance = BlockProducer::with_economics(
             storage.clone(),
             executor.clone(),
             mempool.clone(),
@@ -1519,7 +1534,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             signing_key,
             config.mining.target_block_time,
             economics_manager,
-        ).await);
+        ).await;
+        // WP-I.3: Share the same pause_flag between RPC server and producer
+        // so citrate_emergencyPause actually halts block production.
+        producer_instance.set_pause_flag(pause_flag.clone());
+        let producer = Arc::new(producer_instance);
 
         tokio::spawn(async move {
             producer.start().await;
