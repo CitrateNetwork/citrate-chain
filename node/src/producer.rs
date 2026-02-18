@@ -2,6 +2,7 @@ use citrate_consensus::chain_selection::ChainSelector;
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::tip_selection::TipSelector;
+use citrate_consensus::crypto::{self, Ed25519SigningKey};
 use citrate_consensus::types::{
     Block, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
@@ -19,27 +20,8 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
-/// Calculate block header hash using SHA3-256
-fn calculate_block_hash_header(header: &BlockHeader) -> Hash {
-    let mut hasher = Sha3_256::new();
-
-    // Hash header fields
-    hasher.update(header.version.to_le_bytes());
-    hasher.update(header.selected_parent_hash.as_bytes());
-    for parent in &header.merge_parent_hashes {
-        hasher.update(parent.as_bytes());
-    }
-    hasher.update(header.timestamp.to_le_bytes());
-    hasher.update(header.height.to_le_bytes());
-    hasher.update(header.blue_score.to_le_bytes());
-    hasher.update(header.blue_work.to_le_bytes());
-    hasher.update(header.pruning_point.as_bytes());
-
-    let hash_bytes = hasher.finalize();
-    let mut hash_array = [0u8; 32];
-    hash_array.copy_from_slice(&hash_bytes[..32]);
-    Hash::new(hash_array)
-}
+// Block hash is now computed via Block::compute_hash() in consensus/types.rs (C-05).
+// This ensures a single canonical hash function used by both producer and validator.
 
 /// Generate a simplified VRF proof for block production.
 /// C4 fix: Produces a non-empty 32-byte proof that passes gossip validation.
@@ -78,6 +60,9 @@ pub struct BlockProducer {
     ai_state_manager: Arc<AIStateManager>,
     peer_manager: Option<Arc<PeerManager>>,
     coinbase: PublicKey,
+    /// ed25519 signing key for block signatures (WP-G.2).
+    /// The proposer_pubkey in block headers is derived from this key.
+    signing_key: Ed25519SigningKey,
     target_block_time: u64,
     reward_calculator: RewardCalculator,
     economics_manager: Option<Arc<UnifiedEconomicsManager>>,
@@ -92,6 +77,7 @@ impl BlockProducer {
         executor: Arc<Executor>,
         mempool: Arc<Mempool>,
         coinbase: PublicKey,
+        signing_key: Ed25519SigningKey,
         target_block_time: u64,
     ) -> Self {
         // Create consensus components with a new DAG store
@@ -136,6 +122,7 @@ impl BlockProducer {
             ai_state_manager,
             peer_manager: None,
             coinbase,
+            signing_key,
             target_block_time,
             reward_calculator,
             economics_manager: None,
@@ -150,6 +137,7 @@ impl BlockProducer {
         mempool: Arc<Mempool>,
         peer_manager: Option<Arc<PeerManager>>,
         coinbase: PublicKey,
+        signing_key: Ed25519SigningKey,
         target_block_time: u64,
     ) -> Self {
         // Create consensus components with a new DAG store
@@ -194,6 +182,7 @@ impl BlockProducer {
             ai_state_manager,
             peer_manager,
             coinbase,
+            signing_key,
             target_block_time,
             reward_calculator,
             economics_manager: None,
@@ -209,6 +198,7 @@ impl BlockProducer {
         mempool: Arc<Mempool>,
         peer_manager: Option<Arc<PeerManager>>,
         coinbase: PublicKey,
+        signing_key: Ed25519SigningKey,
         target_block_time: u64,
         reward_config: RewardConfig,
     ) -> Self {
@@ -243,6 +233,7 @@ impl BlockProducer {
             ai_state_manager,
             peer_manager,
             coinbase,
+            signing_key,
             target_block_time,
             reward_calculator,
             economics_manager: None,
@@ -257,6 +248,7 @@ impl BlockProducer {
         mempool: Arc<Mempool>,
         peer_manager: Option<Arc<PeerManager>>,
         coinbase: PublicKey,
+        signing_key: Ed25519SigningKey,
         target_block_time: u64,
         economics_manager: Arc<UnifiedEconomicsManager>,
     ) -> Self {
@@ -316,6 +308,7 @@ impl BlockProducer {
             ai_state_manager,
             peer_manager,
             coinbase,
+            signing_key,
             target_block_time,
             reward_calculator,
             economics_manager: Some(economics_manager),
@@ -395,7 +388,7 @@ impl BlockProducer {
                 blue_score: 0, // Will be calculated
                 blue_work: 0,  // Will be calculated
                 pruning_point: Hash::default(),
-                proposer_pubkey: self.coinbase,
+                proposer_pubkey: PublicKey::new(self.signing_key.verifying_key().to_bytes()),
                 vrf_reveal: generate_block_vrf(&self.coinbase, &selected_parent, 0),
                 base_fee_per_gas: 1_000_000_000, // 1 gwei
                 gas_used: 0,
@@ -445,17 +438,14 @@ impl BlockProducer {
             blue_score,
             blue_work,
             pruning_point: Hash::default(),
-            proposer_pubkey: self.coinbase,
+            proposer_pubkey: PublicKey::new(self.signing_key.verifying_key().to_bytes()),
             vrf_reveal: generate_block_vrf(&self.coinbase, &selected_parent, last_height + 1),
             base_fee_per_gas: 1_000_000_000, // 1 gwei - TODO: calculate from parent
             gas_used: 0, // Will be updated after execution
             gas_limit: 30_000_000, // 30M gas default
         };
 
-        // Compute block hash (simplified)
-        header.block_hash = calculate_block_hash_header(&header);
-
-        // Execute transactions and calculate state roots
+        // Execute transactions and calculate state/commitment roots FIRST
         let (state_root, receipts) = self
             .execute_block_transactions(&transactions, &header)
             .await?;
@@ -463,8 +453,8 @@ impl BlockProducer {
         let receipt_root = self.calculate_receipt_root(&receipts)?;
         let artifact_root = self.calculate_artifact_root(&transactions)?;
 
-        // Create block with all computed data
-        let block = Block {
+        // Create block with all computed data (hash + signature placeholders — computed next)
+        let mut block = Block {
             header: header.clone(),
             state_root,
             tx_root,
@@ -472,10 +462,17 @@ impl BlockProducer {
             artifact_root,
             ghostdag_params: self.ghostdag.params().clone(),
             transactions,
-            signature: Signature::new([1; 64]), // Dummy signature for devnet
+            signature: Signature::default(), // Placeholder — signed below
             embedded_models: vec![],
             required_pins: vec![],
         };
+
+        // C-05: Compute canonical block hash from ALL fields including commitment roots.
+        // This must happen AFTER execution so state_root/tx_root/receipt_root are final.
+        block.header.block_hash = block.compute_hash();
+
+        // WP-G.2: Sign the canonical block hash with the proposer's ed25519 key.
+        block.signature = crypto::sign_block(&block.header.block_hash, &self.signing_key);
 
         // Process economics if available, otherwise use basic rewards
         if let Some(economics) = &self.economics_manager {
@@ -542,6 +539,20 @@ impl BlockProducer {
         info!("Persisting state changes to storage...");
         let modified_count = self.executor.persist_state_changes()?;
         info!("Persisted {} modified accounts to storage", modified_count);
+
+        // WP-G.4: Verify state root consistency after persistence.
+        // The executor's in-memory state root (used in the block) must still match.
+        let post_persist_root = self.executor.calculate_state_root();
+        if post_persist_root != block.state_root {
+            error!(
+                "STATE ROOT MISMATCH after persist: block={} post_persist={}",
+                block.state_root, post_persist_root
+            );
+            return Err(anyhow::anyhow!(
+                "State root mismatch after persistence: block {} vs post-persist {}",
+                block.state_root, post_persist_root
+            ));
+        }
 
         // Persist block and related data
         self.storage.blocks.put_block(&block)?;
@@ -619,25 +630,36 @@ impl BlockProducer {
         Ok((selected_parent, merge_parents))
     }
 
-    /// Select transactions with AI operation priority
+    /// Select transactions with AI operation priority.
+    /// H-03 fix: Deduplicates by hash across AI and standard selection phases.
     async fn select_transactions_with_ai_priority(&self) -> anyhow::Result<Vec<Transaction>> {
         let mut selected = Vec::new();
+        let mut seen = std::collections::HashSet::new();
 
         // Define capacity limits
-        const MAX_BLOCK_SIZE: usize = 10_000_000; // 10MB
+        // H-08 fix: Use network-aligned limit (see WP-G.6)
+        const MAX_BLOCK_SIZE: usize = 1_000_000; // 1MB — aligned with transport/gossip
         const MAX_AI_TXS_PER_BLOCK: usize = 10;
         const MAX_STANDARD_TXS: usize = 100;
 
         // Get AI transactions first (model operations, inference requests)
         let ai_txs = self.mempool.get_ai_transactions(MAX_AI_TXS_PER_BLOCK).await;
-        selected.extend(ai_txs);
+        for tx in ai_txs {
+            if seen.insert(tx.hash) {
+                selected.push(tx);
+            }
+        }
 
-        // Fill remaining space with standard transactions
+        // Fill remaining space with standard transactions, skipping duplicates
         let standard_txs = self
             .mempool
             .get_best_transactions(MAX_STANDARD_TXS, MAX_BLOCK_SIZE)
             .await;
-        selected.extend(standard_txs);
+        for tx in standard_txs {
+            if seen.insert(tx.hash) {
+                selected.push(tx);
+            }
+        }
 
         Ok(selected)
     }
@@ -690,8 +712,10 @@ impl BlockProducer {
             }
         }
 
-        // Calculate final state root including AI state
-        let state_root = self.ai_state_manager.calculate_state_root().await?;
+        // WP-G.4: Compute state root from the executor's in-memory post-execution state.
+        // This uses the state trie that has been updated by transaction execution,
+        // NOT the storage-backed view which still reflects the previous block.
+        let state_root = self.executor.calculate_state_root();
 
         Ok((state_root, receipts))
     }

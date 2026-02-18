@@ -193,6 +193,54 @@ impl Block {
         self.header.block_hash
     }
 
+    /// Compute the canonical block hash from all consensus-critical fields (C-05).
+    ///
+    /// This is the single authoritative hash function for blocks. It covers:
+    /// - All header fields (parent, height, timestamp, blue score, proposer, VRF)
+    /// - All commitment roots (state, tx, receipt, artifact)
+    /// - Gas parameters
+    ///
+    /// Both the producer and the validator MUST use this function.
+    pub fn compute_hash(&self) -> Hash {
+        use sha3::{Digest, Sha3_256};
+        let mut hasher = Sha3_256::new();
+
+        // Header fields
+        hasher.update(self.header.version.to_le_bytes());
+        hasher.update(self.header.selected_parent_hash.as_bytes());
+        for parent in &self.header.merge_parent_hashes {
+            hasher.update(parent.as_bytes());
+        }
+        hasher.update(self.header.timestamp.to_le_bytes());
+        hasher.update(self.header.height.to_le_bytes());
+        hasher.update(self.header.blue_score.to_le_bytes());
+        hasher.update(self.header.blue_work.to_le_bytes());
+        hasher.update(self.header.pruning_point.as_bytes());
+        hasher.update(self.header.proposer_pubkey.as_bytes());
+        hasher.update(&self.header.vrf_reveal.proof);
+        hasher.update(self.header.vrf_reveal.output.as_bytes());
+        hasher.update(self.header.base_fee_per_gas.to_le_bytes());
+        hasher.update(self.header.gas_used.to_le_bytes());
+        hasher.update(self.header.gas_limit.to_le_bytes());
+
+        // Commitment roots (these bind the block body to the hash)
+        hasher.update(self.state_root.as_bytes());
+        hasher.update(self.tx_root.as_bytes());
+        hasher.update(self.receipt_root.as_bytes());
+        hasher.update(self.artifact_root.as_bytes());
+
+        let hash_bytes = hasher.finalize();
+        let mut hash_array = [0u8; 32];
+        hash_array.copy_from_slice(&hash_bytes[..32]);
+        Hash::new(hash_array)
+    }
+
+    /// Verify that the block's advertised hash matches the canonical computation.
+    /// Returns false if the hash has been tampered with.
+    pub fn verify_hash(&self) -> bool {
+        self.header.block_hash == self.compute_hash()
+    }
+
     /// Get selected parent
     pub fn selected_parent(&self) -> Hash {
         self.header.selected_parent_hash

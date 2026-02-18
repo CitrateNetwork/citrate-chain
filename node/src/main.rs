@@ -1442,6 +1442,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let mut coinbase = [0u8; 32];
         coinbase.copy_from_slice(&coinbase_bytes[..32.min(coinbase_bytes.len())]);
 
+        // WP-G.2: Generate block signing key.
+        // Deterministic derivation from coinbase for devnet reproducibility.
+        // Production nodes should load a persistent key from disk.
+        let signing_key = {
+            use sha3::{Digest as _, Sha3_256};
+            let mut hasher = Sha3_256::new();
+            hasher.update(b"citrate-block-signing-key-v1");
+            hasher.update(&coinbase);
+            let seed = hasher.finalize();
+            let mut seed_bytes = [0u8; 32];
+            seed_bytes.copy_from_slice(&seed);
+            citrate_consensus::crypto::Ed25519SigningKey::from_bytes(&seed_bytes)
+        };
+        info!(
+            "Block signing key: proposer_pubkey={}",
+            hex::encode(signing_key.verifying_key().to_bytes())
+        );
+
         // Always use peer manager if we have one (network is already setup above)
         let producer_peer_manager = Some(peer_manager.clone());
 
@@ -1463,6 +1481,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             mempool.clone(),
             producer_peer_manager,
             citrate_consensus::PublicKey::new(coinbase),
+            signing_key,
             config.mining.target_block_time,
             economics_manager,
         ).await);

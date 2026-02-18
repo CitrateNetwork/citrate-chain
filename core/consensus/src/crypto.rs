@@ -1,8 +1,11 @@
 // citrate/core/consensus/src/crypto.rs
 
-use crate::types::{PublicKey, Signature, Transaction};
+use crate::types::{Block, Hash, PublicKey, Signature, Transaction};
 use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, Verifier, VerifyingKey};
 use thiserror::Error;
+
+// Re-export SigningKey so callers (e.g., node crate) don't need a direct ed25519-dalek dependency.
+pub use ed25519_dalek::SigningKey as Ed25519SigningKey;
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -121,6 +124,29 @@ fn canonical_tx_bytes(tx: &Transaction) -> Result<Vec<u8>, CryptoError> {
 /// Generate a new keypair for testing
 pub fn generate_keypair() -> SigningKey {
     SigningKey::from_bytes(&rand::random())
+}
+
+/// Sign a block's canonical hash with an ed25519 signing key.
+///
+/// The block hash MUST already be computed via `Block::compute_hash()` before calling this.
+/// The signature covers the hash, which in turn covers all consensus-critical fields.
+pub fn sign_block(block_hash: &Hash, signing_key: &SigningKey) -> Signature {
+    let sig: DalekSignature = signing_key.sign(block_hash.as_bytes());
+    Signature::new(sig.to_bytes())
+}
+
+/// Verify a block's signature against its `proposer_pubkey`.
+///
+/// Returns `Ok(true)` if valid, `Ok(false)` if the signature doesn't match.
+/// Returns `Err` only for malformed keys.
+pub fn verify_block_signature(block: &Block) -> Result<bool, CryptoError> {
+    let pubkey = VerifyingKey::from_bytes(block.header.proposer_pubkey.as_bytes())
+        .map_err(|_| CryptoError::InvalidPublicKey)?;
+    let sig = DalekSignature::from_bytes(block.signature.as_bytes());
+    match pubkey.verify(block.header.block_hash.as_bytes(), &sig) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 #[cfg(test)]

@@ -133,14 +133,16 @@ impl GossipProtocol {
 
         self.stats.write().await.blocks_received += 1;
 
-        // Validate block (basic checks)
+        // Validate block (full integrity checks — WP-G.3)
         if !self.validate_block(&block).await {
-            warn!("Invalid block received from {}: {}", from_peer, hash);
+            warn!("Block validation failed from {}: {}", from_peer, hash);
             // Penalize peer for sending invalid block
             self.peer_manager
                 .update_peer_score(from_peer, SCORE_INVALID_BLOCK)
                 .await;
-            return Err(NetworkError::InvalidMessage("Invalid block".to_string()));
+            return Err(NetworkError::InvalidMessage(
+                format!("Block {} failed validation", hash)
+            ));
         }
 
         // Reward peer for valid block relay
@@ -289,38 +291,110 @@ impl GossipProtocol {
         eligible
     }
 
-    /// Validate block (basic checks)
+    /// Validate block with full integrity checks (WP-G.3).
+    ///
+    /// Checks performed (in order):
+    /// 1. BLOCK_OVERSIZED — serialized size exceeds transport limit
+    /// 2. INVALID_HEIGHT — height=0 on non-genesis
+    /// 3. TIMESTAMP_FUTURE — timestamp > now + 15min
+    /// 4. ZERO_BLUE_SCORE — non-genesis with blue_score=0
+    /// 5. MISSING_VRF — non-genesis without VRF proof
+    /// 6. MISSING_PARENT — non-genesis with zero selected_parent_hash
+    /// 7. HASH_MISMATCH — recomputed hash differs from advertised (C-05)
+    /// 8. TX_ROOT_MISMATCH — recomputed tx_root differs from header
+    /// 9. INVALID_SIGNATURE — ed25519 signature verification failed (WP-G.2)
     async fn validate_block(&self, block: &Block) -> bool {
-        // Check block size
+        // 1. BLOCK_OVERSIZED
         let size = bincode::serialize(block).unwrap_or_default().len();
         if size > self.config.max_message_size {
+            warn!("[BLOCK_OVERSIZED] block={} size={}", block.header.block_hash, size);
             return false;
         }
 
-        // Additional validation
-        // Check block header validity
+        // 2. INVALID_HEIGHT
         if block.header.height == 0 && !block.is_genesis() {
+            warn!("[INVALID_HEIGHT] block={}", block.header.block_hash);
             return false;
         }
 
-        // Check timestamp is reasonable (not too far in future)
+        // 3. TIMESTAMP_FUTURE
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
         if block.header.timestamp > now + 900 {
-            // Allow 15 minutes clock drift
+            warn!("[TIMESTAMP_FUTURE] block={} ts={} now={}", block.header.block_hash, block.header.timestamp, now);
             return false;
         }
 
-        // Check blue score is not decreasing
+        // 4. ZERO_BLUE_SCORE
         if block.header.blue_score == 0 && !block.is_genesis() {
+            warn!("[ZERO_BLUE_SCORE] block={}", block.header.block_hash);
             return false;
         }
 
-        // VRF proof must be present for non-genesis blocks
+        // 5. MISSING_VRF
         if !block.is_genesis() && block.header.vrf_reveal.proof.is_empty() {
+            warn!("[MISSING_VRF] block={}", block.header.block_hash);
             return false;
+        }
+
+        // 6. MISSING_PARENT — non-genesis must reference a selected parent
+        if !block.is_genesis() && block.header.selected_parent_hash == Hash::default() {
+            warn!("[MISSING_PARENT] block={}", block.header.block_hash);
+            return false;
+        }
+
+        // 7. HASH_MISMATCH — recompute canonical hash from all fields (C-05)
+        if !block.verify_hash() {
+            warn!(
+                "[HASH_MISMATCH] block={} computed={}",
+                block.header.block_hash,
+                block.compute_hash()
+            );
+            return false;
+        }
+
+        // 8. TX_ROOT_MISMATCH — verify tx_root matches transactions in block
+        {
+            use sha3::{Digest, Sha3_256};
+            let mut hasher = Sha3_256::new();
+            for tx in &block.transactions {
+                hasher.update(tx.hash.as_bytes());
+            }
+            let computed_bytes = hasher.finalize();
+            let mut computed_array = [0u8; 32];
+            computed_array.copy_from_slice(&computed_bytes[..32]);
+            let computed_tx_root = Hash::new(computed_array);
+            if block.tx_root != computed_tx_root {
+                warn!(
+                    "[TX_ROOT_MISMATCH] block={} expected={} computed={}",
+                    block.header.block_hash, block.tx_root, computed_tx_root
+                );
+                return false;
+            }
+        }
+
+        // 9. INVALID_SIGNATURE — verify ed25519 block signature (skip genesis)
+        if !block.is_genesis() {
+            match citrate_consensus::crypto::verify_block_signature(block) {
+                Ok(true) => { /* valid */ }
+                Ok(false) => {
+                    warn!(
+                        "[INVALID_SIGNATURE] block={} proposer={}",
+                        block.header.block_hash,
+                        hex::encode(block.header.proposer_pubkey.as_bytes())
+                    );
+                    return false;
+                }
+                Err(e) => {
+                    warn!(
+                        "[INVALID_SIGNATURE] block={} error={}",
+                        block.header.block_hash, e
+                    );
+                    return false;
+                }
+            }
         }
 
         true
