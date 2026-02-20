@@ -15,7 +15,6 @@ members = [
     "node-app",
     "wallet",
     "faucet",
-    "gui/citrate-core/src-tauri",
     "gui/lattice-core/src-tauri",
 ]
 # Default build targets: unified node binary (includes wallet + CLI).

@@ -458,13 +458,78 @@ impl BlockProducer {
             gas_limit: 30_000_000, // 30M gas default
         };
 
-        // Execute transactions and calculate state/commitment roots FIRST
-        let (state_root, receipts) = self
+        // Execute transactions (state root computed after rewards below)
+        let (_pre_reward_root, receipts) = self
             .execute_block_transactions(&transactions, &header)
             .await?;
         let tx_root = self.calculate_tx_root(&transactions)?;
         let receipt_root = self.calculate_receipt_root(&receipts)?;
         let artifact_root = self.calculate_artifact_root(&transactions)?;
+
+        // Apply block rewards BEFORE computing the final state root.
+        // Rewards modify the executor's in-memory state, so state_root must
+        // be computed after this step to include reward balances.
+        let validator_address = citrate_execution::types::Address(
+            self.coinbase.0[0..20].try_into().unwrap_or([0; 20])
+        );
+
+        if let Some(economics) = &self.economics_manager {
+            info!("Economics: Applying enhanced reward system for block {}", header.height);
+
+            let base_reward = economics.get_config().rewards_config.base_block_reward;
+            let mut total_reward = base_reward;
+
+            let staked_amount = economics.get_staked_balance(&validator_address);
+            if staked_amount > primitive_types::U256::zero() {
+                let staking_bonus = base_reward / primitive_types::U256::from(10);
+                total_reward = total_reward + staking_bonus;
+                info!("Economics: Applied staking bonus of {} wei for staked amount {}", staking_bonus, staked_amount);
+            }
+
+            let reputation_score = economics.get_reputation_score(&validator_address);
+            if reputation_score > 0.5 {
+                let reputation_bonus = base_reward * primitive_types::U256::from((reputation_score * 20.0) as u64) / primitive_types::U256::from(100);
+                total_reward = total_reward + reputation_bonus;
+                info!("Economics: Applied reputation bonus of {} wei for score {}", reputation_bonus, reputation_score);
+            }
+
+            let current_gas_price = economics.get_operation_cost(citrate_economics::OperationType::AIInference { compute_units: 1000 });
+            if current_gas_price > economics.get_config().pricing_config.base_gas_price {
+                let congestion_bonus = base_reward / primitive_types::U256::from(20);
+                total_reward = total_reward + congestion_bonus;
+                info!("Economics: Applied congestion bonus of {} wei due to high gas prices", congestion_bonus);
+            }
+
+            let current_balance = self.executor.get_balance(&validator_address);
+            self.executor.set_balance(&validator_address, current_balance + total_reward);
+            info!("Economics: Applied total enhanced reward of {} wei to validator {} (base: {}, bonuses: {})",
+                total_reward, hex::encode(validator_address.0), base_reward, total_reward - base_reward);
+
+            if let Some(economic_state) = economics.get_economic_state() {
+                info!("Economics: Network state - Gas price: {}, Staked: {}, Treasury: {}",
+                    economic_state.gas_price, economic_state.staked_amount, economic_state.treasury_balance);
+            }
+        } else {
+            // Basic reward system — create a temporary block for reward calculation
+            // (calculate_reward only reads header.height and transactions, not state_root)
+            let temp_block = Block {
+                header: header.clone(),
+                state_root: Hash::default(),
+                tx_root,
+                receipt_root,
+                artifact_root,
+                ghostdag_params: self.ghostdag.params().clone(),
+                transactions: transactions.clone(),
+                signature: Signature::default(),
+                embedded_models: vec![],
+                required_pins: vec![],
+            };
+            let reward = self.reward_calculator.calculate_reward(&temp_block);
+            self.apply_basic_rewards(&reward, &validator_address);
+        }
+
+        // NOW compute final state root — includes both tx effects and reward balances
+        let state_root = self.executor.calculate_state_root();
 
         // Create block with all computed data (hash + signature placeholders — computed next)
         let mut block = Block {
@@ -481,74 +546,13 @@ impl BlockProducer {
         };
 
         // C-05: Compute canonical block hash from ALL fields including commitment roots.
-        // This must happen AFTER execution so state_root/tx_root/receipt_root are final.
+        // This must happen AFTER execution AND rewards so state_root is final.
         block.header.block_hash = block.compute_hash();
 
         // WP-G.2: Sign the canonical block hash with the proposer's ed25519 key.
         block.signature = crypto::sign_block(&block.header.block_hash, &self.signing_key);
 
-        // Process economics if available, otherwise use basic rewards
-        if let Some(economics) = &self.economics_manager {
-            // Apply economics-based rewards
-            info!("Economics: Applying enhanced reward system for block {}", block.header.height);
-
-            // Get base reward from economics config
-            let base_reward = economics.get_config().rewards_config.base_block_reward;
-
-            // Apply economics-based rewards to validator
-            let validator_address = citrate_execution::types::Address(
-                self.coinbase.0[0..20].try_into().unwrap_or([0; 20])
-            );
-
-            // Calculate rewards based on economics config and network participation
-            let mut total_reward = base_reward;
-
-            // Apply staking bonus if validator has staked tokens
-            let staked_amount = economics.get_staked_balance(&validator_address);
-            if staked_amount > primitive_types::U256::zero() {
-                let staking_bonus = base_reward / primitive_types::U256::from(10); // 10% staking bonus
-                total_reward = total_reward + staking_bonus;
-                info!("Economics: Applied staking bonus of {} wei for staked amount {}", staking_bonus, staked_amount);
-            }
-
-            // Apply reputation bonus based on AI contributions
-            let reputation_score = economics.get_reputation_score(&validator_address);
-            if reputation_score > 0.5 {
-                let reputation_bonus = base_reward * primitive_types::U256::from((reputation_score * 20.0) as u64) / primitive_types::U256::from(100);
-                total_reward = total_reward + reputation_bonus;
-                info!("Economics: Applied reputation bonus of {} wei for score {}", reputation_bonus, reputation_score);
-            }
-
-            // Calculate dynamic gas pricing for future blocks
-            let current_gas_price = economics.get_operation_cost(citrate_economics::OperationType::AIInference { compute_units: 1000 });
-            if current_gas_price > economics.get_config().pricing_config.base_gas_price {
-                // Network is congested, apply congestion bonus
-                let congestion_bonus = base_reward / primitive_types::U256::from(20); // 5% congestion bonus
-                total_reward = total_reward + congestion_bonus;
-                info!("Economics: Applied congestion bonus of {} wei due to high gas prices", congestion_bonus);
-            }
-
-            // Apply the calculated rewards
-            let current_balance = self.executor.get_balance(&validator_address);
-            self.executor.set_balance(&validator_address, current_balance + total_reward);
-            info!("Economics: Applied total enhanced reward of {} wei to validator {} (base: {}, bonuses: {})",
-                total_reward, hex::encode(validator_address.0), base_reward, total_reward - base_reward);
-
-            // Track economic metrics for the block
-            if let Some(economic_state) = economics.get_economic_state() {
-                info!("Economics: Network state - Gas price: {}, Staked: {}, Treasury: {}",
-                    economic_state.gas_price, economic_state.staked_amount, economic_state.treasury_balance);
-            }
-        } else {
-            // Use basic reward system as fallback
-            let reward = self.reward_calculator.calculate_reward(&block);
-            let validator_address = citrate_execution::types::Address(
-                self.coinbase.0[0..20].try_into().unwrap_or([0; 20])
-            );
-            self.apply_basic_rewards(&reward, &validator_address);
-        }
-
-        // Persist state changes from executed transactions to storage
+        // Persist state changes from executed transactions + rewards to storage
         info!("Persisting state changes to storage...");
         let modified_count = self.executor.persist_state_changes()?;
         info!("Persisted {} modified accounts to storage", modified_count);
