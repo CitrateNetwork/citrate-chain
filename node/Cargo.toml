@@ -39,6 +39,7 @@ async-trait = "0.1"
 # Enable TLS, multipart uploads (IPFS add), and JSON helpers used in node code
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "multipart", "json"] }
 rand = { workspace = true }
+k256 = { version = "0.13", features = ["ecdsa"] }
 # Prometheus-style metrics
 metrics = "0.21"
 metrics-exporter-prometheus = "0.12"

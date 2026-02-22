@@ -105,7 +105,11 @@ enum Commands {
     Devnet,
 
     /// Generate a new keypair for signing
-    Keygen,
+    Keygen {
+        /// Generate ed25519 keypair (for P2P identity). Default is secp256k1 (EVM/MetaMask compatible).
+        #[arg(long)]
+        ed25519: bool,
+    },
 
     /// Manage AI models (download, pin, list)
     Model {
@@ -220,8 +224,8 @@ async fn main() -> Result<()> {
             run_devnet().await?;
             return Ok(());
         }
-        Some(Commands::Keygen) => {
-            generate_keypair();
+        Some(Commands::Keygen { ed25519 }) => {
+            generate_keypair(ed25519);
             return Ok(());
         }
         Some(Commands::Model { command }) => {
@@ -591,13 +595,42 @@ async fn run_devnet() -> Result<()> {
     start_node(config).await
 }
 
-fn generate_keypair() {
-    let signing_key = crypto::generate_keypair();
-    let verifying_key = signing_key.verifying_key();
+fn generate_keypair(use_ed25519: bool) {
+    if use_ed25519 {
+        // Ed25519 — for P2P Noise identity and native Citrate operations
+        let signing_key = crypto::generate_keypair();
+        let verifying_key = signing_key.verifying_key();
 
-    println!("New keypair generated:");
-    println!("Private key: {}", hex::encode(signing_key.to_bytes()));
-    println!("Public key:  {}", hex::encode(verifying_key.to_bytes()));
+        println!("Ed25519 keypair generated (for P2P / native Citrate):");
+        println!("Private key: {}", hex::encode(signing_key.to_bytes()));
+        println!("Public key:  {}", hex::encode(verifying_key.to_bytes()));
+    } else {
+        // Secp256k1 — MetaMask / Foundry / EVM compatible (default)
+        use k256::ecdsa::SigningKey as K256SigningKey;
+        use sha3::{Digest, Keccak256};
+
+        let secret_key = K256SigningKey::random(&mut rand::thread_rng());
+        let public_key = secret_key.verifying_key();
+
+        // Uncompressed public key (65 bytes: 0x04 || x || y)
+        let pubkey_bytes = public_key.to_encoded_point(false);
+        // Ethereum address = last 20 bytes of Keccak256(pubkey_xy)
+        // Skip the 0x04 prefix byte
+        let mut hasher = Keccak256::new();
+        hasher.update(&pubkey_bytes.as_bytes()[1..]);
+        let hash = hasher.finalize();
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&hash[12..32]);
+
+        let private_key_hex = hex::encode(secret_key.to_bytes());
+
+        println!("Secp256k1 keypair generated (EVM / MetaMask compatible):");
+        println!("Private key: 0x{}", private_key_hex);
+        println!("Address:     0x{}", hex::encode(address));
+        println!();
+        println!("Import the private key into MetaMask to use this account.");
+        println!("The address above will match what MetaMask displays.");
+    }
 }
 
 fn show_genesis_info() -> Result<()> {
