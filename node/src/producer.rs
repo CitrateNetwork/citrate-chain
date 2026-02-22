@@ -105,10 +105,10 @@ impl BlockProducer {
 
         // Create reward calculator with default config
         let reward_config = RewardConfig {
-            block_reward: 10, // 10 LATT per block
+            block_reward: 10, // 10 SALT per block
             halving_interval: 2_100_000,
-            inference_bonus: 1,        // 0.01 LATT per inference
-            model_deployment_bonus: 1, // 1 LATT per model deployment
+            inference_bonus: 1,        // 0.01 SALT per inference
+            model_deployment_bonus: 1, // 1 SALT per model deployment
             treasury_percentage: 10,
             treasury_address: citrate_execution::types::Address([0x11; 20]), // Treasury address
         };
@@ -165,10 +165,10 @@ impl BlockProducer {
 
         // Create reward calculator with default config
         let reward_config = RewardConfig {
-            block_reward: 10, // 10 LATT per block
+            block_reward: 10, // 10 SALT per block
             halving_interval: 2_100_000,
-            inference_bonus: 1,        // 0.01 LATT per inference
-            model_deployment_bonus: 1, // 1 LATT per model deployment
+            inference_bonus: 1,        // 0.01 SALT per inference
+            model_deployment_bonus: 1, // 1 SALT per model deployment
             treasury_percentage: 10,
             treasury_address: citrate_execution::types::Address([0x11; 20]), // Treasury address
         };

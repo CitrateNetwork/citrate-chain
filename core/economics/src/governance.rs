@@ -9,10 +9,10 @@ use anyhow::{Result, anyhow};
 /// Governance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernanceConfig {
-    /// Minimum LATT required to create a proposal
+    /// Minimum SALT required to create a proposal
     pub proposal_threshold: U256,
 
-    /// Minimum LATT required to vote
+    /// Minimum SALT required to vote
     pub vote_threshold: U256,
 
     /// Voting period in blocks
@@ -34,8 +34,8 @@ pub struct GovernanceConfig {
 impl Default for GovernanceConfig {
     fn default() -> Self {
         Self {
-            proposal_threshold: U256::from(10_000) * U256::from(10).pow(U256::from(18)), // 10,000 LATT
-            vote_threshold: U256::from(1) * U256::from(10).pow(U256::from(18)), // 1 LATT
+            proposal_threshold: U256::from(10_000) * U256::from(10).pow(U256::from(18)), // 10,000 SALT
+            vote_threshold: U256::from(1) * U256::from(10).pow(U256::from(18)), // 1 SALT
             voting_period: 50_400, // ~7 days at 2s blocks
             execution_delay: 7_200, // ~1 day delay
             quorum_percentage: 10, // 10% of total supply must vote
@@ -416,7 +416,7 @@ mod tests {
                 new_value: U256::from(15),
             },
             "Increase block reward".to_string(),
-            "Proposal to increase block reward to 15 LATT".to_string(),
+            "Proposal to increase block reward to 15 SALT".to_string(),
             100,
             balance,
         ).unwrap();

@@ -468,7 +468,7 @@ pub struct RequiredModel {
     pub size_bytes: u64,
     /// Whether validators MUST pin this model
     pub must_pin: bool,
-    /// Penalty in LATT tokens for not pinning
+    /// Penalty in SALT tokens for not pinning
     pub slash_penalty: u128,
     /// Grace period in hours for new validators
     #[serde(default = "default_grace_period")]

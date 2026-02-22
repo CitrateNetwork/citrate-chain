@@ -26,7 +26,7 @@ pub enum WalletError {
     #[error("Account not found: {0}")]
     AccountNotFound(String),
 
-    #[error("Insufficient balance: need {need} LATT, have {have} LATT")]
+    #[error("Insufficient balance: need {need} SALT, have {have} SALT")]
     InsufficientBalance { need: String, have: String },
 
     #[error("RPC error: {0}")]

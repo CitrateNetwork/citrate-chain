@@ -43,7 +43,7 @@ All notable changes in this PR are documented here. This follows a Keep‑a‑Ch
   - GUI prefers `citrate_listModels` (with fallback), fetches full info via `citrate_getModel`.
   - JS SDK README aligned to `rpcEndpoint`, `sdk.accounts`, list/get/runInference flows; signing best practices.
   - Stubbed out permission RPCs in SDK with clear “Not implemented” errors.
-  - Files: `gui/citrate-core/src/services/rpc-client.ts`, `gui/citrate-core/src/services/tauri.ts`, `sdk/javascript/README.md`, `sdk/javascript/src/model.ts`.
+  - Files: `gui/citrate_gui_v2/src/services/rpc-client.ts`, `gui/citrate_gui_v2/src/services/tauri.ts`, `sdk/javascript/README.md`, `sdk/javascript/src/model.ts`.
 - Node networking
   - Node starts listener, dials bootstrap nodes (peer@host:port, ip:port, hostname:port), integrates Discovery peer exchange.
   - Persistent local peer id (stored at `<data_dir>/peer.id`) used in handshake; outbound connections use remote `peer_id` from HelloAck.

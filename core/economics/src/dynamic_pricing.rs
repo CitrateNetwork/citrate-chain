@@ -46,7 +46,7 @@ impl Default for DynamicPricingConfig {
             adjustment_factor: 125, // 1.25% per block
             utilization_window: 20, // 20 blocks
             ai_inference_multiplier: 200, // 2x for AI ops
-            model_deployment_base: U256::from(100) * U256::from(10).pow(U256::from(18)), // 100 LATT
+            model_deployment_base: U256::from(100) * U256::from(10).pow(U256::from(18)), // 100 SALT
             compute_scaling_factor: 150, // 1.5x scaling per compute unit
         }
     }
@@ -223,12 +223,12 @@ impl DynamicPricingManager {
             },
             OperationType::ModelDeployment { model_size_mb } => {
                 let base = self.config.model_deployment_base;
-                let size_scaling = U256::from(model_size_mb) * U256::from(10).pow(U256::from(16)); // 0.01 LATT per MB
+                let size_scaling = U256::from(model_size_mb) * U256::from(10).pow(U256::from(16)); // 0.01 SALT per MB
                 base + size_scaling
             },
             OperationType::ModelTraining { dataset_size_gb } => {
                 let base = self.current_gas_price * U256::from(1_000_000);
-                let data_scaling = U256::from(dataset_size_gb) * U256::from(10).pow(U256::from(17)); // 0.1 LATT per GB
+                let data_scaling = U256::from(dataset_size_gb) * U256::from(10).pow(U256::from(17)); // 0.1 SALT per GB
                 base + data_scaling
             },
         }

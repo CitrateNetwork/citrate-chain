@@ -29,7 +29,7 @@ COPY contracts ./contracts
 COPY node-app ./node-app
 COPY wallet ./wallet
 COPY faucet ./faucet
-COPY gui/citrate-core/src-tauri ./gui/citrate-core/src-tauri
+COPY gui/citrate_gui_v2/src-tauri ./gui/citrate_gui_v2/src-tauri
 
 # Build release binary
 RUN cargo build --release -p citrate-node

@@ -35,7 +35,7 @@ impl Default for UnifiedEconomicsConfig {
             rewards_config: EnhancedRewardConfig::default(),
             revenue_share_config: RevenueShareConfig::default(),
             gas_governance_ratio: 0.1, // 10% weight from gas usage
-            minimum_governance_balance: U256::from(100) * U256::from(10).pow(U256::from(18)), // 100 LATT
+            minimum_governance_balance: U256::from(100) * U256::from(10).pow(U256::from(18)), // 100 SALT
             economic_security_threshold: 0.67, // 67% threshold for economic security
         }
     }

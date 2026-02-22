@@ -42,7 +42,7 @@ impl Default for RevenueShareConfig {
             infrastructure_share_bps: 1500, // 15%
             treasury_share_bps: 1500,       // 15%
             staker_share_bps: 1500,         // 15%
-            min_distribution_threshold: U256::from(1000) * U256::from(10).pow(U256::from(18)), // 1000 LATT
+            min_distribution_threshold: U256::from(1000) * U256::from(10).pow(U256::from(18)), // 1000 SALT
             distribution_frequency: 7200,   // ~1 day at 2s blocks
             performance_bonus_bps: 500,     // 5% max bonus
         }
@@ -522,7 +522,7 @@ mod tests {
         manager.register_stakeholder(model_creator, StakeholderType::ModelCreator).unwrap();
 
         // Collect revenue
-        let fee_amount = U256::from(2000) * U256::from(10).pow(U256::from(18)); // 2000 LATT
+        let fee_amount = U256::from(2000) * U256::from(10).pow(U256::from(18)); // 2000 SALT
         manager.collect_revenue(RevenuePool::AIInference, fee_amount, validator).unwrap();
 
         // Update contributions

@@ -69,7 +69,7 @@ enum Commands {
         #[arg(short, long)]
         to: String,
 
-        /// Amount in LATT
+        /// Amount in SALT
         #[arg(short, long)]
         amount: String,
 
@@ -265,7 +265,7 @@ async fn list_accounts(wallet: &mut Wallet) -> Result<()> {
 
         if unlocked {
             let balance_latt = format_latt(account.balance);
-            println!("      Balance: {} LATT", balance_latt.bright_green());
+            println!("      Balance: {} SALT", balance_latt.bright_green());
             println!("      Nonce:   {}", account.nonce);
         }
 
@@ -303,7 +303,7 @@ async fn show_balance(wallet: &mut Wallet, account: Option<String>) -> Result<()
                 println!("  Alias:   {}", alias);
             }
 
-            println!("  Balance: {} LATT", format_latt(balance).bright_green());
+            println!("  Balance: {} SALT", format_latt(balance).bright_green());
             println!("  Nonce:   {}", nonce);
         } else if let Some(stripped) = acc.strip_prefix("0x") {
             // Show any address balance
@@ -339,7 +339,7 @@ async fn show_balance(wallet: &mut Wallet, account: Option<String>) -> Result<()
                 }
             }
 
-            println!("  Balance: {} LATT", format_latt(balance).bright_green());
+            println!("  Balance: {} SALT", format_latt(balance).bright_green());
             println!("  Nonce:   {}", nonce);
         } else {
             anyhow::bail!("Invalid account specifier");
@@ -387,7 +387,7 @@ async fn send_transaction(
     println!("{}", "Transaction Details:".bright_cyan());
     println!("  From:   Account #{}", from);
     println!("  To:     0x{}", hex::encode(to_address.0));
-    println!("  Amount: {} LATT", amount);
+    println!("  Amount: {} SALT", amount);
 
     if let Some(gp) = gas_price {
         println!("  Gas Price: {} gwei", gp);
@@ -570,7 +570,7 @@ async fn interactive_mode(wallet: &mut Wallet) -> Result<()> {
                     .interact()?;
 
                 let amount = Input::<String>::new()
-                    .with_prompt("Amount in LATT")
+                    .with_prompt("Amount in SALT")
                     .interact()?;
 
                 send_transaction(wallet, from, &to, &amount, None, None).await?;
@@ -602,7 +602,7 @@ async fn interactive_mode(wallet: &mut Wallet) -> Result<()> {
     Ok(())
 }
 
-/// Format U256 wei to LATT string
+/// Format U256 wei to SALT string
 fn format_latt(wei: U256) -> String {
     let decimals = U256::from(10).pow(U256::from(18));
     let whole = wei / decimals;
@@ -623,7 +623,7 @@ fn format_latt(wei: U256) -> String {
     }
 }
 
-/// Convert LATT to wei
+/// Convert SALT to wei
 fn latt_to_wei(latt: f64) -> U256 {
     let wei_per_latt = 1_000_000_000_000_000_000u128; // 10^18
     let wei = (latt * wei_per_latt as f64) as u128;

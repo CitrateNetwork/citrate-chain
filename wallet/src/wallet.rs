@@ -273,7 +273,7 @@ impl Wallet {
     }
 }
 
-/// Format U256 as LATT with decimals
+/// Format U256 as SALT with decimals
 fn format_latt(value: U256) -> String {
     let decimals = U256::from(10).pow(U256::from(18));
     let whole = value / decimals;

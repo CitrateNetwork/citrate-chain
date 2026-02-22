@@ -10,7 +10,7 @@ use anyhow::Result;
 /// Enhanced reward configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnhancedRewardConfig {
-    /// Base block reward in LATT
+    /// Base block reward in SALT
     pub base_block_reward: U256,
 
     /// Validator performance bonus pool (% of base reward)
@@ -41,12 +41,12 @@ pub struct EnhancedRewardConfig {
 impl Default for EnhancedRewardConfig {
     fn default() -> Self {
         Self {
-            base_block_reward: U256::from(10) * U256::from(10).pow(U256::from(18)), // 10 LATT
+            base_block_reward: U256::from(10) * U256::from(10).pow(U256::from(18)), // 10 SALT
             performance_bonus_pool: 30, // 30% for performance
             ai_contribution_pool: 25,   // 25% for AI contributions
             network_health_pool: 20,    // 20% for network health
             staking_bonus_pool: 25,     // 25% for long-term staking
-            min_validator_stake: U256::from(32_000) * U256::from(10).pow(U256::from(18)), // 32k LATT
+            min_validator_stake: U256::from(32_000) * U256::from(10).pow(U256::from(18)), // 32k SALT
             performance_window: 100,    // 100 blocks
             ai_quality_threshold: 0.85, // 85% quality threshold
             participation_threshold: 0.9, // 90% participation

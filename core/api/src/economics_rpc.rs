@@ -246,9 +246,9 @@ pub fn register_economics_methods(
         } else {
             Ok(json!({
                 "name": "Citrate",
-                "symbol": "LATT",
+                "symbol": "SALT",
                 "decimals": 18,
-                "totalSupply": "0xc9f2c9cd04674edea40000000", // 1B LATT
+                "totalSupply": "0xc9f2c9cd04674edea40000000", // 1B SALT
                 "maxSupply": "0xc9f2c9cd04674edea40000000",
             }))
         }

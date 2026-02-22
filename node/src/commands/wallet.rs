@@ -52,7 +52,7 @@ pub enum WalletCommands {
         #[arg(short, long)]
         to: String,
 
-        /// Amount in LATT
+        /// Amount in SALT
         #[arg(short, long)]
         amount: String,
 
@@ -218,7 +218,7 @@ async fn list_accounts(wallet: &mut Wallet) -> Result<()> {
 
         if unlocked {
             let balance_latt = format_latt(account.balance);
-            println!("      Balance: {} LATT", balance_latt.bright_green());
+            println!("      Balance: {} SALT", balance_latt.bright_green());
             println!("      Nonce:   {}", account.nonce);
         }
 
@@ -254,7 +254,7 @@ async fn show_balance(wallet: &mut Wallet, account: Option<String>) -> Result<()
                 println!("  Alias:   {}", alias);
             }
 
-            println!("  Balance: {} LATT", format_latt(balance).bright_green());
+            println!("  Balance: {} SALT", format_latt(balance).bright_green());
             println!("  Nonce:   {}", nonce);
         } else if let Some(stripped) = acc.strip_prefix("0x") {
             let addr_bytes = hex::decode(stripped)?;
@@ -287,7 +287,7 @@ async fn show_balance(wallet: &mut Wallet, account: Option<String>) -> Result<()
                 }
             }
 
-            println!("  Balance: {} LATT", format_latt(balance).bright_green());
+            println!("  Balance: {} SALT", format_latt(balance).bright_green());
             println!("  Nonce:   {}", nonce);
         } else {
             anyhow::bail!("Invalid account specifier");
@@ -328,7 +328,7 @@ async fn send_transaction(
     println!("{}", "Transaction Details:".bright_cyan());
     println!("  From:   Account #{}", from);
     println!("  To:     0x{}", hex::encode(to_address.0));
-    println!("  Amount: {} LATT", amount);
+    println!("  Amount: {} SALT", amount);
 
     let confirm = dialoguer::Confirm::new()
         .with_prompt("Send transaction?")
@@ -492,7 +492,7 @@ async fn interactive_mode(wallet: &mut Wallet) -> Result<()> {
                     .interact()?;
 
                 let amount = Input::<String>::new()
-                    .with_prompt("Amount in LATT")
+                    .with_prompt("Amount in SALT")
                     .interact()?;
 
                 send_transaction(wallet, from, &to, &amount, None, None).await?;
