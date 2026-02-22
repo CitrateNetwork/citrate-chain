@@ -145,6 +145,14 @@ pub struct RateLimitConfig {
     /// WP-I.2: Secure default is None — operators must explicitly set a token
     /// for production deployments.
     pub operator_token: Option<String>,
+    /// API key for gating all JSON-RPC requests (Sprint 03 — closed beta).
+    /// When set, every request must present this key via:
+    ///   - `Authorization: Bearer <key>`
+    ///   - `X-API-Key: <key>`
+    ///   - `?api_key=<key>` query parameter
+    /// `/health` and `/ready` endpoints are exempt.
+    /// When None (default), all requests are allowed (open mode / devnet).
+    pub api_key: Option<String>,
 }
 
 impl Default for RateLimitConfig {
@@ -155,6 +163,7 @@ impl Default for RateLimitConfig {
             trusted_proxies: Vec::new(), // WP-I.1: secure default — no header trust
             method_costs: Vec::new(),
             operator_token: None, // WP-I.2: no auth in devnet by default
+            api_key: None, // Sprint 03: no API key required by default
         }
     }
 }
@@ -170,23 +179,77 @@ pub struct RateLimiter {
     buckets: Arc<DashMap<String, BucketEntry>>,
     trusted_set: HashSet<IpAddr>,
     operator_token: Option<String>,
+    api_key: Option<String>,
 }
 
 impl RateLimiter {
     pub fn new(config: RateLimitConfig) -> Self {
         let trusted_set: HashSet<IpAddr> = config.trusted_proxies.iter().cloned().collect();
         let operator_token = config.operator_token.clone();
+        let api_key = config.api_key.clone();
         Self {
             config,
             buckets: Arc::new(DashMap::new()),
             trusted_set,
             operator_token,
+            api_key,
         }
+    }
+
+    /// Extract API key from request via Bearer token, X-API-Key header, or query param.
+    fn extract_api_key(request: &hyper::Request<Body>) -> Option<String> {
+        // 1. Authorization: Bearer <key>
+        if let Some(auth) = request.headers().get("authorization") {
+            if let Ok(auth_str) = auth.to_str() {
+                if let Some(key) = auth_str.strip_prefix("Bearer ") {
+                    return Some(key.to_string());
+                }
+            }
+        }
+        // 2. X-API-Key: <key>
+        if let Some(key_header) = request.headers().get("x-api-key") {
+            if let Ok(key) = key_header.to_str() {
+                return Some(key.to_string());
+            }
+        }
+        // 3. ?api_key=<key> query parameter
+        if let Some(query) = request.uri().query() {
+            for pair in query.split('&') {
+                if let Some(val) = pair.strip_prefix("api_key=") {
+                    return Some(val.to_string());
+                }
+            }
+        }
+        None
     }
 }
 
 impl RequestMiddleware for RateLimiter {
     fn on_request(&self, request: hyper::Request<Body>) -> RequestMiddlewareAction {
+        // Sprint 03: API key gating — reject unauthenticated requests early.
+        // /health and /ready are exempt to allow load balancer probes.
+        if let Some(ref expected_key) = self.api_key {
+            let path = request.uri().path();
+            if path != "/health" && path != "/ready" {
+                let key_valid = Self::extract_api_key(&request)
+                    .map(|k| k == *expected_key)
+                    .unwrap_or(false);
+                if !key_valid {
+                    warn!("API key authentication failed for {}", path);
+                    let body = r#"{"jsonrpc":"2.0","error":{"code":-32099,"message":"Unauthorized: invalid or missing API key"},"id":null}"#;
+                    let response = hyper::Response::builder()
+                        .status(401)
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body))
+                        .expect("valid response");
+                    return RequestMiddlewareAction::Respond {
+                        should_validate_hosts: false,
+                        response: Box::pin(async { Ok(response) }),
+                    };
+                }
+            }
+        }
+
         // WP-I.2: Set operator authentication state for this request.
         // Method handlers check is_operator_authenticated() for privileged ops.
         let authenticated = match &self.operator_token {
@@ -471,6 +534,105 @@ mod tests {
         // Budget limit is 1000 per second — 100 calls at cost=10 should pass
         for _ in 0..100 {
             assert!(check_method_budget(10).is_ok());
+        }
+    }
+
+    // Sprint 03: API key gating tests
+
+    #[test]
+    fn test_api_key_rejects_without_key() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            api_key: Some("test-secret-key".to_string()),
+            ..Default::default()
+        });
+        // Request without any API key → 401
+        match limiter.on_request(make_req()) {
+            RequestMiddlewareAction::Respond { .. } => {} // Expected 401
+            RequestMiddlewareAction::Proceed { .. } => panic!("Should reject without API key"),
+        }
+    }
+
+    #[test]
+    fn test_api_key_accepts_bearer_token() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            api_key: Some("test-secret-key".to_string()),
+            ..Default::default()
+        });
+        let req = make_req_with_header("authorization", "Bearer test-secret-key");
+        match limiter.on_request(req) {
+            RequestMiddlewareAction::Proceed { .. } => {} // Expected 200
+            RequestMiddlewareAction::Respond { .. } => panic!("Should accept valid Bearer token"),
+        }
+    }
+
+    #[test]
+    fn test_api_key_accepts_x_api_key_header() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            api_key: Some("test-secret-key".to_string()),
+            ..Default::default()
+        });
+        let req = make_req_with_header("x-api-key", "test-secret-key");
+        match limiter.on_request(req) {
+            RequestMiddlewareAction::Proceed { .. } => {} // Expected 200
+            RequestMiddlewareAction::Respond { .. } => panic!("Should accept valid X-API-Key header"),
+        }
+    }
+
+    #[test]
+    fn test_api_key_accepts_query_param() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            api_key: Some("test-secret-key".to_string()),
+            ..Default::default()
+        });
+        let req = hyper::Request::builder()
+            .uri("http://localhost:8545/?api_key=test-secret-key")
+            .body(Body::empty())
+            .unwrap();
+        match limiter.on_request(req) {
+            RequestMiddlewareAction::Proceed { .. } => {} // Expected 200
+            RequestMiddlewareAction::Respond { .. } => panic!("Should accept valid query param"),
+        }
+    }
+
+    #[test]
+    fn test_api_key_open_when_none() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            api_key: None,
+            ..Default::default()
+        });
+        // No API key configured → all requests pass
+        match limiter.on_request(make_req()) {
+            RequestMiddlewareAction::Proceed { .. } => {} // Expected
+            RequestMiddlewareAction::Respond { .. } => panic!("Should allow all requests when no API key configured"),
+        }
+    }
+
+    #[test]
+    fn test_api_key_health_exempt() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            api_key: Some("test-secret-key".to_string()),
+            ..Default::default()
+        });
+        let req = hyper::Request::builder()
+            .uri("http://localhost:8545/health")
+            .body(Body::empty())
+            .unwrap();
+        match limiter.on_request(req) {
+            RequestMiddlewareAction::Proceed { .. } => {} // Expected: /health exempt
+            RequestMiddlewareAction::Respond { .. } => panic!("/health should be exempt from API key"),
+        }
+    }
+
+    #[test]
+    fn test_api_key_wrong_key_rejected() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            api_key: Some("correct-key".to_string()),
+            ..Default::default()
+        });
+        let req = make_req_with_header("authorization", "Bearer wrong-key");
+        match limiter.on_request(req) {
+            RequestMiddlewareAction::Respond { .. } => {} // Expected 401
+            RequestMiddlewareAction::Proceed { .. } => panic!("Should reject wrong API key"),
         }
     }
 

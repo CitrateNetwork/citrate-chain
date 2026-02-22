@@ -15,7 +15,7 @@ members = [
     "node-app",
     "wallet",
     "faucet",
-    "gui/lattice-core/src-tauri",
+    "gui/citrate_gui_v2/src-tauri",
 ]
 # Default build targets: unified node binary (includes wallet + CLI).
 # Standalone wallet/cli/faucet can still be built with `cargo build -p citrate-wallet` etc.

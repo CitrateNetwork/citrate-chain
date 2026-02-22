@@ -1,0 +1,33 @@
+# Citrate Testnet Beta Configuration
+# Closed beta network with P2P peer whitelist + RPC API key gating.
+# Chain ID: 42069
+
+[chain]
+chain_id = 42069
+genesis_hash = ""
+block_time = 2
+ghostdag_k = 18
+
+[network]
+listen_addr = "0.0.0.0:30303"
+bootstrap_nodes = []           # Populated after seed nodes start
+max_peers = 50
+allowed_peers = []             # Beta tester Noise public keys (hex-encoded)
+
+[rpc]
+enabled = true
+listen_addr = "0.0.0.0:8545"
+ws_addr = "0.0.0.0:8546"
+allow_eth_send_transaction = false
+# api_key = ""                 # Set via CITRATE_API_KEY env var or --api-key flag
+
+[storage]
+data_dir = ".citrate-testnet-beta"
+pruning = false
+keep_blocks = 100000
+
+[mining]
+enabled = true
+coinbase = ""                  # Per-node: operator's wallet address (hex, no 0x prefix)
+target_block_time = 2
+min_gas_price = 1000000000

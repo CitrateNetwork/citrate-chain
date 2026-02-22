@@ -75,6 +75,10 @@ struct Cli {
     #[arg(long)]
     coinbase: Option<String>,
 
+    /// API key for JSON-RPC authentication (overrides config file and CITRATE_API_KEY env)
+    #[arg(long, value_name = "KEY")]
+    api_key: Option<String>,
+
     /// Disable RPC server
     #[arg(long)]
     no_rpc: bool,
@@ -312,6 +316,9 @@ async fn main() -> Result<()> {
     }
     if cli.no_rpc {
         config.rpc.enabled = false;
+    }
+    if let Some(api_key) = cli.api_key {
+        config.rpc.api_key = Some(api_key);
     }
 
     // If running as bootstrap node, clear bootstrap_nodes list
@@ -784,7 +791,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
         citrate_execution::types::Address(a)
     };
-    // Flat provider fee = 0.01 LATT (1e16 wei)
+    // Flat provider fee = 0.01 SALT (1e16 wei)
     let provider_fee = primitive_types::U256::from(10u128.pow(16));
     let inf_svc = Arc::new(crate::inference::NodeInferenceService::new(
         mcp.clone(),
@@ -955,9 +962,22 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let sync_for_rx = sync.clone();
 
         // Start transport listener and connect to bootstrap nodes
+        // Sprint 03: Persistent Noise identity — load from disk or generate once.
         // WP-H.1: Derive PeerId from Noise static key so identity is cryptographically
         // bound. The old random `peer_{u64}` approach allowed identity spoofing.
-        let noise_keypair = citrate_network::NoiseKeypair::generate();
+        let noise_key_path = config.storage.data_dir.join("noise.key");
+        let noise_keypair = if noise_key_path.exists() {
+            let key_bytes = std::fs::read(&noise_key_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read noise key: {}", e))?;
+            citrate_network::NoiseKeypair::from_bytes(&key_bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to parse noise key: {}", e))?
+        } else {
+            let kp = citrate_network::NoiseKeypair::generate();
+            std::fs::write(&noise_key_path, kp.to_bytes())
+                .map_err(|e| anyhow::anyhow!("Failed to write noise key: {}", e))?;
+            info!("Generated new persistent Noise identity at {:?}", noise_key_path);
+            kp
+        };
         let local_peer_id = noise_keypair.derive_peer_id();
         info!(
             "Noise identity: {}... (peer_id={})",
@@ -974,7 +994,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 head_hash,
             },
         )
-        .with_noise(noise_keypair);
+        .with_noise(noise_keypair)
+        .with_allowed_peers(config.network.allowed_peers.clone());
         let listen_addr = config.network.listen_addr;
         transport
             .start_listener(listen_addr)
@@ -1435,6 +1456,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let operator_token = std::env::var("CITRATE_OPERATOR_TOKEN").ok()
             .filter(|t| !t.is_empty());
 
+        // Sprint 03: API key gating — CLI flag > config file > env var
+        let api_key = config.rpc.api_key.clone()
+            .or_else(|| std::env::var("CITRATE_API_KEY").ok().filter(|k| !k.is_empty()));
+        if api_key.is_some() {
+            info!("RPC API key authentication enabled");
+        }
+
         let rpc_config = RpcConfig {
             listen_addr: config.rpc.listen_addr,
             max_connections: 100,
@@ -1444,6 +1472,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             allow_eth_send_transaction: config.rpc.allow_eth_send_transaction,
             rate_limit: citrate_api::rate_limit::RateLimitConfig {
                 operator_token,
+                api_key,
                 ..Default::default()
             },
             ..Default::default()

@@ -45,6 +45,29 @@ impl NoiseKeypair {
     pub fn derive_peer_id(&self) -> crate::peer::PeerId {
         crate::peer::PeerId::new(format!("noise_{}", self.public_key_hex()))
     }
+
+    /// Serialize keypair to bytes (private || public, 64 bytes total).
+    /// Used to persist Noise identity across node restarts.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(&self.private);
+        out.extend_from_slice(&self.public);
+        out
+    }
+
+    /// Deserialize keypair from bytes (private || public, 64 bytes).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::NetworkError> {
+        if bytes.len() != 64 {
+            return Err(crate::NetworkError::TransportError(format!(
+                "invalid noise key length: expected 64, got {}",
+                bytes.len()
+            )));
+        }
+        Ok(Self {
+            private: bytes[..32].to_vec(),
+            public: bytes[32..].to_vec(),
+        })
+    }
 }
 
 /// Encrypted session established after the Noise handshake.
@@ -270,6 +293,23 @@ mod tests {
         let kp1 = NoiseKeypair::generate();
         let kp2 = NoiseKeypair::generate();
         assert_ne!(kp1.public, kp2.public);
+    }
+
+    #[test]
+    fn test_keypair_persistence_roundtrip() {
+        let kp = NoiseKeypair::generate();
+        let bytes = kp.to_bytes();
+        assert_eq!(bytes.len(), 64);
+        let restored = NoiseKeypair::from_bytes(&bytes).unwrap();
+        assert_eq!(kp.private, restored.private);
+        assert_eq!(kp.public, restored.public);
+        assert_eq!(kp.derive_peer_id(), restored.derive_peer_id());
+    }
+
+    #[test]
+    fn test_keypair_from_bytes_invalid_length() {
+        let result = NoiseKeypair::from_bytes(&[0u8; 32]);
+        assert!(result.is_err());
     }
 
     #[tokio::test]

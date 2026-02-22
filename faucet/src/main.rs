@@ -5,23 +5,33 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
 use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
 use citrate_execution::types::Address;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 struct FaucetState {
     signing_key: Arc<SigningKey>,
     rpc_url: String,
+    api_key: Option<String>,
     nonce: Arc<Mutex<u64>>,
     chain_id: u64,
     faucet_address: Address,
+    /// Per-IP rate limit: tracks last request time
+    ip_rate_limit: Arc<DashMap<String, Instant>>,
+    /// Per-address cooldown: tracks last request time (24h between requests)
+    address_cooldown: Arc<DashMap<String, Instant>>,
+    /// Address whitelist: only these addresses can claim. Empty = no whitelist.
+    address_whitelist: Arc<HashSet<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,13 +54,22 @@ async fn main() {
 
     info!("Starting Citrate Faucet Service");
 
-    // Faucet private key (for testing only - uses a portion of treasury funds)
-    // In production, this would be a separate funded account
-    let faucet_key_bytes =
-        hex::decode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-            .expect("Invalid faucet key");
+    // Configuration from environment
+    let rpc_url = std::env::var("CITRATE_RPC_URL")
+        .unwrap_or_else(|_| "http://localhost:8545".to_string());
+    let api_key = std::env::var("CITRATE_API_KEY").ok().filter(|k| !k.is_empty());
+    let chain_id = std::env::var("CITRATE_CHAIN_ID")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(42069);
 
-    let signing_key = SigningKey::from_bytes(&faucet_key_bytes.try_into().unwrap());
+    // Faucet private key from env or default test key
+    let faucet_key_hex = std::env::var("FAUCET_PRIVATE_KEY")
+        .unwrap_or_else(|_| {
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()
+        });
+    let faucet_key_bytes = hex::decode(&faucet_key_hex).expect("Invalid faucet key hex");
+    let signing_key = SigningKey::from_bytes(&faucet_key_bytes.try_into().expect("Key must be 32 bytes"));
 
     // Calculate faucet address from public key
     let public_key = signing_key.verifying_key();
@@ -62,13 +81,33 @@ async fn main() {
     let faucet_address = Address(addr_bytes);
 
     info!("Faucet address: 0x{}", hex::encode(faucet_address.0));
+    info!("RPC endpoint: {}", rpc_url);
+    info!("Chain ID: {}", chain_id);
+    if api_key.is_some() {
+        info!("API key authentication enabled for RPC calls");
+    }
+
+    // Address whitelist from env (comma-separated)
+    let address_whitelist: HashSet<String> = std::env::var("FAUCET_WHITELIST")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_lowercase().trim_start_matches("0x").to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !address_whitelist.is_empty() {
+        info!("Address whitelist enabled: {} addresses", address_whitelist.len());
+    }
 
     let state = FaucetState {
         signing_key: Arc::new(signing_key),
-        rpc_url: "http://localhost:8545".to_string(),
+        rpc_url,
+        api_key,
         nonce: Arc::new(Mutex::new(0)),
-        chain_id: 1337,
+        chain_id,
         faucet_address,
+        ip_rate_limit: Arc::new(DashMap::new()),
+        address_cooldown: Arc::new(DashMap::new()),
+        address_whitelist: Arc::new(address_whitelist),
     };
 
     // Build router
@@ -76,6 +115,7 @@ async fn main() {
         .route("/", get(root))
         .route("/faucet", post(request_tokens))
         .route("/status", get(status))
+        .route("/health", get(health))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -96,9 +136,13 @@ async fn root() -> &'static str {
 async fn status() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "online",
-        "network": "citrate-testnet",
-        "amount_per_request": "10 LATT"
+        "network": "citrate-testnet-beta",
+        "amount_per_request": "10 SALT"
     }))
+}
+
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
 }
 
 async fn request_tokens(
@@ -106,8 +150,8 @@ async fn request_tokens(
     Json(payload): Json<FaucetRequest>,
 ) -> Result<Json<FaucetResponse>, StatusCode> {
     // Parse recipient address
-    let recipient_hex = payload.address.trim_start_matches("0x");
-    let recipient_bytes = match hex::decode(recipient_hex) {
+    let recipient_hex = payload.address.trim_start_matches("0x").to_lowercase();
+    let recipient_bytes = match hex::decode(&recipient_hex) {
         Ok(b) if b.len() == 20 => b,
         _ => {
             return Ok(Json(FaucetResponse {
@@ -118,6 +162,37 @@ async fn request_tokens(
             }));
         }
     };
+
+    // Address whitelist check
+    if !state.address_whitelist.is_empty() && !state.address_whitelist.contains(&recipient_hex) {
+        warn!("Faucet request rejected: address {} not in whitelist", recipient_hex);
+        return Ok(Json(FaucetResponse {
+            success: false,
+            tx_hash: None,
+            message: "Address not whitelisted for testnet beta".to_string(),
+            amount: "0".to_string(),
+        }));
+    }
+
+    // Per-address cooldown: 24h between requests
+    let cooldown_secs = 24 * 3600; // 24 hours
+    if let Some(last_request) = state.address_cooldown.get(&recipient_hex) {
+        let elapsed = last_request.elapsed().as_secs();
+        if elapsed < cooldown_secs {
+            let remaining = cooldown_secs - elapsed;
+            let hours = remaining / 3600;
+            let minutes = (remaining % 3600) / 60;
+            return Ok(Json(FaucetResponse {
+                success: false,
+                tx_hash: None,
+                message: format!(
+                    "Rate limited: {}h {}m remaining before next claim",
+                    hours, minutes
+                ),
+                amount: "0".to_string(),
+            }));
+        }
+    }
 
     let mut recipient_addr = [0u8; 20];
     recipient_addr.copy_from_slice(&recipient_bytes);
@@ -144,7 +219,7 @@ async fn request_tokens(
         hash: Hash::default(),
         from: from_pubkey,
         to: Some(to_pubkey),
-        value: 10_000_000_000_000_000_000u128, // 10 LATT
+        value: 10_000_000_000_000_000_000u128, // 10 SALT
         data: vec![],
         nonce,
         gas_price: 1_000_000_000, // 1 gwei
@@ -157,7 +232,7 @@ async fn request_tokens(
     // Calculate transaction hash
     tx.hash = calculate_tx_hash(&tx, state.chain_id);
 
-    // Sign transaction with the inner signing key
+    // Sign transaction
     use ed25519_dalek::Signer;
     let signature = state.signing_key.as_ref().sign(tx.hash.as_bytes());
     tx.signature = Signature::new(signature.to_bytes());
@@ -178,36 +253,42 @@ async fn request_tokens(
 
     let tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
-    // Send transaction via RPC
+    // Send transaction via RPC (with API key if configured)
     let client = reqwest::Client::new();
-    let response = client
+    let mut request = client
         .post(&state.rpc_url)
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
             "method": "eth_sendRawTransaction",
             "params": [tx_hex],
             "id": 1
-        }))
-        .send()
-        .await;
+        }));
+
+    // Add API key header for authenticated RPC
+    if let Some(ref key) = state.api_key {
+        request = request.header("X-API-Key", key.as_str());
+    }
+
+    let response = request.send().await;
 
     match response {
         Ok(res) => {
             let json: serde_json::Value = res.json().await.unwrap_or_default();
 
             if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
-                // Success - increment nonce
+                // Success - increment nonce and record cooldown
                 *nonce_guard += 1;
+                state.address_cooldown.insert(recipient_hex, Instant::now());
 
                 info!(
-                    "Faucet sent 10 LATT to {} - tx: {}",
+                    "Faucet sent 10 SALT to {} - tx: {}",
                     payload.address, result
                 );
 
                 Ok(Json(FaucetResponse {
                     success: true,
                     tx_hash: Some(result.to_string()),
-                    message: "Successfully sent 10 LATT".to_string(),
+                    message: "Successfully sent 10 SALT".to_string(),
                     amount: "10000000000000000000".to_string(),
                 }))
             } else if let Some(error) = json.get("error") {

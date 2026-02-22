@@ -126,7 +126,7 @@ fn create_required_mistral_7b() -> RequiredModel {
         "QmUsYyxg71bV8USRQ6Ccm3SdMqeWgEEVnCYkgNDaxvBTZB".to_string(), // IPFS CID
         Hash::new(sha256_bytes),   // SHA256 hash of GGUF file
         4_367_438_912,             // 4.1 GB (exact file size)
-        1_000_000_000_000_000_000_000, // 1000 LATT slash penalty
+        1_000_000_000_000_000_000_000, // 1000 SALT slash penalty
     )
 }
 
@@ -187,8 +187,12 @@ pub async fn initialize_genesis_state(
     // Create genesis block
     let mut genesis = create_genesis_block(config);
 
-    // Create economics genesis config
-    let economics_config = EconomicsGenesisConfig::default();
+    // Create economics genesis config — use testnet_beta for chain_id 42069
+    let economics_config = if config.chain_id == 42069 {
+        EconomicsGenesisConfig::testnet_beta()
+    } else {
+        EconomicsGenesisConfig::default()
+    };
 
     // Initialize genesis accounts from economics config
     for account in &economics_config.accounts {
@@ -206,7 +210,7 @@ pub async fn initialize_genesis_state(
         }
 
         tracing::info!(
-            "Initialized genesis account 0x{} with balance {} LATT ({} wei)",
+            "Initialized genesis account 0x{} with balance {} SALT ({} wei)",
             hex::encode(account.address.0),
             account.balance / U256::from(10).pow(U256::from(18)),
             account.balance

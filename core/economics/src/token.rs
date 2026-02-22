@@ -22,7 +22,7 @@ impl Default for TokenConfig {
     fn default() -> Self {
         Self {
             name: "Citrate".to_string(),
-            symbol: "LATT".to_string(),
+            symbol: "SALT".to_string(),
             decimals: DECIMALS,
             total_supply: U256::from(1_000_000_000) * U256::from(10).pow(U256::from(DECIMALS)),
             initial_distribution: HashMap::new(),

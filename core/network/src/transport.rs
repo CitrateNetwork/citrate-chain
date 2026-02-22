@@ -12,6 +12,7 @@ use bincode;
 use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use citrate_consensus::types::Hash;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -34,6 +35,10 @@ pub struct NetworkTransport {
     local_id: PeerId,
     params: HandshakeParams,
     noise_keypair: Option<Arc<NoiseKeypair>>,
+    /// Allowed peer Noise public keys (hex-encoded).
+    /// When non-empty, only peers whose Noise public key hex is in this set can connect.
+    /// When empty, all peers are allowed (open mode).
+    allowed_peers: Arc<HashSet<String>>,
 }
 
 const MAX_FRAME_LEN: usize = 1024 * 1024; // 1MB
@@ -45,7 +50,18 @@ impl NetworkTransport {
             local_id,
             params,
             noise_keypair: None,
+            allowed_peers: Arc::new(HashSet::new()),
         }
+    }
+
+    /// Set the peer whitelist. Only peers whose Noise public key hex is in this set
+    /// will be allowed to connect. Empty set means open mode.
+    pub fn with_allowed_peers(mut self, peers: Vec<String>) -> Self {
+        if !peers.is_empty() {
+            info!("P2P peer whitelist enabled: {} allowed keys", peers.len());
+        }
+        self.allowed_peers = Arc::new(peers.into_iter().collect());
+        self
     }
 
     /// Enable Noise_XX encrypted transport.
@@ -69,6 +85,7 @@ impl NetworkTransport {
         let local_id = self.local_id.clone();
         let params = self.params.clone();
         let noise_kp = self.noise_keypair.clone();
+        let allowed = self.allowed_peers.clone();
 
         tokio::spawn(async move {
             loop {
@@ -78,9 +95,10 @@ impl NetworkTransport {
                         let local_id = local_id.clone();
                         let params = params.clone();
                         let noise_kp = noise_kp.clone();
+                        let allowed = allowed.clone();
                         tokio::spawn(async move {
                             if let Err(e) =
-                                handle_inbound(stream, remote, pm, local_id, params, noise_kp)
+                                handle_inbound(stream, remote, pm, local_id, params, noise_kp, allowed)
                                     .await
                             {
                                 warn!("inbound error from {}: {}", remote, e);
@@ -120,9 +138,10 @@ impl NetworkTransport {
         let local_id = self.local_id.clone();
         let params = self.params.clone();
         let noise_kp = self.noise_keypair.clone();
+        let allowed = self.allowed_peers.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_outbound(stream, addr, pm, local_id, params, noise_kp, expected_id).await
+                handle_outbound(stream, addr, pm, local_id, params, noise_kp, expected_id, allowed).await
             {
                 warn!("outbound error to {}: {}", addr, e);
             }
@@ -142,6 +161,7 @@ async fn handle_inbound(
     local_id: PeerId,
     params: HandshakeParams,
     noise_keypair: Option<Arc<NoiseKeypair>>,
+    allowed_peers: Arc<HashSet<String>>,
 ) -> Result<(), NetworkError> {
     // Noise handshake (if enabled)
     let noise_session = if let Some(ref kp) = noise_keypair {
@@ -149,6 +169,28 @@ async fn handle_inbound(
     } else {
         None
     };
+
+    // Sprint 03: Peer whitelist check — reject non-whitelisted peers after Noise handshake.
+    if !allowed_peers.is_empty() {
+        if let Some(ref ns) = noise_session {
+            let remote_hex = hex::encode(ns.remote_public_key());
+            if !allowed_peers.contains(&remote_hex) {
+                warn!(
+                    "PEER_WHITELIST_REJECTED inbound from {} (noise_key={}...)",
+                    addr, &remote_hex[..16]
+                );
+                return Err(NetworkError::ProtocolError(
+                    "peer not in allowed_peers whitelist".into(),
+                ));
+            }
+            debug!("Peer whitelist check passed for {}", &remote_hex[..16]);
+        } else {
+            warn!("Peer whitelist configured but Noise is disabled — rejecting {}", addr);
+            return Err(NetworkError::ProtocolError(
+                "peer whitelist requires Noise encryption".into(),
+            ));
+        }
+    }
 
     let noise_session = noise_session.map(Arc::new);
 
@@ -342,6 +384,7 @@ async fn handle_outbound(
     params: HandshakeParams,
     noise_keypair: Option<Arc<NoiseKeypair>>,
     expected_id: Option<PeerId>,
+    allowed_peers: Arc<HashSet<String>>,
 ) -> Result<(), NetworkError> {
     // Noise handshake (if enabled)
     let noise_session = if let Some(ref kp) = noise_keypair {
@@ -349,6 +392,22 @@ async fn handle_outbound(
     } else {
         None
     };
+
+    // Sprint 03: Peer whitelist check for outbound connections too.
+    if !allowed_peers.is_empty() {
+        if let Some(ref ns) = noise_session {
+            let remote_hex = hex::encode(ns.remote_public_key());
+            if !allowed_peers.contains(&remote_hex) {
+                warn!(
+                    "PEER_WHITELIST_REJECTED outbound to {} (noise_key={}...)",
+                    addr, &remote_hex[..16]
+                );
+                return Err(NetworkError::ProtocolError(
+                    "peer not in allowed_peers whitelist".into(),
+                ));
+            }
+        }
+    }
 
     let noise_session = noise_session.map(Arc::new);
 

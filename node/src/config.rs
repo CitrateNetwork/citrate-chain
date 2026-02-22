@@ -125,6 +125,12 @@ pub struct NetworkConfig {
 
     /// Max peers
     pub max_peers: usize,
+
+    /// Allowed peer Noise public keys (hex-encoded).
+    /// When non-empty, only peers whose Noise key is in this list can connect.
+    /// When empty (default), all peers are allowed (open mode / devnet).
+    #[serde(default)]
+    pub allowed_peers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +148,12 @@ pub struct RpcConfig {
     /// SECURITY (C-02): Must only be true in devnet/dev mode.
     #[serde(default)]
     pub allow_eth_send_transaction: bool,
+
+    /// API key for gating all JSON-RPC requests.
+    /// When set, every request must present this key via Bearer token, X-API-Key header, or query param.
+    /// When None, all requests are allowed (devnet mode).
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

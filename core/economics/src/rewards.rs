@@ -9,16 +9,16 @@ use serde::{Deserialize, Serialize};
 /// Block reward configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RewardConfig {
-    /// Base block reward in LATT
+    /// Base block reward in SALT
     pub block_reward: u64,
 
     /// Halving interval (number of blocks)
     pub halving_interval: u64,
 
-    /// Inference bonus per inference in block (in LATT)
+    /// Inference bonus per inference in block (in SALT)
     pub inference_bonus: u64,
 
-    /// Model deployment bonus (in LATT)
+    /// Model deployment bonus (in SALT)
     pub model_deployment_bonus: u64,
 
     /// Treasury allocation percentage (0-100)
@@ -31,10 +31,10 @@ pub struct RewardConfig {
 impl Default for RewardConfig {
     fn default() -> Self {
         Self {
-            block_reward: 10,                   // 10 LATT per block
+            block_reward: 10,                   // 10 SALT per block
             halving_interval: 2_100_000,        // ~4 years at 2s blocks
-            inference_bonus: 0,                 // 0.01 LATT per inference
-            model_deployment_bonus: 1,          // 1 LATT per model deployment
+            inference_bonus: 0,                 // 0.01 SALT per inference
+            model_deployment_bonus: 1,          // 1 SALT per model deployment
             treasury_percentage: 10,            // 10% to treasury
             treasury_address: Address([0; 20]), // Will be set in genesis
         }
@@ -77,7 +77,7 @@ impl RewardCalculator {
         if inference_count > 0 {
             let inference_reward = U256::from(self.config.inference_bonus)
                 * U256::from(inference_count)
-                * U256::from(10).pow(U256::from(DECIMALS - 2)); // 0.01 LATT units
+                * U256::from(10).pow(U256::from(DECIMALS - 2)); // 0.01 SALT units
             total_reward += inference_reward;
         }
 
@@ -212,7 +212,7 @@ mod tests {
 
         let reward = calculator.calculate_reward(&block);
 
-        // 10 LATT = 10 * 10^18 wei
+        // 10 SALT = 10 * 10^18 wei
         let expected_total = U256::from(10) * U256::from(10).pow(U256::from(18));
         assert_eq!(reward.total_reward, expected_total);
 
@@ -260,7 +260,7 @@ mod tests {
 
         let reward = calculator.calculate_reward(&block);
 
-        // After halving: 5 LATT = 5 * 10^18 wei
+        // After halving: 5 SALT = 5 * 10^18 wei
         let expected_total = U256::from(5) * U256::from(10).pow(U256::from(18));
         assert_eq!(reward.total_reward, expected_total);
     }

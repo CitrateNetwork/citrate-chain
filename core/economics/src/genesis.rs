@@ -47,21 +47,21 @@ impl Default for GenesisConfig {
 
         // Test accounts with initial balances
         let test_accounts = vec![
-            // Faucet account (10 million LATT for testnet distribution)
+            // Faucet account (10 million SALT for testnet distribution)
             GenesisAccount {
                 address: faucet,
                 balance: latt_to_wei(10_000_000),
                 nonce: 0,
                 code: None,
             },
-            // Treasury (100 million LATT)
+            // Treasury (100 million SALT)
             GenesisAccount {
                 address: treasury,
                 balance: latt_to_wei(100_000_000),
                 nonce: 0,
                 code: None,
             },
-            // Ecosystem fund (250 million LATT)
+            // Ecosystem fund (250 million SALT)
             GenesisAccount {
                 address: ecosystem,
                 balance: latt_to_wei(250_000_000),
@@ -90,7 +90,7 @@ impl Default for GenesisConfig {
             treasury_address: treasury,
             team_allocations: HashMap::new(), // No team allocations for testnet
             ecosystem_fund: ecosystem,
-            mining_pool_max: latt_to_wei(500_000_000), // 500M LATT for mining
+            mining_pool_max: latt_to_wei(500_000_000), // 500M SALT for mining
         }
     }
 }
@@ -101,7 +101,7 @@ impl GenesisConfig {
         let treasury = address_from_hex("0x1111111111111111111111111111111111111111").unwrap();
         let ecosystem = address_from_hex("0x2222222222222222222222222222222222222222").unwrap();
 
-        // Team allocations (15% = 150M LATT, vested over 4 years)
+        // Team allocations (15% = 150M SALT, vested over 4 years)
         let team_allocations = HashMap::new();
         // Add team member addresses and allocations here
 
@@ -125,6 +125,45 @@ impl GenesisConfig {
             ],
             treasury_address: treasury,
             team_allocations,
+            ecosystem_fund: ecosystem,
+            mining_pool_max: latt_to_wei(500_000_000),
+        }
+    }
+
+    /// Create testnet beta genesis configuration (chain_id = 42069).
+    /// Used for the closed beta testnet with peer whitelist + API key gating.
+    pub fn testnet_beta() -> Self {
+        let treasury = Address([0x11; 20]);
+        let ecosystem = Address([0x22; 20]);
+        let faucet = Address([0x33; 20]);
+
+        Self {
+            chain_id: 42069, // Testnet beta
+            accounts: vec![
+                // Faucet account (10M SALT for testnet distribution)
+                GenesisAccount {
+                    address: faucet,
+                    balance: latt_to_wei(10_000_000),
+                    nonce: 0,
+                    code: None,
+                },
+                // Treasury (100M SALT)
+                GenesisAccount {
+                    address: treasury,
+                    balance: latt_to_wei(100_000_000),
+                    nonce: 0,
+                    code: None,
+                },
+                // Ecosystem fund (250M SALT)
+                GenesisAccount {
+                    address: ecosystem,
+                    balance: latt_to_wei(250_000_000),
+                    nonce: 0,
+                    code: None,
+                },
+            ],
+            treasury_address: treasury,
+            team_allocations: HashMap::new(),
             ecosystem_fund: ecosystem,
             mining_pool_max: latt_to_wei(500_000_000),
         }
@@ -205,7 +244,7 @@ mod tests {
         let config = GenesisConfig::default();
         let total = config.total_preallocation();
 
-        // Should be 360M LATT (10M faucet + 100M treasury + 250M ecosystem + 2K test accounts)
+        // Should be 360M SALT (10M faucet + 100M treasury + 250M ecosystem + 2K test accounts)
         let expected = latt_to_wei(360_002_000);
         assert_eq!(total, expected);
     }
