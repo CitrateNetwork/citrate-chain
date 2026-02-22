@@ -202,12 +202,14 @@ impl Default for NodeConfig {
                 listen_addr: "127.0.0.1:30303".parse().unwrap(),
                 bootstrap_nodes: vec![],
                 max_peers: 50,
+                allowed_peers: vec![],
             },
             rpc: RpcConfig {
                 enabled: true,
                 listen_addr: "127.0.0.1:8545".parse().unwrap(),
                 ws_addr: "127.0.0.1:8546".parse().unwrap(),
                 allow_eth_send_transaction: false, // Secure default
+                api_key: None,
             },
             storage: StorageConfig {
                 data_dir: dirs::home_dir()
