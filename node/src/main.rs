@@ -1435,9 +1435,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     let mut economics_manager_temp = UnifiedEconomicsManager::new(economics_config);
 
     // Register initial stakeholders
-    let coinbase_bytes = hex::decode(&config.mining.coinbase).unwrap_or_else(|_| vec![0; 32]);
+    let coinbase_bytes = hex::decode(&config.mining.coinbase).unwrap_or_else(|_| vec![0; 20]);
     let mut coinbase = [0u8; 32];
-    coinbase.copy_from_slice(&coinbase_bytes[..32.min(coinbase_bytes.len())]);
+    let copy_len = coinbase_bytes.len().min(32);
+    coinbase[..copy_len].copy_from_slice(&coinbase_bytes[..copy_len]);
     let validator_address = citrate_execution::types::Address(coinbase[0..20].try_into().unwrap_or([0; 20]));
     let _ = economics_manager_temp.register_stakeholder(validator_address, StakeholderType::Validator);
 
@@ -1517,9 +1518,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         info!("Starting block producer...");
 
         // Parse coinbase address
-        let coinbase_bytes = hex::decode(&config.mining.coinbase).unwrap_or_else(|_| vec![0; 32]);
+        let coinbase_bytes = hex::decode(&config.mining.coinbase).unwrap_or_else(|_| vec![0; 20]);
         let mut coinbase = [0u8; 32];
-        coinbase.copy_from_slice(&coinbase_bytes[..32.min(coinbase_bytes.len())]);
+        let copy_len = coinbase_bytes.len().min(32);
+        coinbase[..copy_len].copy_from_slice(&coinbase_bytes[..copy_len]);
 
         // WP-G.2: Generate block signing key.
         // Deterministic derivation from coinbase for devnet reproducibility.
