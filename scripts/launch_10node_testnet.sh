@@ -157,7 +157,7 @@ for i in $(seq 0 $((NUM_NODES > 5 ? 4 : NUM_NODES - 1))); do
     fi
 
     BLOCK_HEX=$(echo "$RESULT" | jq -r '.result // "0x0"' 2>/dev/null || echo "0x0")
-    HEIGHT=$((16#${BLOCK_HEX#0x} 2>/dev/null)) || HEIGHT=0
+    HEIGHT=$((16#${BLOCK_HEX#0x})) 2>/dev/null || HEIGHT=0
     echo "    Node $i (port $PORT): Block #$HEIGHT"
 done
 if [ "$NUM_NODES" -gt 5 ]; then
