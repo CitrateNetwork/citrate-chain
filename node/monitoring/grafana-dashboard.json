@@ -1,0 +1,74 @@
+{
+  "dashboard": {
+    "title": "Citrate Node Dashboard",
+    "uid": "citrate-node",
+    "timezone": "utc",
+    "refresh": "5s",
+    "panels": [
+      {
+        "title": "Block Height",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+        "targets": [{ "expr": "citrate_block_height", "legendFormat": "Height" }]
+      },
+      {
+        "title": "Node Uptime",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+        "targets": [{ "expr": "citrate_node_uptime_seconds", "legendFormat": "Uptime" }],
+        "fieldConfig": { "defaults": { "unit": "s" } }
+      },
+      {
+        "title": "Peer Count",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+        "targets": [{ "expr": "citrate_peer_count", "legendFormat": "Peers" }]
+      },
+      {
+        "title": "Mempool Size",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+        "targets": [{ "expr": "citrate_mempool_size", "legendFormat": "Pending TXs" }]
+      },
+      {
+        "title": "RPC Request Rate",
+        "type": "graph",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+        "targets": [{ "expr": "rate(citrate_rpc_requests_total[1m])", "legendFormat": "{{ method }}" }]
+      },
+      {
+        "title": "RPC Latency (p99)",
+        "type": "graph",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+        "targets": [{ "expr": "histogram_quantile(0.99, rate(citrate_rpc_latency_seconds_bucket[5m]))", "legendFormat": "p99" }],
+        "fieldConfig": { "defaults": { "unit": "s" } }
+      },
+      {
+        "title": "DAG Tips",
+        "type": "graph",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+        "targets": [{ "expr": "citrate_dag_tips_count", "legendFormat": "Tips" }]
+      },
+      {
+        "title": "AI Inference Requests",
+        "type": "graph",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+        "targets": [
+          { "expr": "rate(citrate_ai_requests_total[5m])", "legendFormat": "AI Requests/s" },
+          { "expr": "rate(citrate_ipfs_uploads_total[5m])", "legendFormat": "IPFS Uploads/s" }
+        ]
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "instance",
+          "type": "query",
+          "query": "label_values(citrate_node_uptime_seconds, instance)",
+          "refresh": 2
+        }
+      ]
+    }
+  },
+  "overwrite": true
+}
