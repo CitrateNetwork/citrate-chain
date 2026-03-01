@@ -419,43 +419,35 @@ Three new fields at BFT finality checkpoints:
 
 ## 9. Recommended Sprint Amendments
 
-### Amendment 1: Add WP-M.1b — Belnap Classification Function φ (5 pts)
+### Amendment 1: Add WP-L.7 — Belnap Classification Function φ (3 pts) ✅ APPLIED
 
-**Rationale**: φ is the core contribution of Paper II. Without it, the system is standard FedAvg.
+**Status**: Applied to Sprint L as WP-L.7. Function `classify_belnap()` in `belnap.rs`. 6 new test cases (PC-T12a through PC-T12f).
 
-**Deliverable**: `classify_embedding(embedding, majority, confidence, θ_high, θ_low) → Vec<BelnapValue>`
+### Amendment 2: Extend WP-M.1 — Dual-Output Aggregation (3 pts) ✅ APPLIED
 
-**Location**: New function in `aggregation.rs` or new `classification.rs` module.
+**Status**: Applied to Sprint M. WP-M.1 now returns `AggregationResult { embedding, state_vector, confidence }`. 3 new test cases (PC-T13a through PC-T13c).
 
-### Amendment 2: Extend WP-M.1 — Dual-Output Aggregation (3 pts)
+### Amendment 3: Add WP-M.2b — Block & Checkpoint Learning Fields (5 pts) ✅ APPLIED
 
-**Rationale**: Aggregation must return `(e_agg, state_vector)`, not just `e_agg`.
+**Status**: Applied to Sprint M as WP-M.2b. 3 new test cases (PC-T16a through PC-T16c).
 
-**Deliverable**: `AggregationResult { embedding: EmbeddingVector, state_vector: Vec<BelnapValue> }`
+### Amendment 4: Extend WP-N.1 — Router Takes State Vector (3 pts) ✅ APPLIED
 
-### Amendment 3: Add WP-M.2b — Block & Checkpoint Learning Fields (5 pts)
+**Status**: Applied to Sprint N. WP-N.1 signature: `route(query, e_agg, state_vector)`. 2 new test cases (PC-T23a, PC-T23b).
 
-**Rationale**: Block struct needs optional embedding/confidence/gradient_commitment fields. Checkpoint needs routing_weights_hash/adapter_registry_hash/performance_profile_hash.
+### Amendment 5: Add WP-N.2b — Macro-Phase State Machine (3 pts) ✅ APPLIED
 
-**Deliverable**: Extended Block and Checkpoint structs (backward-compatible Optional fields).
+**Status**: Applied to Sprint N as WP-N.2b. `NetworkLearningPhase { Collection, RoutingActive, FullSystem }`. 2 new test cases (PC-T29a, PC-T29b).
 
-### Amendment 4: Extend WP-N.1 — Router Takes State Vector (3 pts)
+### Amendment 6: Fix Config Default (0 pts — trivial) ✅ APPLIED
 
-**Rationale**: Router must receive Belnap state vector to make paraconsistent routing decisions.
+**Status**: Applied directly to `core/learning/src/config.rs`. Default changed from 128 to 768. New fields added: `belnap_high_threshold`, `belnap_low_threshold`, `temperature`, `lora_rank`, `adapter_consolidation_interval`. 3 new config validation tests.
 
-**Deliverable**: `route(query, e_agg, encoded_state_vector) → routing_weights`
+### LoRA + Confidence Gating (GAP-8 + additional) ✅ APPLIED
 
-### Amendment 5: Add WP-N.2b — Macro-Phase State Machine (3 pts)
+**Status**: Applied to Sprint O. WP-O.1 now specifies LoRA matrices instead of embedding deltas, with confidence-gated application. 4 new test cases (PC-T35a through PC-T35c, PC-T47).
 
-**Rationale**: Paper's Phase 1/2/3 are distinct from per-checkpoint OODA cycle.
-
-**Deliverable**: `NetworkLearningPhase { Collection, RoutingActive, FullSystem }` with transition criteria.
-
-### Amendment 6: Fix Config Default (0 pts — trivial)
-
-**Rationale**: Change `embedding_dimensions` from 128 to 768 per Paper II Table A2.
-
-**Total Additional Points**: ~19 pts spread across Sprints M and N.
+**Total Additional Points**: 22 pts across Sprints L (+3), M (+11), N (+6), O (+5). Total program: 434 → 456 pts.
 
 ---
 

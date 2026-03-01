@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearningConfig {
     /// Embedding vector dimensionality.
+    /// Paper II Table A2 specifies 768 (common transformer hidden size).
     pub embedding_dimensions: usize,
 
     /// Minimum participants required to trigger aggregation.
@@ -40,12 +41,31 @@ pub struct LearningConfig {
 
     /// Maximum adapter size in bytes.
     pub max_adapter_bytes: usize,
+
+    /// Belnap classification high threshold (θ_high).
+    /// Paper II Table A2: 0.8. Requires testnet calibration.
+    pub belnap_high_threshold: f32,
+
+    /// Belnap classification low threshold (θ_low).
+    /// Paper II Table A2: 0.3. Requires testnet calibration.
+    pub belnap_low_threshold: f32,
+
+    /// Temperature parameter τ for softmax(blue_score/τ) trust weighting.
+    /// Paper II Table A2: 1.0. Controls blue-score trust concentration.
+    pub temperature: f32,
+
+    /// LoRA adapter rank (r). Paper II Table A2: 16.
+    pub lora_rank: usize,
+
+    /// Adapter consolidation interval (in checkpoints).
+    /// Paper II Table A2: every 1000 checkpoints (~83 min).
+    pub adapter_consolidation_interval: u64,
 }
 
 impl Default for LearningConfig {
     fn default() -> Self {
         Self {
-            embedding_dimensions: 128,
+            embedding_dimensions: 768,       // Paper II Table A2
             min_participants: 3,
             stale_threshold_rounds: 10,
             phase_timeout_ms: 30_000,
@@ -55,7 +75,12 @@ impl Default for LearningConfig {
             router_hidden_dim: 64,
             router_num_destinations: 4,
             router_learning_rate: 0.01,
-            max_adapter_bytes: 1_048_576, // 1 MB
+            max_adapter_bytes: 1_048_576,    // 1 MB
+            belnap_high_threshold: 0.8,      // Paper II Table A2
+            belnap_low_threshold: 0.3,       // Paper II Table A2
+            temperature: 1.0,                // Paper II Table A2
+            lora_rank: 16,                   // Paper II Table A2
+            adapter_consolidation_interval: 1_000, // Paper II Table A2 (~83 min)
         }
     }
 }
@@ -69,10 +94,10 @@ impl LearningConfig {
                 reason: "must be > 0".to_string(),
             });
         }
-        if self.embedding_dimensions > 1024 {
+        if self.embedding_dimensions > 4096 {
             return Err(LearningError::ConfigInvalid {
                 field: "embedding_dimensions".to_string(),
-                reason: "must be <= 1024".to_string(),
+                reason: "must be <= 4096".to_string(),
             });
         }
         if self.min_participants == 0 {
@@ -105,6 +130,30 @@ impl LearningConfig {
                 reason: "must be in (0.0, 1.0]".to_string(),
             });
         }
+        if self.belnap_high_threshold <= self.belnap_low_threshold {
+            return Err(LearningError::ConfigInvalid {
+                field: "belnap_high_threshold".to_string(),
+                reason: "must be > belnap_low_threshold".to_string(),
+            });
+        }
+        if self.belnap_low_threshold < 0.0 || self.belnap_high_threshold > 1.0 {
+            return Err(LearningError::ConfigInvalid {
+                field: "belnap_thresholds".to_string(),
+                reason: "must be in [0.0, 1.0]".to_string(),
+            });
+        }
+        if self.temperature <= 0.0 {
+            return Err(LearningError::ConfigInvalid {
+                field: "temperature".to_string(),
+                reason: "must be > 0.0".to_string(),
+            });
+        }
+        if self.lora_rank == 0 {
+            return Err(LearningError::ConfigInvalid {
+                field: "lora_rank".to_string(),
+                reason: "must be > 0".to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -118,8 +167,12 @@ mod tests {
     fn test_default_config_valid() {
         let config = LearningConfig::default();
         assert!(config.validate().is_ok());
-        assert_eq!(config.embedding_dimensions, 128);
+        assert_eq!(config.embedding_dimensions, 768); // Paper II Table A2
         assert_eq!(config.min_participants, 3);
+        assert_eq!(config.belnap_high_threshold, 0.8);
+        assert_eq!(config.belnap_low_threshold, 0.3);
+        assert_eq!(config.temperature, 1.0);
+        assert_eq!(config.lora_rank, 16);
     }
 
     #[test]
@@ -132,7 +185,7 @@ mod tests {
     #[test]
     fn test_config_excessive_dimensions() {
         let mut config = LearningConfig::default();
-        config.embedding_dimensions = 2048;
+        config.embedding_dimensions = 8192;
         assert!(config.validate().is_err());
     }
 
@@ -157,6 +210,29 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.router_learning_rate = 1.5;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_invalid_belnap_thresholds() {
+        let mut config = LearningConfig::default();
+        // high <= low
+        config.belnap_high_threshold = 0.2;
+        config.belnap_low_threshold = 0.5;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_invalid_temperature() {
+        let mut config = LearningConfig::default();
+        config.temperature = 0.0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_invalid_lora_rank() {
+        let mut config = LearningConfig::default();
+        config.lora_rank = 0;
         assert!(config.validate().is_err());
     }
 
