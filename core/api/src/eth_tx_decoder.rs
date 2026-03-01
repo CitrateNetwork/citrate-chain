@@ -260,6 +260,11 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
         // This is done AFTER RLP to prevent Ethereum RLP bytes from
         // accidentally deserializing as bincode (which would skip chain ID validation).
         if let Ok(mut tx) = bincode::deserialize::<Transaction>(tx_bytes) {
+            // WP-K.1: SECURITY — never trust wire-serialized ecdsa_verified flag.
+            // A malicious client could craft a bincode payload with ecdsa_verified=true
+            // to bypass ECDSA recovery. Force it to false so the mempool/verifier
+            // must independently verify the signature.
+            tx.ecdsa_verified = false;
             eprintln!("Successfully decoded as Citrate native transaction (bincode fallback)");
             if tx.hash == Hash::default() {
                 tx.hash = Hash::new(hash_bytes);

@@ -20,6 +20,10 @@ pub enum DagStoreError {
 
     #[error("Storage error: {0}")]
     StorageError(String),
+
+    /// WP-K.5: Block failed VRF/proposer admission check
+    #[error("Invalid VRF: {0}")]
+    InvalidVrf(String),
 }
 
 /// DAG storage manager
@@ -41,6 +45,10 @@ pub struct DagStore {
 
     /// Pruning point
     pruning_point: Arc<RwLock<Hash>>,
+
+    /// WP-K.5: When true, blocks failing VRF admission are rejected.
+    /// When false (default/testnet), failures are logged but blocks are accepted.
+    strict_vrf: bool,
 }
 
 impl DagStore {
@@ -52,7 +60,48 @@ impl DagStore {
             tips: Arc::new(RwLock::new(HashSet::new())),
             finalized: Arc::new(RwLock::new(HashSet::new())),
             pruning_point: Arc::new(RwLock::new(Hash::default())),
+            strict_vrf: false,
         }
+    }
+
+    /// Create a DagStore with strict VRF enforcement.
+    /// WP-K.5: In strict mode, blocks failing VRF admission are rejected.
+    pub fn with_strict_vrf(strict_vrf: bool) -> Self {
+        Self {
+            strict_vrf,
+            ..Self::new()
+        }
+    }
+
+    /// WP-K.5: Validate block admission — VRF plausibility and proposer checks.
+    /// Non-genesis blocks must have a structurally valid VRF proof and non-zero proposer.
+    fn validate_block_admission(&self, block: &Block) -> Result<(), String> {
+        // Genesis blocks are exempt from VRF checks
+        if block.is_genesis() {
+            return Ok(());
+        }
+
+        // Proposer pubkey must be non-zero
+        if block.header.proposer_pubkey.as_bytes().iter().all(|&b| b == 0) {
+            return Err("Block has zero proposer public key".to_string());
+        }
+
+        // VRF proof must be non-empty
+        if block.header.vrf_reveal.proof.is_empty() {
+            return Err("Block has empty VRF proof".to_string());
+        }
+
+        // VRF output must be non-zero
+        if block.header.vrf_reveal.output == Hash::default() {
+            return Err("Block has zero VRF output".to_string());
+        }
+
+        // Block signature must be non-zero (structurally present)
+        if block.signature.as_bytes().iter().all(|&b| b == 0) {
+            return Err("Block has zero signature".to_string());
+        }
+
+        Ok(())
     }
 
     /// Store a block in the DAG
@@ -62,6 +111,18 @@ impl DagStore {
         // Check if block already exists
         if self.blocks.read().await.contains_key(&hash) {
             return Err(DagStoreError::BlockExists(hash));
+        }
+
+        // WP-K.5: VRF admission gate
+        if let Err(e) = self.validate_block_admission(&block) {
+            if self.strict_vrf {
+                return Err(DagStoreError::InvalidVrf(e));
+            } else {
+                tracing::warn!(
+                    "Block {} VRF plausibility check failed (permissive mode): {}",
+                    hash, e
+                );
+            }
         }
 
         // Update parent-child relationships
@@ -403,5 +464,96 @@ mod tests {
         for i in 5..10 {
             assert!(store.has_block(&Hash::new([i as u8; 32])).await);
         }
+    }
+
+    /// Helper: create a block with valid VRF structure
+    fn create_block_with_vrf(hash: [u8; 32], height: u64, parent: Hash) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                block_hash: Hash::new(hash),
+                selected_parent_hash: parent,
+                merge_parent_hashes: vec![],
+                timestamp: 0,
+                height,
+                blue_score: 0,
+                blue_work: 0,
+                pruning_point: Hash::default(),
+                proposer_pubkey: PublicKey::new([1; 32]), // Non-zero proposer
+                vrf_reveal: VrfProof {
+                    proof: vec![1, 2, 3, 4], // Non-empty proof
+                    output: Hash::new([0xAA; 32]), // Non-zero output
+                },
+                base_fee_per_gas: 0,
+                gas_used: 0,
+                gas_limit: 30_000_000,
+            },
+            state_root: Hash::default(),
+            tx_root: Hash::default(),
+            receipt_root: Hash::default(),
+            artifact_root: Hash::default(),
+            ghostdag_params: GhostDagParams::default(),
+            transactions: vec![],
+            signature: Signature::new([1; 64]), // Non-zero signature
+            embedded_models: vec![],
+            required_pins: vec![],
+        }
+    }
+
+    /// WP-K.5: Block with empty VRF → warning in permissive mode, accepted
+    #[tokio::test]
+    async fn test_k5_empty_vrf_permissive_mode() {
+        let store = DagStore::new(); // strict_vrf=false by default
+        // Non-genesis block with empty VRF (test helper creates these)
+        // First store a genesis so we have a valid parent
+        let genesis = create_test_block([0xFE; 32], 0, Hash::default());
+        store.store_block(genesis.clone()).await.unwrap();
+        let block = create_test_block([1; 32], 1, genesis.hash());
+        // Should succeed in permissive mode (just logs a warning)
+        assert!(store.store_block(block).await.is_ok());
+    }
+
+    /// WP-K.5: Block with empty VRF → rejection in strict mode
+    #[tokio::test]
+    async fn test_k5_empty_vrf_strict_mode() {
+        let store = DagStore::with_strict_vrf(true);
+        // Store genesis first (genesis is exempt from VRF checks)
+        let genesis = create_test_block([0xFE; 32], 0, Hash::default());
+        store.store_block(genesis.clone()).await.unwrap();
+        // Non-genesis block with empty VRF proof
+        let block = create_test_block([1; 32], 1, genesis.hash());
+        let result = store.store_block(block).await;
+        assert!(
+            matches!(result, Err(DagStoreError::InvalidVrf(_))),
+            "Block with empty VRF must be rejected in strict mode, got: {:?}",
+            result
+        );
+    }
+
+    /// WP-K.5: Block with valid VRF structure → accepted in both modes
+    #[tokio::test]
+    async fn test_k5_valid_vrf_accepted() {
+        // Permissive mode
+        let store = DagStore::new();
+        let genesis = create_test_block([0xFE; 32], 0, Hash::default());
+        store.store_block(genesis.clone()).await.unwrap();
+        let block = create_block_with_vrf([1; 32], 1, genesis.hash());
+        assert!(store.store_block(block).await.is_ok());
+
+        // Strict mode
+        let store_strict = DagStore::with_strict_vrf(true);
+        let genesis2 = create_test_block([0xFD; 32], 0, Hash::default());
+        store_strict.store_block(genesis2.clone()).await.unwrap();
+        let block2 = create_block_with_vrf([2; 32], 1, genesis2.hash());
+        assert!(store_strict.store_block(block2).await.is_ok());
+    }
+
+    /// WP-K.5: Genesis block bypasses VRF check even in strict mode
+    #[tokio::test]
+    async fn test_k5_genesis_exempt_strict_mode() {
+        let store = DagStore::with_strict_vrf(true);
+        // Genesis block: parent=default, no merge parents — empty VRF is fine
+        let genesis = create_test_block([0xFF; 32], 0, Hash::default());
+        assert!(store.store_block(genesis).await.is_ok());
     }
 }

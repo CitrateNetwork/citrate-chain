@@ -322,6 +322,90 @@ impl BlockProducer {
         }
     }
 
+    /// WP-K.2: Access the producer's shared DAG store.
+    /// Used to feed network-received blocks into the live DAG for fork-choice.
+    pub fn dag_store(&self) -> Arc<DagStore> {
+        self.dag_store.clone()
+    }
+
+    /// WP-K.2: Access the producer's shared GhostDag instance.
+    /// Used to update blue set calculations when network blocks arrive.
+    pub fn ghostdag(&self) -> Arc<GhostDag> {
+        self.ghostdag.clone()
+    }
+
+    /// Create with pre-built DAG components and economics manager.
+    /// WP-K.2: Allows sharing the DAG store and GhostDag between the
+    /// producer and the network message handler for live fork-choice.
+    pub async fn with_shared_dag(
+        storage: Arc<StorageManager>,
+        executor: Arc<Executor>,
+        mempool: Arc<Mempool>,
+        peer_manager: Option<Arc<PeerManager>>,
+        coinbase: PublicKey,
+        signing_key: Ed25519SigningKey,
+        target_block_time: u64,
+        economics_manager: Arc<UnifiedEconomicsManager>,
+        dag_store: Arc<DagStore>,
+        ghostdag: Arc<GhostDag>,
+    ) -> Self {
+        // Load existing chain data into DAG so we continue from last tip
+        let latest_height = storage.blocks.get_latest_height().unwrap_or(0);
+        if latest_height > 0 {
+            info!("Loading {} blocks from storage into DAG...", latest_height + 1);
+            for height in 0..=latest_height {
+                if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
+                    if let Ok(Some(block)) = storage.blocks.get_block(&block_hash) {
+                        let _ = dag_store.store_block(block.clone()).await;
+                        let _ = ghostdag.add_block(&block).await;
+                    }
+                }
+            }
+            info!("DAG loaded: {} blocks, resuming from height {}", latest_height + 1, latest_height);
+        }
+
+        let tip_selector = Arc::new(TipSelector::new(
+            dag_store.clone(),
+            ghostdag.clone(),
+            citrate_consensus::tip_selection::SelectionStrategy::HighestBlueScore,
+        ));
+        let chain_selector = Arc::new(ChainSelector::new(
+            dag_store.clone(),
+            ghostdag.clone(),
+            tip_selector.clone(),
+            100,
+        ));
+
+        let reward_config = RewardConfig {
+            block_reward: 10,
+            halving_interval: 2_100_000,
+            inference_bonus: 1,
+            model_deployment_bonus: 1,
+            treasury_percentage: 10,
+            treasury_address: citrate_execution::types::Address([0x11; 20]),
+        };
+        let reward_calculator = RewardCalculator::new(reward_config);
+        let ai_state_manager = Arc::new(AIStateManager::new(storage.db.clone()));
+
+        Self {
+            storage,
+            executor,
+            mempool,
+            dag_store,
+            ghostdag,
+            tip_selector,
+            chain_selector,
+            ai_state_manager,
+            peer_manager,
+            coinbase,
+            signing_key,
+            target_block_time,
+            reward_calculator,
+            economics_manager: Some(economics_manager),
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Set an external pause flag (shared with the RPC server).
     /// WP-I.3: This allows the RPC citrate_emergencyPause method to
     /// directly control block production.

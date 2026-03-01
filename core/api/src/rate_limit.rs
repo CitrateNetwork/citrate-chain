@@ -28,6 +28,7 @@ static METHOD_BUDGETS: Lazy<DashMap<String, MethodBudgetEntry>> = Lazy::new(Dash
 struct MethodBudgetEntry {
     cost_used: u32,
     window_start: Instant,
+    last_access: Instant,
 }
 
 /// Check if a method call should be allowed under the per-client method budget.
@@ -53,6 +54,7 @@ pub fn check_method_budget(method_cost: u32) -> Result<(), jsonrpc_core::Error> 
     let mut entry = METHOD_BUDGETS.entry(key).or_insert_with(|| MethodBudgetEntry {
         cost_used: 0,
         window_start: now,
+        last_access: now,
     });
 
     if now.duration_since(entry.window_start) >= window {
@@ -61,6 +63,7 @@ pub fn check_method_budget(method_cost: u32) -> Result<(), jsonrpc_core::Error> 
     }
 
     entry.cost_used += method_cost;
+    entry.last_access = now;
 
     if entry.cost_used > BUDGET_LIMIT {
         drop(entry);
@@ -153,6 +156,10 @@ pub struct RateLimitConfig {
     /// `/health` and `/ready` endpoints are exempt.
     /// When None (default), all requests are allowed (open mode / devnet).
     pub api_key: Option<String>,
+    /// WP-K.4: Whether the RPC server is bound to a public (non-loopback) interface.
+    /// When true and no operator_token is set, operator methods are DENIED
+    /// (fail-closed) rather than allowed to everyone.
+    pub is_public_bind: bool,
 }
 
 impl Default for RateLimitConfig {
@@ -164,13 +171,20 @@ impl Default for RateLimitConfig {
             method_costs: Vec::new(),
             operator_token: None, // WP-I.2: no auth in devnet by default
             api_key: None, // Sprint 03: no API key required by default
+            is_public_bind: false, // WP-K.4: safe default for devnet/localhost
         }
     }
 }
 
+/// WP-K.3: Eviction constants for rate limit buckets
+const BUCKET_TTL_SECS: u64 = 300; // 5 minutes
+const MAX_BUCKETS: usize = 100_000;
+const EVICTION_INTERVAL_SECS: u64 = 60; // sweep every minute
+
 struct BucketEntry {
     count: u32,
     window_start: Instant,
+    last_access: Instant,
 }
 
 /// Per-client sliding window rate limiter implementing `RequestMiddleware`.
@@ -180,6 +194,10 @@ pub struct RateLimiter {
     trusted_set: HashSet<IpAddr>,
     operator_token: Option<String>,
     api_key: Option<String>,
+    /// WP-K.4: Whether RPC is bound to a public interface
+    is_public_bind: bool,
+    /// WP-K.3: Last time stale buckets were evicted
+    last_eviction: Arc<std::sync::Mutex<Instant>>,
 }
 
 impl RateLimiter {
@@ -187,13 +205,42 @@ impl RateLimiter {
         let trusted_set: HashSet<IpAddr> = config.trusted_proxies.iter().cloned().collect();
         let operator_token = config.operator_token.clone();
         let api_key = config.api_key.clone();
+        let is_public_bind = config.is_public_bind;
         Self {
             config,
             buckets: Arc::new(DashMap::new()),
             trusted_set,
             operator_token,
             api_key,
+            is_public_bind,
+            last_eviction: Arc::new(std::sync::Mutex::new(Instant::now())),
         }
+    }
+
+    /// WP-K.3: Evict stale buckets to prevent unbounded memory growth.
+    /// Removes entries not accessed within BUCKET_TTL_SECS.
+    /// If still over MAX_BUCKETS after TTL eviction, removes oldest entries.
+    fn evict_stale_buckets(&self, now: Instant) {
+        let ttl = std::time::Duration::from_secs(BUCKET_TTL_SECS);
+
+        // Evict stale per-client buckets
+        self.buckets.retain(|_, entry| now.duration_since(entry.last_access) < ttl);
+
+        // If still over capacity, remove oldest entries
+        if self.buckets.len() > MAX_BUCKETS {
+            let mut entries: Vec<(String, Instant)> = self.buckets
+                .iter()
+                .map(|e| (e.key().clone(), e.value().last_access))
+                .collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let to_remove = self.buckets.len() - MAX_BUCKETS;
+            for (key, _) in entries.iter().take(to_remove) {
+                self.buckets.remove(key);
+            }
+        }
+
+        // Also evict stale METHOD_BUDGETS entries
+        METHOD_BUDGETS.retain(|_, entry| now.duration_since(entry.last_access) < ttl);
     }
 
     /// Extract API key from request via Bearer token, X-API-Key header, or query param.
@@ -250,7 +297,7 @@ impl RequestMiddleware for RateLimiter {
             }
         }
 
-        // WP-I.2: Set operator authentication state for this request.
+        // WP-I.2 + WP-K.4: Set operator authentication state for this request.
         // Method handlers check is_operator_authenticated() for privileged ops.
         let authenticated = match &self.operator_token {
             Some(expected) => {
@@ -260,7 +307,12 @@ impl RequestMiddleware for RateLimiter {
                     .map(|token| token == expected.as_str())
                     .unwrap_or(false)
             }
-            None => true, // No token configured → all requests are "operator" (devnet mode)
+            None => {
+                // WP-K.4: Fail-closed — if no token configured on a public interface,
+                // deny operator access rather than granting it to everyone.
+                // Localhost-only: allow for devnet convenience.
+                !self.is_public_bind
+            }
         };
         OPERATOR_AUTH.with(|a| a.set(authenticated));
 
@@ -275,9 +327,20 @@ impl RequestMiddleware for RateLimiter {
         let window = std::time::Duration::from_secs(self.config.window_secs);
         let max = self.config.max_requests;
 
+        // WP-K.3: Periodically evict stale buckets to prevent unbounded growth
+        {
+            let mut last = self.last_eviction.lock().unwrap();
+            if now.duration_since(*last) >= std::time::Duration::from_secs(EVICTION_INTERVAL_SECS) {
+                *last = now;
+                drop(last); // Release lock before eviction
+                self.evict_stale_buckets(now);
+            }
+        }
+
         let mut entry = self.buckets.entry(client_key.clone()).or_insert_with(|| BucketEntry {
             count: 0,
             window_start: now,
+            last_access: now,
         });
 
         // Reset window if expired
@@ -285,6 +348,9 @@ impl RequestMiddleware for RateLimiter {
             entry.count = 0;
             entry.window_start = now;
         }
+
+        // WP-K.3: Update last access time
+        entry.last_access = now;
 
         // WP-I.4: Method-based cost is deferred until we can read the body.
         // For middleware, we apply uniform cost=1 here. Method-level budgets
@@ -634,6 +700,102 @@ mod tests {
             RequestMiddlewareAction::Respond { .. } => {} // Expected 401
             RequestMiddlewareAction::Proceed { .. } => panic!("Should reject wrong API key"),
         }
+    }
+
+    // WP-K.4: Fail-closed operator auth tests
+
+    // WP-K.3: Bucket eviction tests
+
+    #[test]
+    fn test_k3_evict_stale_buckets() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 100,
+            window_secs: 1,
+            ..Default::default()
+        });
+
+        // Manually insert a "stale" entry with very old last_access
+        let past = Instant::now() - std::time::Duration::from_secs(BUCKET_TTL_SECS + 10);
+        limiter.buckets.insert("stale_client".to_string(), BucketEntry {
+            count: 5,
+            window_start: past,
+            last_access: past,
+        });
+
+        // Insert a fresh entry
+        limiter.buckets.insert("fresh_client".to_string(), BucketEntry {
+            count: 1,
+            window_start: Instant::now(),
+            last_access: Instant::now(),
+        });
+
+        assert_eq!(limiter.buckets.len(), 2);
+
+        // Evict stale entries
+        limiter.evict_stale_buckets(Instant::now());
+
+        assert_eq!(limiter.buckets.len(), 1, "Stale entry should be evicted");
+        assert!(limiter.buckets.contains_key("fresh_client"));
+        assert!(!limiter.buckets.contains_key("stale_client"));
+    }
+
+    #[test]
+    fn test_k3_max_bucket_cap() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+
+        // Insert entries up to MAX_BUCKETS + 10
+        let now = Instant::now();
+        for i in 0..(MAX_BUCKETS + 10) {
+            limiter.buckets.insert(format!("client_{}", i), BucketEntry {
+                count: 1,
+                window_start: now,
+                last_access: now,
+            });
+        }
+
+        assert!(limiter.buckets.len() > MAX_BUCKETS);
+
+        // Eviction should cap at MAX_BUCKETS (none are stale, so cap enforced)
+        limiter.evict_stale_buckets(now);
+
+        assert!(limiter.buckets.len() <= MAX_BUCKETS,
+            "Bucket count should be capped at MAX_BUCKETS after eviction");
+    }
+
+    #[test]
+    fn test_k4_public_bind_no_token_denies_operator() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            operator_token: None,
+            is_public_bind: true, // Public interface
+            ..Default::default()
+        });
+        // No token configured on public interface → operator methods denied
+        let _ = limiter.on_request(make_req());
+        assert!(!is_operator_authenticated(), "Public bind + no token must deny operator access");
+    }
+
+    #[test]
+    fn test_k4_localhost_no_token_allows_operator() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            operator_token: None,
+            is_public_bind: false, // Localhost
+            ..Default::default()
+        });
+        // Localhost + no token → operator methods allowed (devnet convenience)
+        let _ = limiter.on_request(make_req());
+        assert!(is_operator_authenticated(), "Localhost + no token must allow operator access");
+    }
+
+    #[test]
+    fn test_k4_public_bind_valid_token_allows_operator() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            operator_token: Some("my-secret".to_string()),
+            is_public_bind: true, // Public interface
+            ..Default::default()
+        });
+        let req = make_req_with_header("authorization", "Bearer my-secret");
+        let _ = limiter.on_request(req);
+        assert!(is_operator_authenticated(), "Public bind + valid token must allow operator access");
     }
 
     #[test]

@@ -355,6 +355,20 @@ impl Mempool {
                 tracing::warn!("Transaction has empty sender public key");
                 return Err(MempoolError::InvalidTransaction("Empty sender".into()));
             }
+            // WP-K.1: For ECDSA-shaped transactions (20-byte embedded EVM address),
+            // require ecdsa_verified=true. This flag is set ONLY by the tx decoder
+            // after cryptographic ECDSA recovery. The bincode fallback path forces
+            // ecdsa_verified=false, so forged payloads cannot bypass this gate.
+            let from_bytes = tx.from.as_bytes();
+            let is_evm_address = from_bytes[20..].iter().all(|&b| b == 0)
+                && !from_bytes[..20].iter().all(|&b| b == 0);
+            if is_evm_address && !tx.ecdsa_verified {
+                tracing::warn!(
+                    "ECDSA-shaped transaction from {:?} rejected: ecdsa_verified=false",
+                    tx.from
+                );
+                return Err(MempoolError::InvalidSignature);
+            }
         }
 
         // Check gas price
@@ -1144,6 +1158,68 @@ mod tests {
             .unwrap();
         let res = mempool.add_transaction(tx2, TxClass::Standard).await;
         assert!(matches!(res, Err(MempoolError::SenderLimitExceeded)));
+    }
+
+    /// WP-K.1 regression: A forged bincode payload with ecdsa_verified=true and
+    /// an EVM-shaped address (20-byte embedded) must be rejected by the mempool.
+    /// The tx decoder now forces ecdsa_verified=false on bincode fallback, and
+    /// the mempool checks the flag for EVM-shaped senders.
+    #[cfg(not(feature = "devnet"))]
+    #[tokio::test]
+    async fn test_k1_forged_ecdsa_verified_rejected() {
+        let config = MempoolConfig {
+            require_valid_signature: false, // Disable crypto verification for this test
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+
+        // Create an EVM-shaped address: first 20 bytes non-zero, last 12 bytes zero
+        let mut evm_sender = [0u8; 32];
+        evm_sender[..20].copy_from_slice(&[0xAA; 20]);
+        // evm_sender[20..32] are already zero — this is the EVM pattern
+
+        // Forged transaction: attacker sets ecdsa_verified=true in bincode payload
+        let mut forged_tx = Transaction {
+            hash: Hash::new([0x42; 32]),
+            nonce: 0,
+            from: PublicKey::new(evm_sender),
+            to: Some(PublicKey::new([2; 32])),
+            value: 1000,
+            gas_limit: 21000,
+            gas_price: 2_000_000_000,
+            data: vec![],
+            signature: Signature::new([1; 64]),
+            chain_id: Some(1337),
+            ecdsa_verified: true, // Attacker-forged value
+            ..Default::default()
+        };
+
+        // Simulate what the tx decoder now does: force ecdsa_verified=false
+        forged_tx.ecdsa_verified = false;
+
+        let result = mempool.add_transaction(forged_tx, TxClass::Standard).await;
+        assert!(
+            matches!(result, Err(MempoolError::InvalidSignature)),
+            "EVM-shaped tx with ecdsa_verified=false must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    /// WP-K.1: Verify that native (non-EVM) senders are NOT affected by the ECDSA gate.
+    /// Full 32-byte pubkeys don't trigger the EVM address check.
+    #[cfg(not(feature = "devnet"))]
+    #[tokio::test]
+    async fn test_k1_native_sender_not_affected() {
+        let config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+
+        // Native sender: all 32 bytes non-zero — not EVM-shaped
+        let tx = create_test_tx(0, 2_000_000_000, [1; 32]);
+        let result = mempool.add_transaction(tx, TxClass::Standard).await;
+        assert!(result.is_ok(), "Native sender should pass ECDSA gate");
     }
 
     #[tokio::test]

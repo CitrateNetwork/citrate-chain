@@ -31,6 +31,9 @@ mod producer;
 mod sync;
 
 use config::NodeConfig;
+use citrate_consensus::dag_store::DagStore;
+use citrate_consensus::ghostdag::GhostDag;
+use citrate_consensus::types::GhostDagParams;
 use genesis::{initialize_genesis_state, GenesisConfig};
 use producer::BlockProducer;
 
@@ -86,6 +89,10 @@ struct Cli {
     /// Run as bootstrap node (no active connections)
     #[arg(long)]
     bootstrap: bool,
+
+    /// Force start even with state root mismatch (WP-K.6)
+    #[arg(long)]
+    force_start: bool,
 
     /// Subcommands
     #[command(subcommand)]
@@ -374,7 +381,45 @@ async fn main() -> Result<()> {
         genesis::initialize_genesis_state(probe_storage, executor, &genesis_config).await?;
         info!("Genesis state initialized for chain ID {}", config.chain.chain_id);
     } else {
-        info!("Genesis block found in storage, skipping initialization");
+        // WP-K.6: Verify state root consistency before proceeding.
+        // If persisted state diverges from genesis, the node would run with corrupted state.
+        info!("Genesis block found in storage, verifying state root...");
+        let genesis_block = probe_storage.blocks.get_block_by_height(0)
+            .ok()
+            .flatten()
+            .and_then(|hash| probe_storage.blocks.get_block(&hash).ok().flatten())
+            .expect("Genesis block must exist (checked above)");
+
+        let persisted_root = probe_storage.state
+            .get_state_root(&genesis_block.header.block_hash)
+            .ok()
+            .flatten();
+
+        match persisted_root {
+            Some(root) if root != genesis_block.state_root => {
+                if config.validator.production_mode && !cli.force_start {
+                    error!(
+                        "FATAL: State root mismatch! Persisted: {}, Expected: {}",
+                        root, genesis_block.state_root
+                    );
+                    error!("Use --force-start to override (data may be corrupted)");
+                    return Err(anyhow::anyhow!("State root mismatch on startup"));
+                } else {
+                    warn!(
+                        "State root mismatch (devnet mode, continuing): Persisted: {}, Expected: {}",
+                        root, genesis_block.state_root
+                    );
+                }
+            }
+            Some(root) => {
+                info!("State root verified: {}", root);
+            }
+            None => {
+                // No persisted state root entry for genesis (pre-K.6 data) — skip check
+                info!("No persisted state root for genesis block (pre-K.6 data), skipping verification");
+            }
+        }
+
         drop(probe_storage);
     }
 
@@ -959,6 +1004,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         info!("Metrics server enabled at {}", addr);
     }
 
+    // WP-K.2: Create shared DAG store and GhostDag BEFORE spawning the network
+    // handler, so both the producer and network handler operate on the same DAG.
+    // This ensures network-received blocks feed into the live fork-choice.
+    let shared_dag_store = Arc::new(DagStore::new());
+    let shared_ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), shared_dag_store.clone()));
+
     // Start P2P listener and connect to bootstrap nodes
     {
         // Prepare head info
@@ -1210,6 +1261,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         );
         let ai_handler_for_rx = ai_handler.clone();
 
+        // WP-K.2: Clone DAG components for the network handler
+        let dag_store_for_net = shared_dag_store.clone();
+        let ghostdag_for_net = shared_ghostdag.clone();
+
         tokio::spawn(async move {
             use citrate_consensus::types::Hash;
             use citrate_network::NetworkMessage;
@@ -1386,6 +1441,26 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 Ok(_) => {
                                     // Block passed validation — persist it
                                     let _ = storage_for_handler.blocks.put_block(&block);
+                                    // WP-K.2: Feed validated block into live DAG for fork-choice
+                                    match dag_store_for_net.store_block(block.clone()).await {
+                                        Ok(_) => {
+                                            let _ = ghostdag_for_net.add_block(&block).await;
+                                            tracing::debug!(
+                                                "Added network block {} to live DAG",
+                                                hex::encode(&block.header.block_hash.as_bytes()[..8])
+                                            );
+                                        }
+                                        Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {
+                                            // Already in DAG (e.g., from local production) — safe to ignore
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to add block {} to live DAG: {}",
+                                                hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -1418,6 +1493,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         hex::encode(&hash.as_bytes()[..8]),
                                         e
                                     );
+                                } else {
+                                    // WP-K.2: Feed synced block into live DAG for fork-choice
+                                    match dag_store_for_net.store_block(block.clone()).await {
+                                        Ok(_) => {
+                                            let _ = ghostdag_for_net.add_block(&block).await;
+                                        }
+                                        Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {}
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to add synced block {} to live DAG: {}",
+                                                hex::encode(&hash.as_bytes()[..8]),
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1497,6 +1587,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             info!("RPC API key authentication enabled");
         }
 
+        // WP-K.4: Detect if RPC is bound to a public (non-loopback) interface
+        let is_public_bind = !config.rpc.listen_addr.ip().is_loopback();
+        if is_public_bind && operator_token.is_none() {
+            warn!("RPC bound to public interface ({}) without CITRATE_OPERATOR_TOKEN — operator methods disabled", config.rpc.listen_addr);
+        }
+
         let rpc_config = RpcConfig {
             listen_addr: config.rpc.listen_addr,
             max_connections: 100,
@@ -1507,6 +1603,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             rate_limit: citrate_api::rate_limit::RateLimitConfig {
                 operator_token,
                 api_key,
+                is_public_bind, // WP-K.4: fail-closed on public interface
                 ..Default::default()
             },
             ..Default::default()
@@ -1588,8 +1685,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             }
         }
 
-        // Use the economics manager created earlier
-        let mut producer_instance = BlockProducer::with_economics(
+        // WP-K.2: Use shared DAG components so the producer and network handler
+        // operate on the same DAG for consistent fork-choice.
+        let mut producer_instance = BlockProducer::with_shared_dag(
             storage.clone(),
             executor.clone(),
             mempool.clone(),
@@ -1598,6 +1696,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             signing_key,
             config.mining.target_block_time,
             economics_manager,
+            shared_dag_store.clone(),
+            shared_ghostdag.clone(),
         ).await;
         // WP-I.3: Share the same pause_flag between RPC server and producer
         // so citrate_emergencyPause actually halts block production.
