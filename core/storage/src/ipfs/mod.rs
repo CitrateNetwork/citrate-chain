@@ -48,7 +48,7 @@ pub enum ModelFramework {
     Custom(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelType {
     Language,
     Vision,

@@ -7,8 +7,10 @@
 //! rewards they have accrued so far.
 
 use super::{Cid, ModelMetadata, ModelType};
+use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Reward information returned whenever a new pin report is recorded.
@@ -147,6 +149,92 @@ impl PinningManager {
     pub fn reward_for_bytes(bytes: u64, model_type: &ModelType) -> u64 {
         let size_gb = bytes_to_gb(bytes).ceil().max(1.0) as u64;
         size_gb * reward_multiplier(model_type)
+    }
+}
+
+// ============================================================================
+// Persistent Pin Registry (WP-R.4)
+// ============================================================================
+
+/// Information about a pinned model in the persistent registry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PinnedModelInfo {
+    pub cid: String,
+    pub model_id: Option<String>,
+    pub pinned_at: u64,
+    pub size_bytes: u64,
+    pub model_type: ModelType,
+}
+
+/// File-backed pin registry that persists pin state across restarts.
+///
+/// Stores pin records as JSON in a file at `persist_path`.
+/// Automatically saves on every mutation (register/remove).
+pub struct PersistentPinRegistry {
+    pins: HashMap<String, PinnedModelInfo>,
+    persist_path: PathBuf,
+}
+
+impl PersistentPinRegistry {
+    /// Create a new registry, loading existing data from `persist_path` if present.
+    pub fn new(persist_path: PathBuf) -> Result<Self> {
+        let pins = if persist_path.exists() {
+            Self::load_from_file(&persist_path)?
+        } else {
+            HashMap::new()
+        };
+        Ok(Self { pins, persist_path })
+    }
+
+    /// Register a pin and auto-save to disk.
+    pub fn register_pin(&mut self, cid: String, info: PinnedModelInfo) -> Result<()> {
+        self.pins.insert(cid, info);
+        self.save()
+    }
+
+    /// Remove a pin and auto-save to disk.
+    pub fn remove_pin(&mut self, cid: &str) -> Result<bool> {
+        let existed = self.pins.remove(cid).is_some();
+        if existed {
+            self.save()?;
+        }
+        Ok(existed)
+    }
+
+    /// Look up a pin by CID.
+    pub fn get_pin(&self, cid: &str) -> Option<&PinnedModelInfo> {
+        self.pins.get(cid)
+    }
+
+    /// List all registered pins.
+    pub fn list_pins(&self) -> Vec<PinnedModelInfo> {
+        self.pins.values().cloned().collect()
+    }
+
+    /// Number of registered pins.
+    pub fn count(&self) -> usize {
+        self.pins.len()
+    }
+
+    /// Persist current state to the JSON file.
+    pub fn save(&self) -> Result<()> {
+        let json = serde_json::to_string_pretty(&self.pins)
+            .context("Failed to serialize pin registry")?;
+        if let Some(parent) = self.persist_path.parent() {
+            std::fs::create_dir_all(parent)
+                .context("Failed to create pin registry directory")?;
+        }
+        std::fs::write(&self.persist_path, json)
+            .context("Failed to write pin registry file")?;
+        Ok(())
+    }
+
+    fn load_from_file(path: &Path) -> Result<HashMap<String, PinnedModelInfo>> {
+        let data = std::fs::read_to_string(path)
+            .context("Failed to read pin registry file")?;
+        let pins: HashMap<String, PinnedModelInfo> = serde_json::from_str(&data)
+            .context("Failed to deserialize pin registry")?;
+        Ok(pins)
     }
 }
 

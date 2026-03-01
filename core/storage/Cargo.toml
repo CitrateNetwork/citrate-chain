@@ -44,6 +44,9 @@ pqcrypto-traits = "0.3"         # Common traits for pqcrypto
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }  # X25519 ECDH
 zeroize = "1.7"                 # Secure memory zeroing
 
+# Compression
+zstd = "0.13"                   # Zstandard compression for IPFS storage
+
 # IPFS daemon management
 dirs = "5.0"                    # Platform-specific directories
 flate2 = "1.0"                  # Gzip decompression for tar.gz

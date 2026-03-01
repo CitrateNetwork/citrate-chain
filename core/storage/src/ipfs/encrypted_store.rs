@@ -466,17 +466,30 @@ impl EncryptedIPFSStore {
         H256::from_slice(hasher.finalize().as_slice())
     }
 
-    /// Compress data using zstd
+    /// Compress data using zstd (level 3 — balanced speed/ratio)
     fn compress_data(&self, data: &[u8]) -> Result<Vec<u8>> {
-        // In production, use zstd::encode_all
-        // For now, return as-is
-        Ok(data.to_vec())
+        #[cfg(feature = "no-compression")]
+        {
+            return Ok(data.to_vec());
+        }
+        #[cfg(not(feature = "no-compression"))]
+        {
+            zstd::encode_all(std::io::Cursor::new(data), 3)
+                .map_err(|e| anyhow!("zstd compression failed: {}", e))
+        }
     }
 
-    /// Decompress data
+    /// Decompress zstd-compressed data
     fn decompress_data(&self, data: &[u8]) -> Result<Vec<u8>> {
-        // In production, use zstd::decode_all
-        Ok(data.to_vec())
+        #[cfg(feature = "no-compression")]
+        {
+            return Ok(data.to_vec());
+        }
+        #[cfg(not(feature = "no-compression"))]
+        {
+            zstd::decode_all(std::io::Cursor::new(data))
+                .map_err(|e| anyhow!("zstd decompression failed: {}", e))
+        }
     }
 }
 

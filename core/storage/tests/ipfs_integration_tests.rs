@@ -261,6 +261,187 @@ async fn test_daemon_status_serialization() {
     }
 }
 
+// ============================================================================
+// zstd Compression Tests (WP-R.3)
+// ============================================================================
+
+/// Test zstd compression round-trip: compress → decompress = identity
+#[test]
+fn test_zstd_compression_round_trip() {
+    let original = b"Hello, this is a test of zstd compression in Citrate storage!";
+    let compressed = zstd::encode_all(std::io::Cursor::new(original.as_slice()), 3).unwrap();
+    let decompressed = zstd::decode_all(std::io::Cursor::new(compressed.as_slice())).unwrap();
+    assert_eq!(original.as_slice(), decompressed.as_slice());
+}
+
+/// Test compressed data is smaller than original for compressible input
+#[test]
+fn test_zstd_compressed_smaller_than_original() {
+    // Highly compressible data (repeated pattern)
+    let original: Vec<u8> = "ABCDEFGH".repeat(1000).into_bytes();
+    let compressed = zstd::encode_all(std::io::Cursor::new(original.as_slice()), 3).unwrap();
+    assert!(
+        compressed.len() < original.len(),
+        "Compressed ({}) should be smaller than original ({})",
+        compressed.len(),
+        original.len()
+    );
+}
+
+/// Test empty data compresses and decompresses correctly
+#[test]
+fn test_zstd_empty_data_round_trip() {
+    let original: &[u8] = b"";
+    let compressed = zstd::encode_all(std::io::Cursor::new(original), 3).unwrap();
+    let decompressed = zstd::decode_all(std::io::Cursor::new(compressed.as_slice())).unwrap();
+    assert_eq!(original, decompressed.as_slice());
+}
+
+/// Test large data (1MB) round-trip integrity
+#[test]
+fn test_zstd_large_data_round_trip() {
+    use rand::RngCore;
+    let mut rng = rand::thread_rng();
+    let mut original = vec![0u8; 1024 * 1024]; // 1MB
+    rng.fill_bytes(&mut original);
+
+    let compressed = zstd::encode_all(std::io::Cursor::new(original.as_slice()), 3).unwrap();
+    let decompressed = zstd::decode_all(std::io::Cursor::new(compressed.as_slice())).unwrap();
+
+    assert_eq!(original.len(), decompressed.len());
+    assert_eq!(original, decompressed);
+}
+
+// ============================================================================
+// PersistentPinRegistry Tests (WP-R.4)
+// ============================================================================
+
+use citrate_storage::ipfs::pinning::{PersistentPinRegistry, PinnedModelInfo};
+
+/// Test register pin and query back
+#[test]
+fn test_persistent_pin_register_and_query() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("pins.json");
+    let mut registry = PersistentPinRegistry::new(path).unwrap();
+
+    let info = PinnedModelInfo {
+        cid: "QmTest123".to_string(),
+        model_id: Some("model-001".to_string()),
+        pinned_at: 1700000000,
+        size_bytes: 1024 * 1024 * 100,
+        model_type: ModelType::Language,
+    };
+
+    registry.register_pin("QmTest123".to_string(), info.clone()).unwrap();
+
+    let retrieved = registry.get_pin("QmTest123").unwrap();
+    assert_eq!(retrieved, &info);
+    assert_eq!(registry.count(), 1);
+}
+
+/// Test remove pin
+#[test]
+fn test_persistent_pin_remove() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("pins.json");
+    let mut registry = PersistentPinRegistry::new(path).unwrap();
+
+    let info = PinnedModelInfo {
+        cid: "QmRemove".to_string(),
+        model_id: None,
+        pinned_at: 1700000000,
+        size_bytes: 512,
+        model_type: ModelType::Vision,
+    };
+
+    registry.register_pin("QmRemove".to_string(), info).unwrap();
+    assert_eq!(registry.count(), 1);
+
+    let removed = registry.remove_pin("QmRemove").unwrap();
+    assert!(removed);
+    assert_eq!(registry.count(), 0);
+    assert!(registry.get_pin("QmRemove").is_none());
+
+    // Removing a non-existent pin returns false
+    let removed_again = registry.remove_pin("QmRemove").unwrap();
+    assert!(!removed_again);
+}
+
+/// Test save to file and reload — data intact
+#[test]
+fn test_persistent_pin_save_and_reload() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("pins.json");
+
+    // Scope 1: create, register, auto-save via register_pin
+    {
+        let mut registry = PersistentPinRegistry::new(path.clone()).unwrap();
+        registry.register_pin("QmPersist1".to_string(), PinnedModelInfo {
+            cid: "QmPersist1".to_string(),
+            model_id: Some("model-a".to_string()),
+            pinned_at: 1700000001,
+            size_bytes: 2048,
+            model_type: ModelType::Audio,
+        }).unwrap();
+        registry.register_pin("QmPersist2".to_string(), PinnedModelInfo {
+            cid: "QmPersist2".to_string(),
+            model_id: None,
+            pinned_at: 1700000002,
+            size_bytes: 4096,
+            model_type: ModelType::Multimodal,
+        }).unwrap();
+    }
+
+    // Scope 2: reload from file
+    let registry = PersistentPinRegistry::new(path).unwrap();
+    assert_eq!(registry.count(), 2);
+
+    let pin1 = registry.get_pin("QmPersist1").unwrap();
+    assert_eq!(pin1.model_id, Some("model-a".to_string()));
+    assert_eq!(pin1.size_bytes, 2048);
+
+    let pin2 = registry.get_pin("QmPersist2").unwrap();
+    assert_eq!(pin2.size_bytes, 4096);
+}
+
+/// Test list pins returns all registered
+#[test]
+fn test_persistent_pin_list_all() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("pins.json");
+    let mut registry = PersistentPinRegistry::new(path).unwrap();
+
+    for i in 0..5 {
+        registry.register_pin(format!("QmList{}", i), PinnedModelInfo {
+            cid: format!("QmList{}", i),
+            model_id: Some(format!("model-{}", i)),
+            pinned_at: 1700000000 + i as u64,
+            size_bytes: 1024 * (i as u64 + 1),
+            model_type: ModelType::Language,
+        }).unwrap();
+    }
+
+    let pins = registry.list_pins();
+    assert_eq!(pins.len(), 5);
+}
+
+/// Test empty registry loads cleanly from non-existent file
+#[test]
+fn test_persistent_pin_empty_registry() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("does_not_exist.json");
+
+    let registry = PersistentPinRegistry::new(path).unwrap();
+    assert_eq!(registry.count(), 0);
+    assert!(registry.list_pins().is_empty());
+    assert!(registry.get_pin("QmAnything").is_none());
+}
+
+// ============================================================================
+// Multiaddr / URL Tests
+// ============================================================================
+
 /// Test multiaddr parsing
 #[tokio::test]
 async fn test_api_url_parsing() {
