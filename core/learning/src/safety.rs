@@ -8,20 +8,15 @@ use serde::{Deserialize, Serialize};
 use tracing;
 
 /// Learning mode controls how the learning layer participates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LearningMode {
     /// Learning is completely disabled. No embeddings collected or aggregated.
+    #[default]
     Disabled,
     /// Learning observes only. Collects embeddings but does not create adapters.
     Passive,
     /// Full learning pipeline active. Collects, aggregates, routes, creates adapters.
     Active,
-}
-
-impl Default for LearningMode {
-    fn default() -> Self {
-        LearningMode::Disabled
-    }
 }
 
 impl std::fmt::Display for LearningMode {

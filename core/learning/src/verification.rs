@@ -2,6 +2,7 @@
 //!
 //! Implements Algorithm 5 and adversarial detection from Gradient Papers No. II.
 
+use crate::belnap::BelnapValue;
 use crate::config::LearningConfig;
 use crate::embeddings::EmbeddingVector;
 use crate::errors::{LearningError, LearningResult};
@@ -79,6 +80,60 @@ impl ByzantineDetector {
         Ok(sum.scale(1.0 / embeddings.len() as f32))
     }
 
+    /// Check if a participant's Belnap state vector is inconsistent.
+    ///
+    /// A participant is considered inconsistent if the fraction of dimensions
+    /// classified as `Both` exceeds `belnap_inconsistency_threshold`.
+    /// This indicates the participant is producing contradictory evidence
+    /// across too many dimensions.
+    pub fn is_belnap_inconsistent(&self, state_vector: &[BelnapValue]) -> bool {
+        if state_vector.is_empty() {
+            return false;
+        }
+        let both_count = state_vector
+            .iter()
+            .filter(|&&v| v == BelnapValue::Both)
+            .count();
+        let fraction = both_count as f32 / state_vector.len() as f32;
+        fraction > self.config.belnap_inconsistency_threshold
+    }
+
+    /// Run all Byzantine checks on a participant and auto-record flags.
+    ///
+    /// Checks:
+    /// 1. Statistical outlier detection (embedding distance from mean)
+    /// 2. Belnap inconsistency (too many Both dimensions)
+    ///
+    /// Returns a list of reasons the participant was flagged (empty if clean).
+    pub fn check_and_flag(
+        &mut self,
+        pubkey: PublicKey,
+        round: u64,
+        embedding: &EmbeddingVector,
+        mean: &EmbeddingVector,
+        std_dev: f32,
+        state_vector: &[BelnapValue],
+    ) -> LearningResult<Vec<String>> {
+        let mut reasons = Vec::new();
+
+        // Check 1: Statistical outlier
+        if self.is_outlier(embedding, mean, std_dev)? {
+            reasons.push("statistical outlier".to_string());
+        }
+
+        // Check 2: Belnap inconsistency
+        if self.is_belnap_inconsistent(state_vector) {
+            reasons.push("belnap inconsistency".to_string());
+        }
+
+        // Auto-record all flags
+        for reason in &reasons {
+            self.record_flag(pubkey, round, reason.clone());
+        }
+
+        Ok(reasons)
+    }
+
     /// Compute the standard deviation of distances from the mean.
     pub fn compute_std_dev(
         embeddings: &[EmbeddingVector],
@@ -152,6 +207,91 @@ mod tests {
         assert!(!detector.can_readmit(10, 13)); // Only 3 rounds
         assert!(detector.can_readmit(10, 15)); // 5 rounds (exact)
         assert!(detector.can_readmit(10, 20)); // 10 rounds
+    }
+
+    // PC-T32a: Belnap inconsistency detection
+    #[test]
+    fn test_belnap_inconsistency_detection() {
+        let detector = ByzantineDetector::new(LearningConfig {
+            belnap_inconsistency_threshold: 0.5,
+            ..test_config()
+        });
+
+        // 60% Both → exceeds 0.5 threshold → inconsistent
+        let mostly_both = vec![
+            BelnapValue::Both,
+            BelnapValue::Both,
+            BelnapValue::Both,
+            BelnapValue::True,
+            BelnapValue::False,
+        ];
+        assert!(detector.is_belnap_inconsistent(&mostly_both));
+
+        // 40% Both → below 0.5 threshold → consistent
+        let mostly_true = vec![
+            BelnapValue::Both,
+            BelnapValue::Both,
+            BelnapValue::True,
+            BelnapValue::True,
+            BelnapValue::True,
+        ];
+        assert!(!detector.is_belnap_inconsistent(&mostly_true));
+
+        // Empty → not inconsistent
+        assert!(!detector.is_belnap_inconsistent(&[]));
+    }
+
+    // PC-T32b: Combined check_and_flag
+    #[test]
+    fn test_check_and_flag_combined() {
+        let mut detector = ByzantineDetector::new(LearningConfig {
+            belnap_inconsistency_threshold: 0.5,
+            ..test_config()
+        });
+        let pk = [3u8; 32];
+        let mean = EmbeddingVector::new(vec![0.0, 0.0]).unwrap();
+
+        // Normal participant: close to mean, low Both fraction → no flags
+        let normal = EmbeddingVector::new(vec![0.5, 0.5]).unwrap();
+        let clean_state = vec![BelnapValue::True, BelnapValue::True];
+        let reasons = detector
+            .check_and_flag(pk, 1, &normal, &mean, 1.0, &clean_state)
+            .unwrap();
+        assert!(reasons.is_empty());
+
+        // Byzantine participant: outlier + inconsistent state
+        let outlier = EmbeddingVector::new(vec![100.0, 100.0]).unwrap();
+        let bad_state = vec![BelnapValue::Both, BelnapValue::Both];
+        let reasons = detector
+            .check_and_flag(pk, 2, &outlier, &mean, 1.0, &bad_state)
+            .unwrap();
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons.contains(&"statistical outlier".to_string()));
+        assert!(reasons.contains(&"belnap inconsistency".to_string()));
+    }
+
+    // PC-T32c: False-positive avoidance — participants with some Both but below threshold pass
+    #[test]
+    fn test_belnap_false_positive_avoidance() {
+        let mut detector = ByzantineDetector::new(LearningConfig {
+            belnap_inconsistency_threshold: 0.5,
+            ..test_config()
+        });
+        let pk = [4u8; 32];
+        let mean = EmbeddingVector::new(vec![0.0, 0.0, 0.0, 0.0]).unwrap();
+
+        // Participant near the mean with 25% Both — should not be flagged
+        let normal = EmbeddingVector::new(vec![0.1, 0.1, 0.1, 0.1]).unwrap();
+        let partial_both = vec![
+            BelnapValue::Both,
+            BelnapValue::True,
+            BelnapValue::True,
+            BelnapValue::True,
+        ];
+        let reasons = detector
+            .check_and_flag(pk, 1, &normal, &mean, 1.0, &partial_both)
+            .unwrap();
+        assert!(reasons.is_empty(), "25% Both below 50% threshold should not flag");
     }
 
     #[test]

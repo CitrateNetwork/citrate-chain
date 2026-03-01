@@ -215,6 +215,7 @@ impl ParaconsistentAggregator {
     /// 3. Reduce to consensus state vector via join across participants
     /// 4. Compute confidence-weighted embedding: `e_agg[j] = Σ(wᵢ · cᵢⱼ · eᵢⱼ) / Σ(wᵢ · cᵢⱼ)`
     /// 5. L2-normalize and return
+    #[allow(clippy::needless_range_loop)]
     pub fn aggregate_paraconsistent(
         &self,
         input: &AggregationInput<'_>,

@@ -60,6 +60,21 @@ pub struct LearningConfig {
     /// Adapter consolidation interval (in checkpoints).
     /// Paper II Table A2: every 1000 checkpoints (~83 min).
     pub adapter_consolidation_interval: u64,
+
+    /// Macro-phase transition: minimum mean confidence for Collection → RoutingActive.
+    /// Paper II §5: transition when confidence is sustained above threshold.
+    pub macro_confidence_threshold: f32,
+
+    /// Macro-phase transition: maximum router loss for RoutingActive → FullSystem.
+    /// Paper II §5: transition when router converges below loss threshold.
+    pub macro_loss_threshold: f32,
+
+    /// Macro-phase transition: consecutive checkpoints above threshold required.
+    pub macro_consecutive_checkpoints: u64,
+
+    /// Byzantine detection: maximum fraction of dimensions classified as Both
+    /// before flagging participant as inconsistent.
+    pub belnap_inconsistency_threshold: f32,
 }
 
 impl Default for LearningConfig {
@@ -81,6 +96,10 @@ impl Default for LearningConfig {
             temperature: 1.0,                // Paper II Table A2
             lora_rank: 16,                   // Paper II Table A2
             adapter_consolidation_interval: 1_000, // Paper II Table A2 (~83 min)
+            macro_confidence_threshold: 0.6,
+            macro_loss_threshold: 0.5,
+            macro_consecutive_checkpoints: 3,
+            belnap_inconsistency_threshold: 0.5,
         }
     }
 }
@@ -152,6 +171,32 @@ impl LearningConfig {
             return Err(LearningError::ConfigInvalid {
                 field: "lora_rank".to_string(),
                 reason: "must be > 0".to_string(),
+            });
+        }
+        if self.macro_confidence_threshold < 0.0 || self.macro_confidence_threshold > 1.0 {
+            return Err(LearningError::ConfigInvalid {
+                field: "macro_confidence_threshold".to_string(),
+                reason: "must be in [0.0, 1.0]".to_string(),
+            });
+        }
+        if self.macro_loss_threshold <= 0.0 {
+            return Err(LearningError::ConfigInvalid {
+                field: "macro_loss_threshold".to_string(),
+                reason: "must be > 0.0".to_string(),
+            });
+        }
+        if self.macro_consecutive_checkpoints == 0 {
+            return Err(LearningError::ConfigInvalid {
+                field: "macro_consecutive_checkpoints".to_string(),
+                reason: "must be > 0".to_string(),
+            });
+        }
+        if self.belnap_inconsistency_threshold < 0.0
+            || self.belnap_inconsistency_threshold > 1.0
+        {
+            return Err(LearningError::ConfigInvalid {
+                field: "belnap_inconsistency_threshold".to_string(),
+                reason: "must be in [0.0, 1.0]".to_string(),
             });
         }
         Ok(())

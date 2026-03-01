@@ -112,7 +112,7 @@ impl ProvenanceChain {
 /// Compute the hash of a provenance entry.
 fn compute_entry_hash(entry: &ProvenanceEntry) -> Hash {
     let mut hasher = Sha3_256::new();
-    hasher.update(&entry.creator);
+    hasher.update(entry.creator);
     hasher.update(entry.round.to_le_bytes());
     hasher.update(entry.checkpoint_height.to_le_bytes());
     if let Some(ref parent) = entry.parent_adapter_hash {

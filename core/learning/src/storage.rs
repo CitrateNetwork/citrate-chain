@@ -3,6 +3,8 @@
 //! Implements Data Structure 4 from Gradient Papers No. II.
 
 use crate::embeddings::EmbeddingVector;
+use crate::errors::{LearningError, LearningResult};
+use crate::phases::{NetworkLearningPhase, OodaPhase, PhaseState};
 use crate::types::{PublicKey, TimestampedEmbedding};
 use dashmap::DashMap;
 
@@ -123,6 +125,101 @@ impl Default for EmbeddingIndex {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase State Persistence (WP-N.4, Paper II §4.1)
+// ---------------------------------------------------------------------------
+
+/// Thread-safe key-value store for OODA phase state and macro-phase persistence.
+///
+/// Allows the learning layer to recover its state after node restarts.
+/// Stale non-Observe OODA phases are reset on recovery (interrupted round).
+pub struct PhaseStore {
+    inner: DashMap<String, String>,
+}
+
+impl PhaseStore {
+    /// Create a new empty phase store.
+    pub fn new() -> Self {
+        Self {
+            inner: DashMap::new(),
+        }
+    }
+
+    /// Save the OODA phase state as JSON.
+    ///
+    /// On recovery, if the persisted phase is not `Observe`, the phase
+    /// is considered interrupted and should be reset.
+    pub fn save_phase_state(&self, state: &PhaseState) -> LearningResult<()> {
+        let json = serde_json::to_string(state).map_err(|e| LearningError::Storage(e.to_string()))?;
+        self.inner.insert("ooda_phase_state".to_string(), json);
+        Ok(())
+    }
+
+    /// Load the OODA phase state from the store.
+    ///
+    /// Returns `None` if no state has been saved yet.
+    pub fn load_phase_state(&self) -> LearningResult<Option<PhaseState>> {
+        match self.inner.get("ooda_phase_state") {
+            Some(json) => {
+                let state: PhaseState = serde_json::from_str(json.value())
+                    .map_err(|e| LearningError::Storage(e.to_string()))?;
+                Ok(Some(state))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Load the OODA phase state with interrupted-round recovery.
+    ///
+    /// If the persisted phase is anything other than `Observe`, the round
+    /// was interrupted mid-cycle. In that case, reset the phase to `Observe`
+    /// for the same round so that the cycle restarts cleanly.
+    pub fn load_phase_state_with_recovery(&self) -> LearningResult<Option<PhaseState>> {
+        match self.load_phase_state()? {
+            Some(mut state) => {
+                if state.phase != OodaPhase::Observe {
+                    tracing::warn!(
+                        interrupted_phase = %state.phase,
+                        round = state.round,
+                        "Interrupted OODA phase detected — resetting to Observe"
+                    );
+                    state.phase = OodaPhase::Observe;
+                    state.submissions = 0;
+                    state.condition_met = false;
+                }
+                Ok(Some(state))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Save the macro-phase.
+    pub fn save_macro_phase(&self, phase: NetworkLearningPhase) -> LearningResult<()> {
+        let json = serde_json::to_string(&phase)
+            .map_err(|e| LearningError::Storage(e.to_string()))?;
+        self.inner.insert("macro_phase".to_string(), json);
+        Ok(())
+    }
+
+    /// Load the macro-phase from the store.
+    pub fn load_macro_phase(&self) -> LearningResult<Option<NetworkLearningPhase>> {
+        match self.inner.get("macro_phase") {
+            Some(json) => {
+                let phase: NetworkLearningPhase = serde_json::from_str(json.value())
+                    .map_err(|e| LearningError::Storage(e.to_string()))?;
+                Ok(Some(phase))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+impl Default for PhaseStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +316,83 @@ mod tests {
         assert_eq!(rc.len(), 3);
         assert!((rc[0] - 0.9).abs() < 1e-6);
         assert!((rc[2] - 0.1).abs() < 1e-6);
+    }
+
+    // --- WP-N.4: PhaseStore tests ---
+
+    #[test]
+    fn test_phase_state_roundtrip() {
+        let store = PhaseStore::new();
+
+        // No state initially
+        assert!(store.load_phase_state().unwrap().is_none());
+
+        // Save and load
+        let state = PhaseState {
+            phase: OodaPhase::Orient,
+            round: 7,
+            submissions: 4,
+            condition_met: true,
+            started_at_ms: 99999,
+        };
+        store.save_phase_state(&state).unwrap();
+
+        let loaded = store.load_phase_state().unwrap().unwrap();
+        assert_eq!(loaded.phase, OodaPhase::Orient);
+        assert_eq!(loaded.round, 7);
+        assert_eq!(loaded.submissions, 4);
+        assert!(loaded.condition_met);
+    }
+
+    #[test]
+    fn test_macro_phase_roundtrip() {
+        let store = PhaseStore::new();
+
+        assert!(store.load_macro_phase().unwrap().is_none());
+
+        store.save_macro_phase(NetworkLearningPhase::RoutingActive).unwrap();
+        let loaded = store.load_macro_phase().unwrap().unwrap();
+        assert_eq!(loaded, NetworkLearningPhase::RoutingActive);
+
+        // Overwrite
+        store.save_macro_phase(NetworkLearningPhase::FullSystem).unwrap();
+        let loaded = store.load_macro_phase().unwrap().unwrap();
+        assert_eq!(loaded, NetworkLearningPhase::FullSystem);
+    }
+
+    #[test]
+    fn test_interrupted_phase_recovery() {
+        let store = PhaseStore::new();
+
+        // Simulate a crash during Orient phase
+        let state = PhaseState {
+            phase: OodaPhase::Orient,
+            round: 3,
+            submissions: 2,
+            condition_met: false,
+            started_at_ms: 50000,
+        };
+        store.save_phase_state(&state).unwrap();
+
+        // Recovery should reset to Observe
+        let recovered = store.load_phase_state_with_recovery().unwrap().unwrap();
+        assert_eq!(recovered.phase, OodaPhase::Observe);
+        assert_eq!(recovered.round, 3); // Same round
+        assert_eq!(recovered.submissions, 0);
+        assert!(!recovered.condition_met);
+
+        // If already in Observe, no reset needed
+        let observe_state = PhaseState {
+            phase: OodaPhase::Observe,
+            round: 5,
+            submissions: 1,
+            condition_met: false,
+            started_at_ms: 60000,
+        };
+        store.save_phase_state(&observe_state).unwrap();
+        let loaded = store.load_phase_state_with_recovery().unwrap().unwrap();
+        assert_eq!(loaded.phase, OodaPhase::Observe);
+        assert_eq!(loaded.submissions, 1); // Not reset since already Observe
     }
 
     #[test]

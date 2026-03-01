@@ -5,6 +5,7 @@
 use crate::aggregation::AggregationResult;
 use crate::belnap::BelnapValue;
 use crate::embeddings::EmbeddingVector;
+use crate::phases::NetworkLearningPhase;
 use crate::types::{Hash, PublicKey};
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,11 @@ pub struct LearningCheckpoint {
     /// None until paraconsistent aggregation completes.
     #[serde(default)]
     pub aggregation_result: Option<AggregationResult>,
+
+    /// Network macro-phase at this checkpoint (Paper II §5).
+    /// None for checkpoints created before Sprint N.
+    #[serde(default)]
+    pub macro_phase: Option<NetworkLearningPhase>,
 }
 
 impl LearningCheckpoint {
@@ -76,6 +82,7 @@ impl LearningCheckpoint {
             performance_profile_hash: None,
             state_vector: None,
             aggregation_result: None,
+            macro_phase: None,
         }
     }
 

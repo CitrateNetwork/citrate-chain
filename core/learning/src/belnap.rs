@@ -16,7 +16,7 @@ use std::fmt;
 /// - `False` — Known to be false
 /// - `Both` — Known to be both true and false (paraconsistent)
 /// - `Neither` — Unknown / no information
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BelnapValue {
     /// Known true.
     True,
@@ -25,6 +25,7 @@ pub enum BelnapValue {
     /// Both true and false (paraconsistent).
     Both,
     /// Neither true nor false (unknown).
+    #[default]
     Neither,
 }
 
@@ -120,12 +121,6 @@ impl fmt::Display for BelnapValue {
     }
 }
 
-impl Default for BelnapValue {
-    fn default() -> Self {
-        BelnapValue::Neither
-    }
-}
-
 // ---------------------------------------------------------------------------
 // WP-L.7: Classification function φ (Paper II §3.1, Definition 5)
 // ---------------------------------------------------------------------------
@@ -169,6 +164,7 @@ pub fn softmax_weights(blue_scores: &[f32], temperature: f32) -> Vec<f32> {
 /// # Panics
 /// Panics if embeddings/confidences/blue_scores lengths don't match, or if any
 /// confidence slice length doesn't match the embedding dimension.
+#[allow(clippy::needless_range_loop)]
 pub fn classify_belnap(
     embeddings: &[&EmbeddingVector],
     confidences: &[&[f32]],
