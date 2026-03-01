@@ -916,6 +916,9 @@ pub fn register_eth_methods(
             signature: Signature::new([0u8; 64]),
             embedded_models: vec![],
             required_pins: vec![],
+            learning_embedding: None,
+            learning_confidence: None,
+            gradient_commitment: None,
         };
 
         // For eth_call, use the sender's current nonce so execution doesn't fail
@@ -1099,6 +1102,9 @@ pub fn register_eth_methods(
             signature: Signature::new([0u8; 64]),
             embedded_models: vec![],
             required_pins: vec![],
+            learning_embedding: None,
+            learning_confidence: None,
+            gradient_commitment: None,
         };
 
         // For gas estimation, use sender's current nonce to pass nonce validation

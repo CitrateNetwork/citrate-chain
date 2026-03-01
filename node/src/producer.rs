@@ -500,6 +500,9 @@ impl BlockProducer {
             signature: Signature::new([0; 64]),
             embedded_models: vec![],
             required_pins: vec![],
+            learning_embedding: None,
+            learning_confidence: None,
+            gradient_commitment: None,
         };
 
         let blue_set = self.ghostdag.calculate_blue_set(&temp_block).await?;
@@ -607,6 +610,9 @@ impl BlockProducer {
                 signature: Signature::default(),
                 embedded_models: vec![],
                 required_pins: vec![],
+                learning_embedding: None,
+                learning_confidence: None,
+                gradient_commitment: None,
             };
             let reward = self.reward_calculator.calculate_reward(&temp_block);
             self.apply_basic_rewards(&reward, &validator_address);
@@ -627,6 +633,9 @@ impl BlockProducer {
             signature: Signature::default(), // Placeholder — signed below
             embedded_models: vec![],
             required_pins: vec![],
+            learning_embedding: None,
+            learning_confidence: None,
+            gradient_commitment: None,
         };
 
         // C-05: Compute canonical block hash from ALL fields including commitment roots.
@@ -785,6 +794,9 @@ impl BlockProducer {
             signature: Signature::new([0; 64]),
             embedded_models: vec![],
             required_pins: vec![],
+            learning_embedding: None,
+            learning_confidence: None,
+            gradient_commitment: None,
         };
 
         // Execute each transaction

@@ -305,6 +305,61 @@ pub fn classify_belnap(
     result
 }
 
+// ---------------------------------------------------------------------------
+// WP-M.5: Blue score normalization bridge (Paper II §3.2, GAP-9)
+// ---------------------------------------------------------------------------
+
+/// Convert consensus-layer `u64` blue scores to softmax trust weights.
+///
+/// Bridge from integer blue scores (as stored in `BlockHeader.blue_score`) to the
+/// float softmax computation used by paraconsistent aggregation.
+///
+/// Equivalent to `softmax_weights(&scores_as_f32, temperature)`.
+pub fn blue_scores_to_trust_weights(blue_scores: &[u64], temperature: f32) -> Vec<f32> {
+    let float_scores: Vec<f32> = blue_scores.iter().map(|&s| s as f32).collect();
+    softmax_weights(&float_scores, temperature)
+}
+
+// ---------------------------------------------------------------------------
+// WP-M.1a: State vector reduction (Paper II §3.2, Algorithm 1 step 3)
+// ---------------------------------------------------------------------------
+
+/// Reduce per-participant Belnap classification matrices to a consensus state vector.
+///
+/// Implements the state-vector reduction step from Algorithm 1, Paper II §3.2:
+///
+///   `s[j] = ⊔ { classifications[i][j] | i in 0..n }`
+///
+/// The join (⊔) follows the knowledge ordering:
+/// - If any participant is `Both` at dimension `j`, the state is `Both`
+/// - If participants split `True`/`False`, the state is `Both`
+/// - If all agree on `True`, the state is `True`
+/// - `Neither` is absorbed by any other value
+///
+/// Returns an empty `Vec` if `classifications` is empty.
+///
+/// # Panics
+///
+/// Panics (debug only) if participant rows have inconsistent lengths.
+pub fn reduce_belnap_states(classifications: &[Vec<BelnapValue>]) -> Vec<BelnapValue> {
+    if classifications.is_empty() {
+        return vec![];
+    }
+    let dim = classifications[0].len();
+    debug_assert!(
+        classifications.iter().all(|row| row.len() == dim),
+        "all participant classification rows must have equal length"
+    );
+
+    let mut state = vec![BelnapValue::Neither; dim];
+    for row in classifications {
+        for j in 0..dim {
+            state[j] = state[j].join(row[j]);
+        }
+    }
+    state
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,6 +681,87 @@ mod tests {
             assert_eq!(val, BelnapValue::True,
                 "single participant is trivially consistent");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // WP-M.5: blue_scores_to_trust_weights tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_blue_scores_to_trust_weights_basic() {
+        let weights = blue_scores_to_trust_weights(&[10, 10, 10], 1.0);
+        assert_eq!(weights.len(), 3);
+        for &w in &weights {
+            assert!((w - 1.0 / 3.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_blue_scores_to_trust_weights_monotone() {
+        let weights = blue_scores_to_trust_weights(&[100, 10], 1.0);
+        assert!(weights[0] > weights[1],
+            "higher blue score should yield higher trust weight");
+    }
+
+    #[test]
+    fn test_blue_scores_to_trust_weights_zero_total() {
+        let weights = blue_scores_to_trust_weights(&[0, 0, 0], 1.0);
+        for &w in &weights {
+            assert!((w - 1.0 / 3.0).abs() < 1e-5,
+                "all-zero blue scores should yield uniform weights");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // WP-M.1a: reduce_belnap_states tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reduce_empty() {
+        let result = reduce_belnap_states(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_reduce_unanimous_true() {
+        use BelnapValue::*;
+        let classifications = vec![
+            vec![True, True],
+            vec![True, True],
+        ];
+        let s = reduce_belnap_states(&classifications);
+        assert_eq!(s, vec![True, True]);
+    }
+
+    #[test]
+    fn test_reduce_true_false_yields_both() {
+        use BelnapValue::*;
+        let classifications = vec![
+            vec![True, False],
+            vec![False, True],
+        ];
+        let s = reduce_belnap_states(&classifications);
+        assert_eq!(s[0], Both);
+        assert_eq!(s[1], Both);
+    }
+
+    #[test]
+    fn test_reduce_neither_absorbed() {
+        use BelnapValue::*;
+        let classifications = vec![
+            vec![Neither, True],
+            vec![True, Neither],
+        ];
+        let s = reduce_belnap_states(&classifications);
+        assert_eq!(s, vec![True, True]);
+    }
+
+    #[test]
+    fn test_reduce_single_participant() {
+        use BelnapValue::*;
+        let classifications = vec![vec![True, False, Neither, Both]];
+        let s = reduce_belnap_states(&classifications);
+        assert_eq!(s, vec![True, False, Neither, Both]);
     }
 }
 

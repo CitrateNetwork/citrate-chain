@@ -55,6 +55,9 @@ fn create_block_with_params(
         signature: Signature::new([0u8; 64]),
         embedded_models: vec![],
         required_pins: vec![],
+        learning_embedding: None,
+        learning_confidence: None,
+        gradient_commitment: None,
     }
 }
 
@@ -550,6 +553,9 @@ mod edge_cases {
                 signature: Signature::new([0u8; 64]),
                 embedded_models: vec![],
                 required_pins: vec![],
+                learning_embedding: None,
+                learning_confidence: None,
+                gradient_commitment: None,
             };
             dag_store.store_block(block.clone()).await.unwrap();
             children.push(block.hash());

@@ -100,6 +100,11 @@ pub struct TimestampedEmbedding {
 
     /// Submitter public key.
     pub submitter: PublicKey,
+
+    /// Raw per-dimension confidence values (pre-φ f32 entropy confidence).
+    /// None for legacy embeddings submitted before Sprint M.
+    #[serde(default)]
+    pub confidence: Option<Vec<f32>>,
 }
 
 // PC-T11: Serialization roundtrip
@@ -153,11 +158,49 @@ mod tests {
             round: 5,
             timestamp: 12345,
             submitter: [99u8; 32],
+            confidence: None,
         };
 
-        let bytes = bincode::serialize(&te).unwrap();
-        let deserialized: TimestampedEmbedding = bincode::deserialize(&bytes).unwrap();
+        // Use serde_json (not bincode) — bincode is positional and breaks
+        // when optional fields are added. TimestampedEmbedding lives in
+        // DashMap (not RocksDB), so JSON is fine.
+        let json = serde_json::to_string(&te).unwrap();
+        let deserialized: TimestampedEmbedding = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.round, 5);
         assert_eq!(deserialized.submitter, [99u8; 32]);
+        assert!(deserialized.confidence.is_none());
+    }
+
+    #[test]
+    fn test_timestamped_embedding_with_confidence() {
+        let te = TimestampedEmbedding {
+            embedding: EmbeddingVector::new(vec![0.5, 0.8, 0.3]).unwrap(),
+            round: 7,
+            timestamp: 99999,
+            submitter: [42u8; 32],
+            confidence: Some(vec![0.9, 0.1, 0.5]),
+        };
+
+        let json = serde_json::to_string(&te).unwrap();
+        let deserialized: TimestampedEmbedding = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.round, 7);
+        let conf = deserialized.confidence.unwrap();
+        assert_eq!(conf.len(), 3);
+        assert!((conf[0] - 0.9).abs() < 1e-6);
+        assert!((conf[2] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_timestamped_embedding_backward_compat() {
+        // Old JSON without confidence field should deserialize fine
+        let old_json = r#"{
+            "embedding": {"data": [0.1, 0.2]},
+            "round": 3,
+            "timestamp": 5000,
+            "submitter": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+        }"#;
+        let te: TimestampedEmbedding = serde_json::from_str(old_json).unwrap();
+        assert_eq!(te.round, 3);
+        assert!(te.confidence.is_none());
     }
 }

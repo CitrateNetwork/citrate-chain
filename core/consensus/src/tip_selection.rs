@@ -382,6 +382,9 @@ mod tests {
             signature: Signature::new([0; 64]),
             embedded_models: vec![],
             required_pins: vec![],
+            learning_embedding: None,
+            learning_confidence: None,
+            gradient_commitment: None,
         }
     }
 

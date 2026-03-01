@@ -194,6 +194,9 @@ impl BlockBuilder {
             signature: Signature::new([1; 64]), // Placeholder signature
             embedded_models: vec![],
             required_pins: vec![],
+            learning_embedding: None,
+            learning_confidence: None,
+            gradient_commitment: None,
         };
 
         // Execute transactions and collect receipts

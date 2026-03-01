@@ -19,7 +19,7 @@ impl EmbeddingIndex {
         }
     }
 
-    /// Insert or update an embedding for a participant.
+    /// Insert or update an embedding for a participant (no confidence data).
     pub fn insert(
         &self,
         key: PublicKey,
@@ -34,6 +34,28 @@ impl EmbeddingIndex {
                 round,
                 timestamp,
                 submitter: key,
+                confidence: None,
+            },
+        );
+    }
+
+    /// Insert or update an embedding with per-dimension confidence values.
+    pub fn insert_with_confidence(
+        &self,
+        key: PublicKey,
+        embedding: EmbeddingVector,
+        confidence: Vec<f32>,
+        round: u64,
+        timestamp: u64,
+    ) {
+        self.inner.insert(
+            key,
+            TimestampedEmbedding {
+                embedding,
+                round,
+                timestamp,
+                submitter: key,
+                confidence: Some(confidence),
             },
         );
     }
@@ -180,5 +202,35 @@ mod tests {
         }
 
         assert_eq!(index.len(), 10);
+    }
+
+    #[test]
+    fn test_insert_with_confidence() {
+        let index = EmbeddingIndex::new();
+        let pk = [5u8; 32];
+        let emb = EmbeddingVector::new(vec![0.1, 0.2, 0.3]).unwrap();
+        let conf = vec![0.9, 0.5, 0.1];
+
+        index.insert_with_confidence(pk, emb, conf.clone(), 3, 500);
+
+        let retrieved = index.get(&pk).unwrap();
+        assert_eq!(retrieved.round, 3);
+        let rc = retrieved.confidence.unwrap();
+        assert_eq!(rc.len(), 3);
+        assert!((rc[0] - 0.9).abs() < 1e-6);
+        assert!((rc[2] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_legacy_insert_no_confidence() {
+        let index = EmbeddingIndex::new();
+        let pk = [6u8; 32];
+        let emb = EmbeddingVector::zeros(4);
+
+        // Legacy insert should set confidence to None
+        index.insert(pk, emb, 1, 100);
+
+        let retrieved = index.get(&pk).unwrap();
+        assert!(retrieved.confidence.is_none());
     }
 }

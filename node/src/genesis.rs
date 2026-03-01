@@ -175,6 +175,9 @@ pub fn create_genesis_block(config: &GenesisConfig) -> Block {
         signature: Signature::new([0; 64]),
         embedded_models,
         required_pins,
+        learning_embedding: None,
+        learning_confidence: None,
+        gradient_commitment: None,
     }
 }
 

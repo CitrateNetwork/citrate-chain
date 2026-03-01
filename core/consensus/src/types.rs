@@ -185,6 +185,22 @@ pub struct Block {
     /// Required model pins (genesis block only, empty for all other blocks)
     #[serde(default)]
     pub required_pins: Vec<RequiredModel>,
+
+    // --- Learning extension fields (Paper II §6.1, Sprint M WP-M.2b) ---
+    // These are optional sidecars. Non-learning nodes set them to None.
+    // They are NOT included in compute_hash() — consensus is unaffected.
+
+    /// Per-dimension embedding vector from this node's local model (~3 KB at d=768).
+    #[serde(default)]
+    pub learning_embedding: Option<Vec<f32>>,
+
+    /// Per-dimension softmax-entropy confidence matching learning_embedding (~3 KB at d=768).
+    #[serde(default)]
+    pub learning_confidence: Option<Vec<f32>>,
+
+    /// SHA3-256 commitment to gradient update, revealed in next block (32 bytes).
+    #[serde(default)]
+    pub gradient_commitment: Option<[u8; 32]>,
 }
 
 impl Block {
@@ -668,6 +684,52 @@ mod tests {
             signature: Signature::new([0; 64]),
             embedded_models: vec![],
             required_pins: vec![],
+            learning_embedding: None,
+            learning_confidence: None,
+            gradient_commitment: None,
         }
+    }
+
+    // PC-T16a: Block without learning fields round-trips via JSON
+    #[test]
+    fn test_block_no_learning_fields_roundtrip() {
+        let block = create_test_block();
+        assert!(block.learning_embedding.is_none());
+        assert!(block.learning_confidence.is_none());
+        assert!(block.gradient_commitment.is_none());
+
+        let json = serde_json::to_string(&block).unwrap();
+        let deserialized: Block = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.learning_embedding.is_none());
+        assert!(deserialized.learning_confidence.is_none());
+        assert!(deserialized.gradient_commitment.is_none());
+    }
+
+    // PC-T16b: Block with all 3 learning fields round-trips
+    #[test]
+    fn test_block_with_learning_fields_roundtrip() {
+        let mut block = create_test_block();
+        block.learning_embedding = Some(vec![0.1, 0.2, 0.3]);
+        block.learning_confidence = Some(vec![0.9, 0.8, 0.7]);
+        block.gradient_commitment = Some([0xAA; 32]);
+
+        let json = serde_json::to_string(&block).unwrap();
+        let deserialized: Block = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.learning_embedding, Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(deserialized.learning_confidence, Some(vec![0.9, 0.8, 0.7]));
+        assert_eq!(deserialized.gradient_commitment, Some([0xAA; 32]));
+    }
+
+    // PC-T16c: Learning fields do NOT affect compute_hash
+    #[test]
+    fn test_learning_fields_excluded_from_hash() {
+        let block_a = create_test_block();
+        let mut block_b = create_test_block();
+        block_b.learning_embedding = Some(vec![1.0, 2.0, 3.0]);
+        block_b.learning_confidence = Some(vec![0.5, 0.5, 0.5]);
+        block_b.gradient_commitment = Some([0xFF; 32]);
+
+        // Hash must be identical — learning fields are NOT consensus-critical
+        assert_eq!(block_a.compute_hash(), block_b.compute_hash());
     }
 }
