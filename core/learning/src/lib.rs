@@ -16,7 +16,7 @@
 //! 4. **Aggregation** — Weighted mean at BFT checkpoints
 //! 5. **Routing** — MLP-based routing of aggregated embeddings
 //! 6. **Phases** — OODA cycle (Observe → Orient → Decide → Act)
-//! 7. **Adapters** — Lightweight model deltas with provenance chains
+//! 7. **Adapters** — LoRA (Low-Rank Adaptation) adapters with provenance chains
 //! 8. **Safety** — Invariant: state roots identical ± learning
 //!
 //! ## Safety Invariant (Theorem 3)
@@ -42,7 +42,7 @@ pub mod types;
 pub mod verification;
 
 // Re-export primary types for convenient access
-pub use adapters::{AdapterFactory, LearningAdapter};
+pub use adapters::{AdapterFactory, AdapterRegistry, LearningAdapter, LoraAdapter};
 pub use aggregation::{
     AggregationInput, AggregationResult, Aggregator, ParaconsistentAggregator,
     WeightedMeanAggregator,

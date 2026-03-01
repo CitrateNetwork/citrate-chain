@@ -2,6 +2,7 @@
 //!
 //! Implements Algorithm 5 and adversarial detection from Gradient Papers No. II.
 
+use crate::adapters::{AdapterFactory, LoraAdapter};
 use crate::belnap::BelnapValue;
 use crate::config::LearningConfig;
 use crate::embeddings::EmbeddingVector;
@@ -132,6 +133,25 @@ impl ByzantineDetector {
         }
 
         Ok(reasons)
+    }
+
+    /// Verify a LoRA adapter's provenance chain and hash integrity.
+    ///
+    /// Checks:
+    /// 1. Provenance chain links are valid (each entry hashes to next parent)
+    /// 2. Adapter hash matches its content (A, B matrices + metadata)
+    pub fn verify_adapter_provenance(&self, adapter: &LoraAdapter) -> LearningResult<()> {
+        // Verify provenance chain integrity
+        adapter.provenance.validate()?;
+
+        // Verify adapter hash matches content
+        if !AdapterFactory::verify_lora_hash(adapter) {
+            return Err(LearningError::AdapterError {
+                reason: "LoRA adapter hash does not match content (possible tampering)".to_string(),
+            });
+        }
+
+        Ok(())
     }
 
     /// Compute the standard deviation of distances from the mean.
@@ -303,5 +323,40 @@ mod tests {
         let mean = ByzantineDetector::compute_mean(&embeddings).unwrap();
         assert!((mean.data[0] - 0.5).abs() < 1e-6);
         assert!((mean.data[1] - 0.5).abs() < 1e-6);
+    }
+
+    // PC-T41: LoRA adapter provenance verification + theft rejection
+    #[test]
+    fn test_lora_adapter_provenance_verification() {
+        use crate::adapters::{AdapterFactory, AdapterMetadata};
+
+        let detector = ByzantineDetector::new(test_config());
+        let embedding = EmbeddingVector::new(vec![1.0, 2.0, 3.0]).unwrap();
+        let metadata = AdapterMetadata {
+            name: "test".to_string(),
+            description: "test".to_string(),
+            round: 1,
+            participant_count: 5,
+            created_at: 12345,
+        };
+
+        // Valid adapter passes verification
+        let adapter = AdapterFactory::create_lora(
+            &embedding, 2, metadata.clone(), [1u8; 32], 100, vec![0u8; 64],
+        )
+        .unwrap();
+        assert!(detector.verify_adapter_provenance(&adapter).is_ok());
+
+        // Tampered adapter fails hash check
+        let mut tampered = adapter.clone();
+        tampered.matrix_a[0][0] = 999.0;
+        let result = detector.verify_adapter_provenance(&tampered);
+        assert!(result.is_err());
+        match result {
+            Err(LearningError::AdapterError { reason }) => {
+                assert!(reason.contains("hash does not match"));
+            }
+            _ => panic!("expected AdapterError"),
+        }
     }
 }

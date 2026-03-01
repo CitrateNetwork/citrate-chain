@@ -2,6 +2,7 @@
 //!
 //! Implements Algorithm 3 and Definition 7 from Gradient Papers No. II.
 
+use crate::adapters::{AdapterFactory, AdapterMetadata, LoraAdapter};
 use crate::aggregation::{AggregationInput, AggregationResult, ParaconsistentAggregator};
 use crate::config::LearningConfig;
 use crate::embeddings::EmbeddingVector;
@@ -349,6 +350,8 @@ pub struct PipelineResult {
     pub aggregation: AggregationResult,
     /// Routing decision from the Decide phase.
     pub routing: RoutingDecision,
+    /// LoRA adapter produced by the Act phase (None if not in FullSystem macro-phase).
+    pub adapter: Option<LoraAdapter>,
 }
 
 /// Lightweight coordinator for the orient → decide → act pipeline.
@@ -356,10 +359,14 @@ pub struct PipelineResult {
 /// Wires the aggregator's dual output into the router:
 /// - `orient()` — runs paraconsistent aggregation
 /// - `decide()` — feeds (query, e_agg, state_vector) into the router
+/// - `act()` — creates a LoRA adapter from aggregation + routing result
 /// - `execute_cycle()` — runs the full orient-decide-act pipeline
 pub struct LearningPipeline {
     aggregator: ParaconsistentAggregator,
     router: MlpRouter,
+    config: LearningConfig,
+    /// Round counter for adapter metadata.
+    round: u64,
 }
 
 impl LearningPipeline {
@@ -373,6 +380,8 @@ impl LearningPipeline {
                 config.router_num_destinations,
                 42, // deterministic seed for pipeline
             ),
+            config: config.clone(),
+            round: 0,
         }
     }
 
@@ -391,26 +400,62 @@ impl LearningPipeline {
             .route(query, &agg_result.embedding, &agg_result.state_vector)
     }
 
-    /// Act phase: dispatch the routing decision.
+    /// Act phase: create a LoRA adapter from the aggregation result.
     ///
-    /// Currently a stub returning the decision index. Sprint O will add
-    /// adapter generation and application here.
-    pub fn act(&self, decision: &RoutingDecision) -> LearningResult<usize> {
-        Ok(decision.selected)
+    /// Uses the aggregated embedding as initialization seed and the routing
+    /// decision as metadata. Returns the adapter produced.
+    pub fn act(
+        &mut self,
+        agg_result: &AggregationResult,
+        decision: &RoutingDecision,
+        creator: [u8; 32],
+        checkpoint_height: u64,
+    ) -> LearningResult<LoraAdapter> {
+        self.round += 1;
+
+        let metadata = AdapterMetadata {
+            name: format!("pipeline-round-{}", self.round),
+            description: format!("Auto-generated LoRA adapter from routing decision {}", decision.selected),
+            round: self.round,
+            participant_count: 0, // Filled by caller if needed
+            created_at: checkpoint_height, // Use checkpoint as timestamp proxy
+        };
+
+        AdapterFactory::create_lora(
+            &agg_result.embedding,
+            self.config.lora_rank,
+            metadata,
+            creator,
+            checkpoint_height,
+            vec![0u8; 64], // Signature filled by caller
+        )
     }
 
     /// Execute a full orient → decide → act cycle.
+    ///
+    /// If `produce_adapter` is true, the Act phase creates a LoRA adapter.
+    /// Pass false during Collection/RoutingActive macro-phases.
     pub fn execute_cycle(
-        &self,
+        &mut self,
         query: &EmbeddingVector,
         input: &AggregationInput<'_>,
+        produce_adapter: bool,
+        creator: [u8; 32],
+        checkpoint_height: u64,
     ) -> LearningResult<PipelineResult> {
         let aggregation = self.orient(input)?;
         let routing = self.decide(query, &aggregation)?;
-        let _dest = self.act(&routing)?;
+
+        let adapter = if produce_adapter {
+            Some(self.act(&aggregation, &routing, creator, checkpoint_height)?)
+        } else {
+            None
+        };
+
         Ok(PipelineResult {
             aggregation,
             routing,
+            adapter,
         })
     }
 
@@ -628,21 +673,27 @@ mod tests {
         assert_eq!(mgr.current_phase(), NetworkLearningPhase::Collection);
     }
 
-    // WP-N.5: Pipeline tests
+    // WP-N.5 / WP-O.5: Pipeline tests
+
+    fn make_pipeline_input(dim: usize) -> (LearningConfig, EmbeddingVector, EmbeddingVector, EmbeddingVector, Vec<f32>) {
+        let config = LearningConfig {
+            embedding_dimensions: dim,
+            lora_rank: 2,
+            ..LearningConfig::default()
+        };
+        let e1 = EmbeddingVector::new(vec![1.0; dim]).unwrap();
+        let e2 = EmbeddingVector::new(vec![0.5; dim]).unwrap();
+        let query = EmbeddingVector::new(vec![0.8; dim]).unwrap();
+        let conf = vec![0.9; dim];
+        (config, e1, e2, query, conf)
+    }
 
     #[test]
     fn test_pipeline_aggregation_feeds_router() {
-        let config = LearningConfig::default();
         let dim = 4;
-        let config = LearningConfig {
-            embedding_dimensions: dim,
-            ..config
-        };
+        let (config, e1, e2, query, conf) = make_pipeline_input(dim);
         let pipeline = LearningPipeline::new(&config);
 
-        let e1 = EmbeddingVector::new(vec![1.0, 0.0, 0.5, 0.5]).unwrap();
-        let e2 = EmbeddingVector::new(vec![0.8, 0.2, 0.4, 0.6]).unwrap();
-        let conf = vec![0.9; dim];
         let input = AggregationInput {
             embeddings: &[&e1, &e2],
             confidences: &[&conf, &conf],
@@ -658,7 +709,6 @@ mod tests {
         assert_eq!(agg_result.state_vector.len(), dim);
 
         // Decide uses the aggregation result
-        let query = EmbeddingVector::new(vec![0.5, 0.5, 0.5, 0.5]).unwrap();
         let decision = pipeline.decide(&query, &agg_result).unwrap();
         assert!(decision.selected < config.router_num_destinations);
     }
@@ -666,16 +716,9 @@ mod tests {
     #[test]
     fn test_pipeline_full_cycle() {
         let dim = 4;
-        let config = LearningConfig {
-            embedding_dimensions: dim,
-            ..LearningConfig::default()
-        };
-        let pipeline = LearningPipeline::new(&config);
+        let (config, e1, e2, query, conf) = make_pipeline_input(dim);
+        let mut pipeline = LearningPipeline::new(&config);
 
-        let e1 = EmbeddingVector::new(vec![1.0, 0.0, 0.0, 1.0]).unwrap();
-        let e2 = EmbeddingVector::new(vec![0.0, 1.0, 1.0, 0.0]).unwrap();
-        let conf = vec![0.9; dim];
-        let query = EmbeddingVector::new(vec![0.5, 0.5, 0.5, 0.5]).unwrap();
         let input = AggregationInput {
             embeddings: &[&e1, &e2],
             confidences: &[&conf, &conf],
@@ -685,9 +728,134 @@ mod tests {
             theta_low: 0.3,
         };
 
-        let result = pipeline.execute_cycle(&query, &input).unwrap();
+        // Without adapter production
+        let result = pipeline.execute_cycle(&query, &input, false, [1u8; 32], 100).unwrap();
         assert_eq!(result.aggregation.embedding.dim(), dim);
         assert!(result.routing.selected < config.router_num_destinations);
+        assert!(result.adapter.is_none());
+    }
+
+    // PC-T42: Full pipeline end-to-end with LoRA adapter
+    #[test]
+    fn test_pipeline_e2e_with_lora() {
+        let dim = 4;
+        let (config, e1, e2, query, conf) = make_pipeline_input(dim);
+        let mut pipeline = LearningPipeline::new(&config);
+
+        let input = AggregationInput {
+            embeddings: &[&e1, &e2],
+            confidences: &[&conf, &conf],
+            blue_scores: &[1.0, 1.0],
+            temperature: 1.0,
+            theta_high: 0.8,
+            theta_low: 0.3,
+        };
+
+        let result = pipeline.execute_cycle(&query, &input, true, [1u8; 32], 100).unwrap();
+        assert!(result.adapter.is_some());
+
+        let adapter = result.adapter.unwrap();
+        assert_eq!(adapter.dim, dim);
+        assert_eq!(adapter.rank, config.lora_rank);
+        assert_eq!(adapter.creator, [1u8; 32]);
+        assert_eq!(adapter.checkpoint_height, 100);
+        assert!(crate::adapters::AdapterFactory::verify_lora_hash(&adapter));
+    }
+
+    // PC-T46: Performance — full cycle < 500ms for 100 participants
+    #[test]
+    fn test_pipeline_performance_100_participants() {
+        let dim = 4;
+        let config = LearningConfig {
+            embedding_dimensions: dim,
+            lora_rank: 2,
+            min_participants: 2,
+            ..LearningConfig::default()
+        };
+        let mut pipeline = LearningPipeline::new(&config);
+
+        // Create 100 participant embeddings
+        let embeddings: Vec<EmbeddingVector> = (0..100)
+            .map(|i| EmbeddingVector::new(vec![(i as f32) / 100.0; dim]).unwrap())
+            .collect();
+        let confidences: Vec<Vec<f32>> = (0..100).map(|_| vec![0.9; dim]).collect();
+        let blue_scores: Vec<f32> = (0..100).map(|i| 1.0 + i as f32).collect();
+        let query = EmbeddingVector::new(vec![0.5; dim]).unwrap();
+
+        let emb_refs: Vec<&EmbeddingVector> = embeddings.iter().collect();
+        let conf_refs: Vec<&[f32]> = confidences.iter().map(|c| c.as_slice()).collect();
+
+        let input = AggregationInput {
+            embeddings: &emb_refs,
+            confidences: &conf_refs,
+            blue_scores: &blue_scores,
+            temperature: 1.0,
+            theta_high: 0.8,
+            theta_low: 0.3,
+        };
+
+        let start = std::time::Instant::now();
+        let result = pipeline.execute_cycle(&query, &input, true, [1u8; 32], 100).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(result.adapter.is_some());
+        assert!(
+            elapsed.as_millis() < 500,
+            "pipeline took {}ms, exceeds 500ms target",
+            elapsed.as_millis()
+        );
+    }
+
+    // PC-T47: Full pipeline with macro-phase progression
+    #[test]
+    fn test_pipeline_with_macro_phase_progression() {
+        let dim = 4;
+        let config = LearningConfig {
+            embedding_dimensions: dim,
+            lora_rank: 2,
+            macro_confidence_threshold: 0.5,
+            macro_loss_threshold: 0.5,
+            macro_consecutive_checkpoints: 1,
+            ..LearningConfig::default()
+        };
+        let mut pipeline = LearningPipeline::new(&config);
+        let mut macro_mgr = MacroPhaseManager::new(config.clone());
+
+        let e1 = EmbeddingVector::new(vec![0.9, 0.8, 0.7, 0.6]).unwrap();
+        let e2 = EmbeddingVector::new(vec![0.85, 0.75, 0.65, 0.55]).unwrap();
+        let conf = vec![0.9; dim];
+        let query = EmbeddingVector::new(vec![0.5; dim]).unwrap();
+        let input = AggregationInput {
+            embeddings: &[&e1, &e2],
+            confidences: &[&conf, &conf],
+            blue_scores: &[1.0, 1.0],
+            temperature: 1.0,
+            theta_high: 0.8,
+            theta_low: 0.3,
+        };
+
+        // Phase 1: Collection — no adapter
+        assert_eq!(macro_mgr.current_phase(), NetworkLearningPhase::Collection);
+        let result = pipeline.execute_cycle(&query, &input, macro_mgr.can_adapt(), [1u8; 32], 100).unwrap();
+        assert!(result.adapter.is_none(), "Collection phase should not produce adapter");
+
+        // Transition to RoutingActive
+        macro_mgr.evaluate_checkpoint(0.8, None);
+        assert_eq!(macro_mgr.current_phase(), NetworkLearningPhase::RoutingActive);
+
+        // Phase 2: RoutingActive — no adapter
+        let result = pipeline.execute_cycle(&query, &input, macro_mgr.can_adapt(), [1u8; 32], 200).unwrap();
+        assert!(result.adapter.is_none(), "RoutingActive phase should not produce adapter");
+
+        // Transition to FullSystem
+        macro_mgr.evaluate_checkpoint(0.8, Some(0.2));
+        assert_eq!(macro_mgr.current_phase(), NetworkLearningPhase::FullSystem);
+
+        // Phase 3: FullSystem — adapter produced!
+        let result = pipeline.execute_cycle(&query, &input, macro_mgr.can_adapt(), [1u8; 32], 300).unwrap();
+        assert!(result.adapter.is_some(), "FullSystem phase should produce adapter");
+        let adapter = result.adapter.unwrap();
+        assert_eq!(adapter.dim, dim);
     }
 
     // PC-T31: Concurrent phase transitions
