@@ -1,0 +1,708 @@
+//! Bridge relay service.
+//!
+//! The relay is the core orchestrator for the Citrate-side bridge.
+//! It polls for events from Ethereum (via an event source), collects
+//! oracle attestations, and processes deposits/withdrawals.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use parking_lot::RwLock;
+use tracing::{debug, error, info, warn};
+
+use crate::config::BridgeConfig;
+use crate::errors::{BridgeError, BridgeResult};
+use crate::events::{
+    BridgeEvent, DepositEvent, EventStatus, TrackedEvent, WithdrawalEvent,
+};
+use crate::metrics::BridgeMetrics;
+use crate::mint::SnapMinter;
+use crate::oracle::OracleRegistry;
+use crate::state::RelayState;
+
+/// Trait for receiving bridge events from an external source.
+///
+/// Implementations may connect to Ethereum via RPC, read from a file,
+/// or provide mock events for testing.
+#[async_trait]
+pub trait BridgeEventSource: Send + Sync {
+    /// Fetch new events since the given block number.
+    async fn fetch_events(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> BridgeResult<Vec<BridgeEvent>>;
+
+    /// Get the current head block number of the source chain.
+    async fn current_block(&self) -> BridgeResult<u64>;
+}
+
+/// Mock event source for testing.
+pub struct MockEventSource {
+    events: RwLock<Vec<BridgeEvent>>,
+    head_block: RwLock<u64>,
+}
+
+impl MockEventSource {
+    /// Create a new mock event source.
+    pub fn new() -> Self {
+        Self {
+            events: RwLock::new(Vec::new()),
+            head_block: RwLock::new(100),
+        }
+    }
+
+    /// Add an event to the mock source.
+    pub fn add_event(&self, event: BridgeEvent) {
+        self.events.write().push(event);
+    }
+
+    /// Set the current head block.
+    pub fn set_head_block(&self, block: u64) {
+        *self.head_block.write() = block;
+    }
+}
+
+impl Default for MockEventSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl BridgeEventSource for MockEventSource {
+    async fn fetch_events(
+        &self,
+        _from_block: u64,
+        _to_block: u64,
+    ) -> BridgeResult<Vec<BridgeEvent>> {
+        let events = self.events.read().clone();
+        // Clear after fetching (simulate one-time delivery)
+        self.events.write().clear();
+        Ok(events)
+    }
+
+    async fn current_block(&self) -> BridgeResult<u64> {
+        Ok(*self.head_block.read())
+    }
+}
+
+/// Bridge relay — the main orchestrator.
+pub struct BridgeRelay {
+    config: BridgeConfig,
+    state: Arc<RwLock<RelayState>>,
+    oracle_registry: Arc<RwLock<OracleRegistry>>,
+    minter: Arc<RwLock<SnapMinter>>,
+    metrics: Arc<BridgeMetrics>,
+    paused: bool,
+}
+
+impl BridgeRelay {
+    /// Create a new bridge relay.
+    pub fn new(config: BridgeConfig) -> Self {
+        let oracle_threshold = config.oracle_threshold;
+        Self {
+            minter: Arc::new(RwLock::new(SnapMinter::new(
+                config.bonding_curve.clone(),
+            ))),
+            state: Arc::new(RwLock::new(RelayState::default())),
+            oracle_registry: Arc::new(RwLock::new(OracleRegistry::new(oracle_threshold))),
+            metrics: Arc::new(BridgeMetrics::new()),
+            paused: false,
+            config,
+        }
+    }
+
+    /// Get a reference to the relay state.
+    pub fn state(&self) -> &Arc<RwLock<RelayState>> {
+        &self.state
+    }
+
+    /// Get a reference to the oracle registry.
+    pub fn oracle_registry(&self) -> &Arc<RwLock<OracleRegistry>> {
+        &self.oracle_registry
+    }
+
+    /// Get a reference to the minter.
+    pub fn minter(&self) -> &Arc<RwLock<SnapMinter>> {
+        &self.minter
+    }
+
+    /// Get a reference to the metrics.
+    pub fn metrics(&self) -> &Arc<BridgeMetrics> {
+        &self.metrics
+    }
+
+    /// Pause the relay (emergency stop).
+    pub fn pause(&mut self, reason: &str) {
+        warn!(reason = reason, "Bridge relay PAUSED");
+        self.paused = true;
+    }
+
+    /// Resume the relay.
+    pub fn resume(&mut self) {
+        info!("Bridge relay RESUMED");
+        self.paused = false;
+    }
+
+    /// Check if the relay is paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Process a single polling cycle: fetch events, validate, process.
+    pub async fn poll_cycle(
+        &self,
+        source: &dyn BridgeEventSource,
+    ) -> BridgeResult<Vec<ProcessingResult>> {
+        if self.paused {
+            return Err(BridgeError::BridgePaused {
+                reason: "Relay is paused".to_string(),
+            });
+        }
+
+        // Get current blocks
+        let source_head = source.current_block().await?;
+        let last_processed = self.state.read().last_eth_block;
+
+        // Apply confirmation depth
+        let safe_block = source_head.saturating_sub(self.config.confirmation_depth);
+        if safe_block <= last_processed {
+            debug!(
+                source_head,
+                safe_block, last_processed, "No new confirmed blocks"
+            );
+            return Ok(vec![]);
+        }
+
+        // Fetch events in the confirmed range
+        let events = source.fetch_events(last_processed + 1, safe_block).await?;
+        info!(
+            event_count = events.len(),
+            from = last_processed + 1,
+            to = safe_block,
+            "Fetched bridge events"
+        );
+
+        let mut results = Vec::new();
+
+        for event in events {
+            let result = self.process_event(event).await;
+            results.push(result);
+        }
+
+        // Update state
+        {
+            let mut state = self.state.write();
+            state.last_eth_block = safe_block;
+            state.heartbeat();
+        }
+
+        // Update metrics
+        self.metrics.set_last_eth_block(safe_block);
+        self.metrics
+            .set_relay_lag(source_head.saturating_sub(safe_block));
+        self.metrics.heartbeat();
+
+        Ok(results)
+    }
+
+    /// Process a single bridge event.
+    async fn process_event(&self, event: BridgeEvent) -> ProcessingResult {
+        let event_id = *event.event_id();
+
+        // Deduplication check
+        if self.state.read().is_known_event(&event_id) {
+            debug!(event_id = hex::encode(event_id), "Duplicate event skipped");
+            return ProcessingResult {
+                event_id,
+                status: EventStatus::Rejected,
+                salt_amount: None,
+                error: Some("Duplicate event".to_string()),
+            };
+        }
+
+        // Track the event
+        let now = chrono::Utc::now().timestamp() as u64;
+        let tracked = TrackedEvent {
+            event: event.clone(),
+            status: EventStatus::Pending,
+            attestation_count: 0,
+            retry_count: 0,
+            detected_at: now,
+            updated_at: now,
+            error: None,
+        };
+        self.state.write().track_event(tracked);
+
+        // Check oracle attestations
+        let oracle_met = self.oracle_registry.read().is_threshold_met(&event_id);
+        if !oracle_met {
+            // In testing / 0-threshold mode, auto-proceed
+            if self.config.oracle_threshold == 0 {
+                info!("Zero-threshold mode: auto-attesting event");
+            } else {
+                self.state.write().update_event_status(
+                    &event_id,
+                    EventStatus::AwaitingAttestations,
+                    None,
+                );
+                return ProcessingResult {
+                    event_id,
+                    status: EventStatus::AwaitingAttestations,
+                    salt_amount: None,
+                    error: None,
+                };
+            }
+        }
+
+        // Process based on event type
+        match event {
+            BridgeEvent::Deposit(deposit) => self.process_deposit(deposit).await,
+            BridgeEvent::Withdrawal(withdrawal) => {
+                self.process_withdrawal(withdrawal).await
+            }
+            BridgeEvent::OracleUpdate(update) => {
+                info!(
+                    oracle = hex::encode(update.oracle_pubkey),
+                    is_addition = update.is_addition,
+                    "Oracle update processed"
+                );
+                self.state.write().update_event_status(
+                    &event_id,
+                    EventStatus::Processed,
+                    None,
+                );
+                ProcessingResult {
+                    event_id,
+                    status: EventStatus::Processed,
+                    salt_amount: None,
+                    error: None,
+                }
+            }
+        }
+    }
+
+    /// Process a deposit event.
+    async fn process_deposit(&self, deposit: DepositEvent) -> ProcessingResult {
+        let event_id = deposit.event_id;
+
+        match self.minter.write().process_deposit(&deposit) {
+            Ok(receipt) => {
+                let salt = receipt.salt_credited;
+                info!(
+                    event_id = hex::encode(event_id),
+                    salt = salt,
+                    depositor = hex::encode(deposit.depositor),
+                    "Deposit processed successfully"
+                );
+
+                // Update state
+                {
+                    let mut state = self.state.write();
+                    state.update_event_status(&event_id, EventStatus::Processed, None);
+                    state.record_deposit(salt);
+                }
+
+                // Update metrics
+                self.metrics.record_deposit(salt);
+
+                ProcessingResult {
+                    event_id,
+                    status: EventStatus::Processed,
+                    salt_amount: Some(salt),
+                    error: None,
+                }
+            }
+            Err(e) => {
+                error!(
+                    event_id = hex::encode(event_id),
+                    error = %e,
+                    "Deposit processing failed"
+                );
+                self.state.write().update_event_status(
+                    &event_id,
+                    EventStatus::Failed,
+                    Some(e.to_string()),
+                );
+                self.metrics.record_deposit_failure();
+
+                ProcessingResult {
+                    event_id,
+                    status: EventStatus::Failed,
+                    salt_amount: None,
+                    error: Some(e.to_string()),
+                }
+            }
+        }
+    }
+
+    /// Process a withdrawal event.
+    async fn process_withdrawal(&self, withdrawal: WithdrawalEvent) -> ProcessingResult {
+        let event_id = withdrawal.event_id;
+        info!(
+            event_id = hex::encode(event_id),
+            salt = withdrawal.salt_amount,
+            recipient = hex::encode(withdrawal.eth_recipient),
+            "Withdrawal processed — Ethereum tx prepared"
+        );
+
+        // Update state
+        {
+            let mut state = self.state.write();
+            state.update_event_status(&event_id, EventStatus::Processed, None);
+            state.record_withdrawal(withdrawal.salt_amount);
+        }
+
+        // Update metrics
+        self.metrics.record_withdrawal(withdrawal.salt_amount);
+
+        ProcessingResult {
+            event_id,
+            status: EventStatus::Processed,
+            salt_amount: Some(withdrawal.salt_amount),
+            error: None,
+        }
+    }
+
+    /// Retry a failed event.
+    pub async fn retry_event(
+        &self,
+        event_id: &[u8; 32],
+        source: &dyn BridgeEventSource,
+    ) -> BridgeResult<ProcessingResult> {
+        let tracked = self
+            .state
+            .read()
+            .events
+            .get(event_id)
+            .cloned()
+            .ok_or_else(|| BridgeError::EventNotFound {
+                event_id: hex::encode(event_id),
+            })?;
+
+        if tracked.status != EventStatus::Failed {
+            return Err(BridgeError::InvalidEventData {
+                reason: format!(
+                    "Cannot retry event in {:?} status",
+                    tracked.status
+                ),
+            });
+        }
+
+        if tracked.retry_count >= self.config.max_retries {
+            return Err(BridgeError::RetryExhausted {
+                attempts: tracked.retry_count,
+                reason: tracked.error.unwrap_or_default(),
+            });
+        }
+
+        // Increment retry count
+        if let Some(t) = self.state.write().events.get_mut(event_id) {
+            t.retry_count += 1;
+            t.status = EventStatus::Pending;
+        }
+
+        let _source_head = source.current_block().await?;
+        Ok(self.process_event(tracked.event).await)
+    }
+}
+
+/// Result of processing a single bridge event.
+#[derive(Debug, Clone)]
+pub struct ProcessingResult {
+    /// Event ID that was processed.
+    pub event_id: [u8; 32],
+
+    /// Final status after processing.
+    pub status: EventStatus,
+
+    /// SALT amount credited/burned (if applicable).
+    pub salt_amount: Option<u64>,
+
+    /// Error message (if failed).
+    pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BridgeConfig;
+    use crate::events::DepositEvent;
+    use crate::oracle::{compute_event_hash, OracleAttestation};
+
+    fn test_config() -> BridgeConfig {
+        BridgeConfig {
+            confirmation_depth: 0, // No confirmation needed in tests
+            oracle_threshold: 0,   // No oracle needed in tests
+            ..Default::default()
+        }
+    }
+
+    fn make_deposit_event(id: u8, amount_eth: f64) -> BridgeEvent {
+        let event_id = DepositEvent::compute_event_id(&[id; 32], 0);
+        BridgeEvent::Deposit(DepositEvent {
+            event_id,
+            eth_tx_hash: [id; 32],
+            log_index: 0,
+            eth_block_number: 50,
+            depositor: [id; 20],
+            recipient: [id + 100; 20],
+            amount_wei: (amount_eth * 1e18) as u128,
+            amount_eth,
+            timestamp: 1000,
+        })
+    }
+
+    fn make_withdrawal_event(id: u8, salt_amount: u64) -> BridgeEvent {
+        let event_id = WithdrawalEvent::compute_event_id(&[id; 32], 200);
+        BridgeEvent::Withdrawal(WithdrawalEvent {
+            event_id,
+            citrate_tx_hash: [id; 32],
+            citrate_block_height: 200,
+            sender: [id; 20],
+            eth_recipient: [id + 100; 20],
+            salt_amount,
+            eth_amount_wei: (salt_amount as u128) * 100_000_000_000_000, // simplified
+            timestamp: 2000,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_deposit_flow_e2e() {
+        let relay = BridgeRelay::new(test_config());
+        let source = MockEventSource::new();
+        source.add_event(make_deposit_event(1, 1.0));
+
+        let results = relay.poll_cycle(&source).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, EventStatus::Processed);
+        assert_eq!(results[0].salt_amount, Some(10_000));
+
+        // Verify state updated
+        let state = relay.state().read();
+        assert_eq!(state.total_deposits, 1);
+        assert_eq!(state.total_salt_credited, 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_deduplication_prevents_double_deposit() {
+        let relay = BridgeRelay::new(test_config());
+        let source = MockEventSource::new();
+
+        let event = make_deposit_event(1, 1.0);
+        source.add_event(event.clone());
+
+        // First poll processes the event
+        let r1 = relay.poll_cycle(&source).await.unwrap();
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0].status, EventStatus::Processed);
+
+        // Add same event again and advance head so there are new blocks to scan
+        source.add_event(event);
+        source.set_head_block(200);
+
+        // Second poll rejects as duplicate
+        let r2 = relay.poll_cycle(&source).await.unwrap();
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].status, EventStatus::Rejected);
+
+        // Only 1 deposit recorded
+        assert_eq!(relay.state().read().total_deposits, 1);
+    }
+
+    #[tokio::test]
+    async fn test_withdrawal_flow() {
+        let relay = BridgeRelay::new(test_config());
+        let source = MockEventSource::new();
+        source.add_event(make_withdrawal_event(1, 5_000));
+
+        let results = relay.poll_cycle(&source).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, EventStatus::Processed);
+        assert_eq!(results[0].salt_amount, Some(5_000));
+
+        let state = relay.state().read();
+        assert_eq!(state.total_withdrawals, 1);
+        assert_eq!(state.total_salt_burned, 5_000);
+    }
+
+    #[tokio::test]
+    async fn test_insufficient_deposit_rejected() {
+        let relay = BridgeRelay::new(test_config());
+        let source = MockEventSource::new();
+
+        // 0.01 ETH < 0.02 ETH minimum
+        let event_id = DepositEvent::compute_event_id(&[1; 32], 0);
+        source.add_event(BridgeEvent::Deposit(DepositEvent {
+            event_id,
+            eth_tx_hash: [1; 32],
+            log_index: 0,
+            eth_block_number: 50,
+            depositor: [1; 20],
+            recipient: [2; 20],
+            amount_wei: 10_000_000_000_000_000, // 0.01 ETH
+            amount_eth: 0.01,
+            timestamp: 1000,
+        }));
+
+        let results = relay.poll_cycle(&source).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, EventStatus::Failed);
+        assert!(results[0].error.as_ref().unwrap().contains("too small"));
+    }
+
+    #[tokio::test]
+    async fn test_oracle_attestation_requirement() {
+        let config = BridgeConfig {
+            confirmation_depth: 0,
+            oracle_threshold: 2, // Require 2 attestations
+            ..Default::default()
+        };
+        let relay = BridgeRelay::new(config);
+        let source = MockEventSource::new();
+
+        // Register 2 oracles
+        {
+            let mut reg = relay.oracle_registry().write();
+            reg.register_oracle([1u8; 32], "Oracle-1".to_string())
+                .unwrap();
+            reg.register_oracle([2u8; 32], "Oracle-2".to_string())
+                .unwrap();
+        }
+
+        let event = make_deposit_event(1, 1.0);
+        let event_id = *event.event_id();
+        source.add_event(event);
+
+        // Poll without attestations — should be awaiting
+        let results = relay.poll_cycle(&source).await.unwrap();
+        assert_eq!(results[0].status, EventStatus::AwaitingAttestations);
+
+        // Submit attestations
+        {
+            let mut reg = relay.oracle_registry().write();
+            let event_hash = compute_event_hash(&event_id, b"deposit");
+            reg.submit_attestation(OracleAttestation {
+                oracle_id: [1u8; 32],
+                event_id,
+                event_hash,
+                signature: vec![0u8; 64],
+                timestamp: 1000,
+            })
+            .unwrap();
+            reg.submit_attestation(OracleAttestation {
+                oracle_id: [2u8; 32],
+                event_id,
+                event_hash,
+                signature: vec![0u8; 64],
+                timestamp: 1001,
+            })
+            .unwrap();
+        }
+
+        // Verify threshold is now met
+        assert!(relay.oracle_registry().read().is_threshold_met(&event_id));
+    }
+
+    #[tokio::test]
+    async fn test_chain_reorg_confirmation_depth() {
+        let config = BridgeConfig {
+            confirmation_depth: 12,
+            oracle_threshold: 0,
+            ..Default::default()
+        };
+        let relay = BridgeRelay::new(config);
+        let source = MockEventSource::new();
+
+        // Source is at block 100, confirmation depth = 12, safe = 88
+        // Last processed = 0, so we scan 1..88
+        source.set_head_block(100);
+        source.add_event(make_deposit_event(1, 1.0));
+
+        let results = relay.poll_cycle(&source).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(relay.state().read().last_eth_block, 88);
+
+        // Source still at 100 — no new blocks
+        let results2 = relay.poll_cycle(&source).await.unwrap();
+        assert_eq!(results2.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bridge_pause_and_resume() {
+        let mut relay = BridgeRelay::new(test_config());
+        let source = MockEventSource::new();
+        source.add_event(make_deposit_event(1, 1.0));
+
+        // Pause the relay
+        relay.pause("maintenance");
+        assert!(relay.is_paused());
+
+        // Poll while paused → error
+        let err = relay.poll_cycle(&source).await.unwrap_err();
+        assert!(matches!(err, BridgeError::BridgePaused { .. }));
+
+        // Resume
+        relay.resume();
+        assert!(!relay.is_paused());
+
+        // Now poll works
+        let results = relay.poll_cycle(&source).await.unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_updated_on_deposit() {
+        let relay = BridgeRelay::new(test_config());
+        let source = MockEventSource::new();
+        source.add_event(make_deposit_event(1, 1.0));
+
+        relay.poll_cycle(&source).await.unwrap();
+
+        let metrics = relay.metrics();
+        assert_eq!(
+            metrics
+                .deposits_processed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .total_salt_credited
+                .load(std::sync::atomic::Ordering::Relaxed),
+            10_000
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_deposits_in_one_cycle() {
+        let relay = BridgeRelay::new(test_config());
+        let source = MockEventSource::new();
+        source.add_event(make_deposit_event(1, 1.0));
+        source.add_event(make_deposit_event(2, 2.0));
+        source.add_event(make_deposit_event(3, 0.5));
+
+        let results = relay.poll_cycle(&source).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.status == EventStatus::Processed));
+
+        let state = relay.state().read();
+        assert_eq!(state.total_deposits, 3);
+    }
+
+    #[tokio::test]
+    async fn test_relay_state_persistence() {
+        let relay = BridgeRelay::new(test_config());
+        let source = MockEventSource::new();
+        source.add_event(make_deposit_event(1, 1.0));
+
+        relay.poll_cycle(&source).await.unwrap();
+
+        // Serialize and deserialize state
+        let json = relay.state().read().to_json().unwrap();
+        let restored = RelayState::from_json(&json).unwrap();
+        assert_eq!(restored.total_deposits, 1);
+        assert_eq!(restored.total_salt_credited, 10_000);
+    }
+}

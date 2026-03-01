@@ -1,0 +1,30 @@
+[package]
+name = "citrate-bridge"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Citrate bridge relay — Ethereum Sepolia <> Citrate devnet cross-chain bridge"
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+sha3 = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+
+# Local
+primitive-types = "0.12"
+dashmap = "5.5"
+hex = "0.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
+proptest = { workspace = true }
