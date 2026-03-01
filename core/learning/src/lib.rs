@@ -44,7 +44,7 @@ pub mod verification;
 // Re-export primary types for convenient access
 pub use adapters::{AdapterFactory, LearningAdapter};
 pub use aggregation::{Aggregator, WeightedMeanAggregator};
-pub use belnap::BelnapValue;
+pub use belnap::{classify_belnap, softmax_weights, BelnapValue};
 pub use checkpoint::LearningCheckpoint;
 pub use config::LearningConfig;
 pub use embeddings::{EmbeddingSpace, EmbeddingVector};

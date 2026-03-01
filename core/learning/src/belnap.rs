@@ -6,6 +6,7 @@
 //! - **Knowledge ordering** (≤k): N ≤k {T, F} ≤k B
 //! - **Truth ordering** (≤t): F ≤t {N, B} ≤t T
 
+use crate::embeddings::EmbeddingVector;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -123,6 +124,185 @@ impl Default for BelnapValue {
     fn default() -> Self {
         BelnapValue::Neither
     }
+}
+
+// ---------------------------------------------------------------------------
+// WP-L.7: Classification function φ (Paper II §3.1, Definition 5)
+// ---------------------------------------------------------------------------
+
+/// Compute softmax weights from blue scores with temperature scaling.
+///
+/// `softmax(bᵢ/τ) = exp(bᵢ/τ) / Σ exp(bⱼ/τ)`
+///
+/// Returns uniform weights if `blue_scores` is empty or all zero.
+/// Reused by Sprint M aggregation (GAP-9).
+pub fn softmax_weights(blue_scores: &[f32], temperature: f32) -> Vec<f32> {
+    if blue_scores.is_empty() {
+        return vec![];
+    }
+    let tau = if temperature <= f32::EPSILON { 1.0 } else { temperature };
+    let scaled: Vec<f32> = blue_scores.iter().map(|&b| b / tau).collect();
+    let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = scaled.iter().map(|&s| (s - max_val).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    if sum < f32::EPSILON {
+        // All zero scores → uniform
+        let uniform = 1.0 / blue_scores.len() as f32;
+        return vec![uniform; blue_scores.len()];
+    }
+    exps.iter().map(|e| e / sum).collect()
+}
+
+/// Classify each participant's embedding into per-dimension Belnap states.
+///
+/// Implements Definition 5 (φ) from Paper II §3.1.
+///
+/// For each participant `i` and dimension `j`:
+/// - **True**: confidence ≥ θ_high AND directionally consistent with blue-score-weighted majority
+/// - **False**: confidence ≥ θ_high AND directionally inconsistent with majority
+/// - **Both**: confidence ≥ θ_high AND at least one other comparably-trusted node also disagrees
+///   at this dimension (genuine paraconsistent disagreement)
+/// - **Neither**: confidence < θ_low (uncertain / no information)
+///
+/// Returns a `Vec` of `BelnapValue` vectors — one per participant, each of length `dim`.
+///
+/// # Panics
+/// Panics if embeddings/confidences/blue_scores lengths don't match, or if any
+/// confidence slice length doesn't match the embedding dimension.
+pub fn classify_belnap(
+    embeddings: &[&EmbeddingVector],
+    confidences: &[&[f32]],
+    blue_scores: &[f32],
+    temperature: f32,
+    theta_high: f32,
+    _theta_low: f32,
+) -> Vec<Vec<BelnapValue>> {
+    let n = embeddings.len();
+    if n == 0 {
+        return vec![];
+    }
+    assert_eq!(n, confidences.len(), "embeddings and confidences length mismatch");
+    assert_eq!(n, blue_scores.len(), "embeddings and blue_scores length mismatch");
+
+    let dim = embeddings[0].dim();
+    for (i, emb) in embeddings.iter().enumerate() {
+        assert_eq!(emb.dim(), dim, "embedding {} has wrong dimension", i);
+        assert_eq!(confidences[i].len(), dim, "confidence {} has wrong dimension", i);
+    }
+
+    // Step 1: Compute trust weights via softmax(blue_scores / τ)
+    let weights = softmax_weights(blue_scores, temperature);
+
+    // Step 2: Compute weighted majority value per dimension
+    let mut majority = vec![0.0f32; dim];
+    for j in 0..dim {
+        for i in 0..n {
+            majority[j] += weights[i] * embeddings[i].data[j];
+        }
+    }
+
+    let epsilon = 1e-6;
+
+    // Step 3: Classify each participant, each dimension
+    //
+    // For each dimension j, we partition high-confidence participants into
+    // "positive" (above majority) and "negative" (below majority) sides,
+    // then classify based on which side has more total trust weight.
+    let mut result = vec![vec![BelnapValue::Neither; dim]; n];
+
+    for j in 0..dim {
+        // Pre-compute deviations from majority and side weights
+        let deviations: Vec<f32> = (0..n)
+            .map(|i| embeddings[i].data[j] - majority[j])
+            .collect();
+
+        // Compute total trust weight on each side (only high-confidence participants)
+        let mut pos_weight = 0.0f32;
+        let mut neg_weight = 0.0f32;
+        for i in 0..n {
+            if confidences[i][j] < theta_high {
+                continue;
+            }
+            if deviations[i] > epsilon {
+                pos_weight += weights[i];
+            } else if deviations[i] < -epsilon {
+                neg_weight += weights[i];
+            }
+            // Negligible deviation participants don't contribute to either side
+        }
+
+        for i in 0..n {
+            let conf = confidences[i][j];
+
+            // Low confidence or grey zone → Neither
+            if conf < theta_high {
+                result[i][j] = BelnapValue::Neither;
+                continue;
+            }
+
+            let dev_i = deviations[i];
+
+            // Negligible deviation from majority → True
+            if dev_i.abs() <= epsilon {
+                result[i][j] = BelnapValue::True;
+                continue;
+            }
+
+            // Determine which side this participant is on
+            let (my_side_weight, other_side_weight) = if dev_i > 0.0 {
+                (pos_weight, neg_weight)
+            } else {
+                (neg_weight, pos_weight)
+            };
+
+            // No opposition at all → True
+            if other_side_weight < epsilon {
+                result[i][j] = BelnapValue::True;
+                continue;
+            }
+
+            // On the heavier side → True (consistent with majority)
+            if my_side_weight > other_side_weight + epsilon {
+                result[i][j] = BelnapValue::True;
+                continue;
+            }
+
+            // Sides are approximately equal → genuine disagreement → Both
+            if (my_side_weight - other_side_weight).abs() <= epsilon {
+                result[i][j] = BelnapValue::Both;
+                continue;
+            }
+
+            // On the lighter (minority) side — check for allies
+            let sign_i = dev_i.signum();
+            let mut has_ally = false;
+            for k in 0..n {
+                if k == i {
+                    continue;
+                }
+                if confidences[k][j] < theta_high {
+                    continue;
+                }
+                if weights[k] < 0.5 * weights[i] {
+                    continue;
+                }
+                if deviations[k].abs() > epsilon && deviations[k].signum() == sign_i {
+                    has_ally = true;
+                    break;
+                }
+            }
+
+            if has_ally {
+                // Has a comparably-trusted ally on the same side → Both
+                result[i][j] = BelnapValue::Both;
+            } else {
+                // Alone on the minority side → False
+                result[i][j] = BelnapValue::False;
+            }
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -273,6 +453,179 @@ mod tests {
         assert_eq!(format!("{}", BelnapValue::False), "F");
         assert_eq!(format!("{}", BelnapValue::Both), "B");
         assert_eq!(format!("{}", BelnapValue::Neither), "N");
+    }
+
+    // --- WP-L.7: φ classification tests ---
+
+    #[test]
+    fn test_softmax_weights_basic() {
+        let w = softmax_weights(&[1.0, 1.0, 1.0], 1.0);
+        assert_eq!(w.len(), 3);
+        // Equal scores → uniform
+        for &wi in &w {
+            assert!((wi - 1.0 / 3.0).abs() < 1e-5);
+        }
+
+        // Higher score → higher weight
+        let w2 = softmax_weights(&[10.0, 1.0], 1.0);
+        assert!(w2[0] > w2[1]);
+    }
+
+    #[test]
+    fn test_softmax_weights_temperature() {
+        // High temperature → more uniform
+        let w_hot = softmax_weights(&[10.0, 1.0], 100.0);
+        // Low temperature → more peaked
+        let w_cold = softmax_weights(&[10.0, 1.0], 0.1);
+        // Hot should be more uniform (closer to 0.5 each)
+        assert!((w_hot[0] - w_hot[1]).abs() < (w_cold[0] - w_cold[1]).abs());
+    }
+
+    // PC-T12a: All participants agree, high confidence → all True
+    #[test]
+    fn test_phi_unanimous_agreement() {
+        let e1 = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
+        let e2 = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
+        let e3 = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
+        let conf = vec![0.9, 0.9]; // high confidence in both dims
+        let blue = vec![10.0, 10.0, 10.0]; // equal trust
+
+        let result = classify_belnap(
+            &[&e1, &e2, &e3],
+            &[&conf[..], &conf[..], &conf[..]],
+            &blue,
+            1.0, 0.8, 0.3,
+        );
+
+        assert_eq!(result.len(), 3);
+        for participant in &result {
+            assert_eq!(participant.len(), 2);
+            for &val in participant {
+                assert_eq!(val, BelnapValue::True, "unanimous agreement should be True");
+            }
+        }
+    }
+
+    // PC-T12b: One participant disagrees, high confidence → False for dissenter
+    #[test]
+    fn test_phi_single_dissenter() {
+        // Two nodes agree on [1.0, 1.0], one dissents to [-5.0, -5.0]
+        let e1 = EmbeddingVector::new(vec![1.0, 1.0]).unwrap();
+        let e2 = EmbeddingVector::new(vec![1.0, 1.0]).unwrap();
+        let e3 = EmbeddingVector::new(vec![-5.0, -5.0]).unwrap();
+        let conf = vec![0.9, 0.9];
+        let blue = vec![10.0, 10.0, 10.0];
+
+        let result = classify_belnap(
+            &[&e1, &e2, &e3],
+            &[&conf[..], &conf[..], &conf[..]],
+            &blue,
+            1.0, 0.8, 0.3,
+        );
+
+        // Majority (e1, e2) should be True
+        assert_eq!(result[0][0], BelnapValue::True);
+        assert_eq!(result[1][0], BelnapValue::True);
+        // Dissenter (e3) should be False (alone in disagreeing against majority)
+        assert_eq!(result[2][0], BelnapValue::False);
+        assert_eq!(result[2][1], BelnapValue::False);
+    }
+
+    // PC-T12c: Two comparable-trust nodes disagree → Both
+    #[test]
+    fn test_phi_comparable_disagreement_both() {
+        // Two nodes point in opposite directions with comparable trust
+        let e1 = EmbeddingVector::new(vec![5.0]).unwrap();
+        let e2 = EmbeddingVector::new(vec![-5.0]).unwrap();
+        let conf1 = vec![0.95];
+        let conf2 = vec![0.95];
+        let blue = vec![10.0, 10.0]; // equal trust
+
+        let result = classify_belnap(
+            &[&e1, &e2],
+            &[&conf1[..], &conf2[..]],
+            &blue,
+            1.0, 0.8, 0.3,
+        );
+
+        // Both nodes have comparable trust and disagree → Both for each
+        assert_eq!(result[0][0], BelnapValue::Both,
+            "comparable disagreement should yield Both, got {:?}", result[0][0]);
+        assert_eq!(result[1][0], BelnapValue::Both,
+            "comparable disagreement should yield Both, got {:?}", result[1][0]);
+    }
+
+    // PC-T12d: Low confidence → Neither regardless of direction
+    #[test]
+    fn test_phi_low_confidence_neither() {
+        let e1 = EmbeddingVector::new(vec![1.0, -5.0]).unwrap();
+        let e2 = EmbeddingVector::new(vec![-1.0, 5.0]).unwrap();
+        let conf1 = vec![0.1, 0.2]; // below θ_low = 0.3
+        let conf2 = vec![0.15, 0.25];
+        let blue = vec![10.0, 10.0];
+
+        let result = classify_belnap(
+            &[&e1, &e2],
+            &[&conf1[..], &conf2[..]],
+            &blue,
+            1.0, 0.8, 0.3,
+        );
+
+        for participant in &result {
+            for &val in participant {
+                assert_eq!(val, BelnapValue::Neither,
+                    "low confidence should always be Neither");
+            }
+        }
+    }
+
+    // PC-T12e: Mixed confidence levels across dimensions
+    #[test]
+    fn test_phi_mixed_confidence() {
+        // dim 0: both high confidence, agree → True
+        // dim 1: participant 0 high conf, participant 1 low conf
+        let e1 = EmbeddingVector::new(vec![1.0, 3.0]).unwrap();
+        let e2 = EmbeddingVector::new(vec![1.0, -3.0]).unwrap();
+        let conf1 = vec![0.9, 0.9]; // high in both
+        let conf2 = vec![0.9, 0.1]; // high in dim 0, low in dim 1
+        let blue = vec![10.0, 10.0];
+
+        let result = classify_belnap(
+            &[&e1, &e2],
+            &[&conf1[..], &conf2[..]],
+            &blue,
+            1.0, 0.8, 0.3,
+        );
+
+        // dim 0: both agree → True
+        assert_eq!(result[0][0], BelnapValue::True);
+        assert_eq!(result[1][0], BelnapValue::True);
+        // dim 1: participant 1 is low confidence → Neither
+        assert_eq!(result[1][1], BelnapValue::Neither);
+        // dim 1: participant 0 is high conf, alone with high conf → True
+        // (the only high-conf voice, so it's trivially the majority)
+        assert_eq!(result[0][1], BelnapValue::True);
+    }
+
+    // PC-T12f: Single participant → all True (no disagreement possible)
+    #[test]
+    fn test_phi_single_participant() {
+        let e = EmbeddingVector::new(vec![1.0, -2.0, 3.0]).unwrap();
+        let conf = vec![0.9, 0.9, 0.9];
+        let blue = vec![10.0];
+
+        let result = classify_belnap(
+            &[&e],
+            &[&conf[..]],
+            &blue,
+            1.0, 0.8, 0.3,
+        );
+
+        assert_eq!(result.len(), 1);
+        for &val in &result[0] {
+            assert_eq!(val, BelnapValue::True,
+                "single participant is trivially consistent");
+        }
     }
 }
 
