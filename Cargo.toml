@@ -11,6 +11,7 @@ members = [
     "core/mcp",
     "core/economics",
     "core/marketplace",
+    "core/learning",
     "node",
     "node-app",
     "wallet",

@@ -1789,6 +1789,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-learning"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "chrono",
+ "criterion",
+ "dashmap",
+ "ed25519-dalek",
+ "hex",
+ "once_cell",
+ "parking_lot 0.12.4",
+ "prometheus",
+ "proptest",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha3",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
 name = "citrate-marketplace"
 version = "0.1.0"
 dependencies = [

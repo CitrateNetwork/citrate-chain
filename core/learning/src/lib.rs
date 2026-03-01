@@ -1,0 +1,56 @@
+//! # citrate-learning
+//!
+//! Paraconsensus learning layer for the Citrate blockchain.
+//!
+//! Implements the Paraconsistent Consensus protocol from Gradient Papers No. II,
+//! providing checkpoint-synchronized federated learning that never affects
+//! consensus state integrity.
+//!
+//! ## Architecture
+//!
+//! The learning layer operates alongside the GhostDAG consensus engine:
+//!
+//! 1. **Belnap FOUR Lattice** — Four-valued logic for paraconsistent reasoning
+//! 2. **Embeddings** — Vector representations with similarity metrics
+//! 3. **Knowledge States** — Per-participant embedding + Belnap confidence
+//! 4. **Aggregation** — Weighted mean at BFT checkpoints
+//! 5. **Routing** — MLP-based routing of aggregated embeddings
+//! 6. **Phases** — OODA cycle (Observe → Orient → Decide → Act)
+//! 7. **Adapters** — Lightweight model deltas with provenance chains
+//! 8. **Safety** — Invariant: state roots identical ± learning
+//!
+//! ## Safety Invariant (Theorem 3)
+//!
+//! For any block B, the state root after executing B's transactions MUST be
+//! identical whether learning is enabled or disabled. This is verified by
+//! property-based tests in the `safety` module.
+
+pub mod adapters;
+pub mod aggregation;
+pub mod belnap;
+pub mod checkpoint;
+pub mod config;
+pub mod embeddings;
+pub mod errors;
+pub mod knowledge;
+pub mod metrics;
+pub mod phases;
+pub mod routing;
+pub mod safety;
+pub mod storage;
+pub mod types;
+pub mod verification;
+
+// Re-export primary types for convenient access
+pub use adapters::{AdapterFactory, LearningAdapter};
+pub use aggregation::{Aggregator, WeightedMeanAggregator};
+pub use belnap::BelnapValue;
+pub use checkpoint::LearningCheckpoint;
+pub use config::LearningConfig;
+pub use embeddings::{EmbeddingSpace, EmbeddingVector};
+pub use errors::LearningError;
+pub use knowledge::KnowledgeState;
+pub use phases::{OodaPhase, PhaseManager};
+pub use routing::{MlpRouter, Router};
+pub use safety::{LearningMode, SafetyGuard};
+pub use types::{LearningRound, Participant};
