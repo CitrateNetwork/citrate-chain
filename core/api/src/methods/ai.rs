@@ -75,6 +75,17 @@ pub struct EmbeddingsResponse {
     pub data: Vec<EmbeddingData>,
     pub model: String,
     pub usage: TokenUsage,
+    /// Citrate metadata: signals when embeddings are deterministic pseudo-vectors
+    /// rather than real model output, so consumers can distinguish the two.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _citrate_meta: Option<CitrateMeta>,
+}
+
+/// Citrate-specific metadata for API responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitrateMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// Embedding data
@@ -900,6 +911,13 @@ impl AiApi {
                 completion_tokens: 0,
                 total_tokens: request.input.iter().map(|s| s.len() as u32 / 4).sum(),
             },
+            _citrate_meta: Some(CitrateMeta {
+                warning: Some(
+                    "Embeddings are deterministic pseudo-vectors derived from SHA3 hashing, \
+                     not real model output. Deploy a GGUF/CoreML embedding model for production use."
+                        .to_string(),
+                ),
+            }),
         })
     }
 }

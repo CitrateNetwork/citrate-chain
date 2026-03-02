@@ -365,7 +365,9 @@ fn compile_standard_json(
 pub struct RpcConfig {
     pub listen_addr: SocketAddr,
     pub max_connections: u32,
-    pub cors_domains: Vec<String>,
+    /// Configurable CORS origins (WP-X.1).
+    /// Empty = no CORS headers. ["*"] = wildcard. Otherwise, explicit allowlist.
+    pub cors_origins: Vec<String>,
     pub threads: usize,
     pub rate_limit: RateLimitConfig,
     /// Allow eth_sendTransaction (unsigned, arbitrary-from transactions).
@@ -379,7 +381,7 @@ impl Default for RpcConfig {
         Self {
             listen_addr: "127.0.0.1:8545".parse().unwrap(),
             max_connections: 100,
-            cors_domains: vec!["*".to_string()],
+            cors_origins: vec!["*".to_string()],
             threads: 4,
             rate_limit: RateLimitConfig::default(),
             allow_eth_send_transaction: false, // Secure default: reject unsigned tx
@@ -2383,7 +2385,7 @@ impl RpcServer {
     pub fn spawn(self) -> Result<(CloseHandle, std::thread::JoinHandle<()>)> {
         let listen_addr = self.config.listen_addr;
         let threads = self.config.threads;
-        let cors_any = !self.config.cors_domains.is_empty();
+        let cors_origins = self.config.cors_origins.clone();
         let rate_limit_config = self.config.rate_limit.clone();
         let io = self.io_handler;
 
@@ -2394,11 +2396,19 @@ impl RpcServer {
         let join_handle = std::thread::spawn(move || {
             let mut builder = ServerBuilder::new(io)
                 .request_middleware(RateLimiter::new(rate_limit_config));
-            if cors_any {
+            // WP-X.1: Config-driven CORS instead of always-wildcard
+            if cors_origins.iter().any(|o| o == "*") {
                 builder = builder.cors(DomainsValidation::AllowOnly(vec![
                     AccessControlAllowOrigin::Any,
                 ]));
+            } else if !cors_origins.is_empty() {
+                let origins: Vec<AccessControlAllowOrigin> = cors_origins
+                    .iter()
+                    .map(|o| AccessControlAllowOrigin::Value(o.clone().into()))
+                    .collect();
+                builder = builder.cors(DomainsValidation::AllowOnly(origins));
             }
+            // Empty cors_origins = no CORS headers (browser cross-origin blocked by default)
             info!("RPC rate limiting enabled: {} req/{}s per IP",
                   100, 1); // defaults
             match builder

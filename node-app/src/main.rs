@@ -23,7 +23,8 @@ fn rpc_addr() -> SocketAddr {
     std::env::var("CITRATE_RPC_ADDR")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| "0.0.0.0:8545".parse().unwrap())
+        // WP-X.1: Default to loopback (was 0.0.0.0 — exposed to all interfaces)
+        .unwrap_or_else(|| "127.0.0.1:8545".parse().unwrap())
 }
 
 fn metrics_addr() -> SocketAddr {
@@ -95,8 +96,9 @@ async fn main() -> Result<()> {
     });
 
     // API service (WebSocket and REST addresses)
-    let ws_addr: SocketAddr = "0.0.0.0:8546".parse().unwrap();
-    let rest_addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
+    // WP-X.1: Default to loopback (was 0.0.0.0)
+    let ws_addr: SocketAddr = "127.0.0.1:8546".parse().unwrap();
+    let rest_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
     let api = ApiService::new(
         rpc_cfg,
         ws_addr,

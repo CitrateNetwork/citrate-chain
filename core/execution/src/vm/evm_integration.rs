@@ -51,11 +51,11 @@ impl EVMIntegration {
             block_timestamp,
             block_hash,
             coinbase,
-            prevrandao: U256::from(block_timestamp), // Simplified
+            prevrandao: U256::from(block_timestamp), // WP-X.4: Simplified in custom EVM; revm path uses real VRF output
             gas_limit,
             chain_id,
             base_fee,
-            blob_base_fee: U256::zero(),
+            blob_base_fee: U256::zero(), // EIP-4844 blobs not supported in Citrate v0.01.x; zero is correct
             origin: origin.0,
             caller: caller.0,
             call_value: value,

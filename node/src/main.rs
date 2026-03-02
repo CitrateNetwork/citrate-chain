@@ -1657,7 +1657,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let rpc_config = RpcConfig {
             listen_addr: config.rpc.listen_addr,
             max_connections: 100,
-            cors_domains: vec!["*".to_string()],
+            // WP-X.1: Propagate CORS config instead of hardcoding wildcard
+            cors_origins: config.rpc.cors_origins.clone(),
             threads: 4,
             // C-02: Only allow eth_sendTransaction in devnet/dev mode
             allow_eth_send_transaction: config.rpc.allow_eth_send_transaction,

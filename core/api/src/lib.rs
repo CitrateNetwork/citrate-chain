@@ -59,6 +59,9 @@ impl ApiService {
         executor: Arc<Executor>,
         chain_id: u64,
     ) -> Self {
+        // WP-X.1: Pass CORS config to REST server
+        let cors_origins = rpc_config.cors_origins.clone();
+
         let rpc_server = RpcServer::new(
             rpc_config,
             storage.clone(),
@@ -69,7 +72,8 @@ impl ApiService {
         );
 
         let ws_server = WebSocketServer::new(ws_addr);
-        let rest_server = OpenAiRestServer::new(storage, mempool, executor);
+        let rest_server =
+            OpenAiRestServer::with_config(storage, mempool, executor, cors_origins, None);
 
         Self {
             rpc_server,

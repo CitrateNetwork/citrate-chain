@@ -234,6 +234,20 @@ pub struct RpcConfig {
     /// When None, all requests are allowed (devnet mode).
     #[serde(default)]
     pub api_key: Option<String>,
+
+    /// Configurable CORS origins for JSON-RPC and REST servers.
+    /// When empty (default), no CORS headers are sent (browser cross-origin blocked).
+    /// Use ["*"] for open access (devnet only).
+    /// WP-X.1: F-08 remediation.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+
+    /// API key for REST endpoints that mutate state (deploy, inference, training, lora).
+    /// When set, these endpoints require Authorization: Bearer <key>.
+    /// Read-only endpoints (/v1/models, /health) remain open.
+    /// WP-X.1: F-07 remediation.
+    #[serde(default)]
+    pub rest_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +306,8 @@ impl Default for NodeConfig {
                 ws_addr: "127.0.0.1:8546".parse().unwrap(),
                 allow_eth_send_transaction: false, // Secure default
                 api_key: None,
+                cors_origins: vec![], // Secure default: no CORS headers
+                rest_api_key: None,
             },
             storage: StorageConfig {
                 data_dir: dirs::home_dir()
@@ -334,6 +350,8 @@ impl NodeConfig {
         config.mining.target_block_time = 2; // Fast blocks for testing
         // C-02: Allow eth_sendTransaction only in devnet mode
         config.rpc.allow_eth_send_transaction = true;
+        // WP-X.1: Permissive CORS in devnet
+        config.rpc.cors_origins = vec!["*".to_string()];
         // WP-W.2: Permissive VRF in devnet (no strict verification)
         config.vrf.strict_vrf = false;
         config
