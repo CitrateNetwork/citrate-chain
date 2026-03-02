@@ -1,4 +1,9 @@
 // citrate/core/api/src/eip1559_decoder.rs
+//
+// DEPRECATED: This module is not used in the production RPC codepath.
+// The primary decoder is `eth_tx_decoder.rs`. This file is retained for
+// backward compatibility until post-audit cleanup.
+// See core/api/DECODER_ARCHITECTURE.md for the full decoder stack map.
 
 use ethereum_types::{H160, H256, U256};
 use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};

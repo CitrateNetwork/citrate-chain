@@ -1714,3 +1714,351 @@ impl TryFrom<u8> for EVMOpcode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ---------------------------------------------------------------
+    // 1. TryFrom<u8> – known valid opcodes
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_opcode_try_from_valid() {
+        assert_eq!(EVMOpcode::try_from(0x00), Ok(EVMOpcode::STOP));
+        assert_eq!(EVMOpcode::try_from(0x01), Ok(EVMOpcode::ADD));
+        assert_eq!(EVMOpcode::try_from(0x60), Ok(EVMOpcode::PUSH1));
+        assert_eq!(EVMOpcode::try_from(0xf1), Ok(EVMOpcode::CALL));
+        assert_eq!(EVMOpcode::try_from(0xff), Ok(EVMOpcode::SELFDESTRUCT));
+    }
+
+    // ---------------------------------------------------------------
+    // 2. TryFrom<u8> – invalid bytes
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_opcode_try_from_invalid() {
+        let invalid_bytes: &[u8] = &[0x0c, 0x21, 0x49, 0xb0, 0xef];
+        for &b in invalid_bytes {
+            assert!(
+                EVMOpcode::try_from(b).is_err(),
+                "Expected Err for byte 0x{:02x}",
+                b
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 3. PUSH1–PUSH32 (0x60–0x7f) all succeed
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_opcode_try_from_push_range() {
+        for byte in 0x60u8..=0x7f {
+            assert!(
+                EVMOpcode::try_from(byte).is_ok(),
+                "PUSH opcode 0x{:02x} should be valid",
+                byte
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 4. DUP1–DUP16 (0x80–0x8f) all succeed
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_opcode_try_from_dup_range() {
+        for byte in 0x80u8..=0x8f {
+            assert!(
+                EVMOpcode::try_from(byte).is_ok(),
+                "DUP opcode 0x{:02x} should be valid",
+                byte
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 5. SWAP1–SWAP16 (0x90–0x9f) all succeed
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_opcode_try_from_swap_range() {
+        for byte in 0x90u8..=0x9f {
+            assert!(
+                EVMOpcode::try_from(byte).is_ok(),
+                "SWAP opcode 0x{:02x} should be valid",
+                byte
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 6. LOG0–LOG4 (0xa0–0xa4) succeed, 0xa5 fails
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_opcode_try_from_log_range() {
+        for byte in 0xa0u8..=0xa4 {
+            assert!(
+                EVMOpcode::try_from(byte).is_ok(),
+                "LOG opcode 0x{:02x} should be valid",
+                byte
+            );
+        }
+        assert!(
+            EVMOpcode::try_from(0xa5).is_err(),
+            "0xa5 is not a valid LOG opcode"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 7. Stack push / pop round-trip
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_stack_push_pop() {
+        let mut state = EVMState::new(1_000_000);
+        let val = U256::from(0xDEAD_BEEFu64);
+        state.stack_push(val).unwrap();
+        assert_eq!(state.stack_pop().unwrap(), val);
+    }
+
+    // ---------------------------------------------------------------
+    // 8. Stack overflow at 1024
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_stack_overflow() {
+        let mut state = EVMState::new(1_000_000);
+
+        // Push exactly 1024 values — should all succeed
+        for i in 0u64..1024 {
+            state
+                .stack_push(U256::from(i))
+                .unwrap_or_else(|_| panic!("Push #{} should succeed", i));
+        }
+        assert_eq!(state.stack.len(), 1024);
+
+        // The 1025th push must fail with StackOverflow
+        match state.stack_push(U256::from(1025u64)) {
+            Err(ExecutionError::StackOverflow) => {} // expected
+            other => panic!("Expected StackOverflow, got {:?}", other),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 9. Stack underflow on empty stack
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_stack_underflow() {
+        let mut state = EVMState::new(1_000_000);
+        match state.stack_pop() {
+            Err(ExecutionError::StackUnderflow) => {} // expected
+            other => panic!("Expected StackUnderflow, got {:?}", other),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 10. Stack peek
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_stack_peek() {
+        let mut state = EVMState::new(1_000_000);
+        let a = U256::from(111u64);
+        let b = U256::from(222u64);
+        let c = U256::from(333u64);
+
+        state.stack_push(a).unwrap(); // bottom
+        state.stack_push(b).unwrap();
+        state.stack_push(c).unwrap(); // top
+
+        // peek(0) = top of stack
+        assert_eq!(state.stack_peek(0).unwrap(), c);
+        // peek(1) = second from top
+        assert_eq!(state.stack_peek(1).unwrap(), b);
+        // peek(2) = bottom
+        assert_eq!(state.stack_peek(2).unwrap(), a);
+
+        // peek beyond stack depth → underflow
+        match state.stack_peek(3) {
+            Err(ExecutionError::StackUnderflow) => {} // expected
+            other => panic!("Expected StackUnderflow, got {:?}", other),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 11. Stack swap
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_stack_swap() {
+        let mut state = EVMState::new(1_000_000);
+        let a = U256::from(1u64);
+        let b = U256::from(2u64);
+        let c = U256::from(3u64);
+
+        state.stack_push(a).unwrap(); // index 2 from top
+        state.stack_push(b).unwrap(); // index 1 from top
+        state.stack_push(c).unwrap(); // index 0 (top)
+
+        // swap(2) swaps top with element 2 positions deep: [1,2,3] -> [3,2,1]
+        state.stack_swap(2).unwrap();
+
+        assert_eq!(state.stack_pop().unwrap(), a); // was bottom, now top
+        assert_eq!(state.stack_pop().unwrap(), b); // middle unchanged
+        assert_eq!(state.stack_pop().unwrap(), c); // was top, now bottom
+    }
+
+    // ---------------------------------------------------------------
+    // 12. Memory write / read round-trip
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_memory_write_read_roundtrip() {
+        let mut state = EVMState::new(1_000_000);
+        let data: &[u8] = &[0xCA, 0xFE, 0xBA, 0xBE];
+
+        let _gas = state.memory_write(64, data).unwrap();
+
+        let read_back = state.memory_read(64, 4);
+        assert_eq!(read_back, data);
+
+        // Reading beyond written data should return zeros
+        let beyond = state.memory_read(200, 4);
+        assert_eq!(beyond, vec![0u8; 4]);
+    }
+
+    // ---------------------------------------------------------------
+    // 13. Memory expansion gas cost (quadratic formula)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_memory_expansion_gas() {
+        let mut state = EVMState::new(1_000_000);
+
+        // Expand from 0 to 32 bytes (1 word)
+        // words_after = 1, cost = 1*3 + 1*1/512 = 3
+        let gas = state.memory_expand(0, 32).unwrap();
+        assert_eq!(gas, 3);
+        assert_eq!(state.memory.len(), 32);
+
+        // Expanding to the same size costs 0
+        let gas = state.memory_expand(0, 32).unwrap();
+        assert_eq!(gas, 0);
+
+        // Expand from 32 bytes (1 word) to 64 bytes (2 words)
+        // words_before=1, cost_before = 3 + 0 = 3
+        // words_after=2, cost_after = 6 + 0 = 6
+        // delta = 3
+        let gas = state.memory_expand(32, 32).unwrap();
+        assert_eq!(gas, 3);
+        assert_eq!(state.memory.len(), 64);
+
+        // Larger expansion: from 64 bytes (2 words) to 1024 bytes (32 words)
+        // words_before=2, cost_before = 6 + 0 = 6
+        // words_after=32, cost_after = 96 + 32*32/512 = 96 + 2 = 98
+        // delta = 92
+        let gas = state.memory_expand(0, 1024).unwrap();
+        assert_eq!(gas, 92);
+        assert_eq!(state.memory.len(), 1024);
+    }
+
+    // ---------------------------------------------------------------
+    // 14. Storage store / load round-trip
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_storage_store_load_roundtrip() {
+        let mut state = EVMState::new(1_000_000);
+        let mut accessed = HashMap::new();
+
+        let key = U256::from(42u64);
+        let value = U256::from(0xBEEFu64);
+
+        state.storage_store(key, value, &mut accessed);
+
+        let loaded = state.storage_load(key, &mut accessed);
+        assert_eq!(loaded, value);
+
+        // Loading a key that was never stored returns zero
+        let missing = state.storage_load(U256::from(999u64), &mut accessed);
+        assert_eq!(missing, U256::zero());
+    }
+
+    // ---------------------------------------------------------------
+    // 15. Storage gas costs (EIP-2200)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_storage_gas_costs() {
+        let mut state = EVMState::new(1_000_000);
+        let mut accessed = HashMap::new();
+        let key = U256::from(1u64);
+
+        // Set: 0 → non-zero costs 20000
+        let gas = state.storage_store(key, U256::from(100u64), &mut accessed);
+        assert_eq!(gas, 20000, "Setting storage from zero should cost 20000");
+
+        // Modify: non-zero → different non-zero costs 2900
+        let gas = state.storage_store(key, U256::from(200u64), &mut accessed);
+        assert_eq!(gas, 2900, "Modifying storage should cost 2900");
+
+        // No-op: value → same value costs 100
+        let gas = state.storage_store(key, U256::from(200u64), &mut accessed);
+        assert_eq!(gas, 100, "No-op storage write should cost 100");
+
+        // Delete: non-zero → zero costs 2300
+        let gas = state.storage_store(key, U256::zero(), &mut accessed);
+        assert_eq!(gas, 2300, "Deleting storage should cost 2300");
+
+        // Confirm the key is actually removed
+        let loaded = state.storage_load(key, &mut accessed);
+        assert_eq!(loaded, U256::zero());
+    }
+
+    // ---------------------------------------------------------------
+    // 16. Transient storage (EIP-1153)
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_transient_storage() {
+        let mut state = EVMState::new(1_000_000);
+
+        // Default is zero
+        assert_eq!(state.tload(U256::from(10u64)), U256::zero());
+
+        // Store and load round-trip
+        state.tstore(U256::from(10u64), U256::from(0xABCDu64));
+        assert_eq!(state.tload(U256::from(10u64)), U256::from(0xABCDu64));
+
+        // Overwrite
+        state.tstore(U256::from(10u64), U256::from(0x1234u64));
+        assert_eq!(state.tload(U256::from(10u64)), U256::from(0x1234u64));
+
+        // Storing zero removes the key
+        state.tstore(U256::from(10u64), U256::zero());
+        assert_eq!(state.tload(U256::from(10u64)), U256::zero());
+        assert!(!state.transient_storage.contains_key(&U256::from(10u64)));
+    }
+
+    // ---------------------------------------------------------------
+    // 17. Gas consumption and OutOfGas
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_gas_consumption() {
+        let mut state = EVMState::new(1000);
+        assert_eq!(state.gas_remaining, 1000);
+
+        // Consume some gas
+        state.consume_gas(300).unwrap();
+        assert_eq!(state.gas_remaining, 700);
+
+        // Consume more
+        state.consume_gas(700).unwrap();
+        assert_eq!(state.gas_remaining, 0);
+
+        // Any further consumption must fail with OutOfGas
+        match state.consume_gas(1) {
+            Err(ExecutionError::OutOfGas) => {} // expected
+            other => panic!("Expected OutOfGas, got {:?}", other),
+        }
+        assert_eq!(state.gas_remaining, 0, "Gas should not go negative");
+
+        // Verify a fresh state with exact consumption
+        let mut state2 = EVMState::new(500);
+        // Consuming more than remaining must fail
+        match state2.consume_gas(501) {
+            Err(ExecutionError::OutOfGas) => {} // expected
+            other => panic!("Expected OutOfGas, got {:?}", other),
+        }
+        assert_eq!(state2.gas_remaining, 500, "Failed consume should not change balance");
+    }
+}

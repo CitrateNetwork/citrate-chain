@@ -192,12 +192,27 @@ impl DagStore {
         };
 
         // Populate in-memory state
-        *self.blocks.try_write().unwrap() = blocks;
-        *self.blocks_by_height.try_write().unwrap() = blocks_by_height;
-        *self.children.try_write().unwrap() = children;
-        *self.tips.try_write().unwrap() = tips;
-        *self.finalized.try_write().unwrap() = finalized;
-        *self.pruning_point.try_write().unwrap() = pruning_point;
+        // These try_write() calls are made during construction (before the DagStore is shared),
+        // so the locks should never be contended. We use map_err to surface any poisoning as a
+        // DagStoreError instead of panicking.
+        *self.blocks.try_write().map_err(|_| {
+            DagStoreError::StorageError("lock contention on blocks during load".into())
+        })? = blocks;
+        *self.blocks_by_height.try_write().map_err(|_| {
+            DagStoreError::StorageError("lock contention on blocks_by_height during load".into())
+        })? = blocks_by_height;
+        *self.children.try_write().map_err(|_| {
+            DagStoreError::StorageError("lock contention on children during load".into())
+        })? = children;
+        *self.tips.try_write().map_err(|_| {
+            DagStoreError::StorageError("lock contention on tips during load".into())
+        })? = tips;
+        *self.finalized.try_write().map_err(|_| {
+            DagStoreError::StorageError("lock contention on finalized during load".into())
+        })? = finalized;
+        *self.pruning_point.try_write().map_err(|_| {
+            DagStoreError::StorageError("lock contention on pruning_point during load".into())
+        })? = pruning_point;
 
         let stats = self.get_stats_sync();
         info!(

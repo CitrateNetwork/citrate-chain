@@ -180,12 +180,17 @@ fn nonce_generation(sk: &Scalar, h_point: &ProjectivePoint) -> Scalar {
     let h_encoded = h_point.to_affine().to_encoded_point(true);
     let h_bytes = h_encoded.as_bytes();
 
+    // HMAC-SHA256 accepts any key length, so new_from_slice never fails for
+    // a 32-byte key. We use expect() to document this invariant rather than
+    // silently masking a logic error.
+    const HMAC_INFALLIBLE: &str = "HMAC-SHA256 accepts any key length; 32-byte key is always valid";
+
     // HMAC-DRBG (RFC 6979 Section 3.2)
     let mut v = [0x01u8; 32];
     let mut k = [0x00u8; 32];
 
     // Step D
-    let mut mac = HmacSha256::new_from_slice(&k).unwrap();
+    let mut mac = HmacSha256::new_from_slice(&k).expect(HMAC_INFALLIBLE);
     mac.update(&v);
     mac.update(&[0x00]);
     mac.update(&sk_bytes);
@@ -193,12 +198,12 @@ fn nonce_generation(sk: &Scalar, h_point: &ProjectivePoint) -> Scalar {
     k = mac.finalize().into_bytes().into();
 
     // Step E
-    let mut mac = HmacSha256::new_from_slice(&k).unwrap();
+    let mut mac = HmacSha256::new_from_slice(&k).expect(HMAC_INFALLIBLE);
     mac.update(&v);
     v = mac.finalize().into_bytes().into();
 
     // Step F
-    let mut mac = HmacSha256::new_from_slice(&k).unwrap();
+    let mut mac = HmacSha256::new_from_slice(&k).expect(HMAC_INFALLIBLE);
     mac.update(&v);
     mac.update(&[0x01]);
     mac.update(&sk_bytes);
@@ -206,13 +211,13 @@ fn nonce_generation(sk: &Scalar, h_point: &ProjectivePoint) -> Scalar {
     k = mac.finalize().into_bytes().into();
 
     // Step G
-    let mut mac = HmacSha256::new_from_slice(&k).unwrap();
+    let mut mac = HmacSha256::new_from_slice(&k).expect(HMAC_INFALLIBLE);
     mac.update(&v);
     v = mac.finalize().into_bytes().into();
 
     // Step H: generate candidates until we get a valid scalar
     loop {
-        let mut mac = HmacSha256::new_from_slice(&k).unwrap();
+        let mut mac = HmacSha256::new_from_slice(&k).expect(HMAC_INFALLIBLE);
         mac.update(&v);
         v = mac.finalize().into_bytes().into();
 
@@ -225,12 +230,12 @@ fn nonce_generation(sk: &Scalar, h_point: &ProjectivePoint) -> Scalar {
         }
 
         // Update k, v for next iteration
-        let mut mac = HmacSha256::new_from_slice(&k).unwrap();
+        let mut mac = HmacSha256::new_from_slice(&k).expect(HMAC_INFALLIBLE);
         mac.update(&v);
         mac.update(&[0x00]);
         k = mac.finalize().into_bytes().into();
 
-        let mut mac = HmacSha256::new_from_slice(&k).unwrap();
+        let mut mac = HmacSha256::new_from_slice(&k).expect(HMAC_INFALLIBLE);
         mac.update(&v);
         v = mac.finalize().into_bytes().into();
     }

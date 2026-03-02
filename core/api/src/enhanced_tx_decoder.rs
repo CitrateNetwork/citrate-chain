@@ -1,4 +1,9 @@
 // citrate/core/api/src/enhanced_tx_decoder.rs
+//
+// DEPRECATED: This module is not used in the production RPC codepath.
+// The primary decoder is `eth_tx_decoder.rs`. This file is retained for
+// backward compatibility until post-audit cleanup.
+// See core/api/DECODER_ARCHITECTURE.md for the full decoder stack map.
 
 use crate::eip1559_decoder::{Eip1559Decoder, TransactionStats};
 use ethereum_types::{H160, H256, U256 as EthU256};
