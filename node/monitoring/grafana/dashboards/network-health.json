@@ -1,0 +1,56 @@
+{
+  "dashboard": {
+    "title": "Citrate Network Health",
+    "uid": "citrate-network-health",
+    "timezone": "utc",
+    "refresh": "5s",
+    "tags": ["citrate", "network"],
+    "panels": [
+      {
+        "title": "RPC Request Rate",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+        "targets": [{ "expr": "rate(citrate_rpc_requests_total[1m])", "legendFormat": "{{ method }}" }]
+      },
+      {
+        "title": "RPC Latency (p50, p95, p99)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+        "targets": [
+          { "expr": "histogram_quantile(0.50, rate(citrate_rpc_latency_seconds_bucket[5m]))", "legendFormat": "p50" },
+          { "expr": "histogram_quantile(0.95, rate(citrate_rpc_latency_seconds_bucket[5m]))", "legendFormat": "p95" },
+          { "expr": "histogram_quantile(0.99, rate(citrate_rpc_latency_seconds_bucket[5m]))", "legendFormat": "p99" }
+        ],
+        "fieldConfig": { "defaults": { "unit": "s" } }
+      },
+      {
+        "title": "Peer Connections Per Node",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+        "targets": [{ "expr": "citrate_peer_count", "legendFormat": "{{ instance }}" }]
+      },
+      {
+        "title": "Relay Sessions (bootstrap nodes)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+        "targets": [{ "expr": "citrate_relay_active_sessions{role='bootstrap'}", "legendFormat": "{{ instance }}" }]
+      },
+      {
+        "title": "Block Propagation Latency",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+        "targets": [
+          { "expr": "histogram_quantile(0.50, rate(citrate_block_propagation_seconds_bucket[5m]))", "legendFormat": "p50" },
+          { "expr": "histogram_quantile(0.95, rate(citrate_block_propagation_seconds_bucket[5m]))", "legendFormat": "p95" }
+        ],
+        "fieldConfig": { "defaults": { "unit": "s" } }
+      },
+      {
+        "title": "AI Inference Requests",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+        "targets": [{ "expr": "rate(citrate_ai_requests_total[5m])", "legendFormat": "{{ instance }}" }]
+      }
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+[
+  {
+    "targets": [
+      "boot1.testnet.citrate.network:9090",
+      "boot2.testnet.citrate.network:9090",
+      "boot3.testnet.citrate.network:9090"
+    ],
+    "labels": {
+      "network": "testnet",
+      "role": "bootstrap"
+    }
+  }
+]

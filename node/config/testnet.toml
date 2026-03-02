@@ -1,14 +1,20 @@
 # Citrate v3 Testnet Configuration
+# WP-S.5: Updated for public testnet launch
 
 [chain]
 chain_id = 42069
 genesis_hash = ""
-block_time = 2
+block_time = 1  # u64 seconds (config parser requires integer; whitepaper 500ms target)
 ghostdag_k = 18
 
 [network]
 listen_addr = "0.0.0.0:30303"
-bootstrap_nodes = []
+bootstrap_nodes = [
+    # Public testnet bootstrap nodes (update with actual addresses)
+    # "noise_<pubkey_hex>@boot1.testnet.citrate.network:30303",
+    # "noise_<pubkey_hex>@boot2.testnet.citrate.network:30303",
+    # "noise_<pubkey_hex>@boot3.testnet.citrate.network:30303",
+]
 max_peers = 50
 
 [rpc]
@@ -26,5 +32,12 @@ keep_blocks = 100000
 # Re-enable this if you want the testnet node to also compete for blocks
 enabled = false
 coinbase = "4E2380b2f63B2Af3B270611cE779e1Db4CcA64c6000000000000000000000000"
-target_block_time = 2
+target_block_time = 1
 min_gas_price = 1000000000
+
+# NOTE: [vrf] and [checkpoint] sections below are documented for reference
+# but are NOT parsed by the current NodeConfig struct (silently ignored by serde).
+# These features are configured in code via consensus defaults.
+
+# WP-S.2: VRF — ECVRF-P256-SHA256 (strict_mode = false for testnet)
+# WP-S.3: BFT checkpoints — interval=50, committee=100, quorum=67

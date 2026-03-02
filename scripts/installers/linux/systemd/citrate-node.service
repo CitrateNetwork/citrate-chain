@@ -1,0 +1,43 @@
+[Unit]
+Description=Citrate Blockchain Node
+Documentation=https://docs.citrate.ai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=citrate
+Group=citrate
+ExecStart=/usr/bin/citrate-node --data-dir /var/lib/citrate/db --config /etc/citrate/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/citrate /var/log/citrate
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=citrate-node
+
+# Environment
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/citrate/env
+
+[Install]
+WantedBy=multi-user.target

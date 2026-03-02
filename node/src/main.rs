@@ -27,6 +27,7 @@ pub mod metrics;
 mod model_manager;
 mod model_verifier;
 mod network_inference;
+mod persistent_dag;
 mod producer;
 mod sync;
 
@@ -1007,7 +1008,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // WP-K.2: Create shared DAG store and GhostDag BEFORE spawning the network
     // handler, so both the producer and network handler operate on the same DAG.
     // This ensures network-received blocks feed into the live fork-choice.
-    let shared_dag_store = Arc::new(DagStore::new());
+    // WP-S.1: Use persistent RocksDB-backed DAG store for restart survivability.
+    let shared_dag_store = {
+        let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
+        match DagStore::persistent(kv) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                warn!("Failed to load persistent DAG, starting fresh: {}", e);
+                Arc::new(DagStore::new())
+            }
+        }
+    };
     let shared_ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), shared_dag_store.clone()));
 
     // Start P2P listener and connect to bootstrap nodes

@@ -24,6 +24,9 @@ anyhow = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 sha2 = "0.10"
+# WP-S.2: ECVRF-P256-SHA256 (RFC 9381)
+p256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
+hmac = "0.12"
 
 [dev-dependencies]
 proptest = { workspace = true }

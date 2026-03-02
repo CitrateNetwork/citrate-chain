@@ -1,0 +1,33 @@
+# Citrate v3 Local Testnet Bootstrap Node 1
+# Mining ENABLED — this node produces blocks
+# P2P: 30303 | RPC: 8545 | WS: 8546 | Metrics: 9090
+
+[chain]
+chain_id = 42069
+genesis_hash = ""
+block_time = 1
+ghostdag_k = 18
+
+[network]
+listen_addr = "0.0.0.0:30303"
+bootstrap_nodes = [
+    "127.0.0.1:30304",
+    "127.0.0.1:30305",
+]
+max_peers = 200
+
+[rpc]
+enabled = true
+listen_addr = "0.0.0.0:8545"
+ws_addr = "0.0.0.0:8546"
+
+[storage]
+data_dir = ".citrate-testnet-boot-1"
+pruning = false
+keep_blocks = 200000
+
+[mining]
+enabled = true
+coinbase = "4E2380b2f63B2Af3B270611cE779e1Db4CcA64c6000000000000000000000000"
+target_block_time = 1
+min_gas_price = 1000000000

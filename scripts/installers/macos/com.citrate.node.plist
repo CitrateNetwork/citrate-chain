@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.citrate.node</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Citrate.app/Contents/Resources/citrate-node</string>
+        <string>--data-dir</string>
+        <string>~/.citrate/db</string>
+        <string>--config</string>
+        <string>~/.citrate/config.toml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>~/.citrate/logs/node-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>~/.citrate/logs/node-stderr.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>~/.citrate</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>

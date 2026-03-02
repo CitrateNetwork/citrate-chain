@@ -1,0 +1,55 @@
+# Institutional Rewards Configuration
+# For school node pilot operators (Sprint T / Paper VII - Mozi Cooperative)
+
+[rewards]
+# Block validation: base monthly SALT reward (before halving/uptime bonus)
+block_validation_monthly_salt = 150
+
+# Uptime bonus multiplier (1.2 = 20% bonus at 100% uptime)
+uptime_bonus_multiplier = 1.2
+
+# Model hosting: SALT per model per 30-day epoch
+model_hosting_per_model_salt = 25
+
+# Adapter creation: SALT per adapter published
+adapter_creation_salt = 10
+
+# Data provision: SALT per dataset contributed per epoch
+data_provision_per_dataset_salt = 5
+
+# Minimum uptime to qualify for rewards (0.0-1.0)
+min_uptime_threshold = 0.90
+
+# Caps per operator per epoch
+max_rewarded_models = 10
+max_rewarded_adapters_per_epoch = 20
+max_rewarded_datasets_per_epoch = 50
+
+[slashing]
+# Equivocation (double-signing) penalty: 10% of stake
+equivocation_penalty_pct = 10
+
+# Invalid state transition penalty: 15%
+invalid_state_penalty_pct = 15
+
+# Censorship penalty: 5%
+censorship_penalty_pct = 5
+
+# Grace period for first offense (epochs)
+first_offense_grace_epochs = 2
+
+# Cooldown after slash before resuming (epochs)
+cooldown_epochs = 1
+
+# Forced deactivation threshold (cumulative %)
+max_cumulative_slash_pct = 50
+
+# Institutional operators are NOT penalized for downtime
+penalize_downtime = false
+
+# Revenue estimates per node (Paper VII reference)
+# Block validation: $100-200/month
+# Model hosting:    $50-150/month
+# Adapter creation: $10-50/month
+# Data provision:   $5-20/month
+# Total per node:   $165-420/month

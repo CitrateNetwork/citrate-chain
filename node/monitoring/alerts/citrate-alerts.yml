@@ -1,0 +1,84 @@
+groups:
+  - name: citrate-node-health
+    rules:
+      # Node down for > 1 minute
+      - alert: NodeDown
+        expr: up{job=~"citrate-.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Citrate node {{ $labels.instance }} is down"
+          description: "Node {{ $labels.instance }} ({{ $labels.network }}) has been unreachable for over 1 minute."
+
+      # Block height hasn't advanced in 60s (at 0.5s block time, that's ~120 missed blocks)
+      - alert: BlockStall
+        expr: increase(citrate_block_height[60s]) == 0 and citrate_block_height > 0
+        for: 60s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Block production stalled on {{ $labels.instance }}"
+          description: "Block height has not increased in 60 seconds on {{ $labels.instance }}."
+
+      # Mempool backlog > 5000 pending transactions
+      - alert: MempoolBacklog
+        expr: citrate_mempool_size > 5000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mempool backlog on {{ $labels.instance }}"
+          description: "Mempool has {{ $value }} pending transactions on {{ $labels.instance }}."
+
+      # Peer count dropped below 3
+      - alert: LowPeerCount
+        expr: citrate_peer_count < 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low peer count on {{ $labels.instance }}"
+          description: "Node {{ $labels.instance }} has only {{ $value }} connected peers."
+
+      # RPC p99 latency > 2 seconds
+      - alert: HighRpcLatency
+        expr: histogram_quantile(0.99, rate(citrate_rpc_latency_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High RPC latency on {{ $labels.instance }}"
+          description: "RPC p99 latency is {{ $value }}s on {{ $labels.instance }}."
+
+      # Finality lag — latest finalized block is > 200 behind current height
+      - alert: FinalityLag
+        expr: (citrate_block_height - citrate_finalized_height) > 200
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Finality lag on {{ $labels.instance }}"
+          description: "Finalized height is {{ $value }} blocks behind current height on {{ $labels.instance }}."
+
+      # DAG tips > 20 (indicates potential network partition)
+      - alert: HighDagTips
+        expr: citrate_dag_tips_count > 20
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Excessive DAG tips on {{ $labels.instance }}"
+          description: "DAG has {{ $value }} active tips, which may indicate a network partition."
+
+  - name: citrate-checkpoint-health
+    rules:
+      # Checkpoint hasn't advanced in 5 minutes (50 blocks * 0.5s = 25s per checkpoint)
+      - alert: CheckpointStall
+        expr: increase(citrate_checkpoint_height[5m]) == 0 and citrate_checkpoint_height > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "BFT checkpoints stalled on {{ $labels.instance }}"
+          description: "No new checkpoint finalized in 5 minutes on {{ $labels.instance }}."
