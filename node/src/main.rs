@@ -1009,10 +1009,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // handler, so both the producer and network handler operate on the same DAG.
     // This ensures network-received blocks feed into the live fork-choice.
     // WP-S.1: Use persistent RocksDB-backed DAG store for restart survivability.
+    // WP-W.2: Wire VRF strictness from config to DAG store
+    let strict_vrf = config.vrf.strict_vrf;
     let shared_dag_store = {
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
-        match DagStore::persistent(kv) {
-            Ok(store) => Arc::new(store),
+        match DagStore::persistent_with_strict_vrf(kv, strict_vrf) {
+            Ok(store) => {
+                info!("DAG store created with strict_vrf={}", strict_vrf);
+                Arc::new(store)
+            }
             Err(e) => {
                 warn!("Failed to load persistent DAG, starting fresh: {}", e);
                 Arc::new(DagStore::new())
@@ -1020,6 +1025,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     };
     let shared_ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), shared_dag_store.clone()));
+
+    // WP-W.1: Create CheckpointManager for BFT finality vote handling
+    let checkpoint_manager = {
+        use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager};
+        let cp_config = CheckpointConfig::default();
+        let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
+        Arc::new(CheckpointManager::with_persistence(cp_config, shared_dag_store.clone(), kv))
+    };
 
     // Start P2P listener and connect to bootstrap nodes
     {
@@ -1275,9 +1288,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // WP-K.2: Clone DAG components for the network handler
         let dag_store_for_net = shared_dag_store.clone();
         let ghostdag_for_net = shared_ghostdag.clone();
+        let checkpoint_mgr_for_net = checkpoint_manager.clone();
 
         tokio::spawn(async move {
             use citrate_consensus::types::Hash;
+            use citrate_consensus::checkpoint::CheckpointVote;
             use citrate_network::NetworkMessage;
             use citrate_sequencer::mempool::TxClass;
             while let Some((pid, msg)) = in_rx.recv().await {
@@ -1552,6 +1567,41 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                     pid.0, e
                                 );
                             }
+                        }
+                    }
+                    // WP-W.1: Handle checkpoint vote messages for BFT finality
+                    NetworkMessage::CheckpointVote { height, block_hash, voter_pubkey, signature } => {
+                        use citrate_consensus::types::{PublicKey, Signature};
+                        let voter_bytes: [u8; 32] = match voter_pubkey.as_slice().try_into() {
+                            Ok(b) => b,
+                            Err(_) => {
+                                tracing::warn!("Invalid voter pubkey length from peer {}", pid.0);
+                                continue;
+                            }
+                        };
+                        let sig_bytes: [u8; 64] = match signature.as_slice().try_into() {
+                            Ok(b) => b,
+                            Err(_) => {
+                                tracing::warn!("Invalid signature length from peer {}", pid.0);
+                                continue;
+                            }
+                        };
+                        let vote = CheckpointVote {
+                            height,
+                            block_hash,
+                            voter: PublicKey::new(voter_bytes),
+                            signature: Signature::new(sig_bytes),
+                        };
+                        match checkpoint_mgr_for_net.submit_vote(vote).await {
+                            Ok(true) => {
+                                tracing::info!("Checkpoint quorum reached at height {}, finalizing", height);
+                                match checkpoint_mgr_for_net.finalize_checkpoint(height).await {
+                                    Ok(cp) => tracing::info!("Checkpoint finalized at height {} with {} votes", cp.height, cp.votes.len()),
+                                    Err(e) => tracing::warn!("Failed to finalize checkpoint at height {}: {}", height, e),
+                                }
+                            }
+                            Ok(false) => tracing::debug!("Checkpoint vote accepted for height {}", height),
+                            Err(e) => tracing::warn!("Checkpoint vote rejected from peer {}: {}", pid.0, e),
                         }
                     }
                     _ => {

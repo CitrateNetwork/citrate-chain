@@ -1,6 +1,7 @@
 // citrate/core/consensus/src/dag_store.rs
 
 use crate::types::{Block, Hash, Tip};
+use crate::vrf::VrfProposerSelector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
@@ -325,6 +326,34 @@ impl DagStore {
         Ok(())
     }
 
+    /// WP-W.2: Cryptographically verify a block's VRF proof against the parent block's VRF output.
+    /// Requires the parent block to already be in the DAG store.
+    async fn verify_block_vrf_crypto(&self, block: &Block) -> Result<(), String> {
+        if block.is_genesis() {
+            return Ok(());
+        }
+
+        let parent_hash = block.selected_parent();
+        let blocks = self.blocks.read().await;
+        let parent = blocks.get(&parent_hash).ok_or_else(|| {
+            format!("Parent block {} not found for VRF verification", parent_hash)
+        })?;
+
+        let prev_vrf_output = parent.header.vrf_reveal.output;
+        let vrf_selector = VrfProposerSelector::new();
+
+        match vrf_selector.verify_vrf_proof(
+            &block.header.proposer_pubkey,
+            &block.header.vrf_reveal,
+            &prev_vrf_output,
+            block.header.height,
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("VRF proof verification failed: invalid proof".to_string()),
+            Err(e) => Err(format!("VRF verification error: {}", e)),
+        }
+    }
+
     /// Store a block in the DAG
     pub async fn store_block(&self, block: Block) -> Result<(), DagStoreError> {
         let hash = block.hash();
@@ -334,7 +363,7 @@ impl DagStore {
             return Err(DagStoreError::BlockExists(hash));
         }
 
-        // WP-K.5: VRF admission gate
+        // WP-K.5: VRF admission gate (structural checks)
         if let Err(e) = self.validate_block_admission(&block) {
             if self.strict_vrf {
                 return Err(DagStoreError::InvalidVrf(e));
@@ -343,6 +372,13 @@ impl DagStore {
                     "Block {} VRF plausibility check failed (permissive mode): {}",
                     hash, e
                 );
+            }
+        }
+
+        // WP-W.2: Cryptographic VRF proof verification (when strict_vrf is enabled)
+        if self.strict_vrf && !block.is_genesis() {
+            if let Err(e) = self.verify_block_vrf_crypto(&block).await {
+                return Err(DagStoreError::InvalidVrf(e));
             }
         }
 
@@ -707,8 +743,37 @@ mod tests {
         }
     }
 
-    /// Helper: create a block with valid VRF structure
+    /// Helper: create a block with a cryptographically valid legacy SHA3 VRF proof.
+    /// The parent's VRF output is needed to compute the correct proof/output pair.
     fn create_block_with_vrf(hash: [u8; 32], height: u64, parent: Hash) -> Block {
+        create_block_with_vrf_parent_output(hash, height, parent, Hash::default())
+    }
+
+    /// Helper: create a block with a valid legacy SHA3 VRF proof using the given parent VRF output.
+    fn create_block_with_vrf_parent_output(
+        hash: [u8; 32],
+        height: u64,
+        parent: Hash,
+        parent_vrf_output: Hash,
+    ) -> Block {
+        use sha3::{Digest, Sha3_256};
+
+        let proposer = PublicKey::new([1; 32]);
+        let proof_bytes: [u8; 32] = [0x42; 32]; // arbitrary 32-byte proof
+
+        // Reconstruct the alpha: SHA3(pubkey || prev_vrf || slot)
+        let mut hasher = Sha3_256::new();
+        hasher.update(proposer.as_bytes());
+        hasher.update(parent_vrf_output.as_bytes());
+        hasher.update(height.to_le_bytes());
+        let input = hasher.finalize();
+
+        // output = SHA3(proof || input)
+        let mut output_hasher = Sha3_256::new();
+        output_hasher.update(&proof_bytes);
+        output_hasher.update(&input);
+        let output = Hash::from_bytes(&output_hasher.finalize());
+
         Block {
             header: BlockHeader {
                 version: 1,
@@ -720,10 +785,10 @@ mod tests {
                 blue_score: 0,
                 blue_work: 0,
                 pruning_point: Hash::default(),
-                proposer_pubkey: PublicKey::new([1; 32]), // Non-zero proposer
+                proposer_pubkey: proposer,
                 vrf_reveal: VrfProof {
-                    proof: vec![1, 2, 3, 4], // Non-empty proof
-                    output: Hash::new([0xAA; 32]), // Non-zero output
+                    proof: proof_bytes.to_vec(),
+                    output,
                 },
                 base_fee_per_gas: 0,
                 gas_used: 0,
@@ -735,7 +800,7 @@ mod tests {
             artifact_root: Hash::default(),
             ghostdag_params: GhostDagParams::default(),
             transactions: vec![],
-            signature: Signature::new([1; 64]), // Non-zero signature
+            signature: Signature::new([1; 64]),
             embedded_models: vec![],
             required_pins: vec![],
             learning_embedding: None,

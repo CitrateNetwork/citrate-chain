@@ -99,7 +99,18 @@ pub struct BridgeRelay {
 
 impl BridgeRelay {
     /// Create a new bridge relay.
+    ///
+    /// # Panics
+    /// Panics if `oracle_threshold` is 0 in non-test builds.
+    /// Zero-threshold mode allows auto-attesting events without any oracle
+    /// verification, which is a critical security risk.
     pub fn new(config: BridgeConfig) -> Self {
+        if config.oracle_threshold == 0 && !cfg!(test) {
+            panic!(
+                "oracle_threshold must be > 0 in production. \
+                 Zero-threshold mode auto-attests events without oracle verification."
+            );
+        }
         let oracle_threshold = config.oracle_threshold;
         Self {
             minter: Arc::new(RwLock::new(SnapMinter::new(
@@ -554,6 +565,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_oracle_attestation_requirement() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Helper: deterministic signing key from seed byte
+        fn test_signing_key(id: u8) -> SigningKey {
+            let mut seed = [0u8; 32];
+            seed[0] = id;
+            SigningKey::from_bytes(&seed)
+        }
+
         let config = BridgeConfig {
             confirmation_depth: 0,
             oracle_threshold: 2, // Require 2 attestations
@@ -562,12 +583,16 @@ mod tests {
         let relay = BridgeRelay::new(config);
         let source = MockEventSource::new();
 
-        // Register 2 oracles
+        // Register 2 oracles with real ed25519 public keys
+        let sk1 = test_signing_key(1);
+        let sk2 = test_signing_key(2);
+        let oracle_id_1 = sk1.verifying_key().to_bytes();
+        let oracle_id_2 = sk2.verifying_key().to_bytes();
         {
             let mut reg = relay.oracle_registry().write();
-            reg.register_oracle([1u8; 32], "Oracle-1".to_string())
+            reg.register_oracle(oracle_id_1, "Oracle-1".to_string())
                 .unwrap();
-            reg.register_oracle([2u8; 32], "Oracle-2".to_string())
+            reg.register_oracle(oracle_id_2, "Oracle-2".to_string())
                 .unwrap();
         }
 
@@ -579,24 +604,47 @@ mod tests {
         let results = relay.poll_cycle(&source).await.unwrap();
         assert_eq!(results[0].status, EventStatus::AwaitingAttestations);
 
-        // Submit attestations
+        // Submit properly signed attestations
         {
             let mut reg = relay.oracle_registry().write();
             let event_hash = compute_event_hash(&event_id, b"deposit");
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            // Sign attestation 1
+            let mut msg1 = Vec::with_capacity(89);
+            msg1.extend_from_slice(b"citrate-bridge-v1");
+            msg1.extend_from_slice(&event_id);
+            msg1.extend_from_slice(&event_hash);
+            msg1.extend_from_slice(&now.to_le_bytes());
+            let sig1 = sk1.sign(&msg1);
+
             reg.submit_attestation(OracleAttestation {
-                oracle_id: [1u8; 32],
+                oracle_id: oracle_id_1,
                 event_id,
                 event_hash,
-                signature: vec![0u8; 64],
-                timestamp: 1000,
+                signature: sig1.to_bytes().to_vec(),
+                timestamp: now,
             })
             .unwrap();
+
+            // Sign attestation 2
+            let now2 = now + 1;
+            let mut msg2 = Vec::with_capacity(89);
+            msg2.extend_from_slice(b"citrate-bridge-v1");
+            msg2.extend_from_slice(&event_id);
+            msg2.extend_from_slice(&event_hash);
+            msg2.extend_from_slice(&now2.to_le_bytes());
+            let sig2 = sk2.sign(&msg2);
+
             reg.submit_attestation(OracleAttestation {
-                oracle_id: [2u8; 32],
+                oracle_id: oracle_id_2,
                 event_id,
                 event_hash,
-                signature: vec![0u8; 64],
-                timestamp: 1001,
+                signature: sig2.to_bytes().to_vec(),
+                timestamp: now2,
             })
             .unwrap();
         }

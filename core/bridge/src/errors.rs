@@ -66,6 +66,15 @@ pub enum BridgeError {
 
     #[error("Serialization error: {0}")]
     SerializationError(String),
+
+    #[error("Invalid attestation signature from oracle {oracle_id}")]
+    InvalidSignature { oracle_id: String },
+
+    #[error("Invalid bridge configuration: {reason}")]
+    InvalidConfig { reason: String },
+
+    #[error("Stale attestation: timestamp {timestamp} is outside the acceptable window")]
+    StaleAttestation { timestamp: u64 },
 }
 
 /// Bridge result type alias.

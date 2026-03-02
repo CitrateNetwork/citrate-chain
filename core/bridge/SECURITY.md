@@ -5,7 +5,10 @@
 ### Oracle Quorum (M-of-N)
 - **Threshold**: M attestations required from N registered oracles before processing any cross-chain event
 - **Default**: M=2, N=3 (configurable via `BridgeConfig.oracle_threshold`)
-- **Attestation**: Each oracle independently verifies the Ethereum event and signs `(event_id || event_hash)`
+- **Zero threshold forbidden**: `oracle_threshold = 0` panics on startup in production builds (WP-W.3)
+- **Attestation signing**: Each oracle signs a domain-separated message using ed25519: `"citrate-bridge-v1" || event_id(32) || event_hash(32) || timestamp(8 LE)` = 89 bytes
+- **Signature verification**: `submit_attestation()` cryptographically verifies the ed25519 signature against the oracle's registered public key before accepting (WP-W.3)
+- **Freshness window**: Attestation timestamps must be within 300 seconds of current time; stale or future-dated attestations are rejected
 - **Consistency check**: All oracle attestations must agree on event hash; disagreements trigger rejection
 
 ### Finality Requirements

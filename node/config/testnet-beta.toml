@@ -31,3 +31,12 @@ enabled = true
 coinbase = ""                  # Per-node: operator's wallet address (hex, no 0x prefix)
 target_block_time = 2
 min_gas_price = 1000000000
+
+[vrf]
+strict_vrf = true
+migration_mode = false
+
+[checkpoint]
+interval = 50
+committee_size = 100
+quorum_threshold = 67

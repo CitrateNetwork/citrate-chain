@@ -10,7 +10,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 axum = "0.7"
-prometheus = "0.13"
+prometheus = { version = "0.13", default-features = false }
 
 # Lattice crates
 citrate-api = { path = "../core/api" }
