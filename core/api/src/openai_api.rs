@@ -1,9 +1,10 @@
 // citrate/core/api/src/openai_api.rs
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::Json,
+    extract::{Path, Query, Request, State},
+    http::{header, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
+    response::{Json, Response},
     routing::{get, post},
     Router,
 };
@@ -11,9 +12,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower::ServiceBuilder;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::methods::ai::{
     AiApi, ChatCompletionRequest, ChatCompletionResponse, CreateLoRARequest,
@@ -30,12 +31,18 @@ pub struct OpenAiRestServer {
     storage: Arc<StorageManager>,
     mempool: Arc<Mempool>,
     executor: Arc<Executor>,
+    /// CORS origins (WP-X.1). Empty = no CORS. ["*"] = wildcard.
+    cors_origins: Vec<String>,
+    /// REST API key for mutating endpoints (WP-X.1).
+    rest_api_key: Option<String>,
 }
 
 /// Server state for Axum handlers
 #[derive(Clone)]
 pub struct AppState {
     ai_api: AiApi,
+    /// REST API key for Bearer auth on mutating endpoints (WP-X.1)
+    rest_api_key: Option<String>,
 }
 
 /// Error response format
@@ -78,6 +85,25 @@ impl OpenAiRestServer {
             storage,
             mempool,
             executor,
+            cors_origins: vec![],
+            rest_api_key: None,
+        }
+    }
+
+    /// Create with CORS and auth configuration (WP-X.1)
+    pub fn with_config(
+        storage: Arc<StorageManager>,
+        mempool: Arc<Mempool>,
+        executor: Arc<Executor>,
+        cors_origins: Vec<String>,
+        rest_api_key: Option<String>,
+    ) -> Self {
+        Self {
+            storage,
+            mempool,
+            executor,
+            cors_origins,
+            rest_api_key,
         }
     }
 
@@ -88,48 +114,76 @@ impl OpenAiRestServer {
             self.mempool.clone(),
             self.executor.clone(),
         );
-        let state = AppState { ai_api };
+        let state = AppState {
+            ai_api,
+            rest_api_key: self.rest_api_key.clone(),
+        };
 
-        Router::new()
-            // OpenAI-compatible endpoints
+        // WP-X.1: Config-driven CORS instead of always-wildcard
+        let cors = if self.cors_origins.iter().any(|o| o == "*") {
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::any())
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        } else if self.cors_origins.is_empty() {
+            // No CORS headers — browser cross-origin blocked by default
+            CorsLayer::new()
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        } else {
+            let origins: Vec<HeaderValue> = self
+                .cors_origins
+                .iter()
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        };
+
+        // Mutating endpoints (require Bearer auth when rest_api_key is set)
+        let mutating_routes = Router::new()
+            .route("/v1/citrate/models", post(citrate_deploy_model))
+            .route("/v1/citrate/inference", post(citrate_request_inference))
+            .route("/v1/citrate/training", post(citrate_create_training_job))
+            .route("/v1/citrate/lora", post(citrate_create_lora))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_rest_api_key,
+            ));
+
+        // Read-only and public endpoints (no auth required)
+        let public_routes = Router::new()
             .route("/v1/models", get(list_models))
             .route("/v1/chat/completions", post(chat_completions))
             .route("/v1/completions", post(completions))
             .route("/v1/embeddings", post(embeddings))
-            // Anthropic-compatible endpoints
             .route("/v1/messages", post(messages))
-            // Citrate-specific AI endpoints
             .route("/v1/citrate/models", get(citrate_list_models))
-            .route("/v1/citrate/models", post(citrate_deploy_model))
             .route("/v1/citrate/models/:model_id", get(citrate_get_model))
             .route(
                 "/v1/citrate/models/:model_id/stats",
                 get(citrate_model_stats),
             )
-            .route("/v1/citrate/inference", post(citrate_request_inference))
             .route(
                 "/v1/citrate/inference/:request_id",
                 get(citrate_get_inference),
             )
-            .route("/v1/citrate/training", post(citrate_create_training_job))
             .route(
                 "/v1/citrate/training/:job_id",
                 get(citrate_get_training_job),
             )
-            .route("/v1/citrate/lora", post(citrate_create_lora))
             .route("/v1/citrate/lora/:adapter_id", get(citrate_get_lora))
-            // Health check
             .route("/health", get(health_check))
-            .route("/", get(root))
+            .route("/", get(root));
+
+        public_routes
+            .merge(mutating_routes)
             .layer(
                 ServiceBuilder::new()
                     .layer(TraceLayer::new_for_http())
-                    .layer(
-                        CorsLayer::new()
-                            .allow_origin(Any)
-                            .allow_methods(Any)
-                            .allow_headers(Any),
-                    ),
+                    .layer(cors),
             )
             .with_state(state)
     }
@@ -144,6 +198,58 @@ impl OpenAiRestServer {
         axum::serve(listener, app).await?;
 
         Ok(())
+    }
+}
+
+// ========== Auth Middleware (WP-X.1) ==========
+
+/// Bearer auth middleware for mutating REST endpoints.
+/// When `rest_api_key` is configured, requires `Authorization: Bearer <key>`.
+/// When no key is configured (devnet), all requests pass through.
+async fn require_rest_api_key(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if let Some(ref expected_key) = state.rest_api_key {
+        let auth_header = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        match auth_header {
+            Some(token) if token == expected_key.as_str() => Ok(next.run(req).await),
+            Some(_) => {
+                warn!("REST API auth failed: invalid Bearer token");
+                Err(StatusCode::UNAUTHORIZED)
+            }
+            None => {
+                warn!("REST API auth failed: missing Authorization header");
+                Err(StatusCode::UNAUTHORIZED)
+            }
+        }
+    } else {
+        // No key configured (devnet mode) — allow all
+        Ok(next.run(req).await)
+    }
+}
+
+/// Derive a deterministic operator address from the REST API key.
+/// When no API key is set (devnet), returns a well-known devnet address.
+fn derive_operator_address(rest_api_key: &Option<String>) -> Address {
+    match rest_api_key {
+        Some(key) => {
+            // Keccak256(api_key)[12..32] = deterministic 20-byte address
+            use sha3::{Digest, Keccak256};
+            let hash = Keccak256::digest(key.as_bytes());
+            let mut addr = [0u8; 20];
+            addr.copy_from_slice(&hash[12..32]);
+            Address(addr)
+        }
+        None => {
+            // Devnet operator: 0x1111...1111
+            Address([0x11; 20])
+        }
     }
 }
 
@@ -403,8 +509,8 @@ async fn citrate_deploy_model(
     State(state): State<AppState>,
     Json(request): Json<DeployModelRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // This would need proper authentication and parameter parsing
-    let from = Address::zero(); // Placeholder
+    // WP-X.1: Derive operator address from API key (no more Address::zero())
+    let from = derive_operator_address(&state.rest_api_key);
     let gas_limit = 1_000_000;
     let gas_price = 10000;
 
@@ -479,7 +585,8 @@ async fn citrate_request_inference(
     State(state): State<AppState>,
     Json(request): Json<InferenceRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let from = Address::zero(); // Placeholder - would get from auth
+    // WP-X.1: Derive operator address from API key
+    let from = derive_operator_address(&state.rest_api_key);
     let gas_price = 10000;
 
     match state
@@ -526,7 +633,8 @@ async fn citrate_create_training_job(
     State(state): State<AppState>,
     Json(request): Json<CreateTrainingJobRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let from = Address::zero(); // Placeholder
+    // WP-X.1: Derive operator address from API key
+    let from = derive_operator_address(&state.rest_api_key);
     let gas_limit = 1_000_000;
     let gas_price = 10000;
 
@@ -575,7 +683,8 @@ async fn citrate_create_lora(
     State(state): State<AppState>,
     Json(request): Json<CreateLoRARequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let from = Address::zero(); // Placeholder
+    // WP-X.1: Derive operator address from API key
+    let from = derive_operator_address(&state.rest_api_key);
 
     match state.ai_api.create_lora(request, from).await {
         Ok(adapter_hash) => Ok(Json(serde_json::json!({
@@ -652,6 +761,9 @@ async fn root() -> Json<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
 
     #[test]
     fn test_error_response_format() {
@@ -666,5 +778,145 @@ mod tests {
         let json = serde_json::to_string(&error).unwrap();
         assert!(json.contains("Test error"));
         assert!(json.contains("invalid_request_error"));
+    }
+
+    // WP-X.1: CORS and auth tests
+
+    fn make_test_server(
+        cors_origins: Vec<String>,
+        rest_api_key: Option<String>,
+    ) -> Router {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(
+            StorageManager::new(
+                temp_dir.path(),
+                citrate_storage::pruning::PruningConfig::default(),
+            )
+            .unwrap(),
+        );
+        // Leak temp_dir so it persists for the test duration
+        std::mem::forget(temp_dir);
+        let mempool = Arc::new(Mempool::new(
+            citrate_sequencer::mempool::MempoolConfig::default(),
+        ));
+        let state_db = Arc::new(citrate_execution::StateDB::new());
+        let executor = Arc::new(citrate_execution::executor::Executor::new(state_db));
+        let server =
+            OpenAiRestServer::with_config(storage, mempool, executor, cors_origins, rest_api_key);
+        server.router()
+    }
+
+    #[tokio::test]
+    async fn test_cors_empty_blocks_cross_origin() {
+        let app = make_test_server(vec![], None);
+        let req = HttpRequest::builder()
+            .uri("/health")
+            .header("Origin", "https://evil.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // No Access-Control-Allow-Origin header when cors_origins is empty
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cors_wildcard_works() {
+        let app = make_test_server(vec!["*".to_string()], None);
+        let req = HttpRequest::builder()
+            .uri("/health")
+            .header("Origin", "https://any-site.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let cors_header = resp
+            .headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(cors_header.as_deref(), Some("*"));
+    }
+
+    #[tokio::test]
+    async fn test_cors_explicit_origin_allowed() {
+        let app = make_test_server(vec!["https://app.citrate.network".to_string()], None);
+        let req = HttpRequest::builder()
+            .uri("/health")
+            .header("Origin", "https://app.citrate.network")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let cors_header = resp
+            .headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(
+            cors_header.as_deref(),
+            Some("https://app.citrate.network")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rest_bearer_auth_required() {
+        let app = make_test_server(vec!["*".to_string()], Some("secret-key-123".to_string()));
+        // POST to mutating endpoint without auth
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/citrate/lora")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_rest_bearer_auth_wrong_key() {
+        let app = make_test_server(vec!["*".to_string()], Some("secret-key-123".to_string()));
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/citrate/lora")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wrong-key")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_read_endpoints_no_auth() {
+        let app = make_test_server(vec!["*".to_string()], Some("secret-key-123".to_string()));
+        // GET to read-only endpoint — should work without auth
+        let req = HttpRequest::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_default_bind_is_loopback() {
+        let config = crate::server::RpcConfig::default();
+        assert!(
+            config.listen_addr.ip().is_loopback(),
+            "RPC default should bind to loopback, got {}",
+            config.listen_addr
+        );
+    }
+
+    #[test]
+    fn test_derive_operator_address_not_zero() {
+        let addr = derive_operator_address(&Some("test-key".to_string()));
+        assert_ne!(addr, Address::zero(), "Derived address must not be zero");
+        // Deterministic
+        let addr2 = derive_operator_address(&Some("test-key".to_string()));
+        assert_eq!(addr, addr2);
+    }
+
+    #[test]
+    fn test_derive_operator_address_devnet_fallback() {
+        let addr = derive_operator_address(&None);
+        assert_eq!(addr, Address([0x11; 20]));
+        assert_ne!(addr, Address::zero());
     }
 }

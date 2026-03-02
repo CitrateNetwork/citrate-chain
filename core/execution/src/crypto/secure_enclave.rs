@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use primitive_types::H256;
 use sha3::{Sha3_256, Digest};
 use std::collections::HashMap;
+use tracing::warn;
 
 /// Attestation from secure enclave
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,15 +130,37 @@ impl AppleSecureEnclave {
         })
     }
 
-    /// Detect Apple Silicon platform capabilities
+    /// Detect Apple Silicon platform capabilities via sysctl.
+    ///
+    /// Reads `machdep.cpu.brand_string` on macOS for real chip identification.
+    /// Attestation support is only claimed on Apple Silicon (M-series).
     fn detect_platform() -> Result<PlatformInfo> {
-        // In production, use system APIs to detect actual hardware
-        // For now, return simulated M2 Pro capabilities
+        let chip_type = Self::read_cpu_brand().unwrap_or_else(|| "Unknown".to_string());
+
+        // Apple Silicon chips start with "Apple M"
+        let is_apple_silicon = chip_type.starts_with("Apple M");
+
         Ok(PlatformInfo {
-            chip_type: "Apple M2 Pro".to_string(),
-            secure_enclave_version: "2.0".to_string(),
-            supports_attestation: true,
+            chip_type,
+            secure_enclave_version: if is_apple_silicon { "2.0".to_string() } else { "0.0".to_string() },
+            supports_attestation: is_apple_silicon,
         })
+    }
+
+    /// Read CPU brand string from sysctl on macOS
+    fn read_cpu_brand() -> Option<String> {
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()?;
+
+        if output.status.success() {
+            let brand = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !brand.is_empty() {
+                return Some(brand);
+            }
+        }
+        None
     }
 
     /// Generate unique enclave identifier
@@ -148,10 +171,18 @@ impl AppleSecureEnclave {
         hex::encode(bytes)
     }
 
-    /// Call Secure Enclave API (simulated)
+    /// Call Secure Enclave API (simulated).
+    ///
+    /// WARNING: All operations are software-simulated. Real Secure Enclave
+    /// integration requires Security.framework and LocalAuthentication.framework
+    /// bindings, which are not yet implemented.
     fn call_enclave_api(&self, operation: &str, data: &[u8]) -> Result<Vec<u8>> {
-        // In production, this would call actual Apple Secure Enclave APIs
-        // using Security.framework and LocalAuthentication.framework
+        warn!(
+            operation = operation,
+            "Secure Enclave API call is SOFTWARE-SIMULATED — \
+             not backed by real hardware enclave. \
+             Integrate Security.framework for production use."
+        );
 
         match operation {
             "seal" => {
@@ -242,8 +273,8 @@ impl SecureEnclaveInterface for AppleSecureEnclave {
         hasher.update(&self.enclave_id.as_bytes());
         let measurement = H256::from_slice(hasher.finalize().as_slice());
 
-        // Generate enclave keypair
-        let enclave_pubkey = [0u8; 32]; // Would be actual key from enclave
+        // Generate enclave keypair (simulated — would come from hardware enclave)
+        let enclave_pubkey: [u8; 32] = rng.gen();
 
         // Sign attestation
         let mut sign_data = Vec::new();
@@ -266,22 +297,47 @@ impl SecureEnclaveInterface for AppleSecureEnclave {
     }
 
     fn verify_attestation(&self, attestation: &Attestation) -> Result<bool> {
-        // Verify timestamp is recent
+        warn!(
+            "Attestation verification is SOFTWARE-SIMULATED — \
+             not backed by real hardware enclave verification. \
+             Integrate Security.framework for production use."
+        );
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        if (now - attestation.timestamp) > 300 {
-            return Ok(false); // Attestation too old (>5 minutes)
+        // Reject attestations with future timestamps (60s clock tolerance)
+        if attestation.timestamp > now + 60 {
+            warn!("Attestation rejected: timestamp in the future (ts={}, now={})", attestation.timestamp, now);
+            return Ok(false);
         }
 
-        // In production, verify signature using enclave public key
-        // and check against known good measurements
+        // Reject attestations older than 5 minutes
+        if now.saturating_sub(attestation.timestamp) > 300 {
+            warn!("Attestation rejected: too old (ts={}, now={})", attestation.timestamp, now);
+            return Ok(false);
+        }
 
-        // For now, do basic validation
-        Ok(!attestation.signature.is_empty() &&
-           !attestation.measurement.is_zero())
+        // Reject attestations with zero enclave pubkey
+        if attestation.enclave_pubkey == [0u8; 32] {
+            warn!("Attestation rejected: zero enclave public key");
+            return Ok(false);
+        }
+
+        // Basic validation: non-empty signature and non-zero measurement
+        if attestation.signature.is_empty() {
+            warn!("Attestation rejected: empty signature");
+            return Ok(false);
+        }
+
+        if attestation.measurement.is_zero() {
+            warn!("Attestation rejected: zero measurement");
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     fn generate_key_pair(&self) -> Result<([u8; 32], [u8; 32])> {
@@ -457,5 +513,76 @@ mod tests {
         let inputs = vec![b"plaintext".to_vec(), b"key".to_vec()];
         let result = enclave.secure_compute("encrypt", inputs).unwrap();
         assert_eq!(result.len(), 9); // Same as plaintext length
+    }
+
+    // ========== WP-X.6: Platform detection & attestation hardening tests ==========
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_detect_platform_not_hardcoded() {
+        let platform = AppleSecureEnclave::detect_platform().unwrap();
+        // Must NOT be the old hardcoded "Apple M2 Pro"
+        // It should reflect whatever the actual hardware is
+        assert!(!platform.chip_type.is_empty());
+        // Verify it came from sysctl (real value), not hardcoded
+        // On any macOS machine, the brand string is populated
+        assert_ne!(platform.chip_type, "Unknown");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_attestation_rejects_zero_pubkey() {
+        let enclave = AppleSecureEnclave::new().unwrap();
+
+        let attestation = Attestation {
+            measurement: H256::from_slice(&[1u8; 32]),
+            platform_id: "test".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            signature: vec![1, 2, 3],
+            enclave_pubkey: [0u8; 32], // Zero pubkey
+            nonce: [0u8; 16],
+        };
+
+        let result = enclave.verify_attestation(&attestation).unwrap();
+        assert!(!result, "Zero pubkey attestation should be rejected");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_attestation_rejects_future_timestamp() {
+        let enclave = AppleSecureEnclave::new().unwrap();
+
+        let future_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() + 300; // 5 min in the future (beyond 60s tolerance)
+
+        let attestation = Attestation {
+            measurement: H256::from_slice(&[1u8; 32]),
+            platform_id: "test".to_string(),
+            timestamp: future_ts,
+            signature: vec![1, 2, 3],
+            enclave_pubkey: [1u8; 32],
+            nonce: [0u8; 16],
+        };
+
+        let result = enclave.verify_attestation(&attestation).unwrap();
+        assert!(!result, "Future timestamp attestation should be rejected");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_enclave_api_logs_simulation_warning() {
+        // This test verifies that call_enclave_api succeeds (the warning
+        // is emitted via tracing, which is hard to capture in unit tests,
+        // but the important thing is the operation still works).
+        let enclave = AppleSecureEnclave::new().unwrap();
+
+        let result = enclave.call_enclave_api("seal", b"test data");
+        assert!(result.is_ok());
+        assert!(result.unwrap().starts_with(b"SEALED:"));
     }
 }

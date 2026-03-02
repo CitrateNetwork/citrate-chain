@@ -192,6 +192,14 @@ impl ExecutionVerifier {
     }
 
     /// Commitment-based proof verification (interim scheme).
+    ///
+    /// Supports two formats:
+    /// - **Nonce-enhanced** (72+ bytes): commitment(32) || response(32) || nonce(8) || extra
+    ///   Verification: commitment == SHA3(statement || response || nonce)
+    ///   Replay protection: nonce is a Unix timestamp; rejected if >5 min old or in the future.
+    /// - **Legacy** (64-71 bytes): commitment(32) || response(32)
+    ///   Verification: commitment == SHA3(statement || response)
+    ///   No replay protection.
     fn verify_commitment_proof(&self, statement: &[u8], proof_data: &[u8]) -> Result<bool> {
         use sha3::{Digest, Sha3_256};
 
@@ -212,23 +220,56 @@ impl ExecutionVerifier {
             return Ok(false);
         }
 
-        // Extract commitment and response from proof
         let commitment = &proof_data[0..32];
         let response = &proof_data[32..64];
 
-        // Compute expected commitment: H(statement || response)
+        // Try nonce-enhanced format first (72+ bytes)
+        if proof_data.len() >= 72 {
+            let nonce_bytes = &proof_data[64..72];
+            let nonce_ts = u64::from_le_bytes(nonce_bytes.try_into().unwrap());
+
+            // Replay protection: reject nonce timestamps >5 minutes old or in the future
+            let now = chrono::Utc::now().timestamp() as u64;
+            let max_age_secs = 300; // 5 minutes
+            let clock_tolerance_secs = 60; // 1 minute forward tolerance
+
+            if nonce_ts + max_age_secs < now {
+                warn!("ZK verification failed: nonce expired (ts={}, now={})", nonce_ts, now);
+                return Ok(false);
+            }
+            if nonce_ts > now + clock_tolerance_secs {
+                warn!("ZK verification failed: nonce in future (ts={}, now={})", nonce_ts, now);
+                return Ok(false);
+            }
+
+            // Verify: commitment == SHA3(statement || response || nonce)
+            let mut hasher = Sha3_256::new();
+            hasher.update(statement);
+            hasher.update(response);
+            hasher.update(nonce_bytes);
+            let expected = hasher.finalize();
+
+            if commitment != expected.as_slice() {
+                warn!("ZK verification failed: nonce-enhanced commitment mismatch");
+                return Ok(false);
+            }
+
+            info!("ZK proof verified successfully (nonce-enhanced, ts={})", nonce_ts);
+            return Ok(true);
+        }
+
+        // Legacy format (64-71 bytes): commitment(32) || response(32), no nonce
         let mut hasher = Sha3_256::new();
         hasher.update(statement);
         hasher.update(response);
         let expected_commitment = hasher.finalize();
 
-        // Verify commitment matches
         if commitment != expected_commitment.as_slice() {
-            warn!("ZK verification failed: commitment mismatch");
+            warn!("ZK verification failed: legacy commitment mismatch");
             return Ok(false);
         }
 
-        info!("ZK proof verified successfully");
+        info!("ZK proof verified successfully (legacy format, no replay protection)");
         Ok(true)
     }
 
@@ -928,5 +969,89 @@ mod tests {
         let result = verifier.verify_execution(&model, input, output, &proof);
         assert!(result.is_ok());
         assert!(result.unwrap());
+    }
+
+    // ========== WP-X.6: Nonce-enhanced commitment tests ==========
+
+    /// Helper: build a nonce-enhanced proof (72 bytes)
+    fn build_nonce_enhanced_proof(statement: &[u8], response: &[u8; 32], nonce_ts: u64) -> Vec<u8> {
+        use sha3::{Digest, Sha3_256};
+        let nonce_bytes = nonce_ts.to_le_bytes();
+
+        let mut hasher = Sha3_256::new();
+        hasher.update(statement);
+        hasher.update(response);
+        hasher.update(&nonce_bytes);
+        let commitment = hasher.finalize();
+
+        let mut proof = Vec::with_capacity(72);
+        proof.extend_from_slice(&commitment); // 32
+        proof.extend_from_slice(response);     // 32
+        proof.extend_from_slice(&nonce_bytes); // 8
+        proof
+    }
+
+    #[test]
+    fn test_commitment_proof_with_nonce_valid() {
+        let verifier = ExecutionVerifier::new();
+        let statement = b"inference request";
+        let response = &[0xABu8; 32];
+        let now = chrono::Utc::now().timestamp() as u64;
+        let proof_data = build_nonce_enhanced_proof(statement, response, now);
+
+        let result = verifier.verify_commitment_proof(statement, &proof_data);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_commitment_proof_with_nonce_expired() {
+        let verifier = ExecutionVerifier::new();
+        let statement = b"inference request";
+        let response = &[0xABu8; 32];
+        // 10 minutes ago — beyond the 5-minute window
+        let old_ts = chrono::Utc::now().timestamp() as u64 - 600;
+        let proof_data = build_nonce_enhanced_proof(statement, response, old_ts);
+
+        let result = verifier.verify_commitment_proof(statement, &proof_data);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "Expired nonce should fail");
+    }
+
+    #[test]
+    fn test_commitment_proof_with_nonce_future() {
+        let verifier = ExecutionVerifier::new();
+        let statement = b"inference request";
+        let response = &[0xABu8; 32];
+        // 5 minutes in the future — beyond the 60-second tolerance
+        let future_ts = chrono::Utc::now().timestamp() as u64 + 300;
+        let proof_data = build_nonce_enhanced_proof(statement, response, future_ts);
+
+        let result = verifier.verify_commitment_proof(statement, &proof_data);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "Future nonce should fail");
+    }
+
+    #[test]
+    fn test_commitment_proof_legacy_fallback() {
+        let verifier = ExecutionVerifier::new();
+        let statement = b"inference request";
+        let response = &[0x42u8; 32];
+
+        // Build 64-byte legacy proof (no nonce)
+        use sha3::{Digest, Sha3_256};
+        let mut hasher = Sha3_256::new();
+        hasher.update(statement);
+        hasher.update(response);
+        let commitment = hasher.finalize();
+
+        let mut proof_data = Vec::with_capacity(64);
+        proof_data.extend_from_slice(&commitment);
+        proof_data.extend_from_slice(response);
+        assert_eq!(proof_data.len(), 64);
+
+        let result = verifier.verify_commitment_proof(statement, &proof_data);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Legacy 64-byte format should still work");
     }
 }

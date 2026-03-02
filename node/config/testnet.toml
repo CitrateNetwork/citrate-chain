@@ -21,6 +21,9 @@ max_peers = 50
 enabled = true
 listen_addr = "0.0.0.0:8545"
 ws_addr = "0.0.0.0:8546"
+# WP-X.1: Explicit CORS origins (no wildcard in production)
+cors_origins = ["https://explorer.citrate.network"]
+# rest_api_key = "" # Uncomment and set for production REST API auth
 
 [storage]
 data_dir = ".citrate-testnet"
