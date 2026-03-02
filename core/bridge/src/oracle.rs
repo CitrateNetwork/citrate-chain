@@ -5,12 +5,17 @@
 //! The bridge relay only processes events once M attestations are collected.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 
 use crate::errors::BridgeError;
 use crate::events::EventId;
+
+/// Maximum age in seconds for an attestation timestamp (5 minutes).
+const ATTESTATION_MAX_AGE_SECS: u64 = 300;
 
 /// Oracle identity (public key, 32 bytes).
 pub type OracleId = [u8; 32];
@@ -67,6 +72,59 @@ pub struct OracleRegistry {
 
     /// Collected attestations per event.
     attestations: HashMap<EventId, Vec<OracleAttestation>>,
+}
+
+/// Verify an attestation signature cryptographically (ed25519).
+///
+/// Domain-separated message: `"citrate-bridge-v1"(17) || event_id(32) || event_hash(32) || timestamp(8 LE)` = 89 bytes.
+fn verify_attestation_signature(attestation: &OracleAttestation) -> Result<(), BridgeError> {
+    let mut message = Vec::with_capacity(89);
+    message.extend_from_slice(b"citrate-bridge-v1");
+    message.extend_from_slice(&attestation.event_id);
+    message.extend_from_slice(&attestation.event_hash);
+    message.extend_from_slice(&attestation.timestamp.to_le_bytes());
+
+    let pubkey = VerifyingKey::from_bytes(&attestation.oracle_id).map_err(|_| {
+        BridgeError::InvalidSignature {
+            oracle_id: hex::encode(attestation.oracle_id),
+        }
+    })?;
+
+    let sig = DalekSignature::from_slice(&attestation.signature).map_err(|_| {
+        BridgeError::InvalidSignature {
+            oracle_id: hex::encode(attestation.oracle_id),
+        }
+    })?;
+
+    pubkey.verify(&message, &sig).map_err(|_| {
+        BridgeError::InvalidSignature {
+            oracle_id: hex::encode(attestation.oracle_id),
+        }
+    })
+}
+
+/// Check if an attestation timestamp is within the acceptable freshness window.
+fn verify_attestation_freshness(attestation: &OracleAttestation) -> Result<(), BridgeError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let age = now.saturating_sub(attestation.timestamp);
+    if age > ATTESTATION_MAX_AGE_SECS {
+        return Err(BridgeError::StaleAttestation {
+            timestamp: attestation.timestamp,
+        });
+    }
+
+    // Also reject attestations from the future (clock skew > 60s)
+    if attestation.timestamp > now + 60 {
+        return Err(BridgeError::StaleAttestation {
+            timestamp: attestation.timestamp,
+        });
+    }
+
+    Ok(())
 }
 
 impl OracleRegistry {
@@ -144,6 +202,12 @@ impl OracleRegistry {
 
     /// Submit an attestation from an oracle.
     ///
+    /// Performs full verification:
+    /// 1. Oracle is registered and active
+    /// 2. Not a duplicate attestation
+    /// 3. Attestation timestamp is within freshness window
+    /// 4. Ed25519 signature over domain-separated message is valid
+    ///
     /// Returns the current attestation count for this event.
     pub fn submit_attestation(
         &mut self,
@@ -178,6 +242,12 @@ impl OracleRegistry {
                 event_id: hex::encode(attestation.event_id),
             });
         }
+
+        // Verify attestation timestamp is within freshness window
+        verify_attestation_freshness(&attestation)?;
+
+        // Cryptographic ed25519 signature verification
+        verify_attestation_signature(&attestation)?;
 
         // Update oracle stats
         oracle.last_attestation = attestation.timestamp;
@@ -250,22 +320,52 @@ pub fn compute_event_hash(event_id: &EventId, data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
-    fn make_attestation(oracle_id: OracleId, event_id: EventId) -> OracleAttestation {
+    /// Generate a deterministic ed25519 signing key from a seed byte.
+    fn make_signing_key(id: u8) -> SigningKey {
+        let mut seed = [0u8; 32];
+        seed[0] = id;
+        SigningKey::from_bytes(&seed)
+    }
+
+    /// Get the OracleId (public key bytes) for a given seed byte.
+    fn make_oracle_id(id: u8) -> OracleId {
+        let sk = make_signing_key(id);
+        sk.verifying_key().to_bytes()
+    }
+
+    /// Create a properly signed attestation.
+    fn make_signed_attestation(id: u8, event_id: EventId) -> OracleAttestation {
+        let sk = make_signing_key(id);
+        let oracle_id = sk.verifying_key().to_bytes();
         let event_hash = compute_event_hash(&event_id, b"test_deposit_data");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Sign the domain-separated message
+        let mut message = Vec::with_capacity(89);
+        message.extend_from_slice(b"citrate-bridge-v1");
+        message.extend_from_slice(&event_id);
+        message.extend_from_slice(&event_hash);
+        message.extend_from_slice(&now.to_le_bytes());
+        let sig = sk.sign(&message);
+
         OracleAttestation {
             oracle_id,
             event_id,
             event_hash,
-            signature: vec![0u8; 64],
-            timestamp: 1000,
+            signature: sig.to_bytes().to_vec(),
+            timestamp: now,
         }
     }
 
     #[test]
     fn test_oracle_registration() {
         let mut registry = OracleRegistry::new(2);
-        let oracle_id = [1u8; 32];
+        let oracle_id = make_oracle_id(1);
 
         registry
             .register_oracle(oracle_id, "Oracle-1".to_string())
@@ -282,7 +382,7 @@ mod tests {
     #[test]
     fn test_oracle_removal() {
         let mut registry = OracleRegistry::new(1);
-        let oracle_id = [1u8; 32];
+        let oracle_id = make_oracle_id(1);
 
         registry
             .register_oracle(oracle_id, "Oracle-1".to_string())
@@ -291,7 +391,7 @@ mod tests {
         assert_eq!(registry.active_oracle_count(), 0);
 
         // Remove unknown oracle fails
-        let err = registry.remove_oracle(&[99u8; 32]).unwrap_err();
+        let err = registry.remove_oracle(&make_oracle_id(99)).unwrap_err();
         assert!(matches!(err, BridgeError::OracleNotFound { .. }));
     }
 
@@ -302,22 +402,21 @@ mod tests {
 
         // Register 3 oracles
         for i in 1..=3u8 {
-            let id = [i; 32];
             registry
-                .register_oracle(id, format!("Oracle-{i}"))
+                .register_oracle(make_oracle_id(i), format!("Oracle-{i}"))
                 .unwrap();
         }
 
         // 1 attestation — below threshold
         registry
-            .submit_attestation(make_attestation([1u8; 32], event_id))
+            .submit_attestation(make_signed_attestation(1, event_id))
             .unwrap();
         assert!(!registry.is_threshold_met(&event_id));
         assert_eq!(registry.attestation_count(&event_id), 1);
 
         // 2 attestations — meets threshold
         registry
-            .submit_attestation(make_attestation([2u8; 32], event_id))
+            .submit_attestation(make_signed_attestation(2, event_id))
             .unwrap();
         assert!(registry.is_threshold_met(&event_id));
         assert_eq!(registry.attestation_count(&event_id), 2);
@@ -326,7 +425,7 @@ mod tests {
     #[test]
     fn test_duplicate_attestation_rejected() {
         let mut registry = OracleRegistry::new(2);
-        let oracle_id = [1u8; 32];
+        let oracle_id = make_oracle_id(1);
         let event_id = [10u8; 32];
 
         registry
@@ -334,12 +433,12 @@ mod tests {
             .unwrap();
 
         registry
-            .submit_attestation(make_attestation(oracle_id, event_id))
+            .submit_attestation(make_signed_attestation(1, event_id))
             .unwrap();
 
         // Same oracle, same event → duplicate
         let err = registry
-            .submit_attestation(make_attestation(oracle_id, event_id))
+            .submit_attestation(make_signed_attestation(1, event_id))
             .unwrap_err();
         assert!(matches!(err, BridgeError::DuplicateAttestation { .. }));
     }
@@ -347,7 +446,7 @@ mod tests {
     #[test]
     fn test_inactive_oracle_rejected() {
         let mut registry = OracleRegistry::new(1);
-        let oracle_id = [1u8; 32];
+        let oracle_id = make_oracle_id(1);
         let event_id = [10u8; 32];
 
         registry
@@ -356,7 +455,7 @@ mod tests {
         registry.deactivate_oracle(&oracle_id).unwrap();
 
         let err = registry
-            .submit_attestation(make_attestation(oracle_id, event_id))
+            .submit_attestation(make_signed_attestation(1, event_id))
             .unwrap_err();
         assert!(matches!(err, BridgeError::OracleInactive { .. }));
     }
@@ -367,7 +466,7 @@ mod tests {
         let event_id = [10u8; 32];
 
         let err = registry
-            .submit_attestation(make_attestation([99u8; 32], event_id))
+            .submit_attestation(make_signed_attestation(99, event_id))
             .unwrap_err();
         assert!(matches!(err, BridgeError::OracleNotFound { .. }));
     }
@@ -379,16 +478,16 @@ mod tests {
 
         for i in 1..=2u8 {
             registry
-                .register_oracle([i; 32], format!("Oracle-{i}"))
+                .register_oracle(make_oracle_id(i), format!("Oracle-{i}"))
                 .unwrap();
         }
 
         // Both oracles attest with same event_hash → consistent
         registry
-            .submit_attestation(make_attestation([1u8; 32], event_id))
+            .submit_attestation(make_signed_attestation(1, event_id))
             .unwrap();
         registry
-            .submit_attestation(make_attestation([2u8; 32], event_id))
+            .submit_attestation(make_signed_attestation(2, event_id))
             .unwrap();
 
         assert!(registry.verify_attestation_consistency(&event_id));
@@ -402,16 +501,16 @@ mod tests {
         // Only register 2 oracles (threshold = 3)
         for i in 1..=2u8 {
             registry
-                .register_oracle([i; 32], format!("Oracle-{i}"))
+                .register_oracle(make_oracle_id(i), format!("Oracle-{i}"))
                 .unwrap();
         }
 
         // Both attest but threshold not met (need 3)
         registry
-            .submit_attestation(make_attestation([1u8; 32], event_id))
+            .submit_attestation(make_signed_attestation(1, event_id))
             .unwrap();
         registry
-            .submit_attestation(make_attestation([2u8; 32], event_id))
+            .submit_attestation(make_signed_attestation(2, event_id))
             .unwrap();
 
         assert!(!registry.is_threshold_met(&event_id));
@@ -428,5 +527,63 @@ mod tests {
         // Different data → different hash
         let h3 = compute_event_hash(&event_id, b"different_data");
         assert_ne!(h1, h3);
+    }
+
+    /// Invalid (tampered) attestation signature is rejected.
+    #[test]
+    fn test_invalid_signature_rejected() {
+        let mut registry = OracleRegistry::new(1);
+        let oracle_id = make_oracle_id(1);
+        let event_id = [10u8; 32];
+
+        registry
+            .register_oracle(oracle_id, "Oracle-1".to_string())
+            .unwrap();
+
+        // Create attestation with tampered signature
+        let mut att = make_signed_attestation(1, event_id);
+        att.signature = vec![0xAB; 64]; // Invalid signature
+
+        let err = registry.submit_attestation(att).unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidSignature { .. }));
+    }
+
+    /// Stale attestation (old timestamp) is rejected.
+    #[test]
+    fn test_stale_attestation_rejected() {
+        let mut registry = OracleRegistry::new(1);
+        let oracle_id = make_oracle_id(1);
+        let event_id = [10u8; 32];
+
+        registry
+            .register_oracle(oracle_id, "Oracle-1".to_string())
+            .unwrap();
+
+        // Create attestation with a timestamp from 10 minutes ago
+        let sk = make_signing_key(1);
+        let event_hash = compute_event_hash(&event_id, b"test_deposit_data");
+        let old_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 600; // 10 minutes ago
+
+        let mut message = Vec::with_capacity(89);
+        message.extend_from_slice(b"citrate-bridge-v1");
+        message.extend_from_slice(&event_id);
+        message.extend_from_slice(&event_hash);
+        message.extend_from_slice(&old_timestamp.to_le_bytes());
+        let sig = sk.sign(&message);
+
+        let att = OracleAttestation {
+            oracle_id,
+            event_id,
+            event_hash,
+            signature: sig.to_bytes().to_vec(),
+            timestamp: old_timestamp,
+        };
+
+        let err = registry.submit_attestation(att).unwrap_err();
+        assert!(matches!(err, BridgeError::StaleAttestation { .. }));
     }
 }

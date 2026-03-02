@@ -24,3 +24,12 @@ enabled = true
 coinbase = "0000000000000000000000000000000000000000000000000000000000000000"
 target_block_time = 2
 min_gas_price = 1000000000
+
+[vrf]
+strict_vrf = true
+migration_mode = false
+
+[checkpoint]
+interval = 50
+committee_size = 100
+quorum_threshold = 67

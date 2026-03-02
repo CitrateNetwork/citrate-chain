@@ -572,6 +572,9 @@ impl BlockBuilder {
             signature: Signature::new([1; 64]),
             embedded_models: vec![],
             required_pins: vec![],
+            learning_embedding: None,
+            learning_confidence: None,
+            gradient_commitment: None,
         };
 
         block.header.block_hash = self.calculate_block_hash(&block);
@@ -895,6 +898,9 @@ mod tests {
             signature: Signature::new([1; 64]), // Non-zero signature for tests
             embedded_models: vec![],
             required_pins: vec![],
+            learning_embedding: None,
+            learning_confidence: None,
+            gradient_commitment: None,
         };
 
         // Valid block

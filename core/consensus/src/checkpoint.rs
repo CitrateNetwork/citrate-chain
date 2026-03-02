@@ -5,6 +5,7 @@
 
 use crate::dag_store::{cf, DagStore, KvStore};
 use crate::types::{Hash, PublicKey, Signature};
+use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -188,6 +189,25 @@ impl CommitteeSelector {
     }
 }
 
+/// Verify a checkpoint vote signature cryptographically (ed25519).
+///
+/// The canonical vote message is: `height(8 LE bytes) || block_hash(32 bytes)` = 40 bytes.
+/// The voter must sign this message with their ed25519 private key.
+fn verify_vote_signature(vote: &CheckpointVote) -> Result<(), CheckpointError> {
+    // Build canonical message: height(8 LE) || block_hash(32) = 40 bytes
+    let mut message = Vec::with_capacity(40);
+    message.extend_from_slice(&vote.height.to_le_bytes());
+    message.extend_from_slice(vote.block_hash.as_bytes());
+
+    let pubkey = VerifyingKey::from_bytes(vote.voter.as_bytes())
+        .map_err(|_| CheckpointError::InvalidSignature(vote.voter))?;
+    let sig = DalekSignature::from_bytes(vote.signature.as_bytes());
+
+    pubkey
+        .verify(&message, &sig)
+        .map_err(|_| CheckpointError::InvalidSignature(vote.voter))
+}
+
 /// Checkpoint manager — proposes, collects votes, and finalizes checkpoints.
 pub struct CheckpointManager {
     config: CheckpointConfig,
@@ -204,6 +224,9 @@ pub struct CheckpointManager {
 
     /// Optional persistent backend for checkpoint storage.
     persistent: Option<Arc<dyn KvStore>>,
+
+    /// Replay protection: tracks (height, voter) pairs already seen.
+    voted: RwLock<HashSet<(u64, PublicKey)>>,
 }
 
 impl CheckpointManager {
@@ -215,6 +238,7 @@ impl CheckpointManager {
             finalized: RwLock::new(HashMap::new()),
             latest_finalized_height: RwLock::new(0),
             persistent: None,
+            voted: RwLock::new(HashSet::new()),
         }
     }
 
@@ -242,6 +266,7 @@ impl CheckpointManager {
             }
         }
         mgr.persistent = Some(kv);
+        // voted is already initialized via new()
         mgr
     }
 
@@ -306,6 +331,14 @@ impl CheckpointManager {
     ///
     /// Returns `true` if quorum was reached by this vote.
     pub async fn submit_vote(&self, vote: CheckpointVote) -> Result<bool, CheckpointError> {
+        // Replay protection: reject if (height, voter) already seen
+        {
+            let mut voted = self.voted.write().await;
+            if !voted.insert((vote.height, vote.voter)) {
+                return Err(CheckpointError::DuplicateVote(vote.voter));
+            }
+        }
+
         let mut pending = self.pending.write().await;
 
         let checkpoint = pending
@@ -318,7 +351,7 @@ impl CheckpointManager {
             return Err(CheckpointError::NotInCommittee(vote.voter));
         }
 
-        // Check for duplicate vote
+        // Check for duplicate vote (also checked by voted set above)
         if checkpoint.votes.contains_key(&vote.voter) {
             return Err(CheckpointError::DuplicateVote(vote.voter));
         }
@@ -328,11 +361,8 @@ impl CheckpointManager {
             return Err(CheckpointError::InvalidSignature(vote.voter));
         }
 
-        // Note: In production, we'd verify the signature cryptographically here.
-        // For now, we accept any non-zero signature from a committee member.
-        if vote.signature.as_bytes().iter().all(|&b| b == 0) {
-            return Err(CheckpointError::InvalidSignature(vote.voter));
-        }
+        // Cryptographic ed25519 signature verification
+        verify_vote_signature(&vote)?;
 
         debug!(
             "Vote from {:?} for checkpoint at height {} ({}/{})",
@@ -426,13 +456,40 @@ impl CheckpointManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
-    fn make_pubkey(id: u8) -> PublicKey {
-        PublicKey::new([id; 32])
+    /// Generate a deterministic ed25519 signing key from a seed byte.
+    fn make_signing_key(id: u8) -> SigningKey {
+        let mut seed = [0u8; 32];
+        seed[0] = id;
+        SigningKey::from_bytes(&seed)
     }
 
-    fn make_signature(id: u8) -> Signature {
-        Signature::new([id; 64])
+    /// Get the PublicKey for a given seed byte.
+    fn make_pubkey(id: u8) -> PublicKey {
+        let sk = make_signing_key(id);
+        let vk = sk.verifying_key();
+        PublicKey::new(vk.to_bytes())
+    }
+
+    /// Sign a checkpoint vote's canonical message with the given signing key.
+    fn sign_vote(height: u64, block_hash: &Hash, signing_key: &SigningKey) -> Signature {
+        let mut message = Vec::with_capacity(40);
+        message.extend_from_slice(&height.to_le_bytes());
+        message.extend_from_slice(block_hash.as_bytes());
+        let sig = signing_key.sign(&message);
+        Signature::new(sig.to_bytes())
+    }
+
+    /// Create a properly signed CheckpointVote for testing.
+    fn make_signed_vote(id: u8, height: u64, block_hash: &Hash) -> CheckpointVote {
+        let sk = make_signing_key(id);
+        CheckpointVote {
+            height,
+            block_hash: *block_hash,
+            voter: make_pubkey(id),
+            signature: sign_vote(height, block_hash, &sk),
+        }
     }
 
     fn create_test_block(hash: [u8; 32], height: u64, parent: Hash) -> crate::types::Block {
@@ -513,7 +570,7 @@ mod tests {
         assert_ne!(c1, c2);
     }
 
-    /// Quorum threshold: 66 rejected, 67 accepted (for default config).
+    /// Quorum threshold: 3 rejected, 4 accepted (for test config with quorum=4).
     #[tokio::test]
     async fn test_quorum_threshold() {
         let dag = Arc::new(DagStore::new());
@@ -530,30 +587,20 @@ mod tests {
 
         // Submit 3 votes (below quorum of 4)
         for i in 0..3u8 {
-            let vote = CheckpointVote {
-                height: 5,
-                block_hash: checkpoint_block.hash(),
-                voter: make_pubkey(i),
-                signature: make_signature(i + 1),
-            };
+            let vote = make_signed_vote(i, 5, &checkpoint_block.hash());
             let quorum_reached = mgr.submit_vote(vote).await.unwrap();
             assert!(!quorum_reached, "Quorum should not be reached with {} votes", i + 1);
         }
 
         // 4th vote reaches quorum
-        let vote = CheckpointVote {
-            height: 5,
-            block_hash: checkpoint_block.hash(),
-            voter: make_pubkey(3),
-            signature: make_signature(4),
-        };
+        let vote = make_signed_vote(3, 5, &checkpoint_block.hash());
         let quorum_reached = mgr.submit_vote(vote).await.unwrap();
         assert!(quorum_reached, "Quorum should be reached with 4 votes");
     }
 
-    /// Invalid signature (all zeros) is rejected.
+    /// Zero signature is rejected.
     #[tokio::test]
-    async fn test_invalid_signature_rejected() {
+    async fn test_zero_signature_rejected() {
         let dag = Arc::new(DagStore::new());
         let config = CheckpointConfig::for_testing();
         let blocks = build_chain(&dag, 6).await;
@@ -572,6 +619,44 @@ mod tests {
         assert!(matches!(result, Err(CheckpointError::InvalidSignature(_))));
     }
 
+    /// Invalid (tampered) signature is rejected by crypto verification.
+    #[tokio::test]
+    async fn test_invalid_signature_rejected() {
+        let dag = Arc::new(DagStore::new());
+        let config = CheckpointConfig::for_testing();
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = CheckpointManager::new(config, dag);
+
+        let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
+        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+
+        // Create a vote with non-zero but cryptographically invalid signature
+        let vote = CheckpointVote {
+            height: 5,
+            block_hash: blocks[5].hash(),
+            voter: make_pubkey(0),
+            signature: Signature::new([0xAB; 64]), // Non-zero but invalid
+        };
+        let result = mgr.submit_vote(vote).await;
+        assert!(matches!(result, Err(CheckpointError::InvalidSignature(_))));
+    }
+
+    /// Valid cryptographic signature is accepted.
+    #[tokio::test]
+    async fn test_valid_signature_accepted() {
+        let dag = Arc::new(DagStore::new());
+        let config = CheckpointConfig::for_testing();
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = CheckpointManager::new(config, dag);
+
+        let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
+        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+
+        let vote = make_signed_vote(0, 5, &blocks[5].hash());
+        let result = mgr.submit_vote(vote).await;
+        assert!(result.is_ok());
+    }
+
     /// Checkpoint finalization propagates to DagStore.
     #[tokio::test]
     async fn test_checkpoint_finalization_propagates() {
@@ -583,16 +668,10 @@ mod tests {
         let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
         mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
 
-        // Submit 4 votes to reach quorum
+        // Submit 4 signed votes to reach quorum
         for i in 0..4u8 {
-            mgr.submit_vote(CheckpointVote {
-                height: 5,
-                block_hash: blocks[5].hash(),
-                voter: make_pubkey(i),
-                signature: make_signature(i + 1),
-            })
-            .await
-            .unwrap();
+            let vote = make_signed_vote(i, 5, &blocks[5].hash());
+            mgr.submit_vote(vote).await.unwrap();
         }
 
         // Finalize
@@ -607,7 +686,7 @@ mod tests {
         assert_eq!(mgr.latest_finalized_height().await, 5);
     }
 
-    /// Duplicate vote from same validator is rejected.
+    /// Duplicate vote from same validator is rejected (replay protection).
     #[tokio::test]
     async fn test_duplicate_vote_rejected() {
         let dag = Arc::new(DagStore::new());
@@ -618,15 +697,10 @@ mod tests {
         let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
         mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
 
-        let vote = CheckpointVote {
-            height: 5,
-            block_hash: blocks[5].hash(),
-            voter: make_pubkey(0),
-            signature: make_signature(1),
-        };
+        let vote = make_signed_vote(0, 5, &blocks[5].hash());
         mgr.submit_vote(vote.clone()).await.unwrap();
 
-        // Duplicate
+        // Duplicate — rejected by replay protection
         let result = mgr.submit_vote(vote).await;
         assert!(matches!(result, Err(CheckpointError::DuplicateVote(_))));
     }
@@ -642,13 +716,33 @@ mod tests {
         let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
         mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
 
+        // Voter 99 has a valid signature but is NOT in the committee
+        let vote = make_signed_vote(99, 5, &blocks[5].hash());
+        let result = mgr.submit_vote(vote).await;
+        assert!(matches!(result, Err(CheckpointError::NotInCommittee(_))));
+    }
+
+    /// Signature for wrong height is rejected.
+    #[tokio::test]
+    async fn test_wrong_height_signature_rejected() {
+        let dag = Arc::new(DagStore::new());
+        let config = CheckpointConfig::for_testing();
+        let blocks = build_chain(&dag, 6).await;
+        let mgr = CheckpointManager::new(config, dag);
+
+        let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
+        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+
+        // Sign for height 10 but submit for height 5 — crypto check fails
+        let sk = make_signing_key(0);
+        let wrong_sig = sign_vote(10, &blocks[5].hash(), &sk);
         let vote = CheckpointVote {
             height: 5,
             block_hash: blocks[5].hash(),
-            voter: make_pubkey(99), // Not in committee
-            signature: make_signature(1),
+            voter: make_pubkey(0),
+            signature: wrong_sig,
         };
         let result = mgr.submit_vote(vote).await;
-        assert!(matches!(result, Err(CheckpointError::NotInCommittee(_))));
+        assert!(matches!(result, Err(CheckpointError::InvalidSignature(_))));
     }
 }

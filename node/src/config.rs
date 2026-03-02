@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 /// Node configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// Chain configuration
     pub chain: ChainConfig,
@@ -23,10 +24,86 @@ pub struct NodeConfig {
     /// Validator configuration
     #[serde(default)]
     pub validator: ValidatorConfig,
+
+    /// VRF configuration (WP-W.2)
+    #[serde(default)]
+    pub vrf: VrfConfig,
+
+    /// Checkpoint configuration (WP-W.2)
+    #[serde(default)]
+    pub checkpoint: CheckpointNodeConfig,
+}
+
+/// VRF configuration for proposer election verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VrfConfig {
+    /// Require cryptographic VRF proof verification.
+    /// Default: true (enforced on non-devnet profiles).
+    #[serde(default = "default_strict_vrf")]
+    pub strict_vrf: bool,
+
+    /// Accept legacy SHA3 proofs during migration period.
+    /// When true, both ECVRF-P256-SHA256 and legacy SHA3 proofs are accepted.
+    #[serde(default)]
+    pub migration_mode: bool,
+}
+
+fn default_strict_vrf() -> bool {
+    true
+}
+
+impl Default for VrfConfig {
+    fn default() -> Self {
+        Self {
+            strict_vrf: true,
+            migration_mode: false,
+        }
+    }
+}
+
+/// Checkpoint configuration for node-level BFT finality.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointNodeConfig {
+    /// Checkpoint interval in blocks.
+    #[serde(default = "default_checkpoint_interval")]
+    pub interval: u64,
+
+    /// Committee size.
+    #[serde(default = "default_committee_size")]
+    pub committee_size: usize,
+
+    /// Quorum threshold (2/3 + 1 of committee).
+    #[serde(default = "default_quorum_threshold")]
+    pub quorum_threshold: usize,
+}
+
+fn default_checkpoint_interval() -> u64 {
+    50
+}
+
+fn default_committee_size() -> usize {
+    100
+}
+
+fn default_quorum_threshold() -> usize {
+    67
+}
+
+impl Default for CheckpointNodeConfig {
+    fn default() -> Self {
+        Self {
+            interval: 50,
+            committee_size: 100,
+            quorum_threshold: 67,
+        }
+    }
 }
 
 /// Validator and production mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidatorConfig {
     /// Production mode: enforces fail-closed behavior for validators
     /// When true, the node will refuse to start without validators configured
@@ -101,6 +178,7 @@ impl ValidatorConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChainConfig {
     /// Chain ID
     pub chain_id: u64,
@@ -116,6 +194,7 @@ pub struct ChainConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// P2P listen address
     pub listen_addr: SocketAddr,
@@ -134,6 +213,7 @@ pub struct NetworkConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RpcConfig {
     /// RPC enabled
     pub enabled: bool,
@@ -157,6 +237,7 @@ pub struct RpcConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     /// Data directory
     pub data_dir: PathBuf,
@@ -169,6 +250,7 @@ pub struct StorageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MiningConfig {
     /// Enable mining
     pub enabled: bool,
@@ -225,6 +307,8 @@ impl Default for NodeConfig {
                 min_gas_price: 1_000_000_000,
             },
             validator: ValidatorConfig::default(),
+            vrf: VrfConfig::default(),
+            checkpoint: CheckpointNodeConfig::default(),
         }
     }
 }
@@ -250,6 +334,8 @@ impl NodeConfig {
         config.mining.target_block_time = 2; // Fast blocks for testing
         // C-02: Allow eth_sendTransaction only in devnet mode
         config.rpc.allow_eth_send_transaction = true;
+        // WP-W.2: Permissive VRF in devnet (no strict verification)
+        config.vrf.strict_vrf = false;
         config
     }
 
