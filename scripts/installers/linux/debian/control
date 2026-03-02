@@ -1,0 +1,14 @@
+Package: citrate-node
+Version: 0.1.0
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: libssl3, libc6 (>= 2.31)
+Suggests: libwebkit2gtk-4.1-0
+Maintainer: Citrate AI <engineering@citrate.ai>
+Description: Citrate AI-native Layer-1 blockchain node
+ Citrate is an AI-native Layer-1 BlockDAG blockchain using GhostDAG
+ consensus, paired with an EVM-compatible execution environment and
+ a standardized Model Context Protocol (MCP) layer. This package
+ installs the citrate-node daemon and systemd service unit.
+Homepage: https://citrate.ai

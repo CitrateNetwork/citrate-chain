@@ -75,12 +75,11 @@ impl VrfProposerSelector {
         }
     }
 
-    /// Generate VRF proof for proposer eligibility
+    /// Generate VRF proof for proposer eligibility.
     ///
-    /// WP-H.6: The output hash includes the proposer's public key, previous VRF,
-    /// and slot, binding the proof to the proposer's identity AND the chain state.
-    /// Without this, the same proof would validate under any proposer/slot/vrf
-    /// (key substitution / replay attack).
+    /// WP-S.2: Uses ECVRF-P256-SHA256 (RFC 9381) for real verifiable randomness.
+    /// The alpha string binds (proposer pubkey || previous VRF || slot) to prevent
+    /// key substitution and replay attacks (WP-H.6).
     pub fn generate_vrf_proof(
         &self,
         secret_key: &[u8; 32],
@@ -88,41 +87,23 @@ impl VrfProposerSelector {
         previous_vrf: &Hash,
         slot: u64,
     ) -> Result<VrfProof, VrfError> {
-        // Create input for VRF — includes proposer identity to prevent key substitution
-        let mut hasher = Sha3_256::new();
-        hasher.update(proposer_pubkey.as_bytes()); // H.6: bind to proposer
-        hasher.update(previous_vrf.as_bytes());
-        hasher.update(slot.to_le_bytes());
-        let input = hasher.finalize();
+        // Build alpha string binding (proposer, previous_vrf, slot)
+        let alpha = Self::build_alpha(proposer_pubkey, previous_vrf, slot);
 
-        // Generate VRF proof (simplified — in production use proper VRF like ECVRF)
-        let mut proof_hasher = Sha3_256::new();
-        proof_hasher.update(secret_key);
-        proof_hasher.update(&input);
-        let proof_bytes = proof_hasher.finalize();
-
-        // Generate VRF output — includes input so verifier can check binding
-        let mut output_hasher = Sha3_256::new();
-        output_hasher.update(&proof_bytes);
-        output_hasher.update(&input); // H.6: bind output to (proposer, slot, prev_vrf)
-        let output_bytes = output_hasher.finalize();
+        // WP-S.2: Use ECVRF-P256-SHA256
+        let (ecvrf_proof, beta) = crate::ecvrf::prove(secret_key, &alpha)
+            .map_err(|e| VrfError::CryptoError(format!("ECVRF prove: {}", e)))?;
 
         Ok(VrfProof {
-            proof: proof_bytes.to_vec(),
-            output: Hash::from_bytes(&output_bytes),
+            proof: ecvrf_proof.to_bytes(), // 81 bytes
+            output: Hash::from_bytes(&beta),
         })
     }
 
     /// Verify VRF proof is bound to the claimed proposer.
     ///
-    /// WP-H.6: The old implementation ignored the `pubkey` parameter entirely
-    /// (it was `_pubkey`), meaning ANY proposer key validated ANY proof. Now
-    /// the output hash includes (proof || input) where input = SHA3(pubkey ||
-    /// prev_vrf || slot). Changing any of these parameters causes the output
-    /// check to fail. This prevents:
-    ///   - Key substitution: proof valid under proposer A fails under proposer B
-    ///   - Slot replay: proof from slot N fails at slot M
-    ///   - Chain replay: proof from chain state X fails at chain state Y
+    /// WP-S.2: Supports both ECVRF (81 bytes) and legacy SHA3 (32 bytes) proofs.
+    /// During chain sync, old blocks with SHA3 proofs are still accepted.
     pub fn verify_vrf_proof(
         &self,
         pubkey: &PublicKey,
@@ -130,14 +111,59 @@ impl VrfProposerSelector {
         previous_vrf: &Hash,
         slot: u64,
     ) -> Result<bool, VrfError> {
-        // Verify proof matches expected format
-        if proof.proof.len() != 32 {
-            return Ok(false);
+        if proof.proof.len() == 114 {
+            // WP-S.2: ECVRF-P256-SHA256 proof (pk_p256=33 + Gamma=33 + c=16 + s=32)
+            self.verify_ecvrf_proof(pubkey, proof, previous_vrf, slot)
+        } else if proof.proof.len() == 32 {
+            // Legacy SHA3 proof — backward compatibility during sync
+            self.verify_legacy_proof(pubkey, proof, previous_vrf, slot)
+        } else {
+            Ok(false)
         }
+    }
 
+    /// Build the alpha string that binds (proposer, previous_vrf, slot).
+    fn build_alpha(proposer_pubkey: &PublicKey, previous_vrf: &Hash, slot: u64) -> Vec<u8> {
+        let mut alpha = Vec::with_capacity(32 + 32 + 8);
+        alpha.extend_from_slice(proposer_pubkey.as_bytes());
+        alpha.extend_from_slice(previous_vrf.as_bytes());
+        alpha.extend_from_slice(&slot.to_le_bytes());
+        alpha
+    }
+
+    /// WP-S.2: Verify an ECVRF-P256-SHA256 proof.
+    /// The P-256 public key is embedded in the proof bytes (self-contained verification).
+    /// The alpha string binds the proof to the proposer's ed25519 identity, preventing
+    /// an attacker from reusing another validator's ECVRF proof.
+    fn verify_ecvrf_proof(
+        &self,
+        pubkey: &PublicKey,
+        proof: &VrfProof,
+        previous_vrf: &Hash,
+        slot: u64,
+    ) -> Result<bool, VrfError> {
+        let ecvrf_proof = crate::ecvrf::EcvrfProof::from_bytes(&proof.proof)
+            .map_err(|e| VrfError::CryptoError(format!("ECVRF decode: {}", e)))?;
+
+        let alpha = Self::build_alpha(pubkey, previous_vrf, slot);
+
+        match crate::ecvrf::verify(&alpha, &ecvrf_proof) {
+            Ok(beta) => Ok(proof.output == Hash::from_bytes(&beta)),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Legacy SHA3-based proof verification (backward compatibility).
+    fn verify_legacy_proof(
+        &self,
+        pubkey: &PublicKey,
+        proof: &VrfProof,
+        previous_vrf: &Hash,
+        slot: u64,
+    ) -> Result<bool, VrfError> {
         // Reconstruct expected input with proposer identity bound
         let mut hasher = Sha3_256::new();
-        hasher.update(pubkey.as_bytes()); // H.6: bind to proposer
+        hasher.update(pubkey.as_bytes());
         hasher.update(previous_vrf.as_bytes());
         hasher.update(slot.to_le_bytes());
         let input = hasher.finalize();
@@ -145,7 +171,7 @@ impl VrfProposerSelector {
         // Verify output matches SHA3(proof || input)
         let mut output_hasher = Sha3_256::new();
         output_hasher.update(&proof.proof);
-        output_hasher.update(&input); // H.6: verifier checks same binding
+        output_hasher.update(&input);
         let expected_output = Hash::from_bytes(&output_hasher.finalize());
 
         Ok(proof.output == expected_output)
@@ -368,8 +394,15 @@ mod tests {
             .generate_vrf_proof(&secret_key, &proposer, &previous_vrf, slot)
             .unwrap();
 
-        assert_eq!(proof.proof.len(), 32);
+        // WP-S.2: ECVRF proofs are 114 bytes (pk_p256=33 + Gamma=33 + c=16 + s=32)
+        assert_eq!(proof.proof.len(), 114);
         assert_ne!(proof.output, Hash::default());
+
+        // Verify the proof roundtrips
+        let verified = selector
+            .verify_vrf_proof(&proposer, &proof, &previous_vrf, slot)
+            .unwrap();
+        assert!(verified, "ECVRF proof should verify against the proposer");
     }
 
     #[tokio::test]

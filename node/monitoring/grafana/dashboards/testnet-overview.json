@@ -1,0 +1,60 @@
+{
+  "dashboard": {
+    "title": "Citrate Testnet Overview",
+    "uid": "citrate-testnet-overview",
+    "timezone": "utc",
+    "refresh": "5s",
+    "tags": ["citrate", "testnet"],
+    "panels": [
+      {
+        "title": "Block Height (all nodes)",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+        "targets": [{ "expr": "max(citrate_block_height{network='testnet'})", "legendFormat": "Max Height" }]
+      },
+      {
+        "title": "Total Peers (network-wide)",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+        "targets": [{ "expr": "sum(citrate_peer_count{network='testnet'})", "legendFormat": "Total Peers" }]
+      },
+      {
+        "title": "Finalized Height",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+        "targets": [{ "expr": "max(citrate_finalized_height{network='testnet'})", "legendFormat": "Finalized" }]
+      },
+      {
+        "title": "Checkpoint Height",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+        "targets": [{ "expr": "max(citrate_checkpoint_height{network='testnet'})", "legendFormat": "Checkpoint" }]
+      },
+      {
+        "title": "Block Height Per Node",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+        "targets": [{ "expr": "citrate_block_height{network='testnet'}", "legendFormat": "{{ instance }}" }]
+      },
+      {
+        "title": "Peer Count Per Node",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+        "targets": [{ "expr": "citrate_peer_count{network='testnet'}", "legendFormat": "{{ instance }}" }]
+      },
+      {
+        "title": "Total Mempool Size",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+        "targets": [{ "expr": "citrate_mempool_size{network='testnet'}", "legendFormat": "{{ instance }}" }]
+      },
+      {
+        "title": "Node Uptime",
+        "type": "stat",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+        "targets": [{ "expr": "citrate_node_uptime_seconds{network='testnet'}", "legendFormat": "{{ instance }}" }],
+        "fieldConfig": { "defaults": { "unit": "s" } }
+      }
+    ]
+  }
+}

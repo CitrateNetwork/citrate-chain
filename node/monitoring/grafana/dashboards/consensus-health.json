@@ -1,0 +1,57 @@
+{
+  "dashboard": {
+    "title": "Citrate Consensus Health",
+    "uid": "citrate-consensus-health",
+    "timezone": "utc",
+    "refresh": "5s",
+    "tags": ["citrate", "consensus"],
+    "panels": [
+      {
+        "title": "DAG Tips Count",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+        "targets": [{ "expr": "citrate_dag_tips_count", "legendFormat": "{{ instance }}" }],
+        "fieldConfig": { "defaults": { "thresholds": { "steps": [
+          { "color": "green", "value": null },
+          { "color": "yellow", "value": 10 },
+          { "color": "red", "value": 20 }
+        ]}}}
+      },
+      {
+        "title": "Block Production Rate (blocks/min)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+        "targets": [{ "expr": "rate(citrate_block_height[1m]) * 60", "legendFormat": "{{ instance }}" }]
+      },
+      {
+        "title": "Finality Lag (blocks)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+        "targets": [{ "expr": "citrate_block_height - citrate_finalized_height", "legendFormat": "{{ instance }}" }],
+        "fieldConfig": { "defaults": { "thresholds": { "steps": [
+          { "color": "green", "value": null },
+          { "color": "yellow", "value": 100 },
+          { "color": "red", "value": 200 }
+        ]}}}
+      },
+      {
+        "title": "Checkpoint Frequency (checkpoints/5m)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+        "targets": [{ "expr": "increase(citrate_checkpoint_height[5m])", "legendFormat": "{{ instance }}" }]
+      },
+      {
+        "title": "Blue Score (max across nodes)",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 8, "x": 0, "y": 16 },
+        "targets": [{ "expr": "max(citrate_blue_score)", "legendFormat": "Blue Score" }]
+      },
+      {
+        "title": "VRF Proof Generation Rate",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 16, "x": 8, "y": 16 },
+        "targets": [{ "expr": "rate(citrate_vrf_proofs_generated_total[1m])", "legendFormat": "{{ instance }}" }]
+      }
+    ]
+  }
+}

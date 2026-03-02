@@ -1,0 +1,40 @@
+# Citrate v3 Testnet Validator Configuration
+# For external validators joining via Tailscale
+#
+# Setup:
+#   1. Install Tailscale and join the testnet tailnet
+#   2. Replace BOOTSTRAP_TAILSCALE_IP below with the bootstrap operator's Tailscale IP:
+#      sed -i '' 's/BOOTSTRAP_TAILSCALE_IP/100.x.y.z/g' testnet-validator.toml
+#   3. Set your coinbase address (or generate one with: ./citrate keygen)
+#   4. Start: ./citrate --config testnet-validator.toml --mine --max-peers 50
+
+[chain]
+chain_id = 42069
+genesis_hash = ""
+block_time = 1
+ghostdag_k = 18
+
+[network]
+listen_addr = "0.0.0.0:30303"
+bootstrap_nodes = [
+    "BOOTSTRAP_TAILSCALE_IP:30303",
+    "BOOTSTRAP_TAILSCALE_IP:30304",
+    "BOOTSTRAP_TAILSCALE_IP:30305",
+]
+max_peers = 50
+
+[rpc]
+enabled = true
+listen_addr = "127.0.0.1:8545"
+ws_addr = "127.0.0.1:8546"
+
+[storage]
+data_dir = ".citrate-testnet-validator"
+pruning = false
+keep_blocks = 100000
+
+[mining]
+enabled = true
+coinbase = "YOUR_COINBASE_ADDRESS_64_HEX_CHARS_HERE_000000000000000000000000"
+target_block_time = 1
+min_gas_price = 1000000000

@@ -8,6 +8,9 @@ pub mod dynamic_pricing;
 pub mod enhanced_rewards;
 pub mod revenue_sharing;
 pub mod unified_economics;
+pub mod institutional;
+pub mod slashing;
+pub mod estimator;
 
 pub use genesis::{GenesisAccount, GenesisConfig};
 pub use rewards::{BlockReward, RewardCalculator, RewardConfig};
@@ -31,6 +34,17 @@ pub use revenue_sharing::{
 pub use unified_economics::{
     UnifiedEconomicsConfig, UnifiedEconomicsManager, VotingPower, EconomicState,
     BlockEconomicUpdate,
+};
+pub use institutional::{
+    InstitutionalRewardType, InstitutionalRewardConfig, InstitutionalOperatorProfile,
+    InstitutionalRewardBreakdown, InstitutionalRewardCalculator,
+};
+pub use slashing::{
+    SlashingOffense, InstitutionalSlashingConfig, SlashingRecord,
+    OperatorSlashingState, InstitutionalSlashingManager,
+};
+pub use estimator::{
+    EstimationParams, MonthlyProjection, RewardEstimation, InstitutionalRewardEstimator,
 };
 
 use primitive_types::U256;

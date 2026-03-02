@@ -1,0 +1,64 @@
+# Citrate v3 Testnet Bootstrap Node Configuration
+# WP-S.5: Bootstrap nodes serve as seed peers + relay nodes for NAT traversal
+#
+# Deploy one copy per bootstrap VM with only the [network] listen_addr
+# and [mining] coinbase changed to match the VM.
+
+[chain]
+chain_id = 42069
+genesis_hash = ""
+block_time = 0.5          # Whitepaper canonical: 500ms
+ghostdag_k = 18
+
+[network]
+listen_addr = "0.0.0.0:30303"
+# Bootstrap nodes peer with each other (fill in after keygen on each VM)
+bootstrap_nodes = [
+    # "noise_<pubkey_hex>@boot1.testnet.citrate.network:30303",
+    # "noise_<pubkey_hex>@boot2.testnet.citrate.network:30303",
+    # "noise_<pubkey_hex>@boot3.testnet.citrate.network:30303",
+]
+max_peers = 500            # Higher limit — bootstrap nodes accept many connections
+enable_relay = true        # WP-S.4: Act as relay for NAT-bound peers
+
+[rpc]
+enabled = true
+listen_addr = "127.0.0.1:8545"   # Bind to loopback only; expose via nginx/ngrok
+ws_addr = "127.0.0.1:8546"
+
+[storage]
+data_dir = "/var/lib/citrate-testnet"
+pruning = false
+keep_blocks = 200000       # Keep more history on bootstrap nodes
+
+[mining]
+# Bootstrap nodes do NOT produce blocks — they serve as seed + relay
+enabled = false
+coinbase = "0000000000000000000000000000000000000000000000000000000000000000"
+target_block_time = 0.5
+min_gas_price = 1000000000
+
+# WP-S.2: VRF configuration
+[vrf]
+strict_mode = false        # permissive for testnet
+
+# WP-S.3: BFT checkpoint configuration
+[checkpoint]
+interval = 50              # checkpoint every 50 blocks (~25s at 0.5s block time)
+committee_size = 100
+quorum_threshold = 67      # 2/3 + 1
+
+# WP-S.4: NAT traversal
+[nat]
+stun_servers = [
+    "stun.l.google.com:19302",
+    "stun1.l.google.com:19302",
+    "stun2.l.google.com:19302",
+]
+relay_max_sessions = 2000  # Higher capacity for bootstrap relays
+relay_session_ttl = 600    # 10 minutes
+
+# Metrics (Prometheus scrape target)
+[metrics]
+enabled = true
+listen_addr = "0.0.0.0:9090"

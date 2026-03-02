@@ -251,6 +251,40 @@ pub enum NetworkMessage {
     DagInfo {
         info: Vec<DagBlockInfo>,
     },
+
+    // WP-S.3: BFT checkpoint vote
+    CheckpointVote {
+        height: u64,
+        block_hash: Hash,
+        voter_pubkey: Vec<u8>,
+        signature: Vec<u8>,
+    },
+
+    // WP-S.4: NAT traversal relay messages
+    /// Request a relay node to forward data to another peer.
+    RelayRequest {
+        target_peer_id: String,
+        payload: Vec<u8>,
+    },
+
+    /// Data forwarded through a relay node from another peer.
+    RelayData {
+        source_peer_id: String,
+        payload: Vec<u8>,
+    },
+
+    /// Request a relay node to facilitate a hole punch.
+    HolePunchRequest {
+        target_peer_id: String,
+        /// The requester's external address as seen by the relay.
+        external_addr: String,
+    },
+
+    /// Notification to a peer that another peer wants to hole punch.
+    HolePunchNotify {
+        peer_id: String,
+        external_addr: String,
+    },
 }
 
 /// Peer address information
