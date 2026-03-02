@@ -136,7 +136,7 @@ echo -e "\n${BLUE}[8/8] Creating fresh genesis configuration...${NC}"
 # Create clean testnet config
 cat > testnet-config.toml << 'EOF'
 [chain]
-chain_id = 42069
+chain_id = 40204
 genesis_hash = ""
 block_time = 2
 ghostdag_k = 18
@@ -214,7 +214,7 @@ fi
 
 echo -e "\n${CYAN}Next steps:${NC}"
 echo -e "1. Create a new wallet:"
-echo -e "   ${YELLOW}./target/release/wallet --chain-id 42069 new${NC}"
+echo -e "   ${YELLOW}./target/release/wallet --chain-id 40204 new${NC}"
 echo -e ""
 echo -e "2. Update coinbase in testnet-config.toml with your wallet address"
 echo -e ""

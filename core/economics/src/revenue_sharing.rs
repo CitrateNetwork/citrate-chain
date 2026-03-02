@@ -24,6 +24,9 @@ pub struct RevenueShareConfig {
     /// Staker rewards share (basis points)
     pub staker_share_bps: u16,
 
+    /// x402 facilitator share of payment settlement fees (basis points)
+    pub facilitator_share_bps: u16,
+
     /// Minimum revenue threshold to trigger distribution
     pub min_distribution_threshold: U256,
 
@@ -37,11 +40,12 @@ pub struct RevenueShareConfig {
 impl Default for RevenueShareConfig {
     fn default() -> Self {
         Self {
-            validator_share_bps: 2500,      // 25%
+            validator_share_bps: 2300,      // 23%
             model_creator_share_bps: 3000,  // 30%
             infrastructure_share_bps: 1500, // 15%
-            treasury_share_bps: 1500,       // 15%
+            treasury_share_bps: 1200,       // 12%
             staker_share_bps: 1500,         // 15%
+            facilitator_share_bps: 500,     // 5%
             min_distribution_threshold: U256::from(1000) * U256::from(10).pow(U256::from(18)), // 1000 SALT
             distribution_frequency: 7200,   // ~1 day at 2s blocks
             performance_bonus_bps: 500,     // 5% max bonus
@@ -64,6 +68,8 @@ pub enum RevenuePool {
     MarketplaceFees,
     /// Slashing penalties redistribution
     SlashingRedistribution,
+    /// x402 payment facilitator settlement fees
+    FacilitatorFees,
 }
 
 /// Stakeholder types in revenue sharing
@@ -74,6 +80,8 @@ pub enum StakeholderType {
     Infrastructure,
     Staker,
     Treasury,
+    /// x402 payment facilitator (settlement service operators)
+    Facilitator,
 }
 
 /// Contribution tracking for stakeholders
@@ -356,6 +364,17 @@ impl RevenueShareManager {
                 self.distribute_to_stakeholder_type(StakeholderType::Staker, staker_amount, &mut distributions);
                 self.distribute_to_stakeholder_type(StakeholderType::Treasury, treasury_amount, &mut distributions);
             },
+            RevenuePool::FacilitatorFees => {
+                // x402 settlement fees: facilitator gets configured share, remainder split between
+                // validators (for settlement finality) and treasury
+                let facilitator_amount = total_amount * U256::from(self.config.facilitator_share_bps) / U256::from(10000);
+                let validator_amount = total_amount * U256::from(self.config.validator_share_bps) / U256::from(10000);
+                let treasury_amount = total_amount - facilitator_amount - validator_amount;
+
+                self.distribute_to_stakeholder_type(StakeholderType::Facilitator, facilitator_amount, &mut distributions);
+                self.distribute_to_stakeholder_type(StakeholderType::Validator, validator_amount, &mut distributions);
+                self.distribute_to_stakeholder_type(StakeholderType::Treasury, treasury_amount, &mut distributions);
+            },
         }
 
         Ok(distributions)
@@ -478,6 +497,7 @@ impl RevenueShareManager {
             RevenuePool::ModelTraining,
             RevenuePool::MarketplaceFees,
             RevenuePool::SlashingRedistribution,
+            RevenuePool::FacilitatorFees,
         ] {
             if let Some(distribution) = self.distribute_revenue(pool, current_block)? {
                 distributions.push(distribution);
@@ -494,7 +514,8 @@ impl RevenueShareManager {
                        new_config.model_creator_share_bps as u32 +
                        new_config.infrastructure_share_bps as u32 +
                        new_config.treasury_share_bps as u32 +
-                       new_config.staker_share_bps as u32;
+                       new_config.staker_share_bps as u32 +
+                       new_config.facilitator_share_bps as u32;
 
         if total_bps > 10000 {
             return Err(anyhow::anyhow!("Total revenue shares exceed 100%"));
@@ -553,5 +574,80 @@ mod tests {
 
         let score = manager.calculate_performance_score(&high_performance);
         assert!(score > 0.8); // Should be high score
+    }
+
+    #[test]
+    fn test_facilitator_fee_distribution() {
+        let config = RevenueShareConfig::default();
+        let mut manager = RevenueShareManager::new(config);
+
+        // Register a facilitator, validator, and treasury stakeholder
+        let facilitator_addr = Address([10; 20]);
+        let validator_addr = Address([11; 20]);
+        let treasury_addr = Address([12; 20]);
+
+        manager.register_stakeholder(facilitator_addr, StakeholderType::Facilitator).unwrap();
+        manager.register_stakeholder(validator_addr, StakeholderType::Validator).unwrap();
+        manager.register_stakeholder(treasury_addr, StakeholderType::Treasury).unwrap();
+
+        // Collect facilitator fees
+        let fee_amount = U256::from(2000) * U256::from(10).pow(U256::from(18)); // 2000 SALT
+        manager.collect_revenue(RevenuePool::FacilitatorFees, fee_amount, facilitator_addr).unwrap();
+
+        // Update contributions so they have nonzero scores
+        manager.update_contribution(facilitator_addr, U256::from(100), 50).unwrap();
+        manager.update_contribution(validator_addr, U256::from(200), 100).unwrap();
+        manager.update_contribution(treasury_addr, U256::from(50), 100).unwrap();
+
+        // Distribute
+        let distribution = manager.distribute_revenue(RevenuePool::FacilitatorFees, 7200).unwrap();
+        assert!(distribution.is_some());
+
+        let dist = distribution.unwrap();
+        assert_eq!(dist.total_revenue, fee_amount);
+
+        // Facilitator should receive its share (5% = 500 bps)
+        let facilitator_expected = fee_amount * U256::from(500) / U256::from(10000);
+        assert!(dist.distributions.contains_key(&facilitator_addr));
+        assert_eq!(dist.distributions[&facilitator_addr], facilitator_expected);
+
+        // Validator should receive its share (23% = 2300 bps)
+        let validator_expected = fee_amount * U256::from(2300) / U256::from(10000);
+        assert!(dist.distributions.contains_key(&validator_addr));
+        assert_eq!(dist.distributions[&validator_addr], validator_expected);
+
+        // Treasury gets remainder
+        let treasury_expected = fee_amount - facilitator_expected - validator_expected;
+        assert!(dist.distributions.contains_key(&treasury_addr));
+        assert_eq!(dist.distributions[&treasury_addr], treasury_expected);
+    }
+
+    #[test]
+    fn test_config_validation_with_facilitator() {
+        let mut manager = RevenueShareManager::new(RevenueShareConfig::default());
+
+        // Config that totals exactly 100% should pass
+        let valid_config = RevenueShareConfig {
+            validator_share_bps: 2300,
+            model_creator_share_bps: 3000,
+            infrastructure_share_bps: 1500,
+            treasury_share_bps: 1200,
+            staker_share_bps: 1500,
+            facilitator_share_bps: 500,
+            ..RevenueShareConfig::default()
+        };
+        assert!(manager.update_config(valid_config).is_ok());
+
+        // Config that exceeds 100% should fail
+        let invalid_config = RevenueShareConfig {
+            validator_share_bps: 3000,
+            model_creator_share_bps: 3000,
+            infrastructure_share_bps: 1500,
+            treasury_share_bps: 1500,
+            staker_share_bps: 1500,
+            facilitator_share_bps: 500, // Total = 11000 bps = 110%
+            ..RevenueShareConfig::default()
+        };
+        assert!(manager.update_config(invalid_config).is_err());
     }
 }

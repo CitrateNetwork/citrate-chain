@@ -83,7 +83,7 @@ echo -e "${GREEN}[✓]${NC} Validator configured: $validator_address"
 # Create config with proper validator
 cat > testnet-config.toml << EOF
 [chain]
-chain_id = 42069
+chain_id = 40204
 genesis_hash = ""
 block_time = 2
 ghostdag_k = 18
@@ -122,7 +122,7 @@ sleep 5
 
 # Verify core is running
 if curl -s http://localhost:8545 -X POST -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' | grep -q "0xa455"; then
+    -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' | grep -q "0x9d0c"; then
     echo -e "${GREEN}[✓]${NC} Core node running with rewards to $validator_address"
 else
     echo -e "${RED}[✗]${NC} Core node failed to start"

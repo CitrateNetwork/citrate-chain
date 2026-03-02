@@ -9,7 +9,7 @@
 #   4. Start: ./citrate --config testnet-validator.toml --mine --max-peers 50
 
 [chain]
-chain_id = 42069
+chain_id = 40204
 genesis_hash = ""
 block_time = 1
 ghostdag_k = 18

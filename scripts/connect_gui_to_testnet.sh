@@ -20,7 +20,7 @@ echo -e "${CYAN}╚════════════════════�
 # Step 1: Check if testnet is running
 echo -e "\n${BLUE}[1/4] Checking testnet node...${NC}"
 if ! curl -s http://localhost:8545 -X POST -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' 2>/dev/null | grep -q "0xa455"; then
+    -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' 2>/dev/null | grep -q "0x9d0c"; then
     echo -e "${RED}[✗] Testnet node not running on port 8545${NC}"
     echo -e "${YELLOW}Please start the testnet first:${NC}"
     echo -e "  ./scripts/start_fresh_testnet.sh"
@@ -60,7 +60,7 @@ cat > "$GUI_CONFIG_DIR/testnet-config.json" << EOF
     "blueScoreK": 18
   },
   "mempool": {
-    "chainId": 42069
+    "chainId": 40204
   }
 }
 EOF

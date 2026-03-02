@@ -4,6 +4,7 @@
 // Standard Ethereum precompiles + Citrate AI extensions
 
 pub mod inference;
+pub mod x402;
 
 use anyhow::Result;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
@@ -109,7 +110,14 @@ impl PrecompileExecutor {
         let is_ai = prefix_check && byte17_check && byte18_check && byte19_check;
 
 
-        is_standard || is_ai
+        // Citrate x402 payment precompiles (0x0200 - 0x0209)
+        // Address format: [0, 0, ..., 0, 2, 0, x] where x is 0-9
+        let is_x402 = addr_bytes[..17].iter().all(|&b| b == 0)
+            && addr_bytes[17] == 2
+            && addr_bytes[18] == 0
+            && addr_bytes[19] <= 9;
+
+        is_standard || is_ai || is_x402
     }
 
     /// Execute a precompile
@@ -119,10 +127,15 @@ impl PrecompileExecutor {
         input: &[u8],
         gas_limit: u64,
     ) -> Result<PrecompileResult> {
-        // Check if it's an AI precompile
         let addr_bytes = address.as_bytes();
-        if addr_bytes[..18].iter().all(|&b| b == 0) && addr_bytes[18] == 1 {
-            // AI precompile
+
+        // x402 payment precompiles (byte 17 = 2, byte 18 = 0)
+        if addr_bytes[..17].iter().all(|&b| b == 0) && addr_bytes[17] == 2 && addr_bytes[18] == 0 {
+            return x402::execute(address, input, gas_limit);
+        }
+
+        // AI precompiles (byte 17 = 1, byte 18 = 0)
+        if addr_bytes[..17].iter().all(|&b| b == 0) && addr_bytes[17] == 1 && addr_bytes[18] == 0 {
             if let Some(ref mut inference) = self.inference {
                 let output = inference.execute(address, input, gas_limit)?;
                 return Ok(PrecompileResult {
@@ -194,7 +207,7 @@ impl PrecompileExecutor {
         };
 
         // Attempt to recover the public key
-        let recovered_address = match Self::recover_address(hash, r, s, recovery_id) {
+        let recovered_address = match recover_address(hash, r, s, recovery_id) {
             Some(addr) => addr,
             None => {
                 return Ok(PrecompileResult {
@@ -214,41 +227,6 @@ impl PrecompileExecutor {
             gas_used: GAS_COST,
             success: true,
         })
-    }
-
-    /// Recover Ethereum address from ECDSA signature components
-    fn recover_address(hash: &[u8], r: &[u8], s: &[u8], recovery_id: u8) -> Option<[u8; 20]> {
-        // Create signature from r and s components
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes[..32].copy_from_slice(r);
-        sig_bytes[32..].copy_from_slice(s);
-
-        let signature = Signature::from_bytes((&sig_bytes).into()).ok()?;
-        let recid = RecoveryId::from_byte(recovery_id)?;
-
-        // Recover the verifying (public) key
-        let recovered_key =
-            VerifyingKey::recover_from_prehash(hash, &signature, recid).ok()?;
-
-        // Get the uncompressed public key bytes (65 bytes: 0x04 prefix + 64 bytes)
-        let pubkey_bytes = recovered_key.to_encoded_point(false);
-        let pubkey_uncompressed = pubkey_bytes.as_bytes();
-
-        // Skip the 0x04 prefix and hash the 64 bytes of the public key
-        if pubkey_uncompressed.len() != 65 {
-            return None;
-        }
-
-        // Keccak256 hash of the public key (without the 0x04 prefix)
-        let mut hasher = Keccak256::new();
-        hasher.update(&pubkey_uncompressed[1..65]);
-        let hash_result = hasher.finalize();
-
-        // Take last 20 bytes as the address
-        let mut address = [0u8; 20];
-        address.copy_from_slice(&hash_result[12..32]);
-
-        Some(address)
     }
 
     fn sha256(&self, input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
@@ -846,6 +824,42 @@ impl PrecompileExecutor {
     }
 }
 
+/// Recover Ethereum address from ECDSA signature components.
+/// Shared by ECRECOVER precompile and x402 payment precompiles.
+pub fn recover_address(hash: &[u8], r: &[u8], s: &[u8], recovery_id: u8) -> Option<[u8; 20]> {
+    // Create signature from r and s components
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes[..32].copy_from_slice(r);
+    sig_bytes[32..].copy_from_slice(s);
+
+    let signature = Signature::from_bytes((&sig_bytes).into()).ok()?;
+    let recid = RecoveryId::from_byte(recovery_id)?;
+
+    // Recover the verifying (public) key
+    let recovered_key =
+        VerifyingKey::recover_from_prehash(hash, &signature, recid).ok()?;
+
+    // Get the uncompressed public key bytes (65 bytes: 0x04 prefix + 64 bytes)
+    let pubkey_bytes = recovered_key.to_encoded_point(false);
+    let pubkey_uncompressed = pubkey_bytes.as_bytes();
+
+    // Skip the 0x04 prefix and hash the 64 bytes of the public key
+    if pubkey_uncompressed.len() != 65 {
+        return None;
+    }
+
+    // Keccak256 hash of the public key (without the 0x04 prefix)
+    let mut hasher = Keccak256::new();
+    hasher.update(&pubkey_uncompressed[1..65]);
+    let hash_result = hasher.finalize();
+
+    // Take last 20 bytes as the address
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&hash_result[12..32]);
+
+    Some(address)
+}
+
 /// Result from precompile execution
 pub struct PrecompileResult {
     pub output: Vec<u8>,
@@ -1355,5 +1369,50 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.gas_used, 0);
         assert_eq!(result.output.len(), 64);
+    }
+
+    // ==================== x402 Routing Integration Tests ====================
+
+    #[test]
+    fn test_is_precompile_x402_addresses() {
+        let executor = PrecompileExecutor::new();
+
+        // x402 addresses should be recognized
+        assert!(executor.is_precompile(&Address(x402::addresses::EIP712_VERIFY)));
+        assert!(executor.is_precompile(&Address(x402::addresses::TRANSFER_AUTH_VERIFY)));
+        assert!(executor.is_precompile(&Address(x402::addresses::BATCH_PAYMENT_VERIFY)));
+
+        // Future x402 slots (0x0203-0x0209) should also be recognized
+        let future_x402 = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 2, 0, 5]);
+        assert!(executor.is_precompile(&future_x402));
+
+        // 0x020A should NOT be recognized (out of range)
+        let out_of_range = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 2, 0, 10]);
+        assert!(!executor.is_precompile(&out_of_range));
+    }
+
+    #[test]
+    fn test_x402_routing_via_executor() {
+        // Verify that PrecompileExecutor::execute() correctly routes to x402 precompiles
+        let mut executor = PrecompileExecutor::new();
+
+        // EIP-712 verify via executor routing (short input → returns zero address)
+        let eip712_addr = Address(x402::addresses::EIP712_VERIFY);
+        let input = vec![0u8; 64]; // Short input
+        let result = executor.execute(&eip712_addr, &input, 10_000).unwrap();
+        assert!(result.success);
+        assert_eq!(result.gas_used, x402::gas_costs::EIP712_VERIFY);
+        assert_eq!(result.output, vec![0u8; 32]);
+
+        // TransferWithAuthorization via executor routing (short input → returns zero)
+        let transfer_addr = Address(x402::addresses::TRANSFER_AUTH_VERIFY);
+        let result = executor.execute(&transfer_addr, &input, 10_000).unwrap();
+        assert!(result.success);
+        assert_eq!(result.gas_used, x402::gas_costs::TRANSFER_AUTH_VERIFY);
+
+        // Unknown x402 address should error
+        let unknown_x402 = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 2, 0, 9]);
+        let result = executor.execute(&unknown_x402, &input, 10_000);
+        assert!(result.is_err());
     }
 }

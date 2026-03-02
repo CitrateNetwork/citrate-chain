@@ -1,9 +1,9 @@
 # Citrate Testnet Beta Configuration
 # Closed beta network with P2P peer whitelist + RPC API key gating.
-# Chain ID: 42069
+# Chain ID: 40204
 
 [chain]
-chain_id = 42069
+chain_id = 40204
 genesis_hash = ""
 block_time = 2
 ghostdag_k = 18

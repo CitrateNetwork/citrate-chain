@@ -3,7 +3,7 @@
 # P2P: 30303 | RPC: 8545 | WS: 8546 | Metrics: 9090
 
 [chain]
-chain_id = 42069
+chain_id = 40204
 genesis_hash = ""
 block_time = 1
 ghostdag_k = 18

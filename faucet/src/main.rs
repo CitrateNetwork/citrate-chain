@@ -61,7 +61,7 @@ async fn main() {
     let chain_id = std::env::var("CITRATE_CHAIN_ID")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(42069);
+        .unwrap_or(40204);
 
     // Faucet private key from env or default test key
     let faucet_key_hex = std::env::var("FAUCET_PRIVATE_KEY")
