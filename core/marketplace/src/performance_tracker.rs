@@ -700,3 +700,93 @@ pub struct MarketStats {
     pub weaknesses: Vec<String>,
     pub growth_potential_score: f32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+
+    #[test]
+    fn test_performance_config_defaults() {
+        let config = PerformanceConfig::default();
+        assert_eq!(config.metrics_retention_days, 30);
+        assert_eq!(config.sampling_interval_seconds, 60);
+        assert_eq!(config.benchmark_threshold_ms, 1000);
+        assert!((config.error_rate_threshold - 0.05).abs() < f32::EPSILON);
+        assert!(config.enable_real_time_monitoring);
+    }
+
+    #[test]
+    fn test_alert_thresholds_defaults() {
+        let config = PerformanceConfig::default();
+        let thresholds = config.alert_thresholds;
+        assert_eq!(thresholds.high_latency_ms, 5000);
+        assert!((thresholds.high_error_rate - 0.1).abs() < f32::EPSILON);
+        assert!((thresholds.low_uptime_percentage - 95.0).abs() < f32::EPSILON);
+        assert!((thresholds.performance_degradation_threshold - 0.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_performance_tracker_new() {
+        let config = PerformanceConfig::default();
+        let tracker = PerformanceTracker::new(config);
+        assert!(tracker.real_time_data.is_empty());
+        assert!(tracker.performance_windows.is_empty());
+        assert!(tracker.benchmark_results.is_empty());
+        assert!(tracker.active_alerts.is_empty());
+        assert!(tracker.model_health.is_empty());
+    }
+
+    #[test]
+    fn test_alert_severity_ordering() {
+        // Verify discriminant ordering: Info=0, Warning=1, Critical=2
+        assert!((AlertSeverity::Info as u8) < (AlertSeverity::Warning as u8));
+        assert!((AlertSeverity::Warning as u8) < (AlertSeverity::Critical as u8));
+    }
+
+    #[test]
+    fn test_health_level_variants() {
+        let levels = [
+            HealthLevel::Excellent,
+            HealthLevel::Good,
+            HealthLevel::Fair,
+            HealthLevel::Poor,
+            HealthLevel::Critical,
+        ];
+        // All five variants are distinct
+        for i in 0..levels.len() {
+            for j in (i + 1)..levels.len() {
+                assert_ne!(levels[i], levels[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_performance_trend_variants() {
+        let trends = [
+            PerformanceTrend::Improving,
+            PerformanceTrend::Stable,
+            PerformanceTrend::Degrading,
+        ];
+        // All three variants are distinct
+        for i in 0..trends.len() {
+            for j in (i + 1)..trends.len() {
+                assert_ne!(trends[i], trends[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_performance_config_serialization() {
+        let config = PerformanceConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: PerformanceConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.metrics_retention_days, config.metrics_retention_days);
+        assert_eq!(deserialized.sampling_interval_seconds, config.sampling_interval_seconds);
+        assert_eq!(deserialized.benchmark_threshold_ms, config.benchmark_threshold_ms);
+        assert!((deserialized.error_rate_threshold - config.error_rate_threshold).abs() < f32::EPSILON);
+        assert_eq!(deserialized.enable_real_time_monitoring, config.enable_real_time_monitoring);
+        assert_eq!(deserialized.alert_thresholds.high_latency_ms, config.alert_thresholds.high_latency_ms);
+        assert!((deserialized.alert_thresholds.high_error_rate - config.alert_thresholds.high_error_rate).abs() < f32::EPSILON);
+    }
+}

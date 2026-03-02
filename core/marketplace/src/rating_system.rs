@@ -635,3 +635,120 @@ pub enum ReviewSortOrder {
     HighestRating,
     LowestRating,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+
+    #[test]
+    fn test_rating_config_defaults() {
+        let config = RatingConfig::default();
+        assert!((config.min_rating - 1.0).abs() < f32::EPSILON);
+        assert!((config.max_rating - 5.0).abs() < f32::EPSILON);
+        assert_eq!(config.required_reviews_for_stability, 10);
+        assert_eq!(config.review_weight_decay_days, 365);
+        assert!(config.enable_sentiment_analysis);
+        assert!((config.spam_detection_threshold - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_rating_config_bounds() {
+        let config = RatingConfig::default();
+        assert!(config.min_rating < config.max_rating);
+    }
+
+    #[test]
+    fn test_rating_system_new() {
+        let config = RatingConfig::default();
+        let system = RatingSystem::new(config);
+        assert!(system.model_ratings.is_empty());
+        assert!(system.enhanced_reviews.is_empty());
+        assert!(system.performance_metrics.is_empty());
+        assert!(system.model_stats.is_empty());
+        assert!(system.reviewer_profiles.is_empty());
+    }
+
+    #[test]
+    fn test_review_quality_fields() {
+        let quality = ReviewQuality {
+            helpfulness_score: 0.0,
+            detail_score: 0.0,
+            verified_purchase: false,
+            reviewer_credibility: 0.0,
+            spam_probability: 0.0,
+        };
+        assert!((quality.spam_probability - 0.0).abs() < f32::EPSILON);
+        assert!((quality.helpfulness_score - 0.0).abs() < f32::EPSILON);
+        assert!((quality.detail_score - 0.0).abs() < f32::EPSILON);
+        assert!(!quality.verified_purchase);
+        assert!((quality.reviewer_credibility - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_sentiment_score_range() {
+        let negative = SentimentAnalysis {
+            overall_sentiment: -1.0,
+            confidence: 0.95,
+            emotion_scores: HashMap::new(),
+            key_phrases: vec![],
+        };
+        assert!(negative.overall_sentiment >= -1.0 && negative.overall_sentiment <= 1.0);
+
+        let positive = SentimentAnalysis {
+            overall_sentiment: 1.0,
+            confidence: 0.99,
+            emotion_scores: HashMap::new(),
+            key_phrases: vec!["great".to_string()],
+        };
+        assert!(positive.overall_sentiment >= -1.0 && positive.overall_sentiment <= 1.0);
+
+        let neutral = SentimentAnalysis {
+            overall_sentiment: 0.0,
+            confidence: 0.5,
+            emotion_scores: HashMap::new(),
+            key_phrases: vec![],
+        };
+        assert!(neutral.overall_sentiment >= -1.0 && neutral.overall_sentiment <= 1.0);
+    }
+
+    #[test]
+    fn test_rating_system_empty_model_rating() {
+        let system = RatingSystem::new(RatingConfig::default());
+        let fake_model_id: ModelId = [0u8; 32];
+        // model_ratings is a DashMap; direct lookup without async
+        let rating = system.model_ratings.get(&fake_model_id);
+        assert!(rating.is_none());
+    }
+
+    #[test]
+    fn test_review_quality_serialization() {
+        let quality = ReviewQuality {
+            helpfulness_score: 0.85,
+            detail_score: 0.7,
+            verified_purchase: true,
+            reviewer_credibility: 0.9,
+            spam_probability: 0.05,
+        };
+        let json = serde_json::to_string(&quality).unwrap();
+        let deserialized: ReviewQuality = serde_json::from_str(&json).unwrap();
+        assert!((deserialized.helpfulness_score - 0.85).abs() < f32::EPSILON);
+        assert!((deserialized.detail_score - 0.7).abs() < f32::EPSILON);
+        assert!(deserialized.verified_purchase);
+        assert!((deserialized.reviewer_credibility - 0.9).abs() < f32::EPSILON);
+        assert!((deserialized.spam_probability - 0.05).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_rating_config_serialization() {
+        let config = RatingConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: RatingConfig = serde_json::from_str(&json).unwrap();
+        assert!((deserialized.min_rating - config.min_rating).abs() < f32::EPSILON);
+        assert!((deserialized.max_rating - config.max_rating).abs() < f32::EPSILON);
+        assert_eq!(deserialized.required_reviews_for_stability, config.required_reviews_for_stability);
+        assert_eq!(deserialized.review_weight_decay_days, config.review_weight_decay_days);
+        assert_eq!(deserialized.enable_sentiment_analysis, config.enable_sentiment_analysis);
+        assert!((deserialized.spam_detection_threshold - config.spam_detection_threshold).abs() < f32::EPSILON);
+    }
+}

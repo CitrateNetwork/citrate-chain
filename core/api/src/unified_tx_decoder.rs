@@ -1,4 +1,9 @@
 // citrate/core/api/src/unified_tx_decoder.rs
+//
+// DEPRECATED: This module is not used in the production RPC codepath.
+// The primary decoder is `eth_tx_decoder.rs`. This file is retained for
+// backward compatibility until post-audit cleanup.
+// See core/api/DECODER_ARCHITECTURE.md for the full decoder stack map.
 
 use crate::enhanced_tx_decoder::{EnhancedTransactionDecoder, DecodedTransaction, DecoderConfig, TransactionDecoderError};
 use citrate_consensus::types::Transaction;

@@ -337,9 +337,11 @@ mod tests {
 
         let peers = discovery.get_peers_for_exchange().await;
 
-        // Should only return non-connected peers, sorted by score
+        // Should only return non-connected peers (order is non-deterministic since
+        // scores are zeroed in get_peers_for_exchange to prevent leaking internal state)
         assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].id, "peer2"); // Highest score
-        assert_eq!(peers[1].id, "peer3");
+        let mut peer_ids: Vec<&str> = peers.iter().map(|p| p.id.as_str()).collect();
+        peer_ids.sort();
+        assert_eq!(peer_ids, vec!["peer2", "peer3"]);
     }
 }

@@ -170,7 +170,9 @@ impl CommitteeSelector {
                 let hash = hasher.finalize();
 
                 // Score = hash_value weighted by stake
-                let hash_val = u64::from_be_bytes(hash[0..8].try_into().unwrap());
+                let hash_val = u64::from_be_bytes(
+                    hash[0..8].try_into().expect("SHA-256 output is 32 bytes; first 8 always valid"),
+                );
                 // Weight by sqrt(stake) to balance fairness with stake
                 let weight = (*stake as f64).sqrt() as u64;
                 let score = hash_val.wrapping_mul(weight.max(1));
@@ -249,17 +251,27 @@ impl CheckpointManager {
         kv: Arc<dyn KvStore>,
     ) -> Self {
         let mut mgr = Self::new(config, dag_store);
-        // Load finalized checkpoints from storage
+        // Load finalized checkpoints from storage.
+        // These try_write() calls are made during construction before the CheckpointManager
+        // is shared, so the locks should never be contended. We log and skip on failure
+        // rather than panicking.
         if let Ok(entries) = kv.kv_iter_cf(cf::DAG_METADATA) {
             for (key, value) in entries {
                 if key.starts_with(b"checkpoint:") {
                     if let Ok(cp) = bincode::deserialize::<Checkpoint>(&value) {
                         if cp.status == CheckpointStatus::Finalized {
-                            let mut latest = mgr.latest_finalized_height.try_write().unwrap();
-                            if cp.height > *latest {
-                                *latest = cp.height;
+                            if let Ok(mut latest) = mgr.latest_finalized_height.try_write() {
+                                if cp.height > *latest {
+                                    *latest = cp.height;
+                                }
+                            } else {
+                                warn!("Failed to acquire write lock on latest_finalized_height during checkpoint load");
                             }
-                            mgr.finalized.try_write().unwrap().insert(cp.height, cp);
+                            if let Ok(mut finalized) = mgr.finalized.try_write() {
+                                finalized.insert(cp.height, cp);
+                            } else {
+                                warn!("Failed to acquire write lock on finalized during checkpoint load");
+                            }
                         }
                     }
                 }

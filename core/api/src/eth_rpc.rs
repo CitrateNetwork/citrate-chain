@@ -2192,3 +2192,304 @@ pub fn register_eth_methods(
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ---------------------------------------------------------------
+    // pubkey_hex_to_evm_address tests
+    // ---------------------------------------------------------------
+
+    /// 1. 64-char hex with trailing 24 zeros (embedded EVM address) → first 40 chars
+    #[test]
+    fn test_evm_address_embedded() {
+        // 20 bytes of real address + 12 bytes of zeros = 40 hex chars + 24 '0' chars
+        let input = "f39fd6e51aad88f6f4ce6ab8827279cfffb92266000000000000000000000000";
+        let result = pubkey_hex_to_evm_address(input);
+        assert_eq!(result, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
+    }
+
+    /// 2. 64-char hex without trailing zeros (full pubkey) → first 40 chars
+    #[test]
+    fn test_evm_address_full_pubkey() {
+        let input = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let result = pubkey_hex_to_evm_address(input);
+        assert_eq!(result, "0xabcdef1234567890abcdef1234567890abcdef12");
+    }
+
+    /// 3. Less than 40 chars → returned as-is with "0x" prefix
+    #[test]
+    fn test_evm_address_short_input() {
+        let input = "deadbeef";
+        let result = pubkey_hex_to_evm_address(input);
+        assert_eq!(result, "0xdeadbeef");
+    }
+
+    /// 4. Exactly 40 chars → "0x" + all 40 chars
+    #[test]
+    fn test_evm_address_exact_40() {
+        let input = "f39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+        let result = pubkey_hex_to_evm_address(input);
+        assert_eq!(result, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
+    }
+
+    /// 5. 64 zeros → still returns first 40 chars (all zeros, not empty)
+    #[test]
+    fn test_evm_address_all_zeros() {
+        let input = "0000000000000000000000000000000000000000000000000000000000000000";
+        let result = pubkey_hex_to_evm_address(input);
+        // The first 20 bytes are all zeros, and last 12 bytes are zeros too,
+        // so the trailing-zeros branch triggers → first 40 chars.
+        assert_eq!(result, "0x0000000000000000000000000000000000000000");
+    }
+
+    /// 6. Result always starts with "0x"
+    #[test]
+    fn test_evm_address_prefix_format() {
+        let inputs = vec![
+            "ab",
+            "f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "f39fd6e51aad88f6f4ce6ab8827279cfffb92266000000000000000000000000",
+        ];
+        for input in inputs {
+            let result = pubkey_hex_to_evm_address(input);
+            assert!(
+                result.starts_with("0x"),
+                "Expected '0x' prefix for input '{}', got '{}'",
+                input,
+                result
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // pubkey_hex_opt_to_evm_address tests
+    // ---------------------------------------------------------------
+
+    /// 7. Some(hex) → Some(address)
+    #[test]
+    fn test_opt_some() {
+        let hex = "f39fd6e51aad88f6f4ce6ab8827279cfffb92266000000000000000000000000".to_string();
+        let result = pubkey_hex_opt_to_evm_address(Some(&hex));
+        assert_eq!(
+            result,
+            Some("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string())
+        );
+    }
+
+    /// 8. None → None
+    #[test]
+    fn test_opt_none() {
+        let result = pubkey_hex_opt_to_evm_address(None);
+        assert_eq!(result, None);
+    }
+
+    // ---------------------------------------------------------------
+    // append_eip_fields tests
+    // ---------------------------------------------------------------
+
+    /// Helper: create an empty serde_json::Map
+    fn empty_map() -> serde_json::Map<String, Value> {
+        serde_json::Map::new()
+    }
+
+    /// 9. Type 0: only "type" field added, no accessList or maxFee fields
+    #[test]
+    fn test_eip_type0() {
+        let mut map = empty_map();
+        append_eip_fields(&mut map, 0, None, None, None, &None);
+        assert_eq!(map.get("type"), Some(&json!("0x0")));
+        assert!(map.get("accessList").is_none(), "type 0 should not have accessList");
+        assert!(map.get("maxFeePerGas").is_none(), "type 0 should not have maxFeePerGas");
+        assert!(
+            map.get("maxPriorityFeePerGas").is_none(),
+            "type 0 should not have maxPriorityFeePerGas"
+        );
+    }
+
+    /// 10. Type 1: "type" + "accessList" added, no maxFee fields
+    #[test]
+    fn test_eip_type1() {
+        let mut map = empty_map();
+        append_eip_fields(&mut map, 1, None, Some(100), Some(10), &None);
+        assert_eq!(map.get("type"), Some(&json!("0x1")));
+        // accessList should be present (empty array since access_list is None)
+        assert!(map.get("accessList").is_some(), "type 1 should have accessList");
+        // maxFeePerGas should NOT be present for type 1 even if values were passed
+        assert!(
+            map.get("maxFeePerGas").is_none(),
+            "type 1 should not have maxFeePerGas"
+        );
+        assert!(
+            map.get("maxPriorityFeePerGas").is_none(),
+            "type 1 should not have maxPriorityFeePerGas"
+        );
+    }
+
+    /// 11. Type 2: "type" + "accessList" + "maxFeePerGas" + "maxPriorityFeePerGas"
+    #[test]
+    fn test_eip_type2() {
+        let mut map = empty_map();
+        append_eip_fields(&mut map, 2, None, Some(1000), Some(50), &None);
+        assert_eq!(map.get("type"), Some(&json!("0x2")));
+        assert!(map.get("accessList").is_some(), "type 2 should have accessList");
+        assert_eq!(map.get("maxFeePerGas"), Some(&json!("0x3e8")));
+        assert_eq!(map.get("maxPriorityFeePerGas"), Some(&json!("0x32")));
+    }
+
+    /// 12. chain_id Some(40204) → "chainId": "0x9d0c"
+    #[test]
+    fn test_eip_chain_id() {
+        let mut map = empty_map();
+        append_eip_fields(&mut map, 0, Some(40204), None, None, &None);
+        assert_eq!(map.get("chainId"), Some(&json!("0x9d0c")));
+    }
+
+    /// 13. chain_id None → no "chainId" key in map
+    #[test]
+    fn test_eip_no_chain_id() {
+        let mut map = empty_map();
+        append_eip_fields(&mut map, 0, None, None, None, &None);
+        assert!(map.get("chainId").is_none(), "chainId should not be present when None");
+    }
+
+    /// 14. access list with entries → proper JSON array of {address, storageKeys}
+    #[test]
+    fn test_eip_access_list_serialization() {
+        let mut map = empty_map();
+        let addr = vec![0xde, 0xad, 0xbe, 0xef];
+        let key1 = vec![0x01, 0x02, 0x03];
+        let key2 = vec![0x04, 0x05, 0x06];
+        let access_list = Some(vec![(addr.clone(), vec![key1.clone(), key2.clone()])]);
+        append_eip_fields(&mut map, 1, None, None, None, &access_list);
+
+        let al = map.get("accessList").expect("accessList should be present");
+        let arr = al.as_array().expect("accessList should be an array");
+        assert_eq!(arr.len(), 1);
+
+        let entry = &arr[0];
+        assert_eq!(entry["address"], json!(format!("0x{}", hex::encode(&addr))));
+
+        let storage_keys = entry["storageKeys"].as_array().expect("storageKeys should be array");
+        assert_eq!(storage_keys.len(), 2);
+        assert_eq!(storage_keys[0], json!(format!("0x{}", hex::encode(&key1))));
+        assert_eq!(storage_keys[1], json!(format!("0x{}", hex::encode(&key2))));
+    }
+
+    /// 15. None access list → empty array for type >= 1
+    #[test]
+    fn test_eip_empty_access_list() {
+        let mut map = empty_map();
+        append_eip_fields(&mut map, 1, None, None, None, &None);
+        let al = map.get("accessList").expect("accessList should be present");
+        let arr = al.as_array().expect("accessList should be an array");
+        assert!(arr.is_empty(), "accessList should be empty when input is None");
+    }
+
+    /// 16. Type hex format: type 2 → "0x2", type 1 → "0x1"
+    #[test]
+    fn test_eip_type_hex_format() {
+        let mut map1 = empty_map();
+        append_eip_fields(&mut map1, 1, None, None, None, &None);
+        assert_eq!(map1.get("type"), Some(&json!("0x1")));
+
+        let mut map2 = empty_map();
+        append_eip_fields(&mut map2, 2, None, None, None, &None);
+        assert_eq!(map2.get("type"), Some(&json!("0x2")));
+
+        let mut map0 = empty_map();
+        append_eip_fields(&mut map0, 0, None, None, None, &None);
+        assert_eq!(map0.get("type"), Some(&json!("0x0")));
+    }
+
+    /// 17. Type 1 should NOT have maxFeePerGas even if values are provided
+    #[test]
+    fn test_eip_max_fee_only_for_type2() {
+        let mut map = empty_map();
+        append_eip_fields(&mut map, 1, None, Some(999), Some(111), &None);
+        assert!(
+            map.get("maxFeePerGas").is_none(),
+            "type 1 should never insert maxFeePerGas"
+        );
+        assert!(
+            map.get("maxPriorityFeePerGas").is_none(),
+            "type 1 should never insert maxPriorityFeePerGas"
+        );
+    }
+
+    /// 18. Type 2 with None fees → fee fields not inserted
+    #[test]
+    fn test_eip_type2_missing_fees() {
+        let mut map = empty_map();
+        append_eip_fields(&mut map, 2, None, None, None, &None);
+        assert!(
+            map.get("maxFeePerGas").is_none(),
+            "maxFeePerGas should not be inserted when None"
+        );
+        assert!(
+            map.get("maxPriorityFeePerGas").is_none(),
+            "maxPriorityFeePerGas should not be inserted when None"
+        );
+        // accessList should still be present for type 2
+        assert!(map.get("accessList").is_some());
+    }
+
+    // ---------------------------------------------------------------
+    // hex format / roundtrip tests
+    // ---------------------------------------------------------------
+
+    /// 19. hex::encode + decode identity roundtrip
+    #[test]
+    fn test_hex_roundtrip() {
+        let original: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe];
+        let encoded = hex::encode(&original);
+        let decoded = hex::decode(&encoded).expect("hex::decode should succeed");
+        assert_eq!(original, decoded);
+    }
+
+    /// 20. Output address always has "0x" prefix followed by even-length hex
+    #[test]
+    fn test_address_length_consistency() {
+        let test_cases = vec![
+            // (input, expected_total_len including "0x")
+            // Short input: "0x" + 8 chars = 10
+            ("deadbeef", 10),
+            // 40-char input: "0x" + 40 = 42
+            ("f39fd6e51aad88f6f4ce6ab8827279cfffb92266", 42),
+            // 64-char embedded: "0x" + 40 = 42
+            (
+                "f39fd6e51aad88f6f4ce6ab8827279cfffb92266000000000000000000000000",
+                42,
+            ),
+            // 64-char full pubkey: "0x" + 40 = 42
+            (
+                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                42,
+            ),
+        ];
+        for (input, expected_len) in test_cases {
+            let result = pubkey_hex_to_evm_address(input);
+            assert!(result.starts_with("0x"), "must start with 0x");
+            assert_eq!(
+                result.len(),
+                expected_len,
+                "For input '{}', expected len {} but got {} ('{}')",
+                input,
+                expected_len,
+                result.len(),
+                result
+            );
+            // The hex portion (after "0x") should have even length
+            let hex_part = &result[2..];
+            assert_eq!(
+                hex_part.len() % 2,
+                0,
+                "Hex portion should have even length for input '{}'",
+                input
+            );
+        }
+    }
+}

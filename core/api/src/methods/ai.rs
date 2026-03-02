@@ -921,3 +921,181 @@ impl AiApi {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+
+    #[test]
+    fn test_chat_message_serialization() {
+        let msg = ChatMessage {
+            role: "user".to_string(),
+            content: "Hello, world!".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.role, "user");
+        assert_eq!(deserialized.content, "Hello, world!");
+    }
+
+    #[test]
+    fn test_chat_completion_request_defaults() {
+        let req = ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Hi".to_string(),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stop: None,
+            stream: None,
+        };
+        assert_eq!(req.model, "gpt-4");
+        assert_eq!(req.messages.len(), 1);
+        assert!(req.max_tokens.is_none());
+        assert!(req.temperature.is_none());
+        assert!(req.top_p.is_none());
+        assert!(req.n.is_none());
+        assert!(req.stop.is_none());
+        assert!(req.stream.is_none());
+    }
+
+    #[test]
+    fn test_embeddings_request_serialization() {
+        let req = EmbeddingsRequest {
+            model: "text-embedding-ada-002".to_string(),
+            input: vec!["hello".to_string(), "world".to_string()],
+            encoding_format: Some("float".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: EmbeddingsRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.model, "text-embedding-ada-002");
+        assert_eq!(deserialized.input.len(), 2);
+        assert_eq!(deserialized.input[0], "hello");
+        assert_eq!(deserialized.input[1], "world");
+        assert_eq!(deserialized.encoding_format, Some("float".to_string()));
+    }
+
+    #[test]
+    fn test_token_usage_total() {
+        let usage = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+        };
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(usage.total_tokens, usage.prompt_tokens + usage.completion_tokens);
+    }
+
+    #[test]
+    fn test_deploy_model_request_serialization() {
+        let req = DeployModelRequest {
+            name: "my-model".to_string(),
+            version: "1.0.0".to_string(),
+            description: "A test model".to_string(),
+            framework: "pytorch".to_string(),
+            model_data: vec![1, 2, 3, 4],
+            metadata: ModelMetadata {
+                name: "my-model".to_string(),
+                version: "1.0.0".to_string(),
+                description: "A test model".to_string(),
+                framework: "pytorch".to_string(),
+                input_shape: vec![1, 3, 224, 224],
+                output_shape: vec![1, 1000],
+                size_bytes: 4,
+                created_at: 1700000000,
+            },
+            access_policy: AccessPolicy::Public,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: DeployModelRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "my-model");
+        assert_eq!(deserialized.version, "1.0.0");
+        assert_eq!(deserialized.description, "A test model");
+        assert_eq!(deserialized.framework, "pytorch");
+        assert_eq!(deserialized.model_data, vec![1, 2, 3, 4]);
+        assert_eq!(deserialized.metadata.name, "my-model");
+        assert_eq!(deserialized.metadata.input_shape, vec![1, 3, 224, 224]);
+    }
+
+    #[test]
+    fn test_lora_info_serialization() {
+        let info = LoRAInfo {
+            adapter_id: "lora-001".to_string(),
+            base_model_id: "base-model-001".to_string(),
+            owner: "0xabcdef".to_string(),
+            rank: 8,
+            alpha: 16.0,
+            description: "Fine-tuned adapter".to_string(),
+            size_bytes: 1048576,
+            created_at: 1700000000,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: LoRAInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.adapter_id, "lora-001");
+        assert_eq!(deserialized.base_model_id, "base-model-001");
+        assert_eq!(deserialized.owner, "0xabcdef");
+        assert_eq!(deserialized.rank, 8);
+        assert!((deserialized.alpha - 16.0).abs() < f32::EPSILON);
+        assert_eq!(deserialized.description, "Fine-tuned adapter");
+        assert_eq!(deserialized.size_bytes, 1048576);
+        assert_eq!(deserialized.created_at, 1700000000);
+    }
+
+    #[test]
+    fn test_model_stats_serialization() {
+        let stats = ModelStats {
+            model_id: "model-abc".to_string(),
+            total_inferences: 5000,
+            total_gas_used: 1000000,
+            total_fees_earned: "500000000000000000".to_string(),
+            average_execution_time_ms: 42.5,
+            success_rate: 0.995,
+            last_used: 1700000000,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let deserialized: ModelStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.model_id, "model-abc");
+        assert_eq!(deserialized.total_inferences, 5000);
+        assert_eq!(deserialized.total_gas_used, 1000000);
+        assert_eq!(deserialized.total_fees_earned, "500000000000000000");
+        assert!((deserialized.average_execution_time_ms - 42.5).abs() < f64::EPSILON);
+        assert!((deserialized.success_rate - 0.995).abs() < f64::EPSILON);
+        assert_eq!(deserialized.last_used, 1700000000);
+    }
+
+    #[test]
+    fn test_inference_result_success_and_error() {
+        let success = InferenceResult {
+            request_id: "req-001".to_string(),
+            model_id: "model-001".to_string(),
+            output_data: vec![10, 20, 30],
+            gas_used: 21000,
+            execution_time_ms: 150,
+            status: "success".to_string(),
+            error: None,
+        };
+        assert_eq!(success.status, "success");
+        assert!(success.error.is_none());
+        assert_eq!(success.output_data, vec![10, 20, 30]);
+
+        let failure = InferenceResult {
+            request_id: "req-002".to_string(),
+            model_id: "model-001".to_string(),
+            output_data: vec![],
+            gas_used: 5000,
+            execution_time_ms: 10,
+            status: "error".to_string(),
+            error: Some("Model not found".to_string()),
+        };
+        assert_eq!(failure.status, "error");
+        assert_eq!(failure.error, Some("Model not found".to_string()));
+        assert!(failure.output_data.is_empty());
+    }
+}
