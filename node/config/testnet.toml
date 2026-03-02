@@ -2,7 +2,7 @@
 # WP-S.5: Updated for public testnet launch
 
 [chain]
-chain_id = 42069
+chain_id = 40204
 genesis_hash = ""
 block_time = 1  # u64 seconds (config parser requires integer; whitepaper 500ms target)
 ghostdag_k = 18

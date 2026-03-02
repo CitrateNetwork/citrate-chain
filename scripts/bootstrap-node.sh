@@ -40,7 +40,7 @@ case "$NETWORK" in
         DATA_DIR="$PROJECT_ROOT/.citrate-mainnet-boot-$NODE_INDEX"
         ;;
     testnet)
-        CHAIN_ID=42069
+        CHAIN_ID=40204
         DATA_DIR="$PROJECT_ROOT/.citrate-testnet-boot-$NODE_INDEX"
         ;;
     devnet)

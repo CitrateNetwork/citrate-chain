@@ -15,7 +15,7 @@ NC='\033[0m' # No Color
 
 # Configuration
 CITRATE_DIR="/Users/soleilklosowski/Downloads/lattice/citrate"
-CHAIN_ID=42069
+CHAIN_ID=40204
 
 # Logging functions
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }

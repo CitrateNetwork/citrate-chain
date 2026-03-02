@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Launch 10-node testnet (Sprint 03 — Closed Beta)
-# Uses chain_id 42069, persistent Noise identities, API key gating.
+# Uses chain_id 40204, persistent Noise identities, API key gating.
 
 set -e
 
@@ -9,7 +9,7 @@ set -e
 NUM_NODES=10
 BASE_P2P_PORT=30303
 BASE_RPC_PORT=8545
-CHAIN_ID=42069
+CHAIN_ID=40204
 DATA_BASE_DIR=".citrate-testnet"
 LOG_DIR="testnet-logs"
 CITRATE_API_KEY="${CITRATE_API_KEY:-}"

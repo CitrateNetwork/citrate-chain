@@ -64,7 +64,7 @@ COINBASE_HEX="${VALIDATOR_ADDRESS:2}$(printf '0%.0s' {1..24})"
 echo -e "\n${BLUE}[4/9] Creating testnet configuration...${NC}"
 cat > testnet-config.toml << EOF
 [chain]
-chain_id = 42069
+chain_id = 40204
 genesis_hash = ""
 block_time = 2
 ghostdag_k = 18
@@ -117,7 +117,7 @@ echo -e "${CYAN}Core node starting (PID: $NODE_PID)...${NC}"
 # Wait for node to be ready
 for i in {1..30}; do
     if curl -s http://localhost:8545 -X POST -H "Content-Type: application/json" \
-        -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' 2>/dev/null | grep -q "0xa455"; then
+        -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' 2>/dev/null | grep -q "0x9d0c"; then
         echo -e "\n${GREEN}[✓]${NC} Core node running and RPC ready!"
         break
     fi
@@ -200,7 +200,7 @@ echo -e "${GREEN}FRESH TESTNET RUNNING!${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
 
 echo -e "\n${MAGENTA}Network Details:${NC}"
-echo -e "  Chain ID:    ${CYAN}42069${NC}"
+echo -e "  Chain ID:    ${CYAN}40204${NC}"
 echo -e "  RPC URL:     ${CYAN}http://localhost:8545${NC}"
 echo -e "  WebSocket:   ${CYAN}ws://localhost:8546${NC}"
 echo -e "  P2P Port:    ${CYAN}30303${NC}"

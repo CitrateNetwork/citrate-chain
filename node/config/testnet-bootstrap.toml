@@ -5,7 +5,7 @@
 # and [mining] coinbase changed to match the VM.
 
 [chain]
-chain_id = 42069
+chain_id = 40204
 genesis_hash = ""
 block_time = 0.5          # Whitepaper canonical: 500ms
 ghostdag_k = 18

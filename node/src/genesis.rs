@@ -190,8 +190,8 @@ pub async fn initialize_genesis_state(
     // Create genesis block
     let mut genesis = create_genesis_block(config);
 
-    // Create economics genesis config — use testnet_beta for chain_id 42069
-    let economics_config = if config.chain_id == 42069 {
+    // Create economics genesis config — use testnet_beta for chain_id 40204
+    let economics_config = if config.chain_id == 40204 {
         EconomicsGenesisConfig::testnet_beta()
     } else {
         EconomicsGenesisConfig::default()

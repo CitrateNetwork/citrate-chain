@@ -115,7 +115,7 @@ case $network_choice in
     2)
         echo "   → Configuring for testnet..."
         NETWORK="testnet"
-        CHAIN_ID=42069
+        CHAIN_ID=40204
         ;;
     *)
         echo "   Invalid choice. Using devnet."

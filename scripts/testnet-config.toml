@@ -1,5 +1,5 @@
 [chain]
-chain_id = 42069
+chain_id = 40204
 genesis_hash = ""
 block_time = 2
 ghostdag_k = 18

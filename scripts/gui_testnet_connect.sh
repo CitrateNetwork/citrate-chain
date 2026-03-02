@@ -18,7 +18,7 @@ NC='\033[0m' # No Color
 # Default configuration
 TESTNET_RPC="http://localhost:8545"
 TESTNET_WS="ws://localhost:8546"
-CHAIN_ID=42069
+CHAIN_ID=40204
 
 echo "========================================="
 echo "  Citrate v3 GUI Testnet Connector"

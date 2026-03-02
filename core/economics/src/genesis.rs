@@ -130,7 +130,7 @@ impl GenesisConfig {
         }
     }
 
-    /// Create testnet beta genesis configuration (chain_id = 42069).
+    /// Create testnet beta genesis configuration (chain_id = 40204).
     /// Used for the closed beta testnet with peer whitelist + API key gating.
     pub fn testnet_beta() -> Self {
         let treasury = Address([0x11; 20]);
@@ -138,7 +138,7 @@ impl GenesisConfig {
         let faucet = Address([0x33; 20]);
 
         Self {
-            chain_id: 42069, // Testnet beta
+            chain_id: 40204, // Testnet beta
             accounts: vec![
                 // Faucet account (10M SALT for testnet distribution)
                 GenesisAccount {

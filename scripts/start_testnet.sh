@@ -9,7 +9,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # Configuration
-CHAIN_ID=42069  # Testnet chain ID (0xa455 in hex)
+CHAIN_ID=40204  # Testnet chain ID (0x9d0c in hex)
 RPC_PORT=8545
 WS_PORT=8546
 P2P_PORT=30303

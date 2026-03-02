@@ -1036,14 +1036,14 @@ async fn test_eth_chain_id_is_configurable() {
     let state_db = Arc::new(citrate_execution::StateDB::new());
     let executor = Arc::new(Executor::new(state_db));
 
-    // Test with chain_id = 42069 (testnet)
+    // Test with chain_id = 40204 (testnet)
     let mut io1 = jsonrpc_core::IoHandler::new();
     citrate_api::eth_rpc::register_eth_methods(
         &mut io1,
         storage.clone(),
         mempool.clone(),
         executor.clone(),
-        42069,
+        40204,
         Arc::new(FilterRegistry::new()),
         None,
     );
@@ -1052,7 +1052,7 @@ async fn test_eth_chain_id_is_configurable() {
         .to_string();
     let resp = io1.handle_request(&req).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    assert_eq!(v["result"], "0xa455"); // 42069 in hex
+    assert_eq!(v["result"], "0x9d0c"); // 40204 in hex
 
     // Test with chain_id = 1 (mainnet)
     let mut io2 = jsonrpc_core::IoHandler::new();
