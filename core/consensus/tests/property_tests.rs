@@ -500,7 +500,7 @@ mod edge_cases {
         // Should work without error
         assert_eq!(
             merge.header.merge_parent_hashes.len(),
-            max_parents as usize - 1
+            max_parents - 1
         );
     }
 

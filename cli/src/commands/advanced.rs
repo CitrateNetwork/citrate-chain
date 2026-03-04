@@ -500,7 +500,7 @@ async fn analyze_topology(
                         peer_id, peer_id, peer_addr));
                 }
 
-                dot_content.push_str("\n");
+                dot_content.push('\n');
 
                 // Add edges (connections)
                 for connection in &connections {
@@ -687,7 +687,7 @@ async fn debug_transaction(
                                 for (i, log) in logs.iter().take(5).enumerate() {
                                     println!("    Log {}: {}", i + 1,
                                         log["topics"].as_array()
-                                            .and_then(|topics| topics.get(0))
+                                            .and_then(|topics| topics.first())
                                             .and_then(|topic| topic.as_str())
                                             .unwrap_or("Unknown topic"));
                                 }

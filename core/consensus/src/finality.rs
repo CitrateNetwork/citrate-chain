@@ -399,11 +399,7 @@ impl FinalityTracker {
         let confirmations = if finalized_height > 0 {
             // Estimate based on finalized height + confirmation depth
             let estimated_tip = finalized_height + self.config.confirmation_depth;
-            if estimated_tip > block_height {
-                estimated_tip - block_height
-            } else {
-                0
-            }
+            estimated_tip.saturating_sub(block_height)
         } else {
             0
         };
@@ -542,13 +538,13 @@ mod tests {
         assert_eq!(tracker.get_finalized_count(), 5);
 
         // Check individual blocks
-        for i in 0..5 {
-            assert!(tracker.is_finalized(&blocks[i].hash()).await);
+        for block in &blocks[..5] {
+            assert!(tracker.is_finalized(&block.hash()).await);
         }
 
         // Blocks 5-14 should not be finalized
-        for i in 5..15 {
-            assert!(!tracker.is_finalized(&blocks[i].hash()).await);
+        for block in &blocks[5..15] {
+            assert!(!tracker.is_finalized(&block.hash()).await);
         }
     }
 

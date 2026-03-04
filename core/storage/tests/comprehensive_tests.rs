@@ -32,7 +32,7 @@ fn create_test_block(num: u8, height: u64, parent: Option<Hash>) -> Block {
             gas_limit: 30_000_000,
         },
         state_root: Hash::new([(height % 256) as u8; 32]),
-        tx_root: Hash::new([(num + 1) as u8; 32]),
+        tx_root: Hash::new([(num + 1); 32]),
         receipt_root: Hash::default(),
         artifact_root: Hash::default(),
         ghostdag_params: GhostDagParams::default(),
@@ -40,6 +40,9 @@ fn create_test_block(num: u8, height: u64, parent: Option<Hash>) -> Block {
         signature: Signature::new([0u8; 64]),
         embedded_models: vec![],
         required_pins: vec![],
+        learning_embedding: None,
+        learning_confidence: None,
+        gradient_commitment: None,
     }
 }
 
@@ -51,8 +54,8 @@ fn create_test_transaction(nonce: u64) -> Transaction {
     // Create a valid signature array (64 bytes)
     let mut sig_bytes = [0u8; 64];
     sig_bytes[0] = nonce as u8;
-    for i in 1..64 {
-        sig_bytes[i] = i as u8;
+    for (i, byte) in sig_bytes.iter_mut().enumerate().skip(1) {
+        *byte = i as u8;
     }
 
     Transaction {

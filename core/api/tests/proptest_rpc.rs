@@ -110,22 +110,22 @@ proptest! {
     ) {
         // Standard JSON-RPC error codes are in [-32768, -32000]
         prop_assert!(
-            code >= -32768 && code <= -32000,
+            (-32768..=-32000).contains(&code),
             "Standard error code {} must be in [-32768, -32000]", code
         );
 
         // Pre-defined codes
         if code == -32700 || code == -32600 || code == -32601 || code == -32602 || code == -32603 {
             prop_assert!(
-                code >= -32700 && code <= -32600,
+                (-32700..=-32600).contains(&code),
                 "Pre-defined error code {} must be in [-32700, -32600]", code
             );
         }
 
         // Server error range
-        if code >= -32099 && code <= -32000 {
+        if (-32099..=-32000).contains(&code) {
             prop_assert!(
-                code >= -32099 && code <= -32000,
+                (-32099..=-32000).contains(&code),
                 "Server error code {} must be in [-32099, -32000]", code
             );
         }

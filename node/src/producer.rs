@@ -37,12 +37,12 @@ fn generate_block_vrf(proposer_pubkey: &PublicKey, coinbase: &PublicKey, prev_vr
 
     let mut proof_hasher = Sha3_256::new();
     proof_hasher.update(coinbase.as_bytes());
-    proof_hasher.update(&input);
+    proof_hasher.update(input.as_slice());
     let proof_bytes = proof_hasher.finalize();
 
     let mut output_hasher = Sha3_256::new();
-    output_hasher.update(&proof_bytes);
-    output_hasher.update(&input); // H.6: bind output to (proposer, slot, prev_vrf)
+    output_hasher.update(proof_bytes.as_slice());
+    output_hasher.update(input.as_slice()); // H.6: bind output to (proposer, slot, prev_vrf)
     let output_bytes = output_hasher.finalize();
 
     VrfProof {
@@ -198,6 +198,7 @@ impl BlockProducer {
 
     /// Create with explicit reward configuration (for governance-driven params)
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn with_peer_manager_and_rewards(
         storage: Arc<StorageManager>,
         executor: Arc<Executor>,
@@ -248,6 +249,7 @@ impl BlockProducer {
     }
 
     /// Create with economics manager for full economic integration
+    #[allow(clippy::too_many_arguments)]
     pub async fn with_economics(
         storage: Arc<StorageManager>,
         executor: Arc<Executor>,
@@ -337,6 +339,7 @@ impl BlockProducer {
     /// Create with pre-built DAG components and economics manager.
     /// WP-K.2: Allows sharing the DAG store and GhostDag between the
     /// producer and the network message handler for live fork-choice.
+    #[allow(clippy::too_many_arguments)]
     pub async fn with_shared_dag(
         storage: Arc<StorageManager>,
         executor: Arc<Executor>,
@@ -528,7 +531,7 @@ impl BlockProducer {
         let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
 
         // Create block header with GhostDAG consensus data
-        let mut header = BlockHeader {
+        let header = BlockHeader {
             version: 1,
             block_hash: Hash::default(), // Will be computed
             selected_parent_hash: selected_parent,
@@ -569,21 +572,21 @@ impl BlockProducer {
             let staked_amount = economics.get_staked_balance(&validator_address);
             if staked_amount > primitive_types::U256::zero() {
                 let staking_bonus = base_reward / primitive_types::U256::from(10);
-                total_reward = total_reward + staking_bonus;
+                total_reward += staking_bonus;
                 info!("Economics: Applied staking bonus of {} wei for staked amount {}", staking_bonus, staked_amount);
             }
 
             let reputation_score = economics.get_reputation_score(&validator_address);
             if reputation_score > 0.5 {
                 let reputation_bonus = base_reward * primitive_types::U256::from((reputation_score * 20.0) as u64) / primitive_types::U256::from(100);
-                total_reward = total_reward + reputation_bonus;
+                total_reward += reputation_bonus;
                 info!("Economics: Applied reputation bonus of {} wei for score {}", reputation_bonus, reputation_score);
             }
 
             let current_gas_price = economics.get_operation_cost(citrate_economics::OperationType::AIInference { compute_units: 1000 });
             if current_gas_price > economics.get_config().pricing_config.base_gas_price {
                 let congestion_bonus = base_reward / primitive_types::U256::from(20);
-                total_reward = total_reward + congestion_bonus;
+                total_reward += congestion_bonus;
                 info!("Economics: Applied congestion bonus of {} wei due to high gas prices", congestion_bonus);
             }
 

@@ -447,6 +447,7 @@ impl RpcServer {
     /// WP-I.3: Full constructor with pause_flag support.
     /// When pause_flag is Some, emergency pause/resume/status RPC methods
     /// are registered and can halt block production.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_economics_and_pause(
         config: RpcConfig,
         storage: Arc<StorageManager>,
@@ -1713,7 +1714,7 @@ impl RpcServer {
                 framework: metadata_obj.get("framework").or_else(|| metadata_obj.get("format")).and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
                 input_shape: vec![1],
                 output_shape: vec![1],
-                size_bytes: size_bytes,
+                size_bytes,
                 created_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())

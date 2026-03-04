@@ -80,6 +80,12 @@ pub struct PrecompileExecutor {
     inference: Option<InferencePrecompile>,
 }
 
+impl Default for PrecompileExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PrecompileExecutor {
     pub fn new() -> Self {
         Self {
@@ -230,7 +236,7 @@ impl PrecompileExecutor {
     }
 
     fn sha256(&self, input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
-        let gas_cost = 60 + (input.len() as u64 + 31) / 32 * 12;
+        let gas_cost = 60 + (input.len() as u64).div_ceil(32) * 12;
         if gas_limit < gas_cost {
             return Err(anyhow::anyhow!("Insufficient gas"));
         }
@@ -248,7 +254,7 @@ impl PrecompileExecutor {
     }
 
     fn ripemd160(&self, input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
-        let gas_cost = 600 + (input.len() as u64 + 31) / 32 * 120;
+        let gas_cost = 600 + (input.len() as u64).div_ceil(32) * 120;
         if gas_limit < gas_cost {
             return Err(anyhow::anyhow!("Insufficient gas"));
         }
@@ -271,7 +277,7 @@ impl PrecompileExecutor {
     }
 
     fn identity(&self, input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
-        let gas_cost = 15 + (input.len() as u64 + 31) / 32 * 3;
+        let gas_cost = 15 + (input.len() as u64).div_ceil(32) * 3;
         if gas_limit < gas_cost {
             return Err(anyhow::anyhow!("Insufficient gas"));
         }
@@ -316,7 +322,7 @@ impl PrecompileExecutor {
 
         // Calculate gas cost (EIP-2565 simplified formula)
         let max_len = std::cmp::max(b_len, m_len);
-        let words = (max_len + 7) / 8;
+        let words = max_len.div_ceil(8);
         let multiplication_complexity = words * words;
 
         // Calculate iteration count from exponent
@@ -423,7 +429,7 @@ impl PrecompileExecutor {
         // Output: x3 (32 bytes) || y3 (32 bytes) = (x1,y1) + (x2,y2)
 
         // Pad input to 128 bytes if needed
-        let mut padded = vec![0u8; 128];
+        let mut padded = [0u8; 128];
         let copy_len = std::cmp::min(input.len(), 128);
         padded[..copy_len].copy_from_slice(&input[..copy_len]);
 
@@ -466,7 +472,7 @@ impl PrecompileExecutor {
         // Output: x' (32 bytes) || y' (32 bytes) = s * (x, y)
 
         // Pad input to 96 bytes if needed
-        let mut padded = vec![0u8; 96];
+        let mut padded = [0u8; 96];
         let copy_len = std::cmp::min(input.len(), 96);
         padded[..copy_len].copy_from_slice(&input[..copy_len]);
 
@@ -598,9 +604,9 @@ impl PrecompileExecutor {
 
         // Parse state vector h (64 bytes = 8 x u64 little-endian)
         let mut h = [0u64; 8];
-        for i in 0..8 {
+        for (i, h_val) in h.iter_mut().enumerate() {
             let offset = 4 + i * 8;
-            h[i] = u64::from_le_bytes([
+            *h_val = u64::from_le_bytes([
                 input[offset], input[offset + 1], input[offset + 2], input[offset + 3],
                 input[offset + 4], input[offset + 5], input[offset + 6], input[offset + 7],
             ]);
@@ -608,9 +614,9 @@ impl PrecompileExecutor {
 
         // Parse message block m (128 bytes = 16 x u64 little-endian)
         let mut m = [0u64; 16];
-        for i in 0..16 {
+        for (i, m_val) in m.iter_mut().enumerate() {
             let offset = 68 + i * 8;
-            m[i] = u64::from_le_bytes([
+            *m_val = u64::from_le_bytes([
                 input[offset], input[offset + 1], input[offset + 2], input[offset + 3],
                 input[offset + 4], input[offset + 5], input[offset + 6], input[offset + 7],
             ]);

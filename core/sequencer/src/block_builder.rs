@@ -492,7 +492,7 @@ impl BlockBuilder {
             hasher.update(receipt.tx_hash.as_bytes());
             hasher.update(cumulative_gas.to_le_bytes());
             hasher.update(receipt.gas_used.to_le_bytes());
-            hasher.update(&[if receipt.status { 1u8 } else { 0u8 }]);
+            hasher.update([if receipt.status { 1u8 } else { 0u8 }]);
 
             // Hash logs bloom (simplified: hash of all log data)
             let mut logs_hasher = Keccak256::new();
@@ -503,7 +503,7 @@ impl BlockBuilder {
                 }
                 logs_hasher.update(&log.data);
             }
-            hasher.update(&logs_hasher.finalize());
+            hasher.update(logs_hasher.finalize());
         }
 
         Ok(Hash::from_bytes(&hasher.finalize()))
@@ -596,7 +596,7 @@ impl BlockBuilder {
             if let Some(to) = &tx.to {
                 hasher.update(to.as_bytes());
             } else {
-                hasher.update(&[0u8; 32]);
+                hasher.update([0u8; 32]);
             }
             hasher.update(tx.value.to_le_bytes());
             hasher.update(tx.nonce.to_le_bytes());
@@ -616,7 +616,7 @@ impl BlockBuilder {
         for tx in transactions {
             hasher.update(tx.hash.as_bytes());
             hasher.update(tx.gas_limit.to_le_bytes());
-            hasher.update(&[1u8]);
+            hasher.update([1u8]);
         }
 
         Hash::from_bytes(&hasher.finalize())

@@ -25,23 +25,20 @@ use std::fmt;
 
 /// Security level for encryption operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum SecurityLevel {
     /// 128-bit classical / 64-bit quantum security (Kyber-512 equivalent)
     /// Suitable for short-term data
     Standard,
     /// 192-bit classical / 96-bit quantum security (Kyber-768)
     /// Recommended for most use cases
+    #[default]
     High,
     /// 256-bit classical / 128-bit quantum security (Kyber-1024 equivalent)
     /// For long-term secrets (AI models, master keys)
     Maximum,
 }
 
-impl Default for SecurityLevel {
-    fn default() -> Self {
-        SecurityLevel::High
-    }
-}
 
 /// Configuration for quantum-safe encryption
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,17 +322,17 @@ impl HybridKEM {
         hasher.update(b"QSSP-v1-hybrid-combine");
 
         // Security level binding
-        hasher.update(&[self.config.security_level as u8]);
+        hasher.update([self.config.security_level as u8]);
 
         // Length-prefixed inputs (prevents extension attacks)
-        hasher.update(&(pq_ss.len() as u32).to_be_bytes());
+        hasher.update((pq_ss.len() as u32).to_be_bytes());
         hasher.update(pq_ss);
-        hasher.update(&(classical_ss.len() as u32).to_be_bytes());
+        hasher.update((classical_ss.len() as u32).to_be_bytes());
         hasher.update(classical_ss);
 
         // Optional context binding
         if let Some(ref context) = self.config.context_binding {
-            hasher.update(&(context.len() as u32).to_be_bytes());
+            hasher.update((context.len() as u32).to_be_bytes());
             hasher.update(context);
         }
 
@@ -351,9 +348,9 @@ impl HybridKEM {
         let mut hasher = Sha3_256::new();
         hasher.update(b"QSSP-v1-key-commit");
         hasher.update(shared_secret);
-        hasher.update(&(pq_ct.len() as u32).to_be_bytes());
+        hasher.update((pq_ct.len() as u32).to_be_bytes());
         hasher.update(pq_ct);
-        hasher.update(&(classical_pk.len() as u32).to_be_bytes());
+        hasher.update((classical_pk.len() as u32).to_be_bytes());
         hasher.update(classical_pk);
         hasher.finalize().into()
     }

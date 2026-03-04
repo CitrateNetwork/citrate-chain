@@ -278,7 +278,7 @@ impl MasterKeyDerivation {
         let mut hasher = Sha3_512::new();
         hasher.update(purpose.domain());
         hasher.update(master.key_bytes());
-        hasher.update(&self.params.version.to_be_bytes());
+        hasher.update(self.params.version.to_be_bytes());
         hasher.update(&self.params.salt);
 
         let digest = hasher.finalize();
@@ -368,7 +368,7 @@ impl MasterKeyDerivation {
         for i in 0..iterations {
             let mut hasher = Sha3_512::new();
             hasher.update(&current);
-            hasher.update(&i.to_be_bytes());
+            hasher.update(i.to_be_bytes());
             current = hasher.finalize().to_vec();
         }
 
@@ -387,7 +387,7 @@ impl MasterKeyDerivation {
         hasher.update(b"QSSP-v1-commit-");
         hasher.update(purpose.domain());
         hasher.update(key);
-        hasher.update(&self.params.version.to_be_bytes());
+        hasher.update(self.params.version.to_be_bytes());
         hasher.finalize().into()
     }
 }

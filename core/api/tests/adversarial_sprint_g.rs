@@ -52,6 +52,9 @@ fn make_signed_block(signing_key: &Ed25519SigningKey, height: u64) -> Block {
         signature: Signature::default(), // signed below
         embedded_models: vec![],
         required_pins: vec![],
+        learning_embedding: None,
+        learning_confidence: None,
+        gradient_commitment: None,
     };
     block.header.block_hash = block.compute_hash();
     block.signature = crypto::sign_block(&block.header.block_hash, signing_key);

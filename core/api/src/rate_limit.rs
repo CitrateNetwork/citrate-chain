@@ -153,8 +153,8 @@ pub struct RateLimitConfig {
     ///   - `Authorization: Bearer <key>`
     ///   - `X-API-Key: <key>`
     ///   - `?api_key=<key>` query parameter
-    /// `/health` and `/ready` endpoints are exempt.
-    /// When None (default), all requests are allowed (open mode / devnet).
+    ///     `/health` and `/ready` endpoints are exempt.
+    ///     When None (default), all requests are allowed (open mode / devnet).
     pub api_key: Option<String>,
     /// WP-K.4: Whether the RPC server is bound to a public (non-loopback) interface.
     /// When true and no operator_token is set, operator methods are DENIED

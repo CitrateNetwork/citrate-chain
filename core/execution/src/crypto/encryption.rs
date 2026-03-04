@@ -186,8 +186,8 @@ impl ModelEncryption {
         // Generate key ID
         let key_id = {
             let mut hasher = Sha3_256::new();
-            hasher.update(&key_bytes);
-            hasher.update(&model_id.as_bytes());
+            hasher.update(key_bytes);
+            hasher.update(model_id.as_bytes());
             H256::from_slice(hasher.finalize().as_slice())
         };
 

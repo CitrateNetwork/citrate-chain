@@ -111,6 +111,12 @@ pub struct MetadataCache {
     max_cache_size: usize,
 }
 
+impl Default for MetadataCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetadataCache {
     /// Create a new metadata cache
     pub fn new() -> Self {

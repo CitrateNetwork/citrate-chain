@@ -496,7 +496,7 @@ impl AnalyticsEngine {
 
         (rating_score * rating_weight +
          performance_score * performance_weight +
-         engagement_score * engagement_weight).max(0.0).min(1.0)
+         engagement_score * engagement_weight).clamp(0.0, 1.0)
     }
 
     fn calculate_rating_trend(&self, reviews: &[EnhancedUserReview]) -> RatingTrend {

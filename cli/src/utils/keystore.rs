@@ -119,7 +119,7 @@ fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
     // Apply 10000 iterations to strengthen the key derivation
     for _ in 0..10000 {
         let mut new_hasher = Sha3_256::new();
-        new_hasher.update(&hash);
+        new_hasher.update(hash);
         new_hasher.update(password.as_bytes());
         new_hasher.update(salt);
         hash = new_hasher.finalize();

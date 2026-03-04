@@ -130,7 +130,7 @@ fn hash_to_try_and_increment(
         compressed[0] = 0x02;
         compressed[1..33].copy_from_slice(&hash_result);
 
-        let encoded = match EncodedPoint::from_bytes(&compressed) {
+        let encoded = match EncodedPoint::from_bytes(compressed) {
             Ok(ep) => ep,
             Err(_) => continue,
         };

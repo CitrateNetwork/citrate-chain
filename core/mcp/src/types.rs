@@ -236,7 +236,7 @@ mod tests {
         let deserialized: ComputeRequirements = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.min_memory, req.min_memory);
-        assert_eq!(deserialized.gpu_required, true);
+        assert!(deserialized.gpu_required);
     }
 
     #[test]

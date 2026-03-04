@@ -351,7 +351,7 @@ async fn test_get_nonce_integration() {
 
     assert!(nonce.is_ok(), "Nonce query failed");
     // Nonce should be >= 0
-    assert!(nonce.unwrap() >= 0);
+    let _ = nonce.unwrap(); // nonce is u64, always >= 0
 }
 
 #[tokio::test]
@@ -371,7 +371,7 @@ async fn test_get_block_number_integration() {
     let block_number = wallet.rpc_client().get_block_number().await;
 
     assert!(block_number.is_ok(), "Block number query failed");
-    assert!(block_number.unwrap() >= 0, "Block number should be >= 0");
+    let _ = block_number.unwrap(); // block number is u64, always >= 0
 }
 
 #[tokio::test]
@@ -485,7 +485,7 @@ fn test_get_nonexistent_account() {
     }
 
     let temp_dir = TempDir::new().unwrap();
-    let mut wallet = create_test_wallet(&temp_dir);
+    let wallet = create_test_wallet(&temp_dir);
 
     // Try to get account that doesn't exist
     let account = wallet.get_account(999);

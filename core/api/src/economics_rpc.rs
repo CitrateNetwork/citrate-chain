@@ -180,8 +180,7 @@ pub fn register_economics_methods(
     let mempool_snap = mempool.clone();
     io_handler.add_sync_method("citrate_getMempoolSnapshot", move |_params: Params| {
         if let Some(mempool) = &mempool_snap {
-            match block_on(mempool.stats()) {
-                stats => {
+            let stats = block_on(mempool.stats());
                     let pending_txs = block_on(mempool.get_transactions(1000)); // Get up to 1000 transactions
                     let mut total_gas_fees = primitive_types::U256::zero();
                     let mut ai_operations = 0u32;
@@ -194,7 +193,7 @@ pub fn register_economics_methods(
 
                         // Calculate fee (gas_limit * gas_price)
                         let fee = primitive_types::U256::from(tx.gas_limit) * primitive_types::U256::from(tx.gas_price);
-                        total_gas_fees = total_gas_fees + fee;
+                        total_gas_fees += fee;
 
                         // Check if this is an AI operation (simplified heuristic)
                         if tx.gas_limit > 500_000 {  // AI operations typically use more gas
@@ -217,8 +216,6 @@ pub fn register_economics_methods(
                         "mempoolSize": stats.total_size,
                         "byClass": stats.by_class,
                     }))
-                }
-            }
         } else {
             // Fallback when no mempool available
             Ok(json!({

@@ -256,7 +256,7 @@ impl EnhancedTransactionDecoder {
             tx_type: TransactionType::Eip1559,
             chain_id: Some(chain_id),
             sender,
-            effective_gas_price: max_fee_per_gas.as_u64().min(u64::MAX),
+            effective_gas_price: max_fee_per_gas.as_u64(),
             access_list_size,
             validation_warnings: warnings,
         })
@@ -290,7 +290,7 @@ impl EnhancedTransactionDecoder {
             tx_type: TransactionType::Eip2930,
             chain_id: Some(eip2930_tx.chain_id),
             sender,
-            effective_gas_price: eip2930_tx.gas_price.as_u64().min(u64::MAX),
+            effective_gas_price: eip2930_tx.gas_price.as_u64(),
             access_list_size: eip2930_tx.access_list.len(),
             validation_warnings: warnings,
         })
@@ -327,7 +327,7 @@ impl EnhancedTransactionDecoder {
             tx_type: TransactionType::Legacy,
             chain_id,
             sender,
-            effective_gas_price: legacy_tx.gas_price.as_u64().min(u64::MAX),
+            effective_gas_price: legacy_tx.gas_price.as_u64(),
             access_list_size: 0,
             validation_warnings: warnings,
         })
@@ -518,7 +518,8 @@ impl EnhancedTransactionDecoder {
         let sighash = Keccak256::digest(&signing_payload);
 
         // Recover address
-        self.recover_address_from_signature(&tx.r, &tx.s, &sighash, ((tx.v - if chain_id.is_some() { 35 + 2 * chain_id.unwrap() } else { 27 }) % 2) as i32)
+        let base = if let Some(cid) = chain_id { 35 + 2 * cid } else { 27 };
+        self.recover_address_from_signature(&tx.r, &tx.s, &sighash, ((tx.v - base) % 2) as i32)
     }
 
     fn recover_eip2930_sender(&self, tx: &Eip2930Transaction, _rlp_payload: &[u8]) -> Result<H160, TransactionDecoderError> {
@@ -636,8 +637,8 @@ impl EnhancedTransactionDecoder {
             PublicKey::new(pk_bytes)
         });
 
-        let gas_price = tx.gas_price.as_u64().min(u64::MAX);
-        let value = tx.value.as_u128().min(u128::MAX);
+        let gas_price = tx.gas_price.as_u64();
+        let value = tx.value.as_u128();
 
         let mut sig_bytes = [0u8; 64];
         sig_bytes[..32].copy_from_slice(tx.r.as_bytes());
@@ -674,8 +675,8 @@ impl EnhancedTransactionDecoder {
             PublicKey::new(pk_bytes)
         });
 
-        let gas_price = tx.gas_price.as_u64().min(u64::MAX);
-        let value = tx.value.as_u128().min(u128::MAX);
+        let gas_price = tx.gas_price.as_u64();
+        let value = tx.value.as_u128();
 
         let mut sig_bytes = [0u8; 64];
         sig_bytes[..32].copy_from_slice(tx.r.as_bytes());

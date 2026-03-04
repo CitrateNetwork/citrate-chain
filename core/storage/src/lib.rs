@@ -48,6 +48,7 @@ pub struct StorageManager {
 
 /// Configuration for storage manager
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct StorageConfig {
     /// Pruning configuration
     pub pruning: PruningConfig,
@@ -55,14 +56,6 @@ pub struct StorageConfig {
     pub encryption: Option<DatabaseEncryptionConfig>,
 }
 
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            pruning: PruningConfig::default(),
-            encryption: None,
-        }
-    }
-}
 
 impl StorageConfig {
     /// Create config with encryption enabled

@@ -322,14 +322,14 @@ impl UnifiedEconomicsManager {
     /// Update reputation scores based on AI contributions
     pub fn update_reputation(&mut self, address: Address, score_delta: f64) {
         let current_score = self.reputation_scores.get(&address).copied().unwrap_or(0.5);
-        let new_score = (current_score + score_delta).max(0.0).min(1.0);
+        let new_score = (current_score + score_delta).clamp(0.0, 1.0);
         self.reputation_scores.insert(address, new_score);
     }
 
     /// Private helper methods
     fn update_gas_usage_history(&mut self, block_height: u64, gas_usage: HashMap<Address, U256>) {
         for (address, gas_used) in gas_usage {
-            let history = self.gas_usage_history.entry(address).or_insert_with(Vec::new);
+            let history = self.gas_usage_history.entry(address).or_default();
             history.push((block_height, gas_used));
 
             // Keep only last 100 blocks

@@ -107,8 +107,8 @@ mod tests {
             bytes[0] = i;
             bytes[1] = i.wrapping_mul(7);
             bytes[2] = i.wrapping_mul(13);
-            for j in 3..20 {
-                bytes[j] = ((i as usize + j) % 256) as u8;
+            for (j, byte) in bytes[3..20].iter_mut().enumerate() {
+                *byte = ((i as usize + j + 3) % 256) as u8;
             }
             // Last 12 bytes are zero for embedded EVM address
             let pk = PublicKey::new(bytes);
@@ -124,8 +124,8 @@ mod tests {
         for i in 0u8..100 {
             let mut bytes = [0u8; 32];
             // Fill all 32 bytes with varying patterns
-            for j in 0..32 {
-                bytes[j] = ((i as usize * 3 + j * 5) % 256) as u8;
+            for (j, byte) in bytes.iter_mut().enumerate() {
+                *byte = ((i as usize * 3 + j * 5) % 256) as u8;
             }
             // Ensure this is NOT an embedded EVM address by setting last 12 bytes non-zero
             bytes[31] = 1; // At least one non-zero byte in last 12
@@ -146,8 +146,8 @@ mod tests {
     fn test_embedded_address_deterministic() {
         // Same embedded EVM bytes should always produce the same address
         let mut bytes = [0u8; 32];
-        for i in 0..20 {
-            bytes[i] = (i as u8) + 0xAB;
+        for (i, byte) in bytes[..20].iter_mut().enumerate() {
+            *byte = (i as u8) + 0xAB;
         }
         let pk1 = PublicKey::new(bytes);
         let pk2 = PublicKey::new(bytes);

@@ -19,6 +19,7 @@ use std::sync::Arc;
 /// Build EIP-typed fields for a transaction JSON response.
 /// Appends `type`, `chainId`, and optionally `accessList`, `maxFeePerGas`,
 /// `maxPriorityFeePerGas` to the given serde_json::Map.
+#[allow(clippy::type_complexity)]
 fn append_eip_fields(
     map: &mut serde_json::Map<String, Value>,
     eth_tx_type: u8,
@@ -1171,7 +1172,7 @@ pub fn register_eth_methods(
         };
 
         // Parse block count (default 1)
-        let block_count: u64 = params.get(0)
+        let block_count: u64 = params.first()
             .and_then(|v| v.as_str())
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
             .unwrap_or(1)
@@ -1179,10 +1180,7 @@ pub fn register_eth_methods(
 
         // Get current height
         let api = ChainApi::new(storage_fee.clone());
-        let current_height = match block_on(api.get_height()) {
-            Ok(h) => h,
-            Err(_) => 0,
-        };
+        let current_height = block_on(api.get_height()).unwrap_or_default();
 
         if current_height == 0 {
             return Ok(json!({
@@ -2096,16 +2094,10 @@ pub fn register_eth_methods(
         let api = ChainApi::new(storage_dag.clone());
 
         // Get current tips
-        let tips = match block_on(api.get_tips()) {
-            Ok(t) => t,
-            Err(_) => vec![],
-        };
+        let tips = block_on(api.get_tips()).unwrap_or_default();
 
         // Get current height
-        let height = match block_on(api.get_height()) {
-            Ok(h) => h,
-            Err(_) => 0,
-        };
+        let height = block_on(api.get_height()).unwrap_or_default();
 
         // Get blue score from the highest tip block
         let mut blue_score = 0u64;

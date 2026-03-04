@@ -44,6 +44,7 @@ struct NSError {
 // CoreML C API functions (linked via Objective-C bridge)
 #[link(name = "CoreML", kind = "framework")]
 #[link(name = "Foundation", kind = "framework")]
+#[allow(clippy::duplicated_attributes)]
 extern "C" {
     // Model loading
     fn MLModelLoad(

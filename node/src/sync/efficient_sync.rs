@@ -708,6 +708,9 @@ mod tests {
             signature: Signature::new([0; 64]),
             embedded_models: vec![],
             required_pins: vec![],
+            learning_embedding: None,
+            learning_confidence: None,
+            gradient_commitment: None,
         }
     }
 
@@ -798,7 +801,7 @@ mod tests {
 
         // Resume should return current height
         let checkpoint = manager.resume_from_checkpoint().unwrap();
-        assert!(checkpoint >= 0); // At least genesis
+        let _ = checkpoint; // At least genesis (u64 is always >= 0)
 
         // Verify checkpoint height accessor
         assert_eq!(manager.checkpoint_height(), checkpoint);

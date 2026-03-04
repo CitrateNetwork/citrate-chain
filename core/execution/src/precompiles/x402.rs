@@ -108,7 +108,7 @@ fn eip712_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
 
     // Compute EIP-712 digest: keccak256("\x19\x01" || domainSeparator || structHash)
     let mut hasher = Keccak256::new();
-    hasher.update(&[0x19, 0x01]);
+    hasher.update([0x19, 0x01]);
     hasher.update(domain_separator);
     hasher.update(struct_hash);
     let digest = hasher.finalize();
@@ -219,9 +219,9 @@ fn transfer_auth_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult
 
     // Compute EIP-712 digest
     let mut digest_hasher = Keccak256::new();
-    digest_hasher.update(&[0x19, 0x01]);
+    digest_hasher.update([0x19, 0x01]);
     digest_hasher.update(domain_separator);
-    digest_hasher.update(&struct_hash);
+    digest_hasher.update(struct_hash);
     let digest = digest_hasher.finalize();
 
     // Parse recovery ID
@@ -339,9 +339,9 @@ fn batch_payment_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult
 
         // EIP-712 digest
         let mut digest_hasher = Keccak256::new();
-        digest_hasher.update(&[0x19, 0x01]);
+        digest_hasher.update([0x19, 0x01]);
         digest_hasher.update(domain_separator);
-        digest_hasher.update(&struct_hash);
+        digest_hasher.update(struct_hash);
         let digest = digest_hasher.finalize();
 
         // Recovery ID
@@ -398,7 +398,7 @@ mod tests {
 
         // Compute EIP-712 digest
         let mut hasher = Keccak256::new();
-        hasher.update(&[0x19, 0x01]);
+        hasher.update([0x19, 0x01]);
         hasher.update(domain_separator);
         hasher.update(struct_hash);
         let digest: [u8; 32] = hasher.finalize().into();
@@ -473,9 +473,9 @@ mod tests {
 
         // EIP-712 digest
         let mut digest_hasher = Keccak256::new();
-        digest_hasher.update(&[0x19, 0x01]);
+        digest_hasher.update([0x19, 0x01]);
         digest_hasher.update(domain_separator);
-        digest_hasher.update(&struct_hash);
+        digest_hasher.update(struct_hash);
         let digest: [u8; 32] = digest_hasher.finalize().into();
 
         // Sign

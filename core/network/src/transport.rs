@@ -376,6 +376,7 @@ async fn handle_inbound(
 // Outbound connection handler
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_outbound(
     mut stream: TcpStream,
     addr: SocketAddr,

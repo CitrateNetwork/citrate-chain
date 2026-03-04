@@ -276,7 +276,7 @@ impl GovernanceManager {
             valid_from: current_block,
         };
 
-        self.delegations.entry(delegate).or_insert_with(Vec::new).push(delegation);
+        self.delegations.entry(delegate).or_default().push(delegation);
         Ok(())
     }
 
@@ -305,11 +305,11 @@ impl GovernanceManager {
                         updates.push(ProposalUpdate::Failed(proposal.id));
                     }
                 }
-                ProposalStatus::Succeeded if proposal.execution_eta.map_or(false, |eta| current_block >= eta) => {
+                ProposalStatus::Succeeded if proposal.execution_eta.is_some_and(|eta| current_block >= eta) => {
                     proposal.status = ProposalStatus::Queued;
                     updates.push(ProposalUpdate::ReadyForExecution(proposal.id));
                 }
-                ProposalStatus::Queued if proposal.execution_eta.map_or(false, |eta| current_block > eta + self.config.grace_period) => {
+                ProposalStatus::Queued if proposal.execution_eta.is_some_and(|eta| current_block > eta + self.config.grace_period) => {
                     proposal.status = ProposalStatus::Expired;
                     updates.push(ProposalUpdate::Expired(proposal.id));
                 }

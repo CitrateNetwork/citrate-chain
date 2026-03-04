@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
 
     defaults:
       run:
@@ -25,11 +25,21 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            citrate_v0.01.1/target
+          key: release-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          restore-keys: release-${{ matrix.os }}-
+
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev cmake
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
 
       - name: Install Windows dependencies
         if: runner.os == 'Windows'
@@ -89,7 +99,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
 
     defaults:
       run:
@@ -106,6 +116,16 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            citrate_v0.01.1/target
+          key: tauri-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          restore-keys: tauri-${{ matrix.os }}-
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'

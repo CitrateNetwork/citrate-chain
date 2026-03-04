@@ -333,7 +333,7 @@ fn i4_rate_limit_response_format() {
         RequestMiddlewareAction::Respond { response, .. } => {
             // The response is a boxed future, we can't easily await it in sync test,
             // but the test proves the middleware returns Respond (not Proceed).
-            let _ = response; // Rate limit response generated
+            drop(response); // Rate limit response generated
         }
         RequestMiddlewareAction::Proceed { .. } => {
             panic!("I.4: Should be rate limited after exceeding max_requests")

@@ -40,6 +40,9 @@ fn create_test_block(num: u8, height: u64) -> Block {
         signature: Signature::new([0u8; 64]),
         embedded_models: vec![],
         required_pins: vec![],
+        learning_embedding: None,
+        learning_confidence: None,
+        gradient_commitment: None,
     }
 }
 

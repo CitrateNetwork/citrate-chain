@@ -173,7 +173,7 @@ impl ExecutionVerifier {
 
         #[cfg(not(feature = "zkp_production"))]
         {
-            return self.verify_commitment_proof(statement, proof_data);
+            self.verify_commitment_proof(statement, proof_data)
         }
     }
 
@@ -344,14 +344,14 @@ impl ExecutionVerifier {
 
         // Round 2: Mix in architecture information for uniqueness
         let mut hasher = Sha3_256::new();
-        hasher.update(&base_key);
+        hasher.update(base_key);
         hasher.update(&model.architecture);
-        hasher.update(&(model.weights.len() as u64).to_le_bytes());
+        hasher.update((model.weights.len() as u64).to_le_bytes());
         let arch_key = hasher.finalize();
 
         // Round 3: Final key derivation with additional entropy
         let mut hasher = Sha3_256::new();
-        hasher.update(&arch_key);
+        hasher.update(arch_key);
         hasher.update(&model.metadata);
         hasher.update(b"final_key_derivation");
         let final_key = hasher.finalize();
@@ -423,7 +423,7 @@ mod tests {
         let response = [42u8; 32];
         let mut hasher = Sha3_256::new();
         hasher.update(&statement);
-        hasher.update(&response);
+        hasher.update(response);
         let commitment = hasher.finalize();
 
         let mut proof_data = commitment.to_vec();
@@ -444,13 +444,13 @@ mod tests {
     #[test]
     fn test_verifier_new() {
         let verifier = ExecutionVerifier::new();
-        assert!(std::mem::size_of_val(&verifier) >= 0); // Just verify it creates
+        let _ = &verifier; // Just verify it creates
     }
 
     #[test]
     fn test_verifier_default() {
         let verifier = ExecutionVerifier::default();
-        assert!(std::mem::size_of_val(&verifier) >= 0);
+        let _ = &verifier;
     }
 
     #[test]
@@ -981,7 +981,7 @@ mod tests {
         let mut hasher = Sha3_256::new();
         hasher.update(statement);
         hasher.update(response);
-        hasher.update(&nonce_bytes);
+        hasher.update(nonce_bytes);
         let commitment = hasher.finalize();
 
         let mut proof = Vec::with_capacity(72);

@@ -91,7 +91,7 @@ impl SearchEngine {
         for token in tokens {
             self.text_index
                 .entry(token)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(model.model_id);
         }
 

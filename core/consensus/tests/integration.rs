@@ -252,11 +252,8 @@ mod finality_progression_tests {
 
         // Try to receive events (non-blocking)
         let mut events_received = 0;
-        loop {
-            match receiver.try_recv() {
-                Ok(_) => events_received += 1,
-                Err(_) => break,
-            }
+        while receiver.try_recv().is_ok() {
+            events_received += 1;
         }
 
         // Should have received at least one finality event
