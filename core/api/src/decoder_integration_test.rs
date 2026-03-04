@@ -1,4 +1,8 @@
 // citrate/core/api/src/decoder_integration_test.rs
+//
+// DEPRECATED: Test module for the deprecated unified/enhanced decoder chain.
+// The primary production decoder is `eth_tx_decoder.rs`.
+// See core/api/DECODER_ARCHITECTURE.md for the full decoder stack map.
 
 #[cfg(test)]
 mod tests {
