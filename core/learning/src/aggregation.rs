@@ -567,6 +567,7 @@ mod proptests {
     use proptest::prelude::*;
 
     /// Strategy: 2-8 participants, 2-16 dimensions, valid f32 values
+    #[allow(clippy::type_complexity)]
     fn aggregation_inputs(
     ) -> impl Strategy<Value = (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>, usize)> {
         (2usize..=8, 2usize..=16).prop_flat_map(|(n, dim)| {

@@ -60,7 +60,7 @@ impl Database for StateDBAdapter {
 
         Ok(Some(AccountInfo {
             balance: balance_revm,
-            nonce: nonce,
+            nonce,
             code_hash: code_hash_b256,
             code: None, // Lazy load code
         }))
@@ -148,6 +148,7 @@ pub struct BlockContext {
 }
 
 /// Execute contract creation using revm
+#[allow(clippy::too_many_arguments)]
 pub fn execute_contract_create(
     state_db: Arc<StateDB>,
     deployer: Address,
@@ -166,6 +167,7 @@ pub fn execute_contract_create(
 }
 
 /// Execute contract creation using revm with full block context (WP-X.4)
+#[allow(clippy::too_many_arguments)]
 pub fn execute_contract_create_with_context(
     state_db: Arc<StateDB>,
     deployer: Address,
@@ -267,6 +269,7 @@ pub fn execute_contract_create_with_context(
 }
 
 /// Execute contract call using revm
+#[allow(clippy::too_many_arguments)]
 pub fn execute_contract_call(
     state_db: Arc<StateDB>,
     caller: Address,
@@ -286,6 +289,7 @@ pub fn execute_contract_call(
 }
 
 /// Execute contract call using revm with full block context (WP-X.4)
+#[allow(clippy::too_many_arguments)]
 pub fn execute_contract_call_with_context(
     state_db: Arc<StateDB>,
     caller: Address,

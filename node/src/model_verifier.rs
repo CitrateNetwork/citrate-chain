@@ -228,7 +228,7 @@ impl ModelVerifier {
                             .as_secs();
 
                         let check = ValidatorPinCheck {
-                            validator: validator.clone(),
+                            validator: *validator,
                             model_cid: model.ipfs_cid.clone(),
                             last_check: now,
                             status: pin_status,
@@ -238,7 +238,7 @@ impl ModelVerifier {
                         pin_checks
                             .write()
                             .await
-                            .insert((validator.clone(), model.ipfs_cid.clone()), check);
+                            .insert((*validator, model.ipfs_cid.clone()), check);
 
                         match pin_status {
                             PinStatus::Pinned => {
@@ -373,7 +373,7 @@ impl ModelVerifier {
             .as_secs();
 
         let check = ValidatorPinCheck {
-            validator: validator.clone(),
+            validator,
             model_cid: model_cid.clone(),
             last_check: now,
             status,
@@ -392,7 +392,7 @@ impl ModelVerifier {
     ) -> Option<ValidatorPinCheck> {
         let checks = self.pin_checks.read().await;
         checks
-            .get(&(validator.clone(), model_cid.to_string()))
+            .get(&(*validator, model_cid.to_string()))
             .cloned()
     }
 
@@ -417,7 +417,7 @@ impl ModelVerifier {
                         .iter()
                         .find(|m| m.ipfs_cid == *model_cid)
                     {
-                        slashable.push((validator.clone(), model_cid.clone(), model.slash_penalty));
+                        slashable.push((*validator, model_cid.clone(), model.slash_penalty));
                     }
                 }
             }
@@ -462,7 +462,7 @@ mod tests {
         let cid = "QmTest123".to_string();
 
         verifier
-            .record_pin_check(validator.clone(), cid.clone(), PinStatus::Pinned, None)
+            .record_pin_check(validator, cid.clone(), PinStatus::Pinned, None)
             .await;
 
         let status = verifier.get_pin_status(&validator, &cid).await;
@@ -481,8 +481,8 @@ mod tests {
         let v1 = PublicKey::new([1u8; 32]);
         let v2 = PublicKey::new([2u8; 32]);
 
-        provider.add_validator(v1.clone()).await;
-        provider.add_validator(v2.clone()).await;
+        provider.add_validator(v1).await;
+        provider.add_validator(v2).await;
 
         let validators = provider.get_active_validators();
         assert_eq!(validators.len(), 2);
@@ -502,7 +502,7 @@ mod tests {
         let v1 = PublicKey::new([1u8; 32]);
         let v2 = PublicKey::new([2u8; 32]);
 
-        let provider = StaticValidatorProvider::with_validators(vec![v1.clone(), v2.clone()]);
+        let provider = StaticValidatorProvider::with_validators(vec![v1, v2]);
 
         let validators = provider.get_active_validators();
         assert_eq!(validators.len(), 2);
@@ -511,7 +511,7 @@ mod tests {
     #[tokio::test]
     async fn test_verifier_with_custom_provider() {
         let v1 = PublicKey::new([1u8; 32]);
-        let provider = Arc::new(StaticValidatorProvider::with_validators(vec![v1.clone()]));
+        let provider = Arc::new(StaticValidatorProvider::with_validators(vec![v1]));
 
         let config = VerifierConfig::default();
         let models = vec![RequiredModel::new(

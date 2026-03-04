@@ -350,6 +350,7 @@ pub struct Transaction {
 
     /// EIP-2930/1559 access list: Vec of (address_bytes, Vec<storage_key_bytes>)
     #[serde(default)]
+    #[allow(clippy::type_complexity)]
     pub access_list: Option<Vec<(Vec<u8>, Vec<Vec<u8>>)>>,
 
     /// Chain ID decoded from the transaction signature

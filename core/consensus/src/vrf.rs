@@ -171,7 +171,7 @@ impl VrfProposerSelector {
         // Verify output matches SHA3(proof || input)
         let mut output_hasher = Sha3_256::new();
         output_hasher.update(&proof.proof);
-        output_hasher.update(&input);
+        output_hasher.update(input);
         let expected_output = Hash::from_bytes(&output_hasher.finalize());
 
         Ok(proof.output == expected_output)

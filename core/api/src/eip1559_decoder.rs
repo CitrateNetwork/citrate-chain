@@ -153,7 +153,7 @@ impl Eip1559Decoder {
         info!(
             "Successfully decoded EIP-1559 transaction: hash=0x{}, from=0x{}, nonce={}",
             hex::encode(citrate_tx.hash.as_bytes()),
-            hex::encode(&sender.as_bytes()),
+            hex::encode(sender.as_bytes()),
             citrate_tx.nonce
         );
 

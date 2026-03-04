@@ -317,7 +317,7 @@ impl AINetworkHandler {
             // Use the pluggable inference executor (MCP/GGUF backed)
             if let Some(ref executor) = self.inference_executor {
                 // Build a provider key from the input hash (32 bytes)
-                let provider_key = input_hash.as_bytes().clone();
+                let provider_key = *input_hash.as_bytes();
 
                 match executor
                     .execute_inference(*model_id.as_bytes(), input_hash.as_bytes().to_vec(), provider_key)
@@ -395,6 +395,7 @@ impl AINetworkHandler {
     }
 
     /// Handle training job announcement
+    #[allow(clippy::too_many_arguments)]
     async fn handle_training_announce(
         &self,
         peer_id: &PeerId,

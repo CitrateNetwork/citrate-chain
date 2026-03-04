@@ -312,7 +312,7 @@ impl IpfsDaemon {
     async fn extract_archive(
         &self,
         archive_bytes: &[u8],
-        install_dir: &PathBuf,
+        install_dir: &std::path::Path,
         os: &str,
     ) -> Result<PathBuf> {
         use std::io::Cursor;

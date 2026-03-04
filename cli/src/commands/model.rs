@@ -263,6 +263,7 @@ pub async fn execute(cmd: ModelCommands, config: &Config) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deploy_model(
     config: &Config,
     model_path: PathBuf,
@@ -291,8 +292,8 @@ async fn deploy_model(
         serde_json::from_str(&content)?
     } else {
         json!({
-            "name": name.as_ref().map(|s| s.as_str()).unwrap_or("Unnamed Model"),
-            "version": version.as_ref().map(|s| s.as_str()).unwrap_or("1.0.0"),
+            "name": name.as_deref().unwrap_or("Unnamed Model"),
+            "version": version.as_deref().unwrap_or("1.0.0"),
             "format": model_format,
             "size": model_data.len(),
             "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -898,7 +899,7 @@ async fn search_hf_models(query: &str, limit: usize, gguf_only: bool) -> Result<
         models
             .iter()
             .filter(|m| {
-                m.tags.as_ref().map_or(false, |tags| {
+                m.tags.as_ref().is_some_and(|tags| {
                     tags.iter().any(|t| t.eq_ignore_ascii_case("gguf"))
                 })
             })

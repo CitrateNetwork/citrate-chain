@@ -217,7 +217,7 @@ impl PerformanceTracker {
     /// Record a performance data point
     pub async fn record_performance(&self, model_id: &ModelId, data_point: PerformanceDataPoint) -> Result<()> {
         // Add to real-time data
-        let mut entry = self.real_time_data.entry(*model_id).or_insert_with(VecDeque::new);
+        let mut entry = self.real_time_data.entry(*model_id).or_default();
         entry.push_back(data_point.clone());
 
         // Limit data retention
@@ -247,7 +247,7 @@ impl PerformanceTracker {
     pub async fn submit_benchmark(&self, result: BenchmarkResult) -> Result<()> {
         let mut benchmarks = self.benchmark_results
             .entry(result.model_id)
-            .or_insert_with(Vec::new);
+            .or_default();
 
         benchmarks.push(result.clone());
 
@@ -402,7 +402,7 @@ impl PerformanceTracker {
             };
 
             // Store performance window
-            let mut windows = performance_windows.entry(model_id).or_insert_with(VecDeque::new);
+            let mut windows = performance_windows.entry(model_id).or_default();
             windows.push_back(window.clone());
 
             // Limit window retention
@@ -474,7 +474,7 @@ impl PerformanceTracker {
         let error_score = (1.0 - (current_window.error_rate / config.alert_thresholds.high_error_rate).min(1.0)).max(0.0);
         let uptime_score = (uptime_percentage / 100.0).max(0.0);
 
-        let health_score = (latency_score * 0.4 + error_score * 0.3 + uptime_score * 0.3).max(0.0).min(1.0);
+        let health_score = (latency_score * 0.4 + error_score * 0.3 + uptime_score * 0.3).clamp(0.0, 1.0);
 
         // Determine overall health level
         let overall_health = match health_score {
@@ -538,7 +538,7 @@ impl PerformanceTracker {
 
         // Store active alerts
         if !alerts.is_empty() {
-            let mut model_alerts = self.active_alerts.entry(*model_id).or_insert_with(Vec::new);
+            let mut model_alerts = self.active_alerts.entry(*model_id).or_default();
             model_alerts.extend(alerts.clone());
 
             // Store in alert history

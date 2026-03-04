@@ -181,6 +181,7 @@ pub enum EVMOpcode {
 }
 
 /// Enhanced EVM execution context supporting all current features
+#[allow(clippy::type_complexity)]
 pub struct EVMContext {
     pub block_number: u64,
     pub block_timestamp: u64,
@@ -279,8 +280,8 @@ impl EVMState {
         }
 
         // Calculate memory expansion gas cost (EIP-150)
-        let words_before = (current_size + 31) / 32;
-        let words_after = (new_size + 31) / 32;
+        let words_before = current_size.div_ceil(32);
+        let words_after = new_size.div_ceil(32);
 
         let cost_before = words_before * 3 + words_before * words_before / 512;
         let cost_after = words_after * 3 + words_after * words_after / 512;
@@ -454,6 +455,12 @@ pub struct EVMExecutor {
     pub gas_schedule: EnhancedGasSchedule,
     pub accessed_addresses: HashMap<[u8; 20], bool>,  // EIP-2929
     pub accessed_storage: HashMap<U256, bool>,        // EIP-2929
+}
+
+impl Default for EVMExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EVMExecutor {
@@ -762,7 +769,7 @@ impl EVMExecutor {
         let src = state.stack_pop()?.as_usize();
         let size = state.stack_pop()?.as_usize();
 
-        let gas_cost = self.gas_schedule.mcopy * ((size + 31) / 32) as u64;
+        let gas_cost = self.gas_schedule.mcopy * size.div_ceil(32) as u64;
         state.consume_gas(gas_cost)?;
 
         let expansion_cost = state.memory_expand(std::cmp::max(dst, src), size)?;
@@ -880,7 +887,7 @@ impl EVMExecutor {
         let b = state.stack_pop()?;
 
         // Calculate gas cost based on exponent size
-        let exp_bytes = (b.bits() + 7) / 8;
+        let exp_bytes = b.bits().div_ceil(8);
         let gas_cost = self.gas_schedule.high + 50 * exp_bytes as u64;
         state.consume_gas(gas_cost)?;
 
@@ -903,7 +910,7 @@ impl EVMExecutor {
         let result = if i >= U256::from(32) {
             val
         } else {
-            let bit_index = (8 * i.as_usize() + 7) as usize;
+            let bit_index = 8 * i.as_usize() + 7;
             if bit_index < 256 && val.bit(bit_index) {
                 // Sign bit is 1, extend with 1s
                 let mask = (U256::MAX << bit_index) << 1;
@@ -1033,7 +1040,7 @@ impl EVMExecutor {
         let offset = state.stack_pop()?.as_usize();
         let size = state.stack_pop()?.as_usize();
 
-        let gas_cost = 30 + 6 * ((size + 31) / 32) as u64; // Keccak256 gas cost
+        let gas_cost = 30 + 6 * size.div_ceil(32) as u64; // Keccak256 gas cost
         state.consume_gas(gas_cost)?;
 
         let expansion_cost = state.memory_expand(offset, size)?;
@@ -1116,7 +1123,7 @@ impl EVMExecutor {
         let offset = state.stack_pop()?.as_usize();
         let size = state.stack_pop()?.as_usize();
 
-        let gas_cost = self.gas_schedule.verylow + 3 * ((size + 31) / 32) as u64;
+        let gas_cost = self.gas_schedule.verylow + 3 * size.div_ceil(32) as u64;
         state.consume_gas(gas_cost)?;
 
         let expansion_cost = state.memory_expand(dest_offset, size)?;
@@ -1141,7 +1148,7 @@ impl EVMExecutor {
         let offset = state.stack_pop()?.as_usize();
         let size = state.stack_pop()?.as_usize();
 
-        let gas_cost = self.gas_schedule.verylow + 3 * ((size + 31) / 32) as u64;
+        let gas_cost = self.gas_schedule.verylow + 3 * size.div_ceil(32) as u64;
         state.consume_gas(gas_cost)?;
 
         let expansion_cost = state.memory_expand(dest_offset, size)?;
@@ -1201,7 +1208,7 @@ impl EVMExecutor {
         } else {
             self.gas_schedule.cold_account_access
         };
-        let copy_cost = 3 * ((size + 31) / 32) as u64;
+        let copy_cost = 3 * size.div_ceil(32) as u64;
         state.consume_gas(access_cost + copy_cost)?;
         self.accessed_addresses.insert(address, true);
 
@@ -1228,7 +1235,7 @@ impl EVMExecutor {
         let offset = state.stack_pop()?.as_usize();
         let size = state.stack_pop()?.as_usize();
 
-        let gas_cost = self.gas_schedule.verylow + 3 * ((size + 31) / 32) as u64;
+        let gas_cost = self.gas_schedule.verylow + 3 * size.div_ceil(32) as u64;
         state.consume_gas(gas_cost)?;
 
         // Check bounds
@@ -1694,10 +1701,12 @@ impl TryFrom<u8> for EVMOpcode {
             0x5e => Ok(EVMOpcode::MCOPY),
             0x5f => Ok(EVMOpcode::PUSH0),
 
-            0x60..=0x7f => Ok(unsafe { std::mem::transmute(value) }),
-            0x80..=0x8f => Ok(unsafe { std::mem::transmute(value) }),
-            0x90..=0x9f => Ok(unsafe { std::mem::transmute(value) }),
-            0xa0..=0xa4 => Ok(unsafe { std::mem::transmute(value) }),
+            // SAFETY: These ranges directly correspond to contiguous enum variants
+            // (PUSH1-PUSH32, DUP1-DUP16, SWAP1-SWAP16, LOG0-LOG4) with matching discriminants
+            0x60..=0x7f => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
+            0x80..=0x8f => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
+            0x90..=0x9f => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
+            0xa0..=0xa4 => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
 
             0xf0 => Ok(EVMOpcode::CREATE),
             0xf1 => Ok(EVMOpcode::CALL),

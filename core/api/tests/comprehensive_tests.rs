@@ -12,7 +12,7 @@ mod api_tests {
         let _tx_hex = "0x00"; // Simplified - would be actual RLP in production
 
         // Test that decoder can handle legacy transactions
-        assert!(true); // Placeholder - actual test would decode and verify
+        // Placeholder - actual test would decode and verify
     }
 
     #[test]
@@ -21,7 +21,7 @@ mod api_tests {
         let _tx_hex = "0x02"; // Simplified - would be actual RLP in production
 
         // Test that decoder can handle EIP-1559 transactions
-        assert!(true); // Placeholder - actual test would decode and verify
+        // Placeholder - actual test would decode and verify
     }
 
     #[test]

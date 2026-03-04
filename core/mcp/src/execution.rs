@@ -440,13 +440,13 @@ impl ModelExecutor {
 
         // Divide weights into chunks and compute gradient for each
         let chunk_size = 32; // SHA3-256 output size
-        let num_chunks = (current_weights.len() + chunk_size - 1) / chunk_size;
+        let num_chunks = current_weights.len().div_ceil(chunk_size);
 
         for i in 0..num_chunks {
             // Hash training data with chunk index to get gradient for this chunk
             let mut hasher = Sha3_256::new();
             hasher.update(b"CITRATE_GRADIENT_V1");
-            hasher.update(&(i as u64).to_le_bytes());
+            hasher.update((i as u64).to_le_bytes());
             hasher.update(training_data);
             hasher.update(&current_weights[..std::cmp::min(256, current_weights.len())]);
             let hash = hasher.finalize();
@@ -634,10 +634,10 @@ impl ModelExecutor {
             let mut hasher = Sha3_256::new();
             hasher.update(b"CITRATE_RESPONSE_V1");
             hasher.update(&statement);
-            hasher.update(&provider.0);
+            hasher.update(provider.0);
             // Add timestamp entropy for uniqueness across executions
             let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            hasher.update(&timestamp.to_le_bytes());
+            hasher.update(timestamp.to_le_bytes());
             hasher.finalize()
         };
 
@@ -645,7 +645,7 @@ impl ModelExecutor {
         let commitment = {
             let mut hasher = Sha3_256::new();
             hasher.update(&statement);
-            hasher.update(&response);
+            hasher.update(response);
             hasher.finalize()
         };
 
@@ -756,7 +756,7 @@ mod tests {
         let new_weights = executor.apply_gradient_update(&weights, &gradient, learning_rate);
 
         // All weights should be valid (0-255)
-        assert!(new_weights.iter().all(|&w| w <= 255));
+        assert!(!new_weights.is_empty()); // u8 values are always <= 255
     }
 
     #[test]
@@ -837,12 +837,12 @@ mod tests {
 
             let mut gradient = Vec::with_capacity(current_weights.len());
             let chunk_size = 32;
-            let num_chunks = (current_weights.len() + chunk_size - 1) / chunk_size;
+            let num_chunks = current_weights.len().div_ceil(chunk_size);
 
             for i in 0..num_chunks {
                 let mut hasher = Sha3_256::new();
                 hasher.update(b"CITRATE_GRADIENT_V1");
-                hasher.update(&(i as u64).to_le_bytes());
+                hasher.update((i as u64).to_le_bytes());
                 hasher.update(training_data);
                 hasher.update(&current_weights[..std::cmp::min(256, current_weights.len())]);
                 let hash = hasher.finalize();

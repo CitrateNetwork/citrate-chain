@@ -76,7 +76,7 @@ impl CheckpointConfig {
 
     /// Check if a height is a checkpoint boundary.
     pub fn is_checkpoint_height(&self, height: u64) -> bool {
-        height > 0 && height % self.interval == 0
+        height > 0 && height.is_multiple_of(self.interval)
     }
 }
 

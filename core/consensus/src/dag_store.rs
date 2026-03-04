@@ -16,6 +16,7 @@ pub trait KvStore: Send + Sync {
     fn kv_delete(&self, cf: &str, key: &[u8]) -> Result<(), String>;
     fn kv_exists(&self, cf: &str, key: &[u8]) -> Result<bool, String>;
     /// Iterate all key-value pairs in a column family.
+    #[allow(clippy::type_complexity)]
     fn kv_iter_cf(&self, cf: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String>;
 }
 
@@ -158,7 +159,7 @@ impl DagStore {
             .map_err(|e| DagStoreError::StorageError(format!("load children: {}", e)))?;
         let mut children: HashMap<Hash, Vec<Hash>> = HashMap::new();
         for (_key, value) in &child_entries {
-            let (parent, child_list): (Hash, Vec<Hash>) = bincode::deserialize(&value)
+            let (parent, child_list): (Hash, Vec<Hash>) = bincode::deserialize(value)
                 .map_err(|e| DagStoreError::StorageError(format!("deserialize children: {}", e)))?;
             children.insert(parent, child_list);
         }
@@ -785,8 +786,8 @@ mod tests {
 
         // output = SHA3(proof || input)
         let mut output_hasher = Sha3_256::new();
-        output_hasher.update(&proof_bytes);
-        output_hasher.update(&input);
+        output_hasher.update(proof_bytes);
+        output_hasher.update(input);
         let output = Hash::from_bytes(&output_hasher.finalize());
 
         Block {
@@ -887,6 +888,7 @@ mod tests {
 
     /// In-memory KvStore for testing persistence without RocksDB.
     struct MemKvStore {
+        #[allow(clippy::type_complexity)]
         data: std::sync::Mutex<HashMap<String, HashMap<Vec<u8>, Vec<u8>>>>,
     }
 

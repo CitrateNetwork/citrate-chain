@@ -1668,7 +1668,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 is_public_bind, // WP-K.4: fail-closed on public interface
                 ..Default::default()
             },
-            ..Default::default()
         };
 
         let rpc_server = RpcServer::with_economics_and_pause(
@@ -1722,7 +1721,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             use sha3::{Digest as _, Sha3_256};
             let mut hasher = Sha3_256::new();
             hasher.update(b"citrate-block-signing-key-v1");
-            hasher.update(&coinbase);
+            hasher.update(coinbase);
             let seed = hasher.finalize();
             let mut seed_bytes = [0u8; 32];
             seed_bytes.copy_from_slice(&seed);

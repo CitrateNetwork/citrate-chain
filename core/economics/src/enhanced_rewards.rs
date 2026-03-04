@@ -200,7 +200,7 @@ impl EnhancedRewardCalculator {
         let halving_interval = 2_100_000u64;
         let halvings = block_height / halving_interval;
         if halvings > 0 && halvings < 64 {
-            base_pool = base_pool / U256::from(2u64.pow(halvings as u32));
+            base_pool /= U256::from(2u64.pow(halvings as u32));
         }
 
         // Network activity bonus
@@ -462,7 +462,7 @@ impl EnhancedRewardCalculator {
     ) {
         // Update validator history
         for performance in validator_performances {
-            let history = self.validator_history.entry(performance.address).or_insert_with(Vec::new);
+            let history = self.validator_history.entry(performance.address).or_default();
             history.push(performance.clone());
             if history.len() > self.config.performance_window as usize {
                 history.remove(0);
@@ -471,7 +471,7 @@ impl EnhancedRewardCalculator {
 
         // Update AI contribution history
         for contribution in ai_contributions {
-            let history = self.ai_contribution_history.entry(contribution.contributor).or_insert_with(Vec::new);
+            let history = self.ai_contribution_history.entry(contribution.contributor).or_default();
             history.push(contribution.clone());
             if history.len() > self.config.performance_window as usize {
                 history.remove(0);

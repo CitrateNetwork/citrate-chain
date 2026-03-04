@@ -221,6 +221,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_config_zero_dimensions() {
         let mut config = LearningConfig::default();
         config.embedding_dimensions = 0;
@@ -228,6 +229,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_config_excessive_dimensions() {
         let mut config = LearningConfig::default();
         config.embedding_dimensions = 8192;
@@ -235,6 +237,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_config_zero_participants() {
         let mut config = LearningConfig::default();
         config.min_participants = 0;
@@ -242,6 +245,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_config_negative_sigma() {
         let mut config = LearningConfig::default();
         config.byzantine_sigma_threshold = -1.0;
@@ -249,6 +253,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_config_invalid_learning_rate() {
         let mut config = LearningConfig::default();
         config.router_learning_rate = 0.0;
@@ -259,6 +264,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_config_invalid_belnap_thresholds() {
         let mut config = LearningConfig::default();
         // high <= low
@@ -268,6 +274,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_config_invalid_temperature() {
         let mut config = LearningConfig::default();
         config.temperature = 0.0;
@@ -275,6 +282,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_config_invalid_lora_rank() {
         let mut config = LearningConfig::default();
         config.lora_rank = 0;

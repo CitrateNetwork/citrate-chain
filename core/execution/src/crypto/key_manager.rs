@@ -130,6 +130,12 @@ pub struct KeyManager {
     rotation_schedule: Arc<RwLock<HashMap<H256, u64>>>,
 }
 
+impl Default for KeyManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeyManager {
     /// Create new key manager
     pub fn new() -> Self {
@@ -190,8 +196,7 @@ impl KeyManager {
 
         // Derive for each path component
         for component in components.iter().skip(1) {
-            let (index, _hardened) = if component.ends_with('\'') {
-                let idx_str = &component[..component.len() - 1];
+            let (index, _hardened) = if let Some(idx_str) = component.strip_suffix('\'') {
                 let idx = idx_str.parse::<u32>()
                     .map_err(|_| anyhow!("Invalid path component"))?;
                 // Check for overflow before adding
@@ -219,7 +224,7 @@ impl KeyManager {
         // Generate key ID
         let key_id = {
             let mut hasher = Sha3_256::new();
-            hasher.update(&current_key);
+            hasher.update(current_key);
             hasher.update(path.as_bytes());
             H256::from_slice(hasher.finalize().as_slice())
         };

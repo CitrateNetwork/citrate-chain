@@ -315,9 +315,11 @@ impl SyncManager {
     /// validation and marked Synced based on height alone. An attacker could
     /// feed garbage blocks to a syncing node, making it believe it was synced
     /// while holding no valid chain data. Now each block is validated:
-    ///   1. Hash integrity (covers header + commitment roots)
-    ///   2. Signature verification (proposer key bound to block hash)
-    ///   3. tx_root consistency (recomputed from transactions)
+    ///
+    /// 1. Hash integrity (covers header + commitment roots)
+    /// 2. Signature verification (proposer key bound to block hash)
+    /// 3. tx_root consistency (recomputed from transactions)
+    ///
     /// Only validated blocks are stored and count toward progress.
     pub async fn handle_blocks(&self, blocks: Vec<Block>) -> Result<(), NetworkError> {
         if blocks.is_empty() {

@@ -22,6 +22,7 @@ impl EVMIntegration {
     }
 
     /// Execute EVM bytecode with full context integration
+    #[allow(clippy::too_many_arguments)]
     pub fn execute(
         &mut self,
         code: &[u8],
@@ -79,7 +80,7 @@ impl EVMIntegration {
             get_code_hash: Box::new(move |addr: &[u8; 20]| {
                 let address = Address(*addr);
                 let code_hash = state_db_code_hash.accounts.get_code_hash(&address);
-                code_hash.as_bytes().clone()
+                *code_hash.as_bytes()
             }),
             get_code: Box::new(move |addr: &[u8; 20]| {
                 let address = Address(*addr);

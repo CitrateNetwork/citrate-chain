@@ -355,15 +355,13 @@ mod tests {
 
     #[test]
     fn test_sort_by_variants() {
-        let variants = vec![
-            SortBy::Relevance,
+        let variants = [SortBy::Relevance,
             SortBy::Rating,
             SortBy::Price,
             SortBy::Sales,
             SortBy::Newest,
             SortBy::MostReviewed,
-            SortBy::Popularity,
-        ];
+            SortBy::Popularity];
         assert_eq!(variants.len(), 7);
     }
 

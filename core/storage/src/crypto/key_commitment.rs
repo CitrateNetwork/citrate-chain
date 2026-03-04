@@ -111,8 +111,8 @@ impl KeyCommitment {
         hasher.update(b"QSSP-v1-key-commitment");
         hasher.update(key);
         hasher.update(salt);
-        hasher.update(&[purpose]);
-        hasher.update(&version.to_be_bytes());
+        hasher.update([purpose]);
+        hasher.update(version.to_be_bytes());
         hasher.finalize().into()
     }
 
@@ -252,7 +252,7 @@ impl KeyRotationProof {
         hasher.update(old_key);
         hasher.update(old_commitment);
         hasher.update(new_commitment);
-        hasher.update(&timestamp.to_be_bytes());
+        hasher.update(timestamp.to_be_bytes());
 
         let digest = hasher.finalize();
         let mut proof = [0u8; 64];
@@ -318,7 +318,7 @@ impl OnChainKeyAnchor {
     fn compute_leaf_hash(&self) -> [u8; 32] {
         let mut hasher = Sha3_256::new();
         hasher.update(b"QSSP-v1-leaf");
-        hasher.update(&self.commitment.to_bytes());
+        hasher.update(self.commitment.to_bytes());
         hasher.finalize().into()
     }
 

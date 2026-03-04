@@ -35,6 +35,7 @@ impl From<Block> for BlockResponse {
 }
 
 /// Transaction response
+#[allow(clippy::type_complexity)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionResponse {
     pub hash: Hash,

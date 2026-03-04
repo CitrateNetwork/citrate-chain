@@ -157,7 +157,7 @@ mod network_tests {
         }
 
         let peers = pm.get_all_peers();
-        assert!(peers.len() > 0);
+        assert!(!peers.is_empty());
     }
 
     #[tokio::test]

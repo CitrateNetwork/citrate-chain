@@ -270,7 +270,7 @@ impl SecureEnclaveInterface for AppleSecureEnclave {
         // Calculate measurement
         let mut hasher = Sha3_256::new();
         hasher.update(b"ENCLAVE_CODE");
-        hasher.update(&self.enclave_id.as_bytes());
+        hasher.update(self.enclave_id.as_bytes());
         let measurement = H256::from_slice(hasher.finalize().as_slice());
 
         // Generate enclave keypair (simulated — would come from hardware enclave)
@@ -367,8 +367,8 @@ impl SecureEnclaveInterface for AppleSecureEnclave {
                 }
                 // Simulate encryption
                 let mut result = inputs[0].clone();
-                for i in 0..result.len() {
-                    result[i] ^= inputs[1][i % inputs[1].len()];
+                for (i, byte) in result.iter_mut().enumerate() {
+                    *byte ^= inputs[1][i % inputs[1].len()];
                 }
                 Ok(result)
             }
@@ -404,7 +404,7 @@ impl AppleSecureEnclave {
                     hasher.update(id.as_bytes());
                 }
                 if let Some(ver) = min_version {
-                    hasher.update(&ver.to_be_bytes());
+                    hasher.update(ver.to_be_bytes());
                 }
             }
         }

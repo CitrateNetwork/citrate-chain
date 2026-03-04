@@ -234,7 +234,6 @@ impl GGUFEngine {
 
         // Try space-separated
         let values: Result<Vec<f32>, _> = output
-            .trim()
             .split_whitespace()
             .map(|s| s.parse::<f32>())
             .collect();

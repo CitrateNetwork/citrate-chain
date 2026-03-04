@@ -760,7 +760,7 @@ impl AiApi {
 
         // Search for model in multiple locations
         let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let search_paths = vec![
+        let search_paths = [
             // Current working directory
             PathBuf::from("./models").join(model_filename),
             // Citrate project models directory (relative)

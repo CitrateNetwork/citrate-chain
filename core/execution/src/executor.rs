@@ -721,7 +721,7 @@ impl Executor {
             metadata.output_shape = vec![1];
         }
 
-        metadata.created_at = metadata.created_at.max(0);
+        // created_at is already set from deserialization
 
         let artifact_cid = if data.len() >= offset + 4 {
             let cid_len = u32::from_be_bytes(
@@ -1831,17 +1831,15 @@ impl Executor {
                     );
                 }
             }
-        } else {
-            if let Some(adapter) = &self.model_registry {
-                if let Err(err) = adapter
-                    .register_model(model_id, &persisted_state, None)
-                    .await
-                {
-                    warn!(
-                        "Model registry adapter failed for model {:?}: {}",
-                        model_id, err
-                    );
-                }
+        } else if let Some(adapter) = &self.model_registry {
+            if let Err(err) = adapter
+                .register_model(model_id, &persisted_state, None)
+                .await
+            {
+                warn!(
+                    "Model registry adapter failed for model {:?}: {}",
+                    model_id, err
+                );
             }
         }
 
@@ -2086,6 +2084,7 @@ mod tests {
     }
 
     impl RecordingStorage {
+        #[allow(clippy::type_complexity)]
         fn new() -> (
             Self,
             Arc<Mutex<Vec<(ModelId, String)>>>,
@@ -2128,11 +2127,13 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     struct RecordingRegistry {
         records: Arc<Mutex<Vec<(ModelId, Option<String>)>>>,
     }
 
     impl RecordingRegistry {
+        #[allow(clippy::type_complexity)]
         fn new() -> (Self, Arc<Mutex<Vec<(ModelId, Option<String>)>>>) {
             let records = Arc::new(Mutex::new(Vec::new()));
             (

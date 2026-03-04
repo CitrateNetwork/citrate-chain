@@ -538,7 +538,7 @@ mod tests {
         let e1 = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
         let e2 = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
         let e3 = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
-        let conf = vec![0.9, 0.9]; // high confidence in both dims
+        let conf = [0.9, 0.9]; // high confidence in both dims
         let blue = vec![10.0, 10.0, 10.0]; // equal trust
 
         let result = classify_belnap(
@@ -564,7 +564,7 @@ mod tests {
         let e1 = EmbeddingVector::new(vec![1.0, 1.0]).unwrap();
         let e2 = EmbeddingVector::new(vec![1.0, 1.0]).unwrap();
         let e3 = EmbeddingVector::new(vec![-5.0, -5.0]).unwrap();
-        let conf = vec![0.9, 0.9];
+        let conf = [0.9, 0.9];
         let blue = vec![10.0, 10.0, 10.0];
 
         let result = classify_belnap(
@@ -588,8 +588,8 @@ mod tests {
         // Two nodes point in opposite directions with comparable trust
         let e1 = EmbeddingVector::new(vec![5.0]).unwrap();
         let e2 = EmbeddingVector::new(vec![-5.0]).unwrap();
-        let conf1 = vec![0.95];
-        let conf2 = vec![0.95];
+        let conf1 = [0.95];
+        let conf2 = [0.95];
         let blue = vec![10.0, 10.0]; // equal trust
 
         let result = classify_belnap(
@@ -611,8 +611,8 @@ mod tests {
     fn test_phi_low_confidence_neither() {
         let e1 = EmbeddingVector::new(vec![1.0, -5.0]).unwrap();
         let e2 = EmbeddingVector::new(vec![-1.0, 5.0]).unwrap();
-        let conf1 = vec![0.1, 0.2]; // below θ_low = 0.3
-        let conf2 = vec![0.15, 0.25];
+        let conf1 = [0.1, 0.2]; // below θ_low = 0.3
+        let conf2 = [0.15, 0.25];
         let blue = vec![10.0, 10.0];
 
         let result = classify_belnap(
@@ -637,8 +637,8 @@ mod tests {
         // dim 1: participant 0 high conf, participant 1 low conf
         let e1 = EmbeddingVector::new(vec![1.0, 3.0]).unwrap();
         let e2 = EmbeddingVector::new(vec![1.0, -3.0]).unwrap();
-        let conf1 = vec![0.9, 0.9]; // high in both
-        let conf2 = vec![0.9, 0.1]; // high in dim 0, low in dim 1
+        let conf1 = [0.9, 0.9]; // high in both
+        let conf2 = [0.9, 0.1]; // high in dim 0, low in dim 1
         let blue = vec![10.0, 10.0];
 
         let result = classify_belnap(
@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn test_phi_single_participant() {
         let e = EmbeddingVector::new(vec![1.0, -2.0, 3.0]).unwrap();
-        let conf = vec![0.9, 0.9, 0.9];
+        let conf = [0.9, 0.9, 0.9];
         let blue = vec![10.0];
 
         let result = classify_belnap(

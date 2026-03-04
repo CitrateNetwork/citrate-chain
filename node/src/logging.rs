@@ -62,7 +62,7 @@ impl TraceId {
     }
 
     /// Create trace ID from string (for propagation)
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         let parts: Vec<&str> = s.split('-').collect();
         if parts.len() != 3 {
             return None;
@@ -75,10 +75,6 @@ impl TraceId {
         })
     }
 
-    /// Convert to string for logging/propagation
-    pub fn to_string(&self) -> String {
-        format!("{:x}-{:x}-{:04x}", self.timestamp, self.counter, self.random)
-    }
 }
 
 impl Default for TraceId {
@@ -114,7 +110,7 @@ impl LogLevel {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "trace" => LogLevel::Trace,
             "debug" => LogLevel::Debug,
@@ -138,7 +134,7 @@ pub enum LogFormat {
 }
 
 impl LogFormat {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "json" => LogFormat::Json,
             "compact" => LogFormat::Compact,
@@ -201,12 +197,12 @@ impl LogConfig {
         if let Ok(rust_log) = std::env::var("RUST_LOG") {
             // Extract default level from start of filter
             let level_str = rust_log.split(',').next().unwrap_or("info");
-            config.level = LogLevel::from_str(level_str);
+            config.level = LogLevel::parse(level_str);
         }
 
         // Log format
         if let Ok(format) = std::env::var("LOG_FORMAT") {
-            config.format = LogFormat::from_str(&format);
+            config.format = LogFormat::parse(&format);
         }
 
         // Log file
@@ -448,7 +444,7 @@ mod tests {
         let id = TraceId::new();
         let id_str = id.to_string();
 
-        let parsed = TraceId::from_str(&id_str);
+        let parsed = TraceId::parse(&id_str);
         assert!(parsed.is_some());
 
         let parsed = parsed.unwrap();
@@ -473,22 +469,24 @@ mod tests {
 
     #[test]
     fn test_log_level_parsing() {
-        assert_eq!(LogLevel::from_str("trace"), LogLevel::Trace);
-        assert_eq!(LogLevel::from_str("DEBUG"), LogLevel::Debug);
-        assert_eq!(LogLevel::from_str("Info"), LogLevel::Info);
-        assert_eq!(LogLevel::from_str("WARN"), LogLevel::Warn);
-        assert_eq!(LogLevel::from_str("error"), LogLevel::Error);
-        assert_eq!(LogLevel::from_str("invalid"), LogLevel::Info);
+        assert_eq!(LogLevel::parse("trace"), LogLevel::Trace);
+        assert_eq!(LogLevel::parse("DEBUG"), LogLevel::Debug);
+        assert_eq!(LogLevel::parse("Info"), LogLevel::Info);
+        assert_eq!(LogLevel::parse("WARN"), LogLevel::Warn);
+        assert_eq!(LogLevel::parse("error"), LogLevel::Error);
+        assert_eq!(LogLevel::parse("invalid"), LogLevel::Info);
     }
 
     #[test]
     fn test_build_filter() {
-        let mut config = LogConfig::default();
-        config.level = LogLevel::Info;
-        config.module_levels = vec![
-            ("citrate_api".to_string(), LogLevel::Debug),
-            ("hyper".to_string(), LogLevel::Warn),
-        ];
+        let config = LogConfig {
+            level: LogLevel::Info,
+            module_levels: vec![
+                ("citrate_api".to_string(), LogLevel::Debug),
+                ("hyper".to_string(), LogLevel::Warn),
+            ],
+            ..Default::default()
+        };
 
         let filter = config.build_filter();
         assert!(filter.contains("info"));
