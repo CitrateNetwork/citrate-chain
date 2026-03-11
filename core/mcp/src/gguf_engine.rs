@@ -37,7 +37,7 @@ impl Default for GGUFEngineConfig {
             llama_cpp_path: home.join("llama.cpp"),
             models_dir: home.join(".citrate/models"),
             threads: num_cpus::get(),
-            context_size: 2048,
+            context_size: 32768,
         }
     }
 }
