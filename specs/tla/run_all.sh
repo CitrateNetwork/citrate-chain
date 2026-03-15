@@ -33,6 +33,9 @@ fi
 SPECS=(
     "GhostDAGConsensus"
     "MempoolSequencer"
+    "SDKConnectionLifecycle"
+    "TransactionExecution"
+    "VRFChainContinuity"
     "VRFElection"
 )
 
