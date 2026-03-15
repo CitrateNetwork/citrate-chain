@@ -10,8 +10,9 @@ Citrate uses TLA+ formal verification to model-check critical protocol invariant
 | Category | Specs | Invariants | Status |
 |----------|-------|------------|--------|
 | Core protocol | 7 | 41 | All passing |
+| Security audit | 3 | 9 | All passing |
 | GUI state machines | 4 | 31 | All passing |
-| **Total** | **11** | **72** | **All passing** |
+| **Total** | **14** | **81** | **All passing** |
 
 ## Core Protocol Specs (`specs/tla/`)
 
