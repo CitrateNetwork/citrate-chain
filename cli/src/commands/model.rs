@@ -1206,6 +1206,56 @@ async fn download_hf_model(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_size_bytes() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(500), "500 B");
+        assert_eq!(format_size(999), "999 B");
+    }
+
+    #[test]
+    fn test_format_size_kilobytes() {
+        assert_eq!(format_size(1_000), "1.0 KB");
+        assert_eq!(format_size(1_500), "1.5 KB");
+        assert_eq!(format_size(999_999), "1000.0 KB");
+    }
+
+    #[test]
+    fn test_format_size_megabytes() {
+        assert_eq!(format_size(1_000_000), "1.0 MB");
+        assert_eq!(format_size(500_000_000), "500.0 MB");
+    }
+
+    #[test]
+    fn test_format_size_gigabytes() {
+        assert_eq!(format_size(1_000_000_000), "1.0 GB");
+        assert_eq!(format_size(4_700_000_000), "4.7 GB");
+    }
+
+    #[test]
+    fn test_extract_quantization_common() {
+        assert_eq!(extract_quantization("model.Q4_K_M.gguf"), Some("Q4_K_M".to_string()));
+        assert_eq!(extract_quantization("model.Q5_K_S.gguf"), Some("Q5_K_S".to_string()));
+        assert_eq!(extract_quantization("model.Q8_0.gguf"), Some("Q8_0".to_string()));
+        assert_eq!(extract_quantization("model.F16.gguf"), Some("F16".to_string()));
+    }
+
+    #[test]
+    fn test_extract_quantization_case_insensitive() {
+        assert_eq!(extract_quantization("Model.q4_k_m.GGUF"), Some("Q4_K_M".to_string()));
+    }
+
+    #[test]
+    fn test_extract_quantization_none() {
+        assert_eq!(extract_quantization("model.gguf"), None);
+        assert_eq!(extract_quantization("random_file.bin"), None);
+    }
+}
+
 async fn auto_pin_to_ipfs(client: &reqwest::Client, file_path: &PathBuf) -> Result<String> {
     let file_data = fs::read(file_path)
         .with_context(|| format!("Failed to read file for IPFS pin: {:?}", file_path))?;

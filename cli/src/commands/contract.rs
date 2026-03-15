@@ -823,6 +823,46 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_no_args() {
+        let sig = "totalSupply()";
+        let out = encode_method_call(sig, serde_json::json!([])).expect("encode");
+        // Just selector, no args = 4 bytes = 8 hex + 2 prefix
+        assert_eq!(out.len(), 2 + 4 * 2);
+    }
+
+    #[test]
+    fn test_encode_arg_count_mismatch() {
+        let sig = "transfer(address,uint256)";
+        let result = encode_method_call(sig, serde_json::json!(["0x1111111111111111111111111111111111111111"]));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("mismatch"));
+    }
+
+    #[test]
+    fn test_encode_invalid_signature_no_parens() {
+        let result = encode_method_call("noparens", serde_json::json!([]));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encode_uint_from_number() {
+        let sig = "setValue(uint256)";
+        let out = encode_method_call(sig, serde_json::json!([42])).expect("encode");
+        // selector + 1 word
+        assert_eq!(out.len(), 2 + (4 + 32) * 2);
+        // Last byte of the word should encode 42 = 0x2a
+        assert!(out.ends_with("2a"));
+    }
+
+    #[test]
+    fn test_encode_bool_false() {
+        let sig = "setFlag(bool)";
+        let out = encode_method_call(sig, serde_json::json!([false])).expect("encode");
+        let bool_word = &out[10..10 + 64];
+        assert!(bool_word.ends_with("00"));
+    }
+
+    #[test]
     fn test_encode_bool_and_bytes32() {
         let bytes32 = "0x".to_string() + &"aa".repeat(32);
         let json = serde_json::json!([true, bytes32]);

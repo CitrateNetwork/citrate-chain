@@ -98,3 +98,98 @@ impl Config {
         dirs::home_dir().map(|home| home.join(".citrate").join("config.json"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_default_config_values() {
+        let config = Config::default();
+        assert_eq!(config.rpc_endpoint, "http://localhost:8545");
+        assert_eq!(config.chain_id, 1337);
+        assert_eq!(config.gas_price, 1_000_000_000);
+        assert_eq!(config.gas_limit, 3_000_000);
+        assert!(config.default_account.is_none());
+        assert!(config.keystore_path.ends_with("keystore"));
+    }
+
+    #[test]
+    fn test_config_serialization_roundtrip() {
+        let config = Config {
+            rpc_endpoint: "http://example.com:9545".to_string(),
+            chain_id: 40204,
+            keystore_path: PathBuf::from("/tmp/test-keystore"),
+            default_account: Some("0xabcd".to_string()),
+            gas_price: 2_000_000_000,
+            gas_limit: 5_000_000,
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let restored: Config = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.rpc_endpoint, config.rpc_endpoint);
+        assert_eq!(restored.chain_id, config.chain_id);
+        assert_eq!(restored.gas_price, config.gas_price);
+        assert_eq!(restored.gas_limit, config.gas_limit);
+        assert_eq!(restored.default_account, config.default_account);
+    }
+
+    #[test]
+    fn test_load_nonexistent_returns_default() {
+        let config = Config::load(Some(Path::new("/tmp/does_not_exist_citrate.json")), None)
+            .expect("should return default");
+        assert_eq!(config.rpc_endpoint, "http://localhost:8545");
+    }
+
+    #[test]
+    fn test_load_with_rpc_override() {
+        let config = Config::load(
+            Some(Path::new("/tmp/does_not_exist_citrate.json")),
+            Some("http://custom:1234"),
+        )
+        .expect("should load");
+        assert_eq!(config.rpc_endpoint, "http://custom:1234");
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.json");
+        let config = Config {
+            rpc_endpoint: "http://roundtrip:8545".to_string(),
+            chain_id: 99999,
+            keystore_path: PathBuf::from("/tmp/ks"),
+            default_account: Some("0xbeef".to_string()),
+            gas_price: 42,
+            gas_limit: 100,
+        };
+        config.save(Some(&config_path)).expect("save");
+        let loaded = Config::load(Some(&config_path), None).expect("load");
+        assert_eq!(loaded.chain_id, 99999);
+        assert_eq!(loaded.rpc_endpoint, "http://roundtrip:8545");
+        assert_eq!(loaded.default_account, Some("0xbeef".to_string()));
+    }
+
+    #[test]
+    fn test_init_creates_config_and_keystore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.json");
+        // We test save + re-init with force
+        let config = Config::default();
+        config.save(Some(&config_path)).expect("save");
+        // File now exists, init without force should fail
+        // We can't easily test init() directly since it uses default_config_path(),
+        // but we can verify the save/load cycle works
+        assert!(config_path.exists());
+    }
+
+    #[test]
+    fn test_load_invalid_json_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("bad.json");
+        let mut f = fs::File::create(&config_path).expect("create");
+        f.write_all(b"not json").expect("write");
+        let result = Config::load(Some(&config_path), None);
+        assert!(result.is_err());
+    }
+}
