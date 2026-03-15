@@ -1,0 +1,229 @@
+================================================================
+  TLA+ Formal Verification Report — Citrate Protocol
+  Citrate AI-Native Layer-1 BlockDAG Blockchain
+  Date: 2026-03-14 20:54:43
+  Java: openjdk version "17.0.18" 2026-01-20
+  Machine: arm64, 12 cores
+================================================================
+
+----------------------------------------------------------------
+Spec: GhostDAGConsensus  |  Category: Core Protocol
+----------------------------------------------------------------
+TLC2 Version 2026.03.12.220102 (rev: 0a0bffb)
+Running breadth-first search Model-Checking with fp 124 and seed 8222831857392544435 with 12 workers on 12 cores with 3641MB heap and 64MB offheap memory [pid: 399] (Mac OS X 15.6.1 aarch64, Homebrew 17.0.18 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/GhostDAGConsensus.tla
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-5363572420785127823/Naturals.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-5363572420785127823/FiniteSets.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-5363572420785127823/TLC.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-5363572420785127823/_TLCTrace.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-5363572420785127823/Sequences.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-5363572420785127823/TLCExt.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-5363572420785127823/Integers.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module GhostDAGConsensus
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module GhostDAGConsensus
+Starting... (2026-03-14 20:54:44)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-03-14 20:54:44.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.4E-16
+115 states generated, 86 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 4.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 7 and the 95th percentile is 6).
+Finished in 00s at (2026-03-14 20:54:44)
+
+----------------------------------------------------------------
+Spec: MempoolSequencer  |  Category: Core Protocol
+----------------------------------------------------------------
+TLC2 Version 2026.03.12.220102 (rev: 0a0bffb)
+Running breadth-first search Model-Checking with fp 1 and seed -5590968102081028061 with 12 workers on 12 cores with 3641MB heap and 64MB offheap memory [pid: 406] (Mac OS X 15.6.1 aarch64, Homebrew 17.0.18 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/MempoolSequencer.tla
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-7999930454581592950/Naturals.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-7999930454581592950/FiniteSets.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-7999930454581592950/Sequences.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-7999930454581592950/TLC.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-7999930454581592950/_TLCTrace.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-7999930454581592950/TLCExt.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-7999930454581592950/Integers.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MempoolSequencer
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MempoolSequencer
+Starting... (2026-03-14 20:54:44)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-03-14 20:54:44.
+Progress(7) at 2026-03-14 20:54:47: 1,258,641 states generated (1,258,641 s/min), 917,663 distinct states found (917,663 ds/min), 740,258 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.2E-5
+  based on the actual fingerprints:  val = 1.3E-8
+31169941 states generated, 10576460 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 13.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 31 and the 95th percentile is 10).
+Finished in 01min 01s at (2026-03-14 20:55:45)
+
+----------------------------------------------------------------
+Spec: VRFElection  |  Category: Core Protocol
+----------------------------------------------------------------
+TLC2 Version 2026.03.12.220102 (rev: 0a0bffb)
+Running breadth-first search Model-Checking with fp 60 and seed 4700541284683084534 with 12 workers on 12 cores with 3641MB heap and 64MB offheap memory [pid: 679] (Mac OS X 15.6.1 aarch64, Homebrew 17.0.18 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/VRFElection.tla
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-14046758591347700792/Naturals.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-14046758591347700792/FiniteSets.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-14046758591347700792/TLC.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-14046758591347700792/_TLCTrace.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-14046758591347700792/Sequences.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-14046758591347700792/TLCExt.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-14046758591347700792/Integers.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module VRFElection
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module VRFElection
+Starting... (2026-03-14 20:55:46)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-03-14 20:55:46.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.6E-10
+  based on the actual fingerprints:  val = 7.7E-11
+119785 states generated, 35413 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 31 and the 95th percentile is 4).
+Finished in 00s at (2026-03-14 20:55:46)
+
+----------------------------------------------------------------
+Spec: CheckpointSafety  |  Category: Security Audit
+----------------------------------------------------------------
+TLC2 Version 2026.03.12.220102 (rev: 0a0bffb)
+Running breadth-first search Model-Checking with fp 54 and seed -8527158355989154725 with 12 workers on 12 cores with 3641MB heap and 64MB offheap memory [pid: 691] (Mac OS X 15.6.1 aarch64, Homebrew 17.0.18 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/.audit/2026-03-02-architecture-security-deep-audit/tla/CheckpointSafety.tla
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-8416020086197294344/Naturals.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-8416020086197294344/FiniteSets.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-8416020086197294344/Sequences.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-8416020086197294344/TLC.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-8416020086197294344/_TLCTrace.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-8416020086197294344/TLCExt.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-8416020086197294344/Integers.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module CheckpointSafety
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module CheckpointSafety
+Starting... (2026-03-14 20:55:46)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-03-14 20:55:47.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 7.0E-16
+234 states generated, 90 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 6.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 8 and the 95th percentile is 4).
+Finished in 00s at (2026-03-14 20:55:47)
+
+----------------------------------------------------------------
+Spec: BridgeAttestationSafety  |  Category: Security Audit
+----------------------------------------------------------------
+TLC2 Version 2026.03.12.220102 (rev: 0a0bffb)
+Running breadth-first search Model-Checking with fp 14 and seed 6129641101009221802 with 12 workers on 12 cores with 3641MB heap and 64MB offheap memory [pid: 698] (Mac OS X 15.6.1 aarch64, Homebrew 17.0.18 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/.audit/2026-03-02-architecture-security-deep-audit/tla/BridgeAttestationSafety.tla
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-13958019109787740671/Naturals.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-13958019109787740671/FiniteSets.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-13958019109787740671/TLC.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-13958019109787740671/_TLCTrace.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-13958019109787740671/Sequences.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-13958019109787740671/TLCExt.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-13958019109787740671/Integers.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module BridgeAttestationSafety
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module BridgeAttestationSafety
+Starting... (2026-03-14 20:55:47)
+Warning: The invariant NoZeroThresholdInProd is a constant-level formula (i.e., it contains no variables, primes, or temporal operators) and evaluates to TRUE. To assert constant-level formulas in your spec, use ASSUME ConstInv. If you optionally want to give the assumption a name, write ASSUME YourAssumption == ConstInv instead. See https://explain.tlapl.us/assumptions-and-invariants for additional details.
+(Use the -nowarning option to disable this warning.)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-03-14 20:55:47.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.5E-11
+41941 states generated, 8100 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 11.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 16 and the 95th percentile is 4).
+Finished in 00s at (2026-03-14 20:55:47)
+
+----------------------------------------------------------------
+Spec: AgentToolAuthorization  |  Category: Security Audit
+----------------------------------------------------------------
+TLC2 Version 2026.03.12.220102 (rev: 0a0bffb)
+Running breadth-first search Model-Checking with fp 118 and seed 5792899763498936866 with 12 workers on 12 cores with 3641MB heap and 64MB offheap memory [pid: 708] (Mac OS X 15.6.1 aarch64, Homebrew 17.0.18 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file /Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/.audit/2026-03-02-architecture-security-deep-audit/tla/AgentToolAuthorization.tla
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-16239213473632727597/FiniteSets.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-16239213473632727597/TLC.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-16239213473632727597/_TLCTrace.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-16239213473632727597/Naturals.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-16239213473632727597/Sequences.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-16239213473632727597/TLCExt.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Parsing file /private/var/folders/jt/zh4f9vxs381cfngsr4rjshgh0000gn/T/tlc-16239213473632727597/Integers.tla (jar:file:/Users/soleilklosowski/Documents/Projects/Citrate-Lattice/citrate/citrate_v0.01.1/specs/tla/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module Integers
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module AgentToolAuthorization
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module AgentToolAuthorization
+Starting... (2026-03-14 20:55:47)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-03-14 20:55:47.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.6E-13
+5809 states generated, 576 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 14.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 5 and the 95th percentile is 3).
+Finished in 00s at (2026-03-14 20:55:47)
+

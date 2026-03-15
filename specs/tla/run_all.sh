@@ -76,7 +76,7 @@ for spec in "${SPECS[@]}"; do
     EXIT_CODE=${EXIT_CODE:-0}
 
     if echo "$OUTPUT" | grep -q "Model checking completed. No error has been found."; then
-        STATES=$(echo "$OUTPUT" | grep -oP '\d+ distinct states found' | head -1 || echo "")
+        STATES=$(echo "$OUTPUT" | grep -o '[0-9]* distinct states found' | head -1 || echo "")
         echo -e "${GREEN}PASS${NC} ${STATES}"
         PASSED=$((PASSED + 1))
     elif [ "$EXIT_CODE" -eq 124 ]; then
