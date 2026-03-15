@@ -481,6 +481,40 @@ mod tests {
         assert_eq!(NetworkMessage::GetPeers.priority(), MessagePriority::Low);
     }
 
+    // -----------------------------------------------------------------------
+    // Property-based tests (proptest)
+    // -----------------------------------------------------------------------
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Property: NetworkMessage Ping serialization round-trip via bincode.
+        #[test]
+        fn prop_ping_pong_serialization_roundtrip(nonce in any::<u64>()) {
+            let ping = NetworkMessage::Ping { nonce };
+            let bytes = bincode::serialize(&ping).expect("serialize Ping");
+            let recovered: NetworkMessage = bincode::deserialize(&bytes).expect("deserialize Ping");
+            match recovered {
+                NetworkMessage::Ping { nonce: n } => prop_assert_eq!(n, nonce),
+                other => prop_assert!(false, "Expected Ping, got {:?}", other),
+            }
+
+            let pong = NetworkMessage::Pong { nonce };
+            let bytes = bincode::serialize(&pong).expect("serialize Pong");
+            let recovered: NetworkMessage = bincode::deserialize(&bytes).expect("deserialize Pong");
+            match recovered {
+                NetworkMessage::Pong { nonce: n } => prop_assert_eq!(n, nonce),
+                other => prop_assert!(false, "Expected Pong, got {:?}", other),
+            }
+        }
+
+        /// Property: ProtocolVersion compatibility is reflexive — a version is always compatible with itself.
+        #[test]
+        fn prop_protocol_version_self_compatible(major in any::<u16>(), minor in any::<u16>(), patch in any::<u16>()) {
+            let v = ProtocolVersion { major, minor, patch };
+            prop_assert!(v.is_compatible(&v), "Version must be compatible with itself");
+        }
+    }
+
     #[test]
     fn test_message_requires_response() {
         let ping = NetworkMessage::Ping { nonce: 42 };

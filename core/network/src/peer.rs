@@ -245,6 +245,7 @@ impl PeerManager {
     }
 
     /// Add a new peer
+    // LOCK ORDERING: acquires Peer.info (read) + stats (read), drops both, then stats (write) — Level 1
     pub async fn add_peer(&self, peer: Arc<Peer>) -> Result<(), NetworkError> {
         let info = peer.info.read().await;
         let peer_id = info.id.clone();
@@ -290,6 +291,7 @@ impl PeerManager {
     }
 
     /// Remove a peer
+    // LOCK ORDERING: acquires Peer.info (read) then PeerManager.stats (write) — Level 1
     pub async fn remove_peer(&self, peer_id: &PeerId) -> Option<Arc<Peer>> {
         let peer = self.peers.remove(peer_id).map(|(_, p)| p);
 

@@ -236,6 +236,44 @@ mod tests {
         assert_eq!(manager.get_balance(&bob), U256::from(300));
     }
 
+    // -----------------------------------------------------------------------
+    // Property-based tests (proptest)
+    // -----------------------------------------------------------------------
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Property: set_balance then get_balance returns the same value.
+        #[test]
+        fn prop_balance_roundtrip(
+            addr_byte in any::<u8>(),
+            balance_lo in any::<u64>(),
+        ) {
+            let manager = AccountManager::new();
+            let mut addr_bytes = [0u8; 20];
+            addr_bytes[0] = addr_byte;
+            let addr = Address(addr_bytes);
+            let balance = U256::from(balance_lo);
+            manager.set_balance(addr, balance);
+            prop_assert_eq!(manager.get_balance(&addr), balance,
+                "get_balance must return the value set by set_balance");
+        }
+
+        /// Property: set_nonce then get_nonce returns the same value.
+        #[test]
+        fn prop_nonce_roundtrip(
+            addr_byte in any::<u8>(),
+            nonce in any::<u64>(),
+        ) {
+            let manager = AccountManager::new();
+            let mut addr_bytes = [0u8; 20];
+            addr_bytes[0] = addr_byte;
+            let addr = Address(addr_bytes);
+            manager.set_nonce(addr, nonce);
+            prop_assert_eq!(manager.get_nonce(&addr), nonce,
+                "get_nonce must return the value set by set_nonce");
+        }
+    }
+
     #[test]
     fn test_insufficient_balance() {
         let manager = AccountManager::new();

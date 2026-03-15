@@ -169,7 +169,8 @@ impl StateDB {
         // Update state trie with account data
         for address in self.accounts.get_dirty_accounts() {
             let account = self.accounts.get_account(&address);
-            let encoded = bincode::serialize(&account).unwrap();
+            let encoded = bincode::serialize(&account)
+                .expect("Account serialization should not fail for a valid Account struct");
             state_trie.insert(address.0.to_vec(), encoded);
 
             // Update storage root for account
@@ -299,6 +300,30 @@ mod tests {
         // Delete storage
         db.delete_storage(addr, b"key1");
         assert_eq!(db.get_storage(&addr, b"key1"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Property-based tests (proptest)
+    // -----------------------------------------------------------------------
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Property: set_storage then get_storage round-trip returns the same value.
+        #[test]
+        fn prop_storage_set_get_roundtrip(
+            addr_byte in any::<u8>(),
+            key in prop::collection::vec(any::<u8>(), 1..32),
+            value in prop::collection::vec(any::<u8>(), 1..64),
+        ) {
+            let db = StateDB::new();
+            let mut addr_bytes = [0u8; 20];
+            addr_bytes[0] = addr_byte;
+            let addr = Address(addr_bytes);
+            db.set_storage(addr, key.clone(), value.clone());
+            let retrieved = db.get_storage(&addr, &key);
+            prop_assert_eq!(retrieved, Some(value),
+                "get_storage must return value set by set_storage");
+        }
     }
 
     #[test]

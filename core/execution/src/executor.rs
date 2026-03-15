@@ -603,7 +603,10 @@ impl Executor {
             })
         } else {
             // Contract call or special operation
-            let to = crate::address_utils::normalize_address(&tx.to.unwrap());
+            // Safety: this branch is only reached when tx.to.is_some() (else clause of is_none check)
+            let to = crate::address_utils::normalize_address(
+                &tx.to.expect("tx.to guaranteed Some by preceding is_none check"),
+            );
 
             // Check first 4 bytes for function selector
             if tx.data.len() >= 4 {

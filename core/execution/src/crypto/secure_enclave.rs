@@ -288,7 +288,7 @@ impl SecureEnclaveInterface for AppleSecureEnclave {
             platform_id: self.platform_info.chip_type.clone(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system clock before UNIX epoch")
                 .as_secs(),
             signature,
             enclave_pubkey,
@@ -305,7 +305,7 @@ impl SecureEnclaveInterface for AppleSecureEnclave {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before UNIX epoch")
             .as_secs();
 
         // Reject attestations with future timestamps (60s clock tolerance)

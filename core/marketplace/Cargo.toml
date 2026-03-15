@@ -31,3 +31,4 @@ chrono = { workspace = true, features = ["serde"] }
 [dev-dependencies]
 tempfile = "3.0"
 test-log = "0.2"
+proptest = { workspace = true }

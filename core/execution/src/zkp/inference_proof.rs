@@ -158,7 +158,7 @@ impl InferenceCircuit {
             model_id,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system clock before UNIX epoch")
                 .as_secs(),
         };
 
@@ -433,7 +433,8 @@ impl InferenceProver {
         // Generate proof
         let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(42);
         let proof = Groth16::<Bls12_381>::prove(
-            self.proving_key.as_ref().unwrap(),
+            self.proving_key.as_ref()
+                .ok_or_else(|| anyhow!("Proving key not initialized — call setup() first"))?,
             circuit,
             &mut rng,
         ).map_err(|e| anyhow!("Proof generation failed: {:?}", e))?;
