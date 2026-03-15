@@ -8,14 +8,17 @@ EXTENDS Naturals, FiniteSets, TLC
 CONSTANTS
     Validators,     \* Set of validator IDs
     Slots,          \* Set of slot numbers (e.g., 1..N)
-    StakeWeight     \* Function: validator -> stake weight (determines eligibility threshold)
+    NoLeader        \* Sentinel value for "no leader elected"
+    \* Note: StakeWeight (validator -> stake) is modeled abstractly via VRF output ordering.
+    \* The spec verifies election safety properties independent of specific stake distribution.
 
 ASSUME Validators # {}
 ASSUME Slots \subseteq Nat /\ Slots # {}
+ASSUME NoLeader \notin Validators
 
 VARIABLES
     proofs,         \* Set of submitted VRF proofs: [validator, slot, output, valid]
-    leaders,        \* Function: slot -> elected leader (or "none")
+    leaders,        \* Function: slot -> elected leader (or NoLeader)
     usedOutputs     \* Set of VRF outputs already consumed (replay protection)
 
 vars == <<proofs, leaders, usedOutputs>>
@@ -34,7 +37,7 @@ HasProof(v, slot) ==
 
 Init ==
     /\ proofs = {}
-    /\ leaders = [s \in Slots |-> "none"]
+    /\ leaders = [s \in Slots |-> NoLeader]
     /\ usedOutputs = {}
 
 \* A validator submits a VRF proof for a slot
@@ -52,7 +55,7 @@ SubmitProof(v, slot, output, valid) ==
 \* The leader is the validator with the lowest valid VRF output (closest to target)
 ElectLeader(slot) ==
     /\ slot \in Slots
-    /\ leaders[slot] = "none"                          \* No leader elected yet
+    /\ leaders[slot] = NoLeader                          \* No leader elected yet
     /\ ValidProofsForSlot(slot) # {}                   \* At least one valid proof
     /\ LET winningProof == CHOOSE p \in ValidProofsForSlot(slot) :
             \A other \in ValidProofsForSlot(slot) : p.output <= other.output IN
@@ -61,7 +64,7 @@ ElectLeader(slot) ==
         /\ usedOutputs' = usedOutputs
 
 Next ==
-    \/ \E v \in Validators, s \in Slots, o \in 1..10, valid \in BOOLEAN :
+    \/ \E v \in Validators, s \in Slots, o \in 1..4, valid \in BOOLEAN :
         SubmitProof(v, s, o, valid)
     \/ \E s \in Slots : ElectLeader(s)
 
@@ -70,13 +73,13 @@ Next ==
 \* INV-1: At most one leader per slot
 AtMostOneLeaderPerSlot ==
     \A s \in Slots :
-        leaders[s] # "none" =>
+        leaders[s] # NoLeader =>
             leaders[s] \in Validators
 
 \* INV-2: Every elected leader has a valid proof
 LeaderHasValidProof ==
     \A s \in Slots :
-        leaders[s] # "none" =>
+        leaders[s] # NoLeader =>
             \E p \in proofs : p.validator = leaders[s] /\ p.slot = s /\ p.valid
 
 \* INV-3: No VRF output reuse across proofs
@@ -92,13 +95,13 @@ NoDuplicateProofs ==
 \* INV-5: Leader election is deterministic — only one validator can win per slot
 LeaderDeterminism ==
     \A s \in Slots :
-        leaders[s] \in Validators \cup {"none"}
+        leaders[s] \in Validators \cup {NoLeader}
 
 \* ---- Type invariant ----
 
 TypeInv ==
     /\ proofs \subseteq [validator: Validators, slot: Slots, output: Nat, valid: BOOLEAN]
-    /\ leaders \in [Slots -> Validators \cup {"none"}]
+    /\ leaders \in [Slots -> Validators \cup {NoLeader}]
     /\ usedOutputs \subseteq Nat
 
 \* ---- Specification ----

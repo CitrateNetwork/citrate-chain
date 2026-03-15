@@ -1355,4 +1355,85 @@ mod tests {
         let total_gas: u64 = block.transactions.iter().map(|tx| tx.gas_limit).sum();
         assert_eq!(total_gas, 100_000);
     }
+
+    /// When gas_used == gas_target, base fee should remain unchanged.
+    #[tokio::test]
+    async fn test_calculate_base_fee_at_target() {
+        let (builder, _) = setup_test_builder().await;
+
+        let parent_base_fee = 2_000_000_000u64; // 2 gwei
+        let gas_target = 15_000_000u64;
+        let gas_used = gas_target; // Exactly at target
+
+        let new_fee = builder.calculate_base_fee(parent_base_fee, gas_used, gas_target);
+        assert_eq!(
+            new_fee, parent_base_fee,
+            "Base fee should be unchanged when gas_used == gas_target"
+        );
+    }
+
+    /// When gas_used > gas_target, base fee should increase.
+    #[tokio::test]
+    async fn test_calculate_base_fee_above_target() {
+        let (builder, _) = setup_test_builder().await;
+
+        let parent_base_fee = 2_000_000_000u64; // 2 gwei
+        let gas_target = 15_000_000u64;
+        let gas_used = 20_000_000u64; // Above target
+
+        let new_fee = builder.calculate_base_fee(parent_base_fee, gas_used, gas_target);
+        assert!(
+            new_fee > parent_base_fee,
+            "Base fee should increase when gas_used ({}) > gas_target ({}), got {} vs parent {}",
+            gas_used,
+            gas_target,
+            new_fee,
+            parent_base_fee
+        );
+
+        // Verify the increase formula: increase = parent * (gas_used - target) / target / 8
+        let expected_delta = gas_used - gas_target;
+        let expected_increase = parent_base_fee * expected_delta / gas_target / 8;
+        assert_eq!(
+            new_fee,
+            parent_base_fee + expected_increase.max(1),
+            "Base fee increase should follow EIP-1559 formula"
+        );
+    }
+
+    /// When gas_used < gas_target, base fee should decrease (but not below MIN_BASE_FEE).
+    #[tokio::test]
+    async fn test_calculate_base_fee_below_target() {
+        let (builder, _) = setup_test_builder().await;
+
+        let parent_base_fee = 2_000_000_000u64; // 2 gwei
+        let gas_target = 15_000_000u64;
+        let gas_used = 5_000_000u64; // Below target
+
+        let new_fee = builder.calculate_base_fee(parent_base_fee, gas_used, gas_target);
+        assert!(
+            new_fee < parent_base_fee,
+            "Base fee should decrease when gas_used ({}) < gas_target ({}), got {} vs parent {}",
+            gas_used,
+            gas_target,
+            new_fee,
+            parent_base_fee
+        );
+
+        // Verify it doesn't go below the minimum (1 gwei)
+        assert!(
+            new_fee >= 1_000_000_000,
+            "Base fee should not drop below MIN_BASE_FEE (1 gwei), got {}",
+            new_fee
+        );
+
+        // Verify the decrease formula: decrease = parent * (target - gas_used) / target / 8
+        let expected_delta = gas_target - gas_used;
+        let expected_decrease = parent_base_fee * expected_delta / gas_target / 8;
+        let expected_fee = (parent_base_fee - expected_decrease).max(1_000_000_000);
+        assert_eq!(
+            new_fee, expected_fee,
+            "Base fee decrease should follow EIP-1559 formula"
+        );
+    }
 }

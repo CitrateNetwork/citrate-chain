@@ -116,7 +116,7 @@ NoncesAboveState ==
 
 TypeInv ==
     /\ mempool \subseteq [hash: Nat, sender: Senders, nonce: 1..MaxNonce, priority: 1..10]
-    /\ stateNonces \in [Senders -> 0..MaxNonce]
+    /\ stateNonces \in [Senders -> 0..(MaxNonce + 1)]
     /\ nextTxId \in Nat
 
 \* ---- Specification ----

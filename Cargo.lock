@@ -1730,6 +1730,7 @@ dependencies = [
  "citrate-storage",
  "hex",
  "primitive-types",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

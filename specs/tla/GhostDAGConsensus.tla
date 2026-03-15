@@ -6,11 +6,12 @@ EXTENDS Naturals, FiniteSets, TLC
 \* Source: core/consensus/src/ghostdag.rs
 
 CONSTANTS
-    Blocks,       \* Set of possible block IDs (including "genesis")
+    Blocks,       \* Set of possible block IDs (including Genesis)
     K,            \* GhostDAG k-cluster parameter
-    MaxParents    \* Maximum number of parents per block
+    MaxParents,   \* Maximum number of parents per block
+    Genesis       \* Distinguished genesis block ID
 
-ASSUME "genesis" \in Blocks
+ASSUME Genesis \in Blocks
 ASSUME K \in Nat /\ K >= 1
 ASSUME MaxParents \in Nat /\ MaxParents >= 1
 
@@ -29,7 +30,7 @@ vars == <<addedBlocks, parents, selectedParent, blueSet, blueScore, tips>>
 \* Past set: all ancestors of a block (transitive closure of parents)
 RECURSIVE PastOf(_, _)
 PastOf(b, depth) ==
-    IF depth = 0 \/ b = "genesis" \/ b \notin addedBlocks
+    IF depth = 0 \/ b = Genesis \/ b \notin addedBlocks
     THEN {}
     ELSE
         LET ps == IF b \in DOMAIN parents THEN parents[b] ELSE {} IN
@@ -52,17 +53,17 @@ IsBlueCandidate(candidate, contextBlue) ==
 \* ---- State machine ----
 
 Init ==
-    /\ addedBlocks = {"genesis"}
-    /\ parents = [b \in {"genesis"} |-> {}]
-    /\ selectedParent = [b \in {"genesis"} |-> "genesis"]
-    /\ blueSet = [b \in {"genesis"} |-> {"genesis"}]
-    /\ blueScore = [b \in {"genesis"} |-> 1]
-    /\ tips = {"genesis"}
+    /\ addedBlocks = {Genesis}
+    /\ parents = [b \in {Genesis} |-> {}]
+    /\ selectedParent = [b \in {Genesis} |-> Genesis]
+    /\ blueSet = [b \in {Genesis} |-> {Genesis}]
+    /\ blueScore = [b \in {Genesis} |-> 1]
+    /\ tips = {Genesis}
 
 \* Add a new block to the DAG
 AddBlock(b) ==
     /\ b \notin addedBlocks                       \* Not already added
-    /\ b # "genesis"                               \* Genesis is pre-added
+    /\ b # Genesis                               \* Genesis is pre-added
     /\ \E ps \in SUBSET addedBlocks :             \* Choose parent set from existing blocks
         /\ ps # {}                                 \* At least one parent
         /\ Cardinality(ps) <= MaxParents           \* Respect max parents
@@ -102,7 +103,7 @@ NoCycles ==
 \* A block's blue score is always >= its selected parent's blue score
 BlueScoreMonotonicity ==
     \A b \in addedBlocks :
-        b # "genesis" /\ b \in DOMAIN selectedParent =>
+        b # Genesis /\ b \in DOMAIN selectedParent =>
             blueScore[b] >= blueScore[selectedParent[b]]
 
 \* INV-3: Tip consistency — tips have no children in the DAG
@@ -112,7 +113,7 @@ TipConsistency ==
 
 \* INV-4: Genesis is always blue in every block's blue set
 GenesisAlwaysBlue ==
-    \A b \in addedBlocks : "genesis" \in blueSet[b]
+    \A b \in addedBlocks : Genesis \in blueSet[b]
 
 \* INV-5: Blue score equals blue set cardinality
 BlueScoreCorrectness ==
@@ -122,7 +123,7 @@ BlueScoreCorrectness ==
 
 TypeInv ==
     /\ addedBlocks \subseteq Blocks
-    /\ "genesis" \in addedBlocks
+    /\ Genesis \in addedBlocks
     /\ tips \subseteq addedBlocks
     /\ \A b \in addedBlocks : b \in DOMAIN blueSet
     /\ \A b \in addedBlocks : b \in DOMAIN blueScore
