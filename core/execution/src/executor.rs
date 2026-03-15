@@ -61,8 +61,8 @@ impl ExecutionContext {
     }
 }
 
-/// Default chain ID for devnet
-pub const DEFAULT_CHAIN_ID: u64 = 1337;
+/// Default chain ID for Citrate network
+pub const DEFAULT_CHAIN_ID: u64 = 40204;
 
 /// Transaction executor
 pub struct Executor {
@@ -296,6 +296,45 @@ impl Executor {
         &self.state_db
     }
 
+    /// Sync a model registration to the model registry adapter (e.g. MCP).
+    /// This is safe to call from a synchronous context — it spawns a
+    /// dedicated thread with its own tokio runtime to avoid deadlocks.
+    pub fn sync_model_to_registry(
+        &self,
+        model_id: ModelId,
+        model_state: &ModelState,
+        artifact_cid: Option<&str>,
+    ) {
+        if let Some(adapter) = &self.model_registry {
+            let adapter = adapter.clone();
+            let state = model_state.clone();
+            let cid = artifact_cid.map(|s| s.to_string());
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("sync_model_to_registry: runtime");
+                if let Err(e) = rt.block_on(adapter.register_model(
+                    model_id,
+                    &state,
+                    cid.as_deref(),
+                )) {
+                    tracing::warn!(
+                        "sync_model_to_registry: MCP registration failed for {:?}: {}",
+                        model_id, e
+                    );
+                } else {
+                    tracing::info!(
+                        "sync_model_to_registry: model {:?} synced to MCP registry",
+                        model_id
+                    );
+                }
+            })
+            .join()
+            .ok();
+        }
+    }
+
     /// Persist all dirty accounts and storage slots from state_db to state_store
     pub fn persist_state_changes(&self) -> anyhow::Result<usize> {
         if let Some(store) = &self.state_store {
@@ -501,6 +540,42 @@ impl Executor {
         );
 
         Ok(receipt)
+    }
+
+    /// Simulate a transaction without persisting state changes.
+    ///
+    /// Used by eth_call and eth_estimateGas. Gives the sender unlimited balance
+    /// and aligns nonce so read-only calls don't fail, then unconditionally
+    /// restores the snapshot afterward. This avoids a race condition where the
+    /// block producer's persist_state_changes() could persist the inflated
+    /// balance to RocksDB between set_balance and restore.
+    pub async fn simulate_transaction(
+        &self,
+        block: &Block,
+        tx: &Transaction,
+    ) -> Result<TransactionReceipt, ExecutionError> {
+        // Snapshot BEFORE any mutations
+        let snapshot = self.state_db.snapshot();
+
+        // Override sender balance for simulation
+        let from = crate::address_utils::normalize_address(&tx.from);
+        self.state_db
+            .accounts
+            .set_balance(from, U256::from(u128::MAX));
+
+        // Align nonce so validation inside execute_transaction passes
+        let current_nonce = self.state_db.accounts.get_nonce(&from);
+        if tx.nonce != current_nonce {
+            self.state_db.accounts.set_nonce(from, tx.nonce);
+        }
+
+        // Execute the transaction (creates its own inner snapshot)
+        let result = self.execute_transaction(block, tx).await;
+
+        // ALWAYS restore — unconditional, no matter success or failure
+        self.state_db.restore(snapshot);
+
+        result
     }
 
     /// Parse transaction data into type
@@ -925,13 +1000,12 @@ impl Executor {
     ) -> Result<(), ExecutionError> {
         context.use_gas(self.gas_schedule.call)?;
 
-        // Transfer value if any
-        if value > U256::zero() {
-            self.state_db.accounts.transfer(&from, &to, value)?;
-        }
-
-        // Precompile dispatch first
+        // Precompile dispatch first (value transfer handled by precompile if needed)
         if self.is_precompile_address(&to) {
+            // Transfer value for precompiles since they don't go through REVM
+            if value > U256::zero() {
+                self.state_db.accounts.transfer(&from, &to, value)?;
+            }
             self.execute_precompile(&to, &data, from, context).await?;
             return Ok(());
         }
@@ -941,13 +1015,13 @@ impl Executor {
             .state_db
             .get_code(&self.state_db.accounts.get_code_hash(&to))
         {
-            // AI opcode scanning is DISABLED for standard EVM contracts because
-            // AI opcodes (0xf0-0xf4) collide with EVM opcodes (CREATE, CALL,
-            // CALLCODE, RETURN, DELEGATECALL). Scanning normal EVM bytecode
-            // triggers false matches and breaks contract execution.
-            // TODO: Re-enable with a proper prefix/marker to distinguish AI contracts.
-
-            // Route standard EVM calls through REVM for correct CALL/CREATE/DELEGATECALL
+            // Route standard EVM calls through REVM for correct CALL/CREATE/DELEGATECALL.
+            //
+            // Sprint EL-1 Fix (Issue #19): REVM handles gas/value/nonce internally
+            // during transact_commit(), but DatabaseCommit::commit() only writes
+            // storage and code — NOT balance or nonce. The executor is the sole
+            // owner of gas/balance/nonce accounting. Value transfer is done
+            // explicitly by the executor after REVM succeeds.
             debug!(
                 "Executing contract at {} with {} bytes of code via REVM",
                 to,
@@ -973,6 +1047,12 @@ impl Executor {
                     }
                     VM_GAS_USED.observe(gas_used as f64);
                     context.output = output;
+
+                    // Transfer value after REVM succeeds. REVM's commit no longer
+                    // writes balance changes, so the executor must handle this.
+                    if value > U256::zero() {
+                        self.state_db.accounts.transfer(&from, &to, value)?;
+                    }
                 }
                 Err(e) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["err"]).inc();

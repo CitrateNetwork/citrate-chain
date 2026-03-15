@@ -23,7 +23,7 @@ struct Cli {
     rpc: String,
 
     /// Chain ID
-    #[arg(short, long, default_value = "1337")]
+    #[arg(short, long, default_value = "40204")]
     chain_id: u64,
 
     #[command(subcommand)]

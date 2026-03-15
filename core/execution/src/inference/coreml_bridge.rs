@@ -119,12 +119,16 @@ impl CoreMLModel {
         let c_path = CString::new(path_str)?;
         let mut error: *mut NSError = ptr::null_mut();
 
+        // SAFETY: `c_path` is a valid null-terminated CString kept alive for the call.
+        // `error` is a valid out-pointer. MLModelLoad returns null on failure, checked below.
         let model = unsafe {
             MLModelLoad(c_path.as_ptr(), &mut error)
         };
 
         if model.is_null() {
             let error_msg = Self::get_error_message(error);
+            // SAFETY: `error` is checked non-null before release. NSErrorRelease is
+            // the correct release call for the NSError allocated by MLModelLoad.
             unsafe {
                 if !error.is_null() {
                     NSErrorRelease(error);
@@ -151,12 +155,16 @@ impl CoreMLModel {
         let c_path = CString::new(path_str)?;
         let mut error: *mut NSError = ptr::null_mut();
 
+        // SAFETY: `c_path` is a valid null-terminated CString kept alive for the call.
+        // `error` is a valid out-pointer. Returns null on failure, checked below.
         let compiled_path = unsafe {
             MLModelCompileModelAtURL(c_path.as_ptr(), &mut error)
         };
 
         if compiled_path.is_null() {
             let error_msg = Self::get_error_message(error);
+            // SAFETY: `error` is checked non-null before release. NSErrorRelease is
+            // the correct release call for the NSError allocated by MLModelCompileModelAtURL.
             unsafe {
                 if !error.is_null() {
                     NSErrorRelease(error);
@@ -165,6 +173,9 @@ impl CoreMLModel {
             anyhow::bail!("Failed to compile CoreML model: {}", error_msg);
         }
 
+        // SAFETY: `compiled_path` was checked non-null above. MLModelCompileModelAtURL
+        // returns a valid null-terminated C string on success. The pointer remains valid
+        // until the enclosing autorelease pool drains.
         let result = unsafe {
             CStr::from_ptr(compiled_path)
                 .to_string_lossy()
@@ -179,6 +190,9 @@ impl CoreMLModel {
         // Create input MultiArray
         let mut error: *mut NSError = ptr::null_mut();
 
+        // SAFETY: `input_shape` slice is valid for the duration of the call. Shape count
+        // is derived from the slice length. `error` is a valid out-pointer. Returns null
+        // on failure, checked below.
         let input_array = unsafe {
             MLMultiArrayCreateWithShape(
                 input_shape.as_ptr(),
@@ -190,6 +204,8 @@ impl CoreMLModel {
 
         if input_array.is_null() {
             let error_msg = Self::get_error_message(error);
+            // SAFETY: `error` is checked non-null before release. NSErrorRelease is
+            // the correct release call for the NSError allocated by MLMultiArrayCreateWithShape.
             unsafe {
                 if !error.is_null() {
                     NSErrorRelease(error);
@@ -199,6 +215,10 @@ impl CoreMLModel {
         }
 
         // Copy input data
+        // SAFETY: `input_array` was verified non-null above. MLMultiArrayGetDataPointer
+        // returns a valid f32 pointer into the array's contiguous buffer. The copy length
+        // (`input.len()`) must not exceed the array capacity (caller's responsibility to
+        // pass matching `input` and `input_shape`). Pointer is checked non-null before copy.
         unsafe {
             let data_ptr = MLMultiArrayGetDataPointer(input_array);
             if !data_ptr.is_null() {
@@ -211,14 +231,20 @@ impl CoreMLModel {
         }
 
         // Create feature provider
+        // SAFETY: MLFeatureProviderCreate takes no arguments and returns a new provider
+        // or null. Null is checked immediately after.
         let provider = unsafe { MLFeatureProviderCreate() };
         if provider.is_null() {
+            // SAFETY: `input_array` is non-null (verified above) and has not been released yet.
             unsafe { MLMultiArrayRelease(input_array); }
             anyhow::bail!("Failed to create feature provider");
         }
 
         // Set input
         let input_name = CString::new(self.input_names[0].as_str())?;
+        // SAFETY: `provider` and `input_array` are verified non-null. `input_name` is a
+        // valid null-terminated CString kept alive for the call. The provider takes
+        // ownership of a reference to the array.
         unsafe {
             MLFeatureProviderSetMultiArray(
                 provider,
@@ -229,6 +255,9 @@ impl CoreMLModel {
 
         // Run prediction
         let mut pred_error: *mut NSError = ptr::null_mut();
+        // SAFETY: `self.model` is verified non-null at construction and kept valid until
+        // Drop. `provider` is non-null (checked above). Null options pointer selects
+        // defaults. `pred_error` is a valid out-pointer. Returns null on failure.
         let output_provider = unsafe {
             MLModelPredictFromFeatures(
                 self.model,
@@ -239,6 +268,9 @@ impl CoreMLModel {
         };
 
         // Clean up input
+        // SAFETY: Both `provider` and `input_array` are non-null and have not been
+        // released yet. Each is released exactly once here, transferring ownership back
+        // to the framework.
         unsafe {
             MLFeatureProviderRelease(provider);
             MLMultiArrayRelease(input_array);
@@ -246,6 +278,8 @@ impl CoreMLModel {
 
         if output_provider.is_null() {
             let error_msg = Self::get_error_message(pred_error);
+            // SAFETY: `pred_error` is checked non-null before release. NSErrorRelease is
+            // the correct release call for the NSError allocated by MLModelPredictFromFeatures.
             unsafe {
                 if !pred_error.is_null() {
                     NSErrorRelease(pred_error);
@@ -256,19 +290,30 @@ impl CoreMLModel {
 
         // Extract output
         let output_name = CString::new(self.output_names[0].as_str())?;
+        // SAFETY: `output_provider` is verified non-null above. `output_name` is a valid
+        // null-terminated CString kept alive for the call. Returns null if the named
+        // feature is not found, checked below.
         let output_array = unsafe {
             MLFeatureProviderGetMultiArray(output_provider, output_name.as_ptr())
         };
 
         if output_array.is_null() {
+            // SAFETY: `output_provider` is non-null (checked above) and cast to *mut
+            // for release. Released exactly once on this error path.
             unsafe { MLFeatureProviderRelease(output_provider as *mut _); }
             anyhow::bail!("Failed to get output array");
         }
 
         // Copy output data
+        // SAFETY: `output_array` is verified non-null above. MLMultiArrayGetCount returns
+        // the total element count of the array.
         let output_count = unsafe { MLMultiArrayGetCount(output_array) };
         let mut output = vec![0.0f32; output_count as usize];
 
+        // SAFETY: `output_array` is non-null. MLMultiArrayGetDataPointer returns a valid
+        // f32 pointer into the array's contiguous buffer. The copy length matches the
+        // count returned by MLMultiArrayGetCount. Pointer is checked non-null before copy.
+        // `output` vec was pre-allocated with exactly `output_count` elements.
         unsafe {
             let data_ptr = MLMultiArrayGetDataPointer(output_array);
             if !data_ptr.is_null() {
@@ -281,6 +326,8 @@ impl CoreMLModel {
         }
 
         // Clean up
+        // SAFETY: `output_provider` is non-null and has not been released on this
+        // success path. Cast to *mut for the release function. Released exactly once.
         unsafe {
             MLFeatureProviderRelease(output_provider as *mut _);
         }
@@ -294,6 +341,11 @@ impl CoreMLModel {
             return "Unknown error".to_string();
         }
 
+        // SAFETY: `error` is verified non-null by the caller guard above.
+        // NSErrorGetLocalizedDescription returns a valid C string pointer (or null,
+        // which we check). The returned string is valid for the lifetime of the NSError.
+        // CStr::from_ptr requires a valid null-terminated pointer, guaranteed by the
+        // Foundation framework for NSError localized descriptions.
         unsafe {
             let desc = NSErrorGetLocalizedDescription(error);
             if desc.is_null() {
@@ -309,6 +361,10 @@ impl CoreMLModel {
 
 impl Drop for CoreMLModel {
     fn drop(&mut self) {
+        // SAFETY: `self.model` is checked non-null before release. The model pointer
+        // was obtained from MLModelLoad and has not been released elsewhere (this is the
+        // sole release point). After this call, the pointer is dangling but Drop runs
+        // only once.
         unsafe {
             if !self.model.is_null() {
                 MLModelRelease(self.model);

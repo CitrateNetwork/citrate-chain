@@ -1739,10 +1739,12 @@ impl RpcServer {
                 usage_stats: Default::default(),
             };
 
-            match exec.state_db().register_model(model_id, model_state) {
+            match exec.state_db().register_model(model_id, model_state.clone()) {
                 Ok(()) => {
                     // Store artifact CID mapping
                     exec.add_model_artifact(&model_hash, &cid);
+                    // Sync to MCP model registry so inference can find it
+                    exec.sync_model_to_registry(model_id, &model_state, Some(&cid));
                     Ok(json!({
                         "model_id": format!("0x{}", hex::encode(model_hash.as_bytes())),
                         "tx_hash": format!("0x{}", hex::encode(model_hash.as_bytes())),
@@ -2163,18 +2165,34 @@ impl RpcServer {
             // optional with_proof (not used in preview other than returning proof if available)
             let _with_proof = obj.get("with_proof").and_then(|v| v.as_bool()).unwrap_or(false);
 
-            let res = match block_on(executor_ai_preview.run_inference_preview(
-                from_addr,
-                model_id,
-                input_bytes,
-                max_gas,
-            )) {
-                Ok(r) => r,
-                Err(e) => {
+            // Spawn a dedicated thread with its own tokio runtime to avoid
+            // deadlocking on tokio::sync::RwLock/Mutex inside the MCP layer
+            // (futures::executor::block_on cannot drive tokio primitives).
+            let exec_inf = executor_ai_preview.clone();
+            let res = match std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("runtime: {}", e))?;
+                rt.block_on(exec_inf.run_inference_preview(
+                    from_addr,
+                    model_id,
+                    input_bytes,
+                    max_gas,
+                ))
+                .map_err(|e| format!("{}", e))
+            })
+            .join()
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     return Err(jsonrpc_core::Error::invalid_params(format!(
                         "Inference failed: {}",
                         e
                     )))
+                }
+                Err(_) => {
+                    return Err(jsonrpc_core::Error::internal_error())
                 }
             };
 

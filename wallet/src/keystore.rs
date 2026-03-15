@@ -297,3 +297,270 @@ impl KeyStore {
         Ok(hex::encode(signing_key.to_bytes()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn temp_keystore() -> (TempDir, KeyStore) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keystore.json");
+        let ks = KeyStore::new(&path).unwrap();
+        (dir, ks)
+    }
+
+    // ── Key Generation ──
+
+    #[test]
+    fn test_generate_key_returns_valid_verifying_key() {
+        let (_dir, mut ks) = temp_keystore();
+        let vk = ks.generate_key("password123", None).unwrap();
+        // Ed25519 verifying key is 32 bytes
+        assert_eq!(vk.to_bytes().len(), 32);
+    }
+
+    #[test]
+    fn test_generate_key_produces_unique_keys() {
+        let (_dir, mut ks) = temp_keystore();
+        let vk1 = ks.generate_key("password123", None).unwrap();
+        let vk2 = ks.generate_key("password123", None).unwrap();
+        assert_ne!(vk1.to_bytes(), vk2.to_bytes());
+    }
+
+    #[test]
+    fn test_generate_key_stores_alias() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("password123", Some("my-account".to_string()))
+            .unwrap();
+        let accounts = ks.list_accounts();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].2, Some("my-account".to_string()));
+    }
+
+    #[test]
+    fn test_generate_key_increments_index() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("pw", None).unwrap();
+        ks.generate_key("pw", None).unwrap();
+        ks.generate_key("pw", None).unwrap();
+        let accounts = ks.list_accounts();
+        assert_eq!(accounts.len(), 3);
+        assert_eq!(accounts[0].0, 0);
+        assert_eq!(accounts[1].0, 1);
+        assert_eq!(accounts[2].0, 2);
+    }
+
+    // ── Key Import ──
+
+    #[test]
+    fn test_import_key_with_0x_prefix() {
+        let (_dir, mut ks) = temp_keystore();
+        let secret = [42u8; 32];
+        let hex_key = format!("0x{}", hex::encode(secret));
+        let vk = ks.import_key(&hex_key, "pw", None).unwrap();
+        let expected = SigningKey::from_bytes(&secret).verifying_key();
+        assert_eq!(vk.to_bytes(), expected.to_bytes());
+    }
+
+    #[test]
+    fn test_import_key_without_prefix() {
+        let (_dir, mut ks) = temp_keystore();
+        let secret = [42u8; 32];
+        let hex_key = hex::encode(secret);
+        let vk = ks.import_key(&hex_key, "pw", None).unwrap();
+        let expected = SigningKey::from_bytes(&secret).verifying_key();
+        assert_eq!(vk.to_bytes(), expected.to_bytes());
+    }
+
+    #[test]
+    fn test_import_key_invalid_length_rejected() {
+        let (_dir, mut ks) = temp_keystore();
+        let err = ks.import_key("abcdef", "pw", None).unwrap_err();
+        match err {
+            WalletError::Other(msg) => assert!(msg.contains("Invalid private key length")),
+            _ => panic!("Expected Other error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_import_key_invalid_hex_rejected() {
+        let (_dir, mut ks) = temp_keystore();
+        let err = ks.import_key("not_hex_at_all_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "pw", None).unwrap_err();
+        match err {
+            WalletError::HexDecode(_) => {}
+            _ => panic!("Expected HexDecode error, got {:?}", err),
+        }
+    }
+
+    // ── Encryption / Decryption Round-trip ──
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let (_dir, mut ks) = temp_keystore();
+        let secret = [7u8; 32];
+        let hex_key = hex::encode(secret);
+        ks.import_key(&hex_key, "correct-password", None).unwrap();
+
+        // Unlock with correct password should succeed
+        ks.unlock("correct-password").unwrap();
+        let recovered = ks.get_signing_key(0).unwrap();
+        assert_eq!(recovered.to_bytes(), secret);
+    }
+
+    #[test]
+    fn test_wrong_password_fails_unlock() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("correct-password", None).unwrap();
+        let err = ks.unlock("wrong-password").unwrap_err();
+        match err {
+            WalletError::InvalidPassword => {}
+            _ => panic!("Expected InvalidPassword, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_nonce_uniqueness_across_encryptions() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("pw", None).unwrap();
+        ks.generate_key("pw", None).unwrap();
+        // Each encryption should have a unique nonce
+        assert_ne!(ks.keys[0].nonce, ks.keys[1].nonce);
+    }
+
+    // ── Lock / Unlock ──
+
+    #[test]
+    fn test_locked_keystore_rejects_get_signing_key() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("pw", None).unwrap();
+        // Keystore starts locked
+        let err = ks.get_signing_key(0).unwrap_err();
+        match err {
+            WalletError::WalletLocked => {}
+            _ => panic!("Expected WalletLocked, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_unlock_then_lock_clears_keys() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("pw", None).unwrap();
+        ks.unlock("pw").unwrap();
+        assert!(ks.get_signing_key(0).is_ok());
+
+        ks.lock();
+        let err = ks.get_signing_key(0).unwrap_err();
+        match err {
+            WalletError::WalletLocked => {}
+            _ => panic!("Expected WalletLocked after lock, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_unlock_decrypts_multiple_keys() {
+        let (_dir, mut ks) = temp_keystore();
+        let s1 = [1u8; 32];
+        let s2 = [2u8; 32];
+        ks.import_key(&hex::encode(s1), "pw", None).unwrap();
+        ks.import_key(&hex::encode(s2), "pw", None).unwrap();
+
+        ks.unlock("pw").unwrap();
+        assert_eq!(ks.get_signing_key(0).unwrap().to_bytes(), s1);
+        assert_eq!(ks.get_signing_key(1).unwrap().to_bytes(), s2);
+    }
+
+    // ── get_signing_key edge cases ──
+
+    #[test]
+    fn test_get_signing_key_out_of_bounds() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("pw", None).unwrap();
+        ks.unlock("pw").unwrap();
+        let err = ks.get_signing_key(99).unwrap_err();
+        match err {
+            WalletError::AccountNotFound(_) => {}
+            _ => panic!("Expected AccountNotFound, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_get_signing_key_by_public() {
+        let (_dir, mut ks) = temp_keystore();
+        let vk = ks.generate_key("pw", None).unwrap();
+        ks.unlock("pw").unwrap();
+
+        let pk_bytes = vk.to_bytes();
+        let signing_key = ks.get_signing_key_by_public(&pk_bytes).unwrap();
+        assert_eq!(signing_key.verifying_key().to_bytes(), pk_bytes);
+    }
+
+    #[test]
+    fn test_get_signing_key_by_unknown_public_key() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("pw", None).unwrap();
+        ks.unlock("pw").unwrap();
+        let err = ks.get_signing_key_by_public(&[0xFF; 32]).unwrap_err();
+        match err {
+            WalletError::AccountNotFound(_) => {}
+            _ => panic!("Expected AccountNotFound, got {:?}", err),
+        }
+    }
+
+    // ── Export ──
+
+    #[test]
+    fn test_export_private_key_matches_imported() {
+        let (_dir, mut ks) = temp_keystore();
+        let secret = [42u8; 32];
+        ks.import_key(&hex::encode(secret), "pw", None).unwrap();
+        ks.unlock("pw").unwrap();
+
+        let exported = ks.export_private_key(0).unwrap();
+        assert_eq!(exported, hex::encode(secret));
+    }
+
+    #[test]
+    fn test_export_private_key_locked_fails() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("pw", None).unwrap();
+        let err = ks.export_private_key(0).unwrap_err();
+        match err {
+            WalletError::WalletLocked => {}
+            _ => panic!("Expected WalletLocked, got {:?}", err),
+        }
+    }
+
+    // ── Persistence ──
+
+    #[test]
+    fn test_keystore_persistence_across_instances() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keystore.json");
+        let secret = [55u8; 32];
+
+        // Create and populate keystore
+        {
+            let mut ks = KeyStore::new(&path).unwrap();
+            ks.import_key(&hex::encode(secret), "pw", Some("test-alias".to_string()))
+                .unwrap();
+        }
+
+        // Reload from disk
+        let mut ks2 = KeyStore::new(&path).unwrap();
+        assert_eq!(ks2.list_accounts().len(), 1);
+        assert_eq!(ks2.list_accounts()[0].2, Some("test-alias".to_string()));
+
+        // Verify decryption still works after reload
+        ks2.unlock("pw").unwrap();
+        assert_eq!(ks2.get_signing_key(0).unwrap().to_bytes(), secret);
+    }
+
+    #[test]
+    fn test_empty_keystore_creates_fresh() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent_keystore.json");
+        let ks = KeyStore::new(&path).unwrap();
+        assert_eq!(ks.list_accounts().len(), 0);
+    }
+}

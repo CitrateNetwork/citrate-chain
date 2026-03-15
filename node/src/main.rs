@@ -72,7 +72,7 @@ struct Cli {
     max_peers: usize,
 
     /// Chain ID
-    #[arg(long, default_value = "1337")]
+    #[arg(long, default_value = "40204")]
     chain_id: u64,
 
     /// Coinbase address for mining rewards (hex)
@@ -528,7 +528,7 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
             // Load genesis config to get required models
             let genesis_config = GenesisConfig {
                 timestamp: 0,
-                chain_id: 1337,
+                chain_id: 40204,
                 initial_accounts: vec![],
             };
 
@@ -688,7 +688,7 @@ fn show_genesis_info() -> Result<()> {
     info!("Creating genesis block...");
     let genesis_config = genesis::GenesisConfig {
         timestamp: 0,
-        chain_id: 1337,
+        chain_id: 40204,
         initial_accounts: vec![],
     };
 

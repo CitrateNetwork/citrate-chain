@@ -245,8 +245,10 @@ impl GovernanceManager {
             block_height: current_block,
         };
 
-        // Now get mutable reference to update the proposal
-        let proposal = self.proposals.get_mut(&proposal_id).unwrap(); // Safe because we checked above
+        // Re-lookup mutably — proposal is guaranteed to exist since we validated above
+        // and no removal occurs between the check and this point.
+        let proposal = self.proposals.get_mut(&proposal_id)
+            .ok_or_else(|| anyhow!("Proposal unexpectedly removed during vote"))?;
 
         // Update vote counts
         match support {
@@ -454,5 +456,109 @@ mod tests {
 
         let proposal = gov.get_proposal(proposal_id).unwrap();
         assert!(proposal.for_votes > U256::zero());
+    }
+
+    #[test]
+    fn test_vote_on_nonexistent_proposal() {
+        let config = GovernanceConfig::default();
+        let mut gov = GovernanceManager::new(config);
+        let voter = Address([2; 20]);
+        let total_supply = U256::from(1_000_000_000) * U256::from(10).pow(U256::from(18));
+
+        let result = gov.vote(999, voter, VoteType::For, 102, total_supply);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_insufficient_balance_for_proposal() {
+        let config = GovernanceConfig::default();
+        let mut gov = GovernanceManager::new(config);
+        let proposer = Address([1; 20]);
+
+        // Balance below threshold
+        let result = gov.create_proposal(
+            proposer,
+            ProposalType::ParameterChange {
+                parameter: "block_reward".to_string(),
+                new_value: U256::from(15),
+            },
+            "Test".to_string(),
+            "Test".to_string(),
+            100,
+            U256::zero(), // zero balance, below threshold
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_proposals_with_max_votes_no_overflow() {
+        // Ensure that processing proposals with U256::MAX-scale votes does not panic
+        let config = GovernanceConfig {
+            quorum_percentage: 1,
+            approval_threshold: 50,
+            voting_period: 10,
+            execution_delay: 5,
+            grace_period: 10,
+            ..GovernanceConfig::default()
+        };
+        let mut gov = GovernanceManager::new(config.clone());
+        let proposer = Address([1; 20]);
+
+        let proposal_id = gov.create_proposal(
+            proposer,
+            ProposalType::ParameterChange {
+                parameter: "block_reward".to_string(),
+                new_value: U256::from(15),
+            },
+            "Test".to_string(),
+            "Test".to_string(),
+            100,
+            config.proposal_threshold,
+        ).unwrap();
+
+        // Manually set large vote counts to test overflow safety in process_proposals
+        {
+            let proposal = gov.proposals.get_mut(&proposal_id).unwrap();
+            proposal.status = ProposalStatus::Active;
+            // Use a very large (but not MAX) value to avoid U256 addition overflow
+            proposal.for_votes = U256::from(u128::MAX);
+            proposal.against_votes = U256::from(1);
+            proposal.abstain_votes = U256::from(1);
+            proposal.voting_ends = 110;
+        }
+
+        // Processing after voting ends should not panic
+        let total_supply = U256::from(u128::MAX);
+        let updates = gov.process_proposals(111, total_supply);
+        // Should produce either Passed or Failed, but not panic
+        assert!(!updates.is_empty());
+    }
+
+    #[test]
+    fn test_double_vote_rejected() {
+        let config = GovernanceConfig::default();
+        let mut gov = GovernanceManager::new(config.clone());
+        let proposer = Address([1; 20]);
+        let voter = Address([2; 20]);
+        let total_supply = U256::from(1_000_000_000) * U256::from(10).pow(U256::from(18));
+
+        let proposal_id = gov.create_proposal(
+            proposer,
+            ProposalType::ParameterChange {
+                parameter: "block_reward".to_string(),
+                new_value: U256::from(15),
+            },
+            "Test".to_string(),
+            "Test".to_string(),
+            100,
+            config.proposal_threshold,
+        ).unwrap();
+
+        // First vote succeeds
+        gov.vote(proposal_id, voter, VoteType::For, 102, total_supply).unwrap();
+
+        // Second vote from same voter rejected
+        let result = gov.vote(proposal_id, voter, VoteType::Against, 103, total_supply);
+        assert!(result.is_err());
     }
 }

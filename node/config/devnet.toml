@@ -1,7 +1,7 @@
 # Sample devnet configuration
 
 [chain]
-chain_id = 1337
+chain_id = 40204
 block_time = 2
 ghostdag_k = 18
 

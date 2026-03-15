@@ -166,4 +166,235 @@ mod tests {
         assert_eq!(token.balance_of(&alice), amount - transfer_amount);
         assert_eq!(token.balance_of(&bob), transfer_amount);
     }
+
+    // --- Overflow tests ---
+
+    #[test]
+    fn test_mint_exceeding_total_supply_rejected() {
+        let config = TokenConfig::default();
+        let mut token = Token::new(config.clone());
+        let alice = Address([1; 20]);
+
+        // Mint exactly total supply — should succeed
+        token.mint(&alice, config.total_supply).unwrap();
+
+        // Mint 1 more wei — should fail
+        let result = token.mint(&alice, U256::from(1));
+        assert!(matches!(result, Err(TokenError::ExceedsSupply)));
+    }
+
+    #[test]
+    fn test_mint_u128_max_rejected() {
+        let config = TokenConfig::default();
+        let mut token = Token::new(config);
+        let alice = Address([1; 20]);
+
+        // u128::MAX is far above 1B SALT total supply
+        let huge = U256::from(u128::MAX);
+        let result = token.mint(&alice, huge);
+        assert!(matches!(result, Err(TokenError::ExceedsSupply)));
+    }
+
+    #[test]
+    fn test_transfer_more_than_balance_rejected() {
+        let config = TokenConfig::default();
+        let mut token = Token::new(config);
+        let alice = Address([1; 20]);
+        let bob = Address([2; 20]);
+
+        let amount = U256::from(1000);
+        token.mint(&alice, amount).unwrap();
+
+        // Try to transfer more than balance
+        let result = token.transfer(&alice, &bob, amount + U256::from(1));
+        assert!(matches!(result, Err(TokenError::InsufficientBalance)));
+    }
+
+    // --- Underflow tests ---
+
+    #[test]
+    fn test_transfer_from_zero_balance_rejected() {
+        let config = TokenConfig::default();
+        let mut token = Token::new(config);
+        let alice = Address([1; 20]);
+        let bob = Address([2; 20]);
+
+        // Alice has zero balance, transfer should fail
+        let result = token.transfer(&alice, &bob, U256::from(1));
+        assert!(matches!(result, Err(TokenError::InsufficientBalance)));
+    }
+
+    #[test]
+    fn test_burn_from_zero_balance_rejected() {
+        let config = TokenConfig::default();
+        let mut token = Token::new(config);
+        let alice = Address([1; 20]);
+
+        let result = token.burn(&alice, U256::from(1));
+        assert!(matches!(result, Err(TokenError::InsufficientBalance)));
+    }
+
+    #[test]
+    fn test_burn_more_than_balance_rejected() {
+        let config = TokenConfig::default();
+        let mut token = Token::new(config);
+        let alice = Address([1; 20]);
+
+        token.mint(&alice, U256::from(100)).unwrap();
+        let result = token.burn(&alice, U256::from(101));
+        assert!(matches!(result, Err(TokenError::InsufficientBalance)));
+    }
+
+    #[test]
+    fn test_transfer_zero_succeeds() {
+        let config = TokenConfig::default();
+        let mut token = Token::new(config);
+        let alice = Address([1; 20]);
+        let bob = Address([2; 20]);
+
+        // Transfer zero from unfunded account — should succeed (0 >= 0)
+        token.transfer(&alice, &bob, U256::zero()).unwrap();
+        assert_eq!(token.balance_of(&alice), U256::zero());
+        assert_eq!(token.balance_of(&bob), U256::zero());
+    }
+
+    #[test]
+    fn test_circulating_supply_after_burn() {
+        let config = TokenConfig::default();
+        let mut token = Token::new(config);
+        let alice = Address([1; 20]);
+
+        let amount = U256::from(1000);
+        token.mint(&alice, amount).unwrap();
+        token.burn(&alice, U256::from(400)).unwrap();
+
+        assert_eq!(token.circulating_supply(), U256::from(600));
+    }
+
+    // --- Conservation of value (property-based) ---
+
+    #[test]
+    fn test_transfer_conserves_total_value() {
+        let config = TokenConfig::default();
+        let mut token = Token::new(config);
+        let alice = Address([1; 20]);
+        let bob = Address([2; 20]);
+
+        let amount = U256::from(10_000);
+        token.mint(&alice, amount).unwrap();
+
+        let supply_before = token.circulating_supply();
+        token.transfer(&alice, &bob, U256::from(3_000)).unwrap();
+        let supply_after = token.circulating_supply();
+
+        assert_eq!(supply_before, supply_after, "Transfer must conserve circulating supply");
+        assert_eq!(
+            token.balance_of(&alice) + token.balance_of(&bob),
+            amount,
+            "Sum of balances must equal minted amount"
+        );
+    }
+
+    #[test]
+    fn test_mint_burn_conservation() {
+        let config = TokenConfig::default();
+        let mut token = Token::new(config);
+        let alice = Address([1; 20]);
+
+        let mint_amount = U256::from(5_000);
+        let burn_amount = U256::from(2_000);
+
+        token.mint(&alice, mint_amount).unwrap();
+        token.burn(&alice, burn_amount).unwrap();
+
+        assert_eq!(token.circulating_supply(), mint_amount - burn_amount);
+        assert_eq!(token.balance_of(&alice), mint_amount - burn_amount);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy to generate a valid mint amount (1..=total_supply_in_units)
+    fn mint_amount_strategy() -> impl Strategy<Value = u64> {
+        // Keep amounts in a manageable u64 range (in wei-less units) to avoid slowness
+        1u64..=1_000_000_000u64
+    }
+
+    fn address_strategy() -> impl Strategy<Value = Address> {
+        prop::array::uniform20(1u8..=255u8).prop_map(Address)
+    }
+
+    proptest! {
+        /// Transfer conserves the sum of sender + receiver balances
+        #[test]
+        fn prop_transfer_conserves_value(
+            initial in 1u64..=1_000_000_000u64,
+            transfer_pct in 0u64..=100u64,
+        ) {
+            let config = TokenConfig::default();
+            let mut token = Token::new(config);
+            let alice = Address([1; 20]);
+            let bob = Address([2; 20]);
+
+            let mint_amount = U256::from(initial);
+            token.mint(&alice, mint_amount).unwrap();
+
+            let transfer_amount = mint_amount * U256::from(transfer_pct) / U256::from(100);
+            token.transfer(&alice, &bob, transfer_amount).unwrap();
+
+            let sum = token.balance_of(&alice) + token.balance_of(&bob);
+            prop_assert_eq!(sum, mint_amount, "Transfer must conserve total value");
+        }
+
+        /// Circulating supply == total_minted - total_burned after arbitrary mint+burn sequence
+        #[test]
+        fn prop_circulating_supply_invariant(
+            mint_val in 1000u64..=1_000_000_000u64,
+            burn_pct in 0u64..=100u64,
+        ) {
+            let config = TokenConfig::default();
+            let mut token = Token::new(config);
+            let alice = Address([1; 20]);
+
+            let mint_amount = U256::from(mint_val);
+            token.mint(&alice, mint_amount).unwrap();
+
+            let burn_amount = mint_amount * U256::from(burn_pct) / U256::from(100);
+            token.burn(&alice, burn_amount).unwrap();
+
+            let expected_circulating = mint_amount - burn_amount;
+            prop_assert_eq!(token.circulating_supply(), expected_circulating);
+            prop_assert_eq!(token.balance_of(&alice), expected_circulating);
+        }
+
+        /// Multi-party transfers conserve total supply across N accounts
+        #[test]
+        fn prop_multi_transfer_conservation(
+            initial in 10_000u64..=1_000_000u64,
+            split1_pct in 0u64..=50u64,
+            split2_pct in 0u64..=50u64,
+        ) {
+            let config = TokenConfig::default();
+            let mut token = Token::new(config);
+            let alice = Address([1; 20]);
+            let bob = Address([2; 20]);
+            let carol = Address([3; 20]);
+
+            let mint_amount = U256::from(initial);
+            token.mint(&alice, mint_amount).unwrap();
+
+            let to_bob = mint_amount * U256::from(split1_pct) / U256::from(100);
+            let to_carol = mint_amount * U256::from(split2_pct) / U256::from(100);
+
+            token.transfer(&alice, &bob, to_bob).unwrap();
+            token.transfer(&alice, &carol, to_carol).unwrap();
+
+            let total = token.balance_of(&alice) + token.balance_of(&bob) + token.balance_of(&carol);
+            prop_assert_eq!(total, mint_amount, "Multi-transfer must conserve total value");
+            prop_assert_eq!(token.circulating_supply(), mint_amount);
+        }
+    }
 }

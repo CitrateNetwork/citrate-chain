@@ -1,0 +1,60 @@
+{
+  "dashboard": {
+    "title": "Citrate Devnet Overview",
+    "uid": "citrate-devnet-overview",
+    "timezone": "utc",
+    "refresh": "5s",
+    "tags": ["citrate", "devnet"],
+    "panels": [
+      {
+        "title": "Block Height",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+        "targets": [{ "expr": "citrate_block_height{network='devnet'}", "legendFormat": "Height" }]
+      },
+      {
+        "title": "Chain ID",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+        "targets": [{ "expr": "citrate_chain_id{network='devnet'}", "legendFormat": "Chain ID" }]
+      },
+      {
+        "title": "Gas Price (gwei)",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+        "targets": [{ "expr": "citrate_gas_price_gwei{network='devnet'}", "legendFormat": "Gas Price" }]
+      },
+      {
+        "title": "Metrics Bridge",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+        "targets": [{ "expr": "citrate_bridge_up", "legendFormat": "Status" }],
+        "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "1": { "text": "UP", "color": "green" }, "0": { "text": "DOWN", "color": "red" } } }] } }
+      },
+      {
+        "title": "Block Height Over Time",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+        "targets": [{ "expr": "citrate_block_height{network='devnet'}", "legendFormat": "Block Height" }]
+      },
+      {
+        "title": "Gas Price Over Time",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+        "targets": [{ "expr": "citrate_gas_price_gwei{network='devnet'}", "legendFormat": "Gas Price (gwei)" }]
+      },
+      {
+        "title": "Mempool Size",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+        "targets": [{ "expr": "citrate_mempool_size{network='devnet'}", "legendFormat": "Mempool" }]
+      },
+      {
+        "title": "Peer Count",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+        "targets": [{ "expr": "citrate_peer_count{network='devnet'}", "legendFormat": "Peers" }]
+      }
+    ]
+  }
+}

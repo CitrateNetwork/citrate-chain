@@ -534,13 +534,21 @@ impl Mempool {
         // Remove from priority queue
         self.priority_queue.write().await.remove(hash);
 
+        let sender = mempool_tx.tx.from;
+        let removed_nonce = mempool_tx.tx.nonce;
+
         // Remove from sender list
-        if let Some(sender_txs) = self.by_sender.write().await.get_mut(&mempool_tx.tx.from) {
+        if let Some(sender_txs) = self.by_sender.write().await.get_mut(&sender) {
             sender_txs.retain(|&h| h != *hash);
         }
 
         // Update total size
         *self.total_size.write().await -= mempool_tx.size;
+
+        // Sprint EL-1 Fix (Issue #20): Rollback nonce if the removed transaction
+        // was at the tip of the sender's nonce chain. This prevents permanent
+        // sender lockout when transactions fail or are evicted.
+        self.rollback_nonce_for_sender(&sender, removed_nonce).await;
 
         // Add to evicted set (to prevent re-addition)
         self.evicted.write().await.insert(*hash);
@@ -548,6 +556,76 @@ impl Mempool {
         debug!("Removed transaction {} from mempool", hash);
 
         Some(mempool_tx.tx)
+    }
+
+    /// Sprint EL-1 (Issue #20): Rollback the expected nonce for a sender after
+    /// a transaction is removed. If the removed nonce was the tip (expected - 1),
+    /// decrement the expected nonce. Otherwise, trigger a full reconciliation.
+    async fn rollback_nonce_for_sender(&self, sender: &PublicKey, removed_nonce: u64) {
+        let mut nonces = self.nonces.write().await;
+        if let Some(expected) = nonces.get_mut(sender) {
+            if *expected == removed_nonce + 1 {
+                // The removed tx was the tip — decrement
+                *expected = removed_nonce;
+                debug!(
+                    "Rolled back nonce for sender {:?}: {} -> {}",
+                    sender, removed_nonce + 1, removed_nonce
+                );
+            }
+            // If the removed nonce wasn't the tip, we may have a gap.
+            // reconcile_nonces() should be called by the producer post-block.
+        }
+    }
+
+    /// Sprint EL-1 (Issue #20): Reconcile the nonce map with actual remaining
+    /// transactions. Called by the producer after block execution to ensure
+    /// the nonce map accurately reflects the mempool state.
+    pub async fn reconcile_nonces(&self) {
+        let by_sender = self.by_sender.read().await;
+        let txs = self.transactions.read().await;
+        let mut nonces = self.nonces.write().await;
+
+        // Collect senders to remove (can't modify nonces while iterating)
+        let mut to_remove = Vec::new();
+
+        for (sender, tx_hashes) in by_sender.iter() {
+            let max_nonce = tx_hashes
+                .iter()
+                .filter_map(|h| txs.get(h).map(|t| t.tx.nonce))
+                .max();
+
+            match max_nonce {
+                Some(n) => {
+                    let new_expected = n + 1;
+                    if let Some(current) = nonces.get(sender) {
+                        if *current != new_expected {
+                            debug!(
+                                "Reconciled nonce for {:?}: {} -> {}",
+                                sender, current, new_expected
+                            );
+                        }
+                    }
+                    nonces.insert(*sender, new_expected);
+                }
+                None => {
+                    // No remaining transactions — remove sender from nonce map
+                    to_remove.push(*sender);
+                }
+            }
+        }
+
+        // Also remove senders who are in nonces but not in by_sender
+        for sender in nonces.keys().cloned().collect::<Vec<_>>() {
+            if !by_sender.contains_key(&sender) {
+                to_remove.push(sender);
+            }
+        }
+
+        for sender in to_remove {
+            if nonces.remove(&sender).is_some() {
+                debug!("Removed stale nonce entry for {:?}", sender);
+            }
+        }
     }
 
     /// Get AI transactions (model operations, inference requests)
@@ -846,6 +924,10 @@ pub trait MempoolAccess: Send + Sync {
 
     /// Get the pending nonce for a sender (next expected nonce)
     async fn get_pending_nonce(&self, sender: &PublicKey) -> Option<u64>;
+
+    /// Sprint EL-1 (Issue #20): Reconcile nonce map with actual remaining transactions.
+    /// Called by the producer after block execution.
+    async fn reconcile_nonces(&self);
 }
 
 /// Implementation of MempoolAccess for Arc<Mempool> (direct access)
@@ -893,6 +975,10 @@ impl MempoolAccess for Arc<Mempool> {
 
     async fn get_pending_nonce(&self, sender: &PublicKey) -> Option<u64> {
         self.nonces.read().await.get(sender).copied()
+    }
+
+    async fn reconcile_nonces(&self) {
+        Mempool::reconcile_nonces(self).await
     }
 }
 
@@ -946,6 +1032,10 @@ impl MempoolAccess for Arc<RwLock<Mempool>> {
 
     async fn get_pending_nonce(&self, sender: &PublicKey) -> Option<u64> {
         self.read().await.nonces.read().await.get(sender).copied()
+    }
+
+    async fn reconcile_nonces(&self) {
+        self.read().await.reconcile_nonces().await
     }
 }
 
@@ -1275,5 +1365,260 @@ mod tests {
         assert_eq!(best[1].hash, tx_mu.hash);
         assert_eq!(best[2].hash, tx_comp.hash);
         assert_eq!(best[3].hash, tx_std.hash);
+    }
+
+    /// Sprint EL-1 regression (Issue #20): After removing a transaction,
+    /// the sender's nonce should be rolled back so that the same nonce
+    /// can be re-submitted.
+    #[tokio::test]
+    async fn test_el2_nonce_rollback_on_remove() {
+        let config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+        let sender = [5u8; 32];
+
+        // Add tx with nonce 0
+        let tx0 = create_test_tx(0, 2_000_000_000, sender);
+        let tx0_hash = tx0.hash;
+        mempool
+            .add_transaction(tx0, TxClass::Standard)
+            .await
+            .unwrap();
+
+        // Expected nonce should now be 1
+        let nonce = mempool.nonces.read().await.get(&PublicKey::new(sender)).copied();
+        assert_eq!(nonce, Some(1), "Expected nonce should be 1 after adding nonce-0 tx");
+
+        // Remove the transaction
+        mempool.remove_transaction(&tx0_hash).await;
+
+        // Expected nonce should be rolled back to 0
+        let nonce_after = mempool.nonces.read().await.get(&PublicKey::new(sender)).copied();
+        assert_eq!(nonce_after, Some(0), "Expected nonce should roll back to 0 after removal");
+
+        // Re-submit with nonce 0 should succeed (use different gas price for unique hash)
+        let tx0_retry = create_test_tx(0, 3_000_000_000, sender);
+        let result = mempool
+            .add_transaction(tx0_retry, TxClass::Standard)
+            .await;
+        assert!(result.is_ok(), "Re-submitting nonce 0 after rollback should succeed: {:?}", result.err());
+    }
+
+    /// Sprint EL-1 regression (Issue #20): reconcile_nonces() resets
+    /// nonce map based on actual remaining transactions per sender.
+    #[tokio::test]
+    async fn test_el2_reconcile_nonces() {
+        let config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+        let sender = [6u8; 32];
+
+        // Add txs with nonces 0, 1, 2
+        let tx0 = create_test_tx(0, 2_000_000_000, sender);
+        let tx1 = create_test_tx(1, 2_000_000_000, sender);
+        let tx2 = create_test_tx(2, 2_000_000_000, sender);
+        let tx1_hash = tx1.hash;
+
+        mempool.add_transaction(tx0, TxClass::Standard).await.unwrap();
+        mempool.add_transaction(tx1, TxClass::Standard).await.unwrap();
+        mempool.add_transaction(tx2, TxClass::Standard).await.unwrap();
+
+        // Expected nonce should be 3
+        let nonce = mempool.nonces.read().await.get(&PublicKey::new(sender)).copied();
+        assert_eq!(nonce, Some(3));
+
+        // Remove tx with nonce 1 (middle tx)
+        mempool.remove_transaction(&tx1_hash).await;
+
+        // After removal, rollback only fires if it was the tip nonce.
+        // Nonce 1 is not the tip (tip is 2+1=3), so rollback won't fire.
+        // But reconcile should fix it based on remaining txs (0 and 2).
+        mempool.reconcile_nonces().await;
+
+        // After reconciliation: remaining nonces are 0 and 2, so expected = max(0,2)+1 = 3
+        let nonce_after = mempool.nonces.read().await.get(&PublicKey::new(sender)).copied();
+        assert_eq!(nonce_after, Some(3), "Reconciled nonce should be max(remaining)+1");
+    }
+
+    /// Sprint EL-1 regression (Issue #20): When all transactions for a sender
+    /// are removed, reconcile_nonces() should remove the sender from the map.
+    #[tokio::test]
+    async fn test_el2_reconcile_removes_stale_sender() {
+        let config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+        let sender = [7u8; 32];
+
+        // Add and remove a transaction
+        let tx0 = create_test_tx(0, 2_000_000_000, sender);
+        let tx0_hash = tx0.hash;
+        mempool.add_transaction(tx0, TxClass::Standard).await.unwrap();
+        mempool.remove_transaction(&tx0_hash).await;
+
+        // Nonce map should still have the sender (rollback sets to 0)
+        let has_sender = mempool.nonces.read().await.contains_key(&PublicKey::new(sender));
+        assert!(has_sender, "Sender should still be in nonce map after rollback");
+
+        // Reconcile should remove sender since no txs remain
+        mempool.reconcile_nonces().await;
+
+        let has_sender_after = mempool.nonces.read().await.contains_key(&PublicKey::new(sender));
+        assert!(!has_sender_after, "Sender with no remaining txs should be removed after reconcile");
+
+        // Re-submit with nonce 0 should succeed (use different gas price for unique hash)
+        let tx0_new = create_test_tx(0, 3_000_000_000, sender);
+        let result = mempool.add_transaction(tx0_new, TxClass::Standard).await;
+        assert!(result.is_ok(), "Fresh submit after sender cleanup should succeed: {:?}", result.err());
+    }
+
+    /// Fill mempool to max_size, then add one more tx with higher gas price.
+    /// The lowest-priority tx should be evicted to make room.
+    #[tokio::test]
+    async fn test_mempool_capacity_eviction() {
+        let config = MempoolConfig {
+            max_size: 3,
+            max_per_sender: 100,
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+
+        // Fill mempool with 3 txs from distinct senders at varying gas prices
+        let tx_low = create_test_tx(0, 1_000_000_000, [10; 32]);
+        let tx_mid = create_test_tx(0, 2_000_000_000, [11; 32]);
+        let tx_high = create_test_tx(0, 3_000_000_000, [12; 32]);
+
+        mempool.add_transaction(tx_low.clone(), TxClass::Standard).await.unwrap();
+        mempool.add_transaction(tx_mid.clone(), TxClass::Standard).await.unwrap();
+        mempool.add_transaction(tx_high.clone(), TxClass::Standard).await.unwrap();
+        assert_eq!(mempool.stats().await.total_transactions, 3);
+
+        // Add a 4th tx with higher gas price than the lowest — should evict tx_low
+        let tx_new = create_test_tx(0, 5_000_000_000, [13; 32]);
+        mempool.add_transaction(tx_new.clone(), TxClass::Standard).await.unwrap();
+
+        // Still 3 txs (one evicted)
+        assert_eq!(mempool.stats().await.total_transactions, 3);
+        // The lowest-priority tx should have been evicted
+        assert!(!mempool.contains(&tx_low.hash).await, "Lowest priority tx should be evicted");
+        // The new tx should be present
+        assert!(mempool.contains(&tx_new.hash).await, "New higher-priority tx should be present");
+    }
+
+    /// Add transactions, call clear(), verify the mempool is empty.
+    #[tokio::test]
+    async fn test_mempool_clear() {
+        let config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+
+        let tx1 = create_test_tx(0, 2_000_000_000, [20; 32]);
+        let tx2 = create_test_tx(0, 2_000_000_000, [21; 32]);
+        mempool.add_transaction(tx1, TxClass::Standard).await.unwrap();
+        mempool.add_transaction(tx2, TxClass::Inference).await.unwrap();
+        assert_eq!(mempool.stats().await.total_transactions, 2);
+
+        mempool.clear().await;
+
+        let stats = mempool.stats().await;
+        assert_eq!(stats.total_transactions, 0, "Mempool should be empty after clear");
+        assert_eq!(stats.total_size, 0, "Total size should be 0 after clear");
+        assert_eq!(stats.unique_senders, 0, "No senders should remain after clear");
+    }
+
+    /// Add a tx with very short expiry, then call clear_expired() and verify removal.
+    /// Note: clear_expired uses wall-clock time, so we set tx_expiry_secs=0 to make
+    /// all existing txs "expired" immediately on the next call.
+    #[tokio::test]
+    async fn test_mempool_expired_tx_cleanup() {
+        let config = MempoolConfig {
+            tx_expiry_secs: 0, // Expire immediately
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+
+        let tx = create_test_tx(0, 2_000_000_000, [30; 32]);
+        let tx_hash = tx.hash;
+        mempool.add_transaction(tx, TxClass::Standard).await.unwrap();
+        assert_eq!(mempool.stats().await.total_transactions, 1);
+
+        // Wait >1s so the tx timestamp (second-precision) is strictly in the past
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        mempool.clear_expired().await;
+
+        assert!(!mempool.contains(&tx_hash).await, "Expired tx should be removed");
+        assert_eq!(mempool.stats().await.total_transactions, 0);
+    }
+
+    /// Add transactions of various classes and verify stats().by_class counts.
+    #[tokio::test]
+    async fn test_mempool_stats() {
+        let config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+
+        // Add 2 Standard, 1 System, 1 Inference from different senders
+        mempool.add_transaction(create_test_tx(0, 2_000_000_000, [40; 32]), TxClass::Standard).await.unwrap();
+        mempool.add_transaction(create_test_tx(0, 2_000_000_000, [41; 32]), TxClass::Standard).await.unwrap();
+        mempool.add_transaction(create_test_tx(0, 2_000_000_000, [42; 32]), TxClass::System).await.unwrap();
+        mempool.add_transaction(create_test_tx(0, 2_000_000_000, [43; 32]), TxClass::Inference).await.unwrap();
+
+        let stats = mempool.stats().await;
+        assert_eq!(stats.total_transactions, 4);
+        assert_eq!(stats.unique_senders, 4);
+        assert_eq!(*stats.by_class.get(&TxClass::Standard).unwrap_or(&0), 2);
+        assert_eq!(*stats.by_class.get(&TxClass::System).unwrap_or(&0), 1);
+        assert_eq!(*stats.by_class.get(&TxClass::Inference).unwrap_or(&0), 1);
+        assert_eq!(*stats.by_class.get(&TxClass::ModelUpdate).unwrap_or(&0), 0);
+    }
+
+    /// Add txs of known sizes, call get_best_transactions with a tight max_size
+    /// limit, and verify the size limit is respected.
+    #[tokio::test]
+    async fn test_mempool_get_best_transactions_respects_size_limit() {
+        let config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+
+        // Create txs with different data sizes. Base tx size is ~200 bytes (hash+nonce+from+to+value+gas+sig).
+        // Adding data increases the size.
+        let mut tx_small = create_test_tx(0, 3_000_000_000, [50; 32]);
+        tx_small.data = vec![0u8; 10]; // ~210 bytes total
+        let mut tx_medium = create_test_tx(0, 2_000_000_000, [51; 32]);
+        tx_medium.data = vec![0u8; 100]; // ~300 bytes total
+        let mut tx_large = create_test_tx(0, 1_000_000_000, [52; 32]);
+        tx_large.data = vec![0u8; 500]; // ~700 bytes total
+
+        mempool.add_transaction(tx_small.clone(), TxClass::Standard).await.unwrap();
+        mempool.add_transaction(tx_medium.clone(), TxClass::Standard).await.unwrap();
+        mempool.add_transaction(tx_large.clone(), TxClass::Standard).await.unwrap();
+
+        // Set max_size that fits only the small and medium txs (~510 bytes)
+        // but not the large one too
+        let best = mempool.get_best_transactions(10, 510).await;
+
+        // The small tx has highest gas price so it's selected first (~210 bytes),
+        // then medium (~300 bytes, total ~510), then large won't fit.
+        assert!(best.len() <= 2, "Should not include all 3 txs under the size limit");
+        // Verify no tx was included that would push total over the limit
+        let total: usize = best.iter().map(|t| {
+            // Replicate the size calculation: 32+8+32+32+16+8+8+data.len()+64
+            32 + 8 + 32 + 32 + 16 + 8 + 8 + t.data.len() + 64
+        }).sum();
+        assert!(total <= 510, "Total selected tx size {} should not exceed max_size 510", total);
     }
 }
