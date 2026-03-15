@@ -1701,11 +1701,16 @@ impl TryFrom<u8> for EVMOpcode {
             0x5e => Ok(EVMOpcode::MCOPY),
             0x5f => Ok(EVMOpcode::PUSH0),
 
-            // SAFETY: These ranges directly correspond to contiguous enum variants
-            // (PUSH1-PUSH32, DUP1-DUP16, SWAP1-SWAP16, LOG0-LOG4) with matching discriminants
+            // SAFETY: PUSH1(0x60)..PUSH32(0x7f) are declared as contiguous enum variants
+            // with explicit discriminants matching the EVM spec. The match arm guarantees
+            // `value` is in 0x60..=0x7f, so the transmute always produces a valid variant.
             0x60..=0x7f => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
+            // SAFETY: DUP1(0x80)..DUP16(0x8f) — same contiguous-discriminant invariant.
             0x80..=0x8f => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
+            // SAFETY: SWAP1(0x90)..SWAP16(0x9f) — same contiguous-discriminant invariant.
             0x90..=0x9f => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
+            // SAFETY: LOG0(0xa0)..LOG4(0xa4) — same contiguous-discriminant invariant.
+            // Note: only 5 values; could be replaced with explicit match arms.
             0xa0..=0xa4 => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
 
             0xf0 => Ok(EVMOpcode::CREATE),

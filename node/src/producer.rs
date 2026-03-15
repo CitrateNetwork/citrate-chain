@@ -714,6 +714,12 @@ impl BlockProducer {
             for tx in &block.transactions {
                 let _ = self.mempool.remove_transaction(&tx.hash).await;
             }
+
+            // Sprint EL-1 (Issue #20): Reconcile nonce map after removing
+            // executed transactions. This ensures that if any txs were removed
+            // (including failed ones), the expected-nonce map stays consistent
+            // so senders are never permanently blocked.
+            self.mempool.reconcile_nonces().await;
         }
 
         // Update DAG store
@@ -808,6 +814,11 @@ impl BlockProducer {
                 Ok(receipt) => receipts.push(receipt),
                 Err(e) => {
                     error!("Failed to execute transaction {}: {}", tx.hash, e);
+
+                    // Sprint EL-1 (Issue #20): Remove failed tx from mempool
+                    // so the sender's nonce is not permanently blocked.
+                    let _ = self.mempool.remove_transaction(&tx.hash).await;
+
                     // Create failed receipt
                     receipts.push(citrate_execution::types::TransactionReceipt {
                         tx_hash: tx.hash,
@@ -932,5 +943,44 @@ impl BlockProducer {
                 .set_balance(&treasury_address, current_balance + reward.treasury_reward);
             info!("Basic: Minted {} wei to treasury", reward.treasury_reward);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vrf_deterministic() {
+        let proposer = PublicKey::new([1u8; 32]);
+        let coinbase = PublicKey::new([2u8; 32]);
+        let prev_vrf = Hash::new([3u8; 32]);
+        let slot = 42u64;
+
+        let vrf_a = generate_block_vrf(&proposer, &coinbase, &prev_vrf, slot);
+        let vrf_b = generate_block_vrf(&proposer, &coinbase, &prev_vrf, slot);
+
+        assert_eq!(vrf_a.proof, vrf_b.proof, "Same inputs must produce same VRF proof");
+        assert_eq!(vrf_a.output, vrf_b.output, "Same inputs must produce same VRF output");
+        assert!(!vrf_a.proof.is_empty(), "VRF proof must not be empty");
+    }
+
+    #[test]
+    fn test_vrf_different_slots_different_output() {
+        let proposer = PublicKey::new([1u8; 32]);
+        let coinbase = PublicKey::new([2u8; 32]);
+        let prev_vrf = Hash::new([3u8; 32]);
+
+        let vrf_slot_1 = generate_block_vrf(&proposer, &coinbase, &prev_vrf, 1);
+        let vrf_slot_2 = generate_block_vrf(&proposer, &coinbase, &prev_vrf, 2);
+
+        assert_ne!(
+            vrf_slot_1.output, vrf_slot_2.output,
+            "Different slot numbers must produce different VRF outputs"
+        );
+        assert_ne!(
+            vrf_slot_1.proof, vrf_slot_2.proof,
+            "Different slot numbers must produce different VRF proofs"
+        );
     }
 }

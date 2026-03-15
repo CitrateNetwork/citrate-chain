@@ -281,11 +281,11 @@ pub struct MiningConfig {
 
 impl Default for NodeConfig {
     fn default() -> Self {
-        // Check for chain ID from environment variable, default to 1337 (devnet)
+        // Check for chain ID from environment variable, default to 40204
         let chain_id = std::env::var("CITRATE_CHAIN_ID")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1337);
+            .unwrap_or(40204);
 
         Self {
             chain: ChainConfig {
@@ -344,7 +344,7 @@ impl NodeConfig {
         let mut config = Self::default();
         // Chain ID already set from env var in default(), only override if not set
         if std::env::var("CITRATE_CHAIN_ID").is_err() {
-            config.chain.chain_id = 1337;
+            config.chain.chain_id = 40204;
         }
         config.mining.enabled = true;
         config.mining.target_block_time = 2; // Fast blocks for testing
@@ -352,6 +352,8 @@ impl NodeConfig {
         config.rpc.allow_eth_send_transaction = true;
         // WP-X.1: Permissive CORS in devnet
         config.rpc.cors_origins = vec!["*".to_string()];
+        // Bind RPC to all interfaces so Tailscale/LAN peers can reach it
+        config.rpc.listen_addr = "0.0.0.0:8545".parse().unwrap();
         // WP-W.2: Permissive VRF in devnet (no strict verification)
         config.vrf.strict_vrf = false;
         config
@@ -371,5 +373,134 @@ impl NodeConfig {
         std::fs::create_dir_all(path.parent().unwrap())?;
         std::fs::write(path, content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        // Clear env var to ensure deterministic defaults
+        std::env::remove_var("CITRATE_CHAIN_ID");
+
+        let config = NodeConfig::default();
+
+        assert_eq!(config.chain.chain_id, 40204);
+        assert_eq!(config.chain.block_time, 5);
+        assert_eq!(config.chain.ghostdag_k, 18);
+        assert_eq!(config.chain.genesis_hash, None);
+
+        assert_eq!(config.rpc.enabled, true);
+        assert_eq!(
+            config.rpc.listen_addr,
+            "127.0.0.1:8545".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            config.rpc.ws_addr,
+            "127.0.0.1:8546".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(config.rpc.allow_eth_send_transaction, false);
+        assert!(config.rpc.cors_origins.is_empty());
+
+        assert_eq!(config.network.max_peers, 50);
+        assert_eq!(
+            config.network.listen_addr,
+            "127.0.0.1:30303".parse::<SocketAddr>().unwrap()
+        );
+
+        assert_eq!(config.mining.enabled, true);
+        assert_eq!(config.mining.target_block_time, 5);
+        assert_eq!(config.mining.min_gas_price, 1_000_000_000);
+
+        assert_eq!(config.vrf.strict_vrf, true);
+        assert_eq!(config.vrf.migration_mode, false);
+    }
+
+    #[test]
+    fn test_devnet_config() {
+        std::env::remove_var("CITRATE_CHAIN_ID");
+
+        let config = NodeConfig::devnet();
+
+        assert_eq!(config.chain.chain_id, 40204);
+        assert_eq!(config.mining.target_block_time, 2);
+        assert_eq!(config.mining.enabled, true);
+        assert_eq!(config.rpc.allow_eth_send_transaction, true);
+        assert_eq!(config.rpc.cors_origins, vec!["*".to_string()]);
+        assert_eq!(
+            config.rpc.listen_addr,
+            "0.0.0.0:8545".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(config.vrf.strict_vrf, false);
+    }
+
+    #[test]
+    fn test_config_serialization_roundtrip() {
+        std::env::remove_var("CITRATE_CHAIN_ID");
+
+        let original = NodeConfig::default();
+        let toml_str = toml::to_string_pretty(&original).expect("serialize to TOML");
+        let deserialized: NodeConfig =
+            toml::from_str(&toml_str).expect("deserialize from TOML");
+
+        assert_eq!(deserialized.chain.chain_id, original.chain.chain_id);
+        assert_eq!(deserialized.chain.block_time, original.chain.block_time);
+        assert_eq!(deserialized.chain.ghostdag_k, original.chain.ghostdag_k);
+        assert_eq!(deserialized.rpc.enabled, original.rpc.enabled);
+        assert_eq!(deserialized.rpc.listen_addr, original.rpc.listen_addr);
+        assert_eq!(deserialized.rpc.ws_addr, original.rpc.ws_addr);
+        assert_eq!(deserialized.network.max_peers, original.network.max_peers);
+        assert_eq!(deserialized.mining.enabled, original.mining.enabled);
+        assert_eq!(
+            deserialized.mining.target_block_time,
+            original.mining.target_block_time
+        );
+        assert_eq!(deserialized.storage.pruning, original.storage.pruning);
+        assert_eq!(
+            deserialized.storage.keep_blocks,
+            original.storage.keep_blocks
+        );
+        assert_eq!(deserialized.vrf.strict_vrf, original.vrf.strict_vrf);
+        assert_eq!(
+            deserialized.checkpoint.interval,
+            original.checkpoint.interval
+        );
+    }
+
+    #[test]
+    fn test_validator_config_production() {
+        let validators = vec!["aabbccdd".to_string()];
+        let config = ValidatorConfig::production(validators.clone());
+
+        assert_eq!(config.production_mode, true);
+        assert_eq!(config.validators, validators);
+        assert_eq!(config.ipfs_api_url, "http://127.0.0.1:5001");
+        assert_eq!(config.check_interval_secs, 3600);
+        assert_eq!(config.grace_period_hours, 24);
+    }
+
+    #[test]
+    fn test_validator_config_validate_requires_validators() {
+        // Production mode with empty validators should fail
+        let config = ValidatorConfig {
+            production_mode: true,
+            validators: vec![],
+            ..ValidatorConfig::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("FAIL-CLOSED"));
+
+        // Production mode with validators should succeed
+        let config = ValidatorConfig::production(vec!["aabb".to_string()]);
+        assert!(config.validate().is_ok());
+
+        // Non-production mode with empty validators should succeed
+        let config = ValidatorConfig::default();
+        assert!(config.validate().is_ok());
     }
 }

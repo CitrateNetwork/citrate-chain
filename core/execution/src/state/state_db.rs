@@ -233,6 +233,13 @@ impl StateDB {
             self.storage_tries.insert(addr, trie);
         }
 
+        // Clear dirty_storage to prevent stale entries from a failed
+        // transaction's REVM commit being persisted by persist_state_changes().
+        // Without this, DatabaseCommit::commit() entries from the reverted tx
+        // would remain and could cause incorrect data to be written to RocksDB.
+        // (Fix: Sprint EL-1, Issue #19)
+        self.dirty_storage.clear();
+
         // Restore models
         self.models.clear();
         for (id, model) in snapshot.models {

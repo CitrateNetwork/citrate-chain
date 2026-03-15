@@ -37,7 +37,7 @@ impl TransactionBuilder {
             nonce: 0,
             gas_price: 1_000_000_000, // 1 gwei default
             gas_limit: 21_000,        // Standard transfer
-            chain_id: 1337,           // Default testnet
+            chain_id: 40204,          // Citrate testnet
         }
     }
 
@@ -189,14 +189,19 @@ fn value_to_u128(value: U256) -> u128 {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use rand::RngCore;
 
-    #[test]
-    fn test_transaction_builder() {
-        use rand::RngCore;
+    fn test_signing_key() -> (SigningKey, PublicKey) {
         let mut secret_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut secret_bytes);
         let signing_key = SigningKey::from_bytes(&secret_bytes);
         let public_key = PublicKey::new(signing_key.verifying_key().to_bytes());
+        (signing_key, public_key)
+    }
+
+    #[test]
+    fn test_transaction_builder() {
+        let (signing_key, public_key) = test_signing_key();
 
         let tx = TransactionBuilder::new()
             .from(public_key)
@@ -205,12 +210,204 @@ mod tests {
             .nonce(0)
             .gas_price(1_000_000_000)
             .gas_limit(21_000)
-            .chain_id(1337)
+            .chain_id(40204)
             .build_and_sign(&signing_key)
             .unwrap();
 
         assert_eq!(tx.transaction.from, public_key);
         assert_eq!(tx.transaction.value, 1000);
         assert_eq!(tx.transaction.nonce, 0);
+    }
+
+    #[test]
+    fn test_builder_defaults() {
+        let builder = TransactionBuilder::new();
+        // Verify defaults match spec
+        assert_eq!(builder.gas_price, 1_000_000_000);
+        assert_eq!(builder.gas_limit, 21_000);
+        assert_eq!(builder.chain_id, 40204);
+        assert_eq!(builder.value, U256::zero());
+        assert_eq!(builder.nonce, 0);
+        assert!(builder.from.is_none());
+        assert!(builder.to.is_none());
+        assert!(builder.data.is_empty());
+    }
+
+    #[test]
+    fn test_build_without_from_fails() {
+        let (signing_key, _) = test_signing_key();
+        let err = TransactionBuilder::new()
+            .to(Some(Address([0x11; 20])))
+            .value(U256::from(100))
+            .build_and_sign(&signing_key)
+            .unwrap_err();
+        match err {
+            WalletError::Other(msg) => assert!(msg.contains("From address not set")),
+            _ => panic!("Expected Other error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_signed_transaction_has_valid_signature() {
+        let (signing_key, public_key) = test_signing_key();
+        let tx = TransactionBuilder::new()
+            .from(public_key)
+            .to(Some(Address([0x22; 20])))
+            .value(U256::from(500))
+            .nonce(5)
+            .build_and_sign(&signing_key)
+            .unwrap();
+
+        // Signature should not be all zeros (was replaced during signing)
+        assert_ne!(tx.transaction.signature.as_bytes(), &[0u8; 64]);
+    }
+
+    #[test]
+    fn test_transaction_hash_includes_chain_id() {
+        let (signing_key, public_key) = test_signing_key();
+
+        let tx1 = TransactionBuilder::new()
+            .from(public_key)
+            .to(Some(Address([0x33; 20])))
+            .value(U256::from(100))
+            .chain_id(40204)
+            .build_and_sign(&signing_key)
+            .unwrap();
+
+        let tx2 = TransactionBuilder::new()
+            .from(public_key)
+            .to(Some(Address([0x33; 20])))
+            .value(U256::from(100))
+            .chain_id(1) // Different chain ID
+            .build_and_sign(&signing_key)
+            .unwrap();
+
+        // Different chain IDs should produce different hashes
+        assert_ne!(tx1.transaction.hash, tx2.transaction.hash);
+    }
+
+    #[test]
+    fn test_transaction_hash_deterministic() {
+        let secret = [42u8; 32];
+        let signing_key = SigningKey::from_bytes(&secret);
+        let public_key = PublicKey::new(signing_key.verifying_key().to_bytes());
+
+        // Build two identical transactions — hashes should be identical
+        // (pre-signature hash, since signing uses randomness)
+        let hash1 = calculate_tx_hash(
+            &Transaction {
+                hash: Hash::default(),
+                from: public_key,
+                to: None,
+                value: 1000,
+                data: vec![1, 2, 3],
+                nonce: 7,
+                gas_price: 1_000_000_000,
+                gas_limit: 21_000,
+                signature: Signature::new([0; 64]),
+                tx_type: None,
+                ..Default::default()
+            },
+            40204,
+        );
+
+        let hash2 = calculate_tx_hash(
+            &Transaction {
+                hash: Hash::default(),
+                from: public_key,
+                to: None,
+                value: 1000,
+                data: vec![1, 2, 3],
+                nonce: 7,
+                gas_price: 1_000_000_000,
+                gas_limit: 21_000,
+                signature: Signature::new([0; 64]),
+                tx_type: None,
+                ..Default::default()
+            },
+            40204,
+        );
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_transaction_raw_serialization() {
+        let (signing_key, public_key) = test_signing_key();
+        let tx = TransactionBuilder::new()
+            .from(public_key)
+            .to(Some(Address([0x44; 20])))
+            .value(U256::from(999))
+            .build_and_sign(&signing_key)
+            .unwrap();
+
+        // Raw bytes should be non-empty bincode serialization
+        assert!(!tx.raw.is_empty());
+        // Should be deserializable back
+        let deserialized: Transaction = bincode::deserialize(&tx.raw).unwrap();
+        assert_eq!(deserialized.from, public_key);
+        assert_eq!(deserialized.value, 999);
+    }
+
+    #[test]
+    fn test_value_to_u128_normal() {
+        assert_eq!(value_to_u128(U256::from(1000)), 1000);
+        assert_eq!(value_to_u128(U256::zero()), 0);
+    }
+
+    #[test]
+    fn test_value_to_u128_overflow_saturates() {
+        let huge = U256::MAX;
+        assert_eq!(value_to_u128(huge), u128::MAX);
+    }
+
+    #[test]
+    fn test_value_to_u128_boundary() {
+        let max_u128 = U256::from(u128::MAX);
+        assert_eq!(value_to_u128(max_u128), u128::MAX);
+    }
+
+    #[test]
+    fn test_builder_fluent_api_chains() {
+        let (signing_key, public_key) = test_signing_key();
+        // All builder methods should chain without issue
+        let tx = TransactionBuilder::new()
+            .from(public_key)
+            .to(Some(Address([0x55; 20])))
+            .value(U256::from(1))
+            .data(vec![0xDE, 0xAD])
+            .nonce(42)
+            .gas_price(2_000_000_000)
+            .gas_limit(50_000)
+            .chain_id(40204)
+            .build_and_sign(&signing_key)
+            .unwrap();
+
+        assert_eq!(tx.transaction.nonce, 42);
+        assert_eq!(tx.transaction.gas_price, 2_000_000_000);
+        assert_eq!(tx.transaction.gas_limit, 50_000);
+        assert_eq!(tx.transaction.data, vec![0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn test_contract_deploy_no_to_address() {
+        let (signing_key, public_key) = test_signing_key();
+        let bytecode = vec![0x60, 0x80, 0x60, 0x40]; // minimal EVM bytecode
+
+        let tx = TransactionBuilder::new()
+            .from(public_key)
+            .to(None) // Contract deployment
+            .data(bytecode.clone())
+            .build_and_sign(&signing_key)
+            .unwrap();
+
+        assert!(tx.transaction.to.is_none());
+        assert_eq!(tx.transaction.data, bytecode);
+    }
+
+    #[test]
+    fn test_default_impl() {
+        let builder = TransactionBuilder::default();
+        assert_eq!(builder.chain_id, 40204);
     }
 }

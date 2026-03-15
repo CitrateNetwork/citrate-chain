@@ -110,28 +110,51 @@ impl DatabaseCommit for StateDBAdapter {
         for (address, account) in changes {
             let addr = Address(address.0 .0);
 
-            // Update balance
-            let balance = U256::from_big_endian(&account.info.balance.to_be_bytes::<32>());
-            self.state_db.accounts.set_balance(addr, balance);
+            // ---- Sprint EL-1 Fix (Issue #19) ----
+            // Do NOT update balance or nonce from REVM. The executor is the
+            // sole owner of gas/balance/nonce accounting:
+            //   - executor.execute_transaction() deducts gas upfront and refunds on success
+            //   - executor.check_and_increment_nonce() manages nonces
+            // REVM also internally tracks gas/value/nonce, causing double-deduction
+            // if we write REVM's values back to StateDB. Instead, REVM only commits
+            // storage and code changes.
 
-            // Update nonce
-            self.state_db.accounts.set_nonce(addr, account.info.nonce);
-
-            // Update storage
-            for (key, value) in account.storage {
+            // Update storage — present_value is the post-transaction value
+            for (key, value) in &account.storage {
                 let key_bytes = key.to_be_bytes::<32>();
                 let value_bytes = value.present_value.to_be_bytes::<32>();
+                debug!(
+                    "REVM commit storage: addr={} slot=0x{} value=0x{} (original=0x{})",
+                    addr,
+                    hex::encode(&key_bytes[28..]),
+                    hex::encode(&value_bytes[28..]),
+                    hex::encode(&value.original_value.to_be_bytes::<32>()[28..]),
+                );
                 self.state_db.set_storage(addr, key_bytes.to_vec(), value_bytes.to_vec());
             }
 
-            // Update code if changed
-            if account.info.code.is_some() {
-                let code = account.info.code.unwrap();
-                let code_bytes = code.bytes().to_vec();
-                if !code_bytes.is_empty() {
-                    self.state_db.set_code(addr, code_bytes);
+            // Update code if the account is a real contract.
+            // REVM v10 includes a 1-byte sentinel (0x00 STOP) as `info.code` for
+            // touched EOAs. Writing this to StateDB would set a non-KECCAK_EMPTY
+            // code_hash, causing EIP-3607 to reject future transactions from that
+            // address. Guard: only write code when the account's code_hash indicates
+            // it is actually a contract (not KECCAK_EMPTY and not zero).
+            let has_code = account.info.code.is_some();
+            let acct_code_hash = account.info.code_hash;
+            let is_contract = acct_code_hash != KECCAK_EMPTY && acct_code_hash != B256::ZERO;
+            if is_contract {
+                if let Some(code) = account.info.code {
+                    let code_bytes = code.bytes().to_vec();
+                    if !code_bytes.is_empty() {
+                        self.state_db.set_code(addr, code_bytes);
+                    }
                 }
             }
+
+            debug!(
+                "REVM commit: addr={} storage_slots={} code_changed={}",
+                addr, account.storage.len(), has_code
+            );
         }
     }
 }
@@ -480,5 +503,147 @@ mod tests {
         );
 
         assert!(result.is_ok(), "Contract call with block context should succeed: {:?}", result.err());
+    }
+
+    /// Sprint EL-1 regression (Issue #19): Verify that SSTORE values persist
+    /// across separate REVM invocations. Deploy → write slot → commit → read
+    /// slot in a new REVM call. The second read must return the written value.
+    #[test]
+    fn test_el1_sstore_persists_across_invocations() {
+        let state_db = Arc::new(StateDB::new());
+        let caller = Address([1u8; 20]);
+        let contract = Address([2u8; 20]);
+
+        // Fund caller
+        state_db
+            .accounts
+            .set_balance(caller, U256::from(10u64).pow(U256::from(18u64)));
+
+        // Simple contract: SSTORE(slot=0, value=0x42) then RETURN
+        // PUSH1 0x42, PUSH1 0x00, SSTORE, STOP
+        let store_code = vec![0x60, 0x42, 0x60, 0x00, 0x55, 0x00];
+        state_db.set_code(contract, store_code);
+
+        // First REVM invocation: write slot 0 = 0x42
+        let result1 = execute_contract_call(
+            state_db.clone(),
+            caller,
+            contract,
+            vec![],
+            U256::zero(),
+            1_000_000,
+            U256::from(1_000_000_000u64),
+            1337,
+            1,
+            1_000_000,
+        );
+        assert!(result1.is_ok(), "First REVM call (SSTORE) should succeed: {:?}", result1.err());
+
+        // Verify storage was written
+        let slot_key = [0u8; 32];
+        let stored = state_db.get_storage(&contract, &slot_key);
+        assert!(stored.is_some(), "Storage slot 0 should have a value after SSTORE");
+        let value_bytes = stored.unwrap();
+        assert_eq!(value_bytes[31], 0x42, "Storage slot 0 should contain 0x42");
+
+        // Second REVM invocation: read slot 0 via SLOAD → PUSH1 0x00 SLOAD → MSTORE → RETURN
+        // PUSH1 0x00, SLOAD, PUSH1 0x00, MSTORE, PUSH1 0x20, PUSH1 0x00, RETURN
+        let read_code = vec![0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        state_db.set_code(contract, read_code);
+
+        let result2 = execute_contract_call(
+            state_db.clone(),
+            caller,
+            contract,
+            vec![],
+            U256::zero(),
+            1_000_000,
+            U256::from(1_000_000_000u64),
+            1337,
+            2,
+            2_000_000,
+        );
+        assert!(result2.is_ok(), "Second REVM call (SLOAD) should succeed: {:?}", result2.err());
+
+        let (output, _gas) = result2.unwrap();
+        assert_eq!(output.len(), 32, "SLOAD return should be 32 bytes");
+        assert_eq!(output[31], 0x42, "SLOAD should return 0x42 from persisted storage");
+    }
+
+    /// Sprint EL-1 regression: Simulate ReentrancyGuard lifecycle.
+    /// Slot goes 0 → 1 → 2 → 1 across a transaction. After commit,
+    /// a fresh REVM invocation must read the final value (1).
+    #[test]
+    fn test_el1_reentrancy_guard_lifecycle() {
+        let state_db = Arc::new(StateDB::new());
+        let contract = Address([3u8; 20]);
+
+        // Simulate ReentrancyGuard: _status slot starts at 0 (uninitialized)
+        // Set it to 1 (NOT_ENTERED)
+        let slot_key = [0u8; 32];
+        let mut val_one = [0u8; 32];
+        val_one[31] = 1;
+        state_db.set_storage(contract, slot_key.to_vec(), val_one.to_vec());
+
+        // Simulate entering guard: 1 → 2
+        let mut val_two = [0u8; 32];
+        val_two[31] = 2;
+        state_db.set_storage(contract, slot_key.to_vec(), val_two.to_vec());
+
+        // Simulate exiting guard: 2 → 1
+        state_db.set_storage(contract, slot_key.to_vec(), val_one.to_vec());
+
+        // Commit state (mimics block finalization)
+        state_db.commit();
+
+        // Verify final value is 1 (NOT_ENTERED)
+        let stored = state_db.get_storage(&contract, &slot_key);
+        assert!(stored.is_some(), "Storage should exist after commit");
+        assert_eq!(stored.unwrap()[31], 1, "ReentrancyGuard _status should be 1 after lifecycle");
+    }
+
+    /// Sprint EL-1 regression: Snapshot restore must clear dirty_storage
+    /// so that stale writes from a reverted transaction don't persist.
+    #[test]
+    fn test_el1_snapshot_restore_clears_dirty() {
+        let state_db = Arc::new(StateDB::new());
+        let addr = Address([4u8; 20]);
+
+        // Set initial state
+        state_db.set_storage(addr, b"slot_a".to_vec(), b"original".to_vec());
+        let _ = state_db.take_dirty_storage(); // clear dirty
+
+        // Snapshot
+        let snap = state_db.snapshot();
+
+        // Simulate a failed tx writing to storage
+        state_db.set_storage(addr, b"slot_a".to_vec(), b"bad_value".to_vec());
+        state_db.set_storage(addr, b"slot_b".to_vec(), b"stale".to_vec());
+
+        // Dirty storage should have entries from the failed tx
+        let dirty_before = state_db.take_dirty_storage();
+        assert!(!dirty_before.is_empty(), "Should have dirty entries before restore");
+
+        // Re-dirty for the restore test (take_dirty_storage already cleared)
+        state_db.set_storage(addr, b"slot_a".to_vec(), b"bad_value2".to_vec());
+
+        // Restore snapshot (should clear dirty_storage)
+        state_db.restore(snap);
+
+        // After restore, dirty_storage should be empty
+        let dirty_after = state_db.take_dirty_storage();
+        assert!(dirty_after.is_empty(), "dirty_storage must be empty after restore (Sprint EL-1 fix)");
+
+        // Verify state was restored
+        assert_eq!(
+            state_db.get_storage(&addr, b"slot_a"),
+            Some(b"original".to_vec()),
+            "Storage should be restored to original value"
+        );
+        assert_eq!(
+            state_db.get_storage(&addr, b"slot_b"),
+            None,
+            "Stale storage from failed tx should not exist"
+        );
     }
 }

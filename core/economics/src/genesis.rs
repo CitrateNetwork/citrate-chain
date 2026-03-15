@@ -98,8 +98,10 @@ impl Default for GenesisConfig {
 impl GenesisConfig {
     /// Create mainnet genesis configuration
     pub fn mainnet() -> Self {
-        let treasury = address_from_hex("0x1111111111111111111111111111111111111111").unwrap();
-        let ecosystem = address_from_hex("0x2222222222222222222222222222222222222222").unwrap();
+        let treasury = address_from_hex("0x1111111111111111111111111111111111111111")
+            .expect("Invalid hardcoded mainnet address: treasury");
+        let ecosystem = address_from_hex("0x2222222222222222222222222222222222222222")
+            .expect("Invalid hardcoded mainnet address: ecosystem");
 
         // Team allocations (15% = 150M SALT, vested over 4 years)
         let team_allocations = HashMap::new();
@@ -247,5 +249,94 @@ mod tests {
         // Should be 360M SALT (10M faucet + 100M treasury + 250M ecosystem + 2K test accounts)
         let expected = latt_to_wei(360_002_000);
         assert_eq!(total, expected);
+    }
+
+    #[test]
+    fn test_mainnet_genesis_valid() {
+        let config = GenesisConfig::mainnet();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.chain_id, 1);
+    }
+
+    #[test]
+    fn test_testnet_beta_genesis_valid() {
+        let config = GenesisConfig::testnet_beta();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.chain_id, 40204);
+    }
+
+    #[test]
+    fn test_exceeds_supply_rejected() {
+        // Create a config that exceeds total supply
+        let mut config = GenesisConfig::default();
+        // Add an account with balance that pushes over 1B total
+        config.accounts.push(GenesisAccount {
+            address: Address([0xAA; 20]),
+            balance: latt_to_wei(999_999_999), // This + existing ~360M > 1B with mining_pool_max
+            nonce: 0,
+            code: None,
+        });
+        assert!(matches!(config.validate(), Err(GenesisError::ExceedsSupply)));
+    }
+
+    #[test]
+    fn test_duplicate_address_rejected() {
+        let mut config = GenesisConfig::default();
+        // Add duplicate of an existing address
+        let dup_addr = config.accounts[0].address;
+        config.accounts.push(GenesisAccount {
+            address: dup_addr,
+            balance: U256::from(1),
+            nonce: 0,
+            code: None,
+        });
+        assert!(matches!(config.validate(), Err(GenesisError::DuplicateAddress(_))));
+    }
+
+    #[test]
+    fn test_preallocation_with_team_allocations() {
+        let mut config = GenesisConfig::default();
+        let team_member = Address([0xBB; 20]);
+        let team_amount = latt_to_wei(1_000);
+        config.team_allocations.insert(team_member, team_amount);
+
+        let expected = latt_to_wei(360_002_000) + team_amount;
+        assert_eq!(config.total_preallocation(), expected);
+    }
+
+    #[test]
+    fn test_address_from_hex_invalid_length() {
+        // Too short
+        let result = address_from_hex("0x1234");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_address_from_hex_valid() {
+        let result = address_from_hex("0x0000000000000000000000000000000000000001");
+        assert!(result.is_ok());
+        let addr = result.unwrap();
+        assert_eq!(addr.0[19], 1);
+    }
+
+    #[test]
+    fn test_zero_balance_accounts_valid() {
+        // A genesis config with zero-balance accounts should be valid
+        let config = GenesisConfig {
+            chain_id: 1337,
+            accounts: vec![
+                GenesisAccount {
+                    address: Address([0x01; 20]),
+                    balance: U256::zero(),
+                    nonce: 0,
+                    code: None,
+                },
+            ],
+            treasury_address: Address([0x11; 20]),
+            team_allocations: HashMap::new(),
+            ecosystem_fund: Address([0x22; 20]),
+            mining_pool_max: latt_to_wei(500_000_000),
+        };
+        assert!(config.validate().is_ok());
     }
 }

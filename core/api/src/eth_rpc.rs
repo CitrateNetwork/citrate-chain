@@ -945,14 +945,9 @@ pub fn register_eth_methods(
         // Determine transaction type from data
         tx.determine_type();
 
-        // Snapshot state, set sender balance to max for read-only simulation, execute, restore
-        let snapshot = exec.state_db().snapshot();
-
-        // For eth_call, give sender unlimited balance so read-only calls don't fail
-        exec.set_balance(&sender_addr, U256::from(u128::MAX));
-
-        let res = block_on(exec.execute_transaction(&blk, &tx));
-        exec.state_db().restore(snapshot);
+        // Simulate without persisting state — avoids race condition where
+        // the block producer could persist the inflated balance to RocksDB.
+        let res = block_on(exec.simulate_transaction(&blk, &tx));
 
         match res {
             Ok(receipt) => Ok(Value::String(format!("0x{}", hex::encode(receipt.output)))),
@@ -1130,12 +1125,9 @@ pub fn register_eth_methods(
         // Determine transaction type from data
         tx.determine_type();
 
-        // Snapshot state, set sender balance to max for simulation, execute, restore
-        let snapshot = exec.state_db().snapshot();
-        exec.set_balance(&sender_addr, U256::from(u128::MAX));
-
-        let res = block_on(exec.execute_transaction(&blk, &tx));
-        exec.state_db().restore(snapshot);
+        // Simulate without persisting state — avoids race condition where
+        // the block producer could persist the inflated balance to RocksDB.
+        let res = block_on(exec.simulate_transaction(&blk, &tx));
 
         match res {
             Ok(receipt) => {
