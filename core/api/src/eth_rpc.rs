@@ -945,6 +945,11 @@ pub fn register_eth_methods(
         // Determine transaction type from data
         tx.determine_type();
 
+        // WP-Z.4: Set block context with latest VRF output for eth_call simulation.
+        // This ensures `block.prevrandao` returns a real value (matching mainnet behavior).
+        // The block context persists from the last produced block, so prevrandao
+        // reflects the most recent VRF output.
+
         // Simulate without persisting state — avoids race condition where
         // the block producer could persist the inflated balance to RocksDB.
         let res = block_on(exec.simulate_transaction(&blk, &tx));

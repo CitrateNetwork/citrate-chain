@@ -33,6 +33,7 @@ fi
 SPECS=(
     "GhostDAGConsensus"
     "MempoolSequencer"
+    "PrevrandaoPipeline"
     "SDKConnectionLifecycle"
     "TransactionExecution"
     "VRFChainContinuity"
