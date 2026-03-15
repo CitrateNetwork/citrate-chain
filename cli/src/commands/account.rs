@@ -282,3 +282,62 @@ fn derive_address(pubkey: &[u8; 32]) -> [u8; 20] {
     address.copy_from_slice(&hash[12..]);
     address
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_address_embedded_evm() {
+        // 20 non-zero bytes followed by 12 zero bytes = embedded EVM address
+        let mut pubkey = [0u8; 32];
+        pubkey[..20].copy_from_slice(&[0xAA; 20]);
+        let addr = derive_address(&pubkey);
+        assert_eq!(addr, [0xAA; 20]);
+    }
+
+    #[test]
+    fn test_derive_address_full_pubkey_uses_keccak() {
+        // Full 32-byte pubkey (non-zero in last 12 bytes) -> Keccak256
+        let pubkey = [0x42u8; 32];
+        let addr = derive_address(&pubkey);
+        // Verify it matches Keccak256 hash last 20 bytes
+        let mut hasher = Keccak256::new();
+        hasher.update(&pubkey);
+        let hash = hasher.finalize();
+        let mut expected = [0u8; 20];
+        expected.copy_from_slice(&hash[12..]);
+        assert_eq!(addr, expected);
+    }
+
+    #[test]
+    fn test_derive_address_all_zeros_uses_keccak() {
+        // All zeros: the embedded-EVM check requires non-zero first 20 bytes
+        let pubkey = [0u8; 32];
+        let addr = derive_address(&pubkey);
+        // Should use Keccak path since first 20 bytes are all zero
+        let mut hasher = Keccak256::new();
+        hasher.update(&pubkey);
+        let hash = hasher.finalize();
+        let mut expected = [0u8; 20];
+        expected.copy_from_slice(&hash[12..]);
+        assert_eq!(addr, expected);
+    }
+
+    #[test]
+    fn test_derive_address_deterministic() {
+        let pubkey = [0x11u8; 32];
+        let addr1 = derive_address(&pubkey);
+        let addr2 = derive_address(&pubkey);
+        assert_eq!(addr1, addr2);
+    }
+
+    #[test]
+    fn test_derive_address_different_keys_different_addresses() {
+        let key_a = [0x01u8; 32];
+        let key_b = [0x02u8; 32];
+        let addr_a = derive_address(&key_a);
+        let addr_b = derive_address(&key_b);
+        assert_ne!(addr_a, addr_b);
+    }
+}

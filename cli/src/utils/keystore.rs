@@ -106,6 +106,61 @@ pub fn load_key(path: &Path, password: &str) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&key_bytes))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn test_save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.json");
+
+        let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
+        save_key(&signing_key, "password123", &path).expect("save");
+
+        let loaded = load_key(&path, "password123").expect("load");
+        assert_eq!(loaded.to_bytes(), signing_key.to_bytes());
+    }
+
+    #[test]
+    fn test_wrong_password_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.json");
+
+        let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
+        save_key(&signing_key, "correct", &path).expect("save");
+
+        let result = load_key(&path, "wrong");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_nonexistent_file_fails() {
+        let result = load_key(Path::new("/tmp/nonexistent_keystore_citrate.json"), "pw");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_keystore_stores_public_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.json");
+
+        let signing_key = SigningKey::from_bytes(&[0x11u8; 32]);
+        save_key(&signing_key, "pw", &path).expect("save");
+
+        let contents = std::fs::read_to_string(&path).expect("read");
+        let keystore: serde_json::Value = serde_json::from_str(&contents).expect("parse");
+        assert_eq!(keystore["version"], 2);
+        assert_eq!(keystore["key_type"], "ed25519");
+        assert!(keystore["public_key"].is_string());
+
+        let stored_pubkey = keystore["public_key"].as_str().unwrap();
+        let expected_pubkey = hex::encode(signing_key.verifying_key().to_bytes());
+        assert_eq!(stored_pubkey, expected_pubkey);
+    }
+}
+
 fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
     // Use SHA3-256 with multiple iterations for key derivation
     let mut key = [0u8; 32];

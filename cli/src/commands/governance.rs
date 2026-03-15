@@ -193,3 +193,109 @@ async fn eth_call_precompile(config: &Config, data_hex: String) -> Result<String
     }
     Ok(v["result"].as_str().unwrap_or("").to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_precompile_address_is_fixed() {
+        let addr = precompile_address();
+        assert_eq!(addr, "0x0000000000000000000000000000000000001003");
+    }
+
+    #[test]
+    fn test_selector_keccak_4bytes() {
+        let sel = selector("setAdmin(address)");
+        assert_eq!(sel.len(), 4);
+        // Verify deterministic
+        let sel2 = selector("setAdmin(address)");
+        assert_eq!(sel, sel2);
+        // Different signatures should produce different selectors
+        let sel3 = selector("getParam(bytes32)");
+        assert_ne!(sel, sel3);
+    }
+
+    #[test]
+    fn test_pad32_no_padding_needed() {
+        let v = vec![0u8; 32];
+        let padded = pad32(v.clone());
+        assert_eq!(padded.len(), 32);
+    }
+
+    #[test]
+    fn test_pad32_adds_padding() {
+        let v = vec![0u8; 10];
+        let padded = pad32(v);
+        assert_eq!(padded.len(), 32);
+        // Last 22 bytes should be zeros (padding)
+        assert!(padded[10..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_pad32_multiple_of_32() {
+        let v = vec![0xAA; 64];
+        let padded = pad32(v);
+        assert_eq!(padded.len(), 64); // Already aligned
+    }
+
+    #[test]
+    fn test_encode_address_20_bytes() {
+        let addr_hex = "0x1111111111111111111111111111111111111111";
+        let encoded = encode_address(addr_hex).expect("valid address");
+        assert_eq!(encoded.len(), 32);
+        // First 12 bytes should be zero (left-padded)
+        assert!(encoded[..12].iter().all(|&b| b == 0));
+        // Last 20 bytes should be the address
+        assert_eq!(encoded[12..], [0x11; 20]);
+    }
+
+    #[test]
+    fn test_encode_address_32_bytes() {
+        let addr_hex = hex::encode([0xAA; 32]);
+        let encoded = encode_address(&addr_hex).expect("valid 32-byte");
+        assert_eq!(encoded, [0xAA; 32]);
+    }
+
+    #[test]
+    fn test_encode_address_invalid_length() {
+        let result = encode_address("0xabcdef"); // 3 bytes
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encode_set_admin_format() {
+        let result = encode_set_admin("0x1111111111111111111111111111111111111111")
+            .expect("encode");
+        assert!(result.starts_with("0x"));
+        // selector (4 bytes = 8 hex) + address word (32 bytes = 64 hex) + "0x" prefix
+        assert_eq!(result.len(), 2 + (4 + 32) * 2);
+    }
+
+    #[test]
+    fn test_encode_get_param_format() {
+        let result = encode_get_param("minStake").expect("encode");
+        assert!(result.starts_with("0x"));
+        // selector (4) + key32 (32) = 36 bytes = 72 hex + 2 prefix
+        assert_eq!(result.len(), 2 + (4 + 32) * 2);
+    }
+
+    #[test]
+    fn test_encode_execute_param_format() {
+        let result = encode_execute_param("blockTime").expect("encode");
+        assert!(result.starts_with("0x"));
+        assert_eq!(result.len(), 2 + (4 + 32) * 2);
+    }
+
+    #[test]
+    fn test_encode_bytes_dynamic() {
+        let data = b"hello";
+        let encoded = encode_bytes(data);
+        // Length word (32 bytes) + data (5 bytes) + padding to 32 = 64 bytes
+        assert_eq!(encoded.len(), 64);
+        // Check length field (big-endian u64 at offset 24)
+        assert_eq!(encoded[31], 5);
+        // Check data
+        assert_eq!(&encoded[32..37], b"hello");
+    }
+}

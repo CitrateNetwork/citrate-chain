@@ -320,6 +320,43 @@ async fn request_tokens(
     }
 }
 
+/// Validate a faucet request address string.
+/// Returns the normalized lowercase hex (without 0x) and the 20-byte address,
+/// or an error message string.
+fn validate_address(address: &str) -> Result<(String, [u8; 20]), &'static str> {
+    let hex_str = address.trim_start_matches("0x").to_lowercase();
+    let bytes = hex::decode(&hex_str).map_err(|_| "Invalid hex encoding")?;
+    if bytes.len() != 20 {
+        return Err("Address must be 20 bytes");
+    }
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&bytes);
+    Ok((hex_str, addr))
+}
+
+/// Check whether an address is whitelisted.
+/// Returns true if the whitelist is empty (no filtering) or the address is in it.
+fn is_whitelisted(whitelist: &HashSet<String>, address_hex: &str) -> bool {
+    whitelist.is_empty() || whitelist.contains(address_hex)
+}
+
+/// Check cooldown status. Returns Ok(()) if no cooldown active, or Err with
+/// a message containing hours/minutes remaining.
+fn check_cooldown(last_request_elapsed_secs: Option<u64>, cooldown_secs: u64) -> Result<(), String> {
+    if let Some(elapsed) = last_request_elapsed_secs {
+        if elapsed < cooldown_secs {
+            let remaining = cooldown_secs - elapsed;
+            let hours = remaining / 3600;
+            let minutes = (remaining % 3600) / 60;
+            return Err(format!("Rate limited: {}h {}m remaining before next claim", hours, minutes));
+        }
+    }
+    Ok(())
+}
+
+/// The drip amount in wei (10 SALT = 10 * 10^18)
+const DRIP_AMOUNT: u128 = 10_000_000_000_000_000_000;
+
 fn calculate_tx_hash(tx: &Transaction, chain_id: u64) -> Hash {
     let mut hasher = Sha3_256::new();
 
@@ -342,4 +379,121 @@ fn calculate_tx_hash(tx: &Transaction, chain_id: u64) -> Hash {
     let mut hash_bytes = [0u8; 32];
     hash_bytes.copy_from_slice(&result);
     Hash::new(hash_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_address_valid_with_prefix() {
+        let addr = "0x1111111111111111111111111111111111111111";
+        let (hex_str, bytes) = validate_address(addr).expect("valid");
+        assert_eq!(hex_str, "1111111111111111111111111111111111111111");
+        assert_eq!(bytes, [0x11; 20]);
+    }
+
+    #[test]
+    fn test_validate_address_valid_without_prefix() {
+        let addr = "aabbccddee11223344556677889900aabbccddee";
+        let (hex_str, _bytes) = validate_address(addr).expect("valid");
+        assert_eq!(hex_str, addr);
+    }
+
+    #[test]
+    fn test_validate_address_invalid_hex() {
+        let result = validate_address("0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_address_wrong_length() {
+        // Too short (19 bytes)
+        let result = validate_address("0xaabbccddee112233445566778899aabbccddee");
+        assert!(result.is_err());
+        // Too long (21 bytes)
+        let result = validate_address("0xaabbccddee11223344556677889900aabbccddeeff");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_whitelisted_empty_whitelist_allows_all() {
+        let whitelist = HashSet::new();
+        assert!(is_whitelisted(&whitelist, "any_address"));
+    }
+
+    #[test]
+    fn test_is_whitelisted_with_entries() {
+        let mut whitelist = HashSet::new();
+        whitelist.insert("abcd".to_string());
+        assert!(is_whitelisted(&whitelist, "abcd"));
+        assert!(!is_whitelisted(&whitelist, "1234"));
+    }
+
+    #[test]
+    fn test_check_cooldown_no_prior_request() {
+        assert!(check_cooldown(None, 86400).is_ok());
+    }
+
+    #[test]
+    fn test_check_cooldown_within_window() {
+        // 1 hour elapsed out of 24h cooldown
+        let result = check_cooldown(Some(3600), 86400);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("Rate limited"));
+        assert!(msg.contains("23h")); // ~23 hours remaining
+    }
+
+    #[test]
+    fn test_check_cooldown_expired() {
+        // 25 hours elapsed, cooldown is 24h
+        assert!(check_cooldown(Some(90000), 86400).is_ok());
+    }
+
+    #[test]
+    fn test_drip_amount_is_10_salt() {
+        // 10 SALT = 10 * 10^18 wei
+        assert_eq!(DRIP_AMOUNT, 10_000_000_000_000_000_000u128);
+    }
+
+    #[test]
+    fn test_calculate_tx_hash_deterministic() {
+        let tx = Transaction {
+            hash: Hash::default(),
+            from: PublicKey::new([0u8; 32]),
+            to: Some(PublicKey::new([1u8; 32])),
+            value: 1000,
+            data: vec![],
+            nonce: 0,
+            gas_price: 1_000_000_000,
+            gas_limit: 21000,
+            signature: Signature::new([0; 64]),
+            tx_type: None,
+            ..Default::default()
+        };
+        let hash1 = calculate_tx_hash(&tx, 40204);
+        let hash2 = calculate_tx_hash(&tx, 40204);
+        assert_eq!(hash1.as_bytes(), hash2.as_bytes());
+    }
+
+    #[test]
+    fn test_calculate_tx_hash_different_chain_id() {
+        let tx = Transaction {
+            hash: Hash::default(),
+            from: PublicKey::new([0u8; 32]),
+            to: Some(PublicKey::new([1u8; 32])),
+            value: 1000,
+            data: vec![],
+            nonce: 0,
+            gas_price: 1_000_000_000,
+            gas_limit: 21000,
+            signature: Signature::new([0; 64]),
+            tx_type: None,
+            ..Default::default()
+        };
+        let hash_a = calculate_tx_hash(&tx, 1);
+        let hash_b = calculate_tx_hash(&tx, 40204);
+        assert_ne!(hash_a.as_bytes(), hash_b.as_bytes());
+    }
 }
