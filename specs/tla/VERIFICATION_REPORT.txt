@@ -192,6 +192,29 @@ The average outdegree of the complete state graph is 1 (minimum is 0, the maximu
 Finished in 00s at (2026-03-14 20:55:47)
 
 ----------------------------------------------------------------
+Spec: PrevrandaoPipeline  |  Category: Core Protocol (Sprint Z)
+----------------------------------------------------------------
+TLC2 Version 2026.03.12.220102 (rev: 0a0bffb)
+Running breadth-first search Model-Checking with 12 workers on 12 cores.
+Starting... (2026-03-15 02:39:44)
+Model checking completed. No error has been found.
+  calculated (optimistic):  val = 5.1E-9
+  based on the actual fingerprints:  val = 1.9E-9
+664219 states generated, 204535 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 13.
+Finished in 02s at (2026-03-15 02:39:46)
+
+Invariants verified (8):
+  - TypeInv: Well-formed state variables
+  - ECVRFProofFormat: All non-genesis blocks use 114-byte ECVRF proofs
+  - VRFChainContinuity: VRF alpha includes parent VRF output
+  - NoVRFReplay: No two blocks share VRF outputs
+  - BlockContextMatchesVRF: BlockContext.prevrandao matches block VRF output
+  - ContractSeesCorrectPrevrandao: Contracts see correct prevrandao
+  - PrevrandaoNonZeroAfterFirstBlock: Non-zero randomness after genesis
+  - ExecutionPrecedesContractAccess: SetBlockContext before contract reads
+
+----------------------------------------------------------------
 Spec: AgentToolAuthorization  |  Category: Security Audit
 ----------------------------------------------------------------
 TLC2 Version 2026.03.12.220102 (rev: 0a0bffb)

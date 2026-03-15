@@ -77,6 +77,10 @@ pub struct Executor {
     precompile_executor: Option<Arc<tokio::sync::RwLock<PrecompileExecutor>>>,
     /// Chain ID for transaction signing and replay protection
     chain_id: u64,
+    /// Block context for current block execution (WP-Z.2).
+    /// Contains coinbase, prevrandao (VRF output), and recent block hashes.
+    /// Set by the block producer before executing transactions.
+    block_context: std::sync::RwLock<crate::revm_adapter::BlockContext>,
 }
 
 /// Trait for state storage to avoid circular dependency
@@ -204,12 +208,29 @@ impl Executor {
             model_registry: None,
             precompile_executor,
             chain_id,
+            block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
         }
     }
 
     /// Get the configured chain ID
     pub fn chain_id(&self) -> u64 {
         self.chain_id
+    }
+
+    /// Set the block context for the current block being executed (WP-Z.2).
+    /// Called by the block producer before `execute_block_transactions()`.
+    pub fn set_block_context(&self, ctx: crate::revm_adapter::BlockContext) {
+        if let Ok(mut guard) = self.block_context.write() {
+            *guard = ctx;
+        }
+    }
+
+    /// Get a clone of the current block context.
+    pub fn get_block_context(&self) -> crate::revm_adapter::BlockContext {
+        self.block_context
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     pub fn with_storage<S: StateStoreTrait + 'static>(
@@ -259,6 +280,7 @@ impl Executor {
             model_registry: None,
             precompile_executor,
             chain_id,
+            block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
         }
     }
 
@@ -939,8 +961,9 @@ impl Executor {
 
         // Execute deployment bytecode using revm (battle-tested EVM)
         // Revm will calculate the correct CREATE address and create the account
+        // WP-Z.2: Pass block context so PREVRANDAO opcode returns real VRF output
         let gas_remaining = context.gas_limit.saturating_sub(context.gas_used);
-        let result = crate::revm_adapter::execute_contract_create(
+        let result = crate::revm_adapter::execute_contract_create_with_context(
             self.state_db.clone(),
             from,
             code,
@@ -950,6 +973,7 @@ impl Executor {
             self.chain_id,
             context.block_number,
             context.timestamp,
+            self.get_block_context(),
         );
 
         match result {
@@ -1031,7 +1055,8 @@ impl Executor {
                 code.len()
             );
             let available_gas = context.gas_limit.saturating_sub(context.gas_used);
-            match crate::revm_adapter::execute_contract_call(
+            // WP-Z.2: Pass block context so PREVRANDAO opcode returns real VRF output
+            match crate::revm_adapter::execute_contract_call_with_context(
                 self.state_db.clone(),
                 from,
                 to,
@@ -1042,6 +1067,7 @@ impl Executor {
                 self.chain_id,
                 context.block_number,
                 context.timestamp,
+                self.get_block_context(),
             ) {
                 Ok((output, gas_used)) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["ok"]).inc();

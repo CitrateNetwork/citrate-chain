@@ -52,7 +52,7 @@ impl EVMIntegration {
             block_timestamp,
             block_hash,
             coinbase,
-            prevrandao: U256::from(block_timestamp), // WP-X.4: Simplified in custom EVM; revm path uses real VRF output
+            prevrandao: U256::from(block_timestamp), // WP-Z.5: Fallback for custom EVM path; production uses REVM with real VRF output via BlockContext
             gas_limit,
             chain_id,
             base_fee,

@@ -10,11 +10,12 @@ use citrate_economics::{
     RewardCalculator, RewardConfig, UnifiedEconomicsManager,
 };
 use citrate_execution::Executor;
+use citrate_execution::revm_adapter::BlockContext;
 use citrate_network::{NetworkMessage, PeerManager};
 use citrate_sequencer::mempool::Mempool;
 use citrate_storage::{state_manager::StateManager as AIStateManager, StorageManager};
 use primitive_types::U256;
-use sha3::{Digest, Sha3_256};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
@@ -23,31 +24,41 @@ use tracing::{error, info, warn};
 // Block hash is now computed via Block::compute_hash() in consensus/types.rs (C-05).
 // This ensures a single canonical hash function used by both producer and validator.
 
-/// Generate a simplified VRF proof for block production.
+/// Generate a real ECVRF-P256-SHA256 proof for block production (WP-Z.1).
 ///
-/// WP-H.6: The input hash includes the proposer's public key and the output
-/// hash includes the input, binding the proof to the proposer's identity.
-/// This prevents key substitution attacks and slot/chain replay.
-fn generate_block_vrf(proposer_pubkey: &PublicKey, coinbase: &PublicKey, prev_vrf: &Hash, slot: u64) -> VrfProof {
-    let mut input_hasher = Sha3_256::new();
-    input_hasher.update(proposer_pubkey.as_bytes()); // H.6: bind to proposer identity
-    input_hasher.update(prev_vrf.as_bytes());
-    input_hasher.update(slot.to_le_bytes());
-    let input = input_hasher.finalize();
+/// Uses RFC 9381 ECVRF with alpha binding: proposer_pubkey(32) || prev_vrf(32) || slot(8).
+/// The ed25519 signing key seed is deterministically converted to a P-256 scalar via
+/// `ecvrf::secret_to_scalar()`. Proof is 114 bytes (self-contained, verifiable).
+///
+/// Falls back to SHA3 stub if ECVRF fails (should not happen with valid keys).
+fn generate_block_vrf(signing_key: &Ed25519SigningKey, proposer_pubkey: &PublicKey, prev_vrf: &Hash, slot: u64) -> VrfProof {
+    let seed_bytes = signing_key.to_bytes();
 
-    let mut proof_hasher = Sha3_256::new();
-    proof_hasher.update(coinbase.as_bytes());
-    proof_hasher.update(input.as_slice());
-    let proof_bytes = proof_hasher.finalize();
+    // Build alpha: proposer_pubkey(32) || prev_vrf(32) || slot(8) = 72 bytes
+    let mut alpha = Vec::with_capacity(72);
+    alpha.extend_from_slice(proposer_pubkey.as_bytes());
+    alpha.extend_from_slice(prev_vrf.as_bytes());
+    alpha.extend_from_slice(&slot.to_le_bytes());
 
-    let mut output_hasher = Sha3_256::new();
-    output_hasher.update(proof_bytes.as_slice());
-    output_hasher.update(input.as_slice()); // H.6: bind output to (proposer, slot, prev_vrf)
-    let output_bytes = output_hasher.finalize();
-
-    VrfProof {
-        proof: proof_bytes.to_vec(),
-        output: Hash::from_bytes(&output_bytes),
+    match citrate_consensus::ecvrf::prove(&seed_bytes, &alpha) {
+        Ok((ecvrf_proof, beta)) => {
+            VrfProof {
+                proof: ecvrf_proof.to_bytes(), // 114 bytes
+                output: Hash::from_bytes(&beta),
+            }
+        }
+        Err(e) => {
+            // Fallback: should never happen with a valid ed25519 key
+            warn!("ECVRF prove failed ({}), using SHA3 fallback", e);
+            use sha3::{Digest, Sha3_256};
+            let mut hasher = Sha3_256::new();
+            hasher.update(&alpha);
+            let output_bytes = hasher.finalize();
+            VrfProof {
+                proof: output_bytes.to_vec(), // 32 bytes (legacy)
+                output: Hash::from_bytes(&output_bytes),
+            }
+        }
     }
 }
 
@@ -489,7 +500,7 @@ impl BlockProducer {
                 blue_work: 0,  // Will be calculated
                 pruning_point: Hash::default(),
                 proposer_pubkey: PublicKey::new(self.signing_key.verifying_key().to_bytes()),
-                vrf_reveal: generate_block_vrf(&PublicKey::new(self.signing_key.verifying_key().to_bytes()), &self.coinbase, &selected_parent, 0),
+                vrf_reveal: generate_block_vrf(&self.signing_key, &PublicKey::new(self.signing_key.verifying_key().to_bytes()), &selected_parent, 0),
                 base_fee_per_gas: 1_000_000_000, // 1 gwei
                 gas_used: 0,
                 gas_limit: 30_000_000,
@@ -511,17 +522,16 @@ impl BlockProducer {
         let blue_set = self.ghostdag.calculate_blue_set(&temp_block).await?;
         let blue_score = self.ghostdag.calculate_blue_score(&temp_block).await?;
 
-        // Get last block height from selected parent
-        let last_height = if selected_parent != Hash::default() {
-            // Get parent block from storage to determine height
+        // Get last block height and parent VRF output from selected parent
+        let (last_height, parent_vrf_output) = if selected_parent != Hash::default() {
             self.storage
                 .blocks
                 .get_block(&selected_parent)
                 .ok()
-                .and_then(|b| b.map(|block| block.header.height))
-                .unwrap_or(0)
+                .and_then(|b| b.map(|block| (block.header.height, block.header.vrf_reveal.output)))
+                .unwrap_or((0, Hash::default()))
         } else {
-            0
+            (0, Hash::default())
         };
 
         // Get transactions from mempool with AI priority
@@ -542,11 +552,19 @@ impl BlockProducer {
             blue_work,
             pruning_point: Hash::default(),
             proposer_pubkey: PublicKey::new(self.signing_key.verifying_key().to_bytes()),
-            vrf_reveal: generate_block_vrf(&PublicKey::new(self.signing_key.verifying_key().to_bytes()), &self.coinbase, &selected_parent, last_height + 1),
+            vrf_reveal: generate_block_vrf(&self.signing_key, &PublicKey::new(self.signing_key.verifying_key().to_bytes()), &parent_vrf_output, last_height + 1),
             base_fee_per_gas: 1_000_000_000, // 1 gwei - TODO: calculate from parent
             gas_used: 0, // Will be updated after execution
             gas_limit: 30_000_000, // 30M gas default
         };
+
+        // WP-Z.3: Set block context with VRF output before executing transactions.
+        // This ensures `block.prevrandao` returns the real VRF randomness in Solidity.
+        self.executor.set_block_context(BlockContext {
+            coinbase: self.coinbase.0[0..20].try_into().unwrap_or([0; 20]),
+            prevrandao: *header.vrf_reveal.output.as_bytes(),
+            block_hashes: HashMap::new(),
+        });
 
         // Execute transactions (state root computed after rewards below)
         let (_pre_reward_root, receipts) = self
@@ -949,16 +967,21 @@ impl BlockProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use citrate_consensus::crypto::Ed25519SigningKey;
+
+    fn test_signing_key() -> Ed25519SigningKey {
+        Ed25519SigningKey::from_bytes(&[42u8; 32])
+    }
 
     #[test]
     fn test_vrf_deterministic() {
-        let proposer = PublicKey::new([1u8; 32]);
-        let coinbase = PublicKey::new([2u8; 32]);
+        let sk = test_signing_key();
+        let proposer = PublicKey::new(sk.verifying_key().to_bytes());
         let prev_vrf = Hash::new([3u8; 32]);
         let slot = 42u64;
 
-        let vrf_a = generate_block_vrf(&proposer, &coinbase, &prev_vrf, slot);
-        let vrf_b = generate_block_vrf(&proposer, &coinbase, &prev_vrf, slot);
+        let vrf_a = generate_block_vrf(&sk, &proposer, &prev_vrf, slot);
+        let vrf_b = generate_block_vrf(&sk, &proposer, &prev_vrf, slot);
 
         assert_eq!(vrf_a.proof, vrf_b.proof, "Same inputs must produce same VRF proof");
         assert_eq!(vrf_a.output, vrf_b.output, "Same inputs must produce same VRF output");
@@ -966,13 +989,48 @@ mod tests {
     }
 
     #[test]
-    fn test_vrf_different_slots_different_output() {
-        let proposer = PublicKey::new([1u8; 32]);
-        let coinbase = PublicKey::new([2u8; 32]);
+    fn test_vrf_produces_ecvrf_proof() {
+        let sk = test_signing_key();
+        let proposer = PublicKey::new(sk.verifying_key().to_bytes());
         let prev_vrf = Hash::new([3u8; 32]);
 
-        let vrf_slot_1 = generate_block_vrf(&proposer, &coinbase, &prev_vrf, 1);
-        let vrf_slot_2 = generate_block_vrf(&proposer, &coinbase, &prev_vrf, 2);
+        let vrf = generate_block_vrf(&sk, &proposer, &prev_vrf, 1);
+
+        // WP-Z.1: Real ECVRF produces 114-byte proofs
+        assert_eq!(vrf.proof.len(), 114, "ECVRF proof must be 114 bytes");
+        // Output must be non-zero
+        assert_ne!(vrf.output, Hash::default(), "VRF output must be non-zero");
+    }
+
+    #[test]
+    fn test_vrf_verifiable() {
+        let sk = test_signing_key();
+        let proposer = PublicKey::new(sk.verifying_key().to_bytes());
+        let prev_vrf = Hash::new([3u8; 32]);
+        let slot = 7u64;
+
+        let vrf = generate_block_vrf(&sk, &proposer, &prev_vrf, slot);
+
+        // Verify the proof using the consensus ECVRF verifier
+        let ecvrf_proof = citrate_consensus::ecvrf::EcvrfProof::from_bytes(&vrf.proof)
+            .expect("Should parse 114-byte proof");
+        let mut alpha = Vec::with_capacity(72);
+        alpha.extend_from_slice(proposer.as_bytes());
+        alpha.extend_from_slice(prev_vrf.as_bytes());
+        alpha.extend_from_slice(&slot.to_le_bytes());
+        let beta = citrate_consensus::ecvrf::verify(&alpha, &ecvrf_proof)
+            .expect("Proof should verify");
+        assert_eq!(Hash::from_bytes(&beta), vrf.output, "Verified beta must match proof output");
+    }
+
+    #[test]
+    fn test_vrf_different_slots_different_output() {
+        let sk = test_signing_key();
+        let proposer = PublicKey::new(sk.verifying_key().to_bytes());
+        let prev_vrf = Hash::new([3u8; 32]);
+
+        let vrf_slot_1 = generate_block_vrf(&sk, &proposer, &prev_vrf, 1);
+        let vrf_slot_2 = generate_block_vrf(&sk, &proposer, &prev_vrf, 2);
 
         assert_ne!(
             vrf_slot_1.output, vrf_slot_2.output,
@@ -982,5 +1040,67 @@ mod tests {
             vrf_slot_1.proof, vrf_slot_2.proof,
             "Different slot numbers must produce different VRF proofs"
         );
+    }
+
+    #[test]
+    fn test_vrf_chain_continuity() {
+        // Block B's alpha includes Block A's VRF output
+        let sk = test_signing_key();
+        let proposer = PublicKey::new(sk.verifying_key().to_bytes());
+        let genesis_vrf = Hash::default();
+
+        // Produce block A
+        let vrf_a = generate_block_vrf(&sk, &proposer, &genesis_vrf, 1);
+        assert_eq!(vrf_a.proof.len(), 114);
+
+        // Produce block B using A's output as prev_vrf
+        let vrf_b = generate_block_vrf(&sk, &proposer, &vrf_a.output, 2);
+        assert_eq!(vrf_b.proof.len(), 114);
+        assert_ne!(vrf_a.output, vrf_b.output, "Chain continuity: different blocks must have different VRF outputs");
+
+        // Verify B's proof is bound to A's output
+        let ecvrf_proof_b = citrate_consensus::ecvrf::EcvrfProof::from_bytes(&vrf_b.proof).unwrap();
+        let mut alpha_b = Vec::with_capacity(72);
+        alpha_b.extend_from_slice(proposer.as_bytes());
+        alpha_b.extend_from_slice(vrf_a.output.as_bytes());
+        alpha_b.extend_from_slice(&2u64.to_le_bytes());
+        let beta_b = citrate_consensus::ecvrf::verify(&alpha_b, &ecvrf_proof_b).unwrap();
+        assert_eq!(Hash::from_bytes(&beta_b), vrf_b.output);
+    }
+
+    #[test]
+    fn test_vrf_backward_compat_legacy_verification() {
+        // Legacy 32-byte proofs should still be accepted by the verifier
+        let vrf_selector = citrate_consensus::vrf::VrfProposerSelector::new();
+        let proposer = PublicKey::new([1u8; 32]);
+        let prev_vrf = Hash::new([3u8; 32]);
+
+        // Create a legacy-style proof (32 bytes)
+        use sha3::{Digest, Sha3_256};
+        let mut hasher = Sha3_256::new();
+        hasher.update(proposer.as_bytes());
+        hasher.update(prev_vrf.as_bytes());
+        hasher.update(1u64.to_le_bytes());
+        let input = hasher.finalize();
+
+        let mut proof_hasher = Sha3_256::new();
+        proof_hasher.update(proposer.as_bytes()); // coinbase = proposer for legacy
+        proof_hasher.update(input.as_slice());
+        let proof_bytes = proof_hasher.finalize();
+
+        let mut output_hasher = Sha3_256::new();
+        output_hasher.update(proof_bytes.as_slice());
+        output_hasher.update(input.as_slice());
+        let output_bytes = output_hasher.finalize();
+
+        let legacy_vrf = VrfProof {
+            proof: proof_bytes.to_vec(), // 32 bytes
+            output: Hash::from_bytes(&output_bytes),
+        };
+
+        assert_eq!(legacy_vrf.proof.len(), 32);
+        // Verifier should accept 32-byte legacy proofs
+        let result = vrf_selector.verify_vrf_proof(&proposer, &legacy_vrf, &prev_vrf, 1);
+        assert!(result.is_ok(), "Legacy VRF verification should not error");
     }
 }

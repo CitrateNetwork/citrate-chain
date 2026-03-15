@@ -9,9 +9,9 @@ Citrate uses TLA+ formal verification to model-check critical protocol invariant
 
 | Category | Specs | Invariants | Status |
 |----------|-------|------------|--------|
-| Core protocol | 6 | 33 | All passing |
+| Core protocol | 7 | 41 | All passing |
 | GUI state machines | 4 | 31 | All passing |
-| **Total** | **10** | **64** | **All passing** |
+| **Total** | **11** | **72** | **All passing** |
 
 ## Core Protocol Specs (`specs/tla/`)
 
@@ -22,6 +22,7 @@ Citrate uses TLA+ formal verification to model-check critical protocol invariant
 | `VRFElection` | 6 | — | ECVRF proposer election, leader uniqueness |
 | `VRFChainContinuity` | 5 | — | VRF output chaining across blocks, reorg safety |
 | `TransactionExecution` | 5 | — | EVM tx execution: balance conservation, nonce monotonicity, gas limits |
+| `PrevrandaoPipeline` | 8 | 204,535 | ECVRF→BlockContext→REVM→Solidity PREVRANDAO pipeline |
 | `SDKConnectionLifecycle` | 5 | — | SDK connection state machine: retry, failover, request bounds |
 
 ## GUI State Machine Specs (`gui/citrate_gui_v2/specs/`)
