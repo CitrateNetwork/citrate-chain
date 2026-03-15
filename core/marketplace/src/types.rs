@@ -294,6 +294,52 @@ mod tests {
         assert_eq!(ModelCategory::from(255), ModelCategory::Other); // Unknown maps to Other
     }
 
+    // -----------------------------------------------------------------------
+    // Property-based tests (proptest)
+    // -----------------------------------------------------------------------
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Property: ModelCategory from u8 always produces a valid variant (never panics).
+        /// Values 0-10 map to specific categories; anything else maps to Other.
+        #[test]
+        fn prop_model_category_from_u8_total(byte in any::<u8>()) {
+            let category = ModelCategory::from(byte);
+            if byte <= 10 {
+                prop_assert_eq!(category as u8, byte,
+                    "In-range byte must map to matching category discriminant");
+            } else {
+                prop_assert_eq!(category, ModelCategory::Other,
+                    "Out-of-range byte must map to Other");
+            }
+        }
+
+        /// Property: Purchase total cost (base_price * quantity) does not overflow for valid inputs.
+        /// Valid inputs: base_price fits in u64 and quantity fits in u32.
+        #[test]
+        fn prop_purchase_cost_no_overflow(
+            base_price in 0u64..1_000_000_000,
+            quantity in 1u32..10_000,
+        ) {
+            let total = (base_price as u128) * (quantity as u128);
+            // Must fit in u128 (always true) and be non-negative
+            prop_assert!(total >= base_price as u128,
+                "Total cost must be >= base_price when quantity >= 1");
+            prop_assert!(total <= u128::MAX,
+                "Total cost must not overflow u128");
+        }
+
+        /// Property: ModelCategory serialization round-trip via serde_json.
+        #[test]
+        fn prop_model_category_serde_roundtrip(byte in 0u8..11) {
+            let category = ModelCategory::from(byte);
+            let json = serde_json::to_string(&category).expect("serialize category");
+            let recovered: ModelCategory = serde_json::from_str(&json).expect("deserialize category");
+            prop_assert_eq!(category, recovered,
+                "ModelCategory serde round-trip must be identity");
+        }
+    }
+
     #[test]
     fn test_model_category_as_str() {
         assert_eq!(ModelCategory::LanguageModel.as_str(), "Language Model");

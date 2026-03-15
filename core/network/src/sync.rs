@@ -436,6 +436,9 @@ impl SyncManager {
     }
 
     /// Start block download phase
+    // LOCK ORDERING: acquires current_height, target_height, state sequentially (dropped between),
+    // then holds downloaded_headers (read) + block_queue (write) simultaneously — Level 2.
+    // Safe: no reverse ordering (block_queue -> downloaded_headers) exists anywhere.
     async fn start_block_download(&self) -> Result<(), NetworkError> {
         let current = *self.current_height.read().await;
         let target = *self.target_height.read().await;

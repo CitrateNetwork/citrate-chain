@@ -187,6 +187,53 @@ mod tests {
         assert_eq!(addr2.0[1..], [0u8; 19]);
     }
 
+    // -----------------------------------------------------------------------
+    // Property-based tests (proptest)
+    // -----------------------------------------------------------------------
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Property: Address derivation is deterministic — same pubkey always yields the same address.
+        #[test]
+        fn prop_address_derivation_deterministic(pk_bytes in prop::collection::vec(any::<u8>(), 32)) {
+            let arr: [u8; 32] = pk_bytes.as_slice().try_into().unwrap();
+            let pk1 = PublicKey::new(arr);
+            let pk2 = PublicKey::new(arr);
+            let addr1 = Address::from_public_key(&pk1);
+            let addr2 = Address::from_public_key(&pk2);
+            prop_assert_eq!(addr1, addr2, "Same public key must produce same address");
+        }
+
+        /// Property: Address from_hex round-trip — Display then from_hex recovers the original address.
+        #[test]
+        fn prop_address_hex_roundtrip(addr_bytes in prop::collection::vec(any::<u8>(), 20)) {
+            let arr: [u8; 20] = addr_bytes.as_slice().try_into().unwrap();
+            let original = Address(arr);
+            let hex_str = format!("{}", original);
+            let recovered = Address::from_hex(&hex_str).expect("from_hex must succeed on Display output");
+            prop_assert_eq!(original, recovered, "Hex round-trip must be identity");
+        }
+
+        /// Property: AccountState serialization round-trip — bincode serialize then deserialize is identity.
+        #[test]
+        fn prop_account_state_serialization_roundtrip(
+            nonce in any::<u64>(),
+            balance_lo in any::<u64>(),
+        ) {
+            let state = AccountState {
+                nonce,
+                balance: U256::from(balance_lo),
+                storage_root: Hash::default(),
+                code_hash: Hash::default(),
+                model_permissions: Vec::new(),
+            };
+            let bytes = bincode::serialize(&state).expect("serialize must succeed");
+            let recovered: AccountState = bincode::deserialize(&bytes).expect("deserialize must succeed");
+            prop_assert_eq!(recovered.nonce, state.nonce);
+            prop_assert_eq!(recovered.balance, state.balance);
+        }
+    }
+
     #[test]
     fn test_address_format_parity() {
         // Verify that addresses derived from embedded EVM format match the original bytes

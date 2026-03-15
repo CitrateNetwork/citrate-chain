@@ -459,6 +459,39 @@ mod tests {
         assert_eq!(trie.get(b"key4"), None);
     }
 
+    // -----------------------------------------------------------------------
+    // Property-based tests (proptest)
+    // -----------------------------------------------------------------------
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Property: Trie insert/get round-trip — insert(key, value) then get(key) returns value.
+        #[test]
+        fn prop_trie_insert_get_roundtrip(
+            key in prop::collection::vec(any::<u8>(), 1..32),
+            value in prop::collection::vec(any::<u8>(), 1..64),
+        ) {
+            let mut trie = Trie::new();
+            trie.insert(key.clone(), value.clone());
+            let retrieved = trie.get(&key);
+            prop_assert_eq!(retrieved, Some(value), "get must return value inserted by insert");
+        }
+
+        /// Property: Trie root_hash is deterministic — same content always produces same hash.
+        #[test]
+        fn prop_trie_root_hash_deterministic(
+            key in prop::collection::vec(any::<u8>(), 1..16),
+            value in prop::collection::vec(any::<u8>(), 1..32),
+        ) {
+            let mut trie1 = Trie::new();
+            let mut trie2 = Trie::new();
+            trie1.insert(key.clone(), value.clone());
+            trie2.insert(key, value);
+            prop_assert_eq!(trie1.root_hash(), trie2.root_hash(),
+                "Same insertions must produce same root hash");
+        }
+    }
+
     #[test]
     fn test_trie_remove() {
         let mut trie = Trie::new();

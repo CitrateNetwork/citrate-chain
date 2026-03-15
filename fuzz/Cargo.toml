@@ -11,12 +11,19 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 citrate-api = { path = "../core/api" }
 citrate-consensus = { path = "../core/consensus" }
+citrate-execution = { path = "../core/execution" }
+citrate-network = { path = "../core/network" }
 bincode = "1.3"
 hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
 
 # Prevent this from interfering with workspace
 [workspace]
 members = ["."]
+
+# ── Existing targets ──────────────────────────────────────────────
 
 [[bin]]
 name = "fuzz_tx_decoder"
@@ -31,4 +38,56 @@ doc = false
 [[bin]]
 name = "fuzz_rpc_hex"
 path = "fuzz_targets/fuzz_rpc_hex.rs"
+doc = false
+
+# ── New targets ───────────────────────────────────────────────────
+
+[[bin]]
+name = "fuzz_json_rpc"
+path = "fuzz_targets/fuzz_json_rpc.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_checkpoint_vote"
+path = "fuzz_targets/fuzz_checkpoint_vote.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_bridge_attestation"
+path = "fuzz_targets/fuzz_bridge_attestation.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_precompile_inputs"
+path = "fuzz_targets/fuzz_precompile_inputs.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_vrf_proof"
+path = "fuzz_targets/fuzz_vrf_proof.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_rlp_decoder"
+path = "fuzz_targets/fuzz_rlp_decoder.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_config_toml"
+path = "fuzz_targets/fuzz_config_toml.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_mempool_admission"
+path = "fuzz_targets/fuzz_mempool_admission.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_network_message"
+path = "fuzz_targets/fuzz_network_message.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_state_key"
+path = "fuzz_targets/fuzz_state_key.rs"
 doc = false

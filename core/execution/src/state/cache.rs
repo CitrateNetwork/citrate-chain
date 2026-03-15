@@ -82,13 +82,16 @@ impl StateCache {
     ) -> Self {
         Self {
             accounts: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(account_cache_size).unwrap(),
+                NonZeroUsize::new(account_cache_size)
+                    .expect("account_cache_size must be > 0"),
             ))),
             storage: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(storage_cache_size).unwrap(),
+                NonZeroUsize::new(storage_cache_size)
+                    .expect("storage_cache_size must be > 0"),
             ))),
             code: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(code_cache_size).unwrap(),
+                NonZeroUsize::new(code_cache_size)
+                    .expect("code_cache_size must be > 0"),
             ))),
             stats: Arc::new(RwLock::new(CacheStats::default())),
             prefetch_enabled: true,

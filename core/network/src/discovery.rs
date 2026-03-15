@@ -186,6 +186,8 @@ impl Discovery {
     }
 
     /// Find new peers to connect to
+    // LOCK ORDERING: holds connected_peers (read) while calling get_peer_counts() -> stats (read).
+    // Safe: both are read locks; no write contention in this path.
     pub async fn find_peers(&self) -> Vec<(String, SocketAddr)> {
         let connected = self.connected_peers.read().await;
         let (current_peers, _, _) = self.peer_manager.get_peer_counts().await;

@@ -231,7 +231,7 @@ impl KeyManager {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before UNIX epoch")
             .as_secs();
 
         let derived_key = DerivedKey {
@@ -467,7 +467,7 @@ impl KeyManager {
         if let Some(time_limited) = policy.time_limited.get(&address) {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system clock before UNIX epoch")
                 .as_secs();
 
             if now >= time_limited.valid_from && now <= time_limited.valid_until {
@@ -492,7 +492,7 @@ impl KeyManager {
     pub fn get_expired_keys(&self) -> Vec<H256> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before UNIX epoch")
             .as_secs();
 
         let keys = self.derived_keys.read();

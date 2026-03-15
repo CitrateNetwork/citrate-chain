@@ -173,21 +173,26 @@ impl MarketplaceStorage {
     }
 
     /// Get marketplace statistics
+    // LOCK ORDERING: acquires interactions (read) first, drops it, then stats (write).
+    // This matches the canonical order: interactions before stats.
     pub async fn get_marketplace_stats(&self) -> Result<MarketplaceStats> {
+        // Snapshot interaction data first (Level 1), then release before acquiring stats (Level 2)
+        let (interaction_count, model_interaction_counts) = {
+            let interactions = self.interactions.read().await;
+            let count = interactions.len() as u64;
+            let mut counts: HashMap<ModelId, u64> = HashMap::new();
+            for interaction in interactions.iter() {
+                *counts.entry(interaction.model_id).or_insert(0) += 1;
+            }
+            (count, counts)
+        };
+
+        // Now acquire stats (Level 2) — interactions lock is already dropped
         let mut stats = self.stats.write().await;
 
-        // Update stats
         stats.total_models = self.models.len() as u64;
-        stats.total_interactions = self.interactions.read().await.len() as u64;
+        stats.total_interactions = interaction_count;
         stats.total_reviews = self.reviews.len() as u64;
-
-        // Calculate top models by interaction count
-        let interactions = self.interactions.read().await;
-        let mut model_interaction_counts: HashMap<ModelId, u64> = HashMap::new();
-
-        for interaction in interactions.iter() {
-            *model_interaction_counts.entry(interaction.model_id).or_insert(0) += 1;
-        }
 
         let mut top_models: Vec<(ModelId, u64)> = model_interaction_counts.into_iter().collect();
         top_models.sort_by(|a, b| b.1.cmp(&a.1));
@@ -230,6 +235,7 @@ impl MarketplaceStorage {
     }
 
     /// Clear all data (for testing)
+    // LOCK ORDERING: acquires interactions (write) then stats (write) — canonical order.
     pub async fn clear_all(&self) -> Result<()> {
         self.models.clear();
         self.interactions.write().await.clear();
