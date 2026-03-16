@@ -78,6 +78,17 @@ if [ -f "$NODE_BIN" ]; then
     echo "Sidecar installed"
 fi
 
+# Copy Windows service installer to resources
+echo ""
+echo "[2b/4] Bundling Windows service scripts..."
+WIN_SCRIPTS_SRC="$SCRIPT_DIR/windows"
+WIN_SCRIPTS_DEST="$GUI_DIR/src-tauri/resources"
+mkdir -p "$WIN_SCRIPTS_DEST"
+if [ -f "$WIN_SCRIPTS_SRC/install_service.ps1" ]; then
+    cp "$WIN_SCRIPTS_SRC/install_service.ps1" "$WIN_SCRIPTS_DEST/"
+    echo "Bundled: install_service.ps1"
+fi
+
 # Step 3: Build Tauri app
 echo ""
 echo "[3/4] Building Tauri installer..."

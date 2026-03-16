@@ -11,6 +11,10 @@ use citrate_execution::executor::Executor;
 use citrate_execution::types::Address;
 use citrate_sequencer::mempool::{Mempool, TxClass};
 use citrate_storage::StorageManager;
+use citrate_economics::{
+    InstitutionalRewardConfig, InstitutionalRewardEstimator, EstimationParams,
+    InstitutionalSlashingConfig, InstitutionalOperatorProfile,
+};
 use primitive_types::U256;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2178,6 +2182,151 @@ pub fn register_eth_methods(
             }
             let paused = pause_flag_status.load(Ordering::Relaxed);
             Ok(json!({"paused": paused}))
+        });
+
+        // ---------------------------------------------------------------
+        // Institutional economics RPC methods (Sprint T)
+        // ---------------------------------------------------------------
+
+        // citrate_estimateInstitutionalRewards — project monthly rewards
+        io_handler.add_sync_method("citrate_estimateInstitutionalRewards", move |params: Params| {
+            let params: Vec<Value> = match params.parse() {
+                Ok(p) => p,
+                Err(_) => vec![],
+            };
+
+            let expected_uptime = params.first()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.95);
+            let models_to_host = params.get(1)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2) as u32;
+            let adapters_per_month = params.get(2)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as u32;
+            let datasets_per_month = params.get(3)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5) as u32;
+            let projection_months = params.get(4)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(12) as u32;
+
+            let config = InstitutionalRewardConfig::default();
+            let estimator = InstitutionalRewardEstimator::new(config);
+            let est_params = EstimationParams {
+                expected_uptime,
+                models_to_host,
+                adapters_per_month,
+                datasets_per_month,
+                projection_months,
+            };
+
+            let result = estimator.estimate(&est_params);
+
+            let monthly: Vec<Value> = result.monthly_projections.iter().map(|m| {
+                json!({
+                    "month": m.month,
+                    "blockValidationSalt": m.block_validation_salt,
+                    "modelHostingSalt": m.model_hosting_salt,
+                    "adapterCreationSalt": m.adapter_creation_salt,
+                    "dataProvisionSalt": m.data_provision_salt,
+                    "totalSalt": m.total_salt,
+                    "cumulativeSalt": m.cumulative_salt,
+                })
+            }).collect();
+
+            Ok(json!({
+                "monthlyProjections": monthly,
+                "totalProjectedSalt": result.total_projected_salt,
+                "averageMonthlySalt": result.average_monthly_salt,
+                "minMonthlySalt": result.min_monthly_salt,
+                "maxMonthlySalt": result.max_monthly_salt,
+            }))
+        });
+
+        // citrate_getInstitutionalConfig — return current reward + slashing config
+        io_handler.add_sync_method("citrate_getInstitutionalConfig", move |_params: Params| {
+            let reward_config = InstitutionalRewardConfig::default();
+            let slashing_config = InstitutionalSlashingConfig::default();
+
+            Ok(json!({
+                "rewards": {
+                    "blockValidationMonthlySalt": reward_config.block_validation_monthly_salt,
+                    "uptimeBonusMultiplier": reward_config.uptime_bonus_multiplier,
+                    "modelHostingPerModelSalt": reward_config.model_hosting_per_model_salt,
+                    "adapterCreationSalt": reward_config.adapter_creation_salt,
+                    "dataProvisionPerDatasetSalt": reward_config.data_provision_per_dataset_salt,
+                    "minUptimeThreshold": reward_config.min_uptime_threshold,
+                    "maxRewardedModels": reward_config.max_rewarded_models,
+                    "maxRewardedAdaptersPerEpoch": reward_config.max_rewarded_adapters_per_epoch,
+                    "maxRewardedDatasetsPerEpoch": reward_config.max_rewarded_datasets_per_epoch,
+                },
+                "slashing": {
+                    "equivocationPenaltyPct": slashing_config.equivocation_penalty_pct,
+                    "invalidStatePenaltyPct": slashing_config.invalid_state_penalty_pct,
+                    "censorshipPenaltyPct": slashing_config.censorship_penalty_pct,
+                    "firstOffenseGraceEpochs": slashing_config.first_offense_grace_epochs,
+                    "cooldownEpochs": slashing_config.cooldown_epochs,
+                    "maxCumulativeSlashPct": slashing_config.max_cumulative_slash_pct,
+                    "penalizeDowntime": slashing_config.penalize_downtime,
+                }
+            }))
+        });
+
+        // citrate_registerSchoolNode — register a new institutional operator
+        io_handler.add_sync_method("citrate_registerSchoolNode", move |params: Params| {
+            let params: Vec<Value> = match params.parse() {
+                Ok(p) => p,
+                Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
+            };
+
+            let institution_name = params.first()
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing institution_name"))?
+                .to_string();
+
+            let contact_email = params.get(1)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing contact_email"))?
+                .to_string();
+
+            let operator_address_hex = params.get(2)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing operator_address"))?;
+
+            let addr_hex = operator_address_hex.strip_prefix("0x").unwrap_or(operator_address_hex);
+            let addr_bytes = hex::decode(addr_hex)
+                .map_err(|e| jsonrpc_core::Error::invalid_params(format!("Invalid address hex: {}", e)))?;
+
+            if addr_bytes.len() < 20 {
+                return Err(jsonrpc_core::Error::invalid_params("Address must be at least 20 bytes"));
+            }
+
+            let mut addr_arr = [0u8; 20];
+            addr_arr.copy_from_slice(&addr_bytes[..20]);
+            let address = Address(addr_arr);
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let profile = InstitutionalOperatorProfile::new(
+                address,
+                institution_name.clone(),
+                contact_email.clone(),
+                now,
+            );
+
+            Ok(json!({
+                "status": "registered",
+                "institutionName": profile.institution_name,
+                "contactEmail": profile.contact_email,
+                "operatorAddress": format!("0x{}", hex::encode(addr_arr)),
+                "registeredAt": profile.registered_at,
+                "isActive": profile.is_active,
+                "currentEpoch": profile.current_epoch,
+            }))
         });
     }
 }

@@ -75,6 +75,25 @@ else
     echo "WARNING: systemd unit not found at $SYSTEMD_SRC (skipping)"
 fi
 
+# Copy IPFS systemd unit
+IPFS_SYSTEMD_SRC="$SCRIPT_DIR/linux/systemd/citrate-ipfs.service"
+IPFS_SYSTEMD_DEST="$GUI_DIR/src-tauri/resources/citrate-ipfs.service"
+if [ -f "$IPFS_SYSTEMD_SRC" ]; then
+    cp "$IPFS_SYSTEMD_SRC" "$IPFS_SYSTEMD_DEST"
+    echo "IPFS systemd unit: $IPFS_SYSTEMD_DEST"
+fi
+
+# Copy post-install and pre-remove scripts
+for script in postinst.sh prerm.sh; do
+    SRC="$SCRIPT_DIR/linux/$script"
+    DEST="$GUI_DIR/src-tauri/resources/$script"
+    if [ -f "$SRC" ]; then
+        cp "$SRC" "$DEST"
+        chmod +x "$DEST"
+        echo "Script: $DEST"
+    fi
+done
+
 # Step 4: Build Tauri packages
 echo ""
 echo "[4/5] Building Tauri packages (.deb, .rpm, .AppImage)..."

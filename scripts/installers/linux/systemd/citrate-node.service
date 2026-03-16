@@ -8,36 +8,18 @@ Wants=network-online.target
 Type=simple
 User=citrate
 Group=citrate
-ExecStart=/usr/bin/citrate-node --data-dir /var/lib/citrate/db --config /etc/citrate/config.toml
-ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=/usr/bin/citrate-node devnet
+WorkingDirectory=/var/lib/citrate
 Restart=on-failure
 RestartSec=10
-TimeoutStartSec=30
-TimeoutStopSec=30
-
-# Security hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/citrate /var/log/citrate
-PrivateTmp=true
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-
-# Resource limits
 LimitNOFILE=65536
-LimitNPROC=4096
-
-# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=citrate-node
 
-# Environment
+Environment=CITRATE_DATA_DIR=/var/lib/citrate
 Environment=RUST_LOG=info
-EnvironmentFile=-/etc/citrate/env
+Environment=CITRATE_METRICS_ADDR=127.0.0.1:9090
 
 [Install]
 WantedBy=multi-user.target
