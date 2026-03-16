@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 
 mod adapters;
 mod artifact;
+pub mod bundled_model;
 mod commands;
 mod config;
 mod genesis;

@@ -45,6 +45,24 @@ if [ ! -f "$NODE_BIN" ]; then
 fi
 echo "Node binary: $NODE_BIN"
 
+# Optional: Build universal binary
+if [ "${3:-}" = "--universal" ]; then
+    echo ""
+    echo "[1b/5] Building universal binary (Intel + Apple Silicon)..."
+    # Build for both architectures
+    cargo build --release -p citrate-node --target aarch64-apple-darwin
+    cargo build --release -p citrate-node --target x86_64-apple-darwin
+
+    # Create universal binary with lipo
+    UNIVERSAL_BIN="$PROJECT_ROOT/target/release/citrate-node-universal"
+    lipo -create \
+        "$PROJECT_ROOT/target/aarch64-apple-darwin/release/citrate-node" \
+        "$PROJECT_ROOT/target/x86_64-apple-darwin/release/citrate-node" \
+        -output "$UNIVERSAL_BIN"
+    NODE_BIN="$UNIVERSAL_BIN"
+    echo "Universal binary: $NODE_BIN"
+fi
+
 # Step 2: Copy node binary as Tauri sidecar
 echo ""
 echo "[2/5] Installing node binary as Tauri sidecar..."
@@ -74,6 +92,14 @@ if [ -f "$PLIST_SRC" ]; then
     echo "LaunchAgent plist: $PLIST_DEST"
 else
     echo "WARNING: LaunchAgent plist not found at $PLIST_SRC (skipping)"
+fi
+
+# Copy first-launch script to resources
+FIRST_LAUNCH_SRC="$SCRIPT_DIR/first_launch.sh"
+FIRST_LAUNCH_DEST="$GUI_DIR/src-tauri/resources/first_launch.sh"
+if [ -f "$FIRST_LAUNCH_SRC" ]; then
+    cp "$FIRST_LAUNCH_SRC" "$FIRST_LAUNCH_DEST"
+    chmod +x "$FIRST_LAUNCH_DEST"
 fi
 
 # Step 4: Build Tauri app
