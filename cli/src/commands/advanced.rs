@@ -374,7 +374,7 @@ async fn benchmark_network(
         let progress = ((batch + 1) * concurrency * 100) / tx_count;
         print!("\rProgress: {}% ", progress);
         use std::io::{self, Write};
-        io::stdout().flush().unwrap();
+        io::stdout().flush().expect("stdout flush");
 
         // Small delay between batches to avoid overwhelming the node
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -589,7 +589,7 @@ async fn stress_test(
         let remaining = duration - elapsed;
         print!("\rTime remaining: {}s ", remaining);
         use std::io::{self, Write};
-        io::stdout().flush().unwrap();
+        io::stdout().flush().expect("stdout flush");
         sleep(Duration::from_secs(1)).await;
     }
 

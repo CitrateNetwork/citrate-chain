@@ -80,7 +80,7 @@ impl FilterRegistry {
             last_polled_at: now,
         };
 
-        self.filters.write().unwrap().insert(id, filter);
+        self.filters.write().expect("filter lock poisoned").insert(id, filter);
         id
     }
 
@@ -96,7 +96,7 @@ impl FilterRegistry {
             last_polled_at: now,
         };
 
-        self.filters.write().unwrap().insert(id, filter);
+        self.filters.write().expect("filter lock poisoned").insert(id, filter);
         id
     }
 
@@ -112,13 +112,13 @@ impl FilterRegistry {
             last_polled_at: now,
         };
 
-        self.filters.write().unwrap().insert(id, filter);
+        self.filters.write().expect("filter lock poisoned").insert(id, filter);
         id
     }
 
     /// Get a filter by ID and update its last polled time
     pub fn get_filter(&self, id: u64) -> Option<Filter> {
-        let mut filters = self.filters.write().unwrap();
+        let mut filters = self.filters.write().expect("filter lock poisoned");
         if let Some(filter) = filters.get_mut(&id) {
             filter.last_polled_at = Instant::now();
             Some(filter.clone())
@@ -129,7 +129,7 @@ impl FilterRegistry {
 
     /// Update the last poll block for a filter
     pub fn update_last_poll_block(&self, id: u64, block: u64) {
-        if let Some(filter) = self.filters.write().unwrap().get_mut(&id) {
+        if let Some(filter) = self.filters.write().expect("filter lock poisoned").get_mut(&id) {
             filter.last_poll_block = block;
             filter.last_polled_at = Instant::now();
         }
@@ -137,13 +137,13 @@ impl FilterRegistry {
 
     /// Uninstall (remove) a filter
     pub fn uninstall_filter(&self, id: u64) -> bool {
-        self.filters.write().unwrap().remove(&id).is_some()
+        self.filters.write().expect("filter lock poisoned").remove(&id).is_some()
     }
 
     /// Clean up stale filters that haven't been polled recently
     pub fn cleanup_stale_filters(&self) {
         let now = Instant::now();
-        let mut filters = self.filters.write().unwrap();
+        let mut filters = self.filters.write().expect("filter lock poisoned");
         filters.retain(|_, filter| {
             now.duration_since(filter.last_polled_at) < self.max_filter_age
         });
@@ -151,7 +151,7 @@ impl FilterRegistry {
 
     /// Get the number of active filters
     pub fn filter_count(&self) -> usize {
-        self.filters.read().unwrap().len()
+        self.filters.read().expect("filter lock poisoned").len()
     }
 }
 

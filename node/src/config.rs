@@ -296,15 +296,15 @@ impl Default for NodeConfig {
                 ghostdag_k: 18,
             },
             network: NetworkConfig {
-                listen_addr: "127.0.0.1:30303".parse().unwrap(),
+                listen_addr: "127.0.0.1:30303".parse().expect("valid hardcoded P2P address"),
                 bootstrap_nodes: vec![],
                 max_peers: 50,
                 allowed_peers: vec![],
             },
             rpc: RpcConfig {
                 enabled: true,
-                listen_addr: "127.0.0.1:8545".parse().unwrap(),
-                ws_addr: "127.0.0.1:8546".parse().unwrap(),
+                listen_addr: "127.0.0.1:8545".parse().expect("valid hardcoded RPC address"),
+                ws_addr: "127.0.0.1:8546".parse().expect("valid hardcoded WebSocket address"),
                 allow_eth_send_transaction: false, // Secure default
                 api_key: None,
                 cors_origins: vec![], // Secure default: no CORS headers
@@ -354,7 +354,7 @@ impl NodeConfig {
         // WP-X.1: Permissive CORS in devnet
         config.rpc.cors_origins = vec!["*".to_string()];
         // Bind RPC to all interfaces so Tailscale/LAN peers can reach it
-        config.rpc.listen_addr = "0.0.0.0:8545".parse().unwrap();
+        config.rpc.listen_addr = "0.0.0.0:8545".parse().expect("valid hardcoded RPC address");
         // WP-W.2: Permissive VRF in devnet (no strict verification)
         config.vrf.strict_vrf = false;
         config
@@ -371,7 +371,7 @@ impl NodeConfig {
     #[allow(dead_code)]
     pub fn save(&self, path: &PathBuf) -> anyhow::Result<()> {
         let content = toml::to_string_pretty(self)?;
-        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::create_dir_all(path.parent().expect("config file path must have a parent directory"))?;
         std::fs::write(path, content)?;
         Ok(())
     }

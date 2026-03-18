@@ -150,7 +150,7 @@ pub fn register_ai_methods(
                     .collect();
 
                 // Sort by similarity (descending)
-                scored_docs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                scored_docs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Take top_k results
                 let results: Vec<serde_json::Value> = scored_docs

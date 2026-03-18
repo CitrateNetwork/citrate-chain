@@ -142,14 +142,14 @@ impl EnvelopeHeader {
             return Err(EnvelopeError::UnsupportedVersion(version));
         }
 
-        let key_version = u32::from_be_bytes(bytes[5..9].try_into().unwrap());
+        let key_version = u32::from_be_bytes(bytes[5..9].try_into().expect("4-byte slice for u32"));
         let algorithm = bytes[9];
         let kdf_method = bytes[10];
 
         let mut column_family_hash = [0u8; 8];
         column_family_hash.copy_from_slice(&bytes[11..19]);
 
-        let encrypted_at = u64::from_be_bytes(bytes[19..27].try_into().unwrap());
+        let encrypted_at = u64::from_be_bytes(bytes[19..27].try_into().expect("8-byte slice for u64"));
 
         let mut key_commitment = [0u8; 16];
         key_commitment.copy_from_slice(&bytes[27..43]);
@@ -259,7 +259,7 @@ impl EncryptionEnvelope {
 
         let ct_len_start = EnvelopeHeader::SIZE + 12;
         let ct_len = u32::from_be_bytes(
-            bytes[ct_len_start..ct_len_start + 4].try_into().unwrap()
+            bytes[ct_len_start..ct_len_start + 4].try_into().expect("4-byte slice for u32")
         ) as usize;
 
         let ct_start = ct_len_start + 4;

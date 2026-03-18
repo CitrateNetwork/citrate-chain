@@ -161,7 +161,7 @@ impl BlockBuilder {
         // Build block header first (needed for execution context)
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system time before UNIX epoch")
             .as_secs();
 
         let header = BlockHeader {
@@ -348,7 +348,7 @@ impl BlockBuilder {
             let bundle = bundles
                 .iter_mut()
                 .find(|b| b.class == class && !b.is_full(self.config.bundle_size))
-                .unwrap();
+                .expect("bundle was just inserted above");
 
             bundle.add_transaction(tx);
         }

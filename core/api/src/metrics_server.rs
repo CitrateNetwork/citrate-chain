@@ -171,11 +171,11 @@ async fn metrics_handler() -> Response<Body> {
             .status(StatusCode::OK)
             .header("Content-Type", encoder.format_type())
             .body(Body::from(buffer))
-            .unwrap(),
+            .expect("valid response builder"),
         Err(e) => Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::from(format!("Error encoding metrics: {}", e)))
-            .unwrap(),
+            .expect("valid response builder"),
     }
 }
 
@@ -184,7 +184,7 @@ async fn health_handler() -> Response<Body> {
     Response::builder()
         .status(StatusCode::OK)
         .body(Body::from("{\"status\":\"healthy\"}"))
-        .unwrap()
+        .expect("valid response builder")
 }
 
 /// Update mempool metrics

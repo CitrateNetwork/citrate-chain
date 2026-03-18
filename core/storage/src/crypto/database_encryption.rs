@@ -100,7 +100,7 @@ impl ColumnFamilyKey {
 
     /// Rotate the key
     pub fn rotate(&self, new_key: DerivedKey) {
-        let mut envelope = self.envelope.write().unwrap();
+        let mut envelope = self.envelope.write().expect("envelope lock poisoned");
         envelope.rotate_key(new_key);
     }
 }
@@ -135,7 +135,7 @@ impl EncryptedValue {
         if self.data.len() < 9 {
             return None;
         }
-        Some(u32::from_be_bytes(self.data[5..9].try_into().unwrap()))
+        Some(u32::from_be_bytes(self.data[5..9].try_into().expect("4-byte slice for u32")))
     }
 }
 
@@ -202,12 +202,12 @@ impl EncryptedDatabase {
 
         // Register with lifecycle manager
         {
-            let mut lifecycle = self.lifecycle.write().unwrap();
+            let mut lifecycle = self.lifecycle.write().expect("lifecycle lock poisoned");
             lifecycle.register_key(master.key_bytes(), master.version, KeyPurpose::MasterKEK as u8);
         }
 
         // Derive column family keys
-        let mut column_keys = self.column_keys.write().unwrap();
+        let mut column_keys = self.column_keys.write().expect("column_keys lock poisoned");
         for (cf_name, enabled) in &self.config.encrypt_column_families {
             if *enabled {
                 let cf_key = self.kdf.derive_column_key(&master, cf_name)
@@ -243,7 +243,7 @@ impl EncryptedDatabase {
             return Ok(EncryptedValue { data: value.to_vec() });
         }
 
-        let column_keys = self.column_keys.read().unwrap();
+        let column_keys = self.column_keys.read().expect("column_keys lock poisoned");
         let cf_key = column_keys.get(column_family)
             .ok_or(DatabaseEncryptionError::ColumnFamilyNotFound(column_family.to_string()))?;
 
@@ -258,13 +258,13 @@ impl EncryptedDatabase {
         let _aad = self.build_aad(column_family, key);
 
         // Encrypt using envelope
-        let envelope = cf_key.envelope.read().unwrap();
+        let envelope = cf_key.envelope.read().expect("envelope lock poisoned");
         let encrypted = envelope.encrypt(&data_to_encrypt, column_family)
             .map_err(|e| DatabaseEncryptionError::EncryptionFailed(e.to_string()))?;
 
         // Update stats
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().expect("stats lock poisoned");
             stats.total_encryptions += 1;
             stats.bytes_encrypted += value.len() as u64;
         }
@@ -284,12 +284,12 @@ impl EncryptedDatabase {
             return Ok(DecryptedValue { data: encrypted.to_vec() });
         }
 
-        let column_keys = self.column_keys.read().unwrap();
+        let column_keys = self.column_keys.read().expect("column_keys lock poisoned");
         let cf_key = column_keys.get(column_family)
             .ok_or(DatabaseEncryptionError::ColumnFamilyNotFound(column_family.to_string()))?;
 
         // Decrypt using envelope
-        let envelope = cf_key.envelope.read().unwrap();
+        let envelope = cf_key.envelope.read().expect("envelope lock poisoned");
         let decrypted = envelope.decrypt(encrypted)
             .map_err(|e| DatabaseEncryptionError::DecryptionFailed(e.to_string()))?;
 
@@ -302,7 +302,7 @@ impl EncryptedDatabase {
 
         // Update stats
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().expect("stats lock poisoned");
             stats.total_decryptions += 1;
             stats.bytes_decrypted += data.len() as u64;
         }
@@ -324,7 +324,7 @@ impl EncryptedDatabase {
             .map_err(|_| DatabaseEncryptionError::KeyDerivationFailed)?;
 
         // Create rotation proof
-        let mut lifecycle = self.lifecycle.write().unwrap();
+        let mut lifecycle = self.lifecycle.write().expect("lifecycle lock poisoned");
         let (_, proof) = lifecycle.rotate_key(
             master.key_bytes(),
             new_cf_key.key_bytes(),
@@ -334,7 +334,7 @@ impl EncryptedDatabase {
         ).map_err(|_| DatabaseEncryptionError::RotationFailed)?;
 
         // Update column key
-        let mut column_keys = self.column_keys.write().unwrap();
+        let mut column_keys = self.column_keys.write().expect("column_keys lock poisoned");
         if let Some(cf_key) = column_keys.get(column_family) {
             cf_key.rotate(new_cf_key.clone());
         } else {
@@ -350,9 +350,9 @@ impl EncryptedDatabase {
             return false;
         }
 
-        let column_keys = self.column_keys.read().unwrap();
+        let column_keys = self.column_keys.read().expect("column_keys lock poisoned");
         if let Some(cf_key) = column_keys.get(column_family) {
-            let envelope = cf_key.envelope.read().unwrap();
+            let envelope = cf_key.envelope.read().expect("envelope lock poisoned");
             envelope.needs_reencryption(encrypted)
         } else {
             false
@@ -365,7 +365,7 @@ impl EncryptedDatabase {
         let reencrypted = self.encrypt(column_family, key, &decrypted.data)?;
 
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().expect("stats lock poisoned");
             stats.reencryptions += 1;
         }
 
@@ -374,12 +374,12 @@ impl EncryptedDatabase {
 
     /// Get encryption statistics
     pub fn get_stats(&self) -> EncryptionStats {
-        self.stats.read().unwrap().clone()
+        self.stats.read().expect("stats lock poisoned").clone()
     }
 
     /// Export key commitments for on-chain anchoring
     pub fn export_key_commitments(&self) -> Vec<KeyCommitment> {
-        let lifecycle = self.lifecycle.read().unwrap();
+        let lifecycle = self.lifecycle.read().expect("lifecycle lock poisoned");
         let trail = lifecycle.export_audit_trail();
 
         let mut commitments = Vec::new();
@@ -391,7 +391,7 @@ impl EncryptedDatabase {
 
     /// Get rotation history
     pub fn get_rotation_history(&self) -> Vec<KeyRotationProof> {
-        let lifecycle = self.lifecycle.read().unwrap();
+        let lifecycle = self.lifecycle.read().expect("lifecycle lock poisoned");
         lifecycle.get_rotation_history().to_vec()
     }
 

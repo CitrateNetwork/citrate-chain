@@ -201,7 +201,8 @@ fn import_account(config: &Config, private_key: &str, password: Option<String>) 
         anyhow::bail!("Invalid private key length. Expected 32 bytes for ed25519.");
     }
 
-    let key_array: [u8; 32] = key_bytes.try_into().unwrap();
+    let key_array: [u8; 32] = key_bytes.try_into()
+        .map_err(|_| anyhow::anyhow!("private key must be exactly 32 bytes"))?;
     let signing_key = SigningKey::from_bytes(&key_array);
 
     // Derive public key and address

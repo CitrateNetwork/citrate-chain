@@ -1064,7 +1064,7 @@ async fn download_hf_model(
         return Ok(());
     }
 
-    let filename = filename.unwrap();
+    let filename = filename.ok_or_else(|| anyhow::anyhow!("cannot extract filename from path"))?;
 
     // Create output directory
     let model_dir = models_dir.join(repo_id.replace('/', "__"));

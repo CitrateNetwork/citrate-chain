@@ -208,7 +208,7 @@ impl KeyStore {
             .map_err(|e| WalletError::Encryption(e.to_string()))?;
 
         // Get the hash bytes for AES key
-        let hash_bytes = password_hash.hash.unwrap();
+        let hash_bytes = password_hash.hash.expect("argon2 hash output present after successful operation");
         let key_bytes = hash_bytes.as_bytes();
 
         // Ensure we have exactly 32 bytes for AES-256
@@ -256,7 +256,7 @@ impl KeyStore {
             .map_err(|e| WalletError::Decryption(e.to_string()))?;
 
         // Get the hash bytes for AES key
-        let hash_bytes = password_hash.hash.unwrap();
+        let hash_bytes = password_hash.hash.expect("argon2 hash output present after successful operation");
         let key_bytes = hash_bytes.as_bytes();
 
         // Ensure we have exactly 32 bytes for AES-256
