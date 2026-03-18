@@ -263,6 +263,7 @@ pub async fn initialize_genesis_state(
 ///
 /// This variant also stores the genesis block in the DAG store for consensus tracking.
 /// The DagStore maintains the DAG structure for GhostDAG consensus.
+#[allow(dead_code)]
 pub async fn initialize_genesis_with_dag(
     storage: Arc<StorageManager>,
     executor: Arc<Executor>,
@@ -284,58 +285,6 @@ pub async fn initialize_genesis_with_dag(
     }
 
     Ok(genesis_hash)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_genesis_block_height_zero() {
-        let config = GenesisConfig::default();
-        let block = create_genesis_block(&config);
-
-        assert_eq!(block.header.height, 0);
-    }
-
-    #[test]
-    fn test_genesis_block_deterministic_hash() {
-        let config = GenesisConfig::default();
-        let block_a = create_genesis_block(&config);
-        let block_b = create_genesis_block(&config);
-
-        // calculate_block_hash is deterministic for identical inputs
-        let hash_a = calculate_block_hash(&block_a);
-        let hash_b = calculate_block_hash(&block_b);
-
-        assert_eq!(hash_a, hash_b, "Same GenesisConfig must produce same block hash");
-    }
-
-    #[test]
-    fn test_genesis_canonical_timestamp() {
-        // 2026-01-01T00:00:00Z
-        assert_eq!(CANONICAL_GENESIS_TIMESTAMP, 1_767_225_600);
-
-        // Verify default config uses this timestamp
-        let config = GenesisConfig::default();
-        assert_eq!(config.timestamp, CANONICAL_GENESIS_TIMESTAMP);
-    }
-
-    #[test]
-    fn test_genesis_block_no_parents() {
-        let config = GenesisConfig::default();
-        let block = create_genesis_block(&config);
-
-        assert!(
-            block.header.merge_parent_hashes.is_empty(),
-            "Genesis block must have no merge parents"
-        );
-        assert_eq!(
-            block.header.selected_parent_hash,
-            Hash::default(),
-            "Genesis block must have zero selected parent"
-        );
-    }
 }
 
 fn register_genesis_model(
@@ -395,4 +344,56 @@ fn register_genesis_model(
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_genesis_block_height_zero() {
+        let config = GenesisConfig::default();
+        let block = create_genesis_block(&config);
+
+        assert_eq!(block.header.height, 0);
+    }
+
+    #[test]
+    fn test_genesis_block_deterministic_hash() {
+        let config = GenesisConfig::default();
+        let block_a = create_genesis_block(&config);
+        let block_b = create_genesis_block(&config);
+
+        // calculate_block_hash is deterministic for identical inputs
+        let hash_a = calculate_block_hash(&block_a);
+        let hash_b = calculate_block_hash(&block_b);
+
+        assert_eq!(hash_a, hash_b, "Same GenesisConfig must produce same block hash");
+    }
+
+    #[test]
+    fn test_genesis_canonical_timestamp() {
+        // 2026-01-01T00:00:00Z
+        assert_eq!(CANONICAL_GENESIS_TIMESTAMP, 1_767_225_600);
+
+        // Verify default config uses this timestamp
+        let config = GenesisConfig::default();
+        assert_eq!(config.timestamp, CANONICAL_GENESIS_TIMESTAMP);
+    }
+
+    #[test]
+    fn test_genesis_block_no_parents() {
+        let config = GenesisConfig::default();
+        let block = create_genesis_block(&config);
+
+        assert!(
+            block.header.merge_parent_hashes.is_empty(),
+            "Genesis block must have no merge parents"
+        );
+        assert_eq!(
+            block.header.selected_parent_hash,
+            Hash::default(),
+            "Genesis block must have zero selected parent"
+        );
+    }
 }

@@ -318,11 +318,13 @@ mod proptests {
     use proptest::prelude::*;
 
     /// Strategy to generate a valid mint amount (1..=total_supply_in_units)
+    #[allow(dead_code)]
     fn mint_amount_strategy() -> impl Strategy<Value = u64> {
         // Keep amounts in a manageable u64 range (in wei-less units) to avoid slowness
         1u64..=1_000_000_000u64
     }
 
+    #[allow(dead_code)]
     fn address_strategy() -> impl Strategy<Value = Address> {
         prop::array::uniform20(1u8..=255u8).prop_map(Address)
     }

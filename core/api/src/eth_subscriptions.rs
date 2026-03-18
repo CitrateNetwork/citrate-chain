@@ -162,6 +162,7 @@ pub struct LogEntry {
 }
 
 /// Ethereum-compatible WebSocket subscription server
+#[allow(dead_code)]
 pub struct EthSubscriptionServer {
     addr: SocketAddr,
     storage: Arc<StorageManager>,

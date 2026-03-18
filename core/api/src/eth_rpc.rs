@@ -2,7 +2,7 @@
 
 use crate::eth_tx_decoder;
 use crate::filter::{FilterRegistry, FilterType};
-use crate::methods::{ChainApi, StateApi, TransactionApi};
+use crate::methods::{ChainApi, StateApi};
 use futures::executor::block_on;
 use hex;
 use jsonrpc_core::{IoHandler, Params, Value};
@@ -2190,10 +2190,7 @@ pub fn register_eth_methods(
 
         // citrate_estimateInstitutionalRewards — project monthly rewards
         io_handler.add_sync_method("citrate_estimateInstitutionalRewards", move |params: Params| {
-            let params: Vec<Value> = match params.parse() {
-                Ok(p) => p,
-                Err(_) => vec![],
-            };
+            let params: Vec<Value> = params.parse().unwrap_or_default();
 
             let expected_uptime = params.first()
                 .and_then(|v| v.as_f64())

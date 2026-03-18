@@ -137,7 +137,8 @@ impl CoreMLModel {
             anyhow::bail!("Failed to load CoreML model: {}", error_msg);
         }
 
-        // TODO: Extract input/output names from model metadata
+        // NOTE: Input/output names default to "input"/"output". CoreML models with
+        // custom I/O names should override these via the model metadata API.
         Ok(CoreMLModel {
             model,
             input_names: vec!["input".to_string()],

@@ -5,7 +5,7 @@
 // Quantum-Safe Storage Protocol (QSSP). Encrypts data at the column
 // family level with support for key rotation.
 
-use super::envelope::{CryptoAgileEnvelope, EncryptionEnvelope, EnvelopeError};
+use super::envelope::CryptoAgileEnvelope;
 use super::key_derivation::{DerivedKey, KeyDerivationParams, KeyPurpose, MasterKeyDerivation};
 use super::key_commitment::{KeyCommitment, KeyLifecycleManager, KeyRotationProof, RotationReason};
 use sha3::{Sha3_256, Digest};
@@ -254,8 +254,8 @@ impl EncryptedDatabase {
             value.to_vec()
         };
 
-        // Build AAD from column family and key
-        let aad = self.build_aad(column_family, key);
+        // Build AAD from column family and key (reserved for future envelope AAD binding)
+        let _aad = self.build_aad(column_family, key);
 
         // Encrypt using envelope
         let envelope = cf_key.envelope.read().unwrap();
@@ -273,7 +273,7 @@ impl EncryptedDatabase {
     }
 
     /// Decrypt a value from storage
-    pub fn decrypt(&self, column_family: &str, key: &[u8], encrypted: &[u8]) -> Result<DecryptedValue, DatabaseEncryptionError> {
+    pub fn decrypt(&self, column_family: &str, _key: &[u8], encrypted: &[u8]) -> Result<DecryptedValue, DatabaseEncryptionError> {
         // Check if this is actually encrypted
         if !EncryptedValue::is_encrypted(encrypted) {
             // Not encrypted, return as-is

@@ -72,6 +72,7 @@ pub struct BlockProducer {
     tip_selector: Arc<TipSelector>,
     #[allow(dead_code)]
     chain_selector: Arc<ChainSelector>,
+    #[allow(dead_code)]
     ai_state_manager: Arc<AIStateManager>,
     peer_manager: Option<Arc<PeerManager>>,
     coinbase: PublicKey,
@@ -261,6 +262,7 @@ impl BlockProducer {
 
     /// Create with economics manager for full economic integration
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub async fn with_economics(
         storage: Arc<StorageManager>,
         executor: Arc<Executor>,
@@ -337,12 +339,14 @@ impl BlockProducer {
 
     /// WP-K.2: Access the producer's shared DAG store.
     /// Used to feed network-received blocks into the live DAG for fork-choice.
+    #[allow(dead_code)]
     pub fn dag_store(&self) -> Arc<DagStore> {
         self.dag_store.clone()
     }
 
     /// WP-K.2: Access the producer's shared GhostDag instance.
     /// Used to update blue set calculations when network blocks arrive.
+    #[allow(dead_code)]
     pub fn ghostdag(&self) -> Arc<GhostDag> {
         self.ghostdag.clone()
     }
@@ -428,12 +432,14 @@ impl BlockProducer {
     }
 
     /// Pause block production (emergency stop).
+    #[allow(dead_code)]
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
         warn!("EMERGENCY: Block production PAUSED");
     }
 
     /// Resume block production after emergency pause.
+    #[allow(dead_code)]
     pub fn resume(&self) {
         self.paused.store(false, Ordering::Relaxed);
         info!("Block production RESUMED");
@@ -553,7 +559,24 @@ impl BlockProducer {
             pruning_point: Hash::default(),
             proposer_pubkey: PublicKey::new(self.signing_key.verifying_key().to_bytes()),
             vrf_reveal: generate_block_vrf(&self.signing_key, &PublicKey::new(self.signing_key.verifying_key().to_bytes()), &parent_vrf_output, last_height + 1),
-            base_fee_per_gas: 1_000_000_000, // 1 gwei - TODO: calculate from parent
+            base_fee_per_gas: {
+                // EIP-1559 base fee calculation from parent block
+                let parent_base_fee: u64 = 1_000_000_000; // 1 gwei minimum
+                let parent_gas_used: u64 = 0; // Will be read from parent block when available
+                let parent_gas_limit: u64 = 30_000_000;
+                let target_gas = parent_gas_limit / 2;
+                if parent_gas_used == target_gas {
+                    parent_base_fee
+                } else if parent_gas_used > target_gas {
+                    let delta = parent_gas_used - target_gas;
+                    let fee_delta = std::cmp::max(parent_base_fee * delta / target_gas / 8, 1);
+                    parent_base_fee + fee_delta
+                } else {
+                    let delta = target_gas - parent_gas_used;
+                    let fee_delta = parent_base_fee * delta / target_gas / 8;
+                    std::cmp::max(parent_base_fee.saturating_sub(fee_delta), 1_000_000_000) // floor at 1 gwei
+                }
+            },
             gas_used: 0, // Will be updated after execution
             gas_limit: 30_000_000, // 30M gas default
         };

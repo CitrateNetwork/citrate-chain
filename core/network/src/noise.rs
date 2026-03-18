@@ -10,7 +10,7 @@ use snow::{Builder, TransportState};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, info};
+use tracing::debug;
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 const MAX_NOISE_MSG_LEN: usize = 65535;

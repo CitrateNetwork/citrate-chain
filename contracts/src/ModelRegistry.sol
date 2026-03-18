@@ -155,7 +155,7 @@ contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
         bytes32 modelHash,
         string memory newVersion,
         string memory newIpfsCID
-    ) external {
+    ) external nonReentrant {
         Model storage model = models[modelHash];
         require(model.owner == msg.sender, "Not model owner");
         require(model.isActive, "Model not active");
@@ -175,7 +175,7 @@ contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
      * @param modelHash Hash of the model
      * @param newPrice New price in LATT wei
      */
-    function setInferencePrice(bytes32 modelHash, uint256 newPrice) external {
+    function setInferencePrice(bytes32 modelHash, uint256 newPrice) external nonReentrant {
         Model storage model = models[modelHash];
         require(model.owner == msg.sender, "Not model owner");
         
@@ -188,7 +188,7 @@ contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
      * @param modelHash Hash of the model
      * @param user Address to grant permission to
      */
-    function grantPermission(bytes32 modelHash, address user) external {
+    function grantPermission(bytes32 modelHash, address user) external nonReentrant {
         Model storage model = models[modelHash];
         require(model.owner == msg.sender, "Not model owner");
         
@@ -201,7 +201,7 @@ contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
      * @param modelHash Hash of the model
      * @param user Address to revoke permission from
      */
-    function revokePermission(bytes32 modelHash, address user) external {
+    function revokePermission(bytes32 modelHash, address user) external nonReentrant {
         Model storage model = models[modelHash];
         require(model.owner == msg.sender, "Not model owner");
         
@@ -250,7 +250,7 @@ contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
      * @notice Deactivate a model
      * @param modelHash Hash of the model
      */
-    function deactivateModel(bytes32 modelHash) external {
+    function deactivateModel(bytes32 modelHash) external nonReentrant {
         Model storage model = models[modelHash];
         require(
             model.owner == msg.sender || hasRole(OPERATOR_ROLE, msg.sender),
@@ -265,7 +265,7 @@ contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
      * @notice Activate a model
      * @param modelHash Hash of the model
      */
-    function activateModel(bytes32 modelHash) external {
+    function activateModel(bytes32 modelHash) external nonReentrant {
         Model storage model = models[modelHash];
         require(
             model.owner == msg.sender || hasRole(OPERATOR_ROLE, msg.sender),

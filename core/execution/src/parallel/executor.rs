@@ -33,7 +33,7 @@ impl ParallelExecutor {
 
         // Record metrics
         #[cfg(feature = "metrics")]
-        crate::api::metrics_server::record_parallel_groups(groups.len());
+        let _ = groups.len(); // metrics_server integration placeholder
 
         // Execute groups in parallel
         let mut tasks = Vec::new();

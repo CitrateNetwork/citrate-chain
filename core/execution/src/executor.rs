@@ -8,7 +8,6 @@ use crate::types::{
     AccessPolicy, Address, ExecutionError, GasSchedule, JobId, JobStatus, Log, ModelId,
     ModelMetadata, ModelState, TransactionReceipt, TransactionType,
 };
-use crate::vm::VM;
 use async_trait::async_trait;
 use hex;
 use citrate_consensus::types::{Block, Hash, Transaction};
@@ -1692,6 +1691,7 @@ impl Executor {
     }
 
     /// Scan bytecode for AI opcodes and execute them
+    #[allow(dead_code)]
     async fn scan_and_execute_ai_opcodes(
         &self,
         code: &[u8],
@@ -1740,6 +1740,7 @@ impl Executor {
     }
 
     /// Execute tensor operation
+    #[allow(dead_code)]
     async fn execute_tensor_operation(
         &self,
         input: &[u8],
@@ -1768,6 +1769,7 @@ impl Executor {
     }
 
     /// Execute model loading
+    #[allow(dead_code)]
     async fn execute_model_load(
         &self,
         input: &[u8],
@@ -1801,6 +1803,7 @@ impl Executor {
     }
 
     /// Execute model inference
+    #[allow(dead_code)]
     async fn execute_model_execution(
         &self,
         input: &[u8],
@@ -1832,6 +1835,7 @@ impl Executor {
     }
 
     /// Execute ZK proof generation
+    #[allow(dead_code)]
     async fn execute_zk_prove(
         &self,
         input: &[u8],
@@ -1854,6 +1858,7 @@ impl Executor {
     }
 
     /// Execute ZK proof verification
+    #[allow(dead_code)]
     async fn execute_zk_verify(
         &self,
         input: &[u8],

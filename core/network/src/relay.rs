@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Maximum relay payload size (1 MB).
 const MAX_RELAY_PAYLOAD: usize = 1_048_576;
@@ -23,6 +23,7 @@ const MAX_SESSIONS: usize = 1000;
 
 /// A relay session between two peers.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct RelaySession {
     /// The peer requesting relay service.
     requester: PeerId,

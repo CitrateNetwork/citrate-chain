@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // citrate/node/src/sync/efficient_sync.rs
 
 // Efficient, non-recursive sync implementation for GhostDAG

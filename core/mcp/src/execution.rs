@@ -397,8 +397,6 @@ impl ModelExecutor {
         &self,
         context: &ExecutionContext,
     ) -> Result<(Vec<u8>, TrainingMetrics, u64)> {
-        use sha3::{Digest, Sha3_256};
-
         // Extract current weights from training context
         let current_weights = match &context.execution_mode {
             ExecutionMode::Training { current_weights } => current_weights.clone(),

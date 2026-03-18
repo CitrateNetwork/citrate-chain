@@ -7,4 +7,5 @@
 
 mod efficient_sync;
 
-pub use efficient_sync::{EfficientSyncManager, ParallelSyncCoordinator, SyncResult};
+// Re-exports available if needed:
+// pub use efficient_sync::{EfficientSyncManager, ParallelSyncCoordinator, SyncResult};

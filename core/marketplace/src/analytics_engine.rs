@@ -21,7 +21,7 @@
 // ## Current Limitations
 // - Usage stats come from in-memory PerformanceTracker (lost on restart)
 // - Market stats require marketplace indexer to be configured
-// - No persistence layer for historical analytics (TODO: add time-series DB)
+// - No persistence layer for historical analytics (requires external time-series DB)
 //
 // ## Fail-Loud Behavior
 // The following methods return errors when data is unavailable:

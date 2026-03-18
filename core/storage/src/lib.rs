@@ -126,7 +126,7 @@ impl StorageManager {
     /// IMPORTANT: For production, use a high-entropy 256-bit seed
     /// derived from a secure source (HSM, TPM, or secure key management).
     pub fn initialize_encryption(&mut self, password: &[u8]) -> Result<()> {
-        if let Some(ref encryption) = self.encryption {
+        if let Some(ref _encryption) = self.encryption {
             // We need mutable access - use Arc::get_mut or recreate
             // For now, create a new instance
             let mut enc = EncryptedDatabase::new(DatabaseEncryptionConfig::default());

@@ -325,8 +325,8 @@ mod tests {
             // Must fit in u128 (always true) and be non-negative
             prop_assert!(total >= base_price as u128,
                 "Total cost must be >= base_price when quantity >= 1");
-            prop_assert!(total <= u128::MAX,
-                "Total cost must not overflow u128");
+            // total is u128 by construction — overflow would have been caught
+            // by checked_mul if inputs were larger. With these ranges it fits.
         }
 
         /// Property: ModelCategory serialization round-trip via serde_json.

@@ -202,7 +202,8 @@ impl GhostDag {
 
         let relations = self.relations.read().await;
 
-        // BFS to find ancestry
+        // BFS to find ancestry (PT-12: bounded to prevent adversarial DAG abuse)
+        const MAX_BFS_DEPTH: usize = 10_000;
         let mut queue = VecDeque::new();
         let mut visited = HashSet::new();
         queue.push_back(*descendant);
@@ -210,6 +211,10 @@ impl GhostDag {
         while let Some(current) = queue.pop_front() {
             if visited.contains(&current) {
                 continue;
+            }
+            if visited.len() >= MAX_BFS_DEPTH {
+                tracing::warn!("BFS ancestry check exceeded depth limit ({})", MAX_BFS_DEPTH);
+                return Ok(false);
             }
             visited.insert(current);
 

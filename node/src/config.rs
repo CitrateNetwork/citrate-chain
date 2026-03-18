@@ -155,6 +155,7 @@ impl Default for ValidatorConfig {
 
 impl ValidatorConfig {
     /// Create a production configuration that enforces validator presence
+    #[allow(dead_code)]
     pub fn production(validators: Vec<String>) -> Self {
         Self {
             production_mode: true,
@@ -392,7 +393,7 @@ mod tests {
         assert_eq!(config.chain.ghostdag_k, 18);
         assert_eq!(config.chain.genesis_hash, None);
 
-        assert_eq!(config.rpc.enabled, true);
+        assert!(config.rpc.enabled);
         assert_eq!(
             config.rpc.listen_addr,
             "127.0.0.1:8545".parse::<SocketAddr>().unwrap()
@@ -401,7 +402,7 @@ mod tests {
             config.rpc.ws_addr,
             "127.0.0.1:8546".parse::<SocketAddr>().unwrap()
         );
-        assert_eq!(config.rpc.allow_eth_send_transaction, false);
+        assert!(!config.rpc.allow_eth_send_transaction);
         assert!(config.rpc.cors_origins.is_empty());
 
         assert_eq!(config.network.max_peers, 50);
@@ -410,12 +411,12 @@ mod tests {
             "127.0.0.1:30303".parse::<SocketAddr>().unwrap()
         );
 
-        assert_eq!(config.mining.enabled, true);
+        assert!(config.mining.enabled);
         assert_eq!(config.mining.target_block_time, 5);
         assert_eq!(config.mining.min_gas_price, 1_000_000_000);
 
-        assert_eq!(config.vrf.strict_vrf, true);
-        assert_eq!(config.vrf.migration_mode, false);
+        assert!(config.vrf.strict_vrf);
+        assert!(!config.vrf.migration_mode);
     }
 
     #[test]
@@ -426,14 +427,14 @@ mod tests {
 
         assert_eq!(config.chain.chain_id, 40204);
         assert_eq!(config.mining.target_block_time, 2);
-        assert_eq!(config.mining.enabled, true);
-        assert_eq!(config.rpc.allow_eth_send_transaction, true);
+        assert!(config.mining.enabled);
+        assert!(config.rpc.allow_eth_send_transaction);
         assert_eq!(config.rpc.cors_origins, vec!["*".to_string()]);
         assert_eq!(
             config.rpc.listen_addr,
             "0.0.0.0:8545".parse::<SocketAddr>().unwrap()
         );
-        assert_eq!(config.vrf.strict_vrf, false);
+        assert!(!config.vrf.strict_vrf);
     }
 
     #[test]
@@ -474,7 +475,7 @@ mod tests {
         let validators = vec!["aabbccdd".to_string()];
         let config = ValidatorConfig::production(validators.clone());
 
-        assert_eq!(config.production_mode, true);
+        assert!(config.production_mode);
         assert_eq!(config.validators, validators);
         assert_eq!(config.ipfs_api_url, "http://127.0.0.1:5001");
         assert_eq!(config.check_interval_secs, 3600);

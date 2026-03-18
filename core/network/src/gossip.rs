@@ -31,6 +31,7 @@ const SCORE_VALID_BLOCK: i32 = 1;
 const SCORE_VALID_TX: i32 = 1;
 
 /// Peer sent excessive duplicate messages (spamming).
+#[allow(dead_code)]
 const SCORE_EXCESSIVE_DUPLICATES: i32 = -5;
 
 #[derive(Debug, Clone)]

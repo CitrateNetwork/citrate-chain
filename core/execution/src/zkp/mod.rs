@@ -19,5 +19,5 @@ pub mod verifier;
 
 pub use backend::ZKPBackend;
 pub use prover::Prover;
-pub use types::{Proof, ProvingKey, VerifyingKey, ZKPError};
+pub use types::{Proof, ProofType, ProvingKey, VerifyingKey, ZKPError};
 pub use verifier::Verifier;

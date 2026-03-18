@@ -2,7 +2,7 @@
 
 use crate::methods::ai::{AiApi, ChatCompletionRequest, EmbeddingsRequest};
 use futures::executor::block_on;
-use jsonrpc_core::{IoHandler, Params, Value};
+use jsonrpc_core::{IoHandler, Params};
 use citrate_execution::executor::Executor;
 use citrate_sequencer::mempool::Mempool;
 use citrate_storage::StorageManager;

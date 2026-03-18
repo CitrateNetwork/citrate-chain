@@ -4,7 +4,7 @@
 // When a NoiseKeypair is provided, all connections perform a Noise handshake first,
 // then run the application Hello/HelloAck over the encrypted channel.
 
-use crate::noise::{self, NoiseKeypair, NoiseSession};
+use crate::noise::{self, NoiseKeypair};
 use crate::peer::{Direction, Peer, PeerId, PeerInfo, PeerManager};
 use crate::protocol::{NetworkMessage, ProtocolVersion};
 use crate::NetworkError;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Parameters sent during handshake
 #[derive(Debug, Clone)]
@@ -91,6 +91,16 @@ impl NetworkTransport {
             loop {
                 match listener.accept().await {
                     Ok((stream, remote)) => {
+                        // PT-11: Reject inbound connections before Noise handshake
+                        // when at capacity, preventing CPU-expensive handshake flooding
+                        let (total, _inbound, _outbound) = pm.get_peer_counts().await;
+                        if total >= pm.max_peers() {
+                            debug!("Rejecting inbound from {} — at capacity ({}/{})",
+                                   remote, total, pm.max_peers());
+                            drop(stream);
+                            continue;
+                        }
+
                         let pm = pm.clone();
                         let local_id = local_id.clone();
                         let params = params.clone();

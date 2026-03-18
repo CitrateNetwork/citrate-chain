@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 // Import CoreML bridge only on macOS
 #[cfg(target_os = "macos")]
@@ -229,6 +230,7 @@ impl MetalRuntime {
             .collect();
 
         // Run inference through CoreML
+        let start = Instant::now();
         let output = CoreMLInference::execute(
             &model_path,
             _input.to_vec(),
@@ -236,7 +238,7 @@ impl MetalRuntime {
         ).await?;
 
         // Update performance stats
-        let inference_time_ms = 5.0; // TODO: Measure actual time
+        let inference_time_ms = start.elapsed().as_secs_f64() * 1000.0;
         tracing::info!("CoreML inference completed in {:.2}ms on {:?}",
                    inference_time_ms, self.capabilities.chip_type);
 

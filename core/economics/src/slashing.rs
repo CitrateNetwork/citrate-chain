@@ -10,8 +10,6 @@ use citrate_execution::types::Address;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 
-use crate::token::DECIMALS;
-
 /// Slashing offense types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlashingOffense {
@@ -176,6 +174,7 @@ impl InstitutionalSlashingManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::token::DECIMALS;
 
     fn test_address() -> Address {
         Address([0x22; 20])

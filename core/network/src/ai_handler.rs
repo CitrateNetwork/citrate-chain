@@ -700,6 +700,7 @@ impl AINetworkHandler {
     }
 
     /// Retrieve input data for inference from off-chain storage
+    #[allow(dead_code)]
     async fn retrieve_input_data(&self, input_hash: &Hash) -> Result<Vec<f32>> {
         // In production, this would:
         // 1. Look up the input data location by hash (IPFS CID, Arweave TX, etc.)
