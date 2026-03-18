@@ -53,3 +53,7 @@ tokio-test = "0.4"
 [[test]]
 name = "integration_tests"
 path = "tests/integration_tests.rs"
+
+[[test]]
+name = "coverage_tests"
+path = "tests/coverage_tests.rs"
