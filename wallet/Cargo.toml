@@ -49,6 +49,7 @@ reqwest = { version = "0.11", features = ["json"] }
 [dev-dependencies]
 tempfile = "3.10"
 tokio-test = "0.4"
+argon2 = "0.5"
 
 [[test]]
 name = "integration_tests"
@@ -57,3 +58,7 @@ path = "tests/integration_tests.rs"
 [[test]]
 name = "coverage_tests"
 path = "tests/coverage_tests.rs"
+
+[[test]]
+name = "known_answer_tests"
+path = "tests/known_answer_tests.rs"
