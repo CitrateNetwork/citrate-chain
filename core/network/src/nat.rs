@@ -183,7 +183,7 @@ fn parse_mapped_address(value: &[u8]) -> Option<SocketAddr> {
 
 /// Detect NAT type and external address using STUN.
 pub async fn detect_nat(local_bind: Option<SocketAddr>) -> NatInfo {
-    let bind_addr = local_bind.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+    let bind_addr = local_bind.unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid hardcoded address"));
 
     let socket = match UdpSocket::bind(bind_addr).await {
         Ok(s) => s,

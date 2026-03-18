@@ -289,7 +289,7 @@ impl ModelManager {
         // Save metadata
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock is before UNIX epoch")
             .as_secs();
 
         let metadata = PinnedModelMetadata {

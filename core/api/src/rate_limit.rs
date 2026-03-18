@@ -329,7 +329,7 @@ impl RequestMiddleware for RateLimiter {
 
         // WP-K.3: Periodically evict stale buckets to prevent unbounded growth
         {
-            let mut last = self.last_eviction.lock().unwrap();
+            let mut last = self.last_eviction.lock().expect("eviction lock poisoned");
             if now.duration_since(*last) >= std::time::Duration::from_secs(EVICTION_INTERVAL_SECS) {
                 *last = now;
                 drop(last); // Release lock before eviction

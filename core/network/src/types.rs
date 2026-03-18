@@ -81,7 +81,7 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:30303".parse().unwrap(),
+            listen_addr: "0.0.0.0:30303".parse().expect("valid default address"),
             bootstrap_nodes: Vec::new(),
             max_peers: 50,
             max_inbound: 30,

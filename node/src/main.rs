@@ -433,7 +433,7 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
     use model_manager::{ModelManager, ModelManagerConfig};
 
     let models_dir = data_dir.clone()
-        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".citrate"))
+        .unwrap_or_else(|| dirs::home_dir().expect("home directory must exist").join(".citrate"))
         .join("models");
 
     let config = ModelManagerConfig {
@@ -522,7 +522,7 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
         ModelCommands::AutoPin { data_dir: cmd_data_dir } => {
             let _data_dir = cmd_data_dir
                 .or(data_dir)
-                .unwrap_or_else(|| dirs::home_dir().unwrap().join(".citrate"));
+                .unwrap_or_else(|| dirs::home_dir().expect("home directory must exist").join(".citrate"));
 
             info!("Initializing genesis to get required models...");
 
@@ -994,7 +994,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     if metrics_enabled {
         let addr_str =
             std::env::var("CITRATE_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9100".to_string());
-        let addr: std::net::SocketAddr = addr_str.parse().unwrap();
+        let addr: std::net::SocketAddr = addr_str.parse().expect("valid metrics listen address");
         tokio::spawn(async move {
             if let Err(e) = citrate_api::metrics_server::MetricsServer::new(addr)
                 .start()

@@ -119,7 +119,7 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.expect("cannot bind faucet to port 3001");
 
     info!("Faucet listening on http://0.0.0.0:3001");
     info!("Request test tokens: POST /faucet with {{\"address\": \"0x...\"}}");

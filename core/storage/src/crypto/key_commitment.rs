@@ -139,18 +139,18 @@ impl KeyCommitment {
         }
 
         let version = bytes[0];
-        let key_version = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+        let key_version = u32::from_be_bytes(bytes[1..5].try_into().expect("4-byte slice for u32"));
         let purpose = bytes[5];
 
         let mut commitment = [0u8; 32];
         commitment.copy_from_slice(&bytes[6..38]);
 
-        let timestamp = u64::from_be_bytes(bytes[38..46].try_into().unwrap());
+        let timestamp = u64::from_be_bytes(bytes[38..46].try_into().expect("8-byte slice for u64"));
 
         let mut node_id = [0u8; 32];
         node_id.copy_from_slice(&bytes[46..78]);
 
-        let sig_len = u16::from_be_bytes(bytes[78..80].try_into().unwrap()) as usize;
+        let sig_len = u16::from_be_bytes(bytes[78..80].try_into().expect("2-byte slice for u16")) as usize;
         let signature = if bytes.len() >= 80 + sig_len {
             bytes[80..80 + sig_len].to_vec()
         } else {

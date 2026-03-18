@@ -224,7 +224,7 @@ impl ExecutionVerifier {
         // Try nonce-enhanced format first (72+ bytes)
         if proof_data.len() >= 72 {
             let nonce_bytes = &proof_data[64..72];
-            let nonce_ts = u64::from_le_bytes(nonce_bytes.try_into().unwrap());
+            let nonce_ts = u64::from_le_bytes(nonce_bytes.try_into().expect("nonce slice is exactly 8 bytes"));
 
             // Replay protection: reject nonce timestamps >5 minutes old or in the future
             let now = chrono::Utc::now().timestamp() as u64;

@@ -114,7 +114,7 @@ impl RocksDB {
         Ok(self
             .db
             .iterator_cf(&cf_handle, rocksdb::IteratorMode::Start)
-            .map(|r| r.unwrap()))
+            .map(|r| r.expect("RocksDB iterator item")))
     }
 
     /// Get iterator with prefix for a column family
@@ -127,7 +127,7 @@ impl RocksDB {
         Ok(self
             .db
             .prefix_iterator_cf(&cf_handle, prefix)
-            .map(|r| r.unwrap()))
+            .map(|r| r.expect("RocksDB iterator item")))
     }
 
     /// Compact a column family
