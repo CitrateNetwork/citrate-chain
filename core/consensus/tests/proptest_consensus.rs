@@ -1,14 +1,19 @@
 // Property-based tests for citrate-consensus crate.
-// Tests fundamental invariants of the GhostDAG consensus types
-// using the proptest framework with the `proptest!` macro.
+//
+// Sprint NN: Replaced tautological tests (asserting u64 >= 0, x+1 > x, etc.)
+// with meaningful property tests that exercise actual consensus invariants
+// using real DAG construction and blue set calculation.
 
 use proptest::prelude::*;
+use std::sync::Arc;
 
 use citrate_consensus::{
     Block, BlockHeader, CheckpointConfig, GhostDagParams,
     Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_consensus::checkpoint::CommitteeSelector;
+use citrate_consensus::dag_store::DagStore;
+use citrate_consensus::ghostdag::GhostDag;
 
 /// Helper: build a minimal valid Block from raw byte arrays for property tests.
 fn make_block(
@@ -34,6 +39,49 @@ fn make_block(
             proposer_pubkey: PublicKey::new([0; 32]),
             vrf_reveal: VrfProof {
                 proof: vrf_proof_bytes,
+                output: Hash::default(),
+            },
+            base_fee_per_gas: 0,
+            gas_used: 0,
+            gas_limit: 30_000_000,
+        },
+        state_root: Hash::default(),
+        tx_root: Hash::default(),
+        receipt_root: Hash::default(),
+        artifact_root: Hash::default(),
+        ghostdag_params: GhostDagParams::default(),
+        transactions: vec![],
+        signature: Signature::new([0; 64]),
+        embedded_models: vec![],
+        required_pins: vec![],
+        learning_embedding: None,
+        learning_confidence: None,
+        gradient_commitment: None,
+    }
+}
+
+/// Helper: build a DAG-compatible block with proper consensus fields.
+fn make_dag_block(
+    hash_bytes: [u8; 32],
+    selected_parent: Hash,
+    merge_parents: Vec<Hash>,
+    height: u64,
+    blue_score: u64,
+) -> Block {
+    Block {
+        header: BlockHeader {
+            version: 1,
+            block_hash: Hash::new(hash_bytes),
+            selected_parent_hash: selected_parent,
+            merge_parent_hashes: merge_parents,
+            timestamp: height,
+            height,
+            blue_score,
+            blue_work: 0,
+            pruning_point: Hash::default(),
+            proposer_pubkey: PublicKey::new([0; 32]),
+            vrf_reveal: VrfProof {
+                proof: vec![],
                 output: Hash::default(),
             },
             base_fee_per_gas: 0,
@@ -84,6 +132,42 @@ fn make_tx(
     }
 }
 
+/// Deterministic hash from seed + index.
+fn hash_for(seed: u64, index: u64) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    let val = seed.wrapping_mul(31).wrapping_add(index);
+    h[0..8].copy_from_slice(&val.to_le_bytes());
+    h[8..16].copy_from_slice(&index.to_le_bytes());
+    h[31] = 0xDD;
+    h
+}
+
+/// Build a linear chain of n blocks on top of genesis, returning
+/// (ghostdag, dag_store, all_hashes_including_genesis).
+async fn build_chain(n: usize, seed: u64) -> (GhostDag, Arc<DagStore>, Vec<Hash>) {
+    let params = GhostDagParams::default();
+    let dag_store = Arc::new(DagStore::new());
+    let ghostdag = GhostDag::new(params, dag_store.clone());
+
+    // Genesis
+    let genesis = make_dag_block([0xFF; 32], Hash::default(), vec![], 0, 0);
+    dag_store.store_block(genesis.clone()).await.unwrap();
+    ghostdag.add_block(&genesis).await.unwrap();
+
+    let mut hashes = vec![genesis.hash()];
+    let mut prev = genesis.hash();
+
+    for i in 0..n {
+        let block = make_dag_block(hash_for(seed, i as u64), prev, vec![], (i + 1) as u64, (i + 1) as u64);
+        dag_store.store_block(block.clone()).await.unwrap();
+        ghostdag.add_block(&block).await.unwrap();
+        hashes.push(block.hash());
+        prev = block.hash();
+    }
+
+    (ghostdag, dag_store, hashes)
+}
+
 proptest! {
     // -----------------------------------------------------------------------
     // 1. Hash uniqueness — different inputs produce different Hash values.
@@ -94,7 +178,6 @@ proptest! {
         let hb: [u8; 32] = b.as_slice().try_into().unwrap();
         let hash_a = Hash::new(ha);
         let hash_b = Hash::new(hb);
-        // If inputs differ, hashes must differ (hashes are identity-wrapping [u8;32])
         if ha != hb {
             prop_assert_ne!(hash_a, hash_b);
         } else {
@@ -115,16 +198,33 @@ proptest! {
     }
 
     // -----------------------------------------------------------------------
-    // 3. Block height monotonicity — child height > parent height.
+    // 3. REPLACED: proptest_genesis_always_blue
+    //    For random-length linear chains, genesis is always in the blue set
+    //    of every block. This exercises real DAG construction and blue set
+    //    calculation, unlike the old tautological height test.
     // -----------------------------------------------------------------------
     #[test]
-    fn block_height_monotonicity(parent_height in 0u64..u64::MAX - 1) {
-        let child_height = parent_height + 1;
-        prop_assert!(child_height > parent_height, "child height must exceed parent height");
+    fn proptest_genesis_always_blue(n in 1..12usize, seed in 1..1000u64) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (ghostdag, dag_store, hashes) = build_chain(n, seed).await;
+            let genesis_hash = hashes[0];
+
+            for hash in &hashes {
+                let block = dag_store.get_block(hash).await.unwrap();
+                let blue_set = ghostdag.calculate_blue_set(&block).await.unwrap();
+                prop_assert!(
+                    blue_set.contains(&genesis_hash),
+                    "Genesis must be in the blue set of block {:?} (chain len={})",
+                    hash, n
+                );
+            }
+            Ok(())
+        })?;
     }
 
     // -----------------------------------------------------------------------
-    // 4. Transaction hash determinism — same content → same hash.
+    // 4. Transaction hash determinism — same content -> same hash.
     // -----------------------------------------------------------------------
     #[test]
     fn transaction_hash_determinism(
@@ -161,13 +261,28 @@ proptest! {
     }
 
     // -----------------------------------------------------------------------
-    // 6. Blue score non-negativity — blue_score always >= 0 (u64 is inherently non-negative).
+    // 6. REPLACED: proptest_blue_score_monotonic
+    //    For any linear chain extension, blue score >= parent's blue score.
+    //    This exercises real blue score computation on random chain lengths.
     // -----------------------------------------------------------------------
     #[test]
-    fn blue_score_non_negative(score in any::<u64>()) {
-        let block = make_block([1; 32], [0; 32], 1, score, 100, vec![], vec![]);
-        // u64 is always >= 0, but confirm the accessor returns the expected value
-        prop_assert_eq!(block.blue_score(), score);
+    fn proptest_blue_score_monotonic(n in 2..15usize, seed in 1..1000u64) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (ghostdag, _dag_store, hashes) = build_chain(n, seed).await;
+            let mut prev_score = 0u64;
+
+            for hash in &hashes {
+                let score = ghostdag.get_blue_score(hash).await.unwrap();
+                prop_assert!(
+                    score >= prev_score,
+                    "Blue score must be monotonically non-decreasing: {} -> {} at {:?}",
+                    prev_score, score, hash
+                );
+                prev_score = score;
+            }
+            Ok(())
+        })?;
     }
 
     // -----------------------------------------------------------------------
@@ -189,30 +304,40 @@ proptest! {
     }
 
     // -----------------------------------------------------------------------
-    // 8. Merge parent count bound — merge parents <= max_parents.
+    // 8. REPLACED: proptest_no_dag_cycles
+    //    For any sequence of block additions to a linear chain, the DAG
+    //    store must never contain cycles. We verify by checking that
+    //    walking parents from any block eventually reaches genesis without
+    //    revisiting a block.
     // -----------------------------------------------------------------------
     #[test]
-    fn merge_parent_count_bounded(
-        num_parents in 0usize..20,
-        max_parents in 1usize..30,
-    ) {
-        let merge: Vec<[u8; 32]> = (0..num_parents).map(|i| {
-            let mut h = [0u8; 32];
-            h[0] = i as u8;
-            h
-        }).collect();
+    fn proptest_no_dag_cycles(n in 1..15usize, seed in 1..1000u64) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (_ghostdag, dag_store, hashes) = build_chain(n, seed).await;
 
-        let block = make_block([1; 32], [0; 32], 1, 0, 100, merge.clone(), vec![]);
-        let actual = block.header.merge_parent_hashes.len();
+            // For each block, walk back via selected_parent and verify no cycles
+            for hash in &hashes {
+                let mut visited = std::collections::HashSet::new();
+                let mut current = *hash;
 
-        // This is the invariant that a block builder must enforce.
-        // We test the check rather than enforce it structurally.
-        if actual <= max_parents {
-            prop_assert!(actual <= max_parents);
-        } else {
-            // When a block exceeds max_parents, it violates the invariant
-            prop_assert!(actual > max_parents);
-        }
+                loop {
+                    prop_assert!(
+                        !visited.contains(&current),
+                        "Cycle detected: block {:?} visited twice while walking from {:?}",
+                        current, hash
+                    );
+                    visited.insert(current);
+
+                    let block = dag_store.get_block(&current).await.unwrap();
+                    if block.is_genesis() {
+                        break;
+                    }
+                    current = block.selected_parent();
+                }
+            }
+            Ok(())
+        })?;
     }
 
     // -----------------------------------------------------------------------
@@ -232,7 +357,6 @@ proptest! {
     fn pubkey_to_hash_determinism(pk_bytes in prop::collection::vec(any::<u8>(), 32)) {
         let arr: [u8; 32] = pk_bytes.as_slice().try_into().unwrap();
         let pk = PublicKey::new(arr);
-        // Two identical public keys must yield identical hex representations
         let hex1 = format!("{:?}", pk);
         let pk2 = PublicKey::new(arr);
         let hex2 = format!("{:?}", pk2);
@@ -259,7 +383,6 @@ proptest! {
             .collect();
         let seed = Hash::new(seed_bytes.as_slice().try_into().unwrap());
         let committee = CommitteeSelector::select(&validators, 100, &seed, committee_size);
-        // Committee size is min(committee_size, num_validators)
         let expected_max = committee_size.min(num_validators);
         prop_assert_eq!(
             committee.len(), expected_max,
@@ -274,7 +397,6 @@ proptest! {
     #[test]
     fn checkpoint_quorum_requirement(vote_count in 0usize..200) {
         let config = CheckpointConfig::default();
-        // Default quorum_threshold is 67
         let quorum_met = vote_count >= config.quorum_threshold;
         if vote_count >= 67 {
             prop_assert!(quorum_met, "67+ votes must meet quorum");
@@ -284,29 +406,7 @@ proptest! {
     }
 
     // -----------------------------------------------------------------------
-    // 13. Block timestamp monotonicity in chains.
-    // -----------------------------------------------------------------------
-    #[test]
-    fn block_timestamp_monotonicity(
-        ts_parent in 0u64..u64::MAX - 1,
-        delta in 1u64..1_000_000,
-    ) {
-        let ts_child = ts_parent.saturating_add(delta);
-        prop_assert!(ts_child >= ts_parent, "Child timestamp must be >= parent timestamp");
-    }
-
-    // -----------------------------------------------------------------------
-    // 14. Transaction nonce non-negative (u64 is inherently non-negative).
-    // -----------------------------------------------------------------------
-    #[test]
-    fn transaction_nonce_non_negative(nonce in any::<u64>()) {
-        let tx = make_tx([0; 32], nonce, [1; 32], 0, 0, vec![]);
-        // u64 is always >= 0; verify we stored it correctly
-        prop_assert_eq!(tx.nonce, nonce);
-    }
-
-    // -----------------------------------------------------------------------
-    // 15. GhostDagParams clone equality.
+    // 13. GhostDagParams clone equality.
     // -----------------------------------------------------------------------
     #[test]
     fn ghostdag_params_clone_equality(
@@ -327,5 +427,42 @@ proptest! {
         prop_assert_eq!(cloned.finality_depth, params.finality_depth);
         prop_assert_eq!(cloned.max_blue_score_diff, params.max_blue_score_diff);
         prop_assert_eq!(cloned.pruning_window, params.pruning_window);
+    }
+
+    // -----------------------------------------------------------------------
+    // 14. Blue set always contains the block itself.
+    //     For any block in a random linear chain, its own hash must be
+    //     in its blue set.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn proptest_blue_set_contains_self(n in 1..12usize, seed in 1..1000u64) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (ghostdag, dag_store, hashes) = build_chain(n, seed).await;
+            for hash in &hashes {
+                let block = dag_store.get_block(hash).await.unwrap();
+                let blue_set = ghostdag.calculate_blue_set(&block).await.unwrap();
+                prop_assert!(
+                    blue_set.contains(hash),
+                    "Block {:?} must be in its own blue set",
+                    hash
+                );
+            }
+            Ok(())
+        })?;
+    }
+
+    // -----------------------------------------------------------------------
+    // 15. compute_hash determinism — same block always produces same hash.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn compute_hash_determinism(
+        height in 0u64..10_000,
+        blue_score in 0u64..10_000,
+    ) {
+        let block = make_block([0xCC; 32], [0xDD; 32], height, blue_score, 100, vec![], vec![]);
+        let hash1 = block.compute_hash();
+        let hash2 = block.compute_hash();
+        prop_assert_eq!(hash1, hash2, "compute_hash must be deterministic");
     }
 }
