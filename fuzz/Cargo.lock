@@ -971,6 +971,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "dashmap",
+ "ed25519-dalek",
+ "hex",
+ "parking_lot 0.12.5",
+ "primitive-types",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha3",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "citrate-consensus"
 version = "0.1.0"
 dependencies = [
@@ -1067,13 +1088,17 @@ version = "0.0.0"
 dependencies = [
  "bincode",
  "citrate-api",
+ "citrate-bridge",
  "citrate-consensus",
  "citrate-execution",
  "citrate-network",
+ "citrate-sequencer",
  "hex",
  "libfuzzer-sys",
  "serde",
  "serde_json",
+ "sha3",
+ "tokio",
  "toml 0.8.23",
 ]
 
