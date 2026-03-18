@@ -1,5 +1,5 @@
 ------------------------------ MODULE VRFChainContinuity ------------------------------
-EXTENDS Naturals, FiniteSets, TLC
+EXTENDS Naturals, FiniteSets, Sequences, TLC
 
 \* Models VRF output chaining across blocks: each block's VRF alpha input
 \* includes the parent block's VRF output, ensuring an unbroken verifiable

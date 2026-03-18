@@ -1,0 +1,24 @@
+[Unit]
+Description=Citrate IPFS Daemon
+Documentation=https://docs.citrate.ai
+After=network-online.target
+Wants=network-online.target
+Before=citrate-node.service
+
+[Service]
+Type=simple
+User=citrate
+Group=citrate
+ExecStart=/usr/bin/ipfs daemon
+WorkingDirectory=/var/lib/citrate
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=citrate-ipfs
+
+Environment=IPFS_PATH=/var/lib/citrate/ipfs
+
+[Install]
+WantedBy=multi-user.target

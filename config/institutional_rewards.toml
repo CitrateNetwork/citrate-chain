@@ -1,0 +1,56 @@
+# Citrate Institutional Reward Configuration
+# Used by school node pilot operators
+# See: core/economics/src/institutional.rs
+
+[rewards]
+# Block validation: base monthly SALT earned for participating in consensus
+block_validation_monthly_salt = 150
+
+# Uptime bonus multiplier: applied when uptime > min threshold
+# 1.2 means 20% bonus at 100% uptime, scaling linearly from threshold
+uptime_bonus_multiplier = 1.2
+
+# Model hosting: SALT earned per model hosted per 30-day epoch
+model_hosting_per_model_salt = 25
+
+# Adapter creation: SALT earned per LoRA adapter published
+adapter_creation_salt = 10
+
+# Data provision: SALT earned per dataset contributed per epoch
+data_provision_per_dataset_salt = 5
+
+# Minimum uptime ratio to qualify for any rewards (0.0-1.0)
+# Below this threshold, no rewards are earned for the epoch
+min_uptime_threshold = 0.90
+
+# Maximum models that earn hosting rewards per operator per epoch
+max_rewarded_models = 10
+
+# Maximum adapters that earn creation rewards per epoch
+max_rewarded_adapters_per_epoch = 20
+
+# Maximum datasets that earn provision rewards per epoch
+max_rewarded_datasets_per_epoch = 50
+
+[slashing]
+# Equivocation (signing conflicting blocks): penalty as percentage of stake
+equivocation_penalty_pct = 10
+
+# Invalid state transition: penalty percentage
+invalid_state_penalty_pct = 15
+
+# Transaction censorship: penalty percentage
+censorship_penalty_pct = 5
+
+# Grace period: first-offense epochs before slashing applies
+first_offense_grace_epochs = 2
+
+# Cooldown: epochs after slash before operator can be slashed again
+cooldown_epochs = 1
+
+# Maximum cumulative slash before forced deactivation
+max_cumulative_slash_pct = 50
+
+# IMPORTANT: Schools are NOT penalized for scheduled downtime
+# (maintenance windows, power outages, summer breaks)
+penalize_downtime = false

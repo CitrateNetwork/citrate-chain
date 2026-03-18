@@ -1,5 +1,5 @@
 ------------------------------ MODULE TransactionExecution ------------------------------
-EXTENDS Naturals, FiniteSets, Sequences, TLC
+EXTENDS Naturals, Integers, FiniteSets, Sequences, TLC
 
 \* Models EVM transaction execution: submission, validation, execution,
 \* commit, and revert with gas accounting and balance conservation.
