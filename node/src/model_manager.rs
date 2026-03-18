@@ -41,6 +41,7 @@ pub struct PinnedModelMetadata {
 
 /// Configuration for model manager
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ModelManagerConfig {
     /// IPFS API endpoint
     pub ipfs_api_url: String,

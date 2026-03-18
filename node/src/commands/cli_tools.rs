@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use clap::Subcommand;
-use citrate_cli::commands::{account, advanced, contract, governance, model, network, wizard};
+use citrate_cli::commands::{account, advanced, contract, governance, network, wizard};
 use citrate_cli::config::Config as CliConfig;
 use std::path::PathBuf;
 
@@ -42,6 +42,7 @@ pub enum CliToolCommands {
     },
 }
 
+#[allow(dead_code)]
 pub async fn execute(
     cmd: CliToolCommands,
     config_path: Option<PathBuf>,

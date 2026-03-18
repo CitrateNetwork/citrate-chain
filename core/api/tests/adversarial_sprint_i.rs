@@ -10,7 +10,7 @@
 //   I.4:  Method-level resource budgets — expensive methods consume more budget
 
 use citrate_api::rate_limit::{
-    check_method_budget, default_method_cost, is_operator_authenticated, RateLimitConfig,
+    default_method_cost, is_operator_authenticated, RateLimitConfig,
     RateLimiter,
 };
 use jsonrpc_http_server::hyper::{self, Body};

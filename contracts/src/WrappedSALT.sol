@@ -105,7 +105,7 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
     }
 
     /// @notice Deposit via receive
-    receive() external payable {
+    receive() external payable nonReentrant {
         balanceOf[msg.sender] += msg.value;
         totalSupply += msg.value;
         emit Deposit(msg.sender, msg.value);

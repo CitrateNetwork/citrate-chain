@@ -520,7 +520,7 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
         }
 
         ModelCommands::AutoPin { data_dir: cmd_data_dir } => {
-            let data_dir = cmd_data_dir
+            let _data_dir = cmd_data_dir
                 .or(data_dir)
                 .unwrap_or_else(|| dirs::home_dir().unwrap().join(".citrate"));
 
@@ -765,7 +765,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     }
 
     // Record node start time for uptime tracking
-    let node_start_time = std::time::Instant::now();
+    let _node_start_time = std::time::Instant::now();
 
     // Create storage
     let storage = Arc::new(StorageManager::new(
@@ -1785,6 +1785,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn load_or_create_peer_id(data_dir: &std::path::Path) -> anyhow::Result<citrate_network::peer::PeerId> {
     use std::fs;
     use std::io::Write;

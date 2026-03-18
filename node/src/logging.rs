@@ -27,7 +27,7 @@ use tracing_subscriber::{
     fmt::format::FmtSpan,
     layer::SubscriberExt,
     util::SubscriberInitExt,
-    EnvFilter, Layer,
+    EnvFilter,
 };
 
 /// Counter for generating unique trace IDs

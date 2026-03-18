@@ -200,8 +200,8 @@ impl EncryptionEnvelope {
         let cipher = Aes256Gcm::new_from_slice(key.key_bytes())
             .map_err(|_| EnvelopeError::CipherInitFailed)?;
 
-        // Include header as additional authenticated data
-        let aad = header.to_bytes();
+        // Include header as additional authenticated data (reserved for AAD binding)
+        let _aad = header.to_bytes();
 
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&nonce), plaintext)

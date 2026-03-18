@@ -6,6 +6,7 @@ use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
 use rlp::{DecoderError, Rlp, RlpStream};
 use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, Secp256k1};
 use sha3::{Digest, Keccak256};
+use tracing::debug;
 
 /// Legacy Ethereum transaction structure for RLP decoding
 #[derive(Debug)]
@@ -40,6 +41,8 @@ impl LegacyTransaction {
                 let to_bytes: Vec<u8> = rlp.val_at(3)?;
                 if to_bytes.is_empty() {
                     None
+                } else if to_bytes.len() != 20 {
+                    return Err(rlp::DecoderError::Custom("invalid to address length"));
                 } else {
                     Some(H160::from_slice(&to_bytes))
                 }
@@ -55,8 +58,8 @@ impl LegacyTransaction {
 
 /// Decode an Ethereum-style RLP transaction into Citrate transaction format
 pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
-    eprintln!("Decoding {} bytes of transaction data", tx_bytes.len());
-    eprintln!("First 20 bytes: {:?}", &tx_bytes[..tx_bytes.len().min(20)]);
+    debug!("Decoding {} bytes of transaction data", tx_bytes.len());
+    debug!("First 20 bytes: {:?}", &tx_bytes[..tx_bytes.len().min(20)]);
 
     // Check if this might be an Ethereum transaction (starts with certain patterns)
     if tx_bytes.is_empty() {
@@ -70,7 +73,7 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
     let mut hash_bytes = [0u8; 32];
     hash_bytes.copy_from_slice(&hash_result);
 
-    eprintln!("Calculated transaction hash: 0x{}", hex::encode(hash_bytes));
+    debug!("Calculated transaction hash: 0x{}", hex::encode(hash_bytes));
 
     // Handle typed transactions (EIP-2718). 0x02 = EIP-1559, 0x01 = EIP-2930
     // Try these BEFORE bincode to prevent RLP bytes from accidentally
@@ -90,12 +93,12 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
         // Try to decode as legacy transaction
         match LegacyTransaction::decode(&rlp) {
             Ok(legacy_tx) => {
-                eprintln!("Successfully decoded legacy Ethereum transaction");
-                eprintln!("  Nonce: {}", legacy_tx.nonce);
-                eprintln!("  Gas limit: {}", legacy_tx.gas_limit);
-                eprintln!("  To: {:?}", legacy_tx.to);
-                eprintln!("  Value: {}", legacy_tx.value);
-                eprintln!("  Data length: {}", legacy_tx.data.len());
+                debug!("Successfully decoded legacy Ethereum transaction");
+                debug!("  Nonce: {}", legacy_tx.nonce);
+                debug!("  Gas limit: {}", legacy_tx.gas_limit);
+                debug!("  To: {:?}", legacy_tx.to);
+                debug!("  Value: {}", legacy_tx.value);
+                debug!("  Data length: {}", legacy_tx.data.len());
 
                 // Determine chain ID and recovery ID from v value
                 // EIP-155: v = chainId * 2 + 35 + {0,1}
@@ -104,7 +107,7 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
                     // EIP-155 transaction
                     let chain_id = (legacy_tx.v - 35) / 2;
                     let recovery_id = ((legacy_tx.v - 35) % 2) as i32;
-                    eprintln!(
+                    debug!(
                         "  EIP-155 transaction: chain_id={}, recovery_id={}",
                         chain_id, recovery_id
                     );
@@ -112,10 +115,10 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
                 } else if legacy_tx.v == 27 || legacy_tx.v == 28 {
                     // Pre-EIP-155 transaction
                     let recovery_id = (legacy_tx.v - 27) as i32;
-                    eprintln!("  Pre-EIP-155 transaction: recovery_id={}", recovery_id);
+                    debug!("  Pre-EIP-155 transaction: recovery_id={}", recovery_id);
                     (recovery_id, None)
                 } else {
-                    eprintln!("  Invalid v value: {}", legacy_tx.v);
+                    debug!("  Invalid v value: {}", legacy_tx.v);
                     return Err(format!("Invalid v value: {}", legacy_tx.v));
                 };
 
@@ -151,7 +154,7 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
 
                 let signable_data = stream.out().to_vec();
                 let sighash = Keccak256::digest(&signable_data);
-                eprintln!("  Signature hash: 0x{}", hex::encode(sighash));
+                debug!("  Signature hash: 0x{}", hex::encode(sighash));
 
                 // Recover the sender's public key and address
                 let secp = Secp256k1::new();
@@ -161,8 +164,8 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
                 rs_bytes[..32].copy_from_slice(legacy_tx.r.as_bytes());
                 rs_bytes[32..].copy_from_slice(legacy_tx.s.as_bytes());
 
-                eprintln!("  Signature R: 0x{}", hex::encode(&rs_bytes[..32]));
-                eprintln!("  Signature S: 0x{}", hex::encode(&rs_bytes[32..]));
+                debug!("  Signature R: 0x{}", hex::encode(&rs_bytes[..32]));
+                debug!("  Signature S: 0x{}", hex::encode(&rs_bytes[32..]));
 
                 // Recover the sender address from signature (fail-closed: C-03).
                 // Any failure in the recovery chain returns Err — never fabricate fallback addresses.
@@ -187,11 +190,11 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
                 let mut addr_bytes = [0u8; 20];
                 addr_bytes.copy_from_slice(&hash[12..]);
                 let from_addr = H160::from_slice(&addr_bytes);
-                eprintln!(
+                debug!(
                     "  Recovered address: 0x{}",
                     hex::encode(from_addr.as_bytes())
                 );
-                eprintln!("  From address: 0x{}", hex::encode(from_addr.as_bytes()));
+                debug!("  From address: 0x{}", hex::encode(from_addr.as_bytes()));
 
                 // Convert addresses to PublicKey format by embedding 20 bytes in 32-byte field
                 let mut from_pk_bytes = [0u8; 32];
@@ -243,15 +246,15 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
                 // Determine transaction type from data
                 tx.determine_type();
 
-                eprintln!("Successfully converted to Citrate transaction format");
-                eprintln!(
+                debug!("Successfully converted to Citrate transaction format");
+                debug!(
                     "Final transaction hash: 0x{}",
                     hex::encode(tx.hash.as_bytes())
                 );
                 Ok(tx)
             }
             Err(e) => {
-                eprintln!("Failed to decode as legacy transaction: {:?}", e);
+                debug!("Failed to decode as legacy transaction: {:?}", e);
                 Err(format!("Failed to decode legacy transaction: {}", e))
             }
         }
@@ -259,26 +262,34 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
         // Last resort: try bincode for Citrate native transactions.
         // This is done AFTER RLP to prevent Ethereum RLP bytes from
         // accidentally deserializing as bincode (which would skip chain ID validation).
+        // PT-04: Limit bincode deserialization to prevent OOM from crafted length prefixes
+        if tx_bytes.len() > 256 * 1024 {
+            return Err("Transaction too large for bincode path (max 256KB)".to_string());
+        }
+        // SECURITY (PT-05): Signature verification is enforced downstream in
+        // mempool.rs (ecdsa_verified gate). The mempool rejects any EVM-shaped
+        // transaction with ecdsa_verified=false. The flag is forced false on the
+        // next line. See test_k1_forged_ecdsa_verified_rejected() for regression test.
         if let Ok(mut tx) = bincode::deserialize::<Transaction>(tx_bytes) {
             // WP-K.1: SECURITY — never trust wire-serialized ecdsa_verified flag.
             // A malicious client could craft a bincode payload with ecdsa_verified=true
             // to bypass ECDSA recovery. Force it to false so the mempool/verifier
             // must independently verify the signature.
             tx.ecdsa_verified = false;
-            eprintln!("Successfully decoded as Citrate native transaction (bincode fallback)");
+            debug!("Successfully decoded as Citrate native transaction (bincode fallback)");
             if tx.hash == Hash::default() {
                 tx.hash = Hash::new(hash_bytes);
             }
             return Ok(tx);
         }
-        eprintln!("Not a valid RLP list, cannot decode transaction");
+        debug!("Not a valid RLP list, cannot decode transaction");
         Err("Invalid RLP: expected a list for legacy transaction".to_string())
     }
 }
 
 /// Decode EIP-1559 (type-0x02) transaction
 fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
-    eprintln!("Decoding EIP-1559 typed transaction (0x02)");
+    debug!("Decoding EIP-1559 typed transaction (0x02)");
     let rlp = Rlp::new(rlp_bytes);
     if !rlp.is_list() {
         return Err("Invalid EIP-1559 RLP payload".into());
@@ -296,6 +307,8 @@ fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
         let tb: Vec<u8> = rlp.val_at(5).map_err(|e| format!("to: {:?}", e))?;
         if tb.is_empty() {
             None
+        } else if tb.len() != 20 {
+            return Err("invalid to address length (expected 20 bytes)".to_string());
         } else {
             Some(H160::from_slice(&tb))
         }
@@ -305,7 +318,7 @@ fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
 
     // Parse access list at index 8
     let access_list = parse_access_list(&rlp, 8)?;
-    eprintln!("  Access list entries: {}", access_list.len());
+    debug!("  Access list entries: {}", access_list.len());
 
     let y_parity: u64 = rlp.val_at(9).map_err(|e| format!("yParity: {:?}", e))?;
 
@@ -500,7 +513,7 @@ fn encode_access_list(stream: &mut RlpStream, access_list: &[AccessListEntry]) {
 
 /// Decode EIP-2930 (type-0x01) transaction with access lists
 fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
-    eprintln!("Decoding EIP-2930 typed transaction (0x01)");
+    debug!("Decoding EIP-2930 typed transaction (0x01)");
     let rlp = Rlp::new(rlp_bytes);
     if !rlp.is_list() {
         return Err("Invalid EIP-2930 RLP payload".into());
@@ -517,6 +530,8 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
         let tb: Vec<u8> = rlp.val_at(4).map_err(|e| format!("to: {:?}", e))?;
         if tb.is_empty() {
             None
+        } else if tb.len() != 20 {
+            return Err("invalid to address length (expected 20 bytes)".to_string());
         } else {
             Some(H160::from_slice(&tb))
         }
@@ -526,7 +541,7 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
 
     // Parse access list at index 7
     let access_list = parse_access_list(&rlp, 7)?;
-    eprintln!("  Access list entries: {}", access_list.len());
+    debug!("  Access list entries: {}", access_list.len());
 
     let y_parity: u64 = rlp.val_at(8).map_err(|e| format!("yParity: {:?}", e))?;
 
@@ -665,11 +680,11 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
     };
     tx.determine_type();
 
-    eprintln!("Successfully decoded EIP-2930 transaction");
-    eprintln!("  From: 0x{}", hex::encode(from_addr.as_bytes()));
-    eprintln!("  To: {:?}", to_opt.map(|t| format!("0x{}", hex::encode(t.as_bytes()))));
-    eprintln!("  Nonce: {}", nonce);
-    eprintln!("  Access list entries: {}", access_list.len());
+    debug!("Successfully decoded EIP-2930 transaction");
+    debug!("  From: 0x{}", hex::encode(from_addr.as_bytes()));
+    debug!("  To: {:?}", to_opt.map(|t| format!("0x{}", hex::encode(t.as_bytes()))));
+    debug!("  Nonce: {}", nonce);
+    debug!("  Access list entries: {}", access_list.len());
 
     Ok(tx)
 }

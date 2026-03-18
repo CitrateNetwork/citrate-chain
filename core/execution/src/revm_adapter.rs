@@ -6,7 +6,7 @@ use primitive_types::U256;
 use revm::{
     primitives::{
         AccountInfo, Address as RevmAddress, Bytecode, Bytes, ExecutionResult, Output,
-        TransactTo, TxEnv, B256, U256 as RevmU256, SpecId, KECCAK_EMPTY,
+        TransactTo, B256, U256 as RevmU256, SpecId, KECCAK_EMPTY,
     },
     Database, DatabaseCommit, Evm,
 };

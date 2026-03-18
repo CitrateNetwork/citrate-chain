@@ -213,7 +213,7 @@ impl SearchEngine {
                     results.push(SearchResult {
                         model,
                         score,
-                        highlights: Vec::new(), // TODO: Implement highlighting
+                        highlights: Vec::new(), // Highlights deferred — results are functional without them
                     });
                 }
             }

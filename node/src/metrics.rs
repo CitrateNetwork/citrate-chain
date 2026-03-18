@@ -36,6 +36,7 @@ use tokio::sync::oneshot;
 static PROMETHEUS_HANDLE: OnceCell<PrometheusHandle> = OnceCell::new();
 
 /// Metrics server shutdown signal
+#[allow(dead_code)]
 static METRICS_SHUTDOWN: OnceCell<RwLock<Option<oneshot::Sender<()>>>> = OnceCell::new();
 
 // ============================================================================

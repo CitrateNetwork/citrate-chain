@@ -1276,9 +1276,9 @@ impl EVMExecutor {
         let hash = U256::from_big_endian(&code_hash);
         state.stack_push(hash)
     }
-    fn op_blockhash(&mut self, state: &mut EVMState, context: &EVMContext) -> Result<(), ExecutionError> {
+    fn op_blockhash(&mut self, state: &mut EVMState, _context: &EVMContext) -> Result<(), ExecutionError> {
         state.consume_gas(self.gas_schedule.blockhash)?;
-        let block_number = state.stack_pop()?;
+        let _block_number = state.stack_pop()?;
 
         // Return zero for now - would need block hash lookup
         let hash = U256::zero();
@@ -1606,7 +1606,7 @@ impl EVMExecutor {
         Ok(())
     }
     fn op_selfdestruct(&mut self, state: &mut EVMState) -> Result<(), ExecutionError> {
-        let address = state.stack_pop()?;
+        let _address = state.stack_pop()?;
 
         // EIP-2929 gas cost
         let gas_cost = if self.accessed_addresses.contains_key(&[0u8; 20]) {

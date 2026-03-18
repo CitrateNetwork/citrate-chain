@@ -21,8 +21,9 @@ max_peers = 50
 enabled = true
 listen_addr = "0.0.0.0:8545"
 ws_addr = "0.0.0.0:8546"
-# Allow local dev frontends + Tailscale access
-cors_origins = ["*"]
+# PT-10: Default to no CORS for testnet (operators configure per deployment)
+# Set to ["*"] only for local development. For production, specify exact origins.
+cors_origins = []
 # rest_api_key = "" # Uncomment and set for production REST API auth
 
 [storage]

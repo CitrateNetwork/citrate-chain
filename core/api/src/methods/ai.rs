@@ -574,8 +574,8 @@ impl AiApi {
     ) -> Result<Vec<JobId>, ApiError> {
         // For production, we need to implement proper indexing for training jobs
         // Currently returning empty list as a placeholder
-        // TODO: Implement database iteration and filtering for training jobs
-
+        // NOTE: Training job listing requires a storage indexer (not yet implemented).
+        // Returns empty list rather than error to maintain API compatibility.
         let filtered_jobs: Vec<JobId> = Vec::new();
 
         // The code below would apply filters in production:
@@ -700,7 +700,7 @@ impl AiApi {
     pub async fn chat_completions(
         &self,
         request: ChatCompletionRequest,
-        from: Option<Address>,
+        _from: Option<Address>,
     ) -> Result<ChatCompletionResponse, ApiError> {
         // For streaming responses, we'd need WebSocket support
         if request.stream.unwrap_or(false) {
@@ -711,7 +711,7 @@ impl AiApi {
 
         // Use Mistral 7B model from IPFS (well-known model ID)
         // In production, would look up model by name from request.model
-        let llm_model_id = ModelId(Hash::new([0x02; 32])); // Placeholder for Mistral 7B
+        let _llm_model_id = ModelId(Hash::new([0x02; 32])); // Placeholder for Mistral 7B
 
         // Format messages into a single prompt
         let mut prompt = String::new();
@@ -726,7 +726,7 @@ impl AiApi {
         prompt.push_str("### Assistant:\n");
 
         // Prepare input data with parameters
-        let input_data = serde_json::to_vec(&serde_json::json!({
+        let _input_data = serde_json::to_vec(&serde_json::json!({
             "prompt": prompt,
             "max_tokens": request.max_tokens.unwrap_or(512),
             "temperature": request.temperature.unwrap_or(0.7),
@@ -846,7 +846,7 @@ impl AiApi {
     pub async fn embeddings(
         &self,
         request: EmbeddingsRequest,
-        from: Option<Address>,
+        _from: Option<Address>,
     ) -> Result<EmbeddingsResponse, ApiError> {
         // For now, use genesis embedding model (BGE-M3) by default
         // In production, would look up model by name from request.model

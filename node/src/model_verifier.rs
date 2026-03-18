@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // Model Pin Verification System
 //
 // This module implements validator pin verification for required AI models.

@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn test_ecrecover_with_real_signature() {
-        use k256::ecdsa::{signature::Signer, SigningKey};
+        use k256::ecdsa::SigningKey;
 
         let executor = PrecompileExecutor::new();
 

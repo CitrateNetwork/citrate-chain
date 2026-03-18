@@ -8,7 +8,6 @@ use crate::metrics::rpc_request;
 use crate::types::{
     error::ApiError,
     request::{BlockId, CallRequest},
-    TransactionRequest,
 };
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -504,7 +503,7 @@ impl RpcServer {
         let mempool_ai_update = mempool.clone();
         io_handler.add_sync_method("citrate_updateModel", move |params: Params| {
             rpc_request("citrate_updateModel");
-            let tx_api =
+            let _tx_api =
                 TransactionApi::new(mempool_ai_update.clone(), executor_ai_update.clone(), chain_id);
             let value: serde_json::Value = match params.parse() {
                 Ok(v) => v,
@@ -568,7 +567,7 @@ impl RpcServer {
             if from_bytes.len() != 20 {
                 return Err(jsonrpc_core::Error::invalid_params("Invalid 'from' length"));
             }
-            let from_addr = citrate_execution::types::Address({
+            let _from_addr = citrate_execution::types::Address({
                 let mut a = [0u8; 20];
                 a.copy_from_slice(&from_bytes);
                 a
@@ -954,6 +953,13 @@ impl RpcServer {
         let executor_send_broadcast = executor.clone();
         let peer_mgr_send_broadcast = peer_manager.clone();
         let allow_send_tx = config.allow_eth_send_transaction;
+        if allow_send_tx {
+            // PT-09: Warn when unsigned transaction submission is enabled on non-loopback
+            let bind = config.listen_addr;
+            if !bind.ip().is_loopback() {
+                tracing::warn!("eth_sendTransaction is ENABLED on non-loopback address '{}'. This allows unsigned transactions from any caller. Use only for local development.", bind);
+            }
+        }
         io_handler.add_sync_method("eth_sendTransaction", move |params: Params| {
             rpc_request("eth_sendTransaction");
 
@@ -1600,7 +1606,7 @@ impl RpcServer {
             }
             let mut from_pkb = [0u8; 32];
             from_pkb[..20].copy_from_slice(&from_bytes);
-            let from_pk = citrate_consensus::types::PublicKey::new(from_pkb);
+            let _from_pk = citrate_consensus::types::PublicKey::new(from_pkb);
             let from_addr = citrate_execution::types::Address({
                 let mut a = [0u8; 20];
                 a.copy_from_slice(&from_bytes);
@@ -1792,8 +1798,8 @@ impl RpcServer {
         });
 
         // citrate_getModel
-        let storage_ai_get = storage.clone();
-        let mempool_ai_get = mempool.clone();
+        let _storage_ai_get = storage.clone();
+        let _mempool_ai_get = mempool.clone();
         let executor_ai_get = executor.clone();
         io_handler.add_sync_method("citrate_getModel", move |params: Params| {
             rpc_request("citrate_getModel");

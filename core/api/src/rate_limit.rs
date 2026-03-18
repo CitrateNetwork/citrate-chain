@@ -426,6 +426,13 @@ pub fn extract_client_key(request: &hyper::Request<Body>, trusted_proxies: &Hash
     //
     // In production, operators MUST configure a reverse proxy that sets
     // X-Forwarded-For and add its address to trusted_proxies.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED_HOST_FALLBACK: AtomicBool = AtomicBool::new(false);
+        if !WARNED_HOST_FALLBACK.swap(true, Ordering::Relaxed) {
+            tracing::warn!("Rate limiting using Host header (spoofable). Configure trusted_proxies for production deployments.");
+        }
+    }
     if let Some(host) = request.headers().get("host") {
         if let Ok(h) = host.to_str() {
             return format!("direct_{}", h);

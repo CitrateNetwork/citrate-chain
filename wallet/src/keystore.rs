@@ -284,6 +284,13 @@ impl KeyStore {
     fn save(&self) -> Result<(), WalletError> {
         let data = serde_json::to_vec_pretty(&self.keys)?;
         std::fs::write(&self.path, data)?;
+        // PT-08: Restrict keystore file to owner-only access (prevent other users from reading)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&self.path, perms)?;
+        }
         Ok(())
     }
 
