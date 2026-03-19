@@ -2,9 +2,11 @@
 
 // Cryptography module for secure model storage and privacy-preserving inference
 
+pub mod ecdh;
 pub mod encryption;
 pub mod key_manager;
 pub mod secure_enclave;
+pub mod shamir;
 
 pub use encryption::{
     EncryptedModel,

@@ -12,12 +12,11 @@
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
-    Aes256Gcm, Key, Nonce,
+    Aes256Gcm, Nonce,
 };
 use anyhow::{anyhow, Result};
-use hmac::{Hmac, Mac};
+use hmac::Mac;
 use k256::{
-    ecdh::EphemeralSecret,
     elliptic_curve::sec1::ToEncodedPoint,
     PublicKey, SecretKey,
 };
@@ -25,7 +24,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
 
-type HmacSha256 = Hmac<Sha256>;
+type HmacSha256 = hmac::Hmac<Sha256>;
 
 /// ECIES (Elliptic Curve Integrated Encryption Scheme) implementation
 /// Uses secp256k1 curve for compatibility with Ethereum
@@ -98,7 +97,7 @@ impl ECIES {
         OsRng.fill_bytes(&mut nonce);
 
         // Encrypt with AES-256-GCM
-        let cipher = Aes256Gcm::new(Key::from_slice(&enc_key));
+        let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(&enc_key));
         let aes_nonce = Nonce::from_slice(&nonce);
 
         // Add associated data for authentication
@@ -144,7 +143,7 @@ impl ECIES {
         full_ciphertext.extend_from_slice(&message.auth_tag);
 
         // Decrypt with AES-256-GCM
-        let cipher = Aes256Gcm::new(Key::from_slice(&enc_key));
+        let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(&enc_key));
         let aes_nonce = Nonce::from_slice(&message.nonce);
 
         // Reconstruct associated data
@@ -181,20 +180,20 @@ impl ECIES {
     /// Derive encryption and MAC keys from shared secret using HKDF-SHA256
     fn derive_keys(shared_secret: &[u8; 32]) -> Result<([u8; 32], [u8; 32])> {
         // HKDF-Extract
-        let mut mac = HmacSha256::new_from_slice(b"CITRATE_ECIES_SALT")
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(b"CITRATE_ECIES_SALT")
             .map_err(|e| anyhow!("HMAC init failed: {}", e))?;
         mac.update(shared_secret);
         let prk = mac.finalize().into_bytes();
 
         // HKDF-Expand for encryption key
-        let mut mac_enc = HmacSha256::new_from_slice(&prk)
+        let mut mac_enc = <HmacSha256 as Mac>::new_from_slice(&prk)
             .map_err(|e| anyhow!("HMAC init failed: {}", e))?;
         mac_enc.update(b"CITRATE_ENC_KEY");
         mac_enc.update(&[0x01]);
         let enc_key_bytes = mac_enc.finalize().into_bytes();
 
         // HKDF-Expand for MAC key
-        let mut mac_auth = HmacSha256::new_from_slice(&prk)
+        let mut mac_auth = <HmacSha256 as Mac>::new_from_slice(&prk)
             .map_err(|e| anyhow!("HMAC init failed: {}", e))?;
         mac_auth.update(b"CITRATE_MAC_KEY");
         mac_auth.update(&[0x02]);
