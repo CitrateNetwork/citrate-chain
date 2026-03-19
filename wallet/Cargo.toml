@@ -62,3 +62,7 @@ path = "tests/coverage_tests.rs"
 [[test]]
 name = "known_answer_tests"
 path = "tests/known_answer_tests.rs"
+
+[[test]]
+name = "coverage_98"
+path = "tests/coverage_98.rs"
