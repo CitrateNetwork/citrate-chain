@@ -26,8 +26,8 @@ Citrate is an AI-native Layer-1 BlockDAG blockchain combining **GhostDAG consens
 
 ### Key Features
 
-- **10,000+ TPS** — BlockDAG architecture with parallel block processing
-- **< 12s Finality** — BFT committee checkpoints with optimistic confirmation
+- **High Throughput** — BlockDAG architecture with parallel block processing (target: 10,000 TPS)
+- **Fast Finality** — BFT committee checkpoints with optimistic confirmation (target: <12s)
 - **Native AI Inference** — On-chain model registry, deployment, and execution
 - **EVM Compatible** — Deploy Solidity contracts without modification
 - **IPFS Storage** — Distributed model weights with pinning incentives
