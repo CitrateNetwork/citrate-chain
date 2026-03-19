@@ -6,12 +6,17 @@
   [![Release](https://img.shields.io/github/v/release/SaulBuilds/citrate?include_prereleases&label=release)](https://github.com/SaulBuilds/citrate/releases)
   [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
   [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
-  [![SDK](https://img.shields.io/npm/v/@citrate/sdk?label=%40citrate%2Fsdk)](https://www.npmjs.com/package/@citrate/sdk)
+  [![Tests](https://img.shields.io/badge/tests-3%2C146%2B-brightgreen.svg)](#testing)
+  [![TLA+](https://img.shields.io/badge/TLA%2B-11_specs-purple.svg)](#formal-verification)
 
   **High-Performance BlockDAG with Native AI Inference • SALT Token**
 
-  [Quick Start](#quick-start) | [Architecture](#architecture) | [SDK](#sdk) | [Releases](https://github.com/SaulBuilds/citrate/releases)
+  [Contributing](#contributing) | [Quick Start](#quick-start) | [Architecture](#architecture) | [Releases](https://github.com/SaulBuilds/citrate/releases)
 </div>
+
+---
+
+> **Contributors (human and AI): Start here.** This repository uses the [Agentile methodology](../.agentile/AGENT_ENTRY.md) for all development. Before writing any code, read [`.agentile/AGENT_ENTRY.md`](../.agentile/AGENT_ENTRY.md) for the full contributor decision tree, rules, and workflows. Every AI coding tool (Claude Code, Cursor, Copilot, Windsurf, Codex, Gemini, etc.) will auto-discover these instructions via `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.windsurfrules`, and `.github/copilot-instructions.md` in the repo root.
 
 ---
 
