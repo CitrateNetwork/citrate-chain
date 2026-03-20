@@ -119,9 +119,14 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.expect("cannot bind faucet to port 3001");
+    let faucet_port = std::env::var("FAUCET_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(3002);
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", faucet_port)).await
+        .unwrap_or_else(|_| panic!("cannot bind faucet to port {}", faucet_port));
 
-    info!("Faucet listening on http://0.0.0.0:3001");
+    info!("Faucet listening on http://0.0.0.0:{}", faucet_port);
     info!("Request test tokens: POST /faucet with {{\"address\": \"0x...\"}}");
 
     if let Err(e) = axum::serve(listener, app).await {
@@ -129,8 +134,60 @@ async fn main() {
     }
 }
 
-async fn root() -> &'static str {
-    "Citrate Testnet Faucet - POST /faucet with {\"address\": \"0x...\"}"
+async fn root() -> axum::response::Html<&'static str> {
+    axum::response::Html(r#"<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Citrate Faucet</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:#0a0a1a;color:#f9fafb;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:#1e1e2e;border:1px solid #374151;border-radius:12px;padding:32px;max-width:440px;width:100%}
+h1{font-size:24px;margin-bottom:4px}
+.sub{color:#9ca3af;font-size:14px;margin-bottom:24px}
+label{font-size:13px;color:#9ca3af;display:block;margin-bottom:6px}
+input{width:100%;padding:10px 12px;background:#0f0f23;border:1px solid #374151;border-radius:6px;color:#f9fafb;font-size:14px;font-family:monospace;outline:none}
+input:focus{border-color:#6366f1}
+button{width:100%;padding:12px;background:#6366f1;color:#fff;border:none;border-radius:6px;font-size:15px;font-weight:600;cursor:pointer;margin-top:16px;transition:background .2s}
+button:hover{background:#818cf8}
+button:disabled{opacity:.5;cursor:not-allowed}
+.msg{margin-top:16px;padding:10px;border-radius:6px;font-size:13px}
+.msg.ok{background:#064e3b;border:1px solid #10b981}
+.msg.err{background:#7f1d1d;border:1px solid #ef4444}
+.info{margin-top:20px;font-size:12px;color:#6b7280;text-align:center}
+</style>
+</head><body>
+<div class="card">
+<h1>Citrate Faucet</h1>
+<p class="sub">Get test SALT tokens for the Citrate testnet</p>
+<label for="addr">Wallet Address (0x...)</label>
+<input id="addr" placeholder="0x0000000000000000000000000000000000000000" spellcheck="false">
+<button id="btn" onclick="claim()">Request 10 SALT</button>
+<div id="msg" class="msg" style="display:none"></div>
+<p class="info">Chain ID: 40204 &middot; 10 SALT per request &middot; 24h cooldown</p>
+</div>
+<script>
+async function claim(){
+  const addr=document.getElementById('addr').value.trim();
+  const btn=document.getElementById('btn');
+  const msg=document.getElementById('msg');
+  if(!addr||!addr.match(/^0x[0-9a-fA-F]{40}$/)){
+    msg.className='msg err';msg.style.display='block';
+    msg.textContent='Please enter a valid 0x address (40 hex chars)';return;
+  }
+  btn.disabled=true;btn.textContent='Sending...';
+  try{
+    const r=await fetch('/faucet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});
+    const d=await r.json();
+    msg.style.display='block';
+    if(d.success){msg.className='msg ok';msg.textContent='Sent 10 SALT! TX: '+d.tx_hash;}
+    else{msg.className='msg err';msg.textContent=d.message;}
+  }catch(e){msg.className='msg err';msg.style.display='block';msg.textContent='Error: '+e.message;}
+  btn.disabled=false;btn.textContent='Request 10 SALT';
+}
+document.getElementById('addr').addEventListener('keydown',e=>{if(e.key==='Enter')claim()});
+</script>
+</body></html>"#)
 }
 
 async fn status() -> Json<serde_json::Value> {
