@@ -54,7 +54,7 @@ citrate keygen
 # Start a local development network (RPC on 127.0.0.1:8545)
 citrate devnet
 
-# Connect MetaMask: http://localhost:8545 • Chain ID 1337
+# Connect MetaMask: http://localhost:8545 • Chain ID 40204
 ```
 
 ### Option B: Build from Source
