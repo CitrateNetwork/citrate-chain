@@ -177,16 +177,43 @@ impl ExecutionVerifier {
         }
     }
 
-    /// Placeholder for Groth16 verification via arkworks.
+    /// Groth16 verification via the execution crate's ZKP backend.
     /// Gated behind `zkp_production` feature flag.
+    ///
+    /// Proof data format: bincode-serialized `SerializableProof` from citrate_execution::zkp.
+    /// The ZKP backend must be initialized with `backend.initialize()` before calling this.
     #[cfg(feature = "zkp_production")]
-    fn verify_groth16_proof(&self, _statement: &[u8], _proof_data: &[u8]) -> Result<bool> {
-        // NOTE: Groth16 verification planned for post-mainnet (requires trusted setup ceremony).
-        // The commitment-based scheme in verify_commitment_proof() is the active verification path.
-        // arkworks dependencies exist in core/execution/src/zkp/ but are not yet wired to MCP.
-        Err(anyhow::anyhow!(
-            "Groth16 verification not yet implemented; enable arkworks integration"
-        ))
+    fn verify_groth16_proof(&self, statement: &[u8], proof_data: &[u8]) -> Result<bool> {
+        use citrate_execution::zkp::backend::ZKPBackend;
+        use citrate_execution::zkp::types::{ProofType, SerializableProof};
+
+        // Deserialize the proof
+        let proof: SerializableProof = bincode::deserialize(proof_data)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize Groth16 proof: {}", e))?;
+
+        // Initialize backend with proving/verifying keys
+        let backend = ZKPBackend::new();
+        backend.initialize()
+            .map_err(|e| anyhow::anyhow!("ZKP backend initialization failed: {}", e))?;
+
+        // Determine proof type from statement prefix (first byte)
+        let proof_type = if statement.is_empty() {
+            ProofType::ModelExecution // Default
+        } else {
+            match statement[0] {
+                0x01 => ProofType::ModelExecution,
+                0x02 => ProofType::GradientSubmission,
+                0x03 => ProofType::StateTransition,
+                0x04 => ProofType::DataIntegrity,
+                _ => ProofType::ModelExecution,
+            }
+        };
+
+        // Verify via the execution crate's Groth16 verifier
+        let result = backend.verify_proof(proof_type, &proof)
+            .map_err(|e| anyhow::anyhow!("Groth16 verification failed: {}", e))?;
+
+        Ok(result.valid)
     }
 
     /// Commitment-based proof verification (interim scheme).
