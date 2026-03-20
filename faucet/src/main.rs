@@ -6,28 +6,20 @@ use axum::{
     Router,
 };
 use dashmap::DashMap;
-use ed25519_dalek::SigningKey;
-use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
 use citrate_execution::types::Address;
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Sha3_256};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
 struct FaucetState {
-    signing_key: Arc<SigningKey>,
     rpc_url: String,
     api_key: Option<String>,
-    nonce: Arc<Mutex<u64>>,
     chain_id: u64,
     faucet_address: Address,
-    /// Per-IP rate limit: tracks last request time
-    ip_rate_limit: Arc<DashMap<String, Instant>>,
     /// Per-address cooldown: tracks last request time (24h between requests)
     address_cooldown: Arc<DashMap<String, Instant>>,
     /// Address whitelist: only these addresses can claim. Empty = no whitelist.
@@ -63,21 +55,14 @@ async fn main() {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(40204);
 
-    // Faucet private key from env or default test key
-    let faucet_key_hex = std::env::var("FAUCET_PRIVATE_KEY")
-        .unwrap_or_else(|_| {
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()
-        });
-    let faucet_key_bytes = hex::decode(&faucet_key_hex).expect("Invalid faucet key hex");
-    let signing_key = SigningKey::from_bytes(&faucet_key_bytes.try_into().expect("Key must be 32 bytes"));
-
-    // Calculate faucet address from public key
-    let public_key = signing_key.verifying_key();
-    let mut hasher = Sha3_256::new();
-    hasher.update(public_key.as_bytes());
-    let hash = hasher.finalize();
+    // Faucet source address: use genesis-funded address (0x33..33 by default)
+    // Override with FAUCET_ADDRESS env var if needed.
+    let faucet_address_hex = std::env::var("FAUCET_ADDRESS")
+        .unwrap_or_else(|_| "3333333333333333333333333333333333333333".to_string());
+    let faucet_addr_bytes = hex::decode(faucet_address_hex.trim_start_matches("0x"))
+        .expect("Invalid FAUCET_ADDRESS hex");
     let mut addr_bytes = [0u8; 20];
-    addr_bytes.copy_from_slice(&hash[12..32]);
+    addr_bytes.copy_from_slice(&faucet_addr_bytes);
     let faucet_address = Address(addr_bytes);
 
     info!("Faucet address: 0x{}", hex::encode(faucet_address.0));
@@ -99,13 +84,10 @@ async fn main() {
     }
 
     let state = FaucetState {
-        signing_key: Arc::new(signing_key),
         rpc_url,
         api_key,
-        nonce: Arc::new(Mutex::new(0)),
         chain_id,
         faucet_address,
-        ip_rate_limit: Arc::new(DashMap::new()),
         address_cooldown: Arc::new(DashMap::new()),
         address_whitelist: Arc::new(address_whitelist),
     };
@@ -257,71 +239,27 @@ async fn request_tokens(
 
     info!("Faucet request for address: 0x{}", hex::encode(recipient.0));
 
-    // Create transaction
-    let mut nonce_guard = state.nonce.lock().await;
-    let nonce = *nonce_guard;
+    // Use eth_sendTransaction (unsigned, devnet mode) from the genesis faucet address.
+    // The genesis faucet at 0x3333...33 is pre-funded with 10M SALT.
+    let from_hex = format!("0x{}", hex::encode(state.faucet_address.0));
+    let to_hex = format!("0x{}", hex::encode(recipient.0));
 
-    // Convert recipient address to PublicKey format for transaction
-    let mut to_pk_bytes = [0u8; 32];
-    to_pk_bytes[..20].copy_from_slice(&recipient.0);
-    let to_pubkey = PublicKey::new(to_pk_bytes);
-
-    // Convert faucet address to PublicKey for transaction
-    let mut from_pk_bytes = [0u8; 32];
-    from_pk_bytes[..20].copy_from_slice(&state.faucet_address.0);
-    let from_pubkey = PublicKey::new(from_pk_bytes);
-
-    // Build transaction
-    let mut tx = Transaction {
-        hash: Hash::default(),
-        from: from_pubkey,
-        to: Some(to_pubkey),
-        value: 10_000_000_000_000_000_000u128, // 10 SALT
-        data: vec![],
-        nonce,
-        gas_price: 1_000_000_000, // 1 gwei
-        gas_limit: 21000,
-        signature: Signature::new([0; 64]),
-        tx_type: None,
-        ..Default::default()
-    };
-
-    // Calculate transaction hash
-    tx.hash = calculate_tx_hash(&tx, state.chain_id);
-
-    // Sign transaction
-    use ed25519_dalek::Signer;
-    let signature = state.signing_key.as_ref().sign(tx.hash.as_bytes());
-    tx.signature = Signature::new(signature.to_bytes());
-
-    // Serialize transaction
-    let tx_bytes = match bincode::serialize(&tx) {
-        Ok(b) => b,
-        Err(e) => {
-            error!("Failed to serialize transaction: {}", e);
-            return Ok(Json(FaucetResponse {
-                success: false,
-                tx_hash: None,
-                message: "Failed to create transaction".to_string(),
-                amount: "0".to_string(),
-            }));
-        }
-    };
-
-    let tx_hex = format!("0x{}", hex::encode(&tx_bytes));
-
-    // Send transaction via RPC (with API key if configured)
     let client = reqwest::Client::new();
     let mut request = client
         .post(&state.rpc_url)
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
-            "method": "eth_sendRawTransaction",
-            "params": [tx_hex],
+            "method": "eth_sendTransaction",
+            "params": [{
+                "from": from_hex,
+                "to": to_hex,
+                "value": format!("0x{:x}", DRIP_AMOUNT),
+                "gas": "0x5208",
+                "gasPrice": "0x3b9aca00"
+            }],
             "id": 1
         }));
 
-    // Add API key header for authenticated RPC
     if let Some(ref key) = state.api_key {
         request = request.header("X-API-Key", key.as_str());
     }
@@ -333,8 +271,7 @@ async fn request_tokens(
             let json: serde_json::Value = res.json().await.unwrap_or_default();
 
             if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
-                // Success - increment nonce and record cooldown
-                *nonce_guard += 1;
+                // Success - record cooldown
                 state.address_cooldown.insert(recipient_hex, Instant::now());
 
                 info!(
@@ -414,29 +351,7 @@ fn check_cooldown(last_request_elapsed_secs: Option<u64>, cooldown_secs: u64) ->
 /// The drip amount in wei (10 SALT = 10 * 10^18)
 const DRIP_AMOUNT: u128 = 10_000_000_000_000_000_000;
 
-fn calculate_tx_hash(tx: &Transaction, chain_id: u64) -> Hash {
-    let mut hasher = Sha3_256::new();
-
-    // Hash transaction fields (EIP-155 style)
-    hasher.update(tx.nonce.to_le_bytes());
-    hasher.update(tx.gas_price.to_le_bytes());
-    hasher.update(tx.gas_limit.to_le_bytes());
-
-    if let Some(to) = &tx.to {
-        hasher.update(to.0);
-    }
-
-    hasher.update(tx.value.to_le_bytes());
-    hasher.update(&tx.data);
-    hasher.update(chain_id.to_le_bytes());
-    hasher.update([0u8; 8]); // r placeholder
-    hasher.update([0u8; 8]); // s placeholder
-
-    let result = hasher.finalize();
-    let mut hash_bytes = [0u8; 32];
-    hash_bytes.copy_from_slice(&result);
-    Hash::new(hash_bytes)
-}
+// calculate_tx_hash removed — faucet now uses eth_sendTransaction (unsigned)
 
 #[cfg(test)]
 mod tests {
@@ -514,43 +429,5 @@ mod tests {
         assert_eq!(DRIP_AMOUNT, 10_000_000_000_000_000_000u128);
     }
 
-    #[test]
-    fn test_calculate_tx_hash_deterministic() {
-        let tx = Transaction {
-            hash: Hash::default(),
-            from: PublicKey::new([0u8; 32]),
-            to: Some(PublicKey::new([1u8; 32])),
-            value: 1000,
-            data: vec![],
-            nonce: 0,
-            gas_price: 1_000_000_000,
-            gas_limit: 21000,
-            signature: Signature::new([0; 64]),
-            tx_type: None,
-            ..Default::default()
-        };
-        let hash1 = calculate_tx_hash(&tx, 40204);
-        let hash2 = calculate_tx_hash(&tx, 40204);
-        assert_eq!(hash1.as_bytes(), hash2.as_bytes());
-    }
-
-    #[test]
-    fn test_calculate_tx_hash_different_chain_id() {
-        let tx = Transaction {
-            hash: Hash::default(),
-            from: PublicKey::new([0u8; 32]),
-            to: Some(PublicKey::new([1u8; 32])),
-            value: 1000,
-            data: vec![],
-            nonce: 0,
-            gas_price: 1_000_000_000,
-            gas_limit: 21000,
-            signature: Signature::new([0; 64]),
-            tx_type: None,
-            ..Default::default()
-        };
-        let hash_a = calculate_tx_hash(&tx, 1);
-        let hash_b = calculate_tx_hash(&tx, 40204);
-        assert_ne!(hash_a.as_bytes(), hash_b.as_bytes());
-    }
+    // tx_hash tests removed — faucet now uses eth_sendTransaction (unsigned)
 }
