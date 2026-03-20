@@ -7,10 +7,16 @@ edition = "2021"
 name = "load-test"
 path = "src/main.rs"
 
+[[bin]]
+name = "benchmark-suite"
+path = "src/bin/benchmark_suite.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
 rand = "0.8"
 futures = "0.3"
+chrono = "0.4"
+
 [workspace]
