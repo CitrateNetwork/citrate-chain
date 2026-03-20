@@ -165,7 +165,7 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            max_requests: 100,
+            max_requests: 10_000, // Increased from 100 for high-throughput testing
             window_secs: 1,
             trusted_proxies: Vec::new(), // WP-I.1: secure default — no header trust
             method_costs: Vec::new(),
