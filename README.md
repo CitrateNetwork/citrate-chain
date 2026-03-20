@@ -6,7 +6,7 @@
   [![Release](https://img.shields.io/github/v/release/SaulBuilds/citrate?include_prereleases&label=release)](https://github.com/SaulBuilds/citrate/releases)
   [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
   [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
-  [![Tests](https://img.shields.io/badge/tests-3%2C146%2B-brightgreen.svg)](#testing)
+  [![Tests](https://img.shields.io/badge/tests-2%2C286%2B-brightgreen.svg)](#testing)
   [![TLA+](https://img.shields.io/badge/TLA%2B-11_specs-purple.svg)](#formal-verification)
 
   **High-Performance BlockDAG with Native AI Inference • SALT Token**
@@ -26,14 +26,23 @@ Citrate is an AI-native Layer-1 BlockDAG blockchain combining **GhostDAG consens
 
 ### Key Features
 
-- **High Throughput** — BlockDAG architecture with parallel block processing (target: 10,000 TPS)
-- **Fast Finality** — BFT committee checkpoints with optimistic confirmation (target: <12s)
+- **High Throughput** — BlockDAG architecture with parallel block processing; 1,000 TPS sustained for 10 minutes, zero failures ([benchmark details](.agentile/docs/BENCHMARKS.md))
+- **Fast Finality** — BFT committee checkpoints with optimistic confirmation ≤ 12s
 - **Native AI Inference** — On-chain model registry, deployment, and execution
 - **EVM Compatible** — Deploy Solidity contracts without modification
 - **IPFS Storage** — Distributed model weights with pinning incentives
 - **SALT Token** — Native token powering staking, governance, and inference fees
 - **RPC API Key Auth** — Bearer token / X-API-Key header authentication
 - **P2P Peer Whitelist** — Noise public key based access control
+
+### Live Testnet
+
+| Resource | URL |
+|----------|-----|
+| **JSON-RPC** | `https://spark-2e01.tailcbe2ba.ts.net` (POST) |
+| **Block Explorer** | `https://spark-2e01.tailcbe2ba.ts.net` (GET) |
+| **Faucet** | [`https://spark-2e01.tailcbe2ba.ts.net/faucet`](https://spark-2e01.tailcbe2ba.ts.net/faucet) |
+| **Chain ID** | `40204` |
 
 ## Quick Start
 
@@ -216,6 +225,14 @@ CITRATE_REQUIRE_VALID_SIGNATURE=false citrate devnet
 ```
 
 Citrate supports legacy, EIP-2930, and EIP-1559 transaction types.
+
+## Testing
+
+| Suite | Count | Command |
+|-------|-------|---------|
+| Rust unit + integration | 2,286+ | `cargo test --workspace` |
+| GUI (Vitest) | 596 | `cd gui/citrate_gui_v2 && npx vitest run` |
+| Solidity (Forge) | 66 | `cd contracts && forge test` |
 
 ## Community & Support
 
