@@ -213,7 +213,7 @@ impl ExecutionVerifier {
         let result = backend.verify_proof(proof_type, &proof)
             .map_err(|e| anyhow::anyhow!("Groth16 verification failed: {}", e))?;
 
-        Ok(result.valid)
+        Ok(result)
     }
 
     /// Commitment-based proof verification (interim scheme).
