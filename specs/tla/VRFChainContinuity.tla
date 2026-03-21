@@ -62,10 +62,13 @@ ComputeVRFAlpha(v, slot, parentVRF) ==
     [validator |-> v, slot |-> slot, parentVRF |-> parentVRF]
 
 \* Build the selected-parent chain: walk from a tip back to genesis
-RECURSIVE ChainToGenesis(_)
-ChainToGenesis(bid) ==
+\* Takes an explicit block map to support computing chains with updated state.
+RECURSIVE ChainToGenesisFrom(_, _)
+ChainToGenesisFrom(bid, bmap) ==
     IF bid = 0 THEN <<0>>
-    ELSE Append(ChainToGenesis(blocks[bid].parentId), bid)
+    ELSE Append(ChainToGenesisFrom(bmap[bid].parentId, bmap), bid)
+
+ChainToGenesis(bid) == ChainToGenesisFrom(bid, blocks)
 
 \* Blue score: for simplicity, depth from genesis along selected parent
 RECURSIVE Depth(_)
@@ -124,11 +127,22 @@ ProduceBlock(v) ==
             /\ vrfOutputs' = vrfOutputs \cup {vrfOut}
             /\ tips' = (tips \ {parentTip}) \cup {newId}
             /\ currentSlot' = currentSlot + 1
-            \* Recompute selected chain from best tip
-            /\ LET bestId == IF newScore > blocks[BestTip].blueScore
+            \* Recompute selected chain from best tip using updated blocks map
+            /\ LET newBlocks == [bid2 \in AddedBlocks \cup {newId} |->
+                    IF bid2 = newId
+                    THEN [
+                        producer   |-> v,
+                        slot       |-> currentSlot,
+                        parentId   |-> parentTip,
+                        vrfAlpha   |-> alpha,
+                        vrfOutput  |-> vrfOut,
+                        blueScore  |-> newScore
+                    ]
+                    ELSE blocks[bid2]]
+                   bestId == IF newScore > blocks[BestTip].blueScore
                              THEN newId
                              ELSE BestTip
-               IN selectedParentChain' = ChainToGenesis(bestId)
+               IN selectedParentChain' = ChainToGenesisFrom(bestId, newBlocks)
 
 \* Reorg: switch selected parent chain to a different fork with higher score
 Reorg ==

@@ -56,6 +56,7 @@ Init ==
 SwitchMode(new_mode) ==
     /\ new_mode \in Modes
     /\ new_mode # learning_mode                    \* No-op if same mode
+    /\ Len(mode_log) < 2 * MaxBlocks               \* Bound log length for finite state space
     /\ mode_log' = Append(mode_log, [from |-> learning_mode, to |-> new_mode])
     /\ learning_mode' = new_mode
     /\ UNCHANGED <<consensus_state, learning_state, blocks_processed>>
