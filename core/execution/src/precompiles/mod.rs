@@ -512,7 +512,7 @@ impl PrecompileExecutor {
         // Output: 1 if pairing check passes, 0 otherwise
 
         // Input must be a multiple of 192 bytes
-        if input.len() % 192 != 0 {
+        if !input.len().is_multiple_of(192) {
             return Err(anyhow::anyhow!("Invalid input length for pairing"));
         }
 

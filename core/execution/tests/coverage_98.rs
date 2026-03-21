@@ -294,7 +294,7 @@ fn statedb_snapshot_restore_full() {
     db.update_model(mid, model2).unwrap();
 
     // Dirty storage should have entries
-    assert!(!db.take_dirty_storage().is_empty() || true); // already taken above, repopulate:
+    // Dirty storage was already taken above; repopulate it:
     db.set_storage(a, b"dirty".to_vec(), b"yes".to_vec());
 
     // Restore
@@ -1227,6 +1227,7 @@ fn types_serializable_proof_invalid_bytes() {
 fn types_proof_type_copy_clone_eq() {
     let pt1 = ProofType::ModelExecution;
     let pt2 = pt1; // Copy
+    #[allow(clippy::clone_on_copy)]
     let pt3 = pt1.clone(); // Clone
     assert_eq!(pt1, pt2);
     assert_eq!(pt2, pt3);
@@ -1414,8 +1415,8 @@ fn backend_prove_training_round() {
     let backend = initialized_backend();
     let proof = backend
         .prove_training_round(
-            &vec![1u8; 32],
-            &vec![2u8; 32],
+            &[1u8; 32],
+            &[2u8; 32],
             vec![3u8; 64],
             0.01,
             256,

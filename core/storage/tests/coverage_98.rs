@@ -705,7 +705,7 @@ fn tx_store_batch_put() {
     let (_tmp, db) = open_db();
     let store = TransactionStore::new(db);
 
-    let txs: Vec<Transaction> = (10..15).map(|n| make_tx(n)).collect();
+    let txs: Vec<Transaction> = (10..15).map(make_tx).collect();
     store.put_transactions(&txs).unwrap();
 
     for tx in &txs {

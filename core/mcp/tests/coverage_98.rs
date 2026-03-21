@@ -952,8 +952,8 @@ fn build_execution_proof_with_nonce(
     let commitment = {
         let mut h = Sha3_256::new();
         h.update(&statement);
-        h.update(&response);
-        h.update(&nonce_bytes);
+        h.update(response);
+        h.update(nonce_bytes);
         h.finalize()
     };
 

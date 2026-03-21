@@ -3,6 +3,7 @@
 // Tests AI precompile infrastructure: addresses, gas costs, proof verification,
 // access control, and input validation. Full execute() tests require MetalRuntime
 // (GPU hardware) and are covered in the inline module tests.
+#![allow(clippy::assertions_on_constants)]
 
 use citrate_execution::precompiles::inference::{
     addresses, gas_costs, verify_commitment_proof,
