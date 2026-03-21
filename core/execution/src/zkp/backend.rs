@@ -27,13 +27,28 @@ impl ZKPBackend {
         Self { prover, verifier }
     }
 
-    /// Initialize the backend with setup for all proof types
+    /// Initialize the backend with setup for all proof types.
+    /// After setup, verifying keys are shared from prover → verifier
+    /// so that proofs can be verified independently.
     pub fn initialize(&self) -> Result<(), ZKPError> {
-        // Setup all proof types
-        self.prover.setup(ProofType::ModelExecution)?;
-        self.prover.setup(ProofType::GradientSubmission)?;
-        self.prover.setup(ProofType::StateTransition)?;
-        self.prover.setup(ProofType::DataIntegrity)?;
+        let proof_types = [
+            ProofType::ModelExecution,
+            ProofType::GradientSubmission,
+            ProofType::StateTransition,
+            ProofType::DataIntegrity,
+        ];
+
+        // Setup all proof types (generates proving + verifying keys in prover)
+        for pt in &proof_types {
+            self.prover.setup(*pt)?;
+        }
+
+        // Wire verifying keys from prover to verifier (closes the VK handoff gap)
+        for pt in &proof_types {
+            if let Some(vk) = self.prover.get_verifying_key(*pt) {
+                self.verifier.add_verifying_key(*pt, vk);
+            }
+        }
 
         Ok(())
     }
