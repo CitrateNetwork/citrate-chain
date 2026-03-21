@@ -1,6 +1,72 @@
-================================================================================
-  Citrate Deep TLC Verification — 2026-03-21 01:41:43
-  Workers: 16 | Heap: 1800m | Timeout: 3600s per spec
-  Specs: 20
-================================================================================
+========================================================================
+  Citrate Deep TLC Verification — 2026-03-21 17:08 UTC
+  Workers: 16 | Heap: 1800m | Timeout: 2700s per spec
+  Specs: 24
+========================================================================
 
+  [ 1/24] AdapterProvenance                   PASS  5,719,003 distinct  (28s)
+  [ 2/24] BelnapLattice                       PASS  65,536 distinct  (1s)
+  [ 3/24] ByzantineDetection                  TIMEOUT  (45m 1s)
+  [ 4/24] GhostDAGConsensus                   PASS  3,948 distinct  (1s)
+  [ 5/24] InferenceRequestLifecycle           PASS  30,707,572 distinct  (1m 25s)
+  [ 6/24] MempoolSequencer                    TIMEOUT  (45m 1s)
+  [ 7/24] ModelLifecycle                      PASS  19 distinct  (0s)
+  [ 8/24] OnboardingFlow                      PASS  54 distinct  (1s)
+  [ 9/24] OODACycle                           PASS  1,092 distinct  (1s)
+  [10/24] ParaconsistentAggregation           TIMEOUT  (45m 1s)
+  [11/24] PrevrandaoPipeline                  PASS  44,795,533 distinct  (2m 10s)
+  [12/24] SafetyInvariant                     PASS  15,330 distinct  (1s)
+  [13/24] SDKConnectionLifecycle              PASS  214 distinct  (1s)
+  [14/24] SpecRegistryLifecycle               PASS  2,738,019 distinct  (15s)
+  [15/24] TransactionExecution                PASS  20,311,182 distinct  (51s)
+  [16/24] TrustScoring                        PASS  294,220,321 distinct  (28m 33s)
+  [17/24] VRFChainContinuity                  PASS  121 distinct  (1s)
+  [18/24] VRFElection                         PASS  942,481 distinct  (7s)
+  [19/24] ZKKeyManagement                     PASS  34 distinct  (0s)
+  [20/24] ZKProofLifecycle                    PASS  9,765,626 distinct  (36s)
+  [21/24] AgentChat                           PASS  140 distinct  (1s)
+  [22/24] AuthStateMachine                    PASS  23 distinct  (1s)
+  [23/24] EnvironmentSwitch                   PASS  84 distinct  (0s)
+  [24/24] WalletSession                       PASS  14 distinct  (1s)
+
+========================================================================
+  RESULTS TABLE
+========================================================================
+
+| Specification                       | Status  | States Generated |  Distinct States |     Time |
+|-------------------------------------|---------|------------------|------------------|----------|
+| AdapterProvenance                   | PASS    |       33,213,679 |        5,719,003 |      28s |
+| BelnapLattice                       | PASS    |          524,289 |           65,536 |       1s |
+| ByzantineDetection                  | TIMEOUT |    1,270,718,744 |      716,655,642 |   45m 1s |
+| GhostDAGConsensus                   | PASS    |            5,613 |            3,948 |       1s |
+| InferenceRequestLifecycle           | PASS    |       95,256,221 |       30,707,572 |   1m 25s |
+| MempoolSequencer                    | TIMEOUT |    2,809,608,438 |      411,082,848 |   45m 1s |
+| ModelLifecycle                      | PASS    |               36 |               19 |       0s |
+| OnboardingFlow                      | PASS    |               88 |               54 |       1s |
+| OODACycle                           | PASS    |            3,377 |            1,092 |       1s |
+| ParaconsistentAggregation           | TIMEOUT |      543,272,404 |      543,272,404 |   45m 1s |
+| PrevrandaoPipeline                  | PASS    |      161,119,249 |       44,795,533 |   2m 10s |
+| SafetyInvariant                     | PASS    |           88,890 |           15,330 |       1s |
+| SDKConnectionLifecycle              | PASS    |              667 |              214 |       1s |
+| SpecRegistryLifecycle               | PASS    |       38,332,269 |        2,738,019 |      15s |
+| TransactionExecution                | PASS    |       24,801,841 |       20,311,182 |      51s |
+| TrustScoring                        | PASS    |    2,019,761,113 |      294,220,321 |  28m 33s |
+| VRFChainContinuity                  | PASS    |              242 |              121 |       1s |
+| VRFElection                         | PASS    |        3,474,001 |          942,481 |       7s |
+| ZKKeyManagement                     | PASS    |               83 |               34 |       0s |
+| ZKProofLifecycle                    | PASS    |       46,875,002 |        9,765,626 |      36s |
+| AgentChat                           | PASS    |              334 |              140 |       1s |
+| AuthStateMachine                    | PASS    |               34 |               23 |       1s |
+| EnvironmentSwitch                   | PASS    |              219 |               84 |       0s |
+| WalletSession                       | PASS    |               34 |               14 |       1s |
+
+========================================================================
+  SUMMARY
+========================================================================
+  Passed:           21 / 24
+  Failed/Timeout:   3
+  States generated: 7,047,056,867
+  Distinct states:  2,080,297,240
+  Completed:        2026-03-21 19:58 UTC
+========================================================================
+  ✗ 3 specs did not complete
