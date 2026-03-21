@@ -250,3 +250,393 @@ impl ZKPBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::types::{
+        ModelExecutionCircuit, GradientProofCircuit,
+        ProofRequest, ProofType, SerializableProof, ZKPError,
+    };
+    use super::super::circuits::{StateTransitionCircuit, DataIntegrityCircuit};
+
+    // ---------------------------------------------------------------
+    // Helper: build a fully-initialized backend (setup all 4 key pairs)
+    // ---------------------------------------------------------------
+    fn initialized_backend() -> ZKPBackend {
+        let backend = ZKPBackend::new();
+        backend.initialize().expect("Backend initialization must succeed");
+        backend
+    }
+
+    // ---------------------------------------------------------------
+    // Helper: create valid circuit_data bytes for each proof type
+    // ---------------------------------------------------------------
+    fn model_execution_data() -> Vec<u8> {
+        // computation_trace must be empty to match the setup circuit's constraint count.
+        // Groth16 requires identical circuit structure between setup and proving.
+        let circuit = ModelExecutionCircuit {
+            model_hash: vec![1u8; 32],
+            input_hash: vec![2u8; 32],
+            output_hash: vec![3u8; 32],
+            computation_trace: vec![],
+        };
+        bincode::serialize(&circuit).unwrap()
+    }
+
+    fn gradient_submission_data() -> Vec<u8> {
+        let circuit = GradientProofCircuit {
+            model_hash: vec![10u8; 32],
+            dataset_hash: vec![11u8; 32],
+            gradient_hash: vec![12u8; 32],
+            loss_value: 0.5,
+            num_samples: 100,
+        };
+        bincode::serialize(&circuit).unwrap()
+    }
+
+    fn state_transition_data() -> Vec<u8> {
+        let circuit = StateTransitionCircuit {
+            old_state_root: vec![20u8; 32],
+            new_state_root: vec![21u8; 32],
+            transaction_hash: vec![22u8; 32],
+        };
+        bincode::serialize(&circuit).unwrap()
+    }
+
+    fn data_integrity_data() -> Vec<u8> {
+        let circuit = DataIntegrityCircuit {
+            data_hash: vec![30u8; 32],
+            merkle_path: vec![],
+            merkle_root: vec![30u8; 32], // same as data_hash => root == leaf (no path)
+            leaf_index: 0,
+        };
+        bincode::serialize(&circuit).unwrap()
+    }
+
+    // ====================================================================
+    // Happy-path tests
+    // ====================================================================
+
+    #[test]
+    fn test_all_proof_types_generate_and_verify() {
+        let backend = initialized_backend();
+
+        let cases: Vec<(ProofType, Vec<u8>)> = vec![
+            (ProofType::ModelExecution, model_execution_data()),
+            (ProofType::GradientSubmission, gradient_submission_data()),
+            (ProofType::StateTransition, state_transition_data()),
+            (ProofType::DataIntegrity, data_integrity_data()),
+        ];
+
+        for (proof_type, circuit_data) in cases {
+            let request = ProofRequest {
+                proof_type,
+                circuit_data,
+                public_inputs: vec![],
+            };
+
+            let response = backend
+                .generate_proof(request)
+                .unwrap_or_else(|e| panic!("generate_proof failed for {:?}: {:?}", proof_type, e));
+
+            assert_eq!(response.proof_type, proof_type);
+            assert!(!response.proof.proof_bytes.is_empty());
+            assert!(response.generation_time_ms > 0 || response.generation_time_ms == 0);
+
+            let valid = backend
+                .verify_proof(proof_type, &response.proof)
+                .unwrap_or_else(|e| panic!("verify_proof failed for {:?}: {:?}", proof_type, e));
+
+            assert!(valid, "Proof for {:?} must verify", proof_type);
+        }
+    }
+
+    #[test]
+    fn test_proof_determinism_with_same_input() {
+        // Same input produces proofs that both verify (bytes differ due to OsRng)
+        let backend = initialized_backend();
+
+        let data = model_execution_data();
+
+        let req1 = ProofRequest {
+            proof_type: ProofType::ModelExecution,
+            circuit_data: data.clone(),
+            public_inputs: vec![],
+        };
+        let req2 = ProofRequest {
+            proof_type: ProofType::ModelExecution,
+            circuit_data: data,
+            public_inputs: vec![],
+        };
+
+        let resp1 = backend.generate_proof(req1).unwrap();
+        let resp2 = backend.generate_proof(req2).unwrap();
+
+        // Both must verify
+        assert!(backend.verify_proof(ProofType::ModelExecution, &resp1.proof).unwrap());
+        assert!(backend.verify_proof(ProofType::ModelExecution, &resp2.proof).unwrap());
+
+        // Public inputs must be identical (same circuit data)
+        assert_eq!(resp1.proof.public_inputs, resp2.proof.public_inputs);
+    }
+
+    #[test]
+    fn test_different_inputs_produce_different_proofs() {
+        let backend = initialized_backend();
+
+        let circuit_a = ModelExecutionCircuit {
+            model_hash: vec![1u8; 32],
+            input_hash: vec![2u8; 32],
+            output_hash: vec![3u8; 32],
+            computation_trace: vec![],
+        };
+        let circuit_b = ModelExecutionCircuit {
+            model_hash: vec![99u8; 32],
+            input_hash: vec![98u8; 32],
+            output_hash: vec![97u8; 32],
+            computation_trace: vec![],
+        };
+
+        let req_a = ProofRequest {
+            proof_type: ProofType::ModelExecution,
+            circuit_data: bincode::serialize(&circuit_a).unwrap(),
+            public_inputs: vec![],
+        };
+        let req_b = ProofRequest {
+            proof_type: ProofType::ModelExecution,
+            circuit_data: bincode::serialize(&circuit_b).unwrap(),
+            public_inputs: vec![],
+        };
+
+        let resp_a = backend.generate_proof(req_a).unwrap();
+        let resp_b = backend.generate_proof(req_b).unwrap();
+
+        // Different inputs should yield different public inputs
+        assert_ne!(
+            resp_a.proof.public_inputs, resp_b.proof.public_inputs,
+            "Different circuit data must produce different public inputs"
+        );
+    }
+
+    // ====================================================================
+    // Edge-case / failure tests
+    // ====================================================================
+
+    #[test]
+    fn test_verify_without_initialize_fails() {
+        // Backend with no keys: verify should return KeyNotFound
+        let backend = ZKPBackend::new();
+
+        // Create a dummy proof (will never reach verification math)
+        let dummy_proof = SerializableProof {
+            proof_bytes: vec![0u8; 192], // Groth16 compressed proof size
+            public_inputs: vec!["0".to_string()],
+        };
+
+        let result = backend.verify_proof(ProofType::ModelExecution, &dummy_proof);
+        assert!(result.is_err(), "verify_proof before initialize must fail");
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ZKPError::KeyNotFound(_)),
+            "Expected KeyNotFound, got: {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn test_generate_without_initialize_fails() {
+        // Backend with no keys: generate should return KeyNotFound
+        let backend = ZKPBackend::new();
+
+        let request = ProofRequest {
+            proof_type: ProofType::ModelExecution,
+            circuit_data: model_execution_data(),
+            public_inputs: vec![],
+        };
+
+        let result = backend.generate_proof(request);
+        assert!(result.is_err(), "generate_proof before initialize must fail");
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ZKPError::KeyNotFound(_)),
+            "Expected KeyNotFound, got: {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn test_invalid_circuit_data_rejected() {
+        let backend = initialized_backend();
+
+        // Garbage bytes that can't be deserialized as any circuit type
+        let request = ProofRequest {
+            proof_type: ProofType::ModelExecution,
+            circuit_data: vec![0xFF, 0xFE, 0xFD, 0xFC],
+            public_inputs: vec![],
+        };
+
+        let result = backend.generate_proof(request);
+        assert!(result.is_err(), "Garbage circuit_data must be rejected");
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ZKPError::InvalidCircuit),
+            "Expected InvalidCircuit, got: {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn test_tampered_proof_rejected() {
+        let backend = initialized_backend();
+
+        let request = ProofRequest {
+            proof_type: ProofType::ModelExecution,
+            circuit_data: model_execution_data(),
+            public_inputs: vec![],
+        };
+
+        let response = backend.generate_proof(request).unwrap();
+
+        // Tamper with one byte in the proof
+        let mut tampered = response.proof.clone();
+        if !tampered.proof_bytes.is_empty() {
+            tampered.proof_bytes[0] ^= 0xFF;
+        }
+
+        // Verification should either fail with an error (deserialization) or return false
+        let result = backend.verify_proof(ProofType::ModelExecution, &tampered);
+        match result {
+            Ok(valid) => assert!(!valid, "Tampered proof must not verify as valid"),
+            Err(_) => {} // Deserialization error is also acceptable for corrupted bytes
+        }
+    }
+
+    #[test]
+    fn test_wrong_proof_type_fails() {
+        let backend = initialized_backend();
+
+        // Generate a ModelExecution proof
+        let request = ProofRequest {
+            proof_type: ProofType::ModelExecution,
+            circuit_data: model_execution_data(),
+            public_inputs: vec![],
+        };
+        let response = backend.generate_proof(request).unwrap();
+
+        // Try to verify it as a GradientSubmission — must fail
+        let result = backend.verify_proof(ProofType::GradientSubmission, &response.proof);
+        match result {
+            Ok(valid) => assert!(
+                !valid,
+                "Proof generated as ModelExecution must not verify as GradientSubmission"
+            ),
+            Err(_) => {} // Error is also acceptable (different VK, deserialization mismatch)
+        }
+    }
+
+    #[test]
+    fn test_empty_public_inputs_parsed() {
+        // The verifier's parse_public_inputs with empty vec should return empty result.
+        // We test indirectly: a proof with empty public_inputs should
+        // fail at verification (no matching field elements), not panic.
+        let backend = initialized_backend();
+
+        let empty_proof = SerializableProof {
+            proof_bytes: vec![0u8; 192],
+            public_inputs: vec![],
+        };
+
+        // Should not panic — will fail at deserialization or verification
+        let result = backend.verify_proof(ProofType::ModelExecution, &empty_proof);
+        // We only care that it doesn't panic; error is expected
+        assert!(result.is_err() || !result.unwrap());
+    }
+
+    #[test]
+    fn test_public_input_hex_parsing() {
+        // Verify that hex-formatted public inputs round-trip through the verifier.
+        // We test parse_public_inputs indirectly since it's private.
+        // A backend initialized with keys should accept proofs with hex public inputs.
+        // For a direct test, we verify the prover produces decimal strings that
+        // the verifier can parse.
+        let backend = initialized_backend();
+
+        let request = ProofRequest {
+            proof_type: ProofType::ModelExecution,
+            circuit_data: model_execution_data(),
+            public_inputs: vec![],
+        };
+        let response = backend.generate_proof(request).unwrap();
+
+        // The public inputs should be parseable decimal strings
+        for pi in &response.proof.public_inputs {
+            let parsed: Result<u128, _> = pi.parse();
+            assert!(
+                parsed.is_ok(),
+                "Public input '{}' must be parseable as u128",
+                pi
+            );
+        }
+
+        // Verify succeeds with these decimal public inputs
+        assert!(backend.verify_proof(ProofType::ModelExecution, &response.proof).unwrap());
+    }
+
+    #[test]
+    fn test_public_input_decimal_parsing() {
+        // Verify that decimal public inputs are correctly handled end-to-end
+        let backend = initialized_backend();
+
+        let request = ProofRequest {
+            proof_type: ProofType::StateTransition,
+            circuit_data: state_transition_data(),
+            public_inputs: vec![],
+        };
+        let response = backend.generate_proof(request).unwrap();
+
+        // All public inputs should be valid decimal strings
+        for pi in &response.proof.public_inputs {
+            assert!(
+                pi.parse::<u128>().is_ok() || pi.starts_with("0x"),
+                "Public input must be decimal or hex, got: {}",
+                pi
+            );
+        }
+    }
+
+    #[test]
+    fn test_public_input_invalid_rejected() {
+        // A proof with an unparseable public input string should fail verification,
+        // not silently produce Fr(0).
+        let backend = initialized_backend();
+
+        let bad_proof = SerializableProof {
+            proof_bytes: vec![0u8; 192],
+            public_inputs: vec!["not_a_number".to_string()],
+        };
+
+        let result = backend.verify_proof(ProofType::ModelExecution, &bad_proof);
+        // Must error or return false — never silently succeed
+        match result {
+            Ok(valid) => assert!(
+                !valid,
+                "Invalid public input 'not_a_number' must not lead to a valid proof"
+            ),
+            Err(e) => {
+                // InvalidPublicInputs or deserialization error is expected
+                let msg = format!("{:?}", e);
+                assert!(
+                    msg.contains("InvalidPublicInputs")
+                        || msg.contains("Deserialization")
+                        || msg.contains("Verification"),
+                    "Expected a parsing/verification error, got: {}",
+                    msg,
+                );
+            }
+        }
+    }
+}

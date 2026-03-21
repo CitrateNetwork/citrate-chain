@@ -208,11 +208,12 @@ impl InferenceCircuit {
     /// native commitments stored in `PublicInputs` match what the R1CS
     /// circuit computes over the witness.
     ///
-    /// IMPORTANT: The Fr→H256 conversion must be lossless and reversible.
+    /// IMPORTANT: The Fr->H256 conversion must be lossless and reversible.
     /// We use `Fr::into_bigint().to_bytes_le()` and reverse it in `verify()`
     /// with `Fr::from_le_bytes_mod_order()`. H256 is treated as an opaque
-    /// 32-byte container here — its endianness convention doesn't matter
+    /// 32-byte container here -- its endianness convention doesn't matter
     /// as long as we're consistent.
+    #[allow(dead_code)] // Used by tests and available for external callers
     fn commit_vector(data: &[Fr]) -> H256 {
         let hash = super::mimc::mimc_hash(data);
         let bytes = super::mimc::fr_to_bytes_le(&hash);
@@ -692,5 +693,114 @@ mod tests {
         eprintln!("Constraints: {}", cs.num_constraints());
 
         assert!(cs.is_satisfied().unwrap(), "Circuit must be satisfiable");
+    }
+
+    // --- New edge-case tests ---
+
+    #[test]
+    fn test_inference_proof_different_model_ids() {
+        // model_id is stored in PublicInputs but is NOT part of the circuit constraints,
+        // so two proofs with different model_ids but same data should still have
+        // identical commitment values (model_commitment, input_commitment, output_commitment).
+        let weights = vec![Fr::from(1u64), Fr::from(2u64)];
+        let inputs = vec![Fr::from(3u64)];
+        let outputs = vec![Fr::from(4u64)];
+
+        let config = CircuitConfig {
+            max_model_size: 2,
+            max_input_size: 1,
+            max_output_size: 1,
+            neurons_per_layer: 1,
+            optimize: true,
+        };
+
+        let circuit_a = InferenceCircuit::new(
+            weights.clone(),
+            inputs.clone(),
+            outputs.clone(),
+            H256::from_low_u64_be(1),
+            config.clone(),
+        );
+        let circuit_b = InferenceCircuit::new(
+            weights,
+            inputs,
+            outputs,
+            H256::from_low_u64_be(2),
+            config,
+        );
+
+        // Commitments are derived from the data, not model_id
+        assert_eq!(
+            circuit_a.public_inputs.model_commitment,
+            circuit_b.public_inputs.model_commitment,
+        );
+        assert_eq!(
+            circuit_a.public_inputs.input_commitment,
+            circuit_b.public_inputs.input_commitment,
+        );
+        assert_eq!(
+            circuit_a.public_inputs.output_commitment,
+            circuit_b.public_inputs.output_commitment,
+        );
+        // But the model_ids themselves differ
+        assert_ne!(
+            circuit_a.public_inputs.model_id,
+            circuit_b.public_inputs.model_id,
+        );
+    }
+
+    #[test]
+    fn test_inference_proof_large_output() {
+        // Verify that a circuit with max_output_size outputs can be constructed
+        // and its constraints generated without panic.
+        use ark_relations::r1cs::ConstraintSystem;
+
+        let max_output = 50;
+        let layer_size = 10;
+        let model_size = layer_size * layer_size; // 1 layer of 10x10
+
+        let config = CircuitConfig {
+            max_model_size: model_size,
+            max_input_size: layer_size,
+            max_output_size: max_output,
+            neurons_per_layer: layer_size,
+            optimize: true,
+        };
+
+        // Zero inputs => zero outputs through ReLU
+        let model_weights: Vec<Fr> = (0..model_size).map(|i| Fr::from(i as u64)).collect();
+        let input_data: Vec<Fr> = vec![Fr::from(0u64); layer_size];
+        let output_data: Vec<Fr> = vec![Fr::from(0u64); max_output];
+
+        let circuit = InferenceCircuit::new(
+            model_weights,
+            input_data,
+            output_data,
+            H256::zero(),
+            config,
+        );
+
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        circuit.generate_constraints(cs.clone()).unwrap();
+
+        assert!(
+            cs.is_satisfied().unwrap(),
+            "Circuit with large output size must be satisfiable"
+        );
+    }
+
+    #[test]
+    fn test_commitment_different_lengths() {
+        // commit_vector with different lengths must produce different hashes
+        let short = vec![Fr::from(42u64)];
+        let long: Vec<Fr> = (0..100).map(|i| Fr::from(i as u64)).collect();
+
+        let c_short = InferenceCircuit::commit_vector(&short);
+        let c_long = InferenceCircuit::commit_vector(&long);
+
+        assert_ne!(
+            c_short, c_long,
+            "Commitments of vectors with different lengths must differ"
+        );
     }
 }

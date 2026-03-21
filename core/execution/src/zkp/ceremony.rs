@@ -700,4 +700,80 @@ mod tests {
         assert_eq!(deserialized.timestamp, c.timestamp);
         assert_eq!(deserialized.attestation, c.attestation);
     }
+
+    // --- New edge-case tests ---
+
+    #[test]
+    fn test_ceremony_contribution_count() {
+        let mut state = CeremonyState::new();
+        assert_eq!(state.contribution_count(), 0);
+
+        state.begin().unwrap();
+        assert_eq!(state.contribution_count(), 0);
+
+        let c0 = make_contribution(1, hash_for_index(0), [0u8; 32], 1000);
+        state.add_contribution(c0).unwrap();
+        assert_eq!(state.contribution_count(), 1);
+
+        let c1 = make_contribution(2, hash_for_index(1), hash_for_index(0), 2000);
+        state.add_contribution(c1).unwrap();
+        assert_eq!(state.contribution_count(), 2);
+
+        let c2 = make_contribution(3, hash_for_index(2), hash_for_index(1), 3000);
+        state.add_contribution(c2).unwrap();
+        assert_eq!(state.contribution_count(), 3);
+
+        // Finalize and verify count is preserved
+        let config = CeremonyConfig {
+            min_participants: 1,
+            ..Default::default()
+        };
+        state.finalize(&config).unwrap();
+        assert_eq!(state.contribution_count(), 3);
+    }
+
+    #[test]
+    fn test_ceremony_config_custom_domain() {
+        // Two ceremonies with different domains but same contributions
+        // must produce different final hashes.
+        let config_a = CeremonyConfig {
+            min_participants: 1,
+            domain: "domain_alpha".to_string(),
+            ..Default::default()
+        };
+        let config_b = CeremonyConfig {
+            min_participants: 1,
+            domain: "domain_beta".to_string(),
+            ..Default::default()
+        };
+
+        let mut state_a = CeremonyState::new();
+        state_a.begin().unwrap();
+        let c0 = make_contribution(1, hash_for_index(0), [0u8; 32], 1000);
+        state_a.add_contribution(c0).unwrap();
+        state_a.finalize(&config_a).unwrap();
+
+        let mut state_b = CeremonyState::new();
+        state_b.begin().unwrap();
+        let c0 = make_contribution(1, hash_for_index(0), [0u8; 32], 1000);
+        state_b.add_contribution(c0).unwrap();
+        state_b.finalize(&config_b).unwrap();
+
+        assert_ne!(
+            state_a.final_hash(),
+            state_b.final_hash(),
+            "Different domains must produce different final hashes"
+        );
+    }
+
+    #[test]
+    fn test_verify_chain_single_contribution() {
+        let c0 = make_contribution(1, hash_for_index(0), [0u8; 32], 1000);
+        let chain = vec![c0];
+        assert_eq!(
+            verify_contribution_chain(&chain),
+            Ok(1),
+            "Single valid contribution chain must verify"
+        );
+    }
 }
