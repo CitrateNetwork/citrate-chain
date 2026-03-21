@@ -1,0 +1,158 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/// @title AgentDecisionRegistry
+/// @notice On-chain audit trail for AI agent tool executions.
+/// Every high-risk agent action (deploy, transfer, execute) is recorded
+/// with its parameters hash, block number, and outcome. Disputes can be
+/// filed against any decision.
+///
+/// Sprint HARDEN — WP-H.13
+contract AgentDecisionRegistry {
+    // ── Types ───────────────────────────────────────────────────────
+
+    enum DecisionStatus { Recorded, Disputed, Resolved }
+
+    struct Decision {
+        bytes32 agentId;        // Identifier for the agent instance
+        string toolName;        // Tool that was called (e.g., "deploy_contract")
+        bytes32 paramsHash;     // keccak256(abi.encode(params))
+        uint256 blockNumber;    // Block when decision was executed
+        uint256 timestamp;      // Block timestamp
+        address executor;       // Address that submitted the record
+        DecisionStatus status;  // Current status
+        string disputeEvidence; // Evidence if disputed (empty otherwise)
+    }
+
+    // ── State ───────────────────────────────────────────────────────
+
+    /// All decisions indexed by ID
+    mapping(uint256 => Decision) public decisions;
+
+    /// Decision count (also serves as next ID)
+    uint256 public decisionCount;
+
+    /// Decisions per agent (agentId → decision IDs)
+    mapping(bytes32 => uint256[]) private agentDecisions;
+
+    /// Dispute count per agent (for trust scoring)
+    mapping(bytes32 => uint256) public disputeCount;
+
+    // ── Events ──────────────────────────────────────────────────────
+
+    event DecisionRecorded(
+        uint256 indexed decisionId,
+        bytes32 indexed agentId,
+        string toolName,
+        bytes32 paramsHash,
+        uint256 blockNumber
+    );
+
+    event DecisionDisputed(
+        uint256 indexed decisionId,
+        bytes32 indexed agentId,
+        address disputer,
+        string evidence
+    );
+
+    event DisputeResolved(
+        uint256 indexed decisionId,
+        bytes32 indexed agentId,
+        DecisionStatus resolution
+    );
+
+    // ── Core Functions ──────────────────────────────────────────────
+
+    /// @notice Record an agent decision on-chain
+    /// @param agentId Unique identifier for the agent
+    /// @param toolName Name of the tool that was called
+    /// @param paramsHash keccak256 hash of the tool parameters
+    function registerDecision(
+        bytes32 agentId,
+        string calldata toolName,
+        bytes32 paramsHash
+    ) external returns (uint256 decisionId) {
+        decisionId = decisionCount++;
+
+        decisions[decisionId] = Decision({
+            agentId: agentId,
+            toolName: toolName,
+            paramsHash: paramsHash,
+            blockNumber: block.number,
+            timestamp: block.timestamp,
+            executor: msg.sender,
+            status: DecisionStatus.Recorded,
+            disputeEvidence: ""
+        });
+
+        agentDecisions[agentId].push(decisionId);
+
+        emit DecisionRecorded(decisionId, agentId, toolName, paramsHash, block.number);
+    }
+
+    /// @notice Dispute a recorded decision
+    /// @param decisionId ID of the decision to dispute
+    /// @param evidence Description of why the decision was wrong
+    function disputeDecision(
+        uint256 decisionId,
+        string calldata evidence
+    ) external {
+        require(decisionId < decisionCount, "Decision does not exist");
+        Decision storage d = decisions[decisionId];
+        require(d.status == DecisionStatus.Recorded, "Decision already disputed or resolved");
+
+        d.status = DecisionStatus.Disputed;
+        d.disputeEvidence = evidence;
+        disputeCount[d.agentId]++;
+
+        emit DecisionDisputed(decisionId, d.agentId, msg.sender, evidence);
+    }
+
+    /// @notice Resolve a dispute (governance or owner action)
+    /// @param decisionId ID of the disputed decision
+    /// @param upheld True if the dispute is upheld (decision was wrong)
+    function resolveDispute(
+        uint256 decisionId,
+        bool upheld
+    ) external {
+        require(decisionId < decisionCount, "Decision does not exist");
+        Decision storage d = decisions[decisionId];
+        require(d.status == DecisionStatus.Disputed, "Decision not disputed");
+
+        d.status = DecisionStatus.Resolved;
+
+        if (!upheld) {
+            // Dispute was invalid — decrement dispute count
+            if (disputeCount[d.agentId] > 0) {
+                disputeCount[d.agentId]--;
+            }
+        }
+
+        emit DisputeResolved(decisionId, d.agentId, d.status);
+    }
+
+    // ── View Functions ──────────────────────────────────────────────
+
+    /// @notice Get all decision IDs for an agent
+    function getDecisionHistory(bytes32 agentId) external view returns (uint256[] memory) {
+        return agentDecisions[agentId];
+    }
+
+    /// @notice Get the number of decisions for an agent
+    function getDecisionCount(bytes32 agentId) external view returns (uint256) {
+        return agentDecisions[agentId].length;
+    }
+
+    /// @notice Get dispute status for a decision
+    function getDisputeStatus(uint256 decisionId) external view returns (DecisionStatus) {
+        require(decisionId < decisionCount, "Decision does not exist");
+        return decisions[decisionId].status;
+    }
+
+    /// @notice Calculate trust score for an agent (decisions - disputes * 2)
+    function getTrustScore(bytes32 agentId) external view returns (int256) {
+        uint256 total = agentDecisions[agentId].length;
+        uint256 disputes = disputeCount[agentId];
+        return int256(total) - int256(disputes * 2);
+    }
+}
