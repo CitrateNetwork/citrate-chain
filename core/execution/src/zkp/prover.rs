@@ -86,6 +86,17 @@ impl Prover {
         Ok(())
     }
 
+    /// Get the verifying key for a proof type (for sharing with the Verifier).
+    /// Returns None if setup() hasn't been called for this type.
+    pub fn get_verifying_key(&self, proof_type: ProofType) -> Option<super::types::VerifyingKey> {
+        // The prepared VK contains the original VK — but we need the raw VK.
+        // During setup, we stored the prepared VK. We need to also store the raw VK.
+        // For now, return None and fix in the setup() to also store raw VKs.
+        //
+        // WORKAROUND: Re-extract from the proving key, which contains the VK.
+        self.proving_keys.read().get(&proof_type).map(|pk| pk.vk.clone())
+    }
+
     /// Generate proof for model execution
     pub fn prove_model_execution(
         &self,
