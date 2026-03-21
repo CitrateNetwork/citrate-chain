@@ -155,4 +155,91 @@ contract AgentDecisionRegistry {
         uint256 disputes = disputeCount[agentId];
         return int256(total) - int256(disputes * 2);
     }
+
+    // ── Trust Tiers (WP-H.16) ─────────────────────────────────────────
+
+    /// Trust tier boundaries (inclusive lower bound).
+    /// Untrusted: score < 100
+    /// Standard:  100 <= score < 500
+    /// Trusted:   score >= 500
+    uint256 public constant TIER_STANDARD_THRESHOLD = 100;
+    uint256 public constant TIER_TRUSTED_THRESHOLD = 500;
+
+    event TrustTierChanged(
+        bytes32 indexed agentId,
+        string oldTier,
+        string newTier,
+        int256 newScore
+    );
+
+    /// @notice Return the trust tier name for an agent.
+    /// @return tier "Untrusted", "Standard", or "Trusted"
+    function getTrustTier(bytes32 agentId) external view returns (string memory tier) {
+        int256 score = this.getTrustScore(agentId);
+        return _tierName(score);
+    }
+
+    /// @notice Record a decision AND emit a tier-change event if the tier transitions.
+    function registerDecisionWithTierCheck(
+        bytes32 agentId,
+        string calldata toolName,
+        bytes32 paramsHash
+    ) external returns (uint256 decisionId) {
+        string memory oldTier = _tierName(this.getTrustScore(agentId));
+
+        decisionId = decisionCount++;
+        decisions[decisionId] = Decision({
+            agentId: agentId,
+            toolName: toolName,
+            paramsHash: paramsHash,
+            blockNumber: block.number,
+            timestamp: block.timestamp,
+            executor: msg.sender,
+            status: DecisionStatus.Recorded,
+            disputeEvidence: ""
+        });
+        agentDecisions[agentId].push(decisionId);
+
+        emit DecisionRecorded(decisionId, agentId, toolName, paramsHash, block.number);
+
+        string memory newTier = _tierName(this.getTrustScore(agentId));
+        if (keccak256(bytes(oldTier)) != keccak256(bytes(newTier))) {
+            emit TrustTierChanged(agentId, oldTier, newTier, this.getTrustScore(agentId));
+        }
+    }
+
+    /// @notice Dispute a decision AND emit a tier-change event if the tier transitions.
+    function disputeDecisionWithTierCheck(
+        uint256 decisionId,
+        string calldata evidence
+    ) external {
+        require(decisionId < decisionCount, "Decision does not exist");
+        Decision storage d = decisions[decisionId];
+        require(d.status == DecisionStatus.Recorded, "Decision already disputed or resolved");
+
+        bytes32 agentId = d.agentId;
+        string memory oldTier = _tierName(this.getTrustScore(agentId));
+
+        d.status = DecisionStatus.Disputed;
+        d.disputeEvidence = evidence;
+        disputeCount[agentId]++;
+
+        emit DecisionDisputed(decisionId, agentId, msg.sender, evidence);
+
+        string memory newTier = _tierName(this.getTrustScore(agentId));
+        if (keccak256(bytes(oldTier)) != keccak256(bytes(newTier))) {
+            emit TrustTierChanged(agentId, oldTier, newTier, this.getTrustScore(agentId));
+        }
+    }
+
+    /// @dev Map a trust score to a tier name.
+    function _tierName(int256 score) internal pure returns (string memory) {
+        if (score < int256(TIER_STANDARD_THRESHOLD)) {
+            return "Untrusted";
+        } else if (score < int256(TIER_TRUSTED_THRESHOLD)) {
+            return "Standard";
+        } else {
+            return "Trusted";
+        }
+    }
 }
