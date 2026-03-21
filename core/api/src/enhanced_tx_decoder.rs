@@ -13,7 +13,9 @@ use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, Secp256
 use sha3::{Digest, Keccak256};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tracing::{debug, error};
+use tracing::debug;
+#[allow(unused_imports)]
+use tracing::error;
 
 /// Enhanced transaction decoder supporting multiple transaction types
 pub struct EnhancedTransactionDecoder {

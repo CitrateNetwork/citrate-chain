@@ -1369,14 +1369,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
 
                         tracing::info!("Sending {} blocks to peer {}", blocks.len(), pid.0);
                         let _ = pm_for_rx
-                            .send_to_peers(&[pid.clone()], &NetworkMessage::Blocks { blocks })
+                            .send_to_peers(std::slice::from_ref(&pid), &NetworkMessage::Blocks { blocks })
                             .await;
                     }
                     NetworkMessage::GetPeers => {
                         // Serve a small list of peers from discovery
                         let peers = discovery.get_peers_for_exchange().await;
                         let _ = pm_for_rx
-                            .send_to_peers(&[pid.clone()], &NetworkMessage::Peers { peers })
+                            .send_to_peers(std::slice::from_ref(&pid), &NetworkMessage::Peers { peers })
                             .await;
                     }
                     NetworkMessage::Peers { peers } => {
@@ -1421,7 +1421,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                         let _ = pm_for_rx
                             .send_to_peers(
-                                &[pid.clone()],
+                                std::slice::from_ref(&pid),
                                 &NetworkMessage::Headers { headers },
                             )
                             .await;
@@ -1438,7 +1438,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                         let _ = pm_for_rx
                             .send_to_peers(
-                                &[pid.clone()],
+                                std::slice::from_ref(&pid),
                                 &NetworkMessage::Transactions { transactions: txs },
                             )
                             .await;
@@ -1558,7 +1558,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         match ai_handler_for_rx.handle_message(&pid, &msg).await {
                             Ok(Some(response)) => {
                                 let _ = pm_for_rx
-                                    .send_to_peers(&[pid.clone()], &response)
+                                    .send_to_peers(std::slice::from_ref(&pid), &response)
                                     .await;
                             }
                             Ok(None) => {} // No response needed

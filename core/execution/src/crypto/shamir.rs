@@ -37,11 +37,11 @@ impl FieldElement {
     /// Create from bytes (little-endian)
     pub fn from_bytes(bytes: &[u8; 32]) -> Self {
         let mut limbs = [0u64; 4];
-        for i in 0..4 {
+        for (i, limb) in limbs.iter_mut().enumerate() {
             let start = i * 8;
             let mut limb_bytes = [0u8; 8];
             limb_bytes.copy_from_slice(&bytes[start..start + 8]);
-            limbs[i] = u64::from_le_bytes(limb_bytes);
+            *limb = u64::from_le_bytes(limb_bytes);
         }
         Self { limbs }.reduce()
     }
@@ -82,10 +82,10 @@ impl FieldElement {
         if needs_reduction {
             // Subtract modulus (simplified)
             let mut borrow = 0u64;
-            for i in 0..4 {
-                let (diff, new_borrow) = self.limbs[i].overflowing_sub(FIELD_MODULUS[i]);
+            for (limb, &modulus_limb) in self.limbs.iter_mut().zip(FIELD_MODULUS.iter()) {
+                let (diff, new_borrow) = limb.overflowing_sub(modulus_limb);
                 let (final_diff, extra_borrow) = diff.overflowing_sub(borrow);
-                self.limbs[i] = final_diff;
+                *limb = final_diff;
                 borrow = (new_borrow || extra_borrow) as u64;
             }
         }
@@ -98,9 +98,9 @@ impl FieldElement {
         let mut result = [0u64; 4];
         let mut carry = 0u64;
 
-        for i in 0..4 {
-            let sum = self.limbs[i] as u128 + other.limbs[i] as u128 + carry as u128;
-            result[i] = sum as u64;
+        for ((r, &a), &b) in result.iter_mut().zip(self.limbs.iter()).zip(other.limbs.iter()) {
+            let sum = a as u128 + b as u128 + carry as u128;
+            *r = sum as u64;
             carry = (sum >> 64) as u64;
         }
 
@@ -112,19 +112,19 @@ impl FieldElement {
         let mut result = [0u64; 4];
         let mut borrow = 0u64;
 
-        for i in 0..4 {
-            let (diff, new_borrow) = self.limbs[i].overflowing_sub(other.limbs[i]);
+        for ((r, &a), &b) in result.iter_mut().zip(self.limbs.iter()).zip(other.limbs.iter()) {
+            let (diff, new_borrow) = a.overflowing_sub(b);
             let (final_diff, extra_borrow) = diff.overflowing_sub(borrow);
-            result[i] = final_diff;
+            *r = final_diff;
             borrow = (new_borrow || extra_borrow) as u64;
         }
 
         if borrow > 0 {
             // Add modulus if we underflowed
             let mut carry = 0u64;
-            for i in 0..4 {
-                let sum = result[i] as u128 + FIELD_MODULUS[i] as u128 + carry as u128;
-                result[i] = sum as u64;
+            for (r, &modulus_limb) in result.iter_mut().zip(FIELD_MODULUS.iter()) {
+                let sum = *r as u128 + modulus_limb as u128 + carry as u128;
+                *r = sum as u64;
                 carry = (sum >> 64) as u64;
             }
         }

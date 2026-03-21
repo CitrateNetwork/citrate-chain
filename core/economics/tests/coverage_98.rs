@@ -472,8 +472,10 @@ fn test_pricing_update_price_change_increase() {
 
 #[test]
 fn test_pricing_utilization_window_trimming() {
-    let mut config = DynamicPricingConfig::default();
-    config.utilization_window = 5;
+    let config = DynamicPricingConfig {
+        utilization_window: 5,
+        ..DynamicPricingConfig::default()
+    };
     let mut pricing = DynamicPricingManager::new(config);
 
     for i in 1..=10 {
@@ -1146,8 +1148,10 @@ fn test_slashing_cumulative_under_threshold() {
 
 #[test]
 fn test_slashing_downtime_configurable() {
-    let mut config = InstitutionalSlashingConfig::default();
-    config.penalize_downtime = true;
+    let config = InstitutionalSlashingConfig {
+        penalize_downtime: true,
+        ..InstitutionalSlashingConfig::default()
+    };
     assert!(InstitutionalSlashingManager::new(config).should_penalize_downtime());
 }
 

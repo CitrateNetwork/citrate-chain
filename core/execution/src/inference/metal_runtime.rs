@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+#[allow(unused_imports)]
 use std::time::Instant;
 
 // Import CoreML bridge only on macOS
@@ -249,7 +250,7 @@ impl MetalRuntime {
     #[cfg(not(target_os = "macos"))]
     async fn infer_coreml(
         &self,
-        model: &MetalModel,
+        _model: &MetalModel,
         _input: &[f32],
     ) -> Result<Vec<f32>> {
         Err(anyhow!("CoreML is only available on macOS"))

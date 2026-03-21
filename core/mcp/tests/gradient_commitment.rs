@@ -38,12 +38,12 @@ fn build_nonce_proof(statement: &[u8], response: &[u8; 32], nonce_ts: u64) -> Ve
     let mut hasher = Sha3_256::new();
     hasher.update(statement);
     hasher.update(response);
-    hasher.update(&nonce_bytes);
+    hasher.update(nonce_bytes);
     let commitment = hasher.finalize();
 
     let mut proof_data = commitment.to_vec(); // 32 bytes
     proof_data.extend_from_slice(response);   // 32 bytes
-    proof_data.extend_from_slice(&nonce_bytes); // 8 bytes = 72 total
+    proof_data.extend_from_slice(&nonce_bytes);// 8 bytes = 72 total
     proof_data
 }
 
@@ -402,8 +402,8 @@ fn test_commitment_generation_under_1ms() {
     for _ in 0..100 {
         let mut hasher = Sha3_256::new();
         hasher.update(statement);
-        hasher.update(&response);
-        hasher.update(&nonce_bytes);
+        hasher.update(response);
+        hasher.update(nonce_bytes);
         let _ = hasher.finalize();
     }
 
@@ -413,8 +413,8 @@ fn test_commitment_generation_under_1ms() {
     for _ in 0..iterations {
         let mut hasher = Sha3_256::new();
         hasher.update(statement);
-        hasher.update(&response);
-        hasher.update(&nonce_bytes);
+        hasher.update(response);
+        hasher.update(nonce_bytes);
         let _ = hasher.finalize();
     }
     let elapsed = start.elapsed();
@@ -487,8 +487,8 @@ fn test_empty_statement_fails() {
     let mut hasher = Sha3_256::new();
     // hash of empty statement + response + nonce
     hasher.update(b"" as &[u8]);
-    hasher.update(&response);
-    hasher.update(&nonce_bytes);
+    hasher.update(response);
+    hasher.update(nonce_bytes);
     let commitment = hasher.finalize();
 
     let mut proof_data = commitment.to_vec();

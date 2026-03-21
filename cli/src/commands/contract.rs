@@ -743,7 +743,7 @@ fn encode_method_call(method_sig: &str, args: serde_json::Value) -> Result<Strin
             ty if ty.starts_with("uint") => {
                 // Determine bit size (default 256)
                 let bits: u16 = ty[4..].parse().unwrap_or(256);
-                if bits == 0 || bits % 8 != 0 || bits > 256 {
+                if bits == 0 || !bits.is_multiple_of(8) || bits > 256 {
                     bail!("unsupported uint size: {}", bits);
                 }
                 // Accept number or hex string

@@ -3,6 +3,7 @@
 // ZKP circuits for different proof types
 use super::types::{GradientProofCircuit, ModelExecutionCircuit};
 use ark_bls12_381::Fr;
+#[allow(unused_imports)]
 use ark_ff::Zero;
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::prelude::*;

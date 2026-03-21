@@ -84,11 +84,11 @@ impl Trie {
                     }
                 } else {
                     let index = key[0] as usize;
-                    children[index] = Box::new(Self::insert_node(
+                    *children[index] = Self::insert_node(
                         *children[index].clone(),
                         &key[1..],
                         value,
-                    ));
+                    );
                     TrieNode::Branch {
                         children,
                         value: branch_value,
@@ -191,8 +191,8 @@ impl Trie {
                     }
                 } else {
                     let index = key[0] as usize;
-                    children[index] =
-                        Box::new(Self::remove_node(*children[index].clone(), &key[1..]));
+                    *children[index] =
+                        Self::remove_node(*children[index].clone(), &key[1..]);
 
                     // Check if branch can be simplified
                     Self::simplify_branch(children, value)
@@ -265,10 +265,10 @@ impl Trie {
         if key1.is_empty() {
             // key1 goes to branch value
             let index = key2[0] as usize;
-            children[index] = Box::new(TrieNode::Leaf {
+            *children[index] = TrieNode::Leaf {
                 key: key2[1..].to_vec(),
                 value: value2,
-            });
+            };
             TrieNode::Branch {
                 children,
                 value: Some(value1),
@@ -276,10 +276,10 @@ impl Trie {
         } else if key2.is_empty() {
             // key2 goes to branch value
             let index = key1[0] as usize;
-            children[index] = Box::new(TrieNode::Leaf {
+            *children[index] = TrieNode::Leaf {
                 key: key1[1..].to_vec(),
                 value: value1,
-            });
+            };
             TrieNode::Branch {
                 children,
                 value: Some(value2),
@@ -290,21 +290,21 @@ impl Trie {
             let index2 = key2[0] as usize;
 
             if index1 == index2 {
-                children[index1] = Box::new(Self::create_branch(
+                *children[index1] = Self::create_branch(
                     key1[1..].to_vec(),
                     value1,
                     key2[1..].to_vec(),
                     value2,
-                ));
+                );
             } else {
-                children[index1] = Box::new(TrieNode::Leaf {
+                *children[index1] = TrieNode::Leaf {
                     key: key1[1..].to_vec(),
                     value: value1,
-                });
-                children[index2] = Box::new(TrieNode::Leaf {
+                };
+                *children[index2] = TrieNode::Leaf {
                     key: key2[1..].to_vec(),
                     value: value2,
-                });
+                };
             }
 
             TrieNode::Branch {
@@ -330,12 +330,12 @@ impl Trie {
         if !remaining_prefix.is_empty() {
             let index = remaining_prefix[0] as usize;
             if remaining_prefix.len() == 1 {
-                children[index] = Box::new(node);
+                *children[index] = node;
             } else {
-                children[index] = Box::new(TrieNode::Extension {
+                *children[index] = TrieNode::Extension {
                     prefix: remaining_prefix[1..].to_vec(),
                     node: Box::new(node),
-                });
+                };
             }
         }
 
@@ -343,10 +343,10 @@ impl Trie {
             Some(value)
         } else {
             let index = remaining_key[0] as usize;
-            children[index] = Box::new(TrieNode::Leaf {
+            *children[index] = TrieNode::Leaf {
                 key: remaining_key[1..].to_vec(),
                 value,
-            });
+            };
             None
         };
 

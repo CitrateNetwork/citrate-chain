@@ -6,8 +6,11 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use primitive_types::H256;
+#[allow(unused_imports)]
 use sha3::{Sha3_256, Digest};
+#[allow(unused_imports)]
 use std::collections::HashMap;
+#[allow(unused_imports)]
 use tracing::warn;
 
 /// Attestation from secure enclave
@@ -467,6 +470,7 @@ impl SecureEnclaveInterface for AppleSecureEnclave {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]
