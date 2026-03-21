@@ -130,10 +130,14 @@ impl Verifier {
         let input_hash_str = &proof.public_inputs[1];
         let output_hash_str = &proof.public_inputs[2];
 
-        // Verify hashes match
-        if hex::encode(expected_model_hash) != *model_hash_str
-            || hex::encode(expected_input_hash) != *input_hash_str
-            || hex::encode(expected_output_hash) != *output_hash_str
+        // Verify hashes match — public inputs are decimal u128 strings (first 16 bytes)
+        let to_field_str = |hash: &[u8]| -> String {
+            hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128).to_string()
+        };
+
+        if to_field_str(expected_model_hash) != *model_hash_str
+            || to_field_str(expected_input_hash) != *input_hash_str
+            || to_field_str(expected_output_hash) != *output_hash_str
         {
             return Ok(false);
         }
@@ -167,9 +171,13 @@ impl Verifier {
         let loss_str = &proof.public_inputs[3];
         let samples_str = &proof.public_inputs[4];
 
-        // Verify hashes match
-        if hex::encode(expected_model_hash) != *model_hash_str
-            || hex::encode(expected_dataset_hash) != *dataset_hash_str
+        // Verify hashes match — public inputs are decimal u128 strings (first 16 bytes)
+        let to_field_str = |hash: &[u8]| -> String {
+            hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128).to_string()
+        };
+
+        if to_field_str(expected_model_hash) != *model_hash_str
+            || to_field_str(expected_dataset_hash) != *dataset_hash_str
         {
             return Ok(false);
         }
@@ -222,25 +230,22 @@ impl Verifier {
         Ok(field_elements)
     }
 
-    /// Verify aggregated proofs (for scalability)
+    /// Verify aggregated proofs (for scalability).
+    ///
+    /// NOT YET IMPLEMENTED — aggregated proof verification (recursive SNARKs or
+    /// Groth16 batch verification) requires additional cryptographic infrastructure.
+    /// Returns an error to prevent callers from assuming verification succeeded.
     pub fn verify_aggregated(
         &self,
-        proof_type: ProofType,
-        aggregated_proof: &SerializableProof,
+        _proof_type: ProofType,
+        _aggregated_proof: &SerializableProof,
         _individual_public_inputs: Vec<Vec<String>>,
     ) -> Result<bool, ZKPError> {
-        // In a real implementation, this would verify an aggregated proof
-        // that proves multiple statements at once
-
-        let result = self.verify(proof_type, aggregated_proof)?;
-
-        if !result.is_valid {
-            return Ok(false);
-        }
-
-        // Additional verification logic for aggregated proofs would go here
-
-        Ok(true)
+        Err(ZKPError::VerificationError(
+            "Aggregated proof verification is not yet implemented. \
+             Use individual verify() calls instead."
+                .to_string(),
+        ))
     }
 }
 

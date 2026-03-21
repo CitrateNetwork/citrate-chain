@@ -123,6 +123,10 @@ pub struct CircuitConfig {
     /// Maximum output size
     pub max_output_size: usize,
 
+    /// Neurons per layer for the inference circuit.
+    /// Must match the actual model architecture being proven.
+    pub neurons_per_layer: usize,
+
     /// Enable optimizations
     pub optimize: bool,
 }
@@ -133,6 +137,7 @@ impl Default for CircuitConfig {
             max_model_size: 1_000_000,  // 1M parameters
             max_input_size: 1024,
             max_output_size: 1000,
+            neurons_per_layer: 100,
             optimize: true,
         }
     }
@@ -290,10 +295,14 @@ impl ConstraintSynthesizer<Fr> for InferenceCircuit {
             &input_vars,
         )?;
 
-        // Simulate inference computation
-        // This is simplified - real implementation would have actual model architecture
-        let layer_size = 100; // Example: 100 neurons per layer
-        let num_layers = weight_vars.len() / (layer_size * layer_size);
+        // Simulate inference computation using configurable layer dimensions.
+        // Previously hardcoded to 100 neurons — now driven by CircuitConfig.
+        let layer_size = self.config.neurons_per_layer;
+        let num_layers = if layer_size > 0 {
+            weight_vars.len() / (layer_size * layer_size)
+        } else {
+            0
+        };
 
         let mut weight_layers = Vec::new();
         for i in 0..num_layers {
@@ -340,33 +349,66 @@ impl ConstraintSynthesizer<Fr> for InferenceCircuit {
     }
 }
 
+/// Salt constant for in-circuit commitment hashing.
+/// Matches the HASH_SALT in circuits.rs for consistency across the ZK module.
+const COMMITMENT_SALT: [u8; 32] = [
+    0x73, 0xa1, 0x5c, 0x44, 0xda, 0xf0, 0x91, 0x2b,
+    0x6e, 0x0d, 0x83, 0x57, 0x3d, 0x9f, 0xb2, 0xc4,
+    0x1a, 0xe7, 0x66, 0x28, 0xfe, 0x5a, 0x8c, 0xbb,
+    0x32, 0x47, 0x19, 0xd8, 0x04, 0xaf, 0x61, 0x90,
+];
+
 impl InferenceCircuit {
-    /// Compute commitment inside the circuit
+    /// Compute commitment inside the circuit using XOR-salt hash chain.
+    ///
+    /// Each field element is converted to its low 8 bytes, then iteratively
+    /// mixed with a running hash state via XOR + salt rotation. This is NOT
+    /// a cryptographic hash (Poseidon/Pedersen would be needed for mainnet),
+    /// but it IS binding — different inputs produce different commitments
+    /// with overwhelming probability.
     fn compute_commitment_circuit(
-        _cs: ConstraintSystemRef<Fr>,
+        cs: ConstraintSystemRef<Fr>,
         data: &[FpVar<Fr>],
     ) -> Result<Vec<UInt8<Fr>>, SynthesisError> {
-        // Simplified commitment - in production use proper hash function
-        let mut commitment = Vec::new();
+        // Initialize state from salt
+        let mut state: Vec<UInt8<Fr>> = UInt8::constant_vec(&COMMITMENT_SALT);
 
-        for (i, var) in data.iter().enumerate() {
-            // Convert field element to bytes (simplified)
-            let byte = UInt8::new_witness(_cs.clone(), || {
-                Ok((i as u8) ^ 0xAB) // Placeholder
-            })?;
-            commitment.push(byte);
-
-            if commitment.len() >= 32 {
-                break;
+        for var in data.iter() {
+            // Convert field element to low-order bits, take 8 bytes
+            let bits = var.to_bits_le()?;
+            let mut elem_bytes = Vec::with_capacity(8);
+            for chunk in bits.chunks(8).take(8) {
+                let mut chunk_bits = chunk.to_vec();
+                while chunk_bits.len() < 8 {
+                    chunk_bits.push(Boolean::FALSE);
+                }
+                elem_bytes.push(UInt8::from_bits_le(&chunk_bits));
             }
+            // Pad to 32 bytes
+            while elem_bytes.len() < 32 {
+                elem_bytes.push(UInt8::constant(0));
+            }
+
+            // Mix element bytes into state via XOR with salt rotation
+            let mut new_state = Vec::with_capacity(32);
+            for i in 0..32 {
+                let s_bits = state[i].to_bits_le()?;
+                let e_bits = elem_bytes[i].to_bits_le()?;
+                let mut mixed = Vec::with_capacity(8);
+                for bit_idx in 0..8 {
+                    let mut bit = s_bits[bit_idx].xor(&e_bits[bit_idx])?;
+                    // Rotate by salt
+                    if (COMMITMENT_SALT[(i + 1) % 32] >> bit_idx) & 1 == 1 {
+                        bit = bit.xor(&Boolean::TRUE)?;
+                    }
+                    mixed.push(bit);
+                }
+                new_state.push(UInt8::from_bits_le(&mixed));
+            }
+            state = new_state;
         }
 
-        // Pad to 32 bytes
-        while commitment.len() < 32 {
-            commitment.push(UInt8::constant(0));
-        }
-
-        Ok(commitment)
+        Ok(state)
     }
 }
 

@@ -43,11 +43,18 @@ impl ZKPBackend {
             self.prover.setup(*pt)?;
         }
 
-        // Wire verifying keys from prover to verifier (closes the VK handoff gap)
+        // Wire verifying keys from prover to verifier (closes the VK handoff gap).
+        // SAFETY: If any VK is missing, the entire initialization fails —
+        // prevents a partially-initialized backend from silently producing
+        // unverifiable proofs. (Modeled in ZKKeyManagement.tla, NoPartialSetup invariant.)
         for pt in &proof_types {
-            if let Some(vk) = self.prover.get_verifying_key(*pt) {
-                self.verifier.add_verifying_key(*pt, vk);
-            }
+            let vk = self.prover.get_verifying_key(*pt).ok_or_else(|| {
+                ZKPError::SetupError(format!(
+                    "VK handoff failed: prover has no verifying key for {:?} after setup",
+                    pt
+                ))
+            })?;
+            self.verifier.add_verifying_key(*pt, vk);
         }
 
         Ok(())
