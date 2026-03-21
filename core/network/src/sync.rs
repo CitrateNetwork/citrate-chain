@@ -274,10 +274,15 @@ impl SyncManager {
         }
 
         let count = headers.len();
-        let first_height = headers.first().expect("checked non-empty").height;
-        let last_height = headers.last().expect("checked non-empty").height;
-        let first_hash = headers.first().map(|h| h.block_hash).unwrap_or_default();
-        let last_hash = headers.last().map(|h| h.block_hash).unwrap_or_default();
+        // Safety: non-empty guaranteed by early return above
+        let (first, last) = match (headers.first(), headers.last()) {
+            (Some(f), Some(l)) => (f, l),
+            _ => return Ok(()),
+        };
+        let first_height = first.height;
+        let last_height = last.height;
+        let first_hash = first.block_hash;
+        let last_hash = last.block_hash;
 
         // Store validated headers
         self.downloaded_headers.write().await.extend(headers);
@@ -327,7 +332,11 @@ impl SyncManager {
         }
 
         let total = blocks.len();
-        let first_height = blocks.first().expect("checked non-empty").header.height;
+        // Safety: non-empty guaranteed by early return above
+        let first_height = match blocks.first() {
+            Some(b) => b.header.height,
+            None => return Ok(()),
+        };
         let mut validated = Vec::with_capacity(total);
         let mut rejected = 0usize;
 
@@ -397,7 +406,10 @@ impl SyncManager {
             return Ok(());
         }
 
-        let last_height = validated.last().expect("checked non-empty").header.height;
+        let last_height = match validated.last() {
+            Some(b) => b.header.height,
+            None => return Ok(()),
+        };
         let accepted = validated.len();
 
         // Store only validated blocks

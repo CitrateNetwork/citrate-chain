@@ -80,19 +80,14 @@ impl StateCache {
         storage_cache_size: usize,
         code_cache_size: usize,
     ) -> Self {
+        // Fall back to 1 if zero is passed, since NonZeroUsize requires > 0.
+        let acct = NonZeroUsize::new(account_cache_size).unwrap_or(NonZeroUsize::MIN);
+        let stor = NonZeroUsize::new(storage_cache_size).unwrap_or(NonZeroUsize::MIN);
+        let code = NonZeroUsize::new(code_cache_size).unwrap_or(NonZeroUsize::MIN);
         Self {
-            accounts: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(account_cache_size)
-                    .expect("account_cache_size must be > 0"),
-            ))),
-            storage: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(storage_cache_size)
-                    .expect("storage_cache_size must be > 0"),
-            ))),
-            code: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(code_cache_size)
-                    .expect("code_cache_size must be > 0"),
-            ))),
+            accounts: Arc::new(RwLock::new(LruCache::new(acct))),
+            storage: Arc::new(RwLock::new(LruCache::new(stor))),
+            code: Arc::new(RwLock::new(LruCache::new(code))),
             stats: Arc::new(RwLock::new(CacheStats::default())),
             prefetch_enabled: true,
             prefetch_depth: 4,

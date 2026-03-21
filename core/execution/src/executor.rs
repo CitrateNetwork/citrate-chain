@@ -331,10 +331,16 @@ impl Executor {
             let state = model_state.clone();
             let cid = artifact_cid.map(|s| s.to_string());
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
+                let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("sync_model_to_registry: runtime");
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!("sync_model_to_registry: failed to build tokio runtime: {}", e);
+                        return;
+                    }
+                };
                 if let Err(e) = rt.block_on(adapter.register_model(
                     model_id,
                     &state,
@@ -625,9 +631,11 @@ impl Executor {
         } else {
             // Contract call or special operation
             // Safety: this branch is only reached when tx.to.is_some() (else clause of is_none check)
-            let to = crate::address_utils::normalize_address(
-                &tx.to.expect("tx.to guaranteed Some by preceding is_none check"),
-            );
+            let to_pk = match tx.to {
+                Some(ref pk) => pk,
+                None => return Err(ExecutionError::InvalidInput),
+            };
+            let to = crate::address_utils::normalize_address(to_pk);
 
             // Check first 4 bytes for function selector
             if tx.data.len() >= 4 {

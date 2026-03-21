@@ -544,7 +544,7 @@ async fn citrate_get_model(
             ));
 
             match state.ai_api.get_model(model_id).await {
-                Ok(model) => Ok(Json(serde_json::to_value(model).expect("model serializable to JSON"))),
+                Ok(model) => Ok(Json(serde_json::to_value(model).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))),
                 Err(e) => {
                     error!("Failed to get model: {}", e);
                     Err(StatusCode::NOT_FOUND)
@@ -569,7 +569,7 @@ async fn citrate_model_stats(
             ));
 
             match state.ai_api.get_model_stats(model_id).await {
-                Ok(stats) => Ok(Json(serde_json::to_value(stats).expect("stats serializable to JSON"))),
+                Ok(stats) => Ok(Json(serde_json::to_value(stats).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))),
                 Err(e) => {
                     error!("Failed to get model stats: {}", e);
                     Err(StatusCode::NOT_FOUND)
@@ -617,7 +617,7 @@ async fn citrate_get_inference(
             let request_hash = citrate_consensus::types::Hash::new(hash_array);
 
             match state.ai_api.get_inference_result(request_hash).await {
-                Ok(result) => Ok(Json(serde_json::to_value(result).expect("inference result serializable to JSON"))),
+                Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))),
                 Err(e) => {
                     error!("Failed to get inference result: {}", e);
                     Err(StatusCode::NOT_FOUND)
@@ -667,7 +667,7 @@ async fn citrate_get_training_job(
                 citrate_execution::types::JobId(citrate_consensus::types::Hash::new(job_id_array));
 
             match state.ai_api.get_training_job(job_id).await {
-                Ok(job) => Ok(Json(serde_json::to_value(job).expect("training job serializable to JSON"))),
+                Ok(job) => Ok(Json(serde_json::to_value(job).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))),
                 Err(e) => {
                     error!("Failed to get training job: {}", e);
                     Err(StatusCode::NOT_FOUND)
@@ -710,7 +710,7 @@ async fn citrate_get_lora(
             let adapter_hash = citrate_consensus::types::Hash::new(adapter_id_array);
 
             match state.ai_api.get_lora(adapter_hash).await {
-                Ok(adapter) => Ok(Json(serde_json::to_value(adapter).expect("LoRA adapter serializable to JSON"))),
+                Ok(adapter) => Ok(Json(serde_json::to_value(adapter).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))),
                 Err(e) => {
                     error!("Failed to get LoRA adapter: {}", e);
                     Err(StatusCode::NOT_FOUND)

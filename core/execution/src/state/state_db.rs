@@ -169,8 +169,13 @@ impl StateDB {
         // Update state trie with account data
         for address in self.accounts.get_dirty_accounts() {
             let account = self.accounts.get_account(&address);
-            let encoded = bincode::serialize(&account)
-                .expect("Account serialization should not fail for a valid Account struct");
+            let encoded = match bincode::serialize(&account) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::error!("Account serialization failed for {:?}: {}", address, e);
+                    continue;
+                }
+            };
             state_trie.insert(address.0.to_vec(), encoded);
 
             // Update storage root for account

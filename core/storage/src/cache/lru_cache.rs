@@ -14,7 +14,7 @@ pub struct Cache<K: Hash + Eq + Clone, V: Clone> {
 impl<K: Hash + Eq + Clone, V: Clone> Cache<K, V> {
     /// Create a new cache with specified capacity
     pub fn new(capacity: usize) -> Self {
-        let capacity = NonZeroUsize::new(capacity).expect("Cache capacity must be non-zero");
+        let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
         Self {
             inner: Arc::new(RwLock::new(LruCache::new(capacity))),
         }

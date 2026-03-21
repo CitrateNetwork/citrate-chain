@@ -209,7 +209,7 @@ impl EnhancedTransactionDecoder {
         // Update statistics
         match &result {
             Ok(decoded) => {
-                let mut stats = self.stats.lock().expect("decoder stats lock poisoned");
+                let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
                 let tx_type_str = match decoded.tx_type {
                     TransactionType::Eip1559 => "eip1559",
                     TransactionType::Eip2930 => "eip2930",
@@ -222,7 +222,7 @@ impl EnhancedTransactionDecoder {
                 );
             }
             Err(e) => {
-                let mut stats = self.stats.lock().expect("decoder stats lock poisoned");
+                let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
                 stats.record_failed_decode(&e.to_string());
             }
         }
@@ -350,7 +350,7 @@ impl EnhancedTransactionDecoder {
         // Extract sender from PublicKey
         let sender = self.extract_sender_from_citrate_tx(&tx);
 
-        let mut stats = self.stats.lock().expect("decoder stats lock poisoned");
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
         stats.record_successful_decode(self.config.default_chain_id, "citrate_native");
 
         let gas_price = tx.gas_price; // Extract before moving tx
@@ -722,12 +722,12 @@ impl EnhancedTransactionDecoder {
 
     /// Get decoder statistics
     pub fn get_stats(&self) -> TransactionStats {
-        self.stats.lock().expect("decoder stats lock poisoned").clone()
+        self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Reset statistics
     pub fn reset_stats(&self) {
-        let mut stats = self.stats.lock().expect("decoder stats lock poisoned");
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
         *stats = TransactionStats::default();
     }
 

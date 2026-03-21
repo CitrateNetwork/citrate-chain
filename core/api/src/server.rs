@@ -378,7 +378,7 @@ pub struct RpcConfig {
 impl Default for RpcConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "127.0.0.1:8545".parse().expect("valid hardcoded address"),
+            listen_addr: "127.0.0.1:8545".parse().unwrap_or_else(|e| panic!("valid hardcoded address: {e}")),
             max_connections: 100,
             cors_origins: vec!["*".to_string()],
             threads: 4,
@@ -1122,7 +1122,7 @@ impl RpcServer {
                 compiled
             } else if let Some(stdj) = standard_json {
                 // Standard JSON supports multi-file projects
-                let sj_str = if stdj.is_string() { stdj.as_str().expect("checked is_string above").to_string() } else { serde_json::to_string(stdj).unwrap_or_default() };
+                let sj_str = if stdj.is_string() { stdj.as_str().unwrap_or_default().to_string() } else { serde_json::to_string(stdj).unwrap_or_default() };
                 let (_creation, runtime) = match compile_standard_json(&sj_str, contract_name) {
                     Ok(t) => t,
                     Err(e) => return Ok(json!({
@@ -1190,7 +1190,7 @@ impl RpcServer {
 
                     // If standard_json provided, compute expected creation bytecode
                     let expected_creation_opt: Option<Vec<u8>> = if let Some(stdj) = standard_json {
-                        let sj_str = if stdj.is_string() { stdj.as_str().expect("checked is_string above").to_string() } else { serde_json::to_string(stdj).unwrap_or_default() };
+                        let sj_str = if stdj.is_string() { stdj.as_str().unwrap_or_default().to_string() } else { serde_json::to_string(stdj).unwrap_or_default() };
                         if let Ok((creation, _runtime)) = compile_standard_json(&sj_str, contract_name) {
                             // Append constructor args if provided (hex-encoded ABI)
                             let extra = constructor_args_hex
@@ -1241,7 +1241,7 @@ impl RpcServer {
 
             // Store record in memory
             {
-                let mut map = VERIFICATIONS.write().expect("verifications lock poisoned");
+                let mut map = VERIFICATIONS.write().unwrap_or_else(|e| e.into_inner());
                 map.insert(address_str.to_string(), record.clone());
             }
 
@@ -1266,7 +1266,7 @@ impl RpcServer {
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
             // Try memory
-            if let Some(val) = VERIFICATIONS.read().expect("verifications lock poisoned").get(&addr).cloned() {
+            if let Some(val) = VERIFICATIONS.read().unwrap_or_else(|e| e.into_inner()).get(&addr).cloned() {
                 return Ok(val);
             }
             // Try storage

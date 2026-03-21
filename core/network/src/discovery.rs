@@ -97,7 +97,7 @@ impl Discovery {
     pub async fn add_peer(&self, id: String, addr: SocketAddr, score: i32) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
+            .unwrap_or_default()
             .as_secs();
 
         let peer = KnownPeer {
@@ -132,7 +132,7 @@ impl Discovery {
     pub async fn get_peers_for_exchange(&self) -> Vec<PeerAddress> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
+            .unwrap_or_default()
             .as_secs();
 
         let connected = self.connected_peers.read().await;
@@ -199,7 +199,7 @@ impl Discovery {
         let needed = self.config.max_peers - current_peers;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
+            .unwrap_or_default()
             .as_secs();
 
         let mut candidates: Vec<_> = self
@@ -240,7 +240,7 @@ impl Discovery {
     pub async fn cleanup_expired(&self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
+            .unwrap_or_default()
             .as_secs();
 
         let expired: Vec<String> = self

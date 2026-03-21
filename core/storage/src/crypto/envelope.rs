@@ -142,14 +142,18 @@ impl EnvelopeHeader {
             return Err(EnvelopeError::UnsupportedVersion(version));
         }
 
-        let key_version = u32::from_be_bytes(bytes[5..9].try_into().expect("4-byte slice for u32"));
+        let mut kv_buf = [0u8; 4];
+        kv_buf.copy_from_slice(&bytes[5..9]);
+        let key_version = u32::from_be_bytes(kv_buf);
         let algorithm = bytes[9];
         let kdf_method = bytes[10];
 
         let mut column_family_hash = [0u8; 8];
         column_family_hash.copy_from_slice(&bytes[11..19]);
 
-        let encrypted_at = u64::from_be_bytes(bytes[19..27].try_into().expect("8-byte slice for u64"));
+        let mut ea_buf = [0u8; 8];
+        ea_buf.copy_from_slice(&bytes[19..27]);
+        let encrypted_at = u64::from_be_bytes(ea_buf);
 
         let mut key_commitment = [0u8; 16];
         key_commitment.copy_from_slice(&bytes[27..43]);
@@ -258,9 +262,9 @@ impl EncryptionEnvelope {
         nonce.copy_from_slice(&bytes[EnvelopeHeader::SIZE..EnvelopeHeader::SIZE + 12]);
 
         let ct_len_start = EnvelopeHeader::SIZE + 12;
-        let ct_len = u32::from_be_bytes(
-            bytes[ct_len_start..ct_len_start + 4].try_into().expect("4-byte slice for u32")
-        ) as usize;
+        let mut cl_buf = [0u8; 4];
+        cl_buf.copy_from_slice(&bytes[ct_len_start..ct_len_start + 4]);
+        let ct_len = u32::from_be_bytes(cl_buf) as usize;
 
         let ct_start = ct_len_start + 4;
         if bytes.len() < ct_start + ct_len {

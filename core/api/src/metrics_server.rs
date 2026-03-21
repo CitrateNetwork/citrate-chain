@@ -15,7 +15,7 @@ pub static RPC_REQUEST_DURATION: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
         "RPC request duration in seconds",
         &["method"]
     )
-    .expect("Failed to register RPC request duration metric")
+    .unwrap_or_else(|e| panic!("Failed to register RPC request duration metric: {e}"))
 });
 
 pub static RPC_REQUEST_COUNT: Lazy<prometheus::CounterVec> = Lazy::new(|| {
@@ -24,13 +24,13 @@ pub static RPC_REQUEST_COUNT: Lazy<prometheus::CounterVec> = Lazy::new(|| {
         "Total number of RPC requests",
         &["method", "status"]
     )
-    .expect("Failed to register RPC request count metric")
+    .unwrap_or_else(|e| panic!("Failed to register RPC request count metric: {e}"))
 });
 
 // Mempool Metrics
 pub static MEMPOOL_SIZE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     register_gauge_vec!("citrate_mempool_size", "Current mempool size", &["class"])
-        .expect("Failed to register mempool size metric")
+        .unwrap_or_else(|e| panic!("Failed to register mempool size metric: {e}"))
 });
 
 pub static MEMPOOL_BYTES: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
@@ -39,7 +39,7 @@ pub static MEMPOOL_BYTES: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
         "Current mempool size in bytes",
         &["class"]
     )
-    .expect("Failed to register mempool bytes metric")
+    .unwrap_or_else(|e| panic!("Failed to register mempool bytes metric: {e}"))
 });
 
 // Storage Metrics
@@ -49,7 +49,7 @@ pub static STORAGE_READ_DURATION: Lazy<prometheus::HistogramVec> = Lazy::new(|| 
         "Storage read duration in seconds",
         &["cf"]
     )
-    .expect("Failed to register storage read duration metric")
+    .unwrap_or_else(|e| panic!("Failed to register storage read duration metric: {e}"))
 });
 
 pub static STORAGE_WRITE_DURATION: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
@@ -58,34 +58,34 @@ pub static STORAGE_WRITE_DURATION: Lazy<prometheus::HistogramVec> = Lazy::new(||
         "Storage write duration in seconds",
         &["cf"]
     )
-    .expect("Failed to register storage write duration metric")
+    .unwrap_or_else(|e| panic!("Failed to register storage write duration metric: {e}"))
 });
 
 // Cache Metrics
 pub static CACHE_HIT_RATE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     register_gauge_vec!("citrate_cache_hit_rate", "Cache hit rate", &["cache_type"])
-        .expect("Failed to register cache hit rate metric")
+        .unwrap_or_else(|e| panic!("Failed to register cache hit rate metric: {e}"))
 });
 
 pub static CACHE_SIZE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     register_gauge_vec!("citrate_cache_size", "Current cache size", &["cache_type"])
-        .expect("Failed to register cache size metric")
+        .unwrap_or_else(|e| panic!("Failed to register cache size metric: {e}"))
 });
 
 // DAG Metrics
 pub static DAG_HEIGHT: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     register_gauge_vec!("citrate_dag_height", "Current DAG height", &[])
-        .expect("Failed to register DAG height metric")
+        .unwrap_or_else(|e| panic!("Failed to register DAG height metric: {e}"))
 });
 
 pub static DAG_TIPS_COUNT: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     register_gauge_vec!("citrate_dag_tips_count", "Number of current tips", &[])
-        .expect("Failed to register DAG tips count metric")
+        .unwrap_or_else(|e| panic!("Failed to register DAG tips count metric: {e}"))
 });
 
 pub static DAG_BLUE_SCORE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     register_gauge_vec!("citrate_dag_blue_score", "Current blue score", &[])
-        .expect("Failed to register DAG blue score metric")
+        .unwrap_or_else(|e| panic!("Failed to register DAG blue score metric: {e}"))
 });
 
 // Execution Metrics
@@ -95,7 +95,7 @@ pub static EXECUTION_TIME: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
         "Transaction execution time",
         &["tx_type"]
     )
-    .expect("Failed to register execution time metric")
+    .unwrap_or_else(|e| panic!("Failed to register execution time metric: {e}"))
 });
 
 pub static PARALLEL_EXECUTION_GROUPS: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
@@ -104,7 +104,7 @@ pub static PARALLEL_EXECUTION_GROUPS: Lazy<prometheus::HistogramVec> = Lazy::new
         "Number of parallel execution groups",
         &[]
     )
-    .expect("Failed to register parallel execution groups metric")
+    .unwrap_or_else(|e| panic!("Failed to register parallel execution groups metric: {e}"))
 });
 
 // Network Metrics
@@ -114,7 +114,7 @@ pub static PEER_COUNT: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
         "Number of connected peers",
         &["state"]
     )
-    .expect("Failed to register peer count metric")
+    .unwrap_or_else(|e| panic!("Failed to register peer count metric: {e}"))
 });
 
 pub static NETWORK_BYTES_RECEIVED: Lazy<prometheus::CounterVec> = Lazy::new(|| {
@@ -123,7 +123,7 @@ pub static NETWORK_BYTES_RECEIVED: Lazy<prometheus::CounterVec> = Lazy::new(|| {
         "Total bytes received",
         &["protocol"]
     )
-    .expect("Failed to register network bytes received metric")
+    .unwrap_or_else(|e| panic!("Failed to register network bytes received metric: {e}"))
 });
 
 pub static NETWORK_BYTES_SENT: Lazy<prometheus::CounterVec> = Lazy::new(|| {
@@ -132,7 +132,7 @@ pub static NETWORK_BYTES_SENT: Lazy<prometheus::CounterVec> = Lazy::new(|| {
         "Total bytes sent",
         &["protocol"]
     )
-    .expect("Failed to register network bytes sent metric")
+    .unwrap_or_else(|e| panic!("Failed to register network bytes sent metric: {e}"))
 });
 
 /// Metrics server configuration
@@ -171,11 +171,15 @@ async fn metrics_handler() -> Response<Body> {
             .status(StatusCode::OK)
             .header("Content-Type", encoder.format_type())
             .body(Body::from(buffer))
-            .expect("valid response builder"),
+            .unwrap_or_else(|e| {
+                Response::new(Body::from(format!("response builder error: {e}")))
+            }),
         Err(e) => Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::from(format!("Error encoding metrics: {}", e)))
-            .expect("valid response builder"),
+            .unwrap_or_else(|e| {
+                Response::new(Body::from(format!("response builder error: {e}")))
+            }),
     }
 }
 
@@ -184,7 +188,9 @@ async fn health_handler() -> Response<Body> {
     Response::builder()
         .status(StatusCode::OK)
         .body(Body::from("{\"status\":\"healthy\"}"))
-        .expect("valid response builder")
+        .unwrap_or_else(|e| {
+            Response::new(Body::from(format!("response builder error: {e}")))
+        })
 }
 
 /// Update mempool metrics

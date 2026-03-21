@@ -99,9 +99,9 @@ impl GenesisConfig {
     /// Create mainnet genesis configuration
     pub fn mainnet() -> Self {
         let treasury = address_from_hex("0x1111111111111111111111111111111111111111")
-            .expect("Invalid hardcoded mainnet address: treasury");
+            .unwrap_or_else(|e| panic!("Invalid hardcoded mainnet address: treasury: {e}"));
         let ecosystem = address_from_hex("0x2222222222222222222222222222222222222222")
-            .expect("Invalid hardcoded mainnet address: ecosystem");
+            .unwrap_or_else(|e| panic!("Invalid hardcoded mainnet address: ecosystem: {e}"));
 
         // Team allocations (15% = 150M SALT, vested over 4 years)
         let team_allocations = HashMap::new();

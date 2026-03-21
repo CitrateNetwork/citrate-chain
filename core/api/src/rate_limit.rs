@@ -288,7 +288,7 @@ impl RequestMiddleware for RateLimiter {
                         .status(401)
                         .header("Content-Type", "application/json")
                         .body(Body::from(body))
-                        .expect("valid response");
+                        .unwrap_or_else(|_| hyper::Response::new(Body::from(body)));
                     return RequestMiddlewareAction::Respond {
                         should_validate_hosts: false,
                         response: Box::pin(async { Ok(response) }),
@@ -329,7 +329,7 @@ impl RequestMiddleware for RateLimiter {
 
         // WP-K.3: Periodically evict stale buckets to prevent unbounded growth
         {
-            let mut last = self.last_eviction.lock().expect("eviction lock poisoned");
+            let mut last = self.last_eviction.lock().unwrap_or_else(|e| e.into_inner());
             if now.duration_since(*last) >= std::time::Duration::from_secs(EVICTION_INTERVAL_SECS) {
                 *last = now;
                 drop(last); // Release lock before eviction
@@ -366,7 +366,7 @@ impl RequestMiddleware for RateLimiter {
                 .header("Content-Type", "application/json")
                 .header("Retry-After", self.config.window_secs.to_string())
                 .body(Body::from(body))
-                .expect("valid response");
+                .unwrap_or_else(|_| hyper::Response::new(Body::from(body)));
             RequestMiddlewareAction::Respond {
                 should_validate_hosts: false,
                 response: Box::pin(async { Ok(response) }),

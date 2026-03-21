@@ -74,7 +74,7 @@ impl IPFSService {
             .use_rustls_tls()
             .no_proxy()
             .build()
-            .expect("failed to build IPFS HTTP client");
+            .unwrap_or_else(|e| panic!("failed to build IPFS HTTP client: {e}"));
 
         Self {
             api_endpoint,

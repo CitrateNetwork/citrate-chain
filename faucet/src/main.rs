@@ -40,7 +40,7 @@ struct FaucetResponse {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
@@ -60,7 +60,7 @@ async fn main() {
     let faucet_address_hex = std::env::var("FAUCET_ADDRESS")
         .unwrap_or_else(|_| "3333333333333333333333333333333333333333".to_string());
     let faucet_addr_bytes = hex::decode(faucet_address_hex.trim_start_matches("0x"))
-        .expect("Invalid FAUCET_ADDRESS hex");
+        .map_err(|e| format!("Invalid FAUCET_ADDRESS hex: {e}"))?;
     let mut addr_bytes = [0u8; 20];
     addr_bytes.copy_from_slice(&faucet_addr_bytes);
     let faucet_address = Address(addr_bytes);
@@ -106,7 +106,7 @@ async fn main() {
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(3002);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", faucet_port)).await
-        .unwrap_or_else(|_| panic!("cannot bind faucet to port {}", faucet_port));
+        .map_err(|e| format!("cannot bind faucet to port {}: {e}", faucet_port))?;
 
     info!("Faucet listening on http://0.0.0.0:{}", faucet_port);
     info!("Request test tokens: POST /faucet with {{\"address\": \"0x...\"}}");
@@ -114,6 +114,8 @@ async fn main() {
     if let Err(e) = axum::serve(listener, app).await {
         error!("Faucet server exited with error: {}", e);
     }
+
+    Ok(())
 }
 
 async fn root() -> axum::response::Html<&'static str> {

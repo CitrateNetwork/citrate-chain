@@ -158,7 +158,7 @@ impl InferenceCircuit {
             model_id,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock before UNIX epoch")
+                .unwrap_or_default()
                 .as_secs(),
         };
 
