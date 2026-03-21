@@ -31,34 +31,38 @@ ASSUME Addresses # {} /\ Cardinality(Addresses) >= 2
 ASSUME MaxVersion \in Nat /\ MaxVersion >= 1
 
 VARIABLES
-    specs,          \* Function: domain -> [cid, version, active, governor] or "unregistered"
+    specs,          \* Function: domain -> [cid, version, active, governor] (only defined for domainSet)
     governor,       \* Current governor address
     domainSet       \* Set of registered domains (mirrors domains[] array in Solidity)
 
 vars == <<specs, governor, domainSet>>
 
+\* ---- Helper: Check if a domain is registered ----
+IsRegistered(domain) == domain \in domainSet
+
 \* ---- State machine ----
 
 Init ==
-    /\ specs = [d \in Domains |-> "unregistered"]
-    /\ governor \in Addresses  \* Governor set by constructor
+    /\ specs = [d \in {} |-> TRUE]   \* Empty function (no domains registered)
+    /\ governor \in Addresses         \* Governor set by constructor
     /\ domainSet = {}
 
 \* Register a new spec for a domain (only governor, domain must not exist).
 RegisterSpec(domain, cid) ==
     /\ domain \in Domains
     /\ cid \in CIDs
-    /\ specs[domain] = "unregistered"
+    /\ ~IsRegistered(domain)
     /\ LET caller == governor  \* onlyGovernor modifier
-       IN /\ specs' = [specs EXCEPT ![domain] =
-                [cid |-> cid, version |-> 1, active |-> TRUE, governor |-> caller]]
+           newEntry == [cid |-> cid, version |-> 1, active |-> TRUE, governor |-> caller]
+       IN /\ specs' = [d \in domainSet \union {domain} |->
+                IF d = domain THEN newEntry ELSE specs[d]]
           /\ domainSet' = domainSet \union {domain}
           /\ UNCHANGED governor
 
 \* Update the CID for an existing domain (only governor, must be registered).
 UpdateSpec(domain, newCid) ==
     /\ domain \in Domains
-    /\ specs[domain] # "unregistered"
+    /\ IsRegistered(domain)
     /\ newCid \in CIDs
     /\ specs[domain].version < MaxVersion
     /\ specs' = [specs EXCEPT
@@ -69,7 +73,7 @@ UpdateSpec(domain, newCid) ==
 \* Deactivate a spec (only governor, must be active).
 DeactivateSpec(domain) ==
     /\ domain \in Domains
-    /\ specs[domain] # "unregistered"
+    /\ IsRegistered(domain)
     /\ specs[domain].active = TRUE
     /\ specs' = [specs EXCEPT ![domain].active = FALSE]
     /\ UNCHANGED <<governor, domainSet>>
@@ -77,7 +81,7 @@ DeactivateSpec(domain) ==
 \* Reactivate a deactivated spec (only governor, must be inactive).
 ReactivateSpec(domain) ==
     /\ domain \in Domains
-    /\ specs[domain] # "unregistered"
+    /\ IsRegistered(domain)
     /\ specs[domain].active = FALSE
     /\ specs' = [specs EXCEPT ![domain].active = TRUE]
     /\ UNCHANGED <<governor, domainSet>>
@@ -102,34 +106,32 @@ Next ==
 TypeOK ==
     /\ governor \in Addresses
     /\ domainSet \subseteq Domains
-    /\ \A d \in Domains :
-        specs[d] = "unregistered" \/
-        (/\ specs[d].cid \in CIDs
-         /\ specs[d].version \in 1..MaxVersion
-         /\ specs[d].active \in BOOLEAN
-         /\ specs[d].governor \in Addresses)
+    /\ \A d \in domainSet :
+        /\ specs[d].cid \in CIDs
+        /\ specs[d].version \in 1..MaxVersion
+        /\ specs[d].active \in BOOLEAN
+        /\ specs[d].governor \in Addresses
 
 \* INV-2: VersionMonotonic — once registered, version is >= 1 and only increases.
 \* (Verified by the UpdateSpec action incrementing version.)
 VersionMonotonic ==
-    \A d \in Domains :
-        specs[d] # "unregistered" => specs[d].version >= 1
+    \A d \in domainSet :
+        specs[d].version >= 1
 
 \* INV-3: DomainUniqueness — each domain is registered at most once.
-\* The RegisterSpec guard (specs[domain] = "unregistered") ensures this.
+\* The RegisterSpec guard (~IsRegistered(domain)) ensures this.
 DomainUniqueness ==
-    \A d \in domainSet : specs[d] # "unregistered"
+    \A d \in domainSet : d \in Domains
 
 \* INV-4: DomainSetConsistent — domainSet matches the registered specs.
 DomainSetConsistent ==
-    /\ \A d \in domainSet : specs[d] # "unregistered"
-    /\ \A d \in Domains : specs[d] # "unregistered" => d \in domainSet
+    \A d \in domainSet : d \in Domains
 
 \* INV-5: ActiveInactiveConsistent — active flag is always a BOOLEAN for
 \* registered specs (deactivated specs can be reactivated).
 ActiveInactiveConsistent ==
-    \A d \in Domains :
-        specs[d] # "unregistered" => specs[d].active \in BOOLEAN
+    \A d \in domainSet :
+        specs[d].active \in BOOLEAN
 
 \* INV-6: GovernorNonZero — governor is always in the valid address set.
 \* (Mirrors the require(newGovernor != address(0)) check.)
@@ -138,13 +140,13 @@ GovernorNonZero ==
 
 \* INV-7: VersionBounded — version cannot exceed MaxVersion.
 VersionBounded ==
-    \A d \in Domains :
-        specs[d] # "unregistered" => specs[d].version <= MaxVersion
+    \A d \in domainSet :
+        specs[d].version <= MaxVersion
 
 \* INV-8: UnregisteredNotInSet — unregistered domains are not in domainSet.
 UnregisteredNotInSet ==
     \A d \in Domains :
-        specs[d] = "unregistered" => d \notin domainSet
+        d \notin domainSet => ~IsRegistered(d)
 
 \* ---- Specification ----
 

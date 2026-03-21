@@ -115,10 +115,11 @@ TypeOK ==
                       parent_hash : (Creators \X Nat \X STRING \union (Creators \X Nat \X (Creators \X Nat \X STRING \union {STRING}))) \union {STRING}])
     /\ nextRound \in Nat
 
-\* INV-2: ChainIntegrity — every entry after the first links to the hash of the previous entry.
+\* INV-2: ChainIntegrity — every non-root entry links to the hash of the previous entry.
+\* Root entries (parent_hash = "none") start a new sub-chain and are exempt.
 ChainIntegrity ==
     \A i \in 2..Len(chain) :
-        chain[i].parent_hash = chain[i-1].hash
+        chain[i].parent_hash # "none" => chain[i].parent_hash = chain[i-1].hash
 
 \* INV-3: HashDeterministic — same inputs produce the same hash.
 \* (This is structural: our EntryHash and AdapterHash are deterministic functions.
