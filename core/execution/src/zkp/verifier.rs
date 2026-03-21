@@ -90,7 +90,7 @@ impl Verifier {
                 &public_inputs,
                 &proof_obj,
             )
-            .unwrap_or(false);
+            .map_err(|e| ZKPError::VerificationError(e.to_string()))?;
 
             results.push(VerificationResult {
                 is_valid,
@@ -207,16 +207,14 @@ impl Verifier {
                 let bytes = hex::decode(input.trim_start_matches("0x"))
                     .map_err(|_| ZKPError::InvalidPublicInputs)?;
 
-                // Convert bytes to field element
-                // This is simplified - real implementation would be more careful
-                let mut value = Fr::from(0u64);
-                for byte in bytes.iter().take(8) {
-                    value = value * Fr::from(256u64) + Fr::from(*byte as u64);
-                }
+                // Convert first 16 bytes to field element for 128-bit collision resistance
+                let val = bytes.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
+                let value = Fr::from(val);
                 field_elements.push(value);
             } else {
-                // Try to parse as number
-                let num: u64 = input.parse().unwrap_or(0);
+                // Try to parse as number (u128 to support 128-bit hash truncations)
+                let num: u128 = input.parse()
+                    .map_err(|_| ZKPError::InvalidPublicInputs)?;
                 field_elements.push(Fr::from(num));
             }
         }

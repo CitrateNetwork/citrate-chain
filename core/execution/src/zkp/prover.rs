@@ -7,6 +7,7 @@ use ark_bls12_381::{Bls12_381, Fr};
 use ark_groth16::{prepare_verifying_key, Groth16, PreparedVerifyingKey};
 use ark_snark::SNARK;
 use parking_lot::RwLock;
+use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -26,8 +27,7 @@ impl Prover {
 
     /// Setup proving and verifying keys for a circuit type
     pub fn setup(&self, proof_type: ProofType) -> Result<(), ZKPError> {
-        use ark_std::rand::SeedableRng;
-        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0u64);
+        let mut rng = OsRng;
 
         let (pk, vk) = match proof_type {
             ProofType::ModelExecution => {
@@ -119,16 +119,15 @@ impl Prover {
             .ok_or_else(|| ZKPError::KeyNotFound("ModelExecution".to_string()))?
             .clone();
 
-        use ark_std::rand::SeedableRng;
-        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0u64);
+        let mut rng = OsRng;
 
         let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
         // Public inputs must match what the circuit allocates via new_input().
-        // The circuit truncates each hash to the first 8 bytes interpreted as u64.
+        // The circuit truncates each hash to the first 16 bytes interpreted as u128.
         let to_field_str = |hash: &[u8]| -> String {
-            let val = hash.iter().take(8).fold(0u64, |acc, &b| acc * 256 + b as u64);
+            let val = hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
             val.to_string()
         };
 
@@ -165,15 +164,14 @@ impl Prover {
             .ok_or_else(|| ZKPError::KeyNotFound("GradientSubmission".to_string()))?
             .clone();
 
-        use ark_std::rand::SeedableRng;
-        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0u64);
+        let mut rng = OsRng;
 
         let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
         // Public inputs must match circuit's new_input() allocations
         let to_field_str = |hash: &[u8]| -> String {
-            hash.iter().take(8).fold(0u64, |acc, &b| acc * 256 + b as u64).to_string()
+            hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128).to_string()
         };
 
         let public_inputs = vec![
@@ -207,14 +205,13 @@ impl Prover {
             .ok_or_else(|| ZKPError::KeyNotFound("StateTransition".to_string()))?
             .clone();
 
-        use ark_std::rand::SeedableRng;
-        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0u64);
+        let mut rng = OsRng;
 
         let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
         let to_field_str = |hash: &[u8]| -> String {
-            hash.iter().take(8).fold(0u64, |acc, &b| acc * 256 + b as u64).to_string()
+            hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128).to_string()
         };
 
         let public_inputs = vec![
@@ -248,14 +245,13 @@ impl Prover {
             .ok_or_else(|| ZKPError::KeyNotFound("DataIntegrity".to_string()))?
             .clone();
 
-        use ark_std::rand::SeedableRng;
-        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0u64);
+        let mut rng = OsRng;
 
         let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
         let to_field_str = |hash: &[u8]| -> String {
-            hash.iter().take(8).fold(0u64, |acc, &b| acc * 256 + b as u64).to_string()
+            hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128).to_string()
         };
 
         let public_inputs = vec![
@@ -266,15 +262,24 @@ impl Prover {
         SerializableProof::from_proof(&proof, public_inputs)
     }
 
-    /// Batch prove multiple circuits of the same type
+    /// Batch prove multiple circuits of the same type.
+    ///
+    /// `public_inputs_per_circuit` must have the same length as `circuits`.
+    /// Each entry contains the public input strings for the corresponding circuit,
+    /// matching what the circuit allocates via `new_input()`.
     pub fn batch_prove<C>(
         &self,
         proof_type: ProofType,
         circuits: Vec<C>,
+        public_inputs_per_circuit: Vec<Vec<String>>,
     ) -> Result<Vec<SerializableProof>, ZKPError>
     where
         C: ark_relations::r1cs::ConstraintSynthesizer<Fr> + Clone,
     {
+        if circuits.len() != public_inputs_per_circuit.len() {
+            return Err(ZKPError::InvalidPublicInputs);
+        }
+
         let pk = self
             .proving_keys
             .read()
@@ -282,18 +287,15 @@ impl Prover {
             .ok_or_else(|| ZKPError::KeyNotFound(format!("{:?}", proof_type)))?
             .clone();
 
-        use ark_std::rand::SeedableRng;
-        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0u64);
+        let mut rng = OsRng;
 
         let mut proofs = Vec::new();
 
-        for circuit in circuits {
+        for (circuit, public_inputs) in circuits.into_iter().zip(public_inputs_per_circuit) {
             let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
                 .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
-            // For batch proving, we use empty public inputs
-            // In practice, these would be provided per circuit
-            let serializable = SerializableProof::from_proof(&proof, vec![])?;
+            let serializable = SerializableProof::from_proof(&proof, public_inputs)?;
             proofs.push(serializable);
         }
 

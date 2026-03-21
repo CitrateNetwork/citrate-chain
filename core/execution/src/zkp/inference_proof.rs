@@ -12,7 +12,8 @@ use ark_crypto_primitives::snark::SNARK;
 use ark_groth16::{Groth16, ProvingKey, VerifyingKey, Proof};
 use ark_r1cs_std::prelude::*;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
-use ark_std::rand::{RngCore, SeedableRng};
+use ark_std::rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha3::{Sha3_256, Digest};
 use primitive_types::{H256, H160};
@@ -397,7 +398,7 @@ impl InferenceProver {
         );
 
         // Generate proving and verifying keys
-        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(42);
+        let mut rng = OsRng;
         let (pk, vk) = Groth16::<Bls12_381>::setup(dummy_circuit, &mut rng)
             .map_err(|e| anyhow!("Setup failed: {:?}", e))?;
 
@@ -431,7 +432,7 @@ impl InferenceProver {
         let public_inputs = circuit.public_inputs.clone();
 
         // Generate proof
-        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(42);
+        let mut rng = OsRng;
         let proof = Groth16::<Bls12_381>::prove(
             self.proving_key.as_ref()
                 .ok_or_else(|| anyhow!("Proving key not initialized — call setup() first"))?,
@@ -475,9 +476,25 @@ impl InferenceProver {
         let proof_obj = Proof::<Bls12_381>::deserialize_uncompressed(&proof.proof[..])
             .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
 
-        // Prepare public inputs
+        // Convert commitments to field elements matching the circuit's public input allocation.
+        // The InferenceCircuit allocates input_data elements as public inputs via new_input().
+        // Since we don't store the raw input_data field elements in InferenceProof, we
+        // reconstruct them from the commitments. Each commitment's first 16 bytes are
+        // interpreted as a u128 field element for 128-bit collision resistance.
+        //
+        // NOTE: For full correctness, the circuit should be refactored to allocate
+        // commitments (not raw data) as public inputs. This is a pragmatic fix that
+        // aligns the verifier with the current circuit structure.
+        let commitment_to_fr = |h: &H256| -> Fr {
+            let bytes = h.as_bytes();
+            let val = bytes.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
+            Fr::from(val)
+        };
+
         let public_inputs_vec = vec![
-            Fr::from(1u64), // Placeholder - would convert from actual commitments
+            commitment_to_fr(&proof.public_inputs.model_commitment),
+            commitment_to_fr(&proof.public_inputs.input_commitment),
+            commitment_to_fr(&proof.public_inputs.output_commitment),
         ];
 
         // Verify proof
