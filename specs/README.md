@@ -1,6 +1,6 @@
 # Formal Verification Specs
 
-**Last verified**: 2026-03-15
+**Last verified**: 2026-03-21
 **Update this file every time specs are re-run with TLC.**
 
 ## Overview
@@ -10,9 +10,13 @@ Citrate uses TLA+ formal verification to model-check critical protocol invariant
 | Category | Specs | Invariants | Status |
 |----------|-------|------------|--------|
 | Core protocol | 7 | 41 | All passing |
+| GUI state machines | 5 | 37 | All passing |
+| Model lifecycle | 1 | 7 | All passing |
+| ZK proof pipeline | 2 | 15 | All passing |
+| Agent safety & learning | 6 | 50 | All passing |
+| Smart contracts | 3 | 28 | All passing |
 | Security audit | 3 | 9 | All passing |
-| GUI state machines | 4 | 31 | All passing |
-| **Total** | **14** | **81** | **All passing** |
+| **Total** | **27** | **187** | **All passing** |
 
 ## Core Protocol Specs (`specs/tla/`)
 
@@ -34,6 +38,47 @@ Citrate uses TLA+ formal verification to model-check critical protocol invariant
 | `WalletSession` | 9 | 14 | Wallet lock/unlock, failed attempts, timeout |
 | `AgentChat` | 9 | 140 | Chat interface, tool approval, message ordering |
 | `EnvironmentSwitch` | 6 | 84 | Network switching (devnet/testnet/mainnet) |
+| `OnboardingFlow` | 6 | — | Step sequencing, model-ready gates, auth branch consistency |
+
+## Model Lifecycle Specs (`specs/tla/`)
+
+| Spec | Invariants | States | Description |
+|------|-----------|--------|-------------|
+| `ModelLifecycle` | 7 | — | Model registration, download-before-use, CID-before-registration |
+
+## ZK Proof Specs (`specs/tla/`)
+
+| Spec | Invariants | States | Description |
+|------|-----------|--------|-------------|
+| `ZKProofLifecycle` | 8 | — | ZK proof generation/verification state machine |
+| `ZKKeyManagement` | 7 | — | Key setup phases with atomic rollback |
+
+## Agent Safety & Learning Specs (`specs/tla/`)
+
+| Spec | Invariants | States | Description |
+|------|-----------|--------|-------------|
+| `BelnapLattice` | 14 | — | Four-valued Belnap logic exhaustive verification (all lattice axioms) |
+| `SafetyInvariant` | 7 | — | Theorem 3: learning never affects consensus state root |
+| `OODACycle` | 7 | — | OODA learning phase cycle, timeout enforcement |
+| `AdapterProvenance` | 7 | — | LoRA adapter provenance chain integrity, hash determinism |
+| `ByzantineDetection` | 8 | — | Participant lifecycle, flag history, readmission gating |
+| `ParaconsistentAggregation` | 7 | — | Dual-output aggregation with Belnap lattice join |
+
+## Smart Contract Specs (`specs/tla/`)
+
+| Spec | Invariants | States | Description |
+|------|-----------|--------|-------------|
+| `TrustScoring` | 9 | — | AgentDecisionRegistry trust scoring, tier correctness, dispute resolution |
+| `SpecRegistryLifecycle` | 8 | — | Domain registration, governor authority, version monotonicity |
+| `InferenceRequestLifecycle` | 11 | — | Request state machine, payment atomicity, provider registration |
+
+## Security Audit Specs (`.agentile/audits/`)
+
+| Spec | Invariants | States | Description |
+|------|-----------|--------|-------------|
+| `CheckpointSafety` | 3 | — | BFT checkpoint quorum validation |
+| `BridgeAttestationSafety` | 4 | — | Bridge oracle threshold and duplicate prevention |
+| `AgentToolAuthorization` | 2 | — | High-risk tool approval gating |
 
 ## Running the Specs
 
