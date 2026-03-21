@@ -116,42 +116,24 @@ fn test_proof_serializes_and_deserializes() {
     assert_eq!(de.proof_bytes, r.proof.proof_bytes);
 }
 
-// ── 7. Verification — VK handoff fixed, public input mismatch found ─
+// ── 7. Full prove + verify roundtrip — ALL FIXED ────────────────────
 //
-// HONEST STATUS (March 20, 2026):
-// ✅ FIX 1: VK handoff gap closed — prover shares VKs with verifier during initialize()
-// ❌ REMAINING: "malformed verifying key" from arkworks during verify_with_processed_vk
-//    Root cause: Circuit constraints produce N public inputs, but SerializableProof
-//    stores 0 public inputs (empty vec). The VK expects to verify against N field
-//    elements but receives 0. This is a circuit-verifier interface mismatch.
-//    Fix: During proof generation, capture the public inputs from the circuit
-//    and include them in SerializableProof. ~20-line change per proof type in prover.rs.
-//
-// The VK handoff itself works (no more KeyNotFound). The next step is wiring
-// public inputs through the prove→serialize→verify pipeline.
+// STATUS (March 21, 2026):
+// ✅ FIX 1: VK handoff — prover shares VKs with verifier during initialize()
+// ✅ FIX 2: Public inputs — circuit allocates via new_input(), prover stores
+//    matching field element strings, verifier parses them correctly
+// ✅ FIX 3: ModelExecution proof generates AND verifies end-to-end
 
 #[test]
-fn test_vk_handoff_reaches_verifier() {
+fn test_model_execution_prove_and_verify() {
     let b = setup_backend();
     let r = b.generate_proof(model_exec_request()).unwrap();
-    // The verify call should NOT return KeyNotFound anymore (handoff works)
-    // It will return VerificationError (public input mismatch) — this is progress
-    let result = b.verify_proof(ProofType::ModelExecution, &r.proof);
-    match &result {
-        Ok(valid) => assert!(*valid, "If verification succeeds, proof should be valid"),
-        Err(e) => {
-            let err_str = format!("{}", e);
-            assert!(!err_str.contains("KeyNotFound"),
-                "VK handoff should work — got KeyNotFound: {}", err_str);
-            // VerificationError is expected (public input mismatch)
-            assert!(err_str.contains("malformed") || err_str.contains("erification"),
-                "Expected verification error, got: {}", err_str);
-        }
-    }
+    let valid = b.verify_proof(ProofType::ModelExecution, &r.proof).unwrap();
+    assert!(valid, "ModelExecution Groth16 proof should verify");
 }
 
 #[test]
-fn test_all_types_reach_verifier_no_key_not_found() {
+fn test_all_types_verify() {
     let b = setup_backend();
     for (req, pt) in [
         (model_exec_request(), ProofType::ModelExecution),
@@ -161,10 +143,8 @@ fn test_all_types_reach_verifier_no_key_not_found() {
     ] {
         let r = b.generate_proof(req).unwrap();
         let result = b.verify_proof(pt, &r.proof);
-        if let Err(e) = &result {
-            assert!(!format!("{}", e).contains("KeyNotFound"),
-                "{:?}: VK handoff failed — still getting KeyNotFound", pt);
-        }
+        assert!(result.is_ok(), "{:?} verification failed: {:?}", pt, result.err());
+        assert!(result.unwrap(), "{:?} proof should verify as valid", pt);
     }
 }
 
@@ -239,3 +219,21 @@ fn test_invalid_circuit_data_rejected() {
 // prover.rs: added get_verifying_key() that extracts VK from the ProvingKey.
 
 // VK handoff test moved to test_all_types_reach_verifier_no_key_not_found above
+
+// ── DIAGNOSTIC: trace exact verification error ──────────────────────
+
+#[test]
+fn test_diagnostic_verification_error() {
+    let b = setup_backend();
+    let r = b.generate_proof(model_exec_request()).unwrap();
+    
+    println!("Proof bytes length: {}", r.proof.proof_bytes.len());
+    println!("Public inputs count: {}", r.proof.public_inputs.len());
+    println!("Public inputs: {:?}", r.proof.public_inputs);
+    
+    let result = b.verify_proof(ProofType::ModelExecution, &r.proof);
+    match &result {
+        Ok(v) => println!("Verification result: valid={}", v),
+        Err(e) => println!("Verification error: {}", e),
+    }
+}
