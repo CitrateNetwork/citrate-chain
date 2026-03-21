@@ -199,4 +199,90 @@ mod tests {
         let recovered = Fr::from_le_bytes_mod_order(&bytes);
         assert_eq!(original, recovered);
     }
+
+    // --- New edge-case tests ---
+
+    #[test]
+    fn test_mimc_hash_single_element() {
+        let h = mimc_hash(&[Fr::from(1u64)]);
+        assert!(!h.is_zero(), "Hash of [1] must be non-zero");
+    }
+
+    #[test]
+    fn test_mimc_hash_large_input() {
+        // Hash of 1000 elements should complete without panic
+        let data: Vec<Fr> = (0..1000).map(|i| Fr::from(i as u64)).collect();
+        let h = mimc_hash(&data);
+        assert!(!h.is_zero(), "Hash of 1000 elements must be non-zero");
+    }
+
+    #[test]
+    fn test_mimc_hash_order_matters() {
+        let a = vec![Fr::from(1u64), Fr::from(2u64)];
+        let b = vec![Fr::from(2u64), Fr::from(1u64)];
+        assert_ne!(mimc_hash(&a), mimc_hash(&b), "[1,2] and [2,1] must hash differently");
+    }
+
+    #[test]
+    fn test_mimc_encrypt_key_matters() {
+        let x = Fr::from(42u64);
+        let k1 = Fr::from(1u64);
+        let k2 = Fr::from(2u64);
+        assert_ne!(
+            mimc_encrypt(x, k1),
+            mimc_encrypt(x, k2),
+            "encrypt(x, k1) must differ from encrypt(x, k2)"
+        );
+    }
+
+    #[test]
+    fn test_mimc_hash_zero_elements() {
+        // Different-length all-zero inputs must produce different hashes
+        let a = vec![Fr::from(0u64), Fr::from(0u64), Fr::from(0u64)];
+        let b = vec![Fr::from(0u64), Fr::from(0u64)];
+        assert_ne!(
+            mimc_hash(&a),
+            mimc_hash(&b),
+            "Hash of [0,0,0] must differ from hash of [0,0]"
+        );
+    }
+
+    #[test]
+    fn test_mimc_circuit_single_element() {
+        use ark_relations::r1cs::ConstraintSystem;
+
+        let data = vec![Fr::from(99u64)];
+        let native_hash = mimc_hash(&data);
+
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let data_vars: Vec<FpVar<Fr>> = data
+            .iter()
+            .map(|d| FpVar::new_witness(cs.clone(), || Ok(*d)).unwrap())
+            .collect();
+
+        let circuit_hash = mimc_hash_circuit(cs.clone(), &data_vars).unwrap();
+        let circuit_val = circuit_hash.value().unwrap();
+
+        assert_eq!(
+            native_hash, circuit_val,
+            "Single-element circuit hash must match native"
+        );
+        assert!(cs.is_satisfied().unwrap(), "Constraints must be satisfied");
+    }
+
+    #[test]
+    fn test_round_constants_distinct() {
+        let constants = &*ROUND_CONSTANTS;
+        // All 220 round constants must be unique
+        let mut seen = std::collections::HashSet::new();
+        for (i, c) in constants.iter().enumerate() {
+            let bytes = fr_to_bytes_le(c);
+            assert!(
+                seen.insert(bytes),
+                "Round constant {} is a duplicate of an earlier constant",
+                i
+            );
+        }
+        assert_eq!(seen.len(), MIMC_ROUNDS);
+    }
 }
