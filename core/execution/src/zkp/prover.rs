@@ -125,11 +125,17 @@ impl Prover {
         let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
-        // Create public inputs
+        // Public inputs must match what the circuit allocates via new_input().
+        // The circuit truncates each hash to the first 8 bytes interpreted as u64.
+        let to_field_str = |hash: &[u8]| -> String {
+            let val = hash.iter().take(8).fold(0u64, |acc, &b| acc * 256 + b as u64);
+            val.to_string()
+        };
+
         let public_inputs = vec![
-            hex::encode(&model_hash),
-            hex::encode(&input_hash),
-            hex::encode(&output_hash),
+            to_field_str(&model_hash),
+            to_field_str(&input_hash),
+            to_field_str(&output_hash),
         ];
 
         SerializableProof::from_proof(&proof, public_inputs)
@@ -165,12 +171,16 @@ impl Prover {
         let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
-        // Create public inputs
+        // Public inputs must match circuit's new_input() allocations
+        let to_field_str = |hash: &[u8]| -> String {
+            hash.iter().take(8).fold(0u64, |acc, &b| acc * 256 + b as u64).to_string()
+        };
+
         let public_inputs = vec![
-            hex::encode(&model_hash),
-            hex::encode(&dataset_hash),
-            hex::encode(&gradient_hash),
-            loss_value.to_string(),
+            to_field_str(&model_hash),
+            to_field_str(&dataset_hash),
+            to_field_str(&gradient_hash),
+            (loss_value as u64).to_string(),
             num_samples.to_string(),
         ];
 
@@ -203,11 +213,14 @@ impl Prover {
         let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
-        // Create public inputs
+        let to_field_str = |hash: &[u8]| -> String {
+            hash.iter().take(8).fold(0u64, |acc, &b| acc * 256 + b as u64).to_string()
+        };
+
         let public_inputs = vec![
-            hex::encode(&old_state_root),
-            hex::encode(&new_state_root),
-            hex::encode(&transaction_hash),
+            to_field_str(&old_state_root),
+            to_field_str(&new_state_root),
+            to_field_str(&transaction_hash),
         ];
 
         SerializableProof::from_proof(&proof, public_inputs)
@@ -241,11 +254,13 @@ impl Prover {
         let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
             .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 
-        // Create public inputs
+        let to_field_str = |hash: &[u8]| -> String {
+            hash.iter().take(8).fold(0u64, |acc, &b| acc * 256 + b as u64).to_string()
+        };
+
         let public_inputs = vec![
-            hex::encode(&data_hash),
-            hex::encode(&merkle_root),
-            leaf_index.to_string(),
+            to_field_str(&data_hash),
+            to_field_str(&merkle_root),
         ];
 
         SerializableProof::from_proof(&proof, public_inputs)
