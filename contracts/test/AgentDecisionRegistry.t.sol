@@ -163,4 +163,130 @@ contract AgentDecisionRegistryTest is Test {
         emit AgentDecisionRegistry.DecisionDisputed(id, AGENT_1, address(this), "evidence");
         registry.disputeDecision(id, "evidence");
     }
+
+    // ── WP-H.16: Trust Tiers ──────────────────────────────────────────
+
+    function test_newAgentStartsAtUntrusted() public view {
+        // New agent has 0 decisions, 0 disputes → score 0 → Untrusted
+        assertEq(registry.getTrustScore(keccak256("new_agent")), 0);
+        assertEq(registry.getTrustTier(keccak256("new_agent")), "Untrusted");
+    }
+
+    function test_20SuccessfulDecisionsStillUntrusted() public {
+        bytes32 agent = keccak256("agent_20");
+        for (uint256 i = 0; i < 20; i++) {
+            registry.registerDecision(agent, "tool", keccak256(abi.encode(i)));
+        }
+
+        // 20 decisions, 0 disputes → score = 20 → still Untrusted (<100)
+        assertEq(registry.getTrustScore(agent), 20);
+        assertEq(registry.getTrustTier(agent), "Untrusted");
+    }
+
+    function test_100SuccessfulDecisionsReachesStandard() public {
+        bytes32 agent = keccak256("agent_100");
+        for (uint256 i = 0; i < 100; i++) {
+            registry.registerDecision(agent, "tool", keccak256(abi.encode(i)));
+        }
+
+        // 100 decisions, 0 disputes → score = 100 → Standard
+        assertEq(registry.getTrustScore(agent), 100);
+        assertEq(registry.getTrustTier(agent), "Standard");
+    }
+
+    function test_500SuccessfulDecisionsReachesTrusted() public {
+        bytes32 agent = keccak256("agent_500");
+        for (uint256 i = 0; i < 500; i++) {
+            registry.registerDecision(agent, "tool", keccak256(abi.encode(i)));
+        }
+
+        // 500 decisions, 0 disputes → score = 500 → Trusted
+        assertEq(registry.getTrustScore(agent), 500);
+        assertEq(registry.getTrustTier(agent), "Trusted");
+    }
+
+    function test_disputeDropsTrustBackToUntrusted() public {
+        bytes32 agent = keccak256("agent_drop");
+
+        // Register 102 decisions → score 102 → Standard
+        for (uint256 i = 0; i < 102; i++) {
+            registry.registerDecision(agent, "tool", keccak256(abi.encode(i)));
+        }
+        assertEq(registry.getTrustScore(agent), 102);
+        assertEq(registry.getTrustTier(agent), "Standard");
+
+        // Dispute 2 decisions → disputeCount = 2, score = 102 - 4 = 98 → Untrusted
+        registry.disputeDecision(0, "bad1");
+        registry.disputeDecision(1, "bad2");
+
+        assertEq(registry.disputeCount(agent), 2);
+        assertEq(registry.getTrustScore(agent), 98);
+        assertEq(registry.getTrustTier(agent), "Untrusted");
+    }
+
+    // ── Tier transition events ────────────────────────────────────────
+
+    function test_tierTransitionEvent_UntrustedToStandard() public {
+        bytes32 agent = keccak256("agent_tier_event");
+
+        // Register 99 decisions normally (no event expected)
+        for (uint256 i = 0; i < 99; i++) {
+            registry.registerDecisionWithTierCheck(agent, "tool", keccak256(abi.encode(i)));
+        }
+        assertEq(registry.getTrustTier(agent), "Untrusted");
+
+        // The 100th decision should trigger TrustTierChanged
+        vm.expectEmit(true, false, false, true);
+        emit AgentDecisionRegistry.TrustTierChanged(agent, "Untrusted", "Standard", 100);
+        registry.registerDecisionWithTierCheck(agent, "tool", keccak256(abi.encode(99)));
+        assertEq(registry.getTrustTier(agent), "Standard");
+    }
+
+    function test_tierTransitionEvent_StandardToUntrustedViaDispute() public {
+        bytes32 agent = keccak256("agent_tier_drop_event");
+
+        // Register 100 decisions → Standard
+        for (uint256 i = 0; i < 100; i++) {
+            registry.registerDecision(agent, "tool", keccak256(abi.encode(i)));
+        }
+        assertEq(registry.getTrustTier(agent), "Standard");
+
+        // Dispute 1 decision: score = 100 - 2 = 98 → Untrusted, should emit event
+        vm.expectEmit(true, false, false, true);
+        emit AgentDecisionRegistry.TrustTierChanged(agent, "Standard", "Untrusted", 98);
+        registry.disputeDecisionWithTierCheck(0, "bad decision");
+        assertEq(registry.getTrustTier(agent), "Untrusted");
+    }
+
+    // ── Adversarial: boundary conditions ──────────────────────────────
+
+    function test_trustScoreAtExactBoundary_99() public {
+        bytes32 agent = keccak256("agent_boundary_99");
+        for (uint256 i = 0; i < 99; i++) {
+            registry.registerDecision(agent, "tool", keccak256(abi.encode(i)));
+        }
+        assertEq(registry.getTrustScore(agent), 99);
+        assertEq(registry.getTrustTier(agent), "Untrusted");
+    }
+
+    function test_trustScoreAtExactBoundary_499() public {
+        bytes32 agent = keccak256("agent_boundary_499");
+        for (uint256 i = 0; i < 499; i++) {
+            registry.registerDecision(agent, "tool", keccak256(abi.encode(i)));
+        }
+        assertEq(registry.getTrustScore(agent), 499);
+        assertEq(registry.getTrustTier(agent), "Standard");
+    }
+
+    function test_negativeScoreStillUntrusted() public {
+        bytes32 agent = keccak256("agent_negative_trust");
+        uint256 id0 = registry.registerDecision(agent, "tool_a", keccak256("a"));
+        registry.disputeDecision(id0, "Bad");
+        uint256 id1 = registry.registerDecision(agent, "tool_b", keccak256("b"));
+        registry.disputeDecision(id1, "Also bad");
+
+        // 2 decisions, 2 disputes → score = 2 - 4 = -2 → Untrusted
+        assertEq(registry.getTrustScore(agent), -2);
+        assertEq(registry.getTrustTier(agent), "Untrusted");
+    }
 }
