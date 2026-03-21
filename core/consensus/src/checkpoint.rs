@@ -170,9 +170,9 @@ impl CommitteeSelector {
                 let hash = hasher.finalize();
 
                 // Score = hash_value weighted by stake
-                let hash_val = u64::from_be_bytes(
-                    hash[0..8].try_into().expect("SHA-256 output is 32 bytes; first 8 always valid"),
-                );
+                let mut hash_prefix = [0u8; 8];
+                hash_prefix.copy_from_slice(&hash[0..8]);
+                let hash_val = u64::from_be_bytes(hash_prefix);
                 // Weight by sqrt(stake) to balance fairness with stake
                 let weight = (*stake as f64).sqrt() as u64;
                 let score = hash_val.wrapping_mul(weight.max(1));

@@ -116,7 +116,7 @@ impl IpfsDaemon {
         let http_client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("Failed to create HTTP client");
+            .unwrap_or_else(|e| panic!("Failed to create HTTP client: {e}"));
 
         Self {
             config,

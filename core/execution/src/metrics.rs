@@ -10,12 +10,12 @@ pub static VM_EXECUTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
         "Number of VM execution calls",
         &["status"]
     )
-    .expect("register citrate_vm_executions_total")
+    .unwrap_or_else(|e| panic!("register citrate_vm_executions_total: {e}"))
 });
 
 pub static VM_GAS_USED: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!("citrate_vm_gas_used", "Gas used by VM execution")
-        .expect("register citrate_vm_gas_used")
+        .unwrap_or_else(|e| panic!("register citrate_vm_gas_used: {e}"))
 });
 
 pub static PRECOMPILE_CALLS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
@@ -24,5 +24,5 @@ pub static PRECOMPILE_CALLS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
         "Total precompile calls",
         &["precompile", "method", "status"]
     )
-    .expect("register citrate_precompile_calls_total")
+    .unwrap_or_else(|e| panic!("register citrate_precompile_calls_total: {e}"))
 });

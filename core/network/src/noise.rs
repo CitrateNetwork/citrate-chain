@@ -25,8 +25,8 @@ pub struct NoiseKeypair {
 impl NoiseKeypair {
     /// Generate a new random X25519 keypair.
     pub fn generate() -> Self {
-        let builder = Builder::new(NOISE_PATTERN.parse().expect("valid noise pattern"));
-        let kp = builder.generate_keypair().expect("keypair generation");
+        let builder = Builder::new(NOISE_PATTERN.parse().unwrap_or_else(|e| panic!("valid noise pattern: {e}")));
+        let kp = builder.generate_keypair().unwrap_or_else(|e| panic!("keypair generation: {e}"));
         Self {
             private: kp.private.clone(),
             public: kp.public.clone(),

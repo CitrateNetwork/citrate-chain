@@ -191,7 +191,7 @@ impl EncryptedIPFSStore {
                 kdf: "PBKDF2".to_string(),
                 encrypted_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system time before UNIX epoch")
+                    .unwrap_or_default()
                     .as_secs(),
                 original_size: model_data.len(),
                 plaintext_hash: self.calculate_hash(model_data),

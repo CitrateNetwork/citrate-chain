@@ -123,7 +123,7 @@ impl MetadataCache {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("Failed to create HTTP client");
+            .unwrap_or_else(|_| Client::new());
 
         let ipfs_gateways = vec![
             "https://ipfs.io/ipfs/".to_string(),

@@ -327,7 +327,7 @@ pub fn register_economics_methods(
             let reputation_score = economics.get_reputation_score(&address);
             Ok(Value::Number(serde_json::Number::from_f64(reputation_score).unwrap_or(serde_json::Number::from(0))))
         } else {
-            Ok(Value::Number(serde_json::Number::from_f64(0.5).expect("literal float is valid")))
+            Ok(Value::Number(serde_json::Number::from_f64(0.5).unwrap_or_else(|| serde_json::Number::from(0))))
         }
     });
 }

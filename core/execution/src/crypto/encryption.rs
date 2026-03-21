@@ -213,7 +213,7 @@ impl ModelEncryption {
             kdf: "Argon2id".to_string(),
             encrypted_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock before UNIX epoch")
+                .unwrap_or_default()
                 .as_secs(),
             original_size: model_data.len(),
             plaintext_hash,

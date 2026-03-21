@@ -390,7 +390,7 @@ async fn main() -> Result<()> {
             .ok()
             .flatten()
             .and_then(|hash| probe_storage.blocks.get_block(&hash).ok().flatten())
-            .expect("Genesis block must exist (checked above)");
+            .ok_or_else(|| anyhow::anyhow!("Genesis block must exist (checked above)"))?;
 
         let persisted_root = probe_storage.state
             .get_state_root(&genesis_block.header.block_hash)
@@ -433,7 +433,7 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
     use model_manager::{ModelManager, ModelManagerConfig};
 
     let models_dir = data_dir.clone()
-        .unwrap_or_else(|| dirs::home_dir().expect("home directory must exist").join(".citrate"))
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".citrate"))
         .join("models");
 
     let config = ModelManagerConfig {
@@ -522,7 +522,7 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
         ModelCommands::AutoPin { data_dir: cmd_data_dir } => {
             let _data_dir = cmd_data_dir
                 .or(data_dir)
-                .unwrap_or_else(|| dirs::home_dir().expect("home directory must exist").join(".citrate"));
+                .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".citrate"));
 
             info!("Initializing genesis to get required models...");
 
@@ -994,7 +994,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     if metrics_enabled {
         let addr_str =
             std::env::var("CITRATE_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9100".to_string());
-        let addr: std::net::SocketAddr = addr_str.parse().expect("valid metrics listen address");
+        let addr: std::net::SocketAddr = match addr_str.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("Invalid CITRATE_METRICS_ADDR '{}': {}, skipping metrics server", addr_str, e);
+                {
+                    // Infallible for a valid hardcoded literal
+                    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9100))
+                }
+            }
+        };
         tokio::spawn(async move {
             if let Err(e) = citrate_api::metrics_server::MetricsServer::new(addr)
                 .start()

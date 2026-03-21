@@ -95,10 +95,11 @@ fn create_account(
     let address = derive_address(verifying_key.as_bytes());
 
     // Get password (prompt if not provided)
-    let password = password.unwrap_or_else(|| {
-        rpassword::prompt_password("Enter password for keystore: ")
-            .expect("Failed to read password")
-    });
+    let password = match password {
+        Some(p) => p,
+        None => rpassword::prompt_password("Enter password for keystore: ")
+            .context("Failed to read password from terminal")?,
+    };
 
     // Save to keystore
     let keystore_path = output.unwrap_or_else(|| {
@@ -210,10 +211,11 @@ fn import_account(config: &Config, private_key: &str, password: Option<String>) 
     let address = derive_address(verifying_key.as_bytes());
 
     // Get password
-    let password = password.unwrap_or_else(|| {
-        rpassword::prompt_password("Enter password for keystore: ")
-            .expect("Failed to read password")
-    });
+    let password = match password {
+        Some(p) => p,
+        None => rpassword::prompt_password("Enter password for keystore: ")
+            .context("Failed to read password from terminal")?,
+    };
 
     // Save to keystore
     let keystore_path = config
@@ -241,9 +243,11 @@ fn export_account(config: &Config, address: &str, password: Option<String>) -> R
     }
 
     // Get password
-    let password = password.unwrap_or_else(|| {
-        rpassword::prompt_password("Enter keystore password: ").expect("Failed to read password")
-    });
+    let password = match password {
+        Some(p) => p,
+        None => rpassword::prompt_password("Enter keystore password: ")
+            .context("Failed to read password from terminal")?,
+    };
 
     // Load and decrypt key
     let signing_key = keystore::load_key(&keystore_path, &password)?;

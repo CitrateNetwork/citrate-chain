@@ -13,6 +13,13 @@ use citrate_storage::pruning::PruningConfig;
 use citrate_storage::StorageManager;
 use prometheus::{gather, Encoder, TextEncoder};
 
+/// Parse a hardcoded socket address literal. This is infallible for valid literals
+/// but avoids a bare `.unwrap()` call in production code.
+fn hardcoded_addr(s: &str) -> SocketAddr {
+    s.parse()
+        .unwrap_or_else(|_| unreachable!("BUG: invalid hardcoded address literal: {}", s))
+}
+
 fn data_dir() -> PathBuf {
     std::env::var_os("CITRATE_DATA_DIR")
         .map(PathBuf::from)
@@ -24,14 +31,14 @@ fn rpc_addr() -> SocketAddr {
         .ok()
         .and_then(|s| s.parse().ok())
         // WP-X.1: Default to loopback (was 0.0.0.0 — exposed to all interfaces)
-        .unwrap_or_else(|| "127.0.0.1:8545".parse().unwrap())
+        .unwrap_or_else(|| hardcoded_addr("127.0.0.1:8545"))
 }
 
 fn metrics_addr() -> SocketAddr {
     std::env::var("CITRATE_METRICS_ADDR")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| "0.0.0.0:9100".parse().unwrap())
+        .unwrap_or_else(|| hardcoded_addr("0.0.0.0:9100"))
 }
 
 async fn metrics_handler() -> impl IntoResponse {
@@ -88,7 +95,13 @@ async fn main() -> Result<()> {
     let maddr = metrics_addr();
     tokio::spawn(async move {
         let app = Router::new().route("/metrics", get(metrics_handler));
-        let listener = tokio::net::TcpListener::bind(&maddr).await.unwrap();
+        let listener = match tokio::net::TcpListener::bind(&maddr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to bind metrics server to {}: {}", maddr, e);
+                return;
+            }
+        };
         info!("Metrics server listening on {}", maddr);
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("metrics server error: {}", e);
@@ -97,8 +110,8 @@ async fn main() -> Result<()> {
 
     // API service (WebSocket and REST addresses)
     // WP-X.1: Default to loopback (was 0.0.0.0)
-    let ws_addr: SocketAddr = "127.0.0.1:8546".parse().unwrap();
-    let rest_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+    let ws_addr: SocketAddr = hardcoded_addr("127.0.0.1:8546");
+    let rest_addr: SocketAddr = hardcoded_addr("127.0.0.1:3000");
     let api = ApiService::new(
         rpc_cfg,
         ws_addr,

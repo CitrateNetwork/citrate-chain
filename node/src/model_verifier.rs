@@ -370,7 +370,7 @@ impl ModelVerifier {
     ) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
+            .unwrap_or_default()
             .as_secs();
 
         let check = ValidatorPinCheck {
@@ -402,7 +402,7 @@ impl ModelVerifier {
         let checks = self.pin_checks.read().await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
+            .unwrap_or_default()
             .as_secs();
 
         let mut slashable = Vec::new();

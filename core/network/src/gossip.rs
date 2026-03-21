@@ -321,7 +321,7 @@ impl GossipProtocol {
         // 3. TIMESTAMP_FUTURE
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
+            .unwrap_or_default()
             .as_secs();
         if block.header.timestamp > now + 900 {
             warn!("[TIMESTAMP_FUTURE] block={} ts={} now={}", block.header.block_hash, block.header.timestamp, now);
