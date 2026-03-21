@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "benchmark-suite"
 path = "src/bin/benchmark_suite.rs"
 
+[[bin]]
+name = "live-bench"
+path = "src/bin/live_bench.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
