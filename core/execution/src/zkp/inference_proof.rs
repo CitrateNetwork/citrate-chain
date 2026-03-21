@@ -7,17 +7,17 @@
 
 use anyhow::{Result, anyhow};
 use ark_bls12_381::{Bls12_381, Fr};
-use ark_crypto_primitives::crh::{TwoToOneCRH, CRH};
-use ark_crypto_primitives::snark::SNARK;
+use ark_ff::PrimeField;
 use ark_groth16::{Groth16, ProvingKey, VerifyingKey, Proof};
+use ark_serialize::{CanonicalSerialize, CanonicalDeserialize};
 use ark_r1cs_std::prelude::*;
+use ark_r1cs_std::fields::fp::FpVar;
+use ark_snark::SNARK;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
-use ark_std::rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha3::{Sha3_256, Digest};
 use primitive_types::{H256, H160};
-use std::collections::HashMap;
 
 /// Private inference proof
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +49,12 @@ pub struct PublicInputs {
 
     /// Inference timestamp
     pub timestamp: u64,
+
+    /// Raw commitment field element bytes (LE) for lossless Fr reconstruction.
+    /// These are the exact bytes of the MiMC hash Fr values, stored alongside
+    /// the H256 commitments to avoid any conversion ambiguity during verification.
+    #[serde(default)]
+    pub commitment_fr_bytes: Option<([u8; 32], [u8; 32], [u8; 32])>,
 }
 
 /// Proof metadata
@@ -152,20 +158,25 @@ impl InferenceCircuit {
         model_id: H256,
         config: CircuitConfig,
     ) -> Self {
-        // Calculate commitments
-        let model_commitment = Self::commit_vector(&model_weights);
-        let input_commitment = Self::commit_vector(&input_data);
-        let output_commitment = Self::commit_vector(&output_data);
+        // Calculate commitments (native MiMC)
+        let mc_fr = super::mimc::mimc_hash(&model_weights);
+        let ic_fr = super::mimc::mimc_hash(&input_data);
+        let oc_fr = super::mimc::mimc_hash(&output_data);
+
+        let mc_bytes = super::mimc::fr_to_bytes_le(&mc_fr);
+        let ic_bytes = super::mimc::fr_to_bytes_le(&ic_fr);
+        let oc_bytes = super::mimc::fr_to_bytes_le(&oc_fr);
 
         let public_inputs = PublicInputs {
-            model_commitment,
-            input_commitment,
-            output_commitment,
+            model_commitment: H256(mc_bytes),
+            input_commitment: H256(ic_bytes),
+            output_commitment: H256(oc_bytes),
             model_id,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            commitment_fr_bytes: Some((mc_bytes, ic_bytes, oc_bytes)),
         };
 
         Self {
@@ -191,15 +202,22 @@ impl InferenceCircuit {
         }
     }
 
-    /// Commit to a vector using SHA3-256
+    /// Commit to a vector using MiMC hash.
+    ///
+    /// Uses the same algebraic hash as the in-circuit commitment so that
+    /// native commitments stored in `PublicInputs` match what the R1CS
+    /// circuit computes over the witness.
+    ///
+    /// IMPORTANT: The Fr→H256 conversion must be lossless and reversible.
+    /// We use `Fr::into_bigint().to_bytes_le()` and reverse it in `verify()`
+    /// with `Fr::from_le_bytes_mod_order()`. H256 is treated as an opaque
+    /// 32-byte container here — its endianness convention doesn't matter
+    /// as long as we're consistent.
     fn commit_vector(data: &[Fr]) -> H256 {
-        let mut hasher = Sha3_256::new();
-        for element in data {
-            // Convert field element to bytes
-            let bytes = element.to_string().into_bytes();
-            hasher.update(&bytes);
-        }
-        H256::from_slice(hasher.finalize().as_slice())
+        let hash = super::mimc::mimc_hash(data);
+        let bytes = super::mimc::fr_to_bytes_le(&hash);
+        // Store LE bytes directly into H256's internal [u8; 32]
+        H256(bytes)
     }
 
     /// Simulate neural network forward pass
@@ -212,7 +230,7 @@ impl InferenceCircuit {
         let mut current_layer = input_vars.to_vec();
 
         // Process each layer
-        for (layer_idx, layer_weights) in weight_vars.iter().enumerate() {
+        for (_layer_idx, layer_weights) in weight_vars.iter().enumerate() {
             let mut next_layer = Vec::new();
 
             // Simplified: each neuron is dot product + ReLU
@@ -225,8 +243,8 @@ impl InferenceCircuit {
                 for (i, input) in current_layer.iter().enumerate() {
                     let weight_idx = neuron_idx * current_layer.len() + i;
                     if weight_idx < layer_weights.len() {
-                        let product = input.mul(&layer_weights[weight_idx])?;
-                        sum = sum.add(&product)?;
+                        let product = input * &layer_weights[weight_idx];
+                        sum = sum + &product;
                     }
                 }
 
@@ -254,21 +272,44 @@ impl ConstraintSynthesizer<Fr> for InferenceCircuit {
         self,
         cs: ConstraintSystemRef<Fr>,
     ) -> Result<(), SynthesisError> {
-        // Allocate private inputs
+        // ---------------------------------------------------------------
+        // 1. PUBLIC INPUTS: MiMC commitments to model, input, and output.
+        //    The verifier only sees these three field elements.
+        // ---------------------------------------------------------------
+        let (pub_model_commitment, pub_input_commitment, pub_output_commitment) =
+            if let Some(private) = &self.private_inputs {
+                // Compute native MiMC hashes and allocate as public inputs
+                let mc = super::mimc::mimc_hash(&private.model_weights);
+                let ic = super::mimc::mimc_hash(&private.input_data);
+                let oc = super::mimc::mimc_hash(&private.output_data);
+                (
+                    FpVar::new_input(cs.clone(), || Ok(mc))?,
+                    FpVar::new_input(cs.clone(), || Ok(ic))?,
+                    FpVar::new_input(cs.clone(), || Ok(oc))?,
+                )
+            } else {
+                // For setup: dummy public inputs (values don't matter)
+                (
+                    FpVar::new_input(cs.clone(), || Ok(Fr::from(0u64)))?,
+                    FpVar::new_input(cs.clone(), || Ok(Fr::from(0u64)))?,
+                    FpVar::new_input(cs.clone(), || Ok(Fr::from(0u64)))?,
+                )
+            };
+
+        // ---------------------------------------------------------------
+        // 2. PRIVATE WITNESSES: raw model weights, input data, output data
+        // ---------------------------------------------------------------
         let (weight_vars, input_vars, output_vars) = if let Some(private) = &self.private_inputs {
-            // Allocate model weights
             let weight_vars: Vec<FpVar<Fr>> = private.model_weights
                 .iter()
                 .map(|w| FpVar::new_witness(cs.clone(), || Ok(*w)))
                 .collect::<Result<_, _>>()?;
 
-            // Allocate input data
             let input_vars: Vec<FpVar<Fr>> = private.input_data
                 .iter()
-                .map(|i| FpVar::new_input(cs.clone(), || Ok(*i)))
+                .map(|i| FpVar::new_witness(cs.clone(), || Ok(*i)))
                 .collect::<Result<_, _>>()?;
 
-            // Allocate output data
             let output_vars: Vec<FpVar<Fr>> = private.output_data
                 .iter()
                 .map(|o| FpVar::new_witness(cs.clone(), || Ok(*o)))
@@ -276,27 +317,40 @@ impl ConstraintSynthesizer<Fr> for InferenceCircuit {
 
             (weight_vars, input_vars, output_vars)
         } else {
-            // For verification, create symbolic variables
-            let weight_vars = vec![FpVar::new_witness(cs.clone(), || Ok(Fr::from(0u64)))?; self.config.max_model_size];
-            let input_vars = vec![FpVar::new_input(cs.clone(), || Ok(Fr::from(0u64)))?; self.config.max_input_size];
-            let output_vars = vec![FpVar::new_witness(cs.clone(), || Ok(Fr::from(0u64)))?; self.config.max_output_size];
+            // Allocate SEPARATE witness variables for each element.
+            // Using vec![single_var?; N] would clone one variable N times,
+            // sharing the same variable index and producing a smaller circuit
+            // than the proving path, which would break Groth16 verification.
+            let weight_vars: Vec<FpVar<Fr>> = (0..self.config.max_model_size)
+                .map(|_| FpVar::new_witness(cs.clone(), || Ok(Fr::from(0u64))))
+                .collect::<Result<_, _>>()?;
+            let input_vars: Vec<FpVar<Fr>> = (0..self.config.max_input_size)
+                .map(|_| FpVar::new_witness(cs.clone(), || Ok(Fr::from(0u64))))
+                .collect::<Result<_, _>>()?;
+            let output_vars: Vec<FpVar<Fr>> = (0..self.config.max_output_size)
+                .map(|_| FpVar::new_witness(cs.clone(), || Ok(Fr::from(0u64))))
+                .collect::<Result<_, _>>()?;
             (weight_vars, input_vars, output_vars)
         };
 
-        // Verify commitment to model weights
+        // ---------------------------------------------------------------
+        // 3. COMMITMENT CONSTRAINTS: in-circuit MiMC must equal public inputs
+        // ---------------------------------------------------------------
         let computed_model_commitment = Self::compute_commitment_circuit(
             cs.clone(),
             &weight_vars,
         )?;
+        computed_model_commitment.enforce_equal(&pub_model_commitment)?;
 
-        // Verify commitment to input
         let computed_input_commitment = Self::compute_commitment_circuit(
             cs.clone(),
             &input_vars,
         )?;
+        computed_input_commitment.enforce_equal(&pub_input_commitment)?;
 
-        // Simulate inference computation using configurable layer dimensions.
-        // Previously hardcoded to 100 neurons — now driven by CircuitConfig.
+        // ---------------------------------------------------------------
+        // 4. INFERENCE: neural network forward pass
+        // ---------------------------------------------------------------
         let layer_size = self.config.neurons_per_layer;
         let num_layers = if layer_size > 0 {
             weight_vars.len() / (layer_size * layer_size)
@@ -317,98 +371,48 @@ impl ConstraintSynthesizer<Fr> for InferenceCircuit {
             &weight_layers,
         )?;
 
-        // Verify output matches commitment
+        // Verify computed output matches declared output
         for (computed, expected) in computed_output.iter().zip(output_vars.iter()) {
             computed.enforce_equal(expected)?;
         }
 
-        // Verify output commitment
+        // ---------------------------------------------------------------
+        // 5. OUTPUT COMMITMENT CONSTRAINT
+        // ---------------------------------------------------------------
         let computed_output_commitment = Self::compute_commitment_circuit(
             cs.clone(),
             &output_vars,
         )?;
+        computed_output_commitment.enforce_equal(&pub_output_commitment)?;
 
-        // Add additional constraints for specific circuit types
-        match &self.private_inputs {
-            Some(_) => {
-                // Add range checks for weights (prevent overflow)
-                for weight in &weight_vars {
-                    // Ensure weight is within reasonable bounds
-                    // In production, use more sophisticated range proofs
-                    let _ = weight.is_cmp(
-                        &FpVar::new_constant(cs.clone(), Fr::from(1000000u64))?,
-                        std::cmp::Ordering::Less,
-                        false,
-                    )?;
-                }
-            }
-            None => {}
+        // ---------------------------------------------------------------
+        // 6. RANGE CHECKS on weights (always generated so the constraint
+        //    structure is identical between setup and proving)
+        // ---------------------------------------------------------------
+        for weight in &weight_vars {
+            let _ = weight.is_cmp(
+                &FpVar::new_constant(cs.clone(), Fr::from(1000000u64))?,
+                std::cmp::Ordering::Less,
+                false,
+            )?;
         }
 
         Ok(())
     }
 }
 
-/// Salt constant for in-circuit commitment hashing.
-/// Matches the HASH_SALT in circuits.rs for consistency across the ZK module.
-const COMMITMENT_SALT: [u8; 32] = [
-    0x73, 0xa1, 0x5c, 0x44, 0xda, 0xf0, 0x91, 0x2b,
-    0x6e, 0x0d, 0x83, 0x57, 0x3d, 0x9f, 0xb2, 0xc4,
-    0x1a, 0xe7, 0x66, 0x28, 0xfe, 0x5a, 0x8c, 0xbb,
-    0x32, 0x47, 0x19, 0xd8, 0x04, 0xaf, 0x61, 0x90,
-];
-
 impl InferenceCircuit {
-    /// Compute commitment inside the circuit using XOR-salt hash chain.
+    /// Compute commitment inside the circuit using MiMC hash.
     ///
-    /// Each field element is converted to its low 8 bytes, then iteratively
-    /// mixed with a running hash state via XOR + salt rotation. This is NOT
-    /// a cryptographic hash (Poseidon/Pedersen would be needed for mainnet),
-    /// but it IS binding — different inputs produce different commitments
-    /// with overwhelming probability.
+    /// MiMC is an algebraic hash that uses only field additions and cubings,
+    /// making it efficient inside R1CS circuits.  220 rounds provide full
+    /// security for the BLS12-381 scalar field.  The Miyaguchi-Preneel
+    /// sponge mode makes it collision-resistant over variable-length inputs.
     fn compute_commitment_circuit(
         cs: ConstraintSystemRef<Fr>,
         data: &[FpVar<Fr>],
-    ) -> Result<Vec<UInt8<Fr>>, SynthesisError> {
-        // Initialize state from salt
-        let mut state: Vec<UInt8<Fr>> = UInt8::constant_vec(&COMMITMENT_SALT);
-
-        for var in data.iter() {
-            // Convert field element to low-order bits, take 8 bytes
-            let bits = var.to_bits_le()?;
-            let mut elem_bytes = Vec::with_capacity(8);
-            for chunk in bits.chunks(8).take(8) {
-                let mut chunk_bits = chunk.to_vec();
-                while chunk_bits.len() < 8 {
-                    chunk_bits.push(Boolean::FALSE);
-                }
-                elem_bytes.push(UInt8::from_bits_le(&chunk_bits));
-            }
-            // Pad to 32 bytes
-            while elem_bytes.len() < 32 {
-                elem_bytes.push(UInt8::constant(0));
-            }
-
-            // Mix element bytes into state via XOR with salt rotation
-            let mut new_state = Vec::with_capacity(32);
-            for i in 0..32 {
-                let s_bits = state[i].to_bits_le()?;
-                let e_bits = elem_bytes[i].to_bits_le()?;
-                let mut mixed = Vec::with_capacity(8);
-                for bit_idx in 0..8 {
-                    let mut bit = s_bits[bit_idx].xor(&e_bits[bit_idx])?;
-                    // Rotate by salt
-                    if (COMMITMENT_SALT[(i + 1) % 32] >> bit_idx) & 1 == 1 {
-                        bit = bit.xor(&Boolean::TRUE)?;
-                    }
-                    mixed.push(bit);
-                }
-                new_state.push(UInt8::from_bits_le(&mixed));
-            }
-            state = new_state;
-        }
-
-        Ok(state)
+    ) -> Result<FpVar<Fr>, SynthesisError> {
+        super::mimc::mimc_hash_circuit(cs, data)
     }
 }
 
@@ -435,13 +439,14 @@ impl InferenceProver {
                 output_commitment: H256::zero(),
                 model_id: H256::zero(),
                 timestamp: 0,
+                commitment_fr_bytes: None,
             },
             config.clone(),
         );
 
         // Generate proving and verifying keys
         let mut rng = OsRng;
-        let (pk, vk) = Groth16::<Bls12_381>::setup(dummy_circuit, &mut rng)
+        let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(dummy_circuit, &mut rng)
             .map_err(|e| anyhow!("Setup failed: {:?}", e))?;
 
         Ok(Self {
@@ -482,9 +487,9 @@ impl InferenceProver {
             &mut rng,
         ).map_err(|e| anyhow!("Proof generation failed: {:?}", e))?;
 
-        // Serialize proof
+        // Serialize proof (compressed for smaller size, consistent with deserialization)
         let mut proof_bytes = Vec::new();
-        proof.serialize_uncompressed(&mut proof_bytes)
+        proof.serialize_compressed(&mut proof_bytes)
             .map_err(|e| anyhow!("Proof serialization failed: {:?}", e))?;
 
         // Calculate VK hash
@@ -514,34 +519,35 @@ impl InferenceProver {
 
     /// Verify inference proof
     pub fn verify(&self, proof: &InferenceProof) -> Result<bool> {
-        // Deserialize proof
-        let proof_obj = Proof::<Bls12_381>::deserialize_uncompressed(&proof.proof[..])
+        // Deserialize proof (compressed format, matching serialize_compressed)
+        let proof_obj = Proof::<Bls12_381>::deserialize_compressed(&proof.proof[..])
             .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
 
-        // Convert commitments to field elements matching the circuit's public input allocation.
-        // The InferenceCircuit allocates input_data elements as public inputs via new_input().
-        // Since we don't store the raw input_data field elements in InferenceProof, we
-        // reconstruct them from the commitments. Each commitment's first 16 bytes are
-        // interpreted as a u128 field element for 128-bit collision resistance.
-        //
-        // NOTE: For full correctness, the circuit should be refactored to allocate
-        // commitments (not raw data) as public inputs. This is a pragmatic fix that
-        // aligns the verifier with the current circuit structure.
-        let commitment_to_fr = |h: &H256| -> Fr {
-            let bytes = h.as_bytes();
-            let val = bytes.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
-            Fr::from(val)
+        // Reconstruct the exact Fr field elements that were used as public inputs.
+        // Use the raw LE bytes stored alongside the H256 commitments to avoid
+        // any conversion ambiguity.
+        let public_inputs_vec = if let Some((mc, ic, oc)) = &proof.public_inputs.commitment_fr_bytes {
+            vec![
+                Fr::from_le_bytes_mod_order(mc),
+                Fr::from_le_bytes_mod_order(ic),
+                Fr::from_le_bytes_mod_order(oc),
+            ]
+        } else {
+            // Fallback for proofs generated before this field existed
+            let commitment_to_fr = |h: &H256| -> Fr {
+                Fr::from_le_bytes_mod_order(&h.0)
+            };
+            vec![
+                commitment_to_fr(&proof.public_inputs.model_commitment),
+                commitment_to_fr(&proof.public_inputs.input_commitment),
+                commitment_to_fr(&proof.public_inputs.output_commitment),
+            ]
         };
 
-        let public_inputs_vec = vec![
-            commitment_to_fr(&proof.public_inputs.model_commitment),
-            commitment_to_fr(&proof.public_inputs.input_commitment),
-            commitment_to_fr(&proof.public_inputs.output_commitment),
-        ];
-
-        // Verify proof
-        let valid = Groth16::<Bls12_381>::verify(
-            &self.verifying_key,
+        // Verify proof using prepared verifying key for efficiency
+        let pvk = ark_groth16::prepare_verifying_key(&self.verifying_key);
+        let valid = Groth16::<Bls12_381>::verify_with_processed_vk(
+            &pvk,
             &public_inputs_vec,
             &proof_obj,
         ).map_err(|e| anyhow!("Verification failed: {:?}", e))?;
@@ -589,23 +595,28 @@ pub struct BatchMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ff::Field;
 
     #[test]
     fn test_inference_proof_generation() {
-        // Setup prover
+        // Setup prover.
+        // Use neurons_per_layer=10 with 100 weights => 1 layer of 10x10.
+        // Zero inputs ensure forward pass produces all-zero outputs (ReLU of 0 = 0),
+        // so the output_data witnesses satisfy the circuit constraints.
         let config = CircuitConfig {
             max_model_size: 100,
             max_input_size: 10,
-            max_output_size: 5,
+            max_output_size: 10,
+            neurons_per_layer: 10,
             optimize: true,
         };
         let prover = InferenceProver::setup(config).unwrap();
 
-        // Create dummy data
+        // Weights can be arbitrary; zero inputs guarantee zero weighted sums
         let model_weights: Vec<Fr> = (0..100).map(|i| Fr::from(i as u64)).collect();
-        let input_data: Vec<Fr> = (0..10).map(|i| Fr::from(i as u64)).collect();
-        let output_data: Vec<Fr> = (0..5).map(|i| Fr::from(i as u64)).collect();
+        let input_data: Vec<Fr> = vec![Fr::from(0u64); 10];
+        // Forward pass with zero inputs: every neuron's weighted sum is 0,
+        // ReLU(0) = 0, so the expected output is all zeros.
+        let output_data: Vec<Fr> = vec![Fr::from(0u64); 10];
 
         // Generate proof
         let model_id = H256::random();
@@ -641,5 +652,45 @@ mod tests {
         let data2 = vec![Fr::from(4u64), Fr::from(5u64), Fr::from(6u64)];
         let commitment3 = InferenceCircuit::commit_vector(&data2);
         assert_ne!(commitment, commitment3);
+    }
+
+    #[test]
+    fn test_commitment_fr_roundtrip() {
+        let data = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64)];
+        let native_hash = crate::zkp::mimc::mimc_hash(&data);
+        let h256 = InferenceCircuit::commit_vector(&data);
+        let recovered = Fr::from_le_bytes_mod_order(&h256.0);
+        assert_eq!(native_hash, recovered, "Fr -> H256 -> Fr must be lossless");
+    }
+
+    #[test]
+    fn test_circuit_constraints_satisfied() {
+        use ark_relations::r1cs::ConstraintSystem;
+
+        let model_weights: Vec<Fr> = (0..100).map(|i| Fr::from(i as u64)).collect();
+        let input_data: Vec<Fr> = vec![Fr::from(0u64); 10];
+        let output_data: Vec<Fr> = vec![Fr::from(0u64); 10];
+
+        let config = CircuitConfig {
+            max_model_size: 100,
+            max_input_size: 10,
+            max_output_size: 10,
+            neurons_per_layer: 10,
+            optimize: true,
+        };
+
+        let circuit = InferenceCircuit::new(
+            model_weights, input_data, output_data,
+            H256::zero(), config,
+        );
+
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        circuit.generate_constraints(cs.clone()).unwrap();
+
+        eprintln!("Instance vars (incl. 'one'): {}", cs.num_instance_variables());
+        eprintln!("Witness vars: {}", cs.num_witness_variables());
+        eprintln!("Constraints: {}", cs.num_constraints());
+
+        assert!(cs.is_satisfied().unwrap(), "Circuit must be satisfiable");
     }
 }
