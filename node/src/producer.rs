@@ -20,10 +20,12 @@ use citrate_storage::{state_manager::StateManager as AIStateManager, StorageMana
 use primitive_types::U256;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
+
+use crate::contribution_recorder::ContributionRecorder;
 
 // Block hash is now computed via Block::compute_hash() in consensus/types.rs (C-05).
 // This ensures a single canonical hash function used by both producer and validator.
@@ -113,6 +115,16 @@ pub struct BlockProducer {
     /// (checkpoint_height, participant). Used by WP-F.6 for mentor selection.
     /// Uses Mutex for interior mutability (produce_block takes &self).
     peer_profile_store: Mutex<PeerProfileStore>,
+
+    /// LC.4.3: ContributionAccounting recorder for automatically recording
+    /// Validation, ModelHosting, and AdapterCreation contributions as they happen.
+    /// None when the ContributionAccounting contract is not configured.
+    contribution_recorder: Option<Arc<ContributionRecorder>>,
+
+    /// LC.4.3: Tracks model inference requests served since last block for
+    /// recording ModelHosting contributions. Atomically incremented by the
+    /// inference handler and reset after each block production.
+    inference_count: Arc<AtomicU64>,
 }
 
 impl BlockProducer {
@@ -177,6 +189,8 @@ impl BlockProducer {
             checkpoint_interval: 50,
             profile_computer: Mutex::new(ProfileComputer::default()),
             peer_profile_store: Mutex::new(PeerProfileStore::default()),
+            contribution_recorder: None,
+            inference_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -242,6 +256,8 @@ impl BlockProducer {
             checkpoint_interval: 50,
             profile_computer: Mutex::new(ProfileComputer::default()),
             peer_profile_store: Mutex::new(PeerProfileStore::default()),
+            contribution_recorder: None,
+            inference_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -299,6 +315,8 @@ impl BlockProducer {
             checkpoint_interval: 50,
             profile_computer: Mutex::new(ProfileComputer::default()),
             peer_profile_store: Mutex::new(PeerProfileStore::default()),
+            contribution_recorder: None,
+            inference_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -381,6 +399,8 @@ impl BlockProducer {
             checkpoint_interval: 50,
             profile_computer: Mutex::new(ProfileComputer::default()),
             peer_profile_store: Mutex::new(PeerProfileStore::default()),
+            contribution_recorder: None,
+            inference_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -473,6 +493,8 @@ impl BlockProducer {
             checkpoint_interval: 50,
             profile_computer: Mutex::new(ProfileComputer::default()),
             peer_profile_store: Mutex::new(PeerProfileStore::default()),
+            contribution_recorder: None,
+            inference_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -501,6 +523,29 @@ impl BlockProducer {
             "Learning enabled: checkpoint_interval={}",
             checkpoint_interval
         );
+    }
+
+    /// LC.4.3: Enable automatic contribution recording via the ContributionAccounting contract.
+    ///
+    /// After calling this, the block producer will automatically record:
+    /// - Validation contributions (1 per block produced)
+    /// - ModelHosting contributions (based on inference count since last block)
+    /// - AdapterCreation contributions (at checkpoints when mentor generates adapter)
+    pub fn enable_contribution_recording(
+        &mut self,
+        rpc_url: String,
+        contract_address: String,
+        recorder_address: String,
+    ) {
+        let recorder = ContributionRecorder::new(rpc_url, contract_address, recorder_address);
+        self.contribution_recorder = Some(Arc::new(recorder));
+        info!("ContributionAccounting recording enabled");
+    }
+
+    /// LC.4.3: Get a handle to the inference counter for incrementing from
+    /// the inference/MCP handler when requests are served.
+    pub fn inference_counter(&self) -> Arc<AtomicU64> {
+        self.inference_count.clone()
     }
 
     /// Pause block production (emergency stop).
@@ -818,6 +863,54 @@ impl BlockProducer {
 
         // WP-F.5: Record block seen for uptime tracking.
         self.profile_computer.lock().record_block();
+
+        // LC.4.3: Record contributions to ContributionAccounting contract.
+        // This is fire-and-forget; failures are logged but do not block production.
+        if let Some(recorder) = &self.contribution_recorder {
+            let recorder: Arc<ContributionRecorder> = recorder.clone();
+            let block_height = block.header.height;
+
+            // 1. Record Validation contribution (1 per block produced)
+            let rec_validation = recorder.clone();
+            tokio::spawn(async move {
+                if let Err(e) = rec_validation.record_validation(1).await {
+                    debug!(
+                        "Failed to record Validation contribution at block {}: {}",
+                        block_height, e
+                    );
+                }
+            });
+
+            // 2. Record ModelHosting contributions (inference requests served since last block)
+            let inferences = self.inference_count.swap(0, Ordering::Relaxed);
+            if inferences > 0 {
+                let rec_hosting = recorder.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = rec_hosting.record_model_hosting(inferences).await {
+                        debug!(
+                            "Failed to record ModelHosting({}) at block {}: {}",
+                            inferences, block_height, e
+                        );
+                    }
+                });
+            }
+
+            // 3. Record AdapterCreation at checkpoint boundaries (when mentor pairings generate adapters)
+            if block.header.height > 0
+                && block.header.height % self.checkpoint_interval == 0
+                && block.learning_root != Hash::default()
+            {
+                let rec_adapter = recorder.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = rec_adapter.record_adapter_creation(1).await {
+                        debug!(
+                            "Failed to record AdapterCreation at checkpoint {}: {}",
+                            block_height, e
+                        );
+                    }
+                });
+            }
+        }
 
         Ok(header.block_hash)
     }

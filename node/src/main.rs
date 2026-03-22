@@ -30,6 +30,7 @@ mod model_verifier;
 mod network_inference;
 mod persistent_dag;
 mod producer;
+mod contribution_recorder;
 mod sync;
 
 use config::NodeConfig;
