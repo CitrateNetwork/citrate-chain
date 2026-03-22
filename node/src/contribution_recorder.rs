@@ -57,6 +57,16 @@ impl ContributionRecorder {
         }
     }
 
+    /// Get the RPC URL this recorder is configured to use.
+    pub fn rpc_url(&self) -> &str {
+        &self.rpc_url
+    }
+
+    /// Get the recorder's address (used as the `from` field in transactions).
+    pub fn recorder_address(&self) -> &str {
+        &self.recorder_address
+    }
+
     /// Record a Validation contribution (type 0).
     /// Called once per block produced.
     pub async fn record_validation(&self, amount: u64) -> anyhow::Result<()> {
