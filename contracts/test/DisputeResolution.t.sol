@@ -48,6 +48,7 @@ contract DisputeResolutionTest is Test {
         vm.deal(challenger, 1000 ether);
         vm.deal(defender, 1000 ether);
         vm.deal(outsider, 100 ether);
+        vm.deal(address(dispute), 100 ether);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────
@@ -259,7 +260,7 @@ contract DisputeResolutionTimeoutTest is Test {
 
     uint256 internal constant BOND = 10 ether;
     uint256 internal constant MAX_ROUNDS = 20;
-    uint256 internal constant RANGE_START_VAL = 0;
+    uint256 internal constant RANGE_START = 0;
     uint256 internal constant RANGE_END = 1048576; // 2^20
 
     function setUp() public {
@@ -270,6 +271,7 @@ contract DisputeResolutionTimeoutTest is Test {
         vm.deal(challenger, 1000 ether);
         vm.deal(defender, 1000 ether);
         vm.deal(outsider, 100 ether);
+        vm.deal(address(dispute), 100 ether);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────
