@@ -192,6 +192,14 @@ pub struct ChainConfig {
 
     /// GhostDAG K parameter
     pub ghostdag_k: u16,
+
+    /// Genesis profile selector.
+    /// Determines which pre-built genesis account set to use when initializing a new chain.
+    /// Values: "default" (devnet accounts), "testnet_beta" (public testnet),
+    ///         "team_testnet" (team validator-funded genesis), "mainnet".
+    /// When absent, the profile is inferred from chain_id for backward compatibility.
+    #[serde(default)]
+    pub genesis_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +309,7 @@ impl Default for NodeConfig {
                 genesis_hash: None,
                 block_time: 5,
                 ghostdag_k: 18,
+                genesis_profile: None,
             },
             network: NetworkConfig {
                 listen_addr: hardcoded_addr("127.0.0.1:30303"),
@@ -512,5 +521,49 @@ mod tests {
         // Non-production mode with empty validators should succeed
         let config = ValidatorConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_team_testnet_toml_parses() {
+        // Verify the team-testnet.toml file is valid against NodeConfig
+        let toml_content = include_str!("../config/team-testnet.toml");
+        let config: NodeConfig =
+            toml::from_str(toml_content).expect("team-testnet.toml must parse as valid NodeConfig");
+
+        assert_eq!(config.chain.chain_id, 40204);
+        assert_eq!(config.chain.block_time, 2);
+        assert_eq!(config.chain.ghostdag_k, 18);
+        assert_eq!(
+            config.chain.genesis_profile.as_deref(),
+            Some("team_testnet")
+        );
+
+        assert_eq!(
+            config.network.listen_addr,
+            "0.0.0.0:30303".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(config.network.max_peers, 20);
+        assert!(config.network.bootstrap_nodes.is_empty());
+
+        assert!(config.rpc.enabled);
+        assert!(config.rpc.allow_eth_send_transaction);
+        assert_eq!(config.rpc.cors_origins, vec!["*".to_string()]);
+
+        assert!(config.mining.enabled);
+        assert_eq!(config.mining.target_block_time, 2);
+
+        assert!(!config.validator.production_mode);
+        assert!(!config.vrf.strict_vrf);
+
+        assert_eq!(config.checkpoint.interval, 50);
+        assert_eq!(config.checkpoint.committee_size, 10);
+        assert_eq!(config.checkpoint.quorum_threshold, 7);
+    }
+
+    #[test]
+    fn test_genesis_profile_none_by_default() {
+        std::env::remove_var("CITRATE_CHAIN_ID");
+        let config = NodeConfig::default();
+        assert!(config.chain.genesis_profile.is_none());
     }
 }

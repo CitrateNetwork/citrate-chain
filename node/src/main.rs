@@ -380,7 +380,13 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
 
-        genesis::initialize_genesis_state(probe_storage, executor, &genesis_config).await?;
+        let genesis_profile = config.chain.genesis_profile.as_deref();
+        genesis::initialize_genesis_state_with_profile(
+            probe_storage,
+            executor,
+            &genesis_config,
+            genesis_profile,
+        ).await?;
         info!("Genesis state initialized for chain ID {}", config.chain.chain_id);
     } else {
         // WP-K.6: Verify state root consistency before proceeding.

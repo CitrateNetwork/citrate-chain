@@ -187,14 +187,47 @@ pub async fn initialize_genesis_state(
     executor: Arc<Executor>,
     config: &GenesisConfig,
 ) -> anyhow::Result<Hash> {
+    initialize_genesis_state_with_profile(storage, executor, config, None).await
+}
+
+/// Initialize genesis state with an explicit genesis profile selector.
+///
+/// The `genesis_profile` chooses which economics genesis configuration to use:
+/// - `Some("team_testnet")` — team testnet with 10 pre-funded validators
+/// - `Some("testnet_beta")` — public testnet beta
+/// - `Some("mainnet")` — mainnet genesis
+/// - `None` or `Some("default")` — infer from chain_id (backward compatible)
+pub async fn initialize_genesis_state_with_profile(
+    storage: Arc<StorageManager>,
+    executor: Arc<Executor>,
+    config: &GenesisConfig,
+    genesis_profile: Option<&str>,
+) -> anyhow::Result<Hash> {
     // Create genesis block
     let mut genesis = create_genesis_block(config);
 
-    // Create economics genesis config — use testnet_beta for chain_id 40204
-    let economics_config = if config.chain_id == 40204 {
-        EconomicsGenesisConfig::testnet_beta()
-    } else {
-        EconomicsGenesisConfig::default()
+    // Select economics genesis config based on explicit profile or chain_id fallback
+    let economics_config = match genesis_profile {
+        Some("team_testnet") => {
+            tracing::info!("Using team_testnet genesis profile (10 pre-funded validators)");
+            EconomicsGenesisConfig::team_testnet_genesis()
+        }
+        Some("testnet_beta") => {
+            tracing::info!("Using testnet_beta genesis profile");
+            EconomicsGenesisConfig::testnet_beta()
+        }
+        Some("mainnet") => {
+            tracing::info!("Using mainnet genesis profile");
+            EconomicsGenesisConfig::mainnet()
+        }
+        _ => {
+            // Backward compatible: infer from chain_id
+            if config.chain_id == 40204 {
+                EconomicsGenesisConfig::testnet_beta()
+            } else {
+                EconomicsGenesisConfig::default()
+            }
+        }
     };
 
     // Initialize genesis accounts from economics config
