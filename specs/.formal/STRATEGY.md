@@ -1,13 +1,13 @@
 # TLA+ Formal Verification Strategy
 
-**Date**: 2026-03-15
-**Status**: Active — Phases 1-2 Complete, Phase 3 (GUI) Complete, Phases 4-5 Planned
+**Date**: 2026-03-22
+**Status**: Active — Phases 1-6 Complete, Phase 7 (Mainnet Hardening) Planned
 
 ---
 
 ## Executive Summary
 
-Citrate's formal verification suite covers **14 TLA+ specifications** verifying **81 invariants** across **42.8M+ states**. Phases 1-3 are complete. This strategy document defines the roadmap for remaining phases.
+Citrate's formal verification suite covers **36 TLA+ specifications** organized into **6 domains**, verifying **200+ invariants** across **75M+ states**. Phases 1-6 are complete. This strategy document defines the roadmap, principles, and adversarial modeling approach.
 
 **Goal**: Every safety-critical state machine in Citrate has a corresponding TLA+ specification with model-checked invariants, integrated into CI via `.github/workflows/tla-check.yml`.
 
@@ -20,9 +20,9 @@ Specifications are prioritized by **blast radius** (how many users/funds are aff
 
 | Priority | Blast Radius | Examples |
 |----------|-------------|----------|
-| **P0 — Critical** | Loss of funds, consensus divergence | DAG ordering, VRF election, bridge attestation, transaction execution |
-| **P1 — High** | State corruption, denial of service | Mempool sequencing, checkpoint finality, state sync, pruning |
-| **P2 — Medium** | UX degradation, data inconsistency | GUI state machines, SDK connection lifecycle, auth flows |
+| **P0 — Critical** | Loss of funds, consensus divergence | DAG ordering, VRF election, bridge attestation, transaction execution, compute escrow |
+| **P1 — High** | State corruption, denial of service | Mempool sequencing, checkpoint finality, slashing, dispute resolution |
+| **P2 — Medium** | UX degradation, data inconsistency | GUI state machines, SDK connection lifecycle, learning cycles |
 | **P3 — Low** | Cosmetic, non-blocking | Explorer rendering, marketing site, documentation |
 
 ### 2. Specification Scope
@@ -45,6 +45,30 @@ Every spec should verify invariants from these categories where applicable:
 | **Authorization** | Access control enforced | `NoHighRiskWithoutApproval` |
 | **Liveness** | Progress eventually made | `EventualFinality` (temporal) |
 | **Consistency** | Replicas agree | `NoFork`, `ConsensusAgreement` |
+| **Economic Safety** | No funds lost, no unjust slashing | `NoUnjustSlashing`, `EscrowIntegrity` |
+
+### 4. Adversarial Modeling Approach
+
+Starting with the compute domain (Sprint COMPUTE-1), specifications explicitly model adversarial behavior:
+
+| Attack Vector | Specs Modeling It | Key Invariants |
+|---------------|-------------------|----------------|
+| **Sybil Attack** | AdversarialCompute | Provider uniqueness, stake-weighted selection |
+| **Result Manipulation** | ComputeVerification, AdversarialCompute | Challenge-response integrity |
+| **Free-riding** | HeartbeatLiveness, ProviderLifecycle | Heartbeat enforcement, auto-slashing |
+| **Escrow Theft** | ComputeMarketplaceLifecycle, DisputeResolution | Escrow release only on verified completion |
+| **Collusion** | AdversarialCompute | Independent verification requirement |
+| **Griefing** | DisputeResolution, AdversarialCompute | Dispute bond requirement, bounded resolution time |
+
+### 5. Integration Specs
+
+Integration specifications verify cross-domain interactions:
+
+| Spec | Domains Connected | Key Property |
+|------|-------------------|-------------|
+| **LearningComputeIntegration** | Learning + Compute | Learning cycles correctly delegate compute jobs |
+| **ComputeE2E** | Compute (all 5 contracts) | End-to-end flow from job creation to payment |
+| **PrevrandaoPipeline** | Consensus + Execution | VRF output correctly flows to smart contracts |
 
 ---
 
@@ -52,13 +76,13 @@ Every spec should verify invariants from these categories where applicable:
 
 ### Phase 1: Core Protocol (COMPLETE)
 
-**Status**: 6/6 specs passing, 27 invariants verified
+**Status**: 6/6 specs, 27 invariants verified
 
 | Spec | Location | Invariants | States |
 |------|----------|-----------|--------|
-| GhostDAGConsensus | `specs/tla/` | 6 | 86 |
-| MempoolSequencer | `specs/tla/` | 6 | 10.5M |
-| VRFElection | `specs/tla/` | 6 | 35K |
+| GhostDAGConsensus | `specs/tla/consensus/` | 6 | 86 |
+| MempoolSequencer | `specs/tla/consensus/` | 6 | 10.5M |
+| VRFElection | `specs/tla/consensus/` | 6 | 35K |
 | CheckpointSafety | `.audit/.../tla/` | 3 | 90 |
 | BridgeAttestationSafety | `.audit/.../tla/` | 4 | 8.1K |
 | AgentToolAuthorization | `.audit/.../tla/` | 2 | 576 |
@@ -67,16 +91,16 @@ Every spec should verify invariants from these categories where applicable:
 
 **Status**: 4 new specs, 23 invariants verified
 
-| Spec | Location | Invariants | States |
-|------|----------|-----------|--------|
-| VRFChainContinuity | `specs/tla/` | 5 | — |
-| TransactionExecution | `specs/tla/` | 5 | — |
-| SDKConnectionLifecycle | `specs/tla/` | 5 | — |
-| PrevrandaoPipeline | `specs/tla/` | 8 | 204K |
+| Spec | Location | Invariants |
+|------|----------|-----------|
+| VRFChainContinuity | `specs/tla/consensus/` | 5 |
+| TransactionExecution | `specs/tla/consensus/` | 5 |
+| SDKConnectionLifecycle | `specs/tla/gui/` | 5 |
+| PrevrandaoPipeline | `specs/tla/consensus/` | 8 |
 
 ### Phase 3: GUI State Machines (COMPLETE)
 
-**Status**: 4 specs with .cfg files, model-checked, 31 invariants verified
+**Status**: 4 specs, 31 invariants verified
 
 | Spec | Location | Invariants | States |
 |------|----------|-----------|--------|
@@ -85,34 +109,52 @@ Every spec should verify invariants from these categories where applicable:
 | AgentChat | `gui/.../specs/` | 9 | 140 |
 | EnvironmentSwitch | `gui/.../specs/` | 6 | 84 |
 
-### Phase 4: SDK & Client State Machines (Target: Sprint Z+3)
+### Phase 4: ZK & Learning (COMPLETE)
 
-| Spec | SDK | Purpose | Priority |
-|------|-----|---------|----------|
-| **SDKConnectionLifecycle** | JS/Python | Connect → authenticate → ready → disconnect | P1 |
-| **SDKTransactionLifecycle** | JS/Python | Create → sign → submit → poll → confirm/fail | P1 |
-| **SDKRetryPolicy** | JS/Python | Retry with backoff, idempotency guarantees | P2 |
-| **WalletCLIFlow** | CLI wallet | Key generation → signing → submission | P1 |
-| **FaucetRateLimiting** | Faucet | Request rate limiting, balance checking | P2 |
-| **ExplorerDataConsistency** | Explorer | Block/tx data consistency with RPC source | P3 |
+**Status**: 13 new specs covering ZK proof systems and paraconsistent learning
 
-**Key SDK invariants**:
-- No transaction submitted without valid signature
-- Retry logic never double-submits (idempotency)
-- Connection state machine: no RPC calls in disconnected state
-- Faucet: per-address rate limits enforced, balance never goes negative
-- Explorer: displayed data matches RPC source of truth
+| Domain | Specs Added | Key Properties |
+|--------|------------|----------------|
+| ZK (2) | ZKProofLifecycle, ZKKeyManagement | Proof validity, key ceremony safety |
+| Learning (11) | BelnapLattice, OODACycle, SafetyInvariant, AdapterProvenance, ByzantineDetection, ParaconsistentAggregation, LearningCycleLifecycle, StrobilationCheckpoint, LearningPool, MentorSelection, LearningComputeIntegration | Lattice ordering, Byzantine tolerance, cycle completion |
 
-### Phase 5: Smart Contract Verification (Target: Sprint Z+4)
+### Phase 5: Contract State Machines (COMPLETE)
+
+**Status**: 7 new specs for on-chain contract logic
+
+| Spec | Key Property |
+|------|-------------|
+| TrustScoring | Trust scores bounded, monotonic under honest behavior |
+| InferenceRequestLifecycle | Request state machine completeness |
+| SpecRegistryLifecycle | Spec versioning integrity |
+| NematocystSlashing | No unjust slashing, appeal window enforced |
+| LiquidStaking | stSALT minting/burning conservation |
+| ContributionAccounting | Contribution tracking accuracy |
+| ClassroomRegistry | Enrollment bounds, graduation requirements |
+
+### Phase 6: Compute Marketplace (COMPLETE)
+
+**Status**: 7 new specs including adversarial modeling
+
+| Spec | Key Property |
+|------|-------------|
+| ComputeMarketplaceLifecycle | Job state machine, escrow integrity |
+| ComputeVerification | Challenge-response correctness |
+| ProviderLifecycle | Stake requirements, registration safety |
+| DisputeResolution | Dispute state machine, bounded resolution |
+| HeartbeatLiveness | Heartbeat enforcement, auto-slashing |
+| AdversarialCompute | 6 attack vectors, 17 invariants |
+| ComputeE2E | End-to-end integration correctness |
+
+### Phase 7: Mainnet Hardening (Target: Pre-Launch)
 
 | Spec | Purpose | Priority |
 |------|---------|----------|
-| **ModelNFTOwnership** | ERC-721 ownership transfer correctness | P1 |
 | **TokenEconomics** | SALT minting/burning/transfer invariants | P0 |
-| **MarketplaceEscrow** | Escrow lock/release/refund state machine | P0 |
 | **GovernanceVoting** | Vote counting, quorum, timelock | P1 |
-
-**Note**: Solidity-level verification may use a combination of TLA+ (for protocol-level properties) and Foundry formal verification (for implementation-level properties via `forge test --ffi`).
+| **NetworkPartition** | Consensus safety under partition | P0 |
+| **StateSync** | State synchronization correctness | P1 |
+| **CrossDomainSettlement** | Multi-contract transaction atomicity | P1 |
 
 ---
 
@@ -123,105 +165,36 @@ Every spec should verify invariants from these categories where applicable:
 - Uses OpenJDK 17 + tla2tools.jar
 - Fails PR if any invariant violation detected
 
-### Target: Extended CI Pipeline
-```yaml
-# Trigger on TLA+ file changes
-on:
-  pull_request:
-    paths:
-      - 'citrate_v0.01.1/specs/tla/**'
-      - 'citrate_v0.01.1/gui/citrate_gui_v2/specs/**'
-      - '.audit/**/tla/**'
+### Runners
 
-jobs:
-  tla-verify:
-    steps:
-      - run: specs/tla/run_all.sh          # Core protocol specs
-      - run: gui/citrate_gui_v2/specs/run_all.sh  # GUI specs
-      - run: .audit/.../tla/run_all.sh      # Security audit specs
-```
-
-### Verification Metrics Dashboard
-Track these metrics over time:
-- Total specifications count
-- Total invariants verified
-- Total states explored
-- Maximum search depth
-- Violations found (should always be 0)
-- Time to verify (should remain <5 min for CI)
-
----
-
-## Specification Writing Guidelines
-
-### Template for New Specs
-```tla+
---------------------------- MODULE SpecName ----------------------------
-EXTENDS Naturals, FiniteSets, TLC
-
-CONSTANTS Param1, Param2, ...
-
-ASSUME Param1 # {}
-ASSUME Param2 \in Nat
-
-VARIABLES var1, var2, ...
-
-TypeInv ==
-    /\ var1 \in SomeSet
-    /\ var2 \subseteq AnotherSet
-
-Init ==
-    /\ var1 = InitialValue
-    /\ var2 = {}
-
-Action1(param) ==
-    /\ precondition
-    /\ var1' = newValue
-    /\ UNCHANGED <<var2>>
-
-Next ==
-    (\E p \in Param1 : Action1(p))
-    \/ Action2
-    \/ ...
-
-\* Safety Invariants
-SafetyProperty1 == \A x \in var1 : SomeCondition(x)
-SafetyProperty2 == Cardinality(var2) <= MaxSize
-
-Spec == Init /\ [][Next]_<<var1, var2>>
-
-THEOREM Safety1 == Spec => []TypeInv
-THEOREM Safety2 == Spec => []SafetyProperty1
-=============================================================================
-```
-
-### Common Pitfalls (Learned from Phase 1)
-1. **String literals vs model values**: Use CONSTANTS, not `"string"` literals
-2. **Nested `\E` scoping**: Always parenthesize disjuncts in `Next` to avoid multiply-defined variables
-3. **Range overflow**: If an action increments a counter, ensure TypeInv range accommodates `MaxValue + 1`
-4. **macOS grep**: Use `grep -o` (POSIX), not `grep -oP` (GNU-only)
-5. **State space explosion**: Keep constant sets small (3-5 elements), reduce cross-products
+| Script | Workers | Timeout | Purpose |
+|--------|---------|---------|---------|
+| `run_all.sh` | 1 | Standard | CI/quick verification |
+| `run_all_27.sh` | 1 | Standard | Legacy 27-spec runner |
+| `run_deep.sh` | 16 | 45 min | Deep verification, edge cases |
 
 ---
 
 ## Success Criteria
 
-| Milestone | Target | Metric |
+| Milestone | Target | Status |
 |-----------|--------|--------|
-| Phase 1 Complete | Done | 6 specs, 27 invariants, 0 violations |
-| Phase 2 Complete | Done | 10 specs, 50 invariants, 0 violations |
-| Phase 3 Complete | Done | 14 specs, 81 invariants, 0 violations |
-| Phase 4 Complete | Future | 20+ specs, 100+ invariants |
-| Phase 5 Complete | Future | 24+ specs, 115+ invariants |
-| Full Coverage | Future | Every P0/P1 subsystem has a spec |
+| Phase 1 Complete | 6 specs, 27 invariants | DONE |
+| Phase 2 Complete | 10 specs, 50 invariants | DONE |
+| Phase 3 Complete | 14 specs, 81 invariants | DONE |
+| Phase 4 Complete | 27 specs, 150+ invariants | DONE |
+| Phase 5 Complete | 34 specs, 180+ invariants | DONE |
+| Phase 6 Complete | 36 specs, 200+ invariants | DONE |
+| Phase 7 Complete | 40+ specs, 230+ invariants | PLANNED |
+| Full Coverage | Every P0/P1 subsystem has a spec | IN PROGRESS |
 
 ---
 
 ## References
 
-- [TLA+ Hyperbook](https://lamport.azurewebsites.net/tla/hyperbook.html) — Leslie Lamport
-- [Specifying Systems](https://lamport.azurewebsites.net/tla/book.html) — Leslie Lamport
+- [TLA+ Hyperbook](https://lamport.azurewebsites.net/tla/hyperbook.html) -- Leslie Lamport
+- [Specifying Systems](https://lamport.azurewebsites.net/tla/book.html) -- Leslie Lamport
 - [TLC Model Checker](https://github.com/tlaplus/tlaplus)
-- [AWS and TLA+](https://lamport.azurewebsites.net/tla/amazon-excerpt.html) — Amazon's use of TLA+ in production systems
-- [Ethereum Consensus Spec](https://github.com/ethereum/consensus-specs) — Reference for VRF/RANDAO verification
-- [RFC 9381](https://www.rfc-editor.org/rfc/rfc9381) — ECVRF-P256-SHA256 specification
+- [AWS and TLA+](https://lamport.azurewebsites.net/tla/amazon-excerpt.html) -- Amazon's use of TLA+ in production systems
+- [Ethereum Consensus Spec](https://github.com/ethereum/consensus-specs) -- Reference for VRF/RANDAO verification
+- [RFC 9381](https://www.rfc-editor.org/rfc/rfc9381) -- ECVRF-P256-SHA256 specification

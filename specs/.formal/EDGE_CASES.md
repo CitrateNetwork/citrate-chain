@@ -73,6 +73,58 @@
 
 ---
 
+## Compute Marketplace Edge Cases (NEW — Sprint COMPUTE-1)
+
+### CM-1: Provider Goes Offline During Active Job
+**Location**: `contracts/src/ComputeMarketplace.sol`, `contracts/src/HeartbeatMonitor.sol`
+**Severity**: P0 — Loss of Funds
+**Description**: If a compute provider accepts a job, receives escrowed payment, then goes offline (missed heartbeats), the job requester's funds are locked in escrow with no result delivered.
+**Current Mitigation**: HeartbeatMonitor detects missed heartbeats and auto-slashes. DisputeResolution allows requester to reclaim funds.
+**Formal Verification**: `HeartbeatLiveness.tla` + `ComputeMarketplaceLifecycle.tla` + `AdversarialCompute.tla`
+**Invariant**: `EscrowRecovery == \A job \in activeJobs : job.providerOffline => job.requester.canReclaim`
+
+### CM-2: Sybil Attack on Compute Pool
+**Location**: `contracts/src/ComputePool.sol`, `contracts/src/ComputeMarketplace.sol`
+**Severity**: P0 — Economic Attack
+**Description**: An attacker creates many low-stake provider identities to dominate job assignment. With enough Sybil identities, attacker can accept most jobs and submit garbage results before challenges are raised.
+**Current Mitigation**: Minimum stake per provider. ComputeVerifier requires proof of computation.
+**Formal Verification**: `AdversarialCompute.tla` — models Sybil attack vector explicitly.
+**Invariant**: `SybilResistance == \A pool \in pools : \A provider \in pool.providers : provider.stake >= MinStake`
+
+### CM-3: Result Manipulation in ComputeVerifier
+**Location**: `contracts/src/ComputeVerifier.sol`
+**Severity**: P0 — Incorrect Results Accepted
+**Description**: A provider submits an incorrect result. If no challenger arises during the challenge window (because challengers lose money if they fail), the incorrect result is accepted and the provider is paid.
+**Current Mitigation**: Challenge bond mechanism. ComputeVerifier uses deterministic verification where possible.
+**Formal Verification**: `ComputeVerification.tla` + `AdversarialCompute.tla`
+**Invariant**: `VerificationCompleteness == \A result \in accepted : result.verified \/ result.unchallenged_after_window`
+
+### CM-4: Dispute Resolution Deadlock
+**Location**: `contracts/src/DisputeResolution.sol`
+**Severity**: P1 — Funds Locked
+**Description**: A dispute is opened but neither party submits evidence. The dispute stays open indefinitely, locking escrowed funds.
+**Current Mitigation**: DisputeResolution has a timeout mechanism — if no evidence submitted, dispute resolves in favor of challenger.
+**Formal Verification**: `DisputeResolution.tla`
+**Invariant**: `DisputeTermination == \A dispute \in openDisputes : dispute.age < MaxDisputeDuration`
+
+### CM-5: Heartbeat Spoofing
+**Location**: `contracts/src/HeartbeatMonitor.sol`
+**Severity**: P1 — Free-riding
+**Description**: A provider registers, sends heartbeats to maintain "alive" status, but never actually processes jobs. They collect pool rewards without providing compute.
+**Current Mitigation**: HeartbeatMonitor tracks both liveness (heartbeats) and productivity (job completions). Providers with zero completions over N heartbeat periods are flagged.
+**Formal Verification**: `HeartbeatLiveness.tla` + `ProviderLifecycle.tla`
+**Invariant**: `NoFreeRiding == \A p \in activeProviders : p.heartbeats > 0 => p.completions > 0 \/ p.age < GracePeriod`
+
+### CM-6: ComputePool Worker Collision
+**Location**: `contracts/src/ComputePool.sol`
+**Severity**: P1 — Double Payment
+**Description**: Two workers in the same pool both accept and complete the same job, submitting different results. Both claim payment.
+**Current Mitigation**: ComputePool assigns jobs to specific workers. Only the assigned worker's result is accepted.
+**Formal Verification**: `ComputeE2E.tla`
+**Invariant**: `NoDualAssignment == \A job \in jobs : Cardinality(job.assignedWorkers) = 1`
+
+---
+
 ## Concurrency Edge Cases
 
 ### CE-1: IPFS Upload Timeout During Model Deployment
@@ -155,16 +207,22 @@
 
 ## Priority Matrix for Formal Verification
 
-| ID | Description | Severity | Effort | Priority |
-|----|-------------|----------|--------|----------|
-| RC-1 | GUI producer commit race | P0 | 3 pts | Immediate |
-| RC-2 | Mempool nonce gap | P0 | 5 pts | Phase 2 |
-| RC-4 | VRF chaining under reorg | P0 | 8 pts | Phase 2 |
-| RC-5 | Checkpoint vs DAG tip race | P0 | 8 pts | Phase 2 |
-| RC-3 | Environment switch race | P1 | 3 pts | Phase 3 |
-| RC-6 | Wallet session expiry | P1 | 3 pts | Phase 3 |
-| RC-8 | State DB concurrency | P1 | 5 pts | Phase 2 |
-| RC-7 | IPC message ordering | P2 | 5 pts | Phase 3 |
-| CE-4 | Faucet double-drip | P2 | 3 pts | Phase 4 |
-| BC-2 | Mempool eviction ordering | P1 | 3 pts | Phase 2 |
-| BC-3 | Zero-validator degraded mode | P1 | 5 pts | Phase 2 |
+| ID | Description | Severity | Effort | Priority | Status |
+|----|-------------|----------|--------|----------|--------|
+| RC-1 | GUI producer commit race | P0 | 3 pts | Immediate | MITIGATED (code fix) |
+| RC-2 | Mempool nonce gap | P0 | 5 pts | Phase 2 | VERIFIED (MempoolSequencer.tla) |
+| RC-4 | VRF chaining under reorg | P0 | 8 pts | Phase 2 | VERIFIED (VRFChainContinuity.tla) |
+| RC-5 | Checkpoint vs DAG tip race | P0 | 8 pts | Phase 2 | VERIFIED (CheckpointSafety.tla) |
+| RC-3 | Environment switch race | P1 | 3 pts | Phase 3 | VERIFIED (EnvironmentSwitch.tla) |
+| RC-6 | Wallet session expiry | P1 | 3 pts | Phase 3 | VERIFIED (WalletSession.tla) |
+| RC-8 | State DB concurrency | P1 | 5 pts | Phase 2 | Covered by unit tests + fuzz |
+| RC-7 | IPC message ordering | P2 | 5 pts | Phase 3 | Covered by GUI tests |
+| CE-4 | Faucet double-drip | P2 | 3 pts | Phase 4 | Covered by unit tests |
+| BC-2 | Mempool eviction ordering | P1 | 3 pts | Phase 2 | VERIFIED (MempoolSequencer.tla) |
+| BC-3 | Zero-validator degraded mode | P1 | 5 pts | Phase 2 | Planned for Phase 7 |
+| CM-1 | Provider offline during job | P0 | 5 pts | Phase 6 | VERIFIED (HeartbeatLiveness.tla) |
+| CM-2 | Sybil attack on pool | P0 | 8 pts | Phase 6 | VERIFIED (AdversarialCompute.tla) |
+| CM-3 | Result manipulation | P0 | 5 pts | Phase 6 | VERIFIED (ComputeVerification.tla) |
+| CM-4 | Dispute resolution deadlock | P1 | 3 pts | Phase 6 | VERIFIED (DisputeResolution.tla) |
+| CM-5 | Heartbeat spoofing | P1 | 5 pts | Phase 6 | VERIFIED (HeartbeatLiveness.tla) |
+| CM-6 | ComputePool worker collision | P1 | 3 pts | Phase 6 | VERIFIED (ComputeE2E.tla) |
