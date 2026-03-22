@@ -11,12 +11,14 @@ use citrate_economics::{
 };
 use citrate_execution::Executor;
 use citrate_execution::revm_adapter::BlockContext;
-use citrate_learning::orchestration::{LearningOrchestrator, PeerEmbedding};
+use citrate_learning::orchestration::{LearningOrchestrator, PeerEmbedding, PeerProfileStore};
+use citrate_learning::profile::ProfileComputer;
 use citrate_network::{GossipProtocol, NetworkMessage, PeerManager};
 use citrate_network::learning_messages::LearningMessage;
 use citrate_sequencer::mempool::Mempool;
 use citrate_storage::{state_manager::StateManager as AIStateManager, StorageManager};
 use primitive_types::U256;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -100,6 +102,17 @@ pub struct BlockProducer {
     /// WP-F.3: Checkpoint interval for learning root computation.
     /// Defaults to 50 blocks (same as BFT checkpoint interval).
     checkpoint_interval: u64,
+
+    /// WP-F.5: Local performance profile computer.
+    /// Tracks inference results, latencies, uptime, and adapter counts
+    /// for computing the node's performance profile at checkpoint boundaries.
+    /// Uses Mutex for interior mutability (produce_block takes &self).
+    profile_computer: Mutex<ProfileComputer>,
+
+    /// WP-F.5: Received peer performance profiles indexed by
+    /// (checkpoint_height, participant). Used by WP-F.6 for mentor selection.
+    /// Uses Mutex for interior mutability (produce_block takes &self).
+    peer_profile_store: Mutex<PeerProfileStore>,
 }
 
 impl BlockProducer {
@@ -162,6 +175,8 @@ impl BlockProducer {
             learning_orchestrator: None,
             gossip: None,
             checkpoint_interval: 50,
+            profile_computer: Mutex::new(ProfileComputer::default()),
+            peer_profile_store: Mutex::new(PeerProfileStore::default()),
         }
     }
 
@@ -225,6 +240,8 @@ impl BlockProducer {
             learning_orchestrator: None,
             gossip: None,
             checkpoint_interval: 50,
+            profile_computer: Mutex::new(ProfileComputer::default()),
+            peer_profile_store: Mutex::new(PeerProfileStore::default()),
         }
     }
 
@@ -280,6 +297,8 @@ impl BlockProducer {
             learning_orchestrator: None,
             gossip: None,
             checkpoint_interval: 50,
+            profile_computer: Mutex::new(ProfileComputer::default()),
+            peer_profile_store: Mutex::new(PeerProfileStore::default()),
         }
     }
 
@@ -360,6 +379,8 @@ impl BlockProducer {
             learning_orchestrator: None,
             gossip: None,
             checkpoint_interval: 50,
+            profile_computer: Mutex::new(ProfileComputer::default()),
+            peer_profile_store: Mutex::new(PeerProfileStore::default()),
         }
     }
 
@@ -450,6 +471,8 @@ impl BlockProducer {
             learning_orchestrator: None,
             gossip: None,
             checkpoint_interval: 50,
+            profile_computer: Mutex::new(ProfileComputer::default()),
+            peer_profile_store: Mutex::new(PeerProfileStore::default()),
         }
     }
 
@@ -831,6 +854,9 @@ impl BlockProducer {
         // Update DAG store
         self.dag_store.store_block(block.clone()).await?;
 
+        // WP-F.5: Record block seen for uptime tracking.
+        self.profile_computer.lock().record_block();
+
         Ok(header.block_hash)
     }
 
@@ -1052,10 +1078,14 @@ impl BlockProducer {
         }
     }
 
-    /// WP-F.3: Compute the learning_root for a checkpoint block.
+    /// WP-F.3 + WP-F.5: Compute the learning_root for a checkpoint block.
     ///
     /// Collects peer embeddings from the gossip layer, runs paraconsensus
     /// aggregation via the learning orchestrator, and returns the hash.
+    ///
+    /// WP-F.5: Also computes and logs the local performance profile at each
+    /// checkpoint boundary. Peer profiles received via gossip are stored in
+    /// the peer_profile_store for WP-F.6 mentor selection.
     ///
     /// If aggregation fails or returns below-quorum, returns zero hash
     /// (block production continues normally — learning is non-blocking).
@@ -1069,7 +1099,36 @@ impl BlockProducer {
             None => return Hash::default(),
         };
 
-        // Collect peer embeddings from gossip layer
+        // WP-F.5: Compute local performance profile at this checkpoint.
+        let local_profile = self.profile_computer.lock().compute_profile();
+        info!(
+            "Checkpoint {} local profile: accuracy={:.3}, latency={}ms, uptime={:.3}, adapters={}, domains={:?}",
+            block_height,
+            local_profile.accuracy,
+            local_profile.latency_ms,
+            local_profile.uptime,
+            local_profile.adapter_count,
+            local_profile.domains,
+        );
+
+        // WP-F.5: Store our own profile in the peer profile store.
+        {
+            let store_profile = citrate_learning::profile::PerformanceProfile {
+                accuracy: local_profile.accuracy,
+                latency_ms: local_profile.latency_ms,
+                domains: local_profile.domains.clone(),
+                uptime: local_profile.uptime,
+                adapter_count: local_profile.adapter_count,
+            };
+            let local_key = *self.coinbase.as_bytes();
+            self.peer_profile_store.lock().store_profile(
+                block_height,
+                local_key,
+                store_profile,
+            );
+        }
+
+        // Collect peer embeddings from gossip layer (also stores peer profiles)
         let peer_embeddings = self.collect_peer_embeddings(block_height).await;
 
         // TODO(WP-F.4): Build local embedding from recent inference activity.
@@ -1108,10 +1167,13 @@ impl BlockProducer {
         }
     }
 
-    /// WP-F.3: Extract peer embeddings from gossip layer's learning data store.
+    /// WP-F.3 + WP-F.5: Extract peer embeddings from gossip layer's learning data store.
     ///
     /// Converts the network-layer `LearningMessage::Embedding` messages into
     /// the learning-crate's `PeerEmbedding` format for aggregation.
+    ///
+    /// WP-F.5: Also extracts and stores peer performance profiles in the
+    /// `peer_profile_store` for use by WP-F.6 mentor selection.
     async fn collect_peer_embeddings(&self, checkpoint_height: u64) -> Vec<PeerEmbedding> {
         let gossip = match &self.gossip {
             Some(g) => g,
@@ -1130,6 +1192,21 @@ impl BlockProducer {
 
         for msg in &data.embeddings {
             if let LearningMessage::Embedding(emb) = msg {
+                // WP-F.5: Store the peer's performance profile for mentor selection.
+                let participant_bytes = *emb.participant.as_bytes();
+                let peer_profile = citrate_learning::profile::PerformanceProfile {
+                    accuracy: emb.profile.accuracy,
+                    latency_ms: emb.profile.latency_ms,
+                    domains: emb.profile.domains.clone(),
+                    uptime: emb.profile.uptime,
+                    adapter_count: emb.profile.adapter_count,
+                };
+                self.peer_profile_store.lock().store_profile(
+                    checkpoint_height,
+                    participant_bytes,
+                    peer_profile,
+                );
+
                 // Default confidence to 0.5 for each dimension if not classified
                 let confidence = if emb.confidence.len() == emb.embedding.len() {
                     // Convert BelnapConfidence to f32 values for aggregation input
@@ -1159,12 +1236,62 @@ impl BlockProducer {
         }
 
         debug!(
-            "Collected {} peer embeddings for checkpoint {}",
+            "Collected {} peer embeddings for checkpoint {} ({} profiles stored)",
             peer_embeddings.len(),
             checkpoint_height,
+            self.peer_profile_store.lock().len(),
         );
 
         peer_embeddings
+    }
+
+    /// WP-F.5: Record an inference result in the local profile computer.
+    ///
+    /// Call this from inference handlers to track accuracy and latency.
+    #[allow(dead_code)]
+    pub fn record_inference(&self, correct: bool, latency_ms: u64, domain: &str) {
+        self.profile_computer.lock().record_inference(correct, latency_ms, domain);
+    }
+
+    /// WP-F.5: Record that this node observed a block (for uptime tracking).
+    #[allow(dead_code)]
+    pub fn record_block_seen(&self) {
+        self.profile_computer.lock().record_block();
+    }
+
+    /// WP-F.5: Record that this node missed a block (for uptime tracking).
+    #[allow(dead_code)]
+    pub fn record_block_missed(&self) {
+        self.profile_computer.lock().record_missed_block();
+    }
+
+    /// WP-F.5: Record an adapter creation.
+    #[allow(dead_code)]
+    pub fn record_adapter_created(&self) {
+        self.profile_computer.lock().record_adapter_created();
+    }
+
+    /// WP-F.5: Get a snapshot of the current local performance profile.
+    #[allow(dead_code)]
+    pub fn get_local_profile(&self) -> citrate_learning::profile::PerformanceProfile {
+        self.profile_computer.lock().compute_profile()
+    }
+
+    /// WP-F.5: Get all peer profiles stored for a given checkpoint height.
+    ///
+    /// Returns (participant_pubkey_bytes, profile) pairs. Used by WP-F.6
+    /// mentor selection.
+    #[allow(dead_code)]
+    pub fn get_peer_profiles_at_checkpoint(
+        &self,
+        checkpoint_height: u64,
+    ) -> Vec<([u8; 32], citrate_learning::profile::PerformanceProfile)> {
+        let store = self.peer_profile_store.lock();
+        store
+            .get_profiles_at_checkpoint(checkpoint_height)
+            .into_iter()
+            .map(|(k, v)| (k, v.clone()))
+            .collect()
     }
 }
 

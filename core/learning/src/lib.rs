@@ -33,9 +33,11 @@ pub mod config;
 pub mod embeddings;
 pub mod errors;
 pub mod knowledge;
+pub mod mentor;
 pub mod metrics;
 pub mod orchestration;
 pub mod phases;
+pub mod profile;
 pub mod routing;
 pub mod safety;
 pub mod storage;
@@ -62,7 +64,12 @@ pub use routing::{MlpRouter, Router};
 pub use storage::PhaseStore;
 pub use orchestration::{
     compute_learning_root, LearningCheckpointResult, LearningOrchestrator,
-    LearningOrchestratorConfig, PeerEmbedding,
+    LearningOrchestratorConfig, PeerEmbedding, PeerProfileKey, PeerProfileStore,
+};
+pub use profile::{ProfileComputer, PerformanceProfile as LocalPerformanceProfile};
+pub use mentor::{
+    generate_adapter_for_mentee, generate_delta_adapter, select_mentors, MentorPairing,
+    MAX_MENTEES_PER_MENTOR, MIN_ACCURACY_GAP,
 };
 pub use safety::{LearningMode, SafetyGuard};
 pub use types::{LearningRound, Participant};
