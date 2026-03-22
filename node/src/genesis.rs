@@ -1,7 +1,7 @@
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::types::{
-    Block, BlockBuilder, BlockHeader, EmbeddedModel, GhostDagParams, Hash, ModelId as ConsensusModelId,
-    ModelMetadata as ConsensusModelMetadata, ModelType, PublicKey, RequiredModel, Signature,
+    Block, BlockBuilder, BlockHeader, EmbeddedModel, Hash, ModelId as ConsensusModelId,
+    ModelMetadata as ConsensusModelMetadata, ModelType, PublicKey, RequiredModel,
     VrfProof,
 };
 use citrate_economics::genesis::GenesisConfig as EconomicsGenesisConfig;

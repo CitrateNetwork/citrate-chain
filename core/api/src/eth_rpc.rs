@@ -793,7 +793,7 @@ pub fn register_eth_methods(
         // WP-I.4: eth_call costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
 
-        use citrate_consensus::types::{Block, BlockHeader, PublicKey, Signature, VrfProof};
+        use citrate_consensus::types::{PublicKey, Signature};
 
         let exec = executor_call.clone();
 
@@ -943,7 +943,7 @@ pub fn register_eth_methods(
         // WP-I.4: eth_estimateGas costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
 
-        use citrate_consensus::types::{Block, BlockHeader, PublicKey, Signature, VrfProof};
+        use citrate_consensus::types::{PublicKey, Signature};
 
         let exec = executor_estimate.clone();
 

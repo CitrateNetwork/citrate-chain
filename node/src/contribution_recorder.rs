@@ -17,7 +17,7 @@
 
 use sha3::{Digest, Keccak256};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Records contributions to the on-chain ContributionAccounting contract.
 ///
@@ -46,6 +46,7 @@ impl ContributionRecorder {
     /// - `rpc_url` — JSON-RPC endpoint (e.g., "http://127.0.0.1:8545")
     /// - `contract_address` — Deployed ContributionAccounting address (0x-prefixed)
     /// - `recorder_address` — Address authorized to call recordContribution (0x-prefixed)
+    #[allow(dead_code)]
     pub fn new(rpc_url: String, contract_address: String, recorder_address: String) -> Self {
         Self {
             rpc_url,
@@ -75,6 +76,7 @@ impl ContributionRecorder {
     }
 
     /// Record a DataProvision contribution (type 3).
+    #[allow(dead_code)]
     pub async fn record_data_provision(&self, amount: u64) -> anyhow::Result<()> {
         self.record_contribution(3, amount).await
     }

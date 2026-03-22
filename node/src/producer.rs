@@ -4,7 +4,7 @@ use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::tip_selection::TipSelector;
 use citrate_consensus::crypto::{self, Ed25519SigningKey};
 use citrate_consensus::types::{
-    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Transaction, VrfProof,
 };
 use citrate_economics::{
     RewardCalculator, RewardConfig, UnifiedEconomicsManager,
@@ -510,6 +510,7 @@ impl BlockProducer {
     /// Call this after construction to wire learning into block production.
     /// The orchestrator runs paraconsensus aggregation at checkpoint boundaries
     /// and computes the `learning_root` hash for inclusion in the block header.
+    #[allow(dead_code)]
     pub fn enable_learning(
         &mut self,
         orchestrator: LearningOrchestrator,
@@ -531,6 +532,7 @@ impl BlockProducer {
     /// - Validation contributions (1 per block produced)
     /// - ModelHosting contributions (based on inference count since last block)
     /// - AdapterCreation contributions (at checkpoints when mentor generates adapter)
+    #[allow(dead_code)]
     pub fn enable_contribution_recording(
         &mut self,
         rpc_url: String,
@@ -544,6 +546,7 @@ impl BlockProducer {
 
     /// LC.4.3: Get a handle to the inference counter for incrementing from
     /// the inference/MCP handler when requests are served.
+    #[allow(dead_code)]
     pub fn inference_counter(&self) -> Arc<AtomicU64> {
         self.inference_count.clone()
     }
