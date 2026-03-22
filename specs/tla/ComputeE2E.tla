@@ -31,8 +31,8 @@ ASSUME Providers # {}
 \* ---- Subsystem constants (hardcoded for tractable model checking) ----
 
 MaxPrice == 2            \* Maximum job price in SALT (small for tractable model checking)
-MinStake == 5            \* Minimum provider stake
-InitStake == 10          \* Initial provider stake on registration
+MinStake == 1            \* Minimum provider stake
+InitStake == 2           \* Initial provider stake on registration
 ValueThreshold == 1      \* Jobs with value > threshold need ZK/TEE verification
 
 \* Verification tiers
@@ -132,10 +132,10 @@ SuspendProvider(p) ==
     /\ p \in Providers
     /\ providerStatus[p] = "Active"
     /\ providerStatus' = [providerStatus EXCEPT ![p] = "Suspended"]
-    \* Tier 1 slash: 5% of stake.
-    /\ LET penalty == (providerStake[p] * 5) \div 100
-           actual == IF penalty > providerStake[p] THEN providerStake[p] ELSE penalty
-       IN providerStake' = [providerStake EXCEPT ![p] = @ - actual]
+    \* Tier 1 slash: modeled as fixed penalty=1 for tractable state space.
+    \* (Percentage math verified in NematocystSlashing module spec.)
+    /\ LET penalty == IF providerStake[p] >= 1 THEN 1 ELSE 0
+       IN providerStake' = [providerStake EXCEPT ![p] = @ - penalty]
     /\ slashEvents' = slashEvents + 1
     /\ UNCHANGED <<jobState, jobPrice, escrow, jobProvider, payments,
                    jobTier, proofSubmitted, verified,
@@ -249,13 +249,11 @@ FailJob(j) ==
     /\ jobState[j] = "Executing"
     /\ jobState' = [jobState EXCEPT ![j] = "Failed"]
     /\ LET prov == jobProvider[j]
-           penalty == (providerStake[prov] * 5) \div 100
-           actual == IF penalty > providerStake[prov]
-                     THEN providerStake[prov] ELSE penalty
-       IN /\ providerStake' = [providerStake EXCEPT ![prov] = @ - actual]
+           penalty == IF providerStake[prov] >= 1 THEN 1 ELSE 0
+       IN /\ providerStake' = [providerStake EXCEPT ![prov] = @ - penalty]
           /\ slashEvents' = slashEvents + 1
     /\ escrow' = [escrow EXCEPT ![j] = 0]
-    /\ totalBurned' = totalBurned + escrow[j]  \* refund modeled as burned for balance
+    /\ totalBurned' = totalBurned + escrow[j]  \* refund accounted for balance conservation
     /\ UNCHANGED <<jobPrice, jobProvider, payments,
                    jobTier, proofSubmitted, verified,
                    providerStatus, contributions, totalDeposited>>
