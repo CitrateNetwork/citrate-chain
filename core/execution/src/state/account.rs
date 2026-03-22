@@ -97,8 +97,10 @@ impl AccountManager {
         self.set_account(*address, account);
     }
 
-    /// Check and increment nonce
-    pub fn check_and_increment_nonce(
+    /// Check nonce matches expected value (does NOT increment).
+    /// Use this before EVM execution so revm sees the correct pre-tx nonce
+    /// for CREATE address derivation.
+    pub fn check_nonce(
         &self,
         address: &Address,
         expected: u64,
@@ -110,6 +112,17 @@ impl AccountManager {
                 got: expected,
             });
         }
+        Ok(())
+    }
+
+    /// Check and increment nonce (legacy — use check_nonce + increment_nonce
+    /// separately for EVM-compliant CREATE address derivation).
+    pub fn check_and_increment_nonce(
+        &self,
+        address: &Address,
+        expected: u64,
+    ) -> Result<(), ExecutionError> {
+        self.check_nonce(address, expected)?;
         self.increment_nonce(address);
         Ok(())
     }
