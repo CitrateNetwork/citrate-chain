@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 // citrate-v3/contracts/src/ModelRegistry.sol
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
 
 import "./interfaces/IModelRegistry.sol";
 import "./lib/AccessControl.sol";

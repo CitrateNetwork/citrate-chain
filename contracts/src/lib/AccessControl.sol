@@ -2,7 +2,7 @@
 
 //citrate-v3/contracts/src/lib/AccessControl.sol
 
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
 
 /**
  * @title AccessControl

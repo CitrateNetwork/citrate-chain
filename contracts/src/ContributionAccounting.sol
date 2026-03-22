@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
 
 /// @title ContributionAccounting — 7-Type Contribution Tracking
 /// @notice Tracks contributions across 7 types with weighted scores.

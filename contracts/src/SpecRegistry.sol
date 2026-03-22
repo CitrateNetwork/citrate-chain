@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
 
 /// @title SpecRegistry
 /// @notice On-chain registry mapping operation domains to behavioral specifications

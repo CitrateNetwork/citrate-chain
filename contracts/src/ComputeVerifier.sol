@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
 
@@ -144,19 +144,13 @@ contract ComputeVerifier is ReentrancyGuard {
             effectiveTier = VerificationTier.ZKProof;
         }
 
-        records[jobId] = VerificationRecord({
-            jobId: jobId,
-            jobValue: value,
-            tier: effectiveTier,
-            result: VerificationResult.Pending,
-            commitmentHash: bytes32(0),
-            commitmentSubmitted: false,
-            proofSubmitted: false,
-            disputeActive: false,
-            bisectionRound: 0,
-            provider: address(0),
-            configuredAt: block.number
-        });
+        // Initialize record field-by-field to reduce stack pressure
+        VerificationRecord storage rec = records[jobId];
+        rec.jobId = jobId;
+        rec.jobValue = value;
+        rec.tier = effectiveTier;
+        rec.result = VerificationResult.Pending;
+        rec.configuredAt = block.number;
 
         emit JobConfigured(jobId, value, effectiveTier);
     }

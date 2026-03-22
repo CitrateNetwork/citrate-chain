@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //citrate-v3/contracts/src/interfaces/IModelRegistry.sol
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
 
 interface IModelRegistry {
     struct ModelMetadata {

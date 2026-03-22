@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
 
 /// @title IERC3009
 /// @notice Interface for EIP-3009: Transfer With Authorization

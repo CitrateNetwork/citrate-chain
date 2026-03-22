@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/ComputeLib.sol";
 import "./ComputeVerifier.sol";
 
 /// @title ComputeMarketplace — Verified Compute Job Lifecycle & Escrow
@@ -276,15 +277,12 @@ contract ComputeMarketplace is ReentrancyGuard {
         require(supportedModels.length > 0, "ComputeMarketplace: no models");
         require(!providers[msg.sender].isRegistered, "ComputeMarketplace: already registered");
 
-        providers[msg.sender] = ProviderProfile({
-            isRegistered: true,
-            stake: msg.value,
-            totalJobsCompleted: 0,
-            totalJobsFailed: 0,
-            reputationScore: BPS, // Start at 100%
-            currentActiveJobs: 0,
-            maxConcurrentJobs: DEFAULT_MAX_CONCURRENT
-        });
+        // Initialize profile field-by-field to reduce stack pressure
+        ProviderProfile storage prov = providers[msg.sender];
+        prov.isRegistered = true;
+        prov.stake = msg.value;
+        prov.reputationScore = BPS; // Start at 100%
+        prov.maxConcurrentJobs = DEFAULT_MAX_CONCURRENT;
 
         for (uint256 i = 0; i < supportedModels.length; i++) {
             providerModels[msg.sender][supportedModels[i]] = true;
@@ -334,22 +332,20 @@ contract ComputeMarketplace is ReentrancyGuard {
         require(execWindow > 0, "ComputeMarketplace: zero exec window");
 
         uint256 jobId = nextJobId++;
+        uint256 deadline = block.number + bidWindow;
 
-        jobs[jobId] = Job({
-            id: jobId,
-            requester: msg.sender,
-            modelHash: modelHash,
-            inputHash: inputHash,
-            maxPrice: maxPrice,
-            tier: tier,
-            state: JobState.Bidding,
-            assignedProvider: address(0),
-            escrow: maxPrice,
-            bidDeadline: block.number + bidWindow,
-            executionDeadline: 0, // Set on assignment
-            createdAt: block.number,
-            bidCount: 0
-        });
+        // Initialize job in storage field-by-field to reduce stack pressure
+        Job storage job = jobs[jobId];
+        job.id = jobId;
+        job.requester = msg.sender;
+        job.modelHash = modelHash;
+        job.inputHash = inputHash;
+        job.maxPrice = maxPrice;
+        job.tier = tier;
+        job.state = JobState.Bidding;
+        job.escrow = maxPrice;
+        job.bidDeadline = deadline;
+        job.createdAt = block.number;
 
         // Configure verification in ComputeVerifier
         verifier.configureJob(jobId, maxPrice, tier);
@@ -360,15 +356,7 @@ contract ComputeMarketplace is ReentrancyGuard {
             require(success, "ComputeMarketplace: refund failed");
         }
 
-        emit JobPosted(
-            jobId,
-            msg.sender,
-            modelHash,
-            maxPrice,
-            tier,
-            block.number + bidWindow,
-            execWindow
-        );
+        emit JobPosted(jobId, msg.sender, modelHash, maxPrice, tier, deadline, execWindow);
 
         return jobId;
     }
@@ -493,21 +481,20 @@ contract ComputeMarketplace is ReentrancyGuard {
         address bestProvider = _findBestProvider(modelHash, maxPrice);
         require(bestProvider != address(0), "ComputeMarketplace: no available provider");
 
-        jobs[jobId] = Job({
-            id: jobId,
-            requester: msg.sender,
-            modelHash: modelHash,
-            inputHash: inputHash,
-            maxPrice: maxPrice,
-            tier: tier,
-            state: JobState.Assigned,
-            assignedProvider: bestProvider,
-            escrow: maxPrice,
-            bidDeadline: block.number, // No bidding window
-            executionDeadline: block.number + 100, // ~5 min at 3s blocks
-            createdAt: block.number,
-            bidCount: 0
-        });
+        // Initialize job in storage field-by-field to reduce stack pressure
+        Job storage job = jobs[jobId];
+        job.id = jobId;
+        job.requester = msg.sender;
+        job.modelHash = modelHash;
+        job.inputHash = inputHash;
+        job.maxPrice = maxPrice;
+        job.tier = tier;
+        job.state = JobState.Assigned;
+        job.assignedProvider = bestProvider;
+        job.escrow = maxPrice;
+        job.bidDeadline = block.number;
+        job.executionDeadline = block.number + 100; // ~5 min at 3s blocks
+        job.createdAt = block.number;
 
         // Configure verification
         verifier.configureJob(jobId, maxPrice, tier);
@@ -674,20 +661,7 @@ contract ComputeMarketplace is ReentrancyGuard {
         job.state = JobState.Timeout;
 
         // Slash the provider for timeout (Tier 1 / Latency)
-        ProviderProfile storage prov = providers[timedOutProvider];
-        uint256 slashAmount = (prov.stake * TIMEOUT_SLASH_BPS) / BPS;
-        if (slashAmount > prov.stake) {
-            slashAmount = prov.stake;
-        }
-        prov.stake -= slashAmount;
-        prov.totalJobsFailed++;
-        prov.currentActiveJobs--;
-
-        // Update reputation
-        uint256 totalJobs = prov.totalJobsCompleted + prov.totalJobsFailed;
-        if (totalJobs > 0) {
-            prov.reputationScore = (prov.totalJobsCompleted * BPS) / totalJobs;
-        }
+        uint256 slashAmount = _slashProviderOnFailure(timedOutProvider);
 
         // INV-8: TimeoutEscrowHeld — escrow remains for potential reassignment
         // Refund escrow to requester since there's no reassignment mechanism yet in this state
@@ -780,46 +754,58 @@ contract ComputeMarketplace is ReentrancyGuard {
         verifier.resolveDispute(jobId, outcome);
 
         if (requesterWins) {
-            // Requester wins: job marked Disputed, escrow refunded, bond returned
-            job.state = JobState.Disputed;
-
-            uint256 refund = job.escrow;
-            job.escrow = 0;
-
-            // Slash provider
-            ProviderProfile storage prov = providers[job.assignedProvider];
-            uint256 slashAmount = (prov.stake * TIMEOUT_SLASH_BPS) / BPS;
-            if (slashAmount > prov.stake) {
-                slashAmount = prov.stake;
-            }
-            prov.stake -= slashAmount;
-            prov.totalJobsFailed++;
-            prov.currentActiveJobs--;
-
-            // Return bond to disputer
-            (bool s1, ) = payable(disputer).call{value: bond}("");
-            require(s1, "ComputeMarketplace: bond return failed");
-
-            // Refund escrow to requester
-            if (refund > 0) {
-                (bool s2, ) = payable(job.requester).call{value: refund}("");
-                require(s2, "ComputeMarketplace: escrow refund failed");
-            }
-
-            emit DisputeResolved(jobId, true, bond);
-            emit EscrowRefunded(jobId, job.requester, refund);
+            _resolveDisputeRequesterWins(jobId, disputer, bond);
         } else {
-            // Provider wins: dispute dismissed, bond burned (GriefUnprofitable)
-            totalDisputeBondsBurned += bond;
-
-            // Burn the bond by sending to address(0) is not possible in EVM,
-            // so we send to dead address (standard burn address)
-            (bool success, ) = payable(address(0xdead)).call{value: bond}("");
-            require(success, "ComputeMarketplace: bond burn failed");
-
-            // Job can now be completed normally
-            emit DisputeResolved(jobId, false, bond);
+            _resolveDisputeProviderWins(jobId, bond);
         }
+    }
+
+    /// @dev Handle dispute resolution when the requester wins
+    function _resolveDisputeRequesterWins(
+        uint256 jobId,
+        address disputer,
+        uint256 bond
+    ) internal {
+        Job storage job = jobs[jobId];
+
+        // Requester wins: job marked Disputed, escrow refunded, bond returned
+        job.state = JobState.Disputed;
+
+        uint256 refund = job.escrow;
+        job.escrow = 0;
+
+        // Slash provider
+        _slashProviderOnFailure(job.assignedProvider);
+
+        // Return bond to disputer
+        (bool s1, ) = payable(disputer).call{value: bond}("");
+        require(s1, "ComputeMarketplace: bond return failed");
+
+        // Refund escrow to requester
+        if (refund > 0) {
+            (bool s2, ) = payable(job.requester).call{value: refund}("");
+            require(s2, "ComputeMarketplace: escrow refund failed");
+        }
+
+        emit DisputeResolved(jobId, true, bond);
+        emit EscrowRefunded(jobId, job.requester, refund);
+    }
+
+    /// @dev Handle dispute resolution when the provider wins
+    function _resolveDisputeProviderWins(
+        uint256 jobId,
+        uint256 bond
+    ) internal {
+        // Provider wins: dispute dismissed, bond burned (GriefUnprofitable)
+        totalDisputeBondsBurned += bond;
+
+        // Burn the bond by sending to address(0) is not possible in EVM,
+        // so we send to dead address (standard burn address)
+        (bool success, ) = payable(address(0xdead)).call{value: bond}("");
+        require(success, "ComputeMarketplace: bond burn failed");
+
+        // Job can now be completed normally
+        emit DisputeResolved(jobId, false, bond);
     }
 
     // ============================================================
@@ -891,44 +877,51 @@ contract ComputeMarketplace is ReentrancyGuard {
         job.escrow = 0;
         job.state = JobState.Completed;
 
-        // BurnRateFixed: burn = price / 40 = 2.5%
-        uint256 burnAmount = payment / BME_BURN_DIVISOR;
-        uint256 treasuryAmount = payment / TREASURY_DIVISOR;
-        uint256 providerAmount = payment - burnAmount - treasuryAmount;
-
         // Update provider stats
-        ProviderProfile storage prov = providers[job.assignedProvider];
+        _updateProviderOnCompletion(job.assignedProvider);
+
+        // Distribute payment
+        _distributeJobPayment(jobId, job.assignedProvider, payment);
+    }
+
+    /// @dev Update provider stats on successful job completion
+    function _updateProviderOnCompletion(address providerAddr) internal {
+        ProviderProfile storage prov = providers[providerAddr];
         prov.totalJobsCompleted++;
         prov.currentActiveJobs--;
-        uint256 totalJobs = prov.totalJobsCompleted + prov.totalJobsFailed;
-        if (totalJobs > 0) {
-            prov.reputationScore = (prov.totalJobsCompleted * BPS) / totalJobs;
-        }
+        prov.reputationScore = ComputeLib.calculateReputation(
+            prov.totalJobsCompleted, prov.totalJobsFailed
+        );
+    }
+
+    /// @dev Distribute payment: 95% provider, 2.5% burned, 2.5% treasury
+    function _distributeJobPayment(uint256 jobId, address providerAddr, uint256 payment) internal {
+        ComputeLib.BMEResult memory bme = ComputeLib.calculateBME(payment);
 
         // Update global accounting
-        totalBurned += burnAmount;
-        totalPaidToProviders += providerAmount;
-        totalTreasuryFees += treasuryAmount;
+        totalBurned += bme.burnAmount;
+        totalPaidToProviders += bme.providerAmount;
+        totalTreasuryFees += bme.treasuryAmount;
 
         // BME burn: send to dead address (address(0) cannot receive ETH in EVM)
-        if (burnAmount > 0) {
-            (bool s1, ) = payable(address(0xdead)).call{value: burnAmount}("");
+        if (bme.burnAmount > 0) {
+            (bool s1, ) = payable(address(0xdead)).call{value: bme.burnAmount}("");
             require(s1, "ComputeMarketplace: burn failed");
         }
 
         // Treasury fee
-        if (treasuryAmount > 0) {
-            (bool s2, ) = payable(treasury).call{value: treasuryAmount}("");
+        if (bme.treasuryAmount > 0) {
+            (bool s2, ) = payable(treasury).call{value: bme.treasuryAmount}("");
             require(s2, "ComputeMarketplace: treasury payment failed");
         }
 
         // Provider payment
-        if (providerAmount > 0) {
-            (bool s3, ) = payable(job.assignedProvider).call{value: providerAmount}("");
+        if (bme.providerAmount > 0) {
+            (bool s3, ) = payable(providerAddr).call{value: bme.providerAmount}("");
             require(s3, "ComputeMarketplace: provider payment failed");
         }
 
-        emit JobCompleted(jobId, job.assignedProvider, providerAmount, burnAmount, treasuryAmount);
+        emit JobCompleted(jobId, providerAddr, bme.providerAmount, bme.burnAmount, bme.treasuryAmount);
     }
 
     /// @dev Fail a job: refund escrow, slash provider, update stats
@@ -938,20 +931,7 @@ contract ComputeMarketplace is ReentrancyGuard {
         job.state = JobState.Failed;
 
         // Slash provider
-        ProviderProfile storage prov = providers[job.assignedProvider];
-        uint256 slashAmount = (prov.stake * TIMEOUT_SLASH_BPS) / BPS;
-        if (slashAmount > prov.stake) {
-            slashAmount = prov.stake;
-        }
-        prov.stake -= slashAmount;
-        prov.totalJobsFailed++;
-        prov.currentActiveJobs--;
-
-        // Update reputation
-        uint256 totalJobs = prov.totalJobsCompleted + prov.totalJobsFailed;
-        if (totalJobs > 0) {
-            prov.reputationScore = (prov.totalJobsCompleted * BPS) / totalJobs;
-        }
+        _slashProviderOnFailure(job.assignedProvider);
 
         // Refund escrow to requester
         uint256 refund = job.escrow;
@@ -966,8 +946,23 @@ contract ComputeMarketplace is ReentrancyGuard {
         emit EscrowRefunded(jobId, job.requester, refund);
     }
 
-    /// @dev Score a provider for bid selection
-    /// Score = price(40%) + reputation(30%) + load(20%) + verificationHistory(10%)
+    /// @dev Slash a provider on job failure/timeout: deduct stake, increment failures,
+    ///      decrement active jobs, recalculate reputation. Returns the slash amount.
+    function _slashProviderOnFailure(address providerAddr) internal returns (uint256 slashAmount) {
+        ProviderProfile storage prov = providers[providerAddr];
+        slashAmount = (prov.stake * TIMEOUT_SLASH_BPS) / BPS;
+        if (slashAmount > prov.stake) {
+            slashAmount = prov.stake;
+        }
+        prov.stake -= slashAmount;
+        prov.totalJobsFailed++;
+        prov.currentActiveJobs--;
+        prov.reputationScore = ComputeLib.calculateReputation(
+            prov.totalJobsCompleted, prov.totalJobsFailed
+        );
+    }
+
+    /// @dev Score a provider for bid selection (delegates to ComputeLib)
     function _scoreProvider(
         address provider,
         uint256 bidPrice,
@@ -976,29 +971,14 @@ contract ComputeMarketplace is ReentrancyGuard {
         ProviderProfile storage prov = providers[provider];
         if (!prov.isRegistered) return 0;
 
-        // Price score: lower is better (inverted, normalized to 0..BPS)
-        uint256 priceScore = BPS - ((BPS * bidPrice) / maxPrice);
-
-        // Load score: lower current load is better
-        uint256 loadScore = BPS;
-        if (prov.maxConcurrentJobs > 0) {
-            loadScore = BPS - ((BPS * prov.currentActiveJobs) / prov.maxConcurrentJobs);
-        }
-
-        // Reputation score: already in BPS
-        uint256 repScore = prov.reputationScore;
-
-        // Verification history: based on completed jobs (normalized, max BPS at 100 jobs)
-        uint256 verifyScore = prov.totalJobsCompleted > 100
-            ? BPS
-            : (prov.totalJobsCompleted * BPS) / 100;
-
-        uint256 score = (priceScore * WEIGHT_PRICE +
-                         repScore * WEIGHT_REPUTATION +
-                         loadScore * WEIGHT_LOAD +
-                         verifyScore * WEIGHT_VERIFICATION) / 100;
-
-        return score;
+        return ComputeLib.scoreProvider(
+            bidPrice,
+            maxPrice,
+            prov.reputationScore,
+            prov.currentActiveJobs,
+            prov.maxConcurrentJobs,
+            prov.totalJobsCompleted
+        );
     }
 
     /// @dev Find the best available provider for auto-assignment
