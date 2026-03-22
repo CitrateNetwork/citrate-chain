@@ -22,6 +22,7 @@ contract LearningCycleManager is ReentrancyGuard {
         uint256 totalRewards;
         bool rewardsDistributed;
         address aggregator;
+        uint256 phaseStartBlock;
     }
 
     // ── Constants ────────────────────────────────────────────────────
@@ -132,7 +133,8 @@ contract LearningCycleManager is ReentrancyGuard {
             mentorCount: 0,
             totalRewards: 0,
             rewardsDistributed: false,
-            aggregator: address(0)
+            aggregator: address(0),
+            phaseStartBlock: block.number
         });
 
         emit CycleOpened(cid, checkpointHeight);
@@ -157,6 +159,7 @@ contract LearningCycleManager is ReentrancyGuard {
         if (ci.state == CycleState.Open) {
             CycleState old = ci.state;
             ci.state = CycleState.Collecting;
+            ci.phaseStartBlock = block.number;
             emit StateAdvanced(cycleId, old, CycleState.Collecting);
         }
 
@@ -187,6 +190,7 @@ contract LearningCycleManager is ReentrancyGuard {
 
         CycleState old = ci.state;
         ci.state = CycleState.Aggregating;
+        ci.phaseStartBlock = block.number;
         emit StateAdvanced(cycleId, old, CycleState.Aggregating);
     }
 
@@ -222,6 +226,7 @@ contract LearningCycleManager is ReentrancyGuard {
         if (ci.state == CycleState.Aggregating) {
             CycleState old = ci.state;
             ci.state = CycleState.AdapterGen;
+            ci.phaseStartBlock = block.number;
             emit StateAdvanced(cycleId, old, CycleState.AdapterGen);
         }
 
@@ -307,6 +312,7 @@ contract LearningCycleManager is ReentrancyGuard {
 
         CycleState old = ci.state;
         ci.state = CycleState.Finalized;
+        ci.phaseStartBlock = block.number;
         emit StateAdvanced(cycleId, old, CycleState.Finalized);
         emit CycleFinalized(cycleId, msg.value);
     }
@@ -345,7 +351,8 @@ contract LearningCycleManager is ReentrancyGuard {
         uint256 mentorCount,
         uint256 totalRewards,
         bool rewardsDistributed,
-        address aggregator
+        address aggregator,
+        uint256 phaseStartBlock
     ) {
         CycleInfo storage ci = _cycleInfo[cycleId];
         return (
@@ -355,7 +362,8 @@ contract LearningCycleManager is ReentrancyGuard {
             ci.mentorCount,
             ci.totalRewards,
             ci.rewardsDistributed,
-            ci.aggregator
+            ci.aggregator,
+            ci.phaseStartBlock
         );
     }
 

@@ -88,7 +88,7 @@ contract LearningCycleManagerTest is Test {
             uint256 checkpointHeight,
             LearningCycleManager.CycleState state,
             uint256 participantCount,
-            ,,,
+            ,,,,
         ) = lcm.getCycleInfo(cid);
         assertEq(checkpointHeight, 500);
         assertEq(uint256(state), uint256(LearningCycleManager.CycleState.Collecting));
@@ -165,7 +165,7 @@ contract LearningCycleManagerTest is Test {
 
         assertEq(uint256(lcm.getCycleState(cid)), uint256(LearningCycleManager.CycleState.Finalized));
 
-        (,,,, uint256 totalRewards, bool rewardsDistributed,) = lcm.getCycleInfo(cid);
+        (,,,, uint256 totalRewards, bool rewardsDistributed,,) = lcm.getCycleInfo(cid);
         assertEq(totalRewards, 100 ether);
         assertTrue(rewardsDistributed);
 
@@ -437,5 +437,64 @@ contract LearningCycleManagerTest is Test {
     function test_receive_accepts_salt() public {
         (bool ok, ) = address(lcm).call{value: 1 ether}("");
         assertTrue(ok, "Contract should accept direct SALT transfers");
+    }
+
+    // ── phaseStartBlock Tests ─────────────────────────────────────────
+
+    function test_phaseStartBlock_set_on_open() public {
+        uint256 blockBefore = block.number;
+        uint256 cid = _openCycle(500);
+
+        (,,,,,,, uint256 phaseStartBlock) = lcm.getCycleInfo(cid);
+        assertGe(phaseStartBlock, blockBefore, "phaseStartBlock should be >= block at open");
+        assertEq(uint256(lcm.getCycleState(cid)), uint256(LearningCycleManager.CycleState.Open));
+    }
+
+    function test_phaseStartBlock_updates_on_each_transition() public {
+        // Open the cycle and record phaseStartBlock for Open state
+        uint256 cid = _openCycle(1000);
+        (,,,,,,, uint256 openBlock) = lcm.getCycleInfo(cid);
+        assertGt(openBlock, 0, "Open phase should have non-zero phaseStartBlock");
+
+        // Advance a few blocks to ensure phaseStartBlock changes are detectable
+        vm.roll(block.number + 5);
+
+        // Register alice -> auto-transitions to Collecting
+        _registerParticipant(cid, alice);
+        (,,,,,,, uint256 collectingBlock) = lcm.getCycleInfo(cid);
+        assertGe(collectingBlock, openBlock, "Collecting phaseStartBlock >= Open phaseStartBlock");
+        assertEq(uint256(lcm.getCycleState(cid)), uint256(LearningCycleManager.CycleState.Collecting));
+
+        // Register bob and submit embeddings
+        _registerParticipant(cid, bob);
+        _submitCommitment(cid, alice, keccak256("alice_emb"));
+        _submitCommitment(cid, bob, keccak256("bob_emb"));
+
+        vm.roll(block.number + 3);
+
+        // Advance to Aggregating
+        lcm.advanceToAggregating(cid);
+        (,,,,,,, uint256 aggregatingBlock) = lcm.getCycleInfo(cid);
+        assertGe(aggregatingBlock, collectingBlock, "Aggregating phaseStartBlock >= Collecting phaseStartBlock");
+        assertEq(uint256(lcm.getCycleState(cid)), uint256(LearningCycleManager.CycleState.Aggregating));
+
+        vm.roll(block.number + 2);
+
+        // Record mentor assignment -> auto-transitions to AdapterGen
+        lcm.recordMentorAssignment(cid, alice, bob);
+        (,,,,,,, uint256 adapterGenBlock) = lcm.getCycleInfo(cid);
+        assertGe(adapterGenBlock, aggregatingBlock, "AdapterGen phaseStartBlock >= Aggregating phaseStartBlock");
+        assertEq(uint256(lcm.getCycleState(cid)), uint256(LearningCycleManager.CycleState.AdapterGen));
+
+        // Record adapter
+        lcm.recordAdapter(cid, alice, keccak256("alice_adapter"));
+
+        vm.roll(block.number + 4);
+
+        // Finalize
+        lcm.finalizeCycle{value: 10 ether}(cid);
+        (,,,,,,, uint256 finalizedBlock) = lcm.getCycleInfo(cid);
+        assertGe(finalizedBlock, adapterGenBlock, "Finalized phaseStartBlock >= AdapterGen phaseStartBlock");
+        assertEq(uint256(lcm.getCycleState(cid)), uint256(LearningCycleManager.CycleState.Finalized));
     }
 }
