@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
 
 /// @title AgentDecisionRegistry
 /// @notice On-chain audit trail for AI agent tool executions.

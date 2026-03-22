@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 // citrate-v3/contracts/src/IPFSIncentives.sol
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
 
 import "./lib/AccessControl.sol";
 import "./lib/ReentrancyGuard.sol";
