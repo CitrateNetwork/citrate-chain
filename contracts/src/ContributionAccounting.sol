@@ -225,6 +225,37 @@ contract ContributionAccounting {
         return contributorList.length;
     }
 
+    /// @notice Get the total count of contributors (alias for snapshot iteration)
+    function getContributorCount() external view returns (uint256) {
+        return contributorList.length;
+    }
+
+    /// @notice Get a paginated page of contributors and their scores
+    /// @param offset Starting index in the contributorList
+    /// @param limit Maximum number of entries to return
+    /// @return addrs Array of contributor addresses
+    /// @return _scores Array of corresponding weighted scores
+    function getContributorListPage(
+        uint256 offset,
+        uint256 limit
+    ) external view returns (address[] memory addrs, uint256[] memory _scores) {
+        uint256 total = contributorList.length;
+        if (offset >= total) {
+            return (new address[](0), new uint256[](0));
+        }
+
+        uint256 remaining = total - offset;
+        uint256 count = remaining < limit ? remaining : limit;
+
+        addrs = new address[](count);
+        _scores = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            address c = contributorList[offset + i];
+            addrs[i] = c;
+            _scores[i] = scores[c];
+        }
+    }
+
     // ── Governance Functions ────────────────────────────────────────
 
     /// @notice Update the weight for a contribution type
