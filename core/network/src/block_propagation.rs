@@ -286,6 +286,7 @@ mod tests {
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
 
         // Test broadcasting

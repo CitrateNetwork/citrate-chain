@@ -59,6 +59,7 @@ fn test_block() -> Block {
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     }
 }
 

@@ -249,6 +249,7 @@ checksum = "1f3a13b34da09176a8baba701233fdffbaa7c1b1192ce031a3da4e55ce1f1a56"
 dependencies = [
  "ark-ec",
  "ark-ff 0.4.2",
+ "ark-r1cs-std",
  "ark-relations",
  "ark-serialize 0.4.2",
  "ark-snark",
@@ -258,6 +259,7 @@ dependencies = [
  "digest 0.10.7",
  "rayon",
  "sha2",
+ "tracing",
 ]
 
 [[package]]
@@ -1791,6 +1793,7 @@ dependencies = [
  "argon2",
  "ark-bls12-381",
  "ark-bn254",
+ "ark-crypto-primitives",
  "ark-ec",
  "ark-ff 0.4.2",
  "ark-groth16",
@@ -1979,6 +1982,7 @@ dependencies = [
  "citrate-consensus",
  "citrate-economics",
  "citrate-execution",
+ "citrate-learning",
  "citrate-mcp",
  "citrate-network",
  "citrate-sequencer",

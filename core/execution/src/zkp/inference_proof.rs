@@ -117,6 +117,21 @@ pub struct InferenceCircuit {
     config: CircuitConfig,
 }
 
+/// Hash function used for vector commitments inside ZK circuits.
+///
+/// New circuits default to Poseidon, which uses significantly fewer R1CS
+/// constraints than MiMC.  Existing proofs generated with MiMC still
+/// verify against their original verification keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommitmentScheme {
+    /// MiMC: 220-round Miyaguchi-Preneel sponge, x^3 S-box.
+    /// ~660 constraints per absorbed field element.
+    MiMC,
+    /// Poseidon: width=3, R_f=8, R_p=56, x^5 S-box.
+    /// ~213-320 constraints per absorbed field element.
+    Poseidon,
+}
+
 /// Circuit configuration
 #[derive(Debug, Clone)]
 pub struct CircuitConfig {
@@ -135,6 +150,11 @@ pub struct CircuitConfig {
 
     /// Enable optimizations
     pub optimize: bool,
+
+    /// Commitment hash function for in-circuit and native commitments.
+    /// Defaults to Poseidon for new circuits; set to MiMC for backward
+    /// compatibility with existing verification keys.
+    pub commitment_scheme: CommitmentScheme,
 }
 
 impl Default for CircuitConfig {
@@ -145,6 +165,7 @@ impl Default for CircuitConfig {
             max_output_size: 1000,
             neurons_per_layer: 100,
             optimize: true,
+            commitment_scheme: CommitmentScheme::Poseidon,
         }
     }
 }
@@ -158,10 +179,14 @@ impl InferenceCircuit {
         model_id: H256,
         config: CircuitConfig,
     ) -> Self {
-        // Calculate commitments (native MiMC)
-        let mc_fr = super::mimc::mimc_hash(&model_weights);
-        let ic_fr = super::mimc::mimc_hash(&input_data);
-        let oc_fr = super::mimc::mimc_hash(&output_data);
+        // Calculate commitments using the configured hash function
+        let commit_fn = match config.commitment_scheme {
+            CommitmentScheme::MiMC => super::mimc::mimc_hash,
+            CommitmentScheme::Poseidon => super::poseidon::poseidon_hash,
+        };
+        let mc_fr = commit_fn(&model_weights);
+        let ic_fr = commit_fn(&input_data);
+        let oc_fr = commit_fn(&output_data);
 
         let mc_bytes = super::mimc::fr_to_bytes_le(&mc_fr);
         let ic_bytes = super::mimc::fr_to_bytes_le(&ic_fr);
@@ -202,7 +227,7 @@ impl InferenceCircuit {
         }
     }
 
-    /// Commit to a vector using MiMC hash.
+    /// Commit to a vector using the configured hash function (MiMC or Poseidon).
     ///
     /// Uses the same algebraic hash as the in-circuit commitment so that
     /// native commitments stored in `PublicInputs` match what the R1CS
@@ -215,9 +240,17 @@ impl InferenceCircuit {
     /// as long as we're consistent.
     #[allow(dead_code)] // Used by tests and available for external callers
     fn commit_vector(data: &[Fr]) -> H256 {
-        let hash = super::mimc::mimc_hash(data);
+        Self::commit_vector_with_scheme(data, CommitmentScheme::MiMC)
+    }
+
+    /// Commit to a vector using a specific commitment scheme.
+    #[allow(dead_code)]
+    fn commit_vector_with_scheme(data: &[Fr], scheme: CommitmentScheme) -> H256 {
+        let hash = match scheme {
+            CommitmentScheme::MiMC => super::mimc::mimc_hash(data),
+            CommitmentScheme::Poseidon => super::poseidon::poseidon_hash(data),
+        };
         let bytes = super::mimc::fr_to_bytes_le(&hash);
-        // Store LE bytes directly into H256's internal [u8; 32]
         H256(bytes)
     }
 
@@ -274,15 +307,20 @@ impl ConstraintSynthesizer<Fr> for InferenceCircuit {
         cs: ConstraintSystemRef<Fr>,
     ) -> Result<(), SynthesisError> {
         // ---------------------------------------------------------------
-        // 1. PUBLIC INPUTS: MiMC commitments to model, input, and output.
+        // 1. PUBLIC INPUTS: commitments to model, input, and output.
         //    The verifier only sees these three field elements.
+        //    The hash function is determined by config.commitment_scheme.
         // ---------------------------------------------------------------
+        let commit_fn = match self.config.commitment_scheme {
+            CommitmentScheme::MiMC => super::mimc::mimc_hash as fn(&[Fr]) -> Fr,
+            CommitmentScheme::Poseidon => super::poseidon::poseidon_hash as fn(&[Fr]) -> Fr,
+        };
         let (pub_model_commitment, pub_input_commitment, pub_output_commitment) =
             if let Some(private) = &self.private_inputs {
-                // Compute native MiMC hashes and allocate as public inputs
-                let mc = super::mimc::mimc_hash(&private.model_weights);
-                let ic = super::mimc::mimc_hash(&private.input_data);
-                let oc = super::mimc::mimc_hash(&private.output_data);
+                // Compute native hashes and allocate as public inputs
+                let mc = commit_fn(&private.model_weights);
+                let ic = commit_fn(&private.input_data);
+                let oc = commit_fn(&private.output_data);
                 (
                     FpVar::new_input(cs.clone(), || Ok(mc))?,
                     FpVar::new_input(cs.clone(), || Ok(ic))?,
@@ -335,17 +373,20 @@ impl ConstraintSynthesizer<Fr> for InferenceCircuit {
         };
 
         // ---------------------------------------------------------------
-        // 3. COMMITMENT CONSTRAINTS: in-circuit MiMC must equal public inputs
+        // 3. COMMITMENT CONSTRAINTS: in-circuit hash must equal public inputs
         // ---------------------------------------------------------------
+        let scheme = self.config.commitment_scheme;
         let computed_model_commitment = Self::compute_commitment_circuit(
             cs.clone(),
             &weight_vars,
+            scheme,
         )?;
         computed_model_commitment.enforce_equal(&pub_model_commitment)?;
 
         let computed_input_commitment = Self::compute_commitment_circuit(
             cs.clone(),
             &input_vars,
+            scheme,
         )?;
         computed_input_commitment.enforce_equal(&pub_input_commitment)?;
 
@@ -383,6 +424,7 @@ impl ConstraintSynthesizer<Fr> for InferenceCircuit {
         let computed_output_commitment = Self::compute_commitment_circuit(
             cs.clone(),
             &output_vars,
+            scheme,
         )?;
         computed_output_commitment.enforce_equal(&pub_output_commitment)?;
 
@@ -403,17 +445,20 @@ impl ConstraintSynthesizer<Fr> for InferenceCircuit {
 }
 
 impl InferenceCircuit {
-    /// Compute commitment inside the circuit using MiMC hash.
+    /// Compute commitment inside the circuit using the configured hash function.
     ///
-    /// MiMC is an algebraic hash that uses only field additions and cubings,
-    /// making it efficient inside R1CS circuits.  220 rounds provide full
-    /// security for the BLS12-381 scalar field.  The Miyaguchi-Preneel
-    /// sponge mode makes it collision-resistant over variable-length inputs.
+    /// Dispatches to either MiMC or Poseidon based on the `CommitmentScheme`:
+    /// - **MiMC**: 220-round Miyaguchi-Preneel sponge (x^3 S-box).
+    /// - **Poseidon**: width=3, R_f=8, R_p=56 (x^5 S-box), significantly fewer constraints.
     fn compute_commitment_circuit(
         cs: ConstraintSystemRef<Fr>,
         data: &[FpVar<Fr>],
+        scheme: CommitmentScheme,
     ) -> Result<FpVar<Fr>, SynthesisError> {
-        super::mimc::mimc_hash_circuit(cs, data)
+        match scheme {
+            CommitmentScheme::MiMC => super::mimc::mimc_hash_circuit(cs, data),
+            CommitmentScheme::Poseidon => super::poseidon::poseidon_hash_circuit(cs, data),
+        }
     }
 }
 
@@ -609,6 +654,7 @@ mod tests {
             max_output_size: 10,
             neurons_per_layer: 10,
             optimize: true,
+            commitment_scheme: CommitmentScheme::Poseidon,
         };
         let prover = InferenceProver::setup(config).unwrap();
 
@@ -678,6 +724,7 @@ mod tests {
             max_output_size: 10,
             neurons_per_layer: 10,
             optimize: true,
+            commitment_scheme: CommitmentScheme::Poseidon,
         };
 
         let circuit = InferenceCircuit::new(
@@ -712,6 +759,7 @@ mod tests {
             max_output_size: 1,
             neurons_per_layer: 1,
             optimize: true,
+            commitment_scheme: CommitmentScheme::Poseidon,
         };
 
         let circuit_a = InferenceCircuit::new(
@@ -765,6 +813,7 @@ mod tests {
             max_output_size: max_output,
             neurons_per_layer: layer_size,
             optimize: true,
+            commitment_scheme: CommitmentScheme::Poseidon,
         };
 
         // Zero inputs => zero outputs through ReLU
@@ -801,6 +850,157 @@ mod tests {
         assert_ne!(
             c_short, c_long,
             "Commitments of vectors with different lengths must differ"
+        );
+    }
+
+    // --- Poseidon-specific tests ---
+
+    #[test]
+    fn test_inference_proof_with_poseidon() {
+        // Full roundtrip: setup -> prove -> verify using Poseidon commitments.
+        let config = CircuitConfig {
+            max_model_size: 100,
+            max_input_size: 10,
+            max_output_size: 10,
+            neurons_per_layer: 10,
+            optimize: true,
+            commitment_scheme: CommitmentScheme::Poseidon,
+        };
+        let prover = InferenceProver::setup(config).unwrap();
+
+        let model_weights: Vec<Fr> = (0..100).map(|i| Fr::from(i as u64)).collect();
+        let input_data: Vec<Fr> = vec![Fr::from(0u64); 10];
+        let output_data: Vec<Fr> = vec![Fr::from(0u64); 10];
+
+        let proof = prover.prove(
+            model_weights,
+            input_data,
+            output_data,
+            H256::random(),
+            H160::random(),
+        ).unwrap();
+
+        let valid = prover.verify(&proof).unwrap();
+        assert!(valid, "Poseidon-based proof must verify");
+    }
+
+    #[test]
+    fn test_mimc_proofs_still_verify() {
+        // Backward compatibility: MiMC commitment scheme still works end-to-end.
+        let config = CircuitConfig {
+            max_model_size: 100,
+            max_input_size: 10,
+            max_output_size: 10,
+            neurons_per_layer: 10,
+            optimize: true,
+            commitment_scheme: CommitmentScheme::MiMC,
+        };
+        let prover = InferenceProver::setup(config).unwrap();
+
+        let model_weights: Vec<Fr> = (0..100).map(|i| Fr::from(i as u64)).collect();
+        let input_data: Vec<Fr> = vec![Fr::from(0u64); 10];
+        let output_data: Vec<Fr> = vec![Fr::from(0u64); 10];
+
+        let proof = prover.prove(
+            model_weights,
+            input_data,
+            output_data,
+            H256::random(),
+            H160::random(),
+        ).unwrap();
+
+        let valid = prover.verify(&proof).unwrap();
+        assert!(valid, "MiMC-based proof must still verify (backward compat)");
+    }
+
+    #[test]
+    fn test_poseidon_and_mimc_commitments_differ() {
+        // Poseidon and MiMC produce different commitments for the same data.
+        let data = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64)];
+
+        let mimc_commit = InferenceCircuit::commit_vector_with_scheme(&data, CommitmentScheme::MiMC);
+        let poseidon_commit = InferenceCircuit::commit_vector_with_scheme(&data, CommitmentScheme::Poseidon);
+
+        assert_ne!(
+            mimc_commit, poseidon_commit,
+            "MiMC and Poseidon must produce different commitments"
+        );
+    }
+
+    #[test]
+    fn test_poseidon_commitment_fr_roundtrip() {
+        // Verify that Poseidon Fr->H256->Fr conversion is lossless.
+        let data = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64)];
+        let native_hash = crate::zkp::poseidon::poseidon_hash(&data);
+        let h256 = InferenceCircuit::commit_vector_with_scheme(&data, CommitmentScheme::Poseidon);
+        let recovered = Fr::from_le_bytes_mod_order(&h256.0);
+        assert_eq!(native_hash, recovered, "Poseidon Fr -> H256 -> Fr must be lossless");
+    }
+
+    #[test]
+    fn test_poseidon_circuit_fewer_constraints_in_inference() {
+        // Compare full InferenceCircuit constraint counts between MiMC and Poseidon.
+        use ark_relations::r1cs::ConstraintSystem;
+
+        let model_weights: Vec<Fr> = (0..100).map(|i| Fr::from(i as u64)).collect();
+        let input_data: Vec<Fr> = vec![Fr::from(0u64); 10];
+        let output_data: Vec<Fr> = vec![Fr::from(0u64); 10];
+
+        // MiMC circuit
+        let mimc_config = CircuitConfig {
+            max_model_size: 100,
+            max_input_size: 10,
+            max_output_size: 10,
+            neurons_per_layer: 10,
+            optimize: true,
+            commitment_scheme: CommitmentScheme::MiMC,
+        };
+        let mimc_circuit = InferenceCircuit::new(
+            model_weights.clone(), input_data.clone(), output_data.clone(),
+            H256::zero(), mimc_config,
+        );
+        let cs_mimc = ConstraintSystem::<Fr>::new_ref();
+        mimc_circuit.generate_constraints(cs_mimc.clone()).unwrap();
+        let mimc_constraints = cs_mimc.num_constraints();
+
+        // Poseidon circuit
+        let pos_config = CircuitConfig {
+            max_model_size: 100,
+            max_input_size: 10,
+            max_output_size: 10,
+            neurons_per_layer: 10,
+            optimize: true,
+            commitment_scheme: CommitmentScheme::Poseidon,
+        };
+        let pos_circuit = InferenceCircuit::new(
+            model_weights, input_data, output_data,
+            H256::zero(), pos_config,
+        );
+        let cs_pos = ConstraintSystem::<Fr>::new_ref();
+        pos_circuit.generate_constraints(cs_pos.clone()).unwrap();
+        let pos_constraints = cs_pos.num_constraints();
+
+        eprintln!(
+            "InferenceCircuit: MiMC={} constraints, Poseidon={} constraints ({}x reduction)",
+            mimc_constraints,
+            pos_constraints,
+            mimc_constraints as f64 / pos_constraints as f64
+        );
+        assert!(
+            pos_constraints < mimc_constraints,
+            "Poseidon InferenceCircuit ({}) should have fewer constraints than MiMC ({})",
+            pos_constraints,
+            mimc_constraints
+        );
+    }
+
+    #[test]
+    fn test_default_config_uses_poseidon() {
+        let config = CircuitConfig::default();
+        assert_eq!(
+            config.commitment_scheme,
+            CommitmentScheme::Poseidon,
+            "Default CircuitConfig must use Poseidon"
         );
     }
 }

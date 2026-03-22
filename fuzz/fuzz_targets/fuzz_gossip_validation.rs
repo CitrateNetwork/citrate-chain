@@ -88,6 +88,7 @@ fuzz_target!(|data: &[u8]| {
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     };
 
     // Replicate gossip validation checks (the method is private on GossipProtocol,

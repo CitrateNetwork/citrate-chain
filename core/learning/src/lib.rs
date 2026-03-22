@@ -34,6 +34,7 @@ pub mod embeddings;
 pub mod errors;
 pub mod knowledge;
 pub mod metrics;
+pub mod orchestration;
 pub mod phases;
 pub mod routing;
 pub mod safety;
@@ -59,5 +60,9 @@ pub use knowledge::KnowledgeState;
 pub use phases::{LearningPipeline, MacroPhaseManager, NetworkLearningPhase, OodaPhase, PhaseManager};
 pub use routing::{MlpRouter, Router};
 pub use storage::PhaseStore;
+pub use orchestration::{
+    compute_learning_root, LearningCheckpointResult, LearningOrchestrator,
+    LearningOrchestratorConfig, PeerEmbedding,
+};
 pub use safety::{LearningMode, SafetyGuard};
 pub use types::{LearningRound, Participant};

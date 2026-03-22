@@ -48,6 +48,7 @@ fn make_block(hash_byte: u8, height: u64, blue_score: u64, parent: Hash) -> Bloc
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     }
 }
 

@@ -197,6 +197,7 @@ impl BlockBuilder {
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
 
         // Execute transactions and collect receipts
@@ -575,6 +576,7 @@ impl BlockBuilder {
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
 
         block.header.block_hash = self.calculate_block_hash(&block);
@@ -901,6 +903,7 @@ mod tests {
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
 
         // Valid block

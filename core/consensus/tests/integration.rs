@@ -52,6 +52,7 @@ fn create_block(block_num: u8, height: u64, parent: Option<Hash>, blue_score: u6
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     }
 }
 

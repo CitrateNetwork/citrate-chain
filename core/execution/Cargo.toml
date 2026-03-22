@@ -67,6 +67,7 @@ num-bigint = "0.4"            # MODEXP big integer operations
 num-traits = "0.2"            # Numeric traits
 ark-bn254 = "0.4"             # BN254 curve for ECADD/ECMUL/ECPAIRING
 blake2 = "0.10"               # BLAKE2F compression
+ark-crypto-primitives = { version = "0.4", features = ["sponge", "r1cs"] }
 
 [build-dependencies]
 cc = "1.0"

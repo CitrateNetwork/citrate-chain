@@ -211,6 +211,7 @@ mod tests {
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
 
         let reward = calculator.calculate_reward(&block);
@@ -262,6 +263,7 @@ mod tests {
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
 
         let reward = calculator.calculate_reward(&block);

@@ -58,6 +58,7 @@ fn make_block(height: u64, transactions: Vec<Transaction>) -> Block {
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     }
 }
 

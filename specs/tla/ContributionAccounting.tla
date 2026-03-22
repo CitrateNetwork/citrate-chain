@@ -9,7 +9,7 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 \*
 \* In production, ContributionTypes = {"Validation", "ModelHosting", "AdapterCreation",
 \* "DataProvision", "AppDev", "BridgeInfra", "Governance"} with weights 10,8,7,6,5,4,3.
-\* For model checking we use a small representative subset.
+\* For model checking we use a small representative subset with uniform weight.
 \*
 \* Source: core/economics/src/contributions.rs, contracts/src/ContributionTracker.sol
 
@@ -26,16 +26,19 @@ VARIABLES
     contributions,    \* Mapping: contributor -> mapping: type -> count
     scores,           \* Mapping: contributor -> weighted score
     rewardPool,       \* Total SALT available for distribution
-    distributed       \* Mapping: contributor -> SALT received
+    distributed,      \* Mapping: contributor -> SALT received
+    totalFunded       \* Total SALT ever funded (bounds state space)
 
-vars == <<contributions, scores, rewardPool, distributed>>
+vars == <<contributions, scores, rewardPool, distributed, totalFunded>>
 
 \* ---- Helper operators ----
 
-\* Weight per type — all types weighted equally at 1 for tractable model checking.
-\* The real system uses varying weights (3-10); the proportionality invariant
-\* holds regardless of specific weight values.
+\* Weight per type — uniform weight for tractable model checking.
 Weight == 1
+
+\* Max reward pool size and total funding cap.
+MaxPool == 2
+MaxTotalFunded == 4
 
 \* Recursive sum over a set with function values.
 RECURSIVE SetSum(_, _)
@@ -57,12 +60,6 @@ WeightedScore(c) == TypeSum(ContributionTypes, contributions[c], 0)
 \* Total weighted score across all contributors.
 TotalScore == SetSum(Contributors, scores)
 
-\* Total distributed rewards.
-TotalDistributed == SetSum(Contributors, distributed)
-
-\* Max reward pool size (bound state space).
-MaxPool == 3
-
 \* ---- State machine ----
 
 Init ==
@@ -70,6 +67,7 @@ Init ==
     /\ scores = [c \in Contributors |-> 0]
     /\ rewardPool = 0
     /\ distributed = [c \in Contributors |-> 0]
+    /\ totalFunded = 0
 
 \* Record a contribution of a given type for a contributor.
 RecordContribution(c, t) ==
@@ -78,17 +76,18 @@ RecordContribution(c, t) ==
     /\ contributions[c][t] < MaxContributions
     /\ contributions' = [contributions EXCEPT ![c][t] = @ + 1]
     /\ scores' = [scores EXCEPT ![c] = WeightedScore(c) + Weight]
-    /\ UNCHANGED <<rewardPool, distributed>>
+    /\ UNCHANGED <<rewardPool, distributed, totalFunded>>
 
 \* Add rewards to the pool.
 FundPool(amount) ==
     /\ amount \in 1..MaxPool
     /\ rewardPool + amount <= MaxPool
+    /\ totalFunded + amount <= MaxTotalFunded
     /\ rewardPool' = rewardPool + amount
+    /\ totalFunded' = totalFunded + amount
     /\ UNCHANGED <<contributions, scores, distributed>>
 
 \* Distribute rewards proportionally.
-\* For simplicity, we distribute integer amounts using floor division.
 DistributeRewards ==
     /\ rewardPool > 0
     /\ TotalScore > 0
@@ -99,7 +98,7 @@ DistributeRewards ==
        IN
        /\ distributed' = [c \in Contributors |-> distributed[c] + alloc[c]]
        /\ rewardPool' = pool - totalAlloc
-       /\ UNCHANGED <<contributions, scores>>
+       /\ UNCHANGED <<contributions, scores, totalFunded>>
 
 Next ==
     \/ \E c \in Contributors, t \in ContributionTypes : RecordContribution(c, t)
@@ -115,6 +114,7 @@ TypeOK ==
         /\ scores[c] \in Nat
         /\ distributed[c] \in Nat
     /\ rewardPool \in Nat
+    /\ totalFunded \in Nat
 
 \* INV-2: ScoreIsWeightedSum — score matches the weighted sum of contributions.
 ScoreIsWeightedSum ==

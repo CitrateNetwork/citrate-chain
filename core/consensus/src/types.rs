@@ -201,6 +201,17 @@ pub struct Block {
     /// SHA3-256 commitment to gradient update, revealed in next block (32 bytes).
     #[serde(default)]
     pub gradient_commitment: Option<[u8; 32]>,
+
+    /// MiMC hash of aggregated learning state at this block's checkpoint height.
+    /// Only set for blocks at checkpoint boundaries (height % checkpoint_interval == 0).
+    /// Zero hash for non-checkpoint blocks or below-quorum checkpoints.
+    ///
+    /// Theorem 3 guarantee: this field NEVER affects state_root computation.
+    /// It is NOT included in compute_hash() — consensus ordering is unaffected.
+    ///
+    /// Verified by TLA+ spec StrobilationCheckpoint.tla (INV-4: StateRootIndependent).
+    #[serde(default)]
+    pub learning_root: Hash,
 }
 
 impl Block {
@@ -688,6 +699,7 @@ mod tests {
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         }
     }
 
@@ -732,5 +744,49 @@ mod tests {
 
         // Hash must be identical — learning fields are NOT consensus-critical
         assert_eq!(block_a.compute_hash(), block_b.compute_hash());
+    }
+
+    // WP-F.3: learning_root does NOT affect compute_hash (Theorem 3).
+    // Per StrobilationCheckpoint.tla INV-4: StateRootIndependent.
+    #[test]
+    fn test_learning_root_excluded_from_hash() {
+        let block_a = create_test_block();
+        let mut block_b = create_test_block();
+        block_b.learning_root = Hash::new([0xFF; 32]);
+
+        // Different learning_root must NOT change the block hash
+        assert_eq!(block_a.compute_hash(), block_b.compute_hash());
+    }
+
+    // WP-F.3: learning_root defaults to zero for backward compatibility.
+    #[test]
+    fn test_learning_root_default_zero() {
+        let block = create_test_block();
+        assert_eq!(block.learning_root, Hash::default());
+    }
+
+    // WP-F.3: learning_root serialization roundtrip via JSON.
+    #[test]
+    fn test_learning_root_serialization_roundtrip() {
+        let mut block = create_test_block();
+        block.learning_root = Hash::new([0xAB; 32]);
+
+        let json = serde_json::to_string(&block).unwrap();
+        let deserialized: Block = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.learning_root, Hash::new([0xAB; 32]));
+    }
+
+    // WP-F.3: Backward compatibility — old JSON without learning_root deserializes.
+    #[test]
+    fn test_learning_root_backward_compat() {
+        // Simulate old block JSON without the learning_root field
+        let block = create_test_block();
+        let mut json: serde_json::Value = serde_json::to_value(&block).unwrap();
+        // Remove learning_root to simulate an old format
+        json.as_object_mut().unwrap().remove("learning_root");
+        let json_str = serde_json::to_string(&json).unwrap();
+        let deserialized: Block = serde_json::from_str(&json_str).unwrap();
+        // Should default to zero hash
+        assert_eq!(deserialized.learning_root, Hash::default());
     }
 }

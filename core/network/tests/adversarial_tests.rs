@@ -70,6 +70,7 @@ fn make_genesis_block() -> Block {
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     };
     block.header.block_hash = block.compute_hash();
     block
@@ -111,6 +112,7 @@ fn make_non_genesis_block(height: u64, blue_score: u64, timestamp: u64) -> Block
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     };
     block.header.block_hash = block.compute_hash();
     block
