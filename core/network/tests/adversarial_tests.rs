@@ -446,7 +446,7 @@ async fn test_duplicate_block_deduplicated() {
     let result2 = gossip.handle_new_block(genesis, &peer_id).await;
     assert!(result2.is_ok(), "Duplicate block should be silently deduplicated");
 
-    let (blocks_received, _, _, _, duplicates_filtered) = gossip.get_stats().await;
+    let (blocks_received, _, _, _, duplicates_filtered, _, _, _) = gossip.get_stats().await;
     assert_eq!(blocks_received, 1, "Only one block should be counted as received");
     assert_eq!(duplicates_filtered, 1, "One duplicate should be filtered");
 }
@@ -574,7 +574,7 @@ async fn test_transaction_deduplication() {
     let r2 = gossip.handle_new_transaction(tx, &peer_id).await;
     assert!(r2.is_ok(), "Duplicate tx should be silently deduplicated");
 
-    let (_, _, txs_received, _, duplicates) = gossip.get_stats().await;
+    let (_, _, txs_received, _, duplicates, _, _, _) = gossip.get_stats().await;
     assert_eq!(txs_received, 1, "Only one tx should be counted as received");
     assert_eq!(duplicates, 1, "One duplicate should be filtered");
 }
@@ -618,7 +618,7 @@ async fn test_seen_cache_cleanup() {
     // Trigger cleanup
     gossip.cleanup_seen_cache().await;
 
-    let (_, _, _, _, _) = gossip.get_stats().await;
+    let (_, _, _, _, _, _, _, _) = gossip.get_stats().await;
     // The seen_blocks cache should be trimmed to max_seen_cache (3)
     // We can't directly access the internal cache, but cleanup should not panic.
     // The fact that we get here without panic is the success criterion.
@@ -634,21 +634,21 @@ async fn test_gossip_stats_tracking() {
     pm.add_peer(peer).await.unwrap();
 
     // Initial stats should be zero
-    let (br, bp, tr, tp, dup) = gossip.get_stats().await;
+    let (br, bp, tr, tp, dup, _, _, _) = gossip.get_stats().await;
     assert_eq!((br, bp, tr, tp, dup), (0, 0, 0, 0, 0));
 
     // Submit a valid genesis block
     let genesis = make_genesis_block();
     gossip.handle_new_block(genesis, &peer_id).await.unwrap();
 
-    let (br, _bp, _tr, _tp, _dup) = gossip.get_stats().await;
+    let (br, _bp, _tr, _tp, _dup, _, _, _) = gossip.get_stats().await;
     assert_eq!(br, 1, "blocks_received should be 1 after one valid block");
 
     // Submit a valid transaction
     let tx = make_valid_transaction(99);
     gossip.handle_new_transaction(tx, &peer_id).await.unwrap();
 
-    let (br, _bp, tr, _tp, _dup) = gossip.get_stats().await;
+    let (br, _bp, tr, _tp, _dup, _, _, _) = gossip.get_stats().await;
     assert_eq!(br, 1);
     assert_eq!(tr, 1, "transactions_received should be 1 after one valid tx");
 }

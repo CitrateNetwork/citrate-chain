@@ -58,6 +58,7 @@ pub mod ai_handler;
 pub mod block_propagation;
 pub mod discovery;
 pub mod gossip;
+pub mod learning_messages;
 pub mod nat;
 pub mod noise;
 pub mod peer;
@@ -71,7 +72,10 @@ pub mod types;
 pub use ai_handler::{AINetworkHandler, NetworkInferenceExecutor, NetworkInferenceResult};
 pub use block_propagation::BlockPropagation;
 pub use discovery::{Discovery, DiscoveryConfig};
-pub use gossip::{GossipConfig, GossipProtocol};
+pub use gossip::{CheckpointLearningData, GossipConfig, GossipProtocol, LearningDedup};
+pub use learning_messages::{
+    AdapterOffer, BelnapConfidence, LearningEmbedding, LearningMessage, PerformanceProfile,
+};
 pub use nat::{NatInfo, NatType};
 pub use peer::{Peer, PeerId, PeerInfo, PeerManager, PeerManagerConfig};
 pub use protocol::{ModelMetadata, NetworkMessage, Protocol, ProtocolVersion};

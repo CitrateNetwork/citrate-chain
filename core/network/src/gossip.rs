@@ -2,15 +2,17 @@
 
 // Gossip protocol implementation
 use crate::{
+    learning_messages::LearningMessage,
     peer::{Peer, PeerId, PeerManager},
     NetworkError, NetworkMessage,
 };
 use dashmap::DashMap;
-use citrate_consensus::types::{Block, Hash, Transaction};
+use citrate_consensus::types::{Block, Hash, PublicKey, Transaction};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Peer scoring penalties / rewards applied during gossip validation.
@@ -33,6 +35,12 @@ const SCORE_VALID_TX: i32 = 1;
 /// Peer sent excessive duplicate messages (spamming).
 #[allow(dead_code)]
 const SCORE_EXCESSIVE_DUPLICATES: i32 = -5;
+
+/// Peer sent an invalid learning message (bad embedding, self-mentoring, etc.).
+const SCORE_INVALID_LEARNING: i32 = -10;
+
+/// Peer relayed a valid learning message.
+const SCORE_VALID_LEARNING: i32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct GossipConfig {
@@ -73,6 +81,22 @@ struct SeenItem {
     propagated: bool,
 }
 
+/// Deduplication key for learning embeddings: (checkpoint_height, participant).
+///
+/// Each participant is allowed at most one embedding per checkpoint height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LearningDedup {
+    pub checkpoint_height: u64,
+    pub participant: PublicKey,
+}
+
+/// Per-checkpoint collection of learning messages awaiting aggregation.
+#[derive(Debug, Default)]
+pub struct CheckpointLearningData {
+    pub embeddings: Vec<LearningMessage>,
+    pub adapters: Vec<LearningMessage>,
+}
+
 /// Gossip protocol implementation
 pub struct GossipProtocol {
     config: GossipConfig,
@@ -81,6 +105,12 @@ pub struct GossipProtocol {
     // Seen caches for deduplication
     seen_blocks: Arc<DashMap<Hash, SeenItem>>,
     seen_transactions: Arc<DashMap<Hash, SeenItem>>,
+
+    // Learning dedup: (checkpoint_height, participant) → first_seen
+    seen_learning: Arc<DashMap<LearningDedup, Instant>>,
+
+    // Per-checkpoint learning data store for aggregation
+    learning_data: Arc<RwLock<HashMap<u64, CheckpointLearningData>>>,
 
     // Statistics
     stats: Arc<RwLock<GossipStats>>,
@@ -93,6 +123,9 @@ struct GossipStats {
     transactions_received: u64,
     transactions_propagated: u64,
     duplicates_filtered: u64,
+    learning_received: u64,
+    learning_propagated: u64,
+    learning_duplicates_filtered: u64,
 }
 
 impl GossipProtocol {
@@ -102,6 +135,8 @@ impl GossipProtocol {
             peer_manager,
             seen_blocks: Arc::new(DashMap::new()),
             seen_transactions: Arc::new(DashMap::new()),
+            seen_learning: Arc::new(DashMap::new()),
+            learning_data: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(GossipStats::default())),
         }
     }
@@ -268,6 +303,136 @@ impl GossipProtocol {
         self.stats.write().await.transactions_propagated += 1;
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Learning gossip (WP-F.2)
+    // -----------------------------------------------------------------------
+
+    /// Handle an incoming learning gossip message.
+    ///
+    /// Deduplication: at most one embedding per (checkpoint_height, participant).
+    /// Rate-limiting is enforced by the dedup key — a second embedding from the
+    /// same participant at the same checkpoint is silently dropped.
+    pub async fn handle_learning_message(
+        &self,
+        msg: LearningMessage,
+        from_peer: &PeerId,
+    ) -> Result<(), NetworkError> {
+        // 1. Structural validation
+        if let Err(e) = msg.validate() {
+            warn!(
+                "[INVALID_LEARNING] from={} error={}",
+                from_peer.0, e
+            );
+            self.peer_manager
+                .update_peer_score(from_peer, SCORE_INVALID_LEARNING)
+                .await;
+            return Err(NetworkError::InvalidMessage(e));
+        }
+
+        // 2. Build dedup key
+        let dedup_key = match &msg {
+            LearningMessage::Embedding(emb) => LearningDedup {
+                checkpoint_height: emb.checkpoint_height,
+                participant: emb.participant,
+            },
+            LearningMessage::Adapter(offer) => LearningDedup {
+                checkpoint_height: offer.checkpoint_height,
+                participant: offer.mentor,
+            },
+        };
+
+        // 3. Check dedup cache
+        if self.seen_learning.contains_key(&dedup_key) {
+            self.stats.write().await.learning_duplicates_filtered += 1;
+            return Ok(());
+        }
+
+        // 4. Mark as seen
+        self.seen_learning.insert(dedup_key, Instant::now());
+        self.stats.write().await.learning_received += 1;
+
+        info!(
+            "[LEARNING] checkpoint={} type={} from={}",
+            msg.checkpoint_height(),
+            match &msg {
+                LearningMessage::Embedding(_) => "embedding",
+                LearningMessage::Adapter(_) => "adapter",
+            },
+            from_peer.0,
+        );
+
+        // 5. Store in per-checkpoint collection
+        {
+            let mut data = self.learning_data.write().await;
+            let entry = data
+                .entry(msg.checkpoint_height())
+                .or_default();
+            match &msg {
+                LearningMessage::Embedding(_) => entry.embeddings.push(msg.clone()),
+                LearningMessage::Adapter(_) => entry.adapters.push(msg.clone()),
+            }
+        }
+
+        // 6. Reward peer
+        self.peer_manager
+            .update_peer_score(from_peer, SCORE_VALID_LEARNING)
+            .await;
+
+        // 7. Propagate to other peers
+        self.propagate_learning(msg, from_peer).await?;
+
+        Ok(())
+    }
+
+    /// Propagate a learning message to gossip peers.
+    async fn propagate_learning(
+        &self,
+        msg: LearningMessage,
+        exclude_peer: &PeerId,
+    ) -> Result<(), NetworkError> {
+        let peers = self.select_gossip_peers(exclude_peer).await;
+
+        if peers.is_empty() {
+            return Ok(());
+        }
+
+        let network_msg = NetworkMessage::LearningGossip { message: msg };
+
+        for peer in peers {
+            if let Err(e) = peer.send(network_msg.clone()).await {
+                debug!("Failed to propagate learning message to peer: {}", e);
+            }
+        }
+
+        self.stats.write().await.learning_propagated += 1;
+
+        Ok(())
+    }
+
+    /// Retrieve the collected learning data for a given checkpoint height.
+    ///
+    /// Returns `None` if no data has been collected for that checkpoint.
+    pub async fn get_learning_data(&self, checkpoint_height: u64) -> Option<CheckpointLearningData> {
+        let data = self.learning_data.read().await;
+        data.get(&checkpoint_height).map(|d| CheckpointLearningData {
+            embeddings: d.embeddings.clone(),
+            adapters: d.adapters.clone(),
+        })
+    }
+
+    /// Remove learning data for checkpoints at or below `finalized_height`.
+    ///
+    /// Call this when a checkpoint is finalized and the learning data has been
+    /// aggregated and committed.
+    pub async fn prune_learning_data(&self, finalized_height: u64) {
+        let mut data = self.learning_data.write().await;
+        data.retain(|&h, _| h > finalized_height);
+
+        // Also prune the dedup cache for old checkpoints
+        self.seen_learning
+            .retain(|key, _| key.checkpoint_height > finalized_height);
     }
 
     /// Select peers for gossip propagation
@@ -457,6 +622,10 @@ impl GossipProtocol {
         self.seen_transactions
             .retain(|_, item| now.duration_since(item.first_seen) < ttl);
 
+        // Clean learning dedup entries
+        self.seen_learning
+            .retain(|_, first_seen| now.duration_since(*first_seen) < ttl);
+
         // Enforce max size
         if self.seen_blocks.len() > self.config.max_seen_cache {
             // Remove oldest entries
@@ -490,8 +659,12 @@ impl GossipProtocol {
         }
     }
 
-    /// Get gossip statistics
-    pub async fn get_stats(&self) -> (u64, u64, u64, u64, u64) {
+    /// Get gossip statistics.
+    ///
+    /// Returns `(blocks_received, blocks_propagated, txs_received,
+    /// txs_propagated, duplicates_filtered, learning_received,
+    /// learning_propagated, learning_duplicates_filtered)`.
+    pub async fn get_stats(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         let stats = self.stats.read().await;
         (
             stats.blocks_received,
@@ -499,6 +672,9 @@ impl GossipProtocol {
             stats.transactions_received,
             stats.transactions_propagated,
             stats.duplicates_filtered,
+            stats.learning_received,
+            stats.learning_propagated,
+            stats.learning_duplicates_filtered,
         )
     }
 }

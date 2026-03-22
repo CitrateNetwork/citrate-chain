@@ -1,6 +1,7 @@
 // citrate/core/network/src/protocol.rs
 
 // Network protocol definitions
+use crate::learning_messages::LearningMessage;
 use citrate_consensus::types::{Block, BlockHeader, Hash, Transaction};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -284,6 +285,14 @@ pub enum NetworkMessage {
     HolePunchNotify {
         peer_id: String,
         external_addr: String,
+    },
+
+    // WP-F.2: Learning gossip messages (paraconsensus layer)
+
+    /// Learning-layer message (embedding broadcast or LoRA adapter offer).
+    /// Gossiped at BFT checkpoint boundaries.
+    LearningGossip {
+        message: LearningMessage,
     },
 }
 
