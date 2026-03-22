@@ -118,7 +118,7 @@ async fn test_gossip_block_received_increments_counter() {
     let peer_id = PeerId::new("sender-1".to_string());
     register_peer(&pm, &peer_id).await;
 
-    let (br_before, _, _, _, _) = gossip.get_stats().await;
+    let (br_before, _, _, _, _, _, _, _) = gossip.get_stats().await;
     assert_eq!(br_before, 0);
 
     let block = make_test_block(1);
@@ -126,7 +126,7 @@ async fn test_gossip_block_received_increments_counter() {
     // should still be incremented.
     let _ = gossip.handle_new_block(block, &peer_id).await;
 
-    let (br_after, _, _, _, _) = gossip.get_stats().await;
+    let (br_after, _, _, _, _, _, _, _) = gossip.get_stats().await;
     assert_eq!(br_after, 1, "blocks_received should be 1 after submitting one block");
 }
 
@@ -154,13 +154,13 @@ async fn test_gossip_transaction_received_increments_counter() {
     let peer_id = PeerId::new("sender-3".to_string());
     register_peer(&pm, &peer_id).await;
 
-    let (_, _, tr_before, _, _) = gossip.get_stats().await;
+    let (_, _, tr_before, _, _, _, _, _) = gossip.get_stats().await;
     assert_eq!(tr_before, 0);
 
     let tx = make_test_tx(1);
     let _ = gossip.handle_new_transaction(tx, &peer_id).await;
 
-    let (_, _, tr_after, _, _) = gossip.get_stats().await;
+    let (_, _, tr_after, _, _, _, _, _) = gossip.get_stats().await;
     assert_eq!(tr_after, 1, "transactions_received should be 1 after submitting one tx");
 }
 
@@ -229,7 +229,7 @@ async fn test_gossip_seen_block_cache_prevents_reprocessing() {
 
     // First submission: enters seen cache, blocks_received incremented
     let _ = gossip.handle_new_block(block.clone(), &peer_id).await;
-    let (br_1, _, _, _, dup_1) = gossip.get_stats().await;
+    let (br_1, _, _, _, dup_1, _, _, _) = gossip.get_stats().await;
     assert_eq!(br_1, 1, "First submission should increment blocks_received");
     assert_eq!(dup_1, 0, "No duplicates on first submission");
 
@@ -242,7 +242,7 @@ async fn test_gossip_seen_block_cache_prevents_reprocessing() {
     // validation), the seen cache check at line 119 (`if seen.propagated`)
     // returns false, so it falls through and processes again.
     let _ = gossip.handle_new_block(block.clone(), &peer_id).await;
-    let (br_2, _, _, _, dup_2) = gossip.get_stats().await;
+    let (br_2, _, _, _, dup_2, _, _, _) = gossip.get_stats().await;
 
     // blocks_received should be 2 (processed twice because propagated=false)
     assert_eq!(br_2, 2, "Second submission should also increment blocks_received (not yet propagated)");
@@ -254,7 +254,7 @@ async fn test_gossip_seen_block_cache_prevents_reprocessing() {
     let tx = make_test_tx(5);
     let _ = gossip.handle_new_transaction(tx.clone(), &peer_id).await;
     let _ = gossip.handle_new_transaction(tx.clone(), &peer_id).await;
-    let (_, _, tr, _, _) = gossip.get_stats().await;
+    let (_, _, tr, _, _, _, _, _) = gossip.get_stats().await;
     // The second tx submission: seen cache has propagated=false (tx also fails
     // propagation since there are no other peers), so it's reprocessed.
     // This is expected behavior — dedup only kicks in for propagated messages.
