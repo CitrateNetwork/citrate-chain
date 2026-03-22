@@ -27,6 +27,14 @@ pub struct RevenueShareConfig {
     /// x402 facilitator share of payment settlement fees (basis points)
     pub facilitator_share_bps: u16,
 
+    /// Market maker allocation from gas fees (basis points, pre-split skim)
+    /// Applied BEFORE the 7-way split: gas_fees * market_maker_bps / 10000 goes to
+    /// market maker, remainder enters normal distribution. Configurable via DAO.
+    pub market_maker_gas_bps: u16,
+
+    /// Market maker contract address (MarketMakerAllocation.sol)
+    pub market_maker_address: Option<Address>,
+
     /// Minimum revenue threshold to trigger distribution
     pub min_distribution_threshold: U256,
 
@@ -46,6 +54,8 @@ impl Default for RevenueShareConfig {
             treasury_share_bps: 1200,       // 12%
             staker_share_bps: 1500,         // 15%
             facilitator_share_bps: 500,     // 5%
+            market_maker_gas_bps: 1000,     // 10% of gas fees (pre-split to MarketMakerAllocation contract)
+            market_maker_address: None,     // Set after contract deployment
             min_distribution_threshold: U256::from(1000) * U256::from(10).pow(U256::from(18)), // 1000 SALT
             distribution_frequency: 7200,   // ~1 day at 2s blocks
             performance_bonus_bps: 500,     // 5% max bonus
@@ -309,10 +319,20 @@ impl RevenueShareManager {
 
         match pool {
             RevenuePool::GasFees => {
-                // Distribute gas fees to validators and stakers
-                let validator_amount = total_amount * U256::from(self.config.validator_share_bps) / U256::from(10000);
-                let staker_amount = total_amount * U256::from(self.config.staker_share_bps) / U256::from(10000);
-                let treasury_amount = total_amount - validator_amount - staker_amount;
+                // Pre-split: skim market maker allocation (10% default) before 7-way distribution.
+                // This incentivizes the market maker (DLP) to maintain deep liquidity and handle CEX listings.
+                // The market maker address and rate are DAO-configurable via MarketMakerAllocation contract.
+                let mut distributable = total_amount;
+                if let Some(mm_addr) = self.config.market_maker_address {
+                    let mm_amount = total_amount * U256::from(self.config.market_maker_gas_bps) / U256::from(10000);
+                    distributions.insert(mm_addr, mm_amount);
+                    distributable = total_amount - mm_amount;
+                }
+
+                // Distribute remaining gas fees to validators, stakers, and treasury
+                let validator_amount = distributable * U256::from(self.config.validator_share_bps) / U256::from(10000);
+                let staker_amount = distributable * U256::from(self.config.staker_share_bps) / U256::from(10000);
+                let treasury_amount = distributable - validator_amount - staker_amount;
 
                 self.distribute_to_stakeholder_type(StakeholderType::Validator, validator_amount, &mut distributions);
                 self.distribute_to_stakeholder_type(StakeholderType::Staker, staker_amount, &mut distributions);
