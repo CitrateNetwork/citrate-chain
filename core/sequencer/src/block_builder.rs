@@ -2,7 +2,7 @@
 
 use crate::mempool::{Mempool, TxClass};
 use citrate_consensus::{
-    Block, BlockBuilder as ConsensusBlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder as ConsensusBlockBuilder, BlockHeader, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_execution::executor::Executor;
 use citrate_execution::parallel::ParallelExecutor;
