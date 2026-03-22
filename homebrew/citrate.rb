@@ -59,7 +59,7 @@ class Lattice < Formula
            citrate-cli status
 
       Documentation: https://docs.citrate.ai
-      Community: https://discord.gg/citrate-ai
+      Community: https://discord.gg/A3Uwe4BvdN
     EOS
   end
 

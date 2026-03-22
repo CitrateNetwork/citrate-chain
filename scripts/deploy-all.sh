@@ -396,7 +396,7 @@ $(ls -la dist/releases/*.deb dist/releases/*.dmg dist/releases/*.msi dist/releas
 
 - Documentation: https://docs.lattice.ai
 - GitHub: https://github.com/citrate-ai/citrate
-- Discord: https://discord.gg/citrate-ai
+- Discord: https://discord.gg/A3Uwe4BvdN
 
 EOF
 
@@ -436,7 +436,7 @@ main() {
     echo "  • Repository: https://github.com/citrate-ai/citrate"
     echo "  • Documentation: https://docs.lattice.ai"
     echo "  • Explorer: https://explorer.lattice.ai"
-    echo "  • Discord: https://discord.gg/citrate-ai"
+    echo "  • Discord: https://discord.gg/A3Uwe4BvdN"
 }
 
 # Handle script arguments
