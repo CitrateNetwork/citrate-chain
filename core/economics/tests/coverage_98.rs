@@ -139,6 +139,7 @@ fn make_block(height: u64, txs: Vec<citrate_consensus::types::Transaction>) -> c
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     }
 }
 

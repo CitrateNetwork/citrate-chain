@@ -924,6 +924,7 @@ pub fn register_eth_methods(
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
 
         // For eth_call, use the sender's current nonce so execution doesn't fail
@@ -1110,6 +1111,7 @@ pub fn register_eth_methods(
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
 
         // For gas estimation, use sender's current nonce to pass nonce validation

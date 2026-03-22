@@ -17,6 +17,7 @@ pub mod ceremony;
 pub mod circuits;
 pub mod inference_proof;
 pub mod mimc;
+pub mod poseidon;
 pub mod prover;
 pub mod types;
 pub mod verifier;

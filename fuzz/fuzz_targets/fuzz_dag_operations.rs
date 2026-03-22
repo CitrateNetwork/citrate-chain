@@ -66,6 +66,7 @@ fuzz_target!(|data: &[u8]| {
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
 
         let _ = dag_store.store_block(genesis.clone()).await;
@@ -113,6 +114,7 @@ fuzz_target!(|data: &[u8]| {
                 learning_embedding: None,
                 learning_confidence: None,
                 gradient_commitment: None,
+            learning_root: Hash::default(),
             };
 
             let _ = dag_store.store_block(block.clone()).await;

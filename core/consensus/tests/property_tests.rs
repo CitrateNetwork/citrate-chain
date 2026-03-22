@@ -58,6 +58,7 @@ fn create_block_with_params(
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     }
 }
 
@@ -556,6 +557,7 @@ mod edge_cases {
                 learning_embedding: None,
                 learning_confidence: None,
                 gradient_commitment: None,
+            learning_root: Hash::default(),
             };
             dag_store.store_block(block.clone()).await.unwrap();
             children.push(block.hash());

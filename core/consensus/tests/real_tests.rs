@@ -46,6 +46,7 @@ fn create_test_block(block_num: u8, height: u64, parent: Option<Hash>) -> Block 
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     }
 }
 

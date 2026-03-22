@@ -69,6 +69,7 @@ fn make_test_block(id: u8) -> Block {
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     }
 }
 

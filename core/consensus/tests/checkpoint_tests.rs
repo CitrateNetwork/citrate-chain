@@ -68,6 +68,7 @@ fn make_block(hash: Hash, parent: Hash, merge: Vec<Hash>, height: u64, blue_scor
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     }
 }
 

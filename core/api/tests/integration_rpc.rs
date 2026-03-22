@@ -46,6 +46,7 @@ fn make_block(height: u64, parent: Hash) -> Block {
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     }
 }
 

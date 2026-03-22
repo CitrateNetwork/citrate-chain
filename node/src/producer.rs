@@ -11,7 +11,9 @@ use citrate_economics::{
 };
 use citrate_execution::Executor;
 use citrate_execution::revm_adapter::BlockContext;
-use citrate_network::{NetworkMessage, PeerManager};
+use citrate_learning::orchestration::{LearningOrchestrator, PeerEmbedding};
+use citrate_network::{GossipProtocol, NetworkMessage, PeerManager};
+use citrate_network::learning_messages::LearningMessage;
 use citrate_sequencer::mempool::Mempool;
 use citrate_storage::{state_manager::StateManager as AIStateManager, StorageManager};
 use primitive_types::U256;
@@ -19,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // Block hash is now computed via Block::compute_hash() in consensus/types.rs (C-05).
 // This ensures a single canonical hash function used by both producer and validator.
@@ -86,6 +88,18 @@ pub struct BlockProducer {
     /// WP-I.3: Shared with the RPC server so citrate_emergencyPause
     /// can halt block production remotely.
     paused: Arc<AtomicBool>,
+
+    /// WP-F.3: Learning orchestrator for checkpoint aggregation.
+    /// None when learning is disabled or not configured.
+    learning_orchestrator: Option<LearningOrchestrator>,
+
+    /// WP-F.3: Gossip protocol reference for collecting peer learning embeddings.
+    /// None when learning is disabled or gossip not initialized.
+    gossip: Option<Arc<GossipProtocol>>,
+
+    /// WP-F.3: Checkpoint interval for learning root computation.
+    /// Defaults to 50 blocks (same as BFT checkpoint interval).
+    checkpoint_interval: u64,
 }
 
 impl BlockProducer {
@@ -145,6 +159,9 @@ impl BlockProducer {
             reward_calculator,
             economics_manager: None,
             paused: Arc::new(AtomicBool::new(false)),
+            learning_orchestrator: None,
+            gossip: None,
+            checkpoint_interval: 50,
         }
     }
 
@@ -205,6 +222,9 @@ impl BlockProducer {
             reward_calculator,
             economics_manager: None,
             paused: Arc::new(AtomicBool::new(false)),
+            learning_orchestrator: None,
+            gossip: None,
+            checkpoint_interval: 50,
         }
     }
 
@@ -257,6 +277,9 @@ impl BlockProducer {
             reward_calculator,
             economics_manager: None,
             paused: Arc::new(AtomicBool::new(false)),
+            learning_orchestrator: None,
+            gossip: None,
+            checkpoint_interval: 50,
         }
     }
 
@@ -334,6 +357,9 @@ impl BlockProducer {
             reward_calculator,
             economics_manager: Some(economics_manager),
             paused: Arc::new(AtomicBool::new(false)),
+            learning_orchestrator: None,
+            gossip: None,
+            checkpoint_interval: 50,
         }
     }
 
@@ -421,6 +447,9 @@ impl BlockProducer {
             reward_calculator,
             economics_manager: Some(economics_manager),
             paused: Arc::new(AtomicBool::new(false)),
+            learning_orchestrator: None,
+            gossip: None,
+            checkpoint_interval: 50,
         }
     }
 
@@ -429,6 +458,26 @@ impl BlockProducer {
     /// directly control block production.
     pub fn set_pause_flag(&mut self, flag: Arc<AtomicBool>) {
         self.paused = flag;
+    }
+
+    /// WP-F.3: Enable checkpoint learning by setting the orchestrator and gossip layer.
+    ///
+    /// Call this after construction to wire learning into block production.
+    /// The orchestrator runs paraconsensus aggregation at checkpoint boundaries
+    /// and computes the `learning_root` hash for inclusion in the block header.
+    pub fn enable_learning(
+        &mut self,
+        orchestrator: LearningOrchestrator,
+        gossip: Arc<GossipProtocol>,
+        checkpoint_interval: u64,
+    ) {
+        self.learning_orchestrator = Some(orchestrator);
+        self.gossip = Some(gossip);
+        self.checkpoint_interval = checkpoint_interval;
+        info!(
+            "Learning enabled: checkpoint_interval={}",
+            checkpoint_interval
+        );
     }
 
     /// Pause block production (emergency stop).
@@ -523,6 +572,7 @@ impl BlockProducer {
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
 
         let blue_set = self.ghostdag.calculate_blue_set(&temp_block).await?;
@@ -657,6 +707,7 @@ impl BlockProducer {
                 learning_embedding: None,
                 learning_confidence: None,
                 gradient_commitment: None,
+                learning_root: Hash::default(),
             };
             let reward = self.reward_calculator.calculate_reward(&temp_block);
             self.apply_basic_rewards(&reward, &validator_address);
@@ -680,7 +731,21 @@ impl BlockProducer {
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
+
+        // WP-F.3: Compute learning_root at checkpoint boundaries.
+        // Per StrobilationCheckpoint.tla: only checkpoint blocks get a learning_root.
+        // Non-checkpoint blocks keep Hash::default() (zero hash).
+        // The learning_root is NOT included in compute_hash() (Theorem 3).
+        let block_height = block.header.height;
+        if block_height > 0
+            && block_height % self.checkpoint_interval == 0
+            && self.learning_orchestrator.is_some()
+        {
+            let learning_root = self.compute_checkpoint_learning_root(block_height).await;
+            block.learning_root = learning_root;
+        }
 
         // C-05: Compute canonical block hash from ALL fields including commitment roots.
         // This must happen AFTER execution AND rewards so state_root is final.
@@ -847,6 +912,7 @@ impl BlockProducer {
             learning_embedding: None,
             learning_confidence: None,
             gradient_commitment: None,
+            learning_root: Hash::default(),
         };
 
         // Execute each transaction
@@ -984,6 +1050,121 @@ impl BlockProducer {
                 .set_balance(&treasury_address, current_balance + reward.treasury_reward);
             info!("Basic: Minted {} wei to treasury", reward.treasury_reward);
         }
+    }
+
+    /// WP-F.3: Compute the learning_root for a checkpoint block.
+    ///
+    /// Collects peer embeddings from the gossip layer, runs paraconsensus
+    /// aggregation via the learning orchestrator, and returns the hash.
+    ///
+    /// If aggregation fails or returns below-quorum, returns zero hash
+    /// (block production continues normally — learning is non-blocking).
+    ///
+    /// Formal specification: StrobilationCheckpoint.tla
+    /// - ProduceCheckpointBlock: requires aggregation complete
+    /// - INV-4 (StateRootIndependent): result never affects state_root
+    async fn compute_checkpoint_learning_root(&self, block_height: u64) -> Hash {
+        let orchestrator = match &self.learning_orchestrator {
+            Some(o) => o,
+            None => return Hash::default(),
+        };
+
+        // Collect peer embeddings from gossip layer
+        let peer_embeddings = self.collect_peer_embeddings(block_height).await;
+
+        // TODO(WP-F.4): Build local embedding from recent inference activity.
+        // For now, we only aggregate peer embeddings.
+        let local_embedding: Option<PeerEmbedding> = None;
+
+        match orchestrator.run_checkpoint_aggregation(
+            block_height,
+            local_embedding,
+            peer_embeddings,
+        ) {
+            Ok(result) => {
+                if result.learning_root == [0u8; 32] {
+                    info!(
+                        "Checkpoint {} learning: below quorum ({} participants), zero root",
+                        block_height, result.participant_count,
+                    );
+                } else {
+                    info!(
+                        "Checkpoint {} learning: {} participants, confidence={:.3}, root={}",
+                        block_height,
+                        result.participant_count,
+                        result.confidence,
+                        hex::encode(result.learning_root),
+                    );
+                }
+                Hash::new(result.learning_root)
+            }
+            Err(e) => {
+                warn!(
+                    "Learning aggregation failed at checkpoint {}: {}",
+                    block_height, e
+                );
+                Hash::default()
+            }
+        }
+    }
+
+    /// WP-F.3: Extract peer embeddings from gossip layer's learning data store.
+    ///
+    /// Converts the network-layer `LearningMessage::Embedding` messages into
+    /// the learning-crate's `PeerEmbedding` format for aggregation.
+    async fn collect_peer_embeddings(&self, checkpoint_height: u64) -> Vec<PeerEmbedding> {
+        let gossip = match &self.gossip {
+            Some(g) => g,
+            None => return vec![],
+        };
+
+        let data = match gossip.get_learning_data(checkpoint_height).await {
+            Some(d) => d,
+            None => {
+                debug!("No learning data for checkpoint height {}", checkpoint_height);
+                return vec![];
+            }
+        };
+
+        let mut peer_embeddings = Vec::with_capacity(data.embeddings.len());
+
+        for msg in &data.embeddings {
+            if let LearningMessage::Embedding(emb) = msg {
+                // Default confidence to 0.5 for each dimension if not classified
+                let confidence = if emb.confidence.len() == emb.embedding.len() {
+                    // Convert BelnapConfidence to f32 values for aggregation input
+                    emb.confidence
+                        .iter()
+                        .map(|c| match c {
+                            citrate_network::learning_messages::BelnapConfidence::True => 0.9,
+                            citrate_network::learning_messages::BelnapConfidence::False => 0.1,
+                            citrate_network::learning_messages::BelnapConfidence::Both => 0.5,
+                            citrate_network::learning_messages::BelnapConfidence::Neither => 0.3,
+                        })
+                        .collect()
+                } else {
+                    vec![0.5; emb.embedding.len()]
+                };
+
+                // Use accuracy * 100 as a proxy for blue_score when actual
+                // blue score is not available from the gossip message.
+                let blue_score = (emb.profile.accuracy * 100.0) as f32;
+
+                peer_embeddings.push(PeerEmbedding {
+                    embedding: emb.embedding.clone(),
+                    confidence,
+                    blue_score,
+                });
+            }
+        }
+
+        debug!(
+            "Collected {} peer embeddings for checkpoint {}",
+            peer_embeddings.len(),
+            checkpoint_height,
+        );
+
+        peer_embeddings
     }
 }
 

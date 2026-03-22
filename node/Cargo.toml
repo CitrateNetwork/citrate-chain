@@ -16,6 +16,7 @@ citrate-network = { path = "../core/network" }
 citrate-sequencer = { path = "../core/sequencer" }
 citrate-api = { path = "../core/api" }
 citrate-economics = { path = "../core/economics" }
+citrate-learning = { path = "../core/learning" }
 citrate-mcp = { path = "../core/mcp" }
 citrate-wallet = { path = "../wallet" }
 citrate-cli = { path = "../cli" }

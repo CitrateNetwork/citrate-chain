@@ -178,6 +178,7 @@ pub fn create_genesis_block(config: &GenesisConfig) -> Block {
         learning_embedding: None,
         learning_confidence: None,
         gradient_commitment: None,
+            learning_root: Hash::default(),
     }
 }
 
