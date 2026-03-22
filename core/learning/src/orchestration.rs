@@ -17,6 +17,9 @@ use crate::belnap::BelnapValue;
 use crate::config::LearningConfig;
 use crate::embeddings::EmbeddingVector;
 use crate::errors::LearningResult;
+use crate::mentor::{self, MentorPairing};
+use crate::profile::PerformanceProfile;
+use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
 /// Result of a checkpoint learning aggregation.
@@ -39,6 +42,11 @@ pub struct LearningCheckpointResult {
 
     /// Mean effective confidence from the aggregation.
     pub confidence: f32,
+
+    /// Mentor-mentee pairings identified at this checkpoint (WP-F.6).
+    ///
+    /// Empty if mentor selection was not run (e.g. below quorum).
+    pub mentor_pairings: Vec<MentorPairing>,
 }
 
 /// A peer embedding submitted at a checkpoint boundary.
@@ -150,6 +158,7 @@ impl LearningOrchestrator {
                 state_vector: vec![],
                 participant_count: valid_embeddings.len(),
                 confidence: 0.0,
+                mentor_pairings: vec![],
             });
         }
 
@@ -177,6 +186,7 @@ impl LearningOrchestrator {
             state_vector: result.state_vector.clone(),
             participant_count: valid_embeddings.len(),
             confidence: result.confidence,
+            mentor_pairings: vec![],
         })
     }
 
@@ -282,6 +292,47 @@ impl LearningOrchestrator {
 
         self.aggregator.aggregate_paraconsistent(&input)
     }
+
+    /// Run mentor selection from the peer profile store (WP-F.6).
+    ///
+    /// After aggregation, call this method with the profile store to identify
+    /// mentor-mentee pairings.  The returned pairings can be attached to the
+    /// `LearningCheckpointResult` and broadcast as `AdapterGenerationRequest`
+    /// messages so that mentors know to produce adapters.
+    pub fn run_mentor_selection(
+        &self,
+        profile_store: &PeerProfileStore,
+        checkpoint_height: u64,
+    ) -> Vec<MentorPairing> {
+        let profiles_at_checkpoint = profile_store.get_profiles_at_checkpoint(checkpoint_height);
+
+        if profiles_at_checkpoint.len() < 2 {
+            debug!(
+                "Checkpoint {}: only {} profiles, skipping mentor selection",
+                checkpoint_height,
+                profiles_at_checkpoint.len(),
+            );
+            return vec![];
+        }
+
+        // Convert from ([u8;32], &PerformanceProfile) to owned for select_mentors.
+        let owned_profiles: Vec<([u8; 32], PerformanceProfile)> = profiles_at_checkpoint
+            .into_iter()
+            .map(|(k, p)| (k, p.clone()))
+            .collect();
+
+        let pairings = mentor::select_mentors(&owned_profiles);
+
+        if !pairings.is_empty() {
+            info!(
+                "Checkpoint {}: {} mentor-mentee pairings identified",
+                checkpoint_height,
+                pairings.len(),
+            );
+        }
+
+        pairings
+    }
 }
 
 /// Compute the deterministic learning_root hash.
@@ -336,6 +387,137 @@ pub fn compute_learning_root(
     let mut result = [0u8; 32];
     result.copy_from_slice(&hash_bytes[..32]);
     result
+}
+
+// ---------------------------------------------------------------------------
+// Peer profile storage (WP-F.5)
+// ---------------------------------------------------------------------------
+
+/// Key for indexing peer profiles: (checkpoint_height, participant_id).
+///
+/// The participant_id is a 32-byte array (the raw public key bytes)
+/// to avoid depending on consensus types in this struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerProfileKey {
+    pub checkpoint_height: u64,
+    pub participant: [u8; 32],
+}
+
+/// Stores performance profiles received from peers at checkpoint boundaries.
+///
+/// Used by WP-F.6 mentor selection to find the best mentor for a given mentee
+/// based on domain overlap, accuracy, and latency.
+///
+/// Profiles older than `max_checkpoints` are pruned automatically on insertion.
+pub struct PeerProfileStore {
+    /// (checkpoint_height, participant) → profile
+    profiles: HashMap<PeerProfileKey, PerformanceProfile>,
+    /// Maximum number of checkpoint heights to retain. Older ones are pruned.
+    max_checkpoints: usize,
+    /// Track known checkpoint heights for pruning.
+    known_heights: Vec<u64>,
+}
+
+impl PeerProfileStore {
+    /// Create a new peer profile store.
+    ///
+    /// `max_checkpoints` controls how many checkpoint generations of profiles
+    /// are retained before the oldest are pruned. Set to 0 for unlimited.
+    pub fn new(max_checkpoints: usize) -> Self {
+        Self {
+            profiles: HashMap::new(),
+            max_checkpoints,
+            known_heights: Vec::new(),
+        }
+    }
+
+    /// Store a peer's performance profile for a given checkpoint.
+    ///
+    /// If a profile already exists for this (checkpoint, participant), it is
+    /// replaced with the new one.
+    pub fn store_profile(
+        &mut self,
+        checkpoint_height: u64,
+        participant: [u8; 32],
+        profile: PerformanceProfile,
+    ) {
+        let key = PeerProfileKey {
+            checkpoint_height,
+            participant,
+        };
+        self.profiles.insert(key, profile);
+
+        // Track this height if new
+        if !self.known_heights.contains(&checkpoint_height) {
+            self.known_heights.push(checkpoint_height);
+            self.known_heights.sort_unstable();
+        }
+
+        // Prune old checkpoints if limit exceeded
+        if self.max_checkpoints > 0 && self.known_heights.len() > self.max_checkpoints {
+            let prune_count = self.known_heights.len() - self.max_checkpoints;
+            let heights_to_remove: Vec<u64> =
+                self.known_heights.drain(..prune_count).collect();
+            for h in &heights_to_remove {
+                self.profiles.retain(|k, _| k.checkpoint_height != *h);
+            }
+            debug!(
+                "Pruned {} old checkpoint heights from peer profile store",
+                heights_to_remove.len(),
+            );
+        }
+    }
+
+    /// Retrieve a peer's profile for a specific checkpoint.
+    pub fn get_profile(
+        &self,
+        checkpoint_height: u64,
+        participant: [u8; 32],
+    ) -> Option<&PerformanceProfile> {
+        let key = PeerProfileKey {
+            checkpoint_height,
+            participant,
+        };
+        self.profiles.get(&key)
+    }
+
+    /// Retrieve all profiles for a specific checkpoint height.
+    ///
+    /// Returns a vec of (participant, profile) pairs.
+    pub fn get_profiles_at_checkpoint(
+        &self,
+        checkpoint_height: u64,
+    ) -> Vec<([u8; 32], &PerformanceProfile)> {
+        self.profiles
+            .iter()
+            .filter(|(k, _)| k.checkpoint_height == checkpoint_height)
+            .map(|(k, v)| (k.participant, v))
+            .collect()
+    }
+
+    /// Total number of stored profiles.
+    pub fn len(&self) -> usize {
+        self.profiles.len()
+    }
+
+    /// Whether the store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.profiles.is_empty()
+    }
+
+    /// Remove all profiles at or below the given finalized height.
+    pub fn prune_below(&mut self, finalized_height: u64) {
+        self.profiles
+            .retain(|k, _| k.checkpoint_height > finalized_height);
+        self.known_heights
+            .retain(|&h| h > finalized_height);
+    }
+}
+
+impl Default for PeerProfileStore {
+    fn default() -> Self {
+        Self::new(10) // retain last 10 checkpoints by default
+    }
 }
 
 #[cfg(test)]
