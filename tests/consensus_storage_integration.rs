@@ -1,4 +1,4 @@
-use citrate_consensus::types::{Block, BlockHeader, Hash, PublicKey, Signature, VrfProof, GhostDagParams};
+use citrate_consensus::types::{Block, BlockBuilder, BlockHeader, Hash, PublicKey, Signature, VrfProof, GhostDagParams};
 use citrate_consensus::dag_store::DagStore;
 use citrate_storage::StorageManager;
 use citrate_storage::pruning::PruningConfig;
@@ -6,28 +6,14 @@ use tempfile::TempDir;
 use std::sync::Arc;
 
 fn make_block(h: u64, parent: Hash) -> Block {
-    Block {
-        header: BlockHeader {
-            version: 1,
-            block_hash: Hash::new([h as u8; 32]),
-            selected_parent_hash: parent,
-            merge_parent_hashes: vec![],
-            timestamp: 1_000_000 + h,
-            height: h,
-            blue_score: h,
-            blue_work: h as u128,
-            pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new([0; 32]),
-            vrf_reveal: VrfProof { proof: vec![], output: Hash::default() },
-        },
-        state_root: Hash::default(),
-        tx_root: Hash::default(),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0; 64]),
-    }
+    BlockBuilder::new()
+        .hash(Hash::new([h as u8; 32]))
+        .parent(parent)
+        .height(h)
+        .timestamp(1_000_000 + h)
+        .blue_score(h)
+        .blue_work(h as u128)
+        .build_unhashed()
 }
 
 #[tokio::test]

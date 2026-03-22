@@ -1,6 +1,6 @@
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::types::{
-    Block, BlockHeader, EmbeddedModel, GhostDagParams, Hash, ModelId as ConsensusModelId,
+    Block, BlockBuilder, BlockHeader, EmbeddedModel, GhostDagParams, Hash, ModelId as ConsensusModelId,
     ModelMetadata as ConsensusModelMetadata, ModelType, PublicKey, RequiredModel, Signature,
     VrfProof,
 };
@@ -164,22 +164,11 @@ pub fn create_genesis_block(config: &GenesisConfig) -> Block {
         embedded_models.iter().map(|m| m.size_bytes()).sum::<usize>() / 1_000_000
     );
 
-    Block {
-        header,
-        state_root: Hash::default(),
-        tx_root: Hash::default(),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0; 64]),
-        embedded_models,
-        required_pins,
-        learning_embedding: None,
-        learning_confidence: None,
-        gradient_commitment: None,
-            learning_root: Hash::default(),
-    }
+    BlockBuilder::new()
+        .header(header)
+        .embedded_models(embedded_models)
+        .required_pins(required_pins)
+        .build_unhashed()
 }
 
 /// Initialize genesis state

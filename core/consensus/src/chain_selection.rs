@@ -499,40 +499,11 @@ mod tests {
         let (dag_store, _, _, chain_selector) = setup_test_env().await;
 
         // Create genesis block
-        let genesis = Block {
-            header: BlockHeader {
-                version: 1,
-                block_hash: Hash::new([0xFF; 32]),
-                selected_parent_hash: Hash::default(),
-                merge_parent_hashes: vec![],
-                timestamp: 0,
-                height: 0,
-                blue_score: 1,
-                blue_work: 1,
-                pruning_point: Hash::default(),
-                proposer_pubkey: PublicKey::new([0; 32]),
-                vrf_reveal: VrfProof {
-                    proof: vec![],
-                    output: Hash::default(),
-                },
-                base_fee_per_gas: 0,
-                gas_used: 0,
-                gas_limit: 30_000_000,
-            },
-            state_root: Hash::default(),
-            tx_root: Hash::default(),
-            receipt_root: Hash::default(),
-            artifact_root: Hash::default(),
-            ghostdag_params: GhostDagParams::default(),
-            transactions: vec![],
-            signature: Signature::new([0; 64]),
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        };
+        let genesis = BlockBuilder::new()
+            .hash(Hash::new([0xFF; 32]))
+            .blue_score(1)
+            .blue_work(1)
+            .build_unhashed();
 
         dag_store.store_block(genesis.clone()).await.unwrap();
 

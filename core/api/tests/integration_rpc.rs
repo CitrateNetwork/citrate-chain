@@ -8,46 +8,20 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use citrate_consensus::types::{
-    Block, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_execution::types::{AccessPolicy, ModelId, ModelMetadata, ModelState};
 use citrate_execution::types::{Address, TransactionReceipt};
 
 fn make_block(height: u64, parent: Hash) -> Block {
-    Block {
-        header: BlockHeader {
-            version: 1,
-            block_hash: Hash::new([height as u8; 32]),
-            selected_parent_hash: parent,
-            merge_parent_hashes: vec![],
-            timestamp: 1_000_000 + height,
-            height,
-            blue_score: height,
-            blue_work: height as u128,
-            pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new([0; 32]),
-            vrf_reveal: VrfProof {
-                proof: vec![],
-                output: Hash::default(),
-            },
-            base_fee_per_gas: 0,
-            gas_used: 0,
-            gas_limit: 30_000_000,
-        },
-        state_root: Hash::default(),
-        tx_root: Hash::default(),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0; 64]),
-        embedded_models: vec![],
-        required_pins: vec![],
-        learning_embedding: None,
-        learning_confidence: None,
-        gradient_commitment: None,
-            learning_root: Hash::default(),
-    }
+    BlockBuilder::new()
+        .hash(Hash::new([height as u8; 32]))
+        .parent(parent)
+        .height(height)
+        .timestamp(1_000_000 + height)
+        .blue_score(height)
+        .blue_work(height as u128)
+        .build_unhashed()
 }
 
 #[tokio::test]

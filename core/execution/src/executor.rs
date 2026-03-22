@@ -2194,7 +2194,7 @@ impl Executor {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use citrate_consensus::types::{BlockHeader, PublicKey, Signature, VrfProof};
+    use citrate_consensus::types::{BlockBuilder, BlockHeader, PublicKey, Signature, VrfProof};
     use parking_lot::Mutex;
     use serde_json::json;
     use sha3::{Digest, Keccak256};
@@ -2283,40 +2283,10 @@ mod tests {
     }
 
     fn create_test_block() -> Block {
-        Block {
-            header: BlockHeader {
-                version: 1,
-                block_hash: Hash::default(),
-                selected_parent_hash: Hash::default(),
-                merge_parent_hashes: vec![],
-                timestamp: 1000000,
-                height: 100,
-                blue_score: 0,
-                blue_work: 0,
-                pruning_point: Hash::default(),
-                proposer_pubkey: PublicKey::new([0; 32]),
-                vrf_reveal: VrfProof {
-                    proof: vec![],
-                    output: Hash::default(),
-                },
-                base_fee_per_gas: 0,
-                gas_used: 0,
-                gas_limit: 30_000_000,
-            },
-            state_root: Hash::default(),
-            tx_root: Hash::default(),
-            receipt_root: Hash::default(),
-            artifact_root: Hash::default(),
-            ghostdag_params: Default::default(),
-            transactions: vec![],
-            signature: Signature::new([0; 64]),
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        }
+        BlockBuilder::new()
+            .height(100)
+            .timestamp(1000000)
+            .build_unhashed()
     }
 
     fn create_test_tx(

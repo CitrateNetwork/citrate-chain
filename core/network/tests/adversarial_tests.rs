@@ -4,7 +4,7 @@
 // invalid messages, eclipse attacks, and gossip protocol abuse.
 
 use citrate_consensus::types::{
-    Block, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_network::{
     gossip::{GossipConfig, GossipProtocol},
@@ -38,40 +38,10 @@ fn make_peer(
 
 /// Build a minimal genesis block (selected_parent == Hash::default(), no merge parents).
 fn make_genesis_block() -> Block {
-    let mut block = Block {
-        header: BlockHeader {
-            version: 1,
-            block_hash: Hash::default(),
-            selected_parent_hash: Hash::default(),
-            merge_parent_hashes: vec![],
-            timestamp: current_timestamp(),
-            height: 0,
-            blue_score: 0,
-            blue_work: 0,
-            pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new([0; 32]),
-            vrf_reveal: VrfProof {
-                proof: vec![],
-                output: Hash::default(),
-            },
-            base_fee_per_gas: 0,
-            gas_used: 0,
-            gas_limit: 30_000_000,
-        },
-        state_root: Hash::default(),
-        tx_root: compute_tx_root(&[]),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0; 64]),
-        embedded_models: vec![],
-        required_pins: vec![],
-        learning_embedding: None,
-        learning_confidence: None,
-        gradient_commitment: None,
-            learning_root: Hash::default(),
-    };
+    let mut block = BlockBuilder::new()
+        .timestamp(current_timestamp())
+        .tx_root(compute_tx_root(&[]))
+        .build_unhashed();
     block.header.block_hash = block.compute_hash();
     block
 }
@@ -80,40 +50,19 @@ fn make_genesis_block() -> Block {
 /// pass full validation (no real signature/VRF) but is useful for testing
 /// specific validation paths.
 fn make_non_genesis_block(height: u64, blue_score: u64, timestamp: u64) -> Block {
-    let mut block = Block {
-        header: BlockHeader {
-            version: 1,
-            block_hash: Hash::default(),
-            selected_parent_hash: Hash::new([1; 32]), // non-zero parent
-            merge_parent_hashes: vec![],
-            timestamp,
-            height,
-            blue_score,
-            blue_work: blue_score as u128,
-            pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new([2; 32]),
-            vrf_reveal: VrfProof {
-                proof: vec![1, 2, 3], // non-empty VRF
-                output: Hash::new([3; 32]),
-            },
-            base_fee_per_gas: 0,
-            gas_used: 0,
-            gas_limit: 30_000_000,
-        },
-        state_root: Hash::default(),
-        tx_root: compute_tx_root(&[]),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0; 64]),
-        embedded_models: vec![],
-        required_pins: vec![],
-        learning_embedding: None,
-        learning_confidence: None,
-        gradient_commitment: None,
-            learning_root: Hash::default(),
-    };
+    let mut block = BlockBuilder::new()
+        .parent(Hash::new([1; 32]))
+        .height(height)
+        .timestamp(timestamp)
+        .blue_score(blue_score)
+        .blue_work(blue_score as u128)
+        .proposer(PublicKey::new([2; 32]))
+        .vrf_reveal(VrfProof {
+            proof: vec![1, 2, 3],
+            output: Hash::new([3; 32]),
+        })
+        .tx_root(compute_tx_root(&[]))
+        .build_unhashed();
     block.header.block_hash = block.compute_hash();
     block
 }

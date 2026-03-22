@@ -246,7 +246,7 @@ impl BlockPropagation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use citrate_consensus::types::{GhostDagParams, PublicKey, Signature, VrfProof};
+    use citrate_consensus::types::{BlockBuilder, GhostDagParams, PublicKey, Signature, VrfProof};
 
     #[tokio::test]
     async fn test_block_propagation() {
@@ -254,40 +254,18 @@ mod tests {
         let propagation = BlockPropagation::new(peer_manager);
 
         // Create a test block
-        let block = Block {
-            header: BlockHeader {
-                version: 1,
-                block_hash: Hash::new([1; 32]),
-                selected_parent_hash: Hash::new([2; 32]),
-                merge_parent_hashes: vec![],
-                timestamp: 12345,
-                height: 100,
-                blue_score: 50,
-                blue_work: 1000,
-                pruning_point: Hash::new([0; 32]),
-                proposer_pubkey: PublicKey::new([0; 32]),
-                vrf_reveal: VrfProof {
-                    proof: vec![],
-                    output: Hash::new([0; 32]),
-                },
-                base_fee_per_gas: 0,
-                gas_used: 0,
-                gas_limit: 30_000_000,
-            },
-            state_root: Hash::new([3; 32]),
-            tx_root: Hash::new([4; 32]),
-            receipt_root: Hash::new([5; 32]),
-            artifact_root: Hash::new([6; 32]),
-            ghostdag_params: GhostDagParams::default(),
-            transactions: vec![],
-            signature: Signature::new([0; 64]),
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        };
+        let block = BlockBuilder::new()
+            .hash(Hash::new([1; 32]))
+            .parent(Hash::new([2; 32]))
+            .timestamp(12345)
+            .height(100)
+            .blue_score(50)
+            .blue_work(1000)
+            .state_root(Hash::new([3; 32]))
+            .tx_root(Hash::new([4; 32]))
+            .receipt_root(Hash::new([5; 32]))
+            .artifact_root(Hash::new([6; 32]))
+            .build_unhashed();
 
         // Test broadcasting
         assert!(propagation.broadcast_block(block.clone()).await.is_ok());

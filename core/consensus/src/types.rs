@@ -555,6 +555,212 @@ pub struct ValidatorPinCheck {
     pub last_proof: Option<Vec<u8>>,
 }
 
+/// Builder for Block with sensible defaults.
+/// All optional fields default to zero/empty/default values.
+/// Required: at minimum, `height` should be set for non-default blocks.
+///
+/// # Examples
+///
+/// ```
+/// use citrate_consensus::types::{BlockBuilder, Hash};
+///
+/// // Simple test block
+/// let block = BlockBuilder::new().height(1).build();
+///
+/// // Production block with specific fields
+/// let block = BlockBuilder::new()
+///     .parent(Hash::new([1; 32]))
+///     .height(5)
+///     .timestamp(1234567890)
+///     .build();
+///
+/// // Test block without hash computation
+/// let block = BlockBuilder::new().height(1).build_unhashed();
+/// ```
+pub struct BlockBuilder {
+    block: Block,
+}
+
+impl BlockBuilder {
+    /// Create a new builder with all defaults (zero hashes, empty vecs, etc.)
+    pub fn new() -> Self {
+        Self {
+            block: Block {
+                header: BlockHeader {
+                    version: 1,
+                    block_hash: Hash::default(),
+                    selected_parent_hash: Hash::default(),
+                    merge_parent_hashes: vec![],
+                    timestamp: 0,
+                    height: 0,
+                    blue_score: 0,
+                    blue_work: 0,
+                    pruning_point: Hash::default(),
+                    proposer_pubkey: PublicKey::default(),
+                    vrf_reveal: VrfProof {
+                        proof: vec![],
+                        output: Hash::default(),
+                    },
+                    base_fee_per_gas: 0,
+                    gas_used: 0,
+                    gas_limit: 30_000_000,
+                },
+                state_root: Hash::default(),
+                tx_root: Hash::default(),
+                receipt_root: Hash::default(),
+                artifact_root: Hash::default(),
+                ghostdag_params: GhostDagParams::default(),
+                transactions: vec![],
+                signature: Signature::default(),
+                embedded_models: vec![],
+                required_pins: vec![],
+                learning_embedding: None,
+                learning_confidence: None,
+                gradient_commitment: None,
+                learning_root: Hash::default(),
+            },
+        }
+    }
+
+    // --- Header field setters ---
+
+    pub fn hash(mut self, hash: Hash) -> Self {
+        self.block.header.block_hash = hash;
+        self
+    }
+    pub fn parent(mut self, hash: Hash) -> Self {
+        self.block.header.selected_parent_hash = hash;
+        self
+    }
+    pub fn merge_parents(mut self, hashes: Vec<Hash>) -> Self {
+        self.block.header.merge_parent_hashes = hashes;
+        self
+    }
+    pub fn height(mut self, h: u64) -> Self {
+        self.block.header.height = h;
+        self
+    }
+    pub fn timestamp(mut self, ts: u64) -> Self {
+        self.block.header.timestamp = ts;
+        self
+    }
+    pub fn blue_score(mut self, score: u64) -> Self {
+        self.block.header.blue_score = score;
+        self
+    }
+    pub fn blue_work(mut self, work: u128) -> Self {
+        self.block.header.blue_work = work;
+        self
+    }
+    pub fn pruning_point(mut self, hash: Hash) -> Self {
+        self.block.header.pruning_point = hash;
+        self
+    }
+    pub fn proposer(mut self, pubkey: PublicKey) -> Self {
+        self.block.header.proposer_pubkey = pubkey;
+        self
+    }
+    pub fn vrf_reveal(mut self, proof: VrfProof) -> Self {
+        self.block.header.vrf_reveal = proof;
+        self
+    }
+    pub fn base_fee_per_gas(mut self, fee: u64) -> Self {
+        self.block.header.base_fee_per_gas = fee;
+        self
+    }
+    pub fn gas_used(mut self, gas: u64) -> Self {
+        self.block.header.gas_used = gas;
+        self
+    }
+    pub fn gas_limit(mut self, limit: u64) -> Self {
+        self.block.header.gas_limit = limit;
+        self
+    }
+    pub fn version(mut self, v: u32) -> Self {
+        self.block.header.version = v;
+        self
+    }
+
+    /// Set the full header at once (useful when header is pre-built)
+    pub fn header(mut self, header: BlockHeader) -> Self {
+        self.block.header = header;
+        self
+    }
+
+    // --- Body field setters ---
+
+    pub fn state_root(mut self, root: Hash) -> Self {
+        self.block.state_root = root;
+        self
+    }
+    pub fn tx_root(mut self, root: Hash) -> Self {
+        self.block.tx_root = root;
+        self
+    }
+    pub fn receipt_root(mut self, root: Hash) -> Self {
+        self.block.receipt_root = root;
+        self
+    }
+    pub fn artifact_root(mut self, root: Hash) -> Self {
+        self.block.artifact_root = root;
+        self
+    }
+    pub fn ghostdag_params(mut self, params: GhostDagParams) -> Self {
+        self.block.ghostdag_params = params;
+        self
+    }
+    pub fn transactions(mut self, txs: Vec<Transaction>) -> Self {
+        self.block.transactions = txs;
+        self
+    }
+    pub fn signature(mut self, sig: Signature) -> Self {
+        self.block.signature = sig;
+        self
+    }
+    pub fn embedded_models(mut self, models: Vec<EmbeddedModel>) -> Self {
+        self.block.embedded_models = models;
+        self
+    }
+    pub fn required_pins(mut self, pins: Vec<RequiredModel>) -> Self {
+        self.block.required_pins = pins;
+        self
+    }
+    pub fn learning_embedding(mut self, emb: Option<Vec<f32>>) -> Self {
+        self.block.learning_embedding = emb;
+        self
+    }
+    pub fn learning_confidence(mut self, conf: Option<Vec<f32>>) -> Self {
+        self.block.learning_confidence = conf;
+        self
+    }
+    pub fn gradient_commitment(mut self, commitment: Option<[u8; 32]>) -> Self {
+        self.block.gradient_commitment = commitment;
+        self
+    }
+    pub fn learning_root(mut self, root: Hash) -> Self {
+        self.block.learning_root = root;
+        self
+    }
+
+    /// Build the block. Computes block_hash from contents.
+    pub fn build(mut self) -> Block {
+        self.block.header.block_hash = self.block.compute_hash();
+        self.block
+    }
+
+    /// Build without computing hash (for tests that set hash manually or
+    /// for intermediate blocks where hash will be set later).
+    pub fn build_unhashed(self) -> Block {
+        self.block
+    }
+}
+
+impl Default for BlockBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Blue set information for a block
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlueSet {
@@ -667,40 +873,7 @@ mod tests {
     }
 
     fn create_test_block() -> Block {
-        Block {
-            header: BlockHeader {
-                version: 1,
-                block_hash: Hash::new([0; 32]),
-                selected_parent_hash: Hash::default(),
-                merge_parent_hashes: vec![],
-                timestamp: 0,
-                height: 0,
-                blue_score: 0,
-                blue_work: 0,
-                pruning_point: Hash::default(),
-                proposer_pubkey: PublicKey::new([0; 32]),
-                vrf_reveal: VrfProof {
-                    proof: vec![],
-                    output: Hash::default(),
-                },
-                base_fee_per_gas: 0,
-                gas_used: 0,
-                gas_limit: 30_000_000,
-            },
-            state_root: Hash::default(),
-            tx_root: Hash::default(),
-            receipt_root: Hash::default(),
-            artifact_root: Hash::default(),
-            ghostdag_params: GhostDagParams::default(),
-            transactions: vec![],
-            signature: Signature::new([0; 64]),
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        }
+        BlockBuilder::new().build_unhashed()
     }
 
     // PC-T16a: Block without learning fields round-trips via JSON
@@ -788,5 +961,131 @@ mod tests {
         let deserialized: Block = serde_json::from_str(&json_str).unwrap();
         // Should default to zero hash
         assert_eq!(deserialized.learning_root, Hash::default());
+    }
+
+    // LC.2.0: BlockBuilder tests
+
+    #[test]
+    fn test_block_builder_defaults() {
+        let block = BlockBuilder::new().build_unhashed();
+        assert_eq!(block.header.version, 1);
+        assert_eq!(block.header.height, 0);
+        assert_eq!(block.header.timestamp, 0);
+        assert_eq!(block.header.blue_score, 0);
+        assert_eq!(block.header.blue_work, 0);
+        assert_eq!(block.header.block_hash, Hash::default());
+        assert_eq!(block.header.selected_parent_hash, Hash::default());
+        assert!(block.header.merge_parent_hashes.is_empty());
+        assert_eq!(block.header.gas_limit, 30_000_000);
+        assert_eq!(block.state_root, Hash::default());
+        assert_eq!(block.tx_root, Hash::default());
+        assert_eq!(block.receipt_root, Hash::default());
+        assert_eq!(block.artifact_root, Hash::default());
+        assert!(block.transactions.is_empty());
+        assert!(block.embedded_models.is_empty());
+        assert!(block.required_pins.is_empty());
+        assert!(block.learning_embedding.is_none());
+        assert!(block.learning_confidence.is_none());
+        assert!(block.gradient_commitment.is_none());
+        assert_eq!(block.learning_root, Hash::default());
+    }
+
+    #[test]
+    fn test_block_builder_sets_fields() {
+        let parent = Hash::new([1; 32]);
+        let merge = vec![Hash::new([2; 32]), Hash::new([3; 32])];
+        let state = Hash::new([4; 32]);
+        let proposer = PublicKey::new([5; 32]);
+
+        let block = BlockBuilder::new()
+            .parent(parent)
+            .merge_parents(merge.clone())
+            .height(42)
+            .timestamp(99999)
+            .blue_score(10)
+            .blue_work(500)
+            .state_root(state)
+            .proposer(proposer)
+            .base_fee_per_gas(1_000_000_000)
+            .gas_limit(15_000_000)
+            .version(2)
+            .build_unhashed();
+
+        assert_eq!(block.header.selected_parent_hash, parent);
+        assert_eq!(block.header.merge_parent_hashes, merge);
+        assert_eq!(block.header.height, 42);
+        assert_eq!(block.header.timestamp, 99999);
+        assert_eq!(block.header.blue_score, 10);
+        assert_eq!(block.header.blue_work, 500);
+        assert_eq!(block.state_root, state);
+        assert_eq!(block.header.proposer_pubkey, proposer);
+        assert_eq!(block.header.base_fee_per_gas, 1_000_000_000);
+        assert_eq!(block.header.gas_limit, 15_000_000);
+        assert_eq!(block.header.version, 2);
+    }
+
+    #[test]
+    fn test_block_builder_computes_hash() {
+        let block = BlockBuilder::new()
+            .height(5)
+            .timestamp(12345)
+            .build();
+
+        // build() should compute the hash
+        assert_ne!(block.header.block_hash, Hash::default());
+        // The hash should match compute_hash()
+        assert_eq!(block.header.block_hash, block.compute_hash());
+    }
+
+    #[test]
+    fn test_block_builder_build_unhashed() {
+        let block = BlockBuilder::new()
+            .height(5)
+            .timestamp(12345)
+            .build_unhashed();
+
+        // build_unhashed() should leave block_hash as default
+        assert_eq!(block.header.block_hash, Hash::default());
+    }
+
+    #[test]
+    fn test_block_builder_header_setter() {
+        let header = BlockHeader {
+            version: 3,
+            block_hash: Hash::new([0xAA; 32]),
+            selected_parent_hash: Hash::new([0xBB; 32]),
+            merge_parent_hashes: vec![],
+            timestamp: 55555,
+            height: 100,
+            blue_score: 50,
+            blue_work: 9999,
+            pruning_point: Hash::default(),
+            proposer_pubkey: PublicKey::new([7; 32]),
+            vrf_reveal: VrfProof {
+                proof: vec![1, 2, 3],
+                output: Hash::new([0xCC; 32]),
+            },
+            base_fee_per_gas: 2_000_000_000,
+            gas_used: 21000,
+            gas_limit: 15_000_000,
+        };
+
+        let block = BlockBuilder::new()
+            .header(header.clone())
+            .state_root(Hash::new([0xDD; 32]))
+            .build_unhashed();
+
+        assert_eq!(block.header.version, 3);
+        assert_eq!(block.header.height, 100);
+        assert_eq!(block.header.timestamp, 55555);
+        assert_eq!(block.state_root, Hash::new([0xDD; 32]));
+    }
+
+    #[test]
+    fn test_block_builder_default_trait() {
+        let builder = BlockBuilder::default();
+        let block = builder.build_unhashed();
+        assert_eq!(block.header.version, 1);
+        assert_eq!(block.header.height, 0);
     }
 }

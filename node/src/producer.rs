@@ -4,7 +4,7 @@ use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::tip_selection::TipSelector;
 use citrate_consensus::crypto::{self, Ed25519SigningKey};
 use citrate_consensus::types::{
-    Block, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_economics::{
     RewardCalculator, RewardConfig, UnifiedEconomicsManager,
@@ -566,37 +566,14 @@ impl BlockProducer {
         };
 
         // Calculate blue set for the new block
-        let temp_block = citrate_consensus::types::Block {
-            header: citrate_consensus::types::BlockHeader {
-                version: 1,
-                block_hash: Hash::default(),
-                selected_parent_hash: selected_parent,
-                merge_parent_hashes: merge_parents.clone(),
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                height: 0,     // Will be calculated
-                blue_score: 0, // Will be calculated
-                blue_work: 0,  // Will be calculated
-                pruning_point: Hash::default(),
-                proposer_pubkey: PublicKey::new(self.signing_key.verifying_key().to_bytes()),
-                vrf_reveal: generate_block_vrf(&self.signing_key, &PublicKey::new(self.signing_key.verifying_key().to_bytes()), &selected_parent, 0),
-                base_fee_per_gas: 1_000_000_000, // 1 gwei
-                gas_used: 0,
-                gas_limit: 30_000_000,
-            },
-            state_root: Hash::default(),
-            tx_root: Hash::default(),
-            receipt_root: Hash::default(),
-            artifact_root: Hash::default(),
-            ghostdag_params: citrate_consensus::types::GhostDagParams::default(),
-            transactions: vec![],
-            signature: Signature::new([0; 64]),
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        };
+        let temp_block = citrate_consensus::types::BlockBuilder::new()
+            .parent(selected_parent)
+            .merge_parents(merge_parents.clone())
+            .timestamp(chrono::Utc::now().timestamp() as u64)
+            .proposer(PublicKey::new(self.signing_key.verifying_key().to_bytes()))
+            .vrf_reveal(generate_block_vrf(&self.signing_key, &PublicKey::new(self.signing_key.verifying_key().to_bytes()), &selected_parent, 0))
+            .base_fee_per_gas(1_000_000_000)
+            .build_unhashed();
 
         let blue_set = self.ghostdag.calculate_blue_set(&temp_block).await?;
         let blue_score = self.ghostdag.calculate_blue_score(&temp_block).await?;
@@ -716,22 +693,14 @@ impl BlockProducer {
         } else {
             // Basic reward system — create a temporary block for reward calculation
             // (calculate_reward only reads header.height and transactions, not state_root)
-            let temp_block = Block {
-                header: header.clone(),
-                state_root: Hash::default(),
-                tx_root,
-                receipt_root,
-                artifact_root,
-                ghostdag_params: self.ghostdag.params().clone(),
-                transactions: transactions.clone(),
-                signature: Signature::default(),
-                embedded_models: vec![],
-                required_pins: vec![],
-                learning_embedding: None,
-                learning_confidence: None,
-                gradient_commitment: None,
-                learning_root: Hash::default(),
-            };
+            let temp_block = BlockBuilder::new()
+                .header(header.clone())
+                .tx_root(tx_root)
+                .receipt_root(receipt_root)
+                .artifact_root(artifact_root)
+                .ghostdag_params(self.ghostdag.params().clone())
+                .transactions(transactions.clone())
+                .build_unhashed();
             let reward = self.reward_calculator.calculate_reward(&temp_block);
             self.apply_basic_rewards(&reward, &validator_address);
         }
@@ -740,22 +709,15 @@ impl BlockProducer {
         let state_root = self.executor.calculate_state_root();
 
         // Create block with all computed data (hash + signature placeholders — computed next)
-        let mut block = Block {
-            header: header.clone(),
-            state_root,
-            tx_root,
-            receipt_root,
-            artifact_root,
-            ghostdag_params: self.ghostdag.params().clone(),
-            transactions,
-            signature: Signature::default(), // Placeholder — signed below
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        };
+        let mut block = BlockBuilder::new()
+            .header(header.clone())
+            .state_root(state_root)
+            .tx_root(tx_root)
+            .receipt_root(receipt_root)
+            .artifact_root(artifact_root)
+            .ghostdag_params(self.ghostdag.params().clone())
+            .transactions(transactions)
+            .build_unhashed();
 
         // WP-F.3: Compute learning_root at checkpoint boundaries.
         // Per StrobilationCheckpoint.tla: only checkpoint blocks get a learning_root.
@@ -924,22 +886,10 @@ impl BlockProducer {
         let mut receipts = Vec::new();
 
         // Create a temporary block for execution context
-        let temp_block = Block {
-            header: header.clone(),
-            state_root: Hash::default(),
-            tx_root: Hash::default(),
-            receipt_root: Hash::default(),
-            artifact_root: Hash::default(),
-            ghostdag_params: self.ghostdag.params().clone(),
-            transactions: vec![],
-            signature: Signature::new([0; 64]),
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        };
+        let temp_block = BlockBuilder::new()
+            .header(header.clone())
+            .ghostdag_params(self.ghostdag.params().clone())
+            .build_unhashed();
 
         // Execute each transaction
         for tx in transactions {

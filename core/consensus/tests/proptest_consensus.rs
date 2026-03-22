@@ -8,7 +8,7 @@ use proptest::prelude::*;
 use std::sync::Arc;
 
 use citrate_consensus::{
-    Block, BlockHeader, CheckpointConfig, GhostDagParams,
+    Block, BlockBuilder, BlockHeader, CheckpointConfig, GhostDagParams,
     Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_consensus::checkpoint::CommitteeSelector;
@@ -25,40 +25,19 @@ fn make_block(
     merge_parents: Vec<[u8; 32]>,
     vrf_proof_bytes: Vec<u8>,
 ) -> Block {
-    Block {
-        header: BlockHeader {
-            version: 1,
-            block_hash: Hash::new(hash_bytes),
-            selected_parent_hash: Hash::new(parent_bytes),
-            merge_parent_hashes: merge_parents.into_iter().map(Hash::new).collect(),
-            timestamp,
-            height,
-            blue_score,
-            blue_work: blue_score as u128,
-            pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new([0; 32]),
-            vrf_reveal: VrfProof {
-                proof: vrf_proof_bytes,
-                output: Hash::default(),
-            },
-            base_fee_per_gas: 0,
-            gas_used: 0,
-            gas_limit: 30_000_000,
-        },
-        state_root: Hash::default(),
-        tx_root: Hash::default(),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0; 64]),
-        embedded_models: vec![],
-        required_pins: vec![],
-        learning_embedding: None,
-        learning_confidence: None,
-        gradient_commitment: None,
-            learning_root: Hash::default(),
-    }
+    BlockBuilder::new()
+        .hash(Hash::new(hash_bytes))
+        .parent(Hash::new(parent_bytes))
+        .merge_parents(merge_parents.into_iter().map(Hash::new).collect())
+        .height(height)
+        .timestamp(timestamp)
+        .blue_score(blue_score)
+        .blue_work(blue_score as u128)
+        .vrf_reveal(VrfProof {
+            proof: vrf_proof_bytes,
+            output: Hash::default(),
+        })
+        .build_unhashed()
 }
 
 /// Helper: build a DAG-compatible block with proper consensus fields.
@@ -69,40 +48,14 @@ fn make_dag_block(
     height: u64,
     blue_score: u64,
 ) -> Block {
-    Block {
-        header: BlockHeader {
-            version: 1,
-            block_hash: Hash::new(hash_bytes),
-            selected_parent_hash: selected_parent,
-            merge_parent_hashes: merge_parents,
-            timestamp: height,
-            height,
-            blue_score,
-            blue_work: 0,
-            pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new([0; 32]),
-            vrf_reveal: VrfProof {
-                proof: vec![],
-                output: Hash::default(),
-            },
-            base_fee_per_gas: 0,
-            gas_used: 0,
-            gas_limit: 30_000_000,
-        },
-        state_root: Hash::default(),
-        tx_root: Hash::default(),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0; 64]),
-        embedded_models: vec![],
-        required_pins: vec![],
-        learning_embedding: None,
-        learning_confidence: None,
-        gradient_commitment: None,
-            learning_root: Hash::default(),
-    }
+    BlockBuilder::new()
+        .hash(Hash::new(hash_bytes))
+        .parent(selected_parent)
+        .merge_parents(merge_parents)
+        .height(height)
+        .timestamp(height)
+        .blue_score(blue_score)
+        .build_unhashed()
 }
 
 /// Helper: build a Transaction from raw fields.
