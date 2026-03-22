@@ -292,7 +292,7 @@ main() {
     echo ""
     echo "Next steps:"
     echo "  1. Read the documentation: https://docs.lattice.ai"
-    echo "  2. Join our Discord: https://discord.gg/citrate-ai"
+    echo "  2. Join our Discord: https://discord.gg/A3Uwe4BvdN"
     echo "  3. Start building with Citrate!"
 }
 

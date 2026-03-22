@@ -355,7 +355,7 @@ The benchmark is a compiled Rust binary using tokio + reqwest with HTTP connecti
 
 - **GitHub**: [github.com/SaulBuilds/citrate](https://github.com/SaulBuilds/citrate)
 - **Issues**: [github.com/SaulBuilds/citrate/issues](https://github.com/SaulBuilds/citrate/issues)
-- **Discord**: [discord.gg/citrate](https://discord.gg/citrate)
+- **Discord**: [discord.gg/A3Uwe4BvdN](https://discord.gg/A3Uwe4BvdN)
 
 ## License
 
