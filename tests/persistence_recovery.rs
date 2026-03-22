@@ -18,31 +18,17 @@ fn create_test_block(num: u8, height: u64) -> Block {
     hash_bytes[0] = num;
     hash_bytes[1] = (height & 0xFF) as u8;
 
-    Block {
-        header: BlockHeader {
-            version: 1,
-            block_hash: Hash::new(hash_bytes),
-            selected_parent_hash: Hash::default(),
-            merge_parent_hashes: vec![],
-            timestamp: 1000000 + height * 10,
-            height,
-            blue_score: height * 10,
-            blue_work: (height as u128) * 1000,
-            pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new([0u8; 32]),
-            vrf_reveal: VrfProof {
-                proof: vec![0u8; 80],
-                output: Hash::default(),
-            },
-        },
-        state_root: Hash::default(),
-        tx_root: Hash::default(),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0u8; 64]),
-    }
+    BlockBuilder::new()
+        .hash(Hash::new(hash_bytes))
+        .height(height)
+        .timestamp(1000000 + height * 10)
+        .blue_score(height * 10)
+        .blue_work((height as u128) * 1000)
+        .vrf_reveal(VrfProof {
+            proof: vec![0u8; 80],
+            output: Hash::default(),
+        })
+        .build_unhashed()
 }
 
 #[cfg(test)]

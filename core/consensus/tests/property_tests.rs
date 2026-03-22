@@ -26,40 +26,20 @@ fn create_block_with_params(
     hash_bytes[0] = block_id;
     hash_bytes[1] = (height & 0xFF) as u8;
 
-    Block {
-        header: BlockHeader {
-            version: 1,
-            block_hash: Hash::new(hash_bytes),
-            selected_parent_hash: selected_parent.unwrap_or_default(),
-            merge_parent_hashes: merge_parents,
-            timestamp: 1000000 + height * 10,
-            height,
-            blue_score,
-            blue_work: blue_score as u128 * 100,
-            pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new([block_id; 32]),
-            vrf_reveal: VrfProof {
-                proof: vec![0u8; 80],
-                output: Hash::default(),
-            },
-            base_fee_per_gas: 0,
-            gas_used: 0,
-            gas_limit: 30_000_000,
-        },
-        state_root: Hash::default(),
-        tx_root: Hash::default(),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0u8; 64]),
-        embedded_models: vec![],
-        required_pins: vec![],
-        learning_embedding: None,
-        learning_confidence: None,
-        gradient_commitment: None,
-            learning_root: Hash::default(),
-    }
+    BlockBuilder::new()
+        .hash(Hash::new(hash_bytes))
+        .parent(selected_parent.unwrap_or_default())
+        .merge_parents(merge_parents)
+        .height(height)
+        .timestamp(1000000 + height * 10)
+        .blue_score(blue_score)
+        .blue_work(blue_score as u128 * 100)
+        .proposer(PublicKey::new([block_id; 32]))
+        .vrf_reveal(VrfProof {
+            proof: vec![0u8; 80],
+            output: Hash::default(),
+        })
+        .build_unhashed()
 }
 
 /// Simple test block without merge parents
@@ -525,40 +505,19 @@ mod edge_cases {
             let mut hash_bytes = [0x01u8; 32];
             hash_bytes[31] = i; // Only differ in last byte
 
-            let block = Block {
-                header: BlockHeader {
-                    version: 1,
-                    block_hash: Hash::new(hash_bytes),
-                    selected_parent_hash: genesis.hash(),
-                    merge_parent_hashes: vec![],
-                    timestamp: 1000000 + i as u64,
-                    height: 1,
-                    blue_score: 1,
-                    blue_work: 100,
-                    pruning_point: Hash::default(),
-                    proposer_pubkey: PublicKey::new([i; 32]),
-                    vrf_reveal: VrfProof {
-                        proof: vec![0u8; 80],
-                        output: Hash::default(),
-                    },
-                    base_fee_per_gas: 0,
-                    gas_used: 0,
-                    gas_limit: 30_000_000,
-                },
-                state_root: Hash::default(),
-                tx_root: Hash::default(),
-                receipt_root: Hash::default(),
-                artifact_root: Hash::default(),
-                ghostdag_params: GhostDagParams::default(),
-                transactions: vec![],
-                signature: Signature::new([0u8; 64]),
-                embedded_models: vec![],
-                required_pins: vec![],
-                learning_embedding: None,
-                learning_confidence: None,
-                gradient_commitment: None,
-            learning_root: Hash::default(),
-            };
+            let block = BlockBuilder::new()
+                .hash(Hash::new(hash_bytes))
+                .parent(genesis.hash())
+                .height(1)
+                .timestamp(1000000 + i as u64)
+                .blue_score(1)
+                .blue_work(100)
+                .proposer(PublicKey::new([i; 32]))
+                .vrf_reveal(VrfProof {
+                    proof: vec![0u8; 80],
+                    output: Hash::default(),
+                })
+                .build_unhashed();
             dag_store.store_block(block.clone()).await.unwrap();
             children.push(block.hash());
         }

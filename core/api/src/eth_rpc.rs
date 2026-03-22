@@ -892,40 +892,9 @@ pub fn register_eth_methods(
         };
 
         // Build a lightweight block context
-        let blk = Block {
-            header: BlockHeader {
-                version: 1,
-                block_hash: citrate_consensus::types::Hash::default(),
-                selected_parent_hash: citrate_consensus::types::Hash::default(),
-                merge_parent_hashes: vec![],
-                timestamp: 0,
-                height: 0,
-                blue_score: 0,
-                blue_work: 0,
-                pruning_point: citrate_consensus::types::Hash::default(),
-                proposer_pubkey: PublicKey::new([0u8; 32]),
-                vrf_reveal: VrfProof {
-                    proof: vec![],
-                    output: citrate_consensus::types::Hash::default(),
-                },
-                base_fee_per_gas: 1_000_000_000, // 1 gwei
-                gas_used: 0,
-                gas_limit: 30_000_000,
-            },
-            state_root: citrate_consensus::types::Hash::default(),
-            tx_root: citrate_consensus::types::Hash::default(),
-            receipt_root: citrate_consensus::types::Hash::default(),
-            artifact_root: citrate_consensus::types::Hash::default(),
-            ghostdag_params: Default::default(),
-            transactions: vec![],
-            signature: Signature::new([0u8; 64]),
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        };
+        let blk = citrate_consensus::types::BlockBuilder::new()
+            .base_fee_per_gas(1_000_000_000)
+            .build_unhashed();
 
         // For eth_call, use the sender's current nonce so execution doesn't fail
         // on nonce validation (both in executor and REVM).
@@ -1076,43 +1045,13 @@ pub fn register_eth_methods(
         }
 
         // Build a lightweight block context for execution
-        let blk = Block {
-            header: BlockHeader {
-                version: 1,
-                block_hash: citrate_consensus::types::Hash::default(),
-                selected_parent_hash: citrate_consensus::types::Hash::default(),
-                merge_parent_hashes: vec![],
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                height: 0,
-                blue_score: 0,
-                blue_work: 0,
-                pruning_point: citrate_consensus::types::Hash::default(),
-                proposer_pubkey: PublicKey::new([0u8; 32]),
-                vrf_reveal: VrfProof {
-                    proof: vec![],
-                    output: citrate_consensus::types::Hash::default(),
-                },
-                base_fee_per_gas: 1_000_000_000, // 1 gwei
-                gas_used: 0,
-                gas_limit: 30_000_000,
-            },
-            state_root: citrate_consensus::types::Hash::default(),
-            tx_root: citrate_consensus::types::Hash::default(),
-            receipt_root: citrate_consensus::types::Hash::default(),
-            artifact_root: citrate_consensus::types::Hash::default(),
-            ghostdag_params: Default::default(),
-            transactions: vec![],
-            signature: Signature::new([0u8; 64]),
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        };
+        let blk = citrate_consensus::types::BlockBuilder::new()
+            .timestamp(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0))
+            .base_fee_per_gas(1_000_000_000)
+            .build_unhashed();
 
         // For gas estimation, use sender's current nonce to pass nonce validation
         let sender_addr = citrate_execution::address_utils::normalize_address(&from_pk);

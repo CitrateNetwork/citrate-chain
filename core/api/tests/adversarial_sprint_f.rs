@@ -13,7 +13,7 @@
 use citrate_api::FilterRegistry;
 use citrate_consensus::crypto::verify_transaction;
 use citrate_consensus::types::{
-    Block, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_execution::executor::Executor;
 use citrate_execution::types::Address;
@@ -52,37 +52,9 @@ fn test_mempool_no_sig() -> Arc<Mempool> {
 }
 
 fn make_genesis_block() -> Block {
-    Block {
-        header: BlockHeader {
-            version: 1,
-            block_hash: Hash::new([0; 32]),
-            selected_parent_hash: Hash::default(),
-            merge_parent_hashes: vec![],
-            timestamp: 1_000_000,
-            height: 0,
-            blue_score: 0,
-            blue_work: 0,
-            pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new([0; 32]),
-            vrf_reveal: VrfProof { proof: vec![], output: Hash::default() },
-            base_fee_per_gas: 0,
-            gas_used: 0,
-            gas_limit: 30_000_000,
-        },
-        state_root: Hash::default(),
-        tx_root: Hash::default(),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0; 64]),
-        embedded_models: vec![],
-        required_pins: vec![],
-        learning_embedding: None,
-        learning_confidence: None,
-        gradient_commitment: None,
-            learning_root: Hash::default(),
-    }
+    BlockBuilder::new()
+        .timestamp(1_000_000)
+        .build_unhashed()
 }
 
 // ===========================================================================

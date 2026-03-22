@@ -56,40 +56,18 @@ fuzz_target!(|data: &[u8]| {
         vec![]
     };
 
-    let block = Block {
-        header: BlockHeader {
-            version,
-            block_hash: Hash::new(block_hash_bytes),
-            selected_parent_hash: Hash::new(parent_hash_bytes),
-            merge_parent_hashes: vec![],
-            timestamp,
-            height,
-            blue_score,
-            blue_work: 0,
-            pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new([0; 32]),
-            vrf_reveal: VrfProof {
-                proof: vrf_proof_bytes,
-                output: Hash::default(),
-            },
-            base_fee_per_gas: 0,
-            gas_used: 0,
-            gas_limit: 30_000_000,
-        },
-        state_root: Hash::default(),
-        tx_root: Hash::default(),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0; 64]),
-        embedded_models: vec![],
-        required_pins: vec![],
-        learning_embedding: None,
-        learning_confidence: None,
-        gradient_commitment: None,
-            learning_root: Hash::default(),
-    };
+    let block = BlockBuilder::new()
+        .version(version)
+        .hash(Hash::new(block_hash_bytes))
+        .parent(Hash::new(parent_hash_bytes))
+        .timestamp(timestamp)
+        .height(height)
+        .blue_score(blue_score)
+        .vrf_reveal(VrfProof {
+            proof: vrf_proof_bytes,
+            output: Hash::default(),
+        })
+        .build_unhashed();
 
     // Replicate gossip validation checks (the method is private on GossipProtocol,
     // so we exercise the same logic inline).

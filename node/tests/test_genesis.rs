@@ -4,7 +4,7 @@
 // The genesis block creation uses feature-gated model embedding (embed-genesis-model).
 // When the feature is disabled, embedded models will be empty (contributor builds).
 
-use citrate_consensus::types::{Block, GhostDagParams, Hash, PublicKey, Signature, VrfProof};
+use citrate_consensus::types::{Block, BlockBuilder, GhostDagParams, Hash, PublicKey, Signature, VrfProof};
 
 /// Create a minimal test genesis block for unit tests
 /// This doesn't include embedded models - those are feature-gated in production code
@@ -31,22 +31,9 @@ fn create_test_genesis_block() -> Block {
         gas_limit: 30_000_000,
     };
 
-    Block {
-        header,
-        state_root: Hash::default(),
-        tx_root: Hash::default(),
-        receipt_root: Hash::default(),
-        artifact_root: Hash::default(),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::new([0; 64]),
-        embedded_models: vec![],
-        required_pins: vec![],
-        learning_embedding: None,
-        learning_confidence: None,
-        gradient_commitment: None,
-            learning_root: Hash::default(),
-    }
+    BlockBuilder::new()
+        .header(header)
+        .build_unhashed()
 }
 
 #[test]

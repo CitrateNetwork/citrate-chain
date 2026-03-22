@@ -37,37 +37,9 @@ fuzz_target!(|data: &[u8]| {
 
         // Genesis block
         let genesis_hash_bytes = [0xFFu8; 32];
-        let genesis = Block {
-            header: BlockHeader {
-                version: 1,
-                block_hash: Hash::new(genesis_hash_bytes),
-                selected_parent_hash: Hash::default(),
-                merge_parent_hashes: vec![],
-                timestamp: 0,
-                height: 0,
-                blue_score: 0,
-                blue_work: 0,
-                pruning_point: Hash::default(),
-                proposer_pubkey: PublicKey::new([0; 32]),
-                vrf_reveal: VrfProof { proof: vec![], output: Hash::default() },
-                base_fee_per_gas: 0,
-                gas_used: 0,
-                gas_limit: 30_000_000,
-            },
-            state_root: Hash::default(),
-            tx_root: Hash::default(),
-            receipt_root: Hash::default(),
-            artifact_root: Hash::default(),
-            ghostdag_params: GhostDagParams::default(),
-            transactions: vec![],
-            signature: Signature::new([0; 64]),
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        };
+        let genesis = BlockBuilder::new()
+            .hash(Hash::new(genesis_hash_bytes))
+            .build_unhashed();
 
         let _ = dag_store.store_block(genesis.clone()).await;
         let _ = ghostdag.add_block(&genesis).await;
@@ -85,37 +57,12 @@ fuzz_target!(|data: &[u8]| {
             hash_bytes[0] = (i as u8).wrapping_add(1);
 
             let parent = block_hashes[parent_idx];
-            let block = Block {
-                header: BlockHeader {
-                    version: 1,
-                    block_hash: Hash::new(hash_bytes),
-                    selected_parent_hash: parent,
-                    merge_parent_hashes: vec![],
-                    timestamp: (i + 1) as u64,
-                    height: (i + 1) as u64,
-                    blue_score: 0,
-                    blue_work: 0,
-                    pruning_point: Hash::default(),
-                    proposer_pubkey: PublicKey::new([0; 32]),
-                    vrf_reveal: VrfProof { proof: vec![], output: Hash::default() },
-                    base_fee_per_gas: 0,
-                    gas_used: 0,
-                    gas_limit: 30_000_000,
-                },
-                state_root: Hash::default(),
-                tx_root: Hash::default(),
-                receipt_root: Hash::default(),
-                artifact_root: Hash::default(),
-                ghostdag_params: GhostDagParams::default(),
-                transactions: vec![],
-                signature: Signature::new([0; 64]),
-                embedded_models: vec![],
-                required_pins: vec![],
-                learning_embedding: None,
-                learning_confidence: None,
-                gradient_commitment: None,
-            learning_root: Hash::default(),
-            };
+            let block = BlockBuilder::new()
+                .hash(Hash::new(hash_bytes))
+                .parent(parent)
+                .timestamp((i + 1) as u64)
+                .height((i + 1) as u64)
+                .build_unhashed();
 
             let _ = dag_store.store_block(block.clone()).await;
             let _ = ghostdag.add_block(&block).await;

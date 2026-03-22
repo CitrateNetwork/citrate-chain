@@ -271,47 +271,21 @@ mod tests {
 
         // Seed blocks at heights 0..=4
         use citrate_consensus::types::{
-            Block, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, VrfProof,
+            Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, VrfProof,
         };
         for h in 0..=4u64 {
-            let block = Block {
-                header: BlockHeader {
-                    version: 1,
-                    block_hash: Hash::new([h as u8; 32]),
-                    selected_parent_hash: if h == 0 {
-                        Hash::default()
-                    } else {
-                        Hash::new([(h - 1) as u8; 32])
-                    },
-                    merge_parent_hashes: vec![],
-                    timestamp: h,
-                    height: h,
-                    blue_score: h,
-                    blue_work: h as u128,
-                    pruning_point: Hash::default(),
-                    proposer_pubkey: PublicKey::new([0; 32]),
-                    vrf_reveal: VrfProof {
-                        proof: vec![],
-                        output: Hash::default(),
-                    },
-                    base_fee_per_gas: 0,
-                    gas_used: 0,
-                    gas_limit: 30_000_000,
-                },
-                state_root: Hash::default(),
-                tx_root: Hash::default(),
-                receipt_root: Hash::default(),
-                artifact_root: Hash::default(),
-                ghostdag_params: GhostDagParams::default(),
-                transactions: vec![],
-                signature: Signature::new([0; 64]),
-                embedded_models: vec![],
-                required_pins: vec![],
-                learning_embedding: None,
-                learning_confidence: None,
-                gradient_commitment: None,
-            learning_root: Hash::default(),
-            };
+            let block = BlockBuilder::new()
+                .hash(Hash::new([h as u8; 32]))
+                .parent(if h == 0 {
+                    Hash::default()
+                } else {
+                    Hash::new([(h - 1) as u8; 32])
+                })
+                .height(h)
+                .timestamp(h)
+                .blue_score(h)
+                .blue_work(h as u128)
+                .build_unhashed();
             block_store.put_block(&block).unwrap();
         }
 

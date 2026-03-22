@@ -2,7 +2,7 @@
 
 use crate::mempool::{Mempool, TxClass};
 use citrate_consensus::{
-    Block, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder as ConsensusBlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_execution::executor::Executor;
 use citrate_execution::parallel::ParallelExecutor;
@@ -183,22 +183,11 @@ impl BlockBuilder {
         };
 
         // Create preliminary block for execution context
-        let mut block = Block {
-            header,
-            state_root: Hash::default(),
-            tx_root: Hash::default(),
-            receipt_root: Hash::default(),
-            artifact_root: Hash::default(),
-            ghostdag_params: GhostDagParams::default(),
-            transactions: transactions.clone(),
-            signature: Signature::new([1; 64]), // Placeholder signature
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        };
+        let mut block = ConsensusBlockBuilder::new()
+            .header(header)
+            .transactions(transactions.clone())
+            .signature(Signature::new([1; 64]))
+            .build_unhashed();
 
         // Execute transactions and collect receipts
         let (executed_txs, receipts) = self.execute_transactions(&block, transactions).await?;
@@ -562,22 +551,14 @@ impl BlockBuilder {
         let state_root = self.calculate_state_root_legacy(&transactions);
         let receipt_root = self.calculate_receipt_root_legacy(&transactions);
 
-        let mut block = Block {
-            header,
-            state_root,
-            tx_root,
-            receipt_root,
-            artifact_root: Hash::default(),
-            ghostdag_params: GhostDagParams::default(),
-            transactions,
-            signature: Signature::new([1; 64]),
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        };
+        let mut block = ConsensusBlockBuilder::new()
+            .header(header)
+            .state_root(state_root)
+            .tx_root(tx_root)
+            .receipt_root(receipt_root)
+            .transactions(transactions)
+            .signature(Signature::new([1; 64]))
+            .build_unhashed();
 
         block.header.block_hash = self.calculate_block_hash(&block);
         Ok(block)
@@ -871,40 +852,12 @@ mod tests {
     async fn test_block_validation() {
         let (builder, _) = setup_test_builder().await;
 
-        let mut block = Block {
-            header: BlockHeader {
-                version: 1,
-                block_hash: Hash::default(),
-                selected_parent_hash: Hash::default(),
-                merge_parent_hashes: vec![],
-                timestamp: 0,
-                height: 1,
-                blue_score: 1,
-                blue_work: 0,
-                pruning_point: Hash::default(),
-                proposer_pubkey: PublicKey::new([0; 32]),
-                vrf_reveal: VrfProof {
-                    proof: vec![],
-                    output: Hash::default(),
-                },
-                base_fee_per_gas: 1_000_000_000,
-                gas_used: 0,
-                gas_limit: 30_000_000,
-            },
-            state_root: Hash::default(),
-            tx_root: Hash::default(),
-            receipt_root: Hash::default(),
-            artifact_root: Hash::default(),
-            ghostdag_params: GhostDagParams::default(),
-            transactions: vec![],
-            signature: Signature::new([1; 64]), // Non-zero signature for tests
-            embedded_models: vec![],
-            required_pins: vec![],
-            learning_embedding: None,
-            learning_confidence: None,
-            gradient_commitment: None,
-            learning_root: Hash::default(),
-        };
+        let mut block = ConsensusBlockBuilder::new()
+            .height(1)
+            .blue_score(1)
+            .base_fee_per_gas(1_000_000_000)
+            .signature(Signature::new([1; 64]))
+            .build_unhashed();
 
         // Valid block
         assert!(builder.validate_block(&block).is_ok());

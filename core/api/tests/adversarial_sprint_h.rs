@@ -13,7 +13,7 @@
 
 use citrate_consensus::crypto::{self, Ed25519SigningKey};
 use citrate_consensus::types::{
-    Block, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_consensus::vrf::VrfProposerSelector;
 use citrate_network::noise::NoiseKeypair;
@@ -26,40 +26,23 @@ use sha3::{Digest, Sha3_256};
 
 fn make_signed_block(signing_key: &Ed25519SigningKey, height: u64) -> Block {
     let proposer_pubkey = PublicKey::new(signing_key.verifying_key().to_bytes());
-    let mut block = Block {
-        header: BlockHeader {
-            version: 1,
-            block_hash: Hash::default(),
-            selected_parent_hash: Hash::new([0xAA; 32]),
-            merge_parent_hashes: vec![],
-            timestamp: 1_000_000 + height,
-            height,
-            blue_score: height,
-            blue_work: height as u128 * 1_000_000,
-            pruning_point: Hash::default(),
-            proposer_pubkey,
-            vrf_reveal: VrfProof {
-                proof: vec![0xBB; 32],
-                output: Hash::new([0xCC; 32]),
-            },
-            base_fee_per_gas: 1_000_000_000,
-            gas_used: 0,
-            gas_limit: 30_000_000,
-        },
-        state_root: Hash::new([0x11; 32]),
-        tx_root: compute_tx_root(&[]),
-        receipt_root: Hash::new([0x33; 32]),
-        artifact_root: Hash::new([0x44; 32]),
-        ghostdag_params: GhostDagParams::default(),
-        transactions: vec![],
-        signature: Signature::default(),
-        embedded_models: vec![],
-        required_pins: vec![],
-        learning_embedding: None,
-        learning_confidence: None,
-        gradient_commitment: None,
-            learning_root: Hash::default(),
-    };
+    let mut block = BlockBuilder::new()
+        .parent(Hash::new([0xAA; 32]))
+        .height(height)
+        .timestamp(1_000_000 + height)
+        .blue_score(height)
+        .blue_work(height as u128 * 1_000_000)
+        .proposer(proposer_pubkey)
+        .vrf_reveal(VrfProof {
+            proof: vec![0xBB; 32],
+            output: Hash::new([0xCC; 32]),
+        })
+        .base_fee_per_gas(1_000_000_000)
+        .state_root(Hash::new([0x11; 32]))
+        .tx_root(compute_tx_root(&[]))
+        .receipt_root(Hash::new([0x33; 32]))
+        .artifact_root(Hash::new([0x44; 32]))
+        .build_unhashed();
     block.header.block_hash = block.compute_hash();
     block.signature = crypto::sign_block(&block.header.block_hash, signing_key);
     block
