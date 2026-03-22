@@ -500,10 +500,11 @@ impl Executor {
         // Create snapshot for potential rollback
         let snapshot = self.state_db.snapshot();
 
-        // Verify and increment nonce (C-04: enforce equality, don't blindly increment).
-        // Even though the mempool validates ordering, the executor is the last line of
-        // defense against out-of-order or replayed transactions.
-        self.state_db.accounts.check_and_increment_nonce(&from, tx.nonce)?;
+        // Verify nonce WITHOUT incrementing (C-04: enforce equality).
+        // The nonce must remain at N during execution so that revm computes
+        // correct CREATE addresses using keccak256(rlp([sender, N])).
+        // Increment happens AFTER execution completes (EVM-compliant ordering).
+        self.state_db.accounts.check_nonce(&from, tx.nonce)?;
 
         // Check balance for gas
         let gas_cost = U256::from(tx.gas_limit) * U256::from(tx.gas_price);
@@ -519,7 +520,7 @@ impl Executor {
         // Deduct gas cost upfront
         self.state_db.accounts.set_balance(from, balance - gas_cost);
 
-        // Parse and execute transaction type
+        // Parse and execute transaction type (nonce still at N for CREATE address derivation)
         let tx_type = self.parse_transaction_type(tx)?;
         let result = self
             .execute_transaction_type(tx_type, &mut context, from)
@@ -528,6 +529,8 @@ impl Executor {
         // Handle execution result
         let status = match result {
             Ok(()) => {
+                // Increment nonce AFTER successful execution
+                self.state_db.accounts.increment_nonce(&from);
                 // Refund unused gas
                 let refund = U256::from(tx.gas_limit - context.gas_used) * U256::from(tx.gas_price);
                 let balance = self.state_db.accounts.get_balance(&from);
@@ -536,11 +539,9 @@ impl Executor {
             }
             Err(e) => {
                 warn!("Transaction execution failed: {}", e);
-                // Rollback state changes but keep gas consumed
+                // Rollback state changes but keep gas consumed and nonce increment
                 self.state_db.restore(snapshot);
-                self.state_db
-                    .accounts
-                    .check_and_increment_nonce(&from, tx.nonce)?;
+                self.state_db.accounts.increment_nonce(&from);
                 self.state_db.accounts.set_balance(from, balance - gas_cost);
                 false
             }
