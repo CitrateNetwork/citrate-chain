@@ -1,13 +1,15 @@
 ------------------------ MODULE OnboardingFlow ------------------------
 EXTENDS Naturals, FiniteSets, TLC
 
-\* Models the 13-step GUI onboarding state machine.
+\* Models the 14-step GUI onboarding state machine with persona branching.
 \* Source: gui/citrate_gui_v2/src/features/onboarding/
 \*
-\* The onboarding flow is sequential with one branch point: the user
-\* chooses either Privy (social) authentication or traditional (password)
-\* authentication. After the auth branch converges at device_binding,
-\* the remaining steps are strictly sequential.
+\* Two branch points:
+\*   1. Auth method: Privy (social) or traditional (password)
+\*   2. Persona selection: home_user, teacher, or developer
+\*      - home_user and teacher skip 3 developer steps
+\*        (core_model_readiness, interactive_lesson, hello_world_deploy)
+\*      - developer gets the full 14-step flow
 
 CONSTANTS
     MaxRetries      \* Maximum retry attempts for any failable step
@@ -18,9 +20,10 @@ VARIABLES
     step,           \* Current onboarding step (see Steps set)
     retries,        \* Retry counter for the current step
     authMethod,     \* Chosen auth method: "none" | "privy" | "traditional"
+    persona,        \* Chosen persona: "none" | "home_user" | "teacher" | "developer"
     visited         \* Set of steps that have been completed
 
-vars == <<step, retries, authMethod, visited>>
+vars == <<step, retries, authMethod, persona, visited>>
 
 \* ---- Step definitions ----
 
@@ -32,6 +35,7 @@ Steps == {
     "device_binding",
     "wallet_provisioning",
     "security_confirmation",
+    "persona_selection",
     "environment_selection",
     "node_bootstrap",
     "core_model_readiness",
@@ -41,6 +45,14 @@ Steps == {
 }
 
 AuthMethods == {"none", "privy", "traditional"}
+Personas == {"none", "home_user", "teacher", "developer"}
+
+\* Steps that only developers see (skipped for home_user and teacher)
+DeveloperOnlySteps == {
+    "core_model_readiness",
+    "interactive_lesson",
+    "hello_world_deploy"
+}
 
 \* Steps that can fail and be retried
 FailableSteps == {
@@ -57,6 +69,7 @@ Init ==
     /\ step = "launch_check"
     /\ retries = 0
     /\ authMethod = "none"
+    /\ persona = "none"
     /\ visited = {}
 
 \* launch_check -> identity_selection
@@ -65,7 +78,7 @@ LaunchCheckComplete ==
     /\ step' = "identity_selection"
     /\ visited' = visited \cup {"launch_check"}
     /\ retries' = 0
-    /\ UNCHANGED <<authMethod>>
+    /\ UNCHANGED <<authMethod, persona>>
 
 \* identity_selection -> privy_auth (choose Privy)
 ChoosePrivy ==
@@ -75,6 +88,7 @@ ChoosePrivy ==
     /\ authMethod' = "privy"
     /\ visited' = visited \cup {"identity_selection"}
     /\ retries' = 0
+    /\ UNCHANGED <<persona>>
 
 \* identity_selection -> traditional_auth (choose traditional)
 ChooseTraditional ==
@@ -84,6 +98,7 @@ ChooseTraditional ==
     /\ authMethod' = "traditional"
     /\ visited' = visited \cup {"identity_selection"}
     /\ retries' = 0
+    /\ UNCHANGED <<persona>>
 
 \* privy_auth -> device_binding (success)
 PrivyAuthSuccess ==
@@ -91,14 +106,14 @@ PrivyAuthSuccess ==
     /\ step' = "device_binding"
     /\ visited' = visited \cup {"privy_auth"}
     /\ retries' = 0
-    /\ UNCHANGED <<authMethod>>
+    /\ UNCHANGED <<authMethod, persona>>
 
 \* privy_auth retry on failure
 PrivyAuthFail ==
     /\ step = "privy_auth"
     /\ retries < MaxRetries
     /\ retries' = retries + 1
-    /\ UNCHANGED <<step, authMethod, visited>>
+    /\ UNCHANGED <<step, authMethod, persona, visited>>
 
 \* traditional_auth -> device_binding (success)
 TraditionalAuthSuccess ==
@@ -106,14 +121,14 @@ TraditionalAuthSuccess ==
     /\ step' = "device_binding"
     /\ visited' = visited \cup {"traditional_auth"}
     /\ retries' = 0
-    /\ UNCHANGED <<authMethod>>
+    /\ UNCHANGED <<authMethod, persona>>
 
 \* traditional_auth retry on failure
 TraditionalAuthFail ==
     /\ step = "traditional_auth"
     /\ retries < MaxRetries
     /\ retries' = retries + 1
-    /\ UNCHANGED <<step, authMethod, visited>>
+    /\ UNCHANGED <<step, authMethod, persona, visited>>
 
 \* device_binding -> wallet_provisioning
 DeviceBindingComplete ==
@@ -121,7 +136,7 @@ DeviceBindingComplete ==
     /\ step' = "wallet_provisioning"
     /\ visited' = visited \cup {"device_binding"}
     /\ retries' = 0
-    /\ UNCHANGED <<authMethod>>
+    /\ UNCHANGED <<authMethod, persona>>
 
 \* wallet_provisioning -> security_confirmation
 WalletProvisioningComplete ==
@@ -129,15 +144,45 @@ WalletProvisioningComplete ==
     /\ step' = "security_confirmation"
     /\ visited' = visited \cup {"wallet_provisioning"}
     /\ retries' = 0
-    /\ UNCHANGED <<authMethod>>
+    /\ UNCHANGED <<authMethod, persona>>
 
-\* security_confirmation -> environment_selection
+\* security_confirmation -> persona_selection
 SecurityConfirmationComplete ==
     /\ step = "security_confirmation"
-    /\ step' = "environment_selection"
+    /\ step' = "persona_selection"
     /\ visited' = visited \cup {"security_confirmation"}
     /\ retries' = 0
-    /\ UNCHANGED <<authMethod>>
+    /\ UNCHANGED <<authMethod, persona>>
+
+\* persona_selection -> environment_selection (choose home_user)
+ChooseHomeUser ==
+    /\ step = "persona_selection"
+    /\ persona = "none"
+    /\ step' = "environment_selection"
+    /\ persona' = "home_user"
+    /\ visited' = visited \cup {"persona_selection"}
+    /\ retries' = 0
+    /\ UNCHANGED <<authMethod, persona>>
+
+\* persona_selection -> environment_selection (choose teacher)
+ChooseTeacher ==
+    /\ step = "persona_selection"
+    /\ persona = "none"
+    /\ step' = "environment_selection"
+    /\ persona' = "teacher"
+    /\ visited' = visited \cup {"persona_selection"}
+    /\ retries' = 0
+    /\ UNCHANGED <<authMethod, persona>>
+
+\* persona_selection -> environment_selection (choose developer)
+ChooseDeveloper ==
+    /\ step = "persona_selection"
+    /\ persona = "none"
+    /\ step' = "environment_selection"
+    /\ persona' = "developer"
+    /\ visited' = visited \cup {"persona_selection"}
+    /\ retries' = 0
+    /\ UNCHANGED <<authMethod, persona>>
 
 \* environment_selection -> node_bootstrap
 EnvironmentSelectionComplete ==
@@ -145,22 +190,24 @@ EnvironmentSelectionComplete ==
     /\ step' = "node_bootstrap"
     /\ visited' = visited \cup {"environment_selection"}
     /\ retries' = 0
-    /\ UNCHANGED <<authMethod>>
+    /\ UNCHANGED <<authMethod, persona>>
 
-\* node_bootstrap -> core_model_readiness (success)
+\* node_bootstrap -> core_model_readiness (developer) or session_active (home/teacher)
 NodeBootstrapSuccess ==
     /\ step = "node_bootstrap"
-    /\ step' = "core_model_readiness"
+    /\ IF persona = "developer"
+       THEN step' = "core_model_readiness"
+       ELSE step' = "session_active"  \* home_user and teacher skip dev steps
     /\ visited' = visited \cup {"node_bootstrap"}
     /\ retries' = 0
-    /\ UNCHANGED <<authMethod>>
+    /\ UNCHANGED <<authMethod, persona>>
 
 \* node_bootstrap retry on failure
 NodeBootstrapFail ==
     /\ step = "node_bootstrap"
     /\ retries < MaxRetries
     /\ retries' = retries + 1
-    /\ UNCHANGED <<step, authMethod, visited>>
+    /\ UNCHANGED <<step, authMethod, persona, visited>>
 
 \* core_model_readiness -> interactive_lesson (success)
 CoreModelReadinessSuccess ==
@@ -168,14 +215,14 @@ CoreModelReadinessSuccess ==
     /\ step' = "interactive_lesson"
     /\ visited' = visited \cup {"core_model_readiness"}
     /\ retries' = 0
-    /\ UNCHANGED <<authMethod>>
+    /\ UNCHANGED <<authMethod, persona>>
 
 \* core_model_readiness retry on failure
 CoreModelReadinessFail ==
     /\ step = "core_model_readiness"
     /\ retries < MaxRetries
     /\ retries' = retries + 1
-    /\ UNCHANGED <<step, authMethod, visited>>
+    /\ UNCHANGED <<step, authMethod, persona, visited>>
 
 \* interactive_lesson -> hello_world_deploy
 InteractiveLessonComplete ==
@@ -183,7 +230,7 @@ InteractiveLessonComplete ==
     /\ step' = "hello_world_deploy"
     /\ visited' = visited \cup {"interactive_lesson"}
     /\ retries' = 0
-    /\ UNCHANGED <<authMethod>>
+    /\ UNCHANGED <<authMethod, persona>>
 
 \* hello_world_deploy -> session_active (success)
 HelloWorldDeploySuccess ==
@@ -191,14 +238,14 @@ HelloWorldDeploySuccess ==
     /\ step' = "session_active"
     /\ visited' = visited \cup {"hello_world_deploy"}
     /\ retries' = 0
-    /\ UNCHANGED <<authMethod>>
+    /\ UNCHANGED <<authMethod, persona>>
 
 \* hello_world_deploy retry on failure
 HelloWorldDeployFail ==
     /\ step = "hello_world_deploy"
     /\ retries < MaxRetries
     /\ retries' = retries + 1
-    /\ UNCHANGED <<step, authMethod, visited>>
+    /\ UNCHANGED <<step, authMethod, persona, visited>>
 
 \* Terminal state: session_active is absorbing
 SessionActive ==
@@ -216,6 +263,9 @@ Next ==
     \/ DeviceBindingComplete
     \/ WalletProvisioningComplete
     \/ SecurityConfirmationComplete
+    \/ ChooseHomeUser
+    \/ ChooseTeacher
+    \/ ChooseDeveloper
     \/ EnvironmentSelectionComplete
     \/ NodeBootstrapSuccess
     \/ NodeBootstrapFail
@@ -233,6 +283,7 @@ TypeOK ==
     /\ step \in Steps
     /\ retries \in 0..MaxRetries
     /\ authMethod \in AuthMethods
+    /\ persona \in Personas
     /\ visited \subseteq Steps
 
 \* INV-2: NoSkipSteps — cannot reach session_active without
@@ -261,6 +312,21 @@ AuthBranchConsistency ==
 RetryBounded ==
     retries <= MaxRetries
 
+\* INV-7: PersonaChosenAfterSelection — if past persona_selection,
+\*         a persona must have been chosen
+PersonaChosen ==
+    step \notin {"launch_check", "identity_selection", "privy_auth",
+                 "traditional_auth", "device_binding", "wallet_provisioning",
+                 "security_confirmation", "persona_selection"} =>
+        persona \in {"home_user", "teacher", "developer"}
+
+\* INV-8: DevStepsOnlyForDeveloper — home_user and teacher never visit
+\*         developer-only steps (core_model_readiness, interactive_lesson,
+\*         hello_world_deploy)
+DevStepsOnlyForDeveloper ==
+    \A s \in DeveloperOnlySteps :
+        s \in visited => persona = "developer"
+
 \* ---- Specification ----
 
 Spec == Init /\ [][Next]_vars
@@ -271,5 +337,7 @@ THEOREM ModelBeforeLesson == Spec => []ModelReadyBeforeLesson
 THEOREM AuthChosen == Spec => []AuthMethodChosen
 THEOREM AuthConsistent == Spec => []AuthBranchConsistency
 THEOREM RetryBound == Spec => []RetryBounded
+THEOREM PersonaIsChosen == Spec => []PersonaChosen
+THEOREM DevOnlyForDev == Spec => []DevStepsOnlyForDeveloper
 
 =============================================================================
