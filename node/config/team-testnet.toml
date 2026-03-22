@@ -1,0 +1,57 @@
+# Citrate Team Testnet Configuration
+# For internal team validators running over Tailscale/LAN.
+#
+# Quick start:
+#   ./scripts/team-testnet.sh
+#
+# Each team member should:
+#   1. Set their coinbase address in [mining].coinbase
+#   2. Add peer IPs to [network].bootstrap_nodes
+#   3. Wipe ~/.citrate-team/ if genesis params change (everyone must start fresh)
+#
+# Genesis profile "team_testnet" pre-funds 10 validator slots at 100,000 SALT
+# plus faucet (10M) and treasury (100M).
+
+[chain]
+chain_id = 40204
+block_time = 2
+ghostdag_k = 18
+genesis_profile = "team_testnet"
+
+[network]
+listen_addr = "0.0.0.0:30303"
+max_peers = 20
+# Team members add each other's Tailscale or LAN IPs here.
+# Example: "100.64.1.2:30303"
+bootstrap_nodes = []
+
+[rpc]
+enabled = true
+listen_addr = "0.0.0.0:8545"
+ws_addr = "0.0.0.0:8546"
+allow_eth_send_transaction = true
+cors_origins = ["*"]
+
+[storage]
+data_dir = ".citrate-team"
+pruning = false
+keep_blocks = 100000
+
+[mining]
+enabled = true
+# Replace with your validator/coinbase address (40 hex chars, no 0x prefix, padded to 64).
+# Generate one with:  ./target/release/citrate keygen
+coinbase = "0000000000000000000000000000000000000000"
+target_block_time = 2
+min_gas_price = 1000000000
+
+[validator]
+production_mode = false
+
+[vrf]
+strict_vrf = false
+
+[checkpoint]
+interval = 50
+committee_size = 10
+quorum_threshold = 7

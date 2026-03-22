@@ -171,6 +171,67 @@ impl GenesisConfig {
         }
     }
 
+    /// Create team testnet genesis configuration (chain_id = 40204).
+    ///
+    /// Pre-funds 10 team validator addresses with 100,000 SALT each for staking
+    /// and operations, plus a faucet (10M SALT) and treasury (100M SALT).
+    ///
+    /// Validator addresses use a deterministic derivation: `0xVV00...00` where VV
+    /// ranges from 0x01 to 0x0A. Team members should replace these with their
+    /// actual validator addresses before a coordinated genesis.
+    pub fn team_testnet_genesis() -> Self {
+        let treasury = Address([0x11; 20]);
+        let ecosystem = Address([0x22; 20]);
+        let faucet = Address([0x33; 20]);
+
+        let mut accounts = vec![
+            // Faucet account (10M SALT for testnet distribution via faucet service)
+            GenesisAccount {
+                address: faucet,
+                balance: latt_to_wei(10_000_000),
+                nonce: 0,
+                code: None,
+            },
+            // Treasury (100M SALT for governance and ecosystem development)
+            GenesisAccount {
+                address: treasury,
+                balance: latt_to_wei(100_000_000),
+                nonce: 0,
+                code: None,
+            },
+            // Ecosystem fund (50M SALT — reduced vs beta since validators get direct funding)
+            GenesisAccount {
+                address: ecosystem,
+                balance: latt_to_wei(50_000_000),
+                nonce: 0,
+                code: None,
+            },
+        ];
+
+        // Pre-fund 10 team validator addresses at 100,000 SALT each.
+        // Addresses: 0x0100...00 through 0x0A00...00 (deterministic placeholders).
+        // Replace with real validator addresses before coordinated team genesis.
+        for i in 1u8..=10 {
+            let mut addr = [0u8; 20];
+            addr[0] = i;
+            accounts.push(GenesisAccount {
+                address: Address(addr),
+                balance: latt_to_wei(100_000),
+                nonce: 0,
+                code: None,
+            });
+        }
+
+        Self {
+            chain_id: 40204,
+            accounts,
+            treasury_address: treasury,
+            team_allocations: HashMap::new(),
+            ecosystem_fund: ecosystem,
+            mining_pool_max: latt_to_wei(500_000_000),
+        }
+    }
+
     /// Get total pre-allocated supply
     pub fn total_preallocation(&self) -> U256 {
         let mut total = U256::zero();
@@ -263,6 +324,48 @@ mod tests {
         let config = GenesisConfig::testnet_beta();
         assert!(config.validate().is_ok());
         assert_eq!(config.chain_id, 40204);
+    }
+
+    #[test]
+    fn test_team_testnet_genesis_valid() {
+        let config = GenesisConfig::team_testnet_genesis();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.chain_id, 40204);
+
+        // 3 system accounts + 10 validator accounts = 13 total
+        assert_eq!(config.accounts.len(), 13);
+
+        // Verify validator funding: each of the 10 validators gets 100,000 SALT
+        for account in &config.accounts[3..] {
+            assert_eq!(account.balance, latt_to_wei(100_000));
+        }
+
+        // Verify system accounts
+        assert_eq!(config.accounts[0].balance, latt_to_wei(10_000_000));  // faucet
+        assert_eq!(config.accounts[1].balance, latt_to_wei(100_000_000)); // treasury
+        assert_eq!(config.accounts[2].balance, latt_to_wei(50_000_000));  // ecosystem
+    }
+
+    #[test]
+    fn test_team_testnet_genesis_no_duplicate_addresses() {
+        let config = GenesisConfig::team_testnet_genesis();
+        let mut addresses = std::collections::HashSet::new();
+        for account in &config.accounts {
+            assert!(
+                addresses.insert(account.address),
+                "Duplicate address found: {:?}",
+                account.address
+            );
+        }
+    }
+
+    #[test]
+    fn test_team_testnet_genesis_total_preallocation() {
+        let config = GenesisConfig::team_testnet_genesis();
+        let total = config.total_preallocation();
+        // 10M faucet + 100M treasury + 50M ecosystem + 10 * 100K validators = 161M SALT
+        let expected = latt_to_wei(161_000_000);
+        assert_eq!(total, expected);
     }
 
     #[test]
