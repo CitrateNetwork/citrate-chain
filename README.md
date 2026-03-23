@@ -6,9 +6,9 @@
   [![Release](https://img.shields.io/github/v/release/SaulBuilds/citrate?include_prereleases&label=release)](https://github.com/SaulBuilds/citrate/releases)
   [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
   [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
-  [![Tests](https://img.shields.io/badge/tests-3%2C213%2B-brightgreen.svg)](#testing)
-  [![TLA+](https://img.shields.io/badge/TLA%2B-36_specs-purple.svg)](#formal-verification)
-  [![Contracts](https://img.shields.io/badge/contracts-24-blue.svg)](#smart-contracts)
+  [![Tests](https://img.shields.io/badge/tests-4%2C669%2B-brightgreen.svg)](#testing)
+  [![TLA+](https://img.shields.io/badge/TLA%2B-41_specs-purple.svg)](#formal-verification)
+  [![Contracts](https://img.shields.io/badge/contracts-31-blue.svg)](#smart-contracts)
 
   **High-Performance BlockDAG with Native AI Inference • SALT Token**
 
@@ -124,8 +124,8 @@ citrate_v0.01.1/
 ├── faucet/              # Testnet faucet with rate limiting
 ├── gui/citrate_gui_v2/  # Tauri desktop app (React + Vite)
 ├── sdk/javascript/      # @citrate/sdk v0.3.0 (TypeScript — models, learning, staking, compute)
-├── contracts/           # 24 Solidity contracts (Foundry)
-├── specs/tla/           # 36 TLA+ formal specs (consensus, zk, learning, contracts, compute, gui)
+├── contracts/           # 31 Solidity contracts (Foundry)
+├── specs/tla/           # 41 TLA+ formal specs (consensus, zk, learning, contracts, compute, gui)
 └── scripts/             # Orchestration & deployment
 ```
 
@@ -146,7 +146,7 @@ citrate_v0.01.1/
 | Min Validator Stake | 32,000 SALT |
 | Decimals | 18 |
 
-## Smart Contracts (24)
+## Smart Contracts (31)
 
 Foundry-based Solidity contracts across four domains:
 
@@ -158,10 +158,10 @@ Foundry-based Solidity contracts across four domains:
 | **Staking & Infra** | LiquidStakingPool, WrappedSALT, IPFSIncentives, ColorCirclesNFT, Counter | Included in base |
 
 ```bash
-cd contracts && forge test -vv   # Run all 133+ tests
+cd contracts && forge test -vv   # Run all 873 tests
 ```
 
-## Formal Verification (36 TLA+ Specs)
+## Formal Verification (41 TLA+ Specs)
 
 Organized into six domains in `specs/tla/`:
 
@@ -345,11 +345,12 @@ The benchmark is a compiled Rust binary using tokio + reqwest with HTTP connecti
 | Suite | Count | Command |
 |-------|-------|---------|
 | Rust unit + integration | 2,484+ | `cargo test --workspace` |
-| GUI (Vitest) | 596 | `cd gui/citrate_gui_v2 && npx vitest run` |
-| Solidity (Forge) | 133+ | `cd contracts && forge test` |
-| TLA+ Formal Verification | 36 specs | `cd specs/tla && bash run_all.sh` |
+| GUI (Vitest) | 1,018 | `cd gui/citrate_gui_v2 && npx vitest run` |
+| Solidity (Forge) | 873 | `cd contracts && forge test` |
+| Python SDK | 253 | `cd sdks/python && pytest` |
+| TLA+ Formal Verification | 41 specs | `cd specs/tla && bash run_all.sh` |
 | Live benchmark | — | `./bench [TPS] [DURATION]` |
-| **Total** | **3,213+** | |
+| **Total** | **4,669+** | |
 
 ## Community & Support
 
