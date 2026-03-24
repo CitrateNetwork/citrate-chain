@@ -229,27 +229,18 @@ pub async fn initialize_genesis_state_with_profile(
         &economics_config,
     );
 
-    // Also initialize legacy initial_accounts if any (backward compat)
-    for (address, balance) in &config.initial_accounts {
-        let addr_bytes = Address(address.0[0..20].try_into().unwrap_or([0; 20]));
-        let balance_u256 = U256::from(*balance);
-        executor.set_balance(&addr_bytes, balance_u256);
+    // The shared genesis function already seeds all accounts including the
+    // Forge deployer. Legacy initial_accounts are NOT applied because they
+    // would produce a different state root than the GUI's shared genesis.
+    // This satisfies the DeterministicGenesis invariant from GenesisSafetyAcrossNodes.tla.
+    if !config.initial_accounts.is_empty() {
         tracing::info!(
-            "Legacy genesis account 0x{}: {} ETH",
-            hex::encode(addr_bytes.0),
-            balance / 1_000_000_000_000_000_000
+            "Skipping {} legacy initial_accounts (shared genesis function handles all accounts)",
+            config.initial_accounts.len()
         );
     }
 
-    // Re-commit if legacy accounts were added (backward compat)
-    let final_state_root = if !config.initial_accounts.is_empty() {
-        let sr = executor.state_db().commit();
-        *sr.as_bytes()
-    } else {
-        state_root_bytes
-    };
-
-    genesis.state_root = Hash::new(final_state_root);
+    genesis.state_root = Hash::new(state_root_bytes);
 
     // Calculate block hash
     genesis.header.block_hash = calculate_block_hash(&genesis);
