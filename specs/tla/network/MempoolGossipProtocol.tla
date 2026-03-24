@@ -37,22 +37,26 @@ Init ==
 
 SubmitTx(node, tx) ==
     /\ tx \notin seenTxs[node]
-    /\ TxNonce[tx] >= appliedNonce[<<node, TxSender[tx]>>]
+    \* Nonce must equal expected (strict ordering, matching real mempool code)
+    \* Real code: if tx.nonce < expected_nonce → reject NonceTooLow
+    \* Real code: on acceptance, expected_nonce advances to tx.nonce + 1
+    /\ TxNonce[tx] = appliedNonce[<<node, TxSender[tx]>>]
     /\ mempool' = [mempool EXCEPT ![node] = @ \cup {tx}]
     /\ seenTxs' = [seenTxs EXCEPT ![node] = @ \cup {tx}]
     /\ gossipQueue' = gossipQueue \cup {<<node, n, tx>> : n \in Nodes \ {node}}
-    /\ UNCHANGED appliedNonce
+    \* Advance expected nonce (matches mempool.rs:313)
+    /\ appliedNonce' = [appliedNonce EXCEPT ![<<node, TxSender[tx]>>] = @ + 1]
 
 DeliverGossip(from, to, tx) ==
     /\ <<from, to, tx>> \in gossipQueue
     /\ gossipQueue' = gossipQueue \ {<<from, to, tx>>}
     /\ IF tx \notin seenTxs[to]
        THEN /\ seenTxs' = [seenTxs EXCEPT ![to] = @ \cup {tx}]
-            /\ IF TxNonce[tx] >= appliedNonce[<<to, TxSender[tx]>>]
-               THEN mempool' = [mempool EXCEPT ![to] = @ \cup {tx}]
-               ELSE UNCHANGED mempool
-       ELSE UNCHANGED <<mempool, seenTxs>>
-    /\ UNCHANGED appliedNonce
+            /\ IF TxNonce[tx] = appliedNonce[<<to, TxSender[tx]>>]
+               THEN /\ mempool' = [mempool EXCEPT ![to] = @ \cup {tx}]
+                    /\ appliedNonce' = [appliedNonce EXCEPT ![<<to, TxSender[tx]>>] = @ + 1]
+               ELSE UNCHANGED <<mempool, appliedNonce>>
+       ELSE UNCHANGED <<mempool, seenTxs, appliedNonce>>
 
 IncludeInBlock(node, tx) ==
     /\ tx \in mempool[node]
@@ -73,9 +77,12 @@ Spec == Init /\ [][Next]_vars
 NoDuplicateTx ==
     \A nd \in Nodes : \A t \in mempool[nd] : t \in seenTxs[nd]
 
+\* NonceOrdering: txs in mempool have nonces less than the current expected nonce
+\* (they were valid when submitted; the expected nonce has advanced past them
+\* as they entered). A tx at nonce N means appliedNonce is now N+1 or higher.
 NonceOrdering ==
     \A n \in Nodes : \A t \in mempool[n] :
-        TxNonce[t] >= appliedNonce[<<n, TxSender[t]>>]
+        TxNonce[t] < appliedNonce[<<n, TxSender[t]>>]
 
 NoDoubleSend ==
     \A n \in Nodes : \A t1 \in mempool[n] : \A t2 \in mempool[n] :
