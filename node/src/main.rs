@@ -1120,8 +1120,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 head_hash,
             },
         )
-        .with_noise(noise_keypair)
         .with_allowed_peers(config.network.allowed_peers.clone());
+        // Disable Noise encryption for team_testnet (GUI uses plaintext PeerManager).
+        // Set CITRATE_NO_NOISE=1 or use team_testnet genesis profile.
+        let use_noise = std::env::var("CITRATE_NO_NOISE").is_err()
+            && config.chain.genesis_profile.as_deref() != Some("team_testnet");
+        let transport = if use_noise {
+            transport.with_noise(noise_keypair)
+        } else {
+            info!("Noise encryption DISABLED (team_testnet or CITRATE_NO_NOISE=1). Using plaintext P2P.");
+            transport
+        };
         let listen_addr = config.network.listen_addr;
         transport
             .start_listener(listen_addr)
