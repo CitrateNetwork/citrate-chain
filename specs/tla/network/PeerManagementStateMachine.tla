@@ -67,6 +67,7 @@ CompleteHandshake(p) ==
 \* Peer sends good data (score increases)
 GoodBehavior(p) ==
     /\ state[p] = "Connected"
+    /\ score[p] < 10  \* Cap score to bound state space
     /\ score' = [score EXCEPT ![p] = @ + 1]
     /\ UNCHANGED <<state, banExpiry, currentBlock, activePeers>>
 
@@ -115,6 +116,7 @@ EvictPeer ==
 
 \* Block advances
 AdvanceBlock ==
+    /\ currentBlock < BanDuration + 2  \* Bound block advancement
     /\ currentBlock' = currentBlock + 1
     /\ UNCHANGED <<state, score, banExpiry, activePeers>>
 
