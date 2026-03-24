@@ -209,8 +209,6 @@ impl GenesisConfig {
         ];
 
         // Pre-fund 10 team validator addresses at 100,000 SALT each.
-        // Addresses: 0x0100...00 through 0x0A00...00 (deterministic placeholders).
-        // Replace with real validator addresses before coordinated team genesis.
         for i in 1u8..=10 {
             let mut addr = [0u8; 20];
             addr[0] = i;
@@ -221,6 +219,31 @@ impl GenesisConfig {
                 code: None,
             });
         }
+
+        // Dev deployer account (Foundry default key: 0x0123456789abcdef...)
+        // Address: 0xFCAd0B19bB29D4674531d6f115237E16AfCE377c
+        // Pre-funded with 1M SALT for contract deployment on testnet.
+        accounts.push(GenesisAccount {
+            address: Address([
+                0xFC, 0xAd, 0x0B, 0x19, 0xbB, 0x29, 0xD4, 0x67, 0x45, 0x31,
+                0xd6, 0xf1, 0x15, 0x23, 0x7E, 0x16, 0xAf, 0xCE, 0x37, 0x7c,
+            ]),
+            balance: latt_to_wei(1_000_000),
+            nonce: 0,
+            code: None,
+        });
+
+        // Saul's deployer wallet (0x9f5B156C53305D4b20c94ca08E3219D1C0e7401a)
+        // Pre-funded with 5M SALT for contract deployment and testing.
+        accounts.push(GenesisAccount {
+            address: Address([
+                0x9f, 0x5B, 0x15, 0x6C, 0x53, 0x30, 0x5D, 0x4b, 0x20, 0xc9,
+                0x4c, 0xa0, 0x8E, 0x32, 0x19, 0xD1, 0xC0, 0xe7, 0x40, 0x1a,
+            ]),
+            balance: latt_to_wei(5_000_000),
+            nonce: 0,
+            code: None,
+        });
 
         Self {
             chain_id: 40204,
@@ -345,16 +368,28 @@ pub fn initialize_shared_genesis_state(
         );
     }
 
-    // 2. Seed the Hardhat/Forge default deployer account (for contract deployment)
-    let forge_addr = Address([
+    // 2. Seed known deployer accounts for testnet contract deployment
+    // Hardhat default #0
+    let hardhat_addr = Address([
         0xf3, 0x9F, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xF6,
         0xF4, 0xce, 0x6a, 0xB8, 0x82, 0x72, 0x79, 0xcf,
         0xfF, 0xb9, 0x22, 0x66,
     ]);
     executor.set_balance(
-        &forge_addr,
+        &hardhat_addr,
         U256::from(10_000) * U256::from(10).pow(U256::from(18)),
     );
+
+    // Saul's deployer wallet (0x9f5B156C53305D4b20c94ca08E3219D1C0e7401a)
+    let saul_deployer = Address([
+        0x9f, 0x5B, 0x15, 0x6C, 0x53, 0x30, 0x5D, 0x4b, 0x20, 0xc9,
+        0x4c, 0xa0, 0x8E, 0x32, 0x19, 0xD1, 0xC0, 0xe7, 0x40, 0x1a,
+    ]);
+    executor.set_balance(
+        &saul_deployer,
+        U256::from(5_000_000) * U256::from(10).pow(U256::from(18)),
+    );
+    tracing::info!("Seeded deployer 0x9f5B...401a with 5M SALT");
 
     // 3. Register genesis AI model (deterministic — same ONNX bytes on all nodes)
     executor.register_genesis_model_from_bytes(
