@@ -466,6 +466,58 @@ impl Executor {
     }
 
     /// Set contract code
+    /// Register a genesis AI model from raw ONNX bytes.
+    ///
+    /// Computes a deterministic model hash from the bytes and registers it
+    /// in the state DB. Used by the shared genesis initialization to ensure
+    /// all nodes register the same model with the same hash.
+    pub fn register_genesis_model_from_bytes(
+        &self,
+        onnx_bytes: &[u8],
+        name: &str,
+        created_at: u64,
+    ) {
+        use sha3::{Digest, Keccak256};
+        use crate::types::{
+            ModelId, ModelMetadata, ModelState, AccessPolicy, UsageStats,
+        };
+        use citrate_consensus::types::Hash;
+
+        let mut hasher = Keccak256::new();
+        hasher.update(onnx_bytes);
+        let h = hasher.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&h[..32]);
+
+        let model_hash = Hash::new(arr);
+        let model_id = ModelId(model_hash);
+
+        let metadata = ModelMetadata {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            description: "Genesis semantic model placeholder".to_string(),
+            framework: "ONNX".to_string(),
+            input_shape: vec![1, 128],
+            output_shape: vec![1, 128],
+            size_bytes: onnx_bytes.len() as u64,
+            created_at,
+        };
+
+        let model_state = ModelState {
+            owner: Address::zero(),
+            model_hash,
+            version: 1,
+            metadata,
+            access_policy: AccessPolicy::Public,
+            usage_stats: UsageStats::default(),
+        };
+
+        match self.state_db.register_model(model_id, model_state) {
+            Ok(_) => info!("Registered genesis model: {:?}", model_id),
+            Err(e) => warn!("Failed to register genesis model: {}", e),
+        }
+    }
+
     pub fn set_code(&self, address: &Address, code: Vec<u8>) {
         let code_hash = self.state_db.set_code(*address, code.clone());
         self.state_db.accounts.set_code_hash(*address, code_hash);
