@@ -1,5 +1,5 @@
 ------------------------------ MODULE PeerManagementStateMachine ------------------------------
-EXTENDS Naturals, FiniteSets, TLC
+EXTENDS Naturals, Integers, FiniteSets, TLC
 
 \* Models the peer lifecycle: connection, scoring, banning, eviction,
 \* and reconnection policies.
