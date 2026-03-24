@@ -220,53 +220,36 @@ pub async fn initialize_genesis_state_with_profile(
         }
     };
 
-    // Initialize genesis accounts from economics config
-    for account in &economics_config.accounts {
-        // Set initial balance using executor
-        executor.set_balance(&account.address, account.balance);
+    // Use the SHARED genesis initialization function.
+    // This is the single source of truth — both standalone node and GUI call
+    // the same function to ensure identical state roots and genesis hashes.
+    // Invariant: DeterministicGenesis (from GenesisSafetyAcrossNodes.tla)
+    let state_root_bytes = citrate_economics::genesis::initialize_shared_genesis_state(
+        &executor,
+        &economics_config,
+    );
 
-        // Set nonce if non-zero
-        if account.nonce > 0 {
-            executor.set_nonce(&account.address, account.nonce);
-        }
-
-        // Deploy code if provided
-        if let Some(code) = &account.code {
-            executor.set_code(&account.address, code.clone());
-        }
-
-        tracing::info!(
-            "Initialized genesis account 0x{} with balance {} SALT ({} wei)",
-            hex::encode(account.address.0),
-            account.balance / U256::from(10).pow(U256::from(18)),
-            account.balance
-        );
-    }
-
-    // Also initialize legacy initial_accounts if any
+    // Also initialize legacy initial_accounts if any (backward compat)
     for (address, balance) in &config.initial_accounts {
-        // Convert PublicKey to Address (first 20 bytes)
         let addr_bytes = Address(address.0[0..20].try_into().unwrap_or([0; 20]));
-
-        // Set initial balance (convert to U256)
         let balance_u256 = U256::from(*balance);
         executor.set_balance(&addr_bytes, balance_u256);
-
         tracing::info!(
-            "Initialized genesis account 0x{} with balance {} ETH",
+            "Legacy genesis account 0x{}: {} ETH",
             hex::encode(addr_bytes.0),
             balance / 1_000_000_000_000_000_000
         );
     }
 
-    // Register a genesis AI model in state (public access)
-    if let Err(e) = register_genesis_model(&storage, &executor, config.timestamp) {
-        tracing::warn!("Failed to register genesis model: {}", e);
-    }
+    // Re-commit if legacy accounts were added (backward compat)
+    let final_state_root = if !config.initial_accounts.is_empty() {
+        let sr = executor.state_db().commit();
+        *sr.as_bytes()
+    } else {
+        state_root_bytes
+    };
 
-    // Commit state changes to persist genesis balances
-    let state_root = executor.state_db().commit();
-    genesis.state_root = Hash::new(*state_root.as_bytes());
+    genesis.state_root = Hash::new(final_state_root);
 
     // Calculate block hash
     genesis.header.block_hash = calculate_block_hash(&genesis);

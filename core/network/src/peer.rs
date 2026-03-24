@@ -498,7 +498,7 @@ async fn handle_incoming(
     addr: SocketAddr,
     pm: Arc<PeerManager>,
     network_id: u32,
-    _genesis_hash: Hash,
+    local_genesis_hash: Hash,
     head_height: u64,
     head_hash: Hash,
 ) -> Result<(), NetworkError> {
@@ -511,27 +511,38 @@ async fn handle_incoming(
         .map_err(|_| NetworkError::ProtocolError("Stream closed".into()))??;
     let hello: NetworkMessage = bincode::deserialize(&bytes)
         .map_err(|e| NetworkError::DecodeError(format!("handshake decode: {}", e)))?;
-    let (peer_id_str, ver, net_ok) = match hello {
+    let (peer_id_str, ver, net_ok, genesis_ok) = match hello {
         NetworkMessage::Hello {
             version,
             network_id: nid,
+            genesis_hash: remote_genesis,
             peer_id,
             ..
-        } => (peer_id, version, nid == network_id),
+        } => (
+            peer_id,
+            version,
+            nid == network_id,
+            remote_genesis == local_genesis_hash,  // GenesisBinding invariant (P2PPeerHandshake.tla)
+        ),
         _ => return Err(NetworkError::ProtocolError("Expected Hello".into())),
     };
-    if !ver.is_compatible(&ProtocolVersion::CURRENT) || !net_ok {
-        // send disconnect
+    if !ver.is_compatible(&ProtocolVersion::CURRENT) || !net_ok || !genesis_ok {
+        let reason = if !ver.is_compatible(&ProtocolVersion::CURRENT) {
+            "incompatible protocol version"
+        } else if !net_ok {
+            "network ID mismatch"
+        } else {
+            "genesis hash mismatch (different chain)"
+        };
+        tracing::warn!("Rejecting peer {}: {}", addr, reason);
         let _ = send_msg(
             &mut framed,
             &NetworkMessage::Disconnect {
-                reason: "incompatible".into(),
+                reason: reason.into(),
             },
         )
         .await;
-        return Err(NetworkError::ProtocolError(
-            "incompatible version or network".into(),
-        ));
+        return Err(NetworkError::ProtocolError(reason.into()));
     }
     // Register peer
     let peer_id = PeerId::new(peer_id_str);
