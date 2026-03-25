@@ -41,7 +41,7 @@ pub struct EnhancedRewardConfig {
 impl Default for EnhancedRewardConfig {
     fn default() -> Self {
         Self {
-            base_block_reward: U256::from(10) * U256::from(10).pow(U256::from(18)), // 10 SALT
+            base_block_reward: U256::from(10_000_000_000_000_000u64), // 0.01 SALT
             performance_bonus_pool: 30, // 30% for performance
             ai_contribution_pool: 25,   // 25% for AI contributions
             network_health_pool: 20,    // 20% for network health
