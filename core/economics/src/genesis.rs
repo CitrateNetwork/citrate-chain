@@ -451,13 +451,17 @@ mod tests {
         assert!(config.validate().is_ok());
         assert_eq!(config.chain_id, 40204);
 
-        // 3 system accounts + 10 validator accounts = 13 total
-        assert_eq!(config.accounts.len(), 13);
+        // 3 system + 10 validators + 1 dev deployer + 1 Saul deployer = 15 total
+        assert_eq!(config.accounts.len(), 15);
 
-        // Verify validator funding: each of the 10 validators gets 100,000 SALT
-        for account in &config.accounts[3..] {
+        // Verify validator funding: accounts[3..13] are validators at 100,000 SALT each
+        for account in &config.accounts[3..13] {
             assert_eq!(account.balance, latt_to_wei(100_000));
         }
+
+        // Verify deployer accounts
+        assert_eq!(config.accounts[13].balance, latt_to_wei(1_000_000));  // dev deployer
+        assert_eq!(config.accounts[14].balance, latt_to_wei(5_000_000));  // Saul deployer
 
         // Verify system accounts
         assert_eq!(config.accounts[0].balance, latt_to_wei(10_000_000));  // faucet
@@ -482,8 +486,8 @@ mod tests {
     fn test_team_testnet_genesis_total_preallocation() {
         let config = GenesisConfig::team_testnet_genesis();
         let total = config.total_preallocation();
-        // 10M faucet + 100M treasury + 50M ecosystem + 10 * 100K validators = 161M SALT
-        let expected = latt_to_wei(161_000_000);
+        // 10M faucet + 100M treasury + 50M ecosystem + 10*100K validators + 1M dev deployer + 5M Saul deployer = 167M SALT
+        let expected = latt_to_wei(167_000_000);
         assert_eq!(total, expected);
     }
 
