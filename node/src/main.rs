@@ -1722,12 +1722,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         None
     };
 
-    // Start block producer if mining is enabled
-    if config.mining.enabled {
+    // Start block producer if mining is enabled and coinbase is configured
+    let coinbase_str = config.mining.coinbase.trim_start_matches("0x");
+    let coinbase_is_valid = !coinbase_str.is_empty()
+        && coinbase_str != "0000000000000000000000000000000000000000"
+        && hex::decode(coinbase_str).map(|b| b.iter().any(|&x| x != 0)).unwrap_or(false);
+
+    if config.mining.enabled && coinbase_is_valid {
         info!("Starting block producer...");
 
         // Parse coinbase address
-        let coinbase_bytes = hex::decode(&config.mining.coinbase).unwrap_or_else(|_| vec![0; 20]);
+        let coinbase_bytes = hex::decode(coinbase_str).unwrap_or_else(|_| vec![0; 20]);
         let mut coinbase = [0u8; 32];
         let copy_len = coinbase_bytes.len().min(32);
         coinbase[..copy_len].copy_from_slice(&coinbase_bytes[..copy_len]);
@@ -1788,6 +1793,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         });
 
         info!("Block producer started");
+    } else if config.mining.enabled && !coinbase_is_valid {
+        warn!(
+            "Block production DISABLED: no valid coinbase address configured. \
+             Set --coinbase <0x...> or mining.coinbase in config file to earn SALT rewards."
+        );
     }
 
     // Wait for shutdown signal
