@@ -335,7 +335,10 @@ impl Default for NodeConfig {
             },
             mining: MiningConfig {
                 enabled: true,
-                coinbase: "0x0000000000000000000000000000000000000000".to_string(),
+                // Empty string means "no coinbase configured". The node will
+                // skip block production unless --coinbase is provided on the CLI
+                // or set in the config file. This prevents rewards going to 0x000.
+                coinbase: String::new(),
                 target_block_time: 5,
                 min_gas_price: 1_000_000_000,
             },
