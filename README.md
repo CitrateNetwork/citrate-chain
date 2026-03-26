@@ -358,6 +358,10 @@ The benchmark is a compiled Rust binary using tokio + reqwest with HTTP connecti
 - **Issues**: [github.com/SaulBuilds/citrate/issues](https://github.com/SaulBuilds/citrate/issues)
 - **Discord**: [discord.gg/A3Uwe4BvdN](https://discord.gg/A3Uwe4BvdN)
 
+## Author
+
+Built by **Larry Klosowski** ([@Saul_loveman](https://twitter.com/Saul_loveman)) with Claude Code.
+
 ## License
 
 MIT — see [LICENSE](LICENSE) for details.
