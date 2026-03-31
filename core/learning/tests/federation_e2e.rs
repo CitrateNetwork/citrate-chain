@@ -204,8 +204,8 @@ fn test_full_ooda_learning_cycle() {
     // NLP dims (0-3) should show disagreement (experts vs learners pull opposite)
     // Vision dims (4-7) should also show disagreement
     // At minimum, some dimensions should be True, Both, or Neither.
-    let has_true = result.state_vector.iter().any(|v| *v == BelnapValue::True);
-    let has_both = result.state_vector.iter().any(|v| *v == BelnapValue::Both);
+    let has_true = result.state_vector.contains(&BelnapValue::True);
+    let has_both = result.state_vector.contains(&BelnapValue::Both);
     // With 5 nodes pulling in different directions, we expect at least some
     // agreement (True) or disagreement (Both) depending on confidence levels.
     assert!(
@@ -402,13 +402,13 @@ fn test_mentor_adapter_improves_accuracy() {
         .expect("Delta adapter should succeed");
 
     // Delta should be: mentor - mentee
-    for i in 0..adapter.len() {
+    for (i, adapter_val) in adapter.iter().enumerate() {
         let expected = mentor.embedding[i] - mentee.embedding[i];
         assert!(
-            (adapter[i] - expected).abs() < 1e-6,
+            (adapter_val - expected).abs() < 1e-6,
             "Adapter[{}] = {:.4} but expected {:.4}",
             i,
-            adapter[i],
+            adapter_val,
             expected,
         );
     }

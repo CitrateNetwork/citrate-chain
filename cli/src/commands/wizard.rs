@@ -235,11 +235,11 @@ async fn model_deploy_wizard(config: &Config) -> Result<()> {
 
         println!();
         println!("{}", "Next steps:".bold());
-        println!("• Monitor deployment: lattice advanced tx-debug {}",
+        println!("• Monitor deployment: citrate advanced tx-debug {}",
                 res.get("tx_hash").and_then(|v| v.as_str()).unwrap_or("TX_HASH"));
-        println!("• Test inference: lattice model inference --model-id {}",
+        println!("• Test inference: citrate model inference --model-id {}",
                 res.get("model_id").and_then(|v| v.as_str()).unwrap_or("MODEL_ID"));
-        println!("• View analytics: lattice advanced model-stats {}",
+        println!("• View analytics: citrate advanced model-stats {}",
                 res.get("model_id").and_then(|v| v.as_str()).unwrap_or("MODEL_ID"));
 
     } else if let Some(error) = result.get("error") {

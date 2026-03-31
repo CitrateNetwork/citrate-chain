@@ -6,9 +6,9 @@
   [![Release](https://img.shields.io/github/v/release/SaulBuilds/citrate?include_prereleases&label=release)](https://github.com/SaulBuilds/citrate/releases)
   [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
   [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
-  [![Tests](https://img.shields.io/badge/tests-4%2C669%2B-brightgreen.svg)](#testing)
-  [![TLA+](https://img.shields.io/badge/TLA%2B-41_specs-purple.svg)](#formal-verification)
-  [![Contracts](https://img.shields.io/badge/contracts-31-blue.svg)](#smart-contracts)
+  [![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](#testing)
+  [![TLA+](https://img.shields.io/badge/TLA%2B-specs-purple.svg)](#formal-verification)
+  [![Contracts](https://img.shields.io/badge/contracts-30%2B-blue.svg)](#smart-contracts)
 
   **High-Performance BlockDAG with Native AI Inference • SALT Token**
 
@@ -17,13 +17,13 @@
 
 ---
 
-> **Contributors (human and AI): Start here.** This repository uses the [Agentile methodology](../.agentile/AGENT_ENTRY.md) for all development. Before writing any code, read [`.agentile/AGENT_ENTRY.md`](../.agentile/AGENT_ENTRY.md) for the full contributor decision tree, rules, and workflows. Every AI coding tool (Claude Code, Cursor, Copilot, Windsurf, Codex, Gemini, etc.) will auto-discover these instructions via `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.windsurfrules`, and `.github/copilot-instructions.md` in the repo root.
+> **Contributors (human and AI): Start here.** We use the [Agentile methodology](../.agentile/AGENT_ENTRY.md) for all development. Read [`.agentile/AGENT_ENTRY.md`](../.agentile/AGENT_ENTRY.md) for the full contributor decision tree, rules, and workflows before writing any code. AI coding tools auto-discover these instructions via `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.windsurfrules`, and `.github/copilot-instructions.md` in the repo root.
 
 ---
 
 ## Overview
 
-Citrate is an AI-native Layer-1 BlockDAG blockchain combining **GhostDAG consensus** with an **EVM-compatible execution environment** and native **AI model inference**. The platform makes AI models first-class on-chain assets with verifiable execution, distributed storage (IPFS), and economic incentives powered by the **SALT** token.
+Citrate is an AI-native Layer-1 BlockDAG blockchain combining **GhostDAG consensus** with an **EVM-compatible execution environment** and native **AI model inference**. AI models are first-class on-chain assets with verifiable execution, distributed storage (IPFS), and economic incentives powered by the **SALT** token.
 
 ### Key Features
 
@@ -40,16 +40,16 @@ Citrate is an AI-native Layer-1 BlockDAG blockchain combining **GhostDAG consens
 
 | Resource | URL |
 |----------|-----|
-| **JSON-RPC** | `https://spark-2e01.tailcbe2ba.ts.net` (POST) |
-| **Block Explorer** | `https://spark-2e01.tailcbe2ba.ts.net` (GET) |
-| **Faucet** | [`https://spark-2e01.tailcbe2ba.ts.net/faucet`](https://spark-2e01.tailcbe2ba.ts.net/faucet) |
+| **JSON-RPC** | `https://rpc.citrate.ai` (POST) |
+| **Block Explorer** | `https://explorer.citrate.ai` |
+| **Faucet** | [`https://rpc.citrate.ai/faucet`](https://rpc.citrate.ai/faucet) |
 | **Chain ID** | `40204` |
 
 ## Quick Start
 
 ### Option A: Download Binary (Recommended)
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/SaulBuilds/citrate/releases).
+Grab the latest release for your platform from [GitHub Releases](https://github.com/SaulBuilds/citrate/releases).
 
 ```bash
 # macOS / Linux — download, make executable, move to PATH
@@ -64,7 +64,8 @@ citrate keygen
 # Start a local development network (RPC on 127.0.0.1:8545)
 citrate devnet
 
-# Connect MetaMask: http://localhost:8545 • Chain ID 40204
+# Connect MetaMask: http://localhost:8545
+# For localhost profiles, query eth_chainId first instead of assuming 40204
 ```
 
 ### Option B: Build from Source
@@ -83,10 +84,8 @@ cargo build --release -p citrate-node -p citrate-wallet -p citrate-cli
 ### Option C: GUI Desktop App
 
 ```bash
-cd gui/citrate_gui_v2
-npm install
-npx tauri dev       # Development
-npx tauri build     # Production installer (dmg/msi/AppImage)
+cd gui/citrate_gui_native
+cargo build --release    # Build native Slint GUI
 ```
 
 ### Option D: Docker
@@ -117,15 +116,23 @@ citrate_v0.01.1/
 │   ├── api/             # JSON-RPC + REST (OpenAI/Anthropic-compatible)
 │   ├── network/         # P2P networking (Noise protocol)
 │   ├── mcp/             # Model Context Protocol layer
+│   ├── learning/        # Paraconsensus (Belnap FOUR, LoRA, safety)
+│   ├── bridge/          # Cross-chain bridge relay
+│   ├── marketplace/     # Model discovery, search, ratings
 │   └── economics/       # SALT token, rewards, governance
 ├── node/                # Main node binary (`citrate`)
 ├── wallet/              # CLI wallet
+├── wallet-core/         # Key management, tx signing (Ed25519+secp256k1)
 ├── cli/                 # CLI tools
 ├── faucet/              # Testnet faucet with rate limiting
-├── gui/citrate_gui_v2/  # Tauri desktop app (React + Vite)
-├── sdk/javascript/      # @citrate/sdk v0.3.0 (TypeScript — models, learning, staking, compute)
-├── contracts/           # 31 Solidity contracts (Foundry)
-├── specs/tla/           # 41 TLA+ formal specs (consensus, zk, learning, contracts, compute, gui)
+├── gui/
+│   ├── citrate_gui_native/  # Native desktop GUI (Slint 1.9)
+│   └── citrate_desktop_app/ # Headless service layer for desktop GUI
+├── sdks/
+│   ├── javascript/citrate-js/  # JavaScript SDK v0.2.0
+│   └── python/                 # Python SDK v0.5.0
+├── contracts/           # 30+ Solidity contracts (Foundry)
+├── specs/tla/           # TLA+ formal specs (subset; canonical set in .agentile/formal/specs/)
 └── scripts/             # Orchestration & deployment
 ```
 
@@ -146,78 +153,61 @@ citrate_v0.01.1/
 | Min Validator Stake | 32,000 SALT |
 | Decimals | 18 |
 
-## Smart Contracts (31)
+## Smart Contracts
 
 Foundry-based Solidity contracts across four domains:
 
-| Domain | Contracts | Tests |
-|--------|-----------|-------|
-| **AI & Marketplace** | ModelRegistry, ModelMarketplace, ModelAccessControl, InferenceRouter, LoRAFactory, AgentDecisionRegistry, SpecRegistry, X402Paywall, X402Facilitator | 66 |
-| **Compute Marketplace** | ComputeMarketplace, ComputeVerifier, ComputePool, HeartbeatMonitor, DisputeResolution | 67 (adversarial + fuzz + integration) |
-| **Learning Center** | LearningPool, LearningCycleManager, ClassroomRegistry, ContributionAccounting, NematocystSlashing | Included in base |
-| **Staking & Infra** | LiquidStakingPool, WrappedSALT, IPFSIncentives, ColorCirclesNFT, Counter | Included in base |
+| Domain | Contracts |
+|--------|-----------|
+| **AI & Marketplace** | ModelRegistry, ModelMarketplace, ModelAccessControl, InferenceRouter, LoRAFactory, AgentDecisionRegistry, SpecRegistry |
+| **Compute Marketplace** | ComputeMarketplace, ComputeVerifier, ComputePool, HeartbeatMonitor, DisputeResolution |
+| **Learning Center** | LearningPool, LearningCycleManager, ClassroomRegistry, ContributionAccounting, NematocystSlashing |
+| **Staking & Infra** | LiquidStakingPool, WrappedSALT, IPFSIncentives, MarketMakerAllocation, TreasuryGovernor |
 
 ```bash
-cd contracts && forge test -vv   # Run all 873 tests
+cd contracts && forge test -vv   # Run all Forge tests
 ```
 
-## Formal Verification (41 TLA+ Specs)
+## Formal Verification (TLA+ Specs)
 
-Organized into six domains in `specs/tla/`:
+The canonical TLA+ spec collection lives in `.agentile/formal/specs/` (84 specs across all domains). A local subset of 46 specs is available in `specs/tla/`, organized into six domains:
 
-| Domain | Specs | Description |
-|--------|-------|-------------|
-| `consensus/` | 6 | GhostDAG, VRF, Prevrandao, Mempool, TX execution, VRF chain |
-| `zk/` | 2 | ZK proof lifecycle, key management (Poseidon, MiMC) |
-| `learning/` | 11 | Belnap lattice, OODA cycle, Byzantine detection, mentor selection, and more |
-| `contracts/` | 7 | Staking, slashing, trust scoring, contributions, classroom registry |
-| `compute/` | 7 | Marketplace lifecycle, verification, provider, dispute, heartbeat, adversarial, E2E |
-| `gui/` | 3 | Onboarding flow, model lifecycle, SDK connection |
+| Domain | Description |
+|--------|-------------|
+| `consensus/` | GhostDAG, VRF, Prevrandao, Mempool, TX execution, VRF chain |
+| `zk/` | ZK proof lifecycle, key management (Poseidon, MiMC) |
+| `learning/` | Belnap lattice, OODA cycle, Byzantine detection, mentor selection |
+| `contracts/` | Staking, slashing, trust scoring, contributions, classroom registry |
+| `compute/` | Marketplace lifecycle, verification, provider, dispute, heartbeat |
+| `gui/` | Onboarding flow, model lifecycle, SDK connection |
+
+For current counts and verification status, see `.agentile/formal/specs/INDEX.md`.
 
 ```bash
-cd specs/tla && bash run_all.sh      # Standard run
+cd specs/tla && bash run_all.sh      # Standard run (local subset)
 cd specs/tla && bash run_deep.sh     # Deep verification (16 workers, 45min timeout)
 ```
 
-## SDK
+## SDKs
+
+### JavaScript (citrate-js v0.2.0)
 
 ```bash
-npm install @citrate/sdk
+cd sdks/javascript/citrate-js
+npm install && npm run build
 ```
 
-```typescript
-import { CitrateSDK } from '@citrate/sdk';
+See [`sdks/javascript/citrate-js/`](sdks/javascript/citrate-js/) for full documentation.
 
-const sdk = new CitrateSDK({ rpcUrl: 'http://localhost:8545' });
+### Python (v0.5.0)
 
-// Deploy a model
-const model = await sdk.models.deploy({
-  name: 'my-model',
-  framework: 'onnx',
-  modelData: modelBuffer,
-});
-
-// Run inference
-const result = await sdk.models.infer(model.id, { text: 'hello' });
-
-// Learning Center
-const pool = await sdk.learning.getPool(poolId);
-const cycle = await sdk.learning.getCycleStatus(cycleId);
-
-// Compute Marketplace
-const job = await sdk.compute.getJob(jobId);
-const providers = await sdk.compute.listProviders();
-
-// Staking
-const info = await sdk.staking.getStakingInfo(address);
-
-// Classrooms
-const classroom = await sdk.classrooms.getClassroom(classroomId);
+```bash
+cd sdks/python
+pip install -e .
+pytest
 ```
 
-SDK exports: `CitrateSDK`, `ModelRegistry`, `ContractManager`, `AccountManager`, `AIManager`, `FilterManager`, `LearningManager`, `StakingManager`, `ClassroomManager`, `ComputeManager`.
-
-See [`sdk/javascript/`](sdk/javascript/) for full documentation.
+See [`sdks/python/`](sdks/python/) for full documentation.
 
 ## API Endpoints
 
@@ -262,8 +252,8 @@ cargo clippy --all-targets --all-features
 # Smart contracts
 cd contracts && forge build && forge test
 
-# GUI (web dev server)
-cd gui/citrate_gui_v2 && npm run dev
+# GUI (native Slint)
+cd gui/citrate_gui_native && cargo build --release
 ```
 
 ## Transaction Signing
@@ -279,7 +269,7 @@ Citrate supports legacy, EIP-2930, and EIP-1559 transaction types.
 
 ## Benchmark — Can You Break It?
 
-Citrate ships with a live benchmark tool that fires real transactions at the chain and shows you every one landing in real time. No simulations, no mocks — these are actual on-chain state transitions.
+Citrate ships with a live benchmark tool that fires real transactions at the chain and shows every one landing in real time. No simulations, no mocks -- these are actual on-chain state transitions.
 
 ### Quick Start
 
@@ -291,7 +281,7 @@ cargo run --release -p citrate-node -- devnet
 ./bench
 ```
 
-That's it. You'll see a live dashboard streaming TPS, latency, and success rate every second.
+You'll see a live dashboard streaming TPS, latency, and success rate every second.
 
 ### Push Harder
 
@@ -304,7 +294,7 @@ That's it. You'll see a live dashboard streaming TPS, latency, and success rate 
 ### Against the Live Testnet
 
 ```bash
-./bench 2000 30 https://spark-2e01.tailcbe2ba.ts.net
+./bench 2000 30 https://rpc.citrate.ai
 ```
 
 ### What You'll See
@@ -338,19 +328,21 @@ This generates a timestamped Markdown report in `benchmarks/`.
 
 ### How It Works
 
-The benchmark is a compiled Rust binary using tokio + reqwest with HTTP connection pooling (500 concurrent connections). It sends real `eth_sendTransaction` calls from the genesis faucet account (`0x3333...3333`), paced to your target TPS with sub-millisecond scheduling. Every transaction creates actual state — this is not a dry run.
+The benchmark is a compiled Rust binary using tokio + reqwest with HTTP connection pooling (500 concurrent connections). It sends real `eth_sendTransaction` calls from the genesis faucet account (`0x3333...3333`), paced to your target TPS with sub-millisecond scheduling. Every transaction creates actual state -- not a dry run.
 
 ## Testing
 
-| Suite | Count | Command |
-|-------|-------|---------|
-| Rust unit + integration | 2,484+ | `cargo test --workspace` |
-| GUI (Vitest) | 1,018 | `cd gui/citrate_gui_v2 && npx vitest run` |
-| Solidity (Forge) | 873 | `cd contracts && forge test` |
-| Python SDK | 253 | `cd sdks/python && pytest` |
-| TLA+ Formal Verification | 41 specs | `cd specs/tla && bash run_all.sh` |
-| Live benchmark | — | `./bench [TPS] [DURATION]` |
-| **Total** | **4,669+** | |
+| Suite | Command |
+|-------|---------|
+| Rust unit + integration | `cargo test --workspace` |
+| GUI (Slint native) | `cd gui/citrate_gui_native && cargo test` |
+| Desktop app services | `cd gui/citrate_desktop_app && cargo test` |
+| Solidity (Forge) | `cd contracts && forge test` |
+| Python SDK | `cd sdks/python && pytest` |
+| TLA+ Formal Verification | `cd specs/tla && bash run_all.sh` |
+| Live benchmark | `./bench [TPS] [DURATION]` |
+
+For current counts, see `.agentile/sprints/CURRENT.md`.
 
 ## Community & Support
 

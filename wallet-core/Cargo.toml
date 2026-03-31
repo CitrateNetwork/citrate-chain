@@ -1,0 +1,54 @@
+[package]
+name = "citrate-wallet-core"
+version = "0.1.0"
+edition = "2021"
+description = "Universal wallet core — key management, transactions, credentials, DIDs"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Key management (WASM-compatible — pure Rust)
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+k256 = { version = "0.13", features = ["ecdsa", "ecdsa-core"] }
+sha2 = "0.10"
+sha3 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+hex = "0.4"
+rlp = "0.5"
+bip39 = { version = "1.2", features = ["rand", "std"] }
+
+# Encryption (WASM-compatible — pure Rust)
+aes-gcm = "0.10"
+argon2 = "0.5"
+
+# Serialization (WASM-compatible)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling (WASM-compatible)
+thiserror = "1"
+anyhow = "1"
+
+# Utilities (WASM-compatible)
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+
+# Native-only dependencies (not compiled for WASM)
+tokio = { version = "1", features = ["full"], optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+bincode = { version = "1", optional = true }
+dirs = { version = "5", optional = true }
+primitive-types = { version = "0.12", optional = true }
+
+# Citrate chain types (native-only)
+citrate-consensus = { path = "../core/consensus", optional = true }
+citrate-execution = { path = "../core/execution", optional = true }
+
+[features]
+default = ["native"]
+native = ["tokio", "reqwest", "bincode", "dirs", "primitive-types", "citrate-consensus", "citrate-execution"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-test = "0.4"
+proptest = "1"

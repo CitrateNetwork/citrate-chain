@@ -1,7 +1,7 @@
 // Comprehensive tests for the execution module
 
 use citrate_consensus::types::{
-    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature,
+    Block, BlockBuilder, Hash, PublicKey, Signature,
     Transaction as ConsensusTransaction, VrfProof,
 };
 use citrate_execution::{address_utils, types::*, Executor, StateDB};

@@ -146,7 +146,7 @@ fn list_accounts(config: &Config) -> Result<()> {
 
     if count == 0 {
         println!("  {}", "No accounts found".yellow());
-        println!("  Use 'lattice account create' to create a new account");
+        println!("  Use 'citrate account create' to create a new account");
     } else {
         println!("\nTotal: {} account(s)", count);
     }
@@ -308,7 +308,7 @@ mod tests {
         let addr = derive_address(&pubkey);
         // Verify it matches Keccak256 hash last 20 bytes
         let mut hasher = Keccak256::new();
-        hasher.update(&pubkey);
+        hasher.update(pubkey);
         let hash = hasher.finalize();
         let mut expected = [0u8; 20];
         expected.copy_from_slice(&hash[12..]);
@@ -322,7 +322,7 @@ mod tests {
         let addr = derive_address(&pubkey);
         // Should use Keccak path since first 20 bytes are all zero
         let mut hasher = Keccak256::new();
-        hasher.update(&pubkey);
+        hasher.update(pubkey);
         let hash = hasher.finalize();
         let mut expected = [0u8; 20];
         expected.copy_from_slice(&hash[12..]);

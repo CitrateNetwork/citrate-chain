@@ -550,17 +550,50 @@ mod tests {
 
         assert!(config.rpc.enabled);
         assert!(config.rpc.allow_eth_send_transaction);
-        assert_eq!(config.rpc.cors_origins, vec!["*".to_string()]);
+        // Team/public configs must use explicit origins, not wildcard
+        assert_eq!(config.rpc.cors_origins, vec![
+            "http://localhost:3000".to_string(),
+            "https://citrate.ai".to_string(),
+            "https://explorer.citrate.ai".to_string(),
+        ]);
+        assert!(!config.rpc.cors_origins.contains(&"*".to_string()),
+            "Team/public configs must not use wildcard CORS");
 
         assert!(config.mining.enabled);
         assert_eq!(config.mining.target_block_time, 2);
 
         assert!(!config.validator.production_mode);
-        assert!(!config.vrf.strict_vrf);
+        assert!(config.vrf.strict_vrf);
+        assert!(!config.vrf.migration_mode);
 
         assert_eq!(config.checkpoint.interval, 50);
         assert_eq!(config.checkpoint.committee_size, 10);
         assert_eq!(config.checkpoint.quorum_threshold, 7);
+    }
+
+    #[test]
+    fn test_testnet_toml_parses_with_strict_vrf() {
+        let toml_content = include_str!("../config/testnet.toml");
+        let config: NodeConfig =
+            toml::from_str(toml_content).expect("testnet.toml must parse as valid NodeConfig");
+
+        assert_eq!(config.chain.chain_id, 40204);
+        assert_eq!(config.chain.block_time, 1);
+        assert!(config.rpc.enabled);
+        assert!(config.vrf.strict_vrf);
+        assert!(!config.vrf.migration_mode);
+    }
+
+    #[test]
+    fn test_mainnet_toml_parses_with_strict_vrf() {
+        let toml_content = include_str!("../config/mainnet.toml");
+        let config: NodeConfig =
+            toml::from_str(toml_content).expect("mainnet.toml must parse as valid NodeConfig");
+
+        assert_eq!(config.chain.chain_id, 1);
+        assert!(config.validator.production_mode);
+        assert!(config.vrf.strict_vrf);
+        assert!(!config.vrf.migration_mode);
     }
 
     #[test]

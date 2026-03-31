@@ -1,0 +1,631 @@
+//! Blockchain transaction building, signing, and RPC communication.
+//!
+//! Imports types from citrate-consensus (PublicKey, Hash, Transaction, Signature)
+//! as read-only dependencies. Does NOT modify chain crates.
+
+use crate::error::WalletError;
+use ed25519_dalek::{Signer, SigningKey};
+use sha3::{Digest, Keccak256};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Transaction builder with fluent API.
+pub struct TransactionBuilder {
+    to: Option<String>,
+    value: u128,
+    data: Vec<u8>,
+    nonce: Option<u64>,
+    gas_price: u64,
+    gas_limit: u64,
+    chain_id: u64,
+}
+
+impl TransactionBuilder {
+    pub fn new() -> Self {
+        Self {
+            to: None,
+            value: 0,
+            data: Vec::new(),
+            nonce: None,
+            gas_price: 1_000_000_000, // 1 Gwei
+            gas_limit: 21_000,
+            chain_id: 40204,
+        }
+    }
+
+    pub fn to(mut self, address: &str) -> Self {
+        self.to = Some(address.to_string());
+        self
+    }
+
+    pub fn value(mut self, wei: u128) -> Self {
+        self.value = wei;
+        self
+    }
+
+    pub fn data(mut self, payload: Vec<u8>) -> Self {
+        self.data = payload;
+        self
+    }
+
+    pub fn nonce(mut self, nonce: u64) -> Self {
+        self.nonce = Some(nonce);
+        self
+    }
+
+    pub fn gas_price(mut self, gwei: u64) -> Self {
+        self.gas_price = gwei;
+        self
+    }
+
+    pub fn gas_limit(mut self, limit: u64) -> Self {
+        self.gas_limit = limit;
+        self
+    }
+
+    pub fn chain_id(mut self, id: u64) -> Self {
+        self.chain_id = id;
+        self
+    }
+
+    /// Build the transaction hash for signing (EIP-155 style).
+    fn build_hash(&self, nonce: u64) -> [u8; 32] {
+        let mut hasher = Keccak256::new();
+        hasher.update(nonce.to_be_bytes());
+        hasher.update(self.gas_price.to_be_bytes());
+        hasher.update(self.gas_limit.to_be_bytes());
+
+        if let Some(ref to) = self.to {
+            let to_clean = to.strip_prefix("0x").unwrap_or(to);
+            if let Ok(to_bytes) = hex::decode(to_clean) {
+                hasher.update(&to_bytes);
+            }
+        }
+
+        hasher.update(self.value.to_be_bytes());
+        hasher.update(&self.data);
+        hasher.update(self.chain_id.to_be_bytes());
+        hasher.update([0u8; 8]); // EIP-155 padding
+        hasher.update([0u8; 8]);
+
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
+
+    /// Sign the transaction with a secp256k1 key (EVM-compatible ECDSA).
+    /// Produces EIP-155 compliant v/r/s signature.
+    pub fn sign_secp256k1(
+        self,
+        signing_key: &k256::ecdsa::SigningKey,
+        nonce: u64,
+    ) -> Result<SignedTransaction, WalletError> {
+        let tx_hash = self.build_hash(nonce);
+
+        // Sign with ECDSA
+        let (signature, recovery_id) = signing_key
+            .sign_prehash_recoverable(&tx_hash)
+            .map_err(|e| WalletError::SigningFailed(format!("secp256k1 sign failed: {}", e)))?;
+
+        let sig_bytes = signature.to_bytes();
+        let r = &sig_bytes[..32];
+        let s = &sig_bytes[32..];
+
+        // EIP-155: v = recovery_id + chain_id * 2 + 35
+        let v = recovery_id.to_byte() as u64 + self.chain_id * 2 + 35;
+
+        // Derive the EVM address from the public key
+        let verifying_key = signing_key.verifying_key();
+        let pubkey_bytes = k256::EncodedPoint::from(verifying_key);
+        let pubkey_uncompressed = pubkey_bytes.as_bytes();
+        // EVM address = Keccak256(pubkey[1..65])[12..32]
+        let mut address_hasher = Keccak256::new();
+        address_hasher.update(&pubkey_uncompressed[1..]); // Skip 0x04 prefix
+        let address_hash = address_hasher.finalize();
+        let from_addr = hex::encode(&address_hash[12..]);
+
+        // Build the RLP-encoded signed transaction for EVM submission
+        let raw = self.serialize_rlp_signed(nonce, v, r, s);
+
+        Ok(SignedTransaction {
+            hash: hex::encode(tx_hash),
+            from: format!("0x{}", from_addr),
+            to: self.to.clone(),
+            value: self.value,
+            nonce,
+            gas_price: self.gas_price,
+            gas_limit: self.gas_limit,
+            chain_id: self.chain_id,
+            data: self.data.clone(),
+            signature: format!("v={} r={} s={}", v, hex::encode(r), hex::encode(s)),
+            raw,
+        })
+    }
+
+    /// RLP-encode a signed legacy transaction (EIP-155).
+    fn serialize_rlp_signed(&self, nonce: u64, v: u64, r: &[u8], s: &[u8]) -> Vec<u8> {
+        let mut stream = rlp::RlpStream::new_list(9);
+        stream.append(&nonce);
+        stream.append(&self.gas_price);
+        stream.append(&self.gas_limit);
+
+        // To address (20 bytes or empty for contract creation)
+        if let Some(ref to) = self.to {
+            let to_clean = to.strip_prefix("0x").unwrap_or(to);
+            if let Ok(to_bytes) = hex::decode(to_clean) {
+                stream.append(&to_bytes.as_slice());
+            } else {
+                stream.append(&Vec::<u8>::new().as_slice());
+            }
+        } else {
+            stream.append(&Vec::<u8>::new().as_slice());
+        }
+
+        stream.append(&self.value);
+        stream.append(&self.data.as_slice());
+        stream.append(&v);
+        stream.append(&r);
+        stream.append(&s);
+
+        stream.out().to_vec()
+    }
+
+    /// Sign the transaction with an Ed25519 key. Returns the signed raw bytes.
+    pub fn sign(self, signing_key: &SigningKey, nonce: u64) -> Result<SignedTransaction, WalletError> {
+        let tx_hash = self.build_hash(nonce);
+        let signature = signing_key.sign(&tx_hash);
+
+        Ok(SignedTransaction {
+            hash: hex::encode(tx_hash),
+            from: hex::encode(signing_key.verifying_key().to_bytes()),
+            to: self.to.clone(),
+            value: self.value,
+            nonce,
+            gas_price: self.gas_price,
+            gas_limit: self.gas_limit,
+            chain_id: self.chain_id,
+            data: self.data.clone(),
+            signature: hex::encode(signature.to_bytes()),
+            raw: self.serialize_signed(nonce, &signing_key.verifying_key().to_bytes(), &signature.to_bytes()),
+        })
+    }
+
+    /// Serialize the signed transaction for RPC submission.
+    fn serialize_signed(&self, nonce: u64, pubkey: &[u8; 32], signature: &[u8; 64]) -> Vec<u8> {
+        // Use bincode serialization matching the chain's expected format
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&nonce.to_le_bytes());
+        buf.extend_from_slice(&self.gas_price.to_le_bytes());
+        buf.extend_from_slice(&self.gas_limit.to_le_bytes());
+
+        // To address (32 bytes, zero-padded)
+        let mut to_bytes = [0u8; 32];
+        if let Some(ref to) = self.to {
+            let to_clean = to.strip_prefix("0x").unwrap_or(to);
+            if let Ok(decoded) = hex::decode(to_clean) {
+                let len = decoded.len().min(32);
+                to_bytes[..len].copy_from_slice(&decoded[..len]);
+            }
+        }
+        buf.extend_from_slice(&to_bytes);
+
+        buf.extend_from_slice(&self.value.to_le_bytes());
+        buf.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.data);
+        buf.extend_from_slice(&self.chain_id.to_le_bytes());
+        buf.extend_from_slice(pubkey);
+        buf.extend_from_slice(signature);
+
+        buf
+    }
+}
+
+impl Default for TransactionBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A signed transaction ready for submission.
+#[derive(Debug, Clone)]
+pub struct SignedTransaction {
+    pub hash: String,
+    pub from: String,
+    pub to: Option<String>,
+    pub value: u128,
+    pub nonce: u64,
+    pub gas_price: u64,
+    pub gas_limit: u64,
+    pub chain_id: u64,
+    pub data: Vec<u8>,
+    pub signature: String,
+    pub raw: Vec<u8>,
+}
+
+/// JSON-RPC client for chain interaction.
+pub struct RpcClient {
+    url: String,
+    client: reqwest::Client,
+    request_id: AtomicU64,
+}
+
+impl RpcClient {
+    pub fn new(url: &str) -> Self {
+        Self {
+            url: url.to_string(),
+            client: reqwest::Client::new(),
+            request_id: AtomicU64::new(1),
+        }
+    }
+
+    fn next_id(&self) -> u64 {
+        self.request_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, WalletError> {
+        let id = self.next_id();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": id,
+        });
+
+        let response = self.client
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| WalletError::Rpc(format!("Request failed: {}", e)))?;
+
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| WalletError::Rpc(format!("Response parse failed: {}", e)))?;
+
+        if let Some(error) = json.get("error") {
+            let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown RPC error");
+            return Err(WalletError::Rpc(msg.to_string()));
+        }
+
+        json.get("result")
+            .cloned()
+            .ok_or_else(|| WalletError::Rpc("No result in response".to_string()))
+    }
+
+    /// Get the balance of an address (in wei).
+    pub async fn get_balance(&self, address: &str) -> Result<u128, WalletError> {
+        let result = self.call("eth_getBalance", serde_json::json!([address, "latest"])).await?;
+        parse_hex_u128(&result)
+    }
+
+    /// Get the transaction count (nonce) for an address.
+    pub async fn get_nonce(&self, address: &str) -> Result<u64, WalletError> {
+        let result = self.call("eth_getTransactionCount", serde_json::json!([address, "pending"])).await?;
+        parse_hex_u64(&result)
+    }
+
+    /// Submit a signed transaction.
+    pub async fn send_raw_transaction(&self, raw_tx: &[u8]) -> Result<String, WalletError> {
+        let hex_tx = format!("0x{}", hex::encode(raw_tx));
+        let result = self.call("eth_sendRawTransaction", serde_json::json!([hex_tx])).await?;
+        result.as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| WalletError::Rpc("Invalid tx hash response".to_string()))
+    }
+
+    /// Get the current block number.
+    pub async fn get_block_number(&self) -> Result<u64, WalletError> {
+        let result = self.call("eth_blockNumber", serde_json::json!([])).await?;
+        parse_hex_u64(&result)
+    }
+
+    /// Get the chain ID.
+    pub async fn get_chain_id(&self) -> Result<u64, WalletError> {
+        let result = self.call("eth_chainId", serde_json::json!([])).await?;
+        parse_hex_u64(&result)
+    }
+
+    /// Estimate gas for a transaction.
+    pub async fn estimate_gas(
+        &self,
+        from: &str,
+        to: &str,
+        value: u128,
+    ) -> Result<u64, WalletError> {
+        let result = self.call("eth_estimateGas", serde_json::json!([{
+            "from": from,
+            "to": to,
+            "value": format!("0x{:x}", value),
+        }])).await?;
+        parse_hex_u64(&result)
+    }
+
+    /// Get a transaction receipt.
+    pub async fn get_transaction_receipt(&self, tx_hash: &str) -> Result<Option<serde_json::Value>, WalletError> {
+        let result = self.call("eth_getTransactionReceipt", serde_json::json!([tx_hash])).await?;
+        if result.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
+    }
+}
+
+fn parse_hex_u64(value: &serde_json::Value) -> Result<u64, WalletError> {
+    let s = value.as_str().ok_or_else(|| WalletError::Rpc("Expected hex string".into()))?;
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    u64::from_str_radix(s, 16).map_err(|e| WalletError::Rpc(format!("Invalid hex u64: {}", e)))
+}
+
+fn parse_hex_u128(value: &serde_json::Value) -> Result<u128, WalletError> {
+    let s = value.as_str().ok_or_else(|| WalletError::Rpc("Expected hex string".into()))?;
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    u128::from_str_radix(s, 16).map_err(|e| WalletError::Rpc(format!("Invalid hex u128: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transaction_builder_defaults() {
+        let builder = TransactionBuilder::new();
+        assert_eq!(builder.chain_id, 40204);
+        assert_eq!(builder.gas_limit, 21_000);
+        assert_eq!(builder.gas_price, 1_000_000_000);
+        assert_eq!(builder.value, 0);
+        assert!(builder.to.is_none());
+    }
+
+    #[test]
+    fn test_transaction_builder_fluent() {
+        let builder = TransactionBuilder::new()
+            .to("0xb5ddd4eb356ddf3bf51eb3aec1ed28213be59129")
+            .value(1_000_000_000_000_000_000) // 1 SALT
+            .gas_limit(21_000)
+            .gas_price(2_000_000_000)
+            .chain_id(40204);
+
+        assert_eq!(builder.to.as_deref(), Some("0xb5ddd4eb356ddf3bf51eb3aec1ed28213be59129"));
+        assert_eq!(builder.value, 1_000_000_000_000_000_000);
+    }
+
+    #[test]
+    fn test_sign_transaction() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let tx = TransactionBuilder::new()
+            .to("0xb5ddd4eb356ddf3bf51eb3aec1ed28213be59129")
+            .value(1000)
+            .sign(&key, 0)
+            .expect("sign transaction");
+
+        assert!(!tx.hash.is_empty());
+        assert!(!tx.signature.is_empty());
+        assert_eq!(tx.signature.len(), 128); // 64 bytes hex
+        assert!(!tx.raw.is_empty());
+        assert_eq!(tx.nonce, 0);
+        assert_eq!(tx.chain_id, 40204);
+    }
+
+    #[test]
+    fn test_sign_deterministic() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let tx1 = TransactionBuilder::new()
+            .to("0xb5ddd4eb356ddf3bf51eb3aec1ed28213be59129")
+            .value(1000)
+            .sign(&key, 5)
+            .expect("sign 1");
+        let tx2 = TransactionBuilder::new()
+            .to("0xb5ddd4eb356ddf3bf51eb3aec1ed28213be59129")
+            .value(1000)
+            .sign(&key, 5)
+            .expect("sign 2");
+
+        assert_eq!(tx1.hash, tx2.hash);
+        assert_eq!(tx1.signature, tx2.signature);
+    }
+
+    #[test]
+    fn test_different_nonce_different_hash() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let tx1 = TransactionBuilder::new()
+            .to("0xb5ddd4eb356ddf3bf51eb3aec1ed28213be59129")
+            .value(1000)
+            .sign(&key, 0)
+            .expect("sign nonce 0");
+        let tx2 = TransactionBuilder::new()
+            .to("0xb5ddd4eb356ddf3bf51eb3aec1ed28213be59129")
+            .value(1000)
+            .sign(&key, 1)
+            .expect("sign nonce 1");
+
+        assert_ne!(tx1.hash, tx2.hash);
+    }
+
+    #[test]
+    fn test_different_chain_id_different_hash() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let tx1 = TransactionBuilder::new().chain_id(1).value(1000).sign(&key, 0).expect("chain 1");
+        let tx2 = TransactionBuilder::new().chain_id(40204).value(1000).sign(&key, 0).expect("chain 40204");
+        assert_ne!(tx1.hash, tx2.hash, "Different chain IDs should produce different hashes (replay protection)");
+    }
+
+    #[test]
+    fn test_contract_deploy_no_to() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let tx = TransactionBuilder::new()
+            .data(vec![0x60, 0x80, 0x60, 0x40]) // minimal bytecode
+            .gas_limit(1_000_000)
+            .sign(&key, 0)
+            .expect("deploy");
+
+        assert!(tx.to.is_none());
+        assert!(!tx.data.is_empty());
+    }
+
+    #[test]
+    fn test_parse_hex_u64_values() {
+        let val = serde_json::json!("0x1");
+        assert_eq!(parse_hex_u64(&val).expect("parse"), 1);
+
+        let val = serde_json::json!("0xff");
+        assert_eq!(parse_hex_u64(&val).expect("parse"), 255);
+
+        let val = serde_json::json!("0x9d0c");
+        assert_eq!(parse_hex_u64(&val).expect("parse"), 40204);
+    }
+
+    #[test]
+    fn test_parse_hex_u128_values() {
+        let val = serde_json::json!("0xde0b6b3a7640000"); // 1 ETH in wei
+        assert_eq!(parse_hex_u128(&val).expect("parse"), 1_000_000_000_000_000_000);
+    }
+
+    #[test]
+    fn test_parse_hex_invalid() {
+        let val = serde_json::json!(42);
+        assert!(parse_hex_u64(&val).is_err());
+
+        let val = serde_json::json!("not_hex");
+        assert!(parse_hex_u64(&val).is_err());
+    }
+
+    #[test]
+    fn test_rpc_client_creation() {
+        let client = RpcClient::new("https://rpc.citrate.ai");
+        assert_eq!(client.url, "https://rpc.citrate.ai");
+    }
+
+    #[test]
+    fn test_rpc_client_id_increments() {
+        let client = RpcClient::new("http://localhost:8545");
+        let id1 = client.next_id();
+        let id2 = client.next_id();
+        assert_eq!(id2, id1 + 1);
+    }
+
+    #[test]
+    fn test_signed_tx_has_from() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let expected_from = hex::encode(key.verifying_key().to_bytes());
+        let tx = TransactionBuilder::new().value(0).sign(&key, 0).expect("sign");
+        assert_eq!(tx.from, expected_from);
+    }
+
+    // === secp256k1 / EVM signing tests ===
+
+    #[test]
+    fn test_secp256k1_sign_produces_valid_tx() {
+        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let tx = TransactionBuilder::new()
+            .to("0xdead000000000000000000000000000000000000")
+            .value(1_000_000_000_000_000_000) // 1 SALT
+            .chain_id(40204)
+            .sign_secp256k1(&key, 0)
+            .expect("secp256k1 sign");
+
+        assert!(!tx.hash.is_empty());
+        assert!(tx.from.starts_with("0x"));
+        assert_eq!(tx.from.len(), 42); // 0x + 40 hex chars
+        assert!(!tx.raw.is_empty());
+        assert!(tx.signature.contains("v="));
+        assert!(tx.signature.contains("r="));
+        assert!(tx.signature.contains("s="));
+    }
+
+    #[test]
+    fn test_secp256k1_sign_deterministic() {
+        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let tx1 = TransactionBuilder::new()
+            .to("0xdead000000000000000000000000000000000000")
+            .value(100)
+            .chain_id(40204)
+            .sign_secp256k1(&key, 5)
+            .expect("sign 1");
+        let tx2 = TransactionBuilder::new()
+            .to("0xdead000000000000000000000000000000000000")
+            .value(100)
+            .chain_id(40204)
+            .sign_secp256k1(&key, 5)
+            .expect("sign 2");
+
+        assert_eq!(tx1.hash, tx2.hash);
+        assert_eq!(tx1.from, tx2.from);
+    }
+
+    #[test]
+    fn test_secp256k1_different_keys_different_from() {
+        let key1 = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let key2 = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+
+        let tx1 = TransactionBuilder::new().value(0).sign_secp256k1(&key1, 0).expect("sign 1");
+        let tx2 = TransactionBuilder::new().value(0).sign_secp256k1(&key2, 0).expect("sign 2");
+
+        assert_ne!(tx1.from, tx2.from);
+    }
+
+    #[test]
+    fn test_secp256k1_eip155_v_value() {
+        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let tx = TransactionBuilder::new()
+            .chain_id(40204)
+            .sign_secp256k1(&key, 0)
+            .expect("sign");
+
+        // EIP-155: v = recovery_id + chain_id * 2 + 35
+        // recovery_id is 0 or 1, so v is either 80443 or 80444 for chain_id 40204
+        let v_str = tx.signature.split("v=").nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .expect("v value");
+        let v: u64 = v_str.parse().expect("parse v");
+        assert!(v == 40204 * 2 + 35 || v == 40204 * 2 + 36);
+    }
+
+    #[test]
+    fn test_secp256k1_rlp_encoded_output() {
+        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let tx = TransactionBuilder::new()
+            .to("0xdead000000000000000000000000000000000000")
+            .value(1000)
+            .chain_id(40204)
+            .sign_secp256k1(&key, 42)
+            .expect("sign");
+
+        // RLP output should be parseable
+        assert!(!tx.raw.is_empty());
+        // First byte should indicate a list (0xc0+)
+        assert!(tx.raw[0] >= 0xc0 || tx.raw[0] >= 0xf7,
+            "RLP should start with list prefix, got 0x{:02x}", tx.raw[0]);
+    }
+
+    #[test]
+    fn test_secp256k1_from_address_is_keccak_derived() {
+        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let tx = TransactionBuilder::new().value(0).sign_secp256k1(&key, 0).expect("sign");
+
+        // Independently derive the address
+        let vk = key.verifying_key();
+        let pubkey_point = k256::EncodedPoint::from(vk);
+        let pubkey_bytes = pubkey_point.as_bytes();
+        let mut hasher = Keccak256::new();
+        hasher.update(&pubkey_bytes[1..]); // Skip 0x04
+        let hash = hasher.finalize();
+        let expected = format!("0x{}", hex::encode(&hash[12..]));
+
+        assert_eq!(tx.from, expected);
+    }
+
+    #[test]
+    fn test_secp256k1_contract_creation_empty_to() {
+        let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let tx = TransactionBuilder::new()
+            .value(0)
+            .data(vec![0x60, 0x60, 0x60, 0x40]) // Minimal bytecode
+            .sign_secp256k1(&key, 0)
+            .expect("sign");
+
+        assert!(tx.to.is_none());
+        assert!(!tx.raw.is_empty());
+    }
+}

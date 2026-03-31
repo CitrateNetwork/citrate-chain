@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use citrate_consensus::types::{
-    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction,
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction,
     TransactionType, VrfProof,
 };
 use citrate_network::{

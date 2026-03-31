@@ -72,8 +72,10 @@ impl ApiService {
         );
 
         let ws_server = WebSocketServer::new(ws_addr);
+        // C-02 FIX: Thread rest_api_key from environment — fail closed on mutating routes when absent
+        let rest_api_key = std::env::var("CITRATE_REST_API_KEY").ok().filter(|k| !k.is_empty());
         let rest_server =
-            OpenAiRestServer::with_config(storage, mempool, executor, cors_origins, None);
+            OpenAiRestServer::with_config(storage, mempool, executor, cors_origins, rest_api_key);
 
         Self {
             rpc_server,

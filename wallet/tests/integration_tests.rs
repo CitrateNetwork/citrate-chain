@@ -17,7 +17,6 @@ use citrate_wallet::{Wallet, WalletConfig};
 use citrate_execution::types::Address;
 use primitive_types::U256;
 use std::env;
-use std::path::PathBuf;
 use tempfile::TempDir;
 
 // ============================================================================
@@ -45,6 +44,7 @@ const TEST_PRIVATE_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efc
 const TEST_ADDRESS: &str = "3333333333333333333333333333333333333333";
 
 const TEST_PRIVATE_KEY_2: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+#[allow(dead_code)]
 const TEST_ADDRESS_2: &str = "70997970C51812dc3A010C7d01b50e0d17dc79C8";
 
 // ============================================================================

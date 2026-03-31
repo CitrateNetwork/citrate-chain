@@ -13,7 +13,7 @@
 use citrate_api::FilterRegistry;
 use citrate_consensus::crypto::verify_transaction;
 use citrate_consensus::types::{
-    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction,
 };
 use citrate_execution::executor::Executor;
 use citrate_execution::types::Address;

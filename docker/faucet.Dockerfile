@@ -1,13 +1,20 @@
-FROM rust:1.75 as builder
+# Citrate Faucet Dockerfile
+FROM rust:1.93.0-slim as builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config libssl-dev build-essential clang cmake \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-COPY lattice-v3 /app/lattice-v3
-RUN apt-get update && apt-get install -y build-essential clang cmake pkg-config && \
-    cargo build -p lattice-faucet --release
+COPY . .
+RUN cargo build --release --bin citrate-faucet
 
 FROM debian:bookworm-slim
-RUN useradd -m lattice
-COPY --from=builder /app/target/release/lattice-faucet /usr/local/bin/lattice-faucet
-USER lattice
-EXPOSE 3001
-ENTRYPOINT ["/usr/local/bin/lattice-faucet"]
+RUN apt-get update && apt-get install -y ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1000 citrate
+COPY --from=builder /app/target/release/citrate-faucet /usr/local/bin/citrate-faucet
 
+USER citrate
+EXPOSE 3003
+CMD ["citrate-faucet"]

@@ -302,24 +302,24 @@ fn test_composition_different_ranks_numerical_stability() {
     let delta_4 = {
         let modified = apply_lora(&base, &a4).unwrap();
         let mut delta = vec![0.0f32; dim];
-        for j in 0..dim {
-            delta[j] = modified.data[j] - base.data[j];
+        for (j, delta_val) in delta.iter_mut().enumerate() {
+            *delta_val = modified.data[j] - base.data[j];
         }
         delta
     };
     let delta_8 = {
         let modified = apply_lora(&base, &a8).unwrap();
         let mut delta = vec![0.0f32; dim];
-        for j in 0..dim {
-            delta[j] = modified.data[j] - base.data[j];
+        for (j, delta_val) in delta.iter_mut().enumerate() {
+            *delta_val = modified.data[j] - base.data[j];
         }
         delta
     };
     let delta_16 = {
         let modified = apply_lora(&base, &a16).unwrap();
         let mut delta = vec![0.0f32; dim];
-        for j in 0..dim {
-            delta[j] = modified.data[j] - base.data[j];
+        for (j, delta_val) in delta.iter_mut().enumerate() {
+            *delta_val = modified.data[j] - base.data[j];
         }
         delta
     };
@@ -327,8 +327,8 @@ fn test_composition_different_ranks_numerical_stability() {
     // composed delta should equal sum of individual deltas
     let delta_composed = {
         let mut delta = vec![0.0f32; dim];
-        for j in 0..dim {
-            delta[j] = result.data[j] - base.data[j];
+        for (j, delta_val) in delta.iter_mut().enumerate() {
+            *delta_val = result.data[j] - base.data[j];
         }
         delta
     };

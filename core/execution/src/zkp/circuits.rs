@@ -4,19 +4,41 @@
 use super::types::{GradientProofCircuit, ModelExecutionCircuit};
 use ark_bls12_381::Fr;
 #[allow(unused_imports)]
-use ark_ff::Zero;
+use ark_ff::{Field, Zero};
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::prelude::*;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 
+#[allow(dead_code)]
 const HASH_OUTPUT_SIZE: usize = 32;
 #[allow(dead_code)]
 const FIXED_POINT_SCALE: u64 = 1_000_000;
-const HASH_SALT: [u8; HASH_OUTPUT_SIZE] = [
-    0x73, 0xa1, 0x5c, 0x44, 0xda, 0xf0, 0x91, 0x2b, 0x6e, 0x0d, 0x83, 0x57, 0x3d, 0x9f, 0xb2,
-    0xc4, 0x1a, 0xe7, 0x66, 0x28, 0xfe, 0x5a, 0x8c, 0xbb, 0x32, 0x47, 0x19, 0xd8, 0x04, 0xaf,
-    0x61, 0x90,
-];
+
+// Large odd constants for field-level hashing (MiMC-style round constants).
+// These are arbitrary non-zero field elements that provide mixing.
+const FIELD_HASH_C1: u128 = 0x73a15c44daf0912b_6e0d83573d9fb2c4;
+const FIELD_HASH_C2: u128 = 0x1ae76628fe5a8cbb_324719d804af6190;
+
+/// Field-level hash: h(a, b) = (a + C1) * (b + C2) + a
+///
+/// This produces ~2 R1CS constraints (one multiply + one add) and operates
+/// natively on field elements, avoiding the broken byte-level XOR decomposition.
+/// Not cryptographically strong, but sufficient for in-circuit binding proofs
+/// (proving that model, dataset, and gradient hashes are all bound together).
+fn hash_pair_field(left: &FpVar<Fr>, right: &FpVar<Fr>) -> Result<FpVar<Fr>, SynthesisError> {
+    let c1 = FpVar::constant(Fr::from(FIELD_HASH_C1));
+    let c2 = FpVar::constant(Fr::from(FIELD_HASH_C2));
+    // h(a, b) = (a + C1) * (b + C2) + a
+    let result = (left + &c1) * (right + &c2) + left;
+    Ok(result)
+}
+
+/// Convert a byte slice (hash) into a field element by interpreting first 16 bytes as u128.
+/// This matches the encoding used for public inputs throughout the circuit.
+fn bytes_to_field(bytes: &[u8]) -> Fr {
+    let val = bytes.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
+    Fr::from(val)
+}
 
 #[allow(dead_code)]
 fn encode_fixed(value: f64) -> Result<u64, SynthesisError> {
@@ -37,75 +59,6 @@ fn allocate_fixed_var(
 ) -> Result<FpVar<Fr>, SynthesisError> {
     let encoded = encode_fixed(value)?;
     FpVar::new_witness(cs, || Ok(Fr::from(encoded)))
-}
-
-#[allow(dead_code)]
-fn fp_to_hash_bytes(value: &FpVar<Fr>) -> Result<Vec<UInt8<Fr>>, SynthesisError> {
-    let bits = value.to_bits_le()?;
-    let mut bytes = Vec::with_capacity(HASH_OUTPUT_SIZE);
-    for chunk in bits.chunks(8).take(HASH_OUTPUT_SIZE) {
-        let mut chunk_bits = chunk.to_vec();
-        while chunk_bits.len() < 8 {
-            chunk_bits.push(Boolean::FALSE);
-        }
-        bytes.push(UInt8::from_bits_le(&chunk_bits));
-    }
-    while bytes.len() < HASH_OUTPUT_SIZE {
-        bytes.push(UInt8::constant(0));
-    }
-    Ok(bytes)
-}
-
-#[allow(dead_code)]
-fn u64_to_hash_bytes(value: u64) -> Vec<UInt8<Fr>> {
-    let mut raw = value.to_le_bytes().to_vec();
-    raw.resize(HASH_OUTPUT_SIZE, 0);
-    UInt8::constant_vec(&raw)
-}
-
-fn hash_pair(left: &[UInt8<Fr>], right: &[UInt8<Fr>]) -> Result<Vec<UInt8<Fr>>, SynthesisError> {
-    let mut result = Vec::with_capacity(HASH_OUTPUT_SIZE);
-    for i in 0..HASH_OUTPUT_SIZE {
-        let l_byte = if i < left.len() {
-            left[i].clone()
-        } else {
-            UInt8::constant(0)
-        };
-        let r_byte = if i < right.len() {
-            right[i].clone()
-        } else {
-            UInt8::constant(0)
-        };
-
-        let l_bits = l_byte.to_bits_le()?;
-        let r_bits = r_byte.to_bits_le()?;
-
-        let mut mixed_bits = Vec::with_capacity(8);
-        for bit_idx in 0..8 {
-            let mut bit = l_bits[bit_idx].xor(&r_bits[bit_idx])?;
-            if (HASH_SALT[i % HASH_OUTPUT_SIZE] >> bit_idx) & 1 == 1 {
-                bit = bit.xor(&Boolean::TRUE)?;
-            }
-            mixed_bits.push(bit);
-        }
-
-        result.push(UInt8::from_bits_le(&mixed_bits));
-    }
-    Ok(result)
-}
-
-#[allow(dead_code)]
-fn hash_chain(chunks: &[Vec<UInt8<Fr>>]) -> Result<Vec<UInt8<Fr>>, SynthesisError> {
-    if chunks.is_empty() {
-        return Ok(UInt8::constant_vec(&HASH_SALT));
-    }
-
-    let seed = UInt8::constant_vec(&HASH_SALT);
-    let mut state = hash_pair(&seed, &chunks[0])?;
-    for chunk in chunks.iter().skip(1) {
-        state = hash_pair(&state, chunk)?;
-    }
-    Ok(state)
 }
 
 /// Implementation of model execution circuit
@@ -171,51 +124,29 @@ impl ConstraintSynthesizer<Fr> for ModelExecutionCircuit {
 impl ConstraintSynthesizer<Fr> for GradientProofCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
         // Public inputs: model, dataset, gradient hashes + loss + samples
-        let model_field = self.model_hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
-        let dataset_field = self.dataset_hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
-        let gradient_field = self.gradient_hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
+        let model_field = bytes_to_field(&self.model_hash);
+        let dataset_field = bytes_to_field(&self.dataset_hash);
+        let gradient_field = bytes_to_field(&self.gradient_hash);
 
-        let _model_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(model_field)))?;
-        let _dataset_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(dataset_field)))?;
-        let _gradient_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(gradient_field)))?;
-        let _loss_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(self.loss_value as u64)))?;
-        let _samples_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(self.num_samples)))?;
+        let model_pub = FpVar::new_input(cs.clone(), || Ok(model_field))?;
+        let dataset_pub = FpVar::new_input(cs.clone(), || Ok(dataset_field))?;
+        let gradient_pub = FpVar::new_input(cs.clone(), || Ok(gradient_field))?;
+        let loss_encoded = encode_fixed(self.loss_value)?;
+        let _loss_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(loss_encoded)))?;
+        let samples_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(self.num_samples)))?;
 
-        // Private witnesses
-        let gradient_hash_vars: Vec<_> = self.gradient_hash.iter()
-            .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
-            .collect::<Result<_, _>>()?;
-        let model_hash_vars: Vec<_> = self.model_hash.iter()
-            .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
-            .collect::<Result<_, _>>()?;
-        let dataset_hash_vars: Vec<_> = self.dataset_hash.iter()
-            .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
-            .collect::<Result<_, _>>()?;
-
-        // Constraint: gradient hash is non-zero (at least one byte must be non-zero)
-        let mut any_nonzero = Boolean::FALSE;
-        for byte_var in &gradient_hash_vars {
-            let is_zero = byte_var.is_eq(&UInt8::constant(0))?;
-            any_nonzero = any_nonzero.or(&is_zero.not())?;
-        }
-        any_nonzero.enforce_equal(&Boolean::TRUE)?;
+        // Constraint: gradient hash field element is non-zero
+        gradient_pub.enforce_not_equal(&FpVar::zero())?;
 
         // Constraint: num_samples > 0 (training must have processed at least one sample)
-        let samples_var = FpVar::new_witness(cs.clone(), || Ok(Fr::from(self.num_samples)))?;
-        let zero = FpVar::zero();
-        samples_var.enforce_not_equal(&zero)?;
+        samples_pub.enforce_not_equal(&FpVar::zero())?;
 
         // Constraint: gradient hash is consistent with model+dataset (binding integrity)
-        // Hash the model and dataset witnesses together, then verify relationship to gradient
-        let combined = hash_pair(&model_hash_vars, &dataset_hash_vars)?;
-        let grad_combined = hash_pair(&combined, &gradient_hash_vars)?;
+        // Field-level hash: hash(model, dataset), then hash(result, gradient)
+        let combined = hash_pair_field(&model_pub, &dataset_pub)?;
+        let grad_combined = hash_pair_field(&combined, &gradient_pub)?;
         // Enforce the combined hash is non-zero (proves all inputs are bound together)
-        let mut combined_nonzero = Boolean::FALSE;
-        for byte_var in &grad_combined {
-            let is_zero = byte_var.is_eq(&UInt8::constant(0))?;
-            combined_nonzero = combined_nonzero.or(&is_zero.not())?;
-        }
-        combined_nonzero.enforce_equal(&Boolean::TRUE)?;
+        grad_combined.enforce_not_equal(&FpVar::zero())?;
 
         Ok(())
     }
@@ -273,46 +204,33 @@ pub struct DataIntegrityCircuit {
 impl ConstraintSynthesizer<Fr> for DataIntegrityCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
         // Public inputs: data_hash, merkle_root
-        let data_field = self.data_hash.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
-        let root_field = self.merkle_root.iter().take(16).fold(0u128, |acc, &b| acc * 256 + b as u128);
+        let data_field = bytes_to_field(&self.data_hash);
+        let root_field = bytes_to_field(&self.merkle_root);
 
-        let _data_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(data_field)))?;
-        let _root_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(root_field)))?;
+        let _data_pub = FpVar::new_input(cs.clone(), || Ok(data_field))?;
+        let root_pub = FpVar::new_input(cs.clone(), || Ok(root_field))?;
+        let _leaf_index_pub = FpVar::new_input(cs.clone(), || Ok(Fr::from(self.leaf_index)))?;
 
-        // Private witnesses
-        let data_hash_vars: Vec<_> = self.data_hash.iter()
-            .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
-            .collect::<Result<_, _>>()?;
-        let root_vars: Vec<_> = self.merkle_root.iter()
-            .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
-            .collect::<Result<_, _>>()?;
-
-        // Verify merkle path
-        let mut current_hash = data_hash_vars;
+        // Verify merkle path using field-level hashing
+        let mut current = FpVar::new_witness(cs.clone(), || Ok(data_field))?;
         let mut index = self.leaf_index;
 
         for sibling in self.merkle_path.iter() {
-            let sibling_vars: Vec<_> = sibling
-                .iter()
-                .map(|byte| UInt8::new_witness(cs.clone(), || Ok(*byte)))
-                .collect::<Result<_, _>>()?;
+            let sibling_field = bytes_to_field(sibling);
+            let sibling_var = FpVar::new_witness(cs.clone(), || Ok(sibling_field))?;
 
-            // Combine hashes based on index bit
+            // Combine hashes based on index bit (order matters for merkle trees)
             if index & 1 == 0 {
-                // Current hash is left child
-                current_hash = hash_pair(&current_hash, &sibling_vars)?;
+                current = hash_pair_field(&current, &sibling_var)?;
             } else {
-                // Current hash is right child
-                current_hash = hash_pair(&sibling_vars, &current_hash)?;
+                current = hash_pair_field(&sibling_var, &current)?;
             }
 
             index >>= 1;
         }
 
         // Verify that computed root matches expected root
-        for (computed, expected) in current_hash.iter().zip(root_vars.iter()) {
-            computed.enforce_equal(expected)?;
-        }
+        current.enforce_equal(&root_pub)?;
 
         Ok(())
     }

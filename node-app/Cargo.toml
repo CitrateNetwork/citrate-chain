@@ -12,7 +12,7 @@ serde = { workspace = true }
 axum = "0.7"
 prometheus = { version = "0.13", default-features = false }
 
-# Lattice crates
+# Citrate crates
 citrate-api = { path = "../core/api" }
 citrate-storage = { path = "../core/storage" }
 citrate-sequencer = { path = "../core/sequencer" }

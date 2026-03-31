@@ -1,8 +1,8 @@
-# TLA+ Formal Verification Suite
+# TLA+ Formal Verification Suite (Local Subset)
 
-**36 specifications | 200+ invariants | 0 violations | 6 domains**
+**46 specifications | 6 domains | 0 violations**
 
-This directory contains Citrate's complete TLA+ formal verification suite. Every safety-critical state machine in the protocol has a corresponding specification with model-checked invariants.
+This directory contains a **local subset** of Citrate's TLA+ formal verification suite. The canonical collection (84 specs) lives at `.agentile/formal/specs/`. This local subset is runnable in CI and covers the core protocol domains.
 
 ## Directory Structure
 
@@ -57,7 +57,7 @@ specs/tla/
 │   ├── ModelLifecycle.tla         Model deploy-update-inference lifecycle
 │   └── SDKConnectionLifecycle.tla Connection state machine, retry, failover
 │
-├── run_all.sh                     Run all 36 specs (standard, single worker)
+├── run_all.sh                     Run all local specs (standard, single worker)
 ├── run_all_27.sh                  Legacy runner for first 27 specs
 ├── run_deep.sh                    Deep verification (16 workers, 45-minute timeout)
 └── tla2tools.jar                  TLC model checker binary
@@ -71,7 +71,7 @@ specs/tla/
 bash run_all.sh
 ```
 
-Runs all 36 specs with a single TLC worker. Takes approximately 5-8 minutes. Used in CI via `.github/workflows/tla-check.yml`.
+Runs all local specs with a single TLC worker. Takes approximately 5-8 minutes. Used in CI via `.github/workflows/tla-check.yml`. For the full canonical spec set (84 specs), see `.agentile/formal/specs/`.
 
 ### Deep Verification
 
@@ -113,7 +113,7 @@ Every spec includes `TypeInv` (type safety) plus domain-specific invariants:
 
 | Category | Example Invariant | Specs Using It |
 |----------|-------------------|---------------|
-| Type Safety | `TypeInv` | All 36 |
+| Type Safety | `TypeInv` | All specs |
 | No Duplication | `NoDuplicateHashes` | Mempool, VRF, Compute |
 | Ordering | `BlueScoreMonotonicity` | GhostDAG, TX Execution |
 | Capacity | `CapacityRespected` | Mempool, ComputePool |

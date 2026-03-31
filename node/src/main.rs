@@ -231,7 +231,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Commands::Devnet) => {
-            run_devnet().await?;
+            run_devnet(cli.coinbase.clone()).await?;
             return Ok(());
         }
         Some(Commands::Keygen { ed25519 }) => {
@@ -615,11 +615,16 @@ async fn init_chain(chain_id: u64) -> Result<()> {
     Ok(())
 }
 
-async fn run_devnet() -> Result<()> {
+async fn run_devnet(coinbase: Option<String>) -> Result<()> {
     info!("Starting devnet...");
 
     let mut config = NodeConfig::devnet();
     config.storage.data_dir = PathBuf::from(".citrate-devnet");
+
+    // Apply CLI coinbase if provided
+    if let Some(cb) = coinbase {
+        config.mining.coinbase = cb;
+    }
 
     // Initialize chain if needed
     if !config.storage.data_dir.exists() {
