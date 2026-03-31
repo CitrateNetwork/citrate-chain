@@ -8,15 +8,17 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 /**
  * @title ModelAccessControl
  * @notice Manages access control and permissions for AI models on Citrate
- * @dev Integrates with precompiles at 0x0100-0x0106 for AI operations
+ * @dev Integrates with state precompile at 0x...1000 and runtime precompiles at 0x0100-0x0106
  */
 contract ModelAccessControl is Ownable, ReentrancyGuard {
     using ECDSA for bytes32;
 
     // ============ Constants ============
 
-    // Precompile addresses
-    address constant MODEL_DEPLOY = address(0x0100);
+    // Precompile addresses — canonical families from executor.rs
+    // State-changing model operations (registration, metadata)
+    address constant MODEL_PRECOMPILE = 0x0000000000000000000000000000000000001000;
+    // Runtime inference operations
     address constant MODEL_INFERENCE = address(0x0101);
     address constant MODEL_ENCRYPTION = address(0x0106);
 
