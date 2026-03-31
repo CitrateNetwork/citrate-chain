@@ -1,6 +1,7 @@
 name: Rust CI
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - 'citrate_v0.01.1/**'
