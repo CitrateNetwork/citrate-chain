@@ -4,7 +4,7 @@
 // The genesis block creation uses feature-gated model embedding (embed-genesis-model).
 // When the feature is disabled, embedded models will be empty (contributor builds).
 
-use citrate_consensus::types::{Block, BlockBuilder, GhostDagParams, Hash, PublicKey, Signature, VrfProof};
+use citrate_consensus::types::{Block, BlockBuilder, GhostDagParams, Hash, PublicKey,  VrfProof};
 
 /// Create a minimal test genesis block for unit tests
 /// This doesn't include embedded models - those are feature-gated in production code

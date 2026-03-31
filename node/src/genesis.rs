@@ -1,45 +1,17 @@
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::types::{
-    Block, BlockBuilder, BlockHeader, EmbeddedModel, Hash, ModelId as ConsensusModelId,
-    ModelMetadata as ConsensusModelMetadata, ModelType, PublicKey, RequiredModel,
-    VrfProof,
+    Block, Hash, PublicKey,
 };
-use citrate_economics::genesis::GenesisConfig as EconomicsGenesisConfig;
+use citrate_economics::genesis::{
+    self as shared_genesis, GenesisConfig as EconomicsGenesisConfig,
+};
 use citrate_execution::executor::Executor;
-use citrate_execution::types::{
-    AccessPolicy, Address, ModelId, ModelMetadata, ModelState, UsageStats,
-};
 use citrate_storage::StorageManager;
-use primitive_types::U256;
-use sha3::{Digest, Sha3_256};
 use std::sync::Arc;
 
 /// Calculate block hash using SHA3-256
 fn calculate_block_hash(block: &Block) -> Hash {
-    let mut hasher = Sha3_256::new();
-
-    // Hash header fields
-    hasher.update(block.header.version.to_le_bytes());
-    hasher.update(block.header.selected_parent_hash.as_bytes());
-    for parent in &block.header.merge_parent_hashes {
-        hasher.update(parent.as_bytes());
-    }
-    hasher.update(block.header.timestamp.to_le_bytes());
-    hasher.update(block.header.height.to_le_bytes());
-    hasher.update(block.header.blue_score.to_le_bytes());
-    hasher.update(block.header.blue_work.to_le_bytes());
-    hasher.update(block.header.pruning_point.as_bytes());
-
-    // Hash roots
-    hasher.update(block.state_root.as_bytes());
-    hasher.update(block.tx_root.as_bytes());
-    hasher.update(block.receipt_root.as_bytes());
-    hasher.update(block.artifact_root.as_bytes());
-
-    let hash_bytes = hasher.finalize();
-    let mut hash_array = [0u8; 32];
-    hash_array.copy_from_slice(&hash_bytes[..32]);
-    Hash::new(hash_array)
+    shared_genesis::calculate_canonical_block_hash(block)
 }
 
 /// Genesis block configuration
@@ -53,7 +25,7 @@ pub struct GenesisConfig {
 /// Canonical genesis timestamp: 2026-01-01T00:00:00Z (UTC).
 /// C2 fix: All nodes MUST use this same timestamp so the genesis block hash
 /// is deterministic and identical across independent node startups.
-pub const CANONICAL_GENESIS_TIMESTAMP: u64 = 1_767_225_600;
+pub const CANONICAL_GENESIS_TIMESTAMP: u64 = shared_genesis::CANONICAL_GENESIS_TIMESTAMP;
 
 impl Default for GenesisConfig {
     fn default() -> Self {
@@ -81,94 +53,23 @@ impl Default for GenesisConfig {
                     0xaf, 0xce, 0x37, 0x7c, 0x00, 0x00, 0x00, 0x00,
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 ]), 10_000_000_000_000_000_000_000), // 10000 ETH for testing
+
+                // Faucet signing key account (0x6680b43af09d9b351332bf5378eb580e3b390182)
+                // Deterministic key from "citrate-faucet-testnet-v1". 10M SALT.
+                (PublicKey::new([
+                    0x66, 0x80, 0xb4, 0x3a, 0xf0, 0x9d, 0x9b, 0x35,
+                    0x13, 0x32, 0xbf, 0x53, 0x78, 0xeb, 0x58, 0x0e,
+                    0x3b, 0x39, 0x01, 0x82, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ]), 10_000_000_000_000_000_000_000_000), // 10M SALT for faucet
             ],
         }
     }
 }
 
-/// Create embedded BGE-M3 model for genesis block
-fn create_embedded_bge_m3() -> EmbeddedModel {
-    // Only embed the actual model when the feature flag is enabled
-    // This allows contributors to build without downloading the 417 MB model file
-    // The genesis block is loaded from the blockchain database at runtime
-    #[cfg(feature = "embed-genesis-model")]
-    const BGE_M3_Q4: &[u8] = include_bytes!("../assets/bge-m3-q4.gguf");
-
-    #[cfg(not(feature = "embed-genesis-model"))]
-    const BGE_M3_Q4: &[u8] = &[];
-
-    EmbeddedModel {
-        model_id: ConsensusModelId::from_name("bge-m3"),
-        model_type: ModelType::Embeddings,
-        weights: BGE_M3_Q4.to_vec(),
-        metadata: ConsensusModelMetadata {
-            name: "BGE-M3 Embeddings".to_string(),
-            version: "1.0.0".to_string(),
-            context_length: 8192,
-            embedding_dim: Some(1024),
-            license: "MIT".to_string(),
-            framework: Some("GGUF".to_string()),
-        },
-    }
-}
-
-/// Create required model for Mistral 7B Instruct v0.3
-/// Model is pinned on IPFS and validators must maintain the pin
-fn create_required_mistral_7b() -> RequiredModel {
-    // SHA256: 1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6
-    let sha256_bytes: [u8; 32] = [
-        0x12, 0x70, 0xd2, 0x2c, 0x0f, 0xbb, 0x3d, 0x09, 0x2f, 0xb7, 0x25, 0xd4, 0xd9, 0x6c, 0x45, 0x7b,
-        0x7b, 0x68, 0x7a, 0x5f, 0x5a, 0x71, 0x5a, 0xbe, 0x1e, 0x81, 0x8d, 0xa3, 0x03, 0xe5, 0x62, 0xb6,
-    ];
-
-    RequiredModel::new(
-        ConsensusModelId::from_name("mistral-7b-instruct-v0.3"),
-        "QmUsYyxg71bV8USRQ6Ccm3SdMqeWgEEVnCYkgNDaxvBTZB".to_string(), // IPFS CID
-        Hash::new(sha256_bytes),   // SHA256 hash of GGUF file
-        4_367_438_912,             // 4.1 GB (exact file size)
-        1_000_000_000_000_000_000_000, // 1000 SALT slash penalty
-    )
-}
-
 /// Create genesis block
 pub fn create_genesis_block(config: &GenesisConfig) -> Block {
-    let header = BlockHeader {
-        version: 1,
-        block_hash: Hash::new([0; 32]),        // Will be computed
-        selected_parent_hash: Hash::default(), // No parent for genesis
-        merge_parent_hashes: vec![],           // No merge parents for genesis
-        timestamp: config.timestamp,
-        height: 0,
-        blue_score: 0,
-        blue_work: 0,
-        pruning_point: Hash::default(),
-        proposer_pubkey: PublicKey::new([0; 32]),
-        vrf_reveal: VrfProof {
-            proof: vec![],
-            output: Hash::default(),
-        },
-        // EIP-1559 fields - genesis sets initial base fee
-        base_fee_per_gas: 1_000_000_000, // 1 gwei initial base fee
-        gas_used: 0,                      // No transactions in genesis
-        gas_limit: 30_000_000,            // 30M gas limit
-    };
-
-    // Create embedded models for genesis
-    let embedded_models = vec![create_embedded_bge_m3()];
-
-    // Create required pin models (validators must pin these)
-    let required_pins = vec![create_required_mistral_7b()];
-
-    tracing::info!("Creating genesis block with {} embedded models ({} MB total)",
-        embedded_models.len(),
-        embedded_models.iter().map(|m| m.size_bytes()).sum::<usize>() / 1_000_000
-    );
-
-    BlockBuilder::new()
-        .header(header)
-        .embedded_models(embedded_models)
-        .required_pins(required_pins)
-        .build_unhashed()
+    shared_genesis::create_canonical_genesis_block(config.timestamp)
 }
 
 /// Initialize genesis state
@@ -229,9 +130,9 @@ pub async fn initialize_genesis_state_with_profile(
         &economics_config,
     );
 
-    // The shared genesis function already seeds all accounts including the
-    // Forge deployer. Legacy initial_accounts are NOT applied because they
-    // would produce a different state root than the GUI's shared genesis.
+    // The shared genesis function initializes the configured account set.
+    // Legacy initial_accounts are NOT applied because they would produce a
+    // different state root than the GUI's shared genesis.
     // This satisfies the DeterministicGenesis invariant from GenesisSafetyAcrossNodes.tla.
     if !config.initial_accounts.is_empty() {
         tracing::info!(
@@ -284,65 +185,6 @@ pub async fn initialize_genesis_with_dag(
     Ok(genesis_hash)
 }
 
-fn register_genesis_model(
-    storage: &Arc<StorageManager>,
-    executor: &Arc<Executor>,
-    created_at: u64,
-) -> anyhow::Result<()> {
-    // Embed a tiny ONNX artifact; acts as a placeholder for the genesis model
-    // The artifact is not executed here; inference uses the configured InferenceService.
-    const ONNX: &[u8] = include_bytes!("../../assets/genesis_model.onnx");
-
-    // Hash artifact to obtain a deterministic model hash/id
-    use sha3::{Digest, Keccak256};
-    let mut hasher = Keccak256::new();
-    hasher.update(ONNX);
-    let h = hasher.finalize();
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&h[..32]);
-    let model_hash = Hash::new(arr);
-    let model_id = ModelId(model_hash);
-
-    // Owner zero for now (public model); can be migrated to governance later
-    let owner = Address::zero();
-
-    let metadata = ModelMetadata {
-        name: "Genesis BERT Tiny".to_string(),
-        version: "1.0.0".to_string(),
-        description: "Genesis semantic model placeholder".to_string(),
-        framework: "ONNX".to_string(),
-        input_shape: vec![1, 128],
-        output_shape: vec![1, 128],
-        size_bytes: ONNX.len() as u64,
-        created_at,
-    };
-
-    let model_state = ModelState {
-        owner,
-        model_hash,
-        version: 1,
-        metadata,
-        access_policy: AccessPolicy::Public,
-        usage_stats: UsageStats::default(),
-    };
-
-    // Best-effort registration (in-memory registry)
-    executor
-        .state_db()
-        .register_model(model_id, model_state)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))
-        ?;
-
-    // Persist to storage manager AI state for RPC visibility
-    if let Some(model) = executor.state_db().get_model(&model_id) {
-        storage
-            .state
-            .put_model(&model_id, &model)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,6 +233,23 @@ mod tests {
             block.header.selected_parent_hash,
             Hash::default(),
             "Genesis block must have zero selected parent"
+        );
+    }
+
+    #[test]
+    fn test_standalone_genesis_matches_shared_canonical_block() {
+        let config = GenesisConfig::default();
+        let standalone = create_genesis_block(&config);
+        let shared =
+            shared_genesis::create_canonical_genesis_block(shared_genesis::CANONICAL_GENESIS_TIMESTAMP);
+
+        assert_eq!(standalone.header.timestamp, shared.header.timestamp);
+        assert_eq!(standalone.header.height, shared.header.height);
+        assert_eq!(standalone.embedded_models.len(), shared.embedded_models.len());
+        assert_eq!(standalone.required_pins.len(), shared.required_pins.len());
+        assert_eq!(
+            calculate_block_hash(&standalone),
+            shared_genesis::calculate_canonical_block_hash(&shared)
         );
     }
 }

@@ -16,8 +16,15 @@ members = [
     "node",
     "node-app",
     "wallet",
+    "wallet-core",
+    "wallet-sdk",
     "faucet",
-    "gui/citrate_gui_v2/src-tauri",
+    "gui/citrate_desktop_app",
+    "gui/citrate_gui_native",
+    "agent-core",
+    "agent-chain",
+    "agent-cron",
+    "agent-code",
 ]
 # Default build targets: unified node binary (includes wallet + CLI).
 # Standalone wallet/cli/faucet can still be built with `cargo build -p citrate-wallet` etc.

@@ -750,43 +750,57 @@ impl AiApi {
         use citrate_mcp::gguf_engine::{GGUFEngine, GGUFEngineConfig};
         use std::path::PathBuf;
 
-        // Try multiple potential model locations
+        // Resolve model name to filename
         let model_filename = match request.model.as_str() {
             "mistral-7b-instruct-v0.3" | "mistral-7b" => "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
             "bge-m3" => "bge-m3-fp16.gguf",
-            "qwen2-0.5b" | "qwen" => "qwen2-0.5b-q4.gguf",
+            "qwen2-0.5b" | "qwen" | "qwen2.5" | "qwen2.5-1.5b" => "qwen2.5-1.5b-instruct-q4_0.gguf",
             other => other,
         };
 
         // Search for model in multiple locations
         let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let search_paths = [
-            // Current working directory
-            PathBuf::from("./models").join(model_filename),
-            // Citrate project models directory (relative)
-            PathBuf::from("../../../models").join(model_filename),
-            // Citrate project models directory (absolute)
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models").join(model_filename),
-            // User's home directory
-            home_dir.join("Models").join(model_filename),
-            home_dir.join(".citrate/models").join(model_filename),
-            // Common IPFS model location
-            home_dir.join(".ipfs/models").join(model_filename),
+        let model_dirs = [
+            PathBuf::from("./models"),
+            PathBuf::from("../../../models"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models"),
+            home_dir.join("Models"),
+            home_dir.join(".citrate/models"),
+            home_dir.join(".ipfs/models"),
         ];
 
-        let model_path = search_paths.iter()
-            .find(|p| p.exists())
-            .cloned()
-            .ok_or_else(|| {
-                let searched = search_paths.iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                ApiError::InternalError(format!(
-                    "Model file '{}' not found. Searched: {}",
-                    model_filename, searched
-                ))
-            })?;
+        // First try exact filename match
+        let mut model_path: Option<PathBuf> = model_dirs.iter()
+            .map(|dir| dir.join(model_filename))
+            .find(|p| p.exists());
+
+        // If not found, scan directories for any .gguf file (auto-detect)
+        if model_path.is_none() {
+            for dir in &model_dirs {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|ext| ext == "gguf") {
+                            tracing::info!("Auto-detected model: {:?}", path);
+                            model_path = Some(path);
+                            break;
+                        }
+                    }
+                    if model_path.is_some() { break; }
+                }
+            }
+        }
+
+        let model_path = model_path.ok_or_else(|| {
+            let searched = model_dirs.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            ApiError::InternalError(format!(
+                "No GGUF model found. Searched directories: {}. Download one with: Settings > AI Configuration > Download",
+                searched
+            ))
+        })?;
 
         // Create GGUF engine for inference
         let gguf_config = GGUFEngineConfig {

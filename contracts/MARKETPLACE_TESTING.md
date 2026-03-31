@@ -79,10 +79,10 @@ curl -X POST http://localhost:8545 \
   }'
 ```
 
-**Test via Tauri Command**:
-- Open GUI developer console
-- Execute: `window.__TAURI__.invoke('eth_call', { request: { to: '0x...', data: '0x...' } })`
-- Verify response format
+**Test via RPC**:
+```bash
+cast call <CONTRACT_ADDR> "getModel(uint256)" 1 --rpc-url http://localhost:8545
+```
 
 ### 3. Frontend Integration Tests
 
@@ -120,7 +120,7 @@ console.log('Featured:', featured);
 ```
 1. Start GUI with testnet connection
    ├─ Verify wallet has funds
-   └─ Confirm network: Chain ID 1337
+   └─ Confirm network: Chain ID 40204 (testnet) or 1337 (devnet)
 
 2. Navigate to Marketplace
    ├─ Check loading state displays

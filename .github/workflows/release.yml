@@ -93,8 +93,8 @@ jobs:
           path: citrate_v0.01.1/dist/*
           if-no-files-found: warn
 
-  build-tauri:
-    name: Build GUI (Tauri) (${{ matrix.os }})
+  build-gui:
+    name: Build GUI (Slint native) (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -103,16 +103,11 @@ jobs:
 
     defaults:
       run:
-        working-directory: citrate_v0.01.1/gui/citrate_gui_v2
+        working-directory: citrate_v0.01.1
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -124,63 +119,54 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             citrate_v0.01.1/target
-          key: tauri-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
-          restore-keys: tauri-${{ matrix.os }}-
+          key: gui-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          restore-keys: gui-${{ matrix.os }}-
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            libssl-dev \
-            libclang-dev \
-            cmake
+          sudo apt-get install -y libssl-dev libclang-dev cmake pkg-config
 
-      - name: Install deps
-        run: npm install
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        run: choco install llvm cmake -y
 
-      - name: Download bundled AI model
+      - name: Build Slint GUI binary
+        run: cargo build --release -p citrate-gui-native
+
+      - name: Package GUI artifact (Linux/macOS)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          mkdir -p src-tauri/resources/models
-          echo "Downloading Qwen2.5-1.5B-Instruct-Q4_K_M (1.1GB)..."
-          curl -L --progress-bar \
-            "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf" \
-            -o src-tauri/resources/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
-          ls -lh src-tauri/resources/models/
-
-      - name: Build Tauri app
-        run: npm run tauri:build
-
-      - name: Collect bundles
-        if: runner.os != 'Windows'
-        run: |
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
           mkdir -p dist
-          cp -r ../../target/release/bundle/* dist/ 2>/dev/null || true
+          cp target/release/citrate-gui-native dist/
+          cd dist && tar -czf citrate-gui-${OS}-${ARCH}.tar.gz citrate-gui-native
+          rm -f citrate-gui-native
 
-      - name: Collect bundles (Windows)
+      - name: Package GUI artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item ..\..\target\release\bundle\* dist\ -Recurse -ErrorAction SilentlyContinue
+          Copy-Item target\release\citrate-gui-native.exe dist\
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          Compress-Archive -Path dist\citrate-gui-native.exe -DestinationPath "dist\citrate-gui-windows-$arch.zip"
+          Remove-Item dist\citrate-gui-native.exe
 
-      - name: Upload GUI bundles
+      - name: Upload GUI artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tauri-${{ matrix.os }}
-          path: citrate_v0.01.1/gui/citrate_gui_v2/dist/**
+          name: gui-${{ matrix.os }}
+          path: citrate_v0.01.1/dist/*
           if-no-files-found: warn
 
   publish:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, build-tauri]
+    needs: [build-binaries, build-gui]
     if: always() && needs.build-binaries.result == 'success'
     permissions:
       contents: write

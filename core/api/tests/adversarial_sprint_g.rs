@@ -12,7 +12,7 @@
 
 use citrate_consensus::crypto::{self, Ed25519SigningKey};
 use citrate_consensus::types::{
-    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use sha3::{Digest, Sha3_256};
 

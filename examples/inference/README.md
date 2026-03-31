@@ -19,7 +19,7 @@ pip install numpy pillow requests
 
 # Start required services
 ipfs daemon &
-./target/release/lattice devnet &
+./target/release/citrate devnet &
 ```
 
 ## Available Examples
@@ -152,6 +152,7 @@ Best for larger models:
 ## Deployment Workflow
 
 1. **Import from HuggingFace**
+   > **Note:** The `tools/` scripts referenced below are archived. Use the Citrate CLI (`citrate model auto-pin`) or IPFS CLI directly.
    ```python
    python tools/import_model.py huggingface bert-base-uncased
    ```
@@ -211,7 +212,7 @@ ipfs swarm peers
 curl http://localhost:8545
 
 # View logs
-tail -f lattice.log
+tail -f citrate.log
 ```
 
 ### Slow Inference
@@ -223,7 +224,8 @@ tail -f lattice.log
 ## Advanced Topics
 
 ### Custom Models
-See `tools/convert_to_coreml.py` for converting your own models.
+> **Note:** The `tools/` scripts are archived. Use the Citrate CLI or IPFS CLI directly for model conversion and upload.
+See `tools/convert_to_coreml.py` for converting your own models (archived).
 
 ### Distributed Inference
 Multiple nodes can serve the same model for load balancing.
@@ -238,7 +240,7 @@ Model owners earn tokens for each inference request.
 
 - [CoreML Documentation](https://developer.apple.com/documentation/coreml)
 - [Metal Performance Shaders](https://developer.apple.com/documentation/metalperformanceshaders)
-- [Citrate Documentation](https://lattice.xyz/docs)
+- [Citrate Documentation](https://citrate.ai/docs)
 - [Model Registry Contract](../../contracts/src/ModelRegistry.sol)
 
 ## License

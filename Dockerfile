@@ -1,8 +1,8 @@
-# Citrate V3 Docker Image
+# Citrate Node Docker Image
 # Multi-stage build for optimal size
 
-# Build stage
-FROM rust:latest as builder
+# Build stage — pinned to match rust-toolchain.toml
+FROM rust:1.93.0 as builder
 
 WORKDIR /usr/src/citrate
 
@@ -28,8 +28,14 @@ COPY cli ./cli
 COPY contracts ./contracts
 COPY node-app ./node-app
 COPY wallet ./wallet
+COPY wallet-core ./wallet-core
+COPY wallet-sdk ./wallet-sdk
 COPY faucet ./faucet
-COPY gui/citrate_gui_v2/src-tauri ./gui/citrate_gui_v2/src-tauri
+COPY agent-core ./agent-core
+COPY agent-chain ./agent-chain
+COPY agent-code ./agent-code
+COPY agent-cron ./agent-cron
+COPY gui/citrate_desktop_app ./gui/citrate_desktop_app
 
 # Build release binary
 RUN cargo build --release -p citrate-node

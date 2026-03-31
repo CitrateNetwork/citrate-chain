@@ -271,7 +271,7 @@ mod tests {
 
         // Seed blocks at heights 0..=4
         use citrate_consensus::types::{
-            Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, VrfProof,
+            BlockBuilder, Hash,
         };
         for h in 0..=4u64 {
             let block = BlockBuilder::new()

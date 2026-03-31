@@ -264,7 +264,7 @@ impl InferenceCircuit {
         let mut current_layer = input_vars.to_vec();
 
         // Process each layer
-        for (_layer_idx, layer_weights) in weight_vars.iter().enumerate() {
+        for layer_weights in weight_vars.iter() {
             let mut next_layer = Vec::new();
 
             // Simplified: each neuron is dot product + ReLU
@@ -278,7 +278,7 @@ impl InferenceCircuit {
                     let weight_idx = neuron_idx * current_layer.len() + i;
                     if weight_idx < layer_weights.len() {
                         let product = input * &layer_weights[weight_idx];
-                        sum = sum + &product;
+                        sum += &product;
                     }
                 }
 

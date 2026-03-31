@@ -9,7 +9,7 @@
       "title": "Blocks / s (per target)",
       "gridPos": {"x": 0, "y": 0, "w": 8, "h": 6},
       "targets": [
-        {"expr": "rate(lattice_blocks_total[1m])", "legendFormat": "{{instance}}"}
+        {"expr": "rate(citrate_block_height[1m])", "legendFormat": "{{instance}}"}
       ]
     },
     {
@@ -17,7 +17,7 @@
       "title": "Mempool Depth",
       "gridPos": {"x": 8, "y": 0, "w": 8, "h": 6},
       "targets": [
-        {"expr": "lattice_mempool_pending"}
+        {"expr": "citrate_mempool_size"}
       ]
     },
     {
@@ -25,7 +25,7 @@
       "title": "Peer Count",
       "gridPos": {"x": 16, "y": 0, "w": 8, "h": 6},
       "targets": [
-        {"expr": "lattice_network_peers"}
+        {"expr": "citrate_peer_count"}
       ]
     }
   ],
@@ -35,7 +35,7 @@
   "templating": {"list": []},
   "time": {"from": "now-15m", "to": "now"},
   "timezone": "browser",
-  "title": "Lattice Node Overview",
+  "title": "Citrate Node Overview",
   "version": 1
 }
 

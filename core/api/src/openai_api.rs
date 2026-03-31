@@ -119,8 +119,9 @@ impl OpenAiRestServer {
             rest_api_key: self.rest_api_key.clone(),
         };
 
-        // WP-X.1: Config-driven CORS instead of always-wildcard
+        // WP-X.1: Config-driven CORS — wildcard emits warning for unsafe deployments
         let cors = if self.cors_origins.iter().any(|o| o == "*") {
+            tracing::warn!("REST API CORS wildcard '*' configured — unsafe for public deployments");
             CorsLayer::new()
                 .allow_origin(AllowOrigin::any())
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -204,8 +205,11 @@ impl OpenAiRestServer {
 // ========== Auth Middleware (WP-X.1) ==========
 
 /// Bearer auth middleware for mutating REST endpoints.
-/// When `rest_api_key` is configured, requires `Authorization: Bearer <key>`.
-/// When no key is configured (devnet), all requests pass through.
+///
+/// S-02 FIX: When `rest_api_key` is configured, requires `Authorization: Bearer <key>`.
+/// When no key is configured, mutating endpoints (POST) are REJECTED (fail-closed)
+/// to prevent unauthenticated model deployment/training. Read-only endpoints (GET)
+/// are still allowed without a key.
 async fn require_rest_api_key(
     State(state): State<AppState>,
     req: Request,
@@ -229,8 +233,35 @@ async fn require_rest_api_key(
             }
         }
     } else {
-        // No key configured (devnet mode) — allow all
-        Ok(next.run(req).await)
+        // S-02 FIX: No key configured — reject mutating operations (fail-closed).
+        // GET requests are allowed for read-only access; POST/PUT/DELETE are blocked.
+        if req.method() == Method::GET || req.method() == Method::OPTIONS || req.method() == Method::HEAD {
+            Ok(next.run(req).await)
+        } else {
+            warn!(
+                method = %req.method(),
+                uri = %req.uri(),
+                "REST API key not configured — mutating operation rejected"
+            );
+            let body = serde_json::json!({
+                "error": {
+                    "message": "REST API key not configured — mutating operations disabled. Set CITRATE_REST_API_KEY to enable.",
+                    "type": "authentication_error",
+                    "code": "api_key_not_configured"
+                }
+            });
+            let response = axum::response::Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_string(&body).unwrap_or_default()))
+                .unwrap_or_else(|_| {
+                    axum::response::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(axum::body::Body::empty())
+                        .expect("fallback response should always succeed")
+                });
+            Ok(response)
+        }
     }
 }
 

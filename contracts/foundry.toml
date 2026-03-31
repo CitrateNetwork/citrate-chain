@@ -10,7 +10,8 @@ gas_reports = ["*"]
 evm_version = "cancun"
 
 [rpc_endpoints]
-lattice = "http://localhost:8545"
+citrate = "http://localhost:8545"
+citrate_testnet = "https://rpc.citrate.ai"
 
 [etherscan]
 citrate = { key = "${ETHERSCAN_API_KEY}" }

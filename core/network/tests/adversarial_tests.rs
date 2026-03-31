@@ -4,7 +4,7 @@
 // invalid messages, eclipse attacks, and gossip protocol abuse.
 
 use citrate_consensus::types::{
-    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_network::{
     gossip::{GossipConfig, GossipProtocol},
