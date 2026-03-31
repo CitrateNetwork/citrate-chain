@@ -298,7 +298,7 @@ fn test_reduce_belnap_states_idempotent() {
     for (i, classifications) in test_cases.iter().enumerate() {
         let s1 = reduce_belnap_states(classifications);
         // Reducing again with the result as a single row should give the same thing
-        let s2 = reduce_belnap_states(&[s1.clone()]);
+        let s2 = reduce_belnap_states(std::slice::from_ref(&s1));
         assert_eq!(
             s1, s2,
             "reduce_belnap_states should be idempotent for test case {}",

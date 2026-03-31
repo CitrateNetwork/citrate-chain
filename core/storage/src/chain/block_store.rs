@@ -257,7 +257,7 @@ fn blue_score_key(score: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use citrate_consensus::types::{BlockBuilder, PublicKey, Signature, VrfProof};
+    use citrate_consensus::types::{BlockBuilder, PublicKey};
     use tempfile::TempDir;
 
     fn create_test_block(height: u64, parent: Hash) -> Block {

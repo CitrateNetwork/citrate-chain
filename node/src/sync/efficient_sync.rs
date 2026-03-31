@@ -674,7 +674,7 @@ impl ParallelSyncCoordinator {
 mod tests {
     use super::*;
     use citrate_consensus::dag_store::DagStore;
-    use citrate_consensus::types::{BlockBuilder, GhostDagParams, PublicKey, Signature, VrfProof};
+    use citrate_consensus::types::{BlockBuilder, GhostDagParams, PublicKey, VrfProof};
     use citrate_storage::pruning::PruningConfig;
     use tempfile::TempDir;
 

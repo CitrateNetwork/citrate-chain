@@ -21,6 +21,7 @@ keep_blocks = 1000
 
 [mining]
 enabled = true
-coinbase = "0000000000000000000000000000000000000000000000000000000000000000"
+# Hardhat account #0 — receives block rewards on devnet
+coinbase = "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 target_block_time = 1
 min_gas_price = 1000000000

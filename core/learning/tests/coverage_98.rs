@@ -304,7 +304,7 @@ fn test_classify_belnap_empty() {
 fn test_classify_belnap_high_conf_negligible_deviation() {
     // All embeddings identical with high confidence -> True at every dim
     let e = EmbeddingVector::new(vec![1.0, 2.0, 3.0]).unwrap();
-    let conf = vec![0.95, 0.95, 0.95];
+    let conf = [0.95, 0.95, 0.95];
     let result = classify_belnap(
         &[&e, &e],
         &[&conf[..], &conf[..]],
@@ -325,7 +325,7 @@ fn test_classify_belnap_grey_zone_confidence() {
     // Confidence between theta_low and theta_high (but below theta_high) -> Neither
     let e1 = EmbeddingVector::new(vec![10.0]).unwrap();
     let e2 = EmbeddingVector::new(vec![-10.0]).unwrap();
-    let conf = vec![0.5]; // between 0.3 (low) and 0.8 (high)
+    let conf = [0.5]; // between 0.3 (low) and 0.8 (high)
     let result = classify_belnap(
         &[&e1, &e2],
         &[&conf[..], &conf[..]],
@@ -845,7 +845,7 @@ fn test_compose_adapters_dimension_mismatch() {
 #[test]
 fn test_aggregation_input_validate_confidence_count_mismatch() {
     let e = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
-    let _conf = vec![0.9, 0.9];
+    let _conf = [0.9, 0.9];
     let input = AggregationInput {
         embeddings: &[&e],
         confidences: &[], // Empty, but 1 embedding
@@ -876,8 +876,8 @@ fn test_aggregation_input_validate_blue_scores_count_mismatch() {
 fn test_aggregation_input_validate_embedding_dim_mismatch() {
     let e1 = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
     let e2 = EmbeddingVector::new(vec![1.0, 2.0, 3.0]).unwrap();
-    let conf1 = vec![0.9, 0.9];
-    let conf2 = vec![0.9, 0.9, 0.9];
+    let conf1 = [0.9, 0.9];
+    let conf2 = [0.9, 0.9, 0.9];
     let input = AggregationInput {
         embeddings: &[&e1, &e2],
         confidences: &[&conf1[..], &conf2[..]],
@@ -893,8 +893,8 @@ fn test_aggregation_input_validate_embedding_dim_mismatch() {
 fn test_aggregation_input_validate_confidence_dim_mismatch() {
     let e1 = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
     let e2 = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
-    let conf1 = vec![0.9, 0.9];
-    let conf2 = vec![0.9]; // Wrong dim
+    let conf1 = [0.9, 0.9];
+    let conf2 = [0.9]; // Wrong dim
     let input = AggregationInput {
         embeddings: &[&e1, &e2],
         confidences: &[&conf1[..], &conf2[..]],
@@ -912,7 +912,7 @@ fn test_paraconsistent_aggregator_nan_in_embedding() {
     let bad = EmbeddingVector {
         data: vec![f32::INFINITY, 1.0],
     };
-    let conf = vec![0.9, 0.9];
+    let conf = [0.9, 0.9];
     let input = AggregationInput {
         embeddings: &[&bad],
         confidences: &[&conf[..]],
@@ -1435,7 +1435,7 @@ fn test_pipeline_act_increments_round() {
     let mut pipeline = LearningPipeline::new(&config);
 
     let e1 = EmbeddingVector::new(vec![1.0; 4]).unwrap();
-    let conf = vec![0.9; 4];
+    let conf = [0.9; 4];
     let query = EmbeddingVector::new(vec![0.5; 4]).unwrap();
     let input = AggregationInput {
         embeddings: &[&e1],
@@ -1557,7 +1557,7 @@ fn test_full_round_with_byzantine_check() {
         .check_and_flag([3u8; 32], 1, &e_byzantine, &mean, std_dev, &bad_state)
         .unwrap();
     assert!(
-        reasons.len() >= 1,
+        !reasons.is_empty(),
         "byzantine participant should be flagged: {:?}",
         reasons
     );

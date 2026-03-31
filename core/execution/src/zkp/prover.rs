@@ -42,12 +42,13 @@ impl Prover {
                     .map_err(|e| ZKPError::SetupError(e.to_string()))?
             }
             ProofType::GradientSubmission => {
+                // Dummy values must satisfy constraints: gradient non-zero, num_samples non-zero
                 let circuit = super::types::GradientProofCircuit {
-                    model_hash: vec![0; 32],
-                    dataset_hash: vec![0; 32],
-                    gradient_hash: vec![0; 32],
-                    loss_value: 0.0,
-                    num_samples: 0,
+                    model_hash: vec![1; 32],
+                    dataset_hash: vec![1; 32],
+                    gradient_hash: vec![1; 32],
+                    loss_value: 1.0,
+                    num_samples: 1,
                 };
 
                 Groth16::<Bls12_381>::circuit_specific_setup(circuit, &mut rng)
@@ -64,10 +65,11 @@ impl Prover {
                     .map_err(|e| ZKPError::SetupError(e.to_string()))?
             }
             ProofType::DataIntegrity => {
+                // Dummy values for R1CS shape discovery — must be valid witnesses
                 let circuit = DataIntegrityCircuit {
-                    data_hash: vec![0; 32],
+                    data_hash: vec![1; 32],
                     merkle_path: vec![],
-                    merkle_root: vec![0; 32],
+                    merkle_root: vec![1; 32],
                     leaf_index: 0,
                 };
 
@@ -178,7 +180,7 @@ impl Prover {
             to_field_str(&model_hash),
             to_field_str(&dataset_hash),
             to_field_str(&gradient_hash),
-            (loss_value as u64).to_string(),
+            ((loss_value * 1_000_000.0).round() as u64).to_string(),
             num_samples.to_string(),
         ];
 
@@ -257,6 +259,7 @@ impl Prover {
         let public_inputs = vec![
             to_field_str(&data_hash),
             to_field_str(&merkle_root),
+            leaf_index.to_string(),
         ];
 
         SerializableProof::from_proof(&proof, public_inputs)

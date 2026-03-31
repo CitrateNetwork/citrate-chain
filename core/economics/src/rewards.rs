@@ -169,9 +169,7 @@ impl RewardCalculator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use citrate_consensus::types::{
-        Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, VrfProof,
-    };
+    use citrate_consensus::types::BlockBuilder;
 
     #[test]
     fn test_block_reward_calculation() {

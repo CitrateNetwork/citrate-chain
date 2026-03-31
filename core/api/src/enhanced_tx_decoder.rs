@@ -242,7 +242,7 @@ impl EnhancedTransactionDecoder {
         let chain_id: u64 = rlp.val_at(0).unwrap_or(self.config.default_chain_id);
         let max_fee_per_gas: EthU256 = rlp.val_at(3).unwrap_or_default();
 
-        // Extract sender from lattice transaction
+        // Extract sender from citrate transaction
         let sender = self.extract_sender_from_citrate_tx(&citrate_tx);
 
         // Parse access list for size calculation

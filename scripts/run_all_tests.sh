@@ -101,25 +101,21 @@ run_rust_tests() {
         "cargo test --workspace 2>&1" \
         "$PROJECT_ROOT"
 
-    run_suite "Tauri backend (cargo test)" \
-        "cargo test 2>&1" \
-        "$PROJECT_ROOT/gui/citrate_gui_v2/src-tauri"
+    run_suite "Desktop app (cargo test -p citrate-desktop-app)" \
+        "cargo test -p citrate-desktop-app 2>&1" \
+        "$PROJECT_ROOT"
 }
 
 # ---------------------------------------------------------------------------
-# GUI Tests
+# GUI Tests (Slint-native)
 # ---------------------------------------------------------------------------
 
 run_gui_tests() {
-    section "GUI Frontend Tests"
+    section "GUI Slint-Native Tests"
 
-    run_suite "TypeScript (tsc --noEmit)" \
-        "npx tsc --noEmit 2>&1" \
-        "$PROJECT_ROOT/gui/citrate_gui_v2"
-
-    run_suite "Vitest (npx vitest run)" \
-        "npx vitest run 2>&1" \
-        "$PROJECT_ROOT/gui/citrate_gui_v2"
+    run_suite "GUI integration tests (cargo test -p citrate-gui-native)" \
+        "cargo test -p citrate-gui-native 2>&1" \
+        "$PROJECT_ROOT"
 }
 
 # ---------------------------------------------------------------------------
@@ -154,6 +150,7 @@ run_solidity_tests() {
 
 find_tlc_jar() {
     for candidate in \
+        "$PROJECT_ROOT/../.agentile/formal/specs/tla2tools.jar" \
         "$PROJECT_ROOT/specs/tla/tla2tools.jar" \
         /usr/local/share/java/tla2tools.jar \
         "$HOME/tla2tools.jar" \
@@ -201,8 +198,8 @@ run_tla_tests() {
     fi
 
     local SPEC_DIRS=(
+        "$PROJECT_ROOT/../.agentile/formal/specs"
         "$PROJECT_ROOT/specs/tla"
-        "$PROJECT_ROOT/gui/citrate_gui_v2/specs"
     )
 
     # Per-spec deep mode overrides.

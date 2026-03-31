@@ -342,7 +342,8 @@ mod tests {
 
             assert_eq!(response.proof_type, proof_type);
             assert!(!response.proof.proof_bytes.is_empty());
-            assert!(response.generation_time_ms > 0 || response.generation_time_ms == 0);
+            // generation_time_ms is u64, always >= 0; just verify the field exists
+            let _ = response.generation_time_ms;
 
             let valid = backend
                 .verify_proof(proof_type, &response.proof)
@@ -509,10 +510,9 @@ mod tests {
 
         // Verification should either fail with an error (deserialization) or return false
         let result = backend.verify_proof(ProofType::ModelExecution, &tampered);
-        match result {
-            Ok(valid) => assert!(!valid, "Tampered proof must not verify as valid"),
-            Err(_) => {} // Deserialization error is also acceptable for corrupted bytes
-        }
+        if let Ok(valid) = result {
+            assert!(!valid, "Tampered proof must not verify as valid");
+        } // Deserialization error is also acceptable for corrupted bytes
     }
 
     #[test]
@@ -529,13 +529,12 @@ mod tests {
 
         // Try to verify it as a GradientSubmission — must fail
         let result = backend.verify_proof(ProofType::GradientSubmission, &response.proof);
-        match result {
-            Ok(valid) => assert!(
+        if let Ok(valid) = result {
+            assert!(
                 !valid,
                 "Proof generated as ModelExecution must not verify as GradientSubmission"
-            ),
-            Err(_) => {} // Error is also acceptable (different VK, deserialization mismatch)
-        }
+            );
+        } // Error is also acceptable (different VK, deserialization mismatch)
     }
 
     #[test]

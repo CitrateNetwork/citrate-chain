@@ -20,6 +20,8 @@ struct FaucetState {
     api_key: Option<String>,
     chain_id: u64,
     faucet_address: Address,
+    /// Ed25519 signing key for the faucet account
+    signing_key: Arc<ed25519_dalek::SigningKey>,
     /// Per-address cooldown: tracks last request time (24h between requests)
     address_cooldown: Arc<DashMap<String, Instant>>,
     /// Address whitelist: only these addresses can claim. Empty = no whitelist.
@@ -55,17 +57,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(40204);
 
-    // Faucet source address: use genesis-funded address (0x33..33 by default)
-    // Override with FAUCET_ADDRESS env var if needed.
-    let faucet_address_hex = std::env::var("FAUCET_ADDRESS")
-        .unwrap_or_else(|_| "3333333333333333333333333333333333333333".to_string());
-    let faucet_addr_bytes = hex::decode(faucet_address_hex.trim_start_matches("0x"))
-        .map_err(|e| format!("Invalid FAUCET_ADDRESS hex: {e}"))?;
-    let mut addr_bytes = [0u8; 20];
-    addr_bytes.copy_from_slice(&faucet_addr_bytes);
-    let faucet_address = Address(addr_bytes);
+    // Faucet signing key: generate deterministically from a seed or read from env.
+    // FAUCET_PRIVATE_KEY should be 64 hex chars (32 bytes) of an ed25519 secret key.
+    // If not provided, a deterministic key is derived from the string "citrate-faucet-testnet".
+    let signing_key = {
+        let key_hex = std::env::var("FAUCET_PRIVATE_KEY").ok();
+        if let Some(hex_str) = key_hex {
+            let bytes = hex::decode(hex_str.trim_start_matches("0x"))
+                .map_err(|e| format!("Invalid FAUCET_PRIVATE_KEY: {e}"))?;
+            let mut key_bytes = [0u8; 32];
+            key_bytes.copy_from_slice(&bytes[..32]);
+            ed25519_dalek::SigningKey::from_bytes(&key_bytes)
+        } else {
+            // Deterministic default for testnet (NOT SECURE for production)
+            use sha3::{Digest, Keccak256};
+            let seed = Keccak256::digest(b"citrate-faucet-testnet-v1");
+            let mut key_bytes = [0u8; 32];
+            key_bytes.copy_from_slice(&seed);
+            info!("Using deterministic faucet key (set FAUCET_PRIVATE_KEY for production)");
+            ed25519_dalek::SigningKey::from_bytes(&key_bytes)
+        }
+    };
+
+    // Derive the faucet address from the signing key
+    let faucet_pubkey = signing_key.verifying_key();
+    let faucet_address = {
+        use sha3::{Digest, Keccak256};
+        let hash = Keccak256::digest(faucet_pubkey.as_bytes());
+        let mut addr = [0u8; 20];
+        addr.copy_from_slice(&hash[12..]);
+        Address(addr)
+    };
 
     info!("Faucet address: 0x{}", hex::encode(faucet_address.0));
+    info!("Faucet pubkey: {}", hex::encode(faucet_pubkey.as_bytes()));
     info!("RPC endpoint: {}", rpc_url);
     info!("Chain ID: {}", chain_id);
     if api_key.is_some() {
@@ -88,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_key,
         chain_id,
         faucet_address,
+        signing_key: Arc::new(signing_key),
         address_cooldown: Arc::new(DashMap::new()),
         address_whitelist: Arc::new(address_whitelist),
     };
@@ -241,24 +267,98 @@ async fn request_tokens(
 
     info!("Faucet request for address: 0x{}", hex::encode(recipient.0));
 
-    // Use eth_sendTransaction (unsigned, devnet mode) from the genesis faucet address.
-    // The genesis faucet at 0x3333...33 is pre-funded with 10M SALT.
-    let from_hex = format!("0x{}", hex::encode(state.faucet_address.0));
-    let to_hex = format!("0x{}", hex::encode(recipient.0));
+    // Build and sign a real transaction using the faucet's ed25519 key.
+    // This uses eth_sendRawTransaction — no unsigned tx support needed on the node.
+    use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
+    use citrate_consensus::crypto as consensus_crypto;
 
+    let from_hex = format!("0x{}", hex::encode(state.faucet_address.0));
     let client = reqwest::Client::new();
+
+    // Query current nonce for the faucet account
+    let nonce: u64 = {
+        let resp = client
+            .post(&state.rpc_url)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_getTransactionCount",
+                "params": [&from_hex, "pending"],
+                "id": 1
+            }))
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                let json: serde_json::Value = r.json().await.unwrap_or_default();
+                json.get("result")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0)
+            }
+            Err(_) => 0,
+        }
+    };
+
+    // Build the transaction
+    let faucet_pubkey = state.signing_key.verifying_key();
+    let from_pk = PublicKey::new(faucet_pubkey.to_bytes());
+    let to_pk = {
+        let mut pk_bytes = [0u8; 32];
+        pk_bytes[..20].copy_from_slice(&recipient.0);
+        PublicKey::new(pk_bytes)
+    };
+
+    let mut tx = Transaction {
+        hash: Hash::default(),
+        from: from_pk,
+        to: Some(to_pk),
+        value: DRIP_AMOUNT,
+        data: Vec::new(),
+        nonce,
+        gas_price: 1_000_000_000,
+        gas_limit: 21_000,
+        signature: Signature::new([0; 64]),
+        tx_type: None,
+        chain_id: Some(state.chain_id),
+        ..Default::default()
+    };
+
+    // Calculate hash
+    {
+        use sha3::{Digest, Keccak256};
+        let mut hasher = Keccak256::new();
+        hasher.update(tx.nonce.to_le_bytes());
+        hasher.update(tx.from.as_bytes());
+        if let Some(ref to) = tx.to {
+            hasher.update(to.as_bytes());
+        }
+        hasher.update(tx.value.to_le_bytes());
+        hasher.update(state.chain_id.to_le_bytes());
+        let hash_bytes = hasher.finalize();
+        tx.hash = Hash::from_bytes(&hash_bytes);
+    }
+
+    // Sign using consensus crypto (matches mempool verification)
+    if let Err(e) = consensus_crypto::sign_transaction(&mut tx, &state.signing_key) {
+        error!("Failed to sign faucet transaction: {}", e);
+        return Ok(Json(FaucetResponse {
+            success: false,
+            tx_hash: None,
+            message: format!("Signing failed: {}", e),
+            amount: "0".to_string(),
+        }));
+    }
+
+    // Serialize and send as raw transaction
+    let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
+    let tx_hex = format!("0x{}", hex::encode(&tx_bytes));
+
     let mut request = client
         .post(&state.rpc_url)
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
-            "method": "eth_sendTransaction",
-            "params": [{
-                "from": from_hex,
-                "to": to_hex,
-                "value": format!("0x{:x}", DRIP_AMOUNT),
-                "gas": "0x5208",
-                "gasPrice": "0x3b9aca00"
-            }],
+            "method": "eth_sendRawTransaction",
+            "params": [tx_hex],
             "id": 1
         }));
 
@@ -319,6 +419,7 @@ async fn request_tokens(
 /// Validate a faucet request address string.
 /// Returns the normalized lowercase hex (without 0x) and the 20-byte address,
 /// or an error message string.
+#[allow(dead_code)]
 fn validate_address(address: &str) -> Result<(String, [u8; 20]), &'static str> {
     let hex_str = address.trim_start_matches("0x").to_lowercase();
     let bytes = hex::decode(&hex_str).map_err(|_| "Invalid hex encoding")?;
@@ -332,12 +433,14 @@ fn validate_address(address: &str) -> Result<(String, [u8; 20]), &'static str> {
 
 /// Check whether an address is whitelisted.
 /// Returns true if the whitelist is empty (no filtering) or the address is in it.
+#[allow(dead_code)]
 fn is_whitelisted(whitelist: &HashSet<String>, address_hex: &str) -> bool {
     whitelist.is_empty() || whitelist.contains(address_hex)
 }
 
 /// Check cooldown status. Returns Ok(()) if no cooldown active, or Err with
 /// a message containing hours/minutes remaining.
+#[allow(dead_code)]
 fn check_cooldown(last_request_elapsed_secs: Option<u64>, cooldown_secs: u64) -> Result<(), String> {
     if let Some(elapsed) = last_request_elapsed_secs {
         if elapsed < cooldown_secs {

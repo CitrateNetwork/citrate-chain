@@ -773,7 +773,7 @@ impl BlockProducer {
         // The learning_root is NOT included in compute_hash() (Theorem 3).
         let block_height = block.header.height;
         if block_height > 0
-            && block_height % self.checkpoint_interval == 0
+            && block_height.is_multiple_of(self.checkpoint_interval)
             && self.learning_orchestrator.is_some()
         {
             let learning_root = self.compute_checkpoint_learning_root(block_height).await;
@@ -900,7 +900,7 @@ impl BlockProducer {
 
             // 3. Record AdapterCreation at checkpoint boundaries (when mentor pairings generate adapters)
             if block.header.height > 0
-                && block.header.height % self.checkpoint_interval == 0
+                && block.header.height.is_multiple_of(self.checkpoint_interval)
                 && block.learning_root != Hash::default()
             {
                 let rec_adapter = recorder.clone();
@@ -921,7 +921,7 @@ impl BlockProducer {
         //
         // Data source: HeartbeatMonitor.heartbeat() via eth_sendTransaction
         // Fire-and-forget: failures are logged but never block production.
-        if block.header.height > 0 && block.header.height % 100 == 0 {
+        if block.header.height > 0 && block.header.height.is_multiple_of(100) {
             if let Some(recorder) = &self.contribution_recorder {
                 let rpc_url = recorder.rpc_url().to_string();
                 let recorder_address = recorder.recorder_address().to_string();

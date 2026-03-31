@@ -52,7 +52,7 @@ if [ "$MODE" = "local" ]; then
     echo ""
     echo -e "${GREEN}Monitoring stack is running:${NC}"
     echo "  Prometheus:   http://localhost:9091"
-    echo "  Grafana:      http://localhost:3000  (admin / lattice123)"
+    echo "  Grafana:      http://localhost:3000  (admin / citrate123)"
     echo "  Alertmanager: http://localhost:9093"
     echo ""
     echo -e "${CYAN}Dashboards:${NC}"
@@ -83,7 +83,7 @@ else
     echo ""
     echo -e "${GREEN}Monitoring stack deployed to $REMOTE_HOST${NC}"
     echo "  Prometheus:   http://$REMOTE_HOST:9091"
-    echo "  Grafana:      http://$REMOTE_HOST:3000  (admin / lattice123)"
+    echo "  Grafana:      http://$REMOTE_HOST:3000  (admin / citrate123)"
     echo "  Alertmanager: http://$REMOTE_HOST:9093"
 fi
 

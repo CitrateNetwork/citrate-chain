@@ -8,7 +8,7 @@ use proptest::prelude::*;
 use std::sync::Arc;
 
 use citrate_consensus::{
-    Block, BlockBuilder, BlockHeader, CheckpointConfig, GhostDagParams,
+    Block, BlockBuilder, CheckpointConfig, GhostDagParams,
     Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_consensus::checkpoint::CommitteeSelector;

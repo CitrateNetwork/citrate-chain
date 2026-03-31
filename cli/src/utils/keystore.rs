@@ -106,6 +106,29 @@ pub fn load_key(path: &Path, password: &str) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&key_bytes))
 }
 
+fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
+    // Use SHA3-256 with multiple iterations for key derivation
+    let mut key = [0u8; 32];
+    let mut hasher = Sha3_256::new();
+
+    // Initial hash
+    hasher.update(password.as_bytes());
+    hasher.update(salt);
+    let mut hash = hasher.finalize();
+
+    // Apply 10000 iterations to strengthen the key derivation
+    for _ in 0..10000 {
+        let mut new_hasher = Sha3_256::new();
+        new_hasher.update(hash);
+        new_hasher.update(password.as_bytes());
+        new_hasher.update(salt);
+        hash = new_hasher.finalize();
+    }
+
+    key.copy_from_slice(&hash);
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,27 +182,4 @@ mod tests {
         let expected_pubkey = hex::encode(signing_key.verifying_key().to_bytes());
         assert_eq!(stored_pubkey, expected_pubkey);
     }
-}
-
-fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
-    // Use SHA3-256 with multiple iterations for key derivation
-    let mut key = [0u8; 32];
-    let mut hasher = Sha3_256::new();
-
-    // Initial hash
-    hasher.update(password.as_bytes());
-    hasher.update(salt);
-    let mut hash = hasher.finalize();
-
-    // Apply 10000 iterations to strengthen the key derivation
-    for _ in 0..10000 {
-        let mut new_hasher = Sha3_256::new();
-        new_hasher.update(hash);
-        new_hasher.update(password.as_bytes());
-        new_hasher.update(salt);
-        hash = new_hasher.finalize();
-    }
-
-    key.copy_from_slice(&hash);
-    Ok(key)
 }

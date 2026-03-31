@@ -45,17 +45,34 @@ Complete reference of all features, APIs, opcodes, consensus mechanisms, and lib
 - **Transaction types**: Legacy, EIP-2930 (access lists), EIP-1559 (priority fees)
 - **Address derivation**: Smart handling — embedded 20-byte EVM addresses used directly, full 32-byte pubkeys Keccak256-hashed
 
-### AI Precompiles (Custom)
+### State Precompiles (Canonical — executor.rs)
+
+These addresses handle on-chain state transitions for AI models and artifacts:
+
+| Address | Name | Function |
+|---------|------|----------|
+| 0x...1000 | ModelPrecompile | Register/manage on-chain AI models (state-changing) |
+| 0x...1002 | ArtifactPrecompile | Store/retrieve model artifacts (state-changing) |
+| 0x...1003 | GovernancePrecompile | DAO governance operations (state-changing) |
+
+### Runtime AI Precompiles (inference.rs)
+
+These addresses handle runtime AI operations (inference, ZK proofs):
 
 | Address | Name | Gas Cost | Function |
 |---------|------|----------|----------|
-| 0x0100 | ModelRegistryPrecompile | 5,000 | Register/query on-chain AI models |
-| 0x0101 | InferencePrecompile | 10,000+ | Execute AI inference with ZK proof option |
-| 0x0102 | GradientCommitPrecompile | 8,000 | Commit federated learning gradients |
-| 0x0103 | AggregationPrecompile | 12,000 | Belnap FOUR paraconsistent aggregation |
-| 0x0104 | ZKVerifyPrecompile | 50,000 | Groth16 proof verification (BLS12-381) |
-| 0x0105 | AdapterComposePrecompile | 6,000 | LoRA adapter composition |
-| 0x0106 | BelnapPrecompile | 3,000 | Belnap lattice operations (join/meet/negate) |
+| 0x0100 | InferenceDeployPrecompile | 5,000 | Deploy model for inference |
+| 0x0101 | InferenceRunPrecompile | 10,000+ | Execute AI inference with ZK proof option |
+| 0x0102 | InferenceBatchPrecompile | 8,000 | Batch inference for efficiency |
+| 0x0103 | InferenceMetadataPrecompile | 3,000 | Query model metadata |
+| 0x0104 | InferenceVerifyPrecompile | 50,000 | Verify inference proof (Groth16, BLS12-381) |
+| 0x0105 | InferenceBenchmarkPrecompile | 6,000 | Benchmark model performance |
+| 0x0106 | InferenceEncryptPrecompile | 3,000 | Model encryption operations |
+
+### Signature Precompiles
+
+| Address | Name | Gas Cost | Function |
+|---------|------|----------|----------|
 | 0x0200 | EIP712VerifyPrecompile | 3,450 | EIP-712 typed data signature recovery |
 | 0x0201 | TransferAuthVerifyPrecompile | 4,200 | EIP-3009 transfer authorization |
 | 0x0202 | BatchPaymentVerifyPrecompile | 2,000+3,800/payment | Batch payment verification |
@@ -112,8 +129,8 @@ Complete reference of all features, APIs, opcodes, consensus mechanisms, and lib
 |--------|-------------|
 | `citrate_getDagStats` | DAG statistics (tips, blue/red blocks, height) |
 | `citrate_getDagBlock` | Block with DAG-specific fields (merge parents, blue score) |
-| `citrate_getModelInfo` | AI model metadata |
-| `citrate_getModels` | List registered models |
+| `citrate_getModel` | AI model metadata by ID |
+| `citrate_listModels` | List registered models (alias: `citrate_getModels`) |
 | `citrate_deployModel` | Deploy AI model |
 | `citrate_runInference` | Execute AI inference |
 | `citrate_getMempoolSnapshot` | Full mempool visibility |
@@ -246,7 +263,7 @@ Gas Fees → 10% Market Maker (pre-split)
 
 ---
 
-## 7. Desktop Application (Tauri)
+## 7. Desktop Application (Slint)
 
 ### Dual Mode
 - **Explorer Mode**: DAG visualization, contract interaction, terminal, developer tools
@@ -379,7 +396,7 @@ Gas Fees → 10% Market Maker (pre-split)
 
 ### TypeScript (GUI)
 - **Framework**: React 19.1 + Vite 5.4 + SWC
-- **Desktop**: Tauri v2.10
+- **Desktop**: Slint 1.9 (Rust-native)
 - **Blockchain**: ethers.js 6.15
 - **Testing**: Vitest 3.2 + Testing Library
 
