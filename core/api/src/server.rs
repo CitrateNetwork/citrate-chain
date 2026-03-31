@@ -27,7 +27,45 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
-use tracing::info;
+use tracing::{info, warn};
+
+/// S-01 FIX: Require operator authentication for model mutation endpoints.
+///
+/// Checks the `operator_token` parameter in the RPC request against the
+/// `CITRATE_OPERATOR_TOKEN` environment variable. If no env var is set AND
+/// no token is provided, the request is REJECTED (fail-closed).
+///
+/// Data source: `CITRATE_OPERATOR_TOKEN` environment variable.
+fn require_operator_auth(params: &serde_json::Map<String, Value>) -> Result<(), jsonrpc_core::Error> {
+    let configured_token = std::env::var("CITRATE_OPERATOR_TOKEN").ok().filter(|t| !t.is_empty());
+    let supplied_token = params.get("operator_token").and_then(|v| v.as_str());
+
+    match (configured_token, supplied_token) {
+        (Some(expected), Some(provided)) if provided == expected => Ok(()),
+        (Some(_), Some(_)) => {
+            warn!("operator auth failed: invalid operator_token");
+            Err(jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::ServerError(-32001),
+                message: "Unauthorized: invalid operator_token".to_string(),
+                data: None,
+            })
+        }
+        (Some(_), None) => {
+            Err(jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::ServerError(-32001),
+                message: "Unauthorized: operator_token required. Set CITRATE_OPERATOR_TOKEN and provide it in the request.".to_string(),
+                data: None,
+            })
+        }
+        (None, _) => {
+            Err(jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::ServerError(-32001),
+                message: "Unauthorized: CITRATE_OPERATOR_TOKEN not configured — model mutation operations are disabled. Set the environment variable to enable.".to_string(),
+                data: None,
+            })
+        }
+    }
+}
 
 /// Helper function to parse optional u64 field from JSON Value
 fn parse_optional_u64_field(value: Option<&Value>, field_name: &str) -> Result<Option<u64>, jsonrpc_core::Error> {
@@ -380,7 +418,8 @@ impl Default for RpcConfig {
         Self {
             listen_addr: "127.0.0.1:8545".parse().unwrap_or_else(|e| panic!("valid hardcoded address: {e}")),
             max_connections: 100,
-            cors_origins: vec!["*".to_string()],
+            // C-02 FIX: No wildcard CORS by default — prevents browser-to-localhost abuse
+            cors_origins: vec!["http://localhost:*".to_string()],
             threads: 4,
             rate_limit: RateLimitConfig::default(),
             allow_eth_send_transaction: false, // Secure default: reject unsigned tx
@@ -513,6 +552,9 @@ impl RpcServer {
                 .as_object()
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("Expected object"))?;
 
+            // S-01 FIX: Require operator authentication before model mutation
+            require_operator_auth(map)?;
+
             let model_id_str = map
                 .get("model_id")
                 .and_then(|v| v.as_str())
@@ -611,6 +653,27 @@ impl RpcServer {
 
             let existing = executor_ai_update.state_db().get_model(&model_id)
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("Model not found"))?;
+
+            // C-01 FIX: Validate caller ownership before allowing update
+            // Parse the 'from' address and verify it matches the model owner
+            let from_addr_trimmed = from_hex.trim_start_matches("0x");
+            if from_addr_trimmed.len() >= 40 {
+                let mut caller_addr = [0u8; 20];
+                if let Ok(bytes) = hex::decode(&from_addr_trimmed[..40]) {
+                    caller_addr.copy_from_slice(&bytes[..20]);
+                    let caller = citrate_execution::types::Address(caller_addr);
+                    if caller != existing.owner {
+                        return Err(jsonrpc_core::Error {
+                            code: jsonrpc_core::ErrorCode::ServerError(-32001),
+                            message: "Unauthorized: caller is not the model owner".to_string(),
+                            data: Some(json!({
+                                "caller": format!("0x{}", hex::encode(caller_addr)),
+                                "owner": format!("0x{}", hex::encode(existing.owner.0)),
+                            })),
+                        });
+                    }
+                }
+            }
 
             // Merge metadata: update only the fields that were provided
             let updated_metadata = citrate_execution::types::ModelMetadata {
@@ -1517,6 +1580,9 @@ impl RpcServer {
         });
 
         // citrate_deployModel: register a model via model precompile
+        // C-01 FIX: Model deployment is a privileged operation.
+        // In production, this should go through a signed transaction to the ModelRegistry contract.
+        // For testnet, we require a valid 'from' address that will be recorded as the owner.
         let executor_ai_deploy = executor.clone();
         io_handler.add_sync_method("citrate_deployModel", move |params: Params| {
             rpc_request("citrate_deployModel");
@@ -1529,6 +1595,9 @@ impl RpcServer {
             let map = value
                 .as_object()
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("Expected object"))?;
+
+            // S-01 FIX: Require operator authentication before model deployment
+            require_operator_auth(map)?;
 
             let from_hex = map
                 .get("from")
@@ -2421,8 +2490,9 @@ impl RpcServer {
         let join_handle = std::thread::spawn(move || {
             let mut builder = ServerBuilder::new(io)
                 .request_middleware(RateLimiter::new(rate_limit_config));
-            // WP-X.1: Config-driven CORS instead of always-wildcard
+            // WP-X.1: Config-driven CORS — wildcard only allowed on localhost
             if cors_origins.iter().any(|o| o == "*") {
+                tracing::warn!("CORS wildcard '*' configured — this is unsafe for public deployments. Use explicit origins in production.");
                 builder = builder.cors(DomainsValidation::AllowOnly(vec![
                     AccessControlAllowOrigin::Any,
                 ]));

@@ -246,7 +246,7 @@ impl BlockPropagation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use citrate_consensus::types::{BlockBuilder, GhostDagParams, PublicKey, Signature, VrfProof};
+    use citrate_consensus::types::BlockBuilder;
 
     #[tokio::test]
     async fn test_block_propagation() {

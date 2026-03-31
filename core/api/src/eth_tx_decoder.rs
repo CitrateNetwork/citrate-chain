@@ -91,8 +91,7 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
     // Check if this is a valid RLP list
     if rlp.is_list() {
         // Try to decode as legacy transaction
-        match LegacyTransaction::decode(&rlp) {
-            Ok(legacy_tx) => {
+        if let Ok(legacy_tx) = LegacyTransaction::decode(&rlp) {
                 debug!("Successfully decoded legacy Ethereum transaction");
                 debug!("  Nonce: {}", legacy_tx.nonce);
                 debug!("  Gas limit: {}", legacy_tx.gas_limit);
@@ -251,14 +250,13 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
                     "Final transaction hash: 0x{}",
                     hex::encode(tx.hash.as_bytes())
                 );
-                Ok(tx)
-            }
-            Err(e) => {
-                debug!("Failed to decode as legacy transaction: {:?}", e);
-                Err(format!("Failed to decode legacy transaction: {}", e))
-            }
+                return Ok(tx);
+        } else {
+            debug!("Failed to decode as legacy RLP, falling back to bincode");
         }
-    } else {
+    }
+    // Fall through: either !is_list() or RLP decode failed — try bincode
+    {
         // Last resort: try bincode for Citrate native transactions.
         // This is done AFTER RLP to prevent Ethereum RLP bytes from
         // accidentally deserializing as bincode (which would skip chain ID validation).

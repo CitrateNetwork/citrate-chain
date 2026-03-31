@@ -9,7 +9,6 @@ use parking_lot::Mutex;
 use snow::{Builder, TransportState};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::debug;
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
@@ -124,8 +123,8 @@ impl NoiseSession {
 ///   → e          (initiator sends ephemeral key)
 ///   ← e, ee, s, es  (responder replies with ephemeral + static)
 ///   → s, se      (initiator reveals static key)
-pub async fn handshake_initiator(
-    stream: &mut TcpStream,
+pub async fn handshake_initiator<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
     keypair: &NoiseKeypair,
 ) -> Result<NoiseSession, NetworkError> {
     let mut hs = Builder::new(
@@ -177,8 +176,8 @@ pub async fn handshake_initiator(
 }
 
 /// Perform Noise_XX handshake as **responder** (inbound connection).
-pub async fn handshake_responder(
-    stream: &mut TcpStream,
+pub async fn handshake_responder<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
     keypair: &NoiseKeypair,
 ) -> Result<NoiseSession, NetworkError> {
     let mut hs = Builder::new(
@@ -233,7 +232,7 @@ pub async fn handshake_responder(
 // After handshake, the regular LengthDelimitedCodec takes over.
 // ---------------------------------------------------------------------------
 
-async fn send_frame(stream: &mut TcpStream, data: &[u8]) -> Result<(), NetworkError> {
+async fn send_frame<W: AsyncWriteExt + Unpin>(stream: &mut W, data: &[u8]) -> Result<(), NetworkError> {
     let len = (data.len() as u32).to_be_bytes();
     stream
         .write_all(&len)
@@ -250,7 +249,7 @@ async fn send_frame(stream: &mut TcpStream, data: &[u8]) -> Result<(), NetworkEr
     Ok(())
 }
 
-async fn recv_frame(stream: &mut TcpStream) -> Result<Vec<u8>, NetworkError> {
+async fn recv_frame<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Vec<u8>, NetworkError> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -278,7 +277,6 @@ async fn recv_frame(stream: &mut TcpStream) -> Result<Vec<u8>, NetworkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
 
     #[test]
     fn test_keypair_generation() {
@@ -312,26 +310,33 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn test_noise_handshake() {
+    // Noise protocol tests use tokio::io::duplex() for in-memory transport.
+    // This avoids loopback TCP socket permission issues in sandboxed CI
+    // while still proving full handshake + encrypt/decrypt correctness.
+
+    /// Helper: perform a full Noise_XX handshake over an in-memory duplex channel.
+    async fn duplex_handshake() -> (NoiseSession, NoiseSession, NoiseKeypair, NoiseKeypair) {
         let server_kp = NoiseKeypair::generate();
         let client_kp = NoiseKeypair::generate();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (mut client_stream, mut server_stream) = tokio::io::duplex(8192);
 
         let server_kp_clone = server_kp.clone();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handshake_responder(&mut stream, &server_kp_clone).await.unwrap()
+            handshake_responder(&mut server_stream, &server_kp_clone).await.expect("responder handshake")
         });
 
-        let mut client_stream = TcpStream::connect(addr).await.unwrap();
         let client_session = handshake_initiator(&mut client_stream, &client_kp)
             .await
-            .unwrap();
+            .expect("initiator handshake");
+        let server_session = server.await.expect("server task");
 
-        let server_session = server.await.unwrap();
+        (client_session, server_session, client_kp, server_kp)
+    }
+
+    #[tokio::test]
+    async fn test_noise_handshake() {
+        let (client_session, server_session, client_kp, server_kp) = duplex_handshake().await;
 
         // Verify remote keys match
         assert_eq!(client_session.remote_public_key(), &server_kp.public);
@@ -340,60 +345,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_noise_encrypt_decrypt() {
-        let server_kp = NoiseKeypair::generate();
-        let client_kp = NoiseKeypair::generate();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server_kp_clone = server_kp.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handshake_responder(&mut stream, &server_kp_clone).await.unwrap()
-        });
-
-        let mut client_stream = TcpStream::connect(addr).await.unwrap();
-        let client_session = handshake_initiator(&mut client_stream, &client_kp)
-            .await
-            .unwrap();
-        let server_session = server.await.unwrap();
+        let (client_session, server_session, _client_kp, _server_kp) = duplex_handshake().await;
 
         // Client encrypts, server decrypts
         let plaintext = b"hello from client";
-        let ciphertext = client_session.encrypt(plaintext).unwrap();
+        let ciphertext = client_session.encrypt(plaintext).expect("encrypt");
         assert_ne!(&ciphertext, plaintext);
-        let decrypted = server_session.decrypt(&ciphertext).unwrap();
+        let decrypted = server_session.decrypt(&ciphertext).expect("decrypt");
         assert_eq!(&decrypted, plaintext);
 
         // Server encrypts, client decrypts
         let plaintext2 = b"hello from server";
-        let ciphertext2 = server_session.encrypt(plaintext2).unwrap();
-        let decrypted2 = client_session.decrypt(&ciphertext2).unwrap();
+        let ciphertext2 = server_session.encrypt(plaintext2).expect("encrypt2");
+        let decrypted2 = client_session.decrypt(&ciphertext2).expect("decrypt2");
         assert_eq!(&decrypted2, plaintext2);
     }
 
     #[tokio::test]
     async fn test_noise_tampered_message_rejected() {
-        let server_kp = NoiseKeypair::generate();
-        let client_kp = NoiseKeypair::generate();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server_kp_clone = server_kp.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handshake_responder(&mut stream, &server_kp_clone).await.unwrap()
-        });
-
-        let mut client_stream = TcpStream::connect(addr).await.unwrap();
-        let client_session = handshake_initiator(&mut client_stream, &client_kp)
-            .await
-            .unwrap();
-        let server_session = server.await.unwrap();
+        let (client_session, server_session, _client_kp, _server_kp) = duplex_handshake().await;
 
         // Encrypt then tamper with ciphertext
-        let ciphertext = client_session.encrypt(b"genuine message").unwrap();
+        let ciphertext = client_session.encrypt(b"genuine message").expect("encrypt");
         let mut tampered = ciphertext.clone();
         if let Some(byte) = tampered.last_mut() {
             *byte ^= 0xff;

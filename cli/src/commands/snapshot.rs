@@ -6,6 +6,10 @@
 //! to allow operators to export and import chain state for backup and
 //! disaster recovery purposes.
 
+// Snapshot commands are implemented but not yet wired into the CLI subcommand
+// dispatch (planned feature for disaster-recovery workflows).
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;

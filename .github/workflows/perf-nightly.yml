@@ -19,7 +19,7 @@ jobs:
           node-version: '20'
 
       - name: Build node image
-        run: docker build -t lattice:v3 citrate
+        run: docker build -t citrate:latest -f citrate_v0.01.1/Dockerfile citrate_v0.01.1
 
       - name: Start cluster
         run: |

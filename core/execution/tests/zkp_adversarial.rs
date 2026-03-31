@@ -113,14 +113,13 @@ fn test_random_bytes_never_verify() {
         };
 
         let result = backend.verify_proof(ProofType::ModelExecution, &random_proof);
-        match result {
-            Ok(valid) => assert!(
+        if let Ok(valid) = result {
+            assert!(
                 !valid,
                 "Random bytes of size {} must not verify as a valid proof",
                 size,
-            ),
-            Err(_) => {} // Deserialization error is acceptable
-        }
+            );
+        } // Deserialization error is acceptable
     }
 }
 
@@ -137,14 +136,13 @@ fn test_zero_proof_rejected() {
         };
 
         let result = backend.verify_proof(ProofType::ModelExecution, &zero_proof);
-        match result {
-            Ok(valid) => assert!(
+        if let Ok(valid) = result {
+            assert!(
                 !valid,
                 "All-zero proof bytes of size {} must not verify",
                 size,
-            ),
-            Err(_) => {} // Expected: deserialization of zero bytes fails
-        }
+            );
+        } // Expected: deserialization of zero bytes fails
     }
 }
 
@@ -168,14 +166,13 @@ fn test_proof_from_wrong_circuit_rejected() {
         ProofType::DataIntegrity,
     ] {
         let result = backend.verify_proof(*wrong_type, &model_proof);
-        match result {
-            Ok(valid) => assert!(
+        if let Ok(valid) = result {
+            assert!(
                 !valid,
                 "ModelExecution proof must not verify as {:?}",
                 wrong_type,
-            ),
-            Err(_) => {} // Also acceptable (different number of public inputs)
-        }
+            );
+        } // Also acceptable (different number of public inputs)
     }
 
     // Also test reverse: DataIntegrity proof checked as ModelExecution
@@ -186,10 +183,7 @@ fn test_proof_from_wrong_circuit_rejected() {
     );
 
     let result = backend.verify_proof(ProofType::ModelExecution, &data_proof);
-    match result {
-        Ok(valid) => assert!(!valid, "DataIntegrity proof must not verify as ModelExecution"),
-        Err(_) => {}
-    }
+    if let Ok(valid) = result { assert!(!valid, "DataIntegrity proof must not verify as ModelExecution") }
 }
 
 /// Replaying a valid proof with different public inputs must fail.
@@ -217,10 +211,9 @@ fn test_replayed_proof_with_different_inputs_fails() {
     };
 
     let result = backend.verify_proof(ProofType::ModelExecution, &replayed_proof);
-    match result {
-        Ok(valid) => assert!(!valid, "Replayed proof with different public inputs must not verify"),
-        Err(_) => {} // Verification math error is also acceptable
-    }
+    if let Ok(valid) = result {
+        assert!(!valid, "Replayed proof with different public inputs must not verify");
+    } // Verification math error is also acceptable
 }
 
 /// Swapping the order of public inputs must cause verification failure.
@@ -261,12 +254,9 @@ fn test_proof_with_swapped_public_inputs_fails() {
         };
 
         let result = backend.verify_proof(ProofType::ModelExecution, &swapped_proof);
-        match result {
-            Ok(valid) => {
-                assert!(!valid, "Proof with swapped public inputs must not verify")
-            }
-            Err(_) => {} // Verification error is acceptable
-        }
+        if let Ok(valid) = result {
+            assert!(!valid, "Proof with swapped public inputs must not verify");
+        } // Verification error is acceptable
     }
 }
 
@@ -285,10 +275,9 @@ fn test_public_input_overflow_rejected() {
     };
 
     let result = backend.verify_proof(ProofType::ModelExecution, &overflow_proof);
-    match result {
-        Ok(valid) => assert!(!valid, "u128::MAX public input must not produce a valid proof"),
-        Err(_) => {} // Expected
-    }
+    if let Ok(valid) = result {
+        assert!(!valid, "u128::MAX public input must not produce a valid proof");
+    } // Expected
 }
 
 /// Field element near p (the BLS12-381 scalar field modulus) should be
@@ -309,10 +298,9 @@ fn test_negative_field_element_handling() {
 
     let result = backend.verify_proof(ProofType::ModelExecution, &proof);
     // Must not panic, and must not return true
-    match result {
-        Ok(valid) => assert!(!valid, "Near-modulus public input must not verify"),
-        Err(_) => {} // Expected
-    }
+    if let Ok(valid) = result {
+        assert!(!valid, "Near-modulus public input must not verify");
+    } // Expected
 }
 
 /// Duplicate public inputs [x, x, x] must not circumvent verification.
@@ -335,10 +323,7 @@ fn test_duplicate_public_inputs_handled() {
     };
 
     let result = backend.verify_proof(ProofType::ModelExecution, &dup_proof);
-    match result {
-        Ok(v) => assert!(!v, "Proof with duplicated public inputs must not verify"),
-        Err(_) => {}
-    }
+    if let Ok(v) = result { assert!(!v, "Proof with duplicated public inputs must not verify") }
 }
 
 // ===========================================================================
@@ -495,13 +480,12 @@ fn test_proof_from_different_setup_rejected() {
 
     // Attempt to verify backend A's proof with backend B's keys
     let result = backend_b.verify_proof(ProofType::ModelExecution, &proof);
-    match result {
-        Ok(valid) => assert!(
+    if let Ok(valid) = result {
+        assert!(
             !valid,
             "Proof from backend A must not verify with backend B's verifying key",
-        ),
-        Err(_) => {} // Verification error is acceptable
-    }
+        );
+    } // Verification error is acceptable
 }
 
 /// Re-initializing a backend (calling initialize() twice) should still
@@ -698,14 +682,13 @@ fn test_single_bit_flip_detected() {
         tampered.proof_bytes[i] ^= 0x01; // Flip lowest bit
 
         let result = backend.verify_proof(ProofType::ModelExecution, &tampered);
-        match result {
-            Ok(v) => assert!(
+        if let Ok(v) = result {
+            assert!(
                 !v,
                 "Proof with bit flip at byte {} must not verify",
                 i,
-            ),
-            Err(_) => {} // Deserialization failure is fine
-        }
+            );
+        } // Deserialization failure is fine
     }
 }
 
@@ -731,10 +714,9 @@ fn test_truncated_proof_rejected() {
         };
 
         let result = backend.verify_proof(ProofType::ModelExecution, &truncated);
-        match result {
-            Ok(v) => assert!(!v, "Truncated proof (len={}) must not verify", truncate_to),
-            Err(_) => {} // Expected: deserialization fails
-        }
+        if let Ok(v) = result {
+            assert!(!v, "Truncated proof (len={}) must not verify", truncate_to);
+        } // Expected: deserialization fails
     }
 }
 
@@ -772,14 +754,11 @@ fn test_extended_proof_bytes_trailing_ignored() {
     // SerializableProof struct encapsulates the full Vec<u8> and the
     // serialization is trusted (bincode/serde boundary).
     let result = backend.verify_proof(ProofType::ModelExecution, &extended);
-    match result {
-        Ok(v) => {
-            // This actually verifies because arkworks ignores trailing bytes.
-            // The test passes — it documents the behavior.
-            assert!(v, "Extended proof with trailing bytes still verifies via arkworks");
-        }
-        Err(_) => {} // If arkworks ever changes to reject trailing bytes, that's fine too
-    }
+    if let Ok(v) = result {
+        // This actually verifies because arkworks ignores trailing bytes.
+        // The test passes — it documents the behavior.
+        assert!(v, "Extended proof with trailing bytes still verifies via arkworks");
+    } // If arkworks ever changes to reject trailing bytes, that's fine too
 }
 
 /// Empty public inputs with a valid proof should fail verification
@@ -800,10 +779,9 @@ fn test_empty_public_inputs_with_valid_proof_bytes_fails() {
     };
 
     let result = backend.verify_proof(ProofType::ModelExecution, &empty_pi);
-    match result {
-        Ok(v) => assert!(!v, "Proof with empty public inputs must not verify"),
-        Err(_) => {} // Expected
-    }
+    if let Ok(v) = result {
+        assert!(!v, "Proof with empty public inputs must not verify");
+    } // Expected
 }
 
 /// Extra public inputs beyond what the circuit expects should cause
@@ -823,10 +801,9 @@ fn test_extra_public_inputs_rejected() {
     extra_pi.public_inputs.push("888888".to_string());
 
     let result = backend.verify_proof(ProofType::ModelExecution, &extra_pi);
-    match result {
-        Ok(v) => assert!(!v, "Proof with extra public inputs must not verify"),
-        Err(_) => {} // Expected
-    }
+    if let Ok(v) = result {
+        assert!(!v, "Proof with extra public inputs must not verify");
+    } // Expected
 }
 
 /// StateTransition with all-zero transaction hash should fail

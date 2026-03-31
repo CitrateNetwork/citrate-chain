@@ -45,3 +45,7 @@ validators = [
 ipfs_api_url = "http://127.0.0.1:5001"
 check_interval_secs = 3600
 grace_period_hours = 24
+
+[vrf]
+strict_vrf = true
+migration_mode = false

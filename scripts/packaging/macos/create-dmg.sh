@@ -68,21 +68,20 @@ if [[ -z "$CLI_BIN" ]]; then
 fi
 echo "  CLI binary: $CLI_BIN"
 
-# --- Locate Tauri .app bundle ---
-GUI_APP=""
-TAURI_BUNDLE="$PROJECT_ROOT/gui/citrate-core/src-tauri/target"
+# --- Locate GUI binary (Slint-native) ---
+GUI_BIN=""
 for candidate in \
-  "$TAURI_BUNDLE/$RUST_TARGET/release/bundle/macos/Citrate.app" \
-  "$TAURI_BUNDLE/release/bundle/macos/Citrate.app"; do
-  if [[ -d "$candidate" ]]; then
-    GUI_APP="$candidate"
+  "$PROJECT_ROOT/target/release/citrate-gui-native" \
+  "$PROJECT_ROOT/gui-binary/citrate-gui-native"; do
+  if [[ -f "$candidate" ]]; then
+    GUI_BIN="$candidate"
     break
   fi
 done
 
-if [[ -z "$GUI_APP" ]]; then
-  echo "Warning: Citrate.app not found — DMG will contain CLI only."
-  echo "  Build GUI with: cd gui/citrate-core && npm run tauri:build"
+if [[ -z "$GUI_BIN" ]]; then
+  echo "Warning: Citrate GUI binary not found — DMG will contain CLI only."
+  echo "  Build GUI with: cargo build --release -p citrate-gui-native"
 fi
 
 # --- Stage DMG contents ---
@@ -91,10 +90,11 @@ echo "Staging DMG contents..."
 DMG_ROOT="$STAGING_DIR/Citrate"
 mkdir -p "$DMG_ROOT"
 
-# Copy GUI app if available
-if [[ -n "$GUI_APP" ]]; then
-  echo "  Copying Citrate.app..."
-  cp -R "$GUI_APP" "$DMG_ROOT/Citrate.app"
+# Copy GUI binary if available
+if [[ -n "$GUI_BIN" ]]; then
+  echo "  Copying citrate-gui-native..."
+  cp "$GUI_BIN" "$DMG_ROOT/citrate-gui"
+  chmod 755 "$DMG_ROOT/citrate-gui"
 fi
 
 # Create cli/ directory with the unified binary

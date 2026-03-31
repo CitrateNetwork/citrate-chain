@@ -71,21 +71,20 @@ if [[ -z "$CLI_BIN" ]]; then
 fi
 echo "  CLI binary: $CLI_BIN"
 
-# --- Locate GUI artifacts ---
-GUI_APPIMAGE=""
-TAURI_BUNDLE="$PROJECT_ROOT/gui/citrate-core/src-tauri/target"
+# --- Locate GUI binary (Slint-native) ---
+GUI_BIN=""
 for candidate in \
-  "$TAURI_BUNDLE/$RUST_TARGET/release/bundle/appimage/"*.AppImage \
-  "$TAURI_BUNDLE/release/bundle/appimage/"*.AppImage; do
+  "$PROJECT_ROOT/target/release/citrate-gui-native" \
+  "$PROJECT_ROOT/gui-binary/citrate-gui-native"; do
   if [[ -f "$candidate" ]]; then
-    GUI_APPIMAGE="$candidate"
+    GUI_BIN="$candidate"
     break
   fi
 done
 
-if [[ -z "$GUI_APPIMAGE" ]]; then
-  echo "Warning: Citrate AppImage not found — DEB will contain CLI only."
-  echo "  Build GUI with: cd gui/citrate-core && npm run tauri:build"
+if [[ -z "$GUI_BIN" ]]; then
+  echo "Warning: Citrate GUI binary not found — DEB will contain CLI only."
+  echo "  Build GUI with: cargo build --release -p citrate-gui-native"
 fi
 
 # --- Build DEB directory structure ---
@@ -100,11 +99,11 @@ chmod 755 "$DEB_ROOT/usr/local/bin/citrate"
 echo "  Installed /usr/local/bin/citrate"
 
 # GUI (if available)
-if [[ -n "$GUI_APPIMAGE" ]]; then
+if [[ -n "$GUI_BIN" ]]; then
   mkdir -p "$DEB_ROOT/opt/citrate"
-  cp "$GUI_APPIMAGE" "$DEB_ROOT/opt/citrate/citrate-gui.AppImage"
-  chmod 755 "$DEB_ROOT/opt/citrate/citrate-gui.AppImage"
-  echo "  Installed /opt/citrate/citrate-gui.AppImage"
+  cp "$GUI_BIN" "$DEB_ROOT/opt/citrate/citrate-gui"
+  chmod 755 "$DEB_ROOT/opt/citrate/citrate-gui"
+  echo "  Installed /opt/citrate/citrate-gui"
 
   # Desktop entry
   mkdir -p "$DEB_ROOT/usr/share/applications"
@@ -113,7 +112,7 @@ if [[ -n "$GUI_APPIMAGE" ]]; then
 Type=Application
 Name=Citrate
 Comment=AI-Native Layer-1 Blockchain
-Exec=/opt/citrate/citrate-gui.AppImage
+Exec=/opt/citrate/citrate-gui
 Icon=citrate
 Categories=Finance;Network;
 Terminal=false
@@ -183,11 +182,8 @@ mkdir -p "$DEB_ROOT/DEBIAN"
 # Calculate installed size (in KB)
 INSTALLED_SIZE=$(du -sk "$DEB_ROOT" | cut -f1)
 
-# Determine dependencies
+# Determine dependencies (Slint-native GUI has no GTK/WebKit deps)
 DEPENDS="libc6 (>= 2.31), libssl3 | libssl1.1"
-if [[ -n "$GUI_APPIMAGE" ]]; then
-  DEPENDS="$DEPENDS, libgtk-3-0, libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37"
-fi
 
 cat > "$DEB_ROOT/DEBIAN/control" << CONTROL_EOF
 Package: citrate

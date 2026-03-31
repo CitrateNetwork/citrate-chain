@@ -112,7 +112,7 @@ pub fn poseidon_hash_circuit(
 
 /// Get a reference to the Poseidon configuration (for testing / external use).
 pub fn poseidon_config() -> &'static PoseidonConfig<Fr> {
-    &*POSEIDON_CONFIG
+    &POSEIDON_CONFIG
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +239,7 @@ mod tests {
             .iter()
             .map(|d| FpVar::new_witness(cs_mimc.clone(), || Ok(*d)).unwrap())
             .collect();
-        super::super::mimc::mimc_hash_circuit(cs_mimc.clone(), &vars_mimc).unwrap();
+        let _ = super::super::mimc::mimc_hash_circuit(cs_mimc.clone(), &vars_mimc).unwrap();
         let mimc_constraints = cs_mimc.num_constraints();
 
         // Poseidon constraints
@@ -248,7 +248,7 @@ mod tests {
             .iter()
             .map(|d| FpVar::new_witness(cs_pos.clone(), || Ok(*d)).unwrap())
             .collect();
-        poseidon_hash_circuit(cs_pos.clone(), &vars_pos).unwrap();
+        let _ = poseidon_hash_circuit(cs_pos.clone(), &vars_pos).unwrap();
         let pos_constraints = cs_pos.num_constraints();
 
         eprintln!(

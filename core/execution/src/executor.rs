@@ -2247,7 +2247,7 @@ impl Executor {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use citrate_consensus::types::{BlockBuilder, BlockHeader, PublicKey, Signature, VrfProof};
+    use citrate_consensus::types::{BlockBuilder, PublicKey, Signature};
     use parking_lot::Mutex;
     use serde_json::json;
     use sha3::{Digest, Keccak256};

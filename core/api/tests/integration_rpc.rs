@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use citrate_consensus::types::{
-    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction,
 };
 use citrate_execution::types::{AccessPolicy, ModelId, ModelMetadata, ModelState};
 use citrate_execution::types::{Address, TransactionReceipt};
