@@ -20,8 +20,8 @@ impl Default for WalletConfig {
     fn default() -> Self {
         Self {
             keystore_path: default_keystore_path(),
-            // Embedded-node-primary: default to local node RPC, not public RPC
-            rpc_url: "http://127.0.0.1:18545".to_string(),
+            // Testnet-primary: use public RPC since embedded node doesn't serve HTTP RPC
+            rpc_url: "https://rpc.citrate.ai".to_string(),
             chain_id: 40204,
             network: "testnet".to_string(),
             default_gas_price: 1_000_000_000, // 1 Gwei
