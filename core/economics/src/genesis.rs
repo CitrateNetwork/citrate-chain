@@ -12,7 +12,32 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 
-pub const TESTNET_TREASURY_ADDRESS: Address = Address([0x11; 20]);
+// Re-genesis 2026-04-01: Real wallet addresses (keys in .env.testnet)
+pub const TESTNET_TREASURY_ADDRESS: Address = Address([
+    0xac, 0xea, 0xa7, 0xd0, 0x0c, 0x02, 0x4d, 0x32, 0xe6, 0xe0,
+    0xa0, 0x70, 0x94, 0xce, 0xb1, 0xa7, 0x70, 0x67, 0x86, 0xd1,
+]);
+// Deployer wallet for contract deployment
+pub const TESTNET_DEPLOYER_ADDRESS: Address = Address([
+    0x42, 0x50, 0x67, 0x5f, 0x90, 0x15, 0xe6, 0x5f, 0xc8, 0x66,
+    0xf3, 0xa3, 0x73, 0xf8, 0x2b, 0xb9, 0xdf, 0xc0, 0x00, 0xc6,
+]);
+// Faucet signing wallet
+pub const TESTNET_FAUCET_ADDRESS: Address = Address([
+    0xf4, 0xad, 0xb1, 0x73, 0x4f, 0x7b, 0xd9, 0xf8, 0x97, 0x9b,
+    0xd5, 0x3b, 0x2b, 0xf6, 0xd7, 0x69, 0x0d, 0x56, 0x2b, 0x6d,
+]);
+// Team/Dev wallet
+pub const TESTNET_TEAM_ADDRESS: Address = Address([
+    0xb6, 0xe9, 0xa5, 0x58, 0xa4, 0xf9, 0xdc, 0x9e, 0x3f, 0x66,
+    0x7a, 0x3b, 0x44, 0x6a, 0x48, 0xbd, 0xdf, 0x67, 0x11, 0x26,
+]);
+// Validator coinbase wallet
+pub const TESTNET_VALIDATOR_ADDRESS: Address = Address([
+    0x04, 0xab, 0xae, 0x08, 0xac, 0x64, 0x3b, 0x2c, 0x51, 0x8f,
+    0x22, 0xe2, 0x12, 0xa2, 0x7f, 0x7b, 0x6e, 0x14, 0xb4, 0xc3,
+]);
+// Legacy ecosystem address (kept for backward compat, no genesis funding)
 pub const TESTNET_ECOSYSTEM_ADDRESS: Address = Address([0x22; 20]);
 pub const LEGACY_FAUCET_PLACEHOLDER_ADDRESS: Address = Address([0x33; 20]);
 pub const HARDHAT_DEFAULT_ADDRESS: Address = Address([
@@ -183,28 +208,27 @@ impl GenesisConfig {
     /// Create testnet beta genesis configuration (chain_id = 40204).
     /// Used for the closed beta testnet with peer whitelist + API key gating.
     pub fn testnet_beta() -> Self {
-        let treasury = TESTNET_TREASURY_ADDRESS;
-        let ecosystem = TESTNET_ECOSYSTEM_ADDRESS;
-        let faucet = DETERMINISTIC_FAUCET_SIGNER_ADDRESS;
-
+        // Re-genesis 2026-04-01: Clean start with real wallet addresses.
+        // Keys stored in .env.testnet (NOT committed to repo).
+        // Total: 1B SALT allocated across 5 accounts.
         Self {
-            chain_id: 40204, // Testnet beta
+            chain_id: 40204,
             accounts: vec![
-                // Faucet signing key account (10M SALT for testnet distribution)
-                account(faucet, 10_000_000),
-                // Treasury (100M SALT)
-                account(treasury, 100_000_000),
-                // Ecosystem fund (250M SALT)
-                account(ecosystem, 250_000_000),
-                // Foundry-recovered deployer for contract deployment
-                account(FOUNDRY_RECOVERED_DEPLOYER_ADDRESS, 1_000_000),
-                // Larry/Saul deployer wallet used in current testnet operations
-                account(SAUL_DEPLOYER_ADDRESS, 5_000_000),
+                // Treasury — main supply, funds future allocations (500M SALT)
+                account(TESTNET_TREASURY_ADDRESS, 500_000_000),
+                // Faucet — dispenses 10 SALT per request to users (50M SALT)
+                account(TESTNET_FAUCET_ADDRESS, 50_000_000),
+                // Deployer — deploys all smart contracts (10M SALT)
+                account(TESTNET_DEPLOYER_ADDRESS, 10_000_000),
+                // Team/Dev — development and testing (10M SALT)
+                account(TESTNET_TEAM_ADDRESS, 10_000_000),
+                // Validator — block production and staking (5M SALT)
+                account(TESTNET_VALIDATOR_ADDRESS, 5_000_000),
             ],
-            treasury_address: treasury,
+            treasury_address: TESTNET_TREASURY_ADDRESS,
             team_allocations: HashMap::new(),
-            ecosystem_fund: ecosystem,
-            mining_pool_max: latt_to_wei(500_000_000),
+            ecosystem_fund: TESTNET_TREASURY_ADDRESS, // Treasury doubles as ecosystem fund
+            mining_pool_max: latt_to_wei(425_000_000), // Remaining 425M for mining rewards
         }
     }
 
