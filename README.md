@@ -42,7 +42,7 @@ Citrate is an AI-native Layer-1 BlockDAG blockchain combining **GhostDAG consens
 |----------|-----|
 | **JSON-RPC** | `https://rpc.citrate.ai` (POST) |
 | **Block Explorer** | `https://explorer.citrate.ai` |
-| **Faucet** | [`https://rpc.citrate.ai/faucet`](https://rpc.citrate.ai/faucet) |
+| **Faucet** | [`https://faucet.citrate.ai`](https://faucet.citrate.ai) |
 | **Chain ID** | `40204` |
 
 ## Quick Start
