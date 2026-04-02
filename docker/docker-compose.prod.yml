@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Core blockchain node
   citrate-node:
@@ -26,28 +24,6 @@ services:
       timeout: 10s
       retries: 3
 
-  # API server with MCP support
-  citrate-api:
-    build:
-      context: ..
-      dockerfile: docker/api.Dockerfile
-    image: citrate/api:latest
-    container_name: citrate-api
-    restart: unless-stopped
-    ports:
-      - "3000:3000"   # REST API
-      - "3001:3001"   # MCP API
-    environment:
-      - LOG_LEVEL=info
-    depends_on:
-      - citrate-node
-      - postgres
-      - redis
-    volumes:
-      - ./config/api.toml:/config/api.toml:ro
-    networks:
-      - citrate-network
-
   # IPFS node for distributed storage
   ipfs:
     build:
@@ -66,32 +42,6 @@ services:
     networks:
       - citrate-network
 
-  # PostgreSQL database
-  postgres:
-    image: postgres:15-alpine
-    container_name: citrate-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: citrate
-      POSTGRES_USER: citrate
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-citrate_secure_password}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    networks:
-      - citrate-network
-
-  # Redis cache
-  redis:
-    image: redis:7-alpine
-    container_name: citrate-redis
-    restart: unless-stopped
-    command: redis-server --appendonly yes
-    volumes:
-      - redis_data:/data
-    networks:
-      - citrate-network
-
   # Faucet service
   faucet:
     build:
@@ -103,7 +53,9 @@ services:
     ports:
       - "3002:3002"
     environment:
-      - NODE_URL=http://citrate-node:8545
+      - CITRATE_RPC_URL=http://citrate-node:8545
+      - CITRATE_CHAIN_ID=40204
+      - FAUCET_PORT=3002
     depends_on:
       - citrate-node
     networks:
@@ -151,10 +103,6 @@ volumes:
     driver: local
   ipfs_data:
     driver: local
-  postgres_data:
-    driver: local
-  redis_data:
-    driver: local
   prometheus_data:
     driver: local
   grafana_data:
@@ -166,4 +114,3 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/16
-

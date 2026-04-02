@@ -1,37 +1,48 @@
-# Citrate Node Configuration
+# Citrate Node Configuration (current schema)
+
+[chain]
+chain_id = 40204
+genesis_hash = ""
+block_time = 2
+ghostdag_k = 18
+genesis_profile = "testnet_beta"
+
 [network]
 listen_addr = "0.0.0.0:30303"
-boot_nodes = []
+bootstrap_nodes = []
 max_peers = 50
+allowed_peers = []
 
 [rpc]
 enabled = true
 listen_addr = "0.0.0.0:8545"
-# For production, restrict to known origins. Wildcard ["*"] is dev-only.
+ws_addr = "0.0.0.0:8546"
+allow_eth_send_transaction = false
 cors_origins = ["http://localhost:*"]
-max_connections = 100
-
-[ws]
-enabled = true
-listen_addr = "0.0.0.0:8546"
-# For production, restrict to known origins. Wildcard ["*"] is dev-only.
-cors_origins = ["http://localhost:*"]
-max_connections = 100
-
-[consensus]
-protocol = "ghostdag"
-k = 18
-finality_depth = 12
-
-[execution]
-vm_type = "evm"
-gas_limit = 30000000
-gas_price = 1000000000
 
 [storage]
 data_dir = "/data"
-cache_size = 1024
+pruning = false
+keep_blocks = 100000
 
-[logging]
-level = "info"
-format = "json"
+[mining]
+enabled = true
+coinbase = ""
+target_block_time = 2
+min_gas_price = 1000000000
+
+[validator]
+production_mode = false
+validators = []
+ipfs_api_url = "http://ipfs:5001"
+check_interval_secs = 3600
+grace_period_hours = 24
+
+[vrf]
+strict_vrf = true
+migration_mode = false
+
+[checkpoint]
+interval = 50
+committee_size = 100
+quorum_threshold = 67

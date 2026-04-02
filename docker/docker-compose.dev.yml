@@ -1,4 +1,3 @@
-version: '3.8'
 services:
   node1:
     build:
@@ -49,13 +48,15 @@ services:
       dockerfile: citrate/docker/faucet.Dockerfile
     container_name: citrate-faucet
     ports:
-      - "3001:3001"
+      - "3002:3002"
     environment:
       - RUST_LOG=info
+      - CITRATE_RPC_URL=http://node1:8545
+      - CITRATE_CHAIN_ID=40204
+      - FAUCET_PORT=3002
     networks:
       - citrate
 
 networks:
   citrate:
     driver: bridge
-

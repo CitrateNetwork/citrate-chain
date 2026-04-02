@@ -4,7 +4,7 @@
   # Citrate — AI-Native BlockDAG
 
   [![Release](https://img.shields.io/github/v/release/SaulBuilds/citrate?include_prereleases&label=release)](https://github.com/SaulBuilds/citrate/releases)
-  [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+  [![License](https://img.shields.io/badge/License-BUSL--1.1%20%2B%20AUG-blue.svg)](../LICENSE)
   [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
   [![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](#testing)
   [![TLA+](https://img.shields.io/badge/TLA%2B-specs-purple.svg)](#formal-verification)
@@ -17,7 +17,7 @@
 
 ---
 
-> **Contributors (human and AI): Start here.** We use the [Agentile methodology](../.agentile/AGENT_ENTRY.md) for all development. Read [`.agentile/AGENT_ENTRY.md`](../.agentile/AGENT_ENTRY.md) for the full contributor decision tree, rules, and workflows before writing any code. AI coding tools auto-discover these instructions via `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.windsurfrules`, and `.github/copilot-instructions.md` in the repo root.
+> **Contributors (human and AI): Start here.** We use the **Agentile** methodology under the **Cnidarian Foundation** for all development. Read [`.agentile/AGENT_ENTRY.md`](../.agentile/AGENT_ENTRY.md) for the contributor decision tree, and read [`.agentile/SPIRIT.md`](../.agentile/SPIRIT.md), [`.agentile/SOUL.md`](../.agentile/SOUL.md), and [`.agentile/AGENT.md`](../.agentile/AGENT.md) for the institutional rule, value, and cooperation layers before writing code.
 
 ---
 
@@ -45,7 +45,26 @@ Citrate is an AI-native Layer-1 BlockDAG blockchain combining **GhostDAG consens
 | **Faucet** | [`https://faucet.citrate.ai`](https://faucet.citrate.ai) |
 | **Chain ID** | `40204` |
 
+## Forking and Licensing
+
+- Small private learning networks, classrooms, labs, and research forks are encouraged.
+- Commercial use, branded deployments, and public product launches are not granted by default.
+- See [../LICENSE](../LICENSE), [docs/guides/forking-and-small-networks.md](docs/guides/forking-and-small-networks.md), [docs/guides/licensing-and-commercial-use.md](docs/guides/licensing-and-commercial-use.md), [LICENSING_FRAMEWORK.md](LICENSING_FRAMEWORK.md), [TRADEMARK_POLICY.md](TRADEMARK_POLICY.md), and [../PATENT_NOTICE.md](../PATENT_NOTICE.md).
+- Commercial and partnership inquiries: **Partnerships@Citrate.ai**
+
 ## Quick Start
+
+### Option 0: One-Line Bootstrap
+
+```bash
+# Developer workstation
+curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile developer
+
+# Agent workstation
+curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile agent
+```
+
+This is the cleanest terminal-first path for open-source contributors. It installs the common toolchain, clones the repo, prepares current config profiles, and builds the main binaries.
 
 ### Option A: Download Binary (Recommended)
 
@@ -170,7 +189,7 @@ cd contracts && forge test -vv   # Run all Forge tests
 
 ## Formal Verification (TLA+ Specs)
 
-The canonical TLA+ spec collection lives in `.agentile/formal/specs/` (84 specs across all domains). A local subset of 46 specs is available in `specs/tla/`, organized into six domains:
+The canonical TLA+ spec collection lives in `.agentile/formal/specs/` (101 authored specs today across all domains). A local subset of 46 specs is available in `specs/tla/`, organized into six domains:
 
 | Domain | Description |
 |--------|-------------|
@@ -356,4 +375,4 @@ Built by **Larry Klosowski** ([@Saul_loveman](https://twitter.com/Saul_loveman))
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+Business Source License 1.1 with a project-specific Additional Use Grant. See [../LICENSE](../LICENSE), [../PATENT_NOTICE.md](../PATENT_NOTICE.md), [TRADEMARK_POLICY.md](TRADEMARK_POLICY.md), and [docs/guides/licensing-and-commercial-use.md](docs/guides/licensing-and-commercial-use.md).
