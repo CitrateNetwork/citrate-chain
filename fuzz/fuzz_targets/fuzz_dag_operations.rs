@@ -24,7 +24,7 @@ fuzz_target!(|data: &[u8]| {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .unwrap_or_else(|err| panic!("failed to build fuzz runtime: {err}"));
 
     rt.block_on(async {
         let dag_store = Arc::new(DagStore::new());
@@ -70,7 +70,6 @@ fuzz_target!(|data: &[u8]| {
 
             // Periodically check invariants
             if i % 5 == 0 && !block_hashes.is_empty() {
-                let last = block_hashes.last().unwrap();
                 // Blue set calculation should not panic
                 let _ = ghostdag.calculate_blue_set(&block).await;
                 // Tips should not panic

@@ -27,7 +27,7 @@ fuzz_target!(|data: &[u8]| {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .unwrap_or_else(|err| panic!("failed to build fuzz runtime: {err}"));
 
     rt.block_on(async {
         use citrate_sequencer::{Mempool, MempoolConfig, TxClass};
@@ -49,8 +49,14 @@ fuzz_target!(|data: &[u8]| {
 
         for chunk in data.chunks_exact(RECORD_SIZE) {
             let action = chunk[0] % 3;
-            let nonce = u64::from_le_bytes(chunk[1..9].try_into().unwrap());
-            let gas_price = u64::from_le_bytes(chunk[9..17].try_into().unwrap());
+            let Ok(nonce_bytes) = <[u8; 8]>::try_from(&chunk[1..9]) else {
+                continue;
+            };
+            let Ok(gas_price_bytes) = <[u8; 8]>::try_from(&chunk[9..17]) else {
+                continue;
+            };
+            let nonce = u64::from_le_bytes(nonce_bytes);
+            let gas_price = u64::from_le_bytes(gas_price_bytes);
             let sender_byte = chunk[17];
 
             match action {

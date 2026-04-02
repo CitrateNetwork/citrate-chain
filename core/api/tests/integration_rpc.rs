@@ -437,7 +437,6 @@ async fn test_eth_estimate_gas_minimal() {
 }
 
 #[tokio::test]
-#[ignore = "AI opcodes (0xf0-0xf4) disabled — collide with EVM CREATE/CALL/RETURN"]
 async fn test_eth_call_ai_tensor_opcode() {
     use primitive_types::U256;
     // Storage/executor/mempool setup
@@ -485,10 +484,18 @@ async fn test_eth_call_ai_tensor_opcode() {
 
     let resp = io.handle_request(&req).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let out = v["result"].as_str().unwrap();
-    assert!(out.starts_with("0x"));
-    // Expect prefix 0xf0 0x01 0x01 0x00 from tensor op result
-    assert!(out.starts_with("0xf0010100"));
+    if let Some(out) = v["result"].as_str() {
+        assert!(out.starts_with("0x"));
+        assert!(
+            !out.starts_with("0xf0010100"),
+            "legacy AI opcode bytes must not execute tensor path anymore"
+        );
+    } else {
+        assert!(
+            v.get("error").is_some(),
+            "legacy AI opcode bytes should now error or return non-AI output"
+        );
+    }
 }
 
 #[tokio::test]
@@ -578,7 +585,6 @@ async fn test_eth_estimate_gas_with_object_returns_constant() {
 }
 
 #[tokio::test]
-#[ignore = "AI opcodes (0xf0-0xf4) disabled — collide with EVM CREATE/CALL/RETURN"]
 async fn test_eth_call_ai_zk_verify_valid_proof() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -624,12 +630,17 @@ async fn test_eth_call_ai_zk_verify_valid_proof() {
     .to_string();
     let resp = io.handle_request(&req).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let out = v["result"].as_str().unwrap();
-    assert!(out.starts_with("0x01"));
+    if let Some(out) = v["result"].as_str() {
+        assert!(
+            !out.starts_with("0x01"),
+            "legacy AI opcode bytes must not verify proofs via eth_call anymore"
+        );
+    } else {
+        assert!(v.get("error").is_some());
+    }
 }
 
 #[tokio::test]
-#[ignore = "AI opcodes (0xf0-0xf4) disabled — collide with EVM CREATE/CALL/RETURN"]
 async fn test_eth_call_ai_zk_verify_invalid_proof() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -675,12 +686,17 @@ async fn test_eth_call_ai_zk_verify_invalid_proof() {
     .to_string();
     let resp = io.handle_request(&req).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let out = v["result"].as_str().unwrap();
-    assert!(out.starts_with("0x00"));
+    if let Some(out) = v["result"].as_str() {
+        assert!(
+            out != "0x00",
+            "legacy AI opcode bytes must not expose proof-verification semantics anymore"
+        );
+    } else {
+        assert!(v.get("error").is_some());
+    }
 }
 
 #[tokio::test]
-#[ignore = "AI opcodes (0xf0-0xf4) disabled — collide with EVM CREATE/CALL/RETURN"]
 async fn test_eth_call_ai_zk_prove_output_length() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -726,11 +742,11 @@ async fn test_eth_call_ai_zk_prove_output_length() {
     let resp = io.handle_request(&req).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     if let Some(out) = v["result"].as_str() {
-        assert!(out.starts_with("0x"));
-        // 64 bytes -> 128 hex chars + 2 for 0x = 130 total
-        assert_eq!(out.len(), 130);
+        assert!(
+            out.len() != 130,
+            "legacy AI opcode bytes must not produce the old 64-byte proof output anymore"
+        );
     } else {
-        // Some environments may surface error instead of result
         assert!(v.get("error").is_some());
     }
 }
@@ -821,7 +837,6 @@ async fn test_eth_call_invalid_data_shapes_error() {
 }
 
 #[tokio::test]
-#[ignore = "AI opcodes (0xf0-0xf4) disabled — collide with EVM CREATE/CALL/RETURN"]
 async fn test_eth_call_ai_model_load_path() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -888,9 +903,14 @@ async fn test_eth_call_ai_model_load_path() {
     .to_string();
     let resp = io.handle_request(&req).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let out = v["result"].as_str().unwrap();
-    // Output should be some non-empty hex (model handle bytes)
-    assert!(out.len() > 2);
+    if let Some(out) = v["result"].as_str() {
+        assert!(
+            out == "0x" || out.len() <= 2,
+            "legacy AI opcode bytes must not expose model-load handles anymore"
+        );
+    } else {
+        assert!(v.get("error").is_some());
+    }
 }
 
 #[tokio::test]

@@ -175,6 +175,10 @@ impl IpfsDaemon {
             if path.exists() {
                 return Ok(path.clone());
             }
+            return Err(anyhow!(
+                "Configured IPFS binary not found at {}",
+                path.display()
+            ));
         }
 
         // Common installation paths
@@ -792,7 +796,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Environment-dependent: fails when IPFS is installed on system PATH"]
     async fn test_find_ipfs_binary_with_custom_path() {
         let config = DaemonConfig {
             binary_path: Some(PathBuf::from("/nonexistent/ipfs")),
@@ -806,10 +809,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Environment-dependent: fails when IPFS daemon is running on system"]
     async fn test_status_not_installed() {
         let config = DaemonConfig {
             binary_path: Some(PathBuf::from("/nonexistent/ipfs")),
+            api_addr: "/ip4/127.0.0.1/tcp/15999".to_string(),
             auto_download: false,
             ..Default::default()
         };

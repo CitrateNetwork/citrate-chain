@@ -46,7 +46,7 @@ async fn main() {
 
     let start = Instant::now();
     let duration = Duration::from_secs(duration_secs);
-    let interval = Duration::from_micros(1_000_000 / target_tps);
+    let _interval = Duration::from_micros(1_000_000 / target_tps);
 
     let mut handles = Vec::new();
     let mut sent: u64 = 0;
