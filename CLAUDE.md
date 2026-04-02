@@ -143,8 +143,10 @@ cargo clippy --all-targets --all-features -D warnings
 # Format
 cargo fmt --all
 
-# GUI tests
-cd gui/citrate_gui_v2 && npx vitest run
+# GUI tests (Slint-native)
+cargo test -p citrate-gui-native
+# Visual proof suite
+scripts/run_gui_visual_proofs.sh
 
 # Forge tests
 cd contracts && forge test
