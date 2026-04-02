@@ -553,23 +553,16 @@ mod tests {
     }
 
     #[test]
-    fn test_testnet_beta_funds_deterministic_faucet_signer() {
+    fn test_testnet_beta_funds_faucet() {
         let config = GenesisConfig::testnet_beta();
 
         let faucet_account = config
             .accounts
             .iter()
-            .find(|account| account.address == DETERMINISTIC_FAUCET_SIGNER_ADDRESS)
-            .expect("testnet beta must fund deterministic faucet signer");
+            .find(|account| account.address == TESTNET_FAUCET_ADDRESS)
+            .expect("testnet beta must fund faucet address");
 
-        assert_eq!(faucet_account.balance, latt_to_wei(10_000_000));
-        assert!(
-            !config
-                .accounts
-                .iter()
-                .any(|account| account.address == LEGACY_FAUCET_PLACEHOLDER_ADDRESS),
-            "testnet beta should not fund the legacy placeholder faucet address"
-        );
+        assert_eq!(faucet_account.balance, latt_to_wei(50_000_000));
     }
 
     #[test]
@@ -577,8 +570,8 @@ mod tests {
         let config = GenesisConfig::testnet_beta();
         let total = config.total_preallocation();
 
-        // 10M faucet signer + 100M treasury + 250M ecosystem + 1M deployer + 5M Saul deployer
-        let expected = latt_to_wei(366_000_000);
+        // Re-genesis 2026-04-01: 500M treasury + 50M faucet + 10M deployer + 10M team + 5M validator
+        let expected = latt_to_wei(575_000_000);
         assert_eq!(total, expected);
     }
 
