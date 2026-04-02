@@ -67,7 +67,10 @@ fuzz_target!(|data: &[u8]| {
                 let signature = data[pos..pos + 64].to_vec();
                 pos += 64;
 
-                let timestamp = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                let Ok(timestamp_bytes) = <[u8; 8]>::try_from(&data[pos..pos + 8]) else {
+                    break;
+                };
+                let timestamp = u64::from_le_bytes(timestamp_bytes);
                 pos += 8;
 
                 let attestation = OracleAttestation {

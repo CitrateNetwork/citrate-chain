@@ -139,10 +139,11 @@ pub fn select_mentors(
         if let Some((mentor_key, score, shared)) = best {
             *mentor_load.entry(mentor_key).or_insert(0) += 1;
 
-            let mentor_profile = potential_mentors
+            let Some(mentor_profile) = potential_mentors
                 .iter()
-                .find(|(k, _)| *k == mentor_key)
-                .expect("mentor must be in potential_mentors");
+                .find(|(k, _)| *k == mentor_key) else {
+                    continue;
+                };
 
             pairings.push(MentorPairing {
                 mentor: mentor_key,

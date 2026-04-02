@@ -255,10 +255,9 @@ async fn require_rest_api_key(
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(serde_json::to_string(&body).unwrap_or_default()))
                 .unwrap_or_else(|_| {
-                    axum::response::Response::builder()
-                        .status(StatusCode::FORBIDDEN)
-                        .body(axum::body::Body::empty())
-                        .expect("fallback response should always succeed")
+                    let mut response = axum::response::Response::new(axum::body::Body::empty());
+                    *response.status_mut() = StatusCode::FORBIDDEN;
+                    response
                 });
             Ok(response)
         }

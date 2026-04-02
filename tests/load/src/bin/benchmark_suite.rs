@@ -24,12 +24,10 @@ const COUNTER_CONTRACT_BYTECODE: &str = "608060405234801561001057600080fd5b50600
 /// Function selector for set(uint256): keccak256("set(uint256)")[:4]
 const SET_SELECTOR: &str = "60fe47b1";
 
-/// Function selector for increment(): keccak256("increment()")[:4]
-const INCREMENT_SELECTOR: &str = "d09de08a";
-
 const FROM: &str = "0x3333333333333333333333333333333333333333";
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct BenchmarkResult {
     name: String,
     target_tps: u64,

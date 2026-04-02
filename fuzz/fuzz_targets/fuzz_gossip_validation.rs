@@ -29,7 +29,10 @@ fuzz_target!(|data: &[u8]| {
     // Parse fuzz bytes into block fields
     let mut offset = 0;
 
-    let version = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+    let Ok(version_bytes) = <[u8; 4]>::try_from(&data[offset..offset + 4]) else {
+        return;
+    };
+    let version = u32::from_le_bytes(version_bytes);
     offset += 4;
 
     let mut block_hash_bytes = [0u8; 32];
@@ -40,13 +43,22 @@ fuzz_target!(|data: &[u8]| {
     parent_hash_bytes.copy_from_slice(&data[offset..offset+32]);
     offset += 32;
 
-    let timestamp = u64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
+    let Ok(timestamp_bytes) = <[u8; 8]>::try_from(&data[offset..offset + 8]) else {
+        return;
+    };
+    let timestamp = u64::from_le_bytes(timestamp_bytes);
     offset += 8;
 
-    let height = u64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
+    let Ok(height_bytes) = <[u8; 8]>::try_from(&data[offset..offset + 8]) else {
+        return;
+    };
+    let height = u64::from_le_bytes(height_bytes);
     offset += 8;
 
-    let blue_score = u64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
+    let Ok(blue_score_bytes) = <[u8; 8]>::try_from(&data[offset..offset + 8]) else {
+        return;
+    };
+    let blue_score = u64::from_le_bytes(blue_score_bytes);
     offset += 8;
 
     // Remaining bytes used for VRF proof (variable length)

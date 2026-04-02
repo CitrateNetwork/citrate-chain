@@ -10,7 +10,7 @@ use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Unified signing key supporting both Ed25519 and secp256k1.
 #[derive(Clone)]
@@ -94,6 +94,34 @@ impl KeyManager {
         }
     }
 
+    fn entries_read(&self) -> RwLockReadGuard<'_, Vec<EncryptedKeyEntry>> {
+        match self.entries.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn entries_write(&self) -> RwLockWriteGuard<'_, Vec<EncryptedKeyEntry>> {
+        match self.entries.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn unlocked_read(&self) -> RwLockReadGuard<'_, HashMap<String, UnifiedKey>> {
+        match self.unlocked_keys.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn unlocked_write(&self) -> RwLockWriteGuard<'_, HashMap<String, UnifiedKey>> {
+        match self.unlocked_keys.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Load existing keys from disk.
     pub fn load(&self) -> Result<(), WalletError> {
         let path = self.keystore_path.join("keys.json");
@@ -104,7 +132,7 @@ impl KeyManager {
             .map_err(|e| WalletError::Storage(format!("Cannot read keystore: {}", e)))?;
         let entries: Vec<EncryptedKeyEntry> = serde_json::from_str(&content)
             .map_err(|e| WalletError::Serialization(format!("Invalid keystore JSON: {}", e)))?;
-        *self.entries.write().expect("write lock") = entries;
+        *self.entries_write() = entries;
         Ok(())
     }
 
@@ -113,7 +141,7 @@ impl KeyManager {
         std::fs::create_dir_all(&self.keystore_path)
             .map_err(|e| WalletError::Storage(format!("Cannot create keystore dir: {}", e)))?;
 
-        let entries = self.entries.read().expect("read lock");
+        let entries = self.entries_read();
         let json = serde_json::to_string_pretty(&*entries)
             .map_err(|e| WalletError::Serialization(format!("Cannot serialize keystore: {}", e)))?;
 
@@ -165,7 +193,7 @@ impl KeyManager {
 
         let entry = encrypt_key(&signing_key, password, &address, &public_key_hex, label)?;
 
-        self.entries.write().expect("write lock").push(entry);
+        self.entries_write().push(entry);
         self.save()?;
 
         Ok(CreateAccountResult {
@@ -205,7 +233,7 @@ impl KeyManager {
         let address = derive_address(&pubkey_bytes);
 
         // Check for duplicate
-        let entries = self.entries.read().expect("read lock");
+        let entries = self.entries_read();
         if entries.iter().any(|e| e.address == address) {
             return Err(WalletError::KeyGeneration(format!(
                 "Account {} already exists",
@@ -215,7 +243,7 @@ impl KeyManager {
         drop(entries);
 
         let entry = encrypt_key(&signing_key, password, &address, &public_key_hex, label)?;
-        self.entries.write().expect("write lock").push(entry);
+        self.entries_write().push(entry);
         self.save()?;
 
         Ok(CreateAccountResult {
@@ -250,7 +278,7 @@ impl KeyManager {
         let address = derive_address(&pubkey_bytes);
 
         // Check duplicate
-        let entries = self.entries.read().expect("read lock");
+        let entries = self.entries_read();
         if entries.iter().any(|e| e.address == address) {
             return Err(WalletError::KeyGeneration(format!(
                 "Account {} already exists", address
@@ -259,7 +287,7 @@ impl KeyManager {
         drop(entries);
 
         let entry = encrypt_key(&signing_key, password, &address, &public_key_hex, label)?;
-        self.entries.write().expect("write lock").push(entry);
+        self.entries_write().push(entry);
         self.save()?;
 
         Ok(CreateAccountResult {
@@ -294,7 +322,7 @@ impl KeyManager {
             KeyType::Secp256k1,
         )?;
 
-        self.entries.write().expect("write lock").push(entry);
+        self.entries_write().push(entry);
         self.save()?;
 
         Ok(CreateAccountResult {
@@ -307,8 +335,8 @@ impl KeyManager {
 
     /// Unlock all keys with the given password.
     pub fn unlock(&self, password: &str) -> Result<usize, WalletError> {
-        let entries = self.entries.read().expect("read lock");
-        let mut unlocked = self.unlocked_keys.write().expect("write lock");
+        let entries = self.entries_read();
+        let mut unlocked = self.unlocked_write();
         let mut count = 0;
 
         for entry in entries.iter() {
@@ -342,18 +370,19 @@ impl KeyManager {
 
     /// Lock all keys — clear decrypted keys from memory.
     pub fn lock(&self) {
-        self.unlocked_keys.write().expect("write lock").clear();
+        self.unlocked_write().clear();
     }
 
     /// Check if any keys are unlocked.
     pub fn is_unlocked(&self) -> bool {
-        !self.unlocked_keys.read().expect("read lock").is_empty()
+        !self.unlocked_read().is_empty()
     }
 
     /// Get a signing key for the given address (must be unlocked).
     pub fn get_signing_key(&self, address: &str) -> Result<UnifiedKey, WalletError> {
         self.unlocked_keys
-            .read().expect("read lock")
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(address)
             .cloned()
             .ok_or(WalletError::WalletLocked)
@@ -362,7 +391,8 @@ impl KeyManager {
     /// List all accounts (without exposing private keys).
     pub fn list_accounts(&self) -> Vec<crate::types::WalletAccount> {
         self.entries
-            .read().expect("read lock")
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .enumerate()
             .map(|(i, entry)| crate::types::WalletAccount {
@@ -380,17 +410,17 @@ impl KeyManager {
 
     /// Check if keystore has any accounts.
     pub fn is_empty(&self) -> bool {
-        self.entries.read().expect("read lock").is_empty()
+        self.entries_read().is_empty()
     }
 
     /// Get the primary (first) account address.
     pub fn primary_address(&self) -> Option<String> {
-        self.entries.read().expect("read lock").first().map(|e| e.address.clone())
+        self.entries_read().first().map(|e| e.address.clone())
     }
 
     /// Delete an account by address (requires password verification).
     pub fn delete_account(&self, address: &str, password: &str) -> Result<(), WalletError> {
-        let mut entries = self.entries.write().expect("write lock");
+        let mut entries = self.entries_write();
         let idx = entries
             .iter()
             .position(|e| e.address == address)
@@ -400,7 +430,7 @@ impl KeyManager {
         decrypt_key(&entries[idx], password)?;
 
         entries.remove(idx);
-        self.unlocked_keys.write().expect("write lock").remove(address);
+        self.unlocked_write().remove(address);
         drop(entries);
 
         self.save()?;
@@ -413,7 +443,7 @@ impl KeyManager {
         address: &str,
         password: &str,
     ) -> Result<String, WalletError> {
-        let entries = self.entries.read().expect("read lock");
+        let entries = self.entries_read();
         let entry = entries
             .iter()
             .find(|e| e.address == address)
