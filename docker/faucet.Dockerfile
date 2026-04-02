@@ -16,5 +16,5 @@ RUN useradd -m -u 1000 citrate
 COPY --from=builder /app/target/release/citrate-faucet /usr/local/bin/citrate-faucet
 
 USER citrate
-EXPOSE 3003
+EXPOSE 3002
 CMD ["citrate-faucet"]

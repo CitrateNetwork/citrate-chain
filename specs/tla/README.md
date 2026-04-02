@@ -2,7 +2,7 @@
 
 **46 specifications | 6 domains | 0 violations**
 
-This directory contains a **local subset** of Citrate's TLA+ formal verification suite. The canonical collection (84 specs) lives at `.agentile/formal/specs/`. This local subset is runnable in CI and covers the core protocol domains.
+This directory contains a **local subset** of Citrate's TLA+ formal verification suite. The canonical collection (101 specs today) lives at `.agentile/formal/specs/`. This local subset is runnable in CI and covers the core protocol domains.
 
 ## Directory Structure
 
@@ -71,7 +71,7 @@ specs/tla/
 bash run_all.sh
 ```
 
-Runs all local specs with a single TLC worker. Takes approximately 5-8 minutes. Used in CI via `.github/workflows/tla-check.yml`. For the full canonical spec set (84 specs), see `.agentile/formal/specs/`.
+Runs all local specs with a single TLC worker. Takes approximately 5-8 minutes. Used in CI via `.github/workflows/tla-check.yml`. For the full canonical spec set (101 specs today), see `.agentile/formal/specs/`.
 
 ### Deep Verification
 

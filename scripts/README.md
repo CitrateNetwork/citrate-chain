@@ -2,6 +2,13 @@
 
 Operational shell scripts for deployment, testing, and orchestration. We recommend starting with `launch_local_testnet.sh` for local development and `run_all_tests.sh` to validate changes before committing.
 
+## Start Here
+
+| Script | Description |
+|--------|-------------|
+| `bootstrap.sh` | Canonical one-step bootstrap for developers and agent operators |
+| `installers/first_launch.sh` | Prepare local data directories, config profiles, and optional IPFS repo |
+
 ## Testnet / Devnet
 
 | Script | Description |
@@ -64,6 +71,12 @@ Platform-specific installer configs in `installers/linux/`, `installers/macos/`,
 ## Common Workflows
 
 ```bash
+# Bootstrap a full developer environment from a fresh machine
+curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile developer
+
+# Bootstrap an agent workstation (best-effort Ollama install included)
+curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile agent
+
 # Bring up a local testnet, run tests, tear it down
 ./scripts/launch_local_testnet.sh
 ./scripts/run_all_tests.sh

@@ -2,7 +2,7 @@
 
 ## Canonical Location
 
-The canonical TLA+ specification collection lives at **`.agentile/formal/specs/`** (84 specs across all domains). That is the authoritative source for spec counts, verification status, and coverage.
+The canonical TLA+ specification collection lives at **`.agentile/formal/specs/`** (101 specs today across all domains). That is the authoritative source for spec counts, verification status, and coverage.
 
 ## Local Subset (`specs/tla/`)
 

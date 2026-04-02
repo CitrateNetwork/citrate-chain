@@ -7,8 +7,8 @@ Docker infrastructure for running Citrate services in containers.
 | File | Purpose |
 |------|---------|
 | `node.Dockerfile` | Citrate blockchain node (JSON-RPC on 8545, P2P on 30303) |
-| `node-app.Dockerfile` | Node application wrapper (REST API on 3000) |
-| `api.Dockerfile` | API server with MCP support (REST on 3000, MCP on 3001) |
+| `node-app.Dockerfile` | Node application wrapper (REST API on 3000, metrics on 9100) |
+| `api.Dockerfile` | Historical API wrapper path; not part of the recommended open-source operator stack |
 | `faucet.Dockerfile` | Testnet token faucet |
 | `ipfs.Dockerfile` | IPFS node for model/artifact storage |
 
@@ -17,10 +17,14 @@ Docker infrastructure for running Citrate services in containers.
 | File | Use Case |
 |------|----------|
 | `docker-compose.dev.yml` | Local development: 2 nodes, node-app, faucet |
-| `docker-compose.prod.yml` | Production: node, API, IPFS, PostgreSQL, Redis, Prometheus, Grafana |
+| `docker-compose.prod.yml` | Recommended operator stack: node, faucet, IPFS, Prometheus, Grafana |
 
 Start dev stack: `docker compose -f docker/docker-compose.dev.yml up --build`
 Start prod stack: `docker compose -f docker/docker-compose.prod.yml up -d`
+
+Notes:
+- The current recommended operator path uses the node itself as the primary JSON-RPC surface.
+- The legacy `api.Dockerfile` and `config/api.toml` remain in-tree for historical/reference work, but they are not part of the clean default rollout path.
 
 ## Config Files (`config/`)
 
