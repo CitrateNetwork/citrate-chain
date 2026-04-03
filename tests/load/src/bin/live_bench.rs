@@ -59,7 +59,8 @@ impl LiveStats {
 
     fn record_success(&self, elapsed_secs: u64, latency_us: u64) {
         self.success.fetch_add(1, Ordering::Relaxed);
-        self.total_latency_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.total_latency_us
+            .fetch_add(latency_us, Ordering::Relaxed);
         let idx = elapsed_secs as usize;
         if idx < self.second_buckets.len() {
             self.second_buckets[idx].fetch_add(1, Ordering::Relaxed);
@@ -95,7 +96,10 @@ impl LiveStats {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let rpc_url = args.get(1).map(|s| s.as_str()).unwrap_or("http://127.0.0.1:8545");
+    let rpc_url = args
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("http://127.0.0.1:8545");
     let target_tps: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
     let duration_secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(30);
     let concurrency: usize = 500.min(target_tps as usize * 2);
@@ -124,6 +128,7 @@ async fn main() {
     print!("  {DIM}Connecting to node...{RESET}");
     let chain_id = get_chain_id(&client, rpc_url).await;
     let start_block = get_block_number(&client, rpc_url).await;
+    let start_nonce = get_transaction_count(&client, rpc_url, FROM).await;
     if start_block == 0 && chain_id == 0 {
         println!(" {RED}{BOLD}FAILED{RESET}");
         println!();
@@ -133,7 +138,7 @@ async fn main() {
         println!();
         std::process::exit(1);
     }
-    println!(" {GREEN}{BOLD}OK{RESET} {DIM}(chain={chain_id}, block={start_block}){RESET}");
+    println!(" {GREEN}{BOLD}OK{RESET} {DIM}(chain={chain_id}, block={start_block}, nonce={start_nonce}){RESET}");
     println!();
 
     // Check faucet balance
@@ -173,7 +178,11 @@ async fn main() {
             let fail = reporter_stats.failed.load(Ordering::Relaxed);
             let total_lat = reporter_stats.total_latency_us.load(Ordering::Relaxed);
             let completed = ok + fail;
-            let avg_lat_ms = if completed > 0 { total_lat / completed / 1000 } else { 0 };
+            let avg_lat_ms = if completed > 0 {
+                total_lat / completed / 1000
+            } else {
+                0
+            };
 
             // Get instant TPS (previous completed second)
             let instant = if secs > 0 {
@@ -207,13 +216,12 @@ async fn main() {
                 avg,
                 avg_lat_ms,
             );
-
         }
     });
 
     // Send transactions
     let mut handles = Vec::new();
-    let mut nonce: u64 = 0;
+    let mut nonce: u64 = start_nonce;
 
     while start.elapsed() < duration {
         let permit = semaphore.clone().acquire_owned().await;
@@ -228,8 +236,8 @@ async fn main() {
         let bench_start = start;
 
         let to_addr = format!("0x{:040x}", rand::random::<u64>());
-        nonce += 1;
         let nonce_hex = format!("0x{:x}", nonce);
+        nonce += 1;
 
         stats.record_sent();
 
@@ -257,10 +265,14 @@ async fn main() {
             let elapsed_secs = bench_start.elapsed().as_secs();
 
             match result {
-                Ok(resp) if resp.status().is_success() => {
-                    s.record_success(elapsed_secs, latency_us);
+                Ok(resp) => {
+                    if rpc_response_has_result(resp).await {
+                        s.record_success(elapsed_secs, latency_us);
+                    } else {
+                        s.record_failure();
+                    }
                 }
-                _ => {
+                Err(_) => {
                     s.record_failure();
                 }
             }
@@ -292,13 +304,21 @@ async fn main() {
     let sent = stats.sent.load(Ordering::Relaxed);
     let total_lat = stats.total_latency_us.load(Ordering::Relaxed);
     let completed = ok + fail;
-    let avg_lat = if completed > 0 { total_lat / completed / 1000 } else { 0 };
+    let avg_lat = if completed > 0 {
+        total_lat / completed / 1000
+    } else {
+        0
+    };
     let actual_tps = ok as f64 / elapsed.as_secs_f64();
 
     // End block
     tokio::time::sleep(Duration::from_secs(2)).await;
     let end_block = get_block_number(&client, rpc_url).await;
-    let blocks = if end_block > start_block { end_block - start_block } else { 0 };
+    let blocks = if end_block > start_block {
+        end_block - start_block
+    } else {
+        0
+    };
     let tx_per_block = if blocks > 0 { ok / blocks } else { 0 };
 
     // Peak TPS (best 1-second window)
@@ -308,7 +328,11 @@ async fn main() {
         .unwrap_or(0);
 
     // Success rate
-    let success_pct = if sent > 0 { ok as f64 / sent as f64 * 100.0 } else { 0.0 };
+    let success_pct = if sent > 0 {
+        ok as f64 / sent as f64 * 100.0
+    } else {
+        0.0
+    };
 
     // Final report
     println!();
@@ -318,9 +342,22 @@ async fn main() {
     println!();
 
     // TPS headline — big and bold
-    let tps_color = if actual_tps >= target_tps as f64 { GREEN } else if actual_tps >= target_tps as f64 * 0.8 { YELLOW } else { RED };
-    println!("  {BOLD}{tps_color}  ▸ {:.0} TPS sustained ({:.1}s){RESET}", actual_tps, elapsed.as_secs_f64());
-    println!("  {BOLD}{MAGENTA}  ▸ {} TPS peak (1s window){RESET}", peak_tps);
+    let tps_color = if actual_tps >= target_tps as f64 {
+        GREEN
+    } else if actual_tps >= target_tps as f64 * 0.8 {
+        YELLOW
+    } else {
+        RED
+    };
+    println!(
+        "  {BOLD}{tps_color}  ▸ {:.0} TPS sustained ({:.1}s){RESET}",
+        actual_tps,
+        elapsed.as_secs_f64()
+    );
+    println!(
+        "  {BOLD}{MAGENTA}  ▸ {} TPS peak (1s window){RESET}",
+        peak_tps
+    );
     println!();
 
     println!("  {DIM}Transactions{RESET}");
@@ -329,13 +366,20 @@ async fn main() {
     if fail > 0 {
         println!("    Failed     {RED}{BOLD}{fail}{RESET}");
     }
-    println!("    Success    {}{BOLD}{:.1}%{RESET}", if success_pct >= 99.0 { GREEN } else { YELLOW }, success_pct);
+    println!(
+        "    Success    {}{BOLD}{:.1}%{RESET}",
+        if success_pct >= 99.0 { GREEN } else { YELLOW },
+        success_pct
+    );
     println!();
 
     println!("  {DIM}Performance{RESET}");
     println!("    Avg latency   {BOLD}{avg_lat}ms{RESET}");
     println!("    Target TPS    {target_tps}");
-    println!("    Actual TPS    {tps_color}{BOLD}{:.0}{RESET}", actual_tps);
+    println!(
+        "    Actual TPS    {tps_color}{BOLD}{:.0}{RESET}",
+        actual_tps
+    );
     println!("    Peak TPS      {MAGENTA}{BOLD}{peak_tps}{RESET}");
     println!();
 
@@ -361,8 +405,14 @@ async fn main() {
 
     // Challenge
     println!("  {DIM}─────────────────────────────────────────────────{RESET}");
-    println!("  {BOLD}Think you can beat {tps_color}{:.0} TPS{RESET}{BOLD}?{RESET}", actual_tps);
-    println!("  {DIM}Try:{RESET}  live-bench {rpc_url} {} {duration_secs}", target_tps * 2);
+    println!(
+        "  {BOLD}Think you can beat {tps_color}{:.0} TPS{RESET}{BOLD}?{RESET}",
+        actual_tps
+    );
+    println!(
+        "  {DIM}Try:{RESET}  live-bench {rpc_url} {} {duration_secs}",
+        target_tps * 2
+    );
     println!("  {DIM}─────────────────────────────────────────────────{RESET}");
     println!();
 }
@@ -405,6 +455,39 @@ async fn get_balance(client: &Client, url: &str, addr: &str) -> u64 {
     let resp = client
         .post(url)
         .json(&json!({"jsonrpc":"2.0","method":"eth_getBalance","params":[addr, "latest"],"id":1}))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| {
+            let body = futures::executor::block_on(r.json::<Value>());
+            body.ok()
+        })
+        .and_then(|j| j["result"].as_str().map(String::from));
+
+    resp.map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+async fn rpc_response_has_result(resp: reqwest::Response) -> bool {
+    if !resp.status().is_success() {
+        return false;
+    }
+
+    match resp.json::<Value>().await {
+        Ok(body) => body.get("result").is_some() && body.get("error").is_none(),
+        Err(_) => false,
+    }
+}
+
+async fn get_transaction_count(client: &Client, url: &str, addr: &str) -> u64 {
+    let resp = client
+        .post(url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getTransactionCount",
+            "params": [addr, "pending"],
+            "id": 1
+        }))
         .send()
         .await
         .ok()
