@@ -1,10 +1,17 @@
 # Deployed Contract Addresses — Testnet (Chain 40204)
 
 *Re-genesis: April 1, 2026*
-*Deployer: 0x4250675F9015E65fC866F3a373F82bb9DFc000c6*
-*Authoritative source: `.agentile/launch/DEPLOYED_CONTRACTS_2026_04_01.md`*
+*Canonical source: `.agentile/launch/DEPLOYED_CONTRACTS_2026_04_01.md`*
 
-## Live Contracts (9 deployed post-re-genesis)
+## Deployer Accounts
+
+| Deployer | Address | Used For |
+|----------|---------|----------|
+| Genesis Deployer | `0x4250675F9015E65fC866F3a373F82bb9DFc000c6` | Core, Economics, Learning, Compute (Apr 1) |
+| Edu Stack Deployer | `0x70997970C51812dc3A010C7d01b50e0d17dc79C8` | Education contracts (Apr 5) |
+| Devnet Coinbase | `0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266` | Block rewards, Hardhat #0 |
+
+## Live Contracts (17 deployed)
 
 ### Core
 
@@ -34,6 +41,36 @@
 |----------|---------|-------|
 | ComputeMarketplace | `0xA6a4122126A75611eA06241E404327ADdFe8eB5e` | 16,146 |
 | ComputeVerifier | `0x0aaa6e00FCab1dA5599F6DCE86e361A5e03A5759` | 8,313 |
+
+### Education (Institutional Stack) — Deployed April 5, 2026
+
+| Contract | Address | Bytes | Governance |
+|----------|---------|-------|------------|
+| InstitutionalVault | `0x8464135c8F25Da09e49BC8782676a84730C318bC` | 6,170 | 2-of-3 multi-sig |
+| ClassroomClusterV1 | `0x71C95911E9a5D330f4D621842EC243EE1343292e` | 9,252 | Vault |
+| Forwarder | `0x948B3c65b89DF0B4894ABE91E6D02FE579834F8F` | 3,960 | Vault |
+| BudgetAllocation | `0x712516e61C8B383dF4A63CFe83d7701Bce54B03e` | 2,082 | Vault |
+| CashoutRequest | `0xbCF26943C0197d2eE0E5D05c716Be60cc2761508` | 2,328 | Vault |
+
+**Vault signers (2-of-3):**
+- `0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266` (Hardhat #0 / devnet coinbase)
+- `0x70997970C51812dc3A010C7d01b50e0d17dc79C8` (Hardhat #1 / edu deployer)
+- `0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC` (Hardhat #2)
+
+**Deploy script:** `script/DeployEduStack.s.sol`
+**Broadcast record:** `broadcast/DeployEduStack2.s.sol/40204/run-latest.json`
+
+### AI Gateway — Portable EIP Implementations (Deployed April 5, 2026)
+
+| Contract | EIP Level | Address | Bytes |
+|----------|-----------|---------|-------|
+| AIModelRegistryPortable | L0+L1 | `0x59F2f1fCfE2474fD5F0b9BA1E73ca90b143Eb8d0` | 2,822 |
+| AIInferenceRouterPortable | L2 | `0xC6bA8C3233eCF65B761049ef63466945c362EdD2` | 4,366 |
+| AILearningCycleCorePortable | L3 | `0x1275D096B9DBf2347bD2a131Fb6BDaB0B4882487` | 4,350 |
+
+**Governance:** `0x70997970C51812dc3A010C7d01b50e0d17dc79C8` (deployer)
+**Deploy script:** `script/DeployAIGateway.s.sol`
+**Profile:** PortableWasm (any EVM chain, no precompiles required)
 
 ## Not Yet Redeployed (21 contracts)
 
