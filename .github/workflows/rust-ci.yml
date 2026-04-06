@@ -60,3 +60,57 @@ jobs:
         run: cargo build -p citrate-api --features verifier-ethers-solc
       - name: Run citrate-api tests with verifier feature
         run: cargo test -p citrate-api --features verifier-ethers-solc -- --nocapture
+
+  learning-center:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: citrate_v0.01.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            citrate_v0.01.1/target
+          key: lc-ci-${{ runner.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          restore-keys: lc-ci-${{ runner.os }}-
+      - name: Check citrate-edu-app (0 warnings)
+        run: cargo check -p citrate-edu-app
+      - name: Check citrate-learning-center (0 warnings)
+        run: cargo check -p citrate-learning-center
+      - name: Test citrate-edu-app (127+ tests)
+        run: cargo test -p citrate-edu-app
+      - name: Test citrate-learning-center visual snapshots
+        run: cargo test -p citrate-learning-center -- visual
+      - name: Zero unwraps audit
+        run: |
+          count=$(grep -rn '\.unwrap()' gui/citrate_edu_app/src/ gui/citrate_learning_center/src/ 2>/dev/null | wc -l)
+          if [ "$count" -gt 0 ]; then echo "FAIL: $count unwraps found"; exit 1; fi
+          echo "PASS: 0 unwraps"
+      - name: Zero stubs audit
+        run: |
+          count=$(grep -rni 'todo\|fixme\|stub\|placeholder\|limitation' gui/citrate_edu_app/src/ gui/citrate_learning_center/src/ 2>/dev/null | grep -v 'No mocks' | grep -v 'cfg.test' | wc -l)
+          if [ "$count" -gt 0 ]; then echo "FAIL: $count stubs found"; exit 1; fi
+          echo "PASS: 0 stubs"
+      - name: Build release binary
+        run: cargo build --release -p citrate-learning-center
+      - name: Checksum release artifact
+        run: |
+          sha256sum target/release/citrate-learning-center > target/release/SHA256SUMS.txt
+          cat target/release/SHA256SUMS.txt
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: citrate-learning-center-linux
+          path: |
+            citrate_v0.01.1/target/release/citrate-learning-center
+            citrate_v0.01.1/target/release/SHA256SUMS.txt
