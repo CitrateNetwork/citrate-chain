@@ -1,7 +1,8 @@
-# Deployed Contract Addresses — Testnet (Chain 40204)
+# Deployed Contract Addresses — Beta (Chain 40204)
 
-*Re-genesis: April 1, 2026*
-*Canonical source: `.agentile/launch/DEPLOYED_CONTRACTS_2026_04_01.md`*
+*Beta re-genesis: April 6, 2026*
+*Canonical source: `.agentile/launch/DEPLOYED_CONTRACTS_2026_04_06.md`*
+*Previous deployment: `.agentile/launch/DEPLOYED_CONTRACTS_2026_04_01.md` (superseded)*
 
 ## Deployer Accounts
 
