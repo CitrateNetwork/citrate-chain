@@ -73,11 +73,18 @@ impl SignerPool {
     /// making rapid-fire `try_acquire` calls won't re-hit the same full
     /// lane first every time.
     pub fn try_acquire(&self) -> Option<(Arc<Signer>, NoncePermit)> {
+        self.try_acquire_indexed().map(|(_, s, p)| (s, p))
+    }
+
+    /// Round-robin acquire that also returns the lane index of the
+    /// signer that was chosen. Used by the runner for per-signer
+    /// accounting.
+    pub fn try_acquire_indexed(&self) -> Option<(usize, Arc<Signer>, NoncePermit)> {
         let n = self.signers.len();
         for _ in 0..n {
             let idx = self.cursor.fetch_add(1, Ordering::AcqRel) % n;
             if let Some(permit) = self.lanes[idx].try_acquire() {
-                return Some((Arc::clone(&self.signers[idx]), permit));
+                return Some((idx, Arc::clone(&self.signers[idx]), permit));
             }
         }
         None

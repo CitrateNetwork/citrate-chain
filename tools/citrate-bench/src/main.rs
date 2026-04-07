@@ -1,29 +1,28 @@
 //! citrate-bench CLI entry point.
 //!
-//! Phase 1 supports config validation and address-table/keystore
-//! inspection. It does NOT submit any transactions. Running a benchmark
-//! requires Phase 3 or later.
+//! Phase 2 supports config validation, address-table inspection,
+//! ceremony-bundle verification, single-tx dry-run, and the new
+//! `dry-run` subcommand that drives the runner at a target rate.
 //!
-//! Subcommands:
-//!
-//!   validate        Parse a bench.toml and run offline validation.
-//!   show-addresses  Parse a 30_address_table.json and print a summary.
-//!   verify-bundle   Recompute and compare the ceremony bundle sha256.
-//!   sign-dry-run    Build and sign a single transfer against a target
-//!                   address without broadcasting (used to smoke-test
-//!                   keystore decryption end-to-end).
+//! It does NOT submit any transactions. Running a benchmark requires
+//! Phase 3 or later.
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 
+use citrate_bench::runner::{RunMode, RunOptions, Runner};
 use citrate_bench::signers::{keystore, pool::SignerPool, Signer};
 use citrate_bench::tx::legacy::LegacyTx;
+use citrate_bench::workload::transfer::SimpleTransfer;
+use citrate_bench::workload::{WorkloadClass, WorkloadContext};
 
 #[derive(Parser)]
 #[command(
     name = "citrate-bench",
     version,
-    about = "Post-ceremony Citrate testnet benchmark (Phase 1: config/keystore/dry-run only)"
+    about = "Post-ceremony Citrate testnet benchmark (Phase 2: dry-run only)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -50,15 +49,13 @@ enum Command {
         expected: String,
     },
     /// Decrypt a keystore file and build (but do not broadcast) a
-    /// signed transfer. Proves keystore → signer → tx pipeline works.
+    /// single signed transfer. Proves the keystore → signer → tx
+    /// pipeline without running the full loop.
     SignDryRun {
         #[arg(long)]
         keystore_file: PathBuf,
-        /// Read passphrase from this file. Mutually exclusive with
-        /// interactive prompt.
         #[arg(long, conflicts_with = "prompt")]
         passphrase_file: Option<PathBuf>,
-        /// Prompt for passphrase on the TTY.
         #[arg(long)]
         prompt: bool,
         #[arg(long, default_value_t = 40204)]
@@ -68,11 +65,42 @@ enum Command {
         #[arg(long, default_value = "0x0000000000000000000000000000000000000001")]
         to: String,
     },
+    /// Run the full signing loop at a target rate with no broadcast.
+    /// Exercises the rate limiter, signer pool, and workload pipeline
+    /// end-to-end without touching the network.
+    DryRun {
+        #[arg(long)]
+        keystore_dir: PathBuf,
+        /// Comma-separated keystore account names.
+        #[arg(long, value_delimiter = ',')]
+        accounts: Vec<String>,
+        #[arg(long, conflicts_with = "prompt")]
+        passphrase_file: Option<PathBuf>,
+        #[arg(long)]
+        prompt: bool,
+        #[arg(long, default_value_t = 40204)]
+        chain_id: u64,
+        #[arg(long, default_value_t = 1000)]
+        target_tps: u64,
+        #[arg(long, default_value_t = 5)]
+        duration_secs: u64,
+        #[arg(long, default_value_t = 1)]
+        gas_price_gwei: u64,
+        #[arg(long, default_value_t = 100)]
+        per_signer_max_inflight: usize,
+        #[arg(long, default_value = "0x0000000000000000000000000000000000000001")]
+        recipient: String,
+        /// Starting nonce applied to every signer. Phase 3 will read
+        /// this per-signer from the chain.
+        #[arg(long, default_value_t = 0)]
+        starting_nonce: u64,
+    },
 }
 
-fn main() -> std::process::ExitCode {
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    match run(cli) {
+    match run(cli).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -81,7 +109,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn run(cli: Cli) -> citrate_bench::Result<()> {
+async fn run(cli: Cli) -> citrate_bench::Result<()> {
     match cli.command {
         Command::Validate { config } => cmd_validate(&config),
         Command::ShowAddresses { table } => cmd_show_addresses(&table),
@@ -94,6 +122,34 @@ fn run(cli: Cli) -> citrate_bench::Result<()> {
             nonce,
             to,
         } => cmd_sign_dry_run(&keystore_file, passphrase_file, prompt, chain_id, nonce, &to),
+        Command::DryRun {
+            keystore_dir,
+            accounts,
+            passphrase_file,
+            prompt,
+            chain_id,
+            target_tps,
+            duration_secs,
+            gas_price_gwei,
+            per_signer_max_inflight,
+            recipient,
+            starting_nonce,
+        } => {
+            cmd_dry_run(DryRunArgs {
+                keystore_dir,
+                accounts,
+                passphrase_file,
+                prompt,
+                chain_id,
+                target_tps,
+                duration_secs,
+                gas_price_gwei,
+                per_signer_max_inflight,
+                recipient,
+                starting_nonce,
+            })
+            .await
+        }
     }
 }
 
@@ -137,23 +193,11 @@ fn cmd_sign_dry_run(
     nonce: u64,
     to_hex: &str,
 ) -> citrate_bench::Result<()> {
-    let source = match (passphrase_file, prompt) {
-        (Some(p), _) => keystore::PassphraseSource::File(p),
-        (None, true) => keystore::PassphraseSource::Prompt {
-            prompt: format!("Passphrase for {}: ", keystore_file.display()),
-        },
-        (None, false) => {
-            return Err(citrate_bench::Error::Config(
-                "must supply --passphrase-file or --prompt".into(),
-            ));
-        }
-    };
+    let source = passphrase_source(passphrase_file, prompt, keystore_file.display().to_string())?;
     let passphrase = keystore::read_passphrase(&source)?;
     let signer: Signer = keystore::load(keystore_file, &passphrase)?;
     println!("signer = {}", signer.address_hex());
 
-    // Use the signer pool machinery even for a single signer, to
-    // exercise the code path.
     let pool = SignerPool::new(vec![signer], vec![nonce], 8)?;
     let (signer, permit) = pool
         .try_acquire()
@@ -173,8 +217,92 @@ fn cmd_sign_dry_run(
     println!("nonce  = {}", signed.nonce);
     println!("hash   = {}", signed.hash_hex());
     println!("raw    = {}", signed.raw_hex());
-    println!("(not broadcast — Phase 1 dry-run)");
+    println!("(not broadcast — single-tx dry-run)");
     Ok(())
+}
+
+struct DryRunArgs {
+    keystore_dir: PathBuf,
+    accounts: Vec<String>,
+    passphrase_file: Option<PathBuf>,
+    prompt: bool,
+    chain_id: u64,
+    target_tps: u64,
+    duration_secs: u64,
+    gas_price_gwei: u64,
+    per_signer_max_inflight: usize,
+    recipient: String,
+    starting_nonce: u64,
+}
+
+async fn cmd_dry_run(args: DryRunArgs) -> citrate_bench::Result<()> {
+    if args.accounts.is_empty() {
+        return Err(citrate_bench::Error::Config(
+            "--accounts must list at least one keystore account".into(),
+        ));
+    }
+
+    let source = passphrase_source(
+        args.passphrase_file,
+        args.prompt,
+        format!("{}", args.keystore_dir.display()),
+    )?;
+
+    let signers = keystore::load_many(&args.keystore_dir, &args.accounts, &source)?;
+    let starting_nonces = vec![args.starting_nonce; signers.len()];
+    let pool = Arc::new(SignerPool::new(
+        signers,
+        starting_nonces,
+        args.per_signer_max_inflight,
+    )?);
+
+    println!("citrate-bench dry-run");
+    println!("  chain_id       = {}", args.chain_id);
+    println!("  target_tps     = {}", args.target_tps);
+    println!("  duration_secs  = {}", args.duration_secs);
+    println!("  signers        = {}", pool.len());
+    for i in 0..pool.len() {
+        if let Some(s) = pool.signer(i) {
+            println!("    [{i}] {}", s.address_hex());
+        }
+    }
+    let gas_price_wei = (args.gas_price_gwei as u128) * 1_000_000_000u128;
+    println!("  gas_price_wei  = {gas_price_wei}");
+    println!();
+
+    let recipient = parse_eth_address(&args.recipient)?;
+    let workload_inner = SimpleTransfer {
+        recipient,
+        value_wei: 1,
+        gas_limit: 21_000,
+    };
+    let workload: Arc<dyn WorkloadClass> = Arc::new(workload_inner);
+
+    let ctx = Arc::new(WorkloadContext::for_dry_run(args.chain_id, gas_price_wei));
+    let options = RunOptions::for_dry_run(args.duration_secs, args.target_tps);
+    let runner = Runner::new(pool, ctx, workload, options)?;
+
+    let result = runner.run(RunMode::DryRun).await?;
+    result.print_summary();
+    println!();
+    println!("(not broadcast — Phase 2 dry-run)");
+    Ok(())
+}
+
+fn passphrase_source(
+    passphrase_file: Option<PathBuf>,
+    prompt: bool,
+    ctx: String,
+) -> citrate_bench::Result<keystore::PassphraseSource> {
+    match (passphrase_file, prompt) {
+        (Some(p), _) => Ok(keystore::PassphraseSource::File(p)),
+        (None, true) => Ok(keystore::PassphraseSource::Prompt {
+            prompt: format!("Passphrase for {ctx}: "),
+        }),
+        (None, false) => Err(citrate_bench::Error::Config(
+            "must supply --passphrase-file or --prompt".into(),
+        )),
+    }
 }
 
 fn parse_eth_address(s: &str) -> citrate_bench::Result<[u8; 20]> {
