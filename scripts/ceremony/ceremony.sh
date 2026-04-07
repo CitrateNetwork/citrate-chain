@@ -59,6 +59,8 @@ readonly CYAN='\033[0;36m'
 readonly BOLD='\033[1m'
 readonly NC='\033[0m'
 
+FORGE_WALLET_ARGS=()
+
 # ---- Logging ----
 log_step() { echo -e "\n${CYAN}[$(date -u +%H:%M:%S)]${NC} ${BOLD}$1${NC}"; }
 log_ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
@@ -97,6 +99,43 @@ require_confirm() {
     else
         log_warn "Rehearsal mode — auto-confirming: $prompt"
     fi
+}
+
+require_deployer_auth() {
+    if [ -n "${CEREMONY_DEPLOYER_ACCOUNT:-}" ]; then
+        return 0
+    fi
+
+    if [ -n "${CEREMONY_DEPLOYER_KEYSTORE:-}" ]; then
+        return 0
+    fi
+
+    log_err "Set CEREMONY_DEPLOYER_ACCOUNT (preferred) or legacy CEREMONY_DEPLOYER_KEYSTORE"
+    exit 1
+}
+
+build_forge_wallet_args() {
+    FORGE_WALLET_ARGS=(--sender "$CEREMONY_DEPLOYER_ADDRESS")
+
+    if [ -n "${CEREMONY_DEPLOYER_ACCOUNT:-}" ]; then
+        FORGE_WALLET_ARGS+=(--account "$CEREMONY_DEPLOYER_ACCOUNT")
+        return 0
+    fi
+
+    local legacy_path legacy_dir legacy_name default_dir
+    legacy_path="${CEREMONY_DEPLOYER_KEYSTORE:-}"
+    legacy_dir="$(dirname "$legacy_path")"
+    legacy_name="$(basename "$legacy_path")"
+    default_dir="$HOME/.foundry/keystores"
+
+    if [ "$legacy_dir" != "$default_dir" ]; then
+        log_err "Legacy CEREMONY_DEPLOYER_KEYSTORE must live under $default_dir"
+        log_err "Set CEREMONY_DEPLOYER_ACCOUNT instead for ceremony runs."
+        exit 1
+    fi
+
+    log_warn "CEREMONY_DEPLOYER_KEYSTORE is legacy. Deriving account name '$legacy_name'."
+    FORGE_WALLET_ARGS+=(--account "$legacy_name")
 }
 
 # ---- Step 00: Preflight ----
@@ -138,8 +177,9 @@ step_preflight() {
     done
 
     require_env CEREMONY_RPC_URL
-    require_env CEREMONY_DEPLOYER_KEYSTORE  # path to Foundry keystore entry
     require_env CEREMONY_DEPLOYER_ADDRESS
+    require_deployer_auth
+    build_forge_wallet_args
 
     log_ok "Preflight complete — log at $log"
 }
@@ -177,12 +217,11 @@ step_deploy_contracts() {
 
     cd "$CONTRACTS_DIR"
 
-    # Use --slow flag to avoid nonce-tracking issues (observed during 2026-04-06 reroll)
-    # Use the keystore rather than raw private key (per keystore_protocol.md)
+    # Use --slow to avoid nonce-tracking issues during cold deployments.
+    # The forge CLI selects the signer; Solidity scripts must never do so.
     local forge_common=(
         --rpc-url "$CEREMONY_RPC_URL"
-        --keystore "$CEREMONY_DEPLOYER_KEYSTORE"
-        --sender "$CEREMONY_DEPLOYER_ADDRESS"
+        "${FORGE_WALLET_ARGS[@]}"
         --slow
         --broadcast
     )
@@ -199,9 +238,13 @@ step_deploy_contracts() {
     forge script script/DeployEduStack.s.sol:DeployEduStack "${forge_common[@]}" \
         2>&1 | tee "$OUTPUT_DIR/20c_deploy_edu.log"
 
-    log_step "  20d: Deploy Forwarder pilot"
-    forge script script/DeployForwarderPilot.s.sol:DeployForwarderPilot "${forge_common[@]}" \
-        2>&1 | tee "$OUTPUT_DIR/20d_deploy_forwarder.log"
+    if [ "${CEREMONY_INCLUDE_MODEL_ACCESS_CONTROL:-1}" = "1" ]; then
+        log_step "  20d: Deploy ModelAccessControl"
+        forge script script/DeployModelAccessControl.s.sol:DeployModelAccessControl "${forge_common[@]}" \
+            2>&1 | tee "$OUTPUT_DIR/20d_deploy_model_access_control.log"
+    else
+        log_warn "Skipping ModelAccessControl because CEREMONY_INCLUDE_MODEL_ACCESS_CONTROL=0"
+    fi
 
     # Extract deployment transactions from broadcast output
     if [ -d "$CONTRACTS_DIR/broadcast" ]; then
@@ -217,6 +260,8 @@ step_address_table() {
     log_step "Step 30: Build canonical address table"
     local md_out="$OUTPUT_DIR/30_address_table.md"
     local json_out="$OUTPUT_DIR/30_address_table.json"
+    local entries_jsonl="$OUTPUT_DIR/30_contract_entries.jsonl"
+    : > "$entries_jsonl"
 
     # Parse all run-latest.json files from broadcast directory and extract contractName → address
     local broadcast_dir="$CONTRACTS_DIR/broadcast"
@@ -225,21 +270,36 @@ step_address_table() {
         return 1
     fi
 
-    # Collect CREATE transactions (contract deployments) from all run-latest.json in this ceremony
-    # Filter to transactions created during this ceremony run
-    {
-        echo "{"
-        echo "  \"chainId\": $CHAIN_ID,"
-        echo "  \"deployedAt\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
-        echo "  \"deployer\": \"$CEREMONY_DEPLOYER_ADDRESS\","
-        echo "  \"contracts\": {"
-        find "$broadcast_dir" -name "run-latest.json" -newer "$OUTPUT_DIR/00_preflight.log" \
-            -exec jq -r '.transactions[] | select(.transactionType=="CREATE") | "    \"\(.contractName)\": \"\(.contractAddress)\","' {} \; 2>/dev/null \
-            | sort -u \
-            | sed '$ s/,$//'
-        echo "  }"
-        echo "}"
-    } > "$json_out"
+    while IFS= read -r run_file; do
+        local script_name
+        script_name="$(basename "$(dirname "$(dirname "$run_file")")")"
+
+        jq -c --arg script "$script_name" '
+            . as $run
+            | .transactions
+            | to_entries[]
+            | select(.value.transactionType == "CREATE")
+            | {
+                name: .value.contractName,
+                address: .value.contractAddress,
+                deployment_tx_hash: .value.hash,
+                source_script: $script,
+                constructor_args: (.value.arguments // []),
+                deployer: .value.transaction.from,
+                chain_id_hex: (.value.transaction.chainId // null),
+                receipt_status_hex: ($run.receipts[.key].status // null),
+                gas_used_hex: ($run.receipts[.key].gasUsed // null)
+            }' "$run_file" >> "$entries_jsonl"
+    done < <(find "$broadcast_dir" -name "run-latest.json" -newer "$OUTPUT_DIR/00_preflight.log" | sort)
+
+    jq -s --arg deployer "$CEREMONY_DEPLOYER_ADDRESS" --arg deployedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson chainId "$CHAIN_ID" '
+        {
+            chainId: $chainId,
+            deployedAt: $deployedAt,
+            deployer: $deployer,
+            contractCount: length,
+            contracts: (sort_by(.name))
+        }' "$entries_jsonl" > "$json_out"
 
     # Markdown version
     {
@@ -249,19 +309,20 @@ step_address_table() {
         echo "- Deployed: $(date -u)"
         echo "- Deployer: \`$CEREMONY_DEPLOYER_ADDRESS\`"
         echo "- Ceremony mode: $CEREMONY_MODE"
+        echo "- Contract count: \`$(jq -r '.contractCount' "$json_out")\`"
         echo
         echo "## Contracts"
         echo
-        echo "| Contract | Address |"
-        echo "|----------|---------|"
-        jq -r '.contracts | to_entries[] | "| \(.key) | `\(.value)` |"' "$json_out"
+        echo "| Contract | Address | Deploy Tx | Script |"
+        echo "|----------|---------|-----------|--------|"
+        jq -r '.contracts[] | "| \(.name) | `\(.address)` | `\(.deployment_tx_hash)` | `\(.source_script)` |"' "$json_out"
     } > "$md_out"
 
     log_ok "Address table written to $md_out"
     log_ok "Machine-readable table at $json_out"
 
     local count
-    count=$(jq -r '.contracts | length' "$json_out")
+    count=$(jq -r '.contractCount' "$json_out")
     log_ok "Total contracts deployed: $count"
 }
 
@@ -282,8 +343,8 @@ step_verify_code() {
 
     while IFS= read -r line; do
         local name address code
-        name="$(echo "$line" | jq -r '.key')"
-        address="$(echo "$line" | jq -r '.value')"
+        name="$(echo "$line" | jq -r '.name')"
+        address="$(echo "$line" | jq -r '.address')"
         code=$(cast code "$address" --rpc-url "$CEREMONY_RPC_URL" 2>/dev/null || echo "ERROR")
         total=$((total + 1))
 
@@ -296,7 +357,7 @@ step_verify_code() {
             log_ok "  $name at $address: $code_size bytes"
             echo "OK $name $address $code_size" >> "$verify_log"
         fi
-    done < <(jq -c '.contracts | to_entries[]' "$json_out")
+    done < <(jq -c '.contracts[]' "$json_out")
 
     echo >> "$verify_log"
     echo "TOTAL: $total contracts, $failed failures" >> "$verify_log"
