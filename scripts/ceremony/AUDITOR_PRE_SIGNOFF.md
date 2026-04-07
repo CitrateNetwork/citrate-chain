@@ -34,13 +34,18 @@ The ceremony will deploy contracts from the following scripts:
 - [ ] `contracts/script/DeployAll.s.sol` — core contract suite
 - [ ] `contracts/script/DeployAIGateway.s.sol` — portable AI gateway contracts
 - [ ] `contracts/script/DeployEduStack.s.sol` — institutional education contracts
-- [ ] `contracts/script/DeployForwarderPilot.s.sol` — pilot forwarder
+
+The auditor explicitly accepts that `contracts/script/DeployForwarderPilot.s.sol`
+is **not** part of the canonical ceremony deployment surface. It is a
+parameterized helper for non-canonical pilot experiments and must not be used
+to establish testnet source-of-truth addresses.
 
 The auditor has reviewed each script for:
 - Correct constructor arguments
 - Correct deployment order (no dependency cycles)
 - No owner/admin set to an address the operator cannot control
 - No hardcoded addresses from prior deployments that would break after re-genesis
+- The expected unique contract count matches `scripts/ceremony/CONTRACT_SCOPE.md`
 
 ### 3. Chain Configuration
 
@@ -135,6 +140,7 @@ Signature: ______________________
 - `provision-host.sh`
 - `keystore_protocol.md`
 - `CEREMONY_CHECKLIST.md`
+- `CONTRACT_SCOPE.md`
 - `.agentile/CONFIG.md`
 - `.agentile/quorum/11_SIGNER_READY_PRODUCTION_READINESS_CHECKLIST.md`
 - `.agentile/quorum/12_A16_SPRINT_K_RESIDUAL_TRIAGE.md`

@@ -15,6 +15,10 @@ path = "src/bin/benchmark_suite.rs"
 name = "live-bench"
 path = "src/bin/live_bench.rs"
 
+[[bin]]
+name = "bench-signed"
+path = "src/bin/bench_signed.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
@@ -22,5 +26,10 @@ serde_json = "1"
 rand = "0.8"
 futures = "0.3"
 chrono = "0.4"
+# bench-signed: self-sign EIP-155 legacy transactions
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
+rlp = "0.5"
+hex = "0.4"
 
 [workspace]

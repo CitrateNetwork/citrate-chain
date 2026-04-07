@@ -87,7 +87,7 @@ These steps happen asynchronously before the live ceremony session. The ceremony
 
 - [ ] `export CEREMONY_MODE=rehearsal` set on deployer host
 - [ ] `export CEREMONY_RPC_URL=http://<rehearsal-rpc>:8545`
-- [ ] `export CEREMONY_DEPLOYER_KEYSTORE=$HOME/.foundry/keystores/rehearsal-deployer`
+- [ ] `export CEREMONY_DEPLOYER_ACCOUNT=rehearsal-deployer`
 - [ ] `export CEREMONY_DEPLOYER_ADDRESS=<rehearsal-deployer-address>`
 - [ ] `./ceremony.sh` runs successfully (no errors)
 - [ ] Output directory captured: `ceremony-output/<timestamp>/`
@@ -221,4 +221,5 @@ Total live-session time for Phase 3: approximately 2-4 hours including review an
 - `ceremony.sh` — the script this checklist runs
 - `provision-host.sh` — host prep script
 - `keystore_protocol.md` — key handling protocol
+- `LOCAL_REHEARSAL.md` — safe disposable local practice path
 - `AUDITOR_PRE_SIGNOFF.md` — the artifact the auditor signs before the ceremony
