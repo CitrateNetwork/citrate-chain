@@ -7,16 +7,17 @@ use std::sync::Arc;
 /// Network-related API methods
 pub struct NetworkApi {
     peer_manager: Arc<PeerManager>,
+    chain_id: u64,
 }
 
 impl NetworkApi {
-    pub fn new(peer_manager: Arc<PeerManager>) -> Self {
-        Self { peer_manager }
+    pub fn new(peer_manager: Arc<PeerManager>, chain_id: u64) -> Self {
+        Self { peer_manager, chain_id }
     }
 
     /// Get network version
     pub async fn get_version(&self) -> Result<String, ApiError> {
-        Ok("1".to_string())
+        Ok(self.chain_id.to_string())
     }
 
     /// Get peer count
@@ -39,7 +40,7 @@ impl NetworkApi {
         Ok(NodeInfo {
             version: "citrate/v0.1.0".to_string(),
             network_id: 1,
-            chain_id: 1337,
+            chain_id: self.chain_id,
             genesis_hash: Hash::default(),
             head_hash: Hash::default(),
             head_height: 0,

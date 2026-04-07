@@ -176,7 +176,7 @@ fn h4_tx_root_mismatch_fails_sync_check() {
         gas_price: 1_000_000_000,
         data: vec![],
         signature: Signature::new([1; 64]),
-        chain_id: Some(1337),
+        chain_id: Some(40204),
         ..Default::default()
     });
     // tx_root still reflects empty transactions — mismatch

@@ -916,12 +916,12 @@ fn test_wallet_config_debug_format() {
     let config = WalletConfig {
         keystore_path: PathBuf::from("/tmp/test.json"),
         rpc_url: "http://localhost:9999".into(),
-        chain_id: 1337,
+        chain_id: 40204,
         default_gas_price: 5_000_000_000,
         default_gas_limit: 100_000,
     };
     let debug = format!("{:?}", config);
-    assert!(debug.contains("1337"));
+    assert!(debug.contains("40204"));
     assert!(debug.contains("9999"));
 }
 

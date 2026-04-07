@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CITRATE_DIR="$SCRIPT_DIR/.."
 WALLET_CLI="$CITRATE_DIR/target/debug/wallet"
 RPC_URL="${RPC_URL:-http://localhost:8545}"
-CHAIN_ID="${CHAIN_ID:-1337}"
+CHAIN_ID="${CHAIN_ID:-40204}"
 KEYSTORE_DIR="${KEYSTORE_DIR:-$HOME/.citrate-wallet}"
 
 # Utility functions
@@ -287,7 +287,7 @@ show_usage() {
     echo
     echo "Environment Variables:"
     echo "  RPC_URL       - RPC server URL (default: http://localhost:8545)"
-    echo "  CHAIN_ID      - Chain ID (default: 1337)"
+    echo "  CHAIN_ID      - Chain ID (default: 40204)"
     echo "  KEYSTORE_DIR  - Keystore directory (default: ~/.citrate-wallet)"
     echo
     echo "Examples:"

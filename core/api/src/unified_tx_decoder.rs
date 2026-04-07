@@ -223,7 +223,7 @@ impl DecoderFactory {
             default_chain_id: 31337, // Common test chain ID
         };
 
-        let enhanced_decoder = EnhancedTransactionDecoder::new(vec![1, 31337, 1337], config);
+        let enhanced_decoder = EnhancedTransactionDecoder::new(vec![1, 31337, 40204], config);
 
         UnifiedTransactionDecoder {
             enhanced_decoder,
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_development_decoder() {
-        let decoder = DecoderFactory::development(vec![1, 5, 1337]);
+        let decoder = DecoderFactory::development(vec![1, 5, 40204]);
         assert!(decoder.fallback_enabled);
     }
 

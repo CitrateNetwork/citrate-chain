@@ -266,7 +266,7 @@ pub struct ValidatorInfo {
 impl Default for GenesisConfig {
     fn default() -> Self {
         Self {
-            chain_id: 1337,
+            chain_id: 40204,
             timestamp: 1704067200, // Jan 1, 2024
             difficulty: 1000000,
             gas_limit: 30000000,

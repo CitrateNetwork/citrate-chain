@@ -158,7 +158,7 @@ impl Default for GenesisConfig {
         ];
 
         Self {
-            chain_id: 1337, // Local testnet
+            chain_id: 40204, // Testnet beta
             accounts: test_accounts,
             treasury_address: treasury,
             team_allocations: HashMap::new(), // No team allocations for testnet
@@ -800,7 +800,7 @@ mod tests {
     fn test_zero_balance_accounts_valid() {
         // A genesis config with zero-balance accounts should be valid
         let config = GenesisConfig {
-            chain_id: 1337,
+            chain_id: 40204,
             accounts: vec![
                 GenesisAccount {
                     address: Address([0x01; 20]),

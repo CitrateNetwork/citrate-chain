@@ -18,5 +18,9 @@ Key functionality:
   (transfer, token transfer, contract creation, model deployment, inference)
 - **Genesis config** -- Chain ID, gas limit, initial validators, token allocations
 
-The `GenesisConfig::default()` creates a devnet genesis with chain ID 1337,
-30M gas limit, and one initial validator.
+The `GenesisConfig::default()` creates a testnet-beta genesis with chain ID
+40204, 30M gas limit, and one initial validator.
+
+Note: this file (`core/genesis/genesis_model.rs`) is a standalone reference
+module. Production genesis construction lives in
+`core/economics/src/genesis.rs` and `node/src/genesis.rs`.

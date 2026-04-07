@@ -120,7 +120,7 @@ console.log('Featured:', featured);
 ```
 1. Start GUI with testnet connection
    ├─ Verify wallet has funds
-   └─ Confirm network: Chain ID 40204 (testnet) or 1337 (devnet)
+   └─ Confirm network: Chain ID 40204 (testnet)
 
 2. Navigate to Marketplace
    ├─ Check loading state displays

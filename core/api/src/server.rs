@@ -919,7 +919,7 @@ impl RpcServer {
         let peers_count = peer_manager.clone();
         io_handler.add_sync_method("net_peerCount", move |_params: Params| {
             rpc_request("net_peerCount");
-            let api = NetworkApi::new(peers_count.clone());
+            let api = NetworkApi::new(peers_count.clone(), chain_id);
 
             match block_on(api.get_peer_count()) {
                 Ok(count) => Ok(Value::String(format!("0x{:x}", count))),
@@ -931,7 +931,7 @@ impl RpcServer {
         let peers_listen = peer_manager.clone();
         io_handler.add_sync_method("net_listening", move |_params: Params| {
             rpc_request("net_listening");
-            let api = NetworkApi::new(peers_listen.clone());
+            let api = NetworkApi::new(peers_listen.clone(), chain_id);
 
             match block_on(api.is_listening()) {
                 Ok(listening) => Ok(Value::Bool(listening)),
@@ -1838,7 +1838,7 @@ impl RpcServer {
         let peers_list = peer_manager.clone();
         io_handler.add_sync_method("net_peers", move |_params: Params| {
             rpc_request("net_peers");
-            let api = NetworkApi::new(peers_list.clone());
+            let api = NetworkApi::new(peers_list.clone(), chain_id);
             match block_on(api.get_peers()) {
                 Ok(ids) => Ok(serde_json::to_value(ids).unwrap_or(Value::Array(vec![]))),
                 Err(_) => Ok(Value::Array(vec![])),

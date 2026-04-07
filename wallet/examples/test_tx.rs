@@ -7,7 +7,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure and create wallet
     let config = WalletConfig {
         rpc_url: "http://localhost:8545".to_string(),
-        chain_id: 1337,
+        chain_id: 40204,
         keystore_path: std::path::PathBuf::from("test_keystore.json"),
         ..Default::default()
     };

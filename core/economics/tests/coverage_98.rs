@@ -1136,7 +1136,7 @@ fn test_slashing_downtime_configurable() {
 #[test]
 fn test_genesis_empty_accounts_valid() {
     let config = GenesisConfig {
-        chain_id: 1337, accounts: vec![],
+        chain_id: 40204, accounts: vec![],
         treasury_address: addr(0x11), team_allocations: HashMap::new(),
         ecosystem_fund: addr(0x22), mining_pool_max: salt(500_000_000),
     };

@@ -120,7 +120,7 @@ fn call_tx(
 
 fn new_executor() -> (Executor, Arc<StateDB>) {
     let state_db = Arc::new(StateDB::new());
-    let executor = Executor::with_chain_id(state_db.clone(), 1337);
+    let executor = Executor::with_chain_id(state_db.clone(), 40204);
     (executor, state_db)
 }
 
