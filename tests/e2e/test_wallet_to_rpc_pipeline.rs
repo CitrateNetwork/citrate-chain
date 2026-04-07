@@ -84,7 +84,7 @@ mod wallet_rpc_pipeline_e2e {
         let signing_key = SigningKey::from_bytes(&secret);
 
         let to = Address([0x11; 20]);
-        let (tx, raw) = build_signed_tx(&signing_key, to, 1_000_000, 0, 1_000_000_000, 21_000, 1337);
+        let (tx, raw) = build_signed_tx(&signing_key, to, 1_000_000, 0, 1_000_000_000, 21_000, 40204);
 
         // Deserialize back
         let decoded: Transaction =
@@ -106,7 +106,7 @@ mod wallet_rpc_pipeline_e2e {
         let verifying_key = signing_key.verifying_key();
 
         let to = Address([0x22; 20]);
-        let (tx, _raw) = build_signed_tx(&signing_key, to, 500, 1, 1_000_000_000, 21_000, 1337);
+        let (tx, _raw) = build_signed_tx(&signing_key, to, 500, 1, 1_000_000_000, 21_000, 40204);
 
         // Verify signature
         use ed25519_dalek::Verifier;
@@ -129,8 +129,8 @@ mod wallet_rpc_pipeline_e2e {
         });
 
         let to = Address([0x33; 20]);
-        let (tx_a, _) = build_signed_tx(&key_a, to, 100, 0, 1_000_000_000, 21_000, 1337);
-        let (tx_b, _) = build_signed_tx(&key_b, to, 100, 0, 1_000_000_000, 21_000, 1337);
+        let (tx_a, _) = build_signed_tx(&key_a, to, 100, 0, 1_000_000_000, 21_000, 40204);
+        let (tx_b, _) = build_signed_tx(&key_b, to, 100, 0, 1_000_000_000, 21_000, 40204);
 
         assert_ne!(
             tx_a.signature.as_bytes(),
@@ -224,7 +224,7 @@ mod wallet_rpc_pipeline_e2e {
         let to = Address([0x44; 20]);
 
         let (tx_mainnet, _) = build_signed_tx(&signing_key, to, 100, 0, 1_000_000_000, 21_000, 1);
-        let (tx_testnet, _) = build_signed_tx(&signing_key, to, 100, 0, 1_000_000_000, 21_000, 1337);
+        let (tx_testnet, _) = build_signed_tx(&signing_key, to, 100, 0, 1_000_000_000, 21_000, 40204);
 
         assert_ne!(
             tx_mainnet.hash, tx_testnet.hash,

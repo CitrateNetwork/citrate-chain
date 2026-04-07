@@ -69,7 +69,7 @@ fn make_tx(nonce: u64, from_byte: u8) -> Transaction {
         gas_price: 1_000_000_000,
         data: vec![],
         signature: Signature::new([1; 64]),
-        chain_id: Some(1337),
+        chain_id: Some(40204),
         ..Default::default()
     }
 }

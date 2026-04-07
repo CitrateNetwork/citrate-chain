@@ -1,4 +1,4 @@
-name: Release (Node/CLI/Wallet + GUI)
+name: Release (Node/CLI/Wallet + Learning Center + GUI)
 
 on:
   push:
@@ -163,11 +163,125 @@ jobs:
           path: citrate_v0.01.1/dist/*
           if-no-files-found: warn
 
+  # ============================================================================
+  # Citrate Learning Center — the school client pilot binary
+  # ============================================================================
+  # Gate: B-1/B-2/B-3/B-5 landed. This job packages citrate-learning-center
+  # alongside the operator-facing citrate-gui-native so the release artifact
+  # surface covers both the school client and the operator GUI.
+  #
+  # Pilot OS: Ubuntu 22.04 LTS (Linux) is the primary supported target for the
+  # first 20-100 managed pilot machines. macOS and Windows artifacts are built
+  # for parity but the pilot operator is expected to deploy on Linux first.
+  # ============================================================================
+  build-learning-center:
+    name: Build Learning Center (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04 is pinned (not ubuntu-latest) to match the pilot target
+        # described above: Ubuntu 22.04 LTS is the supported OS for the first
+        # 20-100 managed pilot machines. macOS and Windows are built for parity.
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        working-directory: citrate_v0.01.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            citrate_v0.01.1/target
+          key: lc-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          restore-keys: lc-${{ matrix.os }}-
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libclang-dev cmake pkg-config libfontconfig1-dev
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        run: choco install llvm cmake -y
+
+      - name: Build Learning Center binary
+        run: cargo build --release -p citrate-learning-center
+
+      - name: Run Learning Center unit tests
+        run: cargo test --release -p citrate-edu-app
+
+      - name: Package Learning Center artifact (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -eux
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          mkdir -p dist
+          cp target/release/citrate-learning-center dist/
+          # Include install guide for pilot operators
+          if [ -f gui/citrate_learning_center/release/INSTALL.md ]; then
+            cp gui/citrate_learning_center/release/INSTALL.md dist/
+          fi
+          cd dist
+          if command -v sha256sum &>/dev/null; then
+            sha256sum citrate-learning-center > LEARNING_CENTER_SHA256.txt
+          else
+            shasum -a 256 citrate-learning-center > LEARNING_CENTER_SHA256.txt
+          fi
+          tar -czf citrate-learning-center-${OS}-${ARCH}.tar.gz \
+            citrate-learning-center LEARNING_CENTER_SHA256.txt \
+            $([ -f INSTALL.md ] && echo INSTALL.md)
+          rm -f citrate-learning-center LEARNING_CENTER_SHA256.txt
+          [ -f INSTALL.md ] && rm -f INSTALL.md || true
+          echo "Created dist/citrate-learning-center-${OS}-${ARCH}.tar.gz"
+
+      - name: Package Learning Center artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\citrate-learning-center.exe dist\
+          if (Test-Path gui\citrate_learning_center\release\INSTALL.md) {
+            Copy-Item gui\citrate_learning_center\release\INSTALL.md dist\
+          }
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          $zip = "dist\citrate-learning-center-windows-$arch.zip"
+          $files = @("dist\citrate-learning-center.exe")
+          if (Test-Path dist\INSTALL.md) { $files += "dist\INSTALL.md" }
+          Compress-Archive -Path $files -DestinationPath $zip
+          Remove-Item dist\citrate-learning-center.exe
+          if (Test-Path dist\INSTALL.md) { Remove-Item dist\INSTALL.md }
+          Write-Host "Created $zip"
+
+      - name: Upload Learning Center artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: learning-center-${{ matrix.os }}
+          path: citrate_v0.01.1/dist/*
+          if-no-files-found: error  # LC is the pilot binary — fail hard if missing
+
   publish:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, build-gui]
-    if: always() && needs.build-binaries.result == 'success'
+    needs: [build-binaries, build-gui, build-learning-center]
+    # All three upstream jobs must succeed before we publish a release. The
+    # operator GUI (citrate-gui-native) ships in the release surface alongside
+    # the node binaries and the Learning Center pilot binary, so a GUI failure
+    # must block publication rather than silently produce a partial release.
+    if: always() && needs.build-binaries.result == 'success' && needs.build-gui.result == 'success' && needs.build-learning-center.result == 'success'
     permissions:
       contents: write
     steps:

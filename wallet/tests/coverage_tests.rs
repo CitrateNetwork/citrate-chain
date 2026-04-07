@@ -856,13 +856,13 @@ fn test_wallet_config_serialization_roundtrip() {
     let config = WalletConfig {
         keystore_path: PathBuf::from("/tmp/test_keystore.json"),
         rpc_url: "http://localhost:9545".to_string(),
-        chain_id: 1337,
+        chain_id: 40204,
         default_gas_price: 2_000_000_000,
         default_gas_limit: 42_000,
     };
     let json = serde_json::to_string(&config).unwrap();
     let d: WalletConfig = serde_json::from_str(&json).unwrap();
-    assert_eq!(d.chain_id, 1337);
+    assert_eq!(d.chain_id, 40204);
     assert_eq!(d.default_gas_limit, 42_000);
 }
 

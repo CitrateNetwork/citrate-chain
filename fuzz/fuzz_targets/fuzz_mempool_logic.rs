@@ -40,7 +40,7 @@ fuzz_target!(|data: &[u8]| {
             allow_replacement: true,
             replacement_factor: 110,
             require_valid_signature: false, // Disable sig checks for fuzzing
-            chain_id: 1337,
+            chain_id: 40204,
         };
 
         let mempool = Mempool::new(config);
@@ -86,7 +86,7 @@ fuzz_target!(|data: &[u8]| {
                         data: vec![],
                         signature: Signature::new([0xAA; 64]),
                         tx_type: None,
-                        chain_id: Some(1337),
+                        chain_id: Some(40204),
                         ..Default::default()
                     };
 

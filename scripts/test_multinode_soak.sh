@@ -67,7 +67,7 @@ for i in $(seq 0 $((NUM_NODES - 1))); do
         --p2p-addr "127.0.0.1:$P2P" \
         --rpc-addr "127.0.0.1:$RPC" \
         --mine \
-        --chain-id 1337 \
+        --chain-id 40204 \
         $BOOTSTRAP_FLAG $BOOTSTRAP_ARG \
         > "$DIR/node.log" 2>&1 &
     PIDS+=($!)

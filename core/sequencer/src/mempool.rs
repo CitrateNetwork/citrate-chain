@@ -161,7 +161,7 @@ impl Default for MempoolConfig {
             replacement_factor: 110,
             // Tighten by default; tests or devnet can disable explicitly
             require_valid_signature: true,
-            chain_id: 1337,
+            chain_id: 40204, // Testnet beta
         }
     }
 }
@@ -1062,7 +1062,7 @@ mod tests {
             data: vec![],
             signature: Signature::new([1; 64]), // Non-zero signature for tests
             tx_type: None,
-            chain_id: Some(1337), // M-01: chain domain binding required
+            chain_id: Some(40204), // M-01: chain domain binding — matches canonical default
             ..Default::default()
         }
     }
@@ -1279,7 +1279,7 @@ mod tests {
             gas_price: 2_000_000_000,
             data: vec![],
             signature: Signature::new([1; 64]),
-            chain_id: Some(1337),
+            chain_id: Some(40204), // Matches canonical MempoolConfig::default()
             ecdsa_verified: true, // Attacker-forged value
             ..Default::default()
         };

@@ -131,12 +131,12 @@ fn ac01_transaction_requires_chain_id() {
     );
 
     let tx_with_chain = Transaction {
-        chain_id: Some(1337),
+        chain_id: Some(40204),
         ..tx
     };
     assert_eq!(
         tx_with_chain.chain_id,
-        Some(1337),
+        Some(40204),
         "AC-01: Transaction with chain_id is replay-protected"
     );
 }
@@ -200,7 +200,7 @@ fn ac02_unverified_transaction_flagged() {
         gas_price: 1_000_000_000,
         data: vec![],
         signature: Signature::new([1; 64]),
-        chain_id: Some(1337),
+        chain_id: Some(40204),
         ecdsa_verified: false, // NOT verified
         ..Default::default()
     };
@@ -235,7 +235,7 @@ fn ac03_forged_block_tampered_transactions() {
         gas_price: 1_000_000_000,
         data: vec![],
         signature: Signature::new([1; 64]),
-        chain_id: Some(1337),
+        chain_id: Some(40204),
         ..Default::default()
     });
 

@@ -545,8 +545,8 @@ mod tests {
 
     #[test]
     fn test_eip1559_decoder_creation() {
-        let decoder = Eip1559Decoder::new(vec![1, 5, 1337]);
-        assert_eq!(decoder.supported_chain_ids, vec![1, 5, 1337]);
+        let decoder = Eip1559Decoder::new(vec![1, 5, 40204]);
+        assert_eq!(decoder.supported_chain_ids, vec![1, 5, 40204]);
     }
 
     #[test]

@@ -19,7 +19,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             rpc_endpoint: "http://localhost:8545".to_string(),
-            chain_id: 1337,
+            chain_id: 40204,
             keystore_path: dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".citrate")
@@ -108,7 +108,7 @@ mod tests {
     fn test_default_config_values() {
         let config = Config::default();
         assert_eq!(config.rpc_endpoint, "http://localhost:8545");
-        assert_eq!(config.chain_id, 1337);
+        assert_eq!(config.chain_id, 40204); // Testnet beta — canonical
         assert_eq!(config.gas_price, 1_000_000_000);
         assert_eq!(config.gas_limit, 3_000_000);
         assert!(config.default_account.is_none());

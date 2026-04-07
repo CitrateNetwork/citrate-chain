@@ -38,7 +38,7 @@ fn make_evm_pubkey(addr: [u8; 20]) -> PublicKey {
 fn test_mempool() -> Arc<Mempool> {
     Arc::new(Mempool::new(MempoolConfig {
         require_valid_signature: true, // Production-like: signatures enforced
-        chain_id: 1337,
+        chain_id: 40204,
         ..Default::default()
     }))
 }
@@ -46,7 +46,7 @@ fn test_mempool() -> Arc<Mempool> {
 fn test_mempool_no_sig() -> Arc<Mempool> {
     Arc::new(Mempool::new(MempoolConfig {
         require_valid_signature: false, // For chain_id-only tests
-        chain_id: 1337,
+        chain_id: 40204,
         ..Default::default()
     }))
 }
@@ -80,7 +80,7 @@ fn c01_forged_embedded_address_without_ecdsa_verified_is_rejected() {
         signature: Signature::new([0xFF; 64]), // Attacker-controlled garbage signature
         tx_type: None,
         ecdsa_verified: false, // NOT cryptographically verified
-        chain_id: Some(1337),
+        chain_id: Some(40204),
         ..Default::default()
     };
 
@@ -105,7 +105,7 @@ fn c01_ecdsa_verified_true_passes_verification() {
         signature: Signature::new([1; 64]),
         tx_type: None,
         ecdsa_verified: true, // Decoder cryptographically verified this
-        chain_id: Some(1337),
+        chain_id: Some(40204),
         ..Default::default()
     };
 
@@ -129,7 +129,7 @@ async fn c01_mempool_rejects_forged_ecdsa_transaction() {
         signature: Signature::new([0xCC; 64]),
         tx_type: None,
         ecdsa_verified: false, // Attacker cannot set this
-        chain_id: Some(1337),
+        chain_id: Some(40204),
         ..Default::default()
     };
 
@@ -170,7 +170,7 @@ async fn c02_eth_send_transaction_rejected_in_production_mode() {
         storage.clone(),
         mempool.clone(),
         executor.clone(),
-        1337,
+        40204,
         Arc::new(FilterRegistry::new()),
         None,
     );
@@ -291,7 +291,7 @@ async fn c04_nonce_skip_rejected_by_executor() {
         data: vec![],
         signature: Signature::new([1; 64]),
         tx_type: None,
-        chain_id: Some(1337),
+        chain_id: Some(40204),
         ecdsa_verified: true,
         ..Default::default()
     };
@@ -335,7 +335,7 @@ async fn c04_nonce_replay_rejected_by_executor() {
         data: vec![],
         signature: Signature::new([1; 64]),
         tx_type: None,
-        chain_id: Some(1337),
+        chain_id: Some(40204),
         ecdsa_verified: true,
         ..Default::default()
     };
@@ -356,7 +356,7 @@ async fn c04_nonce_replay_rejected_by_executor() {
         data: vec![],
         signature: Signature::new([1; 64]),
         tx_type: None,
-        chain_id: Some(1337),
+        chain_id: Some(40204),
         ecdsa_verified: true,
         ..Default::default()
     };
@@ -392,7 +392,7 @@ async fn c04_sequential_nonces_succeed() {
             data: vec![],
             signature: Signature::new([1; 64]),
             tx_type: None,
-            chain_id: Some(1337),
+            chain_id: Some(40204),
             ecdsa_verified: true,
             ..Default::default()
         };
@@ -443,7 +443,7 @@ async fn m01_missing_chain_id_rejected() {
 /// Transaction with wrong chain_id (cross-chain replay attempt) must be rejected
 #[tokio::test]
 async fn m01_wrong_chain_id_rejected() {
-    let mempool = test_mempool_no_sig(); // chain_id=1337
+    let mempool = test_mempool_no_sig(); // chain_id=40204
 
     let tx = Transaction {
         hash: Hash::new([41; 32]),
@@ -467,7 +467,7 @@ async fn m01_wrong_chain_id_rejected() {
     );
     let err_msg = format!("{:?}", result.unwrap_err());
     assert!(
-        err_msg.contains("1337") && err_msg.contains("1"),
+        err_msg.contains("40204") && err_msg.contains("1"),
         "Error should show expected vs got chain IDs, got: {}",
         err_msg
     );
@@ -489,7 +489,7 @@ async fn m01_correct_chain_id_accepted() {
         data: vec![],
         signature: Signature::new([1; 64]),
         tx_type: None,
-        chain_id: Some(1337), // CORRECT
+        chain_id: Some(40204), // CORRECT
         ..Default::default()
     };
 

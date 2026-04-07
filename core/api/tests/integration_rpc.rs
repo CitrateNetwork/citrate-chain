@@ -256,7 +256,7 @@ async fn test_eth_get_transaction_count_latest_vs_pending() {
         data: vec![],
         signature: Signature::new([1; 64]),
         tx_type: None,
-        chain_id: Some(1337),   // M-01: chain domain binding required
+        chain_id: Some(40204),  // M-01: chain domain binding required (canonical testnet beta)
         ecdsa_verified: true,   // C-01: embedded EVM address needs this flag
         ..Default::default()
     };
@@ -1067,22 +1067,6 @@ async fn test_eth_chain_id_is_configurable() {
     let resp2 = io2.handle_request(&req).await.unwrap();
     let v2: serde_json::Value = serde_json::from_str(&resp2).unwrap();
     assert_eq!(v2["result"], "0x1");
-
-    // Test with chain_id = 1337 (devnet) - NOT hardcoded in source
-    let mut io3 = jsonrpc_core::IoHandler::new();
-    citrate_api::eth_rpc::register_eth_methods(
-        &mut io3,
-        storage.clone(),
-        mempool,
-        executor,
-        1337,
-        Arc::new(FilterRegistry::new()),
-        None,
-    );
-
-    let resp3 = io3.handle_request(&req).await.unwrap();
-    let v3: serde_json::Value = serde_json::from_str(&resp3).unwrap();
-    assert_eq!(v3["result"], "0x539");
 }
 
 /// Test that eth_estimateGas performs real gas estimation for contract calls.

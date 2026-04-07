@@ -332,7 +332,7 @@ Gas Fees → 10% Market Maker (pre-split)
 - **Message types**: Block, Transaction, LearningGossip, CheckpointVote
 
 ### Configuration
-- **Chain ID**: 40204 (testnet), 1337 (devnet)
+- **Chain ID**: 40204 (testnet)
 - **Default ports**: 8545 (RPC), 8546 (WebSocket), 30303 (P2P)
 - **Testnet RPC**: https://rpc.citrate.ai
 - **Block time**: 2 seconds (testnet), 1 second (devnet)

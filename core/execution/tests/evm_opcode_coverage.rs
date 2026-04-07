@@ -20,7 +20,7 @@ fn test_context_with_code(code: Vec<u8>) -> EVMContext {
         coinbase: [0x42; 20],
         prevrandao: U256::from(12345),
         gas_limit: 30_000_000,
-        chain_id: 1337,
+        chain_id: 40204,
         base_fee: U256::from(1_000_000_000u64),
         blob_base_fee: U256::zero(),
         origin: [0x01; 20],
@@ -610,7 +610,7 @@ fn test_block_info_opcodes() {
 
     // CHAINID (0x46)
     executor.execute_opcode(0x46, &mut state, &context).unwrap();
-    assert_eq!(state.stack_pop().unwrap(), U256::from(1337));
+    assert_eq!(state.stack_pop().unwrap(), U256::from(40204));
 
     // BASEFEE (0x48)
     executor.execute_opcode(0x48, &mut state, &context).unwrap();

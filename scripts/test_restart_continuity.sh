@@ -40,7 +40,7 @@ echo ""
 
 # Phase 1: Start node and produce blocks
 echo "[Phase 1] Starting node..."
-"$BINARY" --data-dir "$DATA_DIR" --mine --rpc-addr "127.0.0.1:$RPC_PORT" --p2p-addr "127.0.0.1:$P2P_PORT" --chain-id 1337 > "$DATA_DIR/phase1.log" 2>&1 &
+"$BINARY" --data-dir "$DATA_DIR" --mine --rpc-addr "127.0.0.1:$RPC_PORT" --p2p-addr "127.0.0.1:$P2P_PORT" --chain-id 40204 > "$DATA_DIR/phase1.log" 2>&1 &
 NODE_PID=$!
 sleep 8
 
@@ -67,7 +67,7 @@ echo "  Node stopped."
 
 # Phase 3: Restart with same data dir
 echo "[Phase 3] Restarting node with same data dir..."
-"$BINARY" --data-dir "$DATA_DIR" --mine --rpc-addr "127.0.0.1:$RPC_PORT" --p2p-addr "127.0.0.1:$P2P_PORT" --chain-id 1337 > "$DATA_DIR/phase3.log" 2>&1 &
+"$BINARY" --data-dir "$DATA_DIR" --mine --rpc-addr "127.0.0.1:$RPC_PORT" --p2p-addr "127.0.0.1:$P2P_PORT" --chain-id 40204 > "$DATA_DIR/phase3.log" 2>&1 &
 NODE_PID=$!
 sleep 8
 

@@ -70,7 +70,7 @@ mod contract_e2e {
             U256::zero(),
             1_000_000,     // gas limit
             U256::from(1), // gas price
-            1337,          // chain_id
+            40204,         // chain_id
             1,             // block_number
             1000,          // block_timestamp
         );
@@ -88,7 +88,7 @@ mod contract_e2e {
                     U256::zero(),
                     1_000_000,
                     U256::from(1),
-                    1337,
+                    40204,
                     2,
                     2000,
                 );
