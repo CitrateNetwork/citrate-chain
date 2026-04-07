@@ -15,8 +15,10 @@ pub mod address_table;
 pub mod config;
 pub mod fingerprint;
 pub mod nonce;
+pub mod runner;
 pub mod signers;
 pub mod tx;
+pub mod workload;
 
 /// Top-level error type for the citrate-bench crate.
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +52,12 @@ pub enum Error {
 
     #[error("nonce lane saturated")]
     NonceLaneSaturated,
+
+    #[error("workload: {0}")]
+    Workload(String),
+
+    #[error("runner: {0}")]
+    Runner(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

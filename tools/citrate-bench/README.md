@@ -17,9 +17,9 @@ Design spec: `.agentile/quorum/16_POST_CEREMONY_BENCHMARK_HARNESS_SPEC.md`.
 
 ## Status
 
-**Phase 1 — skeleton, no chain required.**
+**Phase 2 — dry-run runner, no chain required.**
 
-Implemented:
+Implemented (Phase 1):
 - `config` — bench.toml loader + offline validation
 - `address_table` — `30_address_table.json` loader
 - `fingerprint` — ceremony bundle sha256 validator
@@ -29,21 +29,50 @@ Implemented:
 - `tx/legacy` — EIP-155 legacy RLP signer (cross-checked against the
   canonical EIP-155 test vector)
 
+Implemented (Phase 2):
+- `workload::WorkloadClass` trait + `WorkloadContext`
+- `workload::transfer::SimpleTransfer` — native-value transfer class
+- `runner::Runner` — deadline-based rate limiter that drives the full
+  keystore → pool → signer → signed-tx pipeline at a target TPS
+- `runner::RunMode::DryRun` — builds and signs but never broadcasts
+- CLI `dry-run` subcommand with keystore-backed multi-signer flow
+
 Not yet implemented (later phases):
-- Phase 2: workload classes + runner + `--dry-run`
 - Phase 3: real submission via `eth_sendRawTransaction`
 - Phase 4: multi-class mix
 - Phase 5: finality tracker (depth + checkpoint)
 - Phase 6: production run on frozen testnet
 
-## Running (Phase 1 features only)
+## Running
 
 ```bash
 cd citrate_v0.01.1/tools/citrate-bench
-cargo test                 # unit tests
-cargo run -- validate --config examples/bench.toml
+
+# All unit + integration tests (no chain required)
+cargo test
+
+# Offline config check
+cargo run -- validate --config path/to/bench.toml
+
+# Inspect a frozen ceremony address table
 cargo run -- show-addresses --table path/to/30_address_table.json
+
+# Verify a ceremony bundle sha256
+cargo run -- verify-bundle --bundle 60_proof_bundle.tar.gz --expected sha256:...
+
+# Phase 2 end-to-end dry-run with Foundry keystore accounts
+cargo run --release -- dry-run \
+  --keystore-dir ~/.foundry/keystores \
+  --accounts bench-01,bench-02,bench-03 \
+  --passphrase-file ~/.bench-pw \
+  --chain-id 40204 \
+  --target-tps 5000 \
+  --duration-secs 10
 ```
+
+The dry-run path signs transactions at the target rate and reports the
+effective TPS, per-signer counts, and sample hashes. It never touches
+the network.
 
 ## Preconditions for a real run
 
