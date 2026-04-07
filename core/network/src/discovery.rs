@@ -53,6 +53,9 @@ struct KnownPeer {
     last_seen: u64,
     score: i32,
     attempts: u32,
+    /// A-10/B-6: Protected bootstrap nodes are never expired and are
+    /// always retried on every discovery tick, even after N failures.
+    is_bootstrap: bool,
 }
 
 /// Peer discovery service
@@ -73,27 +76,43 @@ impl Discovery {
         }
     }
 
-    /// Initialize with bootstrap nodes
+    /// Initialize with bootstrap nodes.
+    ///
+    /// A-10/B-6: Parse multiple bootstrap address formats:
+    ///   - `ip:port` (e.g., `203.0.113.10:30303`)
+    ///   - `noise_<hex>@ip:port` (trusted identity — stripped and addr used)
+    ///   - `peer_id@ip:port` (non-noise identity — stripped)
+    ///
+    /// Hostnames are NOT resolved here (that happens at the transport layer in
+    /// `node/src/main.rs:1156` via `tokio::net::lookup_host`). Only literal
+    /// SocketAddrs are added to the discovery known_peers set; hostnames are
+    /// still dialed via the node-level bootstrap loop for the initial connect.
     pub async fn init(&self) -> Result<(), NetworkError> {
+        let mut added = 0usize;
         for node in &self.config.bootstrap_nodes {
-            if let Ok(addr) = node.parse::<SocketAddr>() {
-                self.add_peer(
+            // Strip any `<identity>@` prefix
+            let addr_part = node.split_once('@').map(|(_, rest)| rest).unwrap_or(node);
+            if let Ok(addr) = addr_part.parse::<SocketAddr>() {
+                self.add_bootstrap_peer(
                     format!("bootstrap_{}", node),
                     addr,
-                    100, // High score for bootstrap nodes
-                )
-                .await;
+                ).await;
+                added += 1;
+            } else {
+                debug!("Bootstrap node is not a literal SocketAddr (possibly hostname): {}", node);
             }
         }
 
         info!(
-            "Initialized discovery with {} bootstrap nodes",
-            self.config.bootstrap_nodes.len()
+            "Initialized discovery with {} bootstrap nodes ({} added as protected, {} deferred to hostname resolution)",
+            self.config.bootstrap_nodes.len(),
+            added,
+            self.config.bootstrap_nodes.len() - added,
         );
         Ok(())
     }
 
-    /// Add a discovered peer
+    /// Add a discovered peer (non-bootstrap).
     pub async fn add_peer(&self, id: String, addr: SocketAddr, score: i32) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -106,10 +125,35 @@ impl Discovery {
             last_seen: now,
             score,
             attempts: 0,
+            is_bootstrap: false,
         };
 
         self.known_peers.insert(id, peer);
         debug!("Added peer to discovery: {}", addr);
+    }
+
+    /// Add a protected bootstrap peer.
+    /// Bootstrap peers are never expired and are always retried, even after
+    /// repeated connection failures. This is what makes multi-bootnode
+    /// failover work: if bootnode A goes offline, the node keeps trying
+    /// bootnodes B and C on every discovery tick.
+    async fn add_bootstrap_peer(&self, id: String, addr: SocketAddr) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let peer = KnownPeer {
+            id: id.clone(),
+            addr,
+            last_seen: now,
+            score: 100, // High score — always try bootstraps first
+            attempts: 0,
+            is_bootstrap: true,
+        };
+
+        self.known_peers.insert(id, peer);
+        info!("Added protected bootstrap peer to discovery: {}", addr);
     }
 
     /// Mark peer as connected
@@ -202,13 +246,21 @@ impl Discovery {
             .unwrap_or_default()
             .as_secs();
 
+        // A-10/B-6: Bootstrap peers are exempt from attempts cap and expiry —
+        // they are always retried so multi-bootnode failover works.
         let mut candidates: Vec<_> = self
             .known_peers
             .iter()
             .filter(|p| {
-                !connected.contains(&p.value().id)
-                    && p.value().attempts < 3
-                    && (now - p.value().last_seen) < self.config.peer_expiry.as_secs()
+                let peer = p.value();
+                if connected.contains(&peer.id) {
+                    return false;
+                }
+                if peer.is_bootstrap {
+                    return true; // Always retry bootstraps
+                }
+                peer.attempts < 3
+                    && (now - peer.last_seen) < self.config.peer_expiry.as_secs()
             })
             .map(|p| p.value().clone())
             .collect();
@@ -236,7 +288,8 @@ impl Discovery {
         }
     }
 
-    /// Clean up expired peers
+    /// Clean up expired peers.
+    /// A-10/B-6: Protected bootstrap peers are never expired.
     pub async fn cleanup_expired(&self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -246,7 +299,10 @@ impl Discovery {
         let expired: Vec<String> = self
             .known_peers
             .iter()
-            .filter(|p| (now - p.value().last_seen) > self.config.peer_expiry.as_secs())
+            .filter(|p| {
+                !p.value().is_bootstrap
+                    && (now - p.value().last_seen) > self.config.peer_expiry.as_secs()
+            })
             .map(|p| p.key().clone())
             .collect();
 
@@ -254,6 +310,20 @@ impl Discovery {
             self.known_peers.remove(&id);
             debug!("Removed expired peer: {}", id);
         }
+    }
+
+    /// A-10: Diagnostics — return count of protected bootstrap peers currently known.
+    pub async fn bootstrap_peer_count(&self) -> usize {
+        self.known_peers.iter().filter(|p| p.value().is_bootstrap).count()
+    }
+
+    /// A-10: Diagnostics — return count of currently connected bootstrap peers.
+    pub async fn connected_bootstrap_count(&self) -> usize {
+        let connected = self.connected_peers.read().await;
+        self.known_peers
+            .iter()
+            .filter(|p| p.value().is_bootstrap && connected.contains(&p.value().id))
+            .count()
     }
 
     /// Run discovery loop
@@ -315,6 +385,122 @@ mod tests {
         discovery.init().await.unwrap();
 
         assert_eq!(discovery.known_peers.len(), 2);
+    }
+
+    // A-10/B-6: Bootstrap nodes with identity prefixes are parsed correctly
+    #[tokio::test]
+    async fn test_bootstrap_identity_prefix_parsed() {
+        let config = DiscoveryConfig {
+            bootstrap_nodes: vec![
+                "noise_abc123@127.0.0.1:30303".to_string(),
+                "peer_xyz@127.0.0.1:30304".to_string(),
+                "127.0.0.1:30305".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let discovery = Discovery::new(config, peer_manager);
+
+        discovery.init().await.unwrap();
+
+        // All 3 should be added as bootstrap peers (identity prefixes stripped)
+        assert_eq!(discovery.known_peers.len(), 3);
+        assert_eq!(discovery.bootstrap_peer_count().await, 3);
+    }
+
+    // A-10/B-6: Bootstrap nodes survive attempt cap (always retryable)
+    #[tokio::test]
+    async fn test_bootstrap_survives_attempt_cap() {
+        let config = DiscoveryConfig {
+            bootstrap_nodes: vec!["127.0.0.1:30303".to_string()],
+            max_peers: 10,
+            ..Default::default()
+        };
+
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let discovery = Discovery::new(config, peer_manager);
+        discovery.init().await.unwrap();
+
+        // Simulate 10 failed attempts — way above the normal attempts<3 cap
+        for _ in 0..10 {
+            discovery.update_attempts("bootstrap_127.0.0.1:30303", false).await;
+        }
+
+        // find_peers should STILL return the bootstrap node because is_bootstrap=true
+        let candidates = discovery.find_peers().await;
+        assert!(!candidates.is_empty(), "Bootstrap peer must remain in candidates after 10 failed attempts");
+        assert_eq!(candidates[0].0, "bootstrap_127.0.0.1:30303");
+    }
+
+    // A-10/B-6: Bootstrap nodes are never expired by cleanup_expired
+    #[tokio::test]
+    async fn test_bootstrap_not_expired() {
+        let config = DiscoveryConfig {
+            bootstrap_nodes: vec!["127.0.0.1:30303".to_string()],
+            peer_expiry: Duration::from_secs(1),
+            ..Default::default()
+        };
+
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let discovery = Discovery::new(config, peer_manager);
+        discovery.init().await.unwrap();
+
+        assert_eq!(discovery.known_peers.len(), 1);
+
+        // Add a non-bootstrap peer that will immediately be eligible for expiry
+        discovery
+            .add_peer("regular".to_string(), "127.0.0.1:9999".parse().unwrap(), 50)
+            .await;
+
+        // Manually age the regular peer
+        if let Some(mut p) = discovery.known_peers.get_mut("regular") {
+            p.last_seen = 0; // Ancient
+        }
+
+        // Manually age the bootstrap peer too
+        if let Some(mut p) = discovery.known_peers.get_mut("bootstrap_127.0.0.1:30303") {
+            p.last_seen = 0;
+        }
+
+        discovery.cleanup_expired().await;
+
+        // Bootstrap peer must survive; regular peer must be removed
+        assert_eq!(discovery.bootstrap_peer_count().await, 1, "Bootstrap peer must not be expired");
+        assert!(!discovery.known_peers.contains_key("regular"), "Regular peer must be expired");
+    }
+
+    // A-10 diagnostics: bootstrap_peer_count + connected_bootstrap_count
+    #[tokio::test]
+    async fn test_bootstrap_diagnostics() {
+        let config = DiscoveryConfig {
+            bootstrap_nodes: vec![
+                "127.0.0.1:30301".to_string(),
+                "127.0.0.1:30302".to_string(),
+                "127.0.0.1:30303".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let discovery = Discovery::new(config, peer_manager);
+        discovery.init().await.unwrap();
+
+        assert_eq!(discovery.bootstrap_peer_count().await, 3);
+        assert_eq!(discovery.connected_bootstrap_count().await, 0);
+
+        // Simulate one bootstrap becoming connected
+        discovery.mark_connected("bootstrap_127.0.0.1:30301").await;
+        assert_eq!(discovery.connected_bootstrap_count().await, 1);
+
+        // Simulate a second one too
+        discovery.mark_connected("bootstrap_127.0.0.1:30302").await;
+        assert_eq!(discovery.connected_bootstrap_count().await, 2);
+
+        // Simulate the first going down
+        discovery.mark_disconnected("bootstrap_127.0.0.1:30301").await;
+        assert_eq!(discovery.connected_bootstrap_count().await, 1);
+        assert_eq!(discovery.bootstrap_peer_count().await, 3, "Total bootstrap count stays at 3");
     }
 
     #[tokio::test]

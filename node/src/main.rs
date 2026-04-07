@@ -106,8 +106,8 @@ struct Cli {
 enum Commands {
     /// Initialize a new chain with genesis block
     Init {
-        /// Chain ID
-        #[arg(long, default_value = "1337")]
+        /// Chain ID (default: 40204 testnet beta; pass explicit value for other networks)
+        #[arg(long, default_value = "40204")]
         chain_id: u64,
     },
 
@@ -140,8 +140,8 @@ enum Commands {
         #[arg(short, long, default_value = "http://localhost:8545")]
         rpc: String,
 
-        /// Chain ID
-        #[arg(long, default_value = "1337")]
+        /// Chain ID (default: 40204 testnet beta)
+        #[arg(long, default_value = "40204")]
         wallet_chain_id: u64,
 
         #[command(subcommand)]
@@ -978,9 +978,29 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         });
 
     // Create mempool
+    // Per-sender cap is overridable via CITRATE_MEMPOOL_MAX_PER_SENDER. The
+    // default of 100 is the production value; benchmark and load-test runs
+    // raise it (e.g., 10000) to characterize throughput at the block builder
+    // level rather than being capped at the per-sender admission gate.
+    // Mempool max_size is also overridable via CITRATE_MEMPOOL_MAX_SIZE so a
+    // raised per-sender cap can actually be exercised.
+    let mempool_max_per_sender: usize = std::env::var("CITRATE_MEMPOOL_MAX_PER_SENDER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let mempool_max_size: usize = std::env::var("CITRATE_MEMPOOL_MAX_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10000);
+    if mempool_max_per_sender != 100 || mempool_max_size != 10000 {
+        tracing::info!(
+            "Mempool overrides active: max_size={} max_per_sender={}",
+            mempool_max_size, mempool_max_per_sender
+        );
+    }
     let mempool = Arc::new(Mempool::new(MempoolConfig {
-        max_size: 10000,
-        max_per_sender: 100,
+        max_size: mempool_max_size,
+        max_per_sender: mempool_max_per_sender,
         min_gas_price: min_gas_price_override.unwrap_or(config.mining.min_gas_price),
         tx_expiry_secs: 3600,
         allow_replacement: true,

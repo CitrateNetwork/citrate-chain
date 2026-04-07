@@ -37,7 +37,7 @@ fn test_tx(nonce: u64, gas_price: u64, sender_byte: u8) -> Transaction {
         data: vec![],
         signature: Signature::new([1; 64]),
         tx_type: None,
-        chain_id: Some(1337),
+        chain_id: Some(40204), // Matches canonical MempoolConfig::default()
         ..Default::default()
     }
 }
