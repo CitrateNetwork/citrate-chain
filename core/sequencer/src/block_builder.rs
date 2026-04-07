@@ -720,7 +720,7 @@ mod tests {
             data: vec![],
             signature: Signature::new([1; 64]), // Non-zero signature for tests
             tx_type: None,
-            chain_id: Some(1337), // M-01: chain domain binding required
+            chain_id: Some(40204), // Matches canonical MempoolConfig::default()
             ..Default::default()
         }
     }

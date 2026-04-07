@@ -1832,9 +1832,11 @@ dependencies = [
  "citrate-wallet-core",
  "getrandom 0.2.16",
  "hex",
+ "hmac",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "sha3",
  "tempfile",
  "thiserror 2.0.16",
@@ -1978,11 +1980,15 @@ dependencies = [
 name = "citrate-learning-center"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "citrate-edu-app",
  "citrate-wallet-core",
  "dirs",
+ "getrandom 0.2.16",
  "hex",
+ "hostname",
  "png 0.17.16",
+ "serde_json",
  "sha3",
  "slint",
  "slint-build",
@@ -4300,6 +4306,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589533453244b0995c858700322199b2becb13b627df2851f64a2775d024abcf"
 dependencies = [
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if 1.0.3",
+ "libc",
+ "windows-link 0.2.0",
 ]
 
 [[package]]

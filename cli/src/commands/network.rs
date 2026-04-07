@@ -36,6 +36,19 @@ pub enum NetworkCommands {
 
     /// Get DAG statistics
     DagStats,
+
+    /// A-10: Bootnode health diagnostics — ping each configured bootnode
+    /// and report reachability. Requires bootnode list from config file or
+    /// --bootnodes flag.
+    Bootnodes {
+        /// Comma-separated list of bootnode addresses (ip:port or identity@ip:port)
+        #[arg(long)]
+        bootnodes: Option<String>,
+
+        /// Timeout per bootnode in milliseconds
+        #[arg(long, default_value = "3000")]
+        timeout_ms: u64,
+    },
 }
 
 pub async fn execute(cmd: NetworkCommands, config: &Config) -> Result<()> {
@@ -47,7 +60,115 @@ pub async fn execute(cmd: NetworkCommands, config: &Config) -> Result<()> {
         NetworkCommands::Peers => get_peers(config).await?,
         NetworkCommands::Sync => get_sync_status(config).await?,
         NetworkCommands::DagStats => get_dag_stats(config).await?,
+        NetworkCommands::Bootnodes { bootnodes, timeout_ms } => {
+            check_bootnodes(bootnodes, timeout_ms).await?;
+        }
     }
+    Ok(())
+}
+
+/// A-10: Check reachability of every configured bootnode.
+/// This is a standalone TCP ping — it does not require the local node to be running.
+/// Operators use it for pilot rollout validation and failover debugging.
+async fn check_bootnodes(bootnodes_arg: Option<String>, timeout_ms: u64) -> Result<()> {
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+
+    let list: Vec<String> = if let Some(s) = bootnodes_arg {
+        s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+    } else {
+        // Fall back to reading from CITRATE_BOOTNODES env var or a default config
+        match std::env::var("CITRATE_BOOTNODES") {
+            Ok(s) => s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+            Err(_) => {
+                anyhow::bail!(
+                    "No bootnodes specified. Use --bootnodes <list> or set CITRATE_BOOTNODES env var."
+                );
+            }
+        }
+    };
+
+    if list.is_empty() {
+        anyhow::bail!("Bootnode list is empty");
+    }
+
+    println!("{}", format!("Checking {} bootnodes (timeout: {}ms)", list.len(), timeout_ms).bold());
+    println!();
+
+    let mut reachable = 0;
+    let mut unreachable = 0;
+    let timeout_dur = Duration::from_millis(timeout_ms);
+
+    for bootnode in &list {
+        // Strip identity prefix (noise_abc@host:port -> host:port)
+        let addr_str = bootnode.split_once('@').map(|(_, rest)| rest).unwrap_or(bootnode);
+
+        // Try to parse as SocketAddr first; if that fails, try hostname resolution
+        let socket_addrs: Vec<std::net::SocketAddr> = if let Ok(addr) = addr_str.parse() {
+            vec![addr]
+        } else {
+            match tokio::net::lookup_host(addr_str).await {
+                Ok(iter) => iter.collect(),
+                Err(e) => {
+                    println!("  {} {}: DNS resolution failed ({})", "✗".red(), bootnode, e);
+                    unreachable += 1;
+                    continue;
+                }
+            }
+        };
+
+        if socket_addrs.is_empty() {
+            println!("  {} {}: no addresses", "✗".red(), bootnode);
+            unreachable += 1;
+            continue;
+        }
+
+        // Try each resolved address
+        let mut connected = false;
+        for addr in &socket_addrs {
+            match timeout(timeout_dur, TcpStream::connect(addr)).await {
+                Ok(Ok(_stream)) => {
+                    println!("  {} {} ({})", "✓".green(), bootnode, addr);
+                    connected = true;
+                    reachable += 1;
+                    break;
+                }
+                Ok(Err(e)) => {
+                    // Connection refused / reset
+                    println!("  {} {} ({}): {}", "✗".red(), bootnode, addr, e);
+                }
+                Err(_) => {
+                    println!("  {} {} ({}): timeout after {}ms", "✗".red(), bootnode, addr, timeout_ms);
+                }
+            }
+        }
+
+        if !connected {
+            unreachable += 1;
+        }
+    }
+
+    println!();
+    println!("{}", "Summary:".bold());
+    println!("  Reachable:   {}/{}", reachable, list.len());
+    println!("  Unreachable: {}/{}", unreachable, list.len());
+
+    if reachable == 0 {
+        anyhow::bail!("No bootnodes are reachable — node will not bootstrap");
+    } else if unreachable > 0 {
+        println!();
+        println!(
+            "  {} {} of {} bootnodes unreachable — failover may be degraded",
+            "⚠".yellow(),
+            unreachable,
+            list.len()
+        );
+    } else {
+        println!();
+        println!("  {} All bootnodes reachable", "✓".green());
+    }
+
     Ok(())
 }
 

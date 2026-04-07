@@ -24,7 +24,7 @@ fn generate_test_transaction(nonce: u64, to: Option<&str>, value: u64) -> String
         "gas": "0x5208", // 21000 gas (minimum for transfer)
         "gasPrice": "0x3b9aca00", // 1 gwei
         "data": "0x", // Empty data
-        "chainId": "0x539" // Local testnet chain ID (1337)
+        "chainId": "0x9d0c" // Citrate testnet beta (40204)
     });
 
     serde_json::to_string(&tx).unwrap_or_default()

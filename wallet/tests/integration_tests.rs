@@ -10,7 +10,7 @@
 //!
 //! Environment variables:
 //! - CITRATE_RPC_URL: RPC endpoint (default: http://localhost:8545)
-//! - CITRATE_CHAIN_ID: Chain ID (default: 1337)
+//! - CITRATE_CHAIN_ID: Chain ID (default: 40204 — testnet beta)
 //! - SKIP_INTEGRATION_TESTS: Set to "true" to skip these tests
 
 use citrate_wallet::{Wallet, WalletConfig};
@@ -31,7 +31,7 @@ fn get_chain_id() -> u64 {
     env::var("CITRATE_CHAIN_ID")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1337)
+        .unwrap_or(40204) // Testnet beta — canonical
 }
 
 fn should_skip_tests() -> bool {
