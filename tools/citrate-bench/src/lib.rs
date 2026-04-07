@@ -15,8 +15,10 @@ pub mod address_table;
 pub mod config;
 pub mod fingerprint;
 pub mod nonce;
+pub mod rpc;
 pub mod runner;
 pub mod signers;
+pub mod tracker;
 pub mod tx;
 pub mod workload;
 
@@ -58,6 +60,15 @@ pub enum Error {
 
     #[error("runner: {0}")]
     Runner(String),
+
+    #[error("rpc: {0}")]
+    Rpc(String),
+
+    #[error("rpc http: {0}")]
+    RpcHttp(String),
+
+    #[error("tracker: {0}")]
+    Tracker(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -9,11 +9,14 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+use citrate_bench::rpc::RpcClient;
 use citrate_bench::runner::{RunMode, RunOptions, Runner};
 use citrate_bench::signers::{keystore, pool::SignerPool, Signer};
+use citrate_bench::tracker::TrackerOptions;
 use citrate_bench::tx::legacy::LegacyTx;
 use citrate_bench::workload::transfer::SimpleTransfer;
 use citrate_bench::workload::{WorkloadClass, WorkloadContext};
@@ -88,12 +91,53 @@ enum Command {
         gas_price_gwei: u64,
         #[arg(long, default_value_t = 100)]
         per_signer_max_inflight: usize,
-        #[arg(long, default_value = "0x0000000000000000000000000000000000000001")]
+        #[arg(long, default_value = "0x00000000000000000000000000000000000000de")]
         recipient: String,
         /// Starting nonce applied to every signer. Phase 3 will read
         /// this per-signer from the chain.
         #[arg(long, default_value_t = 0)]
         starting_nonce: u64,
+    },
+    /// Real benchmark: submit signed txs via eth_sendRawTransaction,
+    /// track receipts, cross-check ground truth against on-chain
+    /// nonce deltas.
+    Bench {
+        #[arg(long)]
+        rpc_url: String,
+        #[arg(long)]
+        keystore_dir: PathBuf,
+        /// Comma-separated keystore account names.
+        #[arg(long, value_delimiter = ',')]
+        accounts: Vec<String>,
+        #[arg(long, conflicts_with = "prompt")]
+        passphrase_file: Option<PathBuf>,
+        #[arg(long)]
+        prompt: bool,
+        /// Expected chain id. If the RPC's `eth_chainId` disagrees,
+        /// the bench refuses to run.
+        #[arg(long)]
+        expected_chain_id: u64,
+        #[arg(long, default_value_t = 1000)]
+        target_tps: u64,
+        #[arg(long, default_value_t = 10)]
+        duration_secs: u64,
+        #[arg(long, default_value_t = 1)]
+        gas_price_gwei: u64,
+        #[arg(long, default_value_t = 100)]
+        per_signer_max_inflight: usize,
+        #[arg(long, default_value_t = 500)]
+        concurrency_cap: usize,
+        #[arg(long, default_value_t = 15)]
+        cooldown_secs: u64,
+        #[arg(long, default_value_t = 16)]
+        tracker_workers: usize,
+        #[arg(long, default_value_t = 60)]
+        receipt_timeout_secs: u64,
+        #[arg(long, default_value = "0x00000000000000000000000000000000000000de")]
+        recipient: String,
+        /// Minimum balance (in wei) each signer must hold at preflight.
+        #[arg(long, default_value_t = 1_000_000_000_000_000u128)]
+        funding_floor_wei: u128,
     },
 }
 
@@ -147,6 +191,44 @@ async fn run(cli: Cli) -> citrate_bench::Result<()> {
                 per_signer_max_inflight,
                 recipient,
                 starting_nonce,
+            })
+            .await
+        }
+        Command::Bench {
+            rpc_url,
+            keystore_dir,
+            accounts,
+            passphrase_file,
+            prompt,
+            expected_chain_id,
+            target_tps,
+            duration_secs,
+            gas_price_gwei,
+            per_signer_max_inflight,
+            concurrency_cap,
+            cooldown_secs,
+            tracker_workers,
+            receipt_timeout_secs,
+            recipient,
+            funding_floor_wei,
+        } => {
+            cmd_bench(BenchArgs {
+                rpc_url,
+                keystore_dir,
+                accounts,
+                passphrase_file,
+                prompt,
+                expected_chain_id,
+                target_tps,
+                duration_secs,
+                gas_price_gwei,
+                per_signer_max_inflight,
+                concurrency_cap,
+                cooldown_secs,
+                tracker_workers,
+                receipt_timeout_secs,
+                recipient,
+                funding_floor_wei,
             })
             .await
         }
@@ -286,6 +368,134 @@ async fn cmd_dry_run(args: DryRunArgs) -> citrate_bench::Result<()> {
     result.print_summary();
     println!();
     println!("(not broadcast — Phase 2 dry-run)");
+    Ok(())
+}
+
+struct BenchArgs {
+    rpc_url: String,
+    keystore_dir: PathBuf,
+    accounts: Vec<String>,
+    passphrase_file: Option<PathBuf>,
+    prompt: bool,
+    expected_chain_id: u64,
+    target_tps: u64,
+    duration_secs: u64,
+    gas_price_gwei: u64,
+    per_signer_max_inflight: usize,
+    concurrency_cap: usize,
+    cooldown_secs: u64,
+    tracker_workers: usize,
+    receipt_timeout_secs: u64,
+    recipient: String,
+    funding_floor_wei: u128,
+}
+
+async fn cmd_bench(args: BenchArgs) -> citrate_bench::Result<()> {
+    if args.accounts.is_empty() {
+        return Err(citrate_bench::Error::Config(
+            "--accounts must list at least one keystore account".into(),
+        ));
+    }
+
+    // Build the RPC client first so we can preflight the chain.
+    let client = RpcClient::new(&args.rpc_url, Duration::from_secs(10))?;
+
+    // Preflight 1: chain id matches.
+    let actual_chain_id = client.chain_id().await?;
+    if actual_chain_id != args.expected_chain_id {
+        return Err(citrate_bench::Error::Config(format!(
+            "chain id mismatch: RPC reports {} but --expected-chain-id is {}",
+            actual_chain_id, args.expected_chain_id
+        )));
+    }
+    println!("preflight ok: chain_id = {actual_chain_id}");
+
+    // Preflight 2: load signers + check funding floor + fetch nonces.
+    let source = passphrase_source(
+        args.passphrase_file,
+        args.prompt,
+        format!("{}", args.keystore_dir.display()),
+    )?;
+    let signers = keystore::load_many(&args.keystore_dir, &args.accounts, &source)?;
+    println!("loaded {} signer(s)", signers.len());
+
+    let mut starting_nonces = Vec::with_capacity(signers.len());
+    for signer in &signers {
+        let addr = signer.address_hex();
+        let balance = client.get_balance(&addr, "latest").await?;
+        if balance < args.funding_floor_wei {
+            return Err(citrate_bench::Error::Config(format!(
+                "signer {} balance {} wei < funding floor {} wei",
+                addr, balance, args.funding_floor_wei
+            )));
+        }
+        let nonce = client.get_transaction_count(&addr, "latest").await?;
+        println!("  {addr}  balance={balance} wei  starting_nonce={nonce}");
+        starting_nonces.push(nonce);
+    }
+
+    // Build the pool with chain-queried starting nonces.
+    let pool = Arc::new(SignerPool::new(
+        signers,
+        starting_nonces,
+        args.per_signer_max_inflight,
+    )?);
+
+    // Workload + context.
+    let recipient = parse_eth_address(&args.recipient)?;
+    let workload_inner = SimpleTransfer {
+        recipient,
+        value_wei: 1,
+        gas_limit: 21_000,
+    };
+    let workload: Arc<dyn WorkloadClass> = Arc::new(workload_inner);
+    let gas_price_wei = (args.gas_price_gwei as u128) * 1_000_000_000u128;
+    let ctx = Arc::new(WorkloadContext::for_dry_run(
+        args.expected_chain_id,
+        gas_price_wei,
+    ));
+
+    // Runner + mode.
+    let options = RunOptions {
+        duration_secs: args.duration_secs,
+        target_tps: args.target_tps,
+        sample_cap: 16,
+    };
+    let runner = Runner::new(pool, ctx, workload, options)?;
+
+    let tracker_options = TrackerOptions {
+        worker_count: args.tracker_workers,
+        per_tx_timeout: Duration::from_secs(args.receipt_timeout_secs),
+        ..TrackerOptions::default()
+    };
+    let mode = RunMode::Broadcast {
+        client,
+        tracker_options,
+        concurrency_cap: args.concurrency_cap,
+        cooldown_secs: args.cooldown_secs,
+    };
+
+    println!();
+    println!("starting bench");
+    println!("  rpc_url               = {}", args.rpc_url);
+    println!("  target_tps            = {}", args.target_tps);
+    println!("  duration_secs         = {}", args.duration_secs);
+    println!("  concurrency_cap       = {}", args.concurrency_cap);
+    println!("  tracker_workers       = {}", args.tracker_workers);
+    println!("  receipt_timeout_secs  = {}", args.receipt_timeout_secs);
+    println!();
+
+    let result = runner.run(mode).await?;
+    result.print_summary();
+
+    if let Some(b) = &result.broadcast {
+        if !b.ground_truth_match {
+            return Err(citrate_bench::Error::Runner(format!(
+                "ground truth mismatch: mined_nonce_delta={} included_total={}",
+                b.mined_nonce_delta_total, b.tracker_stats.included
+            )));
+        }
+    }
     Ok(())
 }
 
