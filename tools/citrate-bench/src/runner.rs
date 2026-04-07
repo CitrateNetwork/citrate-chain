@@ -1,37 +1,75 @@
 //! Benchmark runner.
 //!
-//! Phase 2 responsibility: drive tx construction at a target rate.
-//! Phase 3 extends this with real RPC submission. The shape of the
-//! loop does not change between phases — only the dispatch inside
-//! the per-tx step does.
+//! Phase 2 introduced the rate-limited dry-run loop. Phase 3 adds
+//! `RunMode::Broadcast` which submits real signed transactions via
+//! `eth_sendRawTransaction`, hands accepted hashes off to a receipt
+//! tracker, and returns both RPC-acceptance and block-inclusion
+//! counters as first-class metrics.
 //!
-//! Rate limiting is **deadline-based**, not sleep-between-each-tx.
-//! For submission index `i`, the target wall-clock moment is
-//! `run_start + (i / target_tps) seconds`. The runner sleeps until
-//! that deadline before building the next tx. This produces a steady
-//! stream that matches `target_tps` regardless of per-tx overhead.
+//! Rate limiting is still **deadline-based**. The main loop signs
+//! inline (fast) and, in broadcast mode, spawns one `tokio::spawn`
+//! per submission. A global `Semaphore` bounds the total number of
+//! concurrent submissions to `concurrency_cap`, giving
+//! backpressure when the network can't keep up.
 //!
-//! When `target_tps` is zero, the loop runs as fast as it can — used
-//! only in unit tests of the loop's accounting.
+//! The per-signer `NoncePermit` is owned by the submission task
+//! until the RPC response lands, so the per-signer in-flight cap
+//! (`max_per_sender`) correctly counts network-inflight, not just
+//! locally-built-but-queued.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::sync::Semaphore;
+
+use crate::rpc::{RpcClient, SendRawOutcome};
 use crate::signers::pool::SignerPool;
+use crate::tracker::{Tracker, TrackerOptions, TrackerStats, TxToTrack};
 use crate::tx::SignedTx;
 use crate::workload::{WorkloadClass, WorkloadContext};
 use crate::{Error, Result};
 
 /// How the runner handles each signed tx.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum RunMode {
-    /// Build + sign transactions but never broadcast. Used for
-    /// Phase 2 and as the `--dry-run` switch in later phases.
+    /// Build + sign transactions, never broadcast.
     DryRun,
-    // Phase 3 will add: Broadcast { rpc_url: String, timeout_ms: u64 }
+    /// Submit via `eth_sendRawTransaction`, track receipts.
+    Broadcast {
+        client: RpcClient,
+        tracker_options: TrackerOptions,
+        /// Max concurrent in-flight submissions across the whole
+        /// runner (not per signer — the per-signer cap is enforced
+        /// by `SignerPool::per_signer_max_inflight`).
+        concurrency_cap: usize,
+        /// How long to keep the tracker running after the main
+        /// submission loop ends, giving late receipts a chance to
+        /// land.
+        cooldown_secs: u64,
+    },
 }
 
-/// Knobs the runner needs.
+impl std::fmt::Debug for RunMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunMode::DryRun => f.write_str("DryRun"),
+            RunMode::Broadcast {
+                client,
+                concurrency_cap,
+                cooldown_secs,
+                ..
+            } => f
+                .debug_struct("Broadcast")
+                .field("rpc_url", &client.url())
+                .field("concurrency_cap", concurrency_cap)
+                .field("cooldown_secs", cooldown_secs)
+                .finish(),
+        }
+    }
+}
+
+/// Knobs the runner needs regardless of mode.
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     pub duration_secs: u64,
@@ -49,25 +87,37 @@ impl RunOptions {
     }
 }
 
-/// Outcome of a single run.
+/// Ground-truth broadcast results. Populated only in `Broadcast` mode.
+#[derive(Debug, Clone, Default)]
+pub struct BroadcastResult {
+    pub rpc_accepted: u64,
+    pub rpc_rejected: u64,
+    pub rejected_reasons: Vec<String>,
+    pub tracker_stats: TrackerStats,
+    /// Summed over all signers, the difference between each signer's
+    /// final `eth_getTransactionCount(latest)` and its starting
+    /// nonce. This is the canonical "mined" count — if it disagrees
+    /// with `tracker_stats.included`, one of the two is wrong, and
+    /// the report flags the mismatch.
+    pub mined_nonce_delta_total: u64,
+    pub ground_truth_match: bool,
+    pub included_tps: f64,
+}
+
+/// Full run outcome.
 #[derive(Debug)]
 pub struct RunResult {
-    /// Slots the rate limiter attempted to fill.
     pub attempted: u64,
-    /// Slots where the pool was saturated and no signer was available.
     pub pool_saturated: u64,
-    /// Transactions successfully signed.
     pub signed_ok: u64,
-    /// Signing errors (should be zero in dry-run under normal inputs).
     pub signing_errors: u64,
     pub duration_secs: f64,
-    /// Signed tx per second, measured end-to-end.
     pub effective_tps: f64,
-    /// One entry per signer, in pool order.
     pub per_signer_count: Vec<u64>,
-    /// First N signed txs (N = `RunOptions::sample_cap`) for inspection.
     pub sample_txs: Vec<SignedTx>,
     pub mode: RunMode,
+    /// Broadcast metrics. `None` in dry-run mode.
+    pub broadcast: Option<BroadcastResult>,
 }
 
 impl RunResult {
@@ -82,6 +132,28 @@ impl RunResult {
         for (i, n) in self.per_signer_count.iter().enumerate() {
             println!("  signer[{i}] signed = {n}");
         }
+        if let Some(b) = &self.broadcast {
+            println!("-- broadcast --");
+            println!("  rpc_accepted             = {}", b.rpc_accepted);
+            println!("  rpc_rejected             = {}", b.rpc_rejected);
+            println!("  included                 = {}", b.tracker_stats.included);
+            println!("  reverted                 = {}", b.tracker_stats.reverted);
+            println!("  inclusion_timeouts       = {}", b.tracker_stats.timeouts);
+            println!("  tracker_transport_errors = {}", b.tracker_stats.transport_errors);
+            println!(
+                "  avg_inclusion_latency_ms = {:.2}",
+                b.tracker_stats.avg_inclusion_latency_ms
+            );
+            println!("  mined_nonce_delta_total  = {}", b.mined_nonce_delta_total);
+            println!("  ground_truth_match       = {}", b.ground_truth_match);
+            println!("  included_tps             = {:.2}", b.included_tps);
+            if !b.rejected_reasons.is_empty() {
+                println!("  reject samples           =");
+                for r in b.rejected_reasons.iter().take(5) {
+                    println!("    {r}");
+                }
+            }
+        }
         for (i, s) in self.sample_txs.iter().take(3).enumerate() {
             println!(
                 "  sample[{i}] nonce={} hash={} (len={} bytes)",
@@ -89,6 +161,48 @@ impl RunResult {
                 s.hash_hex(),
                 s.raw.len()
             );
+        }
+    }
+}
+
+/// Shared mutable state accumulated during the run. Atomics for the
+/// hot path; a mutex for the cold sample path.
+struct RunState {
+    signing_errors: AtomicU64,
+    rpc_accepted: AtomicU64,
+    rpc_rejected: AtomicU64,
+    per_signer_count: Vec<AtomicU64>,
+    sample_txs: Mutex<Vec<SignedTx>>,
+    rejected_reasons: Mutex<Vec<String>>,
+    sample_cap: usize,
+}
+
+impl RunState {
+    fn new(pool_len: usize, sample_cap: usize) -> Self {
+        Self {
+            signing_errors: AtomicU64::new(0),
+            rpc_accepted: AtomicU64::new(0),
+            rpc_rejected: AtomicU64::new(0),
+            per_signer_count: (0..pool_len).map(|_| AtomicU64::new(0)).collect(),
+            sample_txs: Mutex::new(Vec::with_capacity(sample_cap)),
+            rejected_reasons: Mutex::new(Vec::with_capacity(16)),
+            sample_cap,
+        }
+    }
+
+    fn record_sample(&self, tx: &SignedTx) {
+        if let Ok(mut v) = self.sample_txs.lock() {
+            if v.len() < self.sample_cap {
+                v.push(tx.clone());
+            }
+        }
+    }
+
+    fn record_rejection(&self, reason: String) {
+        if let Ok(mut v) = self.rejected_reasons.lock() {
+            if v.len() < 16 {
+                v.push(reason);
+            }
         }
     }
 }
@@ -113,7 +227,6 @@ impl Runner {
         if options.duration_secs == 0 {
             return Err(Error::Runner("duration_secs must be > 0".into()));
         }
-        // target_tps == 0 is allowed (best-effort mode for tests).
         Ok(Self {
             pool,
             context,
@@ -126,23 +239,35 @@ impl Runner {
     pub async fn run(&self, mode: RunMode) -> Result<RunResult> {
         let duration = Duration::from_secs(self.options.duration_secs);
         let target_tps = self.options.target_tps;
-        // Nanoseconds between tx slots. Zero means "as fast as possible".
         let tx_interval_ns: u64 = if target_tps > 0 {
             1_000_000_000 / target_tps
         } else {
             0
         };
 
+        let state = Arc::new(RunState::new(self.pool.len(), self.options.sample_cap));
         let mut attempted: u64 = 0;
         let mut pool_saturated: u64 = 0;
-        let mut signed_ok: u64 = 0;
-        let mut signing_errors: u64 = 0;
-        let mut per_signer: Vec<u64> = vec![0; self.pool.len()];
-        let mut sample: Vec<SignedTx> = Vec::with_capacity(self.options.sample_cap);
+
+        // Broadcast-mode setup: tracker + submission semaphore.
+        let (tracker, submission_sem, starting_nonces) = match &mode {
+            RunMode::DryRun => (None, None, Vec::new()),
+            RunMode::Broadcast {
+                client,
+                tracker_options,
+                concurrency_cap,
+                ..
+            } => {
+                let starting = self.fetch_starting_nonces(client).await?;
+                let tracker = Tracker::spawn(client.clone(), tracker_options.clone());
+                let sem = Arc::new(Semaphore::new(*concurrency_cap));
+                (Some(tracker), Some(sem), starting)
+            }
+        };
 
         let start = Instant::now();
+
         while start.elapsed() < duration {
-            // Deadline scheduling.
             if tx_interval_ns > 0 {
                 let target_elapsed = Duration::from_nanos(tx_interval_ns * attempted);
                 let now_elapsed = start.elapsed();
@@ -153,20 +278,16 @@ impl Runner {
 
             attempted += 1;
 
-            // Acquire signer + lane.
             let Some((lane_idx, signer, permit)) = self.pool.try_acquire_indexed() else {
                 pool_saturated += 1;
                 continue;
             };
 
-            // Build + sign.
+            // Sign inline.
             let signed = match self.workload.build(&self.context, &signer, permit.nonce) {
                 Ok(tx) => tx,
                 Err(_e) => {
-                    signing_errors += 1;
-                    // Drop permit; the nonce is effectively burned for
-                    // this slot. In Phase 3 the classifier decides
-                    // whether to release or burn.
+                    state.signing_errors.fetch_add(1, Ordering::AcqRel);
                     drop(permit);
                     continue;
                 }
@@ -175,29 +296,158 @@ impl Runner {
             debug_assert_eq!(signed.sender, signer.address);
             debug_assert_eq!(signed.nonce, permit.nonce);
 
-            per_signer[lane_idx] += 1;
-            signed_ok += 1;
-            if sample.len() < self.options.sample_cap {
-                sample.push(signed.clone());
-            }
+            state.per_signer_count[lane_idx].fetch_add(1, Ordering::AcqRel);
+            state.record_sample(&signed);
 
             // Dispatch by mode.
             match &mode {
                 RunMode::DryRun => {
-                    // No broadcast. Drop the permit so the lane can
-                    // reuse the slot. In a real run the permit would
-                    // be held until the receipt lands.
+                    // Drop permit immediately; no network activity.
                     drop(permit);
+                }
+                RunMode::Broadcast { client, .. } => {
+                    // Acquire a submission slot (bounded). This blocks
+                    // the main loop if concurrency_cap would be
+                    // exceeded, applying backpressure to target TPS.
+                    let sem = submission_sem.as_ref().expect("semaphore present in broadcast mode");
+                    let submission_permit =
+                        sem.clone().acquire_owned().await.map_err(|e| {
+                            Error::Runner(format!("submission semaphore closed: {e}"))
+                        })?;
+                    let tracker_tx = tracker
+                        .as_ref()
+                        .expect("tracker present in broadcast mode")
+                        .sender();
+                    let client = client.clone();
+                    let state = Arc::clone(&state);
+                    // Move the NoncePermit into the task so it lives
+                    // until the submission response is known.
+                    let nonce_permit = permit;
+                    tokio::spawn(async move {
+                        let submitted_at = Instant::now();
+                        match client.send_raw_transaction(&signed.raw_hex()).await {
+                            Ok(SendRawOutcome::Accepted(hash)) => {
+                                state.rpc_accepted.fetch_add(1, Ordering::AcqRel);
+                                let _ = tracker_tx
+                                    .send(TxToTrack {
+                                        tx_hash: hash,
+                                        submitted_at,
+                                    })
+                                    .await;
+                            }
+                            Ok(SendRawOutcome::Rejected { code, message }) => {
+                                state.rpc_rejected.fetch_add(1, Ordering::AcqRel);
+                                state.record_rejection(format!("code={code}: {message}"));
+                            }
+                            Err(e) => {
+                                state.rpc_rejected.fetch_add(1, Ordering::AcqRel);
+                                state.record_rejection(format!("transport: {e}"));
+                            }
+                        }
+                        drop(nonce_permit);
+                        drop(submission_permit);
+                    });
                 }
             }
         }
 
+        // --- Drain ---
+        let mode_final = mode.clone_for_result();
+        let broadcast_result = match mode {
+            RunMode::DryRun => None,
+            RunMode::Broadcast {
+                cooldown_secs,
+                client,
+                ..
+            } => {
+                // Give spawned submissions a moment to finish, then
+                // drain the tracker.
+                if cooldown_secs > 0 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                let tracker = tracker.expect("tracker present in broadcast mode");
+                let stats = tokio::time::timeout(
+                    Duration::from_secs(cooldown_secs),
+                    tracker.drain(),
+                )
+                .await
+                .unwrap_or_default();
+
+                // Ground truth: sum the per-signer nonce deltas.
+                let mut mined_delta: u64 = 0;
+                for (i, start_nonce) in starting_nonces.iter().enumerate() {
+                    if let Some(signer) = self.pool.signer(i) {
+                        match client
+                            .get_transaction_count(&signer.address_hex(), "latest")
+                            .await
+                        {
+                            Ok(current) => {
+                                mined_delta = mined_delta.saturating_add(
+                                    current.saturating_sub(*start_nonce),
+                                );
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+
+                let accepted = state.rpc_accepted.load(Ordering::Acquire);
+                let rejected = state.rpc_rejected.load(Ordering::Acquire);
+                let rejected_reasons = state
+                    .rejected_reasons
+                    .lock()
+                    .map(|r| r.clone())
+                    .unwrap_or_default();
+                // Match means the on-chain nonce delta equals the
+                // tracker's included count AND the submission
+                // accounting adds up. We only assert delta == included
+                // here; runners with known timeout windows may see
+                // included < delta because some txs mine after the
+                // tracker gave up.
+                let ground_truth_match = mined_delta == stats.included;
+                Some(BroadcastResult {
+                    rpc_accepted: accepted,
+                    rpc_rejected: rejected,
+                    rejected_reasons,
+                    tracker_stats: stats,
+                    mined_nonce_delta_total: mined_delta,
+                    ground_truth_match,
+                    included_tps: 0.0, // filled below
+                })
+            }
+        };
+
         let duration_secs = start.elapsed().as_secs_f64();
+        let signed_ok: u64 = state
+            .per_signer_count
+            .iter()
+            .map(|a| a.load(Ordering::Acquire))
+            .sum();
+        let signing_errors = state.signing_errors.load(Ordering::Acquire);
         let effective_tps = if duration_secs > 0.0 {
             signed_ok as f64 / duration_secs
         } else {
             0.0
         };
+        let per_signer_count = state
+            .per_signer_count
+            .iter()
+            .map(|a| a.load(Ordering::Acquire))
+            .collect::<Vec<_>>();
+        let sample_txs = state
+            .sample_txs
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+
+        let broadcast = broadcast_result.map(|mut b| {
+            b.included_tps = if duration_secs > 0.0 {
+                b.tracker_stats.included as f64 / duration_secs
+            } else {
+                0.0
+            };
+            b
+        });
 
         Ok(RunResult {
             attempted,
@@ -206,10 +456,46 @@ impl Runner {
             signing_errors,
             duration_secs,
             effective_tps,
-            per_signer_count: per_signer,
-            sample_txs: sample,
-            mode,
+            per_signer_count,
+            sample_txs,
+            mode: mode_final,
+            broadcast,
         })
+    }
+
+    /// Preflight: query each signer's current `latest` nonce. Returns
+    /// them in pool order so the caller can compute deltas later.
+    async fn fetch_starting_nonces(&self, client: &RpcClient) -> Result<Vec<u64>> {
+        let mut out = Vec::with_capacity(self.pool.len());
+        for i in 0..self.pool.len() {
+            let Some(signer) = self.pool.signer(i) else {
+                continue;
+            };
+            let n = client
+                .get_transaction_count(&signer.address_hex(), "latest")
+                .await?;
+            out.push(n);
+        }
+        Ok(out)
+    }
+}
+
+impl RunMode {
+    fn clone_for_result(&self) -> RunMode {
+        match self {
+            RunMode::DryRun => RunMode::DryRun,
+            RunMode::Broadcast {
+                client,
+                tracker_options,
+                concurrency_cap,
+                cooldown_secs,
+            } => RunMode::Broadcast {
+                client: client.clone(),
+                tracker_options: tracker_options.clone(),
+                concurrency_cap: *concurrency_cap,
+                cooldown_secs: *cooldown_secs,
+            },
+        }
     }
 }
 
@@ -240,8 +526,6 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_respects_target_rate() {
-        // 50 tps × 1 second ≈ 50 signed txs, allow a small window
-        // either side for scheduler jitter.
         let pool = pool_of(2);
         let r = runner(pool, 50, 1);
         let result = r.run(RunMode::DryRun).await.expect("run");
@@ -252,6 +536,7 @@ mod tests {
         );
         assert_eq!(result.signing_errors, 0);
         assert_eq!(result.pool_saturated, 0);
+        assert!(result.broadcast.is_none());
     }
 
     #[tokio::test]
@@ -261,7 +546,6 @@ mod tests {
         r.options.sample_cap = 5;
         let result = r.run(RunMode::DryRun).await.expect("run");
         assert!(result.sample_txs.len() <= 5);
-        // At 200 tps for 1s we should definitely have at least 5 samples.
         assert_eq!(result.sample_txs.len(), 5);
     }
 
@@ -272,8 +556,6 @@ mod tests {
         let result = r.run(RunMode::DryRun).await.expect("run");
         let sum: u64 = result.per_signer_count.iter().sum();
         assert_eq!(sum, result.signed_ok);
-        // Round-robin across 4 signers at 100 tps for 1s should spread
-        // roughly evenly. Assert no signer got zero.
         for (i, n) in result.per_signer_count.iter().enumerate() {
             assert!(*n > 0, "signer {i} got zero work: {:?}", result.per_signer_count);
         }
@@ -284,9 +566,6 @@ mod tests {
         let pool = pool_of(3);
         let r = runner(pool, 300, 1);
         let result = r.run(RunMode::DryRun).await.expect("run");
-        // Group sample nonces by signer address and confirm each
-        // group is strictly increasing (they may not be contiguous
-        // because sample_cap may drop some).
         use std::collections::BTreeMap;
         let mut by_sender: BTreeMap<[u8; 20], Vec<u64>> = BTreeMap::new();
         for tx in &result.sample_txs {
@@ -306,13 +585,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_empty_pool() {
+    async fn rejects_zero_duration() {
         let pool = Arc::new(
             SignerPool::new(vec![signer_with_last_byte(1)], vec![0], 1)
                 .expect("pool"),
         );
-        // Empty would fail construction, so instead test that
-        // Runner::new rejects zero duration.
         let ctx = Arc::new(WorkloadContext::for_dry_run(40204, 1));
         let workload: Arc<dyn WorkloadClass> = Arc::new(SimpleTransfer::default_bench());
         let bad = Runner::new(

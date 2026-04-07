@@ -17,7 +17,7 @@ Design spec: `.agentile/quorum/16_POST_CEREMONY_BENCHMARK_HARNESS_SPEC.md`.
 
 ## Status
 
-**Phase 2 — dry-run runner, no chain required.**
+**Phase 3 — broadcast runner validated against local anvil.**
 
 Implemented (Phase 1):
 - `config` — bench.toml loader + offline validation
@@ -37,8 +37,21 @@ Implemented (Phase 2):
 - `runner::RunMode::DryRun` — builds and signs but never broadcasts
 - CLI `dry-run` subcommand with keystore-backed multi-signer flow
 
+Implemented (Phase 3):
+- `rpc::RpcClient` — typed JSON-RPC client (eth_chainId, eth_blockNumber,
+  eth_getTransactionCount, eth_getBalance, eth_sendRawTransaction,
+  eth_getTransactionReceipt) with mockito-based unit tests
+- `tracker::Tracker` — receipt polling worker pool with exponential
+  backoff, per-tx timeout, atomic counters, bounded mpsc channel
+- `runner::RunMode::Broadcast` — submits via `eth_sendRawTransaction`,
+  spawns bounded concurrent submission tasks, hands accepted hashes
+  to the tracker, computes ground-truth cross-check from on-chain
+  nonce deltas
+- CLI `bench` subcommand with chain-id + balance + nonce preflight
+- Anvil-based integration test (`tests/broadcast_anvil.rs`, `#[ignore]`
+  by default, opt in via `CITRATE_BENCH_ANVIL_*` env vars)
+
 Not yet implemented (later phases):
-- Phase 3: real submission via `eth_sendRawTransaction`
 - Phase 4: multi-class mix
 - Phase 5: finality tracker (depth + checkpoint)
 - Phase 6: production run on frozen testnet
@@ -60,7 +73,7 @@ cargo run -- show-addresses --table path/to/30_address_table.json
 # Verify a ceremony bundle sha256
 cargo run -- verify-bundle --bundle 60_proof_bundle.tar.gz --expected sha256:...
 
-# Phase 2 end-to-end dry-run with Foundry keystore accounts
+# Phase 2: end-to-end dry-run, no network
 cargo run --release -- dry-run \
   --keystore-dir ~/.foundry/keystores \
   --accounts bench-01,bench-02,bench-03 \
@@ -68,11 +81,32 @@ cargo run --release -- dry-run \
   --chain-id 40204 \
   --target-tps 5000 \
   --duration-secs 10
+
+# Phase 3: real broadcast against a running chain
+cargo run --release -- bench \
+  --rpc-url http://127.0.0.1:8545 \
+  --keystore-dir ~/.foundry/keystores \
+  --accounts bench-01,bench-02,bench-03 \
+  --passphrase-file ~/.bench-pw \
+  --expected-chain-id 40204 \
+  --target-tps 5000 \
+  --duration-secs 30 \
+  --concurrency-cap 500 \
+  --tracker-workers 16 \
+  --funding-floor-wei 1000000000000000000
+
+# Phase 3 integration test against live anvil (opt-in)
+CITRATE_BENCH_ANVIL_RPC=http://127.0.0.1:18546 \
+CITRATE_BENCH_ANVIL_CHAIN_ID=31337 \
+CITRATE_BENCH_ANVIL_FUNDER_PK=0x... \
+cargo test --test broadcast_anvil -- --ignored --nocapture
 ```
 
-The dry-run path signs transactions at the target rate and reports the
-effective TPS, per-signer counts, and sample hashes. It never touches
-the network.
+The `bench` subcommand preflights chain id, balance floor, and per-signer
+starting nonce against the RPC before running. It then submits signed
+transactions via `eth_sendRawTransaction`, tracks receipts, and cross-
+checks the included count against on-chain nonce deltas as ground truth.
+Exits non-zero if `ground_truth_match` is false.
 
 ## Preconditions for a real run
 

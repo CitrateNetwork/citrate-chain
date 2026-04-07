@@ -22,12 +22,22 @@ pub struct SimpleTransfer {
 }
 
 impl SimpleTransfer {
-    /// Recipient `0x00...01` with 1 wei and 21_000 gas. The recipient
-    /// does not matter for the benchmark as long as it is not the
-    /// sender itself.
+    /// Default recipient: `0x00000000000000000000000000000000000000de` — an
+    /// EOA-shaped address well outside the precompile range
+    /// (0x01..=0x09).
+    ///
+    /// Why this matters: revm-based chains (including anvil) mark
+    /// plain-value transfers to precompile addresses as reverted, so
+    /// the naive choice of `0x...01` produces `status = 0x0` receipts
+    /// even though gas is consumed and nonce is advanced. The benchmark
+    /// would then misreport every tx as a revert. Picking any address
+    /// above `0x09` avoids the issue.
+    ///
+    /// Defaults to 1 wei and 21_000 gas. Real benchmark configs should
+    /// override `recipient` with an address they control.
     pub fn default_bench() -> Self {
         let mut to = [0u8; 20];
-        to[19] = 1;
+        to[19] = 0xde;
         Self {
             recipient: to,
             value_wei: 1,

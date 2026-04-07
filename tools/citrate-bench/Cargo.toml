@@ -30,8 +30,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 
-# Async runtime (runner rate limiter + Phase 3+ RPC client)
+# Async runtime (runner rate limiter + RPC client)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+# HTTP JSON-RPC client (Phase 3+)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # CLI and error handling
 clap = { version = "4", features = ["derive"] }
@@ -44,6 +47,7 @@ rpassword = "7"
 [dev-dependencies]
 tempfile = "3"
 rand = "0.8"
+mockito = "1"
 
 [workspace]
 # Standalone crate: NOT a member of the main citrate workspace.
