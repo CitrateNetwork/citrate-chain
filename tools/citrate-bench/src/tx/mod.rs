@@ -4,9 +4,11 @@
 //! EIP-155 signing hash are cross-checked against the canonical test
 //! vector in EIP-155 itself (see `tests/legacy_tx_vectors.rs`).
 //!
-//! Later phases will add EIP-1559 typed transactions and the ABI
-//! encoders for the workload classes.
+//! Phase 4 adds `abi`: the narrow set of Ethereum ABI encoders the
+//! contract workload classes need (function selectors, static words,
+//! the `Forwarder.execute` tuple).
 
+pub mod abi;
 pub mod legacy;
 
 /// A signed transaction, ready to submit via `eth_sendRawTransaction`.
