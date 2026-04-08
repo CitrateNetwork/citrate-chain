@@ -24,7 +24,7 @@ impl StateApi {
             .state
             .get_account(&address)
             .map_err(|e| ApiError::InternalError(e.to_string()))?
-            .unwrap_or_default();
+            .unwrap_or_else(|| self.executor.get_canonical_account(&address));
 
         Ok(AccountResponse {
             address,
@@ -42,19 +42,19 @@ impl StateApi {
 
     /// Get account balance
     pub async fn get_balance(&self, address: Address) -> Result<U256, ApiError> {
-        let balance = self.executor.get_balance(&address);
+        let balance = self.executor.get_canonical_account(&address).balance;
         Ok(balance)
     }
 
     /// Get account nonce
     pub async fn get_nonce(&self, address: Address) -> Result<u64, ApiError> {
-        let nonce = self.executor.get_nonce(&address);
+        let nonce = self.executor.get_canonical_account(&address).nonce;
         Ok(nonce)
     }
 
     /// Get contract code
     pub async fn get_code(&self, address: Address) -> Result<Vec<u8>, ApiError> {
-        let code_hash = self.executor.get_code_hash(&address);
+        let code_hash = self.executor.get_canonical_account(&address).code_hash;
 
         if code_hash == Hash::default() {
             return Ok(Vec::new());
