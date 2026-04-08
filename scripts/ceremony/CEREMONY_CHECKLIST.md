@@ -82,12 +82,17 @@ These steps happen asynchronously before the live ceremony session. The ceremony
 - [ ] `provision-host.sh deployer` has run on the deployer host
 - [ ] `provision-host.sh bootnode` has run on at least one rehearsal bootnode
 - [ ] Fresh genesis generated on the rehearsal bootnode
+- [ ] If this is a retry after a previous rehearsal, `ceremony-reroll.sh --reroll`
+      was run on every host that had prior deploy state (see
+      `LOCAL_REHEARSAL.md` §Clean-Slate Reroll). Stale
+      `.citrate-testnet-beta/` dirs or `contracts/broadcast/` files
+      cause `CreateCollision` on first DeployAll.
 
 ### 1.2 — Rehearsal Ceremony
 
 - [ ] `export CEREMONY_MODE=rehearsal` set on deployer host
 - [ ] `export CEREMONY_RPC_URL=http://<rehearsal-rpc>:8545`
-- [ ] `export CEREMONY_DEPLOYER_KEYSTORE=$HOME/.foundry/keystores/rehearsal-deployer`
+- [ ] `export CEREMONY_DEPLOYER_ACCOUNT=rehearsal-deployer`
 - [ ] `export CEREMONY_DEPLOYER_ADDRESS=<rehearsal-deployer-address>`
 - [ ] `./ceremony.sh` runs successfully (no errors)
 - [ ] Output directory captured: `ceremony-output/<timestamp>/`
@@ -221,4 +226,5 @@ Total live-session time for Phase 3: approximately 2-4 hours including review an
 - `ceremony.sh` — the script this checklist runs
 - `provision-host.sh` — host prep script
 - `keystore_protocol.md` — key handling protocol
+- `LOCAL_REHEARSAL.md` — safe disposable local practice path
 - `AUDITOR_PRE_SIGNOFF.md` — the artifact the auditor signs before the ceremony

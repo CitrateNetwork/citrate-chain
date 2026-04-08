@@ -1,4 +1,25 @@
-//! Citrate Comprehensive Benchmark Suite
+//! # DEPRECATED FOR TESTNET OR RELEASE CLAIMS
+//!
+//! This binary is a **devnet rehearsal tool only**. It uses
+//! `eth_sendTransaction` with a hardcoded fake unlocked sender,
+//! which only works on permissive local devnet nodes (e.g., `anvil`).
+//! It does **not** exercise the real client signing flow, and its
+//! output must **not** be used as evidence for auditors, release
+//! notes, blog posts, or anything that leaves the repository.
+//!
+//! **Canonical harness**: `citrate_v0.01.1/tools/citrate-bench/`.
+//! That harness signs transactions client-side via
+//! `eth_sendRawTransaction`, computes ground truth from on-chain
+//! nonce deltas, and produces auditable reports. Use it for anything
+//! you would put in front of another human.
+//!
+//! See `citrate_v0.01.1/tests/load/README.md` for the full rationale
+//! and `.agentile/quorum/16_POST_CEREMONY_BENCHMARK_HARNESS_SPEC.md`
+//! for the historical lint this deprecation notice closes.
+//!
+//! ---
+//!
+//! Citrate Comprehensive Benchmark Suite (historical)
 //!
 //! Runs a series of transaction types at configurable TPS and produces
 //! a timestamped report. Covers: simple transfers, contract deployment,

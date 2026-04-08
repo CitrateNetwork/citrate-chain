@@ -4,7 +4,7 @@ use citrate_consensus::{Hash, PublicKey, Transaction};
 use priority_queue::PriorityQueue;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -23,6 +23,14 @@ pub enum MempoolError {
 
     #[error("Nonce too low: expected {expected}, got {got}")]
     NonceTooLow { expected: u64, got: u64 },
+
+    /// A transaction with this exact nonce is already buffered in the
+    /// mempool for this sender. Replacement with a higher gas price
+    /// is not yet supported; senders must wait for the prior tx to
+    /// either be included in a block or be evicted before re-using
+    /// the nonce.
+    #[error("Duplicate nonce for sender: nonce {nonce}")]
+    DuplicateNonce { nonce: u64 },
 
     #[error("Gas price too low: minimum {min}, got {got}")]
     GasPriceTooLow { min: u64, got: u64 },
@@ -190,8 +198,30 @@ pub struct Mempool {
     /// Transactions grouped by sender
     by_sender: Arc<RwLock<HashMap<PublicKey, VecDeque<Hash>>>>,
 
-    /// Nonce tracking per sender
-    nonces: Arc<RwLock<HashMap<PublicKey, u64>>>,
+    /// Per-sender set of nonces currently buffered in the mempool.
+    ///
+    /// Previously this was a `HashMap<PublicKey, u64>` tracking a
+    /// single "next expected nonce" per sender, written through
+    /// `tx.nonce + 1` on every accepted tx. That design had two
+    /// catastrophic faults (backlog #123, L-002):
+    ///
+    /// 1. **Forward-jump accept**: any accepted future-nonce tx
+    ///    leapfrogged the counter, causing every later lower-nonce
+    ///    tx to be rejected as `NonceTooLow` under any concurrent
+    ///    submission pattern.
+    /// 2. **Stale counter**: the counter was never decremented when
+    ///    txs left the mempool (eviction, expiration), leaving a
+    ///    phantom high watermark that permanently poisoned the
+    ///    sender until node restart.
+    ///
+    /// The set-of-nonces model fixes both: the set IS the source
+    /// of truth for "what nonces does this sender have pending?",
+    /// it's pruned on every removal, and `pending_nonce` is
+    /// derived from it on read. No counter to leapfrog, no phantom
+    /// to persist.
+    ///
+    /// Empty sets are pruned from the map eagerly.
+    sender_nonces: Arc<RwLock<HashMap<PublicKey, BTreeSet<u64>>>>,
 
     /// Recently evicted transaction hashes (for duplicate detection)
     evicted: Arc<RwLock<HashSet<Hash>>>,
@@ -211,7 +241,7 @@ impl Mempool {
             transactions: Arc::new(RwLock::new(HashMap::new())),
             priority_queue: Arc::new(RwLock::new(PriorityQueue::new())),
             by_sender: Arc::new(RwLock::new(HashMap::new())),
-            nonces: Arc::new(RwLock::new(HashMap::new())),
+            sender_nonces: Arc::new(RwLock::new(HashMap::new())),
             evicted: Arc::new(RwLock::new(HashSet::new())),
             total_size: Arc::new(RwLock::new(0)),
         }
@@ -272,6 +302,25 @@ impl Mempool {
         }
         drop(sender_txs);
 
+        // Per-sender nonce uniqueness check: the mempool buffers a
+        // set of nonces per sender, not a next-expected counter.
+        // Reject an attempt to add two txs with the same nonce from
+        // the same sender (nonce-replacement is not yet supported).
+        // This path must come AFTER the hash-level duplicate check so
+        // that exact-tx re-adds are caught as DuplicateTransaction,
+        // and we only surface DuplicateNonce when the nonce collides
+        // with a different tx hash.
+        if let Some(set) = self.sender_nonces.read().await.get(&sender) {
+            if set.contains(&tx.nonce) {
+                tracing::warn!(
+                    "Duplicate nonce for sender {:?}: nonce={}",
+                    sender,
+                    tx.nonce
+                );
+                return Err(MempoolError::DuplicateNonce { nonce: tx.nonce });
+            }
+        }
+
         // Check mempool size limit
         if self.transactions.read().await.len() >= self.config.max_size {
             // Try to evict lower priority transaction
@@ -309,8 +358,19 @@ impl Mempool {
             .or_insert_with(VecDeque::new)
             .push_back(tx_hash);
 
-        // Update nonce tracking
-        self.nonces.write().await.insert(sender, tx.nonce + 1);
+        // Update the per-sender nonce set. The old model had a buggy
+        // write-through "next expected" counter here
+        // (`self.nonces.insert(sender, tx.nonce + 1)`) — see the
+        // sender_nonces doc comment on the struct for why that was
+        // catastrophically wrong. The new model simply adds this
+        // tx's nonce to the sender's set; pending_nonce is derived
+        // from the max of the set on read.
+        self.sender_nonces
+            .write()
+            .await
+            .entry(sender)
+            .or_default()
+            .insert(tx.nonce);
 
         // Update total size
         *self.total_size.write().await += tx_size;
@@ -409,20 +469,20 @@ impl Mempool {
             }
         }
 
-        // Check nonce
-        if let Some(&expected_nonce) = self.nonces.read().await.get(&tx.from) {
-            if tx.nonce < expected_nonce {
-                tracing::warn!(
-                    "Transaction nonce too low: {} < {}",
-                    tx.nonce,
-                    expected_nonce
-                );
-                return Err(MempoolError::NonceTooLow {
-                    expected: expected_nonce,
-                    got: tx.nonce,
-                });
-            }
-        }
+        // Note: nonce validation against a per-sender "expected"
+        // counter was removed as part of backlog #123 (L-002) — that
+        // counter was a single high-watermark value that couldn't
+        // represent buffered future nonces and that got poisoned by
+        // evicted forward-jump txs. The new model treats duplicate
+        // nonces from the same sender as the only validation-time
+        // rejection (`DuplicateNonce`, enforced in add_transaction
+        // under the sender-limit check). Stale-vs-chain-state
+        // rejection requires state access and is tracked as a
+        // follow-up (see backlog #123 §"State-aware validation").
+        // Until then, stale txs naturally get filtered out by
+        // get_best_transactions (which picks consecutive nonces
+        // from the mempool minimum) and by the executor rejecting
+        // mismatched nonces on block application.
 
         // Verify signature using real cryptographic verification unless disabled by config
         if !self.config.require_valid_signature {
@@ -545,10 +605,23 @@ impl Mempool {
         // Update total size
         *self.total_size.write().await -= mempool_tx.size;
 
-        // Sprint EL-1 Fix (Issue #20): Rollback nonce if the removed transaction
-        // was at the tip of the sender's nonce chain. This prevents permanent
-        // sender lockout when transactions fail or are evicted.
-        self.rollback_nonce_for_sender(&sender, removed_nonce).await;
+        // Remove this tx's nonce from the per-sender set and prune
+        // the entry entirely if no nonces remain. This replaces the
+        // old `rollback_nonce_for_sender` path, which could only
+        // handle tip-removal and left phantom high watermarks when
+        // a non-tip nonce was removed (backlog #123 fault 2).
+        {
+            let mut sender_nonces = self.sender_nonces.write().await;
+            let prune = if let Some(set) = sender_nonces.get_mut(&sender) {
+                set.remove(&removed_nonce);
+                set.is_empty()
+            } else {
+                false
+            };
+            if prune {
+                sender_nonces.remove(&sender);
+            }
+        }
 
         // Add to evicted set (to prevent re-addition)
         self.evicted.write().await.insert(*hash);
@@ -558,74 +631,70 @@ impl Mempool {
         Some(mempool_tx.tx)
     }
 
-    /// Sprint EL-1 (Issue #20): Rollback the expected nonce for a sender after
-    /// a transaction is removed. If the removed nonce was the tip (expected - 1),
-    /// decrement the expected nonce. Otherwise, trigger a full reconciliation.
-    async fn rollback_nonce_for_sender(&self, sender: &PublicKey, removed_nonce: u64) {
-        let mut nonces = self.nonces.write().await;
-        if let Some(expected) = nonces.get_mut(sender) {
-            if *expected == removed_nonce + 1 {
-                // The removed tx was the tip — decrement
-                *expected = removed_nonce;
-                debug!(
-                    "Rolled back nonce for sender {:?}: {} -> {}",
-                    sender, removed_nonce + 1, removed_nonce
-                );
-            }
-            // If the removed nonce wasn't the tip, we may have a gap.
-            // reconcile_nonces() should be called by the producer post-block.
-        }
-    }
-
-    /// Sprint EL-1 (Issue #20): Reconcile the nonce map with actual remaining
-    /// transactions. Called by the producer after block execution to ensure
-    /// the nonce map accurately reflects the mempool state.
+    /// Consistency check for the per-sender nonce sets.
+    ///
+    /// Historically (Sprint EL-1, Issue #20) this method rebuilt a
+    /// single "expected next nonce" counter per sender from
+    /// `by_sender` after the block producer finished a block, to
+    /// work around the forward-jump bug (backlog #123 fault 1).
+    /// The new set-based nonce model prunes on every
+    /// `remove_transaction` so no post-block reconciliation should
+    /// be needed under normal operation.
+    ///
+    /// This method is kept as a safety net and as a public API for
+    /// tests + the producer. It rebuilds `sender_nonces` from
+    /// `by_sender`/`transactions`, correcting any drift (which
+    /// should only happen if someone bypassed `remove_transaction`).
     pub async fn reconcile_nonces(&self) {
         let by_sender = self.by_sender.read().await;
         let txs = self.transactions.read().await;
-        let mut nonces = self.nonces.write().await;
+        let mut sender_nonces = self.sender_nonces.write().await;
 
-        // Collect senders to remove (can't modify nonces while iterating)
-        let mut to_remove = Vec::new();
-
+        let mut rebuilt: HashMap<PublicKey, BTreeSet<u64>> = HashMap::new();
         for (sender, tx_hashes) in by_sender.iter() {
-            let max_nonce = tx_hashes
+            let set: BTreeSet<u64> = tx_hashes
                 .iter()
                 .filter_map(|h| txs.get(h).map(|t| t.tx.nonce))
-                .max();
+                .collect();
+            if !set.is_empty() {
+                rebuilt.insert(*sender, set);
+            }
+        }
 
-            match max_nonce {
-                Some(n) => {
-                    let new_expected = n + 1;
-                    if let Some(current) = nonces.get(sender) {
-                        if *current != new_expected {
-                            debug!(
-                                "Reconciled nonce for {:?}: {} -> {}",
-                                sender, current, new_expected
-                            );
-                        }
-                    }
-                    nonces.insert(*sender, new_expected);
+        // Detect any divergence for the debug log, then swap in the
+        // rebuilt view wholesale.
+        for (sender, new_set) in rebuilt.iter() {
+            match sender_nonces.get(sender) {
+                Some(old) if old != new_set => {
+                    debug!(
+                        "Reconciled sender_nonces for {:?}: {:?} -> {:?}",
+                        sender, old, new_set
+                    );
                 }
-                None => {
-                    // No remaining transactions — remove sender from nonce map
-                    to_remove.push(*sender);
-                }
+                _ => {}
+            }
+        }
+        for sender in sender_nonces.keys().cloned().collect::<Vec<_>>() {
+            if !rebuilt.contains_key(&sender) {
+                debug!("Removed stale sender_nonces entry for {:?}", sender);
             }
         }
 
-        // Also remove senders who are in nonces but not in by_sender
-        for sender in nonces.keys().cloned().collect::<Vec<_>>() {
-            if !by_sender.contains_key(&sender) {
-                to_remove.push(sender);
-            }
-        }
+        *sender_nonces = rebuilt;
+    }
 
-        for sender in to_remove {
-            if nonces.remove(&sender).is_some() {
-                debug!("Removed stale nonce entry for {:?}", sender);
-            }
-        }
+    /// Return the highest-plus-one nonce currently buffered in the
+    /// mempool for this sender, or `None` if no txs from this sender
+    /// are pending. This is the "pending nonce" value surfaced to
+    /// `eth_getTransactionCount(address, "pending")` via the
+    /// `MempoolAccess::get_pending_nonce` trait method.
+    ///
+    /// Note this is derived on read from the authoritative
+    /// `sender_nonces` set — it cannot drift from the actual tx
+    /// storage the way the old `self.nonces` counter could.
+    pub async fn pending_nonce_for(&self, sender: &PublicKey) -> Option<u64> {
+        let set = self.sender_nonces.read().await;
+        set.get(sender).and_then(|s| s.iter().next_back().copied()).map(|n| n + 1)
     }
 
     /// Get AI transactions (model operations, inference requests)
@@ -869,7 +938,7 @@ impl Mempool {
         self.priority_queue.write().await.clear();
         self.by_sender.write().await.clear();
         self.evicted.write().await.clear();
-        self.nonces.write().await.clear();
+        self.sender_nonces.write().await.clear();
         *self.total_size.write().await = 0;
     }
 }
@@ -974,7 +1043,7 @@ impl MempoolAccess for Arc<Mempool> {
     }
 
     async fn get_pending_nonce(&self, sender: &PublicKey) -> Option<u64> {
-        self.nonces.read().await.get(sender).copied()
+        Mempool::pending_nonce_for(self, sender).await
     }
 
     async fn reconcile_nonces(&self) {
@@ -1031,7 +1100,7 @@ impl MempoolAccess for Arc<RwLock<Mempool>> {
     }
 
     async fn get_pending_nonce(&self, sender: &PublicKey) -> Option<u64> {
-        self.read().await.nonces.read().await.get(sender).copied()
+        self.read().await.pending_nonce_for(sender).await
     }
 
     async fn reconcile_nonces(&self) {
@@ -1099,16 +1168,155 @@ mod tests {
             .await
             .unwrap();
 
-        // After adding tx with nonce 0, expected nonce becomes 1
-        // So adding the same tx again fails with NonceTooLow, not DuplicateTransaction
-        // This is correct behavior - nonce validation happens before duplicate check
+        // Re-adding the exact same tx (same hash) is rejected as
+        // DuplicateTransaction. Pre-backlog-#123 this case was
+        // masked by a spurious NonceTooLow rejection (the buggy
+        // expected-nonce counter had advanced past 0), so the test
+        // asserted the wrong variant; the set-based nonce model
+        // surfaces the real reason.
         let result = mempool.add_transaction(tx.clone(), TxClass::Standard).await;
-        assert!(matches!(result, Err(MempoolError::NonceTooLow { .. })));
+        assert!(
+            matches!(result, Err(MempoolError::DuplicateTransaction(_))),
+            "exact hash re-add should be DuplicateTransaction, got {result:?}"
+        );
+    }
 
-        // To test actual duplicate detection, we need a tx with correct nonce but same hash
-        // Since hash is deterministic based on content, we can't create a true duplicate
-        // without having the same nonce (which triggers NonceTooLow).
-        // This test verifies that old nonces are properly rejected.
+    /// Backlog #123: A second tx with the **same nonce but a different
+    /// hash** from the same sender must be rejected as
+    /// `DuplicateNonce`, not `DuplicateTransaction`. This is the
+    /// nonce-replacement-not-supported case.
+    #[tokio::test]
+    async fn test_duplicate_nonce_different_hash() {
+        let config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+        let sender = [0xab; 32];
+
+        let first = create_test_tx(7, 2_000_000_000, sender);
+        mempool
+            .add_transaction(first, TxClass::Standard)
+            .await
+            .unwrap();
+
+        // Second tx: same sender, same nonce, different gas price
+        // (therefore different hash).
+        let second = create_test_tx(7, 3_000_000_000, sender);
+        let result = mempool.add_transaction(second, TxClass::Standard).await;
+        assert!(
+            matches!(
+                result,
+                Err(MempoolError::DuplicateNonce { nonce: 7 })
+            ),
+            "same-nonce different-hash must be DuplicateNonce, got {result:?}"
+        );
+    }
+
+    /// Backlog #123 primary regression: concurrent out-of-order
+    /// submissions from the same sender must all be accepted, and the
+    /// block-builder must serialize them into consecutive nonce order.
+    ///
+    /// Pre-fix, this test would fail because the mempool's forward-
+    /// jump-accept at line 313 would promote the highest-arrived nonce
+    /// as the expected counter, rejecting every lower-nonce tx that
+    /// followed as `NonceTooLow`.
+    #[tokio::test]
+    async fn test_concurrent_out_of_order_nonces_all_accepted() {
+        let config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+        let sender = [0xcc; 32];
+        let sender_pk = PublicKey::new(sender);
+
+        // Submit nonces in the pathological order 5, 3, 7, 0, 4, 2, 6, 1.
+        // Pre-fix: 5 is accepted, expected becomes 6, then 3 is
+        // NonceTooLow and everything after is rejected.
+        // Post-fix: all eight land in the mempool.
+        let nonces = [5u64, 3, 7, 0, 4, 2, 6, 1];
+        for n in nonces {
+            let tx = create_test_tx(n, 2_000_000_000, sender);
+            mempool
+                .add_transaction(tx, TxClass::Standard)
+                .await
+                .unwrap_or_else(|e| panic!("nonce {n} rejected: {e}"));
+        }
+
+        // The sender set should contain all eight nonces.
+        assert_eq!(mempool.stats().await.total_transactions, 8);
+        assert_eq!(mempool.pending_nonce_for(&sender_pk).await, Some(8));
+
+        // Block-builder should serialize them into 0..=7 order.
+        let best = mempool.get_best_transactions(16, 1_000_000).await;
+        assert_eq!(best.len(), 8);
+        for (i, tx) in best.iter().enumerate() {
+            assert_eq!(tx.nonce, i as u64, "block position {i} has nonce {}", tx.nonce);
+        }
+    }
+
+    /// Backlog #123 phantom-eviction regression: after a tx is added
+    /// and then evicted (the case that catastrophically poisoned the
+    /// mempool during the 2026-04-08 live-chain bench attempt), the
+    /// sender's pending nonce should reflect ONLY currently-buffered
+    /// txs — there must be no phantom high-water-mark left behind.
+    ///
+    /// Pre-fix: the `self.nonces` counter was written with
+    /// `tx.nonce + 1` on add and not decremented when the tx was
+    /// evicted, so a ghost value from the evicted high-nonce tx
+    /// locked out every legitimate later submission.
+    #[tokio::test]
+    async fn test_phantom_eviction_does_not_poison_sender() {
+        let config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+        let sender = [0xdd; 32];
+        let sender_pk = PublicKey::new(sender);
+
+        // Submit a wildly forward-jumped tx at nonce 99_000 and
+        // verify it lands.
+        let future_tx = create_test_tx(99_000, 2_000_000_000, sender);
+        let future_hash = future_tx.hash;
+        mempool
+            .add_transaction(future_tx, TxClass::Standard)
+            .await
+            .unwrap();
+        assert_eq!(
+            mempool.pending_nonce_for(&sender_pk).await,
+            Some(99_001)
+        );
+
+        // Evict the forward-jumped tx — simulate capacity pressure,
+        // expiration, or any other non-inclusion drop.
+        mempool.remove_transaction(&future_hash).await;
+        assert_eq!(
+            mempool.pending_nonce_for(&sender_pk).await,
+            None,
+            "phantom nonce must not persist after eviction"
+        );
+
+        // The same sender must now be able to submit nonces 0..=5
+        // freely (the real use case that was broken on the live
+        // chain: the bench burners were poisoned to reject every
+        // submission after a set of high-nonce forward-jumps were
+        // evicted).
+        for n in 0u64..=5 {
+            let tx = create_test_tx(n, 3_000_000_000, sender);
+            mempool
+                .add_transaction(tx, TxClass::Standard)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("nonce {n} rejected after phantom eviction: {e}")
+                });
+        }
+        assert_eq!(mempool.stats().await.total_transactions, 6);
+        assert_eq!(
+            mempool.pending_nonce_for(&sender_pk).await,
+            Some(6)
+        );
     }
 
     #[tokio::test]
@@ -1367,9 +1575,14 @@ mod tests {
         assert_eq!(best[3].hash, tx_std.hash);
     }
 
-    /// Sprint EL-1 regression (Issue #20): After removing a transaction,
-    /// the sender's nonce should be rolled back so that the same nonce
-    /// can be re-submitted.
+    /// Sprint EL-1 regression (Issue #20), refreshed for backlog #123:
+    /// After removing a transaction, the sender's pending nonce should
+    /// reflect the reduced set so the same nonce can be re-submitted.
+    ///
+    /// The original Sprint EL-1 version reached into `mempool.nonces`
+    /// directly to assert values. With the set-based nonce model that
+    /// field no longer exists; this test uses the public
+    /// `pending_nonce_for` accessor instead.
     #[tokio::test]
     async fn test_el2_nonce_rollback_on_remove() {
         let config = MempoolConfig {
@@ -1378,6 +1591,7 @@ mod tests {
         };
         let mempool = Mempool::new(config);
         let sender = [5u8; 32];
+        let sender_pk = PublicKey::new(sender);
 
         // Add tx with nonce 0
         let tx0 = create_test_tx(0, 2_000_000_000, sender);
@@ -1387,27 +1601,39 @@ mod tests {
             .await
             .unwrap();
 
-        // Expected nonce should now be 1
-        let nonce = mempool.nonces.read().await.get(&PublicKey::new(sender)).copied();
-        assert_eq!(nonce, Some(1), "Expected nonce should be 1 after adding nonce-0 tx");
+        // Pending nonce should now be 1 (max of {0} plus 1)
+        assert_eq!(
+            mempool.pending_nonce_for(&sender_pk).await,
+            Some(1),
+            "pending_nonce should be 1 after adding nonce-0 tx"
+        );
 
-        // Remove the transaction
+        // Remove the transaction — the sender's set should now be empty
+        // and the sender entry should be pruned.
         mempool.remove_transaction(&tx0_hash).await;
-
-        // Expected nonce should be rolled back to 0
-        let nonce_after = mempool.nonces.read().await.get(&PublicKey::new(sender)).copied();
-        assert_eq!(nonce_after, Some(0), "Expected nonce should roll back to 0 after removal");
+        assert_eq!(
+            mempool.pending_nonce_for(&sender_pk).await,
+            None,
+            "pending_nonce should be None after removing the only tx"
+        );
 
         // Re-submit with nonce 0 should succeed (use different gas price for unique hash)
         let tx0_retry = create_test_tx(0, 3_000_000_000, sender);
         let result = mempool
             .add_transaction(tx0_retry, TxClass::Standard)
             .await;
-        assert!(result.is_ok(), "Re-submitting nonce 0 after rollback should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Re-submitting nonce 0 after removal should succeed: {:?}",
+            result.err()
+        );
     }
 
-    /// Sprint EL-1 regression (Issue #20): reconcile_nonces() resets
-    /// nonce map based on actual remaining transactions per sender.
+    /// Sprint EL-1 regression (Issue #20), refreshed for backlog #123:
+    /// reconcile_nonces() should leave a correct view of the per-sender
+    /// nonce sets when called after mutation. With the set-based model
+    /// this is primarily a safety net — remove_transaction keeps the
+    /// sets in sync directly.
     #[tokio::test]
     async fn test_el2_reconcile_nonces() {
         let config = MempoolConfig {
@@ -1416,6 +1642,7 @@ mod tests {
         };
         let mempool = Mempool::new(config);
         let sender = [6u8; 32];
+        let sender_pk = PublicKey::new(sender);
 
         // Add txs with nonces 0, 1, 2
         let tx0 = create_test_tx(0, 2_000_000_000, sender);
@@ -1427,25 +1654,40 @@ mod tests {
         mempool.add_transaction(tx1, TxClass::Standard).await.unwrap();
         mempool.add_transaction(tx2, TxClass::Standard).await.unwrap();
 
-        // Expected nonce should be 3
-        let nonce = mempool.nonces.read().await.get(&PublicKey::new(sender)).copied();
-        assert_eq!(nonce, Some(3));
+        // Pending nonce should be 3 (max of {0,1,2} + 1).
+        assert_eq!(mempool.pending_nonce_for(&sender_pk).await, Some(3));
 
-        // Remove tx with nonce 1 (middle tx)
+        // Remove tx with nonce 1 (middle tx). The set is now {0, 2}.
+        // pending_nonce should still be 3 (max + 1), NOT 1 — the gap
+        // at nonce 1 is representable and doesn't rewind the pending
+        // view. The sender can legitimately re-submit nonce 1 to fill
+        // the gap.
         mempool.remove_transaction(&tx1_hash).await;
+        assert_eq!(mempool.pending_nonce_for(&sender_pk).await, Some(3));
 
-        // After removal, rollback only fires if it was the tip nonce.
-        // Nonce 1 is not the tip (tip is 2+1=3), so rollback won't fire.
-        // But reconcile should fix it based on remaining txs (0 and 2).
+        // reconcile is a no-op in steady state — running it should
+        // not change the observable view.
         mempool.reconcile_nonces().await;
+        assert_eq!(mempool.pending_nonce_for(&sender_pk).await, Some(3));
 
-        // After reconciliation: remaining nonces are 0 and 2, so expected = max(0,2)+1 = 3
-        let nonce_after = mempool.nonces.read().await.get(&PublicKey::new(sender)).copied();
-        assert_eq!(nonce_after, Some(3), "Reconciled nonce should be max(remaining)+1");
+        // Re-submit the gap: nonce 1 at a different gas price (fresh hash).
+        // This must succeed — the old model rejected it as NonceTooLow
+        // because expected was cached at 3; the new model sees a free
+        // slot in the set and accepts.
+        let tx1_retry = create_test_tx(1, 3_000_000_000, sender);
+        let result = mempool.add_transaction(tx1_retry, TxClass::Standard).await;
+        assert!(
+            result.is_ok(),
+            "Refilling a nonce gap must succeed under the set-based model: {:?}",
+            result.err()
+        );
     }
 
-    /// Sprint EL-1 regression (Issue #20): When all transactions for a sender
-    /// are removed, reconcile_nonces() should remove the sender from the map.
+    /// Sprint EL-1 regression (Issue #20), refreshed for backlog #123:
+    /// When all transactions for a sender are removed, the sender
+    /// entry should be pruned from the nonce map. This used to
+    /// require a separate reconcile call; now it happens eagerly in
+    /// remove_transaction.
     #[tokio::test]
     async fn test_el2_reconcile_removes_stale_sender() {
         let config = MempoolConfig {
@@ -1454,6 +1696,7 @@ mod tests {
         };
         let mempool = Mempool::new(config);
         let sender = [7u8; 32];
+        let sender_pk = PublicKey::new(sender);
 
         // Add and remove a transaction
         let tx0 = create_test_tx(0, 2_000_000_000, sender);
@@ -1461,20 +1704,25 @@ mod tests {
         mempool.add_transaction(tx0, TxClass::Standard).await.unwrap();
         mempool.remove_transaction(&tx0_hash).await;
 
-        // Nonce map should still have the sender (rollback sets to 0)
-        let has_sender = mempool.nonces.read().await.contains_key(&PublicKey::new(sender));
-        assert!(has_sender, "Sender should still be in nonce map after rollback");
+        // The sender entry should be pruned eagerly by remove_transaction.
+        assert_eq!(
+            mempool.pending_nonce_for(&sender_pk).await,
+            None,
+            "sender entry should be pruned after last tx removed"
+        );
 
-        // Reconcile should remove sender since no txs remain
+        // reconcile should remain a no-op.
         mempool.reconcile_nonces().await;
+        assert_eq!(mempool.pending_nonce_for(&sender_pk).await, None);
 
-        let has_sender_after = mempool.nonces.read().await.contains_key(&PublicKey::new(sender));
-        assert!(!has_sender_after, "Sender with no remaining txs should be removed after reconcile");
-
-        // Re-submit with nonce 0 should succeed (use different gas price for unique hash)
+        // Re-submit with nonce 0 should succeed.
         let tx0_new = create_test_tx(0, 3_000_000_000, sender);
         let result = mempool.add_transaction(tx0_new, TxClass::Standard).await;
-        assert!(result.is_ok(), "Fresh submit after sender cleanup should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Fresh submit after sender cleanup should succeed: {:?}",
+            result.err()
+        );
     }
 
     /// Fill mempool to max_size, then add one more tx with higher gas price.
