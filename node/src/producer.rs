@@ -645,7 +645,7 @@ impl BlockProducer {
         let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
 
         // Create block header with GhostDAG consensus data
-        let header = BlockHeader {
+        let mut header = BlockHeader {
             version: 1,
             block_hash: Hash::default(), // Will be computed
             selected_parent_hash: selected_parent,
@@ -688,12 +688,15 @@ impl BlockProducer {
         });
 
         // Execute transactions (state root computed after rewards below)
-        let (_pre_reward_root, receipts) = self
+        let (_pre_reward_root, executed_transactions, mut receipts) = self
             .execute_block_transactions(&transactions, &header)
             .await?;
-        let tx_root = self.calculate_tx_root(&transactions)?;
+        let total_gas_used: u64 = receipts.iter().map(|receipt| receipt.gas_used).sum();
+        header.gas_used = total_gas_used;
+
+        let tx_root = self.calculate_tx_root(&executed_transactions)?;
         let receipt_root = self.calculate_receipt_root(&receipts)?;
-        let artifact_root = self.calculate_artifact_root(&transactions)?;
+        let artifact_root = self.calculate_artifact_root(&executed_transactions)?;
 
         // Apply block rewards BEFORE computing the final state root.
         // Rewards modify the executor's in-memory state, so state_root must
@@ -747,7 +750,7 @@ impl BlockProducer {
                 .receipt_root(receipt_root)
                 .artifact_root(artifact_root)
                 .ghostdag_params(self.ghostdag.params().clone())
-                .transactions(transactions.clone())
+                .transactions(executed_transactions.clone())
                 .build_unhashed();
             let reward = self.reward_calculator.calculate_reward(&temp_block);
             self.apply_basic_rewards(&reward, &validator_address);
@@ -764,7 +767,7 @@ impl BlockProducer {
             .receipt_root(receipt_root)
             .artifact_root(artifact_root)
             .ghostdag_params(self.ghostdag.params().clone())
-            .transactions(transactions)
+            .transactions(executed_transactions)
             .build_unhashed();
 
         // WP-F.3: Compute learning_root at checkpoint boundaries.
@@ -784,12 +787,17 @@ impl BlockProducer {
         // This must happen AFTER execution AND rewards so state_root is final.
         block.header.block_hash = block.compute_hash();
 
+        for receipt in &mut receipts {
+            receipt.block_hash = block.header.block_hash;
+            receipt.block_number = block.header.height;
+        }
+
         // WP-G.2: Sign the canonical block hash with the proposer's ed25519 key.
         block.signature = crypto::sign_block(&block.header.block_hash, &self.signing_key);
 
         // Persist state changes from executed transactions + rewards to storage
         info!("Persisting state changes to storage...");
-        let modified_count = self.executor.persist_state_changes()?;
+        let modified_count = self.executor.persist_state_changes().await?;
         info!("Persisted {} modified accounts to storage", modified_count);
 
         // WP-G.4: Verify state root consistency after persistence.
@@ -839,12 +847,12 @@ impl BlockProducer {
                 .put_transactions(&block.transactions)?;
 
             // Pair tx hashes with receipts and store
-            let mut pairs: Vec<(Hash, citrate_execution::types::TransactionReceipt)> = Vec::new();
-            for (i, tx) in block.transactions.iter().enumerate() {
-                if let Some(r) = receipts.get(i) {
-                    pairs.push((tx.hash, r.clone()));
-                }
-            }
+            let pairs: Vec<(Hash, citrate_execution::types::TransactionReceipt)> = block
+                .transactions
+                .iter()
+                .zip(receipts.iter())
+                .map(|(tx, receipt)| (tx.hash, receipt.clone()))
+                .collect();
             if !pairs.is_empty() {
                 self.storage.transactions.put_receipts(&pairs)?;
             }
@@ -932,7 +940,7 @@ impl BlockProducer {
             }
         }
 
-        Ok(header.block_hash)
+        Ok(block.header.block_hash)
     }
 
     /// Sprint COMPUTE-2: Send heartbeat to HeartbeatMonitor contract.
@@ -1068,7 +1076,8 @@ impl BlockProducer {
         &self,
         transactions: &[Transaction],
         header: &BlockHeader,
-    ) -> anyhow::Result<(Hash, Vec<citrate_execution::types::TransactionReceipt>)> {
+    ) -> anyhow::Result<(Hash, Vec<Transaction>, Vec<citrate_execution::types::TransactionReceipt>)> {
+        let mut executed_transactions = Vec::new();
         let mut receipts = Vec::new();
 
         // Create a temporary block for execution context
@@ -1080,30 +1089,16 @@ impl BlockProducer {
         // Execute each transaction
         for tx in transactions {
             match self.executor.execute_transaction(&temp_block, tx).await {
-                Ok(receipt) => receipts.push(receipt),
+                Ok(receipt) => {
+                    executed_transactions.push(tx.clone());
+                    receipts.push(receipt);
+                }
                 Err(e) => {
                     error!("Failed to execute transaction {}: {}", tx.hash, e);
 
                     // Sprint EL-1 (Issue #20): Remove failed tx from mempool
                     // so the sender's nonce is not permanently blocked.
                     let _ = self.mempool.remove_transaction(&tx.hash).await;
-
-                    // Create failed receipt
-                    receipts.push(citrate_execution::types::TransactionReceipt {
-                        tx_hash: tx.hash,
-                        block_hash: header.block_hash,
-                        block_number: header.height,
-                        from: citrate_execution::types::Address::from_public_key(&tx.from),
-                        to: tx
-                            .to
-                            .map(|pk| citrate_execution::types::Address::from_public_key(&pk)),
-                        gas_used: tx.gas_limit, // All gas consumed on failure
-                        status: false,
-                        logs: vec![],
-                        output: vec![],
-                        eth_tx_type: 0,
-                        effective_gas_price: 0,
-                    });
                 }
             }
         }
@@ -1113,7 +1108,7 @@ impl BlockProducer {
         // NOT the storage-backed view which still reflects the previous block.
         let state_root = self.executor.calculate_state_root();
 
-        Ok((state_root, receipts))
+        Ok((state_root, executed_transactions, receipts))
     }
 
     /// Calculate transaction root
@@ -1435,9 +1430,38 @@ impl BlockProducer {
 mod tests {
     use super::*;
     use citrate_consensus::crypto::Ed25519SigningKey;
+    use citrate_consensus::types::Signature;
+    use citrate_execution::types::Address;
+    use citrate_sequencer::mempool::{MempoolConfig, TxClass};
+    use citrate_storage::pruning::PruningConfig;
+    use citrate_storage::StorageManager;
+    use tempfile::TempDir;
 
     fn test_signing_key() -> Ed25519SigningKey {
         Ed25519SigningKey::from_bytes(&[42u8; 32])
+    }
+
+    fn embedded_pubkey(address: Address) -> PublicKey {
+        let mut bytes = [0u8; 32];
+        bytes[..20].copy_from_slice(&address.0);
+        PublicKey::new(bytes)
+    }
+
+    fn transfer_tx(hash_byte: u8, from: Address, to: Address, nonce: u64) -> Transaction {
+        Transaction {
+            hash: Hash::new([hash_byte; 32]),
+            nonce,
+            from: embedded_pubkey(from),
+            to: Some(embedded_pubkey(to)),
+            value: 0,
+            gas_limit: 21_000,
+            gas_price: 1_000_000_000,
+            data: vec![],
+            signature: Signature::new([1; 64]),
+            tx_type: None,
+            chain_id: Some(40204),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1569,5 +1593,81 @@ mod tests {
         // Verifier should accept 32-byte legacy proofs
         let result = vrf_selector.verify_vrf_proof(&proposer, &legacy_vrf, &prev_vrf, 1);
         assert!(result.is_ok(), "Legacy VRF verification should not error");
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_filters_unexecuted_txs_and_persists_real_receipts() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
+        let state_db = Arc::new(citrate_execution::StateDB::new());
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            state_db.clone(),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+
+        let good_from = Address([0x11; 20]);
+        let bad_from = Address([0x22; 20]);
+        let recipient = Address([0x33; 20]);
+
+        state_db.accounts.create_account_if_not_exists(good_from);
+        state_db
+            .accounts
+            .set_balance(good_from, U256::from(21_000u64 * 1_000_000_000u64 * 10));
+        state_db.accounts.create_account_if_not_exists(bad_from);
+        state_db.accounts.set_balance(bad_from, U256::from(21_000u64 * 1_000_000_000u64 * 10));
+
+        let good_tx = transfer_tx(0xA1, good_from, recipient, 0);
+        let bad_tx = transfer_tx(0xB2, bad_from, recipient, 7);
+
+        mempool
+            .add_transaction(good_tx.clone(), TxClass::Standard)
+            .await
+            .unwrap();
+        mempool
+            .add_transaction(bad_tx.clone(), TxClass::Standard)
+            .await
+            .unwrap();
+
+        let signing_key = test_signing_key();
+        let coinbase = embedded_pubkey(Address([0x44; 20]));
+        let producer = BlockProducer::new(
+            storage.clone(),
+            executor,
+            mempool.clone(),
+            coinbase,
+            signing_key,
+            2,
+        );
+
+        let block_hash = producer.produce_block().await.unwrap();
+        let block = storage.blocks.get_block(&block_hash).unwrap().unwrap();
+
+        assert_eq!(block.transactions.len(), 1, "Only executed txs should be included");
+        assert_eq!(block.transactions[0].hash, good_tx.hash);
+        assert_eq!(block.header.gas_used, 21_000);
+
+        let good_receipt = storage
+            .transactions
+            .get_receipt(&good_tx.hash)
+            .unwrap()
+            .expect("receipt for executed tx");
+        assert_eq!(good_receipt.block_hash, block_hash);
+        assert_eq!(good_receipt.block_number, block.header.height);
+        assert!(good_receipt.status);
+        assert_eq!(good_receipt.gas_used, 21_000);
+
+        assert!(
+            storage.transactions.get_receipt(&bad_tx.hash).unwrap().is_none(),
+            "Execution errors must not create synthetic receipts"
+        );
+        assert!(
+            storage.transactions.get_transaction(&bad_tx.hash).unwrap().is_none(),
+            "Execution errors must not be persisted as block transactions"
+        );
     }
 }
