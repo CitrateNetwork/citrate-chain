@@ -123,15 +123,25 @@ enum Command {
     Bench {
         #[arg(long)]
         rpc_url: String,
-        #[arg(long)]
-        keystore_dir: PathBuf,
-        /// Comma-separated keystore account names.
-        #[arg(long, value_delimiter = ',')]
+        /// Foundry keystore directory. Required unless
+        /// `--private-keys-file` is given.
+        #[arg(long, conflicts_with = "private_keys_file")]
+        keystore_dir: Option<PathBuf>,
+        /// Comma-separated keystore account names. Required unless
+        /// `--private-keys-file` is given.
+        #[arg(long, value_delimiter = ',', conflicts_with = "private_keys_file")]
         accounts: Vec<String>,
-        #[arg(long, conflicts_with = "prompt")]
+        #[arg(long, conflicts_with_all = ["prompt", "private_keys_file"])]
         passphrase_file: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "private_keys_file")]
         prompt: bool,
+        /// Plaintext private-keys file. One hex 32-byte key per line,
+        /// `0x` optional, `#` comments allowed. Mutually exclusive
+        /// with keystore flags. Intended for throwaway burner signers
+        /// on ephemeral (pre-reroll) chains only — **never** use this
+        /// for keys that hold real value.
+        #[arg(long)]
+        private_keys_file: Option<PathBuf>,
         /// Expected chain id. If the RPC's `eth_chainId` disagrees,
         /// the bench refuses to run.
         #[arg(long)]
@@ -246,6 +256,7 @@ async fn run(cli: Cli) -> citrate_bench::Result<()> {
             accounts,
             passphrase_file,
             prompt,
+            private_keys_file,
             expected_chain_id,
             target_tps,
             duration_secs,
@@ -269,6 +280,7 @@ async fn run(cli: Cli) -> citrate_bench::Result<()> {
                 accounts,
                 passphrase_file,
                 prompt,
+                private_keys_file,
                 expected_chain_id,
                 target_tps,
                 duration_secs,
@@ -437,10 +449,11 @@ async fn cmd_dry_run(args: DryRunArgs) -> citrate_bench::Result<()> {
 
 struct BenchArgs {
     rpc_url: String,
-    keystore_dir: PathBuf,
+    keystore_dir: Option<PathBuf>,
     accounts: Vec<String>,
     passphrase_file: Option<PathBuf>,
     prompt: bool,
+    private_keys_file: Option<PathBuf>,
     expected_chain_id: u64,
     target_tps: u64,
     duration_secs: u64,
@@ -460,13 +473,8 @@ struct BenchArgs {
 }
 
 async fn cmd_bench(args: BenchArgs) -> citrate_bench::Result<()> {
-    if args.accounts.is_empty() {
-        return Err(citrate_bench::Error::Config(
-            "--accounts must list at least one keystore account".into(),
-        ));
-    }
-
-    // Build the RPC client first so we can preflight the chain.
+    // Signer source validation happens later in the loader block —
+    // here we only build the RPC client so preflight can run first.
     let client = RpcClient::new(&args.rpc_url, Duration::from_secs(10))?;
 
     // Preflight 1: chain id matches.
@@ -480,12 +488,33 @@ async fn cmd_bench(args: BenchArgs) -> citrate_bench::Result<()> {
     println!("preflight ok: chain_id = {actual_chain_id}");
 
     // Preflight 2: load signers + check funding floor + fetch nonces.
-    let source = passphrase_source(
-        args.passphrase_file,
-        args.prompt,
-        format!("{}", args.keystore_dir.display()),
-    )?;
-    let signers = keystore::load_many(&args.keystore_dir, &args.accounts, &source)?;
+    // Two signer source paths: a Foundry keystore (default) or a
+    // plaintext private-keys file (throwaway bench override). The CLI
+    // parser already enforced mutual exclusivity.
+    let signers: Vec<Signer> = if let Some(pk_path) = args.private_keys_file.as_ref() {
+        println!(
+            "loading signers from plaintext private-keys file: {}",
+            pk_path.display()
+        );
+        citrate_bench::signers::load_from_private_keys_file(pk_path)?
+    } else {
+        let keystore_dir = args.keystore_dir.as_ref().ok_or_else(|| {
+            citrate_bench::Error::Config(
+                "must pass --keystore-dir + --accounts or --private-keys-file".into(),
+            )
+        })?;
+        if args.accounts.is_empty() {
+            return Err(citrate_bench::Error::Config(
+                "--accounts must list at least one keystore account".into(),
+            ));
+        }
+        let source = passphrase_source(
+            args.passphrase_file.clone(),
+            args.prompt,
+            format!("{}", keystore_dir.display()),
+        )?;
+        keystore::load_many(keystore_dir, &args.accounts, &source)?
+    };
     println!("loaded {} signer(s)", signers.len());
 
     let mut starting_nonces = Vec::with_capacity(signers.len());

@@ -3,11 +3,17 @@
 //!
 //! The signer type holds the decrypted private key in a `Zeroizing`
 //! wrapper so that dropping a signer overwrites the key material. The
-//! only way to obtain a signer is via `keystore::load` which prompts
-//! for or reads a passphrase.
+//! typical way to obtain a signer is via `keystore::load` which
+//! prompts for or reads a passphrase. For throwaway benches against
+//! ephemeral (pre-reroll) chains there is also `load_from_private_keys_file`
+//! which reads raw 32-byte hex keys from disk — it is explicitly a
+//! convenience path for burn accounts and must never be used for
+//! keys that hold real value.
 
 pub mod keystore;
 pub mod pool;
+
+use std::path::Path;
 
 use k256::ecdsa::SigningKey;
 use sha3::{Digest, Keccak256};
@@ -60,6 +66,52 @@ impl std::fmt::Debug for Signer {
     }
 }
 
+/// Load a set of signers from a plaintext private-keys file.
+///
+/// The file format is one 32-byte secp256k1 key per line, as hex
+/// (optional `0x` prefix). Blank lines and lines beginning with `#`
+/// are ignored. Keys are zeroed out of the intermediate buffer after
+/// each signer is constructed.
+///
+/// This path exists for throwaway benches against ephemeral chains
+/// where managing a Foundry keystore would be pointless overhead.
+/// **Never use it for keys that hold real value** — plaintext key
+/// storage has obvious and unmitigated risks.
+pub fn load_from_private_keys_file(path: &Path) -> Result<Vec<Signer>> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| Error::Keystore(format!("read private-keys file: {e}")))?;
+    let mut signers = Vec::new();
+    for (lineno, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let stripped = line.strip_prefix("0x").or_else(|| line.strip_prefix("0X")).unwrap_or(line);
+        if stripped.len() != 64 {
+            return Err(Error::Keystore(format!(
+                "private-keys file line {}: expected 64 hex chars, got {}",
+                lineno + 1,
+                stripped.len()
+            )));
+        }
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        hex::decode_to_slice(stripped, bytes.as_mut()).map_err(|e| {
+            Error::Keystore(format!(
+                "private-keys file line {}: hex decode: {e}",
+                lineno + 1
+            ))
+        })?;
+        signers.push(Signer::from_key_bytes(bytes.as_ref())?);
+        // bytes zeroed on drop
+    }
+    if signers.is_empty() {
+        return Err(Error::Keystore(
+            "private-keys file contained zero usable keys".into(),
+        ));
+    }
+    Ok(signers)
+}
+
 /// Derive the 20-byte Ethereum address from a 32-byte secp256k1
 /// private key by taking the last 20 bytes of
 /// `keccak256(uncompressed_pubkey[1..])`.
@@ -106,5 +158,44 @@ mod tests {
         let printed = format!("{s:?}");
         assert!(!printed.contains("42"));
         assert!(printed.contains("0x"));
+    }
+
+    #[test]
+    fn load_from_private_keys_file_parses_three_keys() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        writeln!(
+            f,
+            "# a comment, should be skipped\n\
+             0x0000000000000000000000000000000000000000000000000000000000000001\n\
+             \n\
+             0000000000000000000000000000000000000000000000000000000000000002\n\
+             0X0000000000000000000000000000000000000000000000000000000000000003"
+        )
+        .expect("write");
+        f.flush().expect("flush");
+        let signers =
+            load_from_private_keys_file(f.path()).expect("load_from_private_keys_file");
+        assert_eq!(signers.len(), 3);
+        // Well-known address for private key = 1:
+        assert_eq!(
+            signers[0].address_hex().to_lowercase(),
+            "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+        );
+    }
+
+    #[test]
+    fn load_from_private_keys_file_rejects_bad_length() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        writeln!(f, "0xdeadbeef").expect("write");
+        f.flush().expect("flush");
+        assert!(load_from_private_keys_file(f.path()).is_err());
+    }
+
+    #[test]
+    fn load_from_private_keys_file_rejects_empty_file() {
+        let f = tempfile::NamedTempFile::new().expect("tempfile");
+        assert!(load_from_private_keys_file(f.path()).is_err());
     }
 }
