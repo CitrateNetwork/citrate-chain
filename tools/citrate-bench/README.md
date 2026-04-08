@@ -116,10 +116,41 @@ Cannot run a benchmark until **all** of the following exist:
 2. A `60_manifest.json` with a matching bundle sha256
 3. Dedicated benchmark signers in a Foundry keystore, funded on the
    target chain above the configured floor
-4. A reachable RPC endpoint whose `eth_chainId` matches the config
+4. A reachable **bootnode RPC** endpoint whose `eth_chainId` matches
+   the config — see the note below on why the bootnode specifically.
 
 The harness refuses to run if any precondition fails. Reasons are
 printed to stderr and no report is emitted.
+
+## Target the canonical bootnode, not a peer
+
+For testnet-beta (chain 40204), the `--rpc-url` flag must point at
+the **canonical bootnode RPC** (`https://rpc.citrate.ai` or
+`https://rpc2.citrate.ai`, both backed by the droplet at
+`159.65.227.42`). Do **not** point it at an independent peer node.
+
+Reason: per known limitation **L-001** in
+[`.agentile/docs/reference/KNOWN_LIMITATIONS.md`](../../../.agentile/docs/reference/KNOWN_LIMITATIONS.md),
+peer nodes on testnet-beta sync block headers but do not execute
+received blocks into state. A benchmark run against a peer will:
+
+- see pending transactions accepted by `eth_sendRawTransaction`
+  (the peer forwards them over gossip);
+- see receipts land eventually from the bootnode's perspective;
+- but the peer's own `eth_getTransactionCount("latest")` will
+  report nonces that do not match ground truth, because the peer
+  never executed those blocks.
+
+That breaks `ground_truth_match` and produces a report that is
+neither honest about what was measured nor useful as an auditor
+artifact. The harness's own preflight does not detect this — it is
+a property of the RPC endpoint, not the harness — so the operator
+must make the right choice here. This paragraph is the reminder.
+
+Backlog #116 (`SaulBuilds/citrate#44`) tracks the fix. Once the
+sync protocol executes received blocks into state, any peer node
+becomes a valid `--rpc-url` target. Until then, stick with the
+bootnode.
 
 ## Why it is a standalone crate
 
