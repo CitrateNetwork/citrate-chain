@@ -45,6 +45,7 @@ readonly REPO_ROOT="$( cd "$SCRIPT_DIR/../.." && pwd )"
 readonly CONTRACTS_DIR="$REPO_ROOT/contracts"
 readonly CHAIN_ID="${CEREMONY_CHAIN_ID:-40204}"
 readonly CEREMONY_MODE="${CEREMONY_MODE:-rehearsal}"
+readonly GAS_ESTIMATE_MULTIPLIER="${CEREMONY_GAS_ESTIMATE_MULTIPLIER:-200}"
 
 # Output directory (timestamped)
 readonly OUTPUT_BASE="${CEREMONY_OUTPUT_DIR:-$REPO_ROOT/ceremony-output}"
@@ -150,6 +151,7 @@ step_preflight() {
         echo "Timestamp (UTC): $(date -u)"
         echo "Ceremony mode: $CEREMONY_MODE"
         echo "Chain ID: $CHAIN_ID"
+        echo "Forge gas estimate multiplier: $GAS_ESTIMATE_MULTIPLIER"
         echo "Output dir: $OUTPUT_DIR"
         echo
         echo "--- Host fingerprint ---"
@@ -222,6 +224,7 @@ step_deploy_contracts() {
     local forge_common=(
         --rpc-url "$CEREMONY_RPC_URL"
         "${FORGE_WALLET_ARGS[@]}"
+        --gas-estimate-multiplier "$GAS_ESTIMATE_MULTIPLIER"
         --slow
         --broadcast
     )
