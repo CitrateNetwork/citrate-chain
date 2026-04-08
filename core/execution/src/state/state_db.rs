@@ -225,6 +225,11 @@ impl StateDB {
                 .iter()
                 .map(|e| (*e.key(), e.value().clone()))
                 .collect(),
+            dirty_storage: self
+                .dirty_storage
+                .iter()
+                .map(|entry| entry.clone())
+                .collect(),
         }
     }
 
@@ -239,12 +244,10 @@ impl StateDB {
             self.storage_tries.insert(addr, trie);
         }
 
-        // Clear dirty_storage to prevent stale entries from a failed
-        // transaction's REVM commit being persisted by persist_state_changes().
-        // Without this, DatabaseCommit::commit() entries from the reverted tx
-        // would remain and could cause incorrect data to be written to RocksDB.
-        // (Fix: Sprint EL-1, Issue #19)
         self.dirty_storage.clear();
+        for entry in snapshot.dirty_storage {
+            self.dirty_storage.insert(entry);
+        }
 
         // Restore models
         self.models.clear();
@@ -282,6 +285,7 @@ pub struct StateSnapshot {
     storage_tries: Vec<(Address, Trie)>,
     models: Vec<(ModelId, ModelState)>,
     training_jobs: Vec<(JobId, TrainingJob)>,
+    dirty_storage: Vec<(Address, Vec<u8>)>,
 }
 
 #[cfg(test)]

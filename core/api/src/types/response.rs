@@ -13,9 +13,14 @@ pub struct BlockResponse {
     pub timestamp: u64,
     pub blue_score: u64,
     pub blue_work: u128,
+    pub gas_used: u64,
+    pub gas_limit: u64,
+    pub base_fee_per_gas: u64,
+    pub proposer_pubkey: String,
     pub transactions: Vec<TransactionResponse>,
     pub state_root: Hash,
     pub tx_root: Hash,
+    pub receipt_root: Hash,
 }
 
 impl From<Block> for BlockResponse {
@@ -27,9 +32,14 @@ impl From<Block> for BlockResponse {
             timestamp: block.header.timestamp,
             blue_score: block.header.blue_score,
             blue_work: block.header.blue_work,
+            gas_used: block.header.gas_used,
+            gas_limit: block.header.gas_limit,
+            base_fee_per_gas: block.header.base_fee_per_gas,
+            proposer_pubkey: hex::encode(block.header.proposer_pubkey.as_bytes()),
             transactions: block.transactions.into_iter().map(Into::into).collect(),
             state_root: block.state_root,
             tx_root: block.tx_root,
+            receipt_root: block.receipt_root,
         }
     }
 }

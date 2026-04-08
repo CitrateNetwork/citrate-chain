@@ -82,6 +82,32 @@ fn pubkey_hex_opt_to_evm_address(hex_opt: Option<&String>) -> Option<String> {
     hex_opt.map(|s| pubkey_hex_to_evm_address(s))
 }
 
+fn eth_block_json(block: &crate::types::response::BlockResponse, transactions: Vec<Value>) -> Value {
+    json!({
+        "number": format!("0x{:x}", block.height),
+        "hash": format!("0x{}", hex::encode(block.hash.as_bytes())),
+        "parentHash": format!("0x{}", hex::encode(block.parent_hash.as_bytes())),
+        "timestamp": format!("0x{:x}", block.timestamp),
+        "gasLimit": format!("0x{:x}", block.gas_limit),
+        "gasUsed": format!("0x{:x}", block.gas_used),
+        "difficulty": "0x0",
+        "totalDifficulty": "0x0",
+        "transactions": transactions,
+        "miner": pubkey_hex_to_evm_address(&block.proposer_pubkey),
+        "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "nonce": "0x0000000000000000",
+        "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+        "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "transactionsRoot": format!("0x{}", hex::encode(block.tx_root.as_bytes())),
+        "stateRoot": format!("0x{}", hex::encode(block.state_root.as_bytes())),
+        "receiptsRoot": format!("0x{}", hex::encode(block.receipt_root.as_bytes())),
+        "size": format!("0x{:x}", 1000),
+        "extraData": "0x",
+        "baseFeePerGas": format!("0x{:x}", block.base_fee_per_gas),
+        "uncles": []
+    })
+}
+
 /// Add Ethereum-compatible RPC methods to the IoHandler
 pub fn register_eth_methods(
     io_handler: &mut IoHandler,
@@ -185,30 +211,7 @@ pub fn register_eth_methods(
                         .collect::<Vec<_>>()
                 };
                 
-                // Convert to Ethereum-compatible format
-                Ok(json!({
-                    "number": format!("0x{:x}", block.height),
-                    "hash": format!("0x{}", hex::encode(block.hash.as_bytes())),
-                    "parentHash": format!("0x{}", hex::encode(block.parent_hash.as_bytes())),
-                    "timestamp": format!("0x{:x}", block.timestamp),
-                    "gasLimit": "0x1c9c380", // 30M gas
-                    "gasUsed": "0x5208",
-                    "difficulty": "0x0", // PoS
-                    "totalDifficulty": "0x0",
-                    "transactions": transactions,
-                    "miner": "0x0000000000000000000000000000000000000000",
-                    "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                    "nonce": "0x0000000000000000",
-                    "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
-                    "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                    "transactionsRoot": format!("0x{}", hex::encode(block.tx_root.as_bytes())),
-                    "stateRoot": format!("0x{}", hex::encode(block.state_root.as_bytes())),
-                    "receiptsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
-                    "size": format!("0x{:x}", 1000), // Approximate
-                    "extraData": "0x",
-                    "baseFeePerGas": "0x7",
-                    "uncles": []
-                }))
+                Ok(eth_block_json(&block, transactions))
             },
             Err(_) => Ok(Value::Null),
         }
@@ -276,29 +279,7 @@ pub fn register_eth_methods(
                         .collect::<Vec<_>>()
                 };
                 
-                Ok(json!({
-                    "number": format!("0x{:x}", block.height),
-                    "hash": format!("0x{}", hex::encode(block.hash.as_bytes())),
-                    "parentHash": format!("0x{}", hex::encode(block.parent_hash.as_bytes())),
-                    "timestamp": format!("0x{:x}", block.timestamp),
-                    "gasLimit": "0x1c9c380",
-                    "gasUsed": "0x5208",
-                    "difficulty": "0x0",
-                    "totalDifficulty": "0x0",
-                    "transactions": transactions,
-                    "miner": "0x0000000000000000000000000000000000000000",
-                    "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                    "nonce": "0x0000000000000000",
-                    "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
-                    "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                    "transactionsRoot": format!("0x{}", hex::encode(block.tx_root.as_bytes())),
-                    "stateRoot": format!("0x{}", hex::encode(block.state_root.as_bytes())),
-                    "receiptsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
-                    "size": format!("0x{:x}", 1000),
-                    "extraData": "0x",
-                    "baseFeePerGas": "0x7",
-                    "uncles": []
-                }))
+                Ok(eth_block_json(&block, transactions))
             },
             Err(_) => Ok(Value::Null),
         }
@@ -1044,6 +1025,25 @@ pub fn register_eth_methods(
             return Ok(Value::String("0x5208".to_string()));
         }
 
+        let calldata_floor = 21_000u64.saturating_add(
+            data.iter()
+                .map(|byte| if *byte == 0 { 4u64 } else { 16u64 })
+                .sum::<u64>(),
+        );
+        let deployment_floor = if to_pk.is_none() && !data.is_empty() {
+            let init_code_len = data.len() as u64;
+            let init_code_words = init_code_len.saturating_add(31) / 32;
+            Some(
+                21_000u64
+                    .saturating_add(32_000)
+                    .saturating_add(init_code_words.saturating_mul(2))
+                    // Use init-code length as a conservative proxy for code deposit cost.
+                    .saturating_add(init_code_len.saturating_mul(200)),
+            )
+        } else {
+            None
+        };
+
         // Build a lightweight block context for execution
         let blk = citrate_consensus::types::BlockBuilder::new()
             .timestamp(std::time::SystemTime::now()
@@ -1083,15 +1083,14 @@ pub fn register_eth_methods(
             Ok(receipt) => {
                 // Return gas used plus 10% buffer for safety margin
                 let gas_with_buffer = receipt.gas_used.saturating_add(receipt.gas_used / 10);
-                // Minimum 21000 for any transaction
-                let final_gas = gas_with_buffer.max(21000);
+                let final_gas = gas_with_buffer
+                    .max(calldata_floor)
+                    .max(deployment_floor.unwrap_or(21_000));
                 Ok(Value::String(format!("0x{:x}", final_gas)))
             }
             Err(_) => {
-                // Execution failed - return a higher estimate or error
-                // For failed executions, we still return an estimate so users
-                // can see what gas would be needed (they may have insufficient balance etc)
-                Ok(Value::String("0x7a120".to_string())) // 500000 gas as fallback
+                let fallback_gas = deployment_floor.unwrap_or(calldata_floor.max(21_000));
+                Ok(Value::String(format!("0x{:x}", fallback_gas)))
             }
         }
     });
