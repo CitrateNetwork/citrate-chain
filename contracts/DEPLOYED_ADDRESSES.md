@@ -14,10 +14,10 @@
 
 - **Chain ID**: 40204
 - **Canonical bootnode**: `159.65.227.42` (droplet)
-- **Public RPC (DNS ready)**: `https://rpc2.citrate.ai` (cloudflared tunnel → droplet)
-- **Public RPC (DNS pending)**: `https://rpc.citrate.ai` (Caddy reverse proxy, waiting on A record)
-- **Explorer**: `https://explorer.citrate.ai` (Caddy, waiting on A record); raw `http://159.65.227.42:3000`
-- **Faucet**: `https://faucet.citrate.ai` (Caddy, waiting on A record); raw `http://159.65.227.42:3002`
+- **Public RPC (primary)**: `https://rpc.citrate.ai` (Cloudflare-proxied → droplet)
+- **Public RPC (cloudflared tunnel)**: `https://rpc2.citrate.ai` (second path to the same droplet)
+- **Explorer**: `https://explorer.citrate.ai`
+- **Faucet**: `https://faucet.citrate.ai`
 - **Snapshot last verified**: 2026-04-08, block 772
 - **Contract count**: **36** (27 core + 3 AI gateway + 5 edu + 1 model access control)
 - **Status**: dry-run — chain will be rerolled before the real ceremony freeze
@@ -223,10 +223,10 @@ done
   (`script/Deploy{All,AIGateway,EduStack,ModelAccessControl}.s.sol`)
   plus the broadcast JSONs.
 - **Not a source of truth for the friendly DNS names.** `rpc.citrate.ai`,
-  `explorer.citrate.ai`, and `faucet.citrate.ai` do not resolve yet —
-  Caddy is configured and ready, waiting on operator-side DNS A
-  records. Until those land, use `rpc2.citrate.ai` (via cloudflared)
-  or the raw droplet IP `159.65.227.42`.
+  `explorer.citrate.ai`, and `faucet.citrate.ai` are live as of
+  2026-04-08 (Cloudflare-proxied to the droplet). `rpc2.citrate.ai`
+  remains as a second path via the cloudflared tunnel. The raw
+  droplet IP `159.65.227.42` is a fallback of last resort.
 
 ---
 
