@@ -80,6 +80,9 @@ pub struct Executor {
     /// Contains coinbase, prevrandao (VRF output), and recent block hashes.
     /// Set by the block producer before executing transactions.
     block_context: std::sync::RwLock<crate::revm_adapter::BlockContext>,
+    /// Serializes stateful execution, persistence, and simulation so snapshot
+    /// rollback cannot race live block execution.
+    execution_guard: tokio::sync::Mutex<()>,
 }
 
 /// Trait for state storage to avoid circular dependency
@@ -208,6 +211,7 @@ impl Executor {
             precompile_executor,
             chain_id,
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
+            execution_guard: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -280,6 +284,7 @@ impl Executor {
             precompile_executor,
             chain_id,
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
+            execution_guard: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -315,6 +320,31 @@ impl Executor {
     /// Get reference to state database
     pub fn state_db(&self) -> &Arc<StateDB> {
         &self.state_db
+    }
+
+    fn get_account_from_store(
+        &self,
+        address: &Address,
+    ) -> Option<crate::types::AccountState> {
+        self.state_store
+            .as_ref()
+            .and_then(|store| match store.get_account(address) {
+                Ok(account) => account,
+                Err(e) => {
+                    warn!("Failed to load account {} from state store: {}", address, e);
+                    None
+                }
+            })
+    }
+
+    /// Return the persisted "latest" account state when storage exists.
+    /// Falls back to in-memory state for test-only or non-persistent executors.
+    pub fn get_canonical_account(
+        &self,
+        address: &Address,
+    ) -> crate::types::AccountState {
+        self.get_account_from_store(address)
+            .unwrap_or_else(|| self.state_db.accounts.get_account(address))
     }
 
     /// Sync a model registration to the model registry adapter (e.g. MCP).
@@ -363,7 +393,8 @@ impl Executor {
     }
 
     /// Persist all dirty accounts and storage slots from state_db to state_store
-    pub fn persist_state_changes(&self) -> anyhow::Result<usize> {
+    pub async fn persist_state_changes(&self) -> anyhow::Result<usize> {
+        let _guard = self.execution_guard.lock().await;
         if let Some(store) = &self.state_store {
             let dirty_accounts = self.state_db.accounts.get_dirty_accounts();
             let mut count = dirty_accounts.len();
@@ -407,15 +438,13 @@ impl Executor {
 
     /// Get account balance
     pub fn get_balance(&self, address: &Address) -> U256 {
-        // Try to load from storage first if available
-        if let Some(store) = &self.state_store {
-            if let Ok(Some(account)) = store.get_account(address) {
-                // Update in-memory state
-                self.state_db
-                    .accounts
-                    .set_account(*address, account.clone());
-                return account.balance;
-            }
+        if self.state_db.accounts.exists(address) {
+            return self.state_db.accounts.get_balance(address);
+        }
+
+        if let Some(account) = self.get_account_from_store(address) {
+            self.state_db.accounts.load_account(*address, account.clone());
+            return account.balance;
         }
 
         self.state_db.accounts.get_balance(address)
@@ -423,11 +452,29 @@ impl Executor {
 
     /// Get account nonce
     pub fn get_nonce(&self, address: &Address) -> u64 {
+        if self.state_db.accounts.exists(address) {
+            return self.state_db.accounts.get_nonce(address);
+        }
+
+        if let Some(account) = self.get_account_from_store(address) {
+            self.state_db.accounts.load_account(*address, account.clone());
+            return account.nonce;
+        }
+
         self.state_db.accounts.get_nonce(address)
     }
 
     /// Get contract code hash
     pub fn get_code_hash(&self, address: &Address) -> Hash {
+        if self.state_db.accounts.exists(address) {
+            return self.state_db.accounts.get_code_hash(address);
+        }
+
+        if let Some(account) = self.get_account_from_store(address) {
+            self.state_db.accounts.load_account(*address, account.clone());
+            return account.code_hash;
+        }
+
         self.state_db.accounts.get_code_hash(address)
     }
 
@@ -546,6 +593,15 @@ impl Executor {
         block: &Block,
         tx: &Transaction,
     ) -> Result<TransactionReceipt, ExecutionError> {
+        let _guard = self.execution_guard.lock().await;
+        self.execute_transaction_inner(block, tx).await
+    }
+
+    async fn execute_transaction_inner(
+        &self,
+        block: &Block,
+        tx: &Transaction,
+    ) -> Result<TransactionReceipt, ExecutionError> {
         let mut context = ExecutionContext::new(block, tx);
         let from = crate::address_utils::normalize_address(&tx.from);
 
@@ -634,6 +690,7 @@ impl Executor {
         block: &Block,
         tx: &Transaction,
     ) -> Result<TransactionReceipt, ExecutionError> {
+        let _guard = self.execution_guard.lock().await;
         // Snapshot BEFORE any mutations
         let snapshot = self.state_db.snapshot();
 
@@ -650,7 +707,7 @@ impl Executor {
         }
 
         // Execute the transaction (creates its own inner snapshot)
-        let result = self.execute_transaction(block, tx).await;
+        let result = self.execute_transaction_inner(block, tx).await;
 
         // ALWAYS restore — unconditional, no matter success or failure
         self.state_db.restore(snapshot);

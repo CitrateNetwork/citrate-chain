@@ -802,7 +802,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             info!("Found {} accounts in storage, loading into memory...", accounts.len());
             for (address, account) in accounts {
                 debug!("Loaded account: 0x{} with balance {}", hex::encode(address.0), account.balance);
-                state_db.accounts.set_account(address, account);
+                state_db.accounts.load_account(address, account);
             }
             info!("State loaded successfully");
         }
