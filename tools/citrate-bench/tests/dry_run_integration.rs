@@ -12,10 +12,17 @@
 
 use std::sync::Arc;
 
+use citrate_bench::address_table::AddressTable;
 use citrate_bench::runner::{RunMode, RunOptions, Runner};
 use citrate_bench::signers::keystore;
 use citrate_bench::signers::pool::SignerPool;
+use citrate_bench::workload::classroom::ClassroomTransferStudent;
+use citrate_bench::workload::forwarder::ForwarderExecute;
+use citrate_bench::workload::inference_router::InferenceRouterRequest;
+use citrate_bench::workload::learning_pool::LearningPoolJoin;
+use citrate_bench::workload::mix::{MixEntry, MixedWorkload};
 use citrate_bench::workload::transfer::SimpleTransfer;
+use citrate_bench::workload::wrapped_salt::WrappedSaltTransfer;
 use citrate_bench::workload::{WorkloadClass, WorkloadContext};
 
 /// Create `count` eth-keystore V3 files in `dir`, named `bench-01`,
@@ -186,5 +193,101 @@ async fn dry_run_is_truly_read_only() {
 
     let result = runner.run(RunMode::DryRun).await.expect("run");
     assert!(result.signed_ok > 0);
+    assert_eq!(result.signing_errors, 0);
+}
+
+/// Phase 4: every contract workload class must round-trip (build,
+/// sign, and verify) against a populated address table via the
+/// public API. This test does **not** submit anything — it just
+/// proves the data source trace holds: "class → address table →
+/// contract → signed tx".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dry_run_mix_exercises_every_workload_class() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _keys = make_keystores(dir.path(), 2, "pw");
+    let signers = keystore::load_many(
+        dir.path(),
+        &["bench-01".to_string(), "bench-02".to_string()],
+        &keystore::PassphraseSource::Literal("pw".to_string()),
+    )
+    .expect("load_many");
+
+    let pool = Arc::new(SignerPool::new(signers, vec![0, 0], 32).expect("pool"));
+
+    // Populate the address table with every contract the Phase 4
+    // workloads need. Addresses are dummy but shape-valid.
+    let json = r#"{
+      "chainId": 40204,
+      "contracts": [
+        { "name": "WrappedSALT",               "address": "0x1111111111111111111111111111111111111111" },
+        { "name": "LearningPool",              "address": "0x2222222222222222222222222222222222222222" },
+        { "name": "AIInferenceRouterPortable", "address": "0x3333333333333333333333333333333333333333" },
+        { "name": "ClassroomClusterV1",        "address": "0x4444444444444444444444444444444444444444" },
+        { "name": "Forwarder",                 "address": "0x5555555555555555555555555555555555555555" }
+      ]
+    }"#;
+    let table: AddressTable = serde_json::from_str(json).expect("parse");
+
+    let mix = MixedWorkload::new(vec![
+        MixEntry {
+            class: Arc::new(SimpleTransfer::default_bench()),
+            weight: 1,
+        },
+        MixEntry {
+            class: Arc::new(WrappedSaltTransfer::default_bench()),
+            weight: 1,
+        },
+        MixEntry {
+            class: Arc::new(LearningPoolJoin::default_bench()),
+            weight: 1,
+        },
+        MixEntry {
+            class: Arc::new(InferenceRouterRequest::default_bench()),
+            weight: 1,
+        },
+        MixEntry {
+            class: Arc::new(ClassroomTransferStudent::default_bench()),
+            weight: 1,
+        },
+        MixEntry {
+            class: Arc::new(ForwarderExecute::default_bench()),
+            weight: 1,
+        },
+    ])
+    .expect("mix");
+
+    let workload: Arc<dyn WorkloadClass> = Arc::new(mix);
+    let ctx = Arc::new(
+        WorkloadContext::for_dry_run(40204, 1_000_000_000)
+            .with_address_table(Arc::new(table)),
+    );
+
+    // 200 txs at 400 tps over 0.5s wall-clock (duration_secs=1 but
+    // the rate limiter overshoots short windows). With 6 classes at
+    // equal weight, each class should get ~1/6 of the total.
+    let options = RunOptions::for_dry_run(1, 400);
+    let runner = Runner::new(pool, ctx, workload, options).expect("runner");
+    let result = runner.run(RunMode::DryRun).await.expect("run");
+
+    assert_eq!(
+        result.effective_mix.len(),
+        6,
+        "expected all six classes in effective_mix, got {:?}",
+        result.effective_mix
+    );
+    // Every class should have at least one sign. With weights
+    // (1,1,1,1,1,1) and >= 6 txs (which trivially holds at 400 tps
+    // for 1s) the deterministic dispatcher guarantees this.
+    for (name, count) in &result.effective_mix {
+        assert!(
+            *count > 0,
+            "class {name} got zero signs (full mix: {:?})",
+            result.effective_mix
+        );
+    }
+    // All class counts should sum to signed_ok.
+    let sum: u64 = result.effective_mix.iter().map(|(_, n)| *n).sum();
+    assert_eq!(sum, result.signed_ok);
+    // No signing errors: every class built cleanly against the table.
     assert_eq!(result.signing_errors, 0);
 }

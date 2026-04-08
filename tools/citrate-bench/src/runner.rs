@@ -118,6 +118,11 @@ pub struct RunResult {
     pub mode: RunMode,
     /// Broadcast metrics. `None` in dry-run mode.
     pub broadcast: Option<BroadcastResult>,
+    /// Per-class sign count. For leaf workloads this has one entry
+    /// equal to `signed_ok`; for `MixedWorkload` this is the
+    /// effective (as-built) breakdown across the mix's sub-classes.
+    /// Preserved in `class_roster()` order.
+    pub effective_mix: Vec<(&'static str, u64)>,
 }
 
 impl RunResult {
@@ -131,6 +136,18 @@ impl RunResult {
         println!("effective_tps      = {:.2}", self.effective_tps);
         for (i, n) in self.per_signer_count.iter().enumerate() {
             println!("  signer[{i}] signed = {n}");
+        }
+        if self.effective_mix.len() > 1 {
+            println!("-- effective mix --");
+            let total: u64 = self.effective_mix.iter().map(|(_, n)| *n).sum();
+            for (class, n) in &self.effective_mix {
+                let pct = if total > 0 {
+                    (*n as f64) * 100.0 / (total as f64)
+                } else {
+                    0.0
+                };
+                println!("  {class:20} {n:8}  ({pct:5.1}%)");
+            }
         }
         if let Some(b) = &self.broadcast {
             println!("-- broadcast --");
@@ -172,18 +189,26 @@ struct RunState {
     rpc_accepted: AtomicU64,
     rpc_rejected: AtomicU64,
     per_signer_count: Vec<AtomicU64>,
+    /// Per-class sign count, indexed parallel to `class_names`. Kept
+    /// as a `Vec` (not a `HashMap`) so the hot path is branch-free
+    /// after the initial class-name linear search.
+    class_counts: Vec<AtomicU64>,
+    class_names: Vec<&'static str>,
     sample_txs: Mutex<Vec<SignedTx>>,
     rejected_reasons: Mutex<Vec<String>>,
     sample_cap: usize,
 }
 
 impl RunState {
-    fn new(pool_len: usize, sample_cap: usize) -> Self {
+    fn new(pool_len: usize, class_names: Vec<&'static str>, sample_cap: usize) -> Self {
+        let class_counts = (0..class_names.len()).map(|_| AtomicU64::new(0)).collect();
         Self {
             signing_errors: AtomicU64::new(0),
             rpc_accepted: AtomicU64::new(0),
             rpc_rejected: AtomicU64::new(0),
             per_signer_count: (0..pool_len).map(|_| AtomicU64::new(0)).collect(),
+            class_counts,
+            class_names,
             sample_txs: Mutex::new(Vec::with_capacity(sample_cap)),
             rejected_reasons: Mutex::new(Vec::with_capacity(16)),
             sample_cap,
@@ -204,6 +229,17 @@ impl RunState {
                 v.push(reason);
             }
         }
+    }
+
+    /// Increment the counter for the class with the given name.
+    /// Linear scan — the class list is small (typically <= 6).
+    fn record_class(&self, name: &'static str) {
+        if let Some(idx) = self.class_names.iter().position(|n| *n == name) {
+            self.class_counts[idx].fetch_add(1, Ordering::AcqRel);
+        }
+        // If the name isn't in the roster (workload misconfigured),
+        // it silently falls through — the effective_mix sum will
+        // then be less than signed_ok, which the report surfaces.
     }
 }
 
@@ -245,7 +281,12 @@ impl Runner {
             0
         };
 
-        let state = Arc::new(RunState::new(self.pool.len(), self.options.sample_cap));
+        let class_names = self.workload.class_roster();
+        let state = Arc::new(RunState::new(
+            self.pool.len(),
+            class_names,
+            self.options.sample_cap,
+        ));
         let mut attempted: u64 = 0;
         let mut pool_saturated: u64 = 0;
 
@@ -283,20 +324,24 @@ impl Runner {
                 continue;
             };
 
-            // Sign inline.
-            let signed = match self.workload.build(&self.context, &signer, permit.nonce) {
-                Ok(tx) => tx,
-                Err(_e) => {
-                    state.signing_errors.fetch_add(1, Ordering::AcqRel);
-                    drop(permit);
-                    continue;
-                }
-            };
+            // Sign inline. `build_with_class` returns both the signed
+            // tx and the concrete class name that produced it, so
+            // `MixedWorkload` can report the effective mix.
+            let (signed, class_name) =
+                match self.workload.build_with_class(&self.context, &signer, permit.nonce) {
+                    Ok(pair) => pair,
+                    Err(_e) => {
+                        state.signing_errors.fetch_add(1, Ordering::AcqRel);
+                        drop(permit);
+                        continue;
+                    }
+                };
 
             debug_assert_eq!(signed.sender, signer.address);
             debug_assert_eq!(signed.nonce, permit.nonce);
 
             state.per_signer_count[lane_idx].fetch_add(1, Ordering::AcqRel);
+            state.record_class(class_name);
             state.record_sample(&signed);
 
             // Dispatch by mode.
@@ -449,6 +494,13 @@ impl Runner {
             b
         });
 
+        let effective_mix: Vec<(&'static str, u64)> = state
+            .class_names
+            .iter()
+            .zip(state.class_counts.iter())
+            .map(|(name, atomic)| (*name, atomic.load(Ordering::Acquire)))
+            .collect();
+
         Ok(RunResult {
             attempted,
             pool_saturated,
@@ -460,6 +512,7 @@ impl Runner {
             sample_txs,
             mode: mode_final,
             broadcast,
+            effective_mix,
         })
     }
 
@@ -503,6 +556,7 @@ impl RunMode {
 mod tests {
     use super::*;
     use crate::signers::Signer;
+    use crate::workload::mix::{MixEntry, MixedWorkload};
     use crate::workload::transfer::SimpleTransfer;
 
     fn signer_with_last_byte(b: u8) -> Signer {
@@ -582,6 +636,95 @@ mod tests {
             };
             assert_eq!(dedup, sorted, "duplicate nonces for a signer");
         }
+    }
+
+    #[tokio::test]
+    async fn dry_run_records_single_class_effective_mix() {
+        let pool = pool_of(1);
+        let r = runner(pool, 50, 1);
+        let result = r.run(RunMode::DryRun).await.expect("run");
+        assert_eq!(result.effective_mix.len(), 1);
+        assert_eq!(result.effective_mix[0].0, "simple_transfer");
+        assert_eq!(result.effective_mix[0].1, result.signed_ok);
+    }
+
+    #[tokio::test]
+    async fn dry_run_records_multi_class_effective_mix() {
+        // Build a mix of two classes that both work without an
+        // address table: two copies of SimpleTransfer with different
+        // recipients. The mix semantics (dispatch + counter) are
+        // identical regardless of class identity, so this is enough
+        // to verify the runner plumbs `effective_mix` correctly.
+        let mut other = SimpleTransfer::default_bench();
+        other.recipient[19] = 0xaa;
+        // Rename the second class via a wrapping newtype so both
+        // entries land in distinct slots of `class_roster`.
+        struct OtherTransfer(SimpleTransfer);
+        impl WorkloadClass for OtherTransfer {
+            fn name(&self) -> &'static str {
+                "other_transfer"
+            }
+            fn required_contracts(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn build(
+                &self,
+                ctx: &WorkloadContext,
+                signer: &Signer,
+                nonce: u64,
+            ) -> crate::Result<SignedTx> {
+                self.0.build(ctx, signer, nonce)
+            }
+        }
+
+        let mix = MixedWorkload::new(vec![
+            MixEntry {
+                class: Arc::new(SimpleTransfer::default_bench()),
+                weight: 40,
+            },
+            MixEntry {
+                class: Arc::new(OtherTransfer(other)),
+                weight: 60,
+            },
+        ])
+        .expect("mix");
+
+        let pool = pool_of(2);
+        let ctx = Arc::new(WorkloadContext::for_dry_run(40204, 1_000_000_000));
+        let workload: Arc<dyn WorkloadClass> = Arc::new(mix);
+        let runner = Runner::new(
+            pool,
+            ctx,
+            workload,
+            RunOptions::for_dry_run(1, 200),
+        )
+        .expect("runner");
+
+        let result = runner.run(RunMode::DryRun).await.expect("run");
+        assert_eq!(result.effective_mix.len(), 2);
+        let class_names: Vec<&str> =
+            result.effective_mix.iter().map(|(n, _)| *n).collect();
+        assert!(class_names.contains(&"simple_transfer"));
+        assert!(class_names.contains(&"other_transfer"));
+        let sum: u64 = result.effective_mix.iter().map(|(_, n)| *n).sum();
+        assert_eq!(sum, result.signed_ok);
+
+        // Weight-based expectation: over ~200 txs with weights 40/60,
+        // each class gets within a couple of full cycles of its
+        // configured ratio.
+        let simple = result
+            .effective_mix
+            .iter()
+            .find(|(n, _)| *n == "simple_transfer")
+            .expect("simple")
+            .1;
+        let other = result
+            .effective_mix
+            .iter()
+            .find(|(n, _)| *n == "other_transfer")
+            .expect("other")
+            .1;
+        assert!(other >= simple, "60%% class should have >= 40%% class");
     }
 
     #[tokio::test]

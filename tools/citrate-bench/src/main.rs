@@ -13,12 +13,19 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+use citrate_bench::address_table::AddressTable;
 use citrate_bench::rpc::RpcClient;
 use citrate_bench::runner::{RunMode, RunOptions, Runner};
 use citrate_bench::signers::{keystore, pool::SignerPool, Signer};
 use citrate_bench::tracker::TrackerOptions;
 use citrate_bench::tx::legacy::LegacyTx;
+use citrate_bench::workload::classroom::ClassroomTransferStudent;
+use citrate_bench::workload::forwarder::ForwarderExecute;
+use citrate_bench::workload::inference_router::InferenceRouterRequest;
+use citrate_bench::workload::learning_pool::LearningPoolJoin;
+use citrate_bench::workload::mix::{MixEntry, MixedWorkload};
 use citrate_bench::workload::transfer::SimpleTransfer;
+use citrate_bench::workload::wrapped_salt::WrappedSaltTransfer;
 use citrate_bench::workload::{WorkloadClass, WorkloadContext};
 
 #[derive(Parser)]
@@ -97,6 +104,18 @@ enum Command {
         /// this per-signer from the chain.
         #[arg(long, default_value_t = 0)]
         starting_nonce: u64,
+        /// Optional workload mix. Format:
+        /// `class1:weight1,class2:weight2,...`. Known classes:
+        /// `simple_transfer`, `wrapped_salt`, `learning_pool`,
+        /// `inference_router`, `classroom`, `forwarder`. Contract
+        /// classes require `--address-table`. Omit for plain
+        /// `simple_transfer`.
+        #[arg(long)]
+        workload_mix: Option<String>,
+        /// Path to a `30_address_table.json` (required whenever
+        /// `--workload-mix` includes a contract class).
+        #[arg(long)]
+        address_table: Option<PathBuf>,
     },
     /// Real benchmark: submit signed txs via eth_sendRawTransaction,
     /// track receipts, cross-check ground truth against on-chain
@@ -138,6 +157,14 @@ enum Command {
         /// Minimum balance (in wei) each signer must hold at preflight.
         #[arg(long, default_value_t = 1_000_000_000_000_000u128)]
         funding_floor_wei: u128,
+        /// Optional workload mix. See `dry-run --workload-mix` for
+        /// the format and class list.
+        #[arg(long)]
+        workload_mix: Option<String>,
+        /// Path to a `30_address_table.json`. Required if the mix
+        /// includes any contract class.
+        #[arg(long)]
+        address_table: Option<PathBuf>,
     },
 }
 
@@ -178,6 +205,8 @@ async fn run(cli: Cli) -> citrate_bench::Result<()> {
             per_signer_max_inflight,
             recipient,
             starting_nonce,
+            workload_mix,
+            address_table,
         } => {
             cmd_dry_run(DryRunArgs {
                 keystore_dir,
@@ -191,6 +220,8 @@ async fn run(cli: Cli) -> citrate_bench::Result<()> {
                 per_signer_max_inflight,
                 recipient,
                 starting_nonce,
+                workload_mix,
+                address_table,
             })
             .await
         }
@@ -211,6 +242,8 @@ async fn run(cli: Cli) -> citrate_bench::Result<()> {
             receipt_timeout_secs,
             recipient,
             funding_floor_wei,
+            workload_mix,
+            address_table,
         } => {
             cmd_bench(BenchArgs {
                 rpc_url,
@@ -229,6 +262,8 @@ async fn run(cli: Cli) -> citrate_bench::Result<()> {
                 receipt_timeout_secs,
                 recipient,
                 funding_floor_wei,
+                workload_mix,
+                address_table,
             })
             .await
         }
@@ -315,6 +350,8 @@ struct DryRunArgs {
     per_signer_max_inflight: usize,
     recipient: String,
     starting_nonce: u64,
+    workload_mix: Option<String>,
+    address_table: Option<PathBuf>,
 }
 
 async fn cmd_dry_run(args: DryRunArgs) -> citrate_bench::Result<()> {
@@ -350,24 +387,30 @@ async fn cmd_dry_run(args: DryRunArgs) -> citrate_bench::Result<()> {
     }
     let gas_price_wei = (args.gas_price_gwei as u128) * 1_000_000_000u128;
     println!("  gas_price_wei  = {gas_price_wei}");
-    println!();
 
     let recipient = parse_eth_address(&args.recipient)?;
-    let workload_inner = SimpleTransfer {
-        recipient,
-        value_wei: 1,
-        gas_limit: 21_000,
-    };
-    let workload: Arc<dyn WorkloadClass> = Arc::new(workload_inner);
+    let address_table = load_address_table(args.address_table.as_deref())?;
+    let workload = build_workload(args.workload_mix.as_deref(), recipient, address_table.as_ref())?;
+    println!("  workload       = {}", workload.name());
+    let roster = workload.class_roster();
+    if roster.len() > 1 {
+        println!("  mix classes    = {}", roster.join(", "));
+    }
+    println!();
 
-    let ctx = Arc::new(WorkloadContext::for_dry_run(args.chain_id, gas_price_wei));
+    let mut ctx = WorkloadContext::for_dry_run(args.chain_id, gas_price_wei);
+    if let Some(t) = address_table {
+        ctx = ctx.with_address_table(t);
+    }
+    let ctx = Arc::new(ctx);
+
     let options = RunOptions::for_dry_run(args.duration_secs, args.target_tps);
     let runner = Runner::new(pool, ctx, workload, options)?;
 
     let result = runner.run(RunMode::DryRun).await?;
     result.print_summary();
     println!();
-    println!("(not broadcast — Phase 2 dry-run)");
+    println!("(not broadcast — dry-run)");
     Ok(())
 }
 
@@ -388,6 +431,8 @@ struct BenchArgs {
     receipt_timeout_secs: u64,
     recipient: String,
     funding_floor_wei: u128,
+    workload_mix: Option<String>,
+    address_table: Option<PathBuf>,
 }
 
 async fn cmd_bench(args: BenchArgs) -> citrate_bench::Result<()> {
@@ -443,17 +488,19 @@ async fn cmd_bench(args: BenchArgs) -> citrate_bench::Result<()> {
 
     // Workload + context.
     let recipient = parse_eth_address(&args.recipient)?;
-    let workload_inner = SimpleTransfer {
-        recipient,
-        value_wei: 1,
-        gas_limit: 21_000,
-    };
-    let workload: Arc<dyn WorkloadClass> = Arc::new(workload_inner);
+    let address_table = load_address_table(args.address_table.as_deref())?;
+    let workload = build_workload(args.workload_mix.as_deref(), recipient, address_table.as_ref())?;
+    println!("workload = {}", workload.name());
+    let roster = workload.class_roster();
+    if roster.len() > 1 {
+        println!("mix classes = {}", roster.join(", "));
+    }
     let gas_price_wei = (args.gas_price_gwei as u128) * 1_000_000_000u128;
-    let ctx = Arc::new(WorkloadContext::for_dry_run(
-        args.expected_chain_id,
-        gas_price_wei,
-    ));
+    let mut ctx = WorkloadContext::for_dry_run(args.expected_chain_id, gas_price_wei);
+    if let Some(t) = address_table {
+        ctx = ctx.with_address_table(t);
+    }
+    let ctx = Arc::new(ctx);
 
     // Runner + mode.
     let options = RunOptions {
@@ -527,4 +574,243 @@ fn parse_eth_address(s: &str) -> citrate_bench::Result<[u8; 20]> {
     let mut out = [0u8; 20];
     out.copy_from_slice(&bytes);
     Ok(out)
+}
+
+/// Optionally load the address table from `path`.
+fn load_address_table(
+    path: Option<&std::path::Path>,
+) -> citrate_bench::Result<Option<Arc<AddressTable>>> {
+    match path {
+        Some(p) => {
+            let tbl = citrate_bench::address_table::load(p)?;
+            Ok(Some(Arc::new(tbl)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Build a workload from the optional `--workload-mix` string.
+///
+/// If `mix_spec` is `None`, returns a `SimpleTransfer` to the given
+/// recipient (the legacy Phase 2/3 behavior).
+///
+/// If `mix_spec` is provided, parses it as a list of
+/// `class[:weight]` entries separated by commas and builds a
+/// `MixedWorkload`. Contract classes require `address_table`; the
+/// error message names the missing dependency.
+fn build_workload(
+    mix_spec: Option<&str>,
+    recipient: [u8; 20],
+    address_table: Option<&Arc<AddressTable>>,
+) -> citrate_bench::Result<Arc<dyn WorkloadClass>> {
+    let Some(spec) = mix_spec else {
+        // Default workload: SimpleTransfer to the CLI recipient.
+        return Ok(Arc::new(SimpleTransfer {
+            recipient,
+            value_wei: 1,
+            gas_limit: 21_000,
+        }));
+    };
+
+    let entries = parse_workload_mix(spec)?;
+    if entries.is_empty() {
+        return Err(citrate_bench::Error::Config(
+            "--workload-mix is empty".into(),
+        ));
+    }
+
+    let needs_table = entries.iter().any(|(class, _)| !matches!(class.as_str(), "simple_transfer"));
+    if needs_table && address_table.is_none() {
+        return Err(citrate_bench::Error::Config(
+            "--workload-mix includes contract classes but --address-table was not provided"
+                .into(),
+        ));
+    }
+
+    let mut built: Vec<MixEntry> = Vec::with_capacity(entries.len());
+    for (class_name, weight) in entries {
+        let class: Arc<dyn WorkloadClass> = match class_name.as_str() {
+            "simple_transfer" => Arc::new(SimpleTransfer {
+                recipient,
+                value_wei: 1,
+                gas_limit: 21_000,
+            }),
+            "wrapped_salt" => Arc::new(WrappedSaltTransfer::default_bench()),
+            "learning_pool" => Arc::new(LearningPoolJoin::default_bench()),
+            "inference_router" => Arc::new(InferenceRouterRequest::default_bench()),
+            "classroom" => Arc::new(ClassroomTransferStudent::default_bench()),
+            "forwarder" => Arc::new(ForwarderExecute::default_bench()),
+            other => {
+                return Err(citrate_bench::Error::Config(format!(
+                    "unknown workload class '{other}' in --workload-mix",
+                )));
+            }
+        };
+        built.push(MixEntry { class, weight });
+    }
+
+    // Degenerate case: single-entry mix is semantically equal to the
+    // underlying class, but we still return a MixedWorkload for
+    // uniform `effective_mix` reporting.
+    Ok(Arc::new(MixedWorkload::new(built)?))
+}
+
+/// Parse a `"class1:weight1,class2:weight2,class3"` string.
+/// Missing weights default to 1.
+fn parse_workload_mix(spec: &str) -> citrate_bench::Result<Vec<(String, u32)>> {
+    let mut out = Vec::new();
+    for token in spec.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (class, weight) = match token.split_once(':') {
+            Some((c, w)) => {
+                let parsed: u32 = w.trim().parse().map_err(|e| {
+                    citrate_bench::Error::Config(format!(
+                        "workload-mix weight '{w}' for class '{c}' is not a u32: {e}"
+                    ))
+                })?;
+                (c.trim().to_string(), parsed)
+            }
+            None => (token.to_string(), 1),
+        };
+        if class.is_empty() {
+            return Err(citrate_bench::Error::Config(
+                "empty class name in --workload-mix".into(),
+            ));
+        }
+        out.push((class, weight));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_workload_mix_single_class_default_weight() {
+        let out = parse_workload_mix("simple_transfer").expect("parse");
+        assert_eq!(out, vec![("simple_transfer".to_string(), 1)]);
+    }
+
+    #[test]
+    fn parse_workload_mix_multiple_classes_with_weights() {
+        let out = parse_workload_mix(
+            "simple_transfer:40,wrapped_salt:20,learning_pool:15,inference_router:15,forwarder:10",
+        )
+        .expect("parse");
+        assert_eq!(
+            out,
+            vec![
+                ("simple_transfer".to_string(), 40),
+                ("wrapped_salt".to_string(), 20),
+                ("learning_pool".to_string(), 15),
+                ("inference_router".to_string(), 15),
+                ("forwarder".to_string(), 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_workload_mix_trims_whitespace() {
+        let out = parse_workload_mix(" simple_transfer : 5 , wrapped_salt : 5 ").expect("parse");
+        assert_eq!(
+            out,
+            vec![
+                ("simple_transfer".to_string(), 5),
+                ("wrapped_salt".to_string(), 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_workload_mix_rejects_bad_weight() {
+        assert!(parse_workload_mix("simple_transfer:abc").is_err());
+    }
+
+    #[test]
+    fn parse_workload_mix_rejects_empty_class() {
+        assert!(parse_workload_mix(":5").is_err());
+    }
+
+    #[test]
+    fn parse_workload_mix_ignores_empty_tokens() {
+        // Trailing comma produces an empty token which we silently skip.
+        let out = parse_workload_mix("simple_transfer:1,").expect("parse");
+        assert_eq!(out, vec![("simple_transfer".to_string(), 1)]);
+    }
+
+    #[test]
+    fn build_workload_default_returns_simple_transfer() {
+        let mut recipient = [0u8; 20];
+        recipient[19] = 0xde;
+        let workload = build_workload(None, recipient, None).expect("build");
+        assert_eq!(workload.name(), "simple_transfer");
+    }
+
+    #[test]
+    fn build_workload_mix_of_simple_transfer_does_not_need_table() {
+        let mut recipient = [0u8; 20];
+        recipient[19] = 0xde;
+        let workload = build_workload(Some("simple_transfer:1"), recipient, None).expect("build");
+        assert_eq!(workload.name(), "mix");
+        assert_eq!(workload.class_roster(), vec!["simple_transfer"]);
+    }
+
+    #[test]
+    fn build_workload_contract_class_without_table_errors() {
+        let recipient = [0u8; 20];
+        let err = build_workload(
+            Some("simple_transfer:1,wrapped_salt:1"),
+            recipient,
+            None,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn build_workload_with_table_accepts_all_classes() {
+        let json = r#"{
+          "chainId": 40204,
+          "contracts": [
+            { "name": "WrappedSALT", "address": "0x1111111111111111111111111111111111111111" },
+            { "name": "LearningPool", "address": "0x2222222222222222222222222222222222222222" },
+            { "name": "AIInferenceRouterPortable", "address": "0x3333333333333333333333333333333333333333" },
+            { "name": "ClassroomClusterV1", "address": "0x4444444444444444444444444444444444444444" },
+            { "name": "Forwarder", "address": "0x5555555555555555555555555555555555555555" }
+          ]
+        }"#;
+        let t: AddressTable = serde_json::from_str(json).expect("parse");
+        let table = Arc::new(t);
+        let recipient = [0u8; 20];
+        let workload = build_workload(
+            Some(
+                "simple_transfer:1,wrapped_salt:1,learning_pool:1,inference_router:1,classroom:1,forwarder:1",
+            ),
+            recipient,
+            Some(&table),
+        )
+        .expect("build");
+        let roster = workload.class_roster();
+        assert_eq!(roster.len(), 6);
+        for name in [
+            "simple_transfer",
+            "wrapped_salt",
+            "learning_pool",
+            "inference_router",
+            "classroom",
+            "forwarder",
+        ] {
+            assert!(roster.contains(&name), "missing class: {name}");
+        }
+    }
+
+    #[test]
+    fn build_workload_rejects_unknown_class() {
+        let recipient = [0u8; 20];
+        let err = build_workload(Some("does_not_exist:1"), recipient, None);
+        assert!(err.is_err());
+    }
 }
