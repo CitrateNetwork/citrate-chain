@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
+import "./ScriptEnv.sol";
 
 // Core
 import "../src/ModelRegistry.sol";
@@ -10,8 +11,8 @@ import "../src/X402Facilitator.sol";
 import "../src/X402Paywall.sol";
 import "../src/ModelMarketplace.sol";
 import "../src/InferenceRouter.sol";
-// ModelAccessControl uses OZ ReentrancyGuard which conflicts with lib/ReentrancyGuard.sol
-// Deploy separately: forge create src/ModelAccessControl.sol:ModelAccessControl --constructor-args <registry>
+// ModelAccessControl is deployed in its own ceremony step so the canonical
+// address table can still include it without coupling OZ imports into this script.
 import "../src/LoRAFactory.sol";
 import "../src/IPFSIncentives.sol";
 
@@ -49,20 +50,17 @@ import "../src/SpecRegistry.sol";
  * @notice Deploys all 31 Citrate production contracts in dependency order.
  *         Run: forge script script/DeployAll.s.sol --rpc-url http://localhost:8545 --broadcast -vvvv
  */
-contract DeployAll is Script {
+contract DeployAll is ScriptEnv {
     function run() external {
-        uint256 deployerKey = vm.envOr(
-            "DEPLOYER_KEY",
-            uint256(0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef)
-        );
-        address deployer = vm.addr(deployerKey);
+        address deployer = deployerAddress();
 
         console.log("=== Citrate Full Contract Deployment ===");
         console.log("Deployer:", deployer);
         console.log("Chain ID:", block.chainid);
         console.log("");
 
-        vm.startBroadcast(deployerKey);
+        // The signer is selected by the forge CLI, not by this script.
+        vm.startBroadcast();
 
         // =====================================================================
         // Layer 1: Core Infrastructure (no dependencies)
@@ -99,8 +97,8 @@ contract DeployAll is Script {
         X402Paywall paywall = new X402Paywall(address(wsalt), 1 ether);
         console.log("  X402Paywall:", address(paywall));
 
-        // ModelAccessControl deployed separately (OZ dependency conflict)
-        console.log("  ModelAccessControl: deploy separately");
+        // ModelAccessControl is deployed by DeployModelAccessControl.s.sol
+        console.log("  ModelAccessControl: separate ceremony step");
 
         // =====================================================================
         // Layer 3: Economics (staking, contribution, slashing)
@@ -222,7 +220,7 @@ contract DeployAll is Script {
         console.log("");
         console.log("=== DEPLOYMENT COMPLETE ===");
         console.log("Chain ID:", block.chainid);
-        console.log("Total contracts deployed: 27 (+ ModelAccessControl separately)");
+        console.log("Total contracts deployed: 27");
         console.log("");
         console.log("--- Contract Addresses ---");
         console.log("ModelRegistry         :", address(registry));
@@ -232,7 +230,7 @@ contract DeployAll is Script {
         console.log("IPFSIncentives        :", address(ipfs));
         console.log("X402Facilitator       :", address(facilitator));
         console.log("X402Paywall           :", address(paywall));
-        console.log("ModelAccessControl    : deploy separately (OZ conflict)");
+        console.log("ModelAccessControl    : separate ceremony step");
         console.log("LiquidStakingPool     :", address(stakingPool));
         console.log("ContributionAccounting:", address(contributions));
         console.log("NematocystSlashing    :", address(slashing));

@@ -26,7 +26,7 @@ The ceremony uses four distinct key classes. Each has a different owner, differe
 
 ## Storage Mechanism: Foundry Keystore
 
-Foundry's `cast wallet import` provides encrypted key storage that the ceremony script uses. Keys are encrypted with a passphrase, stored in `~/.foundry/keystores/<name>`, and accessed via `--keystore` flag.
+Foundry's `cast wallet import` provides encrypted key storage that the ceremony script uses. Keys are encrypted with a passphrase, stored in `~/.foundry/keystores/<name>`, and accessed by keystore account name during the ceremony.
 
 ### Creating a key
 
@@ -53,9 +53,9 @@ cast wallet list
 ### Using a keystore entry
 
 ```bash
-# The ceremony script uses --keystore with the path to the keystore entry
-export CEREMONY_DEPLOYER_KEYSTORE="$HOME/.foundry/keystores/ceremony-deployer"
-export CEREMONY_DEPLOYER_ADDRESS="$(cast wallet address --keystore "$CEREMONY_DEPLOYER_KEYSTORE")"
+# The ceremony script uses the account name in the default Foundry keystore folder
+export CEREMONY_DEPLOYER_ACCOUNT="ceremony-deployer"
+export CEREMONY_DEPLOYER_ADDRESS="$(cast wallet address --keystore "$HOME/.foundry/keystores/$CEREMONY_DEPLOYER_ACCOUNT")"
 
 # The script will prompt for the passphrase when forge needs to sign
 ./ceremony.sh
@@ -64,7 +64,7 @@ export CEREMONY_DEPLOYER_ADDRESS="$(cast wallet address --keystore "$CEREMONY_DE
 ### Key properties enforced by this protocol
 
 - **Never touches git**: keystore files live in `$HOME/.foundry/keystores/`, not the repo
-- **Never in env vars**: we pass the keystore PATH, not the key itself, through env
+- **Never in env vars**: we pass the keystore account name, not the key itself, through env
 - **Never transmitted**: keys are created on the deployer host and never leave it
 - **Prompt-gated**: every signing operation requires the operator to re-enter the passphrase
 - **Single-use for deployer**: the deployer key signs one ceremony's worth of transactions and is then retired
@@ -83,7 +83,7 @@ export CEREMONY_DEPLOYER_ADDRESS="$(cast wallet address --keystore "$CEREMONY_DE
 
 ### During ceremony (T-0)
 
-1. Operator sets `CEREMONY_DEPLOYER_KEYSTORE` and `CEREMONY_DEPLOYER_ADDRESS` env vars
+1. Operator sets `CEREMONY_DEPLOYER_ACCOUNT` and `CEREMONY_DEPLOYER_ADDRESS` env vars
 2. Operator runs `ceremony.sh` in rehearsal mode first
 3. Rehearsal passes — operator runs ceremony.sh in real mode
 4. Every `forge script` invocation prompts for the keystore passphrase
@@ -136,7 +136,7 @@ After every ceremony run (rehearsal OR real):
 
 ## References
 
-- `ceremony.sh` — uses `CEREMONY_DEPLOYER_KEYSTORE` env var per this protocol
+- `ceremony.sh` — uses `CEREMONY_DEPLOYER_ACCOUNT` env var per this protocol
 - `provision-host.sh deployer` — installs Foundry in a way that supports this protocol
 - `CEREMONY_CHECKLIST.md` — pre-ceremony procurement checklist including funding the deployer address
 - `AUDITOR_PRE_SIGNOFF.md` — the document the auditor signs to verify this protocol was followed

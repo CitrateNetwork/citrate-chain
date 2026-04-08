@@ -1,4 +1,19 @@
-//! Citrate Live Benchmark — real-time streaming transaction viewer
+//! # DEPRECATED FOR TESTNET OR RELEASE CLAIMS
+//!
+//! This binary is a **devnet rehearsal tool only**. Like its sibling
+//! `benchmark-suite`, it uses `eth_sendTransaction` with a hardcoded
+//! fake unlocked sender — it only works on permissive local devnet
+//! nodes and does **not** exercise the real client signing flow. Its
+//! output must **not** be used as evidence for auditors or release
+//! claims.
+//!
+//! **Canonical harness**: `citrate_v0.01.1/tools/citrate-bench/`.
+//!
+//! See `citrate_v0.01.1/tests/load/README.md` for the full rationale.
+//!
+//! ---
+//!
+//! Citrate Live Benchmark — real-time streaming transaction viewer (historical)
 //!
 //! Watch thousands of transactions per second hit the chain in real time.
 //! Designed for developers who want to SEE the throughput, not just read a number.

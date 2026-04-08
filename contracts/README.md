@@ -26,13 +26,17 @@ forge fmt                      # Format Solidity
 ## Deploy
 
 We recommend deploying via Forge scripts. Point `--rpc-url` at a running Citrate node (devnet or testnet).
+The scripts themselves are signer-agnostic; the signer is chosen by the Forge CLI.
 
 ```bash
 # Deploy to local devnet
-forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast
+forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --private-key $PRIVATE_KEY --broadcast
 
 # Deploy to testnet
-forge script script/Deploy.s.sol --rpc-url https://rpc.citrate.ai --private-key $PRIVATE_KEY --broadcast
+forge script script/Deploy.s.sol --rpc-url https://rpc.citrate.ai \
+  --account ceremony-deployer \
+  --sender $DEPLOYER_ADDRESS \
+  --broadcast
 ```
 
 If deployment fails, verify the node is reachable with `curl http://localhost:8545` and check that your account has sufficient SALT for gas.
