@@ -24,6 +24,12 @@ fn make_block(height: u64, parent: Hash) -> Block {
         .build_unhashed()
 }
 
+fn embedded_pubkey(address: Address) -> PublicKey {
+    let mut bytes = [0u8; 32];
+    bytes[..20].copy_from_slice(&address.0);
+    PublicKey::new(bytes)
+}
+
 #[tokio::test]
 async fn test_eth_block_number_and_get_block() {
     // Storage
@@ -114,6 +120,60 @@ async fn test_eth_get_block_by_hash() {
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert!(v["result"].is_object());
     assert_eq!(v["result"]["number"], "0x1");
+}
+
+#[tokio::test]
+async fn test_eth_get_block_reports_persisted_gas_and_receipt_fields() {
+    let tmp = TempDir::new().unwrap();
+    let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
+
+    let proposer = embedded_pubkey(Address([0xAB; 20]));
+    let block = BlockBuilder::new()
+        .hash(Hash::new([0x44; 32]))
+        .parent(Hash::default())
+        .height(1)
+        .timestamp(1_000_001)
+        .proposer(proposer)
+        .gas_limit(30_000_000)
+        .gas_used(42_000)
+        .base_fee_per_gas(1_000_000_007)
+        .receipt_root(Hash::new([0x55; 32]))
+        .build_unhashed();
+    storage.blocks.put_block(&block).unwrap();
+
+    let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
+    let state_db = Arc::new(citrate_execution::StateDB::new());
+    let executor = Arc::new(Executor::new(state_db));
+
+    let mut io = jsonrpc_core::IoHandler::new();
+    citrate_api::eth_rpc::register_eth_methods(
+        &mut io,
+        storage.clone(),
+        mempool,
+        executor,
+        40204,
+        Arc::new(FilterRegistry::new()),
+        None,
+    );
+
+    let req = serde_json::json!({
+        "jsonrpc":"2.0",
+        "id":4,
+        "method":"eth_getBlockByNumber",
+        "params":["0x1", false]
+    })
+    .to_string();
+    let resp = io.handle_request(&req).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+
+    assert_eq!(v["result"]["gasUsed"], "0xa410");
+    assert_eq!(v["result"]["gasLimit"], "0x1c9c380");
+    assert_eq!(v["result"]["baseFeePerGas"], "0x3b9aca07");
+    assert_eq!(
+        v["result"]["receiptsRoot"],
+        format!("0x{}", hex::encode(block.receipt_root.as_bytes()))
+    );
+    assert_eq!(v["result"]["miner"], "0xabababababababababababababababababababab");
 }
 
 #[tokio::test]
@@ -331,6 +391,96 @@ async fn test_eth_get_balance_and_code_smoke() {
     let code_hex = vcode["result"].as_str().unwrap();
     assert!(code_hex.starts_with("0x"));
     assert!(code_hex.len() > 2); // non-empty code
+}
+
+#[tokio::test]
+async fn test_eth_latest_reads_survive_simulation_before_persist() {
+    use primitive_types::U256;
+
+    let tmp = TempDir::new().unwrap();
+    let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
+    let state_db = Arc::new(citrate_execution::StateDB::new());
+    let executor = Arc::new(Executor::with_storage(state_db, Some(storage.state.clone())));
+
+    let sender = Address([0x11; 20]);
+    let recipient = Address([0x22; 20]);
+    let sim_sender = Address([0x33; 20]);
+    let sim_recipient = Address([0x44; 20]);
+
+    executor.set_balance(&sender, U256::from(1_000_000u64));
+    executor.set_balance(&sim_sender, U256::from(1_000_000u64));
+
+    let block = make_block(1, Hash::default());
+    let mined_tx = Transaction {
+        hash: Hash::new([0x90; 32]),
+        nonce: 0,
+        from: embedded_pubkey(sender),
+        to: Some(embedded_pubkey(recipient)),
+        value: 123,
+        gas_limit: 21_000,
+        gas_price: 1,
+        signature: Signature::new([1; 64]),
+        chain_id: Some(40204),
+        ecdsa_verified: true,
+        ..Default::default()
+    };
+
+    let receipt = executor.execute_transaction(&block, &mined_tx).await.unwrap();
+    assert!(receipt.status);
+
+    // Reproduce the live corruption shape: a simulation occurs before the mined
+    // block's dirty state is persisted.
+    let sim_tx = Transaction {
+        hash: Hash::new([0x91; 32]),
+        nonce: 0,
+        from: embedded_pubkey(sim_sender),
+        to: Some(embedded_pubkey(sim_recipient)),
+        value: 1,
+        gas_limit: 21_000,
+        gas_price: 1,
+        signature: Signature::new([1; 64]),
+        chain_id: Some(40204),
+        ecdsa_verified: true,
+        ..Default::default()
+    };
+    let sim_receipt = executor.simulate_transaction(&block, &sim_tx).await.unwrap();
+    assert!(sim_receipt.status);
+
+    executor.persist_state_changes().await.unwrap();
+
+    // Use a fresh executor/handler to prove the mined "latest" state was
+    // actually persisted, not just left in memory.
+    let fresh_executor = Arc::new(Executor::with_storage(
+        Arc::new(citrate_execution::StateDB::new()),
+        Some(storage.state.clone()),
+    ));
+    let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
+    let mut io = jsonrpc_core::IoHandler::new();
+    citrate_api::eth_rpc::register_eth_methods(
+        &mut io,
+        storage,
+        mempool,
+        fresh_executor,
+        40204,
+        Arc::new(FilterRegistry::new()),
+        None,
+    );
+
+    let balance_req = serde_json::json!({
+        "jsonrpc":"2.0","id":1,"method":"eth_getBalance",
+        "params":[format!("0x{}", hex::encode(recipient.0)), "latest"]
+    }).to_string();
+    let balance_resp = io.handle_request(&balance_req).await.unwrap();
+    let balance_json: serde_json::Value = serde_json::from_str(&balance_resp).unwrap();
+    assert_eq!(balance_json["result"], "0x7b");
+
+    let nonce_req = serde_json::json!({
+        "jsonrpc":"2.0","id":2,"method":"eth_getTransactionCount",
+        "params":[format!("0x{}", hex::encode(sender.0)), "latest"]
+    }).to_string();
+    let nonce_resp = io.handle_request(&nonce_req).await.unwrap();
+    let nonce_json: serde_json::Value = serde_json::from_str(&nonce_resp).unwrap();
+    assert_eq!(nonce_json["result"], "0x1");
 }
 
 #[tokio::test]
@@ -1136,4 +1286,48 @@ async fn test_eth_estimate_gas_real_execution() {
     let resp_empty = io.handle_request(&req_empty).await.unwrap();
     let v_empty: serde_json::Value = serde_json::from_str(&resp_empty).unwrap();
     assert_eq!(v_empty["result"], "0x5208", "Empty params should default to 21000");
+}
+
+#[tokio::test]
+async fn test_eth_estimate_gas_contract_deploy_not_simple_transfer() {
+    use primitive_types::U256;
+
+    let tmp = TempDir::new().unwrap();
+    let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
+    let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
+    let state_db = Arc::new(citrate_execution::StateDB::new());
+    let executor = Arc::new(Executor::new(state_db));
+
+    let from_addr = Address([0x77; 20]);
+    executor.set_balance(&from_addr, U256::from(1_000_000_000u64));
+
+    let mut io = jsonrpc_core::IoHandler::new();
+    citrate_api::eth_rpc::register_eth_methods(
+        &mut io,
+        storage,
+        mempool,
+        executor,
+        40204,
+        Arc::new(FilterRegistry::new()),
+        None,
+    );
+
+    // Simple init code: PUSH1 0x00 PUSH1 0x00 RETURN
+    let init_code = "0x60006000f3";
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":4,"method":"eth_estimateGas",
+        "params":[{
+            "from": format!("0x{}", hex::encode(from_addr.0)),
+            "data": init_code
+        }]
+    }).to_string();
+    let resp = io.handle_request(&req).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let gas_hex = v["result"].as_str().unwrap();
+    let gas = u64::from_str_radix(gas_hex.trim_start_matches("0x"), 16).unwrap();
+    assert!(
+        gas > 21_000,
+        "contract deployment estimate must not collapse to simple-transfer gas: {}",
+        gas
+    );
 }
