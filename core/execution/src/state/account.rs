@@ -36,6 +36,15 @@ impl AccountManager {
         self.dirty.insert(address, true);
     }
 
+    /// Load account state without marking it dirty.
+    ///
+    /// This is used when hydrating executor memory from persisted storage or
+    /// restoring snapshots. Plain reads must not create synthetic dirty state.
+    pub fn load_account(&self, address: Address, state: AccountState) {
+        self.accounts.insert(address, state);
+        self.dirty.remove(&address);
+    }
+
     /// Get balance
     pub fn get_balance(&self, address: &Address) -> U256 {
         self.get_account(address).balance
@@ -190,6 +199,12 @@ impl AccountManager {
                 .iter()
                 .map(|e| (*e.key(), e.value().clone()))
                 .collect(),
+            dirty: self
+                .dirty
+                .iter()
+                .filter(|e| *e.value())
+                .map(|e| *e.key())
+                .collect(),
         }
     }
 
@@ -197,9 +212,12 @@ impl AccountManager {
     pub fn restore(&self, snapshot: AccountSnapshot) {
         self.accounts.clear();
         for (addr, state) in snapshot.accounts {
-            self.accounts.insert(addr, state);
+            self.load_account(addr, state);
         }
         self.dirty.clear();
+        for addr in snapshot.dirty {
+            self.dirty.insert(addr, true);
+        }
     }
 }
 
@@ -212,6 +230,7 @@ impl Default for AccountManager {
 /// Account snapshot for rollback
 pub struct AccountSnapshot {
     accounts: Vec<(Address, AccountState)>,
+    dirty: Vec<Address>,
 }
 
 #[cfg(test)]

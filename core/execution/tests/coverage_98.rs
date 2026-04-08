@@ -283,6 +283,12 @@ fn statedb_snapshot_restore_full() {
     db.register_model(mid, make_model(a)).unwrap();
     db.create_training_job(make_training_job(jid, a, mid)).unwrap();
 
+    // Drain dirty_storage before snapshot so the snapshot captures an empty
+    // tracker. The post-restore assertion below then checks that restore
+    // correctly returns dirty_storage to its snapshot-time value (empty),
+    // not that restore unconditionally clears it.
+    let _ = db.take_dirty_storage();
+
     // Snapshot
     let snap = db.snapshot();
 
@@ -292,9 +298,6 @@ fn statedb_snapshot_restore_full() {
     let mut model2 = make_model(a);
     model2.version = 99;
     db.update_model(mid, model2).unwrap();
-
-    // Dirty storage should have entries
-    // Dirty storage was already taken above; repopulate it:
     db.set_storage(a, b"dirty".to_vec(), b"yes".to_vec());
 
     // Restore
@@ -303,7 +306,7 @@ fn statedb_snapshot_restore_full() {
     assert_eq!(db.accounts.get_balance(&a), U256::from(500));
     assert_eq!(db.get_storage(&a, b"slot"), Some(b"before".to_vec()));
     assert_eq!(db.get_model(&mid).unwrap().version, 1);
-    // dirty_storage is cleared by restore
+    // dirty_storage was empty at snapshot time, so restore returns it to empty
     assert!(db.take_dirty_storage().is_empty());
 }
 
