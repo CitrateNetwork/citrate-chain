@@ -148,4 +148,57 @@ After a clean local rehearsal:
 
 1. run two disposable infra rehearsals per `CEREMONY_CHECKLIST.md`
 2. execute the real `40204` ceremony only after those rehearsals are clean
+
+## Clean-Slate Reroll
+
+**When to use**: you ran a rehearsal against a local (non-`anvil`)
+`citrate-node`, it produced deploy state under `.citrate-testnet-beta/`,
+and you want to start fresh without hand-killing processes and
+`rm -rf`'ing directories on the fly. This is exactly the situation
+that bit the 2026-04-08 dry run: stale contract state caused
+`CreateCollision` on the first DeployAll run.
+
+Run the reroll script, then re-run the ceremony:
+
+```bash
+./citrate_v0.01.1/scripts/ceremony/ceremony-reroll.sh --reroll
+./citrate_v0.01.1/scripts/ceremony/ceremony.sh
+```
+
+The reroll script is safe and reversible:
+
+- It will **not** run without explicit opt-in (`--reroll` flag or
+  `CEREMONY_REROLL=1` env var).
+- It will **not** run in `CEREMONY_MODE=real` unless you ALSO set
+  `CEREMONY_REROLL_REAL=1` — a two-key confirmation for destructive
+  real-mode operations.
+- It moves the data directory to a timestamped backup via `mv`; it
+  does **not** `rm -rf`. The archive path is printed along with the
+  exact command to recover it.
+- It clears `contracts/broadcast/` and `contracts/cache/` because
+  forge will otherwise happily re-use stale deployment records and
+  compiler caches.
+
+Override knobs (env vars, all optional):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CEREMONY_DATA_DIR` | `.citrate-testnet-beta` | Node data dir to archive. |
+| `CEREMONY_RPC_PORT` | `8545` | Port to probe for a running listener. |
+| `CEREMONY_MODE` | `rehearsal` | Set to `real` + `CEREMONY_REROLL_REAL=1` for real-mode reroll. |
+| `CITRATE_REPO_ROOT` | (script's grandparent) | Workspace root override — used by the integration test, not needed in normal operation. |
+
+### Integration test
+
+`scripts/ceremony/tests/test_ceremony_reroll.sh` exercises every
+acceptance criterion in backlog #111 against a hand-built fake
+workspace under `/tmp` so it never touches the real repo. Run it
+any time `ceremony-reroll.sh` is modified:
+
+```bash
+./citrate_v0.01.1/scripts/ceremony/tests/test_ceremony_reroll.sh
+```
+
+Expected: `ALL TESTS PASSED` and exit code 0. Fails loudly with
+per-assertion diagnostics otherwise.
 3. rebuild the benchmark harness against the frozen testnet truth rather than the old devnet assumptions

@@ -82,6 +82,11 @@ These steps happen asynchronously before the live ceremony session. The ceremony
 - [ ] `provision-host.sh deployer` has run on the deployer host
 - [ ] `provision-host.sh bootnode` has run on at least one rehearsal bootnode
 - [ ] Fresh genesis generated on the rehearsal bootnode
+- [ ] If this is a retry after a previous rehearsal, `ceremony-reroll.sh --reroll`
+      was run on every host that had prior deploy state (see
+      `LOCAL_REHEARSAL.md` §Clean-Slate Reroll). Stale
+      `.citrate-testnet-beta/` dirs or `contracts/broadcast/` files
+      cause `CreateCollision` on first DeployAll.
 
 ### 1.2 — Rehearsal Ceremony
 
