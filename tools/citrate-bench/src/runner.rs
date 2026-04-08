@@ -164,6 +164,23 @@ impl RunResult {
             println!("  mined_nonce_delta_total  = {}", b.mined_nonce_delta_total);
             println!("  ground_truth_match       = {}", b.ground_truth_match);
             println!("  included_tps             = {:.2}", b.included_tps);
+            if b.tracker_stats.depth_finalized > 0
+                || b.tracker_stats.depth_finality_timeouts > 0
+            {
+                println!("-- depth finality --");
+                println!(
+                    "  depth_finalized          = {}",
+                    b.tracker_stats.depth_finalized
+                );
+                println!(
+                    "  depth_finality_timeouts  = {}",
+                    b.tracker_stats.depth_finality_timeouts
+                );
+                println!(
+                    "  avg_depth_finality_ms    = {:.2}",
+                    b.tracker_stats.avg_depth_finality_latency_ms
+                );
+            }
             if !b.rejected_reasons.is_empty() {
                 println!("  reject samples           =");
                 for r in b.rejected_reasons.iter().take(5) {

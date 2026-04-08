@@ -17,7 +17,7 @@ use citrate_bench::address_table::AddressTable;
 use citrate_bench::rpc::RpcClient;
 use citrate_bench::runner::{RunMode, RunOptions, Runner};
 use citrate_bench::signers::{keystore, pool::SignerPool, Signer};
-use citrate_bench::tracker::TrackerOptions;
+use citrate_bench::tracker::{FinalityOptions, TrackerOptions};
 use citrate_bench::tx::legacy::LegacyTx;
 use citrate_bench::workload::classroom::ClassroomTransferStudent;
 use citrate_bench::workload::forwarder::ForwarderExecute;
@@ -165,6 +165,21 @@ enum Command {
         /// includes any contract class.
         #[arg(long)]
         address_table: Option<PathBuf>,
+        /// Depth-finality confirmation count. When > 0, the tracker
+        /// waits until the chain head is `N - 1` blocks above each
+        /// tx's inclusion block before recording depth-finality
+        /// latency. `0` disables depth finality. Phase 5 default.
+        #[arg(long, default_value_t = 0)]
+        depth_finality: u64,
+        /// Per-tx finality timeout in seconds, independent of the
+        /// receipt timeout. Ignored when `--depth-finality == 0`.
+        #[arg(long, default_value_t = 180)]
+        finality_timeout_secs: u64,
+        /// Head-watcher poll interval in milliseconds. Controls how
+        /// often the tracker refreshes its view of the chain head
+        /// for finality checks.
+        #[arg(long, default_value_t = 500)]
+        finality_poll_ms: u64,
     },
 }
 
@@ -244,6 +259,9 @@ async fn run(cli: Cli) -> citrate_bench::Result<()> {
             funding_floor_wei,
             workload_mix,
             address_table,
+            depth_finality,
+            finality_timeout_secs,
+            finality_poll_ms,
         } => {
             cmd_bench(BenchArgs {
                 rpc_url,
@@ -264,6 +282,9 @@ async fn run(cli: Cli) -> citrate_bench::Result<()> {
                 funding_floor_wei,
                 workload_mix,
                 address_table,
+                depth_finality,
+                finality_timeout_secs,
+                finality_poll_ms,
             })
             .await
         }
@@ -433,6 +454,9 @@ struct BenchArgs {
     funding_floor_wei: u128,
     workload_mix: Option<String>,
     address_table: Option<PathBuf>,
+    depth_finality: u64,
+    finality_timeout_secs: u64,
+    finality_poll_ms: u64,
 }
 
 async fn cmd_bench(args: BenchArgs) -> citrate_bench::Result<()> {
@@ -510,9 +534,19 @@ async fn cmd_bench(args: BenchArgs) -> citrate_bench::Result<()> {
     };
     let runner = Runner::new(pool, ctx, workload, options)?;
 
+    let finality = if args.depth_finality > 0 {
+        Some(FinalityOptions {
+            depth_blocks: args.depth_finality,
+            poll_interval: Duration::from_millis(args.finality_poll_ms),
+            per_tx_timeout: Duration::from_secs(args.finality_timeout_secs),
+        })
+    } else {
+        None
+    };
     let tracker_options = TrackerOptions {
         worker_count: args.tracker_workers,
         per_tx_timeout: Duration::from_secs(args.receipt_timeout_secs),
+        finality,
         ..TrackerOptions::default()
     };
     let mode = RunMode::Broadcast {
