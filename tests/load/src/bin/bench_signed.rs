@@ -1,4 +1,23 @@
-//! Citrate Self-Signed Benchmark — production-correct TPS measurement
+//! # HISTORICAL WIP — PRODUCTIONIZED IN `tools/citrate-bench/`
+//!
+//! This binary is the **original proof-of-concept** that client-side
+//! EIP-155 signing works end-to-end against a Citrate node. Its logic
+//! has been productionized and extended in
+//! `citrate_v0.01.1/tools/citrate-bench/`, which is the canonical
+//! benchmark harness and where all new benchmark work lives.
+//!
+//! `bench-signed` is retained only as a clean reference point for
+//! anyone looking at how the early signed-tx proof was constructed.
+//! **It is not to be used for new benchmark runs or release claims.**
+//! Use `citrate-bench` instead.
+//!
+//! See `citrate_v0.01.1/tests/load/README.md` and
+//! `.agentile/quorum/16_POST_CEREMONY_BENCHMARK_HARNESS_SPEC.md` for
+//! the full rationale.
+//!
+//! ---
+//!
+//! Citrate Self-Signed Benchmark — production-correct TPS measurement (historical)
 //!
 //! Unlike `benchmark-suite` which uses the legacy `eth_sendTransaction` RPC
 //! (requires node-side keystore management), this binary signs EIP-155 legacy
