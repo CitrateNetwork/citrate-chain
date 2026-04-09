@@ -138,11 +138,11 @@ Institutional education contracts, deployed in dependency order.
 
 | # | Contract | Address | Governance |
 |---|----------|---------|------------|
-| 31 | `InstitutionalVault` | `0xf7c3180dda79fb046173d96d172bf43b70174031` | 2-of-3 multi-sig (SIGNER_1/2/3) |
-| 32 | `ClassroomClusterV1` | `0xc12dbcdb80ef2ae675315f455210f39a736a373c` | Vault |
-| 33 | `Forwarder` | `0xf1eae5dd4a1639922ea610142f7ce51330065b57` | Vault (device/session validation) |
-| 34 | `BudgetAllocation` | `0xbaa2505d0446043be3540c0b9150c6df42d33180` | Vault |
-| 35 | `CashoutRequest` | `0xbf62ee8ee209321bbddf5dd15afd77ac327367cd` | Vault |
+| 31 | `InstitutionalVault` | `0x18d3e03eb3364f63db8e4f6bbd078ad8098c2c2b` | 2-of-3 multi-sig (SIGNER_1/2/3) |
+| 32 | `ClassroomClusterV1` | `0x00132c0f7fad65a6d54d2c561dc4609237437449` | Vault |
+| 33 | `Forwarder` | `0xcb5fcad35f892e7e1da4bb4d17a48dd9e056583e` | Vault (device/session validation) |
+| 34 | `BudgetAllocation` | `0xdaff2b9dc254b6cb3040f8f14304d30e136fa136` | Vault |
+| 35 | `CashoutRequest` | `0xb87a4f754ca316d2416553d04f4eded26424b536` | Vault |
 
 ### Model Access Control (1) — `script/DeployModelAccessControl.s.sol`
 
