@@ -93,7 +93,7 @@ contract EduStackIntegrationTest is Test {
     function test_e2e_full_school_workflow() public {
         // Step 1: Admin creates a classroom
         vm.prank(principal);
-        uint256 classroomId = cluster.createClassroom("Biology 101", teacher1);
+        uint256 classroomId = cluster.createClassroom("Biology 101", teacher1, 10, 2026, "A");
         assertEq(cluster.getClassroomName(classroomId), "Biology 101");
         assertEq(cluster.getClassroomTeacher(classroomId), teacher1);
 
@@ -157,7 +157,7 @@ contract EduStackIntegrationTest is Test {
     function test_e2e_multiple_students_contribute() public {
         // Setup classroom
         vm.prank(principal);
-        uint256 cid = cluster.createClassroom("Chemistry 201", teacher1);
+        uint256 cid = cluster.createClassroom("Chemistry 201", teacher1, 11, 2026, "B");
 
         // Register 3 devices and students
         address student2 = address(0x5002);
@@ -217,7 +217,7 @@ contract EduStackIntegrationTest is Test {
     function test_e2e_device_revoked_mid_session() public {
         // Setup
         vm.prank(principal);
-        uint256 cid = cluster.createClassroom("Math 301", teacher1);
+        uint256 cid = cluster.createClassroom("Math 301", teacher1, 9, 2026, "");
         vm.prank(itDir);
         cluster.registerDevice(device1Cert, student1);
         vm.prank(teacher1);
@@ -275,9 +275,9 @@ contract EduStackIntegrationTest is Test {
         address teacher2 = address(0x4002);
 
         vm.prank(principal);
-        uint256 bio = cluster.createClassroom("Bio 101", teacher1);
+        uint256 bio = cluster.createClassroom("Bio 101", teacher1, 9, 2026, "");
         vm.prank(principal);
-        uint256 chem = cluster.createClassroom("Chem 201", teacher2);
+        uint256 chem = cluster.createClassroom("Chem 201", teacher2, 9, 2026, "");
 
         // Student starts in Bio
         vm.prank(teacher1);
@@ -305,7 +305,7 @@ contract EduStackIntegrationTest is Test {
     function test_e2e_emergency_pause() public {
         // Setup a pending cashout
         vm.prank(principal);
-        cluster.createClassroom("Bio 101", teacher1);
+        cluster.createClassroom("Bio 101", teacher1, 10, 2026, "");
 
         vm.prank(teacher1);
         cashout.requestCashout(0, 5 ether, keccak256("supplies"));
@@ -337,7 +337,7 @@ contract EduStackIntegrationTest is Test {
     function test_e2e_student_cannot_escalate_through_any_contract() public {
         // Setup
         vm.prank(principal);
-        cluster.createClassroom("Bio 101", teacher1);
+        cluster.createClassroom("Bio 101", teacher1, 10, 2026, "");
         vm.prank(itDir);
         cluster.registerDevice(device1Cert, student1);
         vm.prank(teacher1);
@@ -351,7 +351,7 @@ contract EduStackIntegrationTest is Test {
 
         // Cannot create classroom
         vm.expectRevert();
-        cluster.createClassroom("Hacked", student1);
+        cluster.createClassroom("Hacked", student1, 0, 0, "");
 
         // Cannot allocate budget
         vm.expectRevert();

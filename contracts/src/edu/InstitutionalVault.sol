@@ -6,6 +6,7 @@ import {IInstitutionalVault} from "./interfaces/IInstitutionalVault.sol";
 /// @title InstitutionalVault
 /// @notice Multi-sig treasury for school-controlled SALT funds.
 /// @dev All 9 invariants from Q-004 InstitutionalVaultSafety.tla enforced.
+///      Signer add/remove now requires k-of-n quorum via proposal flow.
 contract InstitutionalVault is IInstitutionalVault {
     // ── Storage ──
 
@@ -32,6 +33,18 @@ contract InstitutionalVault is IInstitutionalVault {
     mapping(address => bool) private _unpauseApprovals;
     uint256 private _unpauseApprovalCount;
 
+    // Signer change proposals
+    struct SignerChangeProposal {
+        address target;        // address to add or remove
+        bool isAdd;            // true = add, false = remove
+        uint256 approvalCount;
+        bool executed;
+        bool rejected;
+    }
+    mapping(uint256 => SignerChangeProposal) private _signerProposals;
+    mapping(uint256 => mapping(address => bool)) private _signerProposalApprovals;
+    uint256 private _nextSignerProposalId;
+
     // ── Errors ──
 
     error NotSigner();
@@ -48,6 +61,11 @@ contract InstitutionalVault is IInstitutionalVault {
     error InsufficientBalance();
     error TransferFailed();
     error ZeroAddress();
+    error SignerProposalNotFound();
+    error SignerProposalAlreadyExecuted();
+    error SignerProposalAlreadyRejected();
+    error SignerProposalAlreadyApproved();
+    error SignerProposalQuorumNotMet();
 
     // ── Modifiers ──
 
@@ -110,6 +128,16 @@ contract InstitutionalVault is IInstitutionalVault {
 
     function hasApproved(uint256 txId, address signer) external view returns (bool) {
         return _approvals[txId][signer];
+    }
+
+    /// @notice Get approval count for a signer change proposal.
+    function getSignerProposalApprovalCount(uint256 proposalId) external view returns (uint256) {
+        return _signerProposals[proposalId].approvalCount;
+    }
+
+    /// @notice Check if a signer has approved a signer change proposal.
+    function hasApprovedSignerChange(uint256 proposalId, address signer) external view returns (bool) {
+        return _signerProposalApprovals[proposalId][signer];
     }
 
     // ── Deposit ──
@@ -219,38 +247,77 @@ contract InstitutionalVault is IInstitutionalVault {
         }
     }
 
-    // ── Signer Management ──
+    // ── Signer Management (Quorum-gated proposal flow) ──
 
-    /// @dev Invariant: SignerAddRemoveRequiresQuorum
-    /// For simplicity in v1, signer changes require ALL current signers to agree.
-    /// A production version would use a separate proposal/approval flow.
-    function addSigner(address signer) external onlySigner {
-        if (signer == address(0)) revert ZeroAddress();
-        if (_isSigner[signer]) revert AlreadySigner();
+    /// @dev Invariant: SignerAddRemoveRequiresQuorum — Step 1: Any signer proposes
+    function proposeSignerChange(address target, bool isAdd) external onlySigner returns (uint256 proposalId) {
+        if (target == address(0)) revert ZeroAddress();
+        if (isAdd && _isSigner[target]) revert AlreadySigner();
+        if (!isAdd && !_isSigner[target]) revert NotASigner();
+        // Pre-check: removing must not drop below threshold
+        if (!isAdd && _signerList.length - 1 < _threshold) revert InvalidThreshold();
 
-        _isSigner[signer] = true;
-        _signerList.push(signer);
+        proposalId = _nextSignerProposalId++;
+        _signerProposals[proposalId] = SignerChangeProposal({
+            target: target,
+            isAdd: isAdd,
+            approvalCount: 0,
+            executed: false,
+            rejected: false
+        });
+        // Proposer auto-approves
+        _signerProposalApprovals[proposalId][msg.sender] = true;
+        _signerProposals[proposalId].approvalCount = 1;
 
-        emit SignerAdded(signer);
+        emit SignerChangeProposed(proposalId, target, isAdd, msg.sender);
     }
 
-    function removeSigner(address signer) external onlySigner {
-        if (!_isSigner[signer]) revert NotASigner();
-        // Invariant: ThresholdBoundsValid — can't reduce below threshold
-        if (_signerList.length - 1 < _threshold) revert InvalidThreshold();
+    /// @dev Step 2: Other signers approve
+    function approveSignerChange(uint256 proposalId) external onlySigner {
+        SignerChangeProposal storage p = _signerProposals[proposalId];
+        if (p.executed) revert SignerProposalAlreadyExecuted();
+        if (p.rejected) revert SignerProposalAlreadyRejected();
+        if (_signerProposalApprovals[proposalId][msg.sender]) revert SignerProposalAlreadyApproved();
 
-        _isSigner[signer] = false;
+        _signerProposalApprovals[proposalId][msg.sender] = true;
+        p.approvalCount++;
 
-        // Remove from list (swap and pop)
-        for (uint256 i = 0; i < _signerList.length; i++) {
-            if (_signerList[i] == signer) {
-                _signerList[i] = _signerList[_signerList.length - 1];
-                _signerList.pop();
-                break;
+        emit SignerChangeApproved(proposalId, msg.sender);
+    }
+
+    /// @dev Step 3: Execute once quorum reached
+    function executeSignerChange(uint256 proposalId) external onlySigner {
+        SignerChangeProposal storage p = _signerProposals[proposalId];
+        if (p.executed) revert SignerProposalAlreadyExecuted();
+        if (p.rejected) revert SignerProposalAlreadyRejected();
+        if (p.approvalCount < _threshold) revert SignerProposalQuorumNotMet();
+
+        p.executed = true;
+
+        if (p.isAdd) {
+            _isSigner[p.target] = true;
+            _signerList.push(p.target);
+            emit SignerAdded(p.target);
+        } else {
+            _isSigner[p.target] = false;
+            for (uint256 i = 0; i < _signerList.length; i++) {
+                if (_signerList[i] == p.target) {
+                    _signerList[i] = _signerList[_signerList.length - 1];
+                    _signerList.pop();
+                    break;
+                }
             }
+            emit SignerRemoved(p.target);
         }
+    }
 
-        emit SignerRemoved(signer);
+    /// @dev Reject a signer change proposal (any signer can reject)
+    function rejectSignerChange(uint256 proposalId) external onlySigner {
+        SignerChangeProposal storage p = _signerProposals[proposalId];
+        if (p.executed) revert SignerProposalAlreadyExecuted();
+        if (p.rejected) revert SignerProposalAlreadyRejected();
+        p.rejected = true;
+        emit SignerChangeRejected(proposalId, msg.sender);
     }
 
     /// @dev Invariant: ThresholdBoundsValid — k > 0 and k <= n

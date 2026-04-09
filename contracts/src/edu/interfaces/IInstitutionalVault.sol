@@ -25,6 +25,9 @@ interface IInstitutionalVault {
     event SignerAdded(address indexed signer);
     event SignerRemoved(address indexed signer);
     event ThresholdChanged(uint256 oldThreshold, uint256 newThreshold);
+    event SignerChangeProposed(uint256 indexed proposalId, address target, bool isAdd, address proposer);
+    event SignerChangeApproved(uint256 indexed proposalId, address approver);
+    event SignerChangeRejected(uint256 indexed proposalId, address rejector);
 
     // ── Views ──
 
@@ -79,12 +82,18 @@ interface IInstitutionalVault {
     /// @dev Invariant: UnpauseRequiresQuorum
     function unpause() external;
 
-    /// @notice Add a new signer (requires k-of-n approval).
+    /// @notice Propose adding or removing a signer (requires k-of-n quorum to execute).
     /// @dev Invariant: SignerAddRemoveRequiresQuorum
-    function addSigner(address signer) external;
+    function proposeSignerChange(address target, bool isAdd) external returns (uint256 proposalId);
 
-    /// @notice Remove a signer (requires k-of-n approval).
-    function removeSigner(address signer) external;
+    /// @notice Approve a pending signer change proposal.
+    function approveSignerChange(uint256 proposalId) external;
+
+    /// @notice Execute a signer change proposal after quorum is met.
+    function executeSignerChange(uint256 proposalId) external;
+
+    /// @notice Reject a signer change proposal.
+    function rejectSignerChange(uint256 proposalId) external;
 
     /// @notice Change the signing threshold (requires k-of-n approval).
     /// @dev Invariant: ThresholdBoundsValid — k > 0 and k <= n

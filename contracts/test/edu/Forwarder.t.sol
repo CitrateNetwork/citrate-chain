@@ -50,7 +50,7 @@ contract ForwarderTest is Test {
 
         // Create classroom + register device
         vm.prank(admin);
-        cluster.createClassroom("Bio 101", teacher);
+        cluster.createClassroom("Bio 101", teacher, 10, 2026, "A");
 
         vm.prank(itAdmin);
         cluster.registerDevice(deviceCert, student);

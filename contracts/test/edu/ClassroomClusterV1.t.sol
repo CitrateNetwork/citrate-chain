@@ -34,7 +34,7 @@ contract ClassroomClusterV1Test is Test {
 
         // Create a classroom
         vm.prank(admin);
-        cluster.createClassroom("Biology 101", teacher1);
+        cluster.createClassroom("Biology 101", teacher1, 0, 0, "");
     }
 
     // ===================================================================
@@ -90,13 +90,16 @@ contract ClassroomClusterV1Test is Test {
         assertEq(uint256(cluster.getOrgRole(itAdmin)), uint256(IClassroomCluster.OrgRole.None));
     }
 
-    function test_revoked_user_cannot_get_new_role() public {
+    function test_revoked_user_can_get_new_role_if_not_expelled() public {
+        // With the new AccountStatus state machine, revokeOrgRole sets Inactive (reversible),
+        // not permanent revocation. Admin can re-enroll the user.
         vm.prank(admin);
         cluster.revokeOrgRole(itAdmin);
 
+        // Status is now Inactive — re-grant is allowed (not expelled)
         vm.prank(admin);
-        vm.expectRevert(); // UserRevoked
         cluster.grantOrgRole(itAdmin, IClassroomCluster.OrgRole.IT);
+        assertEq(uint256(cluster.getOrgRole(itAdmin)), uint256(IClassroomCluster.OrgRole.IT));
     }
 
     // ===================================================================
@@ -138,7 +141,7 @@ contract ClassroomClusterV1Test is Test {
         // Cannot act as admin anymore
         vm.prank(teacher1);
         vm.expectRevert();
-        cluster.createClassroom("Denied", address(0x77));
+        cluster.createClassroom("Denied", address(0x77), 0, 0, "");
     }
 
     // Invariant 4: MultiRoleConsistency
@@ -154,7 +157,7 @@ contract ClassroomClusterV1Test is Test {
 
         // teacher1 can now create classrooms (Admin privilege) AND manage students (Teacher privilege)
         vm.prank(teacher1);
-        cluster.createClassroom("Chemistry 201", teacher2);
+        cluster.createClassroom("Chemistry 201", teacher2, 0, 0, "");
 
         vm.prank(teacher1);
         cluster.grantClassroomRole(0, student1, IClassroomCluster.ClassroomRole.Student);
@@ -179,7 +182,7 @@ contract ClassroomClusterV1Test is Test {
     function test_invariant_transfer_atomicity() public {
         // Create second classroom
         vm.prank(admin);
-        uint256 classroomB = cluster.createClassroom("Chemistry 201", teacher2);
+        uint256 classroomB = cluster.createClassroom("Chemistry 201", teacher2, 0, 0, "");
 
         // Add student to classroom 0
         vm.prank(teacher1);
@@ -211,7 +214,7 @@ contract ClassroomClusterV1Test is Test {
         // Student cannot create classrooms
         vm.prank(student1);
         vm.expectRevert();
-        cluster.createClassroom("Hacked", student1);
+        cluster.createClassroom("Hacked", student1, 0, 0, "");
 
         // Student cannot grant org roles
         vm.prank(student1);
@@ -266,7 +269,7 @@ contract ClassroomClusterV1Test is Test {
         // teacher1 teaches Bio 101 (classroom 0)
         // Create another classroom for same teacher
         vm.prank(admin);
-        uint256 chem = cluster.createClassroom("Chemistry 301", teacher1);
+        uint256 chem = cluster.createClassroom("Chemistry 301", teacher1, 0, 0, "");
 
         // teacher1 is Teacher in both
         assertEq(uint256(cluster.getClassroomRole(0, teacher1)), uint256(IClassroomCluster.ClassroomRole.Teacher));
@@ -332,7 +335,7 @@ contract ClassroomClusterV1Test is Test {
         cluster.grantClassroomRole(0, student1, IClassroomCluster.ClassroomRole.Teacher);
 
         vm.expectRevert();
-        cluster.createClassroom("Hacked", student1);
+        cluster.createClassroom("Hacked", student1, 0, 0, "");
 
         vm.stopPrank();
     }
@@ -356,13 +359,13 @@ contract ClassroomClusterV1Test is Test {
         // Try to act as admin
         vm.prank(teacher2);
         vm.expectRevert();
-        cluster.createClassroom("Denied", address(0x77));
+        cluster.createClassroom("Denied", address(0x77), 0, 0, "");
     }
 
     // Transfer student who isn't in source classroom
     function test_adversarial_invalid_transfer() public {
         vm.prank(admin);
-        uint256 classroomB = cluster.createClassroom("Chem", teacher2);
+        uint256 classroomB = cluster.createClassroom("Chem", teacher2, 0, 0, "");
 
         // student1 is NOT in classroom 0
         vm.prank(teacher1);
@@ -377,7 +380,7 @@ contract ClassroomClusterV1Test is Test {
     function testFuzz_create_classroom(string calldata name) public {
         vm.assume(bytes(name).length > 0 && bytes(name).length < 256);
         vm.prank(admin);
-        uint256 id = cluster.createClassroom(name, teacher2);
+        uint256 id = cluster.createClassroom(name, teacher2, 0, 0, "");
         assertEq(cluster.getClassroomName(id), name);
     }
 
@@ -412,5 +415,225 @@ contract ClassroomClusterV1Test is Test {
         vm.prank(teacher1);
         vm.expectRevert(); // ZeroAddress
         cluster.grantClassroomRole(0, address(0), IClassroomCluster.ClassroomRole.Student);
+    }
+
+    // ===================================================================
+    // ACCOUNT STATUS TESTS — FERPA-aligned state machine
+    // ===================================================================
+
+    /// @dev New user (fresh address) has default Active status (zero value = Active).
+    function test_status_default_is_active() public {
+        // Grant a fresh address a role; default status is Active (enum value 0)
+        address freshUser = address(0xAAAA);
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+        assertEq(
+            uint256(cluster.getAccountStatus(freshUser)),
+            uint256(IClassroomCluster.AccountStatus.Active)
+        );
+    }
+
+    /// @dev IT can set a user from Active to Inactive (non-disciplinary).
+    function test_it_can_set_inactive() public {
+        address freshUser = address(0xBBBB);
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+        assertEq(uint256(cluster.getAccountStatus(freshUser)), uint256(IClassroomCluster.AccountStatus.Active));
+
+        vm.prank(itAdmin);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Inactive);
+        assertEq(uint256(cluster.getAccountStatus(freshUser)), uint256(IClassroomCluster.AccountStatus.Inactive));
+    }
+
+    /// @dev IT cannot set Suspended (disciplinary); reverts with InsufficientPrivilege.
+    function test_it_cannot_set_suspended() public {
+        address freshUser = address(0xCCCC);
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+
+        vm.prank(itAdmin);
+        vm.expectRevert(ClassroomClusterV1.InsufficientPrivilege.selector);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Suspended);
+    }
+
+    /// @dev Admin can set Active→Suspended (disciplinary action).
+    function test_admin_can_set_suspended() public {
+        address freshUser = address(0xDDDD);
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+
+        vm.prank(admin);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Suspended);
+        assertEq(uint256(cluster.getAccountStatus(freshUser)), uint256(IClassroomCluster.AccountStatus.Suspended));
+    }
+
+    /// @dev Admin can reinstate a Suspended user back to Active.
+    function test_admin_can_reinstate_from_suspended() public {
+        address freshUser = address(0xEEEE);
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+
+        vm.prank(admin);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Suspended);
+
+        vm.prank(admin);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Active);
+        assertEq(uint256(cluster.getAccountStatus(freshUser)), uint256(IClassroomCluster.AccountStatus.Active));
+    }
+
+    /// @dev SuperAdmin (governance) can set Expelled on a user.
+    function test_superadmin_can_expel() public {
+        address freshUser = address(0xFF00);
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+
+        vm.prank(governance);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Expelled);
+        assertEq(uint256(cluster.getAccountStatus(freshUser)), uint256(IClassroomCluster.AccountStatus.Expelled));
+    }
+
+    /// @dev Expelled user cannot be granted an org role (AccountExpelled).
+    function test_expelled_user_cannot_be_granted_role() public {
+        address freshUser = address(0xFF11);
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+
+        vm.prank(governance);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Expelled);
+
+        vm.prank(admin);
+        vm.expectRevert(ClassroomClusterV1.AccountExpelled.selector);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+    }
+
+    /// @dev Expelled status is permanent — setAccountStatus reverts with AccountExpelled.
+    function test_expelled_user_cannot_change_status() public {
+        address freshUser = address(0xFF22);
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+
+        vm.prank(governance);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Expelled);
+
+        // Even governance cannot change an expelled status
+        vm.prank(governance);
+        vm.expectRevert(ClassroomClusterV1.AccountExpelled.selector);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Active);
+    }
+
+    /// @dev Graduated status is permanent — setAccountStatus reverts with InvalidStatusTransition.
+    function test_graduated_user_is_final() public {
+        address freshUser = address(0xFF33);
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+
+        vm.prank(governance);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Graduated);
+
+        vm.prank(governance);
+        vm.expectRevert(ClassroomClusterV1.InvalidStatusTransition.selector);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Active);
+    }
+
+    /// @dev Inactive user can be reactivated by IT or above.
+    function test_inactive_user_can_be_reactivated() public {
+        address freshUser = address(0xFF44);
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+
+        vm.prank(itAdmin);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Inactive);
+        assertEq(uint256(cluster.getAccountStatus(freshUser)), uint256(IClassroomCluster.AccountStatus.Inactive));
+
+        vm.prank(itAdmin);
+        cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Active);
+        assertEq(uint256(cluster.getAccountStatus(freshUser)), uint256(IClassroomCluster.AccountStatus.Active));
+    }
+
+    /// @dev revokeOrgRole sets Inactive (not permanent), so grantOrgRole succeeds afterward.
+    function test_revoke_org_role_sets_inactive_not_permanent() public {
+        address freshUser = address(0xFF55);
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+
+        // Revoke — should set to Inactive
+        vm.prank(admin);
+        cluster.revokeOrgRole(freshUser);
+
+        assertEq(uint256(cluster.getOrgRole(freshUser)), uint256(IClassroomCluster.OrgRole.None));
+        assertEq(uint256(cluster.getAccountStatus(freshUser)), uint256(IClassroomCluster.AccountStatus.Inactive));
+
+        // Re-enroll — should work because Inactive is reversible
+        vm.prank(admin);
+        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+        assertEq(uint256(cluster.getOrgRole(freshUser)), uint256(IClassroomCluster.OrgRole.IT));
+    }
+
+    /// @dev Classroom created with grade=5, year=2026, section="A" stores the metadata correctly.
+    function test_classroom_includes_grade_and_year() public {
+        vm.prank(admin);
+        uint256 cid = cluster.createClassroom("5th Grade Math", teacher2, 5, 2026, "A");
+
+        (
+            string memory name,
+            address teacher,
+            uint256 studentCount,
+            uint8 gradeLevel,
+            uint16 academicYear,
+            string memory section
+        ) = cluster.getClassroomInfo(cid);
+
+        assertEq(name, "5th Grade Math");
+        assertEq(teacher, teacher2);
+        assertEq(studentCount, 0);
+        assertEq(gradeLevel, 5);
+        assertEq(academicYear, 2026);
+        assertEq(section, "A");
+    }
+
+    /// @dev gradeLevel=13 (college/university) is accepted without revert.
+    function test_college_grade_level_above_12() public {
+        vm.prank(admin);
+        uint256 cid = cluster.createClassroom("Intro to CS", teacher2, 13, 2026, "Honors");
+
+        (,,,uint8 gradeLevel,,) = cluster.getClassroomInfo(cid);
+        assertEq(gradeLevel, 13);
+    }
+
+    /// @dev Bulk: set 5 users to Inactive, then reactivate them all.
+    function test_bulk_status_operations() public {
+        address[5] memory users = [
+            address(0xA001),
+            address(0xA002),
+            address(0xA003),
+            address(0xA004),
+            address(0xA005)
+        ];
+
+        // Grant roles to all users
+        for (uint256 i = 0; i < 5; i++) {
+            vm.prank(admin);
+            cluster.grantOrgRole(users[i], IClassroomCluster.OrgRole.IT);
+        }
+
+        // Set all to Inactive
+        for (uint256 i = 0; i < 5; i++) {
+            vm.prank(itAdmin);
+            cluster.setAccountStatus(users[i], IClassroomCluster.AccountStatus.Inactive);
+            assertEq(
+                uint256(cluster.getAccountStatus(users[i])),
+                uint256(IClassroomCluster.AccountStatus.Inactive)
+            );
+        }
+
+        // Reactivate all
+        for (uint256 i = 0; i < 5; i++) {
+            vm.prank(itAdmin);
+            cluster.setAccountStatus(users[i], IClassroomCluster.AccountStatus.Active);
+            assertEq(
+                uint256(cluster.getAccountStatus(users[i])),
+                uint256(IClassroomCluster.AccountStatus.Active)
+            );
+        }
     }
 }
