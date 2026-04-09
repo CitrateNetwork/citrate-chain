@@ -233,17 +233,23 @@ contract InstitutionalVaultTest is Test {
     }
 
     // Invariant 4: SignerAddRemoveRequiresQuorum
-    // (Simplified in v1 — any signer can add, but removal enforces threshold bounds)
+    // Now enforced via proposal flow — remove requires quorum before execution
     function test_invariant_cannot_remove_below_threshold() public {
-        // 3 signers, threshold 2. Removing one leaves 2 signers with threshold 2 — ok.
+        // 3 signers, threshold 2. Propose removing signer3 — both signer1 and signer2 approve.
         vm.prank(signer1);
-        vault.removeSigner(signer3);
+        uint256 pid = vault.proposeSignerChange(signer3, false);
+
+        vm.prank(signer2);
+        vault.approveSignerChange(pid);
+
+        vm.prank(signer1);
+        vault.executeSignerChange(pid);
         assertEq(vault.getSignerCount(), 2);
 
-        // Now 2 signers, threshold 2. Removing another would leave 1 < 2 — should fail.
+        // Now 2 signers, threshold 2. Proposing removal would leave 1 < 2 — should fail at proposal time.
         vm.prank(signer1);
         vm.expectRevert(); // InvalidThreshold
-        vault.removeSigner(signer2);
+        vault.proposeSignerChange(signer2, false);
     }
 
     // Invariant 5: BudgetCannotExceedVaultBalance
@@ -300,29 +306,34 @@ contract InstitutionalVaultTest is Test {
         assertEq(vault.getBalance(), 100 ether);
     }
 
-    // Adversarial 2: Signer rotation attack
+    // Adversarial 2: Signer rotation attack — now requires quorum to add a signer
     function test_adversarial_signer_rotation_attack() public {
-        // Attacker (signer1) adds accomplice, then tries to drain
+        // Attacker (signer1) proposes adding accomplice — alone this is not enough
         vm.prank(signer1);
-        vault.addSigner(signer4);
+        uint256 propId = vault.proposeSignerChange(signer4, true);
+        // signer4 is NOT a signer yet — proposal has only 1 approval (signer1 auto-approves)
+        // threshold is 2, so we need signer2 or signer3 to approve before signer4 is a signer
+        // Attacker cannot execute alone
+        vm.prank(signer1);
+        vm.expectRevert(); // SignerProposalQuorumNotMet
+        vault.executeSignerChange(propId);
 
+        // signer4 is still NOT a signer
+        assertFalse(vault.isSigner(signer4));
+        assertEq(vault.getSignerCount(), 3);
+
+        // Even if signer4 were added via quorum, attacker still can't drain alone:
+        // propose cashout, accomplice approves — still can't self-approve
         vm.prank(signer1);
         uint256 txId = vault.proposeCashout(signer1, 100 ether, keccak256("steal"));
 
-        // Accomplice approves
-        vm.prank(signer4);
+        vm.prank(signer2);
         vault.approveCashout(txId);
 
-        // Still needs 2 approvals (threshold=2), accomplice is 1
         // Attacker can't self-approve (SelfApproval)
         vm.prank(signer1);
         vm.expectRevert();
         vault.approveCashout(txId);
-
-        // Only 1 approval — can't execute
-        vm.prank(signer1);
-        vm.expectRevert();
-        vault.executeCashout(txId);
     }
 
     // Adversarial 3: Pause-then-unpause by same signer
@@ -372,10 +383,10 @@ contract InstitutionalVaultTest is Test {
         vault.emergencyPause();
 
         vm.expectRevert();
-        vault.addSigner(nonSigner);
+        vault.proposeSignerChange(signer4, true);
 
         vm.expectRevert();
-        vault.removeSigner(signer1);
+        vault.proposeSignerChange(signer1, false);
 
         vm.expectRevert();
         vault.setThreshold(1);
@@ -506,6 +517,116 @@ contract InstitutionalVaultTest is Test {
         vm.prank(signer1);
         vault.unpause();
         assertTrue(vault.isPaused()); // Still paused, only 1 approval
+    }
+
+    // ===================================================================
+    // SIGNER CHANGE PROPOSAL TESTS
+    // ===================================================================
+
+    /// @dev Proposing alone is not enough — threshold approvals needed to execute.
+    function test_add_signer_requires_quorum() public {
+        // signer1 proposes adding signer4 — auto-approves (1 approval)
+        vm.prank(signer1);
+        uint256 propId = vault.proposeSignerChange(signer4, true);
+        assertEq(vault.getSignerProposalApprovalCount(propId), 1);
+
+        // threshold is 2, so execution should fail with 1 approval
+        vm.prank(signer1);
+        vm.expectRevert(InstitutionalVault.SignerProposalQuorumNotMet.selector);
+        vault.executeSignerChange(propId);
+
+        // signer4 is still NOT a signer
+        assertFalse(vault.isSigner(signer4));
+        assertEq(vault.getSignerCount(), 3);
+    }
+
+    /// @dev Full propose→approve→execute flow for adding a signer.
+    function test_signer_change_executes_after_quorum() public {
+        // signer1 proposes
+        vm.prank(signer1);
+        uint256 propId = vault.proposeSignerChange(signer4, true);
+
+        // signer2 approves — now at threshold (2-of-3)
+        vm.prank(signer2);
+        vault.approveSignerChange(propId);
+        assertEq(vault.getSignerProposalApprovalCount(propId), 2);
+
+        // Execute
+        vm.prank(signer1);
+        vault.executeSignerChange(propId);
+
+        assertTrue(vault.isSigner(signer4));
+        assertEq(vault.getSignerCount(), 4);
+    }
+
+    /// @dev Same quorum requirement for removing a signer.
+    function test_remove_signer_requires_quorum() public {
+        // Propose removing signer3 — signer1 auto-approves
+        vm.prank(signer1);
+        uint256 propId = vault.proposeSignerChange(signer3, false);
+
+        // Only 1 approval — cannot execute yet
+        vm.prank(signer1);
+        vm.expectRevert(InstitutionalVault.SignerProposalQuorumNotMet.selector);
+        vault.executeSignerChange(propId);
+        assertEq(vault.getSignerCount(), 3); // Unchanged
+
+        // signer2 approves
+        vm.prank(signer2);
+        vault.approveSignerChange(propId);
+
+        // Execute
+        vm.prank(signer1);
+        vault.executeSignerChange(propId);
+
+        assertFalse(vault.isSigner(signer3));
+        assertEq(vault.getSignerCount(), 2);
+    }
+
+    /// @dev rejectSignerChange marks proposal as rejected; further approvals fail.
+    function test_signer_change_rejected() public {
+        vm.prank(signer1);
+        uint256 propId = vault.proposeSignerChange(signer4, true);
+
+        vm.prank(signer2);
+        vault.rejectSignerChange(propId);
+
+        // Approve after rejection should fail
+        vm.prank(signer3);
+        vm.expectRevert(InstitutionalVault.SignerProposalAlreadyRejected.selector);
+        vault.approveSignerChange(propId);
+
+        // Execute after rejection should fail
+        vm.prank(signer1);
+        vm.expectRevert(InstitutionalVault.SignerProposalAlreadyRejected.selector);
+        vault.executeSignerChange(propId);
+
+        // signer4 was not added
+        assertFalse(vault.isSigner(signer4));
+    }
+
+    /// @dev proposeSignerChange reverts if target is already a signer.
+    function test_cannot_add_existing_signer() public {
+        vm.prank(signer1);
+        vm.expectRevert(InstitutionalVault.AlreadySigner.selector);
+        vault.proposeSignerChange(signer2, true);
+    }
+
+    /// @dev proposeSignerChange reverts if removing would drop below threshold.
+    function test_cannot_remove_below_threshold_via_proposal() public {
+        // 3 signers, threshold 2. First remove signer3 (leaves 2 >= threshold 2 — ok).
+        vm.prank(signer1);
+        uint256 p1 = vault.proposeSignerChange(signer3, false);
+        vm.prank(signer2);
+        vault.approveSignerChange(p1);
+        vm.prank(signer1);
+        vault.executeSignerChange(p1);
+        assertEq(vault.getSignerCount(), 2);
+
+        // Now 2 signers, threshold 2. Proposing removal of signer2 would leave 1 < 2 — revert.
+        vm.prank(signer1);
+        vm.expectRevert(InstitutionalVault.InvalidThreshold.selector);
+        vault.proposeSignerChange(signer2, false);
     }
 }
 

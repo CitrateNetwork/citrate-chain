@@ -20,6 +20,20 @@ interface IClassroomCluster {
     enum OrgRole { None, Admin, IT, SuperAdmin }
     enum ClassroomRole { None, Student, TA, Teacher }
 
+    /// @notice CEDS/FERPA-aligned enrollment status.
+    /// Inactive = not enrolled, no behavioral connotation (FERPA: "not in membership").
+    /// Suspended/Expelled = behavioral disciplinary actions only.
+    /// Expelled is institution-local — does NOT propagate to other deployments.
+    enum AccountStatus {
+        Active,      // Enrolled and in good standing
+        Inactive,    // Not enrolled, reversible (leave, between terms, waiting)
+        Withdrawn,   // Voluntarily unenrolled, reversible
+        Transferred, // Moved to another institution; account is exportable
+        Graduated,   // Completed program — final
+        Suspended,   // Behavioral: temporary — reversible, due process required
+        Expelled     // Behavioral: permanent from THIS institution only
+    }
+
     // ── Events ──
 
     event OrgRoleGranted(address indexed user, OrgRole role, address indexed grantedBy);
@@ -30,6 +44,12 @@ interface IClassroomCluster {
     event DeviceRegistered(bytes32 indexed deviceCertHash, address indexed user);
     event DeviceRevoked(bytes32 indexed deviceCertHash);
     event StudentTransferred(address indexed student, uint256 indexed fromClassroom, uint256 indexed toClassroom);
+    event AccountStatusChanged(
+        address indexed user,
+        AccountStatus indexed oldStatus,
+        AccountStatus indexed newStatus,
+        address changedBy
+    );
 
     // ── Views ──
 
@@ -57,6 +77,9 @@ interface IClassroomCluster {
     /// @notice Get student count in a classroom.
     function getStudentCount(uint256 classroomId) external view returns (uint256);
 
+    /// @notice Get a user's FERPA-aligned account status.
+    function getAccountStatus(address user) external view returns (AccountStatus);
+
     // ── Org Role Management ──
 
     /// @notice Grant an org-level role (Admin or SuperAdmin only).
@@ -67,10 +90,20 @@ interface IClassroomCluster {
     /// @dev Invariant: ImmediateRevocation — all derived permissions lost immediately.
     function revokeOrgRole(address user) external;
 
+    /// @notice Update a user's FERPA-aligned account status.
+    /// @dev Access control: IT/Admin = non-disciplinary; Admin = disciplinary; SuperAdmin/gov = final.
+    function setAccountStatus(address user, AccountStatus status) external;
+
     // ── Classroom Management ──
 
     /// @notice Create a new classroom (Admin only).
-    function createClassroom(string calldata name, address teacher) external returns (uint256 classroomId);
+    function createClassroom(
+        string calldata name,
+        address teacher,
+        uint8 gradeLevel,
+        uint16 academicYear,
+        string calldata section
+    ) external returns (uint256 classroomId);
 
     /// @notice Grant a classroom role (Teacher of that classroom, or Admin).
     function grantClassroomRole(uint256 classroomId, address user, ClassroomRole role) external;

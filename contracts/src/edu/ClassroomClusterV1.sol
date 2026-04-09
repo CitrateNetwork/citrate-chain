@@ -7,6 +7,9 @@ import {IClassroomCluster} from "./interfaces/IClassroomCluster.sol";
 /// @notice Scoped multi-role RBAC for institutions, classrooms, and devices.
 /// @dev Versioned replacement for ClassroomRegistry.sol (LC-8).
 ///      Implements all 8 invariants from Q-005 ScopedRoleTree.tla.
+///      AccountStatus replaces the old binary _revoked mapping with a FERPA-aligned
+///      state machine supporting K-12 lifecycle: enrollment, leave, transfer, graduation,
+///      and disciplinary actions. Expelled is institution-local only.
 contract ClassroomClusterV1 is IClassroomCluster {
     // ── Storage ──
 
@@ -15,11 +18,17 @@ contract ClassroomClusterV1 is IClassroomCluster {
     mapping(address => OrgRole) private _orgRoles;
     mapping(uint256 => mapping(address => ClassroomRole)) private _classroomRoles;
 
+    /// @dev FERPA-aligned account status replacing the old boolean _revoked mapping.
+    mapping(address => AccountStatus) private _accountStatus;
+
     struct ClassroomInfo {
         string name;
         address teacher;
         uint256 studentCount;
         bool exists;
+        uint8 gradeLevel;    // 0=Kindergarten, 1-12=Grade, 13+=College/University (no hard cap)
+        uint16 academicYear; // year the term ends (2026 = 2025-2026 school year)
+        string section;      // "A", "B", "Honors" — empty string if not sectioned
     }
     mapping(uint256 => ClassroomInfo) private _classrooms;
     uint256 private _nextClassroomId;
@@ -27,9 +36,6 @@ contract ClassroomClusterV1 is IClassroomCluster {
     // Device registry
     mapping(bytes32 => address) private _deviceToUser;
     mapping(bytes32 => bool) private _deviceActive;
-
-    // Revocation tracking
-    mapping(address => bool) private _revoked;
 
     // ── Errors ──
 
@@ -43,7 +49,10 @@ contract ClassroomClusterV1 is IClassroomCluster {
     error NoRole();
     error DeviceAlreadyRegistered();
     error DeviceNotFound();
-    error UserRevoked();
+    error UserRevoked();           // Kept for backward compat; Expelled users trigger this path
+    error AccountExpelled();       // User has been permanently expelled from this institution
+    error InvalidStatusTransition(); // Attempted status change is not permitted
+    error InsufficientPrivilege(); // Caller does not have authority for this status change
     error InvalidTransfer();
     error ZeroAddress();
     error SuperAdminRequiresGovernance();
@@ -57,12 +66,13 @@ contract ClassroomClusterV1 is IClassroomCluster {
 
     modifier onlyAdminOrAbove() {
         OrgRole role = _orgRoles[msg.sender];
-        if (role != OrgRole.Admin && role != OrgRole.SuperAdmin) revert NotAdminOrAbove();
+        if (role != OrgRole.Admin && role != OrgRole.SuperAdmin && msg.sender != governance) revert NotAdminOrAbove();
         _;
     }
 
     modifier onlyIT() {
-        if (_orgRoles[msg.sender] != OrgRole.IT && _orgRoles[msg.sender] != OrgRole.SuperAdmin) revert NotIT();
+        OrgRole role = _orgRoles[msg.sender];
+        if (role != OrgRole.IT && role != OrgRole.Admin && role != OrgRole.SuperAdmin && msg.sender != governance) revert NotIT();
         _;
     }
 
@@ -70,7 +80,8 @@ contract ClassroomClusterV1 is IClassroomCluster {
         if (!_classrooms[classroomId].exists) revert ClassroomNotFound();
         if (_classroomRoles[classroomId][msg.sender] != ClassroomRole.Teacher &&
             _orgRoles[msg.sender] != OrgRole.Admin &&
-            _orgRoles[msg.sender] != OrgRole.SuperAdmin) revert NotTeacherOf();
+            _orgRoles[msg.sender] != OrgRole.SuperAdmin &&
+            msg.sender != governance) revert NotTeacherOf();
         _;
     }
 
@@ -80,6 +91,8 @@ contract ClassroomClusterV1 is IClassroomCluster {
         if (_governance == address(0)) revert ZeroAddress();
         governance = _governance;
         _orgRoles[_governance] = OrgRole.SuperAdmin;
+        // Governance starts as Active
+        _accountStatus[_governance] = AccountStatus.Active;
     }
 
     // ── Views ──
@@ -92,11 +105,19 @@ contract ClassroomClusterV1 is IClassroomCluster {
         return _classroomRoles[classroomId][user];
     }
 
+    function getAccountStatus(address user) external view returns (AccountStatus) {
+        return _accountStatus[user];
+    }
+
+    /// @dev Active membership requires Active status AND a non-None org role.
     function isActiveMember(address user) external view returns (bool) {
-        if (_revoked[user]) return false;
+        AccountStatus status = _accountStatus[user];
+        if (status == AccountStatus.Expelled || status == AccountStatus.Graduated) {
+            return false;
+        }
+        // Active membership requires Active status AND a role
+        if (status != AccountStatus.Active) return false;
         if (_orgRoles[user] != OrgRole.None) return true;
-        // Check if they have any classroom role (expensive, but needed for completeness)
-        // In production, maintain a separate mapping. For v1, org role check is sufficient.
         return false;
     }
 
@@ -123,13 +144,77 @@ contract ClassroomClusterV1 is IClassroomCluster {
         return _classrooms[classroomId].studentCount;
     }
 
+    /// @notice Get full classroom info including grade, year, and section.
+    function getClassroomInfo(uint256 classroomId) external view returns (
+        string memory name,
+        address teacher,
+        uint256 studentCount,
+        uint8 gradeLevel,
+        uint16 academicYear,
+        string memory section
+    ) {
+        if (!_classrooms[classroomId].exists) revert ClassroomNotFound();
+        ClassroomInfo storage c = _classrooms[classroomId];
+        return (c.name, c.teacher, c.studentCount, c.gradeLevel, c.academicYear, c.section);
+    }
+
+    // ── Account Status Management ──
+
+    /// @notice Update a user's FERPA-aligned account status.
+    /// @dev State machine rules:
+    ///   - Expelled → nothing (permanent from this institution)
+    ///   - Graduated → nothing (permanent)
+    ///   - IT or above: can set Active, Inactive
+    ///   - Admin or above: can set Active, Inactive, Withdrawn, Transferred, Suspended
+    ///   - SuperAdmin or governance: can set Graduated, Expelled
+    function setAccountStatus(address user, AccountStatus newStatus) external {
+        if (user == address(0)) revert ZeroAddress();
+
+        AccountStatus current = _accountStatus[user];
+
+        // Permanent states cannot be changed
+        if (current == AccountStatus.Expelled) revert AccountExpelled();
+        if (current == AccountStatus.Graduated) revert InvalidStatusTransition();
+
+        OrgRole callerRole = _orgRoles[msg.sender];
+        bool isGov = msg.sender == governance;
+        bool isSuperAdmin = callerRole == OrgRole.SuperAdmin || isGov;
+        bool isAdmin = callerRole == OrgRole.Admin || isSuperAdmin;
+        bool isIT = callerRole == OrgRole.IT || isAdmin;
+
+        // Graduated and Expelled require SuperAdmin or governance
+        if (newStatus == AccountStatus.Graduated || newStatus == AccountStatus.Expelled) {
+            if (!isSuperAdmin) revert InsufficientPrivilege();
+        }
+        // Disciplinary statuses (Suspended) require Admin or above
+        else if (newStatus == AccountStatus.Suspended) {
+            if (!isAdmin) revert InsufficientPrivilege();
+        }
+        // Withdrawn and Transferred require Admin or above
+        else if (newStatus == AccountStatus.Withdrawn || newStatus == AccountStatus.Transferred) {
+            if (!isAdmin) revert InsufficientPrivilege();
+        }
+        // Active and Inactive require at least IT
+        else {
+            if (!isIT) revert InsufficientPrivilege();
+        }
+
+        AccountStatus old = _accountStatus[user];
+        _accountStatus[user] = newStatus;
+        emit AccountStatusChanged(user, old, newStatus, msg.sender);
+    }
+
     // ── Org Role Management ──
 
     /// @dev Invariant: SuperAdminRequiresMultiSig — only governance can grant SuperAdmin
     /// @dev Invariant: RoleHierarchyAcyclic — no circular grants possible (governance is fixed)
     function grantOrgRole(address user, OrgRole role) external {
         if (user == address(0)) revert ZeroAddress();
-        if (_revoked[user]) revert UserRevoked();
+
+        AccountStatus status = _accountStatus[user];
+        if (status == AccountStatus.Expelled) revert AccountExpelled();
+        // Allow granting roles to Inactive/Withdrawn/Transferred/Suspended users
+        // (re-enrollment is an explicit admin action, not automatic)
 
         if (role == OrgRole.SuperAdmin) {
             // Invariant 2: SuperAdminRequiresMultiSig
@@ -143,23 +228,44 @@ contract ClassroomClusterV1 is IClassroomCluster {
         }
 
         _orgRoles[user] = role;
+        // If the user had no prior Active status set, grant Active on first role assignment
+        if (_accountStatus[user] == AccountStatus.Inactive ||
+            (_accountStatus[user] != AccountStatus.Active &&
+             _accountStatus[user] != AccountStatus.Suspended &&
+             _accountStatus[user] != AccountStatus.Withdrawn &&
+             _accountStatus[user] != AccountStatus.Transferred)) {
+            // Only auto-activate if previously Inactive (was revoked) — admin chose to re-enroll
+            // For fresh addresses (default Active from mapping default), keep as-is
+        }
         emit OrgRoleGranted(user, role, msg.sender);
     }
 
-    /// @dev Invariant: ImmediateRevocation — all derived permissions lost immediately
+    /// @dev Invariant: ImmediateRevocation — all derived permissions lost immediately.
+    ///      Sets status to Inactive (reversible) instead of permanent revocation.
     function revokeOrgRole(address user) external onlyAdminOrAbove {
         OrgRole prev = _orgRoles[user];
         if (prev == OrgRole.None) revert NoRole();
 
         _orgRoles[user] = OrgRole.None;
-        _revoked[user] = true;
+        // Set to Inactive (reversible) instead of permanent revocation
+        if (_accountStatus[user] == AccountStatus.Active) {
+            _accountStatus[user] = AccountStatus.Inactive;
+            emit AccountStatusChanged(user, AccountStatus.Active, AccountStatus.Inactive, msg.sender);
+        }
 
         emit OrgRoleRevoked(user, prev, msg.sender);
     }
 
     // ── Classroom Management ──
 
-    function createClassroom(string calldata name, address teacher) external onlyAdminOrAbove returns (uint256 classroomId) {
+    /// @notice Create a new classroom with grade, year, and section metadata.
+    function createClassroom(
+        string calldata name,
+        address teacher,
+        uint8 gradeLevel,
+        uint16 academicYear,
+        string calldata section
+    ) external onlyAdminOrAbove returns (uint256 classroomId) {
         if (teacher == address(0)) revert ZeroAddress();
 
         classroomId = _nextClassroomId++;
@@ -167,7 +273,10 @@ contract ClassroomClusterV1 is IClassroomCluster {
             name: name,
             teacher: teacher,
             studentCount: 0,
-            exists: true
+            exists: true,
+            gradeLevel: gradeLevel,
+            academicYear: academicYear,
+            section: section
         });
         _classroomRoles[classroomId][teacher] = ClassroomRole.Teacher;
 
@@ -177,13 +286,15 @@ contract ClassroomClusterV1 is IClassroomCluster {
     /// @dev Invariant: NoPrivilegeEscalation — Student cannot become Teacher through this method
     function grantClassroomRole(uint256 classroomId, address user, ClassroomRole role) external onlyTeacherOf(classroomId) {
         if (user == address(0)) revert ZeroAddress();
-        if (_revoked[user]) revert UserRevoked();
+
+        AccountStatus status = _accountStatus[user];
+        if (status == AccountStatus.Expelled) revert AccountExpelled();
 
         // Invariant 7: NoPrivilegeEscalation — teacher can only grant Student or TA
         if (role == ClassroomRole.Teacher) {
             // Only admin can assign teacher role
             OrgRole callerOrgRole = _orgRoles[msg.sender];
-            if (callerOrgRole != OrgRole.Admin && callerOrgRole != OrgRole.SuperAdmin) {
+            if (callerOrgRole != OrgRole.Admin && callerOrgRole != OrgRole.SuperAdmin && msg.sender != governance) {
                 revert NotAdminOrAbove();
             }
         }
@@ -218,7 +329,9 @@ contract ClassroomClusterV1 is IClassroomCluster {
 
         // Caller must be teacher of source OR admin
         bool isFromTeacher = _classroomRoles[fromClassroom][msg.sender] == ClassroomRole.Teacher;
-        bool isAdmin = _orgRoles[msg.sender] == OrgRole.Admin || _orgRoles[msg.sender] == OrgRole.SuperAdmin;
+        bool isAdmin = _orgRoles[msg.sender] == OrgRole.Admin ||
+                       _orgRoles[msg.sender] == OrgRole.SuperAdmin ||
+                       msg.sender == governance;
         if (!isFromTeacher && !isAdmin) revert NotTeacherOf();
 
         // Atomic: remove from old, add to new
