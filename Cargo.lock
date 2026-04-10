@@ -1854,7 +1854,9 @@ name = "citrate-edu-app"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "argon2",
  "async-trait",
+ "axum",
  "calamine",
  "citrate-wallet-core",
  "csv",
@@ -1870,6 +1872,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.16",
  "tokio",
+ "tower 0.5.2",
  "tracing",
  "wiremock",
 ]
