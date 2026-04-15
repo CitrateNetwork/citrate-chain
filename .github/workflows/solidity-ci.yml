@@ -11,6 +11,10 @@ on:
       - 'citrate_v0.01.1/contracts/**'
       - 'citrate_v0.01.1/foundry.toml'
 
+concurrency:
+  group: solidity-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   forge-tests:
     runs-on: ubuntu-latest

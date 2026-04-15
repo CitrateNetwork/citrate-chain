@@ -25,13 +25,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            citrate_v0.01.1/target
           key: release-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
           restore-keys: release-${{ matrix.os }}-
 
@@ -112,13 +111,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            citrate_v0.01.1/target
           key: gui-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
           restore-keys: gui-${{ matrix.os }}-
 
@@ -196,13 +194,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            citrate_v0.01.1/target
           key: lc-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
           restore-keys: lc-${{ matrix.os }}-
 
