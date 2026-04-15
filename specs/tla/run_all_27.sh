@@ -31,7 +31,7 @@ declare -a CFG_FILES=()
 for dir in \
     "$BASE/specs/tla" \
     "$BASE/gui/citrate_gui_v2/specs" \
-    "$BASE/../.agentile/audits/2026-03-02-architecture-security-deep-audit/tla"; do
+    "$BASE/../.agentile/audits/2026-03/2026-03-02-architecture-security-deep-audit/tla"; do
     [ -d "$dir" ] || continue
     for tla in "$dir"/*.tla; do
         [ -f "$tla" ] || continue

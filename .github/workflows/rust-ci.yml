@@ -11,6 +11,11 @@ on:
       - 'citrate_v0.01.1/**'
       - '.github/workflows/rust-ci.yml'
 
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
@@ -33,13 +38,12 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            citrate_v0.01.1/target
           key: rust-ci-${{ runner.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
           restore-keys: rust-ci-${{ runner.os }}-
-      - name: Build tests (no run) — exclude GUI crate
-        run: cargo test --workspace --exclude citrate-core --no-run
-      - name: Run tests — exclude GUI crate
-        run: cargo test --workspace --exclude citrate-core --quiet
+      - name: Build tests (no run)
+        run: cargo test --workspace --no-run
+      - name: Run tests
+        run: cargo test --workspace --quiet
 
   verifier-tests:
     runs-on: ubuntu-latest
@@ -73,14 +77,13 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config xvfb
       - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            citrate_v0.01.1/target
           key: lc-ci-${{ runner.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
           restore-keys: lc-ci-${{ runner.os }}-
       - name: Check citrate-edu-app (0 warnings)
@@ -90,7 +93,7 @@ jobs:
       - name: Test citrate-edu-app (127+ tests)
         run: cargo test -p citrate-edu-app
       - name: Test citrate-learning-center visual snapshots
-        run: cargo test -p citrate-learning-center -- visual
+        run: xvfb-run -a cargo test -p citrate-learning-center -- visual
       - name: Zero unwraps audit
         run: |
           count=$(grep -rn '\.unwrap()' gui/citrate_edu_app/src/ gui/citrate_learning_center/src/ 2>/dev/null | wc -l)
