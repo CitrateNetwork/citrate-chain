@@ -20,7 +20,7 @@ on:
       - '.github/workflows/rust-ci.yml'
 
 concurrency:
-  group: rust-ci-${{ github.event.pull_request.number || github.ref }}
+  group: rust-ci-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
