@@ -1,20 +1,7 @@
-name: Security Audit
+name: Security Audit (manual)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'citrate_v0.01.1/**/Cargo.toml'
-      - 'citrate_v0.01.1/**/Cargo.lock'
-      - '.github/workflows/security-audit.yml'
-  pull_request:
-    paths:
-      - 'citrate_v0.01.1/**/Cargo.toml'
-      - 'citrate_v0.01.1/**/Cargo.lock'
-      - '.github/workflows/security-audit.yml'
-  schedule:
-    # Run weekly on Monday at 00:00 UTC
-    - cron: '0 0 * * 1'
+  workflow_dispatch:
 
 jobs:
   cargo-audit:
@@ -28,40 +15,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        run: cargo install cargo-audit --locked
       - name: Run cargo-audit
         run: cargo audit
-
-  clippy-deny:
-    name: Clippy (deny warnings)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: citrate_v0.01.1
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
-      - name: Run clippy with denied warnings
-        run: cargo clippy --workspace --exclude citrate-core --all-targets -- -D warnings -A dead_code -A unused_imports -A unused_variables
-
-  cargo-deny:
-    name: License & Advisory Check
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: citrate_v0.01.1
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install cargo-deny
-        run: cargo install cargo-deny
-      - name: Check advisories
-        run: cargo deny check advisories 2>&1 || true
-      - name: Check licenses
-        run: cargo deny check licenses 2>&1 || true

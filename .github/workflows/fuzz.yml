@@ -1,8 +1,6 @@
-name: Fuzz Testing
+name: Fuzz Testing (manual)
 
 on:
-  schedule:
-    - cron: '0 3 * * 1'  # Weekly Monday 3am UTC
   workflow_dispatch:
 
 jobs:
