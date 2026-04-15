@@ -12,7 +12,7 @@ on:
       - 'citrate_v0.01.1/foundry.toml'
 
 concurrency:
-  group: solidity-ci-${{ github.event.pull_request.number || github.ref }}
+  group: solidity-ci-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
