@@ -37,7 +37,7 @@ use config::NodeConfig;
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::types::GhostDagParams;
-use genesis::{initialize_genesis_state, GenesisConfig};
+use genesis::{initialize_genesis_state, initialize_genesis_state_with_profile, GenesisConfig};
 use producer::BlockProducer;
 
 #[derive(Parser)]
@@ -231,7 +231,12 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Commands::Devnet) => {
-            run_devnet(cli.coinbase.clone()).await?;
+            run_devnet(
+                cli.coinbase.clone(),
+                cli.data_dir.clone(),
+                cli.p2p_addr.clone(),
+                cli.rpc_addr.clone(),
+            ).await?;
             return Ok(());
         }
         Some(Commands::Keygen { ed25519 }) => {
@@ -615,39 +620,71 @@ async fn init_chain(chain_id: u64) -> Result<()> {
     Ok(())
 }
 
-async fn run_devnet(coinbase: Option<String>) -> Result<()> {
+async fn run_devnet(
+    coinbase: Option<String>,
+    data_dir: Option<PathBuf>,
+    p2p_addr: Option<String>,
+    rpc_addr: Option<String>,
+) -> Result<()> {
     info!("Starting devnet...");
 
     let mut config = NodeConfig::devnet();
-    config.storage.data_dir = PathBuf::from(".citrate-devnet");
+    config.storage.data_dir = data_dir.unwrap_or_else(|| PathBuf::from(".citrate-devnet"));
+    config.chain.genesis_profile = Some("default".to_string());
 
     // Apply CLI coinbase if provided
     if let Some(cb) = coinbase {
         config.mining.coinbase = cb;
     }
+    if let Some(addr) = p2p_addr {
+        config.network.listen_addr = addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid P2P address: {}", e))?;
+    }
+    if let Some(addr) = rpc_addr {
+        config.rpc.listen_addr = addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid RPC address: {}", e))?;
+    }
 
-    // Initialize chain if needed
-    if !config.storage.data_dir.exists() {
-        std::fs::create_dir_all(&config.storage.data_dir)?;
-
+    // Initialize chain if needed.
+    // An existing but empty temp dir should still bootstrap genesis.
+    std::fs::create_dir_all(&config.storage.data_dir)?;
+    {
         let storage = Arc::new(StorageManager::new(
             &config.storage.data_dir,
             PruningConfig::default(),
         )?);
 
-        let state_db = Arc::new(StateDB::new());
-        let executor = Arc::new(Executor::with_storage(
-            state_db,
-            Some(storage.state.clone()),
-        ));
+        let has_genesis = storage.blocks.get_block_by_height(0)
+            .ok()
+            .flatten()
+            .and_then(|hash| storage.blocks.get_block(&hash).ok().flatten())
+            .is_some();
 
-        let genesis_config = GenesisConfig {
-            chain_id: config.chain.chain_id,
-            ..Default::default()
-        };
+        if !has_genesis {
+            let state_db = Arc::new(StateDB::new());
+            let executor = Arc::new(Executor::with_storage(
+                state_db,
+                Some(storage.state.clone()),
+            ));
 
-        initialize_genesis_state(storage, executor, &genesis_config).await?;
-        info!("Devnet chain initialized");
+            let genesis_config = GenesisConfig {
+                chain_id: config.chain.chain_id,
+                ..Default::default()
+            };
+
+            initialize_genesis_state_with_profile(
+                storage,
+                executor,
+                &genesis_config,
+                Some("default"),
+            )
+            .await?;
+            info!("Devnet chain initialized");
+        } else {
+            info!("Existing devnet genesis found, reusing initialized chain");
+        }
     }
 
     // Start node with devnet config

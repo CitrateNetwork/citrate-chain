@@ -3,6 +3,7 @@ chain_id = 40204
 genesis_hash = ""
 block_time = 1
 ghostdag_k = 8
+genesis_profile = "default"
 
 [network]
 listen_addr = "0.0.0.0:30303"
