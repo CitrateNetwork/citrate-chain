@@ -89,6 +89,7 @@ jobs:
           cp README.md "${STAGE}/"
           cp CHANGELOG.md "${STAGE}/"
           cp ../RELEASE_PACKAGE_MATRIX.md "${STAGE}/"
+          cp ../PRECOMPILE_DEVELOPER_CHEATSHEET.md "${STAGE}/"
           cd "${STAGE}"
           if command -v sha256sum &>/dev/null; then
             sha256sum citrate citrate-cli citrate-wallet citrate-faucet > SHA256SUMS.txt
@@ -114,6 +115,7 @@ jobs:
           Copy-Item README.md $stage\
           Copy-Item CHANGELOG.md $stage\
           Copy-Item ..\RELEASE_PACKAGE_MATRIX.md $stage\
+          Copy-Item ..\PRECOMPILE_DEVELOPER_CHEATSHEET.md $stage\
           $hashTargets = @(
             "$stage\citrate.exe",
             "$stage\citrate-cli.exe",
