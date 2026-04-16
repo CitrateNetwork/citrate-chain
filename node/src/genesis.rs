@@ -99,6 +99,10 @@ pub async fn initialize_genesis_state_with_profile(
 
     // Select economics genesis config based on explicit profile or chain_id fallback
     let economics_config = match genesis_profile {
+        Some("default") => {
+            tracing::info!("Using default devnet genesis profile");
+            EconomicsGenesisConfig::default()
+        }
         Some("team_testnet") => {
             tracing::info!("Using team_testnet genesis profile (10 pre-funded validators)");
             EconomicsGenesisConfig::team_testnet_genesis()
