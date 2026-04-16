@@ -44,6 +44,14 @@ pub const HARDHAT_DEFAULT_ADDRESS: Address = Address([
     0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce,
     0x6a, 0xb8, 0x82, 0x72, 0x79, 0xcf, 0xff, 0xb9, 0x22, 0x66,
 ]);
+pub const HARDHAT_SECONDARY_ADDRESS: Address = Address([
+    0x70, 0x99, 0x79, 0x70, 0xc5, 0x18, 0x12, 0xdc, 0x3a, 0x01,
+    0x0c, 0x7d, 0x01, 0xb5, 0x0e, 0x0d, 0x17, 0xdc, 0x79, 0xc8,
+]);
+pub const HARDHAT_TERTIARY_ADDRESS: Address = Address([
+    0x3c, 0x44, 0xcd, 0xdd, 0xb6, 0xa9, 0x00, 0xfa, 0x2b, 0x58,
+    0x5d, 0xd2, 0x99, 0xe0, 0x3d, 0x12, 0xfa, 0x42, 0x93, 0xbc,
+]);
 pub const FOUNDRY_RECOVERED_DEPLOYER_ADDRESS: Address = Address([
     0xfc, 0xad, 0x0b, 0x19, 0xbb, 0x29, 0xd4, 0x67, 0x45, 0x31,
     0xd6, 0xf1, 0x15, 0x23, 0x7e, 0x16, 0xaf, 0xce, 0x37, 0x7c,
@@ -155,6 +163,9 @@ impl Default for GenesisConfig {
             account(Address([0x02; 20]), 1_000),
             // Hardhat / Foundry default deployer for local dev flows
             account(HARDHAT_DEFAULT_ADDRESS, 10_000),
+            // Secondary and tertiary Hardhat accounts for SDK / wallet integration tests
+            account(HARDHAT_SECONDARY_ADDRESS, 10_000),
+            account(HARDHAT_TERTIARY_ADDRESS, 10_000),
         ];
 
         Self {
@@ -532,9 +543,28 @@ mod tests {
         let config = GenesisConfig::default();
         let total = config.total_preallocation();
 
-        // 10M faucet + 100M treasury + 250M ecosystem + 2K test accounts + 10K hardhat deployer
-        let expected = latt_to_wei(360_012_000);
+        // 10M faucet + 100M treasury + 250M ecosystem + 2K test accounts + 30K hardhat accounts
+        let expected = latt_to_wei(360_032_000);
         assert_eq!(total, expected);
+    }
+
+    #[test]
+    fn test_default_genesis_funds_sdk_test_accounts() {
+        let config = GenesisConfig::default();
+
+        for address in [
+            HARDHAT_DEFAULT_ADDRESS,
+            HARDHAT_SECONDARY_ADDRESS,
+            HARDHAT_TERTIARY_ADDRESS,
+        ] {
+            let account = config
+                .accounts
+                .iter()
+                .find(|account| account.address == address)
+                .expect("default genesis must fund SDK test account");
+
+            assert_eq!(account.balance, latt_to_wei(10_000));
+        }
     }
 
     #[test]
@@ -725,7 +755,7 @@ mod tests {
         let team_amount = latt_to_wei(1_000);
         config.team_allocations.insert(team_member, team_amount);
 
-        let expected = latt_to_wei(360_012_000) + team_amount;
+        let expected = latt_to_wei(360_032_000) + team_amount;
         assert_eq!(config.total_preallocation(), expected);
     }
 
