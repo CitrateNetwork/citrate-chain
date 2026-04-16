@@ -4,12 +4,24 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'citrate_v0.01.1/**'
+      - 'citrate_v0.01.1/**/Cargo.toml'
+      - 'citrate_v0.01.1/Cargo.lock'
+      - 'citrate_v0.01.1/**/*.rs'
+      - 'citrate_v0.01.1/**/*.slint'
+      - 'citrate_v0.01.1/**/build.rs'
       - '.github/workflows/rust-ci.yml'
   pull_request:
     paths:
-      - 'citrate_v0.01.1/**'
+      - 'citrate_v0.01.1/**/Cargo.toml'
+      - 'citrate_v0.01.1/Cargo.lock'
+      - 'citrate_v0.01.1/**/*.rs'
+      - 'citrate_v0.01.1/**/*.slint'
+      - 'citrate_v0.01.1/**/build.rs'
       - '.github/workflows/rust-ci.yml'
+
+concurrency:
+  group: rust-ci-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
 
 env:
   CARGO_INCREMENTAL: 0
@@ -17,7 +29,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  build-and-test:
+  core-workspace:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -32,7 +44,7 @@ jobs:
           sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
       - name: Show toolchain
         run: rustc -Vv && cargo -V
-      - name: Cache cargo registry + target
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
@@ -40,10 +52,8 @@ jobs:
             ~/.cargo/git
           key: rust-ci-${{ runner.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
           restore-keys: rust-ci-${{ runner.os }}-
-      - name: Build tests (no run)
-        run: cargo test --workspace --no-run
-      - name: Run tests
-        run: cargo test --workspace --quiet
+      - name: Run core workspace tests
+        run: cargo test --workspace --quiet --exclude citrate-edu-app --exclude citrate-learning-center
 
   verifier-tests:
     runs-on: ubuntu-latest

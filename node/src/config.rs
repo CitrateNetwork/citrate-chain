@@ -366,6 +366,7 @@ impl NodeConfig {
         if std::env::var("CITRATE_CHAIN_ID").is_err() {
             config.chain.chain_id = 40204;
         }
+        config.chain.genesis_profile = Some("default".to_string());
         config.mining.enabled = true;
         config.mining.target_block_time = 2; // Fast blocks for testing
         // C-02: Allow eth_sendTransaction only in devnet mode
@@ -601,5 +602,12 @@ mod tests {
         std::env::remove_var("CITRATE_CHAIN_ID");
         let config = NodeConfig::default();
         assert!(config.chain.genesis_profile.is_none());
+    }
+
+    #[test]
+    fn test_devnet_uses_default_genesis_profile() {
+        std::env::remove_var("CITRATE_CHAIN_ID");
+        let config = NodeConfig::devnet();
+        assert_eq!(config.chain.genesis_profile.as_deref(), Some("default"));
     }
 }
