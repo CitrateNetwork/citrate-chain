@@ -1,13 +1,33 @@
-name: Release (Node/CLI/Wallet + Learning Center + GUI)
+name: Release (Developer Bundles + GUI + Learning Center)
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing tag to publish or rebuild (for example: v0.3.0-rc.2)'
+        required: true
+        type: string
+      publish_release:
+        description: 'Publish immediately instead of creating a draft release'
+        required: false
+        default: false
+        type: boolean
+      supersede_old_prereleases:
+        description: 'Mark v0.3.0-beta.4 and v0.3.0-rc.1 as superseded after publishing'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  RELEASE_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true && 'false' || 'true' }}
 
 jobs:
-  build-binaries:
-    name: Build Binaries (${{ matrix.os }})
+  build-developer-bundles:
+    name: Build Developer Bundle (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -48,52 +68,80 @@ jobs:
         run: |
           cargo build --release -p citrate-node -p citrate-cli -p citrate-wallet -p citrate-faucet
 
-      - name: Package artifacts (Linux/macOS)
+      - name: Package developer bundle (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -eux
-          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          case "$(uname -s)" in
+            Linux) OS=linux ;;
+            Darwin) OS=macos ;;
+            *) OS=$(uname -s | tr '[:upper:]' '[:lower:]') ;;
+          esac
           ARCH=$(uname -m)
-          mkdir -p dist
-          cp target/release/citrate dist/
-          cp target/release/citrate-cli dist/
-          cp target/release/wallet dist/citrate-wallet
-          cp target/release/citrate-faucet dist/
-          cd dist
+          STAGE="dist/citrate-developer-${OS}-${ARCH}"
+          mkdir -p "${STAGE}"
+          cp target/release/citrate "${STAGE}/"
+          cp target/release/citrate-cli "${STAGE}/"
+          cp target/release/wallet "${STAGE}/citrate-wallet"
+          cp target/release/citrate-faucet "${STAGE}/"
+          cp ../LICENSE "${STAGE}/"
+          cp README.md "${STAGE}/"
+          cp CHANGELOG.md "${STAGE}/"
+          cp ../RELEASE_PACKAGE_MATRIX.md "${STAGE}/"
+          cp ../PRECOMPILE_DEVELOPER_CHEATSHEET.md "${STAGE}/"
+          cd "${STAGE}"
           if command -v sha256sum &>/dev/null; then
             sha256sum citrate citrate-cli citrate-wallet citrate-faucet > SHA256SUMS.txt
           else
             shasum -a 256 citrate citrate-cli citrate-wallet citrate-faucet > SHA256SUMS.txt
           fi
-          tar -czf citrate-${OS}-${ARCH}.tar.gz citrate citrate-cli citrate-wallet citrate-faucet SHA256SUMS.txt
-          rm -f citrate citrate-cli citrate-wallet citrate-faucet
-          echo "Created dist/citrate-${OS}-${ARCH}.tar.gz"
+          cd ..
+          tar -czf "citrate-developer-${OS}-${ARCH}.tar.gz" "citrate-developer-${OS}-${ARCH}"
+          rm -rf "citrate-developer-${OS}-${ARCH}"
+          echo "Created dist/citrate-developer-${OS}-${ARCH}.tar.gz"
 
-      - name: Package artifacts (Windows)
+      - name: Package developer bundle (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target\release\citrate.exe dist\
-          Copy-Item target\release\citrate-cli.exe dist\
-          Copy-Item target\release\wallet.exe dist\citrate-wallet.exe
-          Copy-Item target\release\citrate-faucet.exe dist\
+          $stage = "dist\citrate-developer-windows-$env:PROCESSOR_ARCHITECTURE"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\release\citrate.exe $stage\
+          Copy-Item target\release\citrate-cli.exe $stage\
+          Copy-Item target\release\wallet.exe "$stage\citrate-wallet.exe"
+          Copy-Item target\release\citrate-faucet.exe $stage\
+          Copy-Item ..\LICENSE $stage\
+          Copy-Item README.md $stage\
+          Copy-Item CHANGELOG.md $stage\
+          Copy-Item ..\RELEASE_PACKAGE_MATRIX.md $stage\
+          Copy-Item ..\PRECOMPILE_DEVELOPER_CHEATSHEET.md $stage\
+          $hashTargets = @(
+            "$stage\citrate.exe",
+            "$stage\citrate-cli.exe",
+            "$stage\citrate-wallet.exe",
+            "$stage\citrate-faucet.exe"
+          )
+          $hashLines = foreach ($file in $hashTargets) {
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            "$hash  $(Split-Path $file -Leaf)"
+          }
+          $hashLines | Set-Content "$stage\SHA256SUMS.txt"
           $arch = $env:PROCESSOR_ARCHITECTURE
-          $zip = "dist\citrate-windows-$arch.zip"
-          Compress-Archive -Path dist\citrate.exe, dist\citrate-cli.exe, dist\citrate-wallet.exe, dist\citrate-faucet.exe -DestinationPath $zip
-          Remove-Item dist\citrate.exe, dist\citrate-cli.exe, dist\citrate-wallet.exe, dist\citrate-faucet.exe
+          $zip = "dist\citrate-developer-windows-$arch.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip
+          Remove-Item $stage -Recurse -Force
           Write-Host "Created $zip"
 
-      - name: Upload build artifacts
+      - name: Upload developer bundle artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-${{ matrix.os }}
+          name: developer-${{ matrix.os }}
           path: citrate_v0.01.1/dist/*
           if-no-files-found: warn
 
-  build-gui:
-    name: Build GUI (Slint native) (${{ matrix.os }})
+  build-core-gui:
+    name: Build Core GUI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -133,31 +181,72 @@ jobs:
       - name: Build Slint GUI binary
         run: cargo build --release -p citrate-gui-native
 
-      - name: Package GUI artifact (Linux/macOS)
+      - name: Package core GUI artifact (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          set -eux
+          case "$(uname -s)" in
+            Linux) OS=linux ;;
+            Darwin) OS=macos ;;
+            *) OS=$(uname -s | tr '[:upper:]' '[:lower:]') ;;
+          esac
           ARCH=$(uname -m)
-          mkdir -p dist
-          cp target/release/citrate-gui-native dist/
-          cd dist && tar -czf citrate-gui-${OS}-${ARCH}.tar.gz citrate-gui-native
-          rm -f citrate-gui-native
+          STAGE="dist/citrate-gui-native-${OS}-${ARCH}"
+          mkdir -p "${STAGE}"
+          cp target/release/citrate-gui-native "${STAGE}/"
+          cp ../LICENSE "${STAGE}/"
+          cp gui/citrate_gui_native/README.md "${STAGE}/"
+          cp README.md "${STAGE}/PROJECT_README.md"
+          cp ../RELEASE_PACKAGE_MATRIX.md "${STAGE}/"
+          cd "${STAGE}"
+          if command -v sha256sum &>/dev/null; then
+            sha256sum citrate-gui-native > SHA256SUMS.txt
+          else
+            shasum -a 256 citrate-gui-native > SHA256SUMS.txt
+          fi
+          cd ..
+          tar -czf "citrate-gui-native-${OS}-${ARCH}.tar.gz" "citrate-gui-native-${OS}-${ARCH}"
+          rm -rf "citrate-gui-native-${OS}-${ARCH}"
 
-      - name: Package GUI artifact (Windows)
+          if [[ "$OS" == "linux" ]]; then
+            ../scripts/release/build_deb.sh \
+              --binary target/release/citrate-gui-native \
+              --package citrate-gui-native \
+              --version "${RELEASE_TAG}" \
+              --arch "${ARCH}" \
+              --output-dir dist \
+              --description "Citrate core desktop GUI" \
+              --doc ../LICENSE \
+              --doc README.md \
+              --doc gui/citrate_gui_native/README.md \
+              --doc ../RELEASE_PACKAGE_MATRIX.md \
+              --icon gui/citrate_gui_native/assets/images/citrate-icon.png \
+              --desktop-name "Citrate Core GUI" \
+              --desktop-comment "Citrate core desktop GUI"
+          fi
+
+      - name: Package core GUI artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target\release\citrate-gui-native.exe dist\
+          $stage = "dist\citrate-gui-native-windows-$env:PROCESSOR_ARCHITECTURE"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\release\citrate-gui-native.exe $stage\
+          Copy-Item ..\LICENSE $stage\
+          Copy-Item gui\citrate_gui_native\README.md $stage\
+          Copy-Item README.md "$stage\PROJECT_README.md"
+          Copy-Item ..\RELEASE_PACKAGE_MATRIX.md $stage\
+          $hash = (Get-FileHash "$stage\citrate-gui-native.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  citrate-gui-native.exe" | Set-Content "$stage\SHA256SUMS.txt"
           $arch = $env:PROCESSOR_ARCHITECTURE
-          Compress-Archive -Path dist\citrate-gui-native.exe -DestinationPath "dist\citrate-gui-windows-$arch.zip"
-          Remove-Item dist\citrate-gui-native.exe
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\citrate-gui-native-windows-$arch.zip"
+          Remove-Item $stage -Recurse -Force
 
-      - name: Upload GUI artifact
+      - name: Upload core GUI artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gui-${{ matrix.os }}
+          name: core-gui-${{ matrix.os }}
           path: citrate_v0.01.1/dist/*
           if-no-files-found: warn
 
@@ -224,43 +313,69 @@ jobs:
         shell: bash
         run: |
           set -eux
-          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          case "$(uname -s)" in
+            Linux) OS=linux ;;
+            Darwin) OS=macos ;;
+            *) OS=$(uname -s | tr '[:upper:]' '[:lower:]') ;;
+          esac
           ARCH=$(uname -m)
-          mkdir -p dist
-          cp target/release/citrate-learning-center dist/
-          # Include install guide for pilot operators
+          STAGE="dist/citrate-learning-center-${OS}-${ARCH}"
+          mkdir -p "${STAGE}"
+          cp target/release/citrate-learning-center "${STAGE}/"
+          cp ../LICENSE "${STAGE}/"
+          cp README.md "${STAGE}/PROJECT_README.md"
+          cp ../RELEASE_PACKAGE_MATRIX.md "${STAGE}/"
           if [ -f gui/citrate_learning_center/release/INSTALL.md ]; then
-            cp gui/citrate_learning_center/release/INSTALL.md dist/
+            cp gui/citrate_learning_center/release/INSTALL.md "${STAGE}/"
           fi
-          cd dist
+          cd "${STAGE}"
           if command -v sha256sum &>/dev/null; then
-            sha256sum citrate-learning-center > LEARNING_CENTER_SHA256.txt
+            sha256sum citrate-learning-center > SHA256SUMS.txt
           else
-            shasum -a 256 citrate-learning-center > LEARNING_CENTER_SHA256.txt
+            shasum -a 256 citrate-learning-center > SHA256SUMS.txt
           fi
-          tar -czf citrate-learning-center-${OS}-${ARCH}.tar.gz \
-            citrate-learning-center LEARNING_CENTER_SHA256.txt \
-            $([ -f INSTALL.md ] && echo INSTALL.md)
-          rm -f citrate-learning-center LEARNING_CENTER_SHA256.txt
-          [ -f INSTALL.md ] && rm -f INSTALL.md || true
+          cd ..
+          tar -czf "citrate-learning-center-${OS}-${ARCH}.tar.gz" \
+            "citrate-learning-center-${OS}-${ARCH}"
+          rm -rf "citrate-learning-center-${OS}-${ARCH}"
           echo "Created dist/citrate-learning-center-${OS}-${ARCH}.tar.gz"
+
+          if [[ "$OS" == "linux" ]]; then
+            ../scripts/release/build_deb.sh \
+              --binary target/release/citrate-learning-center \
+              --package citrate-learning-center \
+              --version "${RELEASE_TAG}" \
+              --arch "${ARCH}" \
+              --output-dir dist \
+              --description "Citrate Learning Center desktop application" \
+              --doc ../LICENSE \
+              --doc README.md \
+              --doc ../RELEASE_PACKAGE_MATRIX.md \
+              --doc gui/citrate_learning_center/release/INSTALL.md \
+              --icon gui/citrate_gui_native/assets/images/citrate-icon.png \
+              --desktop-name "Citrate Learning Center" \
+              --desktop-comment "Citrate Learning Center desktop application"
+          fi
 
       - name: Package Learning Center artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target\release\citrate-learning-center.exe dist\
+          $stage = "dist\citrate-learning-center-windows-$env:PROCESSOR_ARCHITECTURE"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\release\citrate-learning-center.exe $stage\
+          Copy-Item ..\LICENSE $stage\
+          Copy-Item README.md "$stage\PROJECT_README.md"
+          Copy-Item ..\RELEASE_PACKAGE_MATRIX.md $stage\
           if (Test-Path gui\citrate_learning_center\release\INSTALL.md) {
-            Copy-Item gui\citrate_learning_center\release\INSTALL.md dist\
+            Copy-Item gui\citrate_learning_center\release\INSTALL.md $stage\
           }
+          $hash = (Get-FileHash "$stage\citrate-learning-center.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  citrate-learning-center.exe" | Set-Content "$stage\SHA256SUMS.txt"
           $arch = $env:PROCESSOR_ARCHITECTURE
           $zip = "dist\citrate-learning-center-windows-$arch.zip"
-          $files = @("dist\citrate-learning-center.exe")
-          if (Test-Path dist\INSTALL.md) { $files += "dist\INSTALL.md" }
-          Compress-Archive -Path $files -DestinationPath $zip
-          Remove-Item dist\citrate-learning-center.exe
-          if (Test-Path dist\INSTALL.md) { Remove-Item dist\INSTALL.md }
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip
+          Remove-Item $stage -Recurse -Force
           Write-Host "Created $zip"
 
       - name: Upload Learning Center artifact
@@ -273,12 +388,12 @@ jobs:
   publish:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, build-gui, build-learning-center]
+    needs: [build-developer-bundles, build-core-gui, build-learning-center]
     # All three upstream jobs must succeed before we publish a release. The
     # operator GUI (citrate-gui-native) ships in the release surface alongside
     # the node binaries and the Learning Center pilot binary, so a GUI failure
     # must block publication rather than silently produce a partial release.
-    if: always() && needs.build-binaries.result == 'success' && needs.build-gui.result == 'success' && needs.build-learning-center.result == 'success'
+    if: always() && needs.build-developer-bundles.result == 'success' && needs.build-core-gui.result == 'success' && needs.build-learning-center.result == 'success'
     permissions:
       contents: write
     steps:
@@ -293,12 +408,40 @@ jobs:
       - name: List artifacts
         run: ls -R artifacts
 
+      - name: Generate release navigator and manifest
+        run: |
+          python3 scripts/release/generate_release_index.py \
+            --tag "${RELEASE_TAG}" \
+            --asset-root artifacts \
+            --output-md "artifacts/release-navigator-${RELEASE_TAG}.md" \
+            --output-json "artifacts/release-manifest-${RELEASE_TAG}.json"
+
+      - name: Generate top-level SHA256 file
+        run: |
+          find artifacts -type f ! -name "SHA256SUMS-${RELEASE_TAG}.txt" -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > "artifacts/SHA256SUMS-${RELEASE_TAG}.txt"
+
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          draft: false
-          generate_release_notes: true
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ env.RELEASE_DRAFT }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
+          generate_release_notes: false
+          body_path: artifacts/release-navigator-${{ env.RELEASE_TAG }}.md
           files: |
             artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mark older prereleases as superseded
+        if: github.event_name == 'workflow_dispatch' && inputs.supersede_old_prereleases == true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/release/supersede_prereleases.sh \
+            "${RELEASE_TAG}" \
+            v0.3.0-beta.4 \
+            v0.3.0-rc.1
