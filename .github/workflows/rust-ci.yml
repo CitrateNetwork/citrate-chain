@@ -39,9 +39,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install system dependencies
+        # libfontconfig1-dev is required by yeslogic-fontconfig-sys, pulled
+        # transitively by Slint's image crate. Even though `--exclude
+        # citrate-edu-app --exclude citrate-learning-center` skips those
+        # crates from test, cargo still resolves and compiles their
+        # workspace dependencies before `--exclude` filters what gets
+        # actually tested. So this job needs the same system deps as the
+        # Slint GUI crates.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config libfontconfig1-dev
       - name: Show toolchain
         run: rustc -Vv && cargo -V
       - name: Cache cargo registry
@@ -67,7 +74,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config libfontconfig1-dev
       - name: Show toolchain
         run: rustc -Vv && cargo -V
       - name: Build citrate-api with verifier feature
@@ -87,7 +94,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config xvfb
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config xvfb libfontconfig1-dev
       - name: Cache cargo
         uses: actions/cache@v4
         with:
