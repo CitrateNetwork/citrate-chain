@@ -86,3 +86,9 @@ harness = false
 metrics = []
 ai_zkp = []
 coreml = []  # Enable CoreML support on macOS
+
+# Multi-Version Concurrency Control scaffold (Sprint P950-A-2).
+# Default off — the existing execution_guard Mutex path remains in force
+# until A-3 wires the MVCC path and benchmarks prove parity. Verified by
+# specs/tla/consensus/ExecutorMVCC.tla (14 safety + 1 liveness invariants).
+mvcc = []
