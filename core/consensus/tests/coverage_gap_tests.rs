@@ -1024,13 +1024,19 @@ fn test_model_id_equality() {
 }
 
 // -- EmbeddedModel tests --
+//
+// Post-WP-B (2026-04-21): EmbeddedModel carries a fixed-size sha256
+// commitment, not raw `Vec<u8>` weights. size_bytes() now returns a
+// constant bound derived from the commitment size + metadata cap.
+// See specs/tla/consensus/EmbeddedModelCommitment.tla for integrity
+// invariants.
 
 #[test]
-fn test_embedded_model_size_bytes() {
+fn test_embedded_model_size_bytes_is_bounded() {
     let model = EmbeddedModel {
         model_id: ModelId::from_name("tiny"),
         model_type: ModelType::TinyLLM,
-        weights: vec![0u8; 1024],
+        weights_sha256: Hash::new([0x11u8; 32]),
         metadata: ModelMetadata {
             name: "tiny".to_string(),
             version: "1.0".to_string(),
@@ -1040,16 +1046,20 @@ fn test_embedded_model_size_bytes() {
             framework: Some("GGUF".to_string()),
         },
     };
-    assert_eq!(model.size_bytes(), 1024);
+    // Post-WP-B: size is fixed, not a function of weight length.
+    let expected = 32 + EmbeddedModel::EMBEDDED_MODEL_METADATA_SIZE_UPPER_BOUND;
+    assert_eq!(model.size_bytes(), expected);
 }
 
 #[test]
-fn test_embedded_model_weights_hash_deterministic() {
-    let weights = vec![1, 2, 3, 4, 5];
+fn test_embedded_model_weights_hash_returns_stored_commitment() {
+    // Post-WP-B: weights_hash() returns the stored `weights_sha256`
+    // commitment directly; no computation happens at call time.
+    let commit = Hash::new([0xBEu8; 32]);
     let model = EmbeddedModel {
         model_id: ModelId::from_name("test"),
         model_type: ModelType::Embeddings,
-        weights: weights.clone(),
+        weights_sha256: commit,
         metadata: ModelMetadata {
             name: "test".to_string(),
             version: "1.0".to_string(),
@@ -1059,9 +1069,9 @@ fn test_embedded_model_weights_hash_deterministic() {
             framework: None,
         },
     };
-    let h1 = model.weights_hash();
-    let h2 = model.weights_hash();
-    assert_eq!(h1, h2);
+    assert_eq!(model.weights_hash(), commit);
+    // Deterministic across calls (trivially: it's a field access).
+    assert_eq!(model.weights_hash(), model.weights_hash());
 }
 
 // -- RequiredModel tests --

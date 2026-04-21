@@ -75,15 +75,35 @@ fn account(address: Address, balance_latt: u64) -> GenesisAccount {
 }
 
 fn create_embedded_bge_m3() -> EmbeddedModel {
-    // The actual GGUF weights are optional in contributor builds.
-    // The canonical genesis block still carries the model metadata shape even
-    // when weights are omitted.
-    let weights: &[u8] = &[];
+    // Post-WP-B (2026-04-21): the genesis block carries only a SHA-256
+    // commitment to the off-chain weights, not the weights themselves.
+    //
+    // Rationale — see .audit/2026-04-21-repo-walkthrough/
+    //             02_GENESIS_AND_EMBEDDED_MODELS.md for the footgun
+    // analysis. The pre-WP-B design committed `weights: Vec<u8>` to
+    // artifact_root, which allowed multi-gigabyte genesis blocks by
+    // construction. Option 1 (Saul-approved 2026-04-21) replaces the
+    // field with `weights_sha256: Hash`.
+    //
+    // The commitment below is the SHA-256 of the canonical BGE-M3 GGUF
+    // content addressed by the project's model resolver. For the initial
+    // genesis we commit to a well-known zero hash (no actual BGE-M3
+    // weights shipped at this sprint); the real commitment is populated
+    // when the off-chain distribution path is wired (deferred to the
+    // pre-mainnet integration WP).
+    //
+    // Determinism property: this function is deterministic — same code
+    // produces the same commitment across nodes. Verified by
+    // `test_canonical_genesis_block_hash_deterministic`.
 
     EmbeddedModel {
         model_id: ConsensusModelId::from_name("bge-m3"),
         model_type: ModelType::Embeddings,
-        weights: weights.to_vec(),
+        // Placeholder commitment: all-zero hash. When the distribution
+        // layer ships, replace with Sha256(gguf_bytes) of the canonical
+        // BGE-M3 artifact. Nodes fetching the off-chain bytes compare
+        // against this commitment and reject on mismatch.
+        weights_sha256: Hash::default(),
         metadata: ConsensusModelMetadata {
             name: "BGE-M3 Embeddings".to_string(),
             version: "1.0.0".to_string(),

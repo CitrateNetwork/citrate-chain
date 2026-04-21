@@ -367,11 +367,13 @@ impl EfficientSyncManager {
 
     /// Estimate block size in bytes for memory management
     fn estimate_block_size(&self, block: &Block) -> usize {
-        // Rough estimation based on Block structure
+        // Rough estimation based on Block structure.
+        // Post-WP-B: embedded_models carry fixed-size commitments
+        // (size_bytes() returns a bounded constant per model).
         std::mem::size_of::<Block>()
             + block.transactions.len() * 200 // Estimate 200 bytes per transaction
             + block.header.merge_parent_hashes.len() * 32 // 32 bytes per hash
-            + block.embedded_models.iter().map(|m| m.weights.len()).sum::<usize>()
+            + block.embedded_models.iter().map(|m| m.size_bytes()).sum::<usize>()
     }
 
     /// Clean up seen blocks set to avoid unbounded growth
