@@ -1,7 +1,9 @@
 // citrate/core/execution/src/revm_adapter.rs
 
+use crate::mvcc::WriteSet;
 use crate::state::StateDB;
 use crate::types::{Address, ExecutionError};
+use parking_lot::Mutex;
 use primitive_types::U256;
 use revm::{
     primitives::{
@@ -14,12 +16,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// Shared handle for per-tx WriteSet capture (Sprint P950-A-4, WP-A.4.1).
+///
+/// The executor creates one of these per tx, threads it through the
+/// REVM adapter, and reads it at commit time to know which accounts
+/// need their MVCC versions bumped.
+pub type WriteSetHandle = Arc<Mutex<WriteSet>>;
+
 /// Adapter to make StateDB compatible with revm's Database trait
 pub struct StateDBAdapter {
     state_db: Arc<StateDB>,
     /// WP-X.4: Block number → block hash mapping for BLOCKHASH opcode.
     /// EVM spec: BLOCKHASH returns the hash for the 256 most recent blocks.
     block_hashes: HashMap<u64, [u8; 32]>,
+    /// Optional per-tx write set capture (Sprint P950-A-4).
+    ///
+    /// When `Some`, every account touched by REVM's `DatabaseCommit::commit`
+    /// is recorded here so the executor can bump per-account MVCC versions
+    /// for all storage-writing transactions, not just transfers.
+    ///
+    /// When `None` (used by standalone tests and legacy paths), the
+    /// adapter behaves exactly as before — no write-set capture.
+    writes: Option<WriteSetHandle>,
 }
 
 impl StateDBAdapter {
@@ -27,6 +45,7 @@ impl StateDBAdapter {
         Self {
             state_db,
             block_hashes: HashMap::new(),
+            writes: None,
         }
     }
 
@@ -34,6 +53,17 @@ impl StateDBAdapter {
     /// Should contain the most recent 256 block number → hash mappings.
     pub fn with_block_hashes(mut self, hashes: HashMap<u64, [u8; 32]>) -> Self {
         self.block_hashes = hashes;
+        self
+    }
+
+    /// Attach a per-tx WriteSet handle for account capture (WP-A.4.1).
+    ///
+    /// When set, `DatabaseCommit::commit` records every account it
+    /// touches (storage writes + code deploys). The executor reads the
+    /// handle after REVM returns and feeds it to
+    /// [`crate::mvcc::CommitCoordinator::commit_writes_serialized`].
+    pub fn with_writes(mut self, writes: WriteSetHandle) -> Self {
+        self.writes = Some(writes);
         self
     }
 }
@@ -110,6 +140,14 @@ impl DatabaseCommit for StateDBAdapter {
         for (address, account) in changes {
             let addr = Address(address.0 .0);
 
+            // Sprint P950-A-4 WP-A.4.1: capture touched accounts into the
+            // per-tx WriteSet handle. Every account in this changes map
+            // had at least one storage slot or code write; the executor
+            // uses this set to bump per-account MVCC versions at commit.
+            if let Some(ws) = &self.writes {
+                ws.lock().record_write(addr);
+            }
+
             // ---- Sprint EL-1 Fix (Issue #19) ----
             // Do NOT update balance or nonce from REVM. The executor is the
             // sole owner of gas/balance/nonce accounting:
@@ -185,11 +223,12 @@ pub fn execute_contract_create(
 ) -> Result<(Address, Vec<u8>, u64), ExecutionError> {
     execute_contract_create_with_context(
         state_db, deployer, init_code, value, gas_limit, gas_price,
-        chain_id, block_number, block_timestamp, BlockContext::default(),
+        chain_id, block_number, block_timestamp, BlockContext::default(), None,
     )
 }
 
 /// Execute contract creation using revm with full block context (WP-X.4)
+/// and optional WriteSet capture (Sprint P950-A-4, WP-A.4.1).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_contract_create_with_context(
     state_db: Arc<StateDB>,
@@ -202,15 +241,19 @@ pub fn execute_contract_create_with_context(
     block_number: u64,
     block_timestamp: u64,
     block_ctx: BlockContext,
+    writes_handle: Option<WriteSetHandle>,
 ) -> Result<(Address, Vec<u8>, u64), ExecutionError> {
     debug!("Executing contract creation with revm");
     debug!("  Deployer: {}", deployer);
     debug!("  Init code size: {} bytes", init_code.len());
     debug!("  Gas limit: {}", gas_limit);
 
-    // Create database adapter with block hashes
+    // Create database adapter with block hashes and optional write capture
     let mut db = StateDBAdapter::new(state_db.clone())
         .with_block_hashes(block_ctx.block_hashes);
+    if let Some(h) = writes_handle {
+        db = db.with_writes(h);
+    }
 
     // Build EVM with transaction
     let coinbase = block_ctx.coinbase;
@@ -307,11 +350,12 @@ pub fn execute_contract_call(
 ) -> Result<(Vec<u8>, u64), ExecutionError> {
     execute_contract_call_with_context(
         state_db, caller, contract, calldata, value, gas_limit, gas_price,
-        chain_id, block_number, block_timestamp, BlockContext::default(),
+        chain_id, block_number, block_timestamp, BlockContext::default(), None,
     )
 }
 
 /// Execute contract call using revm with full block context (WP-X.4)
+/// and optional WriteSet capture (Sprint P950-A-4, WP-A.4.1).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_contract_call_with_context(
     state_db: Arc<StateDB>,
@@ -325,15 +369,19 @@ pub fn execute_contract_call_with_context(
     block_number: u64,
     block_timestamp: u64,
     block_ctx: BlockContext,
+    writes_handle: Option<WriteSetHandle>,
 ) -> Result<(Vec<u8>, u64), ExecutionError> {
     debug!("Executing contract call with revm");
     debug!("  Caller: {}", caller);
     debug!("  Contract: {}", contract);
     debug!("  Calldata size: {} bytes", calldata.len());
 
-    // Create database adapter with block hashes
+    // Create database adapter with block hashes and optional write capture
     let mut db = StateDBAdapter::new(state_db)
         .with_block_hashes(block_ctx.block_hashes);
+    if let Some(h) = writes_handle {
+        db = db.with_writes(h);
+    }
 
     // Build EVM with transaction
     let coinbase = block_ctx.coinbase;
@@ -462,6 +510,7 @@ mod tests {
             100,
             1_000_000,
             ctx,
+            None, // No WriteSet capture in this test
         );
 
         // Should succeed (not panic) with custom coinbase/prevrandao
@@ -500,6 +549,7 @@ mod tests {
             100,
             1_000_000,
             ctx,
+            None, // No WriteSet capture in this test
         );
 
         assert!(result.is_ok(), "Contract call with block context should succeed: {:?}", result.err());
