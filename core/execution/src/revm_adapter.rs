@@ -107,12 +107,17 @@ impl Database for StateDBAdapter {
         // executor's journal-routed path), return the pending value.
         // Otherwise fall through to committed state in state_db.
         //
+        // Sprint P950-A-5 WP-A.5.3: also record the account in the
+        // journal's read_set so concurrent commits that write to this
+        // account invalidate our pin and force a retry.
+        //
         // This is what enables REVM to see post-gas-deduction balance
         // during execution even when the executor routes gas deduction
         // through the journal (concurrent-safe path) rather than
         // mutating state_db eagerly.
         let (balance, nonce) = if let Some(journal) = &self.journal {
-            let j = journal.lock();
+            let mut j = journal.lock();
+            j.record_read(addr);
             let pending_balance = j.pending_balance(&addr);
             let pending_nonce = j.pending_nonce(&addr);
             (
@@ -165,8 +170,14 @@ impl Database for StateDBAdapter {
         // semantics within a tx. If this tx previously SSTOREd the slot,
         // the pending value is in the journal; return it. Only fall through
         // to state_db if the slot hasn't been written yet in this tx.
+        //
+        // Sprint P950-A-5 WP-A.5.3: record the account in the journal's
+        // read_set so concurrent commits to this account's storage
+        // invalidate the pin and force retry.
         if let Some(journal) = &self.journal {
-            if let Some(pending) = journal.lock().pending_storage(&addr, &key_bytes).map(|v| v.to_vec()) {
+            let mut j = journal.lock();
+            j.record_read(addr);
+            if let Some(pending) = j.pending_storage(&addr, &key_bytes).map(|v| v.to_vec()) {
                 let mut padded = [0u8; 32];
                 let len = pending.len().min(32);
                 padded[32 - len..].copy_from_slice(&pending[pending.len() - len..]);
@@ -265,7 +276,14 @@ impl DatabaseCommit for StateDBAdapter {
                 if let Some(code) = account.info.code {
                     let code_bytes = code.bytes().to_vec();
                     if !code_bytes.is_empty() {
-                        self.state_db.set_code(addr, code_bytes);
+                        // Sprint P950-A-5 WP-A.5.3: route code writes through
+                        // the journal so mid-tx contract deployment (CREATE
+                        // opcode) is isolated from concurrent workers.
+                        if let Some(journal) = &self.journal {
+                            journal.lock().record_code(addr, code_bytes);
+                        } else {
+                            self.state_db.set_code(addr, code_bytes);
+                        }
                     }
                 }
             }
