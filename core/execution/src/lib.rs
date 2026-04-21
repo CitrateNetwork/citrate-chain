@@ -13,6 +13,13 @@ pub mod state;
 pub mod tensor;
 pub mod types;
 pub mod vm;
+
+// Multi-Version Concurrency Control (MVCC) primitives. Scaffolded in
+// Sprint P950-A-2, gated off by default. When the flag is off, the
+// existing execution_guard Mutex path in executor.rs is untouched.
+// Verified by specs/tla/consensus/ExecutorMVCC.tla.
+#[cfg(feature = "mvcc")]
+pub mod mvcc;
 /// ZK proof circuits (Groth16 + arkworks).
 ///
 /// **EXPERIMENTAL**: Circuit implementations use simplified/placeholder logic.
