@@ -702,89 +702,157 @@ impl Executor {
         self.state_db.calculate_state_root()
     }
 
-    /// Execute a transaction via the MVCC path (Sprint P950-A-3).
+    /// Execute a transaction via the MVCC path.
+    ///
+    /// Sprint P950-A-5 WP-A.5.3: parallel execution via journal + CAS.
     ///
     /// Flow:
-    /// 1. Acquire the async exec lock from the commit coordinator.
-    ///    This transitionally serializes execution; true parallel
-    ///    execution lands in P950-A-4.
-    /// 2. Run the existing inner execution logic (snapshot → REVM →
-    ///    commit-or-rollback), unchanged.
-    /// 3. On success, advance the coordinator's global version and
-    ///    record the tx's write set (sender + recipient + REVM-touched
-    ///    accounts). Per-account version tracking readies the executor
-    ///    for parallel CAS-based commits in A-4.
-    /// 4. On failure, no version bump (the tx never committed state
-    ///    changes that survive persistence).
+    /// 1. Pin a fresh per-tx ScratchJournal at the current global version.
+    /// 2. Execute the tx; ALL mutations land in the journal, ALL reads
+    ///    populate the journal's read set.
+    /// 3. `try_commit`: validate read set against current account versions
+    ///    under the short commit-lock critical section. On success:
+    ///    atomically advance global version + bump per-account versions
+    ///    for the write set. On conflict: abort and retry with a fresh pin.
+    /// 4. On success: drain the journal into state_db; persist versions.
+    /// 5. Fallback-to-serial on retry exhaustion: acquire the async
+    ///    `exec_lock` and commit unconditionally. Guarantees progress.
+    ///
+    /// The former always-serial `exec_lock` on the fast path is gone —
+    /// workers now execute concurrently, only synchronized on the short
+    /// commit-lock critical section inside `try_commit`.
     pub async fn execute_transaction(
         &self,
         block: &Block,
         tx: &Transaction,
     ) -> Result<TransactionReceipt, ExecutionError> {
-        let _guard = self.commit_coordinator.acquire_exec_lock().await;
-        let (receipt, writes) = self.execute_transaction_inner(block, tx).await?;
+        const MAX_RETRIES: usize = 8;
+        let coord = &self.commit_coordinator;
 
-        if receipt.status {
-            // Successful tx: advance global version and bump per-account
-            // versions for everything touched during execution.
-            //
-            // `writes` now contains:
-            //   - sender (balance/nonce change)
-            //   - optional recipient (balance change)
-            //   - every account REVM wrote storage or code for (captured
-            //     via the WriteSet handle threaded through the adapter;
-            //     Sprint P950-A-4 WP-A.4.1)
-            let new_version = self.commit_coordinator.commit_writes_serialized(&writes);
+        // -- Fast path: bounded CAS retries with NO exec_lock held --
+        for _attempt in 0..MAX_RETRIES {
+            let mut context = ExecutionContext::new(block, tx);
+            let pin = coord.current_version();
+            context.journal.lock().pin_at(pin);
 
-            // Sprint P950-A-4 WP-A.4.3: persist versions to RocksDB.
-            // Non-fatal if persistence fails — log and continue. A restart
-            // without persisted versions still works (in-memory reset is
-            // conservatively-safe; all prior reads are treated invalid).
-            if let Some(store) = &self.state_store {
-                let entries: Vec<(Address, u64)> = writes
-                    .iter()
-                    .map(|a| (*a, new_version.as_u64()))
-                    .collect();
-                if let Err(e) = store.put_account_versions(&entries) {
-                    warn!("account_versions persistence failed (non-fatal): {}", e);
+            let (receipt, writes) = match self.execute_tx_into_journal(block, tx, &mut context).await {
+                Ok(pair) => pair,
+                // Validation errors (InvalidNonce, InsufficientBalance) are
+                // deterministic — no point retrying.
+                Err(e) => return Err(e),
+            };
+
+            let outcome = {
+                let journal = context.journal.lock();
+                coord.try_commit(&journal)
+            };
+            use crate::mvcc::CommitOutcome;
+            match outcome {
+                CommitOutcome::Committed { new_version } => {
+                    self.drain_journal(&context.journal);
+                    self.persist_account_versions(&writes, new_version);
+                    return Ok(receipt);
                 }
-                if let Err(e) = store.put_global_version(new_version.as_u64()) {
-                    warn!("global_version persistence failed (non-fatal): {}", e);
+                CommitOutcome::Aborted { .. } => {
+                    // Nothing drained → nothing to undo.
+                    // Journal will be recreated fresh on next attempt.
+                    continue;
                 }
             }
         }
 
+        // -- Fallback path: serialized via exec_lock --
+        //
+        // Acquiring the exec_lock guarantees no concurrent CAS attempts;
+        // we then commit unconditionally (no read-set validation needed).
+        // Progress is guaranteed (TLA+ `Progress` temporal property).
+        let _guard = coord.acquire_exec_lock().await;
+        let mut context = ExecutionContext::new(block, tx);
+        context.journal.lock().pin_at(coord.current_version());
+        let (receipt, writes) = self
+            .execute_tx_into_journal(block, tx, &mut context)
+            .await?;
+        let new_version = coord.commit_writes_serialized(&writes);
+        self.drain_journal(&context.journal);
+        self.persist_account_versions(&writes, new_version);
         Ok(receipt)
     }
 
-    async fn execute_transaction_inner(
+    /// Persist per-account + global MVCC versions to RocksDB.
+    ///
+    /// Sprint P950-A-4 WP-A.4.3. Non-fatal: failures are logged but do
+    /// not abort the tx. A restart without persisted versions is
+    /// conservatively-safe (in-memory tracker starts at v0).
+    fn persist_account_versions(
+        &self,
+        writes: &WriteSet,
+        new_version: crate::mvcc::ReadVersion,
+    ) {
+        if let Some(store) = &self.state_store {
+            let entries: Vec<(Address, u64)> = writes
+                .iter()
+                .map(|a| (*a, new_version.as_u64()))
+                .collect();
+            if let Err(e) = store.put_account_versions(&entries) {
+                warn!("account_versions persistence failed (non-fatal): {}", e);
+            }
+            if let Err(e) = store.put_global_version(new_version.as_u64()) {
+                warn!("global_version persistence failed (non-fatal): {}", e);
+            }
+        }
+    }
+
+    /// Execute a tx into a pre-pinned journal. All mutations land in the
+    /// journal (no direct state_db writes); all reads record into the
+    /// journal's read_set for CAS validation.
+    ///
+    /// Sprint P950-A-5 WP-A.5.3. Replaces the former
+    /// `execute_transaction_inner` — snapshot/restore is gone (the journal
+    /// IS the rollback mechanism: abort means discard pending writes; commit
+    /// means drain).
+    ///
+    /// The caller is responsible for:
+    /// - Creating the ExecutionContext with a fresh journal
+    /// - Pinning the journal at the current global version
+    /// - Either `try_commit` + drain (success) or discard (retry)
+    async fn execute_tx_into_journal(
         &self,
         block: &Block,
         tx: &Transaction,
+        context: &mut ExecutionContext,
     ) -> Result<(TransactionReceipt, WriteSet), ExecutionError> {
-        let mut context = ExecutionContext::new(block, tx);
         let from = crate::address_utils::normalize_address(&tx.from);
 
-        // Snapshot for rolling back residual direct state_db mutations
-        // (e.g., create_account_if_not_exists in execute_transfer, REVM's
-        // direct set_code writes through DatabaseCommit::commit for
-        // mid-tx contract deployment). Balance/nonce/value mutations route
-        // through the per-tx journal (WP-A.5.2) and are discarded at the
-        // journal level on failure, so the snapshot handles only the
-        // non-journal-routed direct writes.
-        let snapshot = self.state_db.snapshot();
+        // Record sender in the read_set — validation against pinned version
+        // at commit time. If another tx commits a write to `from` before
+        // we commit, our CAS aborts and retries.
+        context.journal.lock().record_read(from);
 
         // Verify nonce WITHOUT incrementing (C-04: enforce equality).
-        // The nonce must remain at N during execution so that revm computes
-        // correct CREATE addresses using keccak256(rlp([sender, N])).
-        // Increment happens AFTER execution completes (EVM-compliant ordering).
-        self.state_db.accounts.check_nonce(&from, tx.nonce)?;
+        // Journal-first for read-your-writes consistency (a prior retry
+        // attempt could have left no pending nonce — fall through to
+        // state_db).
+        {
+            let j = context.journal.lock();
+            let current_nonce = j
+                .pending_nonce(&from)
+                .unwrap_or_else(|| self.state_db.accounts.get_nonce(&from));
+            if current_nonce != tx.nonce {
+                return Err(ExecutionError::InvalidNonce {
+                    expected: current_nonce,
+                    got: tx.nonce,
+                });
+            }
+        }
 
-        // Check balance for gas
+        // Check balance for gas, journal-first.
         let gas_cost = U256::from(tx.gas_limit) * U256::from(tx.gas_price);
-        let balance = self.state_db.accounts.get_balance(&from);
+        let balance = {
+            let j = context.journal.lock();
+            j.pending_balance(&from)
+                .unwrap_or_else(|| self.state_db.accounts.get_balance(&from))
+        };
         if balance < gas_cost + U256::from(tx.value) {
-            // No mutations happened — nothing to restore.
             return Err(ExecutionError::InsufficientBalance {
                 need: gas_cost + U256::from(tx.value),
                 have: balance,
@@ -794,21 +862,18 @@ impl Executor {
         // Sprint P950-A-5 WP-A.5.2: deduct gas cost into the journal rather
         // than state_db. REVM's `Database::basic` does journal-first lookup
         // so the EVM sees the post-deduction balance during execution.
-        // On success: the journal drains into state_db at the end.
-        // On failure: the journal is discarded + re-recorded with the
-        //             gas-burn amount (same net effect).
         context.journal.lock().record_balance(from, balance - gas_cost);
 
-        // Parse and execute transaction type (nonce still at N for CREATE address derivation)
+        // Parse and execute transaction type.
         let tx_type = self.parse_transaction_type(tx)?;
         let result = self
-            .execute_transaction_type(tx_type, &mut context, from)
+            .execute_transaction_type(tx_type, context, from)
             .await;
 
-        // Handle execution result
+        // Handle execution result — all journal-routed.
         let status = match result {
             Ok(()) => {
-                // Success path: nonce increment + gas refund via journal.
+                // Success: nonce increment + gas refund via journal.
                 let refund =
                     U256::from(tx.gas_limit - context.gas_used) * U256::from(tx.gas_price);
                 let current_balance = {
@@ -825,22 +890,13 @@ impl Executor {
             }
             Err(e) => {
                 warn!("Transaction execution failed: {}", e);
-                // Failure path:
-                //   1. Discard the journal's pending writes (gas deduction,
-                //      REVM storage, value transfers, contract deploys).
-                //      Preserve read_set + write_set for conservative
-                //      version bumping at commit.
-                //   2. Re-record ONLY the failure-mode accounting:
-                //      gas-burn balance + nonce-increment.
-                //   3. Restore state_db to undo non-journal-routed direct
-                //      mutations (create_account_if_not_exists, set_code).
-                {
-                    let mut j = context.journal.lock();
-                    j.discard_writes();
-                    j.record_balance(from, balance - gas_cost);
-                    j.record_nonce(from, tx.nonce + 1);
-                }
-                self.state_db.restore(snapshot);
+                // Failure: discard pending writes, re-record only gas-burn
+                // + nonce-increment. No state_db rollback needed since
+                // nothing was written to state_db during execution.
+                let mut j = context.journal.lock();
+                j.discard_writes();
+                j.record_balance(from, balance - gas_cost);
+                j.record_nonce(from, tx.nonce + 1);
                 false
             }
         };
@@ -854,8 +910,8 @@ impl Executor {
             to: tx.to.map(|pk| crate::address_utils::normalize_address(&pk)),
             gas_used: context.gas_used,
             status,
-            logs: context.logs,
-            output: context.output,
+            logs: context.logs.clone(),
+            output: context.output.clone(),
             eth_tx_type: tx.eth_tx_type,
             effective_gas_price: tx.gas_price,
         };
@@ -881,34 +937,32 @@ impl Executor {
             writes.record_write(to);
         }
 
-        // Drain the journal into state_db. The journal now always contains
-        // at least the gas accounting + nonce for the sender, regardless of
-        // success/failure. Storage + per-account mutations (balance/nonce/
-        // code) land here.
-        //
-        // Order: storage first, then per-account — matches the pre-journal
-        // ordering where storage writes came through DatabaseCommit and
-        // balance/nonce came from the executor.
-        {
-            let journal = context.journal.lock();
-            for ((addr, key), value) in journal.iter_storage_writes() {
-                self.state_db.set_storage(*addr, key.clone(), value.clone());
+        Ok((receipt, writes))
+    }
+
+    /// Apply a pinned scratch journal's pending mutations to state_db.
+    ///
+    /// Sprint P950-A-5 WP-A.5.3. Extracted so both the serial path and
+    /// (future) the CAS-retry path use the same drain logic. Code writes
+    /// go through `self.set_code` so state_store persistence is applied
+    /// uniformly with direct code deploys.
+    fn drain_journal(&self, journal: &crate::mvcc::JournalHandle) {
+        let journal = journal.lock();
+        for ((addr, key), value) in journal.iter_storage_writes() {
+            self.state_db.set_storage(*addr, key.clone(), value.clone());
+        }
+        for (addr, pending) in journal.iter_writes() {
+            if let Some(new_balance) = pending.new_balance {
+                self.state_db.accounts.set_balance(*addr, new_balance);
             }
-            for (addr, pending) in journal.iter_writes() {
-                if let Some(new_balance) = pending.new_balance {
-                    self.state_db.accounts.set_balance(*addr, new_balance);
-                }
-                if let Some(new_nonce) = pending.new_nonce {
-                    self.state_db.accounts.set_nonce(*addr, new_nonce);
-                }
-                if let Some(code) = &pending.new_code {
-                    self.state_db.accounts.create_account_if_not_exists(*addr);
-                    self.state_db.set_code(*addr, code.clone());
-                }
+            if let Some(new_nonce) = pending.new_nonce {
+                self.state_db.accounts.set_nonce(*addr, new_nonce);
+            }
+            if let Some(code) = &pending.new_code {
+                self.state_db.accounts.create_account_if_not_exists(*addr);
+                self.set_code(addr, code.clone());
             }
         }
-
-        Ok((receipt, writes))
     }
 
     /// Simulate a transaction without persisting state changes.
@@ -923,8 +977,13 @@ impl Executor {
         block: &Block,
         tx: &Transaction,
     ) -> Result<TransactionReceipt, ExecutionError> {
+        // Simulation acquires the exec_lock to serialize against real tx
+        // execution — the simulation's temporary balance/nonce overrides
+        // must not be observable to concurrent workers. Short critical
+        // section; eth_call / eth_estimateGas are not throughput-critical.
         let _guard = self.commit_coordinator.acquire_exec_lock().await;
-        // Snapshot BEFORE any mutations
+
+        // Snapshot BEFORE any mutations (to undo the simulation overrides).
         let snapshot = self.state_db.snapshot();
 
         // Override sender balance for simulation
@@ -933,20 +992,30 @@ impl Executor {
             .accounts
             .set_balance(from, U256::from(u128::MAX));
 
-        // Align nonce so validation inside execute_transaction passes
+        // Align nonce so validation inside execute_tx_into_journal passes
         let current_nonce = self.state_db.accounts.get_nonce(&from);
         if tx.nonce != current_nonce {
             self.state_db.accounts.set_nonce(from, tx.nonce);
         }
 
-        // Execute the transaction (creates its own inner snapshot)
-        let result = self.execute_transaction_inner(block, tx).await;
+        // Execute the tx into a pinned (but never committed) journal.
+        // Simulation doesn't drain the journal — all pending mutations
+        // stay in the journal and get thrown away on return.
+        let mut context = ExecutionContext::new(block, tx);
+        context
+            .journal
+            .lock()
+            .pin_at(self.commit_coordinator.current_version());
+        let result = self
+            .execute_tx_into_journal(block, tx, &mut context)
+            .await;
 
-        // ALWAYS restore — unconditional, no matter success or failure
+        // ALWAYS restore — unconditional, no matter success or failure.
+        // Undoes the inflated balance + nonce override.
         self.state_db.restore(snapshot);
 
-        // Simulation discards any WriteSet capture: no MVCC version
-        // bumps escape the simulation (that's the whole point of sim).
+        // Simulation discards the journal + WriteSet capture: no MVCC
+        // version bumps escape the simulation, no state changes land.
         result.map(|(receipt, _writes)| receipt)
     }
 
@@ -1275,6 +1344,10 @@ impl Executor {
     /// pending map; the executor drains them into state_db at commit time.
     /// REVM-adjacent paths read balances via journal-first lookup so the
     /// in-flight transfer is visible within this tx.
+    ///
+    /// WP-A.5.3: records both parties into the journal's read_set so
+    /// concurrent commits against either account invalidate this tx and
+    /// force a retry.
     async fn execute_transfer(
         &self,
         from: Address,
@@ -1284,16 +1357,18 @@ impl Executor {
     ) -> Result<(), ExecutionError> {
         context.use_gas(self.gas_schedule.transfer)?;
 
-        // Self-transfer: balance net-zero, but ensure the account exists.
+        // Self-transfer: balance net-zero, no-op.
         if from == to {
-            self.state_db.accounts.create_account_if_not_exists(to);
             return Ok(());
         }
 
         // Read journal-first so we see this tx's pending gas deduction
         // (and any prior transfers routed through the journal).
+        // Record both accounts into the read_set for CAS validation.
         let (from_balance, to_balance) = {
-            let j = context.journal.lock();
+            let mut j = context.journal.lock();
+            j.record_read(from);
+            j.record_read(to);
             let fb = j
                 .pending_balance(&from)
                 .unwrap_or_else(|| self.state_db.accounts.get_balance(&from));
@@ -1309,10 +1384,6 @@ impl Executor {
                 have: from_balance,
             });
         }
-
-        // Ensure recipient exists in state_db for balance storage (the
-        // snapshot captured pre-existence and will roll back on failure).
-        self.state_db.accounts.create_account_if_not_exists(to);
 
         {
             let mut j = context.journal.lock();
@@ -1351,12 +1422,13 @@ impl Executor {
         context: &mut ExecutionContext,
     ) -> Result<(), ExecutionError> {
         if from == to {
-            self.state_db.accounts.create_account_if_not_exists(to);
             return Ok(());
         }
 
         let (from_balance, to_balance) = {
-            let j = context.journal.lock();
+            let mut j = context.journal.lock();
+            j.record_read(from);
+            j.record_read(to);
             let fb = j
                 .pending_balance(&from)
                 .unwrap_or_else(|| self.state_db.accounts.get_balance(&from));
@@ -1372,8 +1444,6 @@ impl Executor {
                 have: from_balance,
             });
         }
-
-        self.state_db.accounts.create_account_if_not_exists(to);
 
         {
             let mut j = context.journal.lock();
@@ -1425,14 +1495,18 @@ impl Executor {
                     runtime_code.len()
                 );
 
-                // Store the runtime bytecode at revm's calculated address
-                if !runtime_code.is_empty() {
-                    self.set_code(&deployed_address, runtime_code);
-                } else {
-                    // Empty return = deployment failed or no runtime code
+                // Store the runtime bytecode at revm's calculated address.
+                // Sprint P950-A-5 WP-A.5.3: route through journal for
+                // concurrent isolation. Drain time applies the code write
+                // via `state_db.set_code` (which also updates the account's
+                // code_hash) and persists to the code store.
+                if runtime_code.is_empty() {
                     warn!("Contract deployment returned empty runtime code");
-                    self.set_code(&deployed_address, vec![]);
                 }
+                context
+                    .journal
+                    .lock()
+                    .record_code(deployed_address, runtime_code);
 
                 // Set contract address in output
                 context.output = deployed_address.0.to_vec();
