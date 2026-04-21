@@ -17,7 +17,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 rocksdb = { workspace = true }
-reqwest = { version = "0.11", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 bytes = "1.5"
 blake3 = "1.5"
 
@@ -26,7 +26,7 @@ citrate-consensus = { path = "../consensus" }
 citrate-execution = { path = "../execution" }
 
 # Storage specific
-lru = "0.12"
+lru = "0.16"
 parking_lot = "0.12"
 dashmap = "5.5"
 hex = "0.4"

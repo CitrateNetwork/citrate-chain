@@ -55,7 +55,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio-tungstenite = "0.21"
 uuid = { version = "1.0", features = ["v4"] }
 base64 = "0.21"
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }
 
 # Optional verifier tooling
 ethers-solc = { version = "2", optional = true }
@@ -66,7 +66,7 @@ default = []
 verifier-ethers-solc = ["ethers-solc", "semver"]
 
 [dev-dependencies]
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
 tokio-test = "0.4"
 tempfile = "3.0"
 tower = { version = "0.4", features = ["util"] }
