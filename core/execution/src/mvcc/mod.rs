@@ -44,9 +44,11 @@
 pub mod read_set;
 pub mod scratch_journal;
 pub mod version;
+pub mod version_tracker;
 pub mod write_set;
 
 pub use read_set::ReadSet;
 pub use scratch_journal::ScratchJournal;
 pub use version::{ReadVersion, StateVersion};
+pub use version_tracker::AccountVersionTracker;
 pub use write_set::WriteSet;
