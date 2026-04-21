@@ -41,12 +41,14 @@
 //! `P950-A-2` (Phase A.2 of the executor-MVCC work). See
 //! `.agentile/sprints/active/sprint-p950-a-2-executor-mvcc-impl/SPRINT.md`.
 
+pub mod commit;
 pub mod read_set;
 pub mod scratch_journal;
 pub mod version;
 pub mod version_tracker;
 pub mod write_set;
 
+pub use commit::{AbortReason, CommitCoordinator, CommitOutcome};
 pub use read_set::ReadSet;
 pub use scratch_journal::ScratchJournal;
 pub use version::{ReadVersion, StateVersion};
