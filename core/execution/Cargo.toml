@@ -82,6 +82,10 @@ criterion = { workspace = true }
 name = "parallel_bench"
 harness = false
 
+[[bench]]
+name = "mvcc_bench"
+harness = false
+
 [features]
 metrics = []
 ai_zkp = []
