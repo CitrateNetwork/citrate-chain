@@ -116,6 +116,46 @@ pub trait StateStoreTrait: Send + Sync {
     fn put_storage(&self, address: &Address, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
     /// C6: Delete a contract storage slot
     fn delete_storage(&self, address: &Address, key: &[u8]) -> anyhow::Result<()>;
+
+    // ------------------------------------------------------------------------
+    // Sprint P950-A-4 WP-A.4.3: MVCC account-version persistence.
+    //
+    // All methods have default no-op implementations so stores that don't
+    // support versions compile unchanged. `StateStore` (the real RocksDB-
+    // backed implementation) overrides them.
+    //
+    // If a store declines to persist versions, the tracker remains in-memory
+    // only: correct for benchmarks and tests, non-durable across restart.
+    // ------------------------------------------------------------------------
+
+    /// Persist one account's version.
+    fn put_account_version(&self, _address: &Address, _version: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Persist many account versions in one batch.
+    /// Default walks single-put — stores with native batch support should override.
+    fn put_account_versions(&self, entries: &[(Address, u64)]) -> anyhow::Result<()> {
+        for (addr, ver) in entries {
+            self.put_account_version(addr, *ver)?;
+        }
+        Ok(())
+    }
+
+    /// Load every persisted account version. Called at executor startup.
+    fn get_all_account_versions(&self) -> anyhow::Result<Vec<(Address, u64)>> {
+        Ok(Vec::new())
+    }
+
+    /// Persist the MVCC global version counter.
+    fn put_global_version(&self, _version: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Load the MVCC global version counter. Called at executor startup.
+    fn get_global_version(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// Bridge trait to persist AI model metadata & artifacts in external storage layers.
@@ -291,9 +331,58 @@ impl Executor {
 
         info!("Executor initialized with chain_id: {}", chain_id);
 
+        // Sprint P950-A-4 WP-A.4.3: eager-load persisted MVCC versions
+        // from RocksDB so per-account versions survive restart. The tracker
+        // is correct-by-construction: we bump to the persisted values and
+        // advance the global counter to at least the max of them, preserving
+        // the spec invariant `accountVersion[a] <= globalVersion`.
+        let state_store_dyn: Option<Arc<dyn StateStoreTrait>> =
+            state_store.map(|s| s as Arc<dyn StateStoreTrait>);
+        let commit_coordinator = Arc::new(CommitCoordinator::new());
+        if let Some(store) = &state_store_dyn {
+            let account_versions = store
+                .get_all_account_versions()
+                .unwrap_or_else(|e| {
+                    warn!("account_versions eager-load failed: {} — starting fresh", e);
+                    Vec::new()
+                });
+            let persisted_global = store
+                .get_global_version()
+                .unwrap_or_else(|e| {
+                    warn!("global_version eager-load failed: {} — starting fresh", e);
+                    None
+                });
+
+            let max_account_v = account_versions
+                .iter()
+                .map(|(_, v)| *v)
+                .max()
+                .unwrap_or(0);
+            let global_to_restore = persisted_global.unwrap_or(0).max(max_account_v);
+
+            // Restore per-account versions
+            let tracker = commit_coordinator.tracker();
+            for (addr, v) in &account_versions {
+                tracker.bump(*addr, crate::mvcc::ReadVersion::from_raw(*v));
+            }
+
+            // Advance globalVersion to the restored floor
+            for _ in 0..global_to_restore {
+                let _ = commit_coordinator.commit_writes_serialized(&WriteSet::new());
+            }
+
+            if !account_versions.is_empty() || persisted_global.is_some() {
+                info!(
+                    "MVCC restore: loaded {} per-account versions, global_version = {}",
+                    account_versions.len(),
+                    global_to_restore,
+                );
+            }
+        }
+
         Self {
             state_db,
-            state_store: state_store.map(|s| s as Arc<dyn StateStoreTrait>),
+            state_store: state_store_dyn,
             gas_schedule: GasSchedule::default(),
             inference_service: None,
             artifact_service: None,
@@ -302,7 +391,7 @@ impl Executor {
             precompile_executor,
             chain_id,
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
-            commit_coordinator: Arc::new(CommitCoordinator::new()),
+            commit_coordinator,
         }
     }
 
@@ -637,7 +726,24 @@ impl Executor {
             //   - every account REVM wrote storage or code for (captured
             //     via the WriteSet handle threaded through the adapter;
             //     Sprint P950-A-4 WP-A.4.1)
-            self.commit_coordinator.commit_writes_serialized(&writes);
+            let new_version = self.commit_coordinator.commit_writes_serialized(&writes);
+
+            // Sprint P950-A-4 WP-A.4.3: persist versions to RocksDB.
+            // Non-fatal if persistence fails — log and continue. A restart
+            // without persisted versions still works (in-memory reset is
+            // conservatively-safe; all prior reads are treated invalid).
+            if let Some(store) = &self.state_store {
+                let entries: Vec<(Address, u64)> = writes
+                    .iter()
+                    .map(|a| (*a, new_version.as_u64()))
+                    .collect();
+                if let Err(e) = store.put_account_versions(&entries) {
+                    warn!("account_versions persistence failed (non-fatal): {}", e);
+                }
+                if let Err(e) = store.put_global_version(new_version.as_u64()) {
+                    warn!("global_version persistence failed (non-fatal): {}", e);
+                }
+            }
         }
 
         Ok(receipt)
