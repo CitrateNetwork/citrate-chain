@@ -82,7 +82,20 @@ criterion = { workspace = true }
 name = "parallel_bench"
 harness = false
 
+[[bench]]
+name = "mvcc_bench"
+harness = false
+
+[[bench]]
+name = "tps_parallel"
+harness = false
+
 [features]
 metrics = []
 ai_zkp = []
 coreml = []  # Enable CoreML support on macOS
+
+# Note: the former `mvcc` feature flag was removed in Sprint P950-A-3
+# (2026-04-21). MVCC is now the only execution path; the tokio::sync::Mutex
+# serialization was deleted. Verified by
+# specs/tla/consensus/ExecutorMVCC.tla (14 safety + 1 action + 1 liveness).

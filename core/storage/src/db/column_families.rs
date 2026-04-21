@@ -26,6 +26,12 @@ pub const CF_DAG_METADATA: &str = "dag_metadata";
 // WP-S.3: BFT checkpoint column family
 pub const CF_CHECKPOINTS: &str = "checkpoints";
 
+// Sprint P950-A-4 WP-A.4.3: persistent MVCC per-account version tracker.
+// Key: 20-byte Address. Value: 8-byte big-endian u64 (ReadVersion inner).
+// One-key slot for global version: [0xFF; 20] (all-ones address, not a
+// valid account under EIP-55 / secp256k1 derivations).
+pub const CF_ACCOUNT_VERSIONS: &str = "account_versions";
+
 /// Get all column families
 pub fn all_column_families() -> Vec<&'static str> {
     vec![
@@ -50,5 +56,6 @@ pub fn all_column_families() -> Vec<&'static str> {
         CF_DAG_HEIGHT_INDEX,
         CF_DAG_METADATA,
         CF_CHECKPOINTS,
+        CF_ACCOUNT_VERSIONS,
     ]
 }
