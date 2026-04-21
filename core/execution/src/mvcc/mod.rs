@@ -1,10 +1,10 @@
 //! Multi-Version Concurrency Control (MVCC) primitives for the executor.
 //!
-//! **Status:** scaffolded; not yet wired into `Executor::execute_transaction`.
-//! Feature-gated behind `mvcc` (default off). When the flag is off, none of
-//! this code compiles into the release binary — the existing
-//! `execution_guard: tokio::sync::Mutex<()>` path in `executor.rs:85` is
-//! unaffected.
+//! **Status:** integrated. As of Sprint P950-A-3 (2026-04-21), the
+//! `CommitCoordinator` owns the executor's serialization lock and
+//! advances per-account versions on each successful tx. The former
+//! `execution_guard: tokio::sync::Mutex<()>` field in `executor.rs` has
+//! been deleted and the `mvcc` feature flag removed.
 //!
 //! # Design
 //!

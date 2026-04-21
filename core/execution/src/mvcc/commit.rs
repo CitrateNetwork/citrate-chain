@@ -117,6 +117,16 @@ struct CommitCoordinatorInner {
     /// Mutex guarding the validate-and-bump critical section. Not held
     /// during tx execution; only during the atomic commit step.
     commit_lock: Mutex<()>,
+    /// **Transitional serialization** (Sprint P950-A-3): ensures only one
+    /// tx executes at a time, because the existing execution path holds
+    /// async state (REVM, inference service calls) across `.await`. True
+    /// parallel execution requires versioned state reads in `StateDB`,
+    /// which is deferred to P950-A-4. When that lands, this field is
+    /// deleted and the CAS on `state_version` is the only serialization.
+    ///
+    /// Separate from `commit_lock` because commit is sync (parking_lot)
+    /// but execution requires an async-compatible mutex.
+    exec_lock: tokio::sync::Mutex<()>,
 }
 
 impl CommitCoordinator {
@@ -205,6 +215,38 @@ impl CommitCoordinator {
     /// would abort, letting callers skip straight to retry.
     pub fn is_read_set_likely_valid(&self, read_set: &ReadSet) -> bool {
         self.inner.tracker.validate(read_set)
+    }
+
+    /// Acquire the async execution lock.
+    ///
+    /// **Transitional API** — held by `Executor::execute_transaction` to
+    /// serialize tx execution while async `.await` points exist in the
+    /// execution path. See `exec_lock` field doc for the removal plan
+    /// (Sprint P950-A-4, when versioned state reads land).
+    ///
+    /// The returned `MutexGuard` is `Send` (tokio's async mutex), so it
+    /// can be held across `.await`. Drop the guard to release.
+    pub async fn acquire_exec_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.exec_lock.lock().await
+    }
+
+    /// Mark a tx's write set as committed at a new version. Called after
+    /// the executor completes a tx successfully, to bump per-account
+    /// versions and advance the global version counter.
+    ///
+    /// This is a convenience shortcut that skips the read-set validation
+    /// (appropriate when we're serialized via the exec_lock). When
+    /// versioned state reads land in A-4, callers switch to `try_commit`
+    /// which validates.
+    ///
+    /// Returns the new global version.
+    pub fn commit_writes_serialized(&self, write_set: &super::write_set::WriteSet) -> ReadVersion {
+        let _guard = self.inner.commit_lock.lock();
+        let new_version = self.inner.state_version.advance_unconditional();
+        self.inner
+            .tracker
+            .bump_all(write_set.iter().copied(), new_version);
+        new_version
     }
 
     /// Execute a closure under exclusive commit-lock access and commit
@@ -436,6 +478,90 @@ mod tests {
         let journal = ScratchJournal::new(); // not pinned
         let _ = coord.try_commit(&journal);
     }
+
+    #[test]
+    fn commit_writes_serialized_bumps_versions_and_advances() {
+        let coord = CommitCoordinator::new();
+        let mut ws = WriteSet::new();
+        ws.record_write(addr(1));
+        ws.record_write(addr(2));
+
+        let v = coord.commit_writes_serialized(&ws);
+        assert_eq!(v, ReadVersion::from_raw(1));
+        assert_eq!(coord.current_version(), ReadVersion::from_raw(1));
+        assert_eq!(coord.tracker().version_of(&addr(1)), ReadVersion::from_raw(1));
+        assert_eq!(coord.tracker().version_of(&addr(2)), ReadVersion::from_raw(1));
+        assert_eq!(coord.tracker().version_of(&addr(3)), ReadVersion::from_raw(0));
+    }
+
+    #[test]
+    fn commit_writes_serialized_skips_validation() {
+        // Even with an adversarial tracker state, commit_writes_serialized
+        // succeeds (unlike try_commit which would validate). This is the
+        // serialized-execution contract: callers are responsible for
+        // ensuring no concurrent commits happen (via the exec_lock).
+        let coord = CommitCoordinator::new();
+        coord.tracker().bump(addr(99), ReadVersion::from_raw(u64::MAX / 2));
+        let mut ws = WriteSet::new();
+        ws.record_write(addr(1));
+        let v = coord.commit_writes_serialized(&ws);
+        assert_eq!(v, ReadVersion::from_raw(1));
+    }
+
+    #[tokio::test]
+    async fn exec_lock_serializes_async_callers() {
+        // Two async tasks both acquire the exec lock; they must not
+        // overlap. Model: each holds the lock for ~10ms and records
+        // entry/exit times; the second task's entry must not precede
+        // the first task's exit.
+        use std::time::{Duration, Instant};
+        use tokio::time::sleep;
+
+        type Event = (u8, &'static str, Instant);
+        let coord = Arc::new(CommitCoordinator::new());
+        let events: Arc<tokio::sync::Mutex<Vec<Event>>> =
+            Arc::new(tokio::sync::Mutex::new(vec![]));
+
+        let coord1 = Arc::clone(&coord);
+        let ev1 = Arc::clone(&events);
+        let t1 = tokio::spawn(async move {
+            let _g = coord1.acquire_exec_lock().await;
+            ev1.lock().await.push((1, "enter", Instant::now()));
+            sleep(Duration::from_millis(10)).await;
+            ev1.lock().await.push((1, "exit", Instant::now()));
+        });
+
+        let coord2 = Arc::clone(&coord);
+        let ev2 = Arc::clone(&events);
+        let t2 = tokio::spawn(async move {
+            // Small delay to make the ordering deterministic: task 1
+            // should acquire first.
+            sleep(Duration::from_millis(1)).await;
+            let _g = coord2.acquire_exec_lock().await;
+            ev2.lock().await.push((2, "enter", Instant::now()));
+            sleep(Duration::from_millis(10)).await;
+            ev2.lock().await.push((2, "exit", Instant::now()));
+        });
+
+        t1.await.unwrap();
+        t2.await.unwrap();
+
+        let ev = events.lock().await;
+        assert_eq!(ev.len(), 4);
+        // Expected order: 1-enter, 1-exit, 2-enter, 2-exit
+        assert_eq!(ev[0].0, 1);
+        assert_eq!(ev[0].1, "enter");
+        assert_eq!(ev[1].0, 1);
+        assert_eq!(ev[1].1, "exit");
+        assert_eq!(ev[2].0, 2);
+        assert_eq!(ev[2].1, "enter");
+        assert!(
+            ev[1].2 <= ev[2].2,
+            "task 2 entered before task 1 exited — lock is not serializing!"
+        );
+    }
+
+    use crate::mvcc::write_set::WriteSet;
 
     #[test]
     fn concurrent_disjoint_commits_all_succeed() {
