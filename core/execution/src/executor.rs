@@ -1,6 +1,7 @@
 // citrate/core/execution/src/executor.rs
 
 use crate::metrics::{PRECOMPILE_CALLS_TOTAL, VM_EXECUTIONS_TOTAL, VM_GAS_USED};
+use crate::mvcc::{CommitCoordinator, WriteSet};
 use crate::precompiles::{PrecompileExecutor, inference::InferencePrecompile};
 use crate::inference::metal_runtime::MetalRuntime;
 use crate::state::StateDB;
@@ -80,9 +81,14 @@ pub struct Executor {
     /// Contains coinbase, prevrandao (VRF output), and recent block hashes.
     /// Set by the block producer before executing transactions.
     block_context: std::sync::RwLock<crate::revm_adapter::BlockContext>,
-    /// Serializes stateful execution, persistence, and simulation so snapshot
-    /// rollback cannot race live block execution.
-    execution_guard: tokio::sync::Mutex<()>,
+    /// MVCC commit coordinator. Owns the exec_lock that serializes tx
+    /// execution (transitionally — until P950-A-4 lands versioned state
+    /// reads for real parallelism) and the per-account version tracker.
+    ///
+    /// Replaces the former `execution_guard: tokio::sync::Mutex<()>` field
+    /// as of Sprint P950-A-3 (2026-04-21). Design proven in
+    /// `specs/tla/consensus/ExecutorMVCC.tla`.
+    commit_coordinator: Arc<CommitCoordinator>,
 }
 
 /// Trait for state storage to avoid circular dependency
@@ -211,7 +217,7 @@ impl Executor {
             precompile_executor,
             chain_id,
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
-            execution_guard: tokio::sync::Mutex::new(()),
+            commit_coordinator: Arc::new(CommitCoordinator::new()),
         }
     }
 
@@ -284,7 +290,7 @@ impl Executor {
             precompile_executor,
             chain_id,
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
-            execution_guard: tokio::sync::Mutex::new(()),
+            commit_coordinator: Arc::new(CommitCoordinator::new()),
         }
     }
 
@@ -394,7 +400,7 @@ impl Executor {
 
     /// Persist all dirty accounts and storage slots from state_db to state_store
     pub async fn persist_state_changes(&self) -> anyhow::Result<usize> {
-        let _guard = self.execution_guard.lock().await;
+        let _guard = self.commit_coordinator.acquire_exec_lock().await;
         if let Some(store) = &self.state_store {
             let dirty_accounts = self.state_db.accounts.get_dirty_accounts();
             let mut count = dirty_accounts.len();
@@ -587,14 +593,44 @@ impl Executor {
         self.state_db.calculate_state_root()
     }
 
-    /// Execute a transaction
+    /// Execute a transaction via the MVCC path (Sprint P950-A-3).
+    ///
+    /// Flow:
+    /// 1. Acquire the async exec lock from the commit coordinator.
+    ///    This transitionally serializes execution; true parallel
+    ///    execution lands in P950-A-4.
+    /// 2. Run the existing inner execution logic (snapshot → REVM →
+    ///    commit-or-rollback), unchanged.
+    /// 3. On success, advance the coordinator's global version and
+    ///    record the tx's write set (sender + recipient + REVM-touched
+    ///    accounts). Per-account version tracking readies the executor
+    ///    for parallel CAS-based commits in A-4.
+    /// 4. On failure, no version bump (the tx never committed state
+    ///    changes that survive persistence).
     pub async fn execute_transaction(
         &self,
         block: &Block,
         tx: &Transaction,
     ) -> Result<TransactionReceipt, ExecutionError> {
-        let _guard = self.execution_guard.lock().await;
-        self.execute_transaction_inner(block, tx).await
+        let _guard = self.commit_coordinator.acquire_exec_lock().await;
+        let receipt = self.execute_transaction_inner(block, tx).await?;
+
+        if receipt.status {
+            // Successful tx: advance global version and record the
+            // write set so per-account versions reflect this commit.
+            // For now we seed the write set from the observable boundary
+            // accounts (sender + optional recipient). REVM-touched
+            // storage contracts will be added in WP-A.3.3 phase 2 when
+            // the REVM adapter records writes into a per-tx journal.
+            let mut writes = WriteSet::new();
+            writes.record_write(receipt.from);
+            if let Some(to) = receipt.to {
+                writes.record_write(to);
+            }
+            self.commit_coordinator.commit_writes_serialized(&writes);
+        }
+
+        Ok(receipt)
     }
 
     async fn execute_transaction_inner(
@@ -690,7 +726,7 @@ impl Executor {
         block: &Block,
         tx: &Transaction,
     ) -> Result<TransactionReceipt, ExecutionError> {
-        let _guard = self.execution_guard.lock().await;
+        let _guard = self.commit_coordinator.acquire_exec_lock().await;
         // Snapshot BEFORE any mutations
         let snapshot = self.state_db.snapshot();
 
