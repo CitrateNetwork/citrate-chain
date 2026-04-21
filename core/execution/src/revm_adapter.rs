@@ -101,8 +101,31 @@ impl Database for StateDBAdapter {
 
     fn basic(&mut self, address: RevmAddress) -> Result<Option<AccountInfo>, Self::Error> {
         let addr = Address(address.0 .0);
-        let balance = self.state_db.accounts.get_balance(&addr);
-        let nonce = self.state_db.accounts.get_nonce(&addr);
+
+        // Sprint P950-A-5 WP-A.5.2: journal-first read for balance and
+        // nonce. If this tx previously wrote to the account (via the
+        // executor's journal-routed path), return the pending value.
+        // Otherwise fall through to committed state in state_db.
+        //
+        // This is what enables REVM to see post-gas-deduction balance
+        // during execution even when the executor routes gas deduction
+        // through the journal (concurrent-safe path) rather than
+        // mutating state_db eagerly.
+        let (balance, nonce) = if let Some(journal) = &self.journal {
+            let j = journal.lock();
+            let pending_balance = j.pending_balance(&addr);
+            let pending_nonce = j.pending_nonce(&addr);
+            (
+                pending_balance.unwrap_or_else(|| self.state_db.accounts.get_balance(&addr)),
+                pending_nonce.unwrap_or_else(|| self.state_db.accounts.get_nonce(&addr)),
+            )
+        } else {
+            (
+                self.state_db.accounts.get_balance(&addr),
+                self.state_db.accounts.get_nonce(&addr),
+            )
+        };
+
         let code_hash = self.state_db.accounts.get_code_hash(&addr);
 
         // Convert to revm types

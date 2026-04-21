@@ -182,6 +182,56 @@ impl ScratchJournal {
             .map(|v| v.as_slice())
     }
 
+    // ------------------------------------------------------------------------
+    // Balance / nonce journaling (Sprint P950-A-5 WP-A.5.2)
+    // ------------------------------------------------------------------------
+    //
+    // The executor currently writes gas deductions, nonce increments, and
+    // gas refunds directly to `state_db.accounts`. For concurrent
+    // execution, those writes must route through the journal so that
+    // concurrent workers don't see each other's pending accounting.
+    //
+    // These methods provide the journal side of the route. The executor
+    // wiring lands in a subsequent commit (the full WP-A.5.2 integration);
+    // for now these are primitives + read-your-writes that the adapter
+    // can already use.
+
+    /// Record a pending balance write for an account. Overwrites any
+    /// prior pending balance for the same address — the executor's
+    /// idempotency guarantees keep this safe (check_nonce, set_balance,
+    /// increment_nonce each happen at most once per tx).
+    pub fn record_balance(&mut self, address: Address, new_balance: U256) {
+        self.write_set.record_write(address);
+        let entry = self.pending.entry(address).or_default();
+        entry.new_balance = Some(new_balance);
+    }
+
+    /// Record a pending nonce write for an account.
+    pub fn record_nonce(&mut self, address: Address, new_nonce: u64) {
+        self.write_set.record_write(address);
+        let entry = self.pending.entry(address).or_default();
+        entry.new_nonce = Some(new_nonce);
+    }
+
+    /// Record a pending code write for an account (contract deployment).
+    pub fn record_code(&mut self, address: Address, code: Vec<u8>) {
+        self.write_set.record_write(address);
+        let entry = self.pending.entry(address).or_default();
+        entry.new_code = Some(code);
+    }
+
+    /// Look up a pending balance write for read-your-writes within a tx.
+    /// Returns `None` if no pending balance write for this address —
+    /// caller falls through to `state_db`.
+    pub fn pending_balance(&self, address: &Address) -> Option<U256> {
+        self.pending.get(address).and_then(|pw| pw.new_balance)
+    }
+
+    /// Look up a pending nonce write for read-your-writes within a tx.
+    pub fn pending_nonce(&self, address: &Address) -> Option<u64> {
+        self.pending.get(address).and_then(|pw| pw.new_nonce)
+    }
+
     /// Iterate over all pending storage writes in arbitrary order.
     ///
     /// Used at commit time to drain slot updates into the real state DB.
@@ -325,5 +375,106 @@ mod tests {
     fn pending_write_not_empty_when_balance_set() {
         let pw = balance_write(100);
         assert!(!pw.is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // Sprint P950-A-5 WP-A.5.1 + WP-A.5.2 tests: storage + balance + nonce
+    // journaling with read-your-writes.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn record_storage_write_populates_pending_and_write_set() {
+        let mut j = ScratchJournal::new();
+        j.pin_at(ReadVersion::from_raw(0));
+
+        let key = vec![0u8; 32];
+        let value = vec![42u8; 32];
+        j.record_storage_write(addr(1), key.clone(), value.clone());
+
+        assert_eq!(j.storage_write_count(), 1);
+        assert_eq!(j.pending_storage(&addr(1), &key), Some(value.as_slice()));
+        // Storage write also records the account in the write set
+        assert!(j.write_set().contains(&addr(1)));
+    }
+
+    #[test]
+    fn pending_storage_miss_returns_none() {
+        let mut j = ScratchJournal::new();
+        j.pin_at(ReadVersion::from_raw(0));
+        assert!(j.pending_storage(&addr(1), &[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn storage_writes_cleared_on_pin() {
+        let mut j = ScratchJournal::new();
+        j.pin_at(ReadVersion::from_raw(0));
+        j.record_storage_write(addr(1), vec![1; 32], vec![2; 32]);
+        assert_eq!(j.storage_write_count(), 1);
+
+        // Re-pin = fresh attempt
+        j.pin_at(ReadVersion::from_raw(1));
+        assert_eq!(j.storage_write_count(), 0);
+    }
+
+    #[test]
+    fn record_balance_populates_pending_and_write_set() {
+        let mut j = ScratchJournal::new();
+        j.pin_at(ReadVersion::from_raw(0));
+
+        j.record_balance(addr(1), U256::from(1000));
+        assert_eq!(j.pending_balance(&addr(1)), Some(U256::from(1000)));
+        assert!(j.write_set().contains(&addr(1)));
+        // No nonce pending
+        assert_eq!(j.pending_nonce(&addr(1)), None);
+    }
+
+    #[test]
+    fn record_nonce_populates_pending_and_write_set() {
+        let mut j = ScratchJournal::new();
+        j.pin_at(ReadVersion::from_raw(0));
+
+        j.record_nonce(addr(1), 42);
+        assert_eq!(j.pending_nonce(&addr(1)), Some(42));
+        assert!(j.write_set().contains(&addr(1)));
+    }
+
+    #[test]
+    fn balance_and_nonce_coexist_on_same_account() {
+        let mut j = ScratchJournal::new();
+        j.pin_at(ReadVersion::from_raw(0));
+
+        j.record_balance(addr(1), U256::from(500));
+        j.record_nonce(addr(1), 7);
+
+        assert_eq!(j.pending_balance(&addr(1)), Some(U256::from(500)));
+        assert_eq!(j.pending_nonce(&addr(1)), Some(7));
+        // Only one pending entry for the account
+        assert_eq!(j.write_count(), 1);
+    }
+
+    #[test]
+    fn record_code_populates_pending() {
+        let mut j = ScratchJournal::new();
+        j.pin_at(ReadVersion::from_raw(0));
+
+        let code = vec![0x60, 0x00, 0x60, 0x00];
+        j.record_code(addr(1), code.clone());
+        assert_eq!(
+            j.pending_write(&addr(1)).and_then(|pw| pw.new_code.as_ref()),
+            Some(&code)
+        );
+    }
+
+    #[test]
+    fn clear_resets_storage_map_too() {
+        let mut j = ScratchJournal::new();
+        j.pin_at(ReadVersion::from_raw(0));
+        j.record_storage_write(addr(1), vec![1; 32], vec![2; 32]);
+        j.record_balance(addr(1), U256::from(100));
+        j.clear();
+
+        assert_eq!(j.storage_write_count(), 0);
+        assert_eq!(j.pending_balance(&addr(1)), None);
+        assert_eq!(j.write_count(), 0);
     }
 }
