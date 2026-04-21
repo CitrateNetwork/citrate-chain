@@ -1,6 +1,6 @@
 // citrate/core/execution/src/revm_adapter.rs
 
-use crate::mvcc::WriteSet;
+use crate::mvcc::{JournalHandle, WriteSet};
 use crate::state::StateDB;
 use crate::types::{Address, ExecutionError};
 use parking_lot::Mutex;
@@ -23,6 +23,10 @@ use tracing::{debug, info};
 /// need their MVCC versions bumped.
 pub type WriteSetHandle = Arc<Mutex<WriteSet>>;
 
+// Re-export JournalHandle from the mvcc module so callers importing
+// from revm_adapter can find it without an extra `use` path.
+pub use crate::mvcc::JournalHandle as RevmJournalHandle;
+
 /// Adapter to make StateDB compatible with revm's Database trait
 pub struct StateDBAdapter {
     state_db: Arc<StateDB>,
@@ -38,6 +42,17 @@ pub struct StateDBAdapter {
     /// When `None` (used by standalone tests and legacy paths), the
     /// adapter behaves exactly as before — no write-set capture.
     writes: Option<WriteSetHandle>,
+    /// Optional per-tx journal for buffered storage writes (Sprint
+    /// P950-A-5 WP-A.5.1). When `Some`, REVM's `DatabaseCommit::commit`
+    /// writes storage slots into the journal's pending_storage map
+    /// instead of directly into `state_db`. Storage reads check the
+    /// journal first (read-your-writes within a tx) then fall back to
+    /// `state_db`. The executor drains the journal into `state_db` on
+    /// successful commit.
+    ///
+    /// When `None`, legacy behavior: REVM writes go directly to
+    /// `state_db`. This preserves every existing test path.
+    journal: Option<JournalHandle>,
 }
 
 impl StateDBAdapter {
@@ -46,6 +61,7 @@ impl StateDBAdapter {
             state_db,
             block_hashes: HashMap::new(),
             writes: None,
+            journal: None,
         }
     }
 
@@ -64,6 +80,18 @@ impl StateDBAdapter {
     /// [`crate::mvcc::CommitCoordinator::commit_writes_serialized`].
     pub fn with_writes(mut self, writes: WriteSetHandle) -> Self {
         self.writes = Some(writes);
+        self
+    }
+
+    /// Attach a per-tx journal for buffered storage writes (Sprint
+    /// P950-A-5 WP-A.5.1).
+    ///
+    /// When set, REVM storage writes buffer into the journal instead of
+    /// hitting `state_db` directly. Reads check the journal first so
+    /// read-your-writes works within a tx. The executor drains the
+    /// journal into `state_db` on successful commit.
+    pub fn with_journal(mut self, journal: JournalHandle) -> Self {
+        self.journal = Some(journal);
         self
     }
 }
@@ -110,7 +138,20 @@ impl Database for StateDBAdapter {
         let addr = Address(address.0 .0);
         let key_bytes: [u8; 32] = index.to_be_bytes();
 
-        // Get storage value as bytes
+        // Sprint P950-A-5 WP-A.5.1: journal-first read for read-your-writes
+        // semantics within a tx. If this tx previously SSTOREd the slot,
+        // the pending value is in the journal; return it. Only fall through
+        // to state_db if the slot hasn't been written yet in this tx.
+        if let Some(journal) = &self.journal {
+            if let Some(pending) = journal.lock().pending_storage(&addr, &key_bytes).map(|v| v.to_vec()) {
+                let mut padded = [0u8; 32];
+                let len = pending.len().min(32);
+                padded[32 - len..].copy_from_slice(&pending[pending.len() - len..]);
+                return Ok(RevmU256::from_be_bytes(padded));
+            }
+        }
+
+        // Get storage value as bytes from committed state
         let value_bytes = self
             .state_db
             .get_storage(&addr, &key_bytes)
@@ -157,7 +198,16 @@ impl DatabaseCommit for StateDBAdapter {
             // if we write REVM's values back to StateDB. Instead, REVM only commits
             // storage and code changes.
 
-            // Update storage — present_value is the post-transaction value
+            // Update storage — present_value is the post-transaction value.
+            //
+            // Sprint P950-A-5 WP-A.5.1: when a journal is attached, storage
+            // writes buffer there instead of hitting state_db directly. The
+            // executor drains the journal into state_db on successful
+            // commit. This keeps concurrent workers isolated: each worker's
+            // pending writes don't leak to others until CAS succeeds.
+            //
+            // When the journal is absent (standalone tests + legacy paths),
+            // writes go directly to state_db as before.
             for (key, value) in &account.storage {
                 let key_bytes = key.to_be_bytes::<32>();
                 let value_bytes = value.present_value.to_be_bytes::<32>();
@@ -168,7 +218,15 @@ impl DatabaseCommit for StateDBAdapter {
                     hex::encode(&value_bytes[28..]),
                     hex::encode(&value.original_value.to_be_bytes::<32>()[28..]),
                 );
-                self.state_db.set_storage(addr, key_bytes.to_vec(), value_bytes.to_vec());
+                if let Some(journal) = &self.journal {
+                    journal.lock().record_storage_write(
+                        addr,
+                        key_bytes.to_vec(),
+                        value_bytes.to_vec(),
+                    );
+                } else {
+                    self.state_db.set_storage(addr, key_bytes.to_vec(), value_bytes.to_vec());
+                }
             }
 
             // Update code if the account is a real contract.
@@ -223,12 +281,13 @@ pub fn execute_contract_create(
 ) -> Result<(Address, Vec<u8>, u64), ExecutionError> {
     execute_contract_create_with_context(
         state_db, deployer, init_code, value, gas_limit, gas_price,
-        chain_id, block_number, block_timestamp, BlockContext::default(), None,
+        chain_id, block_number, block_timestamp, BlockContext::default(), None, None,
     )
 }
 
-/// Execute contract creation using revm with full block context (WP-X.4)
-/// and optional WriteSet capture (Sprint P950-A-4, WP-A.4.1).
+/// Execute contract creation using revm with full block context (WP-X.4),
+/// optional WriteSet capture (Sprint P950-A-4, WP-A.4.1), and optional
+/// journal for buffered storage writes (Sprint P950-A-5, WP-A.5.1).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_contract_create_with_context(
     state_db: Arc<StateDB>,
@@ -242,17 +301,21 @@ pub fn execute_contract_create_with_context(
     block_timestamp: u64,
     block_ctx: BlockContext,
     writes_handle: Option<WriteSetHandle>,
+    journal_handle: Option<JournalHandle>,
 ) -> Result<(Address, Vec<u8>, u64), ExecutionError> {
     debug!("Executing contract creation with revm");
     debug!("  Deployer: {}", deployer);
     debug!("  Init code size: {} bytes", init_code.len());
     debug!("  Gas limit: {}", gas_limit);
 
-    // Create database adapter with block hashes and optional write capture
+    // Create database adapter with block hashes + optional write/journal capture
     let mut db = StateDBAdapter::new(state_db.clone())
         .with_block_hashes(block_ctx.block_hashes);
     if let Some(h) = writes_handle {
         db = db.with_writes(h);
+    }
+    if let Some(j) = journal_handle {
+        db = db.with_journal(j);
     }
 
     // Build EVM with transaction
@@ -350,12 +413,13 @@ pub fn execute_contract_call(
 ) -> Result<(Vec<u8>, u64), ExecutionError> {
     execute_contract_call_with_context(
         state_db, caller, contract, calldata, value, gas_limit, gas_price,
-        chain_id, block_number, block_timestamp, BlockContext::default(), None,
+        chain_id, block_number, block_timestamp, BlockContext::default(), None, None,
     )
 }
 
-/// Execute contract call using revm with full block context (WP-X.4)
-/// and optional WriteSet capture (Sprint P950-A-4, WP-A.4.1).
+/// Execute contract call using revm with full block context (WP-X.4),
+/// optional WriteSet capture (Sprint P950-A-4, WP-A.4.1), and optional
+/// journal for buffered storage writes (Sprint P950-A-5, WP-A.5.1).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_contract_call_with_context(
     state_db: Arc<StateDB>,
@@ -370,17 +434,21 @@ pub fn execute_contract_call_with_context(
     block_timestamp: u64,
     block_ctx: BlockContext,
     writes_handle: Option<WriteSetHandle>,
+    journal_handle: Option<JournalHandle>,
 ) -> Result<(Vec<u8>, u64), ExecutionError> {
     debug!("Executing contract call with revm");
     debug!("  Caller: {}", caller);
     debug!("  Contract: {}", contract);
     debug!("  Calldata size: {} bytes", calldata.len());
 
-    // Create database adapter with block hashes and optional write capture
+    // Create database adapter with block hashes + optional write/journal capture
     let mut db = StateDBAdapter::new(state_db)
         .with_block_hashes(block_ctx.block_hashes);
     if let Some(h) = writes_handle {
         db = db.with_writes(h);
+    }
+    if let Some(j) = journal_handle {
+        db = db.with_journal(j);
     }
 
     // Build EVM with transaction
@@ -511,6 +579,7 @@ mod tests {
             1_000_000,
             ctx,
             None, // No WriteSet capture in this test
+            None, // No journal buffering in this test
         );
 
         // Should succeed (not panic) with custom coinbase/prevrandao
@@ -550,6 +619,7 @@ mod tests {
             1_000_000,
             ctx,
             None, // No WriteSet capture in this test
+            None, // No journal buffering in this test
         );
 
         assert!(result.is_ok(), "Contract call with block context should succeed: {:?}", result.err());
