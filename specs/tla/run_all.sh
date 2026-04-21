@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# run_all.sh — Run TLC model checker on ALL 36 TLA+ specs (organized by category)
+# run_all.sh — Run TLC model checker on ALL TLA+ specs (organized by category)
 # Usage: bash specs/tla/run_all.sh
 # Requires: Java 8+ and tla2tools.jar (auto-downloaded if missing)
+#
+# Picks up any `<spec>.tla` with a matching `<spec>.cfg` in the category
+# subdirs. Additional parameter cfgs (e.g., `<spec>_medium.cfg`,
+# `<spec>_liveness.cfg`) are NOT run by this script — those are deep
+# verifications run on demand. See `run_deep.sh` for the long-timeout
+# batch mode.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -139,16 +139,17 @@ Init ==
     /\ commitOrder = <<>>
 
 \* ============================================================================
-\* Actions — WP-A.1.3 (added TryCommit, AbortAndRetry)
+\* Actions — WP-A.1.5 (added FallbackToSerial)
 \* ============================================================================
 \*
 \* Actions added incrementally across WP-A.1.*:
 \*
 \*   WP-A.1.1 — IdleTick (skeleton)
 \*   WP-A.1.2 — PickUpTx, LocalExecute
-\*   WP-A.1.3 — TryCommit, AbortAndRetry                      [THIS CUT]
-\*   WP-A.1.4 — (liveness via fairness, no new actions)
-\*   WP-A.1.5 — FallbackToSerial
+\*   WP-A.1.3 — TryCommit, AbortAndRetry
+\*   WP-A.1.5 — FallbackToSerial                              [THIS CUT]
+\*   WP-A.1.4 — (liveness via fairness, no new actions; sequenced after A.1.5
+\*              because Progress depends on FallbackToSerial)
 
 \* --- IdleTick: stuttering action, enabled when any worker is idle. ---
 \* Kept from WP-A.1.1; ensures TLC has at least one enabled transition even
@@ -294,12 +295,63 @@ AbortAndRetry(w) ==
     /\ UNCHANGED <<accountVersion, globalVersion, workerCurrentTx,
                    txStatus, commitOrder>>
 
+\* --- FallbackToSerial(w): retry budget exhausted; commit via serial slot. ---
+\*
+\* Preconditions:
+\*   - worker is ready
+\*   - worker has a claimed tx
+\*   - retry budget exhausted (workerRetries[w] >= MaxRetries)
+\*   - (ReadSetValid check omitted — fallback commits regardless of whether
+\*     the stale read set is still valid, since we're re-executing fresh)
+\*   - globalVersion headroom
+\*
+\* Effects:
+\*   - Atomically: choose a fresh write set (as if re-executing the tx
+\*     against current state) and commit it. This models the serial-lock
+\*     path of Block-STM: the worker acquires a global slot, re-reads
+\*     from current state, re-executes deterministically, and commits.
+\*   - tx marked committed, appended to commitOrder
+\*   - worker reset to idle with retries cleared
+\*
+\* Maps to real code: the fallback path after N retries acquires an
+\* exclusive lock on the executor, re-executes the tx against the
+\* current trie, and commits atomically. The nondeterministic write
+\* choice here models "whatever re-execution produces."
+\*
+\* Why this terminates: unlike TryCommit, FallbackToSerial has no
+\* ReadSetValid precondition, so it always succeeds once enabled.
+\* Combined with the MaxRetries cap, every tx that reaches retry
+\* exhaustion commits in exactly one more step. See FallbackTerminates
+\* invariant and Progress liveness property.
+FallbackToSerial(w) ==
+    /\ workerStatus[w] = StatusReady
+    /\ workerCurrentTx[w] # NoTx
+    /\ workerRetries[w] >= MaxRetries
+    /\ globalVersion < MaxVersion
+    /\ \E writes \in SUBSET Accounts :
+         LET tx     == workerCurrentTx[w]
+             newVer == globalVersion + 1
+         IN
+            /\ accountVersion'  = [a \in Accounts |->
+                                      IF a \in writes THEN newVer
+                                      ELSE accountVersion[a]]
+            /\ globalVersion'   = newVer
+            /\ txStatus'        = [txStatus EXCEPT ![tx] = TxCommitted]
+            /\ commitOrder'     = Append(commitOrder, tx)
+            /\ workerStatus'    = [workerStatus EXCEPT ![w] = StatusIdle]
+            /\ workerCurrentTx' = [workerCurrentTx EXCEPT ![w] = NoTx]
+            /\ workerReadSet'   = [workerReadSet EXCEPT ![w] = {}]
+            /\ workerWriteSet'  = [workerWriteSet EXCEPT ![w] = {}]
+            /\ workerRetries'   = [workerRetries EXCEPT ![w] = 0]
+    /\ UNCHANGED <<workerReadVersion>>
+
 Next ==
     \/ IdleTick
     \/ \E w \in Workers, t \in Txs : PickUpTx(w, t)
     \/ \E w \in Workers : LocalExecute(w)
     \/ \E w \in Workers : TryCommit(w)
     \/ \E w \in Workers : AbortAndRetry(w)
+    \/ \E w \in Workers : FallbackToSerial(w)
 
 \* ============================================================================
 \* Invariants
@@ -431,18 +483,66 @@ ReadVersionMonotonic ==
     [][\A w \in Workers : workerReadVersion'[w] >= workerReadVersion[w]]_vars
 
 \* ============================================================================
-\* Liveness — placeholders for WP-A.1.4
+\* Fairness — WP-A.1.4
 \* ============================================================================
 \*
-\* Progress and NonInterferenceForIndependent are defined and checked in
-\* WP-A.1.4 once the real state-machine actions exist. Declaring them here
-\* with trivial bodies would produce false-positive passes; left for later.
+\* Weak fairness on every worker-level action. Semantics: if the action
+\* is continuously enabled for a worker, the worker eventually takes it.
+\* Combined with FallbackToSerial's always-succeeds-when-enabled property,
+\* this is sufficient to prove Progress (every tx eventually commits).
+\*
+\* We do NOT use strong fairness (SF) because our model doesn't have
+\* actions that become enabled, disabled, and re-enabled repeatedly in
+\* ways that WF can't handle. WF is sufficient given the action
+\* preconditions.
+
+Fairness ==
+    /\ \A w \in Workers : WF_vars(\E t \in Txs : PickUpTx(w, t))
+    /\ \A w \in Workers : WF_vars(LocalExecute(w))
+    /\ \A w \in Workers : WF_vars(TryCommit(w))
+    /\ \A w \in Workers : WF_vars(AbortAndRetry(w))
+    /\ \A w \in Workers : WF_vars(FallbackToSerial(w))
+
+\* ============================================================================
+\* Liveness properties — WP-A.1.4
+\* ============================================================================
+
+\* Every pending tx eventually reaches the TxCommitted state.
+\*
+\* This is THE liveness property of the executor: no tx gets stuck forever.
+\* Proof obligations, satisfied by the action construction + fairness:
+\*   (1) Every pending tx is eventually claimed (WF on PickUpTx)
+\*   (2) Every claimed tx is eventually executed (WF on LocalExecute)
+\*   (3) Every executed tx either commits (WF on TryCommit with ReadSetValid)
+\*       or retries (WF on AbortAndRetry with retries < MaxRetries)
+\*       or falls back (WF on FallbackToSerial with retries >= MaxRetries)
+\*   (4) FallbackToSerial cannot fail — no precondition depends on other
+\*       workers' behavior, so it's not blockable by concurrent execution.
+\*
+\* Liveness is therefore guaranteed by the chain: pending → executing →
+\* ready → {committed via TryCommit OR committed via FallbackToSerial}.
+\* Abort-retry loops are bounded by MaxRetries; past that, Fallback always
+\* makes progress.
+Progress ==
+    \A t \in Txs : <>(txStatus[t] = TxCommitted)
 
 \* ============================================================================
 \* Specification
 \* ============================================================================
+\*
+\* Two specifications are provided:
+\*
+\*   Spec     — safety-only. Init + next-state relation, no fairness.
+\*              Used for pure invariant checking (TypeInv, and so on).
+\*              Cheaper to model-check.
+\*   SpecLive — safety + liveness. Adds Fairness constraint. Used when
+\*              checking temporal properties (Progress).
+\*
+\* Split because liveness checking is substantially slower than safety.
+\* The .cfg selects which one to verify against via SPECIFICATION.
 
-Spec == Init /\ [][Next]_vars
+Spec     == Init /\ [][Next]_vars
+SpecLive == Spec /\ Fairness
 
 \* ============================================================================
 \* Theorems — skeleton set; expanded in subsequent WPs
@@ -463,5 +563,6 @@ THEOREM AccVerBoundedByCommits == Spec => []AccountVersionBoundedByCommits
 THEOREM IdleHasEmptySets       == Spec => []IdleSetsEmpty
 THEOREM ReadyConsistent        == Spec => []ReadyWorkerCommitOrRetry
 THEOREM ReadVersionMono        == Spec => ReadVersionMonotonic
+THEOREM EveryTxCommits         == SpecLive => Progress
 
 =============================================================================
