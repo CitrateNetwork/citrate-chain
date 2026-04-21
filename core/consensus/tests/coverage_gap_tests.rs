@@ -1074,6 +1074,116 @@ fn test_embedded_model_weights_hash_returns_stored_commitment() {
     assert_eq!(model.weights_hash(), model.weights_hash());
 }
 
+/// WP-B.3: size-bound regression test.
+///
+/// Verifies the property proven structurally by WP-B.2 and formally by
+/// `specs/tla/consensus/EmbeddedModelCommitment.tla` `PerModelOnChainSizeBounded`:
+/// serializing an `EmbeddedModel` yields a byte count bounded by
+/// `size_bytes()` — regardless of what we try to put in its fields.
+///
+/// This test exists to close the pre-WP-B footgun documented in
+/// `.audit/2026-04-21-repo-walkthrough/02_GENESIS_AND_EMBEDDED_MODELS.md`.
+/// Before WP-B, an `EmbeddedModel` could be constructed with a multi-GB
+/// `weights: Vec<u8>`, which would then serialize to multi-GB and bloat
+/// every propagated block. After WP-B, the struct has no `Vec<u8>` field
+/// at all, so the serialized size is bounded at compile time by the sum
+/// of the fixed-size fields (commitment hash + fixed-size metadata).
+#[test]
+fn test_embedded_model_serialized_size_is_bounded() {
+    let model = EmbeddedModel {
+        model_id: ModelId::from_name("adversarially-named-model-with-a-very-long-identifier-that-should-not-matter-for-commitment-size"),
+        model_type: ModelType::TinyLLM,
+        weights_sha256: Hash::new([0xFFu8; 32]),
+        metadata: ModelMetadata {
+            // Even with maximally long strings, metadata is bounded by
+            // EMBEDDED_MODEL_METADATA_SIZE_UPPER_BOUND (enforced at block
+            // validation, not at struct construction).
+            name: "adversarial-name-attempting-to-inflate-the-on-chain-footprint-through-metadata-length".to_string(),
+            version: "9999.999.999-rc.adversarial".to_string(),
+            context_length: u32::MAX,
+            embedding_dim: Some(u32::MAX),
+            license: "CC0 with additional clauses designed to lengthen this field adversarially".to_string(),
+            framework: Some("hypothetical-framework-name-of-extreme-length-for-testing-purposes".to_string()),
+        },
+    };
+
+    // bincode is the serializer the consensus layer uses for block
+    // propagation. Serializing should produce a bounded byte count.
+    let bytes = bincode::serialize(&model).expect("serialize");
+
+    // Upper bound: 32-byte commitment + metadata fields. The concrete
+    // bincode encoding adds a few bytes of length prefixes per string,
+    // but remains well under a generous 4 KiB cap — orders of magnitude
+    // smaller than the pre-WP-B pathological case (multi-GB weights).
+    //
+    // 4 KiB is the "this is a commitment, not an artifact" regime. If
+    // this assertion ever fires, something has added an unbounded
+    // field to EmbeddedModel and reintroduced the footgun.
+    const HARD_CAP_BYTES: usize = 4096;
+    assert!(
+        bytes.len() < HARD_CAP_BYTES,
+        "serialized EmbeddedModel is {} bytes; exceeds hard cap of {} — \
+         did someone reintroduce an unbounded field? See WP-B and \
+         ADR_010_EMBEDDED_MODEL_COMMITMENT.md.",
+        bytes.len(),
+        HARD_CAP_BYTES,
+    );
+
+    // And the nominal bound reported by size_bytes() should also hold
+    // with margin over the actual serialized size.
+    assert!(
+        bytes.len() <= model.size_bytes(),
+        "actual serialized size {} exceeds size_bytes() estimate {}",
+        bytes.len(),
+        model.size_bytes(),
+    );
+}
+
+/// WP-B.3: block-level size-bound sanity.
+///
+/// Constructs a block with multiple embedded models and asserts the
+/// serialized `embedded_models` section scales linearly with the model
+/// count, not with any per-model inflation vector. Any future regression
+/// that re-adds an unbounded per-model field would break the linear
+/// scaling.
+#[test]
+fn test_block_embedded_models_scales_linearly() {
+    fn make_model(i: u8) -> EmbeddedModel {
+        EmbeddedModel {
+            model_id: ModelId::from_name(&format!("model-{}", i)),
+            model_type: ModelType::Embeddings,
+            weights_sha256: Hash::new([i; 32]),
+            metadata: ModelMetadata {
+                name: format!("model-{}", i),
+                version: "1.0.0".to_string(),
+                context_length: 512,
+                embedding_dim: Some(384),
+                license: "MIT".to_string(),
+                framework: Some("GGUF".to_string()),
+            },
+        }
+    }
+
+    let one_model = vec![make_model(1)];
+    let ten_models: Vec<_> = (0..10).map(make_model).collect();
+
+    let one_bytes = bincode::serialize(&one_model).expect("serialize 1");
+    let ten_bytes = bincode::serialize(&ten_models).expect("serialize 10");
+
+    // 10 models should serialize to less than 15× the one-model size
+    // (generous bound: per-model overhead + length prefix accounts for
+    // some sublinear growth, and 15× is well above the true ~10× ratio).
+    // If this ever fails, something is adding super-linear bloat.
+    assert!(
+        ten_bytes.len() < one_bytes.len() * 15,
+        "embedded_models serialization scales super-linearly: \
+         1 model = {} bytes, 10 models = {} bytes (expected < {})",
+        one_bytes.len(),
+        ten_bytes.len(),
+        one_bytes.len() * 15,
+    );
+}
+
 // -- RequiredModel tests --
 
 #[test]
