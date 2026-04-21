@@ -206,6 +206,49 @@ impl CommitCoordinator {
     pub fn is_read_set_likely_valid(&self, read_set: &ReadSet) -> bool {
         self.inner.tracker.validate(read_set)
     }
+
+    /// Execute a closure under exclusive commit-lock access and commit
+    /// the resulting journal unconditionally.
+    ///
+    /// Maps to the TLA+ `FallbackToSerial` action: when a worker has
+    /// exhausted its retry budget, it takes the exclusive path where
+    /// no other commit can race. Because we hold the commit lock for
+    /// the full duration of `execute`, the journal's reads see
+    /// guaranteed-consistent state and its writes are applied
+    /// atomically without possibility of abort.
+    ///
+    /// The closure receives a freshly pinned journal and the pin
+    /// version. It is expected to populate the journal's read and
+    /// write sets + pending writes.
+    ///
+    /// # Warning
+    ///
+    /// Holding the commit lock across the closure blocks every other
+    /// commit attempt for the duration. Use only for the genuine
+    /// fallback path, not as an optimization.
+    pub fn commit_exclusive<F>(&self, execute: F) -> ReadVersion
+    where
+        F: FnOnce(&mut ScratchJournal, ReadVersion),
+    {
+        let _guard = self.inner.commit_lock.lock();
+
+        // Pin at current version INSIDE the lock, so no race window
+        let pin = self.inner.state_version.load();
+        let mut journal = ScratchJournal::new();
+        journal.pin_at(pin);
+
+        // Run user code under the lock
+        execute(&mut journal, pin);
+
+        // Unconditional commit — no other worker can be committing,
+        // so CAS-style conflict is impossible.
+        let new_version = self.inner.state_version.advance_unconditional();
+        self.inner
+            .tracker
+            .bump_all(journal.write_set().iter().copied(), new_version);
+
+        new_version
+    }
 }
 
 #[cfg(test)]

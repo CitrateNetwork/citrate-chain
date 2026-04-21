@@ -43,6 +43,7 @@
 
 pub mod commit;
 pub mod read_set;
+pub mod retry;
 pub mod scratch_journal;
 pub mod version;
 pub mod version_tracker;
@@ -50,6 +51,7 @@ pub mod write_set;
 
 pub use commit::{AbortReason, CommitCoordinator, CommitOutcome};
 pub use read_set::ReadSet;
+pub use retry::{CommitSuccess, RetryHarness, RetryMetrics, DEFAULT_MAX_RETRIES};
 pub use scratch_journal::ScratchJournal;
 pub use version::{ReadVersion, StateVersion};
 pub use version_tracker::AccountVersionTracker;
