@@ -29,10 +29,21 @@ pub struct ExecutionContext {
     pub origin: Address,
     pub logs: Vec<Log>,
     pub output: Vec<u8>,
+    /// Per-tx WriteSet capture handle (Sprint P950-A-4 WP-A.4.1).
+    ///
+    /// Created fresh per tx by `Executor::execute_transaction`. Threaded
+    /// through `execute_deploy` / `execute_call` into the REVM adapter
+    /// via `_with_context` functions. After tx completes, the executor
+    /// reads accumulated writes and passes them to
+    /// `CommitCoordinator::commit_writes_serialized` for per-account
+    /// MVCC version bumps.
+    pub writes_handle: crate::revm_adapter::WriteSetHandle,
 }
 
 impl ExecutionContext {
     pub fn new(block: &Block, tx: &Transaction) -> Self {
+        use crate::mvcc::WriteSet;
+        use parking_lot::Mutex;
         Self {
             block_number: block.header.height,
             block_hash: block.hash(),
@@ -43,6 +54,7 @@ impl ExecutionContext {
             origin: crate::address_utils::normalize_address(&tx.from),
             logs: Vec::new(),
             output: Vec::new(),
+            writes_handle: Arc::new(Mutex::new(WriteSet::new())),
         }
     }
 
@@ -613,20 +625,18 @@ impl Executor {
         tx: &Transaction,
     ) -> Result<TransactionReceipt, ExecutionError> {
         let _guard = self.commit_coordinator.acquire_exec_lock().await;
-        let receipt = self.execute_transaction_inner(block, tx).await?;
+        let (receipt, writes) = self.execute_transaction_inner(block, tx).await?;
 
         if receipt.status {
-            // Successful tx: advance global version and record the
-            // write set so per-account versions reflect this commit.
-            // For now we seed the write set from the observable boundary
-            // accounts (sender + optional recipient). REVM-touched
-            // storage contracts will be added in WP-A.3.3 phase 2 when
-            // the REVM adapter records writes into a per-tx journal.
-            let mut writes = WriteSet::new();
-            writes.record_write(receipt.from);
-            if let Some(to) = receipt.to {
-                writes.record_write(to);
-            }
+            // Successful tx: advance global version and bump per-account
+            // versions for everything touched during execution.
+            //
+            // `writes` now contains:
+            //   - sender (balance/nonce change)
+            //   - optional recipient (balance change)
+            //   - every account REVM wrote storage or code for (captured
+            //     via the WriteSet handle threaded through the adapter;
+            //     Sprint P950-A-4 WP-A.4.1)
             self.commit_coordinator.commit_writes_serialized(&writes);
         }
 
@@ -637,7 +647,7 @@ impl Executor {
         &self,
         block: &Block,
         tx: &Transaction,
-    ) -> Result<TransactionReceipt, ExecutionError> {
+    ) -> Result<(TransactionReceipt, WriteSet), ExecutionError> {
         let mut context = ExecutionContext::new(block, tx);
         let from = crate::address_utils::normalize_address(&tx.from);
 
@@ -711,7 +721,23 @@ impl Executor {
             tx.hash, status, context.gas_used
         );
 
-        Ok(receipt)
+        // Assemble the final WriteSet for MVCC version bumping:
+        // - REVM-captured accounts (storage/code writes), if any
+        // - sender (always touched: nonce + balance)
+        // - recipient (touched if present)
+        let mut writes = WriteSet::new();
+        {
+            let revm_captured = context.writes_handle.lock();
+            for addr in revm_captured.iter() {
+                writes.record_write(*addr);
+            }
+        }
+        writes.record_write(receipt.from);
+        if let Some(to) = receipt.to {
+            writes.record_write(to);
+        }
+
+        Ok((receipt, writes))
     }
 
     /// Simulate a transaction without persisting state changes.
@@ -748,7 +774,9 @@ impl Executor {
         // ALWAYS restore — unconditional, no matter success or failure
         self.state_db.restore(snapshot);
 
-        result
+        // Simulation discards any WriteSet capture: no MVCC version
+        // bumps escape the simulation (that's the whole point of sim).
+        result.map(|(receipt, _writes)| receipt)
     }
 
     /// Parse transaction data into type
@@ -1127,6 +1155,7 @@ impl Executor {
             context.block_number,
             context.timestamp,
             self.get_block_context(),
+            Some(context.writes_handle.clone()),
         );
 
         match result {
@@ -1221,6 +1250,7 @@ impl Executor {
                 context.block_number,
                 context.timestamp,
                 self.get_block_context(),
+                Some(context.writes_handle.clone()),
             ) {
                 Ok((output, gas_used)) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["ok"]).inc();
