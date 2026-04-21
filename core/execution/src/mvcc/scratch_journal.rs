@@ -252,6 +252,21 @@ impl ScratchJournal {
         self.pending.clear();
         self.pending_storage.clear();
     }
+
+    /// Discard pending writes only — clear `pending` (balance/nonce/code)
+    /// and `pending_storage`, but preserve the `read_set`, `write_set`,
+    /// and the pinned version.
+    ///
+    /// Used on the tx failure path: the tx's state mutations must be
+    /// rolled back, but we still need to record gas-burn + nonce-increment
+    /// before draining, and we want the read/write-set tracking to persist
+    /// so MVCC version bumps remain conservative (any account REVM touched
+    /// during the failed attempt still gets its version bumped, preventing
+    /// stale reads by concurrent workers).
+    pub fn discard_writes(&mut self) {
+        self.pending.clear();
+        self.pending_storage.clear();
+    }
 }
 
 #[cfg(test)]
@@ -476,5 +491,57 @@ mod tests {
         assert_eq!(j.storage_write_count(), 0);
         assert_eq!(j.pending_balance(&addr(1)), None);
         assert_eq!(j.write_count(), 0);
+    }
+
+    #[test]
+    fn discard_writes_clears_pending_but_preserves_sets_and_pin() {
+        let mut j = ScratchJournal::new();
+        j.pin_at(ReadVersion::from_raw(7));
+        j.record_read(addr(1));
+        j.record_balance(addr(2), U256::from(100));
+        j.record_storage_write(addr(3), vec![1; 32], vec![2; 32]);
+
+        j.discard_writes();
+
+        assert_eq!(j.pending_balance(&addr(2)), None);
+        assert_eq!(j.storage_write_count(), 0);
+        assert_eq!(j.write_count(), 0);
+        // Sets + pin preserved — conservative version bumping still happens
+        assert!(j.is_pinned());
+        assert_eq!(j.pinned_version(), Some(ReadVersion::from_raw(7)));
+        assert!(j.read_set().iter().any(|a| *a == addr(1)));
+        assert!(j.write_set().contains(&addr(2)));
+        assert!(j.write_set().contains(&addr(3)));
+    }
+
+    #[test]
+    fn discard_writes_then_rerecord_lets_final_drain_apply_only_rerecorded() {
+        let mut j = ScratchJournal::new();
+        j.pin_at(ReadVersion::from_raw(0));
+        // Initial "optimistic" writes (e.g., pre-REVM gas deduction,
+        // REVM-issued storage writes, REVM-issued value transfer).
+        j.record_balance(addr(1), U256::from(50));
+        j.record_storage_write(addr(2), vec![1; 32], vec![99; 32]);
+        j.record_nonce(addr(1), 42);
+
+        // Tx fails mid-execution. Discard the pending state, re-record
+        // only the failure-mode accounting (gas-burn + nonce-increment).
+        j.discard_writes();
+        j.record_balance(addr(1), U256::from(30)); // gas-burn amount
+        j.record_nonce(addr(1), 43);
+
+        // Drain sees only the failure-mode records.
+        let balances: HashMap<Address, u64> = j
+            .iter_writes()
+            .filter_map(|(a, w)| w.new_balance.map(|b| (*a, b.as_u64())))
+            .collect();
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[&addr(1)], 30);
+        let nonces: HashMap<Address, u64> = j
+            .iter_writes()
+            .filter_map(|(a, w)| w.new_nonce.map(|n| (*a, n)))
+            .collect();
+        assert_eq!(nonces[&addr(1)], 43);
+        assert_eq!(j.storage_write_count(), 0);
     }
 }

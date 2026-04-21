@@ -765,7 +765,13 @@ impl Executor {
         let mut context = ExecutionContext::new(block, tx);
         let from = crate::address_utils::normalize_address(&tx.from);
 
-        // Create snapshot for potential rollback
+        // Snapshot for rolling back residual direct state_db mutations
+        // (e.g., create_account_if_not_exists in execute_transfer, REVM's
+        // direct set_code writes through DatabaseCommit::commit for
+        // mid-tx contract deployment). Balance/nonce/value mutations route
+        // through the per-tx journal (WP-A.5.2) and are discarded at the
+        // journal level on failure, so the snapshot handles only the
+        // non-journal-routed direct writes.
         let snapshot = self.state_db.snapshot();
 
         // Verify nonce WITHOUT incrementing (C-04: enforce equality).
@@ -778,15 +784,20 @@ impl Executor {
         let gas_cost = U256::from(tx.gas_limit) * U256::from(tx.gas_price);
         let balance = self.state_db.accounts.get_balance(&from);
         if balance < gas_cost + U256::from(tx.value) {
-            self.state_db.restore(snapshot);
+            // No mutations happened — nothing to restore.
             return Err(ExecutionError::InsufficientBalance {
                 need: gas_cost + U256::from(tx.value),
                 have: balance,
             });
         }
 
-        // Deduct gas cost upfront
-        self.state_db.accounts.set_balance(from, balance - gas_cost);
+        // Sprint P950-A-5 WP-A.5.2: deduct gas cost into the journal rather
+        // than state_db. REVM's `Database::basic` does journal-first lookup
+        // so the EVM sees the post-deduction balance during execution.
+        // On success: the journal drains into state_db at the end.
+        // On failure: the journal is discarded + re-recorded with the
+        //             gas-burn amount (same net effect).
+        context.journal.lock().record_balance(from, balance - gas_cost);
 
         // Parse and execute transaction type (nonce still at N for CREATE address derivation)
         let tx_type = self.parse_transaction_type(tx)?;
@@ -797,20 +808,39 @@ impl Executor {
         // Handle execution result
         let status = match result {
             Ok(()) => {
-                // Increment nonce AFTER successful execution
-                self.state_db.accounts.increment_nonce(&from);
-                // Refund unused gas
-                let refund = U256::from(tx.gas_limit - context.gas_used) * U256::from(tx.gas_price);
-                let balance = self.state_db.accounts.get_balance(&from);
-                self.state_db.accounts.set_balance(from, balance + refund);
+                // Success path: nonce increment + gas refund via journal.
+                let refund =
+                    U256::from(tx.gas_limit - context.gas_used) * U256::from(tx.gas_price);
+                let current_balance = {
+                    let j = context.journal.lock();
+                    j.pending_balance(&from)
+                        .unwrap_or_else(|| self.state_db.accounts.get_balance(&from))
+                };
+                {
+                    let mut j = context.journal.lock();
+                    j.record_nonce(from, tx.nonce + 1);
+                    j.record_balance(from, current_balance + refund);
+                }
                 true
             }
             Err(e) => {
                 warn!("Transaction execution failed: {}", e);
-                // Rollback state changes but keep gas consumed and nonce increment
+                // Failure path:
+                //   1. Discard the journal's pending writes (gas deduction,
+                //      REVM storage, value transfers, contract deploys).
+                //      Preserve read_set + write_set for conservative
+                //      version bumping at commit.
+                //   2. Re-record ONLY the failure-mode accounting:
+                //      gas-burn balance + nonce-increment.
+                //   3. Restore state_db to undo non-journal-routed direct
+                //      mutations (create_account_if_not_exists, set_code).
+                {
+                    let mut j = context.journal.lock();
+                    j.discard_writes();
+                    j.record_balance(from, balance - gas_cost);
+                    j.record_nonce(from, tx.nonce + 1);
+                }
                 self.state_db.restore(snapshot);
-                self.state_db.accounts.increment_nonce(&from);
-                self.state_db.accounts.set_balance(from, balance - gas_cost);
                 false
             }
         };
@@ -851,13 +881,30 @@ impl Executor {
             writes.record_write(to);
         }
 
-        // Sprint P950-A-5 WP-A.5.1: drain buffered REVM storage writes
-        // into state_db ONLY on successful tx. On failure, the journal
-        // is discarded, which is the natural rollback for storage.
-        if status {
+        // Drain the journal into state_db. The journal now always contains
+        // at least the gas accounting + nonce for the sender, regardless of
+        // success/failure. Storage + per-account mutations (balance/nonce/
+        // code) land here.
+        //
+        // Order: storage first, then per-account — matches the pre-journal
+        // ordering where storage writes came through DatabaseCommit and
+        // balance/nonce came from the executor.
+        {
             let journal = context.journal.lock();
             for ((addr, key), value) in journal.iter_storage_writes() {
                 self.state_db.set_storage(*addr, key.clone(), value.clone());
+            }
+            for (addr, pending) in journal.iter_writes() {
+                if let Some(new_balance) = pending.new_balance {
+                    self.state_db.accounts.set_balance(*addr, new_balance);
+                }
+                if let Some(new_nonce) = pending.new_nonce {
+                    self.state_db.accounts.set_nonce(*addr, new_nonce);
+                }
+                if let Some(code) = &pending.new_code {
+                    self.state_db.accounts.create_account_if_not_exists(*addr);
+                    self.state_db.set_code(*addr, code.clone());
+                }
             }
         }
 
@@ -1223,7 +1270,11 @@ impl Executor {
         }
     }
 
-    /// Execute transfer
+    /// Execute transfer — value transfer routed through the per-tx journal
+    /// (WP-A.5.2). Sender/recipient balance updates land in the journal's
+    /// pending map; the executor drains them into state_db at commit time.
+    /// REVM-adjacent paths read balances via journal-first lookup so the
+    /// in-flight transfer is visible within this tx.
     async fn execute_transfer(
         &self,
         from: Address,
@@ -1233,11 +1284,41 @@ impl Executor {
     ) -> Result<(), ExecutionError> {
         context.use_gas(self.gas_schedule.transfer)?;
 
-        // Create recipient account if not exists
+        // Self-transfer: balance net-zero, but ensure the account exists.
+        if from == to {
+            self.state_db.accounts.create_account_if_not_exists(to);
+            return Ok(());
+        }
+
+        // Read journal-first so we see this tx's pending gas deduction
+        // (and any prior transfers routed through the journal).
+        let (from_balance, to_balance) = {
+            let j = context.journal.lock();
+            let fb = j
+                .pending_balance(&from)
+                .unwrap_or_else(|| self.state_db.accounts.get_balance(&from));
+            let tb = j
+                .pending_balance(&to)
+                .unwrap_or_else(|| self.state_db.accounts.get_balance(&to));
+            (fb, tb)
+        };
+
+        if from_balance < value {
+            return Err(ExecutionError::InsufficientBalance {
+                need: value,
+                have: from_balance,
+            });
+        }
+
+        // Ensure recipient exists in state_db for balance storage (the
+        // snapshot captured pre-existence and will roll back on failure).
         self.state_db.accounts.create_account_if_not_exists(to);
 
-        // Transfer value
-        self.state_db.accounts.transfer(&from, &to, value)?;
+        {
+            let mut j = context.journal.lock();
+            j.record_balance(from, from_balance - value);
+            j.record_balance(to, to_balance + value);
+        }
 
         // Add transfer log
         context.add_log(Log {
@@ -1251,6 +1332,55 @@ impl Executor {
         });
 
         debug!("Transfer: {} -> {} : {}", from, to, value);
+        Ok(())
+    }
+
+    /// Journal-routed value transfer for REVM-adjacent paths (precompile
+    /// calls, post-REVM transfer in `execute_call`). Sprint P950-A-5
+    /// WP-A.5.2.
+    ///
+    /// Unlike `execute_transfer`, this does NOT charge transfer gas — the
+    /// caller has already accounted for gas via the REVM / precompile
+    /// pathway. Balance reads are journal-first so pending mutations from
+    /// earlier in the same tx are visible.
+    fn journal_transfer(
+        &self,
+        from: Address,
+        to: Address,
+        value: U256,
+        context: &mut ExecutionContext,
+    ) -> Result<(), ExecutionError> {
+        if from == to {
+            self.state_db.accounts.create_account_if_not_exists(to);
+            return Ok(());
+        }
+
+        let (from_balance, to_balance) = {
+            let j = context.journal.lock();
+            let fb = j
+                .pending_balance(&from)
+                .unwrap_or_else(|| self.state_db.accounts.get_balance(&from));
+            let tb = j
+                .pending_balance(&to)
+                .unwrap_or_else(|| self.state_db.accounts.get_balance(&to));
+            (fb, tb)
+        };
+
+        if from_balance < value {
+            return Err(ExecutionError::InsufficientBalance {
+                need: value,
+                have: from_balance,
+            });
+        }
+
+        self.state_db.accounts.create_account_if_not_exists(to);
+
+        {
+            let mut j = context.journal.lock();
+            j.record_balance(from, from_balance - value);
+            j.record_balance(to, to_balance + value);
+        }
+
         Ok(())
     }
 
@@ -1336,9 +1466,10 @@ impl Executor {
 
         // Precompile dispatch first (value transfer handled by precompile if needed)
         if self.is_precompile_address(&to) {
-            // Transfer value for precompiles since they don't go through REVM
+            // Sprint P950-A-5 WP-A.5.2: route precompile value transfer
+            // through the journal for concurrent isolation.
             if value > U256::zero() {
-                self.state_db.accounts.transfer(&from, &to, value)?;
+                self.journal_transfer(from, to, value, context)?;
             }
             self.execute_precompile(&to, &data, from, context).await?;
             return Ok(());
@@ -1388,8 +1519,10 @@ impl Executor {
 
                     // Transfer value after REVM succeeds. REVM's commit no longer
                     // writes balance changes, so the executor must handle this.
+                    // Sprint P950-A-5 WP-A.5.2: route through the journal for
+                    // concurrent isolation.
                     if value > U256::zero() {
-                        self.state_db.accounts.transfer(&from, &to, value)?;
+                        self.journal_transfer(from, to, value, context)?;
                     }
                 }
                 Err(e) => {
