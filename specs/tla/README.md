@@ -1,6 +1,6 @@
 # TLA+ Formal Verification Suite (Local Subset)
 
-**46 specifications | 6 domains | 0 violations**
+**48 specifications | 6 domains | 0 violations**
 
 This directory contains a **local subset** of Citrate's TLA+ formal verification suite. The canonical collection (101 specs today) lives at `.agentile/formal/specs/`. This local subset is runnable in CI and covers the core protocol domains.
 
@@ -9,13 +9,15 @@ This directory contains a **local subset** of Citrate's TLA+ formal verification
 ```
 specs/tla/
 ├── README.md                      <- This file
-├── consensus/                     6 specs — Core protocol
+├── consensus/                     8 specs — Core protocol
 │   ├── GhostDAGConsensus.tla      DAG consensus: blue set, tip selection, acyclicity
 │   ├── VRFElection.tla            ECVRF proposer election, leader uniqueness
 │   ├── VRFChainContinuity.tla     VRF output chaining, reorg safety
 │   ├── PrevrandaoPipeline.tla     ECVRF-to-BlockContext-to-REVM-to-Solidity
 │   ├── MempoolSequencer.tla       Mempool admission, eviction, nonce ordering
-│   └── TransactionExecution.tla   Balance conservation, nonce monotonicity, gas limits
+│   ├── TransactionExecution.tla   Balance conservation, nonce monotonicity, gas limits
+│   ├── ExecutorMVCC.tla           Block-STM-style concurrency: CAS commits + retry-to-serial fallback
+│   └── EmbeddedModelCommitment.tla Post-WP-B commitment integrity: tamper detection, size-bounded on-chain footprint
 │
 ├── zk/                            2 specs — Zero-knowledge proofs
 │   ├── ZKProofLifecycle.tla       Proof generation, verification, on-chain settlement

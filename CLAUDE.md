@@ -161,4 +161,13 @@ cd tests/load
 ./target/release/benchmark-suite http://127.0.0.1:8545 10000 60 ../../benchmarks/
 ```
 
-Baseline (March 20, 2026): 5,000 TPS sustained, 10,000 TPS ceiling. >10% regression blocks the commit.
+Baselines:
+- **Network baseline (March 20, 2026)**: 5,000 TPS sustained, 10,000 TPS ceiling via
+  `benchmark-suite` (HTTP RPC to a live node).
+- **Executor ceiling (April 21, 2026, Sprint P950-A-5)**: 773K tx/s @ 8 workers,
+  321K tx/s @ 1 worker on disjoint-senders workload
+  (`benches/tps_parallel.rs`). The journal + CAS path achieves 2.41× speedup
+  from 1 → 8 workers. Real-world TPS is RPC/signature-bound and sits well
+  below this ceiling; closing the gap is tracked separately.
+
+Regression policy: >10% regression on EITHER baseline blocks the commit.

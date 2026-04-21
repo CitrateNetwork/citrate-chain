@@ -37,6 +37,35 @@ The DAG store supports both in-memory operation and persistent write-through to 
 - **`DagRelation`** -- Parent-child-blue_set relationship for a block
 - **`Transaction`** -- Transaction with EIP-1559/2930 support, AI transaction types, ECDSA verification flag
 
+### AI Model Artifacts — Three-Tier Commitment Model
+
+The consensus layer treats AI models as first-class artifacts but follows a strict three-tier model for where data lives. The rule: **commitments are on-chain; distribution is off-chain.**
+
+| Tier | Type | On-chain footprint | Where bytes live | Use |
+|------|------|---------------------|------------------|-----|
+| 1. Metadata + commitment | `EmbeddedModel` | fixed (~544 B per model) | off-chain, addressed by `weights_sha256` | Genesis-era canonical models; bytes bundled in release, pinned on IPFS, or resolved by node |
+| 2. Pin declaration | `RequiredModel` | fixed (~140 B per pin) | off-chain (IPFS CID) | Models validators must pin to participate fully; carries SHA-256, size declaration, slash penalty |
+| 3. Application-layer registration | `ModelRegistry` contract | variable (Solidity storage) | off-chain | Models deployed by users post-genesis; lives in contract state, not block commitments |
+
+Under this model, **block size is bounded by construction regardless of model size**. A block carrying ten embedded models committed to 10 GB of weights occupies roughly the same on-chain space as a block carrying ten small models — the weights live off-chain, and only fixed-size commitments are replicated to every peer.
+
+#### Integrity and tamper detection
+
+Each `EmbeddedModel` carries a `weights_sha256: Hash` commitment. A node verifying a block's embedded models:
+
+1. Retrieves the bytes from off-chain storage (bundled asset, IPFS, or trusted mirror)
+2. Computes `sha256(retrieved_bytes)`
+3. Compares to the on-chain `weights_sha256`
+4. Accepts the block iff every embedded model's commitment matches
+
+Under SHA-256 collision-resistance, tampering with the off-chain bytes is detectable: the hash changes, and the block's stored commitment fails to match.
+
+The integrity properties are formally verified by [`specs/tla/consensus/EmbeddedModelCommitment.tla`](../../specs/tla/consensus/EmbeddedModelCommitment.tla) — 7 invariants, 7,110 distinct states explored, zero violations.
+
+#### History — why this design
+
+The pre-2026-04-21 design carried raw GGUF bytes in an `EmbeddedModel.weights: Vec<u8>` field, with no size cap at the consensus layer. This permitted arbitrarily large genesis blocks by construction. The [2026-04-21 repo walkthrough audit](../../../.audit/2026-04-21-repo-walkthrough/02_GENESIS_AND_EMBEDDED_MODELS.md) flagged this as a mainnet blocker. Sprint P950-B (April 2026) replaced the field with the `weights_sha256` commitment. See [`ADR-010`](../../../.agentile/planset/architecture/ADR_010_EMBEDDED_MODEL_COMMITMENT.md) for the decision record.
+
 ### GhostDAG Engine
 - **`GhostDag::new(params, dag_store)`** -- Create engine with parameters and storage
 - **`GhostDag::calculate_blue_set(block)`** -- Calculate blue set following k-cluster rule

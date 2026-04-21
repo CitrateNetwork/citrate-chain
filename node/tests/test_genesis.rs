@@ -132,13 +132,16 @@ fn test_genesis_required_pins_format() {
 
 #[test]
 fn test_embedded_model_structure() {
-    use citrate_consensus::types::{EmbeddedModel, ModelMetadata, ModelType, ModelId};
+    use citrate_consensus::types::{EmbeddedModel, Hash, ModelMetadata, ModelType, ModelId};
 
-    // Create test embedded model
+    // Post-WP-B (2026-04-21): EmbeddedModel carries a 32-byte sha256
+    // commitment (`weights_sha256`), not raw `Vec<u8>` weights. See
+    // .agentile/planset/architecture/ADR_010_EMBEDDED_MODEL_COMMITMENT.md
+    // (to be authored in WP-B.4).
     let model = EmbeddedModel {
         model_id: ModelId::from_name("test-embedding-model"),
         model_type: ModelType::Embeddings,
-        weights: vec![0u8; 100], // Small test weights
+        weights_sha256: Hash::new([0xAAu8; 32]),
         metadata: ModelMetadata {
             name: "Test Model".to_string(),
             version: "1.0.0".to_string(),
@@ -149,8 +152,13 @@ fn test_embedded_model_structure() {
         },
     };
 
-    // Verify structure
-    assert_eq!(model.size_bytes(), 100);
+    // size_bytes() now returns a fixed upper bound driven by the
+    // commitment hash + metadata cap, not a function of weight length.
+    let expected_size = 32 + EmbeddedModel::EMBEDDED_MODEL_METADATA_SIZE_UPPER_BOUND;
+    assert_eq!(model.size_bytes(), expected_size);
     assert!(matches!(model.model_type, ModelType::Embeddings));
     assert_eq!(model.metadata.embedding_dim, Some(1024));
+
+    // weights_hash() now returns the stored commitment directly.
+    assert_eq!(model.weights_hash(), Hash::new([0xAAu8; 32]));
 }
