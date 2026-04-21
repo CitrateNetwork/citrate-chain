@@ -45,6 +45,78 @@ impl StateStoreTrait for StateStore {
         self.db.delete_cf(CF_STORAGE, &storage_key)?;
         Ok(())
     }
+
+    // Sprint P950-A-4 WP-A.4.3: persist MVCC per-account versions.
+
+    fn put_account_version(&self, address: &Address, version: u64) -> Result<()> {
+        self.db.put_cf(
+            CF_ACCOUNT_VERSIONS,
+            &address.0,
+            &version.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
+    fn put_account_versions(&self, entries: &[(Address, u64)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut batch = self.db.batch();
+        for (addr, ver) in entries {
+            self.db.batch_put_cf(
+                &mut batch,
+                CF_ACCOUNT_VERSIONS,
+                &addr.0,
+                &ver.to_be_bytes(),
+            )?;
+        }
+        self.db.write_batch(batch)?;
+        Ok(())
+    }
+
+    fn get_all_account_versions(&self) -> Result<Vec<(Address, u64)>> {
+        let mut out = Vec::new();
+        let iter = self.db.iter_cf(CF_ACCOUNT_VERSIONS)?;
+        for (key, value) in iter {
+            // Skip the global-version sentinel key (all 0xFF) — handled by
+            // get_global_version() separately. Addresses are 20 bytes;
+            // anything else is ignored defensively.
+            if key.len() != 20 {
+                continue;
+            }
+            let mut addr_bytes = [0u8; 20];
+            addr_bytes.copy_from_slice(&key);
+            if addr_bytes == [0xFF; 20] {
+                continue;
+            }
+            if value.len() == 8 {
+                let mut ver_bytes = [0u8; 8];
+                ver_bytes.copy_from_slice(&value);
+                out.push((Address(addr_bytes), u64::from_be_bytes(ver_bytes)));
+            }
+        }
+        Ok(out)
+    }
+
+    fn put_global_version(&self, version: u64) -> Result<()> {
+        self.db.put_cf(
+            CF_ACCOUNT_VERSIONS,
+            &[0xFFu8; 20],
+            &version.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
+    fn get_global_version(&self) -> Result<Option<u64>> {
+        match self.db.get_cf(CF_ACCOUNT_VERSIONS, &[0xFFu8; 20])? {
+            Some(bytes) if bytes.len() == 8 => {
+                let mut ver_bytes = [0u8; 8];
+                ver_bytes.copy_from_slice(&bytes);
+                Ok(Some(u64::from_be_bytes(ver_bytes)))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 impl StateStore {
