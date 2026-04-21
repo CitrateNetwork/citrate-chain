@@ -52,7 +52,16 @@ pub mod write_set;
 pub use commit::{AbortReason, CommitCoordinator, CommitOutcome};
 pub use read_set::ReadSet;
 pub use retry::{CommitSuccess, RetryHarness, RetryMetrics, DEFAULT_MAX_RETRIES};
-pub use scratch_journal::ScratchJournal;
+pub use scratch_journal::{PendingWrite, ScratchJournal};
 pub use version::{ReadVersion, StateVersion};
 pub use version_tracker::AccountVersionTracker;
 pub use write_set::WriteSet;
+
+/// Shared handle to a per-tx [`ScratchJournal`] for concurrent use by the
+/// executor, the REVM adapter, and the commit drain path.
+///
+/// Wrapped in `parking_lot::Mutex` (not tokio) because the access pattern
+/// is always short: record-write or read-pending lookups, each sub-µs.
+/// The outer `Arc` lets the handle be cheaply cloned into the adapter
+/// without taking ownership of the journal.
+pub type JournalHandle = std::sync::Arc<parking_lot::Mutex<ScratchJournal>>;

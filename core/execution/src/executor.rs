@@ -1,7 +1,7 @@
 // citrate/core/execution/src/executor.rs
 
 use crate::metrics::{PRECOMPILE_CALLS_TOTAL, VM_EXECUTIONS_TOTAL, VM_GAS_USED};
-use crate::mvcc::{CommitCoordinator, WriteSet};
+use crate::mvcc::{CommitCoordinator, JournalHandle, ScratchJournal, WriteSet};
 use crate::precompiles::{PrecompileExecutor, inference::InferencePrecompile};
 use crate::inference::metal_runtime::MetalRuntime;
 use crate::state::StateDB;
@@ -38,6 +38,13 @@ pub struct ExecutionContext {
     /// `CommitCoordinator::commit_writes_serialized` for per-account
     /// MVCC version bumps.
     pub writes_handle: crate::revm_adapter::WriteSetHandle,
+    /// Per-tx journal for buffered REVM storage writes (Sprint P950-A-5
+    /// WP-A.5.1). Storage slots that REVM `SSTORE`s land here instead
+    /// of being applied directly to `state_db`. The executor drains this
+    /// into `state_db` after a successful commit. This is the foundation
+    /// for concurrent tx execution: each worker's journal is isolated
+    /// until CAS succeeds.
+    pub journal: JournalHandle,
 }
 
 impl ExecutionContext {
@@ -55,6 +62,7 @@ impl ExecutionContext {
             logs: Vec::new(),
             output: Vec::new(),
             writes_handle: Arc::new(Mutex::new(WriteSet::new())),
+            journal: Arc::new(Mutex::new(ScratchJournal::new())),
         }
     }
 
@@ -843,6 +851,16 @@ impl Executor {
             writes.record_write(to);
         }
 
+        // Sprint P950-A-5 WP-A.5.1: drain buffered REVM storage writes
+        // into state_db ONLY on successful tx. On failure, the journal
+        // is discarded, which is the natural rollback for storage.
+        if status {
+            let journal = context.journal.lock();
+            for ((addr, key), value) in journal.iter_storage_writes() {
+                self.state_db.set_storage(*addr, key.clone(), value.clone());
+            }
+        }
+
         Ok((receipt, writes))
     }
 
@@ -1262,6 +1280,7 @@ impl Executor {
             context.timestamp,
             self.get_block_context(),
             Some(context.writes_handle.clone()),
+            Some(context.journal.clone()),
         );
 
         match result {
@@ -1357,6 +1376,7 @@ impl Executor {
                 context.timestamp,
                 self.get_block_context(),
                 Some(context.writes_handle.clone()),
+                Some(context.journal.clone()),
             ) {
                 Ok((output, gas_used)) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["ok"]).inc();

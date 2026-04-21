@@ -54,17 +54,26 @@ impl Default for PendingWrite {
 /// - the pinned [`ReadVersion`]
 /// - the [`ReadSet`] (accounts observed, for validity check)
 /// - the [`WriteSet`] (accounts to be written, for version bumps on commit)
-/// - the actual pending values (for draining into state on commit)
+/// - pending per-account mutations (balance/nonce/code) for commit drain
+/// - pending per-slot storage mutations (Sprint P950-A-5 WP-A.5.1) for
+///   commit drain. These are the EVM `SSTORE` writes that REVM would
+///   otherwise apply eagerly to state; journal-mediation keeps concurrent
+///   workers isolated from each other's pending storage updates.
 ///
 /// On successful `TryCommit`, the journal is drained: for every account
 /// in the [`WriteSet`], the pending write is applied to the state DB and
 /// the account's per-account version is bumped to the new global version.
-/// The [`ReadSet`] is *not* drained — its role ends at the CAS check.
+/// Storage slots in `pending_storage` are flushed to `state_db.set_storage`
+/// at the same point. The [`ReadSet`] is *not* drained — its role ends at
+/// the CAS check.
 #[derive(Debug, Clone, Default)]
 pub struct ScratchJournal {
     read_set: ReadSet,
     write_set: WriteSet,
     pending: HashMap<Address, PendingWrite>,
+    /// (address, slot-key-bytes) → slot-value-bytes, for EVM storage writes
+    /// buffered during REVM execution. Sprint P950-A-5 WP-A.5.1.
+    pending_storage: HashMap<(Address, Vec<u8>), Vec<u8>>,
 }
 
 impl ScratchJournal {
@@ -81,6 +90,7 @@ impl ScratchJournal {
         self.read_set.pin_at(version);
         self.write_set.clear();
         self.pending.clear();
+        self.pending_storage.clear();
     }
 
     /// Whether the journal has been pinned.
@@ -139,12 +149,58 @@ impl ScratchJournal {
         self.pending.len()
     }
 
+    // ------------------------------------------------------------------------
+    // Pending storage slots — Sprint P950-A-5 WP-A.5.1
+    // ------------------------------------------------------------------------
+
+    /// Record a pending EVM storage-slot write.
+    ///
+    /// Called by `StateDBAdapter::DatabaseCommit::commit` when REVM flushes
+    /// its internal cache. Keys/values are raw bytes per EVM convention
+    /// (typically 32-byte big-endian).
+    ///
+    /// Repeated writes to the same (addr, key) overwrite in-place — REVM
+    /// squashes intermediate values internally, so this code path sees
+    /// only the final post-tx value per slot, but we handle repeats
+    /// defensively.
+    ///
+    /// Also records the address in the WriteSet so MVCC version bumps
+    /// include accounts that only changed via storage (not balance/nonce).
+    pub fn record_storage_write(&mut self, address: Address, key: Vec<u8>, value: Vec<u8>) {
+        self.write_set.record_write(address);
+        self.pending_storage.insert((address, key), value);
+    }
+
+    /// Look up a pending storage-slot write made earlier in this same tx.
+    ///
+    /// Enables read-your-writes semantics within a single tx: if the tx
+    /// `SSTORE`d slot X then `SLOAD`s slot X, the load sees the pending
+    /// value from this journal — not the stale value in state_db.
+    pub fn pending_storage(&self, address: &Address, key: &[u8]) -> Option<&[u8]> {
+        self.pending_storage
+            .get(&(*address, key.to_vec()))
+            .map(|v| v.as_slice())
+    }
+
+    /// Iterate over all pending storage writes in arbitrary order.
+    ///
+    /// Used at commit time to drain slot updates into the real state DB.
+    pub fn iter_storage_writes(&self) -> impl Iterator<Item = (&(Address, Vec<u8>), &Vec<u8>)> {
+        self.pending_storage.iter()
+    }
+
+    /// Number of pending storage-slot writes.
+    pub fn storage_write_count(&self) -> usize {
+        self.pending_storage.len()
+    }
+
     /// Clear the journal entirely. Called on commit (after drain) or on
     /// abort (journal is thrown away).
     pub fn clear(&mut self) {
         self.read_set.clear();
         self.write_set.clear();
         self.pending.clear();
+        self.pending_storage.clear();
     }
 }
 
