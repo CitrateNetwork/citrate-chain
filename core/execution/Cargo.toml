@@ -29,13 +29,20 @@ rlp = "0.5"
 hex = "0.4"
 dashmap = "5.5"
 parking_lot = "0.12"
-lru = "0.17"
+lru = "0.16"
 prometheus = { version = "0.13", default-features = false }
 once_cell = "1.19"
 
-# Battle-tested EVM implementation (used by Foundry/Anvil)
-revm = { version = "20", default-features = false, features = ["std", "serde"] }
-revm-primitives = "5"
+# Battle-tested EVM implementation (used by Foundry/Anvil).
+#
+# Pinned to 10 — Dependabot PR #69 (merged 2026-04-22) bumped to 20,
+# which is a breaking API change: `revm::primitives::*` was
+# reorganized, `Evm` moved, `AccountInfo` / `Bytecode` / `TransactTo`
+# / `SpecId` are now under `revm_primitives`. `src/revm_adapter.rs`
+# uses the v10 API. Adapting to v20 is tracked as a dedicated sprint
+# item; pinning back to 10 restores the release build. See BACKLOG
+# #126.
+revm = { version = "=10", default-features = false, features = ["std", "serde"] }
 
 # Tensor operations
 ndarray = "0.15"
@@ -43,14 +50,20 @@ ndarray-rand = "0.14"
 
 # Zero-knowledge proofs (experimental — circuits are placeholder implementations)
 # Production Groth16 verification gated behind `zkp_production` in core/mcp
-ark-std = "0.5"
+# Arkworks suite — all crates pinned to the 0.4 line so the ecosystem
+# is internally consistent. Dependabot bumped ark-std and ark-relations
+# to 0.5 (PRs #68, #70), but ark-groth16/ark-r1cs-std/ark-bls12-381
+# don't have 0.5 releases yet, so mixing creates unresolvable trait
+# bounds (e.g. `ark-ff::Fp<...>: ark-relations::r1cs::Field`). Lock all
+# to 0.4 until the whole ecosystem moves together.
+ark-std = "0.4"
 ark-ff = "0.4"
 ark-ec = "0.4"
 ark-poly = "0.4"
 ark-serialize = "0.4"
 ark-groth16 = "0.4"
 ark-r1cs-std = "0.4"
-ark-relations = "0.5"
+ark-relations = "0.4"
 ark-bls12-381 = "0.4"
 ark-snark = "0.4"
 
