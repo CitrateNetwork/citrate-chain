@@ -328,7 +328,7 @@ dependencies = [
  "ark-ec",
  "ark-ff 0.4.2",
  "ark-r1cs-std",
- "ark-relations",
+ "ark-relations 0.4.0",
  "ark-serialize 0.4.2",
  "ark-snark",
  "ark-std 0.4.0",
@@ -495,7 +495,7 @@ dependencies = [
  "ark-ec",
  "ark-ff 0.4.2",
  "ark-poly",
- "ark-relations",
+ "ark-relations 0.4.0",
  "ark-serialize 0.4.2",
  "ark-std 0.4.0",
  "rayon",
@@ -523,7 +523,7 @@ checksum = "de1d1472e5cb020cb3405ce2567c91c8d43f21b674aef37b0202f5c3304761db"
 dependencies = [
  "ark-ec",
  "ark-ff 0.4.2",
- "ark-relations",
+ "ark-relations 0.4.0",
  "ark-std 0.4.0",
  "derivative",
  "num-bigint",
@@ -542,6 +542,17 @@ dependencies = [
  "ark-std 0.4.0",
  "tracing",
  "tracing-subscriber 0.2.25",
+]
+
+[[package]]
+name = "ark-relations"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec46ddc93e7af44bcab5230937635b06fb5744464dd6a7e7b083e80ebd274384"
+dependencies = [
+ "ark-ff 0.5.0",
+ "ark-std 0.5.0",
+ "tracing",
 ]
 
 [[package]]
@@ -596,7 +607,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84d3cc6833a335bb8a600241889ead68ee89a3cf8448081fb7694c0fe503da63"
 dependencies = [
  "ark-ff 0.4.2",
- "ark-relations",
+ "ark-relations 0.4.0",
  "ark-serialize 0.4.2",
  "ark-std 0.4.0",
 ]
@@ -1858,7 +1869,7 @@ dependencies = [
  "ark-groth16",
  "ark-poly",
  "ark-r1cs-std",
- "ark-relations",
+ "ark-relations 0.5.1",
  "ark-serialize 0.4.2",
  "ark-snark",
  "ark-std 0.4.0",
