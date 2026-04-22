@@ -73,7 +73,7 @@ x25519-dalek = "2.0"
 # handler that calls rand::rng(). Citrate uses tracing-subscriber and
 # does not meet the trigger preconditions. Migration is scheduled as a
 # dedicated WP; see .agentile/sprints/backlog/rand-0.9-migration.md.
-rand = "=0.8.6"
+rand = "=0.9.3"
 
 # Networking
 libp2p = "0.54"
