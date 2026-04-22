@@ -445,20 +445,45 @@ mod tests {
 
     #[test]
     fn high_contention_with_read_write_triggers_retries() {
-        // 8 workers EACH reading and writing account 1 from a synchronized
-        // pin. This triggers the true abort-retry-or-fallback cycle.
+        // 8 workers EACH reading and writing account 1. The naive version
+        // of this test (one start-barrier, then each worker calls execute)
+        // is timing-dependent: on a 2-core runner the kernel can serialize
+        // threads so each one pins *after* the previous commit, producing
+        // zero conflicts and zero retries. We saw this as a CI flake on
+        // GitHub's shared runners (got 2 retries, asserted >=7).
+        //
+        // To make the conflict deterministic we use two barriers:
+        //   b_start — release all 8 threads at once into execute()
+        //   b_pinned — inside the closure, after the journal is pinned,
+        //              block until all 8 have pinned
+        //
+        // That second barrier guarantees all 8 workers pin at the same
+        // read-version (v0) before any try_commit runs. Then exactly one
+        // thread wins the commit lock and the other 7 observe the bump
+        // and must retry. MaxRetries=16 gives every retry room to succeed.
+        //
+        // The b_pinned barrier only fires on the first attempt — retries
+        // would deadlock the barrier (count=8, only 1 waiter). We use a
+        // local FnMut-captured bool to gate it.
         let h = Arc::new(RetryHarness::new().with_max_retries(16));
-        let barrier = Arc::new(Barrier::new(8));
+        let b_start = Arc::new(Barrier::new(8));
+        let b_pinned = Arc::new(Barrier::new(8));
 
         let handles: Vec<_> = (0..8u8)
             .map(|i| {
                 let h = Arc::clone(&h);
-                let b = Arc::clone(&barrier);
+                let bs = Arc::clone(&b_start);
+                let bp = Arc::clone(&b_pinned);
                 thread::spawn(move || {
-                    b.wait();
+                    bs.wait();
+                    let mut first_attempt = true;
                     h.execute(|journal, _pin| {
                         journal.record_read(addr(1));
                         journal.record_write(addr(1), balance_write(i as u64));
+                        if first_attempt {
+                            first_attempt = false;
+                            bp.wait();
+                        }
                     })
                 })
             })
@@ -469,13 +494,16 @@ mod tests {
         assert_eq!(h.current_version(), ReadVersion::from_raw(8));
         assert_eq!(h.metrics().commits(), 8);
 
-        // With 8 workers synchronized on a common pin, at least 7 of
-        // them will see an aborted first attempt. Retries should be
-        // substantial; fallbacks depend on scheduler + MaxRetries=16.
+        // With all 8 pins deterministically forced to v0, exactly one
+        // thread wins the commit lock on the first attempt; the other
+        // seven must observe the bump and retry (or exhaust retries and
+        // fall back). Either path counts as non-first-attempt behavior.
+        let retries_or_fallbacks = h.metrics().retries() + h.metrics().fallbacks();
         assert!(
-            h.metrics().retries() >= 7,
-            "expected >=7 retries from synchronized conflict, got {}",
-            h.metrics().retries()
+            retries_or_fallbacks >= 7,
+            "expected >=7 retry-or-fallback events from synchronized conflict, got retries={} fallbacks={}",
+            h.metrics().retries(),
+            h.metrics().fallbacks()
         );
     }
 
