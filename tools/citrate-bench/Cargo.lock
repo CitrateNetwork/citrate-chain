@@ -180,7 +180,7 @@ dependencies = [
  "hex",
  "k256",
  "mockito",
- "rand 0.8.6",
+ "rand 0.9.4",
  "reqwest",
  "rlp",
  "rpassword",
