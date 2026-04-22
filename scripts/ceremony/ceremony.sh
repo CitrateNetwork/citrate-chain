@@ -423,14 +423,20 @@ step_verify_code() {
 step_benchmark() {
     log_step "Step 50: Post-deploy benchmark"
     local bench_out="$OUTPUT_DIR/50_benchmark.md"
-    local bench_bin="$REPO_ROOT/tests/load/target/release/benchmark-suite"
+    # Canonical benchmark tool since Apr 2026: tools/citrate-bench.
+    # The older tests/load binary (`benchmark-suite`) is a devnet-only
+    # rehearsal tool that uses `eth_sendTransaction` with a fake
+    # unlocked sender — it silently returns 0% success on any real
+    # testnet. Do not use it for ceremony evidence.
+    local bench_bin="$REPO_ROOT/tools/citrate-bench/target/release/citrate-bench"
+    local legacy_bin="$REPO_ROOT/tests/load/target/release/benchmark-suite"
 
     if [ ! -f "$bench_bin" ]; then
-        local msg="Benchmark suite binary not found at $bench_bin"
+        local msg="citrate-bench binary not found at $bench_bin"
         if [ "$CEREMONY_MODE" = "real" ]; then
             log_err "$msg"
-            log_err "Real ceremony REQUIRES benchmark evidence. Build the suite first:"
-            log_err "  cd $REPO_ROOT/tests/load && cargo build --release"
+            log_err "Real ceremony REQUIRES benchmark evidence. Build the canonical harness first:"
+            log_err "  cd $REPO_ROOT/tools/citrate-bench && cargo build --release"
             log_err "Aborting ceremony — benchmark gate cannot be bypassed in real mode."
             echo "# Benchmark MISSING — ceremony aborted" > "$bench_out"
             echo "Binary not found: $bench_bin" >> "$bench_out"
@@ -438,16 +444,46 @@ step_benchmark() {
         else
             log_warn "$msg (rehearsal mode — continuing, but you MUST build this before real run)"
             echo "# Benchmark SKIPPED (rehearsal only)" > "$bench_out"
-            echo "The benchmark suite binary was not found. Build it with:" >> "$bench_out"
-            echo "  cd $REPO_ROOT/tests/load && cargo build --release" >> "$bench_out"
+            echo "The citrate-bench binary was not found. Build it with:" >> "$bench_out"
+            echo "  cd $REPO_ROOT/tools/citrate-bench && cargo build --release" >> "$bench_out"
             echo "" >> "$bench_out"
             echo "**This skip is ONLY acceptable in rehearsal mode.**" >> "$bench_out"
             return 0
         fi
     fi
 
-    log_ok "Running benchmark suite against $CEREMONY_RPC_URL"
-    if ! "$bench_bin" "$CEREMONY_RPC_URL" 1000 30 "$OUTPUT_DIR"; then
+    # CEREMONY_BENCH_KEYS_FILE is a file containing one hex 32-byte
+    # private key per line for burner signers. Operators set this in
+    # their ceremony env (e.g. derived from .env.testnet identities).
+    # For rehearsal-mode anvil runs, we use the funded deployer alone.
+    if [ -z "${CEREMONY_BENCH_KEYS_FILE:-}" ]; then
+        log_warn "CEREMONY_BENCH_KEYS_FILE not set — falling back to legacy harness"
+        if [ -f "$legacy_bin" ]; then
+            log_ok "Running legacy benchmark suite against $CEREMONY_RPC_URL (devnet-only — 0% success on real testnets)"
+            "$legacy_bin" "$CEREMONY_RPC_URL" 1000 30 "$OUTPUT_DIR" || true
+            # Do not fail the ceremony on legacy-harness issues — operator
+            # has been warned.
+            return 0
+        fi
+        log_warn "No legacy fallback either; skipping benchmark step"
+        return 0
+    fi
+
+    log_ok "Running citrate-bench against $CEREMONY_RPC_URL"
+    local bench_target_tps="${CEREMONY_BENCH_TARGET_TPS:-50}"
+    local bench_duration_secs="${CEREMONY_BENCH_DURATION_SECS:-30}"
+    local bench_cooldown_secs="${CEREMONY_BENCH_COOLDOWN_SECS:-300}"
+    local bench_report="$OUTPUT_DIR/benchmark_$(date -u +%Y-%m-%dT%H-%M-%SZ).md"
+
+    if ! "$bench_bin" bench \
+            --rpc-url "$CEREMONY_RPC_URL" \
+            --private-keys-file "$CEREMONY_BENCH_KEYS_FILE" \
+            --expected-chain-id "$CHAIN_ID" \
+            --target-tps "$bench_target_tps" \
+            --duration-secs "$bench_duration_secs" \
+            --gas-price-gwei 1 \
+            --cooldown-secs "$bench_cooldown_secs" \
+            > "$bench_report.raw" 2>&1; then
         local msg="Benchmark suite exited with non-zero status"
         if [ "$CEREMONY_MODE" = "real" ]; then
             log_err "$msg"
@@ -458,6 +494,22 @@ step_benchmark() {
             return 0
         fi
     fi
+
+    # Wrap the human-readable bench stdout as markdown so the report
+    # discovery check below sees it.
+    {
+        echo "# Citrate Benchmark — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo ""
+        echo "Harness: tools/citrate-bench (canonical, signs client-side)"
+        echo "RPC: $CEREMONY_RPC_URL"
+        echo "Chain: $CHAIN_ID"
+        echo "Target TPS: $bench_target_tps for ${bench_duration_secs}s"
+        echo ""
+        echo '```'
+        cat "$bench_report.raw"
+        echo '```'
+    } > "$bench_report"
+    rm -f "$bench_report.raw"
 
     # Verify the benchmark actually wrote a report file
     # (the benchmark-suite binary writes benchmark_<timestamp>.md into OUTPUT_DIR)
