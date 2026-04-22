@@ -18,8 +18,8 @@
 - **Public RPC (cloudflared tunnel)**: `https://rpc2.citrate.ai` (second path to the same droplet)
 - **Explorer**: `https://explorer.citrate.ai`
 - **Faucet**: `https://faucet.citrate.ai`
-- **Snapshot last verified**: 2026-04-08, block 772
-- **Contract count**: **36** (27 core + 3 AI gateway + 5 edu + 1 model access control)
+- **Snapshot last verified**: 2026-04-22, post-reroll
+- **Contract count**: **36** (from 30_address_table.json)
 - **Status**: dry-run — chain will be rerolled before the real ceremony freeze
 
 ---
