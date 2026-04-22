@@ -61,6 +61,41 @@ readonly BOLD='\033[1m'
 readonly NC='\033[0m'
 
 FORGE_WALLET_ARGS=()
+CEREMONY_PASSFILE=""
+
+# Bridge CAST_PASSWORD (how operators set the keystore password for cast,
+# e.g. in .env.testnet) to ETH_PASSWORD (the file-path env var forge
+# consults for --account). Without this bridge, forge falls back to an
+# interactive stdin prompt and dies with ENXIO in scripted runs.
+#
+# We only create a temp file if neither ETH_PASSWORD nor --password is
+# already in play. The temp file is chmod 600 and shredded on exit via
+# the trap below. Callers that prefer to manage their own password file
+# can pre-set ETH_PASSWORD and this branch is skipped.
+setup_forge_password() {
+    if [ -n "${ETH_PASSWORD:-}" ]; then
+        return 0
+    fi
+    if [ -z "${CAST_PASSWORD:-}" ]; then
+        return 0
+    fi
+    CEREMONY_PASSFILE="$(mktemp -t citrate-ceremony-pass.XXXXXXXX)"
+    chmod 600 "$CEREMONY_PASSFILE"
+    printf '%s' "$CAST_PASSWORD" > "$CEREMONY_PASSFILE"
+    export ETH_PASSWORD="$CEREMONY_PASSFILE"
+}
+
+cleanup_forge_password() {
+    if [ -n "$CEREMONY_PASSFILE" ] && [ -f "$CEREMONY_PASSFILE" ]; then
+        if command -v shred >/dev/null 2>&1; then
+            shred -u "$CEREMONY_PASSFILE" 2>/dev/null || rm -f "$CEREMONY_PASSFILE"
+        else
+            rm -f "$CEREMONY_PASSFILE"
+        fi
+        CEREMONY_PASSFILE=""
+    fi
+}
+trap cleanup_forge_password EXIT INT TERM
 
 # ---- Logging ----
 log_step() { echo -e "\n${CYAN}[$(date -u +%H:%M:%S)]${NC} ${BOLD}$1${NC}"; }
@@ -182,6 +217,12 @@ step_preflight() {
     require_env CEREMONY_DEPLOYER_ADDRESS
     require_deployer_auth
     build_forge_wallet_args
+    setup_forge_password
+    if [ -n "${ETH_PASSWORD:-}" ]; then
+        log_ok "Forge keystore password: ETH_PASSWORD is set (file-path)"
+    else
+        log_warn "Forge keystore password not set — ceremony will prompt on stdin (interactive only)"
+    fi
 
     log_ok "Preflight complete — log at $log"
 }
