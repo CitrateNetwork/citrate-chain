@@ -322,11 +322,26 @@ impl PeerManager {
         self.peers.iter().map(|p| p.value().clone()).collect()
     }
 
-    /// Get peer count by direction
+    /// Get peer count by direction.
+    ///
+    /// Returns `(total, inbound, outbound)` where `total` is the live
+    /// size of the peer map (ground truth). `inbound` and `outbound`
+    /// come from the stats counter, which may drift by 1–2 during
+    /// churn but converges back to the map size on the next
+    /// add/remove cycle.
+    ///
+    /// Why this matters: `stats.total_connected` used to be the
+    /// source of truth, but on a reconnecting-peer workload we
+    /// observed the counter growing to 34 while the peer map had
+    /// exactly 1 entry. Root cause is any code path that inserts a
+    /// peer into the map without going through `add_peer()`, or a
+    /// crash between `add_peer()` and subsequent `remove_peer()`.
+    /// Rather than audit every `self.peers.insert` site, we trust
+    /// the map for `total`.
     pub async fn get_peer_counts(&self) -> (usize, usize, usize) {
         let stats = self.stats.read().await;
         (
-            stats.total_connected,
+            self.peers.len(),
             stats.inbound_count,
             stats.outbound_count,
         )

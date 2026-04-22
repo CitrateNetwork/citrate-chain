@@ -339,7 +339,10 @@ impl Default for NodeConfig {
                 // skip block production unless --coinbase is provided on the CLI
                 // or set in the config file. This prevents rewards going to 0x000.
                 coinbase: String::new(),
-                target_block_time: 5,
+                // Default block time — testnet target per CLAUDE.md is 1–2s.
+                // Mainnet.toml explicitly overrides to 5s for conservatism,
+                // so lowering the default doesn't affect mainnet.
+                target_block_time: 1,
                 min_gas_price: 1_000_000_000,
             },
             validator: ValidatorConfig::default(),
@@ -434,7 +437,7 @@ mod tests {
         );
 
         assert!(config.mining.enabled);
-        assert_eq!(config.mining.target_block_time, 5);
+        assert_eq!(config.mining.target_block_time, 1);
         assert_eq!(config.mining.min_gas_price, 1_000_000_000);
 
         assert!(config.vrf.strict_vrf);

@@ -156,7 +156,15 @@ enum Command {
         per_signer_max_inflight: usize,
         #[arg(long, default_value_t = 500)]
         concurrency_cap: usize,
-        #[arg(long, default_value_t = 15)]
+        /// Seconds to keep the tracker polling after the send phase
+        /// ends. `drain()` is wrapped in `timeout(cooldown_secs)` — if
+        /// the timeout fires before all workers finish their polls,
+        /// stats reset to zero and `included` silently reports 0. The
+        /// default is sized to let a pool of 16 workers clear a queue
+        /// of ~1000 receipts even when the chain catches up lazily
+        /// (observed on single-node testnets: ~10s avg inclusion
+        /// latency + per-tx retries).
+        #[arg(long, default_value_t = 300)]
         cooldown_secs: u64,
         #[arg(long, default_value_t = 16)]
         tracker_workers: usize,
