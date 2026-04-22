@@ -1038,32 +1038,54 @@ impl BlockProducer {
     }
 
     /// Select transactions with AI operation priority.
+    ///
     /// H-03 fix: Deduplicates by hash across AI and standard selection phases.
+    ///
+    /// **Throughput sizing (Apr 2026)**: previously this function hardcoded
+    /// `MAX_STANDARD_TXS = 100`, which was the real TPS ceiling on the node
+    /// (100 txs/block × 1 block / block_time). That cap is gone; selection
+    /// is now bounded by `MAX_GAS_PER_BLOCK` (30M gas, which fits ~1400
+    /// simple transfers at 21k gas each) and `MAX_BLOCK_SIZE` (1 MB, the
+    /// network-aligned transport limit — H-08). The tx-count cap stays in
+    /// play as a safety valve at 5000, matching `BlockBuilderConfig::Default`.
+    ///
+    /// We stop filling as soon as any cap would be exceeded, so a block
+    /// with a mix of high-gas contract calls naturally packs fewer txs.
     async fn select_transactions_with_ai_priority(&self) -> anyhow::Result<Vec<Transaction>> {
         let mut selected = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut total_gas: u64 = 0;
 
-        // Define capacity limits
-        // H-08 fix: Use network-aligned limit (see WP-G.6)
-        const MAX_BLOCK_SIZE: usize = 1_000_000; // 1MB — aligned with transport/gossip
+        // Capacity limits. Gas is the dominant real-world ceiling;
+        // count + size are safety valves.
+        const MAX_BLOCK_SIZE: usize = 1_000_000; // 1 MB — matches transport (H-08)
+        const MAX_GAS_PER_BLOCK: u64 = 30_000_000; // Chain genesis constant
         const MAX_AI_TXS_PER_BLOCK: usize = 10;
-        const MAX_STANDARD_TXS: usize = 100;
+        const MAX_STANDARD_TXS: usize = 5_000;
 
-        // Get AI transactions first (model operations, inference requests)
+        // AI transactions first (model ops, inference). Small reserved slice.
         let ai_txs = self.mempool.get_ai_transactions(MAX_AI_TXS_PER_BLOCK).await;
         for tx in ai_txs {
+            if total_gas.saturating_add(tx.gas_limit) > MAX_GAS_PER_BLOCK {
+                break;
+            }
             if seen.insert(tx.hash) {
+                total_gas = total_gas.saturating_add(tx.gas_limit);
                 selected.push(tx);
             }
         }
 
-        // Fill remaining space with standard transactions, skipping duplicates
+        // Fill remaining gas budget with standard txs.
         let standard_txs = self
             .mempool
             .get_best_transactions(MAX_STANDARD_TXS, MAX_BLOCK_SIZE)
             .await;
         for tx in standard_txs {
+            if total_gas.saturating_add(tx.gas_limit) > MAX_GAS_PER_BLOCK {
+                break;
+            }
             if seen.insert(tx.hash) {
+                total_gas = total_gas.saturating_add(tx.gas_limit);
                 selected.push(tx);
             }
         }
