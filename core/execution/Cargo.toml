@@ -43,7 +43,7 @@ ndarray-rand = "0.14"
 
 # Zero-knowledge proofs (experimental — circuits are placeholder implementations)
 # Production Groth16 verification gated behind `zkp_production` in core/mcp
-ark-std = "0.4"
+ark-std = "0.5"
 ark-ff = "0.4"
 ark-ec = "0.4"
 ark-poly = "0.4"
