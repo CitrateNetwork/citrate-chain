@@ -151,26 +151,53 @@ impl GhostDag {
         selected_parent_blue: &BlueSet,
         current_blue_parents: &[Hash],
     ) -> Result<bool, GhostDagError> {
-        // Count blue anticone size
+        // The k-cluster rule only cares whether the anticone count
+        // exceeds k — not the exact count. We pass k as an upper bound
+        // so `count_blue_anticone` can short-circuit after k+1 hits,
+        // instead of walking the entire blue set (thousands of entries
+        // on a long-running chain) with an O(BFS_depth) call each.
+        //
+        // Before this bound, validation of a single block at chain
+        // height 14k+ was doing millions of BFS visits and OOM-killing
+        // the node (observed on testnet-beta, Apr 2026). See
+        // `count_blue_anticone` docs.
+        let k = self.params.k as usize;
         let anticone_size = self
-            .count_blue_anticone(candidate, selected_parent_blue, current_blue_parents)
+            .count_blue_anticone(candidate, selected_parent_blue, current_blue_parents, k + 1)
             .await?;
 
-        // Check k-cluster rule
-        Ok(anticone_size <= self.params.k as usize)
+        Ok(anticone_size <= k)
     }
 
-    /// Count blue blocks in anticone
+    /// Count blue blocks in anticone, short-circuiting once the count
+    /// reaches `max_count` (the caller only needs to know whether the
+    /// count exceeds a threshold, not the exact total).
+    ///
+    /// **Why the bound matters**: each pair of `is_ancestor_of` calls
+    /// does a BFS up to `MAX_BFS_DEPTH` ancestors, allocating a
+    /// HashSet + VecDeque per call. A reference blue set on a
+    /// long-running chain can contain thousands of blocks, so the
+    /// unbounded version did O(|blue_set| × BFS_depth) work per block
+    /// validation — routinely millions of visits and the actual
+    /// memory pressure behind the OOM loop on testnet-beta (Apr 2026).
+    ///
+    /// With `max_count = k + 1` (the k-cluster rule's threshold), this
+    /// caps the work at O(k × BFS_depth) per call. For k=18, that's
+    /// ~18 BFS calls worst case instead of thousands.
     async fn count_blue_anticone(
         &self,
         block: &Hash,
         reference_blue_set: &BlueSet,
         additional_blues: &[Hash],
+        max_count: usize,
     ) -> Result<usize, GhostDagError> {
         let mut count = 0;
 
         // Check against reference blue set
         for blue_block in &reference_blue_set.blocks {
+            if count >= max_count {
+                return Ok(count);
+            }
             if !self.is_ancestor_of(block, blue_block).await?
                 && !self.is_ancestor_of(blue_block, block).await?
             {
@@ -180,6 +207,9 @@ impl GhostDag {
 
         // Check against additional blue blocks
         for blue_block in additional_blues {
+            if count >= max_count {
+                return Ok(count);
+            }
             if !self.is_ancestor_of(block, blue_block).await?
                 && !self.is_ancestor_of(blue_block, block).await?
             {
@@ -213,7 +243,16 @@ impl GhostDag {
                 continue;
             }
             if visited.len() >= MAX_BFS_DEPTH {
-                tracing::warn!("BFS ancestry check exceeded depth limit ({})", MAX_BFS_DEPTH);
+                // Demoted from warn to debug: on a long-running chain
+                // this fires per block validation and the I/O floods
+                // the log before systemd can rotate it. The false-
+                // negative behavior (treating an unreachable-within-
+                // 10k-ancestors block as "not an ancestor") is
+                // unchanged — this is just log volume.
+                debug!(
+                    "BFS ancestry check exceeded depth limit ({}) for {} → {}",
+                    MAX_BFS_DEPTH, ancestor, descendant
+                );
                 return Ok(false);
             }
             visited.insert(current);
@@ -565,6 +604,64 @@ mod tests {
         assert!(blue.contains(&c.hash()));
         assert!(blue.contains(&d.hash()));
         assert!(blue.score >= 4);
+    }
+
+    #[tokio::test]
+    async fn test_count_blue_anticone_short_circuits_at_max_count() {
+        // Regression test for the OOM fix (Apr 2026): count_blue_anticone
+        // must stop walking once the count reaches max_count. The caller
+        // (is_blue_candidate) only needs to know whether the count
+        // exceeds k; walking the entire blue set is O(|blue| × BFS_depth)
+        // per block and drove the testnet-beta node into a 14k-restart
+        // OOM loop.
+        let params = GhostDagParams::default();
+        let dag_store = Arc::new(DagStore::new());
+        let ghostdag = GhostDag::new(params, dag_store.clone());
+
+        // Build a reference blue set with many unrelated blocks — all
+        // hit the "not ancestor" branch and increment count.
+        let mut blue_set = BlueSet::new();
+        for i in 0..200u8 {
+            let mut h = [0u8; 32];
+            h[0] = i;
+            blue_set.insert(Hash::new(h));
+        }
+        blue_set.score = 200;
+
+        let mut candidate_hash = [0u8; 32];
+        candidate_hash[31] = 0xFF;
+        let candidate = Hash::new(candidate_hash);
+
+        // max_count = 5 — should return exactly 5, not 200.
+        let count = ghostdag
+            .count_blue_anticone(&candidate, &blue_set, &[], 5)
+            .await
+            .expect("count_blue_anticone should succeed");
+
+        assert_eq!(count, 5, "expected early-exit at max_count=5, got {}", count);
+    }
+
+    #[tokio::test]
+    async fn test_count_blue_anticone_zero_max_short_circuits_immediately() {
+        // Edge case: max_count=0 must return 0 without walking at all.
+        let params = GhostDagParams::default();
+        let dag_store = Arc::new(DagStore::new());
+        let ghostdag = GhostDag::new(params, dag_store.clone());
+
+        let mut blue_set = BlueSet::new();
+        for i in 0..50u8 {
+            let mut h = [0u8; 32];
+            h[0] = i;
+            blue_set.insert(Hash::new(h));
+        }
+
+        let candidate = Hash::new([0xAA; 32]);
+        let count = ghostdag
+            .count_blue_anticone(&candidate, &blue_set, &[], 0)
+            .await
+            .expect("count_blue_anticone should succeed");
+
+        assert_eq!(count, 0);
     }
 
     // -----------------------------------------------------------------------
