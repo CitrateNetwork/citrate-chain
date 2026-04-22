@@ -151,26 +151,53 @@ impl GhostDag {
         selected_parent_blue: &BlueSet,
         current_blue_parents: &[Hash],
     ) -> Result<bool, GhostDagError> {
-        // Count blue anticone size
+        // The k-cluster rule only cares whether the anticone count
+        // exceeds k — not the exact count. We pass k as an upper bound
+        // so `count_blue_anticone` can short-circuit after k+1 hits,
+        // instead of walking the entire blue set (thousands of entries
+        // on a long-running chain) with an O(BFS_depth) call each.
+        //
+        // Before this bound, validation of a single block at chain
+        // height 14k+ was doing millions of BFS visits and OOM-killing
+        // the node (observed on testnet-beta, Apr 2026). See
+        // `count_blue_anticone` docs.
+        let k = self.params.k as usize;
         let anticone_size = self
-            .count_blue_anticone(candidate, selected_parent_blue, current_blue_parents)
+            .count_blue_anticone(candidate, selected_parent_blue, current_blue_parents, k + 1)
             .await?;
 
-        // Check k-cluster rule
-        Ok(anticone_size <= self.params.k as usize)
+        Ok(anticone_size <= k)
     }
 
-    /// Count blue blocks in anticone
+    /// Count blue blocks in anticone, short-circuiting once the count
+    /// reaches `max_count` (the caller only needs to know whether the
+    /// count exceeds a threshold, not the exact total).
+    ///
+    /// **Why the bound matters**: each pair of `is_ancestor_of` calls
+    /// does a BFS up to `MAX_BFS_DEPTH` ancestors, allocating a
+    /// HashSet + VecDeque per call. A reference blue set on a
+    /// long-running chain can contain thousands of blocks, so the
+    /// unbounded version did O(|blue_set| × BFS_depth) work per block
+    /// validation — routinely millions of visits and the actual
+    /// memory pressure behind the OOM loop on testnet-beta (Apr 2026).
+    ///
+    /// With `max_count = k + 1` (the k-cluster rule's threshold), this
+    /// caps the work at O(k × BFS_depth) per call. For k=18, that's
+    /// ~18 BFS calls worst case instead of thousands.
     async fn count_blue_anticone(
         &self,
         block: &Hash,
         reference_blue_set: &BlueSet,
         additional_blues: &[Hash],
+        max_count: usize,
     ) -> Result<usize, GhostDagError> {
         let mut count = 0;
 
         // Check against reference blue set
         for blue_block in &reference_blue_set.blocks {
+            if count >= max_count {
+                return Ok(count);
+            }
             if !self.is_ancestor_of(block, blue_block).await?
                 && !self.is_ancestor_of(blue_block, block).await?
             {
@@ -180,6 +207,9 @@ impl GhostDag {
 
         // Check against additional blue blocks
         for blue_block in additional_blues {
+            if count >= max_count {
+                return Ok(count);
+            }
             if !self.is_ancestor_of(block, blue_block).await?
                 && !self.is_ancestor_of(blue_block, block).await?
             {
@@ -213,7 +243,16 @@ impl GhostDag {
                 continue;
             }
             if visited.len() >= MAX_BFS_DEPTH {
-                tracing::warn!("BFS ancestry check exceeded depth limit ({})", MAX_BFS_DEPTH);
+                // Demoted from warn to debug: on a long-running chain
+                // this fires per block validation and the I/O floods
+                // the log before systemd can rotate it. The false-
+                // negative behavior (treating an unreachable-within-
+                // 10k-ancestors block as "not an ancestor") is
+                // unchanged — this is just log volume.
+                debug!(
+                    "BFS ancestry check exceeded depth limit ({}) for {} → {}",
+                    MAX_BFS_DEPTH, ancestor, descendant
+                );
                 return Ok(false);
             }
             visited.insert(current);
@@ -243,7 +282,30 @@ impl GhostDag {
         Ok(blue_set.score)
     }
 
-    /// Get or calculate blue set for a block
+    /// Get or calculate blue set for a block.
+    ///
+    /// The selected-parent chain walk is **iterative** so replay of a
+    /// long chain with an empty cache cannot blow the stack. Before
+    /// this rewrite, a fresh startup recursed one frame per block along
+    /// the selected-parent chain. On testnet-beta at chain height ~1800
+    /// the main thread hit its stack limit and aborted with:
+    ///
+    /// ```text
+    /// thread 'main' has overflowed its stack
+    /// fatal runtime error: stack overflow, aborting
+    /// ```
+    ///
+    /// Now the algorithm:
+    ///
+    /// 1. Walk the selected-parent chain backward, collecting each
+    ///    uncached block into a `Vec`, until we hit either the cache,
+    ///    genesis, or a missing block (error). All heap, no recursion.
+    /// 2. Walk that list forward (oldest → newest), composing each
+    ///    block's blue set from its now-cached selected parent plus
+    ///    its qualified merge parents.
+    ///
+    /// Merge-parent calls remain recursive because merge parents form
+    /// a wide-but-shallow DAG in practice, not a 1000+ deep chain.
     fn get_or_calculate_blue_set<'a>(
         &'a self,
         hash: &'a Hash,
@@ -251,49 +313,86 @@ impl GhostDag {
         Box<dyn std::future::Future<Output = Result<BlueSet, GhostDagError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            // Check cache first
+            // Fast path: already cached
             if let Some(cached) = self.blue_cache.read().await.get(hash) {
                 return Ok(cached.clone());
             }
 
-            // Fetch the block from DAG store
-            let block = self
-                .dag_store
-                .get_block(hash)
-                .await
-                .map_err(|_| GhostDagError::BlockNotFound(*hash))?;
+            // --- Phase 1: unwind the selected-parent chain iteratively ---
+            // `pending` holds blocks whose blue set we must compute,
+            // ordered from oldest (pending.last()) to newest (pending.first()).
+            let mut pending: Vec<Block> = Vec::new();
+            let mut cursor = *hash;
 
-            // Genesis: blue set is itself
-            if block.is_genesis() {
+            loop {
+                if self.blue_cache.read().await.contains_key(&cursor) {
+                    // Hit a cached ancestor — stop walking back.
+                    break;
+                }
+
+                let block = self
+                    .dag_store
+                    .get_block(&cursor)
+                    .await
+                    .map_err(|_| GhostDagError::BlockNotFound(cursor))?;
+
+                if block.is_genesis() {
+                    // Seed the cache with genesis, then stop.
+                    let mut blue = BlueSet::new();
+                    blue.blocks.insert(cursor);
+                    blue.score = 1;
+                    self.blue_cache.write().await.insert(cursor, blue);
+                    break;
+                }
+
+                let parent = block.selected_parent();
+                pending.push(block);
+                cursor = parent;
+            }
+
+            // --- Phase 2: compose blue sets forward, oldest first ---
+            // pending is newest-first; reverse-iterate for oldest-first.
+            for block in pending.iter().rev() {
+                let bhash = block.hash();
+
+                let selected_parent_blue = {
+                    let cache = self.blue_cache.read().await;
+                    cache
+                        .get(&block.selected_parent())
+                        .cloned()
+                        .ok_or_else(|| {
+                            // Should never happen — Phase 1 guarantees
+                            // the selected parent is now cached.
+                            GhostDagError::BlockNotFound(block.selected_parent())
+                        })?
+                };
+
+                let blue_merge_parents = self
+                    .calculate_blue_merge_parents(block, &selected_parent_blue)
+                    .await?;
+
+                let mut all_blocks = selected_parent_blue.blocks.clone();
+                // Merge parents: recurse, but depth here is bounded by
+                // DAG width (usually <= max_parents = 10), not chain
+                // length, so stack is safe.
+                for p in &blue_merge_parents {
+                    let pset = self.get_or_calculate_blue_set(p).await?;
+                    all_blocks.extend(pset.blocks);
+                }
+                all_blocks.insert(bhash);
+
                 let mut blue = BlueSet::new();
-                blue.blocks.insert(*hash);
-                blue.score = 1;
-                self.blue_cache.write().await.insert(*hash, blue.clone());
-                return Ok(blue);
+                blue.blocks = all_blocks;
+                blue.score = blue.blocks.len() as u64;
+                self.blue_cache.write().await.insert(bhash, blue);
             }
 
-            // Recursively compose from selected parent and qualified merge parents
-            let selected_parent_blue = self
-                .get_or_calculate_blue_set(&block.selected_parent())
-                .await?;
-
-            // Determine blue merge parents using the same rule as top-level calculation
-            let blue_merge_parents = self
-                .calculate_blue_merge_parents(&block, &selected_parent_blue)
-                .await?;
-
-            let mut all_blocks = selected_parent_blue.blocks.clone();
-            for p in &blue_merge_parents {
-                let pset = self.get_or_calculate_blue_set(p).await?;
-                all_blocks.extend(pset.blocks);
-            }
-            all_blocks.insert(*hash);
-
-            let mut blue = BlueSet::new();
-            blue.blocks = all_blocks;
-            blue.score = blue.blocks.len() as u64;
-            self.blue_cache.write().await.insert(*hash, blue.clone());
-            Ok(blue)
+            // By construction the requested hash is now cached.
+            let cache = self.blue_cache.read().await;
+            cache
+                .get(hash)
+                .cloned()
+                .ok_or(GhostDagError::BlockNotFound(*hash))
         })
     }
 
@@ -565,6 +664,114 @@ mod tests {
         assert!(blue.contains(&c.hash()));
         assert!(blue.contains(&d.hash()));
         assert!(blue.score >= 4);
+    }
+
+    #[tokio::test]
+    async fn test_count_blue_anticone_short_circuits_at_max_count() {
+        // Regression test for the OOM fix (Apr 2026): count_blue_anticone
+        // must stop walking once the count reaches max_count. The caller
+        // (is_blue_candidate) only needs to know whether the count
+        // exceeds k; walking the entire blue set is O(|blue| × BFS_depth)
+        // per block and drove the testnet-beta node into a 14k-restart
+        // OOM loop.
+        let params = GhostDagParams::default();
+        let dag_store = Arc::new(DagStore::new());
+        let ghostdag = GhostDag::new(params, dag_store.clone());
+
+        // Build a reference blue set with many unrelated blocks — all
+        // hit the "not ancestor" branch and increment count.
+        let mut blue_set = BlueSet::new();
+        for i in 0..200u8 {
+            let mut h = [0u8; 32];
+            h[0] = i;
+            blue_set.insert(Hash::new(h));
+        }
+        blue_set.score = 200;
+
+        let mut candidate_hash = [0u8; 32];
+        candidate_hash[31] = 0xFF;
+        let candidate = Hash::new(candidate_hash);
+
+        // max_count = 5 — should return exactly 5, not 200.
+        let count = ghostdag
+            .count_blue_anticone(&candidate, &blue_set, &[], 5)
+            .await
+            .expect("count_blue_anticone should succeed");
+
+        assert_eq!(count, 5, "expected early-exit at max_count=5, got {}", count);
+    }
+
+    #[tokio::test]
+    async fn test_deep_chain_cold_blue_set_is_stack_safe() {
+        // Regression for the stack-overflow fix (Apr 2026): on a fresh
+        // start with an empty blue_cache, computing the blue set for
+        // the tip of a long selected-parent chain must not recurse
+        // one-frame-per-block. Before the iterative rewrite, this
+        // aborted the main thread at ~1800 blocks on testnet-beta.
+        //
+        // We build a 4_000-block linear chain and call calculate_blue_set
+        // on its tip with an EMPTY cache (no priming from add_block's
+        // own cache writes). 4k is well past the pre-fix crash point
+        // (~1779) and within a normal test runtime.
+        let params = GhostDagParams::default();
+        let dag_store = Arc::new(DagStore::new());
+        let ghostdag = GhostDag::new(params, dag_store.clone());
+
+        // Genesis, primed into dag_store only (not into blue_cache).
+        let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        let mut prev = genesis.hash();
+
+        for i in 0..4_000usize {
+            let mut h = [0u8; 32];
+            h[0..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            let block = create_test_block_with_parents(h, prev, vec![], (i + 1) as u64);
+            dag_store.store_block(block.clone()).await.unwrap();
+            prev = block.hash();
+        }
+
+        // Compute blue set for the tip with an empty blue_cache.
+        // Must not panic with stack overflow.
+        let tip_block = dag_store.get_block(&prev).await.unwrap();
+        let blue = ghostdag
+            .calculate_blue_set(&tip_block)
+            .await
+            .expect("deep-chain cold blue set should succeed");
+
+        // Primary invariant: cold computation completes without stack
+        // overflow. Score and block count are both positive and
+        // correlated with chain length. The exact count depends on
+        // how BlueSet::insert handles hash collisions and the
+        // is_genesis/blocks-insertion semantics of calculate_blue_set;
+        // property-based tests cover the precise relationships.
+        assert!(
+            blue.blocks.len() > 3_900,
+            "blue set should contain nearly all 4000 chain blocks, got {}",
+            blue.blocks.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_count_blue_anticone_zero_max_short_circuits_immediately() {
+        // Edge case: max_count=0 must return 0 without walking at all.
+        let params = GhostDagParams::default();
+        let dag_store = Arc::new(DagStore::new());
+        let ghostdag = GhostDag::new(params, dag_store.clone());
+
+        let mut blue_set = BlueSet::new();
+        for i in 0..50u8 {
+            let mut h = [0u8; 32];
+            h[0] = i;
+            blue_set.insert(Hash::new(h));
+        }
+
+        let candidate = Hash::new([0xAA; 32]);
+        let count = ghostdag
+            .count_blue_anticone(&candidate, &blue_set, &[], 0)
+            .await
+            .expect("count_blue_anticone should succeed");
+
+        assert_eq!(count, 0);
     }
 
     // -----------------------------------------------------------------------
