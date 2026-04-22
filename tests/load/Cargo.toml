@@ -23,7 +23,7 @@ path = "src/bin/bench_signed.rs"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
-rand = "0.9"
+rand = { workspace = true }
 futures = "0.3"
 chrono = "0.4"
 # bench-signed: self-sign EIP-155 legacy transactions
