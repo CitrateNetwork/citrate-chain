@@ -67,13 +67,25 @@ sha3 = "0.10"
 blake3 = "1.5"
 ed25519-dalek = { version = "2.1", features = ["serde"] }
 x25519-dalek = "2.0"
-# Pinned to 0.8.6: rand 0.9 is a breaking API migration (thread_rng→rng,
-# gen→random, OsRng becomes TryCryptoRng). GHSA-cq8v-f236-94qc is the only
-# open advisory — severity=low, CVSS 0.0, requires a custom log::Log
-# handler that calls rand::rng(). Citrate uses tracing-subscriber and
-# does not meet the trigger preconditions. Migration is scheduled as a
-# dedicated WP; see .agentile/sprints/backlog/rand-0.9-migration.md.
-rand = "=0.9.3"
+# Workspace pin: "0.8" (range, not an exact =). rand 0.9 is a
+# breaking API migration (thread_rng→rng, gen→random, OsRng becomes
+# TryCryptoRng). Our direct-use crates (consensus, execution, wallet,
+# network, cli, etc.) still use the 0.8 API. Migration tracked in
+# BACKLOG #124.
+#
+# We intentionally allow transitive consumers (e.g. rfd → ashpd →
+# rand 0.9) to pull their own 0.9 copy. Cargo de-duplicates major-
+# version trees, so direct consumers stay on 0.8 and the two versions
+# coexist until the migration closes #124. Do NOT change this to an
+# exact "=0.8.6" — that forces a resolution error on any crate that
+# requires 0.9.
+#
+# Dependabot history: PRs #62, #83 (2026-04-22) both tried to bump
+# this to 0.9.x. The `ignore` rule in dependabot.yml blocks
+# semver-major/minor; the "security group" override bypassed it
+# once. Keep this pin and close future Dependabot rand PRs with a
+# pointer to BACKLOG #124 until the migration ships.
+rand = "0.8"
 
 # Networking
 libp2p = "0.54"
@@ -98,7 +110,10 @@ thiserror = "1.0"
 anyhow = "1.0"
 
 # Testing
-proptest = "1.5"
+# Pinned to 1.5.0 — proptest 1.11+ requires rand 0.9 which we haven't
+# migrated to yet (BACKLOG #124). Workspace-wide pin here so every
+# consumer stays on a version compatible with rand 0.8.6.
+proptest = "=1.5.0"
 criterion = "0.5"
 
 [profile.release]
