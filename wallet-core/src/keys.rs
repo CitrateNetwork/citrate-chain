@@ -478,6 +478,40 @@ pub fn derive_address(pubkey_bytes: &[u8; 32]) -> String {
     derive_address_from_ed25519(pubkey_bytes)
 }
 
+/// Deterministically derive a secp256k1 secret scalar from a BIP39 seed.
+///
+/// Uses the first 32 bytes of the 64-byte seed. If that scalar lies outside
+/// the valid range [1, n-1] (probability ≈ 2^-128 for uniform entropy), we
+/// fall back to the last 32 bytes. If both fail, the mnemonic is
+/// unrecoverable-to-secp256k1 and we surface an error so callers see the
+/// failure instead of panicking.
+///
+/// This is intentionally not BIP32/BIP44 — Citrate doesn't yet use HD
+/// derivation paths. The scheme is simple enough that `seed → address` is
+/// deterministic: same mnemonic → same address, always.
+pub fn secp256k1_secret_from_seed(seed: &[u8]) -> Result<[u8; 32], WalletError> {
+    if seed.len() < 32 {
+        return Err(WalletError::KeyGeneration(
+            "seed too short (need at least 32 bytes)".to_string(),
+        ));
+    }
+    let mut primary = [0u8; 32];
+    primary.copy_from_slice(&seed[..32]);
+    if k256::ecdsa::SigningKey::from_bytes((&primary).into()).is_ok() {
+        return Ok(primary);
+    }
+    if seed.len() >= 64 {
+        let mut secondary = [0u8; 32];
+        secondary.copy_from_slice(&seed[seed.len() - 32..]);
+        if k256::ecdsa::SigningKey::from_bytes((&secondary).into()).is_ok() {
+            return Ok(secondary);
+        }
+    }
+    Err(WalletError::KeyGeneration(
+        "seed does not yield a valid secp256k1 scalar".to_string(),
+    ))
+}
+
 /// Encrypt an Ed25519 signing key (convenience wrapper).
 fn encrypt_key(
     signing_key: &Ed25519SigningKey,
