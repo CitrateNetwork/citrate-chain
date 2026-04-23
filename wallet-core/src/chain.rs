@@ -4,7 +4,7 @@
 //! as read-only dependencies. Does NOT modify chain crates.
 
 use crate::error::WalletError;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use sha3::{Digest, Keccak256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -171,13 +171,82 @@ impl TransactionBuilder {
     }
 
     /// Sign the transaction with an Ed25519 key. Returns the signed raw bytes.
+    ///
+    /// The `raw` output is a bincode-serialized `citrate_consensus::types::Transaction`
+    /// — the exact format the chain's `eth_tx_decoder` recognizes in its
+    /// bincode fallback path. Earlier versions of this function produced a
+    /// hand-rolled layout that matched neither RLP nor bincode, so every
+    /// ed25519 `eth_sendRawTransaction` call returned "failed to parse
+    /// transaction".
     pub fn sign(self, signing_key: &SigningKey, nonce: u64) -> Result<SignedTransaction, WalletError> {
-        let tx_hash = self.build_hash(nonce);
-        let signature = signing_key.sign(&tx_hash);
+        use citrate_consensus::types as cc_types;
+
+        // Build the chain's Transaction struct.
+        let from_pubkey_bytes = signing_key.verifying_key().to_bytes();
+        let from_pk = cc_types::PublicKey::new(from_pubkey_bytes);
+
+        let to_pk = if let Some(ref to_hex) = self.to {
+            let to_clean = to_hex.strip_prefix("0x").unwrap_or(to_hex);
+            let decoded = hex::decode(to_clean)
+                .map_err(|e| WalletError::SigningFailed(format!("Invalid 'to' hex: {}", e)))?;
+            if decoded.is_empty() {
+                None
+            } else {
+                // 20-byte EVM address → embed in first 20 bytes, zero-pad to 32.
+                // 32-byte native pubkey → copy as-is.
+                let mut pk_bytes = [0u8; 32];
+                let copy_len = decoded.len().min(32);
+                pk_bytes[..copy_len].copy_from_slice(&decoded[..copy_len]);
+                Some(cc_types::PublicKey::new(pk_bytes))
+            }
+        } else {
+            None
+        };
+
+        let mut tx = cc_types::Transaction {
+            hash: cc_types::Hash::default(),
+            nonce,
+            from: from_pk,
+            to: to_pk,
+            value: self.value,
+            gas_limit: self.gas_limit,
+            gas_price: self.gas_price,
+            data: self.data.clone(),
+            signature: cc_types::Signature::default(),
+            tx_type: None,
+            eth_tx_type: 0,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            access_list: None,
+            chain_id: Some(self.chain_id),
+            ecdsa_verified: false,
+        };
+
+        // Sign via the chain's canonical byte format so `verify_transaction`
+        // on the node side accepts the signature. `sign_transaction` also
+        // refreshes `tx.from` from the signing key (defensive).
+        citrate_consensus::crypto::sign_transaction(&mut tx, signing_key)
+            .map_err(|e| WalletError::SigningFailed(format!("ed25519 sign failed: {:?}", e)))?;
+
+        // Hash the signed transaction so `hash` is populated for UI display.
+        // The chain may recompute this; it's not authoritative here.
+        let mut hasher = Keccak256::new();
+        let canonical = bincode::serialize(&tx)
+            .map_err(|e| WalletError::SigningFailed(format!("bincode serialize: {}", e)))?;
+        hasher.update(&canonical);
+        let hash = hasher.finalize();
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(&hash);
+        tx.hash = cc_types::Hash::new(hash_bytes);
+
+        // Re-serialize with the populated hash. `raw` is the exact payload
+        // fed to `eth_sendRawTransaction`.
+        let raw = bincode::serialize(&tx)
+            .map_err(|e| WalletError::SigningFailed(format!("bincode serialize: {}", e)))?;
 
         Ok(SignedTransaction {
-            hash: hex::encode(tx_hash),
-            from: hex::encode(signing_key.verifying_key().to_bytes()),
+            hash: hex::encode(hash_bytes),
+            from: hex::encode(from_pubkey_bytes),
             to: self.to.clone(),
             value: self.value,
             nonce,
@@ -185,38 +254,9 @@ impl TransactionBuilder {
             gas_limit: self.gas_limit,
             chain_id: self.chain_id,
             data: self.data.clone(),
-            signature: hex::encode(signature.to_bytes()),
-            raw: self.serialize_signed(nonce, &signing_key.verifying_key().to_bytes(), &signature.to_bytes()),
+            signature: hex::encode(tx.signature.as_bytes()),
+            raw,
         })
-    }
-
-    /// Serialize the signed transaction for RPC submission.
-    fn serialize_signed(&self, nonce: u64, pubkey: &[u8; 32], signature: &[u8; 64]) -> Vec<u8> {
-        // Use bincode serialization matching the chain's expected format
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&nonce.to_le_bytes());
-        buf.extend_from_slice(&self.gas_price.to_le_bytes());
-        buf.extend_from_slice(&self.gas_limit.to_le_bytes());
-
-        // To address (32 bytes, zero-padded)
-        let mut to_bytes = [0u8; 32];
-        if let Some(ref to) = self.to {
-            let to_clean = to.strip_prefix("0x").unwrap_or(to);
-            if let Ok(decoded) = hex::decode(to_clean) {
-                let len = decoded.len().min(32);
-                to_bytes[..len].copy_from_slice(&decoded[..len]);
-            }
-        }
-        buf.extend_from_slice(&to_bytes);
-
-        buf.extend_from_slice(&self.value.to_le_bytes());
-        buf.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&self.data);
-        buf.extend_from_slice(&self.chain_id.to_le_bytes());
-        buf.extend_from_slice(pubkey);
-        buf.extend_from_slice(signature);
-
-        buf
     }
 }
 
