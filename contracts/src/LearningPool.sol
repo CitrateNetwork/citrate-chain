@@ -69,6 +69,31 @@ contract LearningPool is ReentrancyGuard {
     }
 
     // ============================================================
+    // Constructor — Genesis Pool
+    // ============================================================
+
+    /// @dev Deploy-time genesis pool #0. Creator is `address(0)` so the pool
+    ///      is permanent — no one can call `closePool`, `startCycle`,
+    ///      `whitelistModel`, or `leavePool` against it as creator. Anyone
+    ///      can join with zero minimum stake. This guarantees the Learning
+    ///      Center always has at least one pool a newcomer can enter.
+    constructor() {
+        uint256 poolId = nextPoolId++;
+        pools[poolId] = Pool({
+            id: poolId,
+            name: "Genesis",
+            description: "The default federated learning pool. Open to everyone, no minimum stake.",
+            creator: address(0),
+            state: PoolState.Active,
+            access: AccessType.Open,
+            minStake: 0,
+            memberCount: 0,
+            createdAt: block.timestamp
+        });
+        emit PoolCreated(poolId, address(0), "Genesis", AccessType.Open);
+    }
+
+    // ============================================================
     // Core: Pool Creation
     // ============================================================
 

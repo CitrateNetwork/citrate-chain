@@ -39,11 +39,13 @@ contract LearningPoolTest is Test {
             1 ether
         );
 
-        assertEq(poolId, 0, "First pool should have ID 0");
-        assertEq(lp.nextPoolId(), 1, "nextPoolId should increment");
+        // Pool #0 is reserved for the constructor-created Genesis pool —
+        // the first user pool is #1.
+        assertEq(poolId, 1, "First user pool should have ID 1 (ID 0 = Genesis)");
+        assertEq(lp.nextPoolId(), 2, "nextPoolId should increment");
 
         LearningPool.Pool memory pool = lp.getPool(poolId);
-        assertEq(pool.id, 0);
+        assertEq(pool.id, 1);
         assertEq(pool.name, "Global Pool");
         assertEq(pool.description, "Open to everyone");
         assertEq(pool.creator, alice);
@@ -572,8 +574,9 @@ contract LearningPoolTest is Test {
         uint256 pool1 = _createOpenPool(alice, 1 ether);
         uint256 pool2 = _createOpenPool(bob, 2 ether);
 
-        assertEq(pool1, 0);
-        assertEq(pool2, 1);
+        // Pool #0 is the Genesis pool reserved by the constructor.
+        assertEq(pool1, 1);
+        assertEq(pool2, 2);
 
         // Alice is member of pool1 only
         assertTrue(lp.isMember(pool1, alice));
