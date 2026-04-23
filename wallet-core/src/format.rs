@@ -1,18 +1,110 @@
-//! SALT/wei formatting utilities.
+//! SALT denomination and display helpers.
 //!
-//! SALT has 18 decimals (same as ETH).
-//! 1 SALT = 1_000_000_000_000_000_000 wei (10^18)
+//! # Terminology
+//!
+//! Citrate uses two names for the native-token unit depending on layer:
+//!
+//! | Layer                      | Name   | Scale                   |
+//! |----------------------------|--------|-------------------------|
+//! | Chain / RPC / transactions | `wei`  | 1 SALT = 10^18 wei       |
+//! | UI / chat / docs           | `grain`| 1 SALT = 10^18 grains    |
+//!
+//! `wei` and `grain` are the **same value** — one `u128` smallest unit.
+//! We keep `wei` in every RPC, transaction, contract call, and eth_* method
+//! for EVM-compat (MetaMask, ethers, cast all assume "wei"). We use `grain`
+//! when writing for humans so it matches the SALT metaphor.
+//!
+//! # The rule
+//!
+//! **Never display raw grains to a user.** Any surface that touches a
+//! balance or value — a Slint widget, a chat system prompt, a toast, a
+//! tool-call response — must run the number through [`grains_to_salt`]
+//! (a.k.a. [`wei_to_salt`]) first. Leaving the raw 18-trailing-zeros
+//! integer in a user message was a recurring bug; the naming here exists
+//! to make the unit discipline visible.
+//!
+//! If you find yourself writing `format!("{} SALT", raw_u128_or_string)`,
+//! stop — use [`format_salt_display`] instead.
 
-const SALT_DECIMALS: u32 = 18;
-const WEI_PER_SALT: u128 = 10u128.pow(SALT_DECIMALS);
+/// SALT has 18 decimals (same as ETH). This is fixed at the consensus
+/// layer (`citrate_economics::token::DECIMALS`) — do not redefine elsewhere.
+pub const SALT_DECIMALS: u32 = 18;
 
-/// Format wei amount as human-readable SALT string.
+/// Number of smallest units (grains / wei) per whole SALT.
+pub const GRAINS_PER_SALT: u128 = 10u128.pow(SALT_DECIMALS);
+
+/// Back-compat alias — same value as `GRAINS_PER_SALT`, kept for code that
+/// predates the grain terminology.
+pub const WEI_PER_SALT: u128 = GRAINS_PER_SALT;
+
+/// The display unit name.
+pub const UNIT_NAME: &str = "SALT";
+
+/// The smallest-unit name as shown to humans.
+pub const SUBUNIT_NAME: &str = "grain";
+
+/// Format a grain (wei) amount as a human-readable SALT string.
+///
 /// Examples:
 ///   0 → "0"
 ///   1_000_000_000_000_000_000 → "1"
 ///   1_500_000_000_000_000_000 → "1.5"
 ///   500_000_000_000_000 → "0.0005"
 ///   123_456_789_012_345_678 → "0.123456789012345678"
+pub fn grains_to_salt(grains: u128) -> String {
+    wei_to_salt(grains)
+}
+
+/// Format a grain (wei) amount provided as a decimal or `0x`-prefixed hex
+/// string. Designed for the boundary between RPC (wire format: hex wei)
+/// and UI (human SALT). Returns the input unchanged if it doesn't parse —
+/// callers should decide whether to treat that as an error.
+pub fn grains_str_to_salt(grains: &str) -> String {
+    let trimmed = grains.trim();
+    let parsed: Option<u128> = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u128::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u128>().ok()
+    };
+    match parsed {
+        Some(g) => grains_to_salt(g),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Format a grain (wei) amount as `"X SALT"` with comma separators for
+/// the whole part. This is the canonical display format for the chat
+/// system prompt, toasts, and anywhere else the value is shown to a user
+/// along with a unit suffix.
+pub fn grains_str_to_salt_display(grains: &str) -> String {
+    let salt = grains_str_to_salt(grains);
+    let parts: Vec<&str> = salt.split('.').collect();
+    let whole = parts[0];
+    let whole_with_commas = if whole.len() <= 3 {
+        whole.to_string()
+    } else {
+        let chars: Vec<char> = whole.chars().rev().collect();
+        chars
+            .chunks(3)
+            .map(|c| c.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join(",")
+            .chars()
+            .rev()
+            .collect()
+    };
+    if parts.len() > 1 {
+        format!("{}.{} {}", whole_with_commas, parts[1], UNIT_NAME)
+    } else {
+        format!("{} {}", whole_with_commas, UNIT_NAME)
+    }
+}
+
+/// Back-compat alias for code that predates the `grain` terminology.
+/// Prefer [`grains_to_salt`] in new code.
 pub fn wei_to_salt(wei: u128) -> String {
     if wei == 0 {
         return "0".to_string();
@@ -207,5 +299,39 @@ mod tests {
     #[test]
     fn test_display_with_fraction() {
         assert_eq!(format_salt_display(WEI_PER_SALT + WEI_PER_SALT / 2), "1.5 SALT");
+    }
+
+    #[test]
+    fn grains_str_decimal_million_salt() {
+        // The canonical "user has 1,000,000 SALT" case the chat used to
+        // leak as the raw 25-digit integer.
+        let grains_million = (1_000_000u128 * WEI_PER_SALT).to_string();
+        assert_eq!(grains_str_to_salt(&grains_million), "1000000");
+        assert_eq!(
+            grains_str_to_salt_display(&grains_million),
+            "1,000,000 SALT"
+        );
+    }
+
+    #[test]
+    fn grains_str_hex_parses() {
+        // eth_getBalance returns hex wei. The grain formatter accepts it.
+        let hex_one_salt = format!("0x{:x}", WEI_PER_SALT);
+        assert_eq!(grains_str_to_salt(&hex_one_salt), "1");
+    }
+
+    #[test]
+    fn grains_str_invalid_preserves_input() {
+        // Non-parseable input is returned as-is. Callers decide whether
+        // to treat that as an error; the formatter never panics.
+        assert_eq!(grains_str_to_salt("not-a-number"), "not-a-number");
+    }
+
+    #[test]
+    fn grains_to_salt_matches_wei_to_salt() {
+        // grain ≡ wei — the two helpers must always agree.
+        for g in [0u128, 1, WEI_PER_SALT, 42 * WEI_PER_SALT + 123, u128::MAX / 2] {
+            assert_eq!(grains_to_salt(g), wei_to_salt(g));
+        }
     }
 }
