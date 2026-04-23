@@ -1878,6 +1878,7 @@ dependencies = [
  "hex",
  "image",
  "mime_guess",
+ "notify",
  "nvml-wrapper",
  "rand 0.8.6",
  "reqwest 0.12.28",
