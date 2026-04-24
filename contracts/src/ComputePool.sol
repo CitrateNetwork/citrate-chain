@@ -57,6 +57,29 @@ contract ComputePool is ReentrancyGuard {
         uint256 payment;
         JobStatus status;
         uint256 createdAt;
+        // CM-05 WP-05.1: dispatch tracking. dispatchBlock=0 means
+        // the coordinator hasn't yet recorded a dispatch; >0 means
+        // it has, and reassignCoordinator's COORDINATION_TIMEOUT
+        // window starts ticking from this value.
+        uint256 dispatchBlock;
+        // The coordinator that recorded the dispatch — slashed if
+        // they fail to complete the job before COORDINATION_TIMEOUT.
+        address dispatchedBy;
+    }
+
+    /// @notice Versioned, structured job spec (CM-05 WP-05.1).
+    /// @dev Replaces the opaque `bytes jobSpec` form for new callers.
+    ///      The legacy `bytes` overload of `requestPoolCompute` is kept
+    ///      for backwards compatibility; callers that want a typed
+    ///      shape use `requestPoolComputeStruct`.
+    struct PoolJobSpec {
+        uint8 version;            // 1 in this release
+        uint8 mode;               // 0=InferencePool (CM-05); 1=DataParallel (CM-07); 2=Pipeline (CM-08)
+        bytes32 modelHash;        // resolved via ModelRegistry
+        bytes inputData;          // up to 64KB inline; beyond that, IPFS CID bytes
+        uint32 maxTokens;         // hard cap on output tokens
+        uint8 verificationTier;   // 0=Commitment, 1=ZKProof, 2=TEE
+        uint32 batchSize;         // 1 for chat, N for batch
     }
 
     // ── Constants ───────────────────────────────────────────────────
@@ -72,6 +95,22 @@ contract ComputePool is ReentrancyGuard {
 
     /// @notice Provider cooldown period in blocks after last job completes (~5 min).
     uint256 public constant LEAVE_COOLDOWN = 150;
+
+    /// @notice Length of a coordinator-election epoch in blocks
+    /// (CM-05 WP-05.1). At ~12s/block this is ~20 minutes per epoch.
+    uint256 public constant EPOCH_LENGTH = 100;
+
+    /// @notice Blocks the coordinator has to complete a dispatched
+    /// job before any pool member can call `reassignCoordinator`.
+    /// At ~12s/block this is ~4 minutes (CM-05 WP-05.1).
+    uint256 public constant COORDINATION_TIMEOUT = 20;
+
+    /// @notice Liveness slash, in basis points of the failed
+    /// coordinator's stake. 10 bps = 0.1% per planset CM-05 risks
+    /// table — small enough to be tolerable per incident, large
+    /// enough that a serial offender churns out via repeated
+    /// liveness slashes.
+    uint256 public constant LIVENESS_SLASH_BPS = 10;
 
     // ── State ───────────────────────────────────────────────────────
 
@@ -121,6 +160,45 @@ contract ComputePool is ReentrancyGuard {
     event SLAViolationReported(uint256 indexed poolId, uint256 actualThroughput, uint256 guaranteedThroughput);
     event SlashingContractUpdated(address oldContract, address newContract);
     event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+
+    // ── CM-05 WP-05.1 events ───────────────────────────────────────
+
+    /// @notice Emitted by view-helper-driven indexers; the contract
+    /// itself does NOT call this on `coordinatorFor` (view fn). The
+    /// coordinator binary fires it off-chain when it detects a
+    /// new-epoch transition. Logged here for ABI completeness +
+    /// indexer subscriptions.
+    event CoordinatorElected(
+        uint256 indexed poolId,
+        uint256 indexed epoch,
+        address indexed coordinator
+    );
+
+    /// @notice Emitted by `reassignCoordinator` when the current
+    /// coordinator times out and a new one takes over.
+    event CoordinatorReassigned(
+        uint256 indexed jobId,
+        address indexed previous,
+        address indexed next
+    );
+
+    /// @notice Emitted by `reassignCoordinator` after slashing the
+    /// stalled coordinator. `amount` is in grains (wei).
+    event CoordinatorSlashedForLiveness(
+        uint256 indexed poolId,
+        address indexed coordinator,
+        uint256 amount
+    );
+
+    /// @notice Emitted when a coordinator records a dispatch via
+    /// `recordDispatch`. Useful for the off-chain timeline UI
+    /// (CM-04 buyer webapp's `/jobs/:id` view) to detect the
+    /// "Dispatched" state transition without scanning every block.
+    event DispatchRecorded(
+        uint256 indexed jobId,
+        address indexed coordinator,
+        uint256 dispatchBlock
+    );
 
     // ── Modifiers ───────────────────────────────────────────────────
 
@@ -324,27 +402,11 @@ contract ComputePool is ReentrancyGuard {
         bytes calldata jobSpec,
         uint256 maxPrice
     ) external payable poolExists(poolId) nonReentrant returns (uint256 jobId) {
-        Pool storage pool = pools[poolId];
-        require(pool.state == PoolState.Active, "Pool not active");
-        require(pool.memberCount >= pool.minProviders, "Insufficient providers");
-        require(msg.value >= pool.pricePerUnit, "Insufficient payment");
-        require(msg.value >= maxPrice, "Payment less than maxPrice");
-        require(jobSpec.length > 0, "Empty job spec");
-
-        jobId = nextJobId++;
-
-        // Initialize job field-by-field to reduce stack pressure
-        PoolJob storage pj = jobs[jobId];
-        pj.poolId = poolId;
-        pj.requester = msg.sender;
-        pj.jobSpec = jobSpec;
-        pj.payment = msg.value;
-        pj.status = JobStatus.Pending;
-        pj.createdAt = block.number;
-
-        pool.activeJobCount++;
-
-        emit ComputeRequested(poolId, jobId, msg.sender, msg.value);
+        // Delegate to the shared internal helper so the typed-struct
+        // overload (`requestPoolComputeStruct`, CM-05 WP-05.1) and
+        // this legacy bytes overload share identical pricing,
+        // pool-state, and counter logic.
+        return _requestPoolCompute(poolId, jobSpec, maxPrice);
     }
 
     /// @notice Mark a job as completed (governance or pool creator).
@@ -521,7 +583,206 @@ contract ComputePool is ReentrancyGuard {
         emit GovernanceTransferred(old, newGovernance);
     }
 
+    // ── CM-05 WP-05.1: Coordinator election + reassignment ─────────
+
+    /// @notice Deterministic, gpuCount-weighted coordinator selection
+    /// for a (poolId, epoch). Reverts with `NoMembers` when the pool
+    /// has no active members.
+    ///
+    /// The seed is `keccak256(blockhash(epochStart) || poolId || epoch)`.
+    /// `blockhash` returns 0x0 for blocks > 256 ago, making old
+    /// epochs un-electable; in production the off-chain coordinator
+    /// binary records the seed at each epoch boundary so historical
+    /// queries can be answered. For slice 1 (this WP) the function
+    /// is reliable for the most-recent ~256 blocks of history, which
+    /// covers the active and immediately-preceding epoch.
+    ///
+    /// @dev Mirrors the `ElectCoordinator` action precondition in
+    ///      .agentile/formal/specs/compute/InferencePoolLifecycle.tla
+    ///      (CM-05 WP-05.0 spec gate). The TLA+ spec verifies
+    ///      `ExactlyOneOrNoCoordinatorPerEpoch` and
+    ///      `CoordinatorIsKnownMember` — this implementation upholds
+    ///      both by always returning a current member.
+    function coordinatorFor(uint256 poolId, uint256 epoch)
+        public
+        view
+        poolExists(poolId)
+        returns (address)
+    {
+        address[] storage memberList = _poolMembers[poolId];
+        require(memberList.length > 0, "NoMembers");
+
+        Pool storage p = pools[poolId];
+        uint256 totalGpus = p.totalGPUs;
+        require(totalGpus > 0, "NoGPUs");
+
+        uint256 epochStart = epoch * EPOCH_LENGTH;
+        // blockhash returns 0x0 for the current block AND blocks > 256
+        // old. We mix in poolId and epoch so the 0x0 fallback case
+        // still produces a varied seed across pools.
+        uint256 seed = uint256(
+            keccak256(abi.encodePacked(blockhash(epochStart), poolId, epoch))
+        );
+        uint256 target = seed % totalGpus;
+
+        uint256 cumulative = 0;
+        for (uint256 i = 0; i < memberList.length; i++) {
+            PoolMember storage m = members[poolId][memberList[i]];
+            if (!m.active || m.gpuCount == 0) continue;
+            cumulative += m.gpuCount;
+            if (target < cumulative) {
+                return memberList[i];
+            }
+        }
+        // Reachable only if `totalGpus` got out of sync with the
+        // sum of active members' gpuCount — which would be a state
+        // corruption bug elsewhere. Defensive fallback.
+        return memberList[memberList.length - 1];
+    }
+
+    /// @notice Same as `requestPoolCompute` but takes a typed
+    /// `PoolJobSpec` instead of opaque bytes. The struct is
+    /// abi-encoded into the underlying `bytes` storage so legacy
+    /// readers continue to work.
+    function requestPoolComputeStruct(
+        uint256 poolId,
+        PoolJobSpec calldata spec,
+        uint256 maxPrice
+    ) external payable poolExists(poolId) nonReentrant returns (uint256 jobId) {
+        require(spec.version == 1, "Unsupported spec version");
+        bytes memory encoded = abi.encode(spec);
+        return _requestPoolCompute(poolId, encoded, maxPrice);
+    }
+
+    /// @notice Decode a previously-encoded `PoolJobSpec` from its
+    /// stored bytes. View helper used by off-chain consumers and
+    /// tests that want to round-trip the typed shape.
+    function decodePoolJobSpec(bytes calldata data)
+        external
+        pure
+        returns (PoolJobSpec memory)
+    {
+        return abi.decode(data, (PoolJobSpec));
+    }
+
+    /// @notice Coordinator reports they've dispatched a job to a
+    /// member. Records the dispatch block so `reassignCoordinator`
+    /// has a timer to compare against.
+    ///
+    /// @dev Only the elected coordinator for the job's pool + the
+    ///      current epoch can call this. Off-chain coordinators
+    ///      (the citrate-pool-coordinator binary, WP-05.2) call this
+    ///      immediately after their HTTPS dispatch to a pool member.
+    function recordDispatch(uint256 jobId) external nonReentrant {
+        PoolJob storage job = jobs[jobId];
+        require(
+            job.status == JobStatus.Pending,
+            "Job not pending"
+        );
+        uint256 epoch = block.number / EPOCH_LENGTH;
+        address expectedCoord = coordinatorFor(job.poolId, epoch);
+        require(msg.sender == expectedCoord, "Not the coordinator");
+
+        job.dispatchBlock = block.number;
+        job.dispatchedBy = msg.sender;
+        job.status = JobStatus.Executing;
+
+        emit DispatchRecorded(jobId, msg.sender, block.number);
+    }
+
+    /// @notice Any pool member can call this to reassign coordinator
+    /// duty for a job whose original coordinator has stalled past
+    /// `COORDINATION_TIMEOUT`. Slashes the stalled coordinator
+    /// `LIVENESS_SLASH_BPS` of their stake and resets the job to
+    /// Pending so the next coordinator (current epoch's election)
+    /// can pick it up.
+    ///
+    /// @dev Caller must be a current pool member to prevent griefing
+    ///      from outsiders. The slash amount is small per-incident
+    ///      (10 bps = 0.1%) but accumulates across repeated
+    ///      offenses, eventually pushing a chronically-offline
+    ///      provider out of the pool via stake exhaustion.
+    function reassignCoordinator(uint256 jobId) external nonReentrant {
+        PoolJob storage job = jobs[jobId];
+        require(
+            job.status == JobStatus.Executing,
+            "Job not in Executing"
+        );
+        require(
+            block.number > job.dispatchBlock + COORDINATION_TIMEOUT,
+            "Coordinator has time"
+        );
+
+        // Caller must be a current pool member (prevents outside
+        // griefing).
+        require(
+            members[job.poolId][msg.sender].active,
+            "Not a pool member"
+        );
+
+        address stalled = job.dispatchedBy;
+        require(stalled != address(0), "No prior coordinator");
+
+        // Slash the stalled coordinator.
+        PoolMember storage badMember = members[job.poolId][stalled];
+        uint256 slashAmount = (badMember.stake * LIVENESS_SLASH_BPS) / BPS;
+        if (slashAmount > 0 && badMember.stake >= slashAmount) {
+            badMember.stake -= slashAmount;
+            // Slashed funds stay in the contract treasury for now;
+            // a future sprint may route them to an insurance pool.
+            emit CoordinatorSlashedForLiveness(
+                job.poolId,
+                stalled,
+                slashAmount
+            );
+        }
+
+        // Reset job state so the next election cycle dispatches it.
+        job.status = JobStatus.Pending;
+        job.dispatchBlock = 0;
+        job.dispatchedBy = address(0);
+
+        // Inform indexers of the reassignment. The "next" address
+        // isn't determined here — the next dispatch action will pick
+        // whichever address `coordinatorFor(poolId, epoch)` returns
+        // at that point, which may differ from the stalled one
+        // automatically (next epoch) or stay the same (same epoch +
+        // VRF still picks them — in which case they get another
+        // chance and another slash if they fail again).
+        emit CoordinatorReassigned(jobId, stalled, address(0));
+    }
+
     // ── Internal ────────────────────────────────────────────────────
+
+    /// @dev Shared body for both `requestPoolCompute` overloads.
+    function _requestPoolCompute(
+        uint256 poolId,
+        bytes memory jobSpec,
+        uint256 maxPrice
+    ) internal returns (uint256 jobId) {
+        Pool storage pool = pools[poolId];
+        require(pool.state == PoolState.Active, "Pool not active");
+        require(pool.memberCount >= pool.minProviders, "Insufficient providers");
+        require(msg.value >= pool.pricePerUnit, "Insufficient payment");
+        require(msg.value >= maxPrice, "Payment less than maxPrice");
+        require(jobSpec.length > 0, "Empty job spec");
+
+        jobId = nextJobId++;
+
+        PoolJob storage pj = jobs[jobId];
+        pj.poolId = poolId;
+        pj.requester = msg.sender;
+        pj.jobSpec = jobSpec;
+        pj.payment = msg.value;
+        pj.status = JobStatus.Pending;
+        pj.createdAt = block.number;
+        // dispatchBlock + dispatchedBy left as zero-defaults; set by
+        // `recordDispatch`.
+
+        pool.activeJobCount++;
+
+        emit ComputeRequested(poolId, jobId, msg.sender, msg.value);
+    }
 
     /// @dev Distribute payment to pool members proportionally based on GPU contribution.
     function _distributePayment(uint256 poolId, uint256 totalPayment) internal {
