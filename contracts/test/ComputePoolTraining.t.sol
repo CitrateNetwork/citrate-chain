@@ -422,6 +422,104 @@ contract ComputePoolTrainingTest is Test {
         pool.commitEpoch(jobId, 0, ROOT0);
     }
 
+    // ── Reassignment (WP-07.3) ──────────────────────────────────────
+
+    function test_reassign_after_timeout_succeeds() public {
+        uint256 jobId = _openJob();
+        _joinThree(jobId);
+        pool.closeRecruitment(jobId, w1);
+
+        // Roll past COORDINATION_TIMEOUT (100 blocks) with no
+        // commitEpoch.
+        vm.roll(block.number + 101);
+
+        // w2 (any joined worker) reassigns to w3.
+        vm.prank(w2);
+        pool.reassignCoordinator(jobId, w3);
+
+        ComputePoolTraining.TrainingJob memory job = pool.getJob(jobId);
+        assertEq(job.coordinator, w3, "coordinator swapped");
+
+        // Liveness slash applied to w1 (0.1% of 10e = 0.01e).
+        ComputePoolTraining.WorkerInfo memory oldInfo = pool.getWorker(jobId, w1);
+        uint128 expectedSlash = uint128(uint256(STAKE) * 10 / 10000);
+        assertEq(oldInfo.stakeSlashed, expectedSlash, "liveness slash applied");
+
+        // The new coordinator can now post commitEpoch.
+        vm.prank(w3);
+        pool.commitEpoch(jobId, 0, ROOT0);
+    }
+
+    function test_reassign_before_timeout_reverts() public {
+        uint256 jobId = _openJob();
+        _joinThree(jobId);
+        pool.closeRecruitment(jobId, w1);
+
+        // Roll only 50 blocks — under COORDINATION_TIMEOUT.
+        vm.roll(block.number + 50);
+
+        vm.prank(w2);
+        vm.expectRevert("ComputePoolTraining: coordinator still active");
+        pool.reassignCoordinator(jobId, w3);
+    }
+
+    function test_reassign_resets_activity_clock() public {
+        // A successful commitEpoch must reset the timeout so the
+        // coordinator isn't vulnerable to spurious reassignment
+        // immediately after posting a root.
+        uint256 jobId = _openJob();
+        _joinThree(jobId);
+        pool.closeRecruitment(jobId, w1);
+
+        uint256 base = block.number;
+
+        // Roll 50 blocks, then commit. Activity clock resets to
+        // the commit block.
+        vm.roll(base + 50);
+        vm.prank(w1);
+        pool.commitEpoch(jobId, 0, ROOT0);
+        uint256 commitBlock = base + 50;
+
+        // Roll to 50 blocks after commit — under COORDINATION_TIMEOUT
+        // from the last activity. Reassign must revert.
+        vm.roll(commitBlock + 50);
+        vm.prank(w2);
+        vm.expectRevert("ComputePoolTraining: coordinator still active");
+        pool.reassignCoordinator(jobId, w3);
+
+        // Roll to 101 blocks after commit — now past timeout. Reassign
+        // succeeds.
+        vm.roll(commitBlock + 101);
+        vm.prank(w2);
+        pool.reassignCoordinator(jobId, w3);
+    }
+
+    function test_only_joined_worker_can_reassign() public {
+        uint256 jobId = _openJob();
+        _joinThree(jobId);
+        pool.closeRecruitment(jobId, w1);
+
+        vm.roll(block.number + 101);
+
+        address outsider = address(0xDEAD);
+        vm.prank(outsider);
+        vm.expectRevert("ComputePoolTraining: caller not joined");
+        pool.reassignCoordinator(jobId, w3);
+    }
+
+    function test_reassign_to_non_member_reverts() public {
+        uint256 jobId = _openJob();
+        _joinThree(jobId);
+        pool.closeRecruitment(jobId, w1);
+
+        vm.roll(block.number + 101);
+
+        address outsider = address(0xDEAD);
+        vm.prank(w2);
+        vm.expectRevert("ComputePoolTraining: new coord not joined");
+        pool.reassignCoordinator(jobId, outsider);
+    }
+
     // ── Scale benchmarks (WP-07.1 decision gate) ────────────────────
     //
     // Measure per-call gas at N=10 and N=50 workers to validate the
