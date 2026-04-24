@@ -64,7 +64,8 @@ contract ComputePoolTraining is ReentrancyGuard {
         uint32 currentEpoch;
         uint32 workerCount;
         uint64 allEpochsCommittedBlock; // 0 until final epoch root posted; then = block.number
-        address coordinator;            // set at closeRecruitment; rotation is a future CM-05-alignment
+        uint64 lastActivityBlock;       // set at closeRecruitment; bumped at each commitEpoch. Used by reassignCoordinator to detect a stalled coordinator.
+        address coordinator;            // current coordinator; reassignable after COORDINATION_TIMEOUT
     }
 
     struct WorkerInfo {
@@ -109,6 +110,21 @@ contract ComputePoolTraining is ReentrancyGuard {
     /// @notice Committee quorum required to resolve a challenge. The
     /// committee is governance-configured (see `setCommittee`).
     uint256 public constant COMMITTEE_QUORUM = 2;
+
+    /// @notice Blocks of coordinator inactivity before any joined
+    /// worker can call `reassignCoordinator` to elect a replacement.
+    /// CM-07 WP-07.3. Mirrors CM-05's COORDINATION_TIMEOUT pattern
+    /// (20 blocks at ~12s = ~4 minutes); training windows tolerate
+    /// more latency than per-request inference so this is set to
+    /// 100 blocks (~20 minutes) to avoid spurious reassignment under
+    /// normal network jitter.
+    uint256 public constant COORDINATION_TIMEOUT = 100;
+
+    /// @notice Liveness slash in basis points of the stalled
+    /// coordinator's stake when they're reassigned out. 0.1% per
+    /// incident — small enough to be survivable, large enough that
+    /// a serial offender churns out via repeated slashes.
+    uint256 public constant LIVENESS_SLASH_BPS = 10;
 
     // ── State ───────────────────────────────────────────────────────
 
@@ -162,6 +178,12 @@ contract ComputePoolTraining is ReentrancyGuard {
     );
     event WorkerJoined(uint256 indexed jobId, address indexed worker, uint128 stake);
     event RecruitmentClosed(uint256 indexed jobId, uint32 workerCount, address coordinator);
+    event CoordinatorReassigned(
+        uint256 indexed jobId,
+        address indexed oldCoordinator,
+        address indexed newCoordinator,
+        uint128 livenessSlash
+    );
     event EpochCommitted(uint256 indexed jobId, uint32 indexed epoch, bytes32 root);
     event EpochPaymentReleased(
         uint256 indexed jobId,
@@ -302,6 +324,7 @@ contract ComputePoolTraining is ReentrancyGuard {
 
         job.state = JobState.Training;
         job.coordinator = coordinator_;
+        job.lastActivityBlock = uint64(block.number);
         emit RecruitmentClosed(jobId, job.workerCount, coordinator_);
     }
 
@@ -357,10 +380,53 @@ contract ComputePoolTraining is ReentrancyGuard {
         emit EpochCommitted(jobId, epoch, root);
 
         job.currentEpoch += 1;
+        job.lastActivityBlock = uint64(block.number);
         if (job.currentEpoch == job.epochCount) {
             job.state = JobState.Awaiting;
             job.allEpochsCommittedBlock = uint64(block.number);
         }
+    }
+
+    /// @notice Reassign the coordinator if they've stalled past
+    /// COORDINATION_TIMEOUT blocks without a commitEpoch. Any
+    /// joined worker can trigger. The stalled coordinator is
+    /// slashed LIVENESS_SLASH_BPS on their posted stake.
+    ///
+    /// Crash-recovery design note (CM-07 WP-07.3): the replacement
+    /// doesn't need to be VRF-elected — the *ability* to reassign
+    /// is open to every joined worker, which is enough to keep the
+    /// job live. VRF rotation per epoch is an optional richness a
+    /// future sprint can add if centralisation analysis shows it's
+    /// needed.
+    function reassignCoordinator(uint256 jobId, address newCoordinator)
+        external
+        jobExists(jobId)
+        nonReentrant
+    {
+        TrainingJob storage job = jobs[jobId];
+        require(job.state == JobState.Training, "ComputePoolTraining: not training");
+        require(workers[jobId][msg.sender].joined, "ComputePoolTraining: caller not joined");
+        require(workers[jobId][newCoordinator].joined, "ComputePoolTraining: new coord not joined");
+        require(
+            block.number > uint256(job.lastActivityBlock) + COORDINATION_TIMEOUT,
+            "ComputePoolTraining: coordinator still active"
+        );
+
+        address oldCoordinator = job.coordinator;
+
+        // Liveness slash on the stalled coordinator. Bounded by
+        // their remaining held stake — can't slash more than they
+        // have.
+        WorkerInfo storage oldInfo = workers[jobId][oldCoordinator];
+        uint128 held = oldInfo.stakePosted - oldInfo.stakeSlashed - oldInfo.stakeReturned;
+        uint128 slash = uint128(uint256(oldInfo.stakePosted) * LIVENESS_SLASH_BPS / BPS);
+        if (slash > held) slash = held;
+        oldInfo.stakeSlashed += slash;
+
+        job.coordinator = newCoordinator;
+        job.lastActivityBlock = uint64(block.number);
+
+        emit CoordinatorReassigned(jobId, oldCoordinator, newCoordinator, slash);
     }
 
     /// @notice Finalize the job. Requires every epoch committed AND
