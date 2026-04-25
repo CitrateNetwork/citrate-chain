@@ -34,6 +34,11 @@ pub enum OrderingError {
 
     #[error("DAG store error: {0}")]
     DagStoreError(String),
+
+    /// RM-B1 / WP-B4.1 (audit C-03): error from the GhostDAG engine
+    /// while computing the canonical blue score for a block.
+    #[error("DAG error: {0}")]
+    DagError(String),
 }
 
 /// Result of ordering a range of blocks
@@ -225,13 +230,27 @@ impl TotalOrderIterator {
                 .await?;
         }
 
-        // Sort mergeset by blue score (descending) then hash (ascending)
+        // Sort mergeset by blue score (descending) then hash (ascending).
+        //
+        // RM-B1 / WP-B4.1 (audit C-03): the score MUST be the
+        // *locally recomputed* blue score, NOT the proposer-supplied
+        // `block.header.blue_score`. A malicious proposer can stuff
+        // u64::MAX into the header to bias mergeset ordering toward
+        // their own block, enabling MEV / sandwich attacks without
+        // controlling the chain tip. Locally recomputing via
+        // `ghostdag.calculate_blue_score(&b)` reduces the ordering
+        // to a function of the DAG content alone.
         let mut ordering_infos: Vec<BlockOrderingInfo> = Vec::new();
         for hash in &mergeset {
             if let Ok(b) = self.dag_store.get_block(hash).await {
+                let blue_score = self
+                    .ghostdag
+                    .calculate_blue_score(&b)
+                    .await
+                    .map_err(|e| OrderingError::DagError(e.to_string()))?;
                 ordering_infos.push(BlockOrderingInfo {
                     hash: *hash,
-                    blue_score: b.header.blue_score,
+                    blue_score,
                     height: b.header.height,
                     is_chain_block: false,
                 });
