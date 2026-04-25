@@ -1,6 +1,6 @@
 // WP-S.1: RocksDB KvStore implementation for persistent DAG storage.
 
-use citrate_consensus::dag_store::KvStore;
+use citrate_consensus::dag_store::{KvOp, KvStore};
 use citrate_storage::db::RocksDB;
 use std::sync::Arc;
 
@@ -40,5 +40,28 @@ impl KvStore for RocksDbKvStore {
                     .collect()
             })
             .map_err(|e| e.to_string())
+    }
+
+    /// RM-B1 / WP-B1.3 (audit H-04): override the trait default with
+    /// a real RocksDB `WriteBatch` so multi-op block-admission writes
+    /// commit atomically. A power loss between two ops can no longer
+    /// leave the DAG in a partial state.
+    fn kv_write_batch(&self, ops: &[KvOp]) -> Result<(), String> {
+        let mut batch = self.db.batch();
+        for op in ops {
+            match op {
+                KvOp::Put { cf, key, value } => {
+                    self.db
+                        .batch_put_cf(&mut batch, cf, key, value)
+                        .map_err(|e| e.to_string())?;
+                }
+                KvOp::Delete { cf, key } => {
+                    self.db
+                        .batch_delete_cf(&mut batch, cf, key)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        self.db.write_batch(batch).map_err(|e| e.to_string())
     }
 }
