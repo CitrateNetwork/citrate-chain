@@ -1,0 +1,77 @@
+# WAL-01 — Argon2::default() must not appear in production code paths.
+#
+# Audit finding (CRITICAL):
+#   .audit/2026-04-24-full-repo-adversarial-audit/08_FINDINGS_WALLET_AGENT_FAUCET.md#wal-01
+#
+# Spec (canonical):
+#   docs/security/KDF_POLICY.md
+#
+# `Argon2::default()` resolves to Argon2id with parameters at the OWASP 2024
+# floor (m=19456 KiB, t=2, p=1) — vulnerable to GPU brute-force at typical
+# password entropy. Production keystores must use the OWASP-recommended
+# parameters via the `argon2_for_version(KDF_VERSION_CURRENT)` dispatcher
+# in wallet-core, or the equivalent explicit `Params::new(65536, 3, 4, ...)`
+# constructor.
+#
+# Acceptable uses (all marked `nosem` or in test-only paths):
+#   - The legacy branch of `argon2_for_version(KDF_VERSION_LEGACY)`, which
+#     intentionally returns the default for backward-compat decryption.
+#   - `#[cfg(test)]`-gated test fixtures.
+#   - Documentation and comments.
+#
+# Variants of this finding scanned at WP-A1.1:
+#   - wallet-core/src/keys.rs (closed)
+#   - wallet/src/keystore.rs (closed)
+#   - gui/citrate_edu_app/src/portal.rs::hash_passphrase (closed inline)
+
+rules:
+  - id: wal-01-argon2-default
+    message: >-
+      `Argon2::default()` is forbidden in production paths (WAL-01).
+      It uses OWASP-floor parameters (m=19456, t=2, p=1) — vulnerable to
+      GPU brute-force. Use `argon2_for_version(KDF_VERSION_CURRENT)`
+      from wallet-core, or build explicitly with
+      `Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::new(65536, 3, 4, Some(32))?)`.
+      See docs/security/KDF_POLICY.md.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "wallet-core/src/**/*.rs"
+        - "wallet/src/**/*.rs"
+        - "wallet-sdk/src/**/*.rs"
+        - "wallet-extension/**/*.rs"
+        - "gui/**/*.rs"
+        - "faucet/src/**/*.rs"
+        - "agent-core/src/**/*.rs"
+        - "agent-chain/src/**/*.rs"
+        - "agent-code/src/**/*.rs"
+        - "agent-cron/src/**/*.rs"
+        - "core/**/*.rs"
+        - "node/src/**/*.rs"
+        - "node-app/src/**/*.rs"
+        - "gateway/src/**/*.rs"
+        - "training-worker/src/**/*.rs"
+        - "pool-coordinator/src/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
+        - "**/*_tests.rs"
+        - "**/benches/**"
+        - "**/examples/**"
+    patterns:
+      - pattern: Argon2::default()
+      # Permit the deliberate legacy branch in argon2_for_version.
+      # That single line is the documented exception per KDF_POLICY.md.
+      - pattern-not-inside: |
+          fn argon2_for_version(...) -> ... {
+            ...
+          }
+    metadata:
+      audit-id: WAL-01
+      severity: critical
+      sprint: RM-A1
+      wp: WP-A1.1
+      spec: citrate_v0.01.1/docs/security/KDF_POLICY.md
+      reference: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
