@@ -49,7 +49,7 @@ fn genesis_block() -> Block {
 
 async fn setup_chain_selector() -> (Arc<DagStore>, Arc<GhostDag>, Arc<TipSelector>, ChainSelector)
 {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
         dag_store.clone(),
@@ -180,7 +180,7 @@ async fn test_find_common_ancestor_same_tip() {
 #[tokio::test]
 async fn test_find_common_ancestor_deep_fork() {
     // Create two diverging chains from genesis. The longer one should win when processed.
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
         dag_store.clone(),
@@ -252,7 +252,7 @@ async fn test_extends_current_chain_via_merge_parent() {
     // Test the merge parent check in extends_current_chain.
     // We need a block whose selected parent is NOT the current tip,
     // but whose merge parent IS the current tip, AND whose ghostdag score <= current.
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
         dag_store.clone(),
@@ -315,7 +315,7 @@ async fn test_extend_chain_without_finality() {
 
 #[tokio::test]
 async fn test_extend_chain_with_finality_tracker() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
         dag_store.clone(),
@@ -348,7 +348,7 @@ async fn test_extend_chain_with_finality_tracker() {
 
 #[tokio::test]
 async fn test_attempt_reorganization_depth_exceeded() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
         dag_store.clone(),
@@ -391,7 +391,7 @@ async fn test_attempt_reorganization_depth_exceeded() {
 
 #[tokio::test]
 async fn test_attempt_reorganization_finality_blocks_reorg() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
         dag_store.clone(),
@@ -479,7 +479,7 @@ async fn test_validate_chain_empty_is_valid() {
 
 #[tokio::test]
 async fn test_on_new_block_higher_score_triggers_reorg() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
         dag_store.clone(),
@@ -555,7 +555,7 @@ async fn test_on_new_block_lower_score_returns_false() {
 
 #[tokio::test]
 async fn test_reorg_history_populated() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
         dag_store.clone(),
@@ -603,7 +603,7 @@ async fn test_reorg_history_populated() {
 
 #[tokio::test]
 async fn test_select_highest_blue_score_single_tip() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
     let gen = genesis_block();
@@ -622,7 +622,7 @@ async fn test_select_highest_blue_score_single_tip() {
 
 #[tokio::test]
 async fn test_select_highest_blue_score_multiple_tips() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
     let gen = genesis_block();
@@ -652,7 +652,7 @@ async fn test_select_highest_blue_score_multiple_tips() {
 
 #[tokio::test]
 async fn test_select_highest_blue_score_with_tiebreak_hash_ordering() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
     let gen = genesis_block();
@@ -682,7 +682,7 @@ async fn test_select_highest_blue_score_with_tiebreak_hash_ordering() {
 
 #[tokio::test]
 async fn test_select_weighted_random_single_tip() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
     let gen = genesis_block();
@@ -701,7 +701,7 @@ async fn test_select_weighted_random_single_tip() {
 
 #[tokio::test]
 async fn test_select_weighted_random_multiple_tips() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
     let gen = genesis_block();
@@ -734,7 +734,7 @@ async fn test_select_weighted_random_multiple_tips() {
 
 #[tokio::test]
 async fn test_select_current_tip_highest_blue_score_strategy() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let gen = genesis_block();
     dag_store.store_block(gen.clone()).await.unwrap();
@@ -750,7 +750,7 @@ async fn test_select_current_tip_highest_blue_score_strategy() {
 
 #[tokio::test]
 async fn test_select_current_tip_tiebreak_strategy() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let gen = genesis_block();
     dag_store.store_block(gen.clone()).await.unwrap();
@@ -766,7 +766,7 @@ async fn test_select_current_tip_tiebreak_strategy() {
 
 #[tokio::test]
 async fn test_select_current_tip_weighted_random_strategy() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let gen = genesis_block();
     dag_store.store_block(gen.clone()).await.unwrap();
@@ -784,7 +784,7 @@ async fn test_select_current_tip_weighted_random_strategy() {
 
 #[tokio::test]
 async fn test_select_parents_limits_to_max() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
     let gen = genesis_block();
@@ -810,7 +810,7 @@ async fn test_select_parents_limits_to_max() {
 
 #[tokio::test]
 async fn test_select_parents_single_tip() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
     let gen = genesis_block();
@@ -832,7 +832,7 @@ async fn test_select_parents_single_tip() {
 
 #[tokio::test]
 async fn test_parent_selector_select_parents_succeeds() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
     let gen = genesis_block();
@@ -853,7 +853,7 @@ async fn test_parent_selector_select_parents_succeeds() {
 
 #[tokio::test]
 async fn test_parent_selector_min_not_met_returns_error() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
     let gen = genesis_block();
@@ -874,7 +874,7 @@ async fn test_parent_selector_min_not_met_returns_error() {
 
 #[tokio::test]
 async fn test_parent_selector_with_multiple_tips() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
     let gen = genesis_block();
@@ -907,7 +907,7 @@ async fn test_parent_selector_with_multiple_tips() {
 
 #[tokio::test]
 async fn test_checkpoint_status_finalized() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let blocks = build_checkpoint_chain(&dag, 6).await;
     let mgr = CheckpointManager::new(config, dag);
@@ -926,7 +926,7 @@ async fn test_checkpoint_status_finalized() {
 
 #[tokio::test]
 async fn test_checkpoint_status_pending() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let blocks = build_checkpoint_chain(&dag, 6).await;
     let mgr = CheckpointManager::new(config, dag);
@@ -939,7 +939,7 @@ async fn test_checkpoint_status_pending() {
 
 #[tokio::test]
 async fn test_checkpoint_status_none() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let mgr = CheckpointManager::new(config, dag);
 
@@ -950,7 +950,7 @@ async fn test_checkpoint_status_none() {
 
 #[tokio::test]
 async fn test_pending_vote_count_with_votes() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let blocks = build_checkpoint_chain(&dag, 6).await;
     let mgr = CheckpointManager::new(config, dag);
@@ -968,7 +968,7 @@ async fn test_pending_vote_count_with_votes() {
 
 #[tokio::test]
 async fn test_pending_vote_count_zero_votes() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let blocks = build_checkpoint_chain(&dag, 6).await;
     let mgr = CheckpointManager::new(config, dag);
@@ -981,7 +981,7 @@ async fn test_pending_vote_count_zero_votes() {
 
 #[tokio::test]
 async fn test_pending_vote_count_nonexistent() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let mgr = CheckpointManager::new(config, dag);
 
@@ -1111,7 +1111,7 @@ fn test_is_checkpoint_height() {
 
 #[tokio::test]
 async fn test_propose_not_checkpoint_boundary() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let blocks = build_checkpoint_chain(&dag, 4).await;
     let mgr = CheckpointManager::new(config, dag);
@@ -1122,7 +1122,7 @@ async fn test_propose_not_checkpoint_boundary() {
 
 #[tokio::test]
 async fn test_propose_block_not_found() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let mgr = CheckpointManager::new(config, dag);
 
@@ -1132,7 +1132,7 @@ async fn test_propose_block_not_found() {
 
 #[tokio::test]
 async fn test_propose_already_exists() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let blocks = build_checkpoint_chain(&dag, 6).await;
     let mgr = CheckpointManager::new(config, dag);
@@ -1148,7 +1148,7 @@ async fn test_propose_already_exists() {
 
 #[tokio::test]
 async fn test_finalize_checkpoint_without_quorum_rejected() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let blocks = build_checkpoint_chain(&dag, 6).await;
     let mgr = CheckpointManager::new(config, dag);
@@ -1172,7 +1172,7 @@ async fn test_finalize_checkpoint_without_quorum_rejected() {
 
 #[tokio::test]
 async fn test_submit_vote_wrong_block_hash() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let blocks = build_checkpoint_chain(&dag, 6).await;
     let mgr = CheckpointManager::new(config, dag);
@@ -1196,7 +1196,7 @@ async fn test_submit_vote_wrong_block_hash() {
 
 #[tokio::test]
 async fn test_latest_finalized_height_and_get_checkpoint() {
-    let dag = Arc::new(DagStore::new());
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let blocks = build_checkpoint_chain(&dag, 6).await;
     let mgr = CheckpointManager::new(config, dag);

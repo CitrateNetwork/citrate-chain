@@ -60,7 +60,7 @@ mod blue_set_determinism {
     async fn test_blue_set_determinism_simple_chain() {
         // Create the same DAG twice and verify blue sets match
         for _ in 0..3 {
-            let dag_store = Arc::new(DagStore::new());
+            let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
             let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
 
             // Build a simple chain: genesis -> A -> B -> C
@@ -97,7 +97,7 @@ mod blue_set_determinism {
     #[tokio::test]
     async fn test_blue_set_determinism_diamond_dag() {
         // Diamond: genesis -> [A, B] -> C (C has both A and B as parents)
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
 
         let genesis = create_simple_block(0, 0, None);
@@ -136,7 +136,7 @@ mod blue_set_determinism {
     /// Test blue set with parallel branches (DAG width test)
     #[tokio::test]
     async fn test_blue_set_parallel_branches() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
 
         // Create genesis
@@ -183,7 +183,7 @@ mod mergeset_ordering {
     /// Test that mergeset ordering is consistent across multiple calls
     #[tokio::test]
     async fn test_mergeset_ordering_consistency() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let _ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
 
         // Build a DAG with merge parents
@@ -221,7 +221,7 @@ mod mergeset_ordering {
     /// Test ordering with deep merge history
     #[tokio::test]
     async fn test_deep_merge_ordering() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
 
         // Create a chain with periodic merges
         let genesis = create_simple_block(0, 0, None);
@@ -275,7 +275,7 @@ mod tip_selection_stability {
     /// Test that tip selection is stable with equal blue scores
     #[tokio::test]
     async fn test_tip_selection_stability_equal_scores() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = TipSelector::new(
             dag_store.clone(),
@@ -315,7 +315,7 @@ mod tip_selection_stability {
     /// Test tip selection with varying blue scores
     #[tokio::test]
     async fn test_tip_selection_prefers_higher_score() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = TipSelector::new(
             dag_store.clone(),
@@ -360,7 +360,7 @@ mod blue_score_monotonicity {
     /// Test that blue scores never decrease along a chain
     #[tokio::test]
     async fn test_blue_score_monotonic_increase() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
 
         // Build a long chain
@@ -389,7 +389,7 @@ mod blue_score_monotonicity {
     /// Test blue score with parallel blocks
     #[tokio::test]
     async fn test_blue_score_with_merges() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
 
         let genesis = create_simple_block(0, 0, None);
@@ -435,7 +435,7 @@ mod edge_cases {
     /// Test single block (genesis only)
     #[tokio::test]
     async fn test_single_block_dag() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
 
         let genesis = create_simple_block(0, 0, None);
@@ -453,7 +453,7 @@ mod edge_cases {
     /// Test maximum merge parents
     #[tokio::test]
     async fn test_max_merge_parents() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let params = GhostDagParams::default();
         let max_parents = params.max_parents;
 
@@ -488,7 +488,7 @@ mod edge_cases {
     /// Test conflicting tips with same hash prefix
     #[tokio::test]
     async fn test_similar_tip_hashes() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = TipSelector::new(
             dag_store.clone(),
@@ -534,7 +534,7 @@ mod edge_cases {
     /// Test reorg scenario detection
     #[tokio::test]
     async fn test_reorg_scenario() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
         let genesis = create_simple_block(0, 0, None);
@@ -589,7 +589,7 @@ mod stress_tests {
     /// Test with many parallel tips
     #[tokio::test]
     async fn test_many_parallel_tips() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = TipSelector::new(
             dag_store.clone(),
@@ -621,7 +621,7 @@ mod stress_tests {
     /// Test deep chain performance
     #[tokio::test]
     async fn test_deep_chain() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
 
         let genesis = create_simple_block(0, 0, None);
@@ -652,7 +652,7 @@ mod stress_tests {
     /// Test wide DAG (many blocks at each height)
     #[tokio::test]
     async fn test_wide_dag() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
 
         let genesis = create_simple_block(0, 0, None);
         dag_store.store_block(genesis.clone()).await.unwrap();

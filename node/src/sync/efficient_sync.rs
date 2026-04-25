@@ -701,7 +701,7 @@ mod tests {
         // Test that sync handles deep chains without stack overflow
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
         let mut manager = EfficientSyncManager::new(storage.clone(), ghostdag.clone());
@@ -734,7 +734,7 @@ mod tests {
         // Test that queue respects memory limits
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store));
 
         let mut manager = EfficientSyncManager::new(storage, ghostdag);
@@ -763,7 +763,7 @@ mod tests {
         // Test checkpoint save and resume functionality
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
         // Store some blocks
@@ -823,7 +823,7 @@ mod tests {
     async fn test_block_header_validation() {
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store));
 
         let manager = EfficientSyncManager::new(storage, ghostdag);
@@ -902,7 +902,7 @@ mod tests {
     async fn test_parallel_sync_coordinator() {
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
         // Store genesis
@@ -926,7 +926,7 @@ mod tests {
     async fn test_find_missing_parents() {
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store));
 
         let manager = EfficientSyncManager::new(storage.clone(), ghostdag);
@@ -947,7 +947,7 @@ mod tests {
     async fn test_manager_reset() {
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store));
 
         let mut manager = EfficientSyncManager::new(storage, ghostdag);

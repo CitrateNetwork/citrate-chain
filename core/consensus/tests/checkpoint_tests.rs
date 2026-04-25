@@ -62,7 +62,7 @@ fn hash_for(n: u64) -> Hash {
 
 #[tokio::test]
 async fn test_checkpoint_quorum_requires_threshold() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let mgr = CheckpointManager::new(config, dag_store.clone());
 
@@ -93,7 +93,7 @@ async fn test_checkpoint_quorum_requires_threshold() {
 
 #[tokio::test]
 async fn test_checkpoint_quorum_reached_with_enough_votes() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let mgr = CheckpointManager::new(config, dag_store.clone());
 
@@ -122,7 +122,7 @@ async fn test_checkpoint_quorum_reached_with_enough_votes() {
 
 #[tokio::test]
 async fn test_checkpoint_duplicate_vote_rejected() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let mgr = CheckpointManager::new(config, dag_store.clone());
 
@@ -144,7 +144,7 @@ async fn test_checkpoint_duplicate_vote_rejected() {
 
 #[tokio::test]
 async fn test_checkpoint_non_committee_vote_rejected() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = CheckpointConfig::for_testing();
     let mgr = CheckpointManager::new(config, dag_store.clone());
 
@@ -168,7 +168,7 @@ async fn test_checkpoint_non_committee_vote_rejected() {
 
 #[tokio::test]
 async fn test_total_ordering_linear_chain() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let params = GhostDagParams::default();
     let ghostdag = Arc::new(GhostDag::new(params, dag_store.clone()));
 
@@ -197,7 +197,7 @@ async fn test_total_ordering_linear_chain() {
 
 #[tokio::test]
 async fn test_total_ordering_deterministic() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let params = GhostDagParams::default();
     let ghostdag = Arc::new(GhostDag::new(params, dag_store.clone()));
 

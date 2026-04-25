@@ -557,7 +557,7 @@ mod tests {
     /// Quorum threshold: 3 rejected, 4 accepted (for test config with quorum=4).
     #[tokio::test]
     async fn test_quorum_threshold() {
-        let dag = Arc::new(DagStore::new());
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = CheckpointConfig::for_testing(); // interval=5, committee=5, quorum=4
         let blocks = build_chain(&dag, 6).await;
         let mgr = CheckpointManager::new(config, dag);
@@ -585,7 +585,7 @@ mod tests {
     /// Zero signature is rejected.
     #[tokio::test]
     async fn test_zero_signature_rejected() {
-        let dag = Arc::new(DagStore::new());
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = CheckpointConfig::for_testing();
         let blocks = build_chain(&dag, 6).await;
         let mgr = CheckpointManager::new(config, dag);
@@ -606,7 +606,7 @@ mod tests {
     /// Invalid (tampered) signature is rejected by crypto verification.
     #[tokio::test]
     async fn test_invalid_signature_rejected() {
-        let dag = Arc::new(DagStore::new());
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = CheckpointConfig::for_testing();
         let blocks = build_chain(&dag, 6).await;
         let mgr = CheckpointManager::new(config, dag);
@@ -628,7 +628,7 @@ mod tests {
     /// Valid cryptographic signature is accepted.
     #[tokio::test]
     async fn test_valid_signature_accepted() {
-        let dag = Arc::new(DagStore::new());
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = CheckpointConfig::for_testing();
         let blocks = build_chain(&dag, 6).await;
         let mgr = CheckpointManager::new(config, dag);
@@ -644,7 +644,7 @@ mod tests {
     /// Checkpoint finalization propagates to DagStore.
     #[tokio::test]
     async fn test_checkpoint_finalization_propagates() {
-        let dag = Arc::new(DagStore::new());
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = CheckpointConfig::for_testing(); // quorum=4
         let blocks = build_chain(&dag, 6).await;
         let mgr = CheckpointManager::new(config, dag.clone());
@@ -673,7 +673,7 @@ mod tests {
     /// Duplicate vote from same validator is rejected (replay protection).
     #[tokio::test]
     async fn test_duplicate_vote_rejected() {
-        let dag = Arc::new(DagStore::new());
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = CheckpointConfig::for_testing();
         let blocks = build_chain(&dag, 6).await;
         let mgr = CheckpointManager::new(config, dag);
@@ -692,7 +692,7 @@ mod tests {
     /// Non-committee member vote is rejected.
     #[tokio::test]
     async fn test_non_committee_vote_rejected() {
-        let dag = Arc::new(DagStore::new());
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = CheckpointConfig::for_testing();
         let blocks = build_chain(&dag, 6).await;
         let mgr = CheckpointManager::new(config, dag);
@@ -709,7 +709,7 @@ mod tests {
     /// Signature for wrong height is rejected.
     #[tokio::test]
     async fn test_wrong_height_signature_rejected() {
-        let dag = Arc::new(DagStore::new());
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = CheckpointConfig::for_testing();
         let blocks = build_chain(&dag, 6).await;
         let mgr = CheckpointManager::new(config, dag);

@@ -31,7 +31,7 @@ mod dag_store_tests {
 
     #[tokio::test]
     async fn test_dag_store_new() {
-        let dag_store = DagStore::new();
+        let dag_store = DagStore::with_permissive_vrf_for_testing();
         let stats = dag_store.get_stats().await;
         assert_eq!(stats.total_blocks, 0);
         assert_eq!(stats.total_tips, 0);
@@ -40,7 +40,7 @@ mod dag_store_tests {
 
     #[tokio::test]
     async fn test_store_and_retrieve_block() {
-        let dag_store = DagStore::new();
+        let dag_store = DagStore::with_permissive_vrf_for_testing();
         let block = create_test_block(1, 0, None);
         let hash = block.hash();
 
@@ -58,7 +58,7 @@ mod dag_store_tests {
 
     #[tokio::test]
     async fn test_has_block() {
-        let dag_store = DagStore::new();
+        let dag_store = DagStore::with_permissive_vrf_for_testing();
         let block = create_test_block(1, 0, None);
         let hash = block.hash();
 
@@ -74,7 +74,7 @@ mod dag_store_tests {
 
     #[tokio::test]
     async fn test_duplicate_block_error() {
-        let dag_store = DagStore::new();
+        let dag_store = DagStore::with_permissive_vrf_for_testing();
         let block = create_test_block(1, 0, None);
 
         // First store should succeed
@@ -91,7 +91,7 @@ mod dag_store_tests {
 
     #[tokio::test]
     async fn test_get_blocks_at_height() {
-        let dag_store = DagStore::new();
+        let dag_store = DagStore::with_permissive_vrf_for_testing();
 
         // Add blocks at different heights
         let block1 = create_test_block(1, 0, None);
@@ -113,7 +113,7 @@ mod dag_store_tests {
 
     #[tokio::test]
     async fn test_get_children() {
-        let dag_store = DagStore::new();
+        let dag_store = DagStore::with_permissive_vrf_for_testing();
 
         let genesis = create_test_block(0, 0, None);
         let child1 = create_test_block(1, 1, Some(genesis.hash()));
@@ -131,7 +131,7 @@ mod dag_store_tests {
 
     #[tokio::test]
     async fn test_tips_tracking() {
-        let dag_store = DagStore::new();
+        let dag_store = DagStore::with_permissive_vrf_for_testing();
 
         // Add genesis - should be a tip
         let genesis = create_test_block(0, 0, None);
@@ -152,7 +152,7 @@ mod dag_store_tests {
 
     #[tokio::test]
     async fn test_finalize_block() {
-        let dag_store = DagStore::new();
+        let dag_store = DagStore::with_permissive_vrf_for_testing();
         let block = create_test_block(1, 0, None);
         let hash = block.hash();
 
@@ -170,7 +170,7 @@ mod dag_store_tests {
 
     #[tokio::test]
     async fn test_pruning_point() {
-        let dag_store = DagStore::new();
+        let dag_store = DagStore::with_permissive_vrf_for_testing();
 
         // Initially default
         assert_eq!(dag_store.get_pruning_point().await, Hash::default());
@@ -191,7 +191,7 @@ mod tip_tiebreak_tests {
 
     #[tokio::test]
     async fn test_tip_tie_breaker_prefers_higher_hash() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = TipSelector::new(
             dag_store.clone(),
@@ -229,7 +229,7 @@ mod parent_selection_tests {
 
     #[tokio::test]
     async fn test_parent_selector_prefers_highest_hash_among_equal_scores() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = Arc::new(TipSelector::new(
             dag_store.clone(),
@@ -265,7 +265,7 @@ mod parent_selection_tests {
 
     #[tokio::test]
     async fn test_parent_selector_respects_min_and_max_parents() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tipsel = Arc::new(TipSelector::new(
             dag_store.clone(),
@@ -305,7 +305,7 @@ mod ghostdag_tests {
     #[tokio::test]
     async fn test_ghostdag_new() {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store);
 
         assert_eq!(ghostdag.params().k, 18);
@@ -315,7 +315,7 @@ mod ghostdag_tests {
     #[tokio::test]
     async fn test_calculate_blue_set_genesis() {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         // Create a genesis block (height 0)
@@ -333,7 +333,7 @@ mod ghostdag_tests {
     #[tokio::test]
     async fn test_tip_selection() {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let _ghostdag = Arc::new(GhostDag::new(params, dag_store.clone()));
 
         // Create tip selector
@@ -442,7 +442,7 @@ mod chain_selection_tests {
     #[tokio::test]
     async fn test_chain_selector_creation() {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let _ghostdag = Arc::new(GhostDag::new(params, dag_store.clone()));
         let tip_selector = Arc::new(TipSelector::new(
             dag_store.clone(),
@@ -490,7 +490,7 @@ mod integration_tests {
     async fn test_full_dag_workflow() {
         // Create components
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let _ghostdag = Arc::new(GhostDag::new(params, dag_store.clone()));
 
         // Add genesis
@@ -525,7 +525,7 @@ mod tip_selection_tests {
     #[tokio::test]
     async fn test_tip_selection_tiebreak_equal_scores() {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(params, dag_store.clone()));
         let tip_selector = TipSelector::new(
             dag_store.clone(),
@@ -559,7 +559,7 @@ mod parent_selector_tests {
     #[tokio::test]
     async fn test_parent_selector_max_bound() {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(params, dag_store.clone()));
         let tip_selector = Arc::new(TipSelector::new(
             dag_store.clone(),

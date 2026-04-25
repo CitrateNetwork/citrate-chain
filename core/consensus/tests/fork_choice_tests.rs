@@ -54,7 +54,7 @@ async fn setup_genesis(dag_store: &Arc<DagStore>, ghostdag: &GhostDag) -> Hash {
 #[tokio::test]
 async fn test_tip_selection_highest_blue_score() {
     let params = GhostDagParams::default();
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;
@@ -108,7 +108,7 @@ async fn test_tip_selection_highest_blue_score() {
 #[tokio::test]
 async fn test_tip_selection_tiebreak_by_hash() {
     let params = GhostDagParams::default();
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;
@@ -152,7 +152,7 @@ async fn test_tip_selection_tiebreak_by_hash() {
 // ============================================================================
 #[tokio::test]
 async fn test_finality_depth_blocks_reorg() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = FinalityConfig {
         confirmation_depth: 5,
         emit_events: false,
