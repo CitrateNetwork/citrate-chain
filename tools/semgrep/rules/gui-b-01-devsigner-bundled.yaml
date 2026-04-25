@@ -1,4 +1,4 @@
-# GUI-B-01 — buyer-webapp DevSigner must not run in production.
+# GUI-B-01 — buyer-webapp must not re-introduce a `lib/devSigner.ts`.
 #
 # Audit finding (MEDIUM):
 #   .audit/2026-04-24-full-repo-adversarial-audit/07_FINDINGS_GUIS.md#gui-b-01
@@ -12,36 +12,70 @@
 # and "sign" transactions — the audit flagged this as a foot-gun
 # (screen-share or phishing leaks the key trivially).
 #
-# Post-fix every entry point in devSigner.ts short-circuits to a
-# no-op when `process.env.NODE_ENV === 'production'`. The full-file
-# deletion + Mock fixture migration is tracked as a follow-on.
+# Phase E first reduced the risk via an `isProductionBuild()` runtime
+# gate. The follow-on cleanup (this commit lives alongside)
+# DELETED `lib/devSigner.ts` outright; tests use
+# `__tests__/fixtures/MockSigner.ts` directly. Production code must
+# not import a `devSigner` module under any path.
 #
-# This rule fires when an entry point of devSigner.ts re-introduces
-# code paths that don't go through the `isProductionBuild()` gate.
+# This rule fires when:
+#   - any file under `buyer-webapp/lib/` exports a function named
+#     `setDevSigner`, `readDevSigner`, or `clearDevSigner`; OR
+#   - any production source imports from `./devSigner` /
+#     `@/lib/devSigner`.
 
 rules:
-  - id: gui-b-01-devsigner-bundled
+  - id: gui-b-01-devsigner-export
     message: >-
-      `buyer-webapp/lib/devSigner.ts` must short-circuit every
-      entry point when `isProductionBuild()` returns true. See
-      audit GUI-B-01 and
+      `buyer-webapp/lib/devSigner.ts` was deleted (audit GUI-B-01).
+      Tests that need a quick signer use
+      `__tests__/fixtures/MockSigner.ts`. Don't re-export a
+      production-bundled DevSigner module. See
       .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md.
     languages: [typescript]
     severity: ERROR
     paths:
       include:
-        - "buyer-webapp/lib/devSigner.ts"
-    patterns:
+        - "buyer-webapp/lib/**/*.ts"
+        - "buyer-webapp/lib/**/*.tsx"
+      exclude:
+        - "**/__tests__/**"
+        - "**/*.test.ts"
+        - "**/*.test.tsx"
+    pattern-either:
       - pattern: |
-          export function setDevSigner($PK: string): Signer {
-            ...
-          }
-      - pattern-not: |
-          export function setDevSigner($PK: string): Signer {
-            ...
-            isProductionBuild()
-            ...
-          }
+          export function setDevSigner($PK: string): $T { ... }
+      - pattern: |
+          export function readDevSigner(): $T { ... }
+      - pattern: |
+          export function clearDevSigner(): $T { ... }
+
+  - id: gui-b-01-devsigner-import
+    message: >-
+      Production code in `buyer-webapp` must not import from
+      `./devSigner` or `@/lib/devSigner` — that module was deleted in
+      audit GUI-B-01 cleanup. Tests use
+      `__tests__/fixtures/MockSigner.ts`.
+    languages: [typescript]
+    severity: ERROR
+    paths:
+      include:
+        - "buyer-webapp/**/*.ts"
+        - "buyer-webapp/**/*.tsx"
+      exclude:
+        - "**/__tests__/**"
+        - "**/*.test.ts"
+        - "**/*.test.tsx"
+        - "buyer-webapp/__tests__/**"
+    pattern-either:
+      - pattern: |
+          import $X from './devSigner';
+      - pattern: |
+          import { ... } from './devSigner';
+      - pattern: |
+          import $X from '@/lib/devSigner';
+      - pattern: |
+          import { ... } from '@/lib/devSigner';
     metadata:
       audit-id: GUI-B-01
       severity: medium
