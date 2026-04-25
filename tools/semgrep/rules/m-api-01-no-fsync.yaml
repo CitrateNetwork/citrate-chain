@@ -1,0 +1,37 @@
+# M-API-01 — Producer-finality writes MUST use write_batch_sync.
+#
+# Audit finding (MEDIUM):
+#   .audit/2026-04-24-full-repo-adversarial-audit/04_FINDINGS_API_NETWORK_STORAGE.md#m-api-01
+#
+# Pre-fix all RocksDB writes used the default `WriteOptions { sync:
+# false }`. WAL is on, but writes return as soon as the OS buffer
+# accepts them. A power loss between block commit and OS flush
+# silently rolled back finalised state.
+#
+# Post-fix `RocksDB::write_batch_sync(batch)` is available for
+# finalised-block commits. The producer is expected to use it for
+# the super-batch encompassing block + tx index + receipts.
+#
+# This rule fires when `write_batch` is called from the producer
+# crate (`node`) — flagging it as potentially needing the sync
+# variant. It's a heuristic — not every write needs sync — so
+# severity is WARNING.
+
+rules:
+  - id: m-api-01-producer-write-batch-no-sync
+    message: >-
+      Producer-finality `write_batch` should be `write_batch_sync`
+      for durability against power loss (M-API-01). Pre-fix a power
+      loss between block commit and OS flush silently rolled back
+      finalised state.
+    languages: [rust]
+    severity: WARNING
+    paths:
+      include:
+        - "node/src/producer.rs"
+        - "core/storage/src/chain/block_store.rs"
+      exclude:
+        - "**/tests/**"
+    patterns:
+      - pattern: $DB.write_batch($BATCH)
+      - pattern-not: $DB.write_batch_sync($BATCH)

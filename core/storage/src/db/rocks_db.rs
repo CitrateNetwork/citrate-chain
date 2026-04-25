@@ -77,9 +77,27 @@ impl RocksDB {
         Ok(self.get_cf(cf, key)?.is_some())
     }
 
-    /// Write a batch of operations atomically
+    /// Write a batch of operations atomically with the default
+    /// (non-sync) WriteOptions. WAL is on, but writes return as
+    /// soon as the OS buffer accepts them.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Write a batch of operations atomically with `sync=true`.
+    ///
+    /// RM-B1 / WP-C3.1 (audit M-API-01): pre-fix all writes used
+    /// the default `WriteOptions { sync: false }`. A power loss
+    /// between block commit and OS flush silently rolled back
+    /// finalised state. Use this method for the producer's
+    /// finalised-block commit batch (block + tx index + receipts
+    /// + DAG persistence in one super-batch). Other writes
+    /// (caches, metrics) can stay async via `write_batch`.
+    pub fn write_batch_sync(&self, batch: WriteBatch) -> Result<()> {
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db.write_opt(batch, &opts)?;
         Ok(())
     }
 
