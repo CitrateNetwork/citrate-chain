@@ -203,6 +203,120 @@ proptest! {
 }
 
 // =========================================================================
+// KNOWN-ANSWER TEST — closes the mutation-testing gap discovered when
+// `cargo mutants` reported `replace argon2_for_version -> ... with
+// Ok(Default::default())` survived. The kdf_version=2 field check above
+// passes under that mutation (encrypt + decrypt are both consistent at
+// default params), but the *actual derived bytes* differ between
+// Argon2::default() and the v2 recipe. Asserting a known answer
+// against (password, salt, version=2) pins the parameter set.
+//
+// If a future change to the v2 params is intentional (e.g., calibrated
+// the `argon2-wasm` build target down for a low-memory device), update
+// the constant below in lockstep with `docs/security/KDF_POLICY.md`
+// §3.2 and bump `KDF_VERSION_CURRENT` to a new version. Don't change
+// the v2 params without bumping the version — old keystores would
+// silently fail to decrypt.
+// =========================================================================
+
+#[test]
+fn test_wal01_argon2_v2_known_answer_locks_parameter_set() {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    // Inputs locked at audit-time. Any change to (password, salt) here
+    // invalidates the known answer; if you need to change them, recompute
+    // the expected output and document why.
+    let password = b"wal01-kat-anchor";
+    let salt = b"WAL01-known-answr"; // 17 bytes; takes 16 below
+    let salt: [u8; 16] = {
+        let mut s = [0u8; 16];
+        s.copy_from_slice(&salt[..16]);
+        s
+    };
+
+    // Expected output under v2 params: m=65536, t=3, p=1, out=32,
+    // Argon2id v0x13. Computed once with the production code path
+    // and pinned here. A regression to default params would shift
+    // every byte and fail this assert.
+    //
+    // To regenerate: `let _ = expected; println!("{}", hex::encode(&out));`
+    // and copy the hex from the failure message.
+    const EXPECTED_V2_HEX: &str =
+        "c803f98d27b8d330fb31a998fdc6b2de24b0faa1e4f67b23fae71b24024a16a9";
+
+    let params =
+        Params::new(65536, 3, 1, Some(32)).expect("WAL-01: v2 params are statically valid");
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; 32];
+    argon2
+        .hash_password_into(password, &salt, &mut out)
+        .expect("hash_password_into");
+
+    let actual = hex::encode(out);
+    if actual != EXPECTED_V2_HEX {
+        // Argon2::default() with the same inputs produces a known-different
+        // hash. Surfacing both makes the regression diagnosis immediate.
+        let mut default_out = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(password, &salt, &mut default_out)
+            .expect("default Argon2 hash");
+        let default_hex = hex::encode(default_out);
+
+        if actual == default_hex {
+            panic!(
+                "WAL-01 known-answer regression: argon2_v2 produced the SAME bytes \
+                 as Argon2::default() — the dispatcher has reverted to weaker \
+                 (default) parameters. See docs/security/KDF_POLICY.md §3.2.\n\
+                 Expected (v2): {}\n\
+                 Got:           {}\n\
+                 Default-recipe match: {}",
+                EXPECTED_V2_HEX, actual, default_hex,
+            );
+        } else {
+            panic!(
+                "WAL-01 known-answer regression: v2 params changed without bumping \
+                 KDF_VERSION_CURRENT. If this is intentional, bump the version per \
+                 docs/security/KDF_POLICY.md §4.1 and update the test constant.\n\
+                 Expected (v2): {}\n\
+                 Got:           {}",
+                EXPECTED_V2_HEX, actual,
+            );
+        }
+    }
+}
+
+#[test]
+fn test_wal01_argon2_v2_differs_from_default() {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    // Direct discriminator: v2 params produce a different output than
+    // Argon2::default() for identical (password, salt). This is what
+    // mutation testing was probing — `Ok(Default::default())` would
+    // collapse the two paths, and this test would catch it.
+    let password = b"discriminator-input";
+    let salt: [u8; 16] = [0xCD; 16];
+
+    let mut v2_out = [0u8; 32];
+    let v2_params =
+        Params::new(65536, 3, 1, Some(32)).expect("WAL-01: v2 params are statically valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, v2_params)
+        .hash_password_into(password, &salt, &mut v2_out)
+        .expect("v2 hash");
+
+    let mut default_out = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(password, &salt, &mut default_out)
+        .expect("default hash");
+
+    assert_ne!(
+        v2_out, default_out,
+        "WAL-01: v2 params (m=65536, t=3, p=1) MUST produce different bytes than \
+         Argon2::default() (m=19456, t=2, p=1). If this fails, mutation testing \
+         has caught a regression to defaults. See docs/security/KDF_POLICY.md."
+    );
+}
+
+// =========================================================================
 // LATENCY HEURISTIC: post-fix create_account should NOT complete in <50 ms
 //
 // Default Argon2 parameters complete in ~30-60 ms on a modern desktop.

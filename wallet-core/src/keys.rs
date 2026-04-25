@@ -432,6 +432,74 @@ impl KeyManager {
         self.unlocked_write().clear();
     }
 
+    /// Migrate every legacy (`kdf_version: 1`) entry to the current
+    /// production parameters. Idempotent: v2+ entries pass through.
+    ///
+    /// Per `docs/security/KDF_POLICY.md` §4.2, migration is **opt-in** and
+    /// **lazy** — callers (GUI, CLI) invoke this when a user has just
+    /// authenticated and the keystore is detected to contain v1 entries.
+    /// We do not auto-migrate during `unlock` to keep that path
+    /// side-effect-free.
+    ///
+    /// Returns the number of entries upgraded. Errors out if any entry
+    /// fails to decrypt under the supplied password (so a partial
+    /// migration leaves the keystore in its original state).
+    pub fn migrate_to_current_kdf(&self, password: &str) -> Result<usize, WalletError> {
+        // First pass: decrypt every v1 entry to make sure the password is
+        // valid before we touch disk. This avoids partial migration if a
+        // later entry fails.
+        let mut new_entries: Vec<EncryptedKeyEntry> = Vec::new();
+        let entries_snapshot = self.entries_read().clone();
+        let mut upgraded = 0usize;
+
+        for entry in entries_snapshot.iter() {
+            if entry.kdf_version >= KDF_VERSION_CURRENT {
+                // Already current — pass through unchanged.
+                new_entries.push(entry.clone());
+                continue;
+            }
+
+            // Decrypt under the entry's declared (v1) parameters.
+            let secret_bytes = decrypt_key(entry, password)?;
+
+            // Re-encrypt under v2 with a fresh salt + nonce.
+            let migrated = encrypt_key_raw(
+                &secret_bytes,
+                password,
+                &entry.address,
+                &entry.public_key_hex,
+                &entry.label,
+                entry.key_type,
+            )?;
+            // Preserve the original creation timestamp; the migration is
+            // not a new account.
+            let migrated = EncryptedKeyEntry {
+                created_at: entry.created_at,
+                ..migrated
+            };
+            new_entries.push(migrated);
+            upgraded += 1;
+        }
+
+        if upgraded == 0 {
+            // Nothing to do; avoid a needless disk write.
+            return Ok(0);
+        }
+
+        // Atomic swap + persist.
+        *self.entries_write() = new_entries;
+        self.save()?;
+        Ok(upgraded)
+    }
+
+    /// Returns true if any entry on the keystore is below the current KDF
+    /// version. Useful for the GUI to surface a "migrate now" prompt.
+    pub fn has_legacy_kdf_entries(&self) -> bool {
+        self.entries_read()
+            .iter()
+            .any(|e| e.kdf_version < KDF_VERSION_CURRENT)
+    }
+
     /// Check if any keys are unlocked.
     pub fn is_unlocked(&self) -> bool {
         !self.unlocked_read().is_empty()
