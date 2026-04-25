@@ -20,6 +20,7 @@ use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use zeroize::Zeroizing;
 
 // =========================================================================
 // KDF version registry
@@ -245,9 +246,13 @@ impl KeyManager {
             .map_err(|e| WalletError::KeyGeneration(format!("Mnemonic generation failed: {}", e)))?;
         let mnemonic = mnemonic_obj.to_string();
 
-        // Derive Ed25519 key from mnemonic seed (first 32 bytes of 64-byte seed)
-        let seed = mnemonic_obj.to_seed("");
-        let mut secret = [0u8; 32];
+        // WAL-04: Derive Ed25519 key from mnemonic seed (first 32 bytes of
+        // 64-byte seed). Both `seed` and `secret` are wrapped so their
+        // bytes are zeroed when the locals go out of scope. The
+        // SigningKey itself zeroizes on drop via ed25519-dalek 2.x's
+        // ZeroizeOnDrop derive.
+        let seed: Zeroizing<Vec<u8>> = Zeroizing::new(mnemonic_obj.to_seed("").to_vec());
+        let mut secret: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         secret.copy_from_slice(&seed[..32]);
         let signing_key = Ed25519SigningKey::from_bytes(&secret);
         let verifying_key = signing_key.verifying_key();
@@ -280,8 +285,13 @@ impl KeyManager {
             return Err(WalletError::InvalidPassword);
         }
 
-        let key_bytes = hex::decode(private_key_hex)
-            .map_err(|e| WalletError::KeyGeneration(format!("Invalid hex: {}", e)))?;
+        // WAL-04: imported private key bytes wrapped in Zeroizing so they
+        // are erased when this scope exits. SigningKey itself zeroizes on
+        // drop via ed25519-dalek 2.x's ZeroizeOnDrop derive.
+        let key_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+            hex::decode(private_key_hex)
+                .map_err(|e| WalletError::KeyGeneration(format!("Invalid hex: {}", e)))?,
+        );
 
         if key_bytes.len() != 32 {
             return Err(WalletError::KeyGeneration(
@@ -289,7 +299,7 @@ impl KeyManager {
             ));
         }
 
-        let mut secret = [0u8; 32];
+        let mut secret: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         secret.copy_from_slice(&key_bytes);
         let signing_key = Ed25519SigningKey::from_bytes(&secret);
         let verifying_key = signing_key.verifying_key();
@@ -333,8 +343,9 @@ impl KeyManager {
         let mnemonic_obj = bip39::Mnemonic::parse(mnemonic_phrase)
             .map_err(|e| WalletError::InvalidMnemonic(format!("{}", e)))?;
 
-        let seed = mnemonic_obj.to_seed("");
-        let mut secret = [0u8; 32];
+        // WAL-04: seed + derived secret bytes are zeroed on drop.
+        let seed: Zeroizing<Vec<u8>> = Zeroizing::new(mnemonic_obj.to_seed("").to_vec());
+        let mut secret: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         secret.copy_from_slice(&seed[..32]);
         let signing_key = Ed25519SigningKey::from_bytes(&secret);
         let verifying_key = signing_key.verifying_key();
@@ -376,7 +387,11 @@ impl KeyManager {
         let signing_key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         let address = derive_address_from_secp256k1(&signing_key);
         let public_key_hex = hex::encode(UnifiedKey::Secp256k1(signing_key.clone()).public_key_bytes());
-        let secret_bytes: [u8; 32] = signing_key.to_bytes().into();
+        // WAL-04: zeroize the secp256k1 secret bytes on drop. The k256
+        // SigningKey itself zeroizes via the k256 crate's Drop impl, but
+        // the intermediate `[u8; 32]` here is a fresh copy that needs
+        // explicit erasure.
+        let secret_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(signing_key.to_bytes().into());
 
         let entry = encrypt_key_raw(
             &secret_bytes,
@@ -466,7 +481,10 @@ impl KeyManager {
             }
 
             // Decrypt under the entry's declared (v1) parameters.
-            let secret_bytes = decrypt_key(entry, password)?;
+            // WAL-04: wrap so the secret is zeroed when the iteration
+            // ends or on early-return via `?`.
+            let secret_bytes: Zeroizing<[u8; 32]> =
+                Zeroizing::new(decrypt_key(entry, password)?);
 
             // Re-encrypt under v2 with a fresh salt + nonce.
             let migrated = encrypt_key_raw(
@@ -582,8 +600,13 @@ impl KeyManager {
             .find(|e| e.address == address)
             .ok_or_else(|| WalletError::KeyNotFound(address.to_string()))?;
 
-        let secret_bytes = decrypt_key(entry, password)?;
-        Ok(hex::encode(secret_bytes))
+        // WAL-04: hold the decrypted key in Zeroizing so the bytes are
+        // erased after we encode them as hex. The hex String itself is
+        // returned to the caller, who is documented as responsible for
+        // wrapping it (Zeroizing<String>) and dropping promptly.
+        let secret_bytes: Zeroizing<[u8; 32]> =
+            Zeroizing::new(decrypt_key(entry, password)?);
+        Ok(hex::encode(secret_bytes.as_ref()))
     }
 }
 
@@ -673,13 +696,16 @@ fn encrypt_key_raw(
     let salt: [u8; 16] = rand::random();
     let nonce_bytes: [u8; 12] = rand::random();
 
-    let mut derived_key = [0u8; 32];
+    // WAL-04: derived_key is the AES-256 key; wrap so its bytes are zeroed
+    // when the local goes out of scope. The cipher copies the bytes into
+    // its own state so we don't need the buffer to persist.
+    let mut derived_key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
     let argon2 = argon2_for_version(KDF_VERSION_CURRENT)?;
     argon2
-        .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
+        .hash_password_into(password.as_bytes(), &salt, derived_key.as_mut())
         .map_err(|e| WalletError::Encryption(format!("Argon2 failed: {}", e)))?;
 
-    let cipher = Aes256Gcm::new_from_slice(&derived_key)
+    let cipher = Aes256Gcm::new_from_slice(derived_key.as_ref())
         .map_err(|e| WalletError::Encryption(format!("AES init failed: {}", e)))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
@@ -724,20 +750,26 @@ fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], Wa
         .decode(&entry.nonce)
         .map_err(|e| WalletError::Decryption(format!("Invalid nonce base64: {}", e)))?;
 
-    // Derive key from password using the entry's declared KDF version.
-    let mut derived_key = [0u8; 32];
+    // WAL-04: Derive key under the entry's declared KDF version. Wrap
+    // in Zeroizing so the bytes are erased when this scope ends.
+    let mut derived_key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
     let argon2 = argon2_for_version(entry.kdf_version)?;
     argon2
-        .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
+        .hash_password_into(password.as_bytes(), &salt, derived_key.as_mut())
         .map_err(|e| WalletError::Decryption(format!("Argon2 failed: {}", e)))?;
 
     // Decrypt
-    let cipher = Aes256Gcm::new_from_slice(&derived_key)
+    let cipher = Aes256Gcm::new_from_slice(derived_key.as_ref())
         .map_err(|e| WalletError::Decryption(format!("AES init failed: {}", e)))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext.as_ref())
-        .map_err(|_| WalletError::InvalidPassword)?;
+    // WAL-04: plaintext holds the decrypted secret key bytes. Zeroize
+    // when the wrapper is dropped (caller copies into its own
+    // Zeroizing-protected slot below).
+    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
+        cipher
+            .decrypt(nonce, ciphertext.as_ref())
+            .map_err(|_| WalletError::InvalidPassword)?,
+    );
 
     if plaintext.len() != 32 {
         return Err(WalletError::Decryption(format!(
@@ -747,7 +779,7 @@ fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], Wa
     }
 
     let mut secret = [0u8; 32];
-    secret.copy_from_slice(&plaintext);
+    secret.copy_from_slice(plaintext.as_slice());
     Ok(secret)
 }
 
