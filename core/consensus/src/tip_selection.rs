@@ -44,11 +44,28 @@ pub struct TipSelector {
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-struct TipInfo {
-    hash: Hash,
-    blue_score: u64,
-    height: u64,
-    timestamp: u64,
+pub(crate) struct TipInfo {
+    pub(crate) hash: Hash,
+    pub(crate) blue_score: u64,
+    pub(crate) height: u64,
+    pub(crate) timestamp: u64,
+}
+
+/// Comparator for sorting tips during parent selection.
+///
+/// Establishes a strict total order on `TipInfo`:
+///   1. higher `blue_score` precedes lower (descending),
+///   2. ties broken by lower `hash` first (ascending lexicographic).
+///
+/// This closes audit finding **H-08** (`select_parents` non-deterministic
+/// with equal blue scores). The hash tie-break MUST NOT be removed —
+/// without it, `Vec::sort_by` is stable but produces input-order-dependent
+/// output across validators whose `dag_store::get_tips()` iteration differs
+/// (e.g., RocksDB key order vs. HashMap entropy).
+pub(crate) fn cmp_tip_for_parent_selection(a: &TipInfo, b: &TipInfo) -> std::cmp::Ordering {
+    b.blue_score
+        .cmp(&a.blue_score)
+        .then_with(|| a.hash.cmp(&b.hash))
 }
 
 impl TipSelector {
@@ -141,8 +158,9 @@ impl TipSelector {
             });
         }
 
-        // Sort by blue score (descending)
-        tip_infos.sort_by(|a, b| b.blue_score.cmp(&a.blue_score));
+        // Sort by blue score (descending), break ties by hash (ascending) —
+        // see `cmp_tip_for_parent_selection` doc + audit finding H-08.
+        tip_infos.sort_by(cmp_tip_for_parent_selection);
 
         // Select top tips up to max_parents
         let selected: Vec<Hash> = tip_infos
@@ -390,5 +408,158 @@ mod tests {
 
         // Test parent selection
         // This would need proper setup with tips
+    }
+
+    // ===================================================================
+    // H-08 regression: parent-selection comparator is a strict total order
+    // ===================================================================
+
+    fn ti(hash_byte: u8, blue: u64) -> TipInfo {
+        TipInfo {
+            hash: Hash::new([hash_byte; 32]),
+            blue_score: blue,
+            height: 0,
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn h08_higher_blue_score_strictly_precedes_lower() {
+        // Higher blue score must come first regardless of hash order.
+        let lo_score_lo_hash = ti(0x10, 5);
+        let hi_score_hi_hash = ti(0xF0, 50);
+        assert_eq!(
+            cmp_tip_for_parent_selection(&hi_score_hi_hash, &lo_score_lo_hash),
+            std::cmp::Ordering::Less,
+        );
+        assert_eq!(
+            cmp_tip_for_parent_selection(&lo_score_lo_hash, &hi_score_hi_hash),
+            std::cmp::Ordering::Greater,
+        );
+    }
+
+    #[test]
+    fn h08_equal_blue_score_breaks_tie_by_lower_hash() {
+        // The lower hash strictly precedes the higher hash when scores are equal.
+        // This is the load-bearing tie-break that closes H-08.
+        let lo_hash = ti(0x10, 42);
+        let hi_hash = ti(0xF0, 42);
+        assert_eq!(
+            cmp_tip_for_parent_selection(&lo_hash, &hi_hash),
+            std::cmp::Ordering::Less,
+        );
+        assert_eq!(
+            cmp_tip_for_parent_selection(&hi_hash, &lo_hash),
+            std::cmp::Ordering::Greater,
+        );
+    }
+
+    #[test]
+    fn h08_identical_tip_compares_equal() {
+        let a = ti(0x42, 100);
+        let b = ti(0x42, 100);
+        assert_eq!(
+            cmp_tip_for_parent_selection(&a, &b),
+            std::cmp::Ordering::Equal,
+        );
+    }
+
+    #[test]
+    fn h08_sort_is_deterministic_across_input_permutations() {
+        // Construct 8 tips with mixed blue scores including ties, sort them
+        // under multiple input permutations, assert canonical order.
+        let canonical = [
+            ti(0x01, 50), // highest score, lowest hash
+            ti(0x02, 50), // highest score, second-lowest hash
+            ti(0x03, 50), // highest score, third-lowest hash
+            ti(0x10, 30), // mid score, lowest hash
+            ti(0x20, 30), // mid score, higher hash
+            ti(0xA0, 10), // lowest score, lowest hash among low-score
+            ti(0xB0, 10),
+            ti(0xC0, 10),
+        ];
+        let canonical_hashes: Vec<Hash> = canonical.iter().map(|t| t.hash).collect();
+
+        // Try several non-trivial permutations including reverse + interleaved.
+        let permutations: Vec<Vec<usize>> = vec![
+            vec![7, 6, 5, 4, 3, 2, 1, 0], // reverse
+            vec![0, 7, 1, 6, 2, 5, 3, 4], // interleaved
+            vec![3, 1, 7, 0, 5, 2, 6, 4], // arbitrary
+            vec![4, 4, 4, 4, 4, 4, 4, 4]
+                .iter()
+                .enumerate()
+                .map(|(i, _)| (i + 5) % 8)
+                .collect(),
+        ];
+
+        for perm in &permutations {
+            let mut shuffled: Vec<TipInfo> = perm.iter().map(|&i| canonical[i].clone()).collect();
+            shuffled.sort_by(cmp_tip_for_parent_selection);
+            let sorted_hashes: Vec<Hash> = shuffled.iter().map(|t| t.hash).collect();
+            assert_eq!(
+                sorted_hashes, canonical_hashes,
+                "tip-selection sort produced different output for permutation {:?}",
+                perm
+            );
+        }
+    }
+
+    proptest::proptest! {
+        // 1024 cases of equal-blue-score tip sets sorted under arbitrary
+        // input permutation MUST produce identical output. This is the
+        // proptest gate the planset calls for at WP-B1.1.
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 1024,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn prop_tip_selection_deterministic_under_tie(
+            // Up to 12 distinct hash bytes; blue scores in 0..3 so ties are
+            // common. We use distinct hashes to model the structural
+            // requirement that no two tips share a hash on a healthy chain.
+            hash_bytes in proptest::collection::vec(0u8..=255, 1..=12),
+            scores in proptest::collection::vec(0u64..3, 1..=12),
+        ) {
+            // Match the two vectors and dedup hashes — proptest may produce
+            // duplicates; we filter to a unique set so the property is
+            // about the comparator, not the input shape.
+            let mut seen = std::collections::HashSet::new();
+            let tips: Vec<TipInfo> = hash_bytes
+                .iter()
+                .zip(scores.iter().cycle())
+                .filter_map(|(h, s)| {
+                    if seen.insert(*h) {
+                        Some(ti(*h, *s))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if tips.len() < 2 {
+                return Ok(());
+            }
+
+            // Canonical sort.
+            let mut canonical = tips.clone();
+            canonical.sort_by(cmp_tip_for_parent_selection);
+            let canonical_order: Vec<Hash> = canonical.iter().map(|t| t.hash).collect();
+
+            // Several permutations.
+            let mut shuffled = tips.clone();
+            shuffled.reverse();
+            shuffled.sort_by(cmp_tip_for_parent_selection);
+            let reversed_then_sorted: Vec<Hash> = shuffled.iter().map(|t| t.hash).collect();
+            proptest::prop_assert_eq!(reversed_then_sorted, canonical_order.clone());
+
+            // Pairwise swap permutations.
+            for i in 0..tips.len().saturating_sub(1) {
+                let mut swapped = tips.clone();
+                swapped.swap(i, i + 1);
+                swapped.sort_by(cmp_tip_for_parent_selection);
+                let swapped_then_sorted: Vec<Hash> = swapped.iter().map(|t| t.hash).collect();
+                proptest::prop_assert_eq!(swapped_then_sorted, canonical_order.clone());
+            }
+        }
     }
 }
