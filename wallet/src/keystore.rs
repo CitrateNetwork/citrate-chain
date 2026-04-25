@@ -10,6 +10,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 use crate::errors::WalletError;
 
@@ -109,9 +110,10 @@ impl KeyStore {
         password: &str,
         alias: Option<String>,
     ) -> Result<VerifyingKey, WalletError> {
-        // Generate new signing key
-        let mut secret_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut secret_bytes);
+        // WAL-04: zeroize the seed bytes after constructing the SigningKey.
+        // ed25519-dalek 2.x's SigningKey is itself ZeroizeOnDrop.
+        let mut secret_bytes: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(secret_bytes.as_mut());
         let signing_key = SigningKey::from_bytes(&secret_bytes);
         let verifying_key = signing_key.verifying_key();
 
@@ -145,13 +147,14 @@ impl KeyStore {
         let hex_str = private_key_hex.strip_prefix("0x")
             .or_else(|| private_key_hex.strip_prefix("0X"))
             .unwrap_or(private_key_hex);
-        let private_bytes = hex::decode(hex_str)?;
+        // WAL-04: hex-decoded private key bytes erased on drop.
+        let private_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(hex::decode(hex_str)?);
 
         if private_bytes.len() != 32 {
             return Err(WalletError::Other("Invalid private key length".to_string()));
         }
 
-        let mut key_bytes = [0u8; 32];
+        let mut key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         key_bytes.copy_from_slice(&private_bytes);
 
         let signing_key = SigningKey::from_bytes(&key_bytes);
@@ -257,12 +260,12 @@ impl KeyStore {
             .ok_or_else(|| WalletError::Encryption("argon2 hash output missing".to_string()))?;
         let key_bytes = hash_bytes.as_bytes();
 
-        // Ensure we have exactly 32 bytes for AES-256
-        let mut aes_key = [0u8; 32];
+        // WAL-04: AES key erased on drop.
+        let mut aes_key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         aes_key.copy_from_slice(&key_bytes[..32]);
 
         // Create cipher
-        let key = Key::<Aes256Gcm>::from_slice(&aes_key);
+        let key = Key::<Aes256Gcm>::from_slice(aes_key.as_ref());
         let cipher = Aes256Gcm::new(key);
 
         // Generate nonce
@@ -270,8 +273,9 @@ impl KeyStore {
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        // Encrypt private key
-        let plaintext = signing_key.to_bytes();
+        // WAL-04: hold the plaintext signing key bytes in Zeroizing so
+        // they are erased after encryption.
+        let plaintext: Zeroizing<[u8; 32]> = Zeroizing::new(signing_key.to_bytes());
         let ciphertext = cipher
             .encrypt(nonce, plaintext.as_ref())
             .map_err(|e| WalletError::Encryption(e.to_string()))?;
@@ -310,22 +314,26 @@ impl KeyStore {
             .ok_or_else(|| WalletError::Decryption("argon2 hash output missing".to_string()))?;
         let key_bytes = hash_bytes.as_bytes();
 
-        // Ensure we have exactly 32 bytes for AES-256
-        let mut aes_key = [0u8; 32];
+        // WAL-04: AES key erased on drop.
+        let mut aes_key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         aes_key.copy_from_slice(&key_bytes[..32]);
 
         // Create cipher
-        let key = Key::<Aes256Gcm>::from_slice(&aes_key);
+        let key = Key::<Aes256Gcm>::from_slice(aes_key.as_ref());
         let cipher = Aes256Gcm::new(key);
 
         // Decrypt
         let nonce = Nonce::from_slice(&encrypted.nonce);
-        let plaintext = cipher
-            .decrypt(nonce, encrypted.ciphertext.as_ref())
-            .map_err(|_| WalletError::InvalidPassword)?;
+        // WAL-04: decrypted private key plaintext erased on drop.
+        let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
+            cipher
+                .decrypt(nonce, encrypted.ciphertext.as_ref())
+                .map_err(|_| WalletError::InvalidPassword)?,
+        );
 
-        // Convert to signing key
-        let mut key_bytes = [0u8; 32];
+        // Convert to signing key (ed25519-dalek 2.x SigningKey is
+        // ZeroizeOnDrop, so the resulting key wipes itself).
+        let mut key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         key_bytes.copy_from_slice(&plaintext);
 
         Ok(SigningKey::from_bytes(&key_bytes))
