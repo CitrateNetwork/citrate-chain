@@ -317,6 +317,105 @@ fn test_wal01_argon2_v2_differs_from_default() {
 }
 
 // =========================================================================
+// PASSWORD-LENGTH BOUNDARY GATES — kill the mutation-detected off-by-one
+// regressions in `password.len() < 8` across create/import/recover paths.
+// The audit doesn't directly call these out under WAL-01, but they're
+// part of the same dispatcher's input-validation surface and a mutation
+// from `<` to `<=` would silently allow 8-character passwords to be
+// rejected (or `<` to `==` to allow lengths 0..7 except exactly 8).
+// =========================================================================
+
+#[test]
+fn test_wal01_create_account_rejects_password_below_8() {
+    let path = fresh_keystore();
+    let km = KeyManager::new(&path);
+    // Length 7 must be rejected (boundary - 1).
+    let result = km.create_account("1234567", "label");
+    assert!(
+        result.is_err(),
+        "WAL-01: 7-char password must be rejected (boundary: < 8)"
+    );
+}
+
+#[test]
+fn test_wal01_create_account_accepts_password_at_exactly_8() {
+    let path = fresh_keystore();
+    let km = KeyManager::new(&path);
+    // Length 8 must be ACCEPTED (boundary). Catches `<` → `<=` mutation.
+    let result = km.create_account("12345678", "label");
+    assert!(
+        result.is_ok(),
+        "WAL-01: 8-char password must be accepted (boundary: < 8). \
+         A `<` -> `<=` mutation would reject this."
+    );
+}
+
+#[test]
+fn test_wal01_import_account_rejects_password_below_8() {
+    let path = fresh_keystore();
+    let km = KeyManager::new(&path);
+    let key = hex::encode([0x42u8; 32]);
+    let result = km.import_account(&key, "1234567", "label");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_wal01_import_account_accepts_password_at_exactly_8() {
+    let path = fresh_keystore();
+    let km = KeyManager::new(&path);
+    let key = hex::encode([0x43u8; 32]);
+    let result = km.import_account(&key, "12345678", "label");
+    assert!(
+        result.is_ok(),
+        "WAL-01 (import path): 8-char password must be accepted (boundary)"
+    );
+}
+
+#[test]
+fn test_wal01_recover_from_mnemonic_rejects_password_below_8() {
+    let path = fresh_keystore();
+    let km = KeyManager::new(&path);
+    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                  abandon abandon abandon abandon abandon abandon abandon abandon \
+                  abandon abandon abandon abandon abandon abandon abandon art";
+    let result = km.recover_from_mnemonic(phrase, "1234567", "label");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_wal01_recover_from_mnemonic_accepts_password_at_exactly_8() {
+    let path = fresh_keystore();
+    let km = KeyManager::new(&path);
+    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                  abandon abandon abandon abandon abandon abandon abandon abandon \
+                  abandon abandon abandon abandon abandon abandon abandon art";
+    let result = km.recover_from_mnemonic(phrase, "12345678", "label");
+    assert!(
+        result.is_ok(),
+        "WAL-01 (recover path): 8-char password must be accepted (boundary)"
+    );
+}
+
+#[test]
+fn test_wal01_secp256k1_account_rejects_password_below_8() {
+    let path = fresh_keystore();
+    let km = KeyManager::new(&path);
+    let result = km.create_secp256k1_account("1234567", "label");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_wal01_secp256k1_account_accepts_password_at_exactly_8() {
+    let path = fresh_keystore();
+    let km = KeyManager::new(&path);
+    let result = km.create_secp256k1_account("12345678", "label");
+    assert!(
+        result.is_ok(),
+        "WAL-01 (secp256k1 path): 8-char password must be accepted (boundary)"
+    );
+}
+
+// =========================================================================
 // LATENCY HEURISTIC: post-fix create_account should NOT complete in <50 ms
 //
 // Default Argon2 parameters complete in ~30-60 ms on a modern desktop.

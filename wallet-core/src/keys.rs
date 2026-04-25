@@ -44,7 +44,13 @@ pub const KDF_VERSION_LOW_MEMORY: u32 = 3;
 /// Returns an error for unknown versions so a corrupted on-disk entry
 /// fails closed (legitimate `decrypt_key` will then surface a clear error
 /// to the user instead of silently using the wrong parameters).
-fn argon2_for_version(version: u32) -> Result<argon2::Argon2<'static>, WalletError> {
+///
+/// `pub(crate)` so the in-module mutation-test guard
+/// (`kdf_dispatcher_tests::test_wal01_v2_dispatcher_returns_owasp_recommended_params`)
+/// can pin the parameter set directly. Without that test, a regression
+/// to `Ok(Argon2::default())` survives the round-trip suite — see
+/// `tools/mutants/RESULTS_2026_04_24.md`.
+pub(crate) fn argon2_for_version(version: u32) -> Result<argon2::Argon2<'static>, WalletError> {
     use argon2::{Algorithm, Argon2, Params, Version};
 
     match version {
@@ -1252,5 +1258,110 @@ mod tests {
         let secret = ed_key.to_bytes();
         let unified = UnifiedKey::Ed25519(ed_key);
         assert_eq!(unified.secret_bytes(), secret);
+    }
+}
+
+// =========================================================================
+// WAL-01 mutation-killer: pin the dispatcher's parameter set in-module.
+//
+// The integration tests in `tests/wal01_kdf_strength.rs` cannot kill a
+// mutation that replaces `argon2_for_version` with `Ok(Default::default())`
+// because they construct `Argon2::new(...)` directly to compute the KAT
+// — the dispatcher is bypassed. This module-internal test calls the
+// dispatcher directly and inspects its `Params` accessors, so any
+// mutation of the v2 arm is caught.
+//
+// See `tools/mutants/RESULTS_2026_04_24.md` for the campaign that
+// surfaced this gap.
+// =========================================================================
+
+#[cfg(test)]
+mod kdf_dispatcher_tests {
+    use super::*;
+
+    #[test]
+    fn test_wal01_v2_dispatcher_returns_owasp_recommended_params() {
+        let argon2 = argon2_for_version(KDF_VERSION_CURRENT)
+            .expect("KDF_VERSION_CURRENT is a known version");
+        let params = argon2.params();
+        assert_eq!(
+            params.m_cost(),
+            65536,
+            "WAL-01: dispatcher v2 m_cost must be 65536 KiB; got {}",
+            params.m_cost()
+        );
+        assert_eq!(
+            params.t_cost(),
+            3,
+            "WAL-01: dispatcher v2 t_cost must be 3; got {}",
+            params.t_cost()
+        );
+        assert_eq!(
+            params.p_cost(),
+            1,
+            "WAL-01: dispatcher v2 p_cost must be 1 (calibrated; see KDF_POLICY.md §3.5); got {}",
+            params.p_cost()
+        );
+        assert_eq!(
+            params.output_len(),
+            Some(32),
+            "WAL-01: dispatcher v2 output_len must be 32 bytes (AES-256); got {:?}",
+            params.output_len()
+        );
+    }
+
+    #[test]
+    fn test_wal01_v2_dispatcher_differs_from_default() {
+        // Mutation-killer: catches `Ok(Default::default())` in the v2 arm.
+        let v2 = argon2_for_version(KDF_VERSION_CURRENT)
+            .expect("v2 dispatcher succeeds");
+        let default_argon2 = argon2::Argon2::default();
+        assert_ne!(
+            v2.params().m_cost(),
+            default_argon2.params().m_cost(),
+            "WAL-01: dispatcher v2 m_cost must NOT equal Argon2::default()'s m_cost. \
+             A regression here means the dispatcher has been collapsed to defaults."
+        );
+    }
+
+    #[test]
+    fn test_wal01_legacy_dispatcher_matches_default() {
+        // The KDF_VERSION_LEGACY arm IS supposed to return Argon2::default()
+        // — pin that contract so the legacy unlock path keeps working.
+        let v1 = argon2_for_version(KDF_VERSION_LEGACY)
+            .expect("v1 dispatcher succeeds");
+        let default_argon2 = argon2::Argon2::default();
+        assert_eq!(v1.params().m_cost(), default_argon2.params().m_cost());
+        assert_eq!(v1.params().t_cost(), default_argon2.params().t_cost());
+        assert_eq!(v1.params().p_cost(), default_argon2.params().p_cost());
+    }
+
+    #[test]
+    fn test_wal01_low_memory_dispatcher_returns_owasp_alternative_params() {
+        let argon2 = argon2_for_version(KDF_VERSION_LOW_MEMORY)
+            .expect("KDF_VERSION_LOW_MEMORY is a known version");
+        let params = argon2.params();
+        assert_eq!(params.m_cost(), 46336);
+        assert_eq!(params.t_cost(), 1);
+        assert_eq!(params.p_cost(), 1);
+        assert_eq!(params.output_len(), Some(32));
+    }
+
+    #[test]
+    fn test_wal01_unknown_kdf_version_rejected() {
+        // Pinning the error path: an unknown version must NOT silently
+        // fall back to defaults; it must error so the caller can surface
+        // a clear "corrupt keystore" message.
+        let result = argon2_for_version(999);
+        assert!(
+            result.is_err(),
+            "WAL-01: unknown kdf_version must return Err, not silently default"
+        );
+        let err_msg = format!("{:?}", result.expect_err("expected Err"));
+        assert!(
+            err_msg.contains("unknown kdf_version") || err_msg.contains("999"),
+            "Error message should reference the unknown version: {}",
+            err_msg
+        );
     }
 }
