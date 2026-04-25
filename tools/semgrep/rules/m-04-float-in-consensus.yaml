@@ -1,0 +1,38 @@
+# M-04 — Float arithmetic in consensus paths is forbidden.
+#
+# Audit finding (MEDIUM):
+#   .audit/2026-04-24-full-repo-adversarial-audit/03_FINDINGS_CONSENSUS_EXECUTION.md#m-04
+#
+# Pre-fix `committee.rs` computed validator weight as
+# `(stake as f64).sqrt() as u64`. The u128 → f64 conversion
+# lossily quantizes for stake > 2^53; the f64 → u64 cast
+# saturates differently across rustc / LLVM versions for special
+# values. Result: committee membership could differ between
+# validators running different toolchains, breaking finality.
+#
+# Post-fix uses `integer_sqrt_u128` (Newton's method on u128) —
+# exact and deterministic on every platform.
+
+rules:
+  - id: m-04-float-in-consensus
+    message: >-
+      Float arithmetic (`as f64`, `.sqrt()`, etc.) is forbidden in
+      consensus paths (M-04). u128 → f64 is lossy above 2^53; f64
+      → u64 saturates non-portably. Use `integer_sqrt_u128` from
+      `core/consensus/src/checkpoint.rs` or another deterministic
+      integer routine.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/consensus/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/proptest-regressions/**"
+        - "core/consensus/src/tip_selection.rs"  # weighted-random selection legitimately uses f64 for randomness
+    patterns:
+      - pattern-either:
+          - pattern: ($EXPR as f64).sqrt()
+          - pattern: ($EXPR as f64).powf($_)
+          - pattern: ($EXPR as f64).ln()
+          - pattern: ($EXPR as f64).log($_)

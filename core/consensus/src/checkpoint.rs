@@ -180,6 +180,29 @@ impl Checkpoint {
     }
 }
 
+/// Integer square root of a u128 via Newton's method.
+/// RM-B1 / WP-B4.2 (audit M-04): replaces the pre-fix
+/// `(stake as f64).sqrt() as u64` which lossily quantized for
+/// stake > 2^53 and saturated non-portably across LLVM versions.
+/// Exact on every platform; deterministic.
+pub fn integer_sqrt_u128(n: u128) -> u128 {
+    if n == 0 {
+        return 0;
+    }
+    // Initial estimate: 2^(bits/2) where `bits` is ceil(log2(n)).
+    let mut x = 1u128 << ((128 - n.leading_zeros()).div_ceil(2));
+    // Newton iteration: x_{k+1} = (x_k + n / x_k) / 2.
+    // Converges in O(log log n) iterations on this initial value.
+    loop {
+        let next = (x + n / x) / 2;
+        if next >= x {
+            // Converged (or oscillating between adjacent values).
+            return x;
+        }
+        x = next;
+    }
+}
+
 /// Deterministic committee selection for checkpoint voting.
 pub struct CommitteeSelector;
 
@@ -212,13 +235,22 @@ impl CommitteeSelector {
                 hasher.update(checkpoint_height.to_le_bytes());
                 let hash = hasher.finalize();
 
-                // Score = hash_value weighted by stake
+                // Score = hash_value weighted by stake.
                 let mut hash_prefix = [0u8; 8];
                 hash_prefix.copy_from_slice(&hash[0..8]);
                 let hash_val = u64::from_be_bytes(hash_prefix);
-                // Weight by sqrt(stake) to balance fairness with stake
-                let weight = (*stake as f64).sqrt() as u64;
-                let score = hash_val.wrapping_mul(weight.max(1));
+                // Weight by sqrt(stake). RM-B1 / WP-B4.2 (audit M-04):
+                // pre-fix used `(*stake as f64).sqrt() as u64` which
+                // lossily quantizes for stake > 2^53 (with 18 decimals,
+                // 0.009 SALT base units already exceeds 2^53), and the
+                // f64→u64 cast saturates differently across rustc/LLVM
+                // versions for special values. Both make committee
+                // membership non-portable. Integer sqrt on u128 is
+                // exact and deterministic on every platform.
+                let weight = integer_sqrt_u128(*stake);
+                // Cap weight at u64::MAX since `wrapping_mul` is u64.
+                let weight_u64 = weight.min(u64::MAX as u128) as u64;
+                let score = hash_val.wrapping_mul(weight_u64.max(1));
                 (*pk, score)
             })
             .collect();
