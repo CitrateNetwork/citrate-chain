@@ -47,12 +47,25 @@ contract ComputePoolPipeline is ReentrancyGuard {
         uint32 progress;            // 0..stageCount (stageCount = Completed)
         RequestState state;
         uint128 escrow;             // paymentPerRequest at submit; drained per stage
+        /// RM-B1 / WP-D5.2 (audit SOL-09): block height past which
+        /// the request can be `failRequest`'d by anyone. Pre-fix
+        /// only the original requester (or governance) could fail
+        /// the request — a stuck request whose requester contract
+        /// had self-destructed became permanent stake-locked state.
+        /// Set to `submitBlock + maxLatencyBlocks` at submit.
+        uint64 deadlineBlock;
     }
 
     // ── Constants ───────────────────────────────────────────────────
 
     uint32 public constant MAX_STAGE_COUNT = 32;
     uint32 public constant MIN_STAGE_COUNT = 2;
+
+    /// RM-B1 / WP-D5.2 (audit SOL-09): per-request block deadline
+    /// after which any caller can `failRequest`. Default 7200
+    /// (~24h at 12s blocks) matches a generous outer bound; the
+    /// real per-stage SLA is enforced off-chain via gateways.
+    uint64 public constant DEFAULT_REQUEST_LATENCY_BLOCKS = 7200;
 
     // ── State ───────────────────────────────────────────────────────
 
@@ -193,7 +206,8 @@ contract ComputePoolPipeline is ReentrancyGuard {
             requester: msg.sender,
             progress: 0,
             state: RequestState.InFlight,
-            escrow: job.paymentPerRequest
+            escrow: job.paymentPerRequest,
+            deadlineBlock: uint64(block.number) + DEFAULT_REQUEST_LATENCY_BLOCKS
         });
         emit PipelineRequestSubmitted(requestId, jobId, msg.sender, job.paymentPerRequest);
     }
@@ -235,10 +249,13 @@ contract ComputePoolPipeline is ReentrancyGuard {
     function failRequest(uint256 requestId) external nonReentrant {
         Request storage req = requests[requestId];
         require(req.state == RequestState.InFlight, "Pipeline: not in-flight");
-        require(
-            msg.sender == req.requester || msg.sender == governance,
-            "Pipeline: not authorized to fail"
-        );
+        // RM-B1 / WP-D5.2 (audit SOL-09): permissionless after
+        // deadline. Pre-fix only the original requester or
+        // governance could fail the request — a self-destructed
+        // requester left the stake/escrow permanently locked.
+        bool authorized = msg.sender == req.requester || msg.sender == governance;
+        bool pastDeadline = block.number > req.deadlineBlock;
+        require(authorized || pastDeadline, "Pipeline: not authorized to fail");
 
         uint128 refund = req.escrow;
         req.escrow = 0;

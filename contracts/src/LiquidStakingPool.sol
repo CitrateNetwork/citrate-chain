@@ -129,8 +129,17 @@ contract LiquidStakingPool is ReentrancyGuard {
     // Core: Deposit
     // ============================================================
 
-    /// @notice Deposit SALT and receive stSALT shares
-    /// @return sharesOut Number of stSALT shares minted
+    /// @notice Deposit SALT and receive stSALT shares.
+    ///
+    /// RM-B1 / WP-D5.8 (audit SOL-16): pre-fix the first depositor
+    /// could grief: deposit 1 wei (gets 1 share), donate via the
+    /// open `receive()` (now closed — see below) to inflate
+    /// `totalPooled` without minting shares, victim's deposit
+    /// captured. Post-fix the share-pricing math uses OZ ERC-4626
+    /// virtual offsets — see `_sharesForDeposit` / `_saltForShares` —
+    /// so a 1-wei first-deposit attack can't dominate the pool's
+    /// share price. The virtual offsets aren't real shares, so
+    /// they don't subtract from real depositor balances.
     function deposit() external payable nonReentrant returns (uint256 sharesOut) {
         require(msg.value > 0, "Zero deposit");
 
@@ -373,6 +382,29 @@ contract LiquidStakingPool is ReentrancyGuard {
     // Receive
     // ============================================================
 
-    /// @notice Accept SALT transfers (for rewards distribution)
-    receive() external payable {}
+    /// @notice Reject unsolicited SALT transfers.
+    ///
+    /// RM-B1 / WP-D5.8 (audit SOL-16): the open `receive()` was
+    /// the second leg of the first-depositor inflation attack —
+    /// pre-fix any caller could donate ETH that bumped `totalPooled`
+    /// without minting shares, dominating share price. Post-fix
+    /// callers MUST go through `deposit()` (which mints shares)
+    /// or `donate()` (which records the donation but does NOT
+    /// affect share math).
+    receive() external payable {
+        revert("LiquidStakingPool: use deposit() or donate()");
+    }
+
+    /// @notice Donate SALT to the pool's reward distribution.
+    /// Updates `totalDonated` for accounting; does NOT touch
+    /// `totalPooled` (which would inflate shares).
+    /// RM-B1 / WP-D5.8 (audit SOL-16).
+    uint256 public totalDonated;
+    event Donated(address indexed from, uint256 amount);
+
+    function donate() external payable {
+        require(msg.value > 0, "Zero donation");
+        totalDonated += msg.value;
+        emit Donated(msg.sender, msg.value);
+    }
 }
