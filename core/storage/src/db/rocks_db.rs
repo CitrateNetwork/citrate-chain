@@ -91,9 +91,10 @@ impl RocksDB {
     /// the default `WriteOptions { sync: false }`. A power loss
     /// between block commit and OS flush silently rolled back
     /// finalised state. Use this method for the producer's
-    /// finalised-block commit batch (block + tx index + receipts
-    /// + DAG persistence in one super-batch). Other writes
-    /// (caches, metrics) can stay async via `write_batch`.
+    /// finalised-block commit batch — block, tx index, receipts,
+    /// and DAG persistence grouped into one super-batch. Other
+    /// writes such as caches and metrics can stay async via
+    /// `write_batch`.
     pub fn write_batch_sync(&self, batch: WriteBatch) -> Result<()> {
         let mut opts = rocksdb::WriteOptions::default();
         opts.set_sync(true);

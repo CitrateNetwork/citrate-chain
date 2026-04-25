@@ -156,6 +156,14 @@ pub struct MempoolConfig {
 
     /// Chain ID for Ethereum-style transaction verification (EIP-155)
     pub chain_id: u64,
+
+    /// RM-B1 / WP-C4.1 (audit M-SEQ-01): maximum allowed gap between
+    /// the sender's lowest mempool nonce and the new tx's nonce.
+    /// Pre-fix the mempool accepted any nonce, so a funded attacker
+    /// could post 100 nonces (1, 1_000_000, u64::MAX, …) per address;
+    /// 99 of those rotted as gap-junk while filling the global cap.
+    /// The 16-slot window matches Geth's default `txpool.accountqueue`.
+    pub max_nonce_gap: u64,
 }
 
 impl Default for MempoolConfig {
@@ -170,6 +178,7 @@ impl Default for MempoolConfig {
             // Tighten by default; tests or devnet can disable explicitly
             require_valid_signature: true,
             chain_id: 40204, // Testnet beta
+            max_nonce_gap: 16,
         }
     }
 }
@@ -310,6 +319,13 @@ impl Mempool {
         // that exact-tx re-adds are caught as DuplicateTransaction,
         // and we only surface DuplicateNonce when the nonce collides
         // with a different tx hash.
+        //
+        // RM-B1 / WP-C4.1 (audit M-SEQ-01): also enforce
+        // `tx.nonce <= min_existing_nonce + max_nonce_gap`. Pre-fix
+        // a funded attacker could post 100 nonces per address with
+        // arbitrary spacing (1, 1_000_000, u64::MAX, …) — 99 of
+        // those rotted as gap-junk while consuming slots. The
+        // 16-slot window matches Geth's `txpool.accountqueue`.
         if let Some(set) = self.sender_nonces.read().await.get(&sender) {
             if set.contains(&tx.nonce) {
                 tracing::warn!(
@@ -318,6 +334,16 @@ impl Mempool {
                     tx.nonce
                 );
                 return Err(MempoolError::DuplicateNonce { nonce: tx.nonce });
+            }
+            if let Some(&min_nonce) = set.iter().next() {
+                let gap = tx.nonce.saturating_sub(min_nonce);
+                if gap > self.config.max_nonce_gap {
+                    tracing::warn!(
+                        "M-SEQ-01: nonce gap from sender {:?}: tx.nonce={}, min_existing={}, gap={} > {}",
+                        sender, tx.nonce, min_nonce, gap, self.config.max_nonce_gap
+                    );
+                    return Err(MempoolError::DuplicateNonce { nonce: tx.nonce });
+                }
             }
         }
 

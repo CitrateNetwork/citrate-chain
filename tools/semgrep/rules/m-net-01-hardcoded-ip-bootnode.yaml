@@ -1,0 +1,36 @@
+# M-NET-01 — Hardcoded-IP bootnode entries are forbidden.
+#
+# Audit finding (MEDIUM):
+#   .audit/2026-04-24-full-repo-adversarial-audit/04_FINDINGS_API_NETWORK_STORAGE.md#m-net-01
+#
+# Spec (canonical):
+#   docs/operations/BOOTNODE_TRUST.md
+#
+# Pre-fix the production config pointed at a single hardcoded
+# bootnode IP. Compromising or BGP-hijacking that one IP gives an
+# attacker eclipse + sybil control over every cold-start node
+# until operators redeploy configs out-of-band.
+#
+# Post-fix bootnode entries MUST be in `noise_<hex>@host:port`
+# format with DNS hostnames (not bare IPs). The Noise public key
+# is the trust root; DNS resolves to a pool of disjoint-ASN
+# bootnodes; the Noise handshake catches MITM.
+
+rules:
+  - id: m-net-01-hardcoded-ip-bootnode
+    message: >-
+      Bare-IP bootnode entries are forbidden (M-NET-01). Use
+      `noise_<hex>@bootnode-N.citrate.ai:30303` format with DNS
+      hostnames so the trust root is the pinned Noise key, not a
+      single IP. See docs/operations/BOOTNODE_TRUST.md.
+    languages: [generic]
+    severity: WARNING
+    paths:
+      include:
+        - "node/config/*.toml"
+        - "gui/citrate_gui_native/config/*.json"
+    patterns:
+      # Match IPv4 dotted-quad followed by :port, but NOT after
+      # the `noise_<hex>@` marker.
+      - pattern-regex: '"\d+\.\d+\.\d+\.\d+:\d+"'
+      - pattern-not-regex: 'noise_[0-9a-fA-F]+@\d+\.\d+\.\d+\.\d+:\d+'

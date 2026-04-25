@@ -382,9 +382,11 @@ async fn handle_connection(
     };
 
     // M-API-02: tungstenite WebSocketConfig caps the frame size.
-    let mut tungstenite_cfg = WebSocketConfig::default();
-    tungstenite_cfg.max_message_size = Some(config.max_frame_size);
-    tungstenite_cfg.max_frame_size = Some(config.max_frame_size);
+    let tungstenite_cfg = WebSocketConfig {
+        max_message_size: Some(config.max_frame_size),
+        max_frame_size: Some(config.max_frame_size),
+        ..Default::default()
+    };
 
     let ws_stream = accept_hdr_async_with_config(stream, origin_callback, Some(tungstenite_cfg))
         .await
