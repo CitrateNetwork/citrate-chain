@@ -95,6 +95,24 @@ pub fn default_method_cost(method: &str) -> u32 {
 // WP-I.2: Thread-local operator authentication state.
 // The middleware sets this before the JSON-RPC method handler runs.
 // Method handlers check `is_operator_authenticated()` to gate privileged ops.
+//
+// RM-B1 / WP-C2.2 (audit M-API-03): the thread-local approach is
+// load-bearing on the assumption that `jsonrpc-http-server`'s
+// middleware + `add_sync_method` handler run on the same OS thread
+// for a given request. Under v18.0's hyper-based executor with
+// `.threads(threads)` worker-pool config, this assumption holds in
+// practice — the middleware uses `block_on` to dispatch synchronously
+// before the handler runs on the same worker.
+//
+// **Full audit closure** requires migrating to `MetaIoHandler<RpcContext>`
+// + per-request `Metadata`. That refactor is invasive (~50 handler
+// signatures touched) and is deferred to **RM-G2 cleanup pass**.
+// In the interim, the canonical recommendation is: production
+// deployments behind a single-threaded RPC executor (`threads(1)`)
+// fully eliminate the failure mode. The Semgrep rule
+// `m-api-03-thread-local-rate.yaml` fires CI on any new
+// `thread_local!` introductions in this module to bound the
+// risk while the full fix lands.
 thread_local! {
     static OPERATOR_AUTH: Cell<bool> = const { Cell::new(false) };
     // WP-I.4: Thread-local client key for method-level budget enforcement.

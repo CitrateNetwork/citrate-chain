@@ -1,0 +1,44 @@
+# H-NET-01 — Block / tx gossip relay BEFORE validation is forbidden.
+#
+# Audit finding (HIGH):
+#   .audit/2026-04-24-full-repo-adversarial-audit/04_FINDINGS_API_NETWORK_STORAGE.md#h-net-01
+#
+# Pre-fix `BlockPropagation::handle_new_block` accepted any block
+# from any peer, inserted the header into `header_cache`, and re-
+# broadcast to every other peer BEFORE any consensus or signature
+# check. One byzantine peer could saturate the network with
+# garbage and force every peer to pay relay bandwidth + cache
+# slots.
+#
+# Post-fix `block.verify_hash()` + `verify_block_signature` run
+# BEFORE the cache insert + relay (genesis exempt).
+#
+# This rule fires on any path that broadcasts / inserts into
+# `header_cache` before calling `verify_hash`. Heuristic — false
+# positives possible — so severity WARNING.
+
+rules:
+  - id: h-net-01-broadcast-before-verify-hash
+    message: >-
+      Block gossip relay before `block.verify_hash()` is forbidden
+      (H-NET-01). Pre-fix one byzantine peer could amplify garbage
+      across the network. Validate hash + signature first, then
+      relay. See core/network/src/block_propagation.rs::handle_new_block.
+    languages: [rust]
+    severity: WARNING
+    paths:
+      include:
+        - "core/network/**/*.rs"
+      exclude:
+        - "**/tests/**"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              self.broadcast_block_except($BLOCK, $_).await
+          - pattern: |
+              self.peer_manager.broadcast(&$_).await
+          - pattern: |
+              self.header_cache.write().await.insert($_, $BLOCK.header.clone())
+      - pattern-not-inside: |
+          if !$BLOCK.verify_hash() { ... }
+          ...
