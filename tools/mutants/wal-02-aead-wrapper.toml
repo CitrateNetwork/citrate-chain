@@ -1,0 +1,38 @@
+# WP-A3.3 / WP-A3.4 — verify the citrate-security AEAD wrapper has full
+# mutation coverage. Companion to wal-01-argon2-kdf.toml.
+#
+# Run:
+#
+#   cargo mutants \
+#     --package citrate-security \
+#     --timeout-multiplier 3.0 \
+#     --jobs 2 \
+#     --no-shuffle \
+#     --output tools/mutants/wal-02-aead-output
+#
+# Expected outcome (recorded 2026-04-25): 6 mutants tested in 13s,
+# 6 caught, 0 missed, 0 unviable.
+#
+# Hand-mutations of interest:
+#   - Aead::new returns Ok with default key                  → must be killed
+#   - Aead::seal omits Payload struct (positional `plaintext`) → must be killed
+#   - Aead::open omits Payload struct                         → must be killed
+#   - Aead::open returns Ok regardless of tag                 → must be killed
+
+# cargo-mutants 27.x doesn't consume this file directly; it documents
+# the campaign for reproducibility. The `--package` and `--output`
+# flags above are the load-bearing arguments.
+test_workspace = false
+test_package = ["citrate-security"]
+
+# Limit blast radius — only mutate the production AEAD wrapper.
+examine_re = [
+    "core/security/src/aead\\.rs",
+    "core/security/src/lib\\.rs",
+]
+
+exclude_re = [
+    "core/security/src/aead\\.rs:.*tests::",
+]
+
+timeout_multiplier = 3.0
