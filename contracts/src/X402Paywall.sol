@@ -18,16 +18,25 @@ contract X402Paywall {
     address public immutable provider;
     uint256 public resourcePrice;
 
-    mapping(bytes32 => bool) public accessGranted;
+    /// RM-B1 / WP-D5.4 (audit SOL-12): paywall access is now
+    /// time-bound. `accessGrantedUntil[key]` is the timestamp
+    /// when access expires (0 = never granted; > now = granted).
+    /// `accessTTL` is the duration applied at grant time.
+    mapping(bytes32 => uint256) public accessGrantedUntil;
+    uint256 public accessTTL;
+    /// Default TTL: 24 hours. Provider can override via setAccessTTL.
+    uint256 public constant DEFAULT_ACCESS_TTL = 1 days;
 
-    event AccessGranted(address indexed payer, bytes32 indexed resourceId, uint256 amount);
+    event AccessGranted(address indexed payer, bytes32 indexed resourceId, uint256 amount, uint256 expiresAt);
     event PriceUpdated(uint256 oldPrice, uint256 newPrice);
+    event AccessTtlUpdated(uint256 oldTtl, uint256 newTtl);
 
     constructor(address _wSALT, uint256 _resourcePrice) {
         require(_wSALT != address(0), "Paywall: zero wSALT");
         wSALT = WrappedSALT(payable(_wSALT));
         provider = msg.sender;
         resourcePrice = _resourcePrice;
+        accessTTL = DEFAULT_ACCESS_TTL;
     }
 
     /// @notice Verify payment authorization and grant access to a resource
@@ -52,19 +61,27 @@ contract X402Paywall {
         bytes32 s
     ) external {
         require(value >= resourcePrice, "Paywall: insufficient payment");
-        require(!accessGranted[keccak256(abi.encodePacked(from, resourceId))], "Paywall: already granted");
+        bytes32 key = keccak256(abi.encodePacked(from, resourceId));
+        // SOL-12 fix: allow re-purchase after expiry. Pre-fix the
+        // access flag was permanent; re-purchase was blocked.
+        require(
+            accessGrantedUntil[key] < block.timestamp,
+            "Paywall: access still active"
+        );
 
         // Execute the payment via transferWithAuthorization
         wSALT.transferWithAuthorization(from, provider, value, validAfter, validBefore, nonce, v, r, s);
 
-        // Grant access
-        accessGranted[keccak256(abi.encodePacked(from, resourceId))] = true;
-        emit AccessGranted(from, resourceId, value);
+        // Grant access until (now + accessTTL).
+        uint256 expiresAt = block.timestamp + accessTTL;
+        accessGrantedUntil[key] = expiresAt;
+        emit AccessGranted(from, resourceId, value, expiresAt);
     }
 
-    /// @notice Check if access has been granted
+    /// @notice Check if access is currently granted (within TTL).
+    /// SOL-12: returns true iff `expiresAt > now`.
     function hasAccess(address payer, bytes32 resourceId) external view returns (bool) {
-        return accessGranted[keccak256(abi.encodePacked(payer, resourceId))];
+        return accessGrantedUntil[keccak256(abi.encodePacked(payer, resourceId))] > block.timestamp;
     }
 
     /// @notice Update resource price (provider only)
@@ -73,5 +90,15 @@ contract X402Paywall {
         uint256 oldPrice = resourcePrice;
         resourcePrice = newPrice;
         emit PriceUpdated(oldPrice, newPrice);
+    }
+
+    /// @notice Update access TTL (provider only).
+    /// RM-B1 / WP-D5.4 (audit SOL-12).
+    function setAccessTTL(uint256 newTTL) external {
+        require(msg.sender == provider, "Paywall: not provider");
+        require(newTTL > 0, "Paywall: zero TTL");
+        uint256 oldTtl = accessTTL;
+        accessTTL = newTTL;
+        emit AccessTtlUpdated(oldTtl, newTTL);
     }
 }

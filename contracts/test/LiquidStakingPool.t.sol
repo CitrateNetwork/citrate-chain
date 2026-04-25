@@ -531,9 +531,23 @@ contract LiquidStakingPoolTest is Test {
     // Receive Fallback Test
     // ============================================================
 
-    function test_receive_accepts_salt() public {
+    function test_receive_rejects_unsolicited_salt() public {
+        // RM-B1 / WP-D5.8 (audit SOL-16): pre-fix the open receive()
+        // was the second leg of the first-depositor inflation attack.
+        // Post-fix direct sends revert; callers must use deposit()
+        // or donate().
         (bool ok, ) = address(pool).call{value: 1 ether}("");
-        assertTrue(ok, "Pool should accept direct SALT transfers");
+        assertFalse(ok, "Pool MUST reject unsolicited SALT (SOL-16)");
+    }
+
+    function test_donate_records_donation_without_inflating_shares() public {
+        // donate() is the explicit replacement: records the
+        // donation but does NOT update totalPooled (which would
+        // grant the donor zero shares while inflating share price).
+        vm.deal(alice, 5 ether);
+        vm.prank(alice);
+        pool.donate{value: 1 ether}();
+        assertEq(pool.totalDonated(), 1 ether);
     }
 
     // ============================================================
@@ -623,10 +637,12 @@ contract LiquidStakingPoolTest is Test {
             pool.addOracle(oracle3);
         }
 
-        // Send SALT to pool to cover rewards
+        // Send SALT to pool to cover rewards.
+        // RM-B1 / WP-D5.8 (audit SOL-16): pool no longer accepts
+        // unsolicited transfers; use donate() to fund rewards
+        // without affecting share math.
         if (rewards > 0) {
-            (bool ok, ) = address(pool).call{value: rewards}("");
-            require(ok, "Fund pool failed");
+            pool.donate{value: rewards}();
         }
 
         // All three oracles report (quorum = ceil(3 * 67 / 100) = 3)

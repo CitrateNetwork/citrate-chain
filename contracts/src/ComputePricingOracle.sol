@@ -163,25 +163,36 @@ contract ComputePricingOracle is IComputePricingOracle {
     // Oracle Committee Management (governance only)
     // ============================================================
 
-    /// @notice Add an oracle committee member
-    /// @param member Address to add
+    /// @notice Add an oracle committee member.
+    ///
+    /// RM-B1 / WP-D5.3 (audit SOL-10): pre-fix membership changes
+    /// mid-vote could finalize a sub-quorum proposal because
+    /// `votesNeeded` was recomputed on every vote against the new
+    /// `oracleCount` while `_computeVoteCount[nonce]` retained
+    /// votes from removed members. Post-fix every membership
+    /// change increments `computePriceNonce` to invalidate any
+    /// in-flight proposal.
     function addOracleMember(address member) external onlyGovernance {
         require(member != address(0), "ComputePricingOracle: zero address");
         require(!isOracleMember[member], "ComputePricingOracle: already member");
 
         isOracleMember[member] = true;
         oracleCount++;
+        // SOL-10: invalidate any in-flight proposal under the
+        // pre-change membership.
+        computePriceNonce++;
 
         emit OracleMemberAdded(member);
     }
 
-    /// @notice Remove an oracle committee member
-    /// @param member Address to remove
+    /// @notice Remove an oracle committee member.
+    /// SOL-10: same nonce-bump as addOracleMember.
     function removeOracleMember(address member) external onlyGovernance {
         require(isOracleMember[member], "ComputePricingOracle: not member");
 
         isOracleMember[member] = false;
         oracleCount--;
+        computePriceNonce++;
 
         emit OracleMemberRemoved(member);
     }
@@ -221,8 +232,16 @@ contract ComputePricingOracle is IComputePricingOracle {
 
         emit ComputePriceProposed(msg.sender, nonce, newPrice);
 
-        // Check quorum: ceil(oracleCount * QUORUM / 100)
+        // Check quorum: ceil(oracleCount * QUORUM / 100), floor 1.
+        // SOL-10: the `>= 1` floor prevents a degenerate case
+        // where `oracleCount=0` (which `require(oracleCount > 0)`
+        // already prevents) AND a more subtle case where
+        // small oracleCount yields votesNeeded=0 via integer
+        // truncation in some quorum settings.
         uint256 votesNeeded = (oracleCount * QUORUM + 99) / 100;
+        if (votesNeeded == 0) {
+            votesNeeded = 1;
+        }
         if (_computeVoteCount[nonce] >= votesNeeded) {
             uint256 oldPrice = computePriceUsdCents;
             computePriceUsdCents = newPrice;

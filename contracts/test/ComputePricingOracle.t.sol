@@ -92,7 +92,13 @@ contract ComputePricingOracleTest is Test {
     // ============================================================
 
     function test_oracle_member_can_propose_compute_price() public {
-        // 14 is within 10% of 13 (max change = 1.3 => 1, so 14 is exactly 1 above = ok? 14-13=1 <= 1.3 yes)
+        // RM-B1 / WP-D5.3 (audit SOL-10): each addOracleMember +
+        // removeOracleMember bumps `computePriceNonce` to invalidate
+        // any in-flight proposal. setUp() adds 3 oracles → nonce=3
+        // before any proposal. Tests now capture the pre-action
+        // nonce and assert deltas instead of absolute values.
+        uint256 nonceBefore = oracle.computePriceNonce();
+
         uint256 newPrice = 14;
         vm.prank(oracle1);
         oracle.proposeComputePrice(newPrice);
@@ -100,7 +106,7 @@ contract ComputePricingOracleTest is Test {
         // Should have 1 vote, not finalized yet (need 3 with 3 oracles)
         (uint256 computeVotes, uint256 computeNonce,,) = oracle.getPendingVotes();
         assertEq(computeVotes, 1, "vote count");
-        assertEq(computeNonce, 0, "nonce should still be 0");
+        assertEq(computeNonce, nonceBefore, "nonce unchanged before quorum");
 
         // Price should NOT have changed yet
         assertEq(oracle.computePriceUsdCents(), INITIAL_COMPUTE_PRICE, "price should not change yet");
@@ -143,11 +149,14 @@ contract ComputePricingOracleTest is Test {
     // ============================================================
 
     function test_compute_price_updates_at_quorum() public {
+        // SOL-10: nonce is bumped on each addOracle (3 in setUp)
+        // plus on quorum-finalize (1) = +1 from the action itself.
+        uint256 nonceBefore = oracle.computePriceNonce();
         uint256 newPrice = 14; // within 10% of 13
         _reachComputePriceQuorum(newPrice);
 
         assertEq(oracle.computePriceUsdCents(), newPrice, "compute price should have updated");
-        assertEq(oracle.computePriceNonce(), 1, "nonce should have incremented");
+        assertEq(oracle.computePriceNonce(), nonceBefore + 1, "nonce +1 from quorum finalize");
         assertEq(oracle.priceHistoryLength(), 2, "should have new snapshot");
     }
 
@@ -516,6 +525,10 @@ contract ComputePricingOracleTest is Test {
     }
 
     function test_sequential_price_updates() public {
+        // SOL-10: addOracle bumps nonce, so the absolute nonce is
+        // not 0 at start. Capture the baseline + assert delta.
+        uint256 nonceBefore = oracle.computePriceNonce();
+
         // First update: 13 -> 14
         _reachComputePriceQuorum(14);
         assertEq(oracle.computePriceUsdCents(), 14);
@@ -524,7 +537,7 @@ contract ComputePricingOracleTest is Test {
         _reachComputePriceQuorum(15);
         assertEq(oracle.computePriceUsdCents(), 15);
 
-        assertEq(oracle.computePriceNonce(), 2, "nonce should be 2 after two updates");
+        assertEq(oracle.computePriceNonce(), nonceBefore + 2, "+2 from two quorum finalizes");
     }
 
     function test_last_update_block_refreshes() public {
