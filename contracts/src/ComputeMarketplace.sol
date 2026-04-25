@@ -5,6 +5,24 @@ import "./lib/ReentrancyGuard.sol";
 import "./lib/ComputeLib.sol";
 import "./ComputeVerifier.sol";
 
+/// @notice Minimal interface to BulkComputeGateway used by the
+/// credits payment path (CM-06 WP-06.1). The full surface lives at
+/// `contracts/src/BulkComputeGateway.sol`; we declare only the two
+/// methods this contract needs to keep the dependency narrow.
+interface IBulkComputeGateway {
+    /// @dev Marketplace must be in `authorizedSpenders` to call this.
+    function spendCredits(address institution, uint256 creditAmount) external returns (bool);
+    function getCreditBalance(address institution) external view returns (uint256);
+}
+
+/// @notice Minimal interface to ComputePricingOracle used to convert
+/// SALT → credits at credits-payment-method post time (CM-06 WP-06.1).
+interface IComputePricingOracleMin {
+    function isPriceStale() external view returns (bool);
+    /// @dev SALT (18 decimals) per PFLOP-hour (18 decimals).
+    function saltPerPflopHour() external view returns (uint256);
+}
+
 /// @title ComputeMarketplace — Verified Compute Job Lifecycle & Escrow
 /// @notice Implements the full job state machine from specs/tla/ComputeMarketplaceLifecycle.tla:
 ///
@@ -51,6 +69,18 @@ contract ComputeMarketplace is ReentrancyGuard {
         Failed,     // 8: Verification failed (terminal)
         Disputed    // 9: Result disputed (terminal after resolution)
     }
+
+    /// @notice Job payment method (CM-06 WP-06.1).
+    ///   SALT       : caller sends msg.value = maxPrice in SALT
+    ///   BulkCredits: caller has a credit balance in
+    ///                BulkComputeGateway; the marketplace spends
+    ///                `_saltToCredits(maxPrice)` of those credits on
+    ///                their behalf at post time.
+    /// Mirrors `PaymentMethods` in
+    /// .agentile/formal/specs/compute/CreditBilling.tla. The spec's
+    /// `NoMixedPayment` invariant is enforced at the implementation
+    /// by the `msg.value == 0` check on the credits path.
+    enum PaymentMethod { SALT, BulkCredits }
 
     struct Job {
         uint256 id;
@@ -153,6 +183,24 @@ contract ComputeMarketplace is ReentrancyGuard {
     /// @notice NematocystSlashing contract for provider slashing
     address public slashingContract;
 
+    /// @notice BulkComputeGateway contract — set by governance via
+    /// `setBulkGateway`. When zero, the credits payment path is
+    /// disabled (CM-06 WP-06.1).
+    IBulkComputeGateway public bulkGateway;
+
+    /// @notice ComputePricingOracle — set by governance via
+    /// `setPricingOracle`. Used by the credits path to convert
+    /// SALT-denominated `maxPrice` into PFLOP-hour credits and to
+    /// gate posts when the price is stale (CM-06 WP-06.1).
+    IComputePricingOracleMin public pricingOracle;
+
+    /// @notice Per-job payment method (CM-06 WP-06.1). Tracked
+    /// out-of-band of the `Job` struct so existing struct consumers
+    /// don't break. Defaults to SALT (the `PaymentMethod` enum's
+    /// zero value) for jobs posted via the legacy `postJob`
+    /// signature.
+    mapping(uint256 => PaymentMethod) public jobPaymentMethod;
+
     /// @notice Total SALT burned via BME (lifetime)
     uint256 public totalBurned;
 
@@ -181,6 +229,19 @@ contract ComputeMarketplace is ReentrancyGuard {
         uint256 bidDeadline,
         uint256 executionDeadline
     );
+
+    /// @notice Emitted alongside JobPosted (CM-06 WP-06.1) carrying
+    /// the chosen PaymentMethod. Kept as a separate event so
+    /// existing JobPosted indexers don't break on a new field.
+    event JobPaymentMethodSet(uint256 indexed jobId, PaymentMethod method);
+
+    /// @notice Emitted when governance updates the BulkComputeGateway
+    /// reference. Setting to address(0) disables the credits path.
+    event BulkGatewayUpdated(address indexed oldGateway, address indexed newGateway);
+
+    /// @notice Emitted when governance updates the ComputePricingOracle
+    /// reference used by the credits-payment-method conversion.
+    event PricingOracleUpdated(address indexed oldOracle, address indexed newOracle);
 
     event BidPlaced(
         uint256 indexed jobId,
@@ -325,16 +386,91 @@ contract ComputeMarketplace is ReentrancyGuard {
         uint256 bidWindow,
         uint256 execWindow
     ) external payable nonReentrant returns (uint256) {
-        require(msg.value >= maxPrice, "ComputeMarketplace: insufficient payment");
+        // Legacy 6-arg signature defaults to PaymentMethod.SALT.
+        // Delegates to the shared internal so the SALT path is byte-
+        // identical to the 7-arg form below.
+        return _postJob(
+            modelHash,
+            inputHash,
+            maxPrice,
+            tier,
+            PaymentMethod.SALT,
+            bidWindow,
+            execWindow
+        );
+    }
+
+    /// @notice Post a job choosing a payment method (CM-06 WP-06.1).
+    /// @dev SALT path: caller sends `msg.value >= maxPrice` (excess
+    ///      refunded). Credits path: `msg.value` MUST be 0; the
+    ///      marketplace debits `_saltToCredits(maxPrice)` from the
+    ///      caller's BulkComputeGateway balance and acts as the
+    ///      authorized spender. The marketplace must be in
+    ///      BulkComputeGateway.authorizedSpenders for the credits
+    ///      path to succeed (governance one-time setup, WP-06.2).
+    function postJobWithMethod(
+        bytes32 modelHash,
+        bytes calldata inputHash,
+        uint256 maxPrice,
+        ComputeVerifier.VerificationTier tier,
+        PaymentMethod paymentMethod,
+        uint256 bidWindow,
+        uint256 execWindow
+    ) external payable nonReentrant returns (uint256) {
+        return _postJob(
+            modelHash,
+            inputHash,
+            maxPrice,
+            tier,
+            paymentMethod,
+            bidWindow,
+            execWindow
+        );
+    }
+
+    /// @dev Shared internal body for both `postJob` overloads.
+    /// Mirrors `PostJobSalt` and `PostJobCredits` actions in
+    /// .agentile/formal/specs/compute/CreditBilling.tla. The
+    /// `NoMixedPayment` and `CreditConservation` invariants from
+    /// that spec are upheld at this layer.
+    function _postJob(
+        bytes32 modelHash,
+        bytes calldata inputHash,
+        uint256 maxPrice,
+        ComputeVerifier.VerificationTier tier,
+        PaymentMethod paymentMethod,
+        uint256 bidWindow,
+        uint256 execWindow
+    ) internal returns (uint256) {
         require(maxPrice > 0, "ComputeMarketplace: zero price");
         require(modelHash != bytes32(0), "ComputeMarketplace: zero model hash");
         require(bidWindow > 0, "ComputeMarketplace: zero bid window");
         require(execWindow > 0, "ComputeMarketplace: zero exec window");
 
+        if (paymentMethod == PaymentMethod.SALT) {
+            require(msg.value >= maxPrice, "ComputeMarketplace: insufficient payment");
+        } else {
+            // Credits path: NoMixedPayment invariant — the call
+            // MUST NOT carry SALT. (CreditBilling.tla NoMixedPayment.)
+            require(msg.value == 0, "ComputeMarketplace: credits path accepts no value");
+            require(address(bulkGateway) != address(0), "ComputeMarketplace: bulk gateway not set");
+            require(address(pricingOracle) != address(0), "ComputeMarketplace: pricing oracle not set");
+            require(!pricingOracle.isPriceStale(), "ComputeMarketplace: oracle price stale");
+
+            uint256 creditCost = _saltToCredits(maxPrice);
+            require(creditCost > 0, "ComputeMarketplace: zero credit cost");
+
+            // spendCredits reverts on insufficient balance OR if
+            // this contract isn't an authorized spender — both
+            // bubble up to the caller as the gateway's revert
+            // message, which is exactly what the user needs to see.
+            bool ok = bulkGateway.spendCredits(msg.sender, creditCost);
+            require(ok, "ComputeMarketplace: spendCredits returned false");
+        }
+
         uint256 jobId = nextJobId++;
         uint256 deadline = block.number + bidWindow;
 
-        // Initialize job in storage field-by-field to reduce stack pressure
         Job storage job = jobs[jobId];
         job.id = jobId;
         job.requester = msg.sender;
@@ -343,22 +479,43 @@ contract ComputeMarketplace is ReentrancyGuard {
         job.maxPrice = maxPrice;
         job.tier = tier;
         job.state = JobState.Bidding;
+        // The escrow field always denominates SALT — for the
+        // credits path the marketplace owes that SALT to the
+        // eventual provider (treasury replenishment is operational,
+        // not protocol-level). The credits-path test in
+        // ComputeMarketplaceCreditPath.t.sol asserts this.
         job.escrow = maxPrice;
         job.bidDeadline = deadline;
         job.createdAt = block.number;
 
-        // Configure verification in ComputeVerifier
+        // Track payment method out-of-band of the Job struct so
+        // existing struct consumers (off-chain decoders, etc.) don't
+        // break on the new field. Public mapping → automatic getter.
+        jobPaymentMethod[jobId] = paymentMethod;
+
         verifier.configureJob(jobId, maxPrice, tier);
 
-        // Refund excess payment
-        if (msg.value > maxPrice) {
+        // SALT path: refund excess payment. (Credits path can't
+        // have excess — msg.value == 0 was required above.)
+        if (paymentMethod == PaymentMethod.SALT && msg.value > maxPrice) {
             (bool success, ) = payable(msg.sender).call{value: msg.value - maxPrice}("");
             require(success, "ComputeMarketplace: refund failed");
         }
 
         emit JobPosted(jobId, msg.sender, modelHash, maxPrice, tier, deadline, execWindow);
+        emit JobPaymentMethodSet(jobId, paymentMethod);
 
         return jobId;
+    }
+
+    /// @dev Convert a SALT amount (18 decimals) to PFLOP-hour credits
+    /// (18 decimals) using the oracle's current SALT/PFLOP-h rate.
+    /// Mirrors the formula `credits = saltAmount * 1e18 /
+    /// saltPerPflopHour`.
+    function _saltToCredits(uint256 saltAmount) internal view returns (uint256) {
+        uint256 rate = pricingOracle.saltPerPflopHour();
+        require(rate > 0, "ComputeMarketplace: zero oracle rate");
+        return (saltAmount * 1e18) / rate;
     }
 
     // ============================================================
@@ -862,6 +1019,24 @@ contract ComputeMarketplace is ReentrancyGuard {
     function transferGovernance(address newGovernance) external onlyGovernance {
         require(newGovernance != address(0), "ComputeMarketplace: zero address");
         governance = newGovernance;
+    }
+
+    /// @notice Update the BulkComputeGateway reference (CM-06 WP-06.1).
+    /// Setting to `address(0)` disables the credits-payment path —
+    /// subsequent credits-mode posts revert with "bulk gateway not set".
+    function setBulkGateway(address gateway) external onlyGovernance {
+        address old = address(bulkGateway);
+        bulkGateway = IBulkComputeGateway(gateway);
+        emit BulkGatewayUpdated(old, gateway);
+    }
+
+    /// @notice Update the ComputePricingOracle reference used by the
+    /// credits-payment path's SALT→credits conversion (CM-06 WP-06.1).
+    function setPricingOracle(address oracle) external onlyGovernance {
+        require(oracle != address(0), "ComputeMarketplace: zero address");
+        address old = address(pricingOracle);
+        pricingOracle = IComputePricingOracleMin(oracle);
+        emit PricingOracleUpdated(old, oracle);
     }
 
     // ============================================================

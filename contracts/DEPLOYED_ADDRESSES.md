@@ -230,6 +230,56 @@ done
 
 ---
 
+## Post-deploy governance steps
+
+Some contracts require a one-time governance call after deploy to be
+fully wired. Without these, certain code paths revert. The scripts
+that perform them live under `contracts/script/`.
+
+### CM-06 — BulkComputeGateway authorisation
+
+After `BulkComputeGateway` and `ComputeMarketplace` are both deployed,
+governance must grant the marketplace permission to call
+`BulkComputeGateway.spendCredits` on behalf of buyers. Without this,
+`ComputeMarketplace.postJobWithMethod(..., PaymentMethod.BulkCredits, ...)`
+reverts at the `spendCredits` call.
+
+```bash
+export CITRATE_BULK_GATEWAY_ADDRESS=0x...
+export CITRATE_MARKETPLACE_ADDRESS=0x...
+# optional extras (gateway operator wallet, credit-backed key keeper):
+# export CITRATE_EXTRA_SPENDER_1=0x...
+# export CITRATE_EXTRA_SPENDER_2=0x...
+
+forge script script/AuthorizeSpenders.s.sol:AuthorizeSpenders \
+    --rpc-url $CITRATE_RPC_URL \
+    --account $GOVERNANCE_KEYSTORE \
+    --broadcast
+```
+
+Verify (one of):
+
+```bash
+# (a) cast call check
+cast call $CITRATE_BULK_GATEWAY_ADDRESS \
+    "authorizedSpenders(address)(bool)" \
+    $CITRATE_MARKETPLACE_ADDRESS \
+    --rpc-url $CITRATE_RPC_URL
+# → expected: true
+
+# (b) the script itself reverts at the end if the post-broadcast
+#     check fails ("AuthorizeSpenders: post-broadcast check failed")
+```
+
+The script is idempotent — already-authorised spenders are skipped
+with a `(skip)` log line. Safe to re-run during a chain reroll.
+
+CI proof: `contracts/test/BulkGatewayAuthorization.t.sol` (8 tests)
+exercises the same code path end-to-end against the real
+BulkComputeGateway + ComputePricingOracle contracts.
+
+---
+
 ## See Also
 
 - `.agentile/docs/journals/2026-04-08T14_DROPLET_STANDUP_SPARK_RETIRED.md`
