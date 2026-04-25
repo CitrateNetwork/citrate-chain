@@ -1055,7 +1055,7 @@ mod tests {
 
         // Confirm sign output is low-s (post-normalize_s would return None).
         assert!(
-            Signature::from_bytes((&sig_bytes).into())
+            Signature::from_bytes(&sig_bytes)
                 .expect("sig parse")
                 .normalize_s()
                 .is_none(),

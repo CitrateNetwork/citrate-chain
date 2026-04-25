@@ -423,11 +423,13 @@ impl CheckpointManager {
     ///
     /// RM-B1 / WP-B2.1 (audit H-01): the `voted` replay-protection
     /// set is updated **only after every validation step succeeds**:
+    ///
     ///   1. Pending checkpoint exists at `vote.height`.
     ///   2. Voter is in the committee for that checkpoint.
     ///   3. Voter has not already cast an ACCEPTED vote (checkpoint.votes).
     ///   4. `vote.block_hash` matches the checkpoint's block hash.
     ///   5. ed25519 signature over the canonical message verifies.
+    ///
     /// Only after step 5 do we mark `(height, voter)` as voted.
     /// Pre-fix, the marker was set at step 1 — a flood of invalid
     /// votes for victim pubkeys could lock honest voters out and
