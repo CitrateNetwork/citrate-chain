@@ -201,6 +201,56 @@ fn h02_canonical_message_layout_pinned() {
     assert_eq!(&msg[hash_start..], block_hash.as_bytes());
 }
 
+/// H-01 (additional): block-hash mismatch in a vote rejected, voter
+/// not marked as having voted. The honest voter can still cast a
+/// vote for the correct block.
+#[tokio::test]
+async fn h01_block_hash_mismatch_does_not_lock_voter() {
+    let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+    let cfg = CheckpointConfig::for_testing();
+    let chain_id = cfg.chain_id;
+    let mgr = CheckpointManager::new(cfg, dag.clone());
+
+    let block = make_block(hash_for(50), hash_for(49), 50);
+    dag.store_block(block).await.expect("block admit");
+
+    let sk = test_key(11);
+    let pk = PublicKey::new(sk.verifying_key().to_bytes());
+    mgr.propose(50, hash_for(50), vec![pk]).await.expect("propose");
+
+    // Attacker (or buggy client) submits a vote signed for the
+    // WRONG block at the right height. Pre-fix this would have
+    // marked voted; post-fix the H-01 ordering rejects it without
+    // updating voted.
+    let wrong_hash_vote = signed_vote_for_chain(&sk, 50, hash_for(99), chain_id);
+    let res = mgr.submit_vote(wrong_hash_vote).await;
+    assert!(res.is_err(), "wrong block_hash must be rejected");
+
+    // Honest vote for the correct block must still succeed.
+    let correct_vote = signed_vote_for_chain(&sk, 50, hash_for(50), chain_id);
+    mgr.submit_vote(correct_vote)
+        .await
+        .expect("H-01: honest correct-hash vote must succeed after wrong-hash attempt");
+}
+
+/// H-02: chain_id is included in CheckpointConfig::default() at
+/// the canonical 40204 testnet-beta value. Pin this so a future
+/// refactor can't silently zero the chain_id and reintroduce the
+/// no-domain-separator state.
+#[test]
+fn h02_default_config_carries_testnet_beta_chain_id() {
+    let cfg = CheckpointConfig::default();
+    assert_eq!(
+        cfg.chain_id, 40204,
+        "H-02: default CheckpointConfig must carry testnet-beta chain_id"
+    );
+    let test_cfg = CheckpointConfig::for_testing();
+    assert_eq!(
+        test_cfg.chain_id, 40204,
+        "H-02: testing CheckpointConfig must carry testnet-beta chain_id"
+    );
+}
+
 /// H-01 + H-02 combined: an attacker who knows the legacy 40-byte
 /// canonical-message format constructs a vote signed over that old
 /// format. The post-fix verifier (which uses the 69-byte canonical

@@ -114,6 +114,43 @@ fn h06_with_zero_cutoff_rejects_all_legacy_proofs() {
     );
 }
 
+/// H-06.5: a legacy proof's binding to (proposer, prev_vrf, slot)
+/// holds — so swapping any of those fields invalidates the proof.
+/// This test pins the alpha-binding even on the legacy path
+/// (below cutoff). Note: an attacker can still FORGE a fresh
+/// legacy proof for any slot; the binding only stops verbatim
+/// reuse of an existing proof.
+#[test]
+fn h06_legacy_proof_alpha_binding_intact_below_cutoff() {
+    let selector = VrfProposerSelector::new();
+    let proposer = PublicKey::new([0x42; 32]);
+    let prev_vrf = Hash::new([0xCD; 32]);
+
+    let proof = legacy_forged_proof(&proposer, &prev_vrf, 10);
+    assert!(
+        selector
+            .verify_vrf_proof(&proposer, &proof, &prev_vrf, 10)
+            .expect("verify"),
+        "self-consistent legacy proof must verify at slot 10"
+    );
+
+    // Same proof, different slot — alpha binding broken.
+    assert!(
+        !selector
+            .verify_vrf_proof(&proposer, &proof, &prev_vrf, 11)
+            .expect("verify"),
+        "same legacy proof at slot 11 must NOT verify (alpha binding)"
+    );
+
+    // Same proof, different prev_vrf — alpha binding broken.
+    assert!(
+        !selector
+            .verify_vrf_proof(&proposer, &proof, &Hash::new([0xEE; 32]), 10)
+            .expect("verify"),
+        "legacy proof with different prev_vrf must NOT verify"
+    );
+}
+
 /// H-06.4: ECVRF proofs (114 bytes) are unaffected by the cutoff
 /// — they're always accepted regardless of height because the
 /// crypto verification is sound. This pins the fix as targeting
