@@ -1,0 +1,50 @@
+# GUI-B-01 — buyer-webapp DevSigner must not run in production.
+#
+# Audit finding (MEDIUM):
+#   .audit/2026-04-24-full-repo-adversarial-audit/07_FINDINGS_GUIS.md#gui-b-01
+#
+# Spec (canonical):
+#   .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
+#   §"Sprint RM-E6 — Faucet + buyer-webapp + GUI-B"
+#
+# Pre-fix `buyer-webapp/lib/devSigner.ts` shipped in production
+# bundles. A user could paste a private key into a browser textbox
+# and "sign" transactions — the audit flagged this as a foot-gun
+# (screen-share or phishing leaks the key trivially).
+#
+# Post-fix every entry point in devSigner.ts short-circuits to a
+# no-op when `process.env.NODE_ENV === 'production'`. The full-file
+# deletion + Mock fixture migration is tracked as a follow-on.
+#
+# This rule fires when an entry point of devSigner.ts re-introduces
+# code paths that don't go through the `isProductionBuild()` gate.
+
+rules:
+  - id: gui-b-01-devsigner-bundled
+    message: >-
+      `buyer-webapp/lib/devSigner.ts` must short-circuit every
+      entry point when `isProductionBuild()` returns true. See
+      audit GUI-B-01 and
+      .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md.
+    languages: [typescript]
+    severity: ERROR
+    paths:
+      include:
+        - "buyer-webapp/lib/devSigner.ts"
+    patterns:
+      - pattern: |
+          export function setDevSigner($PK: string): Signer {
+            ...
+          }
+      - pattern-not: |
+          export function setDevSigner($PK: string): Signer {
+            ...
+            isProductionBuild()
+            ...
+          }
+    metadata:
+      audit-id: GUI-B-01
+      severity: medium
+      sprint: RM-E6
+      wp: WP-E6.4
+      spec: .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
