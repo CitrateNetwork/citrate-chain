@@ -10,6 +10,19 @@ use tracing::{info, warn};
 
 /// WP-S.1: Key-value store trait for DAG persistence.
 /// Implemented by RocksDB in the node crate; DagStore uses this for write-through persistence.
+///
+/// RM-B1 / WP-B1.3 (audit H-04): the trait gained
+/// [`KvOp`] + [`KvStore::kv_write_batch`] so multi-write operations
+/// (block admission writes block bytes, child links, tip updates,
+/// height index in a single logical step) can be applied atomically.
+/// Without batching, a power loss between two `kv_put` calls left the
+/// DAG in an inconsistent state on restart (block exists but no
+/// children pointer; tips set excludes the new tip; etc.).
+///
+/// Default trait method `kv_write_batch` falls back to sequential
+/// `kv_put` / `kv_delete` so simple in-memory test stores keep
+/// working. The RocksDB adapter overrides it with a real `WriteBatch`
+/// so production gets atomicity.
 pub trait KvStore: Send + Sync {
     fn kv_get(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String>;
     fn kv_put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), String>;
@@ -18,6 +31,57 @@ pub trait KvStore: Send + Sync {
     /// Iterate all key-value pairs in a column family.
     #[allow(clippy::type_complexity)]
     fn kv_iter_cf(&self, cf: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String>;
+
+    /// Apply a sequence of operations as a single atomic write.
+    ///
+    /// The default implementation performs the ops sequentially with
+    /// `kv_put` / `kv_delete`. Backends that support real atomicity
+    /// (RocksDB `WriteBatch`) MUST override this — otherwise H-04
+    /// regressions silently land. The contract is: either every op
+    /// in `ops` is durably applied, or none is.
+    fn kv_write_batch(&self, ops: &[KvOp]) -> Result<(), String> {
+        for op in ops {
+            match op {
+                KvOp::Put { cf, key, value } => self.kv_put(cf, key, value)?,
+                KvOp::Delete { cf, key } => self.kv_delete(cf, key)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Single operation inside a [`KvStore::kv_write_batch`] payload.
+/// RM-B1 / WP-B1.3 (audit H-04).
+#[derive(Debug, Clone)]
+pub enum KvOp {
+    /// Insert / overwrite `value` at `(cf, key)`.
+    Put {
+        cf: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// Delete `(cf, key)`.
+    Delete { cf: String, key: Vec<u8> },
+}
+
+/// Append a `(parent, children)` serialization to the batch.
+/// Called from [`DagStore::store_block`]; on encode failure logs and
+/// skips (M-06 pattern).
+fn push_children_op(ops: &mut Vec<KvOp>, parent: &Hash, children: &[Hash]) {
+    let entry = (*parent, children.to_vec());
+    match bincode::serialize(&entry) {
+        Ok(bytes) => ops.push(KvOp::Put {
+            cf: cf::DAG_CHILDREN.to_string(),
+            key: parent.as_bytes().to_vec(),
+            value: bytes,
+        }),
+        Err(e) => {
+            tracing::error!(
+                "M-06: serialize children for {} failed: {} — skipping persistence",
+                parent, e
+            );
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -265,91 +329,13 @@ impl DagStore {
         }
     }
 
-    /// WP-S.1: Persist a block to the backend.
-    /// RM-B1 / WP-B1.5 (audit M-06): on serialization failure, log
-    /// `error!` and skip the kv_put rather than writing empty bytes
-    /// (which would silently deserialize-fail on the next restart).
-    fn persist_block(&self, block: &Block, hash: &Hash) {
-        if let Some(ref kv) = self.persistent {
-            let block_bytes = match bincode::serialize(block) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    tracing::error!(
-                        "M-06: serialize block {} failed: {} — skipping persistence",
-                        hash, e
-                    );
-                    return;
-                }
-            };
-            if let Err(e) = kv.kv_put(cf::DAG_BLOCKS, hash.as_bytes(), &block_bytes) {
-                warn!("Failed to persist block {}: {}", hash, e);
-            }
-        }
-    }
-
-    /// WP-S.1: Persist children map entry.
-    /// RM-B1 / WP-B1.5 (audit M-06): see `persist_block` doc.
-    fn persist_children(&self, parent: &Hash, children: &[Hash]) {
-        if let Some(ref kv) = self.persistent {
-            let entry = (*parent, children.to_vec());
-            let bytes = match bincode::serialize(&entry) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    tracing::error!(
-                        "M-06: serialize children for {} failed: {} — skipping persistence",
-                        parent, e
-                    );
-                    return;
-                }
-            };
-            if let Err(e) = kv.kv_put(cf::DAG_CHILDREN, parent.as_bytes(), &bytes) {
-                warn!("Failed to persist children for {}: {}", parent, e);
-            }
-        }
-    }
-
-    /// WP-S.1: Persist the tip set.
-    fn persist_tip_add(&self, hash: &Hash) {
-        if let Some(ref kv) = self.persistent {
-            if let Err(e) = kv.kv_put(cf::DAG_TIPS, hash.as_bytes(), &[1]) {
-                warn!("Failed to persist tip {}: {}", hash, e);
-            }
-        }
-    }
-
-    fn persist_tip_remove(&self, hash: &Hash) {
-        if let Some(ref kv) = self.persistent {
-            if let Err(e) = kv.kv_delete(cf::DAG_TIPS, hash.as_bytes()) {
-                warn!("Failed to remove tip {}: {}", hash, e);
-            }
-        }
-    }
-
-    /// WP-S.1: Persist finalization.
+    /// WP-S.1: Persist finalization. Single-op write — atomic by
+    /// construction. (`store_block`'s multi-op path uses
+    /// `kv_write_batch` instead; see WP-B1.3.)
     fn persist_finalized(&self, hash: &Hash) {
         if let Some(ref kv) = self.persistent {
             if let Err(e) = kv.kv_put(cf::DAG_FINALIZED, hash.as_bytes(), &[1]) {
                 warn!("Failed to persist finalized {}: {}", hash, e);
-            }
-        }
-    }
-
-    /// WP-S.1: Persist height index.
-    /// RM-B1 / WP-B1.5 (audit M-06): see `persist_block` doc.
-    fn persist_height_index(&self, height: u64, hashes: &[Hash]) {
-        if let Some(ref kv) = self.persistent {
-            let bytes = match bincode::serialize(hashes) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    tracing::error!(
-                        "M-06: serialize height index {} failed: {} — skipping persistence",
-                        height, e
-                    );
-                    return;
-                }
-            };
-            if let Err(e) = kv.kv_put(cf::DAG_HEIGHT_INDEX, &height.to_be_bytes(), &bytes) {
-                warn!("Failed to persist height index {}: {}", height, e);
             }
         }
     }
@@ -430,7 +416,14 @@ impl DagStore {
         }
     }
 
-    /// Store a block in the DAG
+    /// Store a block in the DAG.
+    ///
+    /// RM-B1 / WP-B1.3 (audit H-04): all persistence operations from
+    /// a single `store_block` invocation are now committed in **one
+    /// atomic `kv_write_batch`** so a power loss between two writes
+    /// can no longer leave the DAG in an inconsistent state on
+    /// restart (e.g., block exists but no children pointer; tips
+    /// excludes the new tip; height index out of sync).
     pub async fn store_block(&self, block: Block) -> Result<(), DagStoreError> {
         let hash = block.hash();
 
@@ -458,62 +451,107 @@ impl DagStore {
             }
         }
 
-        // WP-S.1: Persist block to backend
-        self.persist_block(&block, &hash);
+        // RM-B1 / WP-B1.3: collect every persistence op into one
+        // batch. The serialization happens here; on encode failure we
+        // log error! and skip persistence (M-06 pattern).
+        let mut ops: Vec<KvOp> = Vec::new();
 
-        // Update parent-child relationships
+        // 1. Block bytes.
+        match bincode::serialize(&block) {
+            Ok(bytes) => ops.push(KvOp::Put {
+                cf: cf::DAG_BLOCKS.to_string(),
+                key: hash.as_bytes().to_vec(),
+                value: bytes,
+            }),
+            Err(e) => {
+                tracing::error!(
+                    "M-06: serialize block {} failed: {} — skipping persistence",
+                    hash, e
+                );
+            }
+        }
+
+        // 2. Parent → child links (and self → empty children entry).
         let mut children = self.children.write().await;
-
-        // Add child reference to selected parent
         if !block.is_genesis() {
             let parent_children = children
                 .entry(block.selected_parent())
                 .or_insert_with(Vec::new);
             parent_children.push(hash);
-            self.persist_children(&block.selected_parent(), parent_children);
+            push_children_op(
+                &mut ops,
+                &block.selected_parent(),
+                parent_children,
+            );
 
-            // Add child reference to merge parents
             for merge_parent in &block.header.merge_parent_hashes {
-                let mp_children = children
-                    .entry(*merge_parent)
-                    .or_insert_with(Vec::new);
+                let mp_children = children.entry(*merge_parent).or_insert_with(Vec::new);
                 mp_children.push(hash);
-                self.persist_children(merge_parent, mp_children);
+                push_children_op(&mut ops, merge_parent, mp_children);
             }
         }
-
-        // Initialize children list for new block
         children.insert(hash, Vec::new());
-        self.persist_children(&hash, &[]);
+        push_children_op(&mut ops, &hash, &[]);
         drop(children);
 
-        // Update tips
+        // 3. Tip set updates.
         let mut tips = self.tips.write().await;
-
-        // Remove parents from tips since they now have a child
         if !block.is_genesis() {
             tips.remove(&block.selected_parent());
-            self.persist_tip_remove(&block.selected_parent());
+            ops.push(KvOp::Delete {
+                cf: cf::DAG_TIPS.to_string(),
+                key: block.selected_parent().as_bytes().to_vec(),
+            });
             for merge_parent in &block.header.merge_parent_hashes {
                 tips.remove(merge_parent);
-                self.persist_tip_remove(merge_parent);
+                ops.push(KvOp::Delete {
+                    cf: cf::DAG_TIPS.to_string(),
+                    key: merge_parent.as_bytes().to_vec(),
+                });
             }
         }
-
-        // Add new block as a tip
         tips.insert(hash);
-        self.persist_tip_add(&hash);
+        ops.push(KvOp::Put {
+            cf: cf::DAG_TIPS.to_string(),
+            key: hash.as_bytes().to_vec(),
+            value: vec![1],
+        });
         drop(tips);
 
-        // Index by height
+        // 4. Height index.
         let height = block.header.height;
         let mut by_height = self.blocks_by_height.write().await;
         let height_hashes = by_height.entry(height).or_insert_with(Vec::new);
         height_hashes.push(hash);
-        self.persist_height_index(height, height_hashes);
+        match bincode::serialize(&*height_hashes) {
+            Ok(bytes) => ops.push(KvOp::Put {
+                cf: cf::DAG_HEIGHT_INDEX.to_string(),
+                key: height.to_be_bytes().to_vec(),
+                value: bytes,
+            }),
+            Err(e) => {
+                tracing::error!(
+                    "M-06: serialize height index {} failed: {} — skipping persistence",
+                    height, e
+                );
+            }
+        }
         drop(by_height);
 
-        // Store the block
+        // 5. Atomic commit. Either every op lands or none does.
+        if let Some(ref kv) = self.persistent {
+            if let Err(e) = kv.kv_write_batch(&ops) {
+                warn!(
+                    "H-04: write_batch for block {} failed: {} — DAG persistence partial",
+                    hash, e
+                );
+            }
+        }
+
+        // 6. Finally update the in-memory blocks map. Note: even if
+        // the batch above failed, the in-memory state still reflects
+        // the new block; the next restart will find missing
+        // persistent state and surface that as a load-time error.
         self.blocks.write().await.insert(hash, block.clone());
 
         info!("Stored block {} at height {}", hash, block.header.height);
