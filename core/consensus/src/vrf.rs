@@ -31,11 +31,33 @@ pub struct Validator {
     pub is_active: bool,
 }
 
+/// Above this block height, the legacy 32-byte SHA3 VRF proof
+/// format is rejected outright. Below it, both ECVRF (114 bytes)
+/// and legacy SHA3 (32 bytes) are accepted — necessary for
+/// replaying the genesis-era chain history that pre-dates ECVRF.
+///
+/// Audit finding **H-06** (HIGH, downgrade): the legacy SHA3 path
+/// is unauthenticated — anyone can compute `proof.proof = anything`
+/// and `output = SHA3(proof || alpha)` and the verifier accepts it.
+/// Accepting it on new blocks lets attackers forge VRF proofs for
+/// any validator. The cutoff bounds the damage to historical
+/// blocks the chain has already finalized.
+///
+/// Cutoff = 100_000 — comfortably past testnet-beta's current
+/// height (April 2026: ~12k) and well before mainnet launch
+/// (target height < 100k at activation). Configurable via
+/// [`VrfProposerSelector::with_legacy_cutoff_height`] for tests
+/// and devnets.
+pub const DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT: u64 = 100_000;
+
 /// VRF-based proposer selection
 pub struct VrfProposerSelector {
     validators: Arc<RwLock<HashMap<PublicKey, Validator>>>,
     total_stake: Arc<RwLock<u128>>,
     difficulty_adjustment: f64,
+    /// Audit H-06: legacy 32-byte SHA3 proofs rejected at or above
+    /// this height. See [`DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT`].
+    legacy_vrf_cutoff_height: u64,
 }
 
 impl VrfProposerSelector {
@@ -44,7 +66,16 @@ impl VrfProposerSelector {
             validators: Arc::new(RwLock::new(HashMap::new())),
             total_stake: Arc::new(RwLock::new(0)),
             difficulty_adjustment: 1.0,
+            legacy_vrf_cutoff_height: DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT,
         }
+    }
+
+    /// Override the legacy-VRF cutoff height. Used by devnet and
+    /// integration tests that exercise the legacy path explicitly.
+    /// Production node startup keeps the default.
+    pub fn with_legacy_cutoff_height(mut self, cutoff: u64) -> Self {
+        self.legacy_vrf_cutoff_height = cutoff;
+        self
     }
 
     /// Register a validator
@@ -102,8 +133,17 @@ impl VrfProposerSelector {
 
     /// Verify VRF proof is bound to the claimed proposer.
     ///
-    /// WP-S.2: Supports both ECVRF (81 bytes) and legacy SHA3 (32 bytes) proofs.
-    /// During chain sync, old blocks with SHA3 proofs are still accepted.
+    /// WP-S.2: Supports both ECVRF (114 bytes) and legacy SHA3
+    /// (32 bytes) proofs. The `slot` parameter doubles as block
+    /// height for the legacy-cutoff check.
+    ///
+    /// RM-B1 / WP-B2.3 (audit H-06): legacy 32-byte SHA3 proofs
+    /// are accepted ONLY below `legacy_vrf_cutoff_height` (default
+    /// `DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT = 100_000`). Above the
+    /// cutoff, only the cryptographic ECVRF path is accepted —
+    /// closing the downgrade vector where an attacker forges
+    /// `proof.proof = anything; output = SHA3(proof || alpha)` and
+    /// the verifier blindly accepts.
     pub fn verify_vrf_proof(
         &self,
         pubkey: &PublicKey,
@@ -115,7 +155,16 @@ impl VrfProposerSelector {
             // WP-S.2: ECVRF-P256-SHA256 proof (pk_p256=33 + Gamma=33 + c=16 + s=32)
             self.verify_ecvrf_proof(pubkey, proof, previous_vrf, slot)
         } else if proof.proof.len() == 32 {
-            // Legacy SHA3 proof — backward compatibility during sync
+            // Legacy SHA3 proof — accepted only below the cutoff
+            // height. See `legacy_vrf_cutoff_height` doc + audit
+            // finding H-06.
+            if slot >= self.legacy_vrf_cutoff_height {
+                tracing::warn!(
+                    "H-06: rejecting legacy 32-byte VRF proof at slot {} (cutoff {})",
+                    slot, self.legacy_vrf_cutoff_height
+                );
+                return Ok(false);
+            }
             self.verify_legacy_proof(pubkey, proof, previous_vrf, slot)
         } else {
             Ok(false)
