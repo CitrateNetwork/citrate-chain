@@ -36,6 +36,27 @@ All 15 learning IPC commands have been wired to real contract calls via `Contrac
 
 **Total: 0 mocks remaining.**
 
+## CM-07 training-worker substitute backends (registered S0 substitutions)
+
+These are trait-abstracted backend swaps for Stage-0 development
+work. Each is a substitute at a stable trait boundary, not a
+disguised production fake. Production builds must NOT wire these
+as defaults; they're selected explicitly in tests and the eventual
+binary config only.
+
+| Trait | S0 impl | Production impl | Replacement WP | Gate |
+|-------|---------|-----------------|----------------|------|
+| `ModelBackend` | `DeterministicTinyModel` | `TchGpuBackend` | CM-07 WP-07.2 S2 | GPU pledge available |
+| `Transport` | `InProcessTransport` | `LibP2pTransport` | CM-07 WP-07.2 S1 | 3-machine LAN available |
+| `ChainClient` | `MockChainClient` | `HttpChainClient` | CM-07 WP-07.2 S1 | Anvil sidecar / testnet RPC |
+
+The `MockChainClient` enforces the same invariants as
+`ComputePoolTraining.sol` (epoch monotonicity, coordinator-only
+commitEpoch, challenge-window gate) — it IS a substitute backend,
+not a behavior mock. A bug caught against it catches the same bug
+against a live deployment. Per the CM-07/08 staged execution plan
+§4 safe-mock criteria, these meet all four safety conditions.
+
 ## Known Limitations (not mocks)
 
 These are documented technical limitations, not mocks:

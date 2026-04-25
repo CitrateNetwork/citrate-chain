@@ -385,15 +385,133 @@ jobs:
           path: citrate_v0.01.1/dist/*
           if-no-files-found: error  # LC is the pilot binary — fail hard if missing
 
+  # ============================================================================
+  # Compute provider bundle — pool-coordinator + training-worker
+  # ============================================================================
+  # The two daemons partner operators run on their infrastructure to join
+  # InferencePools (CM-05 pool-coordinator) or training pools (CM-07
+  # citrate-training-worker). Shipped together as a single "compute provider
+  # bundle" tarball so a partner pulls one archive and has the binaries for
+  # both join paths.
+  #
+  # Ubuntu 22.04 LTS is the primary target (matches the partner starter kit at
+  # docs/partner-starter-kit.md); macOS and Windows artifacts are built for
+  # parity but Linux is the documented happy path.
+  # ============================================================================
+  build-compute-provider-bundles:
+    name: Build Compute Provider Bundle (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        working-directory: citrate_v0.01.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cp-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          restore-keys: cp-${{ matrix.os }}-
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libclang-dev cmake pkg-config
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        run: choco install llvm cmake -y
+
+      - name: Build compute provider binaries
+        run: |
+          cargo build --release -p citrate-pool-coordinator -p citrate-training-worker
+
+      - name: Package compute provider bundle (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -eux
+          case "$(uname -s)" in
+            Linux) OS=linux ;;
+            Darwin) OS=macos ;;
+            *) OS=$(uname -s | tr '[:upper:]' '[:lower:]') ;;
+          esac
+          ARCH=$(uname -m)
+          STAGE="dist/citrate-compute-provider-${OS}-${ARCH}"
+          mkdir -p "${STAGE}"
+          cp target/release/citrate-pool-coordinator "${STAGE}/"
+          cp target/release/citrate-training-worker "${STAGE}/"
+          cp ../LICENSE "${STAGE}/"
+          cp README.md "${STAGE}/PROJECT_README.md"
+          cp ../docs/partner-starter-kit.md "${STAGE}/"
+          cd "${STAGE}"
+          if command -v sha256sum &>/dev/null; then
+            sha256sum citrate-pool-coordinator citrate-training-worker > SHA256SUMS.txt
+          else
+            shasum -a 256 citrate-pool-coordinator citrate-training-worker > SHA256SUMS.txt
+          fi
+          cd ..
+          tar -czf "citrate-compute-provider-${OS}-${ARCH}.tar.gz" \
+            "citrate-compute-provider-${OS}-${ARCH}"
+          rm -rf "citrate-compute-provider-${OS}-${ARCH}"
+          echo "Created dist/citrate-compute-provider-${OS}-${ARCH}.tar.gz"
+
+      - name: Package compute provider bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "dist\citrate-compute-provider-windows-$env:PROCESSOR_ARCHITECTURE"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\release\citrate-pool-coordinator.exe $stage\
+          Copy-Item target\release\citrate-training-worker.exe $stage\
+          Copy-Item ..\LICENSE $stage\
+          Copy-Item README.md "$stage\PROJECT_README.md"
+          Copy-Item ..\docs\partner-starter-kit.md $stage\
+          $hashTargets = @(
+            "$stage\citrate-pool-coordinator.exe",
+            "$stage\citrate-training-worker.exe"
+          )
+          $hashLines = foreach ($file in $hashTargets) {
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            "$hash  $(Split-Path $file -Leaf)"
+          }
+          $hashLines | Set-Content "$stage\SHA256SUMS.txt"
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          $zip = "dist\citrate-compute-provider-windows-$arch.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip
+          Remove-Item $stage -Recurse -Force
+          Write-Host "Created $zip"
+
+      - name: Upload compute provider bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: compute-provider-${{ matrix.os }}
+          path: citrate_v0.01.1/dist/*
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-developer-bundles, build-core-gui, build-learning-center]
+    needs: [build-developer-bundles, build-core-gui, build-learning-center, build-compute-provider-bundles]
     # All three upstream jobs must succeed before we publish a release. The
     # operator GUI (citrate-gui-native) ships in the release surface alongside
     # the node binaries and the Learning Center pilot binary, so a GUI failure
     # must block publication rather than silently produce a partial release.
-    if: always() && needs.build-developer-bundles.result == 'success' && needs.build-core-gui.result == 'success' && needs.build-learning-center.result == 'success'
+    if: always() && needs.build-developer-bundles.result == 'success' && needs.build-core-gui.result == 'success' && needs.build-learning-center.result == 'success' && needs.build-compute-provider-bundles.result == 'success'
     permissions:
       contents: write
     steps:
