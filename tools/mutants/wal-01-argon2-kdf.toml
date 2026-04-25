@@ -1,0 +1,32 @@
+# WP-A1.1 Step 4 — verify mutations of the v2 KDF dispatcher are killed.
+# Scoped to wallet-core/src/keys.rs (the canonical dispatcher) + the
+# wallet-core types.rs kdf_version field. The CLI wallet's parallel
+# implementation gets its own campaign in the RM-G2 consolidation sprint.
+#
+# Run: cargo mutants --config tools/mutants/wal-01-argon2-kdf.toml --in-place \
+#                    --no-shuffle --jobs 4 --timeout-multiplier 3.0
+#
+# Hand-mutations of interest:
+#   - argon2_for_version(KDF_VERSION_CURRENT) → returns Argon2::default()  → must be killed
+#   - encrypt_key_raw writes kdf_version: 1 instead of 2                   → must be killed
+#   - decrypt_key always uses argon2_for_version(2) regardless of entry    → must be killed (legacy unlock breaks)
+
+# cargo-mutants config file
+test_workspace = false
+test_package = ["citrate-wallet-core"]
+
+# Limit blast radius — only mutate the production KDF code paths.
+examine_re = [
+    "wallet-core/src/keys\\.rs",
+    "wallet-core/src/types\\.rs",
+]
+
+# Skip non-production paths.
+exclude_re = [
+    "wallet-core/tests/.*",
+    "wallet-core/benches/.*",
+    "wallet/.*",  # CLI wallet has separate campaign in RM-G2
+]
+
+# Tighten timeout — the proptest does ~16 Argon2 rounds (~7s on Spark).
+timeout_multiplier = 3.0

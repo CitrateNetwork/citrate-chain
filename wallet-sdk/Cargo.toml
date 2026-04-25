@@ -18,6 +18,12 @@ serde_json = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["sync"] }
 
+# Cryptography exposed to WASM consumers (browser extension, edu webapp).
+# Pulled in unconditionally — wallet-core re-exports its dispatcher and
+# the `argon2` crate is a tiny no_std-compatible build on wasm32 already.
+# WP-A1.5 (audit findings WAL-01, EXT-01).
+argon2 = "0.5"
+
 # WASM bindings (optional — only for wasm32 target)
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
@@ -28,6 +34,10 @@ getrandom = { version = "0.2", optional = true, features = ["js"] }
 [features]
 default = []
 wasm = ["wasm-bindgen", "js-sys", "serde-wasm-bindgen", "web-sys", "getrandom"]
+# WP-A1.5: pre-build target for browser-extension Argon2id migration.
+# `argon2-wasm` implies `wasm` and adds the `argon2_v2_derive_key` export.
+# The full PBKDF2 → Argon2 migration in the extension lands in RM-G1.
+argon2-wasm = ["wasm"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

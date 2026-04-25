@@ -1,0 +1,6 @@
+# cargo-mutants output directories — regenerated on every campaign run.
+# We commit the configs (.toml) and the human-authored RESULTS docs
+# (RESULTS_*.md), but NOT the per-mutant diff trees.
+wal-01-output/
+wal-01-output-v2/
+*.out/
