@@ -1,0 +1,48 @@
+# H-06 — Accepting 32-byte legacy SHA3 VRF proofs without a height cutoff is forbidden.
+#
+# Audit finding (HIGH, downgrade):
+#   .audit/2026-04-24-full-repo-adversarial-audit/03_FINDINGS_CONSENSUS_EXECUTION.md#h-06
+#
+# Spec (canonical):
+#   docs/security/ECVRF_DEPRECATION_PLAN.md
+#
+# The legacy 32-byte SHA3 "VRF" format is unauthenticated — anyone
+# computing `proof.proof = X; output = SHA3(X || alpha)` produces
+# a "proof" the verifier blindly accepts. Pre-fix the verifier
+# accepted both 114-byte ECVRF and 32-byte legacy proofs without
+# bounds. Post-fix legacy proofs are accepted ONLY below
+# `legacy_vrf_cutoff_height` (default 100_000); above the cutoff
+# they're rejected.
+#
+# This rule catches new dispatch sites that branch on
+# `proof.proof.len() == 32` without first checking the height.
+
+rules:
+  - id: h-06-legacy-vrf-fallback
+    message: >-
+      Legacy 32-byte SHA3 VRF proof handling is forbidden without a
+      height-cutoff guard (H-06). Use
+      `VrfProposerSelector::verify_vrf_proof(slot)` which checks
+      `slot >= legacy_vrf_cutoff_height` before delegating to the
+      legacy path. See docs/security/ECVRF_DEPRECATION_PLAN.md.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/consensus/**/*.rs"
+      exclude:
+        - "core/consensus/src/vrf.rs"  # canonical implementation
+        - "**/tests/**"
+        - "**/proptest-regressions/**"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              if $PROOF.proof.len() == 32 {
+                  ...
+              }
+          - pattern: |
+              match $PROOF.proof.len() {
+                  ...
+                  32 => $_,
+                  ...
+              }

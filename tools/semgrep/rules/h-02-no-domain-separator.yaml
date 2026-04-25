@@ -1,0 +1,56 @@
+# H-02 — checkpoint vote canonical message MUST include the domain separator + chain_id.
+#
+# Audit finding (HIGH, replay):
+#   .audit/2026-04-24-full-repo-adversarial-audit/03_FINDINGS_CONSENSUS_EXECUTION.md#h-02
+#
+# Spec (canonical):
+#   specs/tla/consensus/CheckpointVoteSafety.tla — invariant
+#   OnlyOwnChainVotesAccepted.
+#
+# Pre-fix `verify_vote_signature` and the test signers built the
+# canonical message as just:
+#   message = height(8 LE) || block_hash(32) = 40 bytes
+# with no domain separator and no chain_id. A vote signed for
+# testnet checkpoint #50 was byte-identical to a vote on a fork or
+# alternate chain with the same height + block hash → cross-chain
+# replay.
+#
+# Post-fix the canonical message is:
+#   CITRATE_VOTE_DOMAIN_SEPARATOR (21 bytes)
+#     || chain_id (8 LE)
+#     || height (8 LE)
+#     || block_hash (32)
+#   = 69 bytes.
+#
+# Built by `pub fn canonical_vote_message(chain_id, height, hash)`.
+# This rule fires on the legacy 40-byte builder pattern.
+
+rules:
+  - id: h-02-no-domain-separator
+    message: >-
+      Manual construction of a 40-byte vote canonical message
+      (height || block_hash) is forbidden (H-02). It lacks the
+      domain separator + chain_id, allowing cross-chain vote replay.
+      Use `citrate_consensus::checkpoint::canonical_vote_message`.
+      See specs/tla/consensus/CheckpointVoteSafety.tla.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/**/*.rs"
+        - "node/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/proptest-regressions/**"
+    patterns:
+      - pattern-either:
+          # Pattern A: explicit "Vec::with_capacity(40)" + height + hash.
+          - pattern: |
+              let mut $MSG = Vec::with_capacity(40);
+              $MSG.extend_from_slice(&$HEIGHT.to_le_bytes());
+              $MSG.extend_from_slice($HASH.as_bytes());
+          # Pattern B: same shape but different identifier names.
+          - pattern: |
+              let mut $MSG = Vec::with_capacity($_);
+              $MSG.extend_from_slice(&$_.height.to_le_bytes());
+              $MSG.extend_from_slice($_.block_hash.as_bytes());

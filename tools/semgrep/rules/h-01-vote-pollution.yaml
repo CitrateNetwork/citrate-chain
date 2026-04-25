@@ -1,0 +1,46 @@
+# H-01 — `voted.insert` before vote validation pollutes the replay-protection set.
+#
+# Audit finding (HIGH, liveness):
+#   .audit/2026-04-24-full-repo-adversarial-audit/03_FINDINGS_CONSENSUS_EXECUTION.md#h-01
+#
+# Spec (canonical):
+#   specs/tla/consensus/CheckpointVoteSafety.tla — invariants
+#   VotedSetTracksAcceptedOnly + GarbageSigDoesNotLockVoter.
+#
+# Pre-fix `submit_vote` inserted (height, voter) into the `voted`
+# replay-protection set BEFORE verifying signature, committee
+# membership, or block-hash match. An attacker flooding 100 invalid
+# votes with victim pubkeys could permanently lock honest voters
+# out of every checkpoint.
+#
+# Post-fix the marker happens AFTER all validation. This rule
+# detects the early-insert pattern resurfacing.
+
+rules:
+  - id: h-01-vote-pollution
+    message: >-
+      `self.voted.write().await; voted.insert(...)` BEFORE
+      `verify_vote_signature` is forbidden (H-01). An attacker
+      floods invalid victim-signed votes and locks out honest
+      voters. Move the insert AFTER all validation steps. See
+      specs/tla/consensus/CheckpointVoteSafety.tla.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/consensus/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/proptest-regressions/**"
+    patterns:
+      - pattern: |
+          let mut $VOTED = $SELF.voted.write().await;
+          $VOTED.insert(...);
+          ...
+          $_ = $SELF.pending.$_(...).await;
+          ...
+      - pattern-not: |
+          $_ = verify_vote_signature(...);
+          ...
+          let mut $VOTED = $SELF.voted.write().await;
+          $VOTED.insert(...);
