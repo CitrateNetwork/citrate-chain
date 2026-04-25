@@ -1,0 +1,38 @@
+# SOL-01 — X402 fee leg via `transferFrom` is forbidden.
+#
+# Audit finding (CRITICAL):
+#   .audit/2026-04-24-full-repo-adversarial-audit/06_FINDINGS_SOLIDITY_CONTRACTS.md#sol-01
+#
+# Pre-fix `X402Facilitator.settlePayment` settled `netValue` via
+# EIP-3009 `transferWithAuthorization`, then pulled the fee via a
+# separate `wSALT.transferFrom(from, treasury, fee)`. That silently
+# required the user to have ERC-20-approved the facilitator —
+# breaking x402's gasless-UX claim.
+#
+# Post-fix uses `wSALT.transferWithFeeAuthorization(from, to,
+# treasury, value, fee, ...)` which consumes ONE EIP-3009
+# authorization for the gross value and splits internally. No
+# pre-approval required.
+#
+# This rule fires on `transferFrom` calls from x402 facilitator
+# code — flagging any path that resurrects the pre-fix shape.
+
+rules:
+  - id: sol-01-x402-fee-via-transferfrom
+    message: >-
+      x402 facilitator code MUST NOT use `transferFrom` for the
+      fee leg (SOL-01). That breaks the gasless-UX claim by
+      requiring a separate ERC-20 allowance. Use
+      `wSALT.transferWithFeeAuthorization(...)` which consumes a
+      single signed authorization for the gross value and splits
+      internally.
+    languages: [solidity]
+    severity: ERROR
+    paths:
+      include:
+        - "contracts/src/X402Facilitator.sol"
+        - "contracts/src/x402/**/*.sol"
+      exclude:
+        - "**/test/**"
+    patterns:
+      - pattern: $TOKEN.transferFrom($_, treasury, $_)

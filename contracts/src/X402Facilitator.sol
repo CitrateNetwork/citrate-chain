@@ -60,14 +60,15 @@ contract X402Facilitator is AccessControl, ReentrancyGuard {
         _grantRole(FACILITATOR_ROLE, msg.sender);
     }
 
-    /// @notice Settle a single x402 payment via transferWithAuthorization
-    /// @dev Calls wSALT.transferWithAuthorization for (value - fee) to recipient,
-    ///      then transfers fee to treasury via a separate authorization or direct transfer.
-    ///      For simplicity, this implementation transfers full value to `to`, then `to` is
-    ///      expected to include fee in the signed value. The facilitator takes its cut
-    ///      from `from`'s balance via a separate fee authorization.
+    /// @notice Settle a single x402 payment via transferWithFeeAuthorization.
     ///
-    ///      Simplified flow: from -> to (full value via auth), fee handled off-chain.
+    /// RM-B1 / WP-D2.1 (audit SOL-01): pre-fix the facilitator pulled
+    /// the fee via a separate `wSALT.transferFrom(from, treasury, fee)`
+    /// which silently required the user to have ERC-20-approved this
+    /// contract — breaking x402's gasless-UX claim. Post-fix the
+    /// settlement uses `wSALT.transferWithFeeAuthorization` which
+    /// consumes ONE signed EIP-3009 authorization for the gross
+    /// `value` and splits internally inside wSALT.
     function settlePayment(
         address from,
         address to,
@@ -82,17 +83,14 @@ contract X402Facilitator is AccessControl, ReentrancyGuard {
         require(value > 0, "X402: zero value");
 
         uint256 fee = (value * feeBps) / 10000;
-        uint256 netValue = value - fee;
 
-        // Execute the authorized transfer for net value
-        wSALT.transferWithAuthorization(from, to, netValue, validAfter, validBefore, nonce, v, r, s);
+        // SOL-01 fix: single signed authorization splits internally.
+        wSALT.transferWithFeeAuthorization(
+            from, to, treasury, value, fee,
+            validAfter, validBefore, nonce, v, r, s
+        );
 
-        // Transfer fee to treasury (requires from to have approved this contract)
-        if (fee > 0) {
-            wSALT.transferFrom(from, treasury, fee);
-        }
-
-        emit PaymentSettled(from, to, netValue, fee, nonce);
+        emit PaymentSettled(from, to, value - fee, fee, nonce);
     }
 
     /// @notice Settle multiple x402 payments in a single transaction
@@ -109,18 +107,15 @@ contract X402Facilitator is AccessControl, ReentrancyGuard {
             require(p.value > 0, "X402: zero value in batch");
 
             uint256 fee = (p.value * feeBps) / 10000;
-            uint256 netValue = p.value - fee;
 
-            wSALT.transferWithAuthorization(
-                p.from, p.to, netValue,
+            // SOL-01 fix: single signed authorization splits internally.
+            wSALT.transferWithFeeAuthorization(
+                p.from, p.to, treasury, p.value, fee,
                 p.validAfter, p.validBefore, p.nonce,
                 p.v, p.r, p.s
             );
 
-            if (fee > 0) {
-                wSALT.transferFrom(p.from, treasury, fee);
-            }
-
+            uint256 netValue = p.value - fee;
             totalValue += netValue;
             totalFees += fee;
 

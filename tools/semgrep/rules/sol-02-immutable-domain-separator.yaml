@@ -1,0 +1,44 @@
+# SOL-02 — `immutable DOMAIN_SEPARATOR` is forbidden when chainId
+# can change.
+#
+# Audit finding (CRITICAL):
+#   .audit/2026-04-24-full-repo-adversarial-audit/06_FINDINGS_SOLIDITY_CONTRACTS.md#sol-02
+#
+# Pre-fix WrappedSALT had `bytes32 public immutable DOMAIN_SEPARATOR`
+# captured ONCE at construction. After a hard-fork chainId change
+# (Citrate's re-genesis policy explicitly allows this), all stored
+# authorizations remained signed under the OLD chainId yet the
+# contract verified them against the cached value — cross-fork
+# replay possible.
+#
+# Post-fix WrappedSALT uses the OZ EIP712 pattern: cache
+# `_CACHED_DOMAIN_SEPARATOR + _CACHED_CHAIN_ID` at construction;
+# rebuild on `block.chainid != _CACHED_CHAIN_ID`. A `function
+# DOMAIN_SEPARATOR() public view returns (bytes32)` exposes the
+# correct value to callers.
+#
+# This rule catches the `immutable DOMAIN_SEPARATOR` pattern
+# resurfacing in any contract.
+
+rules:
+  - id: sol-02-immutable-domain-separator
+    message: >-
+      `bytes32 immutable DOMAIN_SEPARATOR` is forbidden (SOL-02).
+      A hard-fork chainId change leaves all existing signatures
+      verifying against the cached chainId, enabling cross-fork
+      replay. Use the OZ EIP712 pattern: cache + rebuild on
+      `block.chainid != _CACHED_CHAIN_ID`. Expose via a
+      `function DOMAIN_SEPARATOR()` getter.
+    languages: [solidity]
+    severity: ERROR
+    paths:
+      include:
+        - "contracts/src/**/*.sol"
+      exclude:
+        - "**/test/**"
+    patterns:
+      - pattern: bytes32 $_ immutable $NAME = $_;
+      - metavariable-pattern:
+          metavariable: $NAME
+          patterns:
+            - pattern-regex: 'DOMAIN_SEPARATOR'

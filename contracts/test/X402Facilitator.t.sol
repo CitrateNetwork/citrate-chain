@@ -34,10 +34,16 @@ contract X402FacilitatorTest is Test {
         vm.prank(admin);
         facilitator = new X402Facilitator(address(wSALT), treasury, FEE_BPS);
 
-        // Alice deposits and approves facilitator for fee deductions
+        // Alice deposits.
+        // RM-B1 / WP-D2.1 (audit SOL-01): note that we do NOT
+        // pre-approve the facilitator here. The post-fix
+        // settlement consumes a single EIP-3009 authorization for
+        // the gross value and splits internally — no allowance
+        // required. Pre-fix tests called `wSALT.approve(...)` to
+        // grant the facilitator unbounded fee-leg access; that's
+        // exactly the UX regression the audit flagged.
         vm.startPrank(alice);
         wSALT.deposit{value: 50 ether}();
-        wSALT.approve(address(facilitator), type(uint256).max);
         vm.stopPrank();
     }
 
@@ -54,9 +60,10 @@ contract X402FacilitatorTest is Test {
         uint256 validBefore = block.timestamp + 1 hours;
         bytes32 nonce = keccak256("settle-1");
 
-        // Alice signs authorization for netValue to bob (facilitator adjusts)
+        // RM-B1 / WP-D2.1 (audit SOL-01): post-fix Alice signs the
+        // GROSS value; the facilitator + wSALT split internally.
         (uint8 v, bytes32 r, bytes32 s) = _signTransferAuth(
-            alicePk, alice, bob, netValue, validAfter, validBefore, nonce
+            alicePk, alice, bob, value, validAfter, validBefore, nonce
         );
 
         vm.prank(admin);
@@ -95,13 +102,12 @@ contract X402FacilitatorTest is Test {
     function test_batchSettle() public {
         X402Facilitator.PaymentAuthorization[] memory payments = new X402Facilitator.PaymentAuthorization[](2);
 
-        // Payment 1
+        // Payment 1 — SOL-01: sign over GROSS value.
         {
             uint256 value1 = 2 ether;
-            uint256 net1 = value1 - (value1 * FEE_BPS) / 10000;
             bytes32 nonce1 = keccak256("batch-1");
             (uint8 v1, bytes32 r1, bytes32 s1) = _signTransferAuth(
-                alicePk, alice, bob, net1, 0, block.timestamp + 1 hours, nonce1
+                alicePk, alice, bob, value1, 0, block.timestamp + 1 hours, nonce1
             );
             payments[0] = X402Facilitator.PaymentAuthorization({
                 from: alice, to: bob, value: value1,
@@ -113,10 +119,9 @@ contract X402FacilitatorTest is Test {
         // Payment 2
         {
             uint256 value2 = 3 ether;
-            uint256 net2 = value2 - (value2 * FEE_BPS) / 10000;
             bytes32 nonce2 = keccak256("batch-2");
             (uint8 v2, bytes32 r2, bytes32 s2) = _signTransferAuth(
-                alicePk, alice, bob, net2, 0, block.timestamp + 1 hours, nonce2
+                alicePk, alice, bob, value2, 0, block.timestamp + 1 hours, nonce2
             );
             payments[1] = X402Facilitator.PaymentAuthorization({
                 from: alice, to: bob, value: value2,
@@ -174,6 +179,124 @@ contract X402FacilitatorTest is Test {
         vm.prank(admin);
         vm.expectRevert("X402: zero treasury address");
         facilitator.setTreasury(address(0));
+    }
+
+    // ============================================================
+    // RM-B1 / WP-D2.1 (audit SOL-01): no pre-approval needed
+    // ============================================================
+
+    /// SOL-01.1: Alice has NOT pre-approved the facilitator. With
+    /// the post-fix `transferWithFeeAuthorization`, settlement
+    /// must succeed anyway because the fee leg is settled as part
+    /// of the same signed authorization. Pre-fix this would have
+    /// reverted with "wSALT: insufficient allowance" on the
+    /// `transferFrom(from, treasury, fee)` call.
+    function test_sol01_settlement_works_without_preapproval() public {
+        // No `wSALT.approve(...)` call in the test setup — so any
+        // path that depends on `transferFrom` allowance will fail.
+        uint256 value = 4 ether;
+        uint256 fee = (value * FEE_BPS) / 10000;
+        bytes32 nonce = keccak256("sol01-no-approve");
+        (uint8 v, bytes32 r, bytes32 s) = _signTransferAuth(
+            alicePk, alice, bob, value, 0, block.timestamp + 1 hours, nonce
+        );
+
+        vm.prank(admin);
+        facilitator.settlePayment(
+            alice, bob, value, 0, block.timestamp + 1 hours, nonce, v, r, s
+        );
+
+        assertEq(wSALT.balanceOf(bob), value - fee);
+        assertEq(wSALT.balanceOf(treasury), fee);
+        // Sanity check: alice did NOT grant any allowance.
+        assertEq(wSALT.allowance(alice, address(facilitator)), 0);
+    }
+
+    /// SOL-01.2: a signature minted with the pre-fix shape
+    /// (signed over `netValue` instead of `value`) must NOT be
+    /// accepted post-fix. This pins the structural bind.
+    function test_sol01_legacy_netvalue_signature_rejected() public {
+        uint256 value = 4 ether;
+        uint256 fee = (value * FEE_BPS) / 10000;
+        uint256 netValue = value - fee;
+        bytes32 nonce = keccak256("sol01-legacy");
+
+        // Sign over netValue (pre-fix shape).
+        (uint8 v, bytes32 r, bytes32 s) = _signTransferAuth(
+            alicePk, alice, bob, netValue, 0, block.timestamp + 1 hours, nonce
+        );
+
+        // Submit gross `value` with the netValue signature — must reject.
+        vm.prank(admin);
+        vm.expectRevert("wSALT: invalid signature");
+        facilitator.settlePayment(
+            alice, bob, value, 0, block.timestamp + 1 hours, nonce, v, r, s
+        );
+    }
+
+    // ============================================================
+    // RM-B1 / WP-D2.2 (audit SOL-02): chainId-rebuilt domain separator
+    // ============================================================
+
+    /// SOL-02.1: at the deploy chainId, DOMAIN_SEPARATOR() returns
+    /// the cached value.
+    function test_sol02_domain_separator_cached_at_deploy_chainid() public view {
+        bytes32 ds = wSALT.DOMAIN_SEPARATOR();
+        // Deploy chainId is whatever foundry uses (default 31337);
+        // the cached value should match a fresh recomputation at
+        // the same chainId.
+        bytes32 typeHash = keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+        );
+        bytes32 expected = keccak256(abi.encode(
+            typeHash,
+            keccak256(bytes(wSALT.name())),
+            keccak256(bytes("1")),
+            block.chainid,
+            address(wSALT)
+        ));
+        assertEq(ds, expected, "SOL-02: DOMAIN_SEPARATOR matches expected");
+    }
+
+    /// SOL-02.2: under a `vm.chainId` change, DOMAIN_SEPARATOR()
+    /// rebuilds — the new value differs from the cached one.
+    /// This is the load-bearing behaviour that closes cross-fork
+    /// replay.
+    function test_sol02_domain_separator_rebuilds_on_chainid_change() public {
+        bytes32 originalDs = wSALT.DOMAIN_SEPARATOR();
+
+        // Simulate a fork: change the chainId.
+        vm.chainId(99_999);
+        bytes32 newDs = wSALT.DOMAIN_SEPARATOR();
+        assertTrue(
+            originalDs != newDs,
+            "SOL-02: DOMAIN_SEPARATOR must rebuild on chainId change"
+        );
+
+        // Restore to the original chainId; cached value resumes.
+        vm.chainId(31337);
+        bytes32 restoredDs = wSALT.DOMAIN_SEPARATOR();
+        assertEq(restoredDs, originalDs, "SOL-02: cached DS resumes when chainId restored");
+    }
+
+    /// SOL-02.3: a signature minted under chainId A is REJECTED
+    /// when verified under chainId B. Cross-fork replay closed.
+    function test_sol02_cross_chainid_signature_replay_rejected() public {
+        uint256 value = 1 ether;
+        bytes32 nonce = keccak256("sol02-cross-chain");
+
+        // Sign at the original chainId.
+        (uint8 v, bytes32 r, bytes32 s) = _signTransferAuth(
+            alicePk, alice, bob, value, 0, block.timestamp + 1 hours, nonce
+        );
+
+        // Switch chainId; the signature should now fail to verify.
+        vm.chainId(99_999);
+        vm.prank(admin);
+        vm.expectRevert("wSALT: invalid signature");
+        facilitator.settlePayment(
+            alice, bob, value, 0, block.timestamp + 1 hours, nonce, v, r, s
+        );
     }
 
     // ============================================================

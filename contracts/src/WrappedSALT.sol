@@ -25,7 +25,19 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
     mapping(address => mapping(bytes32 => bool)) private _authorizationStates;
 
     // EIP-712 domain separator (computed at deployment, includes chainId + address)
-    bytes32 public immutable DOMAIN_SEPARATOR;
+    /// RM-B1 / WP-D2.2 (audit SOL-02): pre-fix DOMAIN_SEPARATOR was
+    /// `immutable` — captured ONCE at construction. After a hard-fork
+    /// chainId change (which Citrate's re-genesis policy explicitly
+    /// allows), all stored authorizations remained signed under the
+    /// OLD chainId yet the contract verified them against the cached
+    /// chainId, making cross-fork replay possible. Post-fix the
+    /// domain separator is rebuilt on every verify when
+    /// `block.chainid != _CACHED_CHAIN_ID`. OZ EIP712.sol pattern.
+    bytes32 private immutable _CACHED_DOMAIN_SEPARATOR;
+    uint256 private immutable _CACHED_CHAIN_ID;
+    bytes32 private immutable _HASHED_NAME;
+    bytes32 private immutable _HASHED_VERSION;
+    bytes32 private immutable _TYPE_HASH;
 
     // EIP-712 type hashes
     bytes32 public constant TRANSFER_WITH_AUTHORIZATION_TYPEHASH =
@@ -44,15 +56,40 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
     event Withdrawal(address indexed account, uint256 amount);
 
     constructor() {
-        DOMAIN_SEPARATOR = keccak256(
-            abi.encode(
-                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-                keccak256(bytes(name)),
-                keccak256(bytes("1")),
-                block.chainid,
-                address(this)
-            )
+        _TYPE_HASH = keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
         );
+        _HASHED_NAME = keccak256(bytes(name));
+        _HASHED_VERSION = keccak256(bytes("1"));
+        _CACHED_CHAIN_ID = block.chainid;
+        _CACHED_DOMAIN_SEPARATOR = _buildDomainSeparator(
+            _TYPE_HASH,
+            _HASHED_NAME,
+            _HASHED_VERSION
+        );
+    }
+
+    /// SOL-02 fix: rebuild on chainId change.
+    function _buildDomainSeparator(
+        bytes32 typeHash,
+        bytes32 nameHash,
+        bytes32 versionHash
+    ) private view returns (bytes32) {
+        return keccak256(
+            abi.encode(typeHash, nameHash, versionHash, block.chainid, address(this))
+        );
+    }
+
+    /// @notice Returns the EIP-712 domain separator for the current chainId.
+    /// RM-B1 / WP-D2.2 (audit SOL-02): if `block.chainid` matches the
+    /// cached value at construction, returns the cached separator;
+    /// otherwise rebuilds on the fly. This prevents cross-fork replay
+    /// after a re-genesis chainId change.
+    function DOMAIN_SEPARATOR() public view returns (bytes32) {
+        if (block.chainid == _CACHED_CHAIN_ID) {
+            return _CACHED_DOMAIN_SEPARATOR;
+        }
+        return _buildDomainSeparator(_TYPE_HASH, _HASHED_NAME, _HASHED_VERSION);
     }
 
     // ============================================================
@@ -136,7 +173,7 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
             TRANSFER_WITH_AUTHORIZATION_TYPEHASH,
             from, to, value, validAfter, validBefore, nonce
         ));
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
         address signer = ecrecover(digest, v, r, s);
         require(signer != address(0) && signer == from, "wSALT: invalid signature");
 
@@ -144,6 +181,73 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
         emit AuthorizationUsed(from, nonce);
 
         _transfer(from, to, value);
+    }
+
+    /// @notice Authorize a transfer of `value` from `from` and split
+    ///         it internally into `value - fee` to `to` plus `fee` to
+    ///         `treasury`. Single signed authorization for the FULL
+    ///         value — caller cannot route any other recipient.
+    ///
+    /// RM-B1 / WP-D2.1 (audit SOL-01): pre-fix the X402Facilitator
+    /// settled `netValue` via `transferWithAuthorization` and pulled
+    /// the fee via a separate `transferFrom` requiring an off-chain
+    /// allowance. That breaks x402's gasless-UX claim — users either
+    /// had to grant unbounded allowances (MEV/sandwich surface) or
+    /// the fee leg reverted after the authorization was marked used.
+    ///
+    /// Post-fix: this function consumes ONE EIP-3009 authorization
+    /// for the gross `value`, then splits internally:
+    ///   - `value - fee` → `to`
+    ///   - `fee`         → `treasury`
+    /// The user signs ONCE for `value` and the routing is done by
+    /// the contract; no separate allowance required.
+    function transferWithFeeAuthorization(
+        address from,
+        address to,
+        address treasury,
+        uint256 value,
+        uint256 fee,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        require(fee <= value, "wSALT: fee exceeds value");
+        require(treasury != address(0), "wSALT: zero treasury");
+        require(block.timestamp > validAfter, "wSALT: authorization not yet valid");
+        require(block.timestamp < validBefore, "wSALT: authorization expired");
+        require(!_authorizationStates[from][nonce], "wSALT: authorization already used");
+
+        // The signed message authorizes the GROSS `value` to the
+        // recipient; the fee split is contract-enforced. We bind
+        // the typehash payload to (from, to, value, ...) — exactly
+        // the same shape as `transferWithAuthorization` — so a
+        // signature minted for one cannot be replayed against the
+        // other (different function entry, different `to`, but the
+        // signed digest is interchangeable with TWA on (from, to,
+        // value)). To prevent replay, we share the
+        // `_authorizationStates[from][nonce]` namespace.
+        bytes32 structHash = keccak256(abi.encode(
+            TRANSFER_WITH_AUTHORIZATION_TYPEHASH,
+            from, to, value, validAfter, validBefore, nonce
+        ));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
+        address signer = ecrecover(digest, v, r, s);
+        require(signer != address(0) && signer == from, "wSALT: invalid signature");
+
+        _authorizationStates[from][nonce] = true;
+        emit AuthorizationUsed(from, nonce);
+
+        // Split internally — single source of truth on the fee math.
+        uint256 netValue = value - fee;
+        if (netValue > 0) {
+            _transfer(from, to, netValue);
+        }
+        if (fee > 0) {
+            _transfer(from, treasury, fee);
+        }
     }
 
     /// @inheritdoc IERC3009
@@ -167,7 +271,7 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
             RECEIVE_WITH_AUTHORIZATION_TYPEHASH,
             from, to, value, validAfter, validBefore, nonce
         ));
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
         address signer = ecrecover(digest, v, r, s);
         require(signer != address(0) && signer == from, "wSALT: invalid signature");
 
@@ -191,7 +295,7 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
             CANCEL_AUTHORIZATION_TYPEHASH,
             authorizer, nonce
         ));
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
         address signer = ecrecover(digest, v, r, s);
         require(signer != address(0) && signer == authorizer, "wSALT: invalid signature");
 

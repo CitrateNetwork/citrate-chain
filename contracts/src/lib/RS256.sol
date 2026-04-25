@@ -177,32 +177,22 @@ library RS256 {
     /// @dev Copy `src.length` bytes from src's data area to memory
     /// position `dst`. Caller is responsible for ensuring `dst` has
     /// at least src.length bytes of allocated space.
+    ///
+    /// RM-B1 / WP-D3.4 (audit SOL-04): pre-fix this function used a
+    /// manual word-by-word copy with a tail-byte mask. The mask
+    /// branch was *currently* correct but fragile — it relied on
+    /// masking-out OOB reads from `mload(srcPtr+i)` past the source's
+    /// data, where `bytes memory` is padded but not zero-filled. A
+    /// future contributor flipping the mask direction would silently
+    /// corrupt the modulus and either DoS all signatures or, worse,
+    /// accept different keys. Post-fix uses Cancun's `mcopy` opcode,
+    /// which is the canonical EVM memory-copy primitive and correct
+    /// by construction for any length.
     function _memcpy(uint256 dst, bytes memory src) private pure {
         uint256 len = src.length;
-        uint256 srcPtr;
         assembly ("memory-safe") {
-            srcPtr := add(src, 32)
-        }
-        // Word-by-word copy.
-        uint256 i = 0;
-        while (i + 32 <= len) {
-            assembly ("memory-safe") {
-                mstore(add(dst, i), mload(add(srcPtr, i)))
-            }
-            unchecked {
-                i += 32;
-            }
-        }
-        // Tail bytes.
-        if (i < len) {
-            uint256 tail = len - i;
-            uint256 mask = (256 ** (32 - tail)) - 1;
-            assembly ("memory-safe") {
-                let srcWord := mload(add(srcPtr, i))
-                let dstWord := mload(add(dst, i))
-                let merged := or(and(dstWord, mask), and(srcWord, not(mask)))
-                mstore(add(dst, i), merged)
-            }
+            // src points at the length word; data starts at src+32.
+            mcopy(dst, add(src, 32), len)
         }
     }
 }
