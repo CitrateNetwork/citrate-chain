@@ -103,6 +103,24 @@ impl Wallet {
     }
 
     /// Create a new Ed25519 account with a BIP39 mnemonic.
+    ///
+    /// **WAL-04 caller contract (RM-A2)**: the returned
+    /// `SdkAccount.mnemonic` is a plaintext `String`. The wallet-core
+    /// internals zeroize their derived seed and secret bytes, but the
+    /// final mnemonic is owned by the caller. Callers SHOULD wrap it
+    /// in [`zeroize::Zeroizing`] immediately and drop after presenting
+    /// it to the user:
+    ///
+    /// ```ignore
+    /// use zeroize::Zeroizing;
+    /// let acc = wallet.create_account("pw", "Primary").await?;
+    /// let z_mnemonic = Zeroizing::new(std::mem::take(&mut acc.mnemonic));
+    /// // ... show to user, then drop(z_mnemonic);
+    /// ```
+    ///
+    /// For callers who want the strong type by default, use
+    /// [`Wallet::create_account_zeroized_mnemonic`] which returns the
+    /// mnemonic separately as `Zeroizing<String>`.
     pub async fn create_account(
         &self,
         password: &str,
@@ -115,6 +133,30 @@ impl Wallet {
             mnemonic: result.mnemonic,
             label: result.label,
         })
+    }
+
+    /// Create a new Ed25519 account, returning the mnemonic in
+    /// `Zeroizing<String>`. Closes WAL-04 for the wallet-sdk surface.
+    ///
+    /// The returned tuple's `SdkAccount` has an empty `mnemonic` field
+    /// (it has been moved into the `Zeroizing<String>` companion).
+    /// Callers receive the mnemonic in a wrapper that erases the bytes
+    /// when the value is dropped. Recommended over [`create_account`]
+    /// for any new code path.
+    pub async fn create_account_zeroized_mnemonic(
+        &self,
+        password: &str,
+        label: &str,
+    ) -> Result<(SdkAccount, zeroize::Zeroizing<String>), WalletError> {
+        let result = self.key_manager.create_account(password, label)?;
+        let mnemonic = zeroize::Zeroizing::new(result.mnemonic);
+        let account = SdkAccount {
+            address: result.address,
+            public_key: result.public_key_hex,
+            mnemonic: String::new(),
+            label: result.label,
+        };
+        Ok((account, mnemonic))
     }
 
     /// Create a new secp256k1 account (EVM-compatible).
@@ -133,6 +175,13 @@ impl Wallet {
     }
 
     /// Recover an account from a BIP39 mnemonic.
+    ///
+    /// **WAL-04 caller contract**: the returned `SdkAccount.mnemonic`
+    /// echoes back the user-supplied phrase. The caller's *input*
+    /// `mnemonic: &str` is borrowed; the caller is responsible for
+    /// holding it in `Zeroizing<String>` on their side. Use
+    /// [`Wallet::recover_account_zeroized_mnemonic`] to receive the
+    /// returned mnemonic in `Zeroizing<String>`.
     pub async fn recover_account(
         &self,
         mnemonic: &str,
@@ -146,6 +195,25 @@ impl Wallet {
             mnemonic: result.mnemonic,
             label: result.label,
         })
+    }
+
+    /// Recover an account from a BIP39 mnemonic, returning the echoed
+    /// phrase in `Zeroizing<String>`. Closes WAL-04 (recover slice).
+    pub async fn recover_account_zeroized_mnemonic(
+        &self,
+        mnemonic: &str,
+        password: &str,
+        label: &str,
+    ) -> Result<(SdkAccount, zeroize::Zeroizing<String>), WalletError> {
+        let result = self.key_manager.recover_from_mnemonic(mnemonic, password, label)?;
+        let z_mnemonic = zeroize::Zeroizing::new(result.mnemonic);
+        let account = SdkAccount {
+            address: result.address,
+            public_key: result.public_key_hex,
+            mnemonic: String::new(),
+            label: result.label,
+        };
+        Ok((account, z_mnemonic))
     }
 
     /// Import an account from a hex private key.

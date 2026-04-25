@@ -24,6 +24,10 @@ tokio = { version = "1", features = ["sync"] }
 # WP-A1.5 (audit findings WAL-01, EXT-01).
 argon2 = "0.5"
 
+# WP-A2.3 (audit finding WAL-04): expose Zeroizing<String> for the async
+# create_account / recover surfaces.
+zeroize = { version = "1.7", features = ["zeroize_derive"] }
+
 # WASM bindings (optional — only for wasm32 target)
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
