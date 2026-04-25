@@ -1,0 +1,57 @@
+# GUI-C-01 — Wallet session timer must be backed by a real Instant,
+# not a hard-coded `Some(3600)` snapshot.
+#
+# Audit finding (HIGH):
+#   .audit/2026-04-24-full-repo-adversarial-audit/06_FINDINGS_GUI_CORE.md#gui-c-01
+#
+# Spec (canonical):
+#   .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
+#   §"Sprint RM-E2 — Wallet session lock + lockout + re-auth + clipboard"
+#
+# Pre-fix `WalletService::SessionStatus.remaining_seconds` was set
+# to a static `Some(3600)` at every unlock and never decremented.
+# The "session timeout" surfaced to the UI was cosmetic. Post-fix
+# the value is computed from `SessionManager::get_status` against
+# a real `Instant` of last activity.
+#
+# This rule fires on direct hard-coded `remaining_seconds: Some(3600)`
+# (or any large literal) inside `wallet_service.rs` — the variant
+# the audit found and the same shape a regression would re-introduce.
+
+rules:
+  - id: gui-c-01-cosmetic-session
+    message: >-
+      `SessionStatus.remaining_seconds` must come from
+      `SessionManager::get_status` (real Instant-backed), not from a
+      hard-coded literal. See
+      .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
+      and audit GUI-C-01.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "gui/citrate_desktop_app/src/services/wallet_service.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/*_test.rs"
+        - "**/*_tests.rs"
+    pattern-either:
+      - pattern: |
+          SessionStatus {
+            ...
+            remaining_seconds: Some(3600),
+            ...
+          }
+      - pattern: |
+          SessionStatus {
+            ...
+            remaining_seconds: Some($N),
+            ...
+          }
+    metadata:
+      audit-id: GUI-C-01
+      severity: high
+      sprint: RM-E2
+      wp: WP-E2.8
+      spec: .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
+      reference: https://owasp.org/www-community/Session_Management_Cheat_Sheet
