@@ -57,7 +57,7 @@ async fn test_dag_with_100_parallel_blocks() {
         max_parents: 10,
         ..GhostDagParams::default()
     };
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;
@@ -104,7 +104,7 @@ async fn test_dag_with_100_parallel_blocks() {
 #[tokio::test]
 async fn test_bfs_depth_limit_respected() {
     let params = GhostDagParams::default();
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;
@@ -143,7 +143,7 @@ async fn test_bfs_depth_limit_respected() {
 #[tokio::test]
 async fn test_conflicting_blocks_same_parent() {
     let params = GhostDagParams::default();
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;
@@ -195,7 +195,7 @@ async fn test_conflicting_blocks_same_parent() {
 async fn test_tip_selection_deterministic() {
     async fn build_dag() -> Hash {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;
@@ -227,7 +227,7 @@ async fn test_tip_selection_deterministic() {
 // ============================================================================
 #[tokio::test]
 async fn test_finality_at_depth() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let config = FinalityConfig {
         confirmation_depth: 10,
         emit_events: false,
@@ -278,7 +278,7 @@ async fn test_finality_at_depth() {
 #[tokio::test]
 async fn test_blue_score_monotonicity() {
     let params = GhostDagParams::default();
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;

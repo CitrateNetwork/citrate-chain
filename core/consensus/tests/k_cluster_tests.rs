@@ -54,7 +54,7 @@ async fn setup_genesis(dag_store: &Arc<DagStore>, ghostdag: &GhostDag) -> Hash {
 #[tokio::test]
 async fn test_linear_chain_all_blue() {
     let params = GhostDagParams::default();
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;
@@ -97,7 +97,7 @@ async fn test_linear_chain_all_blue() {
 #[tokio::test]
 async fn test_diamond_dag_blue_set() {
     let params = GhostDagParams::default();
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     // A = genesis
@@ -145,7 +145,7 @@ async fn test_wide_dag_at_k_limit() {
         max_parents: 10,
         ..GhostDagParams::default()
     };
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;
@@ -198,7 +198,7 @@ async fn test_wide_dag_at_k_limit() {
 #[tokio::test]
 async fn test_adversarial_withhold_attack() {
     let params = GhostDagParams::default();
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;
@@ -258,7 +258,7 @@ async fn test_adversarial_withhold_attack() {
 #[tokio::test]
 async fn test_selected_parent_always_highest_score() {
     let params = GhostDagParams::default();
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;
@@ -304,7 +304,7 @@ async fn test_selected_parent_always_highest_score() {
 #[tokio::test]
 async fn test_genesis_always_in_blue_set() {
     let params = GhostDagParams::default();
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     let genesis_hash = setup_genesis(&dag_store, &ghostdag).await;

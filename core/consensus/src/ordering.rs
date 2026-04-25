@@ -451,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_linear_chain_ordering() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(
             GhostDagParams::default(),
             dag_store.clone(),
@@ -481,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple_fork_ordering() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(
             GhostDagParams::default(),
             dag_store.clone(),
@@ -525,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ordering_determinism() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(
             GhostDagParams::default(),
             dag_store.clone(),
@@ -559,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ordered_blocks_range() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(
             GhostDagParams::default(),
             dag_store.clone(),
@@ -591,7 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transaction_ordering() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(
             GhostDagParams::default(),
             dag_store.clone(),

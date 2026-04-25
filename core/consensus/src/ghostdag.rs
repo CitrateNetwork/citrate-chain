@@ -509,7 +509,7 @@ mod tests {
     #[tokio::test]
     async fn test_genesis_block_blue_set() {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
@@ -525,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_block() {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         // Add genesis
@@ -575,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn test_tip_selection() {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         // Create simple chain
@@ -614,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn test_blue_set_with_merge_parents_unions_parents() {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         // Genesis
@@ -675,7 +675,7 @@ mod tests {
         // per block and drove the testnet-beta node into a 14k-restart
         // OOM loop.
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         // Build a reference blue set with many unrelated blocks — all
@@ -714,7 +714,7 @@ mod tests {
         // own cache writes). 4k is well past the pre-fix crash point
         // (~1779) and within a normal test runtime.
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         // Genesis, primed into dag_store only (not into blue_cache).
@@ -755,7 +755,7 @@ mod tests {
     async fn test_count_blue_anticone_zero_max_short_circuits_immediately() {
         // Edge case: max_count=0 must return 0 without walking at all.
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         let mut blue_set = BlueSet::new();
@@ -784,7 +784,7 @@ mod tests {
     /// Returns (ghostdag, dag_store, block_hashes_in_order).
     async fn build_random_chain(n: usize, seed: u64) -> (GhostDag, Arc<DagStore>, Vec<Hash>) {
         let params = GhostDagParams::default();
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         // Genesis

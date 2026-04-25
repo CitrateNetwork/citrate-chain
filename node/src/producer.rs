@@ -138,7 +138,7 @@ impl BlockProducer {
         target_block_time: u64,
     ) -> Self {
         // Create consensus components with a new DAG store
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let _chain_store = storage.blocks.clone();
 
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
@@ -205,7 +205,7 @@ impl BlockProducer {
         target_block_time: u64,
     ) -> Self {
         // Create consensus components with a new DAG store
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let _chain_store = storage.blocks.clone();
 
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
@@ -275,7 +275,7 @@ impl BlockProducer {
         reward_config: RewardConfig,
     ) -> Self {
         // Create consensus components with a new DAG store
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let _chain_store = storage.blocks.clone();
 
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
@@ -335,7 +335,7 @@ impl BlockProducer {
     ) -> Self {
         // C5 fix: Create DAG store and load existing blocks from persistent
         // storage so the chain resumes at the correct height after restart.
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
 
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 

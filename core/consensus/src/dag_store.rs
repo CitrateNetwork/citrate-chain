@@ -60,8 +60,11 @@ pub struct DagStore {
     /// Pruning point
     pruning_point: Arc<RwLock<Hash>>,
 
-    /// WP-K.5: When true, blocks failing VRF admission are rejected.
-    /// When false (default/testnet), failures are logged but blocks are accepted.
+    /// WP-K.5 / RM-B1 (audit H-05): When true (the production default),
+    /// blocks failing structural VRF admission or full ECVRF crypto
+    /// verification are rejected. The permissive opt-out exists only
+    /// for unit/integration tests via
+    /// [`Self::with_permissive_vrf_for_testing`].
     strict_vrf: bool,
 
     /// WP-S.1: Optional persistent backend for write-through durability.
@@ -79,6 +82,19 @@ pub mod cf {
 }
 
 impl DagStore {
+    /// Create a DagStore with **strict VRF enforcement enabled** (the
+    /// production default). Blocks failing structural admission checks
+    /// (empty proof, zero VRF output, zero proposer pubkey, zero
+    /// signature) or full ECVRF cryptographic verification are
+    /// **rejected**.
+    ///
+    /// Closes audit finding **H-05**: previously the in-code default was
+    /// `strict_vrf: false` which silently admitted garbage VRF blocks.
+    /// Test scaffolding that legitimately needs to admit synthetic
+    /// blocks without real VRF proofs MUST construct via
+    /// [`Self::with_permissive_vrf_for_testing`] (an explicit opt-out
+    /// makes the test's reliance on permissive admission visible at the
+    /// call site).
     pub fn new() -> Self {
         Self {
             blocks: Arc::new(RwLock::new(HashMap::new())),
@@ -87,18 +103,30 @@ impl DagStore {
             tips: Arc::new(RwLock::new(HashSet::new())),
             finalized: Arc::new(RwLock::new(HashSet::new())),
             pruning_point: Arc::new(RwLock::new(Hash::default())),
-            strict_vrf: false,
+            strict_vrf: true,
             persistent: None,
         }
     }
 
-    /// Create a DagStore with strict VRF enforcement.
+    /// Create a DagStore with explicit VRF strictness.
     /// WP-K.5: In strict mode, blocks failing VRF admission are rejected.
     pub fn with_strict_vrf(strict_vrf: bool) -> Self {
         Self {
             strict_vrf,
             ..Self::new()
         }
+    }
+
+    /// **Test-only** constructor that disables VRF admission checks. Use
+    /// this in unit / integration tests that exercise GhostDAG semantics
+    /// without producing real ECVRF proofs.
+    ///
+    /// Production code MUST NOT call this. The `_for_testing` suffix is
+    /// load-bearing — audit finding H-05 was that a permissive default
+    /// silently masked invalid blocks; making the opt-out visibly named
+    /// at every call site keeps the misuse risk grep-able.
+    pub fn with_permissive_vrf_for_testing() -> Self {
+        Self::with_strict_vrf(false)
     }
 
     /// WP-S.1: Create a persistent DagStore that writes through to a KvStore backend.
@@ -111,7 +139,7 @@ impl DagStore {
             tips: Arc::new(RwLock::new(HashSet::new())),
             finalized: Arc::new(RwLock::new(HashSet::new())),
             pruning_point: Arc::new(RwLock::new(Hash::default())),
-            strict_vrf: false,
+            strict_vrf: true,
             persistent: Some(kv),
         };
         store.load_from_persistent()?;
@@ -643,7 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_and_retrieve_block() {
-        let store = DagStore::new();
+        let store = DagStore::with_permissive_vrf_for_testing();
         let block = create_test_block([1; 32], 1, Hash::default());
 
         store.store_block(block.clone()).await.unwrap();
@@ -655,7 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_block() {
-        let store = DagStore::new();
+        let store = DagStore::with_permissive_vrf_for_testing();
         let block = create_test_block([1; 32], 1, Hash::default());
 
         store.store_block(block.clone()).await.unwrap();
@@ -666,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tips_management() {
-        let store = DagStore::new();
+        let store = DagStore::with_permissive_vrf_for_testing();
 
         // Add genesis - use non-zero hash to avoid confusion with Hash::default()
         let genesis = create_test_block([0xFF; 32], 0, Hash::default());
@@ -687,7 +715,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalization() {
-        let store = DagStore::new();
+        let store = DagStore::with_permissive_vrf_for_testing();
         let block = create_test_block([1; 32], 1, Hash::default());
 
         store.store_block(block.clone()).await.unwrap();
@@ -699,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pruning() {
-        let store = DagStore::new();
+        let store = DagStore::with_permissive_vrf_for_testing();
 
         // Add blocks at different heights
         for i in 0..10 {
@@ -778,7 +806,7 @@ mod tests {
     /// WP-K.5: Block with empty VRF → warning in permissive mode, accepted
     #[tokio::test]
     async fn test_k5_empty_vrf_permissive_mode() {
-        let store = DagStore::new(); // strict_vrf=false by default
+        let store = DagStore::with_permissive_vrf_for_testing();
         // Non-genesis block with empty VRF (test helper creates these)
         // First store a genesis so we have a valid parent
         let genesis = create_test_block([0xFE; 32], 0, Hash::default());
@@ -809,7 +837,7 @@ mod tests {
     #[tokio::test]
     async fn test_k5_valid_vrf_accepted() {
         // Permissive mode
-        let store = DagStore::new();
+        let store = DagStore::with_permissive_vrf_for_testing();
         let genesis = create_test_block([0xFE; 32], 0, Hash::default());
         store.store_block(genesis.clone()).await.unwrap();
         let block = create_block_with_vrf([1; 32], 1, genesis.hash());
@@ -892,7 +920,7 @@ mod tests {
         let kv = Arc::new(MemKvStore::new());
 
         // Store a genesis block
-        let store = DagStore::persistent(kv.clone()).unwrap();
+        let store = DagStore::persistent_with_strict_vrf(kv.clone(), false).unwrap();
         let genesis = create_test_block([0xFF; 32], 0, Hash::default());
         let genesis_hash = genesis.hash();
         store.store_block(genesis).await.unwrap();
@@ -904,7 +932,7 @@ mod tests {
 
         // Drop the store and recreate from the same KvStore
         drop(store);
-        let store2 = DagStore::persistent(kv).unwrap();
+        let store2 = DagStore::persistent_with_strict_vrf(kv, false).unwrap();
 
         // Both blocks should be recoverable
         let recovered = store2.get_block(&genesis_hash).await.unwrap();
@@ -919,7 +947,7 @@ mod tests {
     async fn test_s1_tip_persistence() {
         let kv = Arc::new(MemKvStore::new());
 
-        let store = DagStore::persistent(kv.clone()).unwrap();
+        let store = DagStore::persistent_with_strict_vrf(kv.clone(), false).unwrap();
         let genesis = create_test_block([0xFF; 32], 0, Hash::default());
         let genesis_hash = genesis.hash();
         store.store_block(genesis).await.unwrap();
@@ -935,7 +963,7 @@ mod tests {
         drop(store);
 
         // Recreate — tip set should be the same
-        let store2 = DagStore::persistent(kv).unwrap();
+        let store2 = DagStore::persistent_with_strict_vrf(kv, false).unwrap();
         let tips2 = store2.get_tips().await;
         assert_eq!(tips2.len(), 1);
         assert_eq!(tips2[0].hash, child_hash);
@@ -946,7 +974,7 @@ mod tests {
     async fn test_s1_finalization_persistence() {
         let kv = Arc::new(MemKvStore::new());
 
-        let store = DagStore::persistent(kv.clone()).unwrap();
+        let store = DagStore::persistent_with_strict_vrf(kv.clone(), false).unwrap();
         let block = create_test_block([1; 32], 1, Hash::default());
         let hash = block.hash();
         store.store_block(block).await.unwrap();
@@ -955,7 +983,7 @@ mod tests {
         drop(store);
 
         // Recreate — finalized state should persist
-        let store2 = DagStore::persistent(kv).unwrap();
+        let store2 = DagStore::persistent_with_strict_vrf(kv, false).unwrap();
         assert!(store2.is_finalized(&hash).await);
     }
 
@@ -964,7 +992,7 @@ mod tests {
     async fn test_s1_pruning_persistence() {
         let kv = Arc::new(MemKvStore::new());
 
-        let store = DagStore::persistent(kv.clone()).unwrap();
+        let store = DagStore::persistent_with_strict_vrf(kv.clone(), false).unwrap();
 
         // Add blocks at heights 0..10
         for i in 0..10u64 {
@@ -985,7 +1013,7 @@ mod tests {
         drop(store);
 
         // Recreate — pruned blocks should be gone
-        let store2 = DagStore::persistent(kv).unwrap();
+        let store2 = DagStore::persistent_with_strict_vrf(kv, false).unwrap();
         for i in 0..5u64 {
             assert!(!store2.has_block(&Hash::new([i as u8; 32])).await);
         }
@@ -999,7 +1027,7 @@ mod tests {
     async fn test_s1_height_index_persistence() {
         let kv = Arc::new(MemKvStore::new());
 
-        let store = DagStore::persistent(kv.clone()).unwrap();
+        let store = DagStore::persistent_with_strict_vrf(kv.clone(), false).unwrap();
 
         // Store blocks at various heights
         let b0 = create_test_block([0xA0; 32], 0, Hash::default());
@@ -1011,7 +1039,7 @@ mod tests {
         drop(store);
 
         // Recreate — blocks should be queryable by height
-        let store2 = DagStore::persistent(kv).unwrap();
+        let store2 = DagStore::persistent_with_strict_vrf(kv, false).unwrap();
         let at_0 = store2.get_blocks_at_height(0).await;
         assert_eq!(at_0.len(), 1);
         assert_eq!(at_0[0].hash(), b0.hash());
@@ -1024,7 +1052,7 @@ mod tests {
     /// WP-S.1: In-memory fallback still works (no persistence backend).
     #[tokio::test]
     async fn test_s1_in_memory_fallback() {
-        let store = DagStore::new(); // No persistent backend
+        let store = DagStore::with_permissive_vrf_for_testing(); // No persistent backend
         let block = create_test_block([1; 32], 1, Hash::default());
         let hash = block.hash();
         store.store_block(block).await.unwrap();

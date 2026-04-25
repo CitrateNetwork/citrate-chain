@@ -477,7 +477,7 @@ mod tests {
         Arc<TipSelector>,
         Arc<ChainSelector>,
     ) {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = Arc::new(TipSelector::new(
             dag_store.clone(),

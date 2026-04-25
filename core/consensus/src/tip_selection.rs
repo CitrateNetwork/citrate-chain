@@ -359,7 +359,7 @@ mod tests {
     use crate::types::*;
 
     async fn setup_test_env() -> (Arc<DagStore>, Arc<GhostDag>, Arc<TipSelector>) {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = Arc::new(TipSelector::new(
             dag_store.clone(),

@@ -45,7 +45,7 @@ mod total_ordering_tests {
     #[tokio::test]
     async fn test_ordering_single_chain() {
         // Test total ordering on a simple chain: genesis -> block1 -> block2 -> block3
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let ordering = TotalOrdering::new(dag_store.clone(), ghostdag.clone());
 
@@ -75,7 +75,7 @@ mod total_ordering_tests {
     #[tokio::test]
     async fn test_ordering_consistency() {
         // Same blocks, multiple calls should return same order
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let ordering = TotalOrdering::new(dag_store.clone(), ghostdag.clone());
 
@@ -109,7 +109,7 @@ mod total_ordering_tests {
     #[tokio::test]
     async fn test_ordering_caching() {
         // Verify caching works correctly by calling twice and verifying consistency
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let ordering = TotalOrdering::new(dag_store.clone(), ghostdag.clone());
 
@@ -143,7 +143,7 @@ mod finality_progression_tests {
     #[tokio::test]
     async fn test_finality_progression_basic() {
         // Test that blocks become finalized after reaching confirmation depth
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig {
             confirmation_depth: 5,
             emit_events: true,
@@ -173,7 +173,7 @@ mod finality_progression_tests {
     #[tokio::test]
     async fn test_finality_depth_boundary() {
         // Test exact boundary conditions for finality
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig {
             confirmation_depth: 3,
             emit_events: false,
@@ -206,7 +206,7 @@ mod finality_progression_tests {
     #[tokio::test]
     async fn test_finality_events() {
         // Test that finality events are emitted correctly
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig {
             confirmation_depth: 2,
             emit_events: true,
@@ -246,7 +246,7 @@ mod reorg_protection_tests {
     #[tokio::test]
     async fn test_reorg_allowed_before_finality() {
         // Reorg should be allowed before any blocks are finalized
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig {
             confirmation_depth: 100, // High depth = nothing finalized yet
             emit_events: false,
@@ -274,7 +274,7 @@ mod reorg_protection_tests {
     #[tokio::test]
     async fn test_reorg_blocked_past_finalized() {
         // Reorg should be blocked past finalized blocks
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig {
             confirmation_depth: 3,
             emit_events: false,
@@ -313,7 +313,7 @@ mod reorg_protection_tests {
     #[tokio::test]
     async fn test_chain_selector_with_finality_protection() {
         // Test ChainSelector rejects reorgs past finalized blocks
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = Arc::new(TipSelector::new(
             dag_store.clone(),
@@ -360,7 +360,7 @@ mod chain_selection_tests {
     #[tokio::test]
     async fn test_chain_extension() {
         // Test simple chain extension
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = Arc::new(TipSelector::new(
             dag_store.clone(),
@@ -385,7 +385,7 @@ mod chain_selection_tests {
     #[tokio::test]
     async fn test_empty_chain_validation() {
         // Empty chain should be valid
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = Arc::new(TipSelector::new(
             dag_store.clone(),
@@ -406,7 +406,7 @@ mod chain_selection_tests {
     #[tokio::test]
     async fn test_reorg_history() {
         // Test that reorg history is tracked
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = Arc::new(TipSelector::new(
             dag_store.clone(),
@@ -433,7 +433,7 @@ mod stress_tests {
     #[tokio::test]
     async fn test_many_blocks_finality() {
         // Test finality with many blocks
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig {
             confirmation_depth: 10,
             emit_events: false,
@@ -460,7 +460,7 @@ mod stress_tests {
     #[tokio::test]
     async fn test_ordering_long_chain() {
         // Test ordering with a longer chain
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let ordering = TotalOrdering::new(dag_store.clone(), ghostdag.clone());
 
@@ -495,7 +495,7 @@ mod finality_tracker_unit_tests {
 
     #[tokio::test]
     async fn test_finality_count_tracking() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig {
             confirmation_depth: 2,
             emit_events: false,
@@ -526,7 +526,7 @@ mod finality_tracker_unit_tests {
 
     #[tokio::test]
     async fn test_finality_reset() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig {
             confirmation_depth: 2,
             emit_events: false,

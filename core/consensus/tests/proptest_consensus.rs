@@ -101,7 +101,7 @@ fn hash_for(seed: u64, index: u64) -> [u8; 32] {
 /// (ghostdag, dag_store, all_hashes_including_genesis).
 async fn build_chain(n: usize, seed: u64) -> (GhostDag, Arc<DagStore>, Vec<Hash>) {
     let params = GhostDagParams::default();
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = GhostDag::new(params, dag_store.clone());
 
     // Genesis

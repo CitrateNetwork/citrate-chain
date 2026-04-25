@@ -463,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_finality_tracker_creation() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let tracker = FinalityTracker::with_defaults(dag_store);
 
         assert!(tracker.get_finalized_tip().await.is_none());
@@ -473,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_finality_below_depth() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig::for_testing(); // depth = 10
         let tracker = FinalityTracker::new(dag_store.clone(), config);
 
@@ -492,7 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_finality_at_depth() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig::for_testing(); // depth = 10
         let tracker = FinalityTracker::new(dag_store.clone(), config);
 
@@ -523,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_incremental_finality() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig::for_testing(); // depth = 10
         let tracker = FinalityTracker::new(dag_store.clone(), config);
 
@@ -561,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reorg_protection() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig::for_testing(); // depth = 10
         let tracker = FinalityTracker::new(dag_store.clone(), config);
 
@@ -606,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_finality_status() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig::for_testing();
         let tracker = FinalityTracker::new(dag_store.clone(), config);
 
@@ -629,7 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_finality_events() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig::for_testing();
         let tracker = FinalityTracker::new(dag_store.clone(), config);
 
@@ -655,7 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_finality() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig::for_testing();
         let tracker = FinalityTracker::new(dag_store.clone(), config);
 
@@ -678,7 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset() {
-        let dag_store = Arc::new(DagStore::new());
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let config = FinalityConfig::for_testing();
         let tracker = FinalityTracker::new(dag_store.clone(), config);
 

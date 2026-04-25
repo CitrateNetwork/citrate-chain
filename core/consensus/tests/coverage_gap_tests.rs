@@ -44,7 +44,7 @@ fn genesis_block() -> Block {
 
 async fn setup_chain_selector() -> (Arc<DagStore>, Arc<GhostDag>, Arc<TipSelector>, ChainSelector)
 {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
         dag_store.clone(),
@@ -77,7 +77,7 @@ async fn test_chain_selector_new_default_state() {
 
 #[tokio::test]
 async fn test_chain_selector_with_finality_constructor() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
         dag_store.clone(),
@@ -100,7 +100,7 @@ async fn test_chain_selector_with_finality_constructor() {
 
 #[tokio::test]
 async fn test_set_finality_tracker() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let tip_selector = Arc::new(TipSelector::new(
         dag_store.clone(),
@@ -268,7 +268,7 @@ async fn test_reorg_event_fields() {
 
 #[tokio::test]
 async fn test_tip_selector_select_tip_empty() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let ts = TipSelector::new(
         dag_store.clone(),
@@ -281,7 +281,7 @@ async fn test_tip_selector_select_tip_empty() {
 
 #[tokio::test]
 async fn test_tip_selector_select_tip_single() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let ts = TipSelector::new(
         dag_store.clone(),
@@ -296,7 +296,7 @@ async fn test_tip_selector_select_tip_single() {
 
 #[tokio::test]
 async fn test_tip_selector_select_tip_multiple_with_stored_blocks() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let ts = TipSelector::new(
         dag_store.clone(),
@@ -322,7 +322,7 @@ async fn test_tip_selector_select_tip_multiple_with_stored_blocks() {
 
 #[tokio::test]
 async fn test_tip_selector_select_tip_same_score_tie_break_by_hash() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let ts = TipSelector::new(
         dag_store.clone(),
@@ -349,7 +349,7 @@ async fn test_tip_selector_select_tip_same_score_tie_break_by_hash() {
 
 #[tokio::test]
 async fn test_tip_selector_select_current_tip_no_tips() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let ts = TipSelector::new(
         dag_store.clone(),
@@ -362,7 +362,7 @@ async fn test_tip_selector_select_current_tip_no_tips() {
 
 #[tokio::test]
 async fn test_tip_selector_clear_cache() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let ts = TipSelector::new(
         dag_store.clone(),
@@ -375,7 +375,7 @@ async fn test_tip_selector_clear_cache() {
 
 #[tokio::test]
 async fn test_tip_selector_select_parents_no_tips() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let ts = TipSelector::new(
         dag_store.clone(),
@@ -418,7 +418,7 @@ async fn test_selection_strategy_equality() {
 
 #[tokio::test]
 async fn test_parent_selector_construction() {
-    let dag_store = Arc::new(DagStore::new());
+    let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
     let ts = Arc::new(TipSelector::new(
         dag_store.clone(),
