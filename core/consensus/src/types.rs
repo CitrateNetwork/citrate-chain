@@ -846,6 +846,15 @@ pub struct DagRelation {
     pub children: Vec<Hash>,
     pub blue_set: BlueSet,
     pub is_chain_block: bool,
+    /// Height of this block in the DAG. Used by `is_ancestor_of` to
+    /// short-circuit structurally impossible ancestry queries
+    /// (audit finding H-07): if `ancestor.height >= descendant.height`
+    /// and the hashes differ, ancestry is impossible regardless of
+    /// BFS budget. `#[serde(default)]` keeps in-memory cache loaded
+    /// from older test fixtures backward-compatible (height 0 falls
+    /// back to the legacy BFS-only path).
+    #[serde(default)]
+    pub height: u64,
 }
 
 /// Represents a tip in the DAG

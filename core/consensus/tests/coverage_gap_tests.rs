@@ -997,6 +997,7 @@ fn test_dag_relation_serialization_roundtrip() {
         children: vec![Hash::new([4; 32]), Hash::new([5; 32])],
         blue_set: BlueSet::new(),
         is_chain_block: true,
+        height: 0,
     };
     let json = serde_json::to_string(&relation).unwrap();
     let d: DagRelation = serde_json::from_str(&json).unwrap();
