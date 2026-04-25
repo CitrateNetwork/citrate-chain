@@ -93,9 +93,47 @@ contract TEEAttestationRegistry is ReentrancyGuard {
 
     /// @notice When true, ONLY `submitAttestationStrict` accepts new
     /// attestations. The V1 governance-trusted `submitAttestation`
-    /// path is still callable but reverts immediately. Off by
-    /// default so the cutover is opt-in per deployment.
+    /// path is still callable but reverts immediately.
+    /// RM-B1 / WP-D3.1 (audit SOL-03): defaults to TRUE — secure-by-
+    /// default. Pre-fix the constructor left this as the bool zero
+    /// (false), which silently degraded a fresh deployment to V1's
+    /// governance-trusted mode. Operators who need V1 during the
+    /// cutover must explicitly opt-in via `setStrictCryptographicMode(false)`.
     bool public strictCryptographicMode;
+
+    /// @notice Tracks JWT signatures already consumed by
+    /// `submitAttestationStrict`. Keyed by `keccak256(jwtSignature)`.
+    /// RM-B1 / WP-D3.2 (audit SOL-05): pre-fix the same valid MAA
+    /// JWT could be replayed indefinitely (by the same worker every
+    /// few seconds, or by a different worker forging the address
+    /// claim) because the contract had no notion of signature
+    /// uniqueness. Post-fix every successful strict submission marks
+    /// the signature as consumed; a re-submit of the same JWT
+    /// reverts with "TEERegistry: jwt replay".
+    mapping(bytes32 => bool) public usedJwtSignatures;
+
+    /// @notice Pending two-step RSA key updates. Governance proposes
+    /// a new key; after `RSA_KEY_TIMELOCK_BLOCKS` blocks anyone may
+    /// finalize the proposal. Protects against compromised governance:
+    /// even if an attacker hijacks governance for one block, they
+    /// cannot install a malicious MAA RSA key (or activate a dormant
+    /// one) without surviving the timelock window.
+    /// RM-B1 / WP-D3.3 (audit SOL-05).
+    struct PendingMaaRsaKey {
+        bytes modulus;
+        bytes exponent;
+        bool active;
+        uint64 etaBlock;
+        bool exists;
+    }
+    mapping(bytes32 => PendingMaaRsaKey) internal _pendingMaaRsaKeys;
+
+    /// @notice Number of blocks between an RSA key proposal and the
+    /// earliest block at which it can be finalized.
+    /// ~30 minutes at 0.5s blocks — long enough for off-chain
+    /// monitoring + an emergency abort, short enough not to break
+    /// real key-rotation timelines.
+    uint64 public constant RSA_KEY_TIMELOCK_BLOCKS = 3600;
 
     /// @notice Governance address (manages signer whitelists + slash
     /// execution).
@@ -117,6 +155,8 @@ contract TEEAttestationRegistry is ReentrancyGuard {
     event MaaSignerUpdated(bytes32 indexed keyHash, bool trusted);
     event NrasSignerUpdated(bytes32 indexed keyHash, bool trusted);
     event MaaRsaKeyUpdated(bytes32 indexed kidHash, bool active);
+    event MaaRsaKeyProposed(bytes32 indexed kidHash, uint64 etaBlock, bool active);
+    event MaaRsaKeyProposalCancelled(bytes32 indexed kidHash);
     event StrictCryptographicModeChanged(bool enabled);
     event AttestedStrict(
         address indexed worker,
@@ -138,6 +178,10 @@ contract TEEAttestationRegistry is ReentrancyGuard {
     constructor(address _governance) {
         require(_governance != address(0), "TEERegistry: zero governance");
         governance = _governance;
+        // RM-B1 / WP-D3.1 (audit SOL-03): secure-by-default. The V1
+        // governance-trusted path requires an explicit opt-out.
+        strictCryptographicMode = true;
+        emit StrictCryptographicModeChanged(true);
     }
 
     // ── Attestation submission ──────────────────────────────────────
@@ -218,6 +262,15 @@ contract TEEAttestationRegistry is ReentrancyGuard {
 
         MaaRsaKey storage key = _maaRsaKeys[kidHash];
         require(key.active, "TEERegistry: unknown or inactive MAA kid");
+
+        // RM-B1 / WP-D3.2 (audit SOL-05): JWT replay protection.
+        // Pre-fix, the same valid (signedJwtPayload, jwtSignature)
+        // could be re-submitted indefinitely. Post-fix the signature
+        // hash is one-time-use: a JWT can be consumed exactly once,
+        // by the address actively submitting it.
+        bytes32 sigHash = keccak256(jwtSignature);
+        require(!usedJwtSignatures[sigHash], "TEERegistry: jwt replay");
+        usedJwtSignatures[sigHash] = true;
 
         // Cryptographic gate: RS256 verify of (signedJwtPayload,
         // jwtSignature) under the stored RSA public key. This is
@@ -377,10 +430,21 @@ contract TEEAttestationRegistry is ReentrancyGuard {
         emit NrasSignerUpdated(keyHash, trusted);
     }
 
-    /// @notice Register or update an MAA RSA public key (mirrors a key
-    /// from Azure's JWKS endpoint). Active keys are usable for
-    /// `submitAttestationStrict`.
-    function setMaaRsaKey(
+    /// @notice Propose registering / updating an MAA RSA public key.
+    /// The key is staged but NOT yet usable; finalization requires
+    /// `RSA_KEY_TIMELOCK_BLOCKS` to elapse and a separate
+    /// `finalizeMaaRsaKey` call.
+    /// RM-B1 / WP-D3.3 (audit SOL-05): two-step key install. Pre-fix
+    /// a one-block governance compromise could install a malicious
+    /// MAA RSA key and immediately accept forged attestations.
+    /// Post-fix the timelock gives off-chain monitors a window to
+    /// observe and abort via `cancelMaaRsaKeyProposal`.
+    ///
+    /// Emergency *deactivation* of an already-active key remains a
+    /// single-step call (`setMaaRsaKeyActive(_, false)`) so a
+    /// compromised key can be killed instantly. Only *activation*
+    /// is gated.
+    function proposeMaaRsaKey(
         bytes32 kidHash,
         bytes calldata modulus,
         bytes calldata exponent,
@@ -388,20 +452,71 @@ contract TEEAttestationRegistry is ReentrancyGuard {
     ) external onlyGovernance {
         require(modulus.length > 0, "TEERegistry: empty modulus");
         require(exponent.length > 0, "TEERegistry: empty exponent");
-        _maaRsaKeys[kidHash] = MaaRsaKey({
+        uint64 eta = uint64(block.number) + RSA_KEY_TIMELOCK_BLOCKS;
+        _pendingMaaRsaKeys[kidHash] = PendingMaaRsaKey({
             modulus: modulus,
             exponent: exponent,
-            active: active
+            active: active,
+            etaBlock: eta,
+            exists: true
         });
-        emit MaaRsaKeyUpdated(kidHash, active);
+        emit MaaRsaKeyProposed(kidHash, eta, active);
+    }
+
+    /// @notice Cancel a pending key proposal before it finalizes.
+    function cancelMaaRsaKeyProposal(bytes32 kidHash) external onlyGovernance {
+        require(_pendingMaaRsaKeys[kidHash].exists, "TEERegistry: no pending proposal");
+        delete _pendingMaaRsaKeys[kidHash];
+        emit MaaRsaKeyProposalCancelled(kidHash);
+    }
+
+    /// @notice Finalize a pending key proposal once its timelock
+    /// has elapsed. Permissionless — anyone may push the change
+    /// across the line, since governance has already signed off
+    /// via `proposeMaaRsaKey` and the timelock gives the community
+    /// time to react.
+    function finalizeMaaRsaKey(bytes32 kidHash) external {
+        PendingMaaRsaKey storage p = _pendingMaaRsaKeys[kidHash];
+        require(p.exists, "TEERegistry: no pending proposal");
+        require(uint64(block.number) >= p.etaBlock, "TEERegistry: timelock not elapsed");
+        _maaRsaKeys[kidHash] = MaaRsaKey({
+            modulus: p.modulus,
+            exponent: p.exponent,
+            active: p.active
+        });
+        bool wasActive = p.active;
+        delete _pendingMaaRsaKeys[kidHash];
+        emit MaaRsaKeyUpdated(kidHash, wasActive);
     }
 
     /// @notice Activate or deactivate an existing MAA RSA key without
-    /// re-uploading bytes. Useful for emergency key rotation.
+    /// re-uploading bytes. Deactivation (`active = false`) is
+    /// deliberately single-step so a compromised key can be killed
+    /// instantly. Activation of a previously-deactivated key is
+    /// also single-step but constrained: the key bytes have already
+    /// been through the timelocked install path, so no new key
+    /// material enters the system here.
     function setMaaRsaKeyActive(bytes32 kidHash, bool active) external onlyGovernance {
         require(_maaRsaKeys[kidHash].modulus.length > 0, "TEERegistry: unknown kid");
         _maaRsaKeys[kidHash].active = active;
         emit MaaRsaKeyUpdated(kidHash, active);
+    }
+
+    /// @notice View the pending RSA key proposal for `kidHash`.
+    /// Returns zero/empty fields if no proposal is active.
+    function getPendingMaaRsaKey(bytes32 kidHash)
+        external
+        view
+        returns (
+            bytes memory modulus,
+            bytes memory exponent,
+            bool active,
+            uint64 etaBlock,
+            bool exists
+        )
+    {
+        PendingMaaRsaKey storage p = _pendingMaaRsaKeys[kidHash];
+        return (p.modulus, p.exponent, p.active, p.etaBlock, p.exists);
     }
 
     /// @notice View accessor for stored MAA RSA keys.

@@ -35,6 +35,11 @@ contract ComputePoolPipelineTest is Test {
         registry = new TEEAttestationRegistry(governance);
         pool = new ComputePoolPipeline(governance, address(registry));
 
+        // RM-B1 / WP-D3.1 (audit SOL-03): registry defaults to V2
+        // strict mode. These pipeline tests exercise the V1 path
+        // (governance-curated signer hashes) so opt out explicitly.
+        registry.setStrictCryptographicMode(false);
+
         // Whitelist signer hashes — governance-curated in production.
         registry.setMaaSigner(MAA_KEY, true);
         registry.setNrasSigner(NRAS_KEY, true);

@@ -23,6 +23,10 @@ contract TEEAttestationRegistryTest is Test {
         registry = new TEEAttestationRegistry(governance);
         registry.setMaaSigner(MAA_KEY, true);
         registry.setNrasSigner(NRAS_KEY, true);
+        // RM-B1 / WP-D3.1 (audit SOL-03): V2 strict mode is now ON
+        // by default. Tests that exercise the V1 path explicitly
+        // toggle it off to keep the legacy fixture coverage intact.
+        registry.setStrictCryptographicMode(false);
         vm.deal(reporter, 10 ether);
     }
 
@@ -200,13 +204,18 @@ contract TEEAttestationRegistryTest is Test {
 
     bytes32 constant MAA_KID_HASH = keccak256("azure-prod-kid-2026q2");
 
+    /// RM-B1 / WP-D3.3 (audit SOL-05): RSA key install is now a
+    /// two-step propose + finalize with `RSA_KEY_TIMELOCK_BLOCKS`
+    /// in between. Helper rolls past the timelock and finalizes.
     function _registerMaaKey() internal {
-        registry.setMaaRsaKey(
+        registry.proposeMaaRsaKey(
             MAA_KID_HASH,
             MAA_RSA_MODULUS,
             MAA_RSA_EXPONENT,
             true
         );
+        vm.roll(block.number + uint256(registry.RSA_KEY_TIMELOCK_BLOCKS()) + 1);
+        registry.finalizeMaaRsaKey(MAA_KID_HASH);
     }
 
     function test_strict_submit_accepts_valid_jwt_signature() public {
@@ -268,6 +277,9 @@ contract TEEAttestationRegistryTest is Test {
 
     function test_strict_submit_rejects_inactive_kid() public {
         _registerMaaKey();
+        // Emergency deactivation remains a single-step call so a
+        // compromised key can be killed instantly. Activation is
+        // what's gated, not deactivation. (audit SOL-05)
         registry.setMaaRsaKeyActive(MAA_KID_HASH, false);
         registry.setStrictCryptographicMode(true);
 
@@ -316,7 +328,10 @@ contract TEEAttestationRegistryTest is Test {
     }
 
     function test_v1_path_works_when_strict_off() public {
-        // Strict mode defaults OFF, so V1 should still work.
+        // RM-B1 / WP-D3.1 (audit SOL-03): strict mode is ON by
+        // default. setUp() explicitly toggled it off for legacy V1
+        // fixture coverage; this test asserts the toggle works as
+        // expected.
         assertFalse(registry.strictCryptographicMode());
         _attest(worker);
         assertTrue(registry.isAttested(worker, block.number));
@@ -333,9 +348,13 @@ contract TEEAttestationRegistryTest is Test {
     }
 
     function test_set_maa_rsa_key_emits_event() public {
+        // Two-step install (audit SOL-05).
+        registry.proposeMaaRsaKey(MAA_KID_HASH, MAA_RSA_MODULUS, MAA_RSA_EXPONENT, true);
+        vm.roll(block.number + uint256(registry.RSA_KEY_TIMELOCK_BLOCKS()) + 1);
+
         vm.expectEmit(true, true, true, true);
         emit TEEAttestationRegistry.MaaRsaKeyUpdated(MAA_KID_HASH, true);
-        registry.setMaaRsaKey(MAA_KID_HASH, MAA_RSA_MODULUS, MAA_RSA_EXPONENT, true);
+        registry.finalizeMaaRsaKey(MAA_KID_HASH);
 
         // Round-trip via getter.
         (bytes memory n, bytes memory e, bool active) = registry.getMaaRsaKey(MAA_KID_HASH);
@@ -347,9 +366,9 @@ contract TEEAttestationRegistryTest is Test {
     function test_set_maa_rsa_key_rejects_empty_inputs() public {
         bytes memory empty;
         vm.expectRevert("TEERegistry: empty modulus");
-        registry.setMaaRsaKey(MAA_KID_HASH, empty, MAA_RSA_EXPONENT, true);
+        registry.proposeMaaRsaKey(MAA_KID_HASH, empty, MAA_RSA_EXPONENT, true);
         vm.expectRevert("TEERegistry: empty exponent");
-        registry.setMaaRsaKey(MAA_KID_HASH, MAA_RSA_MODULUS, empty, true);
+        registry.proposeMaaRsaKey(MAA_KID_HASH, MAA_RSA_MODULUS, empty, true);
     }
 
     function test_strict_mode_toggle_only_governance() public {
@@ -361,6 +380,6 @@ contract TEEAttestationRegistryTest is Test {
     function test_set_maa_rsa_key_only_governance() public {
         vm.prank(worker);
         vm.expectRevert("TEERegistry: not governance");
-        registry.setMaaRsaKey(MAA_KID_HASH, MAA_RSA_MODULUS, MAA_RSA_EXPONENT, true);
+        registry.proposeMaaRsaKey(MAA_KID_HASH, MAA_RSA_MODULUS, MAA_RSA_EXPONENT, true);
     }
 }
