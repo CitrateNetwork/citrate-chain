@@ -40,6 +40,40 @@ pub enum CheckpointError {
     StorageError(String),
 }
 
+/// Domain separator prefix for checkpoint vote canonical messages.
+///
+/// RM-B1 / WP-B2.2 (audit H-02): the canonical signing message MUST be
+/// prefixed with this byte string so a vote signed for one chain
+/// cannot be replayed onto a fork or alternate chain. The trailing
+/// version `-V1` lets future protocol changes rotate the separator
+/// without ambiguity. The full canonical layout is:
+///
+/// ```text
+/// CITRATE_VOTE_DOMAIN_SEPARATOR (21 bytes)
+///   || chain_id (8 bytes, little-endian)
+///   || height   (8 bytes, little-endian)
+///   || block_hash (32 bytes)
+/// ```
+///
+/// = 69 bytes total.
+pub const CITRATE_VOTE_DOMAIN_SEPARATOR: &[u8] = b"CITRATE-CHECKPOINT-V1";
+
+/// Build the canonical signing message for a checkpoint vote.
+///
+/// RM-B1 / WP-B2.2 (audit H-02). Used by both the producer (when
+/// signing a vote) and the verifier (when checking a vote signature)
+/// — these MUST agree byte-for-byte.
+pub fn canonical_vote_message(chain_id: u64, height: u64, block_hash: &Hash) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(
+        CITRATE_VOTE_DOMAIN_SEPARATOR.len() + 8 + 8 + 32,
+    );
+    msg.extend_from_slice(CITRATE_VOTE_DOMAIN_SEPARATOR);
+    msg.extend_from_slice(&chain_id.to_le_bytes());
+    msg.extend_from_slice(&height.to_le_bytes());
+    msg.extend_from_slice(block_hash.as_bytes());
+    msg
+}
+
 /// Checkpoint configuration.
 #[derive(Debug, Clone)]
 pub struct CheckpointConfig {
@@ -52,6 +86,13 @@ pub struct CheckpointConfig {
     /// Quorum threshold (minimum votes for finalization).
     /// Default: 67/100 (2/3 + 1).
     pub quorum_threshold: usize,
+
+    /// Chain ID. RM-B1 / WP-B2.2 (audit H-02): bound into the
+    /// canonical vote message via [`canonical_vote_message`] so a
+    /// vote on one chain cannot replay onto another. Defaults to
+    /// the testnet-beta chain id (40204) — production configs MUST
+    /// set this explicitly.
+    pub chain_id: u64,
 }
 
 impl Default for CheckpointConfig {
@@ -60,6 +101,7 @@ impl Default for CheckpointConfig {
             interval: 50,
             committee_size: 100,
             quorum_threshold: 67,
+            chain_id: 40204,
         }
     }
 }
@@ -71,6 +113,7 @@ impl CheckpointConfig {
             interval: 5,
             committee_size: 5,
             quorum_threshold: 4,
+            chain_id: 40204,
         }
     }
 
@@ -193,13 +236,16 @@ impl CommitteeSelector {
 
 /// Verify a checkpoint vote signature cryptographically (ed25519).
 ///
-/// The canonical vote message is: `height(8 LE bytes) || block_hash(32 bytes)` = 40 bytes.
-/// The voter must sign this message with their ed25519 private key.
-fn verify_vote_signature(vote: &CheckpointVote) -> Result<(), CheckpointError> {
-    // Build canonical message: height(8 LE) || block_hash(32) = 40 bytes
-    let mut message = Vec::with_capacity(40);
-    message.extend_from_slice(&vote.height.to_le_bytes());
-    message.extend_from_slice(vote.block_hash.as_bytes());
+/// RM-B1 / WP-B2.2 (audit H-02): canonical message is
+/// `CITRATE-CHECKPOINT-V1 || chain_id(8 LE) || height(8 LE) || block_hash(32)`
+/// = 69 bytes — see [`canonical_vote_message`]. Cross-chain replay
+/// is structurally impossible because chain_id is bound into the
+/// signed bytes.
+fn verify_vote_signature(
+    vote: &CheckpointVote,
+    chain_id: u64,
+) -> Result<(), CheckpointError> {
+    let message = canonical_vote_message(chain_id, vote.height, &vote.block_hash);
 
     let pubkey = VerifyingKey::from_bytes(vote.voter.as_bytes())
         .map_err(|_| CheckpointError::InvalidSignature(vote.voter))?;
@@ -342,39 +388,56 @@ impl CheckpointManager {
     /// Submit a vote for a pending checkpoint.
     ///
     /// Returns `true` if quorum was reached by this vote.
+    ///
+    /// RM-B1 / WP-B2.1 (audit H-01): the `voted` replay-protection
+    /// set is updated **only after every validation step succeeds**:
+    ///   1. Pending checkpoint exists at `vote.height`.
+    ///   2. Voter is in the committee for that checkpoint.
+    ///   3. Voter has not already cast an ACCEPTED vote (checkpoint.votes).
+    ///   4. `vote.block_hash` matches the checkpoint's block hash.
+    ///   5. ed25519 signature over the canonical message verifies.
+    /// Only after step 5 do we mark `(height, voter)` as voted.
+    /// Pre-fix, the marker was set at step 1 — a flood of invalid
+    /// votes for victim pubkeys could lock honest voters out and
+    /// permanently break liveness at every checkpoint height.
     pub async fn submit_vote(&self, vote: CheckpointVote) -> Result<bool, CheckpointError> {
-        // Replay protection: reject if (height, voter) already seen
-        {
-            let mut voted = self.voted.write().await;
-            if !voted.insert((vote.height, vote.voter)) {
-                return Err(CheckpointError::DuplicateVote(vote.voter));
-            }
-        }
-
         let mut pending = self.pending.write().await;
 
         let checkpoint = pending
             .get_mut(&vote.height)
             .ok_or(CheckpointError::BlockNotFound(Hash::default()))?;
 
-        // Verify voter is in committee
+        // 1. Verify voter is in committee.
         let committee_set: HashSet<&PublicKey> = checkpoint.committee.iter().collect();
         if !committee_set.contains(&vote.voter) {
             return Err(CheckpointError::NotInCommittee(vote.voter));
         }
 
-        // Check for duplicate vote (also checked by voted set above)
+        // 2. Check for an already-accepted vote from this voter.
         if checkpoint.votes.contains_key(&vote.voter) {
             return Err(CheckpointError::DuplicateVote(vote.voter));
         }
 
-        // Verify vote is for the correct block
+        // 3. Verify vote is for the correct block.
         if vote.block_hash != checkpoint.block_hash {
             return Err(CheckpointError::InvalidSignature(vote.voter));
         }
 
-        // Cryptographic ed25519 signature verification
-        verify_vote_signature(&vote)?;
+        // 4. Cryptographic ed25519 signature verification (binds
+        //    chain_id + height + block_hash into the signed bytes).
+        verify_vote_signature(&vote, self.config.chain_id)?;
+
+        // 5. Replay protection — ONLY mark voted after all validation
+        //    succeeds. Pre-fix this happened at step 0; the H-01
+        //    flood-DoS exploited that ordering.
+        {
+            let mut voted = self.voted.write().await;
+            if !voted.insert((vote.height, vote.voter)) {
+                // Race: another concurrent submit_vote already
+                // accepted this voter. Treat as duplicate.
+                return Err(CheckpointError::DuplicateVote(vote.voter));
+            }
+        }
 
         debug!(
             "Vote from {:?} for checkpoint at height {} ({}/{})",
@@ -497,10 +560,9 @@ mod tests {
     }
 
     /// Sign a checkpoint vote's canonical message with the given signing key.
+    /// RM-B1 / WP-B2.2 (H-02): uses canonical_vote_message helper.
     fn sign_vote(height: u64, block_hash: &Hash, signing_key: &SigningKey) -> Signature {
-        let mut message = Vec::with_capacity(40);
-        message.extend_from_slice(&height.to_le_bytes());
-        message.extend_from_slice(block_hash.as_bytes());
+        let message = canonical_vote_message(40204, height, block_hash);
         let sig = signing_key.sign(&message);
         Signature::new(sig.to_bytes())
     }
