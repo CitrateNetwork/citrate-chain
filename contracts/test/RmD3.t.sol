@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {TEEAttestationRegistry} from "../src/TEEAttestationRegistry.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 /// @title RmD3Test — RM-D3 SOL-03 + SOL-05 acceptance suite
 /// @notice
@@ -209,7 +210,7 @@ contract RmD3Test is Test {
     function test_sol05_propose_only_governance() public {
         bytes32 newKid = keccak256("rotation-2026q3");
         vm.prank(worker1);
-        vm.expectRevert("TEERegistry: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         registry.proposeMaaRsaKey(newKid, MAA_RSA_MODULUS, MAA_RSA_EXPONENT, true);
     }
 
@@ -218,7 +219,7 @@ contract RmD3Test is Test {
         registry.proposeMaaRsaKey(newKid, MAA_RSA_MODULUS, MAA_RSA_EXPONENT, true);
 
         vm.prank(worker1);
-        vm.expectRevert("TEERegistry: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         registry.cancelMaaRsaKeyProposal(newKid);
     }
 

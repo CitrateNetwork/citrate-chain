@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/Governable.sol";
 
 /// @title ComputeVerifier — Tiered Verification Dispatch for Compute Marketplace
 /// @notice Verifies compute job outputs using three tiers: Commitment, ZKProof, TEE.
@@ -19,7 +20,7 @@ import "./lib/ReentrancyGuard.sol";
 /// @dev Adversarial invariants (from AdversarialCompute.tla) enforced:
 ///      - VerificationIntegrity: no false positive/negative via commitment hash binding
 ///      - NoFrontRunning: only marketplace contract can call verify functions
-contract ComputeVerifier is ReentrancyGuard {
+contract ComputeVerifier is ReentrancyGuard, Governable {
     // ============================================================
     // Types
     // ============================================================
@@ -64,8 +65,7 @@ contract ComputeVerifier is ReentrancyGuard {
     /// @notice The ComputeMarketplace contract (only caller for verification actions)
     address public marketplace;
 
-    /// @notice Governance address for TEE oracle management and dispute resolution
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     /// @notice Trusted TEE attestation oracles
     mapping(address => bool) public teeOracles;
@@ -89,7 +89,7 @@ contract ComputeVerifier is ReentrancyGuard {
     event TEEOracleAdded(address indexed oracle);
     event TEEOracleRemoved(address indexed oracle);
     event MarketplaceUpdated(address indexed oldMarketplace, address indexed newMarketplace);
-    event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+    // GovernanceTransferred event is provided by Governable mixin.
 
     // ============================================================
     // Modifiers
@@ -100,10 +100,7 @@ contract ComputeVerifier is ReentrancyGuard {
         _;
     }
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "ComputeVerifier: caller is not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     modifier jobConfigured(uint256 jobId) {
         require(records[jobId].configuredAt > 0, "ComputeVerifier: job not configured");
@@ -114,10 +111,9 @@ contract ComputeVerifier is ReentrancyGuard {
     // Constructor
     // ============================================================
 
-    constructor(address _marketplace) {
+    constructor(address _marketplace) Governable(msg.sender) {
         require(_marketplace != address(0), "ComputeVerifier: zero marketplace address");
         marketplace = _marketplace;
-        governance = msg.sender;
     }
 
     // ============================================================
@@ -396,7 +392,7 @@ contract ComputeVerifier is ReentrancyGuard {
         VerificationResult outcome
     ) external jobConfigured(jobId) {
         require(
-            msg.sender == governance || msg.sender == marketplace,
+            msg.sender == governance() || msg.sender == marketplace,
             "ComputeVerifier: caller is not governance or marketplace"
         );
         VerificationRecord storage rec = records[jobId];
@@ -492,14 +488,7 @@ contract ComputeVerifier is ReentrancyGuard {
         emit MarketplaceUpdated(old, newMarketplace);
     }
 
-    /// @notice Transfer governance to a new address
-    /// @param newGovernance The new governance address
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "ComputeVerifier: zero address");
-        address old = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(old, newGovernance);
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     // ============================================================
     // Internal Verification Helpers

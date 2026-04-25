@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {ComputeMarketplace} from "../src/ComputeMarketplace.sol";
 import {ComputeVerifier} from "../src/ComputeVerifier.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 /// @title ComputeMarketplaceTest — 30+ tests covering all TLA+ invariants
 /// @dev Tests all 11 invariants from ComputeMarketplaceLifecycle.tla and
@@ -803,9 +804,15 @@ contract ComputeMarketplaceTest is Test {
     }
 
     function test_governance_transferGovernance() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         address newGov = address(0x8888);
         marketplace.transferGovernance(newGov);
-        assertEq(marketplace.governance(), newGov, "Governance transferred");
+        assertEq(marketplace.pendingGovernance(), newGov, "pending recorded");
+        // Governance unchanged until acceptance.
+        assertEq(marketplace.governance(), address(this), "still old gov");
+        vm.prank(newGov);
+        marketplace.acceptGovernance();
+        assertEq(marketplace.governance(), newGov, "now new gov");
     }
 
     function test_nonGovernance_cannotResolveDispute() public {
@@ -821,7 +828,7 @@ contract ComputeMarketplaceTest is Test {
         marketplace.disputeResult{value: 10 ether}(jobId);
 
         vm.prank(outsider);
-        vm.expectRevert("ComputeMarketplace: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         marketplace.resolveDispute(jobId, true);
     }
 

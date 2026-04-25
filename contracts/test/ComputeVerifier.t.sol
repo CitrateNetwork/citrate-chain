@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {ComputeVerifier} from "../src/ComputeVerifier.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 /// @title ComputeVerifierTest — 20+ tests covering all 9 ComputeVerification.tla invariants
 /// @dev Tests tiered verification dispatch: Commitment, ZKProof, TEE
@@ -446,8 +447,13 @@ contract ComputeVerifierTest is Test {
     }
 
     function test_transferGovernance() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         address newGov = address(0x8888);
         verifier.transferGovernance(newGov);
+        assertEq(verifier.pendingGovernance(), newGov, "pending recorded");
+        assertEq(verifier.governance(), address(this), "still old gov");
+        vm.prank(newGov);
+        verifier.acceptGovernance();
         assertEq(verifier.governance(), newGov, "Governance transferred");
     }
 

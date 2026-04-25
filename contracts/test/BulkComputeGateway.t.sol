@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import {BulkComputeGateway} from "../src/BulkComputeGateway.sol";
 import {StablecoinTreasury} from "../src/StablecoinTreasury.sol";
 import {ComputePricingOracle} from "../src/ComputePricingOracle.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 /// @dev Minimal ERC-20 mock for testing
 contract MockERC20 {
@@ -131,7 +132,7 @@ contract BulkComputeGatewayTest is Test {
     }
 
     function test_deploy_zero_governance_reverts() public {
-        vm.expectRevert("BulkComputeGateway: zero governance");
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         new BulkComputeGateway(address(treasury), address(oracle), address(0));
     }
 
@@ -326,7 +327,7 @@ contract BulkComputeGatewayTest is Test {
 
     function test_authorize_spender_non_governance_reverts() public {
         vm.prank(outsider);
-        vm.expectRevert("BulkComputeGateway: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         gateway.authorizeSpender(address(0x1234));
     }
 
@@ -348,18 +349,22 @@ contract BulkComputeGatewayTest is Test {
     }
 
     function test_transfer_governance() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         gateway.transferGovernance(school1);
+        assertEq(gateway.pendingGovernance(), school1, "pending recorded");
+        vm.prank(school1);
+        gateway.acceptGovernance();
         assertEq(gateway.governance(), school1);
     }
 
     function test_transfer_governance_zero_reverts() public {
-        vm.expectRevert("BulkComputeGateway: zero address");
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         gateway.transferGovernance(address(0));
     }
 
     function test_transfer_governance_non_governance_reverts() public {
         vm.prank(outsider);
-        vm.expectRevert("BulkComputeGateway: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         gateway.transferGovernance(outsider);
     }
 

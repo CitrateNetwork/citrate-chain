@@ -6,6 +6,7 @@ import {ComputeMarketplace} from "../src/ComputeMarketplace.sol";
 import {ComputeVerifier} from "../src/ComputeVerifier.sol";
 import {HeartbeatMonitor} from "../src/HeartbeatMonitor.sol";
 import {DisputeResolution} from "../src/DisputeResolution.sol";
+import {Governable} from "../src/lib/Governable.sol";
 import {ComputePool} from "../src/ComputePool.sol";
 
 /// @title ReentrancyAttackMarketplace — Attempts reentrancy during completeJob payout
@@ -743,7 +744,7 @@ contract ComputeAdversarialTest is Test {
         marketplace.disputeResult{value: 10 ether}(jobId);
 
         vm.prank(attacker);
-        vm.expectRevert("ComputeMarketplace: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         marketplace.resolveDispute(jobId, true);
     }
 

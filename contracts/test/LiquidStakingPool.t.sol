@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import {LiquidStakingPool} from "../src/LiquidStakingPool.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 contract LiquidStakingPoolTest is Test {
     LiquidStakingPool public pool;
@@ -402,7 +403,7 @@ contract LiquidStakingPoolTest is Test {
 
     function test_non_governance_cannot_add_oracle() public {
         vm.prank(alice);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         pool.addOracle(oracle1);
     }
 
@@ -410,7 +411,7 @@ contract LiquidStakingPoolTest is Test {
         pool.addOracle(oracle1);
 
         vm.prank(alice);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         pool.removeOracle(oracle1);
     }
 
@@ -427,11 +428,15 @@ contract LiquidStakingPoolTest is Test {
     }
 
     function test_governance_transfer() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         pool.transferGovernance(alice);
+        assertEq(pool.pendingGovernance(), alice, "pending recorded");
+        vm.prank(alice);
+        pool.acceptGovernance();
         assertEq(pool.governance(), alice);
 
         // Old governance can no longer act
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         pool.addOracle(oracle1);
 
         // New governance can act

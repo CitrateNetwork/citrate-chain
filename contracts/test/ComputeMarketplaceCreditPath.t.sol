@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {ComputeMarketplace} from "../src/ComputeMarketplace.sol";
 import {ComputeVerifier} from "../src/ComputeVerifier.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 /// @title ComputeMarketplaceCreditPath.t.sol — CM-06 WP-06.1
 /// @notice Tests for the dual-payment-path (SALT vs BulkCredits)
@@ -263,7 +264,7 @@ contract ComputeMarketplaceCreditPathTest is Test {
     function test_setBulkGateway_only_governance() public {
         address attacker = address(0xBAD1);
         vm.prank(attacker);
-        vm.expectRevert(bytes("ComputeMarketplace: not governance"));
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         market.setBulkGateway(address(bulk));
     }
 
@@ -281,7 +282,7 @@ contract ComputeMarketplaceCreditPathTest is Test {
     function test_setPricingOracle_only_governance() public {
         address attacker = address(0xBAD2);
         vm.prank(attacker);
-        vm.expectRevert(bytes("ComputeMarketplace: not governance"));
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         market.setPricingOracle(address(oracle));
     }
 }

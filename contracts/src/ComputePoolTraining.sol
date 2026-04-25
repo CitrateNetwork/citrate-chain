@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/Governable.sol";
 
 /// @title ComputePoolTraining — DataParallel training jobs (CM-07)
 /// @notice Extension contract for the CM-05 ComputePool surface that
@@ -29,7 +30,7 @@ import "./lib/ReentrancyGuard.sol";
 ///         remains at its own address for InferencePool traffic.
 ///
 /// @dev CM-07 WP-07.1. See docs/adr/ADR-008-gradient-commitment.md.
-contract ComputePoolTraining is ReentrancyGuard {
+contract ComputePoolTraining is ReentrancyGuard, Governable {
     // ── Types ───────────────────────────────────────────────────────
 
     enum JobState { Recruiting, Training, Awaiting, Finalized, Aborted }
@@ -179,8 +180,7 @@ contract ComputePoolTraining is ReentrancyGuard {
 
     uint256 public nextJobId;
 
-    /// @notice Governance address (manages committee + upgrades).
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ── Events ──────────────────────────────────────────────────────
 
@@ -244,10 +244,7 @@ contract ComputePoolTraining is ReentrancyGuard {
 
     // ── Modifiers ───────────────────────────────────────────────────
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "ComputePoolTraining: not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     modifier jobExists(uint256 jobId) {
         require(jobs[jobId].requester != address(0), "ComputePoolTraining: unknown job");
@@ -256,10 +253,7 @@ contract ComputePoolTraining is ReentrancyGuard {
 
     // ── Constructor ─────────────────────────────────────────────────
 
-    constructor(address _governance) {
-        require(_governance != address(0), "ComputePoolTraining: zero governance");
-        governance = _governance;
-    }
+    constructor(address _governance) Governable(_governance) {}
 
     // ── Job lifecycle ───────────────────────────────────────────────
 
@@ -656,10 +650,7 @@ contract ComputePoolTraining is ReentrancyGuard {
         emit CommitteeUpdated(member, active);
     }
 
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "ComputePoolTraining: zero governance");
-        governance = newGovernance;
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     /// @notice Abort a recruiting job whose minWorkers was never met.
     /// Refunds the requester's escrow + any already-joined workers'
@@ -668,7 +659,7 @@ contract ComputePoolTraining is ReentrancyGuard {
     function abortRecruiting(uint256 jobId) external jobExists(jobId) nonReentrant {
         TrainingJob storage job = jobs[jobId];
         require(job.state == JobState.Recruiting, "ComputePoolTraining: not recruiting");
-        require(msg.sender == job.requester || msg.sender == governance,
+        require(msg.sender == job.requester || msg.sender == governance(),
                 "ComputePoolTraining: not authorized");
 
         job.state = JobState.Aborted;
