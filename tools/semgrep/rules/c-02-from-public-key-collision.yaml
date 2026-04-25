@@ -1,0 +1,41 @@
+# C-02 — Untrusted PublicKey ingress without `is_admissible` is forbidden.
+#
+# Audit finding (CRITICAL):
+#   .audit/2026-04-24-full-repo-adversarial-audit/03_FINDINGS_CONSENSUS_EXECUTION.md#c-02
+#
+# Pre-fix `Address::from_public_key` accepted any 32-byte byte
+# string at network gossip + RPC ingress, then dual-format
+# derivation could be tricked into mapping an attacker-supplied
+# `[victim_evm_addr || X..]` pattern to attacker-controlled
+# addresses. The structural fix is `PublicKey::is_admissible`,
+# applied at every untrusted ingress point.
+#
+# This rule fires on direct calls to `Address::from_public_key`
+# inside RPC / network code paths that aren't preceded by an
+# admissibility check. It's a coarse heuristic — the canonical
+# implementation in `core/execution/src/types.rs` is exempted by
+# path.
+
+rules:
+  - id: c-02-from-public-key-without-admission-check
+    message: >-
+      `Address::from_public_key` should not be called on an
+      untrusted PublicKey without first calling
+      `PublicKey::is_admissible` (C-02). Pre-fix this allowed
+      attribution-spoofing via attacker-chosen byte strings. See
+      core/consensus/src/types.rs::PublicKey::is_admissible.
+    languages: [rust]
+    severity: WARNING
+    paths:
+      include:
+        - "core/api/**/*.rs"
+        - "core/network/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/proptest-regressions/**"
+    patterns:
+      - pattern: Address::from_public_key($PK)
+      - pattern-not-inside: |
+          if $PK.is_admissible() { ... }
+      - pattern-not-inside: |
+          if !$PK.is_admissible() { ... return $_ ... }

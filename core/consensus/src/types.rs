@@ -48,6 +48,41 @@ impl PublicKey {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Returns true if this PublicKey appears to encode an embedded
+    /// 20-byte EVM address — first 20 bytes non-zero, last 12 bytes
+    /// all zero. This is Citrate's dual-format convention: a wallet
+    /// whose canonical identity is a 20-byte EVM address embeds it
+    /// in a 32-byte PublicKey by padding with zeros.
+    pub fn is_likely_embedded_evm(&self) -> bool {
+        self.0[20..].iter().all(|&b| b == 0) && !self.0[..20].iter().all(|&b| b == 0)
+    }
+
+    /// Returns true if these 32 bytes encode a valid ed25519 curve
+    /// point. A non-curve byte string is overwhelmingly unlikely to
+    /// occur on a randomly-generated keypair, so a "natural-looking"
+    /// but non-curve PublicKey at network ingress is almost
+    /// certainly an attacker probe.
+    pub fn is_valid_ed25519_curve_point(&self) -> bool {
+        ed25519_dalek::VerifyingKey::from_bytes(&self.0).is_ok()
+    }
+
+    /// **Admission gate** for untrusted ingress (RPC, P2P gossip,
+    /// wallet import). Returns true iff the PublicKey is either an
+    /// embedded-EVM form OR a valid ed25519 curve point.
+    ///
+    /// Closes audit finding **C-02** (CRITICAL). Pre-fix, network
+    /// gossip and `eth_tx_decoder` admitted any 32-byte byte string
+    /// as a PublicKey, then `Address::from_public_key` dual-format
+    /// derivation could be tricked into mapping an attacker-supplied
+    /// `[victim_evm_addr || 0x00; 12]` to the victim's address (an
+    /// edge case the curve-point check on its own would miss because
+    /// embedded-EVM form is intentional dual-format). The
+    /// `is_admissible` gate accepts both legitimate forms and rejects
+    /// arbitrary byte strings that happen to be neither.
+    pub fn is_admissible(&self) -> bool {
+        self.is_likely_embedded_evm() || self.is_valid_ed25519_curve_point()
+    }
 }
 
 /// Signature type

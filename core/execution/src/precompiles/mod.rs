@@ -832,6 +832,14 @@ impl PrecompileExecutor {
 
 /// Recover Ethereum address from ECDSA signature components.
 /// Shared by ECRECOVER precompile and x402 payment precompiles.
+///
+/// RM-B1 / WP-B3.4 (audit M-01): rejects high-s signatures per
+/// EIP-2 / Yellow Paper. Without this check, a contract using
+/// `ecrecover(hash, v, r, s) == expected_signer` for replay
+/// protection would accept both `(r, s)` and `(r, n - s)` as
+/// equally valid signatures over the same message — a malleability
+/// vector. Mirrors Geth's pattern: `if signature.s_normalized() !=
+/// signature.s() { reject }`.
 pub fn recover_address(hash: &[u8], r: &[u8], s: &[u8], recovery_id: u8) -> Option<[u8; 20]> {
     // Create signature from r and s components
     let mut sig_bytes = [0u8; 64];
@@ -839,6 +847,15 @@ pub fn recover_address(hash: &[u8], r: &[u8], s: &[u8], recovery_id: u8) -> Opti
     sig_bytes[32..].copy_from_slice(s);
 
     let signature = Signature::from_bytes((&sig_bytes).into()).ok()?;
+
+    // M-01 fix: reject high-s signatures. `normalize_s` returns
+    // `Some(normalized)` iff the s-value was not already in low-s
+    // form; we treat any input that needed normalization as a
+    // malleability attempt and reject.
+    if signature.normalize_s().is_some() {
+        return None;
+    }
+
     let recid = RecoveryId::from_byte(recovery_id)?;
 
     // Recover the verifying (public) key
@@ -1021,6 +1038,89 @@ mod tests {
         assert!(result.success);
         // Check that recovered address matches expected
         assert_eq!(&result.output[12..32], &expected_address);
+    }
+
+    // ==================== M-01: ECRECOVER low-s tests ====================
+
+    #[test]
+    fn m01_ecrecover_accepts_low_s_signature() {
+        // Real signing typically produces a low-s signature
+        // already (most libraries normalize). This test pins the
+        // happy path: low-s signature recovers correctly.
+        use k256::ecdsa::SigningKey;
+        let sk = SigningKey::from_bytes(&[0x42; 32].into()).expect("sk");
+        let hash = [0xCD; 32];
+        let (sig, recid) = sk.sign_prehash_recoverable(&hash).expect("sign");
+        let sig_bytes = sig.to_bytes();
+
+        // Confirm sign output is low-s (post-normalize_s would return None).
+        assert!(
+            Signature::from_bytes((&sig_bytes).into())
+                .expect("sig parse")
+                .normalize_s()
+                .is_none(),
+            "signing output must already be low-s"
+        );
+
+        let recovered = recover_address(
+            &hash,
+            &sig_bytes[0..32],
+            &sig_bytes[32..64],
+            recid.to_byte(),
+        );
+        assert!(recovered.is_some(), "low-s signature must recover");
+    }
+
+    #[test]
+    fn m01_ecrecover_rejects_high_s_signature() {
+        // Take a real low-s signature, then negate s (mod n) to
+        // get the malleated high-s form. Pre-fix `recover_address`
+        // accepted both; post-fix the high-s form is rejected.
+        use k256::ecdsa::SigningKey;
+        use k256::elliptic_curve::scalar::IsHigh;
+
+        let sk = SigningKey::from_bytes(&[0x55; 32].into()).expect("sk");
+        let hash = [0xAB; 32];
+        let (sig, recid) = sk.sign_prehash_recoverable(&hash).expect("sign");
+        let sig_bytes_low = sig.to_bytes();
+
+        // Build the malleated high-s form: negate the s scalar mod n.
+        let s_scalar = sig.s();
+        // The negation is the high-s form because |scalar| < n/2 on
+        // input → |-scalar mod n| > n/2 on output.
+        let neg_s = -s_scalar;
+        assert!(bool::from(neg_s.is_high()), "neg_s must be high-s by construction");
+
+        let mut sig_bytes_high = [0u8; 64];
+        sig_bytes_high[0..32].copy_from_slice(&sig_bytes_low[0..32]);
+        sig_bytes_high[32..64].copy_from_slice(&neg_s.to_bytes());
+
+        // M-01 fix: high-s must be rejected.
+        let recovered = recover_address(
+            &hash,
+            &sig_bytes_high[0..32],
+            &sig_bytes_high[32..64],
+            // recovery_id flips when s flips; we just probe both
+            // values to cover the malleability attack space.
+            recid.to_byte() ^ 1,
+        );
+        assert!(
+            recovered.is_none(),
+            "M-01: high-s signature must be rejected (malleability defense)"
+        );
+
+        // Also try the original recovery_id to be defensive — both
+        // recid values should reject the high-s form.
+        let recovered2 = recover_address(
+            &hash,
+            &sig_bytes_high[0..32],
+            &sig_bytes_high[32..64],
+            recid.to_byte(),
+        );
+        assert!(
+            recovered2.is_none(),
+            "M-01: high-s signature must be rejected regardless of recovery_id"
+        );
     }
 
     // ==================== RIPEMD160 Tests ====================

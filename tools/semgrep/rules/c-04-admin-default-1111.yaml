@@ -1,0 +1,49 @@
+# C-04 — Defaulting governance ADMIN to 0x1111…1111 is forbidden.
+#
+# Audit finding (CRITICAL):
+#   .audit/2026-04-24-full-repo-adversarial-audit/03_FINDINGS_CONSENSUS_EXECUTION.md#c-04
+#
+# Pre-fix `executor.rs::current_admin` did
+# `.unwrap_or(Address([0x11; 20]))` on the ADMIN storage slot.
+# Anyone whose tx-sender derived to 0x11..11 (a well-known burner
+# address) could call setAdmin on a fresh chain and take over
+# governance. Post-fix, an unset admin returns Err / None, and
+# only `block.height == 0` (genesis context) lets a caller
+# bootstrap the admin via setAdmin.
+#
+# This rule catches the pattern resurfacing — typically copy-paste
+# of the 0x11..11 magic constant.
+
+rules:
+  - id: c-04-admin-default-1111
+    message: >-
+      Defaulting governance ADMIN to `Address([0x11; 20])` is
+      forbidden (C-04). Anyone controlling the well-known burner
+      address could grab governance on a fresh chain. Use
+      `match get_storage(... ADMIN ...) { Some(a) => a, None =>
+      return Err(AccessDenied) }` and gate setAdmin on
+      `context.block_number == 0` for the bootstrap. See
+      core/execution/src/executor.rs::governance precompile path.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/execution/**/*.rs"
+        - "core/api/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/proptest-regressions/**"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              .unwrap_or(Address([0x11; 20]))
+          - pattern: |
+              .unwrap_or_else(|| Address([0x11; 20]))
+          - pattern: |
+              Address([0x11; 20])
+      - pattern-not-inside: |
+          fn $_($_: $_, $_: $_) -> $_ {
+            ...
+            #[cfg(test)]
+            ...
+          }
