@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
 import "./lib/RS256.sol";
+import "./lib/JWTParser.sol";
 
 /// @title TEEAttestationRegistry — CM-08 on-chain attestation state
 /// @notice Stores per-worker TEE attestation records for
@@ -282,6 +283,87 @@ contract TEEAttestationRegistry is ReentrancyGuard {
             key.exponent
         );
         require(sigOk, "TEERegistry: invalid MAA JWT signature");
+
+        uint64 blockNum = uint64(block.number);
+        AttestationRecord memory rec = AttestationRecord({
+            attestedAtBlock: blockNum,
+            expiryBlock: blockNum + ATTESTATION_LIFETIME_BLOCKS,
+            modelHash: modelHash,
+            vmMeasurement: vmMeasurement,
+            gpuMeasurement: gpuMeasurement,
+            slashed: false
+        });
+        attestations[msg.sender] = rec;
+
+        emit Attested(msg.sender, rec.attestedAtBlock, rec.expiryBlock, modelHash);
+        emit AttestedStrict(
+            msg.sender,
+            rec.attestedAtBlock,
+            rec.expiryBlock,
+            modelHash,
+            kidHash
+        );
+    }
+
+    /// @notice JWT-content-bound strict submission. In addition to
+    /// verifying the RS256 signature (as `submitAttestationStrict`
+    /// does), this variant requires that the caller-supplied
+    /// `vmMeasurementClaim` bytes appear LITERALLY inside the
+    /// JWT payload. The on-chain `vmMeasurement` is then derived
+    /// as `keccak256(vmMeasurementClaim)` — the caller cannot
+    /// substitute an unrelated measurement.
+    ///
+    /// `vmMeasurementClaim` should be the EXACT bytes of the
+    /// JSON pair, including field name, colon, and quotes —
+    /// e.g. `"x-ms-runtime-vm-measurement":"0xabcd..."`. ADR-010
+    /// §"MAA schema" enumerates the valid field names.
+    ///
+    /// RM-B1 / WP-D3.4 (audit SOL-05): closes the half of SOL-05
+    /// that `submitAttestationStrict` left open — pre-fix the
+    /// signature verification was real but the on-chain measurement
+    /// claim was caller-asserted. A worker holding any valid MAA
+    /// JWT could substitute an arbitrary measurement. Post-fix the
+    /// measurement is bound to actual JWT content.
+    function submitAttestationStrictBound(
+        bytes calldata signedJwtPayload,
+        bytes calldata jwtSignature,
+        bytes32 kidHash,
+        bytes calldata vmMeasurementClaim,
+        bytes32 gpuMeasurement,
+        bytes32 modelHash,
+        bytes32 nrasSignerHash
+    ) external {
+        require(!attestations[msg.sender].slashed, "TEERegistry: slashed cannot re-attest");
+        require(modelHash != bytes32(0), "TEERegistry: zero model hash");
+        require(trustedNrasSigners[nrasSignerHash], "TEERegistry: untrusted NRAS signer");
+        require(vmMeasurementClaim.length > 0, "TEERegistry: empty vm claim");
+
+        MaaRsaKey storage key = _maaRsaKeys[kidHash];
+        require(key.active, "TEERegistry: unknown or inactive MAA kid");
+
+        // Replay protection — same as submitAttestationStrict.
+        bytes32 sigHash = keccak256(jwtSignature);
+        require(!usedJwtSignatures[sigHash], "TEERegistry: jwt replay");
+        usedJwtSignatures[sigHash] = true;
+
+        // RS256 signature verification.
+        bool sigOk = RS256.verify(
+            signedJwtPayload,
+            jwtSignature,
+            key.modulus,
+            key.exponent
+        );
+        require(sigOk, "TEERegistry: invalid MAA JWT signature");
+
+        // Bind: parse the JWT payload and verify the measurement
+        // claim is literally present.
+        bytes memory payloadJson = JWTParser.extractPayload(signedJwtPayload);
+        require(
+            JWTParser.containsClaim(payloadJson, vmMeasurementClaim),
+            "TEERegistry: vm claim not in jwt"
+        );
+
+        bytes32 vmMeasurement = keccak256(vmMeasurementClaim);
 
         uint64 blockNum = uint64(block.number);
         AttestationRecord memory rec = AttestationRecord({
