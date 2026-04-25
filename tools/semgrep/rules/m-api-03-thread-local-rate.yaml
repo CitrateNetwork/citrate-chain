@@ -1,0 +1,44 @@
+# M-API-03 — `thread_local!` for per-request RPC state is fragile.
+#
+# Audit finding (MEDIUM):
+#   .audit/2026-04-24-full-repo-adversarial-audit/04_FINDINGS_API_NETWORK_STORAGE.md#m-api-03
+#
+# `RateLimiter::on_request` sets `CLIENT_KEY` thread-local then
+# expects method handlers to read it. `jsonrpc-http-server` may
+# dispatch sync handlers on different threads from the middleware
+# under some configurations — the thread-local then leaks one
+# request's key into another request's accounting.
+#
+# Full closure requires migrating to `MetaIoHandler<RpcContext>` +
+# per-request Metadata. That's deferred to RM-G2 cleanup pass.
+# This rule bounds the risk by firing CI errors on any NEW
+# `thread_local!` declarations introduced into the rate-limit
+# module while the full fix is pending.
+
+rules:
+  - id: m-api-03-thread-local-in-rate-limit
+    message: >-
+      `thread_local!` for per-request RPC state is forbidden
+      (M-API-03). Use `MetaIoHandler<RpcContext>` + per-request
+      Metadata instead. The existing `OPERATOR_AUTH` and
+      `CLIENT_KEY` thread-locals are documented exemptions
+      pending the RM-G2 Metadata refactor.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/api/src/rate_limit.rs"
+      exclude:
+        - "**/tests/**"
+    patterns:
+      - pattern: |
+          thread_local! {
+              static $NEW: $T = $_;
+              ...
+          }
+      - pattern-not: |
+          thread_local! {
+              static OPERATOR_AUTH: $_ = $_;
+              ...
+              static CLIENT_KEY: $_ = $_;
+          }

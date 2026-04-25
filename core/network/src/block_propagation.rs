@@ -7,7 +7,7 @@ use citrate_consensus::types::{Block, BlockHeader, Hash};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Block propagation handler for efficient block distribution
 pub struct BlockPropagation {
@@ -18,7 +18,14 @@ pub struct BlockPropagation {
     block_sources: Arc<RwLock<HashMap<Hash, HashSet<PeerId>>>>,
 
     /// Recent blocks we've broadcasted (to avoid re-broadcasting)
+    /// RM-B1 / WP-C2.1 (audit H-NET-01): bounded recent-broadcast
+    /// dedup. Pre-fix the underlying set was wiped wholesale at
+    /// 1000 entries (`clear()`), letting the same hashes ping-pong
+    /// after a wipe. Post-fix it's a `VecDeque` paired with a
+    /// `HashSet` to evict oldest first.
     recent_broadcasts: Arc<RwLock<HashSet<Hash>>>,
+    /// Insertion-order queue for `recent_broadcasts` LRU eviction.
+    recent_broadcasts_order: Arc<RwLock<std::collections::VecDeque<Hash>>>,
 
     /// Blocks we're currently downloading
     downloading: Arc<RwLock<HashSet<Hash>>>,
@@ -33,12 +40,44 @@ impl BlockPropagation {
             peer_manager,
             block_sources: Arc::new(RwLock::new(HashMap::new())),
             recent_broadcasts: Arc::new(RwLock::new(HashSet::new())),
+            recent_broadcasts_order: Arc::new(RwLock::new(
+                std::collections::VecDeque::with_capacity(1024),
+            )),
             downloading: Arc::new(RwLock::new(HashSet::new())),
             header_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Handle new block announcement
+    /// RM-B1 / WP-C2.1 (audit H-NET-01): bounded LRU insert.
+    /// Caller holds neither lock; this method takes both write
+    /// locks for the duration. Pre-fix the dedup table was
+    /// `HashSet::clear()`'d at 1000 entries, allowing replay.
+    async fn track_recent_broadcast(&self, hash: Hash) {
+        const MAX: usize = 1024;
+        let mut set = self.recent_broadcasts.write().await;
+        let mut order = self.recent_broadcasts_order.write().await;
+        if set.insert(hash) {
+            order.push_back(hash);
+            // Evict oldest until under the cap.
+            while order.len() > MAX {
+                if let Some(old) = order.pop_front() {
+                    set.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// Handle new block announcement.
+    ///
+    /// RM-B1 / WP-C2.1 (audit H-NET-01): pre-fix this method
+    /// inserted the block into `header_cache` and re-broadcast it
+    /// to every other peer BEFORE any consensus / signature check.
+    /// One byzantine peer could saturate the network with garbage
+    /// and force every peer to pay relay bandwidth + cache slots.
+    /// Post-fix `block.verify_hash()` + `verify_block_signature`
+    /// run BEFORE the cache insert + relay. Genesis is exempt
+    /// (the genesis block carries the network identity, not a
+    /// proposer signature).
     pub async fn handle_new_block(&self, peer_id: &PeerId, block: Block) -> Result<()> {
         let block_hash = block.header.block_hash;
 
@@ -57,9 +96,47 @@ impl BlockPropagation {
         peers.insert(peer_id.clone());
         drop(sources);
 
+        // H-NET-01 fix: validate-then-relay. Hash mismatch = peer
+        // sent garbage; reject + don't relay.
+        if !block.verify_hash() {
+            warn!(
+                "H-NET-01: rejecting block {} from peer {} — hash mismatch",
+                block_hash, peer_id
+            );
+            return Err(anyhow::anyhow!(
+                "H-NET-01: block hash verification failed"
+            ));
+        }
+
+        // Signature verification (skip genesis).
+        if !block.is_genesis() {
+            match citrate_consensus::crypto::verify_block_signature(&block) {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        "H-NET-01: rejecting block {} from peer {} — signature invalid",
+                        block_hash, peer_id
+                    );
+                    return Err(anyhow::anyhow!(
+                        "H-NET-01: block signature verification failed"
+                    ));
+                }
+                Err(e) => {
+                    warn!(
+                        "H-NET-01: rejecting block {} from peer {} — signature error: {}",
+                        block_hash, peer_id, e
+                    );
+                    return Err(anyhow::anyhow!(
+                        "H-NET-01: block signature error: {}",
+                        e
+                    ));
+                }
+            }
+        }
+
         info!("Received new block {} from peer {}", block_hash, peer_id);
 
-        // Cache the header
+        // Cache the header (only after validation).
         self.header_cache
             .write()
             .await
@@ -75,21 +152,16 @@ impl BlockPropagation {
     pub async fn broadcast_block(&self, block: Block) -> Result<()> {
         let block_hash = block.header.block_hash;
 
-        // Check if we've recently broadcasted this
-        let mut recent = self.recent_broadcasts.write().await;
-        if recent.contains(&block_hash) {
-            debug!("Block {} was recently broadcasted, skipping", block_hash);
-            return Ok(());
+        // RM-B1 / WP-C2.1 (audit H-NET-01): dedup via bounded LRU
+        // instead of `HashSet::clear()` at 1000 entries.
+        {
+            let recent = self.recent_broadcasts.read().await;
+            if recent.contains(&block_hash) {
+                debug!("Block {} was recently broadcasted, skipping", block_hash);
+                return Ok(());
+            }
         }
-
-        recent.insert(block_hash);
-
-        // Clean up old entries if too many
-        if recent.len() > 1000 {
-            recent.clear();
-        }
-
-        drop(recent);
+        self.track_recent_broadcast(block_hash).await;
 
         // Broadcast to all peers
         let message = NetworkMessage::NewBlock { block };
@@ -103,8 +175,8 @@ impl BlockPropagation {
     async fn broadcast_block_except(&self, block: Block, except_peer: &PeerId) -> Result<()> {
         let block_hash = block.header.block_hash;
 
-        // Mark as recently broadcasted
-        self.recent_broadcasts.write().await.insert(block_hash);
+        // H-NET-01 fix: track via bounded LRU.
+        self.track_recent_broadcast(block_hash).await;
 
         // Get all peers except the sender
         let all_peers = self.peer_manager.get_all_peers();
@@ -220,13 +292,12 @@ impl BlockPropagation {
         self.header_cache.read().await.get(hash).cloned()
     }
 
-    /// Clean up old data
+    /// Clean up old data.
+    ///
+    /// RM-B1 / WP-C2.1 (audit H-NET-01): the recent_broadcasts
+    /// LRU is already self-trimming in `track_recent_broadcast`,
+    /// so this method only needs to handle the header cache.
     pub async fn cleanup(&self) {
-        // Clean up old broadcast records
-        let mut recent = self.recent_broadcasts.write().await;
-        if recent.len() > 10000 {
-            recent.clear();
-        }
 
         // Clean up header cache
         let mut cache = self.header_cache.write().await;
@@ -253,19 +324,21 @@ mod tests {
         let peer_manager = Arc::new(PeerManager::new(Default::default()));
         let propagation = BlockPropagation::new(peer_manager);
 
-        // Create a test block
+        // RM-B1 / WP-C2.1 (H-NET-01): handle_new_block now
+        // requires `block.verify_hash()` AND signature verification
+        // for non-genesis. Use a true-genesis shape (default parent
+        // + no merge parents + height 0) so the signature check is
+        // skipped, and `.build()` to compute a canonical hash.
         let block = BlockBuilder::new()
-            .hash(Hash::new([1; 32]))
-            .parent(Hash::new([2; 32]))
             .timestamp(12345)
-            .height(100)
-            .blue_score(50)
+            .height(0) // genesis: signature check skipped
+            .blue_score(0)
             .blue_work(1000)
             .state_root(Hash::new([3; 32]))
             .tx_root(Hash::new([4; 32]))
             .receipt_root(Hash::new([5; 32]))
             .artifact_root(Hash::new([6; 32]))
-            .build_unhashed();
+            .build();
 
         // Test broadcasting
         assert!(propagation.broadcast_block(block.clone()).await.is_ok());
@@ -273,7 +346,8 @@ mod tests {
         // Should skip re-broadcasting
         assert!(propagation.broadcast_block(block.clone()).await.is_ok());
 
-        // Test header caching
+        // Test header caching — handle_new_block now validates
+        // hash + signature first.
         let peer_id = PeerId::new("test_peer".to_string());
         assert!(propagation
             .handle_new_block(&peer_id, block.clone())
@@ -285,5 +359,39 @@ mod tests {
             .await;
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().block_hash, block.header.block_hash);
+    }
+
+    /// H-NET-01.1: a block with a wrong-hash header is rejected at
+    /// `handle_new_block` and NOT inserted into the header cache,
+    /// NOT relayed.
+    #[tokio::test]
+    async fn h_net_01_garbage_block_not_relayed() {
+        let peer_manager = Arc::new(PeerManager::new(Default::default()));
+        let propagation = BlockPropagation::new(peer_manager);
+
+        // Build with explicit (wrong) hash — verify_hash fails.
+        let block = BlockBuilder::new()
+            .hash(Hash::new([0xFF; 32])) // hash that doesn't match the header content
+            .parent(Hash::new([0x02; 32]))
+            .height(100)
+            .blue_score(50)
+            .blue_work(1000)
+            .build_unhashed();
+
+        let peer_id = PeerId::new("byzantine_peer".to_string());
+        let result = propagation.handle_new_block(&peer_id, block.clone()).await;
+        assert!(
+            result.is_err(),
+            "H-NET-01: block with wrong hash MUST be rejected"
+        );
+
+        // Header cache must NOT contain the rejected block.
+        let cached = propagation
+            .get_cached_header(&block.header.block_hash)
+            .await;
+        assert!(
+            cached.is_none(),
+            "H-NET-01: rejected block must NOT enter header cache"
+        );
     }
 }
