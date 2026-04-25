@@ -19,10 +19,13 @@ on:
       - 'citrate_v0.01.1/**/build.rs'
       - '.github/workflows/rust-ci.yml'
 
+<<<<<<< Updated upstream
 concurrency:
   group: rust-ci-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
+=======
+>>>>>>> Stashed changes
 env:
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: 0
@@ -59,8 +62,15 @@ jobs:
             ~/.cargo/git
           key: rust-ci-${{ runner.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
           restore-keys: rust-ci-${{ runner.os }}-
+<<<<<<< Updated upstream
       - name: Run core workspace tests
         run: cargo test --workspace --quiet --exclude citrate-edu-app --exclude citrate-learning-center
+=======
+      - name: Build tests (no run)
+        run: cargo test --workspace --no-run
+      - name: Run tests
+        run: cargo test --workspace --quiet
+>>>>>>> Stashed changes
 
   verifier-tests:
     runs-on: ubuntu-latest
@@ -94,7 +104,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
+<<<<<<< Updated upstream
           sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config xvfb libfontconfig1-dev
+=======
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config xvfb
+>>>>>>> Stashed changes
       - name: Cache cargo
         uses: actions/cache@v4
         with:

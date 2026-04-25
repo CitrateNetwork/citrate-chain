@@ -471,7 +471,20 @@ impl GossipProtocol {
     /// 9. INVALID_SIGNATURE — ed25519 signature verification failed (WP-G.2)
     async fn validate_block(&self, block: &Block) -> bool {
         // 1. BLOCK_OVERSIZED
-        let size = bincode::serialize(block).unwrap_or_default().len();
+        // RM-B1 / WP-B1.5 (audit M-06): on serialize failure reject
+        // outright — a block that doesn't serialize cannot be sized,
+        // and silently treating it as zero-size let oversized blocks
+        // pass validation under the pre-fix `unwrap_or_default` path.
+        let size = match bincode::serialize(block) {
+            Ok(bytes) => bytes.len(),
+            Err(e) => {
+                warn!(
+                    "[BLOCK_SERIALIZE_FAIL] block={} err={} — rejecting",
+                    block.header.block_hash, e
+                );
+                return false;
+            }
+        };
         if size > self.config.max_message_size {
             warn!("[BLOCK_OVERSIZED] block={} size={}", block.header.block_hash, size);
             return false;
@@ -568,8 +581,13 @@ impl GossipProtocol {
 
     /// Validate transaction (basic checks)
     async fn validate_transaction(&self, tx: &Transaction) -> bool {
-        // Check transaction size
-        let size = bincode::serialize(tx).unwrap_or_default().len();
+        // Check transaction size.
+        // RM-B1 / WP-B1.5 (audit M-06): on serialize failure reject
+        // outright — see `validate_block` for rationale.
+        let size = match bincode::serialize(tx) {
+            Ok(bytes) => bytes.len(),
+            Err(_) => return false,
+        };
         if size > self.config.max_message_size {
             return false;
         }

@@ -1,0 +1,60 @@
+# H-08 — Sorting tips by `blue_score` without a hash tie-break is forbidden.
+#
+# Audit finding (HIGH):
+#   .audit/2026-04-24-full-repo-adversarial-audit/03_FINDINGS_CONSENSUS_EXECUTION.md#h-08
+#
+# Spec (canonical):
+#   specs/tla/consensus/GhostDAGSafety.tla — invariants TipSelectionDeterministic,
+#   TieBreakRespected, NoTwoTipsShareRank.
+#
+# Pre-fix `tip_selection.rs:145` did:
+#   tip_infos.sort_by(|a, b| b.blue_score.cmp(&a.blue_score));
+# With equal blue scores the sort fell back to input order (HashMap /
+# RocksDB iteration), so different validators produced different
+# parent sets → split DAG.
+#
+# Post-fix the comparator MUST include a hash tie-break:
+#   b.blue_score.cmp(&a.blue_score).then_with(|| a.hash.cmp(&b.hash))
+#
+# All sort sites in `core/consensus/` were audited at WP-B1.1; the
+# canonical helper is `cmp_tip_for_parent_selection` in
+# `core/consensus/src/tip_selection.rs`. New consensus-path sort sites
+# operating on tip-shaped data MUST either reuse that helper or add an
+# equivalent tie-break.
+
+rules:
+  - id: h-08-tip-sort-no-tiebreak
+    message: >-
+      Sorting tips by `blue_score` without a hash tie-break is forbidden (H-08).
+      Two validators iterating tips in different orders compute different
+      parent sets and split the DAG. Use `cmp_tip_for_parent_selection`
+      from `core/consensus/src/tip_selection.rs`, or add
+      `.then_with(|| a.hash.cmp(&b.hash))`. See specs/tla/consensus/GhostDAGSafety.tla.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/consensus/**/*.rs"
+        - "core/sequencer/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/proptest-regressions/**"
+    patterns:
+      # Sort by blue_score with NO tie-break.
+      - pattern-either:
+          - pattern: |
+              $TIPS.sort_by(|$A, $B| $B.blue_score.cmp(&$A.blue_score))
+          - pattern: |
+              $TIPS.sort_by(|$A, $B| $A.blue_score.cmp(&$B.blue_score))
+          - pattern: |
+              $TIPS.sort_by_key(|$T| $T.blue_score)
+          - pattern: |
+              $TIPS.sort_unstable_by(|$A, $B| $B.blue_score.cmp(&$A.blue_score))
+      # Make sure we DON'T match the canonical helper or anything
+      # that already chains a hash tie-break.
+      - pattern-not: |
+          $TIPS.sort_by(cmp_tip_for_parent_selection)
+      - pattern-not: |
+          $TIPS.sort_by(|$A, $B| $B.blue_score.cmp(&$A.blue_score).then_with($_))
+      - pattern-not: |
+          $TIPS.sort_by(|$A, $B| $A.blue_score.cmp(&$B.blue_score).then_with($_))

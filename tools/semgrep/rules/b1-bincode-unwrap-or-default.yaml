@@ -1,0 +1,48 @@
+# M-06 — `bincode::serialize(...).unwrap_or_default()` is forbidden.
+#
+# Audit finding (MEDIUM):
+#   .audit/2026-04-24-full-repo-adversarial-audit/03_FINDINGS_CONSENSUS_EXECUTION.md#m-06
+#
+# Pre-fix this pattern silently emitted an empty `Vec<u8>` on encode
+# failure. The `kv_put` then dutifully stored empty bytes; the next
+# restart's `bincode::deserialize` failed and the entry was silently
+# dropped — corruption masked as "no record."
+#
+# Post-fix, every call site uses one of:
+#
+#   - `match bincode::serialize(&x) { Ok(b) => ..., Err(e) => log+skip }`
+#   - `bincode::serialize(&x).map_err(...)?` (`?` propagates as a
+#     domain-typed error)
+#
+# Sites fixed at WP-B1.5:
+#   - core/consensus/src/dag_store.rs (3 sites — also touched by
+#     WP-B1.3 `kv_write_batch` refactor, which inlines the matches)
+#   - core/consensus/src/checkpoint.rs:426
+#   - core/api/src/enhanced_tx_decoder.rs:342
+#   - faucet/src/main.rs:353
+#
+# The Semgrep rule fires CI on the pattern resurfacing anywhere in
+# the workspace.
+
+rules:
+  - id: b1-bincode-unwrap-or-default
+    message: >-
+      `bincode::serialize(...).unwrap_or_default()` is forbidden (M-06).
+      On encode failure it silently emits empty bytes which deserialize-
+      fail downstream, masking corruption as "no record." Use
+      `match bincode::serialize(&x)` or `bincode::serialize(&x)?` /
+      `.map_err(...)?` so the error propagates. See
+      .audit/2026-04-24-full-repo-adversarial-audit/03_FINDINGS_CONSENSUS_EXECUTION.md#m-06.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - "**/tests/**"
+        - "**/proptest-regressions/**"
+        - "**/target/**"
+    patterns:
+      - pattern-either:
+          - pattern: bincode::serialize($X).unwrap_or_default()
+          - pattern: bincode::serialize(&$X).unwrap_or_default()
+          - pattern: bincode::serialize($X).unwrap_or_else($_)
+          - pattern: bincode::serialize(&$X).unwrap_or_else($_)
