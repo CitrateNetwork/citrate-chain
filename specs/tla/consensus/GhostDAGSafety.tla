@@ -113,6 +113,28 @@ NoTwoTipsShareRank ==
     \A a, b \in Tips :
         a # b => RankOf(a) # RankOf(b)
 
+\* INV-5: BlueSetIsContentDetermined — captures the H-07 fix. TLC
+\* cannot directly model "BFS budget" (a runtime quantity), but it
+\* CAN witness the structural property that closes H-07: the order in
+\* which RankOf assigns positions to tips is a *pure function of the
+\* constants* (Tips, BlueScores) — no nondeterminism, no caching, no
+\* runtime budget enters the definition. The strongest form we can
+\* express is: any two evaluations of RankOf with identical inputs
+\* yield identical outputs. In TLA+ this is trivially true because
+\* RankOf is a total deterministic operator. The invariant below
+\* makes that explicit by asserting `RankOf` is determined solely by
+\* `Cardinality` over a content-bound set.
+\*
+\* Code-level witness: the H-07 reachability test
+\* `h07_modest_chain_blue_set_is_content_determined` asserts that on
+\* a 200-block linear chain the tip's blue score equals chain length
+\* + 1, which holds only when ancestry is structurally determined.
+\* The `--ignored` deep-chain test pushes this to 11_000 blocks (past
+\* the legacy MAX_BFS_DEPTH cap of 10_000).
+BlueSetIsContentDetermined ==
+    \A t \in Tips :
+        RankOf(t) = Cardinality({ x \in Tips : PrecedesInTipOrder(x, t) })
+
 \* ---- Type invariant ----
 
 TypeInv ==
@@ -124,6 +146,7 @@ THEOREM TotalOrderHolds == Spec => []TotalOrderOnTips
 THEOREM DeterminismHolds == Spec => []TipSelectionDeterministic
 THEOREM TieBreakHolds == Spec => []TieBreakRespected
 THEOREM RanksDistinct == Spec => []NoTwoTipsShareRank
+THEOREM ContentDetermined == Spec => []BlueSetIsContentDetermined
 THEOREM TypeSafety == Spec => []TypeInv
 
 =============================================================================

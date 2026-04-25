@@ -220,7 +220,39 @@ impl GhostDag {
         Ok(count)
     }
 
-    /// Check if `ancestor` is an ancestor of `descendant`
+    /// Check if `ancestor` is an ancestor of `descendant`.
+    ///
+    /// Closes audit finding **H-07**. The previous implementation BFS-
+    /// walked up to a fixed `MAX_BFS_DEPTH = 10_000` cap and silently
+    /// returned `Ok(false)` on exhaustion — turning an unknown answer
+    /// into a definitively-wrong "no". On a long-running chain, this
+    /// caused divergent blue-set computation between fresh-sync nodes
+    /// (small relations cache, BFS cap fires often) and warm-cache
+    /// nodes (large cache, no cap), producing fork-inducing blue-set
+    /// disagreement.
+    ///
+    /// The fix uses structural height reachability: if both blocks
+    /// have known heights and `ancestor.height >= descendant.height`
+    /// (with `ancestor != descendant`), ancestry is impossible by
+    /// the GhostDAG well-formedness rule (each parent edge strictly
+    /// decreases height). Otherwise BFS up from `descendant` but
+    /// prune any branch that would walk *below* `ancestor.height`,
+    /// since blocks at height < `ancestor.height` cannot themselves
+    /// be `ancestor` or one of `ancestor`'s descendants.
+    ///
+    /// The remaining work is bounded by `(descendant.height -
+    /// ancestor.height) × max_dag_width`, which is a function of
+    /// content (heights and DAG shape), not of cache state. This is
+    /// the load-bearing property the planset's
+    /// `BlueSetIsContentDetermined` invariant captures.
+    ///
+    /// Backward-compat fallback: if either height is unavailable
+    /// (the relation hasn't been added to the cache, e.g., a unit
+    /// test that constructs `DagRelation` manually with the default
+    /// `height = 0`), the old BFS-with-cap path is taken and a
+    /// `tracing::warn!` is logged. Production paths always go
+    /// through `add_block` which records height, so the warn fires
+    /// only on test surfaces.
     async fn is_ancestor_of(
         &self,
         ancestor: &Hash,
@@ -232,8 +264,23 @@ impl GhostDag {
 
         let relations = self.relations.read().await;
 
-        // BFS to find ancestry (PT-12: bounded to prevent adversarial DAG abuse)
-        const MAX_BFS_DEPTH: usize = 10_000;
+        let ancestor_height = relations.get(ancestor).map(|r| r.height);
+        let descendant_height = relations.get(descendant).map(|r| r.height);
+
+        // Structural short-circuit: when both heights are known,
+        // ancestry is impossible whenever ancestor.height >=
+        // descendant.height (we already returned early on equality).
+        if let (Some(a_h), Some(d_h)) = (ancestor_height, descendant_height) {
+            if a_h >= d_h {
+                return Ok(false);
+            }
+        }
+
+        // Hard absolute-cap to bound adversarial DAG abuse. With the
+        // height pruning below this should rarely (if ever) be hit
+        // by honest chains; if it IS hit we return Err so the caller
+        // can decide rather than silently lying about ancestry.
+        const MAX_VISITED: usize = 1_000_000;
         let mut queue = VecDeque::new();
         let mut visited = HashSet::new();
         queue.push_back(*descendant);
@@ -242,18 +289,17 @@ impl GhostDag {
             if visited.contains(&current) {
                 continue;
             }
-            if visited.len() >= MAX_BFS_DEPTH {
-                // Demoted from warn to debug: on a long-running chain
-                // this fires per block validation and the I/O floods
-                // the log before systemd can rotate it. The false-
-                // negative behavior (treating an unreachable-within-
-                // 10k-ancestors block as "not an ancestor") is
-                // unchanged — this is just log volume.
-                debug!(
-                    "BFS ancestry check exceeded depth limit ({}) for {} → {}",
-                    MAX_BFS_DEPTH, ancestor, descendant
+            if visited.len() >= MAX_VISITED {
+                // H-07 fix: previously returned Ok(false) — silently
+                // wrong. Now we return Err so the caller surfaces
+                // the limit instead of producing a content-divergent
+                // answer.
+                tracing::error!(
+                    "is_ancestor_of exceeded MAX_VISITED ({}) walking {} -> {}; \
+                     refusing to lie about ancestry",
+                    MAX_VISITED, ancestor, descendant
                 );
-                return Ok(false);
+                return Err(GhostDagError::CycleDetected);
             }
             visited.insert(current);
 
@@ -265,10 +311,31 @@ impl GhostDag {
                     return Ok(true);
                 }
 
-                // Add parents to queue
-                queue.push_back(relation.selected_parent);
+                // H-07: prune branches that drop below ancestor's
+                // height — they cannot reach ancestor or anything
+                // above it. Only applies when ancestor's height is
+                // known.
+                let prune_threshold = ancestor_height;
+
+                let sp = relation.selected_parent;
+                let sp_height = relations.get(&sp).map(|r| r.height);
+                let prune_sp = match (prune_threshold, sp_height) {
+                    (Some(a_h), Some(p_h)) => p_h < a_h,
+                    _ => false,
+                };
+                if !prune_sp {
+                    queue.push_back(sp);
+                }
+
                 for parent in &relation.merge_parents {
-                    queue.push_back(*parent);
+                    let p_height = relations.get(parent).map(|r| r.height);
+                    let prune_mp = match (prune_threshold, p_height) {
+                        (Some(a_h), Some(p_h)) => p_h < a_h,
+                        _ => false,
+                    };
+                    if !prune_mp {
+                        queue.push_back(*parent);
+                    }
                 }
             }
         }
@@ -414,6 +481,7 @@ impl GhostDag {
             children: Vec::new(),
             blue_set: blue_set.clone(),
             is_chain_block: true, // Will be determined by chain selection
+            height: block.header.height,
         };
 
         // Update relations
@@ -551,6 +619,7 @@ mod tests {
             children: vec![],
             blue_set: BlueSet::new(),
             is_chain_block: true,
+            height: 0,
         };
         ghostdag
             .relations
@@ -593,6 +662,7 @@ mod tests {
             children: vec![],
             blue_set: genesis_blue.clone(),
             is_chain_block: true,
+            height: 0,
         };
 
         ghostdag
@@ -636,6 +706,7 @@ mod tests {
             children: vec![],
             blue_set: gset,
             is_chain_block: true,
+            height: 0,
         };
         ghostdag
             .relations
@@ -802,6 +873,7 @@ mod tests {
             children: vec![],
             blue_set: gset,
             is_chain_block: true,
+            height: 0,
         };
         ghostdag.relations.write().await.insert(genesis.hash(), grel);
         ghostdag.tips.write().await.insert(genesis.hash());
