@@ -266,9 +266,21 @@ impl DagStore {
     }
 
     /// WP-S.1: Persist a block to the backend.
+    /// RM-B1 / WP-B1.5 (audit M-06): on serialization failure, log
+    /// `error!` and skip the kv_put rather than writing empty bytes
+    /// (which would silently deserialize-fail on the next restart).
     fn persist_block(&self, block: &Block, hash: &Hash) {
         if let Some(ref kv) = self.persistent {
-            let block_bytes = bincode::serialize(block).unwrap_or_default();
+            let block_bytes = match bincode::serialize(block) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::error!(
+                        "M-06: serialize block {} failed: {} — skipping persistence",
+                        hash, e
+                    );
+                    return;
+                }
+            };
             if let Err(e) = kv.kv_put(cf::DAG_BLOCKS, hash.as_bytes(), &block_bytes) {
                 warn!("Failed to persist block {}: {}", hash, e);
             }
@@ -276,10 +288,20 @@ impl DagStore {
     }
 
     /// WP-S.1: Persist children map entry.
+    /// RM-B1 / WP-B1.5 (audit M-06): see `persist_block` doc.
     fn persist_children(&self, parent: &Hash, children: &[Hash]) {
         if let Some(ref kv) = self.persistent {
             let entry = (*parent, children.to_vec());
-            let bytes = bincode::serialize(&entry).unwrap_or_default();
+            let bytes = match bincode::serialize(&entry) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::error!(
+                        "M-06: serialize children for {} failed: {} — skipping persistence",
+                        parent, e
+                    );
+                    return;
+                }
+            };
             if let Err(e) = kv.kv_put(cf::DAG_CHILDREN, parent.as_bytes(), &bytes) {
                 warn!("Failed to persist children for {}: {}", parent, e);
             }
@@ -313,9 +335,19 @@ impl DagStore {
     }
 
     /// WP-S.1: Persist height index.
+    /// RM-B1 / WP-B1.5 (audit M-06): see `persist_block` doc.
     fn persist_height_index(&self, height: u64, hashes: &[Hash]) {
         if let Some(ref kv) = self.persistent {
-            let bytes = bincode::serialize(hashes).unwrap_or_default();
+            let bytes = match bincode::serialize(hashes) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::error!(
+                        "M-06: serialize height index {} failed: {} — skipping persistence",
+                        height, e
+                    );
+                    return;
+                }
+            };
             if let Err(e) = kv.kv_put(cf::DAG_HEIGHT_INDEX, &height.to_be_bytes(), &bytes) {
                 warn!("Failed to persist height index {}: {}", height, e);
             }
