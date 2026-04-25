@@ -7,9 +7,56 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_hdr_async_with_config,
+    tungstenite::{
+        handshake::server::{Request, Response, ErrorResponse},
+        http::StatusCode,
+        protocol::WebSocketConfig,
+        Message,
+    },
+};
 use tracing::{debug, error, info, warn};
+
+/// RM-B1 / WP-C1.4 (audit M-API-02): WebSocket configuration with
+/// the structural caps that close the audit finding.
+///
+/// Defaults are conservative — production operators should tune
+/// based on observed traffic. The pre-fix server had NO caps and
+/// used tungstenite's 64MB default frame size.
+#[derive(Debug, Clone)]
+pub struct WsConfig {
+    /// Maximum concurrent connections. New connections beyond this
+    /// cap are rejected at accept time.
+    pub max_connections: usize,
+    /// Maximum subscriptions per connection. Subscribe requests
+    /// beyond this cap return a WsMessage::Error.
+    pub max_subscriptions_per_conn: usize,
+    /// Maximum frame size in bytes. Tungstenite's default is 64MB
+    /// — we set 1MB to bound per-connection memory.
+    pub max_frame_size: usize,
+    /// Idle timeout: connections without any message for this long
+    /// are dropped. Pre-fix idle connections lived forever.
+    pub idle_timeout_secs: u64,
+    /// CORS allowlist for the Origin header. RM-B1 / WP-C1.5
+    /// (audit L-API-01). Empty list = allow all (dev / testnet).
+    /// Wildcard `"*"` entries are NOT supported — require exact match.
+    pub allowed_origins: Vec<String>,
+}
+
+impl Default for WsConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 1024,
+            max_subscriptions_per_conn: 64,
+            max_frame_size: 1_048_576, // 1 MiB
+            idle_timeout_secs: 60,
+            allowed_origins: vec![],
+        }
+    }
+}
 
 /// WebSocket subscription types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,31 +110,69 @@ pub struct WebSocketServer {
     addr: SocketAddr,
     connections:
         Arc<tokio::sync::RwLock<HashMap<String, Arc<tokio::sync::Mutex<WebSocketConnection>>>>>,
+    /// RM-B1 / WP-C1.4 (audit M-API-02): bounds on connections,
+    /// subscriptions, frame size, and idle timeout.
+    config: WsConfig,
+    /// Atomic counter of active connections — used to enforce
+    /// `config.max_connections` at accept time.
+    active_count: Arc<AtomicUsize>,
 }
 
 impl WebSocketServer {
-    /// Create a new WebSocket server
+    /// Create a new WebSocket server with default config (1024
+    /// connections, 64 subscriptions/conn, 1MB frames, 60s idle).
     pub fn new(addr: SocketAddr) -> Self {
+        Self::new_with_config(addr, WsConfig::default())
+    }
+
+    /// Create a new WebSocket server with explicit config.
+    /// RM-B1 / WP-C1.4 (audit M-API-02).
+    pub fn new_with_config(addr: SocketAddr, config: WsConfig) -> Self {
         Self {
             addr,
             connections: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            config,
+            active_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// Start the WebSocket server
     pub async fn start(self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(self.addr).await?;
-        info!("WebSocket server listening on {}", self.addr);
+        info!(
+            "WebSocket server listening on {} (max_connections={}, max_frame={}KB, allowed_origins={:?})",
+            self.addr,
+            self.config.max_connections,
+            self.config.max_frame_size / 1024,
+            self.config.allowed_origins
+        );
 
         let connections = self.connections.clone();
+        let config = Arc::new(self.config.clone());
+        let active_count = self.active_count.clone();
 
         while let Ok((stream, peer_addr)) = listener.accept().await {
+            // M-API-02: enforce max_connections at accept time.
+            let prior = active_count.fetch_add(1, AtomicOrdering::SeqCst);
+            if prior >= config.max_connections {
+                active_count.fetch_sub(1, AtomicOrdering::SeqCst);
+                warn!(
+                    "M-API-02: rejecting WS from {} — max_connections ({}) reached",
+                    peer_addr, config.max_connections
+                );
+                drop(stream);
+                continue;
+            }
+
             let connections = connections.clone();
+            let config = config.clone();
+            let active_count = active_count.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, peer_addr, connections).await {
+                if let Err(e) = handle_connection(stream, peer_addr, connections, config).await {
                     error!("WebSocket connection error from {}: {}", peer_addr, e);
                 }
+                active_count.fetch_sub(1, AtomicOrdering::SeqCst);
             });
         }
 
@@ -252,17 +337,59 @@ impl WebSocketServer {
     }
 }
 
-/// Handle a new WebSocket connection
+/// Handle a new WebSocket connection.
+///
+/// RM-B1 / WP-C1.4 + WP-C1.5 (audit M-API-02 + L-API-01): enforces
+/// max_frame_size during the WebSocket handshake and validates the
+/// Origin header against the CORS allowlist before upgrading.
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     connections: Arc<
         tokio::sync::RwLock<HashMap<String, Arc<tokio::sync::Mutex<WebSocketConnection>>>>,
     >,
+    config: Arc<WsConfig>,
 ) -> anyhow::Result<()> {
     debug!("New WebSocket connection from {}", peer_addr);
 
-    let ws_stream = accept_async(stream).await?;
+    // L-API-01: capture the Origin header during upgrade and verify
+    // it against `config.allowed_origins`. Empty allowlist = allow
+    // all (devnet / testnet).
+    let allowed_origins = config.allowed_origins.clone();
+    let origin_callback = move |req: &Request, response: Response|
+        -> Result<Response, ErrorResponse>
+    {
+        if allowed_origins.is_empty() {
+            return Ok(response);
+        }
+        let origin = req
+            .headers()
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !allowed_origins.iter().any(|allowed| allowed == origin) {
+            warn!(
+                "L-API-01: rejecting WS upgrade — Origin '{}' not in allowed_origins",
+                origin
+            );
+            let body = "Origin not allowed";
+            let resp = ErrorResponse::new(Some(body.to_string()));
+            let (mut parts, body) = resp.into_parts();
+            parts.status = StatusCode::FORBIDDEN;
+            return Err(ErrorResponse::from_parts(parts, body));
+        }
+        Ok(response)
+    };
+
+    // M-API-02: tungstenite WebSocketConfig caps the frame size.
+    let mut tungstenite_cfg = WebSocketConfig::default();
+    tungstenite_cfg.max_message_size = Some(config.max_frame_size);
+    tungstenite_cfg.max_frame_size = Some(config.max_frame_size);
+
+    let ws_stream = accept_hdr_async_with_config(stream, origin_callback, Some(tungstenite_cfg))
+        .await
+        .map_err(|e| anyhow::anyhow!("WS upgrade failed: {}", e))?;
+
     let connection_id = format!("{}-{}", peer_addr, chrono::Utc::now().timestamp_millis());
 
     let connection = Arc::new(tokio::sync::Mutex::new(WebSocketConnection {
@@ -277,8 +404,15 @@ async fn handle_connection(
         connections_map.insert(connection_id.clone(), connection.clone());
     }
 
-    // Handle messages from this connection
-    let result = handle_connection_messages(connection.clone()).await;
+    // Handle messages from this connection.
+    // M-API-02: enforce idle timeout via tokio::time::timeout per
+    // message read; on timeout, drop the connection.
+    let result = handle_connection_messages(
+        connection.clone(),
+        config.idle_timeout_secs,
+        config.max_subscriptions_per_conn,
+    )
+    .await;
 
     // Remove from connections map when done
     {
@@ -291,19 +425,37 @@ async fn handle_connection(
     result
 }
 
-/// Handle messages from a WebSocket connection
+/// Handle messages from a WebSocket connection.
+///
+/// RM-B1 / WP-C1.4 (audit M-API-02): each `next()` is wrapped in a
+/// `tokio::time::timeout(idle_timeout)`. A connection that goes
+/// silent for longer than the timeout is dropped. Subscribe
+/// requests beyond `max_subscriptions_per_conn` are rejected.
 async fn handle_connection_messages(
     connection: Arc<tokio::sync::Mutex<WebSocketConnection>>,
+    idle_timeout_secs: u64,
+    max_subs_per_conn: usize,
 ) -> anyhow::Result<()> {
+    let idle = std::time::Duration::from_secs(idle_timeout_secs);
     loop {
         let message = {
             let mut conn = connection.lock().await;
-            conn.sink.next().await
+            match tokio::time::timeout(idle, conn.sink.next()).await {
+                Ok(m) => m,
+                Err(_) => {
+                    info!(
+                        "M-API-02: dropping idle WS connection {} after {}s without traffic",
+                        conn.id, idle_timeout_secs
+                    );
+                    let _ = conn.sink.send(Message::Close(None)).await;
+                    return Ok(());
+                }
+            }
         };
 
         match message {
             Some(Ok(Message::Text(text))) => {
-                if let Err(e) = handle_text_message(connection.clone(), text).await {
+                if let Err(e) = handle_text_message(connection.clone(), text, max_subs_per_conn).await {
                     warn!("Error handling WebSocket message: {}", e);
                 }
             }
@@ -343,12 +495,33 @@ async fn handle_connection_messages(
 async fn handle_text_message(
     connection: Arc<tokio::sync::Mutex<WebSocketConnection>>,
     text: String,
+    max_subs_per_conn: usize,
 ) -> anyhow::Result<()> {
     let message: WsMessage = serde_json::from_str(&text)?;
 
     match message {
         WsMessage::Subscribe { id, subscription } => {
             let subscription_id = uuid::Uuid::new_v4().to_string();
+
+            // RM-B1 / WP-C1.4 (audit M-API-02): cap per-connection
+            // subscription count.
+            {
+                let conn = connection.lock().await;
+                if conn.subscriptions.len() >= max_subs_per_conn {
+                    drop(conn);
+                    let err = WsMessage::Error {
+                        id: id.clone(),
+                        error: format!(
+                            "M-API-02: subscription cap ({}) reached on this connection",
+                            max_subs_per_conn
+                        ),
+                    };
+                    let err_json = serde_json::to_string(&err)?;
+                    let mut conn = connection.lock().await;
+                    conn.sink.send(Message::Text(err_json)).await?;
+                    return Ok(());
+                }
+            }
 
             {
                 let mut conn = connection.lock().await;

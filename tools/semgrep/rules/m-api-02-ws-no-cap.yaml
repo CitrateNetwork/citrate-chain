@@ -1,0 +1,38 @@
+# M-API-02 — WebSocket server requires connection / subscription /
+# frame caps + idle timeout.
+#
+# Audit finding (MEDIUM):
+#   .audit/2026-04-24-full-repo-adversarial-audit/04_FINDINGS_API_NETWORK_STORAGE.md#m-api-02
+#
+# Pre-fix `WebSocketServer::start` spawned an unlimited number of
+# connections, accepted unbounded subscriptions per connection,
+# and used tungstenite's 64MB default frame size. A trivial
+# attacker could open thousands of connections with thousands of
+# subscriptions each, exhausting memory.
+#
+# Post-fix `WsConfig` carries `max_connections`, `max_subscriptions_per_conn`,
+# `max_frame_size`, `idle_timeout_secs`, and `allowed_origins`. The
+# default constructor `WebSocketServer::new` returns the audited
+# defaults; `WebSocketServer::new_with_config` lets ops override.
+#
+# This rule fires on direct `accept_async(stream)` calls without a
+# config that caps the frame size. The canonical impl in
+# `websocket.rs` is exempted by path.
+
+rules:
+  - id: m-api-02-ws-no-frame-cap
+    message: >-
+      WebSocket `accept_async(stream)` without a frame-size cap
+      is forbidden (M-API-02). Use `accept_hdr_async_with_config`
+      with `WebSocketConfig { max_frame_size: Some(1MB), ... }`.
+      See core/api/src/websocket.rs::handle_connection.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/api/**/*.rs"
+      exclude:
+        - "core/api/src/websocket.rs"  # canonical impl
+        - "**/tests/**"
+    patterns:
+      - pattern: tokio_tungstenite::accept_async($STREAM).await

@@ -1891,8 +1891,34 @@ pub fn register_eth_methods(
     });
 
     // citrate_getMempoolSnapshot - Get all pending transactions in mempool
+    //
+    // RM-B1 / WP-C1.1 (audit H-API-01): operator-auth gated. Pre-fix
+    // any unauthenticated caller could dump the full mempool — sender,
+    // target, value, calldata, gas price — enabling generalised front-
+    // running and deanonymisation. Post-fix the method requires the
+    // same `operator_token` that `setOperator` etc. require, gated by
+    // `CITRATE_OPERATOR_TOKEN`. Without that env var set, the endpoint
+    // is fail-closed (returns 401-equivalent JSON-RPC error).
     let mempool_snapshot = mempool.clone();
-    io_handler.add_sync_method("citrate_getMempoolSnapshot", move |_params: Params| {
+    io_handler.add_sync_method("citrate_getMempoolSnapshot", move |params: Params| {
+        // Parse params as an object for the operator_token field.
+        let params_map = match params {
+            Params::Map(map) => map,
+            Params::None => serde_json::Map::new(),
+            Params::Array(arr) => {
+                // Some clients send `params: [{ "operator_token": "..." }]`.
+                // Accept the first object element if present.
+                if let Some(serde_json::Value::Object(map)) = arr.into_iter().next() {
+                    map
+                } else {
+                    serde_json::Map::new()
+                }
+            }
+        };
+
+        // H-API-01 fix: operator-auth gate.
+        crate::server::require_operator_auth(&params_map)?;
+
         let mp = mempool_snapshot.clone();
 
         // Get mempool stats to know how many transactions to fetch
