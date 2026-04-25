@@ -19,6 +19,8 @@ sha3 = "0.10"
 argon2 = "0.5"
 aes-gcm = "0.10"
 scrypt = { version = "0.11", default-features = false }
+# Audit finding WAL-04: zeroize secret material on drop.
+zeroize = { version = "1.7", features = ["zeroize_derive"] }
 
 # Storage
 serde = { version = "1.0", features = ["derive"] }
