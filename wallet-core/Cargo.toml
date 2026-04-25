@@ -20,6 +20,10 @@ bip39 = { version = "1.2", features = ["rand", "std"] }
 # Encryption (WASM-compatible — pure Rust)
 aes-gcm = "0.10"
 argon2 = "0.5"
+# Audit finding WAL-04: zeroize secret material on drop.
+# Audit finding CX-02: constant-time byte comparison for MAC/tag values.
+zeroize = { version = "1.7", features = ["zeroize_derive"] }
+subtle = "2.5"
 
 # Serialization (WASM-compatible)
 serde = { version = "1", features = ["derive"] }
