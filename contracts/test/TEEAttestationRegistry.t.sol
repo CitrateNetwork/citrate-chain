@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {TEEAttestationRegistry} from "../src/TEEAttestationRegistry.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 /// @title TEEAttestationRegistryTest — CM-08 WP-08.1 acceptance
 /// @notice Verifies the PipelineParallelTEE.tla invariants at
@@ -373,13 +374,13 @@ contract TEEAttestationRegistryTest is Test {
 
     function test_strict_mode_toggle_only_governance() public {
         vm.prank(worker);
-        vm.expectRevert("TEERegistry: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         registry.setStrictCryptographicMode(true);
     }
 
     function test_set_maa_rsa_key_only_governance() public {
         vm.prank(worker);
-        vm.expectRevert("TEERegistry: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         registry.proposeMaaRsaKey(MAA_KID_HASH, MAA_RSA_MODULUS, MAA_RSA_EXPONENT, true);
     }
 }

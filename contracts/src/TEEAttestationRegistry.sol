@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import "./lib/ReentrancyGuard.sol";
 import "./lib/RS256.sol";
 import "./lib/JWTParser.sol";
+import "./lib/Governable.sol";
 
 /// @title TEEAttestationRegistry — CM-08 on-chain attestation state
 /// @notice Stores per-worker TEE attestation records for
@@ -36,7 +37,7 @@ import "./lib/JWTParser.sol";
 ///           NotAttested → Attested → Expired → Slashed (absorbing)
 ///
 /// @dev CM-08 WP-08.1. See docs/adr/ADR-010-tee-attestation-registry.md.
-contract TEEAttestationRegistry is ReentrancyGuard {
+contract TEEAttestationRegistry is ReentrancyGuard, Governable {
     // ── Types ───────────────────────────────────────────────────────
 
     struct AttestationRecord {
@@ -136,9 +137,9 @@ contract TEEAttestationRegistry is ReentrancyGuard {
     /// real key-rotation timelines.
     uint64 public constant RSA_KEY_TIMELOCK_BLOCKS = 3600;
 
-    /// @notice Governance address (manages signer whitelists + slash
-    /// execution).
-    address public governance;
+    // Governance state lives in Governable mixin (RM-B1 / WP-D1.1,
+    // audit SOL-21). Read via `governance()` view; mutations go
+    // through `transferGovernance` + `acceptGovernance`.
 
     // ── Events ──────────────────────────────────────────────────────
 
@@ -167,18 +168,11 @@ contract TEEAttestationRegistry is ReentrancyGuard {
         bytes32 indexed kidHash
     );
 
-    // ── Modifiers ───────────────────────────────────────────────────
-
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "TEERegistry: not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     // ── Constructor ─────────────────────────────────────────────────
 
-    constructor(address _governance) {
-        require(_governance != address(0), "TEERegistry: zero governance");
-        governance = _governance;
+    constructor(address _governance) Governable(_governance) {
         // RM-B1 / WP-D3.1 (audit SOL-03): secure-by-default. The V1
         // governance-trusted path requires an explicit opt-out.
         strictCryptographicMode = true;
@@ -621,8 +615,6 @@ contract TEEAttestationRegistry is ReentrancyGuard {
         emit StrictCryptographicModeChanged(enabled);
     }
 
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "TEERegistry: zero governance");
-        governance = newGovernance;
-    }
+    // transferGovernance / acceptGovernance / cancelGovernanceTransfer
+    // are inherited from Governable.
 }

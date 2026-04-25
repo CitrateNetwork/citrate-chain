@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/Governable.sol";
 import "./TEEAttestationRegistry.sol";
 
 /// @title ComputePoolPipeline — PipelineParallel inference (CM-08)
@@ -26,7 +27,7 @@ import "./TEEAttestationRegistry.sol";
 ///
 /// @dev CM-08 WP-08.1. Stand-alone deployment; separate from
 ///      ComputePool (CM-05) and ComputePoolTraining (CM-07).
-contract ComputePoolPipeline is ReentrancyGuard {
+contract ComputePoolPipeline is ReentrancyGuard, Governable {
     // ── Types ───────────────────────────────────────────────────────
 
     enum JobState { Forming, Active, Draining, Terminated }
@@ -90,7 +91,7 @@ contract ComputePoolPipeline is ReentrancyGuard {
     uint256 public nextJobId;
     uint256 public nextRequestId;
 
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ── Events ──────────────────────────────────────────────────────
 
@@ -108,10 +109,7 @@ contract ComputePoolPipeline is ReentrancyGuard {
 
     // ── Modifiers ───────────────────────────────────────────────────
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "Pipeline: not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     modifier jobExists(uint256 jobId) {
         require(jobs[jobId].creator != address(0), "Pipeline: unknown job");
@@ -120,10 +118,10 @@ contract ComputePoolPipeline is ReentrancyGuard {
 
     // ── Constructor ─────────────────────────────────────────────────
 
-    constructor(address _governance, address _teeRegistry) {
-        require(_governance != address(0), "Pipeline: zero governance");
+    constructor(address _governance, address _teeRegistry)
+        Governable(_governance)
+    {
         require(_teeRegistry != address(0), "Pipeline: zero registry");
-        governance = _governance;
         teeRegistry = TEEAttestationRegistry(_teeRegistry);
     }
 
@@ -253,7 +251,7 @@ contract ComputePoolPipeline is ReentrancyGuard {
         // deadline. Pre-fix only the original requester or
         // governance could fail the request — a self-destructed
         // requester left the stake/escrow permanently locked.
-        bool authorized = msg.sender == req.requester || msg.sender == governance;
+        bool authorized = msg.sender == req.requester || msg.sender == governance();
         bool pastDeadline = block.number > req.deadlineBlock;
         require(authorized || pastDeadline, "Pipeline: not authorized to fail");
 
@@ -279,7 +277,7 @@ contract ComputePoolPipeline is ReentrancyGuard {
         address former = stageOwner[jobId][stage];
         require(former != address(0), "Pipeline: no owner to fault");
         require(
-            _isAnyStageOwner(jobId, msg.sender) || msg.sender == governance,
+            _isAnyStageOwner(jobId, msg.sender) || msg.sender == governance(),
             "Pipeline: not authorized to fault"
         );
 
@@ -318,7 +316,7 @@ contract ComputePoolPipeline is ReentrancyGuard {
     function drainJob(uint256 jobId) external jobExists(jobId) {
         Job storage job = jobs[jobId];
         require(job.state == JobState.Active, "Pipeline: not active");
-        require(msg.sender == job.creator || msg.sender == governance, "Pipeline: not authorized");
+        require(msg.sender == job.creator || msg.sender == governance(), "Pipeline: not authorized");
         job.state = JobState.Draining;
         emit JobDraining(jobId);
     }

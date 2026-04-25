@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/Governable.sol";
 import "./StablecoinTreasury.sol";
 import "./interfaces/IComputePricingOracle.sol";
 
@@ -19,7 +20,7 @@ import "./interfaces/IComputePricingOracle.sol";
 ///   5. estimateCallsRemaining() returns approximate inference budget
 ///
 /// Sprint ECON-2 — WP-E2.1
-contract BulkComputeGateway is ReentrancyGuard {
+contract BulkComputeGateway is ReentrancyGuard, Governable {
     // ============================================================
     // Constants
     // ============================================================
@@ -40,8 +41,7 @@ contract BulkComputeGateway is ReentrancyGuard {
     /// @notice Oracle for compute-to-USD pricing
     IComputePricingOracle public oracle;
 
-    /// @notice Governance address
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ============================================================
     // State — Authorized Spenders
@@ -100,20 +100,17 @@ contract BulkComputeGateway is ReentrancyGuard {
     event SpenderRevoked(address indexed spender);
     event OracleUpdated(address indexed oldOracle, address indexed newOracle);
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
-    event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+    // GovernanceTransferred event is provided by Governable mixin.
 
     // ============================================================
     // Modifiers
     // ============================================================
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "BulkComputeGateway: not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     modifier onlyAuthorizedSpender() {
         require(
-            authorizedSpenders[msg.sender] || msg.sender == governance,
+            authorizedSpenders[msg.sender] || msg.sender == governance(),
             "BulkComputeGateway: not authorized spender"
         );
         _;
@@ -131,14 +128,12 @@ contract BulkComputeGateway is ReentrancyGuard {
         address _treasury,
         address _oracle,
         address _governance
-    ) {
+    ) Governable(_governance) {
         require(_treasury != address(0), "BulkComputeGateway: zero treasury");
         require(_oracle != address(0), "BulkComputeGateway: zero oracle");
-        require(_governance != address(0), "BulkComputeGateway: zero governance");
 
         treasury = StablecoinTreasury(_treasury);
         oracle = IComputePricingOracle(_oracle);
-        governance = _governance;
     }
 
     // ============================================================
@@ -342,13 +337,7 @@ contract BulkComputeGateway is ReentrancyGuard {
         emit TreasuryUpdated(old, newTreasury);
     }
 
-    /// @notice Transfer governance
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "BulkComputeGateway: zero address");
-        address old = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(old, newGovernance);
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     // ============================================================
     // Internal Helpers

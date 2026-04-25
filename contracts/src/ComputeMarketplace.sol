@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import "./lib/ReentrancyGuard.sol";
 import "./lib/ComputeLib.sol";
 import "./lib/Burner.sol";
+import "./lib/Governable.sol";
 import "./ComputeVerifier.sol";
 
 /// @notice Minimal interface to BulkComputeGateway used by the
@@ -53,7 +54,7 @@ interface IComputePricingOracleMin {
 ///   - StakeNonNegative: no account goes below zero
 ///
 /// @dev Extends InferenceRouter patterns with full lifecycle, bidding, escrow, BME burn.
-contract ComputeMarketplace is ReentrancyGuard {
+contract ComputeMarketplace is ReentrancyGuard, Governable {
     // ============================================================
     // Types
     // ============================================================
@@ -184,8 +185,7 @@ contract ComputeMarketplace is ReentrancyGuard {
     /// @notice Treasury address for fee collection
     address public treasury;
 
-    /// @notice Governance address
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     /// @notice Burner contract for permanently locking ETH.
     /// RM-B1 / WP-D5.9 (audit SOL-19): replaces `payable(0xdead)`.
@@ -314,10 +314,7 @@ contract ComputeMarketplace is ReentrancyGuard {
     // Modifiers
     // ============================================================
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "ComputeMarketplace: not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     modifier jobExists(uint256 jobId) {
         require(jobId < nextJobId, "ComputeMarketplace: job does not exist");
@@ -328,13 +325,14 @@ contract ComputeMarketplace is ReentrancyGuard {
     // Constructor
     // ============================================================
 
-    constructor(address _verifier, address _treasury) {
+    constructor(address _verifier, address _treasury)
+        Governable(msg.sender)
+    {
         require(_verifier != address(0), "ComputeMarketplace: zero verifier");
         require(_treasury != address(0), "ComputeMarketplace: zero treasury");
 
         verifier = ComputeVerifier(_verifier);
         treasury = _treasury;
-        governance = msg.sender;
         // RM-B1 / WP-D5.9 (audit SOL-19): deploy a fresh Burner
         // at construction time so burns are immediately functional.
         // Governance can later swap it via `setBurner` if needed.
@@ -1059,11 +1057,7 @@ contract ComputeMarketplace is ReentrancyGuard {
         slashingContract = _slashing;
     }
 
-    /// @notice Transfer governance
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "ComputeMarketplace: zero address");
-        governance = newGovernance;
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     /// @notice Set the Burner contract for permanently locking
     /// burned bonds + BME burn share.

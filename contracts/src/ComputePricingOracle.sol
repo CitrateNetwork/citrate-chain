@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "./interfaces/IComputePricingOracle.sol";
+import "./lib/Governable.sol";
 
 /// @title ComputePricingOracle — On-Chain Compute-to-SALT Pricing
 /// @notice BFT quorum oracle that maps real-world compute costs (PFLOP-hours) to SALT.
@@ -21,7 +22,7 @@ import "./interfaces/IComputePricingOracle.sol";
 ///      4. At 67% quorum, price is finalized and applied
 ///      5. Rate limiter rejects changes > 10% from current price
 ///      6. lastUpdateBlock is set; staleness checked against MAX_STALENESS
-contract ComputePricingOracle is IComputePricingOracle {
+contract ComputePricingOracle is IComputePricingOracle, Governable {
     // ============================================================
     // Constants
     // ============================================================
@@ -102,11 +103,7 @@ contract ComputePricingOracle is IComputePricingOracle {
     mapping(uint256 => uint256) private _saltVoteCount;
     mapping(uint256 => bool) private _saltFinalized;
 
-    // ============================================================
-    // State — Governance
-    // ============================================================
-
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ============================================================
     // Events
@@ -118,16 +115,13 @@ contract ComputePricingOracle is IComputePricingOracle {
     event SaltPriceUpdated(uint256 oldPrice, uint256 newPrice, uint256 nonce);
     event OracleMemberAdded(address indexed member);
     event OracleMemberRemoved(address indexed member);
-    event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+    // GovernanceTransferred event is provided by Governable mixin.
 
     // ============================================================
     // Modifiers
     // ============================================================
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "ComputePricingOracle: not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     modifier onlyOracle() {
         require(isOracleMember[msg.sender], "ComputePricingOracle: not oracle member");
@@ -141,11 +135,12 @@ contract ComputePricingOracle is IComputePricingOracle {
     /// @notice Deploy with initial prices
     /// @param _computePriceUsdCents Initial compute price in USD cents per PFLOP-hour
     /// @param _saltPriceUsdCents Initial SALT price in USD cents
-    constructor(uint256 _computePriceUsdCents, uint256 _saltPriceUsdCents) {
+    constructor(uint256 _computePriceUsdCents, uint256 _saltPriceUsdCents)
+        Governable(msg.sender)
+    {
         require(_computePriceUsdCents > 0, "ComputePricingOracle: zero compute price");
         require(_saltPriceUsdCents > 0, "ComputePricingOracle: zero SALT price");
 
-        governance = msg.sender;
         computePriceUsdCents = _computePriceUsdCents;
         saltPriceUsdCents = _saltPriceUsdCents;
         lastUpdateBlock = block.number;
@@ -397,14 +392,7 @@ contract ComputePricingOracle is IComputePricingOracle {
     // Governance
     // ============================================================
 
-    /// @notice Transfer governance to a new address
-    /// @param newGovernance The new governance address
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "ComputePricingOracle: zero address");
-        address old = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(old, newGovernance);
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     // ============================================================
     // Internal Helpers

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/Governable.sol";
 
 /// @title LiquidStakingPool — stSALT Liquid Staking
 /// @notice Deposit SALT and receive stSALT shares. Rewards accrue to the pool,
@@ -9,7 +10,7 @@ import "./lib/ReentrancyGuard.sol";
 /// @dev Implements a Lido-style shares model adapted for compute staking.
 ///      Provider collateral follows the Rocket Pool tiered pattern.
 ///      Oracle committee (BFT checkpoint validators) reports rewards.
-contract LiquidStakingPool is ReentrancyGuard {
+contract LiquidStakingPool is ReentrancyGuard, Governable {
     // ============================================================
     // Constants
     // ============================================================
@@ -90,8 +91,7 @@ contract LiquidStakingPool is ReentrancyGuard {
     mapping(address => uint256) public providerCollateral;
 
     // --- Governance ---
-
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ============================================================
     // Events
@@ -104,7 +104,7 @@ contract LiquidStakingPool is ReentrancyGuard {
     event ProviderSlashed(address indexed provider, uint256 amount);
     event OracleAdded(address indexed oracle);
     event OracleRemoved(address indexed oracle);
-    event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+    // GovernanceTransferred event is provided by Governable mixin.
     event CollateralDeposited(address indexed provider, uint256 amount);
     event CollateralWithdrawn(address indexed provider, uint256 amount);
 
@@ -112,18 +112,13 @@ contract LiquidStakingPool is ReentrancyGuard {
     // Modifiers
     // ============================================================
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "Not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     // ============================================================
     // Constructor
     // ============================================================
 
-    constructor() {
-        governance = msg.sender;
-    }
+    constructor() Governable(msg.sender) {}
 
     // ============================================================
     // Core: Deposit
@@ -370,13 +365,7 @@ contract LiquidStakingPool is ReentrancyGuard {
         emit OracleRemoved(oracle);
     }
 
-    /// @notice Transfer governance to a new address
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "Zero address");
-        address oldGov = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(oldGov, newGovernance);
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     // ============================================================
     // Receive

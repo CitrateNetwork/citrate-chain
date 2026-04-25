@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
 import {ComputePricingOracle} from "../src/ComputePricingOracle.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 contract ComputePricingOracleTest is Test {
     ComputePricingOracle public oracle;
@@ -435,13 +436,13 @@ contract ComputePricingOracleTest is Test {
 
     function test_add_oracle_member_governance_only() public {
         vm.prank(nonMember);
-        vm.expectRevert("ComputePricingOracle: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         oracle.addOracleMember(address(0xBEEF));
     }
 
     function test_remove_oracle_member_governance_only() public {
         vm.prank(nonMember);
-        vm.expectRevert("ComputePricingOracle: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         oracle.removeOracleMember(oracle1);
     }
 
@@ -473,19 +474,23 @@ contract ComputePricingOracleTest is Test {
     }
 
     function test_transfer_governance() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         address newGov = address(0xBEEF);
         oracle.transferGovernance(newGov);
+        assertEq(oracle.pendingGovernance(), newGov, "pending recorded");
+        vm.prank(newGov);
+        oracle.acceptGovernance();
         assertEq(oracle.governance(), newGov, "governance should transfer");
     }
 
     function test_transfer_governance_zero_address_reverts() public {
-        vm.expectRevert("ComputePricingOracle: zero address");
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         oracle.transferGovernance(address(0));
     }
 
     function test_transfer_governance_non_governance_reverts() public {
         vm.prank(nonMember);
-        vm.expectRevert("ComputePricingOracle: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         oracle.transferGovernance(nonMember);
     }
 
