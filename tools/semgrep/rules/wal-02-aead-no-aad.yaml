@@ -1,0 +1,75 @@
+# WAL-02 / GUI-L-01 — AES-GCM encrypt/decrypt must bind AAD via aead::Payload.
+#
+# Audit findings:
+#   .audit/2026-04-24-full-repo-adversarial-audit/08_FINDINGS_WALLET_AGENT_FAUCET.md#wal-02
+#   .audit/2026-04-24-full-repo-adversarial-audit/07_FINDINGS_GUIS.md#gui-l-01
+#
+# Spec:
+#   citrate_v0.01.1/docs/security/SECRET_LIFECYCLE.md
+#
+# `cipher.encrypt(nonce, plaintext)` and `cipher.decrypt(nonce, ciphertext)`
+# do not bind any associated authenticated data (AAD) into the GCM tag.
+# A file-system-write-capable attacker can swap (ciphertext, nonce, salt)
+# triples across records of the same key version and decrypt to wrong
+# context.
+#
+# Production paths must call:
+#
+#     cipher.encrypt(nonce, Payload { msg, aad })
+#     cipher.decrypt(nonce, Payload { msg: ciphertext, aad })
+#
+# Closed call sites (post-WP-A3.1 + WP-A3.2):
+#   - wallet-core/src/keys.rs::{encrypt_key_raw, decrypt_key} (v2 path)
+#   - gui/citrate_edu_app/src/encryption.rs::{encrypt, decrypt}
+#
+# Acceptable exceptions (Semgrep can't statically detect intent):
+#   - wallet-core/src/keys.rs::decrypt_key v1-legacy branch — must
+#     remain no-AAD for backward-compat unlock of pre-WAL-02 entries.
+#     The match arm is documented; the rule's `pattern-not-inside`
+#     is intentionally absent because the dispatch shape `match
+#     entry.kdf_version { KDF_VERSION_LEGACY => cipher.decrypt(...) }`
+#     would require an over-broad exclusion. Rely on review.
+
+rules:
+  - id: wal-02-aead-no-aad
+    message: >-
+      Direct `cipher.encrypt(nonce, plaintext)` / `cipher.decrypt(nonce,
+      ciphertext)` does not bind AAD into the AES-GCM tag, leaving the
+      record vulnerable to substitution attacks (WAL-02 / GUI-L-01).
+      Use `cipher.encrypt(nonce, Payload { msg, aad })` instead. See
+      docs/security/SECRET_LIFECYCLE.md.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "wallet-core/src/**/*.rs"
+        - "wallet/src/**/*.rs"
+        - "wallet-sdk/src/**/*.rs"
+        - "gui/**/*.rs"
+        - "core/security/src/**/*.rs"
+        - "gateway/src/**/*.rs"
+        - "training-worker/src/**/*.rs"
+        - "pool-coordinator/src/**/*.rs"
+        - "node/src/**/*.rs"
+        - "node-app/src/**/*.rs"
+        - "faucet/src/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
+        - "**/*_tests.rs"
+        - "**/benches/**"
+    pattern-either:
+      # Direct positional encrypt/decrypt with two args (slice as second).
+      - pattern: $CIPHER.encrypt($NONCE, $PT.as_ref())
+      - pattern: $CIPHER.encrypt($NONCE, $PT.as_slice())
+      - pattern: $CIPHER.decrypt($NONCE, $CT.as_ref())
+      - pattern: $CIPHER.decrypt($NONCE, $CT.as_slice())
+    metadata:
+      audit-id: WAL-02
+      related: GUI-L-01
+      severity: high
+      sprint: RM-A3
+      wp: WP-A3.1
+      spec: citrate_v0.01.1/docs/security/SECRET_LIFECYCLE.md
+      reference: https://docs.rs/aes-gcm/latest/aes_gcm/aead/struct.Payload.html
