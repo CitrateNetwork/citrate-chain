@@ -354,25 +354,35 @@ contract BulkComputeGateway is ReentrancyGuard {
     // Internal Helpers
     // ============================================================
 
-    /// @dev Low-level ERC-20 transferFrom
+    /// @dev Low-level ERC-20 transferFrom.
+    ///
+    /// RM-B1 / WP-D5.6 (audit SOL-14): pre-fix the low-level
+    /// `token.call` returned `success=true, data=""` when the
+    /// token contract had no code (selfdestructed / deprecated).
+    /// The result-check `success && (data.length == 0 || ...)`
+    /// then accepted the empty data as success — silently
+    /// "transferring" 0 tokens and crediting the institution.
+    /// Post-fix `require(token.code.length > 0)` catches this.
     function _transferFrom(
         address token,
         address from,
         address to,
         uint256 amount
     ) internal returns (bool) {
+        require(token.code.length > 0, "BulkGateway: token has no code");
         (bool success, bytes memory data) = token.call(
             abi.encodeWithSignature("transferFrom(address,address,uint256)", from, to, amount)
         );
         return success && (data.length == 0 || abi.decode(data, (bool)));
     }
 
-    /// @dev Low-level ERC-20 approve
+    /// @dev Low-level ERC-20 approve. SOL-14: same code-length check.
     function _approve(
         address token,
         address spender,
         uint256 amount
     ) internal returns (bool) {
+        require(token.code.length > 0, "BulkGateway: token has no code");
         (bool success, bytes memory data) = token.call(
             abi.encodeWithSignature("approve(address,uint256)", spender, amount)
         );

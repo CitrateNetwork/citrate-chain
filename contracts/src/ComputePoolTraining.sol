@@ -702,17 +702,30 @@ contract ComputePoolTraining is ReentrancyGuard {
     /// the sort-by-(step, worker) canonical leaf ordering described
     /// in ADR-008 — the verifier is independent of leaf order as long
     /// as both sides agree on it.
+    ///
+    /// RM-B1 / WP-D5.10 (audit SOL-20): pre-fix the verifier hashed
+    /// `keccak(min, max)` for both leaves and internal nodes — same
+    /// domain. This made it possible to present an internal hash
+    /// from a larger tree as a leaf in a smaller tree (second-
+    /// preimage). Post-fix leaves are domain-prefixed with `0x00`
+    /// and internals with `0x01`. Off-chain proof generators MUST
+    /// match: leaf = keccak(0x00 || <content>); internal =
+    /// keccak(0x01 || min || max).
+    bytes1 private constant MERKLE_LEAF_PREFIX = 0x00;
+    bytes1 private constant MERKLE_INTERNAL_PREFIX = 0x01;
+
     function _verifyMerkleProof(
         bytes32[] calldata proof,
         bytes32 root,
         bytes32 leaf
     ) internal pure returns (bool) {
-        bytes32 computed = leaf;
+        // Promote the raw leaf hash into the leaf domain.
+        bytes32 computed = keccak256(abi.encodePacked(MERKLE_LEAF_PREFIX, leaf));
         for (uint256 i = 0; i < proof.length; i++) {
             bytes32 sibling = proof[i];
             computed = computed <= sibling
-                ? keccak256(abi.encodePacked(computed, sibling))
-                : keccak256(abi.encodePacked(sibling, computed));
+                ? keccak256(abi.encodePacked(MERKLE_INTERNAL_PREFIX, computed, sibling))
+                : keccak256(abi.encodePacked(MERKLE_INTERNAL_PREFIX, sibling, computed));
         }
         return computed == root;
     }

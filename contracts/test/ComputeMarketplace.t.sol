@@ -325,10 +325,10 @@ contract ComputeMarketplaceTest is Test {
         _submitCommitment(jobId, provider1);
         _submitResult(jobId, provider1);
 
-        uint256 deadBalBefore = address(0xdead).balance;
+        uint256 deadBalBefore = marketplace.burner().balance;
         marketplace.completeJob(jobId);
 
-        uint256 burned = address(0xdead).balance - deadBalBefore;
+        uint256 burned = marketplace.burner().balance - deadBalBefore;
         // 8 ether / 40 = 0.2 ether
         assertEq(burned, 0.2 ether, "BME burn should be exactly 2.5%");
         assertEq(marketplace.totalBurned(), 0.2 ether, "Total burned tracking");
@@ -546,13 +546,13 @@ contract ComputeMarketplaceTest is Test {
         vm.prank(disputer);
         marketplace.disputeResult{value: 10 ether}(jobId);
 
-        uint256 deadBalBefore = address(0xdead).balance;
+        uint256 deadBalBefore = marketplace.burner().balance;
 
         // Resolve: provider wins (grief attack fails)
         marketplace.resolveDispute(jobId, false);
 
         // Bond burned (sent to dead address)
-        uint256 bondBurned = address(0xdead).balance - deadBalBefore;
+        uint256 bondBurned = marketplace.burner().balance - deadBalBefore;
         assertEq(bondBurned, 10 ether, "Bond should be burned");
         assertEq(marketplace.totalDisputeBondsBurned(), 10 ether, "Bond burn tracked");
 

@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
 import "./lib/ComputeLib.sol";
+import "./lib/Burner.sol";
 import "./ComputeVerifier.sol";
 
 /// @notice Minimal interface to BulkComputeGateway used by the
@@ -134,6 +135,12 @@ contract ComputeMarketplace is ReentrancyGuard {
     /// @notice Default max concurrent jobs per provider
     uint256 public constant DEFAULT_MAX_CONCURRENT = 10;
 
+    /// RM-B1 / WP-D5.7 (audit SOL-15): minimum payment for
+    /// `autoAssignJob`. Floors out 1-wei griefing escrows that
+    /// were "Assigned" but no provider with reasonable capacity
+    /// would serve. 0.01 SALT = 1e16 wei.
+    uint256 public constant MIN_AUTO_ASSIGN_PAYMENT = 0.01 ether;
+
     /// @notice Slash rate on timeout: 5% of provider stake (Tier 1 / Latency)
     uint256 public constant TIMEOUT_SLASH_BPS = 500;
 
@@ -179,6 +186,12 @@ contract ComputeMarketplace is ReentrancyGuard {
 
     /// @notice Governance address
     address public governance;
+
+    /// @notice Burner contract for permanently locking ETH.
+    /// RM-B1 / WP-D5.9 (audit SOL-19): replaces `payable(0xdead)`.
+    /// Set via `setBurner` by governance; if unset, burns revert
+    /// (fail-closed — better than continuing to use 0xdead).
+    address public burner;
 
     /// @notice NematocystSlashing contract for provider slashing
     address public slashingContract;
@@ -322,6 +335,10 @@ contract ComputeMarketplace is ReentrancyGuard {
         verifier = ComputeVerifier(_verifier);
         treasury = _treasury;
         governance = msg.sender;
+        // RM-B1 / WP-D5.9 (audit SOL-19): deploy a fresh Burner
+        // at construction time so burns are immediately functional.
+        // Governance can later swap it via `setBurner` if needed.
+        burner = address(new Burner());
     }
 
     // ============================================================
@@ -596,10 +613,24 @@ contract ComputeMarketplace is ReentrancyGuard {
             }
         }
 
+        // RM-B1 / WP-D5.1 (audit SOL-08): if all bidders score 0
+        // (e.g., all unregistered or all at-capacity) bestIndex
+        // remains 0 and the loop selects bid[0] without verifying
+        // the score is meaningful. Reject when no bid earned a
+        // positive score.
+        require(bestScore > 0, "ComputeMarketplace: no eligible bid");
+
         Bid storage winner = bids[bestIndex];
 
         // INV-6: AssignedProviderRegistered
         require(providers[winner.provider].isRegistered, "ComputeMarketplace: provider not registered");
+        // SOL-08 follow-up: re-check capacity at assign time, not
+        // just at bid time — provider may have taken on jobs
+        // since their bid landed.
+        require(
+            providers[winner.provider].currentActiveJobs < providers[winner.provider].maxConcurrentJobs,
+            "ComputeMarketplace: provider at capacity"
+        );
 
         job.state = JobState.Assigned;
         job.assignedProvider = winner.provider;
@@ -628,7 +659,12 @@ contract ComputeMarketplace is ReentrancyGuard {
         bytes calldata inputHash,
         ComputeVerifier.VerificationTier tier
     ) external payable nonReentrant returns (uint256) {
-        require(msg.value > 0, "ComputeMarketplace: zero payment");
+        // RM-B1 / WP-D5.7 (audit SOL-15): pre-fix `msg.value > 0`
+        // allowed 1-wei escrow paths that were "Assigned" but no
+        // provider with reasonable capacity served — a bid-table
+        // pollution / state-bloat griefing surface. Floor at
+        // 0.01 SALT (1e16 wei).
+        require(msg.value >= MIN_AUTO_ASSIGN_PAYMENT, "ComputeMarketplace: payment below minimum");
         require(modelHash != bytes32(0), "ComputeMarketplace: zero model hash");
 
         uint256 maxPrice = msg.value;
@@ -958,7 +994,15 @@ contract ComputeMarketplace is ReentrancyGuard {
 
         // Burn the bond by sending to address(0) is not possible in EVM,
         // so we send to dead address (standard burn address)
-        (bool success, ) = payable(address(0xdead)).call{value: bond}("");
+        // RM-B1 / WP-D5.9 (audit SOL-19): burn via Burner contract
+        // (calls `Burner.burn{value: bond}()`) so funds are
+        // provably unrecoverable. Pre-fix `0xdead` was a sentinel
+        // address whose private key, if ever recovered, would
+        // expose the accumulated balance.
+        require(burner != address(0), "ComputeMarketplace: burner not set");
+        (bool success, ) = payable(burner).call{value: bond}(
+            abi.encodeWithSignature("burn()")
+        );
         require(success, "ComputeMarketplace: bond burn failed");
 
         // Job can now be completed normally
@@ -1021,6 +1065,19 @@ contract ComputeMarketplace is ReentrancyGuard {
         governance = newGovernance;
     }
 
+    /// @notice Set the Burner contract for permanently locking
+    /// burned bonds + BME burn share.
+    /// RM-B1 / WP-D5.9 (audit SOL-19).
+    function setBurner(address newBurner) external onlyGovernance {
+        require(newBurner != address(0), "ComputeMarketplace: zero burner");
+        require(newBurner.code.length > 0, "ComputeMarketplace: burner has no code");
+        address old = burner;
+        burner = newBurner;
+        emit BurnerUpdated(old, newBurner);
+    }
+
+    event BurnerUpdated(address oldBurner, address newBurner);
+
     /// @notice Update the BulkComputeGateway reference (CM-06 WP-06.1).
     /// Setting to `address(0)` disables the credits-payment path —
     /// subsequent credits-mode posts revert with "bulk gateway not set".
@@ -1078,9 +1135,12 @@ contract ComputeMarketplace is ReentrancyGuard {
         totalPaidToProviders += bme.providerAmount;
         totalTreasuryFees += bme.treasuryAmount;
 
-        // BME burn: send to dead address (address(0) cannot receive ETH in EVM)
+        // BME burn via Burner contract (SOL-19).
         if (bme.burnAmount > 0) {
-            (bool s1, ) = payable(address(0xdead)).call{value: bme.burnAmount}("");
+            require(burner != address(0), "ComputeMarketplace: burner not set");
+            (bool s1, ) = payable(burner).call{value: bme.burnAmount}(
+                abi.encodeWithSignature("burn()")
+            );
             require(s1, "ComputeMarketplace: burn failed");
         }
 
