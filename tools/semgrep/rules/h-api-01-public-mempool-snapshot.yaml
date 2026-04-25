@@ -1,0 +1,47 @@
+# H-API-01 — `citrate_getMempoolSnapshot` must require operator auth.
+#
+# Audit finding (HIGH):
+#   .audit/2026-04-24-full-repo-adversarial-audit/04_FINDINGS_API_NETWORK_STORAGE.md#h-api-01
+#
+# Pre-fix any unauthenticated caller could dump the full mempool —
+# sender, target, value, calldata, gas price — enabling generalised
+# frontrunning and deanonymisation. Post-fix the method calls
+# `crate::server::require_operator_auth(params)` before serving.
+#
+# This rule fires when a `citrate_*` JSON-RPC method that exposes
+# pending-tx detail is registered without a require_operator_auth
+# call in the same closure body. It's a heuristic — false positives
+# possible — so severity is WARNING.
+
+rules:
+  - id: h-api-01-public-mempool-snapshot
+    message: >-
+      The `citrate_getMempoolSnapshot` method (and similar mempool
+      read endpoints) MUST call `require_operator_auth` before
+      returning data (H-API-01). Pre-fix any caller could dump
+      pending txs.
+    languages: [rust]
+    severity: WARNING
+    paths:
+      include:
+        - "core/api/src/eth_rpc.rs"
+      exclude:
+        - "**/tests/**"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              io_handler.add_sync_method("citrate_getMempoolSnapshot", $CB)
+          - pattern: |
+              io_handler.add_method("citrate_getMempoolSnapshot", $CB)
+      - pattern-not: |
+          io_handler.add_sync_method("citrate_getMempoolSnapshot", move |$P| {
+              ...
+              crate::server::require_operator_auth(...)?;
+              ...
+          })
+      - pattern-not: |
+          io_handler.add_sync_method("citrate_getMempoolSnapshot", move |$P| {
+              ...
+              require_operator_auth(...)?;
+              ...
+          })

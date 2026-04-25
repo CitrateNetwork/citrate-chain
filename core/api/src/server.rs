@@ -36,7 +36,11 @@ use tracing::{info, warn};
 /// no token is provided, the request is REJECTED (fail-closed).
 ///
 /// Data source: `CITRATE_OPERATOR_TOKEN` environment variable.
-fn require_operator_auth(params: &serde_json::Map<String, Value>) -> Result<(), jsonrpc_core::Error> {
+///
+/// `pub(crate)` so other modules in this crate (e.g., `eth_rpc.rs`) can
+/// gate operator-only endpoints — RM-B1 / WP-C1.1 (audit H-API-01)
+/// uses this for `citrate_getMempoolSnapshot`.
+pub(crate) fn require_operator_auth(params: &serde_json::Map<String, Value>) -> Result<(), jsonrpc_core::Error> {
     let configured_token = std::env::var("CITRATE_OPERATOR_TOKEN").ok().filter(|t| !t.is_empty());
     let supplied_token = params.get("operator_token").and_then(|v| v.as_str());
 

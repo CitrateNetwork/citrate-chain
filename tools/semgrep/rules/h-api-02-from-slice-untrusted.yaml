@@ -1,0 +1,47 @@
+# H-API-02 — `H160::from_slice` / `H256::from_slice` on attacker-supplied
+# RLP bytes is forbidden without a length check.
+#
+# Audit finding (HIGH):
+#   .audit/2026-04-24-full-repo-adversarial-audit/04_FINDINGS_API_NETWORK_STORAGE.md#h-api-02
+#
+# `H160::from_slice` PANICS if the slice length isn't 20.
+# `H256::from_slice` PANICS if the slice length isn't 32.
+# RLP-decoded byte vectors come from the network and have
+# attacker-controlled length. A crafted EIP-1559 / EIP-2930 tx with
+# a 19-byte access-list address or a 31-byte storage key panics
+# the RPC worker.
+#
+# Post-fix every from_slice on RLP-decoded bytes is preceded by a
+# length check that returns Err on mismatch. This rule fires on
+# the unchecked pattern.
+
+rules:
+  - id: h-api-02-from-slice-untrusted-rlp
+    message: >-
+      `H160::from_slice` / `H256::from_slice` on RLP-decoded bytes
+      requires a length check (H-API-02). Pre-fix length mismatch
+      panicked the RPC worker. Validate `bytes.len() == 20` (or
+      32) and return Err on mismatch.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/api/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/proptest-regressions/**"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              let $BYTES: Vec<u8> = $RLP.val_at($_).map_err($_)?;
+              ...
+              H160::from_slice(&$BYTES)
+          - pattern: |
+              let $BYTES: Vec<u8> = $RLP.val_at($_).map_err($_)?;
+              ...
+              H256::from_slice(&$BYTES)
+      - pattern-not: |
+          if $BYTES.len() != $LEN {
+              return Err(...);
+          }
+          ...

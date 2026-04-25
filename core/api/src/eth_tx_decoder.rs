@@ -468,22 +468,69 @@ struct AccessListEntry {
     storage_keys: Vec<H256>,
 }
 
-/// Parse access list from RLP at given index
+/// Hard cap on access-list entries to prevent CPU/memory exhaustion
+/// via attacker-supplied huge access lists. RM-B1 / WP-C1.2 (audit
+/// H-API-02). Geth's effective limit is around 100s; 1024 is a
+/// generous upper bound.
+const MAX_ACCESS_LIST_ENTRIES: usize = 1024;
+/// Hard cap on storage keys per access-list entry. Same rationale.
+const MAX_STORAGE_KEYS_PER_ENTRY: usize = 1024;
+
+/// Parse access list from RLP at given index.
+///
+/// RM-B1 / WP-C1.2 (audit H-API-02): pre-fix this function called
+/// `H160::from_slice(&address_bytes)` and `H256::from_slice(&key_bytes)`
+/// without checking the slice length. Both panic on length mismatch.
+/// A crafted EIP-1559 / EIP-2930 tx posted to `eth_sendRawTransaction`
+/// could panic the RPC worker thread by supplying a 19-byte address
+/// or a 31-byte storage key. Post-fix, length checks return `Err`
+/// instead, and the entry/key counts are capped to prevent DoS via
+/// huge access lists.
 fn parse_access_list(rlp: &Rlp, index: usize) -> Result<Vec<AccessListEntry>, String> {
     let access_list_rlp = rlp.at(index).map_err(|e| format!("access_list: {:?}", e))?;
-    let mut access_list = Vec::new();
+    let item_count = access_list_rlp.item_count().unwrap_or(0);
+    if item_count > MAX_ACCESS_LIST_ENTRIES {
+        return Err(format!(
+            "H-API-02: access list has {} entries; max is {}",
+            item_count, MAX_ACCESS_LIST_ENTRIES
+        ));
+    }
 
-    for i in 0..access_list_rlp.item_count().unwrap_or(0) {
+    let mut access_list = Vec::with_capacity(item_count);
+
+    for i in 0..item_count {
         let entry_rlp = access_list_rlp.at(i).map_err(|e| format!("access_entry[{}]: {:?}", i, e))?;
 
         let address_bytes: Vec<u8> = entry_rlp.val_at(0).map_err(|e| format!("address: {:?}", e))?;
+        if address_bytes.len() != 20 {
+            return Err(format!(
+                "H-API-02: access list address[{}] is {} bytes; expected 20",
+                i,
+                address_bytes.len()
+            ));
+        }
         let address = H160::from_slice(&address_bytes);
 
         let storage_keys_rlp = entry_rlp.at(1).map_err(|e| format!("storage_keys: {:?}", e))?;
-        let mut storage_keys = Vec::new();
+        let key_count = storage_keys_rlp.item_count().unwrap_or(0);
+        if key_count > MAX_STORAGE_KEYS_PER_ENTRY {
+            return Err(format!(
+                "H-API-02: access list entry[{}] has {} storage keys; max is {}",
+                i, key_count, MAX_STORAGE_KEYS_PER_ENTRY
+            ));
+        }
+        let mut storage_keys = Vec::with_capacity(key_count);
 
-        for j in 0..storage_keys_rlp.item_count().unwrap_or(0) {
+        for j in 0..key_count {
             let key_bytes: Vec<u8> = storage_keys_rlp.val_at(j).map_err(|e| format!("storage_key[{}]: {:?}", j, e))?;
+            if key_bytes.len() != 32 {
+                return Err(format!(
+                    "H-API-02: access list entry[{}].storage_key[{}] is {} bytes; expected 32",
+                    i,
+                    j,
+                    key_bytes.len()
+                ));
+            }
             storage_keys.push(H256::from_slice(&key_bytes));
         }
 
