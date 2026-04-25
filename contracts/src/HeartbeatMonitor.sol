@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/Governable.sol";
 import "./interfaces/INematocystSlashing.sol";
 
 /// @title HeartbeatMonitor — Provider Liveness Checking
@@ -21,7 +22,7 @@ import "./interfaces/INematocystSlashing.sol";
 ///           INV-8 SuspendedMissedMax — suspended providers have missedCount >= maxMissed
 ///
 /// @dev WP-CI.1 — Compute Infrastructure: Heartbeat Monitor
-contract HeartbeatMonitor is ReentrancyGuard {
+contract HeartbeatMonitor is ReentrancyGuard, Governable {
     // ── Types ───────────────────────────────────────────────────────
 
     struct ProviderHealth {
@@ -48,8 +49,7 @@ contract HeartbeatMonitor is ReentrancyGuard {
     /// @notice NematocystSlashing contract for triggering slashes on suspension.
     INematocystSlashing public slashingContract;
 
-    /// @notice Governance address (can update parameters and set slashing contract).
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ── Events ──────────────────────────────────────────────────────
 
@@ -61,26 +61,24 @@ contract HeartbeatMonitor is ReentrancyGuard {
     event HeartbeatIntervalUpdated(uint256 oldInterval, uint256 newInterval);
     event MaxMissedUpdated(uint256 oldMax, uint256 newMax);
     event SlashingContractUpdated(address oldContract, address newContract);
-    event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+    // GovernanceTransferred event provided by Governable mixin.
 
     // ── Modifiers ───────────────────────────────────────────────────
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "Not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     // ── Constructor ─────────────────────────────────────────────────
 
     /// @param _heartbeatInterval Blocks between required heartbeats.
     /// @param _maxMissed Maximum consecutive missed heartbeats before suspension.
-    constructor(uint256 _heartbeatInterval, uint256 _maxMissed) {
+    constructor(uint256 _heartbeatInterval, uint256 _maxMissed)
+        Governable(msg.sender)
+    {
         require(_heartbeatInterval >= 1, "Interval must be >= 1");
         require(_maxMissed >= 1, "MaxMissed must be >= 1");
 
         heartbeatInterval = _heartbeatInterval;
         maxMissed = _maxMissed;
-        governance = msg.sender;
     }
 
     // ── Provider Registration ───────────────────────────────────────
@@ -259,12 +257,5 @@ contract HeartbeatMonitor is ReentrancyGuard {
         emit SlashingContractUpdated(old, _slashingContract);
     }
 
-    /// @notice Transfer governance to a new address.
-    /// @param newGovernance New governance address.
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "Zero address");
-        address old = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(old, newGovernance);
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 }

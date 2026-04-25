@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/Governable.sol";
 import "./interfaces/INematocystSlashing.sol";
 
 /// @title DisputeResolution — Bisection Game for Challenged Compute Results
@@ -31,7 +32,7 @@ import "./interfaces/INematocystSlashing.sol";
 ///           DisputeBondPositive      — active disputes always hold bond
 ///
 /// @dev WP-CI.2 — Compute Infrastructure: Dispute Resolution
-contract DisputeResolution is ReentrancyGuard {
+contract DisputeResolution is ReentrancyGuard, Governable {
     // ── Types ───────────────────────────────────────────────────────
 
     enum DisputeState { Inactive, Initiated, Bisecting, Resolved }
@@ -84,8 +85,7 @@ contract DisputeResolution is ReentrancyGuard {
     /// @notice NematocystSlashing contract for triggering slashes.
     INematocystSlashing public slashingContract;
 
-    /// @notice Governance address.
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ── Events ──────────────────────────────────────────────────────
 
@@ -108,27 +108,25 @@ contract DisputeResolution is ReentrancyGuard {
     event DisputeBondUpdated(uint256 oldBond, uint256 newBond);
     event MaxBisectionRoundsUpdated(uint256 oldRounds, uint256 newRounds);
     event SlashingContractUpdated(address oldContract, address newContract);
-    event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+    // GovernanceTransferred event provided by Governable mixin.
 
     // ── Modifiers ───────────────────────────────────────────────────
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "Not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     // ── Constructor ─────────────────────────────────────────────────
 
     /// @param _disputeBond Bond required to initiate dispute (SALT).
     /// @param _maxBisectionRounds Maximum bisection rounds.
-    constructor(uint256 _disputeBond, uint256 _maxBisectionRounds) {
+    constructor(uint256 _disputeBond, uint256 _maxBisectionRounds)
+        Governable(msg.sender)
+    {
         require(_disputeBond >= 1, "Bond must be >= 1");
         require(_maxBisectionRounds >= 1, "MaxRounds must be >= 1");
 
         disputeBond = _disputeBond;
         maxBisectionRounds = _maxBisectionRounds;
         roundDeadline = DEFAULT_ROUND_DEADLINE;
-        governance = msg.sender;
     }
 
     // ── Dispute Initiation ──────────────────────────────────────────
@@ -350,13 +348,7 @@ contract DisputeResolution is ReentrancyGuard {
         roundDeadline = newDeadline;
     }
 
-    /// @notice Transfer governance.
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "Zero address");
-        address old = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(old, newGovernance);
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     // ── Internal ────────────────────────────────────────────────────
 

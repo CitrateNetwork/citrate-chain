@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {ComputePool} from "../src/ComputePool.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 /// @notice Mock NematocystSlashing for pool SLA integration testing.
 contract MockSlashingForPool {
@@ -378,7 +379,7 @@ contract ComputePoolTest is Test {
         uint256 poolId = _createAndPopulate();
 
         vm.prank(outsider);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         pool.reportSLAViolation(poolId, 50);
     }
 
@@ -531,12 +532,16 @@ contract ComputePoolTest is Test {
     // ══════════════════════════════════════════════════════════════════
 
     function test_transferGovernance() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         pool.transferGovernance(creator);
+        assertEq(pool.pendingGovernance(), creator);
+        vm.prank(creator);
+        pool.acceptGovernance();
         assertEq(pool.governance(), creator);
     }
 
     function test_transferGovernance_zero_address_reverts() public {
-        vm.expectRevert("Zero address");
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         pool.transferGovernance(address(0));
     }
 

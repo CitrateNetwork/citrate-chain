@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import {TestnetFarmingAccounting} from "../src/TestnetFarmingAccounting.sol";
 import {ContributionAccounting} from "../src/ContributionAccounting.sol";
 import {StablecoinTreasury} from "../src/StablecoinTreasury.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 /// @dev Minimal ERC-20 mock for testing
 contract MockERC20 {
@@ -156,7 +157,7 @@ contract TestnetFarmingAccountingTest is Test {
     }
 
     function test_deploy_zero_governance_reverts() public {
-        vm.expectRevert("TestnetFarming: zero governance");
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         new TestnetFarmingAccounting(address(contributions), address(treasury), address(0));
     }
 
@@ -191,7 +192,7 @@ contract TestnetFarmingAccountingTest is Test {
         address[] memory participants = new address[](1);
         participants[0] = alice;
         vm.prank(outsider);
-        vm.expectRevert("TestnetFarming: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         farming.takeSnapshot(participants);
     }
 
@@ -342,7 +343,7 @@ contract TestnetFarmingAccountingTest is Test {
     function test_activate_distribution_non_governance_reverts() public {
         _takeFullSnapshot();
         vm.prank(outsider);
-        vm.expectRevert("TestnetFarming: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         farming.activateDistribution(address(usdc), 1_000_000e6);
     }
 
@@ -556,7 +557,7 @@ contract TestnetFarmingAccountingTest is Test {
         _activateDistribution(100_000e6);
 
         vm.prank(outsider);
-        vm.expectRevert("TestnetFarming: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         farming.sweep(governance);
     }
 
@@ -592,18 +593,22 @@ contract TestnetFarmingAccountingTest is Test {
     // ============================================================
 
     function test_transfer_governance() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         farming.transferGovernance(alice);
+        assertEq(farming.pendingGovernance(), alice);
+        vm.prank(alice);
+        farming.acceptGovernance();
         assertEq(farming.governance(), alice);
     }
 
     function test_transfer_governance_zero_reverts() public {
-        vm.expectRevert("TestnetFarming: zero address");
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         farming.transferGovernance(address(0));
     }
 
     function test_transfer_governance_non_governance_reverts() public {
         vm.prank(outsider);
-        vm.expectRevert("TestnetFarming: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         farming.transferGovernance(outsider);
     }
 

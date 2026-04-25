@@ -103,8 +103,11 @@ contract TreasuryGovernorTest is Test {
         vm.stopPrank();
 
         // Transfer treasury governance to the governor contract
-        // so it can call treasury.distribute()
+        // so it can call treasury.distribute(). Post Governable
+        // migration (audit SOL-21), this is a two-step process:
+        // current governance proposes, then the governor pulls.
         treasury.transferGovernance(address(governor));
+        governor.acceptGovernanceOf(address(treasury));
 
         // Fund accounts with SALT for voting power
         vm.deal(proposer, 50_000 ether);

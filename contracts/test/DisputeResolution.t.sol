@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {DisputeResolution} from "../src/DisputeResolution.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 /// @notice Mock NematocystSlashing for dispute integration testing.
 contract MockSlashingForDispute {
@@ -373,7 +374,7 @@ contract DisputeResolutionTimeoutTest is Test {
         _bisectOnce(disputeId);
 
         vm.prank(outsider);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         dispute.resolve(disputeId, true);
     }
 
@@ -473,7 +474,11 @@ contract DisputeResolutionTimeoutTest is Test {
     }
 
     function test_transferGovernance() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         dispute.transferGovernance(challenger);
+        assertEq(dispute.pendingGovernance(), challenger);
+        vm.prank(challenger);
+        dispute.acceptGovernance();
         assertEq(dispute.governance(), challenger);
     }
 

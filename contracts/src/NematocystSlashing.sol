@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/Governable.sol";
 
 /// @title NematocystSlashing — Graduated 3-Tier Slashing with Correlation Multiplier
 /// @notice Implements the nematocyst slashing model from the Citrate economics design:
@@ -10,7 +11,7 @@ import "./lib/ReentrancyGuard.sol";
 ///         The Ethereum-research correlation multiplier scales penalties when multiple
 ///         providers are slashed in the same window.
 /// @dev WP-F.10
-contract NematocystSlashing is ReentrancyGuard {
+contract NematocystSlashing is ReentrancyGuard, Governable {
     // ── Types ───────────────────────────────────────────────────────
 
     enum SlashTier { Latency, Inconsistency, Byzantine }
@@ -55,8 +56,7 @@ contract NematocystSlashing is ReentrancyGuard {
     /// @notice Slash count per block number (for correlation multiplier).
     mapping(uint256 => uint256) public slashesInBlock;
 
-    /// @notice Governance address (can call slash).
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ── Events ───────────────────────────────────────────────────────
 
@@ -69,20 +69,15 @@ contract NematocystSlashing is ReentrancyGuard {
         uint256 correlationMultiplier
     );
     event Banned(address indexed provider);
-    event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+    // GovernanceTransferred event provided by Governable mixin.
 
     // ── Modifiers ────────────────────────────────────────────────────
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "Not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     // ── Constructor ──────────────────────────────────────────────────
 
-    constructor() {
-        governance = msg.sender;
-    }
+    constructor() Governable(msg.sender) {}
 
     // ── Provider Staking ─────────────────────────────────────────────
 
@@ -214,13 +209,7 @@ contract NematocystSlashing is ReentrancyGuard {
 
     // ── Governance ───────────────────────────────────────────────────
 
-    /// @notice Transfer governance to a new address.
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "Zero address");
-        address oldGov = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(oldGov, newGovernance);
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     // ── Internal Helpers ─────────────────────────────────────────────
 

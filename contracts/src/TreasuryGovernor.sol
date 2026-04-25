@@ -5,6 +5,12 @@ import "./lib/ReentrancyGuard.sol";
 import "./LiquidStakingPool.sol";
 import "./StablecoinTreasury.sol";
 
+/// @dev Minimal interface for calling `acceptGovernance` on a
+/// Governable target. Avoids importing the full mixin.
+interface IGovernableTarget {
+    function acceptGovernance() external;
+}
+
 /// @title TreasuryGovernor — On-Chain DAO Governor for Treasury Spending
 /// @notice Full on-chain governance for Citrate treasury operations.
 ///         Voting power = SALT balance + stSALT shares * sharePrice (from LiquidStakingPool).
@@ -401,6 +407,24 @@ contract TreasuryGovernor is ReentrancyGuard {
         p.canceled = true;
 
         emit ProposalCanceled(proposalId);
+    }
+
+    // ============================================================
+    // Governable handover plumbing (audit SOL-21 follow-on)
+    // ============================================================
+
+    /// @notice Accept pending governance for an external Governable
+    /// contract. The standard handover flow is:
+    ///   1. Current governor calls `target.transferGovernance(governor)`.
+    ///   2. Anyone calls `governor.acceptGovernanceOf(target)` to
+    ///      complete the two-step transfer.
+    ///
+    /// Permissionless because the Governable mixin already requires
+    /// that the calling address be `pendingGovernance` — only the
+    /// governor itself can satisfy that, and this method just lets
+    /// anyone trigger it on behalf of the governor contract.
+    function acceptGovernanceOf(address target) external {
+        IGovernableTarget(target).acceptGovernance();
     }
 
     // ============================================================

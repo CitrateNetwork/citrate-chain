@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/Governable.sol";
 
 /// @title StablecoinTreasury — Stablecoin Accumulation & Distribution
 /// @notice Accumulates stablecoins from institutional compute purchases.
@@ -16,7 +17,7 @@ import "./lib/ReentrancyGuard.sol";
 ///   - No SALT involved; stablecoins only (ERC-20 transferFrom)
 ///
 /// Sprint ECON-2 — WP-E2.1
-contract StablecoinTreasury is ReentrancyGuard {
+contract StablecoinTreasury is ReentrancyGuard, Governable {
     // ============================================================
     // Constants
     // ============================================================
@@ -27,12 +28,7 @@ contract StablecoinTreasury is ReentrancyGuard {
     /// @notice Maximum number of accepted stablecoins (gas safety)
     uint256 public constant MAX_STABLECOINS = 20;
 
-    // ============================================================
-    // State — Governance
-    // ============================================================
-
-    /// @notice Governance address (deployer or multisig)
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ============================================================
     // State — Accepted Stablecoins
@@ -98,17 +94,14 @@ contract StablecoinTreasury is ReentrancyGuard {
         address indexed to,
         uint256 amount
     );
-    event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+    // GovernanceTransferred event provided by Governable mixin.
     event EpochAdvanced(uint256 indexed epoch, uint256 startBlock, uint256 endBlock);
 
     // ============================================================
     // Modifiers
     // ============================================================
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "StablecoinTreasury: not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     // ============================================================
     // Constructor
@@ -116,9 +109,7 @@ contract StablecoinTreasury is ReentrancyGuard {
 
     /// @notice Deploy the treasury
     /// @param _governance Governance multisig or deployer address
-    constructor(address _governance) {
-        require(_governance != address(0), "StablecoinTreasury: zero governance");
-        governance = _governance;
+    constructor(address _governance) Governable(_governance) {
         genesisBlock = block.number;
         // Initialize epoch 0
         epochRevenue[0] = EpochRevenue({
@@ -299,14 +290,7 @@ contract StablecoinTreasury is ReentrancyGuard {
     // Governance
     // ============================================================
 
-    /// @notice Transfer governance to a new address
-    /// @param newGovernance New governance address
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "StablecoinTreasury: zero address");
-        address old = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(old, newGovernance);
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     // ============================================================
     // Internal Helpers

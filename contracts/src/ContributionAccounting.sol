@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import "./lib/Governable.sol";
+
 /// @title ContributionAccounting — 7-Type Contribution Tracking
 /// @notice Tracks contributions across 7 types with weighted scores.
 ///         Distributes rewards proportional to weighted contribution scores.
@@ -10,7 +12,7 @@ pragma solidity ^0.8.26;
 ///   AppDevelopment, BridgeInfra, Governance
 ///
 /// Sprint FORMAL — WP-F.9
-contract ContributionAccounting {
+contract ContributionAccounting is Governable {
     // ── Types ───────────────────────────────────────────────────────
 
     /// 7 contribution types (Paper VII)
@@ -64,8 +66,7 @@ contract ContributionAccounting {
 
     // ── Access Control ──────────────────────────────────────────────
 
-    /// Governance address (deployer); can update weights, add recorders
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     /// Protocol contracts authorised to call recordContribution
     mapping(address => bool) public isRecorder;
@@ -101,9 +102,7 @@ contract ContributionAccounting {
 
     // ── Constructor ─────────────────────────────────────────────────
 
-    constructor() {
-        governance = msg.sender;
-
+    constructor() Governable(msg.sender) {
         // Default weights (basis points): 10000 = 1.0x multiplier
         weights[ContributionType.Validation]      = 10000;  // 1.0x
         weights[ContributionType.ModelHosting]     = 15000;  // 1.5x
@@ -125,7 +124,7 @@ contract ContributionAccounting {
         ContributionType ctype,
         uint256 amount
     ) external {
-        require(isRecorder[msg.sender] || msg.sender == governance, "Not authorized");
+        require(isRecorder[msg.sender] || msg.sender == governance(), "Not authorized");
         require(amount > 0, "Zero amount");
 
         contributions[contributor][ctype] += amount;
@@ -155,8 +154,7 @@ contract ContributionAccounting {
     ///         Each contributor's share is computed as (pool * score / totalScore) and
     ///         added to their claimable balance. This freezes fair shares at the point
     ///         of distribution, so claim order does not affect amounts.
-    function distributeRewards() external {
-        require(msg.sender == governance, "Not governance");
+    function distributeRewards() external onlyGovernance {
         require(rewardPool > 0, "Empty pool");
         require(totalScore > 0, "No contributions");
 
@@ -259,24 +257,21 @@ contract ContributionAccounting {
     // ── Governance Functions ────────────────────────────────────────
 
     /// @notice Update the weight for a contribution type
-    function updateWeight(ContributionType ctype, uint256 newWeight) external {
-        require(msg.sender == governance, "Not governance");
+    function updateWeight(ContributionType ctype, uint256 newWeight) external onlyGovernance {
         uint256 old = weights[ctype];
         weights[ctype] = newWeight;
         emit WeightUpdated(ctype, old, newWeight);
     }
 
     /// @notice Add a protocol contract that may call recordContribution
-    function addRecorder(address recorder) external {
-        require(msg.sender == governance, "Not governance");
+    function addRecorder(address recorder) external onlyGovernance {
         require(recorder != address(0), "Zero address");
         isRecorder[recorder] = true;
         emit RecorderAdded(recorder);
     }
 
     /// @notice Remove a previously authorised recorder
-    function removeRecorder(address recorder) external {
-        require(msg.sender == governance, "Not governance");
+    function removeRecorder(address recorder) external onlyGovernance {
         isRecorder[recorder] = false;
         emit RecorderRemoved(recorder);
     }

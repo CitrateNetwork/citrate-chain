@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
 import {StablecoinTreasury} from "../src/StablecoinTreasury.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 /// @dev Minimal ERC-20 mock for testing stablecoin interactions
 contract MockERC20 {
@@ -97,7 +98,7 @@ contract StablecoinTreasuryTest is Test {
     }
 
     function test_deploy_zero_governance_reverts() public {
-        vm.expectRevert("StablecoinTreasury: zero governance");
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         new StablecoinTreasury(address(0));
     }
 
@@ -123,7 +124,7 @@ contract StablecoinTreasuryTest is Test {
 
     function test_add_stablecoin_non_governance_reverts() public {
         vm.prank(outsider);
-        vm.expectRevert("StablecoinTreasury: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         treasury.addStablecoin(address(dai));
     }
 
@@ -254,7 +255,7 @@ contract StablecoinTreasuryTest is Test {
         amounts[0] = 50_000e6;
 
         vm.prank(outsider);
-        vm.expectRevert("StablecoinTreasury: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         treasury.distribute(address(usdc), recipients, amounts);
     }
 
@@ -336,7 +337,7 @@ contract StablecoinTreasuryTest is Test {
 
     function test_emergency_withdraw_non_governance_reverts() public {
         vm.prank(outsider);
-        vm.expectRevert("StablecoinTreasury: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         treasury.emergencyWithdraw(address(usdc), outsider);
     }
 
@@ -375,18 +376,22 @@ contract StablecoinTreasuryTest is Test {
     // ============================================================
 
     function test_transfer_governance() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         treasury.transferGovernance(alice);
+        assertEq(treasury.pendingGovernance(), alice);
+        vm.prank(alice);
+        treasury.acceptGovernance();
         assertEq(treasury.governance(), alice);
     }
 
     function test_transfer_governance_zero_reverts() public {
-        vm.expectRevert("StablecoinTreasury: zero address");
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         treasury.transferGovernance(address(0));
     }
 
     function test_transfer_governance_non_governance_reverts() public {
         vm.prank(outsider);
-        vm.expectRevert("StablecoinTreasury: not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         treasury.transferGovernance(outsider);
     }
 
