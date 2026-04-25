@@ -26,8 +26,15 @@ contract ComputePoolTrainingTest is Test {
     // Simulated epoch roots. In production these are keccak256 Merkle
     // roots over (step, worker) leaves; in tests we just need a
     // non-zero bytes32 the committee can verify against.
-    bytes32 internal constant ROOT0 = bytes32(uint256(0x1111));
-    bytes32 internal constant ROOT1 = bytes32(uint256(0x2222));
+    //
+    // RM-B1 / WP-D5.10 (audit SOL-20): post-fix the verifier
+    // domain-prefixes the leaf (`keccak(0x00 || leaf)`) so for a
+    // single-leaf tree the committed root must equal that hash.
+    // ROOT0/ROOT1 are now derived from raw leaves LEAF0/LEAF1.
+    bytes32 internal constant LEAF0 = bytes32(uint256(0x1111));
+    bytes32 internal constant LEAF1 = bytes32(uint256(0x2222));
+    bytes32 internal ROOT0 = keccak256(abi.encodePacked(bytes1(0x00), LEAF0));
+    bytes32 internal ROOT1 = keccak256(abi.encodePacked(bytes1(0x00), LEAF1));
 
     uint128 internal constant STAKE = 10 ether;
     uint128 internal constant EPOCH_BUDGET = 30 ether;
@@ -289,9 +296,10 @@ contract ComputePoolTrainingTest is Test {
         vm.prank(w1);
         pool.commitEpoch(jobId, 0, ROOT0);
 
-        // Build a leaf whose Merkle proof resolves to ROOT0. With a
-        // single-leaf tree, the leaf IS the root — empty proof.
-        bytes32 leaf = ROOT0;
+        // SOL-20: leaf is the raw content; verifier domain-prefixes
+        // it (`keccak(0x00 || leaf)`) and compares to ROOT0 which
+        // is `keccak(0x00 || LEAF0)`.
+        bytes32 leaf = LEAF0;
         bytes32[] memory emptyProof = new bytes32[](0);
 
         // Challenge w2 at epoch 0 step 0.
@@ -332,8 +340,9 @@ contract ComputePoolTrainingTest is Test {
         bytes32[] memory emptyProof = new bytes32[](0);
         uint256 challengerBeforeBalance = challenger.balance;
 
+        // SOL-20: pass the raw leaf; verifier domain-prefixes it.
         vm.prank(challenger);
-        pool.challengeStep{value: 1 ether}(jobId, 0, 1, w2, ROOT0, emptyProof);
+        pool.challengeStep{value: 1 ether}(jobId, 0, 1, w2, LEAF0, emptyProof);
 
         // Committee votes Reject with quorum.
         vm.prank(committee1);

@@ -67,6 +67,11 @@ contract ComputePoolPipeline is ReentrancyGuard {
     mapping(uint256 => mapping(address => uint128)) public stageStake;
     /// jobId → ownerAddress → paymentEarned (from served requests)
     mapping(uint256 => mapping(address => uint128)) public paymentEarned;
+    /// RM-B1 / WP-D5.5 (audit SOL-13): O(1) duplicate-stage check.
+    /// jobId → ownerAddress → owns at least one stage in this job.
+    /// Pre-fix the duplicate-stage scan was O(N) on every
+    /// `assignStage` call (bounded by `MAX_STAGE_COUNT = 32`).
+    mapping(uint256 => mapping(address => bool)) public hasStage;
 
     mapping(uint256 => Request) public requests;
     uint256 public nextJobId;
@@ -148,14 +153,15 @@ contract ComputePoolPipeline is ReentrancyGuard {
             "Pipeline: not attested"
         );
 
-        // Enforce uniqueness: one worker per job, not multiple stages.
-        // O(N) scan bounded by MAX_STAGE_COUNT (32).
-        for (uint32 i = 0; i < job.stageCount; i++) {
-            require(stageOwner[jobId][i] != msg.sender, "Pipeline: worker holds another stage");
-        }
+        // RM-B1 / WP-D5.5 (audit SOL-13): O(1) duplicate-stage
+        // check via the `hasStage` mapping. Pre-fix this was an
+        // O(N) loop bounded by MAX_STAGE_COUNT (32). Bumping
+        // stage count past that bound was gas-bounded.
+        require(!hasStage[jobId][msg.sender], "Pipeline: worker holds another stage");
 
         stageOwner[jobId][stage] = msg.sender;
         stageStake[jobId][msg.sender] = job.perStakePerStage;
+        hasStage[jobId][msg.sender] = true;
         emit StageAssigned(jobId, stage, msg.sender, job.perStakePerStage);
     }
 
@@ -262,6 +268,9 @@ contract ComputePoolPipeline is ReentrancyGuard {
 
         draftReplacements[jobId][stage] = former;
         stageOwner[jobId][stage] = address(0);
+        // SOL-13: clear `hasStage` so the former owner can be
+        // reassigned to a different stage in this job.
+        hasStage[jobId][former] = false;
         emit StageFaulted(jobId, stage, former);
     }
 
@@ -277,10 +286,12 @@ contract ComputePoolPipeline is ReentrancyGuard {
             teeRegistry.isAttested(msg.sender, block.number),
             "Pipeline: not attested"
         );
-        require(!_isAnyStageOwner(jobId, msg.sender), "Pipeline: worker holds another stage");
+        // SOL-13: O(1) check via hasStage mapping.
+        require(!hasStage[jobId][msg.sender], "Pipeline: worker holds another stage");
 
         stageOwner[jobId][stage] = msg.sender;
         stageStake[jobId][msg.sender] = job.perStakePerStage;
+        hasStage[jobId][msg.sender] = true;
         draftReplacements[jobId][stage] = address(0);
         emit StageReassigned(jobId, stage, former, msg.sender);
     }
