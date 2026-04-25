@@ -154,6 +154,22 @@ impl Database for StateDBAdapter {
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         let hash = citrate_consensus::types::Hash::new(code_hash.0);
+
+        // RM-B1 / WP-B5.4 (audit H-03): mark the tx as requiring
+        // serial commit. The MVCC read_set keys on `Address`, but
+        // this method only has the code-hash and not the address
+        // that owns it — so we cannot record a per-account read
+        // here. Pre-fix this meant a concurrent SELFDESTRUCT+CREATE2
+        // could replace the code under us between our pin and our
+        // commit, and the commit would land with stale-code-derived
+        // state. Falling back to serial commit when ANY tx accesses
+        // code-by-hash is conservative (over-aborts under contention)
+        // but structurally safe.
+        if let Some(journal) = &self.journal {
+            let mut j = journal.lock();
+            j.mark_requires_serial_commit();
+        }
+
         let code = self
             .state_db
             .get_code(&hash)

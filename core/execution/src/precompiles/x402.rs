@@ -153,7 +153,7 @@ fn eip712_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
 
 /// Precompile 0x0201: EIP-3009 TransferWithAuthorization Verification
 ///
-/// Input format (233 bytes):
+/// Input format (265 bytes):
 ///   domain_separator (32) | from (20) | to (20) | value (32) |
 ///   validAfter (32) | validBefore (32) | nonce (32) |
 ///   v (1) | r (32) | s (32)
@@ -163,6 +163,9 @@ fn eip712_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
 ///   Bytes 12-31: recovered signer address (20 bytes)
 ///
 /// Gas: 4,200
+///
+/// RM-B1 / WP-B5.7 (audit Info-02): doc previously said 233 bytes
+/// but the parser at line 172 below requires 265. Fixed above.
 fn transfer_auth_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     if gas_limit < gas_costs::TRANSFER_AUTH_VERIFY {
         return Err(anyhow!("Insufficient gas for TransferWithAuthorization verify"));

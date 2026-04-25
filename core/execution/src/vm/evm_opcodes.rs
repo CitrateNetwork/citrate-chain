@@ -1701,17 +1701,91 @@ impl TryFrom<u8> for EVMOpcode {
             0x5e => Ok(EVMOpcode::MCOPY),
             0x5f => Ok(EVMOpcode::PUSH0),
 
-            // SAFETY: PUSH1(0x60)..PUSH32(0x7f) are declared as contiguous enum variants
-            // with explicit discriminants matching the EVM spec. The match arm guarantees
-            // `value` is in 0x60..=0x7f, so the transmute always produces a valid variant.
-            0x60..=0x7f => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
-            // SAFETY: DUP1(0x80)..DUP16(0x8f) — same contiguous-discriminant invariant.
-            0x80..=0x8f => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
-            // SAFETY: SWAP1(0x90)..SWAP16(0x9f) — same contiguous-discriminant invariant.
-            0x90..=0x9f => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
-            // SAFETY: LOG0(0xa0)..LOG4(0xa4) — same contiguous-discriminant invariant.
-            // Note: only 5 values; could be replaced with explicit match arms.
-            0xa0..=0xa4 => Ok(unsafe { std::mem::transmute::<u8, EVMOpcode>(value) }),
+            // RM-B1 / WP-B5.5 (audit L-02): pre-fix used
+            // `unsafe std::mem::transmute<u8, EVMOpcode>` here. The
+            // comment claimed "every byte in the range is a valid
+            // discriminant" — true today, but a future enum-variant
+            // rename or removal would compile cleanly while
+            // silently producing UB at runtime. Explicit match arms
+            // give us compile-time guarantees: removing or renaming
+            // a variant breaks the build instead of the executor.
+
+            // PUSH1(0x60) .. PUSH32(0x7f) — 32 arms
+            0x60 => Ok(EVMOpcode::PUSH1),
+            0x61 => Ok(EVMOpcode::PUSH2),
+            0x62 => Ok(EVMOpcode::PUSH3),
+            0x63 => Ok(EVMOpcode::PUSH4),
+            0x64 => Ok(EVMOpcode::PUSH5),
+            0x65 => Ok(EVMOpcode::PUSH6),
+            0x66 => Ok(EVMOpcode::PUSH7),
+            0x67 => Ok(EVMOpcode::PUSH8),
+            0x68 => Ok(EVMOpcode::PUSH9),
+            0x69 => Ok(EVMOpcode::PUSH10),
+            0x6a => Ok(EVMOpcode::PUSH11),
+            0x6b => Ok(EVMOpcode::PUSH12),
+            0x6c => Ok(EVMOpcode::PUSH13),
+            0x6d => Ok(EVMOpcode::PUSH14),
+            0x6e => Ok(EVMOpcode::PUSH15),
+            0x6f => Ok(EVMOpcode::PUSH16),
+            0x70 => Ok(EVMOpcode::PUSH17),
+            0x71 => Ok(EVMOpcode::PUSH18),
+            0x72 => Ok(EVMOpcode::PUSH19),
+            0x73 => Ok(EVMOpcode::PUSH20),
+            0x74 => Ok(EVMOpcode::PUSH21),
+            0x75 => Ok(EVMOpcode::PUSH22),
+            0x76 => Ok(EVMOpcode::PUSH23),
+            0x77 => Ok(EVMOpcode::PUSH24),
+            0x78 => Ok(EVMOpcode::PUSH25),
+            0x79 => Ok(EVMOpcode::PUSH26),
+            0x7a => Ok(EVMOpcode::PUSH27),
+            0x7b => Ok(EVMOpcode::PUSH28),
+            0x7c => Ok(EVMOpcode::PUSH29),
+            0x7d => Ok(EVMOpcode::PUSH30),
+            0x7e => Ok(EVMOpcode::PUSH31),
+            0x7f => Ok(EVMOpcode::PUSH32),
+
+            // DUP1(0x80) .. DUP16(0x8f) — 16 arms
+            0x80 => Ok(EVMOpcode::DUP1),
+            0x81 => Ok(EVMOpcode::DUP2),
+            0x82 => Ok(EVMOpcode::DUP3),
+            0x83 => Ok(EVMOpcode::DUP4),
+            0x84 => Ok(EVMOpcode::DUP5),
+            0x85 => Ok(EVMOpcode::DUP6),
+            0x86 => Ok(EVMOpcode::DUP7),
+            0x87 => Ok(EVMOpcode::DUP8),
+            0x88 => Ok(EVMOpcode::DUP9),
+            0x89 => Ok(EVMOpcode::DUP10),
+            0x8a => Ok(EVMOpcode::DUP11),
+            0x8b => Ok(EVMOpcode::DUP12),
+            0x8c => Ok(EVMOpcode::DUP13),
+            0x8d => Ok(EVMOpcode::DUP14),
+            0x8e => Ok(EVMOpcode::DUP15),
+            0x8f => Ok(EVMOpcode::DUP16),
+
+            // SWAP1(0x90) .. SWAP16(0x9f) — 16 arms
+            0x90 => Ok(EVMOpcode::SWAP1),
+            0x91 => Ok(EVMOpcode::SWAP2),
+            0x92 => Ok(EVMOpcode::SWAP3),
+            0x93 => Ok(EVMOpcode::SWAP4),
+            0x94 => Ok(EVMOpcode::SWAP5),
+            0x95 => Ok(EVMOpcode::SWAP6),
+            0x96 => Ok(EVMOpcode::SWAP7),
+            0x97 => Ok(EVMOpcode::SWAP8),
+            0x98 => Ok(EVMOpcode::SWAP9),
+            0x99 => Ok(EVMOpcode::SWAP10),
+            0x9a => Ok(EVMOpcode::SWAP11),
+            0x9b => Ok(EVMOpcode::SWAP12),
+            0x9c => Ok(EVMOpcode::SWAP13),
+            0x9d => Ok(EVMOpcode::SWAP14),
+            0x9e => Ok(EVMOpcode::SWAP15),
+            0x9f => Ok(EVMOpcode::SWAP16),
+
+            // LOG0(0xa0) .. LOG4(0xa4) — 5 arms
+            0xa0 => Ok(EVMOpcode::LOG0),
+            0xa1 => Ok(EVMOpcode::LOG1),
+            0xa2 => Ok(EVMOpcode::LOG2),
+            0xa3 => Ok(EVMOpcode::LOG3),
+            0xa4 => Ok(EVMOpcode::LOG4),
 
             0xf0 => Ok(EVMOpcode::CREATE),
             0xf1 => Ok(EVMOpcode::CALL),

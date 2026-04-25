@@ -184,6 +184,20 @@ impl CommitCoordinator {
 
         let _guard = self.inner.commit_lock.lock();
 
+        // RM-B1 / WP-B5.4 (audit H-03): if the journal flagged
+        // itself as requiring serial commit (because the tx
+        // accessed code-by-hash, which the read_set cannot pin
+        // per-account), abort it back to the executor's serial
+        // fallback path. Pre-fix, a concurrent SELFDESTRUCT+CREATE2
+        // could race and our commit would land with stale-code
+        // state. The over-abort here is the conservative defense.
+        if journal.requires_serial_commit() {
+            return CommitOutcome::Aborted {
+                reason: AbortReason::ReadSetInvalidated,
+                current_version: self.inner.state_version.load(),
+            };
+        }
+
         // --- Validation: is the read set still consistent with current
         //     account versions under our pinned version? ---
         if !self.inner.tracker.validate(journal.read_set()) {

@@ -74,6 +74,13 @@ pub struct ScratchJournal {
     /// (address, slot-key-bytes) → slot-value-bytes, for EVM storage writes
     /// buffered during REVM execution. Sprint P950-A-5 WP-A.5.1.
     pending_storage: HashMap<(Address, Vec<u8>), Vec<u8>>,
+    /// RM-B1 / WP-B5.4 (audit H-03): set when the executing tx
+    /// invokes `code_by_hash` (e.g., REVM EXTCODESIZE / EXTCODECOPY
+    /// against a contract whose code might be replaced by a
+    /// concurrent SELFDESTRUCT+CREATE2 commit). The MVCC commit
+    /// coordinator inspects this and falls back to serial commit
+    /// rather than risk a stale-code read.
+    requires_serial_commit: bool,
 }
 
 impl ScratchJournal {
@@ -91,6 +98,8 @@ impl ScratchJournal {
         self.write_set.clear();
         self.pending.clear();
         self.pending_storage.clear();
+        // H-03: fresh attempt resets the serial-commit flag.
+        self.requires_serial_commit = false;
     }
 
     /// Whether the journal has been pinned.
@@ -106,6 +115,21 @@ impl ScratchJournal {
     /// Record that the worker read an account. Updates the read set.
     pub fn record_read(&mut self, address: Address) {
         self.read_set.record_read(address);
+    }
+
+    /// RM-B1 / WP-B5.4 (audit H-03): mark this tx as requiring
+    /// serial commit because it invoked `code_by_hash`. Without
+    /// this defense, a concurrent SELFDESTRUCT+CREATE2 in another
+    /// tx could replace the code under us and our commit would
+    /// land with stale-code-derived state.
+    pub fn mark_requires_serial_commit(&mut self) {
+        self.requires_serial_commit = true;
+    }
+
+    /// Whether this journal has been marked as requiring serial
+    /// commit (set by `mark_requires_serial_commit`).
+    pub fn requires_serial_commit(&self) -> bool {
+        self.requires_serial_commit
     }
 
     /// Record a pending write to an account. Updates the write set and
