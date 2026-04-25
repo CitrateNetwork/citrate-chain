@@ -54,8 +54,8 @@ fn argon2_for_version(version: u32) -> Result<argon2::Argon2<'static>, WalletErr
             Ok(Argon2::default())
         }
         KDF_VERSION_CURRENT => {
-            let params = Params::new(65536, 3, 4, Some(32))
-                .expect("WAL-01: Argon2 v2 params (m=65536, t=3, p=4, out=32) are statically valid; see docs/security/KDF_POLICY.md");
+            let params = Params::new(65536, 3, 1, Some(32))
+                .expect("WAL-01: Argon2 v2 params (m=65536, t=3, p=1, out=32) are statically valid; see docs/security/KDF_POLICY.md");
             Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
         }
         KDF_VERSION_LOW_MEMORY => {
