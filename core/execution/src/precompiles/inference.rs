@@ -90,6 +90,18 @@ pub struct InferencePrecompile {
     model_cache: HashMap<H256, Arc<MetalModel>>,
     /// Access control map: model_id → (owner, policy)
     model_access: HashMap<H256, ModelAccessEntry>,
+    /// RM-B1 / WP-B5.1 (audit C-01): when false (mainnet
+    /// default), the non-deterministic inference precompiles
+    /// (0x0101 MODEL_INFERENCE, 0x0102 BATCH_INFERENCE) are
+    /// disabled — invoking them returns an error rather than
+    /// running floating-point hardware-dependent inference. This
+    /// closes the consensus-fork vector where Metal/CUDA/CPU
+    /// validators produced different bit-identical f32 outputs
+    /// from the same model + input. Devnet / testnet keep
+    /// `allow_nondeterministic_inference = true` for backward
+    /// compat with existing test suites; mainnet flips to false
+    /// pending TEE attestation (CM-08 path).
+    allow_nondeterministic_inference: bool,
 }
 
 impl InferencePrecompile {
@@ -98,7 +110,19 @@ impl InferencePrecompile {
             runtime,
             model_cache: HashMap::new(),
             model_access: HashMap::new(),
+            // Default to `true` for now — devnet / testnet
+            // continue working out of the box. Mainnet config
+            // will set this to `false` via `with_strict_inference`.
+            allow_nondeterministic_inference: true,
         }
+    }
+
+    /// RM-B1 / WP-B5.1 (audit C-01): disable the non-deterministic
+    /// inference precompiles. Use on mainnet block-validation paths
+    /// until TEE-attested deterministic inference is wired (CM-08).
+    pub fn with_strict_inference(mut self) -> Self {
+        self.allow_nondeterministic_inference = false;
+        self
     }
 
     /// Register access policy for a model (called at deploy time)
@@ -142,8 +166,26 @@ impl InferencePrecompile {
         if addr == &addresses::MODEL_DEPLOY {
             self.deploy_model(input, gas_limit)
         } else if addr == &addresses::MODEL_INFERENCE {
+            // RM-B1 / WP-B5.1 (audit C-01): on strict-mode chains
+            // the non-deterministic inference precompile is
+            // disabled to prevent consensus forks from f32 / GPU
+            // kernel divergence across validators.
+            if !self.allow_nondeterministic_inference {
+                return Err(anyhow!(
+                    "C-01: non-deterministic inference precompile (0x0101) \
+                     is disabled on this chain (mainnet block-validation \
+                     mode); pending TEE attestation per CM-08"
+                ));
+            }
             self.run_inference(input, gas_limit)
         } else if addr == &addresses::BATCH_INFERENCE {
+            if !self.allow_nondeterministic_inference {
+                return Err(anyhow!(
+                    "C-01: non-deterministic batch inference precompile \
+                     (0x0102) is disabled on this chain (mainnet block-\
+                     validation mode); pending TEE attestation per CM-08"
+                ));
+            }
             self.run_batch_inference(input, gas_limit)
         } else if addr == &addresses::MODEL_METADATA {
             self.get_metadata(input, gas_limit)
@@ -173,12 +215,27 @@ impl InferencePrecompile {
             return Err(anyhow!("Insufficient gas for model deployment"));
         }
 
-        // Extract model data and metadata
-        let model_size = U256::from_big_endian(&input[0..32]);
-        let metadata_size = U256::from_big_endian(&input[32..64]);
+        // Extract model data and metadata.
+        // RM-B1 / WP-B5.2 (audit M-02): size validation uses
+        // checked u64 conversion (rejects U256 > u64::MAX) and
+        // checked addition. Pre-fix `as u64` truncated, letting
+        // a forged size pass the equality check while overflowing
+        // arithmetic on the weights_start computation below.
+        let model_size_u256 = U256::from_big_endian(&input[0..32]);
+        let metadata_size_u256 = U256::from_big_endian(&input[32..64]);
+        let model_size: usize = model_size_u256
+            .try_into()
+            .map_err(|_| anyhow!("M-02: model_size exceeds usize"))?;
+        let metadata_size: usize = metadata_size_u256
+            .try_into()
+            .map_err(|_| anyhow!("M-02: metadata_size exceeds usize"))?;
+        let total = model_size
+            .checked_add(metadata_size)
+            .and_then(|s| s.checked_add(64))
+            .ok_or_else(|| anyhow!("M-02: size sum overflow"))?;
 
         // Validate sizes
-        if model_size.as_u64() as usize + metadata_size.as_u64() as usize + 64 != input.len() {
+        if total != input.len() {
             return Err(anyhow!("Invalid model data size"));
         }
 
@@ -186,7 +243,9 @@ impl InferencePrecompile {
         let model_id = H256::from_slice(&sha3::Keccak256::digest(input));
 
         // Extract weights from input
-        let weights_start = 64 + metadata_size.as_u64() as usize;
+        let weights_start = 64usize
+            .checked_add(metadata_size)
+            .ok_or_else(|| anyhow!("M-02: weights_start overflow"))?;
         let weights = &input[weights_start..];
 
         // Create model structure
@@ -198,7 +257,7 @@ impl InferencePrecompile {
             config: ModelConfig {
                 input_shape: vec![1, 512], // Default shape
                 output_shape: vec![1, 2],
-                memory_required_mb: (model_size.as_u64() / (1024 * 1024)) as u32,
+                memory_required_mb: (model_size / (1024 * 1024)) as u32,
                 batch_size: 1,
                 max_sequence_length: None,
                 quantization: crate::inference::metal_runtime::QuantizationType::Float32,

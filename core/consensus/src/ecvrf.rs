@@ -182,8 +182,14 @@ fn challenge_to_scalar(c: &[u8; C_LEN]) -> Scalar {
     padded[32 - C_LEN..].copy_from_slice(c);
     let field_bytes = p256::FieldBytes::from_slice(&padded);
     let opt: Option<Scalar> = Scalar::from_repr(*field_bytes).into();
-    // c is 16 bytes so always < curve order (32 bytes); unwrap is safe
-    opt.unwrap_or(Scalar::ZERO)
+    // RM-B1 / WP-B5.6 (audit L-03): pre-fix used `unwrap_or(Scalar::ZERO)`
+    // here. The fallback to zero scalar in the verification equation
+    // `c * pk` produces the identity element — a forger-passes case
+    // if reachable. `c` is C_LEN = 16 bytes which is always < curve
+    // order (P-256 order is ~256 bits), so `from_repr` ALWAYS
+    // succeeds. `.expect()` documents the invariant and panics
+    // loudly if a future C_LEN bump invalidates it.
+    opt.expect("c is C_LEN bytes (≤ 16); always fits in P-256 scalar field")
 }
 
 /// RFC 6979-style deterministic nonce generation using HMAC-DRBG.
