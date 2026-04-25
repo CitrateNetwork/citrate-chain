@@ -722,7 +722,9 @@ fn keystore_v2_aad(kdf_version: u32, key_type: KeyType, address: &str) -> Vec<u8
 /// Encrypt raw key bytes with Argon2 + AES-256-GCM.
 ///
 /// New entries are always written with `KDF_VERSION_CURRENT` (= 2) per
-/// `docs/security/KDF_POLICY.md`. WAL-01: KDF strength. WAL-02: AAD bind.
+/// `docs/security/KDF_POLICY.md`. WAL-01: KDF strength. WAL-02: AAD bind
+/// (routed through `citrate_security::Aead`, the canonical AEAD
+/// wrapper added in WP-A3.3).
 fn encrypt_key_raw(
     secret_bytes: &[u8; 32],
     password: &str,
@@ -731,13 +733,11 @@ fn encrypt_key_raw(
     label: &str,
     key_type: KeyType,
 ) -> Result<EncryptedKeyEntry, WalletError> {
-    use aes_gcm::{aead::{Aead, Payload}, Aes256Gcm, KeyInit, Nonce};
-
     let salt: [u8; 16] = rand::random();
     let nonce_bytes: [u8; 12] = rand::random();
 
     // WAL-04: derived_key is the AES-256 key; wrap so its bytes are zeroed
-    // when the local goes out of scope. The cipher copies the bytes into
+    // when the local goes out of scope. Aead::new copies the bytes into
     // its own state so we don't need the buffer to persist.
     let mut derived_key: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
     let argon2 = argon2_for_version(KDF_VERSION_CURRENT)?;
@@ -745,21 +745,14 @@ fn encrypt_key_raw(
         .hash_password_into(password.as_bytes(), &salt, derived_key.as_mut())
         .map_err(|e| WalletError::Encryption(format!("Argon2 failed: {}", e)))?;
 
-    let cipher = Aes256Gcm::new_from_slice(derived_key.as_ref())
-        .map_err(|e| WalletError::Encryption(format!("AES init failed: {}", e)))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let aead = citrate_security::Aead::new(&derived_key)
+        .map_err(|e| WalletError::Encryption(format!("AEAD init failed: {}", e)))?;
 
     // WAL-02: bind metadata as AAD for v2 entries.
     let aad = keystore_v2_aad(KDF_VERSION_CURRENT, key_type, address);
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: secret_bytes.as_ref(),
-                aad: &aad,
-            },
-        )
-        .map_err(|e| WalletError::Encryption(format!("AES encrypt failed: {}", e)))?;
+    let ciphertext = aead
+        .seal(&nonce_bytes, secret_bytes.as_ref(), &aad)
+        .map_err(|e| WalletError::Encryption(format!("AEAD seal failed: {}", e)))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -793,7 +786,6 @@ fn encrypt_key_raw(
 /// surfaces as `WalletError::InvalidPassword` to the caller. The legacy
 /// v1 path decrypts without AAD for backward compatibility.
 fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], WalletError> {
-    use aes_gcm::{aead::{Aead, Payload}, Aes256Gcm, KeyInit, Nonce};
     use base64::Engine;
 
     let ciphertext = base64::engine::general_purpose::STANDARD
@@ -802,9 +794,17 @@ fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], Wa
     let salt = base64::engine::general_purpose::STANDARD
         .decode(&entry.salt)
         .map_err(|e| WalletError::Decryption(format!("Invalid salt base64: {}", e)))?;
-    let nonce_bytes = base64::engine::general_purpose::STANDARD
+    let nonce_bytes_vec = base64::engine::general_purpose::STANDARD
         .decode(&entry.nonce)
         .map_err(|e| WalletError::Decryption(format!("Invalid nonce base64: {}", e)))?;
+    if nonce_bytes_vec.len() != 12 {
+        return Err(WalletError::Decryption(format!(
+            "Invalid nonce length: {} bytes, expected 12",
+            nonce_bytes_vec.len()
+        )));
+    }
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&nonce_bytes_vec);
 
     // WAL-04: Derive key under the entry's declared KDF version. Wrap
     // in Zeroizing so the bytes are erased when this scope ends.
@@ -814,29 +814,31 @@ fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], Wa
         .hash_password_into(password.as_bytes(), &salt, derived_key.as_mut())
         .map_err(|e| WalletError::Decryption(format!("Argon2 failed: {}", e)))?;
 
-    // Decrypt
-    let cipher = Aes256Gcm::new_from_slice(derived_key.as_ref())
-        .map_err(|e| WalletError::Decryption(format!("AES init failed: {}", e)))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
     // WAL-02: dispatch on kdf_version. v1 (legacy) entries decrypt
     // without AAD; v2+ entries enforce the AAD binding documented at
-    // `keystore_v2_aad`. Future versions follow the same pattern via
-    // dispatch on the `kdf_version` field.
+    // `keystore_v2_aad`. The v2+ path routes through the canonical
+    // `citrate_security::Aead` wrapper (WP-A3.3); the v1 path uses
+    // raw aes-gcm because legacy entries on disk were encrypted
+    // without AAD and that contract is preserved for read.
     let plaintext_vec: Vec<u8> = match entry.kdf_version {
-        KDF_VERSION_LEGACY => cipher
-            .decrypt(nonce, ciphertext.as_ref())
-            .map_err(|_| WalletError::InvalidPassword)?,
-        KDF_VERSION_CURRENT | KDF_VERSION_LOW_MEMORY => {
-            let aad = keystore_v2_aad(entry.kdf_version, entry.key_type, &entry.address);
+        KDF_VERSION_LEGACY => {
+            // Legacy v1: no AAD. Use raw aes-gcm. This is the ONE
+            // production call site of the raw API; the Semgrep rule
+            // wal-02-aead-no-aad documents this exception.
+            use aes_gcm::aead::Aead as RawAead;
+            use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+            let cipher = Aes256Gcm::new_from_slice(derived_key.as_ref())
+                .map_err(|e| WalletError::Decryption(format!("AES init failed: {}", e)))?;
+            let nonce = Nonce::from_slice(&nonce_bytes);
             cipher
-                .decrypt(
-                    nonce,
-                    Payload {
-                        msg: ciphertext.as_ref(),
-                        aad: &aad,
-                    },
-                )
+                .decrypt(nonce, ciphertext.as_ref())
+                .map_err(|_| WalletError::InvalidPassword)?
+        }
+        KDF_VERSION_CURRENT | KDF_VERSION_LOW_MEMORY => {
+            let aead = citrate_security::Aead::new(&derived_key)
+                .map_err(|e| WalletError::Decryption(format!("AEAD init failed: {}", e)))?;
+            let aad = keystore_v2_aad(entry.kdf_version, entry.key_type, &entry.address);
+            aead.open(&nonce_bytes, &ciphertext, &aad)
                 .map_err(|_| WalletError::InvalidPassword)?
         }
         _ => {

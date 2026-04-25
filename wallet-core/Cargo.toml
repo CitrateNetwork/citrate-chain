@@ -18,7 +18,12 @@ rlp = "0.5"
 bip39 = { version = "1.2", features = ["rand", "std"] }
 
 # Encryption (WASM-compatible — pure Rust)
+# WP-A3.3: AEAD calls route through the citrate-security wrapper which
+# enforces AAD-bind via Payload. Direct aes-gcm use in this crate is
+# allowed only inside the keystore migration path; new code must call
+# `Aead::seal/open`.
 aes-gcm = "0.10"
+citrate-security = { path = "../core/security" }
 argon2 = "0.5"
 # Audit finding WAL-04: zeroize secret material on drop.
 # Audit finding CX-02: constant-time byte comparison for MAC/tag values.
