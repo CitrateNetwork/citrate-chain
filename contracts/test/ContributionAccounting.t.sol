@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {ContributionAccounting} from "../src/ContributionAccounting.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 contract ContributionAccountingTest is Test {
     ContributionAccounting internal accounting;
@@ -234,7 +235,7 @@ contract ContributionAccountingTest is Test {
 
     function test_non_governance_cannot_update_weight() public {
         vm.prank(outsider);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         accounting.updateWeight(ContributionAccounting.ContributionType.Validation, 50000);
     }
 
@@ -297,7 +298,7 @@ contract ContributionAccountingTest is Test {
         accounting.fundRewards{value: 1 ether}();
 
         vm.prank(outsider);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         accounting.distributeRewards();
     }
 
@@ -393,7 +394,7 @@ contract ContributionAccountingTest is Test {
 
     function test_non_governance_cannot_add_recorder() public {
         vm.prank(outsider);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         accounting.addRecorder(address(0x1234));
     }
 

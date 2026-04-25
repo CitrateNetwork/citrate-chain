@@ -2,13 +2,14 @@
 pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/Governable.sol";
 
 /// @title LearningCycleManager — On-Chain Learning Cycle Orchestration
 /// @notice Manages the full lifecycle of collaborative learning cycles:
 ///         Open → Collecting → Aggregating → AdapterGen → Finalized.
 ///         Reward distribution: 40% participants, 35% mentors, 15% improved mentees, 10% aggregator.
 /// @dev WP-F.11
-contract LearningCycleManager is ReentrancyGuard {
+contract LearningCycleManager is ReentrancyGuard, Governable {
     // ── Types ───────────────────────────────────────────────────────
 
     enum CycleState { Open, Collecting, Aggregating, AdapterGen, Finalized }
@@ -46,8 +47,7 @@ contract LearningCycleManager is ReentrancyGuard {
     /// @notice Current (latest) cycle ID. Incremented on each `openCycle`.
     uint256 public currentCycleId;
 
-    /// @notice Governance address.
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ── Per-Cycle Storage ────────────────────────────────────────────
 
@@ -94,20 +94,15 @@ contract LearningCycleManager is ReentrancyGuard {
     event AdapterRecorded(uint256 indexed cycleId, address indexed mentor, bytes32 adapterHash);
     event CycleFinalized(uint256 indexed cycleId, uint256 totalRewards);
     event RewardClaimed(uint256 indexed cycleId, address indexed participant, uint256 amount);
-    event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+    // GovernanceTransferred event provided by Governable mixin.
 
     // ── Modifiers ────────────────────────────────────────────────────
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "Not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     // ── Constructor ──────────────────────────────────────────────────
 
-    constructor() {
-        governance = msg.sender;
-    }
+    constructor() Governable(msg.sender) {}
 
     // ── Cycle Lifecycle ──────────────────────────────────────────────
 
@@ -399,13 +394,7 @@ contract LearningCycleManager is ReentrancyGuard {
 
     // ── Governance ───────────────────────────────────────────────────
 
-    /// @notice Transfer governance to a new address.
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "Zero address");
-        address oldGov = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(oldGov, newGovernance);
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     // ── Receive ──────────────────────────────────────────────────────
 

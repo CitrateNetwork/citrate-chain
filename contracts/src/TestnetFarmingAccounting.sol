@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
+import "./lib/Governable.sol";
 import "./ContributionAccounting.sol";
 import "./StablecoinTreasury.sol";
 
@@ -25,7 +26,7 @@ import "./StablecoinTreasury.sol";
 ///   - Sum of all claims <= distributionPool
 ///
 /// Sprint ECON-2 — WP-E2.2
-contract TestnetFarmingAccounting is ReentrancyGuard {
+contract TestnetFarmingAccounting is ReentrancyGuard, Governable {
     // ============================================================
     // State — Dependencies
     // ============================================================
@@ -36,8 +37,7 @@ contract TestnetFarmingAccounting is ReentrancyGuard {
     /// @notice StablecoinTreasury (source of distribution funds)
     StablecoinTreasury public treasury;
 
-    /// @notice Governance address
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ============================================================
     // State — Snapshot
@@ -101,16 +101,13 @@ contract TestnetFarmingAccounting is ReentrancyGuard {
         uint256 totalScore
     );
     event Swept(address indexed stablecoin, address indexed to, uint256 amount);
-    event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+    // GovernanceTransferred event provided by Governable mixin.
 
     // ============================================================
     // Modifiers
     // ============================================================
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "TestnetFarming: not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     // ============================================================
     // Constructor
@@ -124,14 +121,12 @@ contract TestnetFarmingAccounting is ReentrancyGuard {
         address _contributions,
         address _treasury,
         address _governance
-    ) {
+    ) Governable(_governance) {
         require(_contributions != address(0), "TestnetFarming: zero contributions");
         require(_treasury != address(0), "TestnetFarming: zero treasury");
-        require(_governance != address(0), "TestnetFarming: zero governance");
 
         contributions = ContributionAccounting(payable(_contributions));
         treasury = StablecoinTreasury(_treasury);
-        governance = _governance;
     }
 
     // ============================================================
@@ -372,13 +367,7 @@ contract TestnetFarmingAccounting is ReentrancyGuard {
         emit Swept(distributionStablecoin, to, remaining);
     }
 
-    /// @notice Transfer governance
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "TestnetFarming: zero address");
-        address old = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(old, newGovernance);
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     // ============================================================
     // Internal Helpers

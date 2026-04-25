@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {HeartbeatMonitor} from "../src/HeartbeatMonitor.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 /// @notice Mock NematocystSlashing for integration testing.
 contract MockSlashing {
@@ -356,15 +357,19 @@ contract HeartbeatMonitorTest is Test {
 
     function test_non_governance_cannot_set_interval() public {
         vm.prank(outsider);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         monitor.setHeartbeatInterval(200);
     }
 
     function test_transferGovernance() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         monitor.transferGovernance(provider1);
+        assertEq(monitor.pendingGovernance(), provider1);
+        vm.prank(provider1);
+        monitor.acceptGovernance();
         assertEq(monitor.governance(), provider1);
 
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         monitor.setMaxMissed(10);
 
         vm.prank(provider1);
@@ -373,7 +378,7 @@ contract HeartbeatMonitorTest is Test {
     }
 
     function test_transferGovernance_zero_address_reverts() public {
-        vm.expectRevert("Zero address");
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         monitor.transferGovernance(address(0));
     }
 

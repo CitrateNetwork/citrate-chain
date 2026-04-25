@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {LearningCycleManager} from "../src/LearningCycleManager.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 contract LearningCycleManagerTest is Test {
     LearningCycleManager internal lcm;
@@ -347,7 +348,7 @@ contract LearningCycleManagerTest is Test {
 
     function test_non_governance_cannot_open_cycle() public {
         vm.prank(outsider);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         lcm.openCycle(1000);
     }
 
@@ -356,7 +357,7 @@ contract LearningCycleManagerTest is Test {
 
         vm.deal(outsider, 100 ether);
         vm.prank(outsider);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         lcm.finalizeCycle{value: 10 ether}(cid);
     }
 
@@ -410,11 +411,15 @@ contract LearningCycleManagerTest is Test {
     }
 
     function test_governance_transfer() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         lcm.transferGovernance(alice);
+        assertEq(lcm.pendingGovernance(), alice);
+        vm.prank(alice);
+        lcm.acceptGovernance();
         assertEq(lcm.governance(), alice);
 
         // Old governance can no longer open cycles
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         lcm.openCycle(1000);
 
         // New governance can

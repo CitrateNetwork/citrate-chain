@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
 import "../src/MarketMakerAllocation.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 contract MarketMakerAllocationTest is Test {
     MarketMakerAllocation public mma;
@@ -33,7 +34,7 @@ contract MarketMakerAllocationTest is Test {
     }
 
     function test_constructor_reverts_zero_governance() public {
-        vm.expectRevert("Zero governance address");
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         new MarketMakerAllocation(marketMaker, address(0));
     }
 
@@ -138,7 +139,7 @@ contract MarketMakerAllocationTest is Test {
 
     function test_non_governance_cannot_change_market_maker() public {
         vm.prank(address(0xBAD));
-        vm.expectRevert("Only governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         mma.changeMarketMaker(newMaker, "Unauthorized");
     }
 
@@ -241,21 +242,25 @@ contract MarketMakerAllocationTest is Test {
     // -----------------------------------------------------------------------
 
     function test_transfer_governance() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         address newGov = address(0x999);
         vm.prank(governance);
         mma.transferGovernance(newGov);
+        assertEq(mma.pendingGovernance(), newGov);
+        vm.prank(newGov);
+        mma.acceptGovernance();
         assertEq(mma.governance(), newGov);
     }
 
     function test_transfer_governance_non_gov_reverts() public {
         vm.prank(address(0xBAD));
-        vm.expectRevert("Only governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         mma.transferGovernance(address(0x999));
     }
 
     function test_transfer_governance_zero_reverts() public {
         vm.prank(governance);
-        vm.expectRevert("Zero address");
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         mma.transferGovernance(address(0));
     }
 

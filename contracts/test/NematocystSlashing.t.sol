@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {NematocystSlashing} from "../src/NematocystSlashing.sol";
+import {Governable} from "../src/lib/Governable.sol";
 
 contract NematocystSlashingTest is Test {
     NematocystSlashing internal slashing;
@@ -173,7 +174,7 @@ contract NematocystSlashingTest is Test {
         _stakeDefault(provider1);
 
         vm.prank(outsider);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         slashing.slash(provider1, NematocystSlashing.SlashTier.Latency, dummyEvidence);
     }
 
@@ -243,12 +244,16 @@ contract NematocystSlashingTest is Test {
     }
 
     function test_governance_transfer() public {
+        // RM-B1 / WP-D1.1 (audit SOL-21): two-step transfer.
         slashing.transferGovernance(provider1);
+        assertEq(slashing.pendingGovernance(), provider1);
+        vm.prank(provider1);
+        slashing.acceptGovernance();
         assertEq(slashing.governance(), provider1);
 
         // Old governance can no longer slash
         _stakeDefault(provider2);
-        vm.expectRevert("Not governance");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         slashing.slash(provider2, NematocystSlashing.SlashTier.Latency, dummyEvidence);
 
         // New governance can slash

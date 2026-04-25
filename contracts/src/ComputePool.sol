@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
 import "./lib/ComputeLib.sol";
+import "./lib/Governable.sol";
 import "./interfaces/INematocystSlashing.sol";
 
 /// @title ComputePool — Multi-Provider GPU Clustering
@@ -20,7 +21,7 @@ import "./interfaces/INematocystSlashing.sol";
 ///           GPUCountAccurate        — totalGPUs = sum of provider GPU allocations
 ///
 /// @dev WP-CI.3 — Compute Infrastructure: Compute Pool
-contract ComputePool is ReentrancyGuard {
+contract ComputePool is ReentrancyGuard, Governable {
     // ── Types ───────────────────────────────────────────────────────
 
     enum PoolMode { InferencePool, DataParallel, PipelineParallel }
@@ -135,8 +136,7 @@ contract ComputePool is ReentrancyGuard {
     /// @notice NematocystSlashing contract for SLA enforcement.
     INematocystSlashing public slashingContract;
 
-    /// @notice Governance address.
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     // ── Events ──────────────────────────────────────────────────────
 
@@ -159,7 +159,7 @@ contract ComputePool is ReentrancyGuard {
     event JobFailed(uint256 indexed jobId, uint256 indexed poolId);
     event SLAViolationReported(uint256 indexed poolId, uint256 actualThroughput, uint256 guaranteedThroughput);
     event SlashingContractUpdated(address oldContract, address newContract);
-    event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+    // GovernanceTransferred event provided by Governable mixin.
 
     // ── CM-05 WP-05.1 events ───────────────────────────────────────
 
@@ -202,10 +202,7 @@ contract ComputePool is ReentrancyGuard {
 
     // ── Modifiers ───────────────────────────────────────────────────
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "Not governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     modifier poolExists(uint256 poolId) {
         require(poolId < nextPoolId, "Pool does not exist");
@@ -219,9 +216,7 @@ contract ComputePool is ReentrancyGuard {
 
     // ── Constructor ─────────────────────────────────────────────────
 
-    constructor() {
-        governance = msg.sender;
-    }
+    constructor() Governable(msg.sender) {}
 
     // ── Pool Management ─────────────────────────────────────────────
 
@@ -418,7 +413,7 @@ contract ComputePool is ReentrancyGuard {
 
         Pool storage pool = pools[job.poolId];
         require(
-            msg.sender == governance || msg.sender == pool.creator,
+            msg.sender == governance() || msg.sender == pool.creator,
             "Not authorized"
         );
 
@@ -439,7 +434,7 @@ contract ComputePool is ReentrancyGuard {
 
         Pool storage pool = pools[job.poolId];
         require(
-            msg.sender == governance || msg.sender == pool.creator,
+            msg.sender == governance() || msg.sender == pool.creator,
             "Not authorized"
         );
 
@@ -574,14 +569,7 @@ contract ComputePool is ReentrancyGuard {
         emit SlashingContractUpdated(old, _slashingContract);
     }
 
-    /// @notice Transfer governance.
-    /// @param newGovernance New governance address.
-    function transferGovernance(address newGovernance) external onlyGovernance {
-        require(newGovernance != address(0), "Zero address");
-        address old = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(old, newGovernance);
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     // ── CM-05 WP-05.1: Coordinator election + reassignment ─────────
 

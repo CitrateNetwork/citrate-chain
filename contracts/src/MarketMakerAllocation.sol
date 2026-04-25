@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import "./lib/Governable.sol";
+
 /**
  * @title MarketMakerAllocation
  * @notice Receives 10% of gas pool fees as a cooperative incentive for the
@@ -20,7 +22,7 @@ pragma solidity ^0.8.26;
  *   - Higher network usage = more gas fees = more market maker revenue = deeper liquidity
  *   - DAO can replace market maker if service quality drops
  */
-contract MarketMakerAllocation {
+contract MarketMakerAllocation is Governable {
     // -----------------------------------------------------------------------
     // State
     // -----------------------------------------------------------------------
@@ -28,8 +30,7 @@ contract MarketMakerAllocation {
     /// @notice Current market maker address (receives gas fee allocation)
     address public marketMaker;
 
-    /// @notice Governance address (TreasuryGovernor or multisig)
-    address public governance;
+    // Governance state lives in Governable mixin (audit SOL-21).
 
     /// @notice Allocation rate in basis points (default: 1000 = 10%)
     uint256 public allocationBps;
@@ -73,16 +74,13 @@ contract MarketMakerAllocation {
         string reason
     );
     event AllocationRateChanged(uint256 previousBps, uint256 newBps);
-    event GovernanceTransferred(address indexed previousGov, address indexed newGov);
+    // GovernanceTransferred event provided by Governable mixin.
 
     // -----------------------------------------------------------------------
     // Modifiers
     // -----------------------------------------------------------------------
 
-    modifier onlyGovernance() {
-        require(msg.sender == governance, "Only governance");
-        _;
-    }
+    // `onlyGovernance` is inherited from Governable.
 
     modifier onlyMarketMaker() {
         require(msg.sender == marketMaker, "Only market maker");
@@ -93,11 +91,9 @@ contract MarketMakerAllocation {
     // Constructor
     // -----------------------------------------------------------------------
 
-    constructor(address _marketMaker, address _governance) {
+    constructor(address _marketMaker, address _governance) Governable(_governance) {
         require(_marketMaker != address(0), "Zero market maker address");
-        require(_governance != address(0), "Zero governance address");
         marketMaker = _marketMaker;
-        governance = _governance;
         allocationBps = 1000; // 10% default
         lastRateChangeBlock = block.number;
     }
@@ -177,12 +173,7 @@ contract MarketMakerAllocation {
         lastRateChangeBlock = block.number;
     }
 
-    /// @notice Transfer governance to new address
-    function transferGovernance(address newGov) external onlyGovernance {
-        require(newGov != address(0), "Zero address");
-        emit GovernanceTransferred(governance, newGov);
-        governance = newGov;
-    }
+    // transferGovernance / acceptGovernance are inherited from Governable.
 
     // -----------------------------------------------------------------------
     // View Functions
