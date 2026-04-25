@@ -1,0 +1,69 @@
+# CX-02 — String/byte equality on bearer tokens, MACs, or password hashes
+# must use `subtle::ConstantTimeEq`, not `==` / `!=`.
+#
+# Audit finding (MEDIUM):
+#   .audit/2026-04-24-full-repo-adversarial-audit/08_FINDINGS_WALLET_AGENT_FAUCET.md#cx-02
+#
+# Reference: https://docs.rs/subtle/latest/subtle/
+#
+# This rule flags `==` comparisons on common token-shaped variable names
+# in production code paths. It is intentionally narrow to avoid false
+# positives on regular string equality checks (which dominate the
+# codebase). Only the named patterns trip the rule.
+#
+# Verified clean call sites (post-WP-A2.5/A2.6):
+#   - agent-core/src/mcp_server.rs::ct_grant_id_eq
+#   - gui/citrate_edu_app/src/portal.rs::verify_passphrase
+
+rules:
+  - id: cx-02-non-constant-time-eq
+    message: >-
+      Comparing a bearer token, grant id, password hash, or MAC value
+      with `==`/`!=` is timing-sensitive and leaks the matching prefix
+      length to an attacker. Use `subtle::ConstantTimeEq::ct_eq` per
+      `docs/security/SECRET_LIFECYCLE.md` (CX-02 section). Acceptable
+      patterns: length-check first, then `subtle::ConstantTimeEq`.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "wallet-core/src/**/*.rs"
+        - "wallet/src/**/*.rs"
+        - "wallet-sdk/src/**/*.rs"
+        - "agent-core/src/**/*.rs"
+        - "agent-chain/src/**/*.rs"
+        - "agent-code/src/**/*.rs"
+        - "agent-cron/src/**/*.rs"
+        - "gui/**/*.rs"
+        - "gateway/src/**/*.rs"
+        - "training-worker/src/**/*.rs"
+        - "pool-coordinator/src/**/*.rs"
+        - "core/**/*.rs"
+        - "node/src/**/*.rs"
+        - "node-app/src/**/*.rs"
+        - "faucet/src/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
+        - "**/*_tests.rs"
+        - "**/benches/**"
+    pattern-either:
+      # Bearer-style identifier comparisons (grant_id, token, api_key).
+      - pattern: $X.id == $Y
+      - pattern: $X.grant_id == $Y
+      - pattern: $X.token == $Y
+      - pattern: $X.api_key == $Y
+      - pattern: $X.bearer == $Y
+      # Hash / MAC comparisons.
+      - pattern: $H.passphrase_hash_hex == $Y
+      - pattern: $X.mac == $Y
+      - pattern: $X.tag == $Y
+      - pattern: |
+          $H.finalize() == $Y
+    metadata:
+      audit-id: CX-02
+      severity: medium
+      sprint: RM-A2
+      wp: WP-A2.5
+      reference: https://docs.rs/subtle/latest/subtle/
