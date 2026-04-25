@@ -52,3 +52,9 @@ native = ["tokio", "reqwest", "bincode", "dirs", "primitive-types", "citrate-con
 tokio = { version = "1", features = ["full"] }
 tokio-test = "0.4"
 proptest = "1"
+# WP-A1.2: Argon2 calibration bench. Pinned to the workspace value.
+criterion = { workspace = true }
+
+[[bench]]
+name = "argon2_calibration"
+harness = false

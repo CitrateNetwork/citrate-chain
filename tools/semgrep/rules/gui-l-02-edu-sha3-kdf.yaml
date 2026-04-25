@@ -1,0 +1,60 @@
+# GUI-L-02 — Edu org-encryption KDF must be Argon2id, not single-round SHA3.
+#
+# Audit finding (HIGH):
+#   .audit/2026-04-24-full-repo-adversarial-audit/07_FINDINGS_GUIS.md#gui-l-02
+#
+# Spec (canonical):
+#   docs/security/KDF_POLICY.md §1 (table) and §3 (Argon2id requirement).
+#
+# `OrgEncryption::from_password_legacy_sha3` is preserved purely as a
+# backward-compat read path for any pre-GUI-L-02 records on disk (no real
+# records exist; the school pilot has not launched). Production code must
+# call `OrgEncryption::from_password` which routes through Argon2id v2 per
+# `docs/security/KDF_POLICY.md`.
+#
+# This rule fires on:
+#   - Any caller of `from_password_legacy_sha3` outside `#[cfg(test)]`
+#     paths.
+#   - Any direct `Sha3_256::digest(<password>)` pattern in
+#     `gui/citrate_edu_app/` (the cross-cutting variant the audit found).
+
+rules:
+  - id: gui-l-02-edu-sha3-kdf
+    message: >-
+      `OrgEncryption::from_password_legacy_sha3` is the legacy read-only
+      path for pre-GUI-L-02 records. Production code must use
+      `from_password` which routes through Argon2id v2. See
+      docs/security/KDF_POLICY.md.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "gui/citrate_edu_app/**/*.rs"
+        - "gui/citrate_learning_center/**/*.rs"
+        - "gui/citrate_edu_native/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
+        - "**/*_tests.rs"
+        - "**/benches/**"
+        - "**/encryption.rs"  # `encryption.rs` defines the legacy fn itself
+    pattern-either:
+      - pattern: from_password_legacy_sha3(...)
+      - patterns:
+          # Reject manual SHA3-only password derivations that bypass
+          # OrgEncryption::from_password. Bound to `gui/citrate_edu_app`
+          # via paths.include.
+          - pattern: |
+              {
+                let mut $H = Sha3_256::new();
+                $H.update($PASSWORD.as_bytes());
+                ...
+              }
+    metadata:
+      audit-id: GUI-L-02
+      severity: high
+      sprint: RM-A1
+      wp: WP-A1.4
+      spec: citrate_v0.01.1/docs/security/KDF_POLICY.md
+      reference: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
