@@ -23,3 +23,10 @@ reqwest = { version = "0.12", features = ["json"] }
 # Local dependencies
 citrate-consensus = { path = "../core/consensus" }
 citrate-execution = { path = "../core/execution" }
+
+[features]
+default = []
+# RM-B1 / WP-E6.2 (audit FAU-02): the deterministic-default seed
+# is now gated behind a build-time flag. Local CI / dev contexts
+# can opt-in; release builds MUST NOT enable this feature.
+unsafe-deterministic-key = []
