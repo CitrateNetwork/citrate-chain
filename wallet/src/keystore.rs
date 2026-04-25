@@ -4,7 +4,7 @@ use aes_gcm::{
 };
 use argon2::{
     password_hash::{PasswordHasher, SaltString},
-    Argon2,
+    Algorithm, Argon2, Params, Version,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
@@ -12,6 +12,44 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::errors::WalletError;
+
+// =========================================================================
+// KDF version registry — mirrors citrate-wallet-core::keys
+// See docs/security/KDF_POLICY.md (canonical) and audit finding WAL-01.
+// =========================================================================
+
+/// Legacy: pre-WAL-01 entries written with `Argon2::default()`.
+const KDF_VERSION_LEGACY: u32 = 1;
+
+/// Current production: OWASP 2024 recommended Argon2id parameters
+/// (m=65536, t=3, p=4, output_len=32).
+const KDF_VERSION_CURRENT: u32 = 2;
+
+/// Default for entries on disk that lack the field.
+fn default_kdf_version_legacy() -> u32 {
+    KDF_VERSION_LEGACY
+}
+
+/// Construct the Argon2 instance for a given KDF version.
+///
+/// Mirrors `citrate_wallet_core::keys::argon2_for_version`. The two
+/// keystore implementations are consolidated under sprint RM-G2; until
+/// then, both must hold to the same KDF policy table.
+fn argon2_for_version(version: u32) -> Result<Argon2<'static>, WalletError> {
+    match version {
+        KDF_VERSION_LEGACY => Ok(Argon2::default()),
+        KDF_VERSION_CURRENT => {
+            let params = Params::new(65536, 3, 4, Some(32))
+                .expect("WAL-01: Argon2 v2 params (m=65536, t=3, p=4, out=32) are statically valid; see docs/security/KDF_POLICY.md");
+            Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+        }
+        unknown => Err(WalletError::Decryption(format!(
+            "WAL-01: unknown kdf_version {} on keystore entry; expected 1 or 2 \
+             (see docs/security/KDF_POLICY.md). Refusing to derive key.",
+            unknown
+        ))),
+    }
+}
 
 /// Encrypted key storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +64,10 @@ pub struct EncryptedKey {
     pub public_key: Vec<u8>,
     /// Optional key alias
     pub alias: Option<String>,
+    /// KDF parameter version. See `docs/security/KDF_POLICY.md`.
+    /// Defaults to 1 (legacy) for entries on disk that lack the field.
+    #[serde(default = "default_kdf_version_legacy")]
+    pub kdf_version: u32,
 }
 
 /// Key store for managing encrypted keys
@@ -193,6 +235,9 @@ impl KeyStore {
     }
 
     /// Encrypt a signing key
+    ///
+    /// Always writes with `KDF_VERSION_CURRENT` per
+    /// `docs/security/KDF_POLICY.md`. Closes WAL-01.
     fn encrypt_key(
         &self,
         signing_key: &SigningKey,
@@ -201,8 +246,8 @@ impl KeyStore {
         // Generate salt
         let salt = SaltString::generate(&mut OsRng);
 
-        // Derive key from password
-        let argon2 = Argon2::default();
+        // Derive key from password using current KDF parameters.
+        let argon2 = argon2_for_version(KDF_VERSION_CURRENT)?;
         let password_hash = argon2
             .hash_password(password.as_bytes(), &salt)
             .map_err(|e| WalletError::Encryption(e.to_string()))?;
@@ -237,10 +282,14 @@ impl KeyStore {
             nonce: nonce_bytes.to_vec(),
             public_key: signing_key.verifying_key().to_bytes().to_vec(),
             alias: None,
+            kdf_version: KDF_VERSION_CURRENT,
         })
     }
 
     /// Decrypt an encrypted key
+    ///
+    /// Selects the Argon2 parameter set from `encrypted.kdf_version` so
+    /// legacy entries continue to unlock under their original parameters.
     fn decrypt_key(
         &self,
         encrypted: &EncryptedKey,
@@ -250,8 +299,8 @@ impl KeyStore {
         let salt = SaltString::from_b64(&encrypted.salt)
             .map_err(|e| WalletError::Decryption(e.to_string()))?;
 
-        // Derive key from password
-        let argon2 = Argon2::default();
+        // Derive key from password using the entry's declared KDF version.
+        let argon2 = argon2_for_version(encrypted.kdf_version)?;
         let password_hash = argon2
             .hash_password(password.as_bytes(), &salt)
             .map_err(|e| WalletError::Decryption(e.to_string()))?;

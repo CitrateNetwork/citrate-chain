@@ -3,6 +3,15 @@
 //! Supports Ed25519 (native Citrate) and secp256k1 (EVM compatibility).
 //! Keys are encrypted at rest with Argon2 + AES-256-GCM.
 //! Address derivation uses Keccak-256(pubkey)[12..32].
+//!
+//! ## KDF policy
+//!
+//! New entries are written with `kdf_version: KDF_VERSION_CURRENT` (= 2),
+//! using OWASP-recommended Argon2id parameters (m=65536 KiB, t=3, p=4,
+//! output_len=32). Legacy entries on disk (`kdf_version: 1`) continue to
+//! decrypt under their original parameters via `argon2_for_version`. See
+//! `docs/security/KDF_POLICY.md` (canonical) and audit finding `WAL-01`
+//! (`.audit/2026-04-24-full-repo-adversarial-audit/08_FINDINGS_WALLET_AGENT_FAUCET.md`).
 
 use crate::error::WalletError;
 use crate::types::{CreateAccountResult, EncryptedKeyEntry, KeyType};
@@ -11,6 +20,56 @@ use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+// =========================================================================
+// KDF version registry
+// =========================================================================
+
+/// Legacy KDF version. Entries written before WAL-01 was closed used
+/// `Argon2::default()` parameters. Accepted on read for backward
+/// compatibility; never written by the current code.
+pub const KDF_VERSION_LEGACY: u32 = 1;
+
+/// Current production KDF version. OWASP 2024 recommended Argon2id
+/// parameters: m=65536 KiB (64 MiB), t=3, p=4, output_len=32.
+pub const KDF_VERSION_CURRENT: u32 = 2;
+
+/// Low-memory KDF version (OWASP "alternative"). Reserved for the
+/// browser extension and other constrained environments — not used by
+/// `wallet-core` directly today. m=46336 KiB, t=1, p=1, output_len=32.
+pub const KDF_VERSION_LOW_MEMORY: u32 = 3;
+
+/// Construct the appropriate Argon2 instance for a given KDF version.
+///
+/// Returns an error for unknown versions so a corrupted on-disk entry
+/// fails closed (legitimate `decrypt_key` will then surface a clear error
+/// to the user instead of silently using the wrong parameters).
+fn argon2_for_version(version: u32) -> Result<argon2::Argon2<'static>, WalletError> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    match version {
+        KDF_VERSION_LEGACY => {
+            // Legacy: Argon2id defaults (m=19456, t=2, p=1, out=32).
+            // Equivalent to `Argon2::default()`.
+            Ok(Argon2::default())
+        }
+        KDF_VERSION_CURRENT => {
+            let params = Params::new(65536, 3, 4, Some(32))
+                .expect("WAL-01: Argon2 v2 params (m=65536, t=3, p=4, out=32) are statically valid; see docs/security/KDF_POLICY.md");
+            Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+        }
+        KDF_VERSION_LOW_MEMORY => {
+            let params = Params::new(46336, 1, 1, Some(32))
+                .expect("WAL-01: Argon2 low-memory params (m=46336, t=1, p=1, out=32) are statically valid; see docs/security/KDF_POLICY.md");
+            Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+        }
+        unknown => Err(WalletError::Decryption(format!(
+            "WAL-01: unknown kdf_version {} on keystore entry; expected 1, 2, or 3 \
+             (see docs/security/KDF_POLICY.md). Refusing to derive key.",
+            unknown
+        ))),
+    }
+}
 
 /// Unified signing key supporting both Ed25519 and secp256k1.
 #[derive(Clone)]
@@ -524,6 +583,9 @@ fn encrypt_key(
 }
 
 /// Encrypt raw key bytes with Argon2 + AES-256-GCM.
+///
+/// New entries are always written with `KDF_VERSION_CURRENT` (= 2) per
+/// `docs/security/KDF_POLICY.md`. Closes audit finding WAL-01.
 fn encrypt_key_raw(
     secret_bytes: &[u8; 32],
     password: &str,
@@ -533,13 +595,13 @@ fn encrypt_key_raw(
     key_type: KeyType,
 ) -> Result<EncryptedKeyEntry, WalletError> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
-    use argon2::Argon2;
 
     let salt: [u8; 16] = rand::random();
     let nonce_bytes: [u8; 12] = rand::random();
 
     let mut derived_key = [0u8; 32];
-    Argon2::default()
+    let argon2 = argon2_for_version(KDF_VERSION_CURRENT)?;
+    argon2
         .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
         .map_err(|e| WalletError::Encryption(format!("Argon2 failed: {}", e)))?;
 
@@ -564,13 +626,18 @@ fn encrypt_key_raw(
         salt: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, salt),
         nonce: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes),
         created_at: now,
+        kdf_version: KDF_VERSION_CURRENT,
     })
 }
 
 /// Decrypt raw secret bytes from an encrypted entry.
+///
+/// The Argon2 parameter set is selected by `entry.kdf_version` so legacy
+/// (v1) entries continue to unlock under their original parameters while
+/// new (v2+) entries use the current production parameters per
+/// `docs/security/KDF_POLICY.md`.
 fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], WalletError> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
-    use argon2::Argon2;
     use base64::Engine;
 
     let ciphertext = base64::engine::general_purpose::STANDARD
@@ -583,9 +650,10 @@ fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], Wa
         .decode(&entry.nonce)
         .map_err(|e| WalletError::Decryption(format!("Invalid nonce base64: {}", e)))?;
 
-    // Derive key from password
+    // Derive key from password using the entry's declared KDF version.
     let mut derived_key = [0u8; 32];
-    Argon2::default()
+    let argon2 = argon2_for_version(entry.kdf_version)?;
+    argon2
         .hash_password_into(password.as_bytes(), &salt, &mut derived_key)
         .map_err(|e| WalletError::Decryption(format!("Argon2 failed: {}", e)))?;
 

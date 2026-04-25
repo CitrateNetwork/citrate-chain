@@ -488,12 +488,14 @@ fn test_encrypted_key_serialization_roundtrip() {
         nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         public_key: vec![0xAA; 32],
         alias: Some("my-key".to_string()),
+        kdf_version: 2,
     };
     let json = serde_json::to_string(&ek).unwrap();
     let d: EncryptedKey = serde_json::from_str(&json).unwrap();
     assert_eq!(d.ciphertext, vec![1, 2, 3, 4]);
     assert_eq!(d.salt, "test_salt");
     assert_eq!(d.alias, Some("my-key".to_string()));
+    assert_eq!(d.kdf_version, 2);
 }
 
 #[test]
@@ -504,10 +506,32 @@ fn test_encrypted_key_no_alias() {
         nonce: vec![],
         public_key: vec![],
         alias: None,
+        kdf_version: 2,
     };
     let json = serde_json::to_string(&ek).unwrap();
     let d: EncryptedKey = serde_json::from_str(&json).unwrap();
     assert_eq!(d.alias, None);
+    assert_eq!(d.kdf_version, 2);
+}
+
+#[test]
+fn test_wal01_legacy_cli_keystore_entry_defaults_to_v1() {
+    // Pre-WAL-01 EncryptedKey blobs lack kdf_version. They MUST still
+    // deserialize (so existing CLI wallets keep working) and default to
+    // kdf_version: 1 so decrypt_key uses the original parameters.
+    let legacy_json = r#"{
+        "ciphertext": [1, 2, 3, 4],
+        "salt": "legacy_salt",
+        "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        "public_key": [],
+        "alias": null
+    }"#;
+    let d: EncryptedKey =
+        serde_json::from_str(legacy_json).expect("legacy EncryptedKey should still deserialize");
+    assert_eq!(
+        d.kdf_version, 1,
+        "WAL-01: CLI wallet legacy entries (no kdf_version field) must default to v1"
+    );
 }
 
 // ============================================================================

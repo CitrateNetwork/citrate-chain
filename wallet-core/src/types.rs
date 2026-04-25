@@ -59,7 +59,21 @@ pub enum KeyType {
     Secp256k1,
 }
 
+/// Default kdf_version for entries written before the field existed.
+///
+/// Pre-WAL-01 entries on disk were encrypted with `Argon2::default()`
+/// (m=19456, t=2, p=1, output_len=32), which is `kdf_version: 1` per
+/// `docs/security/KDF_POLICY.md`.
+fn default_kdf_version_legacy() -> u32 {
+    1
+}
+
 /// Encrypted key storage format (JSON on disk)
+///
+/// `kdf_version` selects the Argon2 parameter set used for this entry.
+/// See `docs/security/KDF_POLICY.md` for the policy table. New entries
+/// are always written with `kdf_version: 2` (OWASP-recommended params).
+/// Legacy entries on disk that lack the field deserialize as version 1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedKeyEntry {
     pub public_key_hex: String,
@@ -70,6 +84,12 @@ pub struct EncryptedKeyEntry {
     pub salt: String,          // base64-encoded Argon2 salt
     pub nonce: String,         // base64-encoded 12-byte AES nonce
     pub created_at: u64,
+    /// KDF parameter version. Per `docs/security/KDF_POLICY.md`:
+    ///   1 = legacy (Argon2::default(): m=19456, t=2, p=1)
+    ///   2 = current production (m=65536, t=3, p=4) — OWASP recommended
+    ///   3 = low-memory profile (m=46336, t=1, p=1) — OWASP alternative
+    #[serde(default = "default_kdf_version_legacy")]
+    pub kdf_version: u32,
 }
 
 /// Result of creating a new account
@@ -162,10 +182,60 @@ mod tests {
             salt: "base64salt".to_string(),
             nonce: "base64nonce".to_string(),
             created_at: 1711555200,
+            kdf_version: 2,
         };
         let json = serde_json::to_string(&entry).expect("serialize entry");
         let deser: EncryptedKeyEntry = serde_json::from_str(&json).expect("deserialize entry");
         assert_eq!(deser.label, "Primary");
         assert_eq!(deser.key_type, KeyType::Ed25519);
+        assert_eq!(deser.kdf_version, 2);
+    }
+
+    #[test]
+    fn test_wal01_legacy_entry_without_kdf_version_deserializes_as_v1() {
+        // Pre-WAL-01 entries on disk lack the kdf_version field.
+        // They MUST deserialize as kdf_version: 1 to retain unlock-ability.
+        let legacy_json = r#"{
+            "public_key_hex": "deadbeef",
+            "address": "0x1234",
+            "label": "Legacy",
+            "key_type": "Ed25519",
+            "ciphertext": "base64cipher",
+            "salt": "base64salt",
+            "nonce": "base64nonce",
+            "created_at": 1711555200
+        }"#;
+        let deser: EncryptedKeyEntry = serde_json::from_str(legacy_json)
+            .expect("legacy entry without kdf_version should still deserialize");
+        assert_eq!(
+            deser.kdf_version, 1,
+            "WAL-01: legacy entries (no kdf_version field) must default to v1, \
+             not panic, and not silently default to v2 (which would fail to decrypt)."
+        );
+    }
+
+    #[test]
+    fn test_wal01_explicit_kdf_version_round_trips() {
+        // A v2 entry serializes with kdf_version=2 in the JSON.
+        let entry = EncryptedKeyEntry {
+            public_key_hex: "cafebabe".to_string(),
+            address: "0xabcd".to_string(),
+            label: "V2".to_string(),
+            key_type: KeyType::Secp256k1,
+            ciphertext: "v2cipher".to_string(),
+            salt: "v2salt".to_string(),
+            nonce: "v2nonce".to_string(),
+            created_at: 1777000000,
+            kdf_version: 2,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize v2 entry");
+        assert!(
+            json.contains("\"kdf_version\":2"),
+            "WAL-01: serialized JSON must include kdf_version=2; got: {}",
+            json
+        );
+        let deser: EncryptedKeyEntry =
+            serde_json::from_str(&json).expect("deserialize v2 entry");
+        assert_eq!(deser.kdf_version, 2);
     }
 }
