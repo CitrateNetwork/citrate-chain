@@ -151,9 +151,20 @@ impl Tensor {
         Ok(())
     }
 
-    /// Convert to bytes for storage
+    /// Convert to bytes for storage.
+    /// RM-B1 / WP-B1.5 (audit M-06): on serialization failure log
+    /// `error!` and return an empty `Vec<u8>` — the empty result is
+    /// caught by `from_bytes` (deserialize returns Err on empty
+    /// input) so the failure surfaces at the next read instead of
+    /// being silently masked by `unwrap_or_default`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
+        match bincode::serialize(self) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!("M-06: tensor serialize failed: {}", e);
+                Vec::new()
+            }
+        }
     }
 
     /// Create from bytes

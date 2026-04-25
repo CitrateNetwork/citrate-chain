@@ -1,0 +1,42 @@
+# WP-B1.3 / H-04 — verify DagStore::store_block atomic batch path is
+# mutation-clean. Companion to wal-01-argon2-kdf.toml.
+#
+# Run:
+#
+#   cargo mutants \
+#     --package citrate-consensus \
+#     --file core/consensus/src/dag_store.rs \
+#     --jobs 2 \
+#     --no-shuffle \
+#     --output tools/mutants/h-04-store-block-atomic-output \
+#     -- --test h04_dagstore_atomicity --test m06_bincode_propagation
+#
+# Hand-mutations of interest (must all be killed):
+#   - `kv.kv_write_batch(&ops)` -> `Ok(())` (skip persistence)
+#       killed by h04_store_block_uses_single_atomic_batch (batch_calls
+#       counter goes to 1 normally; if write_batch is no-oped, the
+#       child-block batch test detects parent stays in tips).
+#   - `KvOp::Delete` -> `KvOp::Put` (wrong tip-removal semantics)
+#       killed by h04_child_block_batch_includes_tip_swap.
+#   - `Vec::new()` substituted for the height-index serialize result
+#       killed by m06_persist_then_reload_round_trip.
+#   - Removing the `kv_write_batch` default trait impl
+#       killed at compile time (default body is the only fallback for
+#       the in-memory test KvStore in m06_bincode_propagation).
+
+# cargo-mutants 27.x doesn't consume this file directly; it documents
+# the campaign for reproducibility. The `--package` and `--file`
+# flags above are the load-bearing arguments.
+test_workspace = false
+test_package = ["citrate-consensus"]
+
+# Limit blast radius — only mutate the persist + batch path.
+examine_re = [
+    "core/consensus/src/dag_store\\.rs",
+]
+
+exclude_re = [
+    "core/consensus/src/dag_store\\.rs:.*tests::",
+]
+
+timeout_multiplier = 3.0
