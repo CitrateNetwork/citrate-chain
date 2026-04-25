@@ -518,6 +518,22 @@ impl GossipProtocol {
             return false;
         }
 
+        // 5a. INVALID_PROPOSER_PUBKEY — RM-B1 / WP-B3.1 (audit C-02):
+        // reject blocks whose `proposer_pubkey` is neither an
+        // embedded-EVM form nor a valid ed25519 curve point. Prevents
+        // attribution-spoofing attacks where an attacker submits
+        // a "natural-looking" 32-byte byte string that bypasses the
+        // dual-format check while remaining off-curve. (Genesis is
+        // exempt — its proposer field carries the network identity.)
+        if !block.is_genesis() && !block.header.proposer_pubkey.is_admissible() {
+            warn!(
+                "[INVALID_PROPOSER_PUBKEY] block={} pubkey={}",
+                block.header.block_hash,
+                hex::encode(block.header.proposer_pubkey.as_bytes())
+            );
+            return false;
+        }
+
         // 6. MISSING_PARENT — non-genesis must reference a selected parent
         if !block.is_genesis() && block.header.selected_parent_hash == Hash::default() {
             warn!("[MISSING_PARENT] block={}", block.header.block_hash);

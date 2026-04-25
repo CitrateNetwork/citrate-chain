@@ -1709,9 +1709,16 @@ impl Executor {
 
         let gov_addr = Self::governance_precompile_address();
 
-        // Read current admin or default to treasury address
+        // RM-B1 / WP-B3.3 (audit C-04): read current admin from
+        // state. NO 0x11..11 fallback — if admin is unset, the
+        // governance precompile is "uninitialized" and only
+        // genesis-context calls (block.height == 0) can call
+        // `setAdmin` to bootstrap. Pre-fix the fallback to
+        // 0x11..11 meant any sender controlling that well-known
+        // burner address could take over governance on a fresh
+        // chain.
         let admin_key = b"ADMIN".to_vec();
-        let current_admin = self
+        let current_admin: Option<Address> = self
             .state_db
             .get_storage(&gov_addr, &admin_key)
             .and_then(|v| {
@@ -1722,11 +1729,20 @@ impl Executor {
                 } else {
                     None
                 }
-            })
-            .unwrap_or(Address([0x11; 20]));
+            });
 
         if selector == sel_set_admin {
-            if from != current_admin {
+            // RM-B1 / WP-B3.3: admin can be set in two ways —
+            //   (a) by the existing admin (rotation), or
+            //   (b) by anyone in the genesis-block context
+            //       (block.height == 0). Genesis is the bootstrap
+            //       window where the chain has no admin yet.
+            // Outside both cases, refuse.
+            let allowed = match current_admin {
+                Some(admin) => from == admin,
+                None => context.block_number == 0,
+            };
+            if !allowed {
                 return Err(ExecutionError::AccessDenied);
             }
             if args.len() < 32 {
@@ -1738,6 +1754,13 @@ impl Executor {
                 .set_storage(gov_addr, admin_key, addr.to_vec());
             return Ok(());
         }
+
+        // For all non-setAdmin governance ops, the admin MUST be
+        // initialized AND the caller must be that admin.
+        let current_admin = match current_admin {
+            Some(a) => a,
+            None => return Err(ExecutionError::AccessDenied),
+        };
 
         if selector == sel_queue {
             if from != current_admin {
@@ -3019,7 +3042,7 @@ mod tests {
         let state_db = Arc::new(StateDB::new());
         let executor = Executor::new(state_db.clone());
 
-        // Set sender to default treasury admin (Address([0x11;20])) so setAdmin/queue can succeed
+        // Set sender to admin address.
         let mut admin_pk_bytes = [0u8; 32];
         admin_pk_bytes[..20].copy_from_slice(&[0x11; 20]);
         let admin_pk = PublicKey::new(admin_pk_bytes);
@@ -3038,6 +3061,17 @@ mod tests {
             a[19] = 0x03;
             Address(a)
         };
+
+        // RM-B1 / WP-B3.3 (audit C-04): the executor no longer
+        // defaults `current_admin` to 0x11..11. We pre-seed the
+        // ADMIN storage slot here to mirror what genesis-block
+        // bootstrap code does on a real chain, so the test can
+        // continue exercising the queue/execute/get path.
+        state_db.set_storage(
+            gov_addr,
+            b"ADMIN".to_vec(),
+            admin_addr.0.to_vec(),
+        );
         let mut gov_pk = [0u8; 32];
         gov_pk[..20].copy_from_slice(&gov_addr.0);
         let gov_pk = PublicKey::new(gov_pk);
@@ -3161,5 +3195,209 @@ mod tests {
         let rcpt_get = executor.execute_transaction(&block, &tx_g).await.unwrap();
         assert!(rcpt_get.status);
         assert_eq!(rcpt_get.output, value);
+    }
+
+    // ==================== C-04 governance ADMIN init tests ====================
+
+    /// C-04.1: at genesis (block.height == 0) anyone can call
+    /// setAdmin to bootstrap. This is the only way an
+    /// uninitialized governance precompile gets an admin.
+    #[tokio::test]
+    async fn c04_genesis_setadmin_bootstraps_uninitialized() {
+        use sha3::{Digest, Keccak256};
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+
+        // Bootstrap caller: any address (we use 0xCAFE..).
+        let mut caller_pk_bytes = [0u8; 32];
+        caller_pk_bytes[..20].copy_from_slice(&[0xCA; 20]);
+        let caller_pk = PublicKey::new(caller_pk_bytes);
+        let caller_addr = Address([0xCA; 20]);
+        state_db
+            .accounts
+            .set_balance(caller_addr, U256::from(1_000_000_000_000_000u128));
+
+        let gov_addr = {
+            let mut a = [0u8; 20];
+            a[18] = 0x10;
+            a[19] = 0x03;
+            Address(a)
+        };
+        let mut gov_pk = [0u8; 32];
+        gov_pk[..20].copy_from_slice(&gov_addr.0);
+        let gov_pk = PublicKey::new(gov_pk);
+
+        // Build a GENESIS block (height = 0).
+        let mut block = BlockBuilder::new()
+            .height(0)
+            .timestamp(1_000_000)
+            .build_unhashed();
+        block.header.timestamp = 1_000_000;
+
+        let mut set_admin = Vec::new();
+        let sel_set_admin = &Keccak256::digest(b"setAdmin(address)")[..4];
+        set_admin.extend_from_slice(sel_set_admin);
+        set_admin.extend_from_slice(&[0u8; 12]);
+        set_admin.extend_from_slice(&caller_addr.0);
+
+        let tx = Transaction {
+            hash: Hash::new([42; 32]),
+            nonce: 0,
+            from: caller_pk,
+            to: Some(gov_pk),
+            value: 0,
+            gas_limit: 200000,
+            gas_price: 1_000_000_000,
+            data: set_admin,
+            signature: Signature::new([0; 64]),
+            tx_type: None,
+            ..Default::default()
+        };
+        let receipt = executor
+            .execute_transaction(&block, &tx)
+            .await
+            .expect("genesis-context setAdmin must succeed");
+        assert!(receipt.status, "C-04: genesis setAdmin must commit");
+    }
+
+    /// C-04.2: post-genesis (block.height > 0) setAdmin from an
+    /// uninitialized state is REFUSED. Pre-fix, the implicit
+    /// 0x11..11 fallback let any sender controlling that burner
+    /// address grab governance on a fresh chain.
+    #[tokio::test]
+    async fn c04_post_genesis_setadmin_uninitialized_refused() {
+        use sha3::{Digest, Keccak256};
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+
+        // Caller derives to 0x11..11 (the pre-fix implicit admin).
+        let mut caller_pk_bytes = [0u8; 32];
+        caller_pk_bytes[..20].copy_from_slice(&[0x11; 20]);
+        let caller_pk = PublicKey::new(caller_pk_bytes);
+        let caller_addr = Address([0x11; 20]);
+        state_db
+            .accounts
+            .set_balance(caller_addr, U256::from(1_000_000_000_000_000u128));
+
+        let gov_addr = {
+            let mut a = [0u8; 20];
+            a[18] = 0x10;
+            a[19] = 0x03;
+            Address(a)
+        };
+        let mut gov_pk = [0u8; 32];
+        gov_pk[..20].copy_from_slice(&gov_addr.0);
+        let gov_pk = PublicKey::new(gov_pk);
+
+        // Post-genesis block — height > 0.
+        let block = BlockBuilder::new()
+            .height(100)
+            .timestamp(1_000_000)
+            .build_unhashed();
+
+        let mut set_admin = Vec::new();
+        let sel_set_admin = &Keccak256::digest(b"setAdmin(address)")[..4];
+        set_admin.extend_from_slice(sel_set_admin);
+        set_admin.extend_from_slice(&[0u8; 12]);
+        set_admin.extend_from_slice(&caller_addr.0);
+
+        let tx = Transaction {
+            hash: Hash::new([43; 32]),
+            nonce: 0,
+            from: caller_pk,
+            to: Some(gov_pk),
+            value: 0,
+            gas_limit: 200000,
+            gas_price: 1_000_000_000,
+            data: set_admin,
+            signature: Signature::new([0; 64]),
+            tx_type: None,
+            ..Default::default()
+        };
+        let receipt = executor
+            .execute_transaction(&block, &tx)
+            .await
+            .expect("tx itself must execute (gas accounted)");
+        assert!(
+            !receipt.status,
+            "C-04: post-genesis setAdmin from uninitialized state MUST be refused"
+        );
+
+        // Verify ADMIN storage slot is still empty.
+        let admin_storage = state_db.get_storage(&gov_addr, &b"ADMIN".to_vec());
+        assert!(
+            admin_storage.is_none(),
+            "C-04: rejected setAdmin must NOT persist any admin"
+        );
+    }
+
+    /// C-04.3: even at genesis, only `setAdmin` can be called on
+    /// an uninitialized governance precompile. `queueSetParam` etc.
+    /// are refused.
+    #[tokio::test]
+    async fn c04_genesis_other_ops_still_refused_when_uninitialized() {
+        use sha3::{Digest, Keccak256};
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+
+        let mut caller_pk_bytes = [0u8; 32];
+        caller_pk_bytes[..20].copy_from_slice(&[0xCA; 20]);
+        let caller_pk = PublicKey::new(caller_pk_bytes);
+        let caller_addr = Address([0xCA; 20]);
+        state_db
+            .accounts
+            .set_balance(caller_addr, U256::from(1_000_000_000_000_000u128));
+
+        let gov_addr = {
+            let mut a = [0u8; 20];
+            a[18] = 0x10;
+            a[19] = 0x03;
+            Address(a)
+        };
+        let mut gov_pk = [0u8; 32];
+        gov_pk[..20].copy_from_slice(&gov_addr.0);
+        let gov_pk = PublicKey::new(gov_pk);
+
+        let block = BlockBuilder::new()
+            .height(0)
+            .timestamp(1_000_000)
+            .build_unhashed();
+
+        // Try queueSetParam at genesis without ADMIN being set.
+        let key = [0xAAu8; 32];
+        let mut queue = Vec::new();
+        let sel_queue = &Keccak256::digest(b"queueSetParam(bytes32,bytes,uint64)")[..4];
+        queue.extend_from_slice(sel_queue);
+        queue.extend_from_slice(&key);
+        let mut off = [0u8; 32];
+        off[31] = 96;
+        queue.extend_from_slice(&off);
+        let mut eta_be = [0u8; 32];
+        eta_be[24..32].copy_from_slice(&60u64.to_be_bytes());
+        queue.extend_from_slice(&eta_be);
+        let mut lenb = [0u8; 32];
+        lenb[31] = 4;
+        queue.extend_from_slice(&lenb);
+        queue.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        queue.extend_from_slice(&[0u8; 28]);
+
+        let tx = Transaction {
+            hash: Hash::new([44; 32]),
+            nonce: 0,
+            from: caller_pk,
+            to: Some(gov_pk),
+            value: 0,
+            gas_limit: 300000,
+            gas_price: 1_000_000_000,
+            data: queue,
+            signature: Signature::new([0; 64]),
+            tx_type: None,
+            ..Default::default()
+        };
+        let receipt = executor.execute_transaction(&block, &tx).await.unwrap();
+        assert!(
+            !receipt.status,
+            "C-04: queueSetParam against uninitialized admin must fail"
+        );
     }
 }

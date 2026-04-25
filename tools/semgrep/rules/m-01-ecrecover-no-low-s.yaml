@@ -1,0 +1,48 @@
+# M-01 — ECRECOVER signature recovery without low-s normalization is forbidden.
+#
+# Audit finding (MEDIUM):
+#   .audit/2026-04-24-full-repo-adversarial-audit/03_FINDINGS_CONSENSUS_EXECUTION.md#m-01
+#
+# Pre-fix `recover_address` accepted both canonical and high-s
+# (malleated) ECDSA signatures. A contract using
+# `ecrecover(hash, v, r, s) == expected_signer` for replay
+# protection accepted both `(r, s)` and `(r, n - s)` as valid
+# signatures over the same message. EIP-2 fixed this in Ethereum
+# in 2017; pre-fix Citrate regressed.
+#
+# Post-fix, `recover_address` calls `signature.normalize_s()` and
+# rejects if the result was non-None (i.e., the input s was high
+# and would have been normalized). Mirrors Geth's pattern.
+#
+# This rule fires on direct `Signature::from_bytes` /
+# `VerifyingKey::recover_from_prehash` patterns that don't
+# include the `normalize_s` reject step.
+
+rules:
+  - id: m-01-ecrecover-no-low-s-normalization
+    message: >-
+      ECDSA signature recovery without low-s normalization is
+      forbidden (M-01). Accept both canonical and malleated `s`
+      values defeats EIP-2 replay protection. After
+      `Signature::from_bytes`, call `.normalize_s()` and reject
+      if it changed (i.e., return None when normalize_s().is_some()).
+      See core/execution/src/precompiles/mod.rs::recover_address.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/execution/**/*.rs"
+      exclude:
+        - "core/execution/src/precompiles/mod.rs"  # canonical impl
+        - "**/tests/**"
+        - "**/proptest-regressions/**"
+    patterns:
+      - pattern: |
+          let $SIG = Signature::from_bytes($_).ok()?;
+          ...
+          VerifyingKey::recover_from_prehash($_, &$SIG, $_).ok()?
+      - pattern-not: |
+          let $SIG = Signature::from_bytes($_).ok()?;
+          ...
+          if $SIG.normalize_s().is_some() { ... }
+          ...
