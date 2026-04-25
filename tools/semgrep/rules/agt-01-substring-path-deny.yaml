@@ -1,0 +1,47 @@
+# AGT-01 — Sandbox path deny must be per-component, not substring.
+#
+# Audit finding (CRITICAL):
+#   .audit/2026-04-24-full-repo-adversarial-audit/08_FINDINGS_WALLET_AGENT_FAUCET.md#agt-01
+#
+# Spec (canonical):
+#   .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
+#   §"Sprint RM-E4 — Agent sandbox replacement"
+#
+# Pre-fix `SandboxPolicy::check_denied_patterns` did `path_str.contains(denied)`,
+# treating denied tokens as substrings. A workspace file named
+# `.envrc-project` matched `.env`; an attacker-controlled component
+# inside the path could embed a denied substring without being denied
+# at the component level.
+# Post-fix the check walks `Path::components()` and matches whole
+# `Component::Normal` strings against `DENIED_COMPONENTS` (exact)
+# and `DENIED_COMPONENT_RUNS` (adjacent run).
+#
+# This rule fires on `path_str.contains(denied)` patterns inside
+# `agent-core/src/adapters/sandbox.rs` — the variant the audit found.
+
+rules:
+  - id: agt-01-substring-path-deny
+    message: >-
+      `SandboxPolicy::check_denied_patterns` must compare path components
+      individually (`Path::components()`), not via `path_str.contains`.
+      See audit AGT-01 and
+      .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "agent-core/src/adapters/sandbox.rs"
+      exclude:
+        - "**/tests/**"
+    pattern-either:
+      - pattern: |
+          $PATH_STR.contains($DENIED)
+      - pattern: |
+          path_str.contains($DENIED)
+    metadata:
+      audit-id: AGT-01
+      severity: critical
+      sprint: RM-E4
+      wp: WP-E4.1
+      spec: .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
+      reference: https://owasp.org/www-community/attacks/Path_Traversal

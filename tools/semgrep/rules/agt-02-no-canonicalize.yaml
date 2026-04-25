@@ -1,0 +1,50 @@
+# AGT-02 — Sandbox path resolution must canonicalize symlinks.
+#
+# Audit finding (CRITICAL):
+#   .audit/2026-04-24-full-repo-adversarial-audit/08_FINDINGS_WALLET_AGENT_FAUCET.md#agt-02
+#
+# Spec (canonical):
+#   .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
+#   §"Sprint RM-E4 — Agent sandbox replacement"
+#
+# Pre-fix `SandboxPolicy::resolve` did lexical normalization only —
+# `<workspace>/link → /etc/passwd` resolved to itself textually and
+# passed the `starts_with(workspace_root)` check.
+# Post-fix `resolve` calls `std::fs::canonicalize`, which follows
+# symlinks; non-existent paths walk up to the deepest existing
+# ancestor and canonicalize there.
+#
+# This rule fires when `SandboxPolicy::resolve` returns a path
+# without ever calling `canonicalize` — the variant a regression
+# would re-introduce.
+
+rules:
+  - id: agt-02-no-canonicalize
+    message: >-
+      `SandboxPolicy::resolve` must canonicalize via
+      `std::fs::canonicalize` to resolve symlinks. Lexical
+      normalization alone allows symlink escape. See audit AGT-02.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "agent-core/src/adapters/sandbox.rs"
+      exclude:
+        - "**/tests/**"
+    patterns:
+      - pattern: |
+          fn resolve(&self, $P: &Path) -> Result<PathBuf, String> {
+            ...
+          }
+      - pattern-not: |
+          fn resolve(&self, $P: &Path) -> Result<PathBuf, String> {
+            ...
+            std::fs::canonicalize(...)
+            ...
+          }
+    metadata:
+      audit-id: AGT-02
+      severity: critical
+      sprint: RM-E4
+      wp: WP-E4.2
+      spec: .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md

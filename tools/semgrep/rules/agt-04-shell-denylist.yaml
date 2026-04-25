@@ -1,0 +1,69 @@
+# AGT-04 — shell_exec must use an allowlist, not a denylist.
+#
+# Audit finding (HIGH):
+#   .audit/2026-04-24-full-repo-adversarial-audit/08_FINDINGS_WALLET_AGENT_FAUCET.md#agt-04
+#
+# Spec (canonical):
+#   .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
+#   §"Sprint RM-E4 — Agent sandbox replacement"
+#
+# Pre-fix `shell_exec` checked a denylist (`DENIED_COMMANDS`) for
+# substrings like "sudo" and "rm -rf /". The audit's variant
+# analysis enumerated 16 bypasses (encoded sudo, base64 eval,
+# chmod chains, redirected sudo, POSIX expansions, etc.).
+# Post-fix `shell_exec` (a) rejects shell metacharacters outright,
+# (b) requires the command's first token's basename to be in
+# `ALLOWED_BINARIES`, and (c) does not invoke `sh -c` at all.
+#
+# This rule fires when `shell_exec.rs` re-introduces a `DENIED_COMMANDS`
+# constant or an `sh -c` shell invocation — the regression patterns.
+
+rules:
+  - id: agt-04-shell-denylist-constant
+    message: >-
+      `shell_exec.rs` must use `ALLOWED_BINARIES` (allowlist), not a
+      `DENIED_COMMANDS` denylist. See audit AGT-04.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "agent-code/src/tools/shell_exec.rs"
+    patterns:
+      - pattern: |
+          const DENIED_COMMANDS: &[&str] = &[$...];
+    metadata:
+      audit-id: AGT-04
+      severity: high
+      sprint: RM-E4
+      wp: WP-E4.4
+      spec: .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
+
+  - id: agt-04-shell-process-without-sandbox
+    message: >-
+      `shell_exec` must not invoke `sh -c`. Use direct
+      `tokio::process::Command::new(binary)` with a vetted binary.
+      See audit AGT-04.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "agent-code/src/tools/shell_exec.rs"
+    pattern-either:
+      - pattern: |
+          tokio::process::Command::new("sh")
+              .arg("-c")
+              .arg(...)
+      - pattern: |
+          Command::new("sh")
+              .arg("-c")
+              .arg(...)
+      - pattern: |
+          tokio::process::Command::new("bash")
+              .arg("-c")
+              .arg(...)
+    metadata:
+      audit-id: AGT-04
+      severity: high
+      sprint: RM-E4
+      wp: WP-E4.4
+      spec: .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
