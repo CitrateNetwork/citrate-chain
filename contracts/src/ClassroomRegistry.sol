@@ -51,6 +51,22 @@ contract ClassroomRegistry {
     /// TLA+ variable: codeToTeacher (code -> teacher or "none").
     mapping(bytes32 => address) public codeToTeacher;
 
+    /// @notice Unix timestamp at which an invite code expires.
+    /// 0 means "no expiry recorded" (defensive — should never happen
+    /// after WP-E3.1 since both `createClassroom` and
+    /// `rotateInviteCode` always populate this).
+    /// RM-B1 / WP-E3.1 (audit GUI-L-03).
+    mapping(bytes32 => uint64) public inviteExpiresAt;
+
+    /// @notice Default invite-code TTL when the teacher doesn't pass
+    /// an explicit value. 7 days matches the planset's default.
+    /// RM-B1 / WP-E3.1 (audit GUI-L-03).
+    uint64 public constant DEFAULT_INVITE_TTL = 7 days;
+
+    /// @notice Maximum TTL a teacher can request. Bounds operator
+    /// surface so an "infinity" TTL doesn't accidentally creep in.
+    uint64 public constant MAX_INVITE_TTL = 90 days;
+
     /// @notice Count of whitelisted models per teacher (for cleanup tracking).
     mapping(address => uint256) public whitelistCount;
 
@@ -69,6 +85,8 @@ contract ClassroomRegistry {
     event ModelWhitelisted(address indexed teacher, bytes32 modelHash);
     event ModelRemoved(address indexed teacher, bytes32 modelHash);
     event InviteCodeRotated(address indexed teacher, bytes32 oldCodeHash, bytes32 newCodeHash);
+    /// RM-B1 / WP-E3.1 (audit GUI-L-03): record TTL on every code mint.
+    event InviteCodeTtlSet(bytes32 indexed codeHash, uint64 expiresAt);
 
     // ============================================================
     // Modifiers
@@ -113,6 +131,11 @@ contract ClassroomRegistry {
 
         activeInviteCode[msg.sender] = inviteCodeHash;
         codeToTeacher[inviteCodeHash] = msg.sender;
+        // RM-B1 / WP-E3.1 (audit GUI-L-03): bind a default TTL so
+        // an unrotated invite code can't live forever.
+        uint64 expiresAt = uint64(block.timestamp) + DEFAULT_INVITE_TTL;
+        inviteExpiresAt[inviteCodeHash] = expiresAt;
+        emit InviteCodeTtlSet(inviteCodeHash, expiresAt);
 
         emit ClassroomCreated(msg.sender, name, maxStudents, inviteCodeHash);
     }
@@ -136,6 +159,14 @@ contract ClassroomRegistry {
         require(teacher != address(0), "Invalid invite code");
         require(classrooms[teacher].exists, "Classroom does not exist");
         require(msg.sender != teacher, "Teacher cannot enroll as student");
+
+        // RM-B1 / WP-E3.1 (audit GUI-L-03): codes that have aged past
+        // their TTL no longer enroll new students. The teacher must
+        // rotate via `rotateInviteCode` to refresh the window.
+        uint64 expiresAt = inviteExpiresAt[inviteCodeHash];
+        require(expiresAt != 0, "Invite code has no TTL recorded");
+        require(block.timestamp <= uint256(expiresAt), "Invite code expired");
+
         require(studentTeacher[msg.sender] == address(0), "Already enrolled in a classroom");
         require(
             classrooms[teacher].studentCount < classrooms[teacher].maxStudents,
@@ -219,19 +250,39 @@ contract ClassroomRegistry {
     ///      mapping cleared, new one established.
     /// @param newCodeHash keccak256 of the new invite code
     function rotateInviteCode(bytes32 newCodeHash) external onlyTeacher {
+        rotateInviteCodeWithTtl(newCodeHash, DEFAULT_INVITE_TTL);
+    }
+
+    /// @notice Rotate the invite code with an explicit TTL.
+    /// RM-B1 / WP-E3.1 (audit GUI-L-03).
+    /// @param newCodeHash keccak256 of the new invite code.
+    /// @param ttlSeconds Seconds until the new code expires. Capped at
+    ///        `MAX_INVITE_TTL`; values <= 0 fall back to
+    ///        `DEFAULT_INVITE_TTL`.
+    function rotateInviteCodeWithTtl(bytes32 newCodeHash, uint64 ttlSeconds)
+        public
+        onlyTeacher
+    {
         require(newCodeHash != bytes32(0), "Invalid invite code hash");
         require(codeToTeacher[newCodeHash] == address(0), "Invite code already in use");
+
+        uint64 ttl = ttlSeconds == 0 ? DEFAULT_INVITE_TTL : ttlSeconds;
+        require(ttl <= MAX_INVITE_TTL, "TTL exceeds MAX_INVITE_TTL");
 
         bytes32 oldCodeHash = activeInviteCode[msg.sender];
 
         // Clear old mapping
         if (oldCodeHash != bytes32(0)) {
             codeToTeacher[oldCodeHash] = address(0);
+            inviteExpiresAt[oldCodeHash] = 0;
         }
 
         // Set new mapping
         activeInviteCode[msg.sender] = newCodeHash;
         codeToTeacher[newCodeHash] = msg.sender;
+        uint64 expiresAt = uint64(block.timestamp) + ttl;
+        inviteExpiresAt[newCodeHash] = expiresAt;
+        emit InviteCodeTtlSet(newCodeHash, expiresAt);
 
         emit InviteCodeRotated(msg.sender, oldCodeHash, newCodeHash);
     }

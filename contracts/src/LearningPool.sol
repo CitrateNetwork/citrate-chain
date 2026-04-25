@@ -39,6 +39,19 @@ contract LearningPool is ReentrancyGuard {
     mapping(uint256 => mapping(bytes32 => bool)) public whitelistedModels;
     mapping(uint256 => mapping(bytes32 => bool)) public validInviteCodes;
 
+    /// @notice Per-(pool, code) expiry timestamp for invite codes.
+    /// 0 means "no expiry recorded" — pre-WP-E3.2 codes are
+    /// transitionally allowed via `_isInviteValid` but the
+    /// `addInviteCode` path now always populates this.
+    /// RM-B1 / WP-E3.2 (audit GUI-L-03).
+    mapping(uint256 => mapping(bytes32 => uint64)) public inviteExpiresAt;
+
+    /// @notice Default invite-code TTL when the creator doesn't pass
+    /// an explicit value. 7 days matches the planset's default.
+    uint64 public constant DEFAULT_INVITE_TTL = 7 days;
+    /// Maximum TTL a creator can request.
+    uint64 public constant MAX_INVITE_TTL = 90 days;
+
     // ============================================================
     // Events
     // ============================================================
@@ -53,6 +66,8 @@ contract LearningPool is ReentrancyGuard {
     event ModelWhitelisted(uint256 indexed poolId, bytes32 modelHash);
     event ModelRemoved(uint256 indexed poolId, bytes32 modelHash);
     event InviteCodeAdded(uint256 indexed poolId, bytes32 codeHash);
+    /// RM-B1 / WP-E3.2 (audit GUI-L-03).
+    event InviteCodeTtlSet(uint256 indexed poolId, bytes32 indexed codeHash, uint64 expiresAt);
 
     // ============================================================
     // Modifiers
@@ -163,6 +178,12 @@ contract LearningPool is ReentrancyGuard {
         require(pool.access == AccessType.InviteOnly, "Not invite pool");
         require(validInviteCodes[poolId][codeHash], "Invalid invite code");
 
+        // RM-B1 / WP-E3.2 (audit GUI-L-03): expired invites stop
+        // enrolling new members. The creator must mint a fresh code.
+        uint64 expiresAt = inviteExpiresAt[poolId][codeHash];
+        require(expiresAt != 0, "Invite code has no TTL recorded");
+        require(block.timestamp <= uint256(expiresAt), "Invite code expired");
+
         _addMember(poolId, msg.sender, msg.value);
     }
 
@@ -261,12 +282,32 @@ contract LearningPool is ReentrancyGuard {
     // Invite Code Management
     // ============================================================
 
-    /// @notice Add an invite code hash (creator only).
+    /// @notice Add an invite code hash (creator only) with the
+    /// default TTL (`DEFAULT_INVITE_TTL`).
     /// @param poolId The pool ID
     /// @param codeHash keccak256 of the invite code
     function addInviteCode(uint256 poolId, bytes32 codeHash) external poolExists(poolId) onlyCreator(poolId) {
+        addInviteCodeWithTtl(poolId, codeHash, DEFAULT_INVITE_TTL);
+    }
+
+    /// @notice Add an invite code hash with an explicit TTL.
+    /// RM-B1 / WP-E3.2 (audit GUI-L-03).
+    /// @param poolId The pool ID
+    /// @param codeHash keccak256 of the invite code
+    /// @param ttlSeconds TTL in seconds. `0` means "use the default";
+    ///        capped at `MAX_INVITE_TTL`.
+    function addInviteCodeWithTtl(uint256 poolId, bytes32 codeHash, uint64 ttlSeconds)
+        public
+        poolExists(poolId)
+        onlyCreator(poolId)
+    {
+        uint64 ttl = ttlSeconds == 0 ? DEFAULT_INVITE_TTL : ttlSeconds;
+        require(ttl <= MAX_INVITE_TTL, "TTL exceeds MAX_INVITE_TTL");
         validInviteCodes[poolId][codeHash] = true;
+        uint64 expiresAt = uint64(block.timestamp) + ttl;
+        inviteExpiresAt[poolId][codeHash] = expiresAt;
         emit InviteCodeAdded(poolId, codeHash);
+        emit InviteCodeTtlSet(poolId, codeHash, expiresAt);
     }
 
     // ============================================================
