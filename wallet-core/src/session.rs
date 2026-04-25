@@ -6,8 +6,9 @@
 //! - Lockout after max failed attempts
 
 use crate::error::WalletError;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Session manager — tracks unlock state and enforces rate limits.
 pub struct SessionManager {
@@ -30,6 +31,24 @@ pub struct SessionStatus {
     pub remaining_secs: Option<u64>,
     pub is_locked_out: bool,
     pub lockout_remaining_secs: Option<u64>,
+}
+
+/// Persistence record for failed-attempt state.
+///
+/// RM-B1 / WP-E2.3 (audit WAL-05): pre-fix `failed_attempts` lived
+/// only in memory. Process restart wiped the counter, letting an
+/// attacker keep brute-forcing indefinitely so long as they crashed
+/// the GUI between attempts. Post-fix this record can be persisted
+/// to disk by the caller; lockout times survive restarts.
+///
+/// Times are captured as Unix seconds for portability across runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedFailure {
+    pub address: String,
+    pub count: u32,
+    /// Unix seconds at which the lockout started, or `None` if the
+    /// failure threshold has not yet been hit.
+    pub lockout_started_unix: Option<u64>,
 }
 
 impl SessionManager {
@@ -146,6 +165,61 @@ impl SessionManager {
             remaining_secs,
             is_locked_out,
             lockout_remaining_secs,
+        }
+    }
+
+    /// Snapshot the failed-attempt state in a serializable form.
+    /// RM-B1 / WP-E2.3 (audit WAL-05).
+    pub fn export_failures(&self) -> Vec<PersistedFailure> {
+        let now = Instant::now();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.failed_attempts
+            .iter()
+            .map(|(addr, (count, started))| {
+                let lockout_started_unix = started.map(|inst| {
+                    // How many seconds ago was the lockout started?
+                    let elapsed = now.saturating_duration_since(inst);
+                    now_unix.saturating_sub(elapsed.as_secs())
+                });
+                PersistedFailure {
+                    address: addr.clone(),
+                    count: *count,
+                    lockout_started_unix,
+                }
+            })
+            .collect()
+    }
+
+    /// Restore failed-attempt state from a previously-exported list.
+    /// Lockouts whose duration has already elapsed at the wall-clock
+    /// level are dropped on the way in.
+    /// RM-B1 / WP-E2.3 (audit WAL-05).
+    pub fn import_failures(&mut self, items: Vec<PersistedFailure>) {
+        let now = Instant::now();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for item in items {
+            // Translate Unix start → Instant. If the lockout window
+            // has already fully elapsed we DROP the record so the
+            // user isn't perma-locked.
+            let started_inst = match item.lockout_started_unix {
+                Some(start_unix) => {
+                    let elapsed_secs = now_unix.saturating_sub(start_unix);
+                    if elapsed_secs >= self.lockout_duration.as_secs() {
+                        // Lockout expired during the gap — reset counter.
+                        continue;
+                    }
+                    Some(now - Duration::from_secs(elapsed_secs))
+                }
+                None => None,
+            };
+            self.failed_attempts
+                .insert(item.address, (item.count, started_inst));
         }
     }
 
@@ -285,6 +359,44 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0], "0xabc");
         assert!(!mgr.is_session_active("0xabc"));
+    }
+
+    /// RM-B1 / WP-E2.3 (audit WAL-05): export/import round-trips
+    /// preserve failure counts across simulated process restart.
+    #[test]
+    fn test_export_import_round_trip_preserves_count() {
+        let mut mgr = test_manager();
+        mgr.record_failure("0xabc").expect("attempt 1");
+        mgr.record_failure("0xabc").expect("attempt 2");
+        let snapshot = mgr.export_failures();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].count, 2);
+
+        // Fresh manager, same persisted state.
+        let mut restored = test_manager();
+        restored.import_failures(snapshot);
+        // Third attempt (continuing from the persisted 2) triggers lockout.
+        let res = restored.record_failure("0xabc");
+        assert!(res.is_err(), "lockout fires at the persisted threshold");
+        assert!(restored.is_locked_out("0xabc"));
+    }
+
+    /// Lockouts whose duration has fully elapsed during the restart
+    /// gap are dropped so the user isn't perma-locked.
+    #[test]
+    fn test_import_drops_expired_lockouts() {
+        let snapshot = vec![PersistedFailure {
+            address: "0xabc".to_string(),
+            count: 3,
+            // Lockout started "1 hour ago" — way past our 5s lockout.
+            lockout_started_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs().saturating_sub(3600)),
+        }];
+        let mut mgr = test_manager();
+        mgr.import_failures(snapshot);
+        assert!(!mgr.is_locked_out("0xabc"), "expired lockout dropped");
     }
 
     #[test]

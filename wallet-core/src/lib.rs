@@ -17,7 +17,7 @@ pub mod chain;
 
 pub use error::WalletError;
 pub use keys::KeyManager;
-pub use session::{SessionManager, SessionStatus};
+pub use session::{PersistedFailure, SessionManager, SessionStatus};
 pub use types::{WalletAccount, WalletConfig};
 
 #[cfg(feature = "native")]
