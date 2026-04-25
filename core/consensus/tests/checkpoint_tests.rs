@@ -20,13 +20,22 @@ fn test_key(seed: u8) -> SigningKey {
 }
 
 fn make_signed_vote(signing_key: &SigningKey, height: u64, block_hash: Hash) -> CheckpointVote {
+    make_signed_vote_for_chain(signing_key, height, block_hash, 40204)
+}
+
+fn make_signed_vote_for_chain(
+    signing_key: &SigningKey,
+    height: u64,
+    block_hash: Hash,
+    chain_id: u64,
+) -> CheckpointVote {
     let pubkey_bytes = signing_key.verifying_key().to_bytes();
 
-    // Canonical message: height(8 LE) || block_hash(32) = 40 bytes
-    // Must match verify_vote_signature() in checkpoint.rs
-    let mut message = Vec::with_capacity(40);
-    message.extend_from_slice(&height.to_le_bytes());
-    message.extend_from_slice(block_hash.as_bytes());
+    // RM-B1 / WP-B2.2 (H-02): use the canonical helper so tests
+    // sign exactly the bytes the verifier checks.
+    let message = citrate_consensus::checkpoint::canonical_vote_message(
+        chain_id, height, &block_hash,
+    );
 
     let sig = signing_key.sign(&message);
 

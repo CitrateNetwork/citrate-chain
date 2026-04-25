@@ -108,11 +108,13 @@ fn make_pubkey(id: u8) -> PublicKey {
 }
 
 /// Sign a checkpoint vote's canonical message with the given signing key.
+/// RM-B1 / WP-B2.2 (H-02): uses the canonical helper so the test bytes
+/// match the verifier's expectation byte-for-byte.
 fn sign_vote(height: u64, block_hash: &Hash, signing_key: &ed25519_dalek::SigningKey) -> Signature {
     use ed25519_dalek::Signer;
-    let mut message = Vec::with_capacity(40);
-    message.extend_from_slice(&height.to_le_bytes());
-    message.extend_from_slice(block_hash.as_bytes());
+    let message = citrate_consensus::checkpoint::canonical_vote_message(
+        40204, height, block_hash,
+    );
     let sig = signing_key.sign(&message);
     Signature::new(sig.to_bytes())
 }
