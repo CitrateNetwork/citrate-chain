@@ -1,0 +1,47 @@
+# M-SEQ-01 — Mempool admission MUST enforce nonce-gap window.
+#
+# Audit finding (MEDIUM):
+#   .audit/2026-04-24-full-repo-adversarial-audit/04_FINDINGS_API_NETWORK_STORAGE.md#m-seq-01
+#
+# Pre-fix the mempool accepted any nonce from a funded sender —
+# e.g. (1, 1_000_000, u64::MAX). 99 of those rotted as gap-junk
+# while consuming slots. The 16-slot window matches Geth's default
+# `txpool.accountqueue` and bounds the storage cost per sender.
+#
+# Post-fix `MempoolConfig::max_nonce_gap` defaults to 16 and the
+# admission path enforces `tx.nonce - min_existing <= max_nonce_gap`.
+#
+# This rule fires if a future `MempoolConfig` declaration omits
+# the `max_nonce_gap` field — at the moment, that means the
+# default applies, but explicit values catch attempts to set it
+# very high (effectively disabling the cap).
+
+rules:
+  - id: m-seq-01-mempool-config-no-nonce-gap-cap
+    message: >-
+      `MempoolConfig` constructions should set `max_nonce_gap`
+      explicitly (M-SEQ-01). Leaving it unset implies the
+      default of 16; a future refactor that drops the field
+      from the struct must not silently disable the cap.
+    languages: [rust]
+    severity: WARNING
+    paths:
+      include:
+        - "core/sequencer/**/*.rs"
+        - "node/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "core/sequencer/src/mempool.rs"  # canonical impl
+    patterns:
+      - pattern: |
+          MempoolConfig {
+              ...
+          }
+      - pattern-not: |
+          MempoolConfig {
+              ...
+              max_nonce_gap: $_,
+              ...
+          }
+      - pattern-not: |
+          MempoolConfig::default()

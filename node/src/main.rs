@@ -1044,6 +1044,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         replacement_factor: 110,
         require_valid_signature,
         chain_id: config.chain.chain_id,
+        max_nonce_gap: 16, // RM-B1 / WP-C4.1 (audit M-SEQ-01): Geth default
     }));
 
     // Create peer manager
