@@ -679,10 +679,50 @@ fn encrypt_key(
     encrypt_key_raw(&signing_key.to_bytes(), password, address, public_key_hex, label, KeyType::Ed25519)
 }
 
+// =========================================================================
+// WAL-02 — AES-GCM AAD canonical encoding.
+//
+// Every v2 (`KDF_VERSION_CURRENT`) keystore entry binds the following
+// metadata as Associated Authenticated Data into the GCM tag:
+//
+//   AAD = b"citrate-keystore-v2"
+//       || kdf_version (4 LE bytes)
+//       || key_type    (1 byte: 0 = Ed25519, 1 = Secp256k1)
+//       || address     (UTF-8 bytes, no length prefix — fixed by domain)
+//
+// An attacker who can swap the (ciphertext, salt, nonce) triple onto a
+// different entry's `(address, key_type, kdf_version)` metadata will
+// fail decryption: the GCM tag was computed over the original AAD and
+// won't verify against the substituted metadata. Closes WAL-02 (HIGH).
+//
+// `kdf_version` is included even though the dispatcher already
+// branches on it — including it in AAD prevents a downgrade attack
+// where the field is rewritten from v2 to v1 to skip the AAD check.
+//
+// v1 (legacy) entries decrypt without AAD for backward compatibility.
+// See `decrypt_key` for the version-dispatch.
+// =========================================================================
+
+const KEYSTORE_AAD_DOMAIN: &[u8] = b"citrate-keystore-v2";
+
+fn keystore_v2_aad(kdf_version: u32, key_type: KeyType, address: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(
+        KEYSTORE_AAD_DOMAIN.len() + 4 + 1 + address.len(),
+    );
+    aad.extend_from_slice(KEYSTORE_AAD_DOMAIN);
+    aad.extend_from_slice(&kdf_version.to_le_bytes());
+    aad.push(match key_type {
+        KeyType::Ed25519 => 0u8,
+        KeyType::Secp256k1 => 1u8,
+    });
+    aad.extend_from_slice(address.as_bytes());
+    aad
+}
+
 /// Encrypt raw key bytes with Argon2 + AES-256-GCM.
 ///
 /// New entries are always written with `KDF_VERSION_CURRENT` (= 2) per
-/// `docs/security/KDF_POLICY.md`. Closes audit finding WAL-01.
+/// `docs/security/KDF_POLICY.md`. WAL-01: KDF strength. WAL-02: AAD bind.
 fn encrypt_key_raw(
     secret_bytes: &[u8; 32],
     password: &str,
@@ -691,7 +731,7 @@ fn encrypt_key_raw(
     label: &str,
     key_type: KeyType,
 ) -> Result<EncryptedKeyEntry, WalletError> {
-    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+    use aes_gcm::{aead::{Aead, Payload}, Aes256Gcm, KeyInit, Nonce};
 
     let salt: [u8; 16] = rand::random();
     let nonce_bytes: [u8; 12] = rand::random();
@@ -708,8 +748,17 @@ fn encrypt_key_raw(
     let cipher = Aes256Gcm::new_from_slice(derived_key.as_ref())
         .map_err(|e| WalletError::Encryption(format!("AES init failed: {}", e)))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
+
+    // WAL-02: bind metadata as AAD for v2 entries.
+    let aad = keystore_v2_aad(KDF_VERSION_CURRENT, key_type, address);
     let ciphertext = cipher
-        .encrypt(nonce, secret_bytes.as_ref())
+        .encrypt(
+            nonce,
+            Payload {
+                msg: secret_bytes.as_ref(),
+                aad: &aad,
+            },
+        )
         .map_err(|e| WalletError::Encryption(format!("AES encrypt failed: {}", e)))?;
 
     let now = std::time::SystemTime::now()
@@ -736,8 +785,15 @@ fn encrypt_key_raw(
 /// (v1) entries continue to unlock under their original parameters while
 /// new (v2+) entries use the current production parameters per
 /// `docs/security/KDF_POLICY.md`.
+///
+/// **WAL-02**: v2 entries require AAD verification. The AAD is computed
+/// from `(kdf_version, key_type, address)` per `keystore_v2_aad`. A
+/// substitution attack — swapping a `(ciphertext, salt, nonce)` triple
+/// onto a different entry's metadata — fails the GCM tag check and
+/// surfaces as `WalletError::InvalidPassword` to the caller. The legacy
+/// v1 path decrypts without AAD for backward compatibility.
 fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], WalletError> {
-    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+    use aes_gcm::{aead::{Aead, Payload}, Aes256Gcm, KeyInit, Nonce};
     use base64::Engine;
 
     let ciphertext = base64::engine::general_purpose::STANDARD
@@ -762,14 +818,35 @@ fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], Wa
     let cipher = Aes256Gcm::new_from_slice(derived_key.as_ref())
         .map_err(|e| WalletError::Decryption(format!("AES init failed: {}", e)))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
-    // WAL-04: plaintext holds the decrypted secret key bytes. Zeroize
-    // when the wrapper is dropped (caller copies into its own
-    // Zeroizing-protected slot below).
-    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
-        cipher
+
+    // WAL-02: dispatch on kdf_version. v1 (legacy) entries decrypt
+    // without AAD; v2+ entries enforce the AAD binding documented at
+    // `keystore_v2_aad`. Future versions follow the same pattern via
+    // dispatch on the `kdf_version` field.
+    let plaintext_vec: Vec<u8> = match entry.kdf_version {
+        KDF_VERSION_LEGACY => cipher
             .decrypt(nonce, ciphertext.as_ref())
             .map_err(|_| WalletError::InvalidPassword)?,
-    );
+        KDF_VERSION_CURRENT | KDF_VERSION_LOW_MEMORY => {
+            let aad = keystore_v2_aad(entry.kdf_version, entry.key_type, &entry.address);
+            cipher
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: ciphertext.as_ref(),
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| WalletError::InvalidPassword)?
+        }
+        _ => {
+            return Err(WalletError::Decryption(format!(
+                "WAL-02: unknown kdf_version {} on keystore entry; refusing to decrypt",
+                entry.kdf_version
+            )));
+        }
+    };
+    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(plaintext_vec);
 
     if plaintext.len() != 32 {
         return Err(WalletError::Decryption(format!(
