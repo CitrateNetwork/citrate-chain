@@ -3324,7 +3324,7 @@ mod tests {
         );
 
         // Verify ADMIN storage slot is still empty.
-        let admin_storage = state_db.get_storage(&gov_addr, &b"ADMIN".to_vec());
+        let admin_storage = state_db.get_storage(&gov_addr, b"ADMIN");
         assert!(
             admin_storage.is_none(),
             "C-04: rejected setAdmin must NOT persist any admin"

@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 // Audit finding M-06 regression: previously
 // `bincode::serialize(...).unwrap_or_default()` silently emitted an
 // empty `Vec<u8>` on encode failure, which the kv_put would dutifully

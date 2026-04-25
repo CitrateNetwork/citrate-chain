@@ -485,11 +485,7 @@ mod tests {
             vec![7, 6, 5, 4, 3, 2, 1, 0], // reverse
             vec![0, 7, 1, 6, 2, 5, 3, 4], // interleaved
             vec![3, 1, 7, 0, 5, 2, 6, 4], // arbitrary
-            vec![4, 4, 4, 4, 4, 4, 4, 4]
-                .iter()
-                .enumerate()
-                .map(|(i, _)| (i + 5) % 8)
-                .collect(),
+            (0..8).map(|i| (i + 5) % 8).collect(),
         ];
 
         for perm in &permutations {

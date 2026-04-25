@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 // Audit finding H-04 regression: previously `DagStore::store_block`
 // performed a sequence of separate `kv_put` / `kv_delete` calls per
 // block (block bytes, child links, tip add/remove, height index).
