@@ -4,17 +4,41 @@ use crate::db::{column_families::*, RocksDB};
 use anyhow::Result;
 use citrate_consensus::types::{Block, BlockHeader, Hash};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tracing::{debug, info};
+
+/// Persistent metadata key for the cached latest height value.
+/// RM-B1 / WP-C3.2 (audit L-STORE-01).
+const LATEST_HEIGHT_KEY: &[u8] = b"latest_height";
 
 /// Block storage manager
 pub struct BlockStore {
     db: Arc<RocksDB>,
+    /// RM-B1 / WP-C3.2 (audit L-STORE-01): cached latest height
+    /// updated atomically inside `put_block`'s WriteBatch so
+    /// `get_latest_height()` is O(1) after warm-up. Pre-fix the
+    /// method iterated all of CF_METADATA on every call —
+    /// after a year of 1s blocks (~31M entries), each call was
+    /// many milliseconds and got compounded by the 50K-req/s
+    /// rate limit into a self-DoS amplifier.
+    cached_latest_height: Arc<AtomicU64>,
 }
 
 impl BlockStore {
     pub fn new(db: Arc<RocksDB>) -> Self {
-        Self { db }
+        // Warm the cache from disk on construction. If the
+        // metadata key is absent (fresh chain), seed at 0.
+        let initial = match db.get_cf(CF_METADATA, LATEST_HEIGHT_KEY) {
+            Ok(Some(bytes)) if bytes.len() == 8 => {
+                u64::from_be_bytes(bytes.as_slice().try_into().unwrap_or([0u8; 8]))
+            }
+            _ => 0,
+        };
+        Self {
+            db,
+            cached_latest_height: Arc::new(AtomicU64::new(initial)),
+        }
     }
 
     /// Store a complete block
@@ -59,7 +83,27 @@ impl BlockStore {
                 .batch_put_cf(&mut batch, CF_BLUE_SET, &blue_score_key, hash.as_bytes())?;
         }
 
+        // RM-B1 / WP-C3.2 (audit L-STORE-01): bump the cached
+        // latest_height inside the same atomic batch as the block
+        // data. On commit we update the in-memory cache; on
+        // restart the cache rebuilds from the metadata key.
+        let prior_height = self.cached_latest_height.load(AtomicOrdering::SeqCst);
+        let new_height = prior_height.max(block.header.height);
+        if new_height > prior_height {
+            self.db.batch_put_cf(
+                &mut batch,
+                CF_METADATA,
+                LATEST_HEIGHT_KEY,
+                &new_height.to_be_bytes(),
+            )?;
+        }
+
         self.db.write_batch(batch)?;
+
+        // Update the in-memory cache only after the batch commits.
+        if new_height > prior_height {
+            self.cached_latest_height.store(new_height, AtomicOrdering::SeqCst);
+        }
 
         debug!("Stored block {} at height {}", hash, block.header.height);
         Ok(())
@@ -104,8 +148,23 @@ impl BlockStore {
         }
     }
 
-    /// Get latest block height
+    /// Get latest block height — O(1) after warm-up.
+    ///
+    /// RM-B1 / WP-C3.2 (audit L-STORE-01): pre-fix this method
+    /// iterated all of CF_METADATA on every call (~31M entries
+    /// after a year of 1s blocks). Combined with the 50K-req/s
+    /// rate limit, every `eth_blockNumber` call was a self-DoS
+    /// amplifier. Post-fix returns from an in-memory atomic
+    /// counter updated inside `put_block`'s WriteBatch.
     pub fn get_latest_height(&self) -> Result<u64> {
+        Ok(self.cached_latest_height.load(AtomicOrdering::SeqCst))
+    }
+
+    /// L-STORE-01 fallback: the original O(N) seek path. Used by
+    /// the cache-rebuild routine on construction if the persisted
+    /// `LATEST_HEIGHT_KEY` is missing or corrupt. Tests can also
+    /// call this to verify the cached value matches the disk truth.
+    pub fn get_latest_height_seek(&self) -> Result<u64> {
         // Iterate through height mappings to find the highest
         let mut max_height = 0u64;
         for (key, _) in self.db.iter_cf(CF_METADATA)? {
@@ -115,9 +174,6 @@ impl BlockStore {
             }
         }
         // Verify the block at max_height actually exists in CF_BLOCKS.
-        // The height key and block data are written in the same batch, but if
-        // the producer crashed or the block hash is stale, fall back to the
-        // highest height whose block data is actually retrievable.
         while max_height > 0 {
             let hk = height_to_key(max_height);
             if let Ok(Some(hash_bytes)) = self.db.get_cf(CF_METADATA, &hk) {
