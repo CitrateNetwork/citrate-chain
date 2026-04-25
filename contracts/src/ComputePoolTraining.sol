@@ -83,6 +83,22 @@ contract ComputePoolTraining is ReentrancyGuard {
         // paid out to the worker in a single transfer at finalize.
         uint128 paymentEarned;
         bool joined;
+        /// RM-B1 / WP-D4.1 (audit SOL-06): payout-eligibility flag.
+        /// Pre-fix `commitEpoch` excluded any worker with
+        /// `stakeSlashed > 0` from epoch payouts entirely. A 0.1%
+        /// liveness slash thus forfeited ~99.9% of remaining
+        /// epoch payments — a 1000× over-punishment that made the
+        /// coordinator role toxic. Post-fix `disqualified` is set
+        /// ONLY on challenge-uphold (real fault); liveness slash
+        /// reduces stake but keeps the worker eligible for
+        /// future epoch payouts.
+        bool disqualified;
+        /// RM-B1 / WP-D4.2 (audit SOL-07): pull-payment slot.
+        /// When `finalizeTrainingJob` / `abortRecruiting` cannot
+        /// push a payment (worker contract reverts on receive),
+        /// the amount is stashed here and the worker can claim
+        /// later via `claimDeferredPayout`.
+        uint128 payoutPending;
     }
 
     struct Challenge {
@@ -218,6 +234,12 @@ contract ComputePoolTraining is ReentrancyGuard {
     event WorkerStakeReturned(uint256 indexed jobId, address indexed worker, uint128 amount);
     event TrainingJobCompleted(uint256 indexed jobId, bytes32 finalWeightsHash);
     event TrainingJobAborted(uint256 indexed jobId, string reason);
+    /// RM-B1 / WP-D4.2 (audit SOL-07): pull-payment pattern.
+    /// Emitted when finalize / abort can't push a payment because
+    /// the worker's contract reverted; the worker can claim later
+    /// via `claimDeferredPayout`.
+    event PayoutDeferred(uint256 indexed jobId, address indexed worker, uint128 amount);
+    event DeferredPayoutClaimed(uint256 indexed jobId, address indexed worker, uint128 amount);
     event CommitteeUpdated(address indexed member, bool isMember);
 
     // ── Modifiers ───────────────────────────────────────────────────
@@ -302,7 +324,9 @@ contract ComputePoolTraining is ReentrancyGuard {
             stakeSlashed: 0,
             stakeReturned: 0,
             paymentEarned: 0,
-            joined: true
+            joined: true,
+            disqualified: false,
+            payoutPending: 0
         });
         _workerList[jobId].push(msg.sender);
         job.workerCount += 1;
@@ -351,14 +375,16 @@ contract ComputePoolTraining is ReentrancyGuard {
 
         epochCommitment[jobId][epoch] = root;
 
-        // Distribute per-epoch payment among un-slashed workers. A
-        // worker with stakeSlashed > 0 forfeits this epoch's share —
-        // the forfeited slice stays in escrow and rolls into the
-        // buyer's refund at finalize.
+        // RM-B1 / WP-D4.1 (audit SOL-06): payout-eligibility is
+        // tracked by `disqualified` (set only on challenge-uphold)
+        // not by `stakeSlashed > 0`. Pre-fix a 0.1% liveness slash
+        // forfeited ~99.9% of remaining epoch payments — a 1000×
+        // over-punishment. Post-fix liveness-slashed workers stay
+        // eligible; only challenge-uphold removes them.
         uint32 paidCount = 0;
         address[] storage wlist = _workerList[jobId];
         for (uint256 i = 0; i < wlist.length; i++) {
-            if (workers[jobId][wlist[i]].stakeSlashed == 0) {
+            if (!workers[jobId][wlist[i]].disqualified) {
                 paidCount += 1;
             }
         }
@@ -367,7 +393,7 @@ contract ComputePoolTraining is ReentrancyGuard {
             uint128 epochTotal = 0;
             for (uint256 i = 0; i < wlist.length; i++) {
                 WorkerInfo storage w = workers[jobId][wlist[i]];
-                if (w.stakeSlashed == 0) {
+                if (!w.disqualified) {
                     w.paymentEarned += perWorker;
                     epochTotal += perWorker;
                     emit EpochPaymentReleased(jobId, epoch, wlist[i], perWorker);
@@ -446,11 +472,13 @@ contract ComputePoolTraining is ReentrancyGuard {
 
         job.state = JobState.Finalized;
 
-        // Return remaining stake to each worker + pay out their
-        // accumulated stakePaid. The pull-vs-push trade-off: push
-        // here means one call finalizes everything. Gas cost scales
-        // linearly with workerCount (~30k per worker for two
-        // transfers). At N=50, ~1.5M gas — acceptable.
+        // RM-B1 / WP-D4.2 (audit SOL-07): pull-payment pattern.
+        // Pre-fix this loop did `worker.call{value:}` per worker;
+        // a malicious worker contract whose fallback reverts (or
+        // runs OOG) blocked finalization for everyone. Post-fix
+        // we try the push; on failure we stash the amount in
+        // `info.payoutPending` and emit `PayoutDeferred(...)`.
+        // The worker can later claim via `claimDeferredPayout`.
         address[] storage wlist = _workerList[jobId];
         for (uint256 i = 0; i < wlist.length; i++) {
             address worker = wlist[i];
@@ -459,14 +487,19 @@ contract ComputePoolTraining is ReentrancyGuard {
             uint128 toPay = info.paymentEarned;
             uint128 toReturn = held;
             info.stakeReturned += held;
-            // Zero out paymentEarned once sent so a surprise re-entry
-            // can't double-spend it.
             info.paymentEarned = 0;
 
-            if (toPay + toReturn > 0) {
-                (bool ok, ) = worker.call{value: uint256(toPay) + uint256(toReturn)}("");
-                require(ok, "ComputePoolTraining: worker transfer failed");
-                if (toReturn > 0) emit WorkerStakeReturned(jobId, worker, toReturn);
+            uint256 amount = uint256(toPay) + uint256(toReturn);
+            if (amount > 0) {
+                (bool ok, ) = worker.call{value: amount}("");
+                if (ok) {
+                    if (toReturn > 0) emit WorkerStakeReturned(jobId, worker, toReturn);
+                } else {
+                    // Stash for later claim — DO NOT revert the
+                    // entire finalize loop on one griefer.
+                    info.payoutPending += uint128(amount);
+                    emit PayoutDeferred(jobId, worker, uint128(amount));
+                }
             }
         }
 
@@ -592,6 +625,11 @@ contract ComputePoolTraining is ReentrancyGuard {
             slashAmount = uint128(uint256(targetInfo.stakePosted) * SLASH_BPS / BPS);
             if (slashAmount > held) slashAmount = held;
             targetInfo.stakeSlashed += slashAmount;
+            // RM-B1 / WP-D4.1 (audit SOL-06): challenge-upheld
+            // means a real fault — disqualify from future epoch
+            // payouts. Liveness slash (the LIVENESS_SLASH_BPS path
+            // in `reassignCoordinator`) does NOT set this flag.
+            targetInfo.disqualified = true;
 
             ch.state = ChallengeState.ResolvedUphold;
             ch.bond = 0;
@@ -635,7 +673,9 @@ contract ComputePoolTraining is ReentrancyGuard {
 
         job.state = JobState.Aborted;
 
-        // Refund joined workers
+        // RM-B1 / WP-D4.2 (audit SOL-07): pull-payment fallback —
+        // a griefer worker contract whose fallback reverts no
+        // longer DoS's the abort.
         address[] storage wlist = _workerList[jobId];
         for (uint256 i = 0; i < wlist.length; i++) {
             address worker = wlist[i];
@@ -644,7 +684,10 @@ contract ComputePoolTraining is ReentrancyGuard {
             info.stakeReturned = amount;
             if (amount > 0) {
                 (bool ok, ) = worker.call{value: amount}("");
-                require(ok, "ComputePoolTraining: stake refund failed");
+                if (!ok) {
+                    info.payoutPending += amount;
+                    emit PayoutDeferred(jobId, worker, amount);
+                }
             }
         }
 
@@ -657,6 +700,19 @@ contract ComputePoolTraining is ReentrancyGuard {
         }
 
         emit TrainingJobAborted(jobId, "recruiting aborted");
+    }
+
+    /// @notice Claim a deferred payout stashed when a push
+    /// transfer failed during finalize / abort.
+    /// RM-B1 / WP-D4.2 (audit SOL-07).
+    function claimDeferredPayout(uint256 jobId) external nonReentrant {
+        WorkerInfo storage info = workers[jobId][msg.sender];
+        uint128 amount = info.payoutPending;
+        require(amount > 0, "ComputePoolTraining: nothing to claim");
+        info.payoutPending = 0;
+        (bool ok, ) = msg.sender.call{value: amount}("");
+        require(ok, "ComputePoolTraining: claim transfer failed");
+        emit DeferredPayoutClaimed(jobId, msg.sender, amount);
     }
 
     // ── View helpers ────────────────────────────────────────────────
