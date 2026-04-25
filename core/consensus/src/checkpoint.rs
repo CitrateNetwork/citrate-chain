@@ -420,12 +420,24 @@ impl CheckpointManager {
             warn!("Failed to finalize checkpoint block in DAG: {}", e);
         }
 
-        // Persist to storage
+        // Persist to storage.
+        // RM-B1 / WP-B1.5 (audit M-06): on serialization failure log
+        // `error!` and skip the kv_put rather than writing empty bytes
+        // (which would silently deserialize-fail on next restart).
         if let Some(ref kv) = self.persistent {
             let key = format!("checkpoint:{}", height);
-            let bytes = bincode::serialize(&checkpoint).unwrap_or_default();
-            if let Err(e) = kv.kv_put(cf::DAG_METADATA, key.as_bytes(), &bytes) {
-                warn!("Failed to persist checkpoint at height {}: {}", height, e);
+            match bincode::serialize(&checkpoint) {
+                Ok(bytes) => {
+                    if let Err(e) = kv.kv_put(cf::DAG_METADATA, key.as_bytes(), &bytes) {
+                        warn!("Failed to persist checkpoint at height {}: {}", height, e);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "M-06: serialize checkpoint at height {} failed: {} — skipping persistence",
+                        height, e
+                    );
+                }
             }
         }
 

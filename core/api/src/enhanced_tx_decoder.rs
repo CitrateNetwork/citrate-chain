@@ -337,9 +337,18 @@ impl EnhancedTransactionDecoder {
 
     /// Handle Citrate native transaction
     fn handle_citrate_native_transaction(&self, mut tx: Transaction) -> Result<DecodedTransaction, TransactionDecoderError> {
-        // Ensure transaction has a proper hash if missing
+        // Ensure transaction has a proper hash if missing.
+        // RM-B1 / WP-B1.5 (audit M-06): on serialization failure
+        // propagate `Err` instead of hashing empty bytes (which would
+        // produce a single fixed hash for every failed-to-serialize
+        // transaction, silently colliding their identifiers).
         if tx.hash == Hash::default() {
-            let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
+            let tx_bytes = bincode::serialize(&tx).map_err(|e| {
+                TransactionDecoderError::MalformedTransaction(format!(
+                    "M-06: bincode serialize for citrate-native hash: {}",
+                    e
+                ))
+            })?;
             let mut hasher = Keccak256::new();
             hasher.update(&tx_bytes);
             let mut hash_bytes = [0u8; 32];

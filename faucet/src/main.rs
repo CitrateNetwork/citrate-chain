@@ -349,8 +349,22 @@ async fn request_tokens(
         }));
     }
 
-    // Serialize and send as raw transaction
-    let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
+    // Serialize and send as raw transaction.
+    // RM-B1 / WP-B1.5 (audit M-06): explicit error path replaces the
+    // prior `unwrap_or_default()` which silently emitted empty bytes
+    // on serialization failure (then the RPC reported a misleading
+    // decode error).
+    let tx_bytes = match bincode::serialize(&tx) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Ok(Json(FaucetResponse {
+                success: false,
+                tx_hash: None,
+                message: format!("Transaction serialization failed: {}", e),
+                amount: "0".to_string(),
+            }));
+        }
+    };
     let tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
     let mut request = client
