@@ -9,6 +9,7 @@ use p256::elliptic_curve::ops::ReduceNonZero;
 use p256::elliptic_curve::PrimeField;
 use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -186,48 +187,55 @@ fn challenge_to_scalar(c: &[u8; C_LEN]) -> Scalar {
 }
 
 /// RFC 6979-style deterministic nonce generation using HMAC-DRBG.
+///
+/// M-05: HMAC-DRBG state `(k, v)` and the secret-key bytes are wrapped in
+/// `Zeroizing<>` so the buffers are erased when this function returns.
+/// The returned `Scalar` is owned by the caller, who is responsible for
+/// dropping it under `Zeroizing` (p256's `Scalar` implements `Zeroize`
+/// via the `zeroize` feature flag, so a stack drop also wipes).
 fn nonce_generation(sk: &Scalar, h_point: &ProjectivePoint) -> Scalar {
-    let sk_bytes = sk.to_bytes();
+    // sk_bytes mirrors the secret scalar; wipe on scope exit.
+    let sk_bytes: Zeroizing<p256::FieldBytes> = Zeroizing::new(sk.to_bytes());
     let h_encoded = h_point.to_affine().to_encoded_point(true);
     let h_bytes = h_encoded.as_bytes();
 
-    // HMAC-DRBG (RFC 6979 Section 3.2)
-    let mut v = [0x01u8; 32];
-    let mut k = [0x00u8; 32];
+    // HMAC-DRBG state `(k, v)` per RFC 6979 §3.2 — both wiped on drop.
+    let mut v: Zeroizing<[u8; 32]> = Zeroizing::new([0x01u8; 32]);
+    let mut k: Zeroizing<[u8; 32]> = Zeroizing::new([0x00u8; 32]);
 
     // Step D
-    let mut mac = hmac_sha256(&k);
-    mac.update(&v);
+    let mut mac = hmac_sha256(k.as_ref());
+    mac.update(v.as_ref());
     mac.update(&[0x00]);
-    mac.update(&sk_bytes);
+    mac.update(sk_bytes.as_ref());
     mac.update(h_bytes);
-    k = mac.finalize().into_bytes().into();
+    *k = mac.finalize().into_bytes().into();
 
     // Step E
-    let mut mac = hmac_sha256(&k);
-    mac.update(&v);
-    v = mac.finalize().into_bytes().into();
+    let mut mac = hmac_sha256(k.as_ref());
+    mac.update(v.as_ref());
+    *v = mac.finalize().into_bytes().into();
 
     // Step F
-    let mut mac = hmac_sha256(&k);
-    mac.update(&v);
+    let mut mac = hmac_sha256(k.as_ref());
+    mac.update(v.as_ref());
     mac.update(&[0x01]);
-    mac.update(&sk_bytes);
+    mac.update(sk_bytes.as_ref());
     mac.update(h_bytes);
-    k = mac.finalize().into_bytes().into();
+    *k = mac.finalize().into_bytes().into();
 
     // Step G
-    let mut mac = hmac_sha256(&k);
-    mac.update(&v);
-    v = mac.finalize().into_bytes().into();
+    let mut mac = hmac_sha256(k.as_ref());
+    mac.update(v.as_ref());
+    *v = mac.finalize().into_bytes().into();
 
     // Step H: generate candidates until we get a valid scalar
     loop {
-        let mut mac = hmac_sha256(&k);
-        mac.update(&v);
-        v = mac.finalize().into_bytes().into();
+        let mut mac = hmac_sha256(k.as_ref());
+        mac.update(v.as_ref());
+        *v = mac.finalize().into_bytes().into();
 
-        let field_bytes = p256::FieldBytes::from_slice(&v);
+        let field_bytes = p256::FieldBytes::from_slice(v.as_ref());
         let opt: Option<Scalar> = Scalar::from_repr(*field_bytes).into();
         if let Some(scalar) = opt {
             if scalar != Scalar::ZERO {
@@ -236,14 +244,14 @@ fn nonce_generation(sk: &Scalar, h_point: &ProjectivePoint) -> Scalar {
         }
 
         // Update k, v for next iteration
-        let mut mac = hmac_sha256(&k);
-        mac.update(&v);
+        let mut mac = hmac_sha256(k.as_ref());
+        mac.update(v.as_ref());
         mac.update(&[0x00]);
-        k = mac.finalize().into_bytes().into();
+        *k = mac.finalize().into_bytes().into();
 
-        let mut mac = hmac_sha256(&k);
-        mac.update(&v);
-        v = mac.finalize().into_bytes().into();
+        let mut mac = hmac_sha256(k.as_ref());
+        mac.update(v.as_ref());
+        *v = mac.finalize().into_bytes().into();
     }
 }
 
@@ -265,8 +273,18 @@ pub fn proof_to_hash(gamma: &AffinePoint) -> [u8; 32] {
 /// Generates an ECVRF proof and output for the given secret key and alpha string.
 /// The `secret` is 32 bytes of key material (e.g., the node's ed25519 private key bytes),
 /// which is deterministically derived to a P-256 scalar.
+///
+/// **Caller contract (M-05)**: the `secret` slice is borrowed; callers
+/// MUST hold their copy in a `Zeroizing<[u8; 32]>` (or equivalent) so
+/// the bytes are erased when their owner is dropped. This function
+/// wraps the *derived* `Scalar` and the nonce locally, but cannot
+/// reach back into the caller's buffer.
 pub fn prove(secret: &[u8; 32], alpha: &[u8]) -> Result<(EcvrfProof, [u8; 32]), EcvrfError> {
-    let sk = secret_to_scalar(secret);
+    // M-05: the derived scalar is the actual signing material. p256's
+    // Scalar implements Zeroize via the `zeroize` feature; wrapping in
+    // Zeroizing<Scalar> is a belt-and-suspenders that also forces drop
+    // ordering.
+    let sk: Zeroizing<Scalar> = Zeroizing::new(secret_to_scalar(secret));
     let pk_point = scalar_to_pubkey_point(&sk);
     let pk_affine = pk_point.to_affine();
     let pk_encoded = pk_affine.to_encoded_point(true);
@@ -276,24 +294,24 @@ pub fn prove(secret: &[u8; 32], alpha: &[u8]) -> Result<(EcvrfProof, [u8; 32]), 
     let h = hash_to_try_and_increment(pk_bytes, alpha)?;
 
     // Step 2: Gamma = sk * H
-    let gamma_proj = h * sk;
+    let gamma_proj = h * *sk;
     let gamma = gamma_proj.to_affine();
 
-    // Step 3: Nonce k
-    let k = nonce_generation(&sk, &h);
+    // Step 3: Nonce k — derived from sk, also a secret. Wrap.
+    let k: Zeroizing<Scalar> = Zeroizing::new(nonce_generation(&sk, &h));
 
     // Step 4: U = k * B (generator)
-    let u = ProjectivePoint::GENERATOR * k;
+    let u = ProjectivePoint::GENERATOR * *k;
 
     // Step 5: V = k * H
-    let v = h * k;
+    let v = h * *k;
 
-    // Step 6: Challenge c = hash_points(H, Gamma, U, V)
+    // Step 6: Challenge c = hash_points(H, Gamma, U, V) — public.
     let c = hash_points(&[h, gamma_proj, u, v]);
 
-    // Step 7: s = (k + c * sk) mod q
+    // Step 7: s = (k + c * sk) mod q — published in the proof, not secret.
     let c_scalar = challenge_to_scalar(&c);
-    let s = k + c_scalar * sk;
+    let s = *k + c_scalar * *sk;
 
     // Step 8: beta = proof_to_hash(Gamma)
     let beta = proof_to_hash(&gamma);
@@ -438,5 +456,32 @@ mod tests {
         let (_, beta2) = prove(&secret, b"alpha two").unwrap();
 
         assert_ne!(beta1, beta2);
+    }
+
+    // M-05 regression: p256 Scalar must implement Zeroize so that the
+    // signing scalars derived inside `prove` actually erase on drop.
+    // This is a type-level assertion — a future bump to a p256 version
+    // that drops the Zeroize impl breaks compilation.
+    #[test]
+    fn test_m05_scalar_implements_zeroize() {
+        fn assert_impls_zeroize<T: zeroize::Zeroize>(_: &T) {}
+        let s = Scalar::ZERO;
+        assert_impls_zeroize(&s);
+    }
+
+    // M-05 regression: prove() runs end-to-end and produces stable output.
+    // Cross-check that wrapping sk and k in Zeroizing<> didn't perturb
+    // the determinism guarantee.
+    #[test]
+    fn test_m05_zeroizing_does_not_perturb_proof_determinism() {
+        let secret = [0xABu8; 32];
+        let alpha = b"m-05 determinism check";
+        let (proof1, beta1) = prove(&secret, alpha).expect("prove");
+        let (proof2, beta2) = prove(&secret, alpha).expect("prove repeat");
+        assert_eq!(beta1, beta2, "M-05: ECVRF must remain deterministic");
+        assert_eq!(
+            proof1.s, proof2.s,
+            "M-05: signature scalar s must remain deterministic"
+        );
     }
 }
