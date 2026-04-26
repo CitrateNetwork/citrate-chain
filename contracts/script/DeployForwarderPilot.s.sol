@@ -14,6 +14,7 @@ contract DeployForwarderPilot is ScriptEnv {
         address vault = vm.envAddress("VAULT_ADDRESS");
         address governance = envAddressOr("FORWARDER_GOVERNANCE", deployer);
         address relayer = envAddressOr("RELAYER", deployer);
+        address pilotTarget = envAddressOr("FORWARDER_TARGET", address(0));
 
         vm.startBroadcast();
         Forwarder f = new Forwarder(governance, cluster, vault);
@@ -22,8 +23,17 @@ contract DeployForwarderPilot is ScriptEnv {
         if (governance == deployer) {
             f.addRelayer(relayer);
             console.log("Relayer authorized:", relayer);
+            if (pilotTarget != address(0) && pilotTarget != vault) {
+                f.setTargetAllowed(pilotTarget, true);
+                console.log("Pilot target allowed:", pilotTarget);
+            } else if (pilotTarget == vault) {
+                console.log("Pilot target was vault; not allowed:", pilotTarget);
+            }
         } else {
             console.log("Governance is not deployer; authorize relayer manually:", relayer);
+            if (pilotTarget != address(0)) {
+                console.log("Governance is not deployer; allow pilot target manually:", pilotTarget);
+            }
         }
 
         vm.stopBroadcast();

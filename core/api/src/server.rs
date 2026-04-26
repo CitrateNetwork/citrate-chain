@@ -3,7 +3,9 @@
 use crate::filter::FilterRegistry;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::{ai_rpc, economics_rpc, eth_rpc};
-use crate::methods::{AiApi, ChainApi, MempoolApi, NetworkApi, StateApi, TransactionApi};
+use crate::methods::{
+    mempool::PendingQuery, AiApi, ChainApi, MempoolApi, NetworkApi, StateApi, TransactionApi,
+};
 use crate::metrics::rpc_request;
 use crate::types::{
     error::ApiError,
@@ -211,6 +213,20 @@ fn parse_pagination(obj: &serde_json::Map<String, serde_json::Value>) -> (usize,
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
     (offset, limit)
+}
+
+fn params_object_or_first_object(params: Params) -> serde_json::Map<String, Value> {
+    match params {
+        Params::Map(map) => map,
+        Params::None => serde_json::Map::new(),
+        Params::Array(arr) => {
+            if let Some(Value::Object(map)) = arr.into_iter().next() {
+                map
+            } else {
+                serde_json::Map::new()
+            }
+        }
+    }
 }
 
 fn access_policy_to_json(policy: &AccessPolicy) -> serde_json::Value {
@@ -904,16 +920,22 @@ impl RpcServer {
         });
 
         // mempool_getPending
+        //
+        // WP-J1.7 / T0-07: pending transaction detail is operator-only.
+        // The response is paginated, capped, and redacted so this method
+        // cannot serve as a public calldata/mempool dump.
         let mempool_pending = mempool.clone();
         io_handler.add_sync_method("mempool_getPending", move |params: Params| {
             rpc_request("mempool_getPending");
             let api = MempoolApi::new(mempool_pending.clone());
 
-            let limit: Option<usize> = params.parse().ok();
+            let params_map = params_object_or_first_object(params);
+            require_operator_auth(&params_map)?;
+            let query = PendingQuery::from_params_map(&params_map)?;
 
-            match block_on(api.get_pending(limit)) {
-                Ok(txs) => Ok(serde_json::to_value(txs).unwrap_or(Value::Array(vec![]))),
-                Err(_) => Ok(Value::Array(vec![])),
+            match block_on(api.get_pending(query)) {
+                Ok(txs) => Ok(serde_json::to_value(txs).unwrap_or(Value::Null)),
+                Err(err) => Err(err.into()),
             }
         });
 
@@ -2552,11 +2574,98 @@ impl RpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use citrate_consensus::types::{PublicKey, Signature, Transaction};
     use citrate_network::peer::PeerManagerConfig;
-    use citrate_sequencer::mempool::MempoolConfig;
+    use citrate_sequencer::mempool::{MempoolConfig, TxClass};
     use citrate_storage::pruning::PruningConfig;
+    use std::sync::Mutex;
     use tempfile::TempDir;
     // no-op
+
+    static OPERATOR_ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(old) = self.old.take() {
+                std::env::set_var(self.key, old);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn relaxed_mempool() -> Arc<Mempool> {
+        Arc::new(Mempool::new(MempoolConfig {
+            max_size: 20_000,
+            max_per_sender: 20_000,
+            min_gas_price: 1,
+            require_valid_signature: false,
+            chain_id: 40204,
+            ..Default::default()
+        }))
+    }
+
+    fn rpc_with_mempool(mempool: Arc<Mempool>) -> (RpcServer, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let storage =
+            Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let state_db = Arc::new(citrate_execution::StateDB::new());
+        let executor = Arc::new(Executor::new(state_db));
+        let rpc = RpcServer::new(
+            RpcConfig::default(),
+            storage,
+            mempool,
+            peer_manager,
+            executor,
+            40204,
+        );
+        (rpc, temp_dir)
+    }
+
+    fn make_test_tx(nonce: u64, data: Vec<u8>) -> Transaction {
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes[24..].copy_from_slice(&nonce.to_be_bytes());
+        let mut from_bytes = [1u8; 32];
+        from_bytes[0..8].copy_from_slice(&nonce.to_be_bytes());
+        let mut to_bytes = [2u8; 32];
+        to_bytes[0..8].copy_from_slice(&nonce.to_be_bytes());
+
+        Transaction {
+            hash: Hash::new(hash_bytes),
+            nonce,
+            from: PublicKey::new(from_bytes),
+            to: Some(PublicKey::new(to_bytes)),
+            value: nonce as u128,
+            gas_limit: 21_000,
+            gas_price: 1_000_000_000 + nonce,
+            data,
+            signature: Signature::new([7u8; 64]),
+            chain_id: Some(40204),
+            ..Default::default()
+        }
+    }
+
+    fn add_test_tx(mempool: &Arc<Mempool>, nonce: u64, data: Vec<u8>) {
+        futures::executor::block_on(mempool.add_transaction(
+            make_test_tx(nonce, data),
+            TxClass::Standard,
+        ))
+        .expect("test transaction admitted to relaxed mempool");
+    }
 
     #[tokio::test]
     async fn test_rpc_chain_height_and_tx_submit() {
@@ -2673,5 +2782,115 @@ mod tests {
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["id"], 42);
         assert!(v.get("error").is_some());
+    }
+
+    #[test]
+    fn test_t0_07_mempool_get_pending_requires_operator_token() {
+        let _lock = OPERATOR_ENV_GUARD.lock().expect("operator env guard");
+        let _env = EnvGuard::set("CITRATE_OPERATOR_TOKEN", "j1-7-token");
+        let mempool = relaxed_mempool();
+        add_test_tx(&mempool, 1, b"private-calldata".to_vec());
+        let (rpc, _temp_dir) = rpc_with_mempool(mempool);
+
+        let req =
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"mempool_getPending","params":{}})
+                .to_string();
+        let resp = futures::executor::block_on(rpc.io_handler.handle_request(&req)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+
+        assert_eq!(v["error"]["code"], -32001);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("operator_token required"),
+            "T0-07: unauthenticated pending dump must fail closed: {}",
+            v
+        );
+    }
+
+    #[test]
+    fn test_t0_07_mempool_get_pending_is_bounded_and_redacted() {
+        let _lock = OPERATOR_ENV_GUARD.lock().expect("operator env guard");
+        let _env = EnvGuard::set("CITRATE_OPERATOR_TOKEN", "j1-7-token");
+        let mempool = relaxed_mempool();
+        add_test_tx(&mempool, 1, b"super-secret-calldata-marker".to_vec());
+        let (rpc, _temp_dir) = rpc_with_mempool(mempool);
+
+        let req = serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"mempool_getPending",
+            "params":{"operator_token":"j1-7-token","limit":10}
+        })
+        .to_string();
+        let resp = futures::executor::block_on(rpc.io_handler.handle_request(&req)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+
+        assert!(v.get("error").is_none(), "T0-07 auth request failed: {}", v);
+        assert_eq!(v["result"]["returned"], 1);
+        assert_eq!(v["result"]["pending"][0]["dataSize"], 28);
+        assert!(
+            !resp.contains("super-secret-calldata-marker"),
+            "T0-07: pending response must not expose raw calldata"
+        );
+    }
+
+    #[test]
+    fn test_t0_07_mempool_get_pending_caps_large_pages() {
+        let _lock = OPERATOR_ENV_GUARD.lock().expect("operator env guard");
+        let _env = EnvGuard::set("CITRATE_OPERATOR_TOKEN", "j1-7-token");
+        let mempool = relaxed_mempool();
+        for nonce in 0..150u64 {
+            add_test_tx(&mempool, nonce, vec![0xAB; 2048]);
+        }
+        let (rpc, _temp_dir) = rpc_with_mempool(mempool);
+
+        let req = serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"mempool_getPending",
+            "params":{"operator_token":"j1-7-token","limit":10_000}
+        })
+        .to_string();
+        let resp = futures::executor::block_on(rpc.io_handler.handle_request(&req)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+
+        assert!(v.get("error").is_none(), "T0-07 capped request failed: {}", v);
+        assert_eq!(v["result"]["limit"], crate::methods::mempool::MAX_PENDING_LIMIT);
+        assert_eq!(v["result"]["returned"], crate::methods::mempool::MAX_PENDING_LIMIT);
+        assert_eq!(v["result"]["truncated"], true);
+        assert!(
+            resp.len() < crate::methods::mempool::MAX_PENDING_RESPONSE_BYTES,
+            "T0-07: pending response exceeded response cap: {} bytes",
+            resp.len()
+        );
+    }
+
+    #[test]
+    fn test_t0_07_pending_method_registrations_are_operator_gated() {
+        let server_src = include_str!("server.rs");
+        let pending_idx = server_src
+            .find("add_sync_method(\"mempool_getPending\"")
+            .expect("server.rs must register mempool_getPending");
+        let pending_window =
+            &server_src[pending_idx..(pending_idx + 1_500).min(server_src.len())];
+        assert!(
+            pending_window.contains("require_operator_auth"),
+            "T0-07: mempool_getPending closure must require operator auth"
+        );
+
+        let eth_rpc_src = include_str!("eth_rpc.rs");
+        let snapshot_idx = eth_rpc_src
+            .find("add_sync_method(\"citrate_getMempoolSnapshot\"")
+            .expect("eth_rpc.rs must register citrate_getMempoolSnapshot");
+        let snapshot_window =
+            &eth_rpc_src[snapshot_idx..(snapshot_idx + 1_500).min(eth_rpc_src.len())];
+        assert!(
+            snapshot_window.contains("require_operator_auth")
+                && snapshot_window.contains("PendingQuery::from_params_map")
+                && snapshot_window.contains("get_pending"),
+            "T0-07: alternate pending-detail method must use the same bounded operator path"
+        );
     }
 }

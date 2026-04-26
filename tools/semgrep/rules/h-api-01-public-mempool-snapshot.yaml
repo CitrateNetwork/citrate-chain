@@ -83,6 +83,9 @@ rules:
   # GetPending, Inspect) and is registered without an auth gate is
   # almost certainly a re-introduction of H-API-01 under a renamed
   # method. This guards the TRP-15 bypass technique (rename to escape).
+  # RM-J1 / WP-J1.7 extends this to the non-`citrate_` method
+  # `mempool_getPending`, which was a separate public pending-detail
+  # surface from `citrate_getMempoolSnapshot`.
   - id: h-api-01-mempool-detail-method-name-pattern
     message: >-
       RPC method names matching the mempool-detail pattern (*Snapshot*,
@@ -106,9 +109,41 @@ rules:
         - "**/*_tests.rs"
     patterns:
       - pattern-either:
-          - pattern-regex: 'add_(sync_)?method\("citrate_getMempool(Snapshot|Dump|Inspect)[A-Za-z]*"'
-          - pattern-regex: 'add_(sync_)?method\("citrate_(getPending|inspectMempool)[A-Za-z]*"'
-      - pattern-not-regex: 'require_operator_auth'
+          - pattern: |
+              $H.add_sync_method($METHOD, move |$P| {
+                ...
+              })
+          - pattern: |
+              $H.add_method($METHOD, move |$P| {
+                ...
+              })
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: '"(citrate_getMempool(Snapshot|Dump|Inspect)[A-Za-z]*|citrate_(getPending|inspectMempool)[A-Za-z]*|mempool_(getPending|getTransactions|inspect|dump)[A-Za-z]*)"'
+      - pattern-not: |
+          $H.add_sync_method($METHOD, move |$P| {
+            ...
+            require_operator_auth(...)?;
+            ...
+          })
+      - pattern-not: |
+          $H.add_sync_method($METHOD, move |$P| {
+            ...
+            crate::server::require_operator_auth(...)?;
+            ...
+          })
+      - pattern-not: |
+          $H.add_method($METHOD, move |$P| {
+            ...
+            require_operator_auth(...)?;
+            ...
+          })
+      - pattern-not: |
+          $H.add_method($METHOD, move |$P| {
+            ...
+            crate::server::require_operator_auth(...)?;
+            ...
+          })
     metadata:
       audit-id: H-API-01
       severity: high
@@ -117,5 +152,8 @@ rules:
       reaudit-finding: RFI-A1
       reaudit-sprint: RM-H1
       reaudit-wp: WP-H1.4
+      public-testnet-reaudit-finding: T0-07
+      public-testnet-reaudit-sprint: RM-J1
+      public-testnet-reaudit-wp: WP-J1.7
       structural-defense: 'capability-based name pattern + duplicate-registration guard'
       reference: https://docs.rs/jsonrpc-core/0.18/jsonrpc_core/struct.MetaIoHandler.html

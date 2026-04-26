@@ -19,6 +19,7 @@ import "../src/edu/CashoutRequest.sol";
  *  - BudgetAllocation governance  = deployer (not vault)
  *  - CashoutRequest governance    = deployer (not vault)
  *  - Forwarder governance         = deployer (not vault)
+ *  - Forwarder targets            = denied by default; tests opt targets in
  *
  * This lets the Anvil test fixture's deployer account call grantOrgRole,
  * createClassroom, allocateBudget, and approveCashout directly without routing
@@ -76,5 +77,6 @@ contract DeployEduStackTest is ScriptEnv {
         console.log("");
         console.log("=== Test Edu Stack Deployed ===");
         console.log("All contract governance set to deployer for direct test access.");
+        console.log("Forwarder targets are denied by default; call setTargetAllowed for each test target.");
     }
 }

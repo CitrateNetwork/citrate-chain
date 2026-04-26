@@ -61,13 +61,13 @@ print_usage() {
     echo "  --all                Build for all supported platforms"
     echo ""
     echo "Other Options:"
-    echo "  --upload <target>    Upload to target (github, scp:user@host:/path)"
+    echo "  --upload <target>    Upload to target (scp:user@host:/path)"
     echo "  --version <ver>      Set version string (default: timestamp)"
     echo "  --skip-unavailable   Skip platforms without required toolchains"
     echo "  -h, --help           Show this help message"
     echo ""
     echo "Examples:"
-    echo "  $0 --all --version v0.1.0-beta --upload github"
+    echo "  $0 --all --version v0.1.0-beta"
     echo "  $0 --linux --windows --version v0.1.0"
     echo "  $0 --linux-x86_64 --upload scp:user@server:/opt/citrate"
 }
@@ -416,38 +416,9 @@ if $UPLOAD && [ ${#SUCCESSFUL_BUILDS[@]} -gt 0 ]; then
     log_info "Uploading to $UPLOAD_TARGET..."
 
     if [[ "$UPLOAD_TARGET" == "github" ]]; then
-        log_info "Creating GitHub release..."
-        if command -v gh &> /dev/null; then
-            # Check if authenticated
-            if ! gh auth status &>/dev/null; then
-                log_error "GitHub CLI not authenticated. Run: gh auth login"
-                exit 1
-            fi
-
-            cd "$RELEASE_DIR/$VERSION"
-
-            # Get list of binaries to upload
-            UPLOAD_FILES=()
-            for f in citrate-*; do
-                if [[ -f "$f" ]]; then
-                    UPLOAD_FILES+=("$f")
-                fi
-            done
-
-            log_info "Uploading ${#UPLOAD_FILES[@]} files..."
-
-            # Create release
-            gh release create "$VERSION" \
-                --repo "SaulBuilds/citrate" \
-                --title "Citrate $VERSION" \
-                --notes-file RELEASE.md \
-                "${UPLOAD_FILES[@]}" \
-                && log_success "GitHub release created: https://github.com/SaulBuilds/citrate/releases/tag/$VERSION" \
-                || log_error "GitHub release failed"
-        else
-            log_error "GitHub CLI (gh) not installed. Install with: sudo apt install gh"
-            exit 1
-        fi
+        log_error "GitHub Release publication is restricted to .github/workflows/release.yml"
+        log_info "Build locally with this script, then publish through workflow_dispatch or a signed v* tag."
+        exit 1
 
     elif [[ "$UPLOAD_TARGET" == scp:* ]]; then
         SCP_DEST="${UPLOAD_TARGET#scp:}"
@@ -457,7 +428,7 @@ if $UPLOAD && [ ${#SUCCESSFUL_BUILDS[@]} -gt 0 ]; then
             || log_error "SCP upload failed"
     else
         log_error "Unknown upload target: $UPLOAD_TARGET"
-        log_info "Supported: github, scp:user@host:/path"
+        log_info "Supported: scp:user@host:/path"
     fi
 fi
 

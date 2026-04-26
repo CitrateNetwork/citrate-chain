@@ -25,6 +25,10 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
   RELEASE_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true && 'false' || 'true' }}
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 # RM-B1 / WP-F1.1 (audit CI-01): minimum permissions at workflow level.
 # The publish job widens to `contents: write` for the GitHub Release.
 permissions:
@@ -529,6 +533,7 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs: [build-developer-bundles, build-core-gui, build-learning-center, build-compute-provider-bundles]
+    environment: github-release
     # All three upstream jobs must succeed before we publish a release. The
     # operator GUI (citrate-gui-native) ships in the release surface alongside
     # the node binaries and the Learning Center pilot binary, so a GUI failure

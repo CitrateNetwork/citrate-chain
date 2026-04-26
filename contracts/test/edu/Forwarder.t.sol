@@ -25,13 +25,19 @@ contract ForwarderTest is Test {
     address admin = address(0x1);
     address itAdmin = address(0x2);
     address teacher = address(0x3);
-    address student = address(0x10);
+    uint256 studentKey = 0xA11CE;
+    uint256 attackerKey = 0xB0B;
+    address student;
+    address attacker;
     address nobody = address(0xBEEF);
 
     bytes32 orgPrincipal = keccak256("student-hmac-001");
     bytes32 deviceCert = keccak256("device-001");
 
     function setUp() public {
+        student = vm.addr(studentKey);
+        attacker = vm.addr(attackerKey);
+
         // Deploy dependencies
         address[] memory signers = new address[](1);
         signers[0] = governance;
@@ -46,6 +52,7 @@ contract ForwarderTest is Test {
         cluster.grantOrgRole(admin, IClassroomCluster.OrgRole.Admin);
         cluster.grantOrgRole(itAdmin, IClassroomCluster.OrgRole.IT);
         forwarder.addRelayer(relayer);
+        forwarder.setTargetAllowed(address(counter), true);
         vm.stopPrank();
 
         // Create classroom + register device
@@ -73,29 +80,48 @@ contract ForwarderTest is Test {
         });
     }
 
+    function _signRequest(IForwarder.ForwardRequest memory req, uint256 privateKey) internal view returns (bytes memory) {
+        bytes32 digest = forwarder.hashForwardRequest(req);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _studentSignature(IForwarder.ForwardRequest memory req) internal view returns (bytes memory) {
+        return _signRequest(req, studentKey);
+    }
+
+    function _executeAsRelayer(
+        IForwarder.ForwardRequest memory req,
+        bytes memory signature
+    ) internal returns (bool) {
+        vm.prank(relayer);
+        return forwarder.execute(req, signature);
+    }
+
+    function _executeStudentRequest(IForwarder.ForwardRequest memory req) internal returns (bool) {
+        return _executeAsRelayer(req, _studentSignature(req));
+    }
+
     // ===================================================================
     // UNIT TESTS
     // ===================================================================
 
     function test_execute_increments_counter() public {
         IForwarder.ForwardRequest memory req = _makeRequest(0);
-        vm.prank(relayer);
-        forwarder.execute(req, "");
+        _executeStudentRequest(req);
         assertEq(counter.count(), 1);
     }
 
     function test_execute_increments_nonce() public {
         IForwarder.ForwardRequest memory req = _makeRequest(0);
-        vm.prank(relayer);
-        forwarder.execute(req, "");
+        _executeStudentRequest(req);
         assertEq(forwarder.getNonce(orgPrincipal, 0), 1);
     }
 
     function test_sequential_executions() public {
         for (uint256 i = 0; i < 5; i++) {
             IForwarder.ForwardRequest memory req = _makeRequest(i);
-            vm.prank(relayer);
-            forwarder.execute(req, "");
+            _executeStudentRequest(req);
         }
         assertEq(counter.count(), 5);
         assertEq(forwarder.getNonce(orgPrincipal, 0), 5);
@@ -103,9 +129,10 @@ contract ForwarderTest is Test {
 
     function test_non_relayer_reverts() public {
         IForwarder.ForwardRequest memory req = _makeRequest(0);
+        bytes memory signature = _studentSignature(req);
         vm.prank(nobody);
         vm.expectRevert(); // NotAuthorizedRelayer
-        forwarder.execute(req, "");
+        forwarder.execute(req, signature);
     }
 
     // ===================================================================
@@ -116,23 +143,22 @@ contract ForwarderTest is Test {
     function test_invariant_nonce_monotonic() public {
         // Skip nonce 0, try nonce 1 directly — should fail
         IForwarder.ForwardRequest memory req = _makeRequest(1);
-        vm.prank(relayer);
+        bytes memory signature = _studentSignature(req);
         vm.expectRevert(); // InvalidNonce
-        forwarder.execute(req, "");
+        _executeAsRelayer(req, signature);
     }
 
     // Invariant 2: NoReplayAccepted
     function test_invariant_no_replay() public {
         IForwarder.ForwardRequest memory req = _makeRequest(0);
-        vm.prank(relayer);
-        forwarder.execute(req, "");
+        _executeStudentRequest(req);
 
         // Same request again (even with correct nonce 1 — but different tx hash)
         // Actually test exact replay: same nonce should fail
         IForwarder.ForwardRequest memory req2 = _makeRequest(0);
-        vm.prank(relayer);
+        bytes memory signature = _studentSignature(req2);
         vm.expectRevert(); // InvalidNonce (nonce already consumed, now expects 1)
-        forwarder.execute(req2, "");
+        _executeAsRelayer(req2, signature);
     }
 
     // Invariant 3: DeviceBindingEnforced
@@ -140,9 +166,9 @@ contract ForwarderTest is Test {
         IForwarder.ForwardRequest memory req = _makeRequest(0);
         req.deviceCertHash = keccak256("unknown-device");
 
-        vm.prank(relayer);
+        bytes memory signature = _studentSignature(req);
         vm.expectRevert(); // DeviceRevoked (device not registered)
-        forwarder.execute(req, "");
+        _executeAsRelayer(req, signature);
     }
 
     // Invariant 4: SessionExpiryEnforced
@@ -150,9 +176,9 @@ contract ForwarderTest is Test {
         IForwarder.ForwardRequest memory req = _makeRequest(0);
         req.sessionExpiry = block.timestamp - 1; // Already expired
 
-        vm.prank(relayer);
+        bytes memory signature = _studentSignature(req);
         vm.expectRevert(); // SessionExpired
-        forwarder.execute(req, "");
+        _executeAsRelayer(req, signature);
     }
 
     // Invariant 5: RevocationBarrierDouble (on-chain)
@@ -162,9 +188,9 @@ contract ForwarderTest is Test {
         cluster.revokeDevice(deviceCert);
 
         IForwarder.ForwardRequest memory req = _makeRequest(0);
-        vm.prank(relayer);
+        bytes memory signature = _studentSignature(req);
         vm.expectRevert(); // DeviceRevoked
-        forwarder.execute(req, "");
+        _executeAsRelayer(req, signature);
     }
 
     // Invariant 6: RelayerCannotCallVault
@@ -172,17 +198,16 @@ contract ForwarderTest is Test {
         IForwarder.ForwardRequest memory req = _makeRequest(0);
         req.target = address(vault); // Try to target the vault
 
-        vm.prank(relayer);
+        bytes memory signature = _studentSignature(req);
         vm.expectRevert(); // TargetIsVault
-        forwarder.execute(req, "");
+        _executeAsRelayer(req, signature);
     }
 
     // Invariant 7: OfflineQueueFlushSafe
     function test_invariant_offline_queue_flush_safe() public {
         // Execute once
         IForwarder.ForwardRequest memory req = _makeRequest(0);
-        vm.prank(relayer);
-        forwarder.execute(req, "");
+        _executeStudentRequest(req);
 
         // Revoke device after execution
         vm.prank(itAdmin);
@@ -190,9 +215,9 @@ contract ForwarderTest is Test {
 
         // Try to flush another queued item — should fail (device revoked)
         IForwarder.ForwardRequest memory req2 = _makeRequest(1);
-        vm.prank(relayer);
+        bytes memory signature = _studentSignature(req2);
         vm.expectRevert(); // DeviceRevoked
-        forwarder.execute(req2, "");
+        _executeAsRelayer(req2, signature);
 
         // Counter only incremented once
         assertEq(counter.count(), 1);
@@ -202,6 +227,74 @@ contract ForwarderTest is Test {
     // ADVERSARIAL TESTS
     // ===================================================================
 
+    function test_t0_01_unsigned_request_reverts() public {
+        IForwarder.ForwardRequest memory req = _makeRequest(0);
+
+        vm.prank(relayer);
+        vm.expectRevert(Forwarder.InvalidSignature.selector);
+        forwarder.execute(req, "");
+    }
+
+    function test_t0_01_wrong_signer_reverts() public {
+        IForwarder.ForwardRequest memory req = _makeRequest(0);
+        bytes memory signature = _signRequest(req, attackerKey);
+
+        vm.expectRevert(Forwarder.InvalidSignature.selector);
+        _executeAsRelayer(req, signature);
+    }
+
+    function test_t0_01_modified_target_after_signing_reverts() public {
+        Counter otherCounter = new Counter();
+        vm.prank(governance);
+        forwarder.setTargetAllowed(address(otherCounter), true);
+
+        IForwarder.ForwardRequest memory req = _makeRequest(0);
+        bytes memory signature = _studentSignature(req);
+        req.target = address(otherCounter);
+
+        vm.prank(relayer);
+        vm.expectRevert(Forwarder.InvalidSignature.selector);
+        forwarder.execute(req, signature);
+        assertEq(counter.count(), 0);
+        assertEq(otherCounter.count(), 0);
+    }
+
+    function test_t0_01_disallowed_target_reverts() public {
+        Counter unlistedCounter = new Counter();
+        IForwarder.ForwardRequest memory req = _makeRequest(0);
+        req.target = address(unlistedCounter);
+        bytes memory signature = _studentSignature(req);
+
+        vm.expectRevert(Forwarder.TargetNotAllowed.selector);
+        _executeAsRelayer(req, signature);
+    }
+
+    function test_t0_01_governance_controls_target_allowlist() public {
+        Counter target = new Counter();
+        assertFalse(forwarder.isAllowedTarget(address(target)));
+
+        vm.prank(nobody);
+        vm.expectRevert(Forwarder.NotGovernance.selector);
+        forwarder.setTargetAllowed(address(target), true);
+
+        vm.prank(governance);
+        forwarder.setTargetAllowed(address(target), true);
+        assertTrue(forwarder.isAllowedTarget(address(target)));
+
+        vm.prank(governance);
+        forwarder.setTargetAllowed(address(target), false);
+        assertFalse(forwarder.isAllowedTarget(address(target)));
+    }
+
+    function test_t0_01_domain_changes_with_chain_id() public {
+        bytes32 originalDomain = forwarder.DOMAIN_SEPARATOR();
+
+        vm.chainId(block.chainid + 1);
+        bytes32 forkDomain = forwarder.DOMAIN_SEPARATOR();
+
+        assertTrue(originalDomain != forkDomain);
+    }
+
     function test_adversarial_relayer_drains_vault() public {
         // Fund vault
         vm.deal(address(vault), 10 ether);
@@ -210,26 +303,25 @@ contract ForwarderTest is Test {
         IForwarder.ForwardRequest memory req = _makeRequest(0);
         req.target = address(vault);
         req.data = abi.encodeWithSignature("executeCashout(uint256)", 0);
+        bytes memory signature = _studentSignature(req);
 
-        vm.prank(relayer);
         vm.expectRevert(); // TargetIsVault
-        forwarder.execute(req, "");
+        _executeAsRelayer(req, signature);
     }
 
     function test_adversarial_nonce_skip_attack() public {
         // Attacker tries to skip ahead to consume future nonces
         IForwarder.ForwardRequest memory req = _makeRequest(100);
-        vm.prank(relayer);
+        bytes memory signature = _studentSignature(req);
         vm.expectRevert(); // InvalidNonce
-        forwarder.execute(req, "");
+        _executeAsRelayer(req, signature);
     }
 
     function test_adversarial_different_classroom_nonce() public {
         // Nonces are per (orgPrincipal, classroomId)
         // Execute in classroom 0
         IForwarder.ForwardRequest memory req = _makeRequest(0);
-        vm.prank(relayer);
-        forwarder.execute(req, "");
+        _executeStudentRequest(req);
 
         // Nonce for classroom 0 is now 1
         assertEq(forwarder.getNonce(orgPrincipal, 0), 1);
@@ -283,8 +375,7 @@ contract ForwarderTest is Test {
 
         for (uint256 i = 0; i < iterations; i++) {
             IForwarder.ForwardRequest memory req = _makeRequest(i);
-            vm.prank(relayer);
-            forwarder.execute(req, "");
+            _executeStudentRequest(req);
         }
 
         assertEq(forwarder.getNonce(orgPrincipal, 0), iterations);
@@ -297,9 +388,9 @@ contract ForwarderTest is Test {
 
         IForwarder.ForwardRequest memory req = _makeRequest(0);
         req.sessionExpiry = expiryTime;
+        bytes memory signature = _studentSignature(req);
 
-        vm.prank(relayer);
         vm.expectRevert();
-        forwarder.execute(req, "");
+        _executeAsRelayer(req, signature);
     }
 }
