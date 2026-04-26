@@ -190,7 +190,11 @@ jobs:
         run: choco install llvm cmake -y
 
       - name: Build Slint GUI binary
-        run: cargo build --release -p citrate-gui-native
+        # WP-I2.4 (audit CI-08, re-audit Stream 7): --locked enforces
+        # the committed Cargo.lock so a transient registry hiccup or a
+        # malicious lockfile-bumping action can't silently change a
+        # dependency in a release artefact.
+        run: cargo build --locked --release -p citrate-gui-native
 
       - name: Package core GUI artifact (Linux/macOS)
         if: runner.os != 'Windows'
@@ -316,10 +320,12 @@ jobs:
         run: choco install llvm cmake -y
 
       - name: Build Learning Center binary
-        run: cargo build --release -p citrate-learning-center
+        # WP-I2.4 (audit CI-08): --locked, see Slint GUI job above for rationale.
+        run: cargo build --locked --release -p citrate-learning-center
 
       - name: Run Learning Center unit tests
-        run: cargo test --release -p citrate-edu-app
+        # WP-I2.4 (audit CI-08): --locked.
+        run: cargo test --locked --release -p citrate-edu-app
 
       - name: Package Learning Center artifact (Linux/macOS)
         if: runner.os != 'Windows'
@@ -452,8 +458,9 @@ jobs:
         run: choco install llvm cmake -y
 
       - name: Build compute provider binaries
+        # WP-I2.4 (audit CI-08): --locked.
         run: |
-          cargo build --release -p citrate-pool-coordinator -p citrate-training-worker
+          cargo build --locked --release -p citrate-pool-coordinator -p citrate-training-worker
 
       - name: Package compute provider bundle (Linux/macOS)
         if: runner.os != 'Windows'

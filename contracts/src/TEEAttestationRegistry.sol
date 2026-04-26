@@ -17,13 +17,16 @@ import "./lib/Governable.sol";
 ///            governance pre-approves signer hashes; caller
 ///            promises the (vmMeasurement, gpuMeasurement) come
 ///            from those signers.
-///         2. `submitAttestationStrict` (cryptographic, V2) — caller
-///            supplies the raw MAA JWT + signature; the contract
+///         2. `submitAttestationStrictBound` (cryptographic, V2) —
+///            caller supplies the raw MAA JWT + signature + literal
+///            JWT claim bytes for the VM measurement; the contract
 ///            verifies the RS256 signature on-chain against a
-///            governance-published RSA public key (the Azure MAA
-///            JWKS endpoint's key, mirrored on-chain). The NRAS
-///            (P384) verification side is still governance-trusted
-///            pending P-384 ECDSA precompile / vetted Solidity lib;
+///            governance-published RSA public key AND verifies that
+///            the literal claim bytes appear inside the decoded JWT
+///            payload (binding the on-chain `vmMeasurement` to actual
+///            JWT content via `JWTParser`). The NRAS (P384)
+///            verification side is still governance-trusted pending
+///            P-384 ECDSA precompile / vetted Solidity lib;
 ///            documented in ADR-010 §"P384 deferred".
 ///
 ///         The `strictCryptographicMode` flag controls whether the
@@ -93,8 +96,8 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
     }
     mapping(bytes32 => MaaRsaKey) internal _maaRsaKeys;
 
-    /// @notice When true, ONLY `submitAttestationStrict` accepts new
-    /// attestations. The V1 governance-trusted `submitAttestation`
+    /// @notice When true, ONLY `submitAttestationStrictBound` accepts
+    /// new attestations. The V1 governance-trusted `submitAttestation`
     /// path is still callable but reverts immediately.
     /// RM-B1 / WP-D3.1 (audit SOL-03): defaults to TRUE — secure-by-
     /// default. Pre-fix the constructor left this as the bool zero
@@ -104,7 +107,7 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
     bool public strictCryptographicMode;
 
     /// @notice Tracks JWT signatures already consumed by
-    /// `submitAttestationStrict`. Keyed by `keccak256(jwtSignature)`.
+    /// `submitAttestationStrictBound`. Keyed by `keccak256(jwtSignature)`.
     /// RM-B1 / WP-D3.2 (audit SOL-05): pre-fix the same valid MAA
     /// JWT could be replayed indefinitely (by the same worker every
     /// few seconds, or by a different worker forging the address
@@ -167,11 +170,6 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
         bytes32 modelHash,
         bytes32 indexed kidHash
     );
-    /// Emitted on every `submitAttestationStrict` call to give
-    /// off-chain monitors a signal for migration progress to the
-    /// `submitAttestationStrictBound` variant. Audit SOL-05 follow-on.
-    event UnboundStrictDeprecatedUsed(address indexed worker, bytes32 indexed kidHash);
-
     // `onlyGovernance` is inherited from Governable.
 
     // ── Constructor ─────────────────────────────────────────────────
@@ -200,7 +198,7 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
         bytes32 maaSignerHash,
         bytes32 nrasSignerHash
     ) external {
-        require(!strictCryptographicMode, "TEERegistry: strict mode active, use submitAttestationStrict");
+        require(!strictCryptographicMode, "TEERegistry: strict mode active, use submitAttestationStrictBound");
         require(!attestations[msg.sender].slashed, "TEERegistry: slashed cannot re-attest");
         require(trustedMaaSigners[maaSignerHash], "TEERegistry: untrusted MAA signer");
         require(trustedNrasSigners[nrasSignerHash], "TEERegistry: untrusted NRAS signer");
@@ -220,109 +218,11 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
         emit Attested(msg.sender, rec.attestedAtBlock, rec.expiryBlock, modelHash);
     }
 
-    /// @notice Strict-mode submission. Verifies the MAA JWT signature
-    /// on-chain via RS256. The NRAS side is still a governance-trusted
-    /// signer hash (P384 verification deferred — see ADR-010
-    /// §"P384 deferred").
-    ///
-    /// @dev DEPRECATED — new integrations should call
-    ///      `submitAttestationStrictBound`, which additionally binds
-    ///      the on-chain `vmMeasurement` to actual JWT payload content
-    ///      via `JWTParser`. This unbound variant trusts the caller's
-    ///      `vmMeasurement` parameter; an attacker holding ANY valid
-    ///      MAA JWT could substitute an unrelated measurement (audit
-    ///      SOL-05). Existing callers (`training-worker/src/attestation.rs`)
-    ///      will be migrated in a coordinated rollout. New callers
-    ///      MUST use the Bound variant.
-    ///
-    /// The caller passes:
-    /// - `signedJwtPayload`: the bytes that were RS256-signed. By
-    ///   RFC 7515 this is `base64url(header) || "." || base64url(payload)`.
-    ///   The contract does NOT parse the JWT — it just verifies that
-    ///   the signature is valid over these bytes under the named
-    ///   RSA public key.
-    /// - `jwtSignature`: the raw RSA signature (256 bytes for RSA-2048)
-    /// - `kidHash`: keccak256(kid) to look up the RSA public key.
-    ///   Caller must pre-compute this from the JWT header's `kid`
-    ///   claim. (We accept the hash rather than the raw kid string
-    ///   to keep calldata bounded and avoid string handling.)
-    /// - `vmMeasurement`: Caller asserts this equals the relevant
-    ///   measurement claim FROM the JWT payload. Since on-chain JWT
-    ///   parsing is gas-prohibitive, the contract's contract is:
-    ///   "we attest the signature over signedJwtPayload is valid;
-    ///   off-chain code is responsible for matching vmMeasurement to
-    ///   the appropriate field in the payload." The auditor's
-    ///   workflow is: replay any submitted attestation, decode the
-    ///   JWT off-chain, confirm vmMeasurement matches the expected
-    ///   field. If it doesn't, governance slashes via `forceSlash`.
-    /// - `gpuMeasurement`, `modelHash`, `nrasSignerHash`: as in V1.
-    function submitAttestationStrict(
-        bytes calldata signedJwtPayload,
-        bytes calldata jwtSignature,
-        bytes32 kidHash,
-        bytes32 vmMeasurement,
-        bytes32 gpuMeasurement,
-        bytes32 modelHash,
-        bytes32 nrasSignerHash
-    ) external {
-        require(!attestations[msg.sender].slashed, "TEERegistry: slashed cannot re-attest");
-        require(modelHash != bytes32(0), "TEERegistry: zero model hash");
-        require(trustedNrasSigners[nrasSignerHash], "TEERegistry: untrusted NRAS signer");
-
-        MaaRsaKey storage key = _maaRsaKeys[kidHash];
-        require(key.active, "TEERegistry: unknown or inactive MAA kid");
-
-        // RM-B1 / WP-D3.2 (audit SOL-05): JWT replay protection.
-        // Pre-fix, the same valid (signedJwtPayload, jwtSignature)
-        // could be re-submitted indefinitely. Post-fix the signature
-        // hash is one-time-use: a JWT can be consumed exactly once,
-        // by the address actively submitting it.
-        bytes32 sigHash = keccak256(jwtSignature);
-        require(!usedJwtSignatures[sigHash], "TEERegistry: jwt replay");
-        usedJwtSignatures[sigHash] = true;
-
-        // Cryptographic gate: RS256 verify of (signedJwtPayload,
-        // jwtSignature) under the stored RSA public key. This is
-        // ~60-100k gas for RSA-2048 e=65537.
-        bool sigOk = RS256.verify(
-            signedJwtPayload,
-            jwtSignature,
-            key.modulus,
-            key.exponent
-        );
-        require(sigOk, "TEERegistry: invalid MAA JWT signature");
-
-        uint64 blockNum = uint64(block.number);
-        AttestationRecord memory rec = AttestationRecord({
-            attestedAtBlock: blockNum,
-            expiryBlock: blockNum + ATTESTATION_LIFETIME_BLOCKS,
-            modelHash: modelHash,
-            vmMeasurement: vmMeasurement,
-            gpuMeasurement: gpuMeasurement,
-            slashed: false
-        });
-        attestations[msg.sender] = rec;
-
-        emit Attested(msg.sender, rec.attestedAtBlock, rec.expiryBlock, modelHash);
-        emit AttestedStrict(
-            msg.sender,
-            rec.attestedAtBlock,
-            rec.expiryBlock,
-            modelHash,
-            kidHash
-        );
-        // RM-D3 follow-on (audit SOL-05): off-chain migration
-        // signal — every legacy strict call emits this event so
-        // dashboards can track progress to the Bound variant.
-        emit UnboundStrictDeprecatedUsed(msg.sender, kidHash);
-    }
-
     /// @notice JWT-content-bound strict submission. In addition to
-    /// verifying the RS256 signature (as `submitAttestationStrict`
-    /// does), this variant requires that the caller-supplied
-    /// `vmMeasurementClaim` bytes appear LITERALLY inside the
-    /// JWT payload. The on-chain `vmMeasurement` is then derived
-    /// as `keccak256(vmMeasurementClaim)` — the caller cannot
+    /// verifying the RS256 signature, this variant requires that the
+    /// caller-supplied `vmMeasurementClaim` bytes appear LITERALLY
+    /// inside the JWT payload. The on-chain `vmMeasurement` is then
+    /// derived as `keccak256(vmMeasurementClaim)` — the caller cannot
     /// substitute an unrelated measurement.
     ///
     /// `vmMeasurementClaim` should be the EXACT bytes of the
@@ -330,12 +230,13 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
     /// e.g. `"x-ms-runtime-vm-measurement":"0xabcd..."`. ADR-010
     /// §"MAA schema" enumerates the valid field names.
     ///
-    /// RM-B1 / WP-D3.4 (audit SOL-05): closes the half of SOL-05
-    /// that `submitAttestationStrict` left open — pre-fix the
-    /// signature verification was real but the on-chain measurement
-    /// claim was caller-asserted. A worker holding any valid MAA
-    /// JWT could substitute an arbitrary measurement. Post-fix the
-    /// measurement is bound to actual JWT content.
+    /// RM-B1 / WP-D3.4 (audit SOL-05): the cryptographic V2 path.
+    /// An earlier `submitAttestationStrict` variant (now removed in
+    /// RM-J3 post-RM-I-3 cleanup) trusted a caller-asserted
+    /// `vmMeasurement bytes32`; an attacker holding any valid MAA
+    /// JWT could substitute an arbitrary measurement. This Bound
+    /// variant binds the measurement to actual JWT content via
+    /// `JWTParser.containsClaim`.
     function submitAttestationStrictBound(
         bytes calldata signedJwtPayload,
         bytes calldata jwtSignature,
@@ -353,7 +254,9 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
         MaaRsaKey storage key = _maaRsaKeys[kidHash];
         require(key.active, "TEERegistry: unknown or inactive MAA kid");
 
-        // Replay protection — same as submitAttestationStrict.
+        // Replay protection: each (signedJwtPayload, jwtSignature)
+        // is consumed exactly once via the keccak256(jwtSignature)
+        // index. Re-submission by the same or another worker reverts.
         bytes32 sigHash = keccak256(jwtSignature);
         require(!usedJwtSignatures[sigHash], "TEERegistry: jwt replay");
         usedJwtSignatures[sigHash] = true;
@@ -625,9 +528,9 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
 
     /// @notice Toggle the strict cryptographic mode. When true, the
     /// V1 governance-trusted `submitAttestation` path reverts and
-    /// only `submitAttestationStrict` is accepted. Allows staged
-    /// cutover: deploy V2, exercise it in shadow, then flip the
-    /// flag once governance is comfortable.
+    /// only `submitAttestationStrictBound` is accepted. Allows
+    /// staged cutover: deploy V2, exercise it in shadow, then flip
+    /// the flag once governance is comfortable.
     function setStrictCryptographicMode(bool enabled) external onlyGovernance {
         strictCryptographicMode = enabled;
         emit StrictCryptographicModeChanged(enabled);

@@ -72,8 +72,36 @@ impl TransactionGossip {
     }
 
     /// Handle new transaction from peer
+    ///
+    /// RM-I / WP-I1.7 (re-audit Stream 2 finding H-NET-01 tx-gossip path):
+    ///   The H-NET-01 closure in RM-C closed the block-gossip relay-before-
+    ///   validate hole, but the tx-gossip path was missed. Pre-fix this
+    ///   method dedup'd against `seen_txs`, marked the peer's inventory,
+    ///   and immediately relayed (`relay_transaction`) without any
+    ///   validation. An attacker peer could flood the network with garbage
+    ///   transactions and they'd be relayed before any node validated them.
+    ///   Post-fix: every newly-seen transaction is validated by
+    ///   `Self::validate_transaction_static` BEFORE entering the relay
+    ///   path. Invalid transactions are dropped (not relayed, not added to
+    ///   `seen_txs`, not added to `peer_inventory`).
     pub async fn handle_new_transaction(&self, peer_id: &PeerId, tx: Transaction) -> Result<bool> {
         let tx_hash = tx.hash;
+
+        // RM-I / WP-I1.7: validate-before-relay. Must run before any
+        // state mutation so an invalid tx leaves no residue. Mirrors
+        // `gossip.rs::validate_transaction` byte-for-byte (see comment
+        // in `validate_transaction_static`). Uses the
+        // `max_message_size` constant since `GossipConfig` (this
+        // module's gossip config) doesn't carry it; the value matches
+        // the block-gossip cap in `gossip.rs::GossipConfig::default()`.
+        const MAX_TX_GOSSIP_MESSAGE_SIZE: usize = 1024 * 1024; // 1 MiB
+        if !Self::validate_transaction_static(&tx, MAX_TX_GOSSIP_MESSAGE_SIZE) {
+            tracing::debug!(
+                "H-NET-01 (tx-gossip): rejecting invalid tx {} from peer {}",
+                tx_hash, peer_id
+            );
+            return Ok(false);
+        }
 
         // Check if we've seen this transaction
         let mut seen = self.seen_txs.write().await;
@@ -142,6 +170,56 @@ impl TransactionGossip {
         }
 
         Ok(is_new)
+    }
+
+    /// RM-I / WP-I1.7 (H-NET-01 tx-gossip): validate a transaction
+    /// before it enters the relay pipeline. Mirrors the field-level
+    /// checks in `gossip.rs::Gossip::validate_transaction`:
+    ///   - serialise round-trip succeeds and size is within
+    ///     `max_message_size`
+    ///   - `gas_price >= MIN_GAS_PRICE` (1 Gwei)
+    ///   - `gas_price > 0` AND `gas_limit > 0`
+    ///   - `gas_limit <= MAX_GAS_LIMIT` (30 M)
+    ///   - `value <= u128::MAX / 2` (overflow guard)
+    ///   - `data.len() <= MAX_TX_DATA_SIZE` (128 KiB)
+    ///
+    /// This is intentionally a static helper so the validation can run
+    /// before any RwLock acquisition. Signature verification is not done
+    /// here — the mempool does the cryptographic check; this is a
+    /// defence-in-depth gate against obviously-malformed payloads.
+    fn validate_transaction_static(tx: &Transaction, max_message_size: usize) -> bool {
+        let size = match bincode::serialize(tx) {
+            Ok(bytes) => bytes.len(),
+            Err(_) => return false,
+        };
+        if size > max_message_size {
+            return false;
+        }
+
+        if tx.gas_price == 0 || tx.gas_limit == 0 {
+            return false;
+        }
+
+        const MIN_GAS_PRICE: u64 = 1_000_000_000; // 1 Gwei
+        if tx.gas_price < MIN_GAS_PRICE {
+            return false;
+        }
+
+        const MAX_GAS_LIMIT: u64 = 30_000_000;
+        if tx.gas_limit > MAX_GAS_LIMIT {
+            return false;
+        }
+
+        if tx.value > u128::MAX / 2 {
+            return false;
+        }
+
+        const MAX_TX_DATA_SIZE: usize = 128 * 1024;
+        if tx.data.len() > MAX_TX_DATA_SIZE {
+            return false;
+        }
+
+        true
     }
 
     /// Broadcast a new local transaction
@@ -344,25 +422,34 @@ mod tests {
     use super::*;
     use citrate_consensus::types::{PublicKey, Signature};
 
+    /// Helper: build a valid transaction passing the WP-I1.7
+    /// validate-before-relay gate.
+    fn valid_tx(hash_byte: u8, tx_type: TransactionType) -> Transaction {
+        Transaction {
+            hash: Hash::new([hash_byte; 32]),
+            nonce: 1,
+            from: PublicKey::new([2; 32]),
+            to: Some(PublicKey::new([3; 32])),
+            value: 1000,
+            gas_limit: 21_000,
+            // RM-I / WP-I1.7: 1 Gwei = MIN_GAS_PRICE in
+            // validate_transaction_static; pre-fix this test used
+            // gas_price=100 (below MIN_GAS_PRICE) and the validator
+            // would now reject it. Updated to a valid value.
+            gas_price: 1_000_000_000,
+            data: vec![],
+            signature: Signature::new([0; 64]),
+            tx_type: Some(tx_type),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn test_transaction_gossip() {
         let peer_manager = Arc::new(PeerManager::new(Default::default()));
         let gossip = TransactionGossip::new(peer_manager, Default::default());
 
-        // Create test transaction
-        let tx = Transaction {
-            hash: Hash::new([1; 32]),
-            nonce: 1,
-            from: PublicKey::new([2; 32]),
-            to: Some(PublicKey::new([3; 32])),
-            value: 1000,
-            gas_limit: 21000,
-            gas_price: 100,
-            data: vec![],
-            signature: Signature::new([0; 64]),
-            tx_type: Some(TransactionType::Standard),
-            ..Default::default()
-        };
+        let tx = valid_tx(1, TransactionType::Standard);
 
         // Test broadcasting
         assert!(gossip.broadcast_transaction(tx.clone()).await.is_ok());
@@ -381,11 +468,7 @@ mod tests {
         assert!(!is_new); // Should not be new since we already have it
 
         // Test AI transaction bundling
-        let ai_tx = Transaction {
-            hash: Hash::new([10; 32]),
-            tx_type: Some(TransactionType::ModelDeploy),
-            ..tx
-        };
+        let ai_tx = valid_tx(10, TransactionType::ModelDeploy);
 
         assert!(gossip
             .handle_new_transaction(&peer_id, ai_tx)
@@ -395,5 +478,84 @@ mod tests {
         // AI tx should be in pending
         let pending = gossip.pending_ai_txs.read().await;
         assert_eq!(pending.len(), 1);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // RM-I / WP-I1.7 — H-NET-01 tx-gossip validate-before-relay tests.
+    // ────────────────────────────────────────────────────────────────
+
+    /// An invalid tx (gas_price = 0) is rejected by `handle_new_transaction`
+    /// BEFORE entering `seen_txs`, `peer_inventory`, or the relay path.
+    #[tokio::test]
+    async fn test_h_net_01_tx_gossip_invalid_tx_rejected_pre_relay() {
+        let peer_manager = Arc::new(PeerManager::new(Default::default()));
+        let gossip = TransactionGossip::new(peer_manager, Default::default());
+
+        let mut bad = valid_tx(0xCA, TransactionType::Standard);
+        bad.gas_price = 0; // Invalid: validator rejects gas_price == 0.
+
+        let peer_id = PeerId::new("attacker_peer".to_string());
+        let result = gossip.handle_new_transaction(&peer_id, bad.clone()).await;
+        assert!(
+            matches!(result, Ok(false)),
+            "H-NET-01: invalid tx must return Ok(false), got {:?}",
+            result
+        );
+
+        // Critically: the tx must NOT have been added to `seen_txs`.
+        // Pre-fix, the dedup logic added it before validation.
+        let seen = gossip.seen_txs.read().await;
+        assert!(
+            !seen.contains_key(&bad.hash),
+            "H-NET-01: invalid tx must NOT be added to seen_txs"
+        );
+        drop(seen);
+
+        // And NOT to the peer's inventory.
+        let inventory = gossip.peer_inventory.read().await;
+        assert!(
+            inventory
+                .get(&peer_id)
+                .map(|s| !s.contains(&bad.hash))
+                .unwrap_or(true),
+            "H-NET-01: invalid tx must NOT be added to peer_inventory"
+        );
+    }
+
+    /// Below-min-gas-price tx is rejected (catches the most common
+    /// adversarial flood: cheap garbage tx).
+    #[tokio::test]
+    async fn test_h_net_01_below_min_gas_price_rejected() {
+        let mut bad = valid_tx(0xCB, TransactionType::Standard);
+        bad.gas_price = 1; // Below 1 Gwei minimum.
+        const MAX: usize = 1024 * 1024;
+        assert!(
+            !TransactionGossip::validate_transaction_static(&bad, MAX),
+            "H-NET-01: gas_price=1 must be rejected by validator"
+        );
+    }
+
+    /// Above-max-data-size tx is rejected (catches the second common
+    /// adversarial flood: huge-payload tx that exhausts memory).
+    #[tokio::test]
+    async fn test_h_net_01_oversize_data_rejected() {
+        let mut bad = valid_tx(0xCC, TransactionType::Standard);
+        bad.data = vec![0u8; 256 * 1024]; // 256 KiB > 128 KiB MAX_TX_DATA_SIZE.
+        const MAX: usize = 1024 * 1024;
+        assert!(
+            !TransactionGossip::validate_transaction_static(&bad, MAX),
+            "H-NET-01: data size > 128 KiB must be rejected"
+        );
+    }
+
+    /// Positive: a valid tx passes the validator.
+    #[tokio::test]
+    async fn test_h_net_01_valid_tx_passes_validator() {
+        let good = valid_tx(0xCD, TransactionType::Standard);
+        const MAX: usize = 1024 * 1024;
+        assert!(
+            TransactionGossip::validate_transaction_static(&good, MAX),
+            "H-NET-01: a valid tx must pass the validator"
+        );
     }
 }

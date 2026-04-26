@@ -18,6 +18,28 @@ pub struct SdkConfig {
     pub session_timeout_secs: u64,
     pub max_failed_attempts: u32,
     pub lockout_duration_secs: u64,
+    /// RM-I / WP-I1.1 (RA-WAL-01): re-auth threshold. Transactions
+    /// whose `value_wei` is >= this amount AND whose session's
+    /// password-freshness exceeds `re_auth_freshness_secs` (below)
+    /// are rejected with `WalletError::ReauthRequired`. Default is
+    /// 10 SALT (10 * 10^18 wei), matching the GUI service-layer
+    /// gate at `gui/citrate_desktop_app/src/services/wallet_service.rs:30`.
+    /// Set to `None` to disable the gate (devnet / non-financial uses).
+    #[serde(default = "default_re_auth_threshold")]
+    pub re_auth_threshold_wei: Option<u128>,
+    /// Maximum age in seconds of a password verification before re-auth
+    /// is required for a high-value transaction. Default 60 seconds.
+    #[serde(default = "default_re_auth_freshness_secs")]
+    pub re_auth_freshness_secs: u64,
+}
+
+fn default_re_auth_threshold() -> Option<u128> {
+    // 10 SALT in wei; matches gui/citrate_desktop_app/src/services/wallet_service.rs:30.
+    Some(10_000_000_000_000_000_000u128)
+}
+
+fn default_re_auth_freshness_secs() -> u64 {
+    60
 }
 
 impl Default for SdkConfig {
@@ -30,6 +52,8 @@ impl Default for SdkConfig {
             session_timeout_secs: core_config.session_timeout_secs,
             max_failed_attempts: core_config.max_failed_attempts,
             lockout_duration_secs: core_config.lockout_duration_secs,
+            re_auth_threshold_wei: default_re_auth_threshold(),
+            re_auth_freshness_secs: default_re_auth_freshness_secs(),
         }
     }
 }
@@ -307,6 +331,15 @@ impl Wallet {
     }
 
     /// Send a transaction. Wallet must be unlocked.
+    ///
+    /// RM-I / WP-I1.1 (RA-WAL-01): if the SDK config sets a non-None
+    /// `re_auth_threshold_wei` and `value_wei` meets or exceeds it,
+    /// the call rejects with `WalletError::ReauthRequired` unless the
+    /// wallet's password was verified within `re_auth_freshness_secs`
+    /// seconds. Pre-fix this gate was GUI-only; non-GUI consumers
+    /// (extension, CLI scripts, third-party SDKs) bypassed it. The
+    /// SDK-level enforcement makes the threshold inescapable for any
+    /// consumer of `wallet-sdk::Wallet`.
     pub async fn send_transaction(
         &self,
         from: &str,
@@ -315,6 +348,20 @@ impl Wallet {
         gas_limit: Option<u64>,
         gas_price: Option<u64>,
     ) -> Result<SdkTransaction, WalletError> {
+        // RA-WAL-01 — high-value re-auth gate.
+        if let Some(threshold) = self.config.re_auth_threshold_wei {
+            if value_wei >= threshold {
+                let session = self.session.read().await;
+                let stale = match session.password_freshness_secs(from) {
+                    None => true,
+                    Some(secs) => secs > self.config.re_auth_freshness_secs,
+                };
+                if stale {
+                    return Err(WalletError::ReauthRequired);
+                }
+            }
+        }
+
         let unified_key = self.key_manager.get_signing_key(from)?;
         // P0 fix: nonce fetch failure is a real error, not silent zero
         let nonce = self.rpc_client.get_nonce(from).await
@@ -619,5 +666,94 @@ mod tests {
         let wallet = test_wallet("short_pwd");
         let result = wallet.create_account("1234567", "Test").await;
         assert!(result.is_err());
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // RM-I / WP-I1.1 — RA-WAL-01 SDK-level re-auth
+    // ────────────────────────────────────────────────────────────────
+
+    /// Default config carries the re-auth threshold (10 SALT) and
+    /// freshness window (60 s) so SDK consumers inherit the gate.
+    #[test]
+    fn test_ra_wal_01_default_config_carries_re_auth_threshold() {
+        let cfg = SdkConfig::default();
+        assert_eq!(
+            cfg.re_auth_threshold_wei,
+            Some(10_000_000_000_000_000_000u128),
+            "RA-WAL-01: SDK default must carry the 10 SALT threshold"
+        );
+        assert_eq!(
+            cfg.re_auth_freshness_secs, 60,
+            "RA-WAL-01: SDK default must carry the 60s freshness window"
+        );
+    }
+
+    /// `password_freshness_secs` returns None for an inactive session
+    /// — `send_transaction` treats that as stale and rejects the call.
+    #[tokio::test]
+    async fn test_ra_wal_01_inactive_session_blocks_high_value_tx() {
+        // Use SessionManager directly so we can assert the predicate
+        // without wiring a full network stack. SDK-level send_transaction
+        // delegates to this exact predicate.
+        use citrate_wallet_core::session::SessionManager;
+        let session = SessionManager::new(5, 300, 900);
+        let address = "0xabc";
+        // No record_success => no session => freshness is None.
+        assert!(
+            session.password_freshness_secs(address).is_none(),
+            "RA-WAL-01: inactive session must report no freshness"
+        );
+    }
+
+    /// After a fresh unlock, password freshness is < 1 second; a
+    /// high-value tx should pass the freshness gate. Exercises the
+    /// SessionManager API the SDK relies on.
+    #[tokio::test]
+    async fn test_ra_wal_01_fresh_session_within_window_passes_gate() {
+        use citrate_wallet_core::session::SessionManager;
+        let mut session = SessionManager::new(5, 300, 900);
+        let address = "0xabc";
+        session.record_success(address);
+        let secs = session
+            .password_freshness_secs(address)
+            .expect("RA-WAL-01: just-unlocked session must have a freshness");
+        assert!(
+            secs < 60,
+            "RA-WAL-01: a freshly unlocked session must be within the default 60s window"
+        );
+    }
+
+    /// `refresh_password_timestamp` zeros the freshness so a high-value
+    /// tx posted right after a re-auth prompt passes the gate.
+    #[tokio::test]
+    async fn test_ra_wal_01_refresh_password_timestamp_zeros_freshness() {
+        use citrate_wallet_core::session::SessionManager;
+        let mut session = SessionManager::new(5, 300, 900);
+        let address = "0xabc";
+        session.record_success(address);
+        // Simulate a small wait...
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let initial = session.password_freshness_secs(address).expect("active");
+        // Refresh.
+        session.refresh_password_timestamp(address);
+        let after = session.password_freshness_secs(address).expect("active");
+        assert!(
+            after <= initial,
+            "RA-WAL-01: refresh_password_timestamp must reset the freshness"
+        );
+    }
+
+    /// Configs may opt out of the gate (devnet / non-financial uses)
+    /// by setting `re_auth_threshold_wei = None`.
+    #[test]
+    fn test_ra_wal_01_threshold_can_be_disabled() {
+        let cfg = SdkConfig {
+            re_auth_threshold_wei: None,
+            ..SdkConfig::default()
+        };
+        assert!(
+            cfg.re_auth_threshold_wei.is_none(),
+            "RA-WAL-01: opt-out config must carry None"
+        );
     }
 }

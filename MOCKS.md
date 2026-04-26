@@ -75,6 +75,37 @@ them along with the parity tests above. Per the CM-07/08 staged
 execution plan §4 safe-mock criteria, the mock meets all four
 safety conditions.
 
+### Merkle proof domain separators — closed in RM-I / WP-I1.8
+
+The 2026-04-25 independent re-audit (Stream 3) caught a parity gap:
+
+> **SOL-20 hardened the contract's Merkle proof with leaf and internal
+> node domain separators (`keccak256(0x00 || leaf_bytes)` for leaves
+> and `keccak256(0x01 || L || R)` for internal nodes) but the mock
+> at `training-worker/src/chain.rs::verify_merkle_proof` (lines
+> 688-706) still did plain sorted-pair concatenation without prefixes.**
+
+**Closed**: RM-I / WP-I1.8 (commit landed 2026-04-26).
+
+The mock's `verify_merkle_proof` now mirrors the contract's
+`_verifyMerkleProof` exactly:
+- Leaves: `keccak256(0x00 || leaf_bytes)` (`MERKLE_LEAF_PREFIX = 0x00`).
+- Internal nodes: `keccak256(0x01 || min(L,R) || max(L,R))` (`MERKLE_INTERNAL_PREFIX = 0x01`).
+
+Parity verified by three new tests in
+`training-worker/src/chain.rs::tests`:
+- `test_wp_i1_8_two_leaf_proof_verifies_with_prefixes` — a proof
+  built with the contract's prefix scheme verifies in the mock.
+- `test_wp_i1_8_unprefixed_proof_does_not_verify` — a proof built
+  WITHOUT the prefixes is rejected (catches the pre-fix shape).
+- `test_wp_i1_8_leaf_internal_collision_rejected` — the
+  second-preimage attack the prefixes prevent (a leaf hash treated as
+  a root by an attacker with no proof) is rejected.
+
+The "byte-for-byte" claim is now accurate. Any future contract change
+to the `_verifyMerkleProof` shape (different prefix bytes, different
+sort order, etc.) requires a matching change here.
+
 ## Known Limitations (not mocks)
 
 These are documented technical limitations, not mocks:

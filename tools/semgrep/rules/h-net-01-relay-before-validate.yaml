@@ -1,7 +1,8 @@
 # H-NET-01 — Block / tx gossip relay BEFORE validation is forbidden.
 #
-# Audit finding (HIGH):
+# Audit findings:
 #   .audit/2026-04-24-full-repo-adversarial-audit/04_FINDINGS_API_NETWORK_STORAGE.md#h-net-01
+#   .audit/2026-04-25-reaudit/04_FINDINGS_API_NETWORK_STORAGE.md (Stream 2: tx-gossip path partial)
 #
 # Pre-fix `BlockPropagation::handle_new_block` accepted any block
 # from any peer, inserted the header into `header_cache`, and re-
@@ -10,12 +11,21 @@
 # garbage and force every peer to pay relay bandwidth + cache
 # slots.
 #
-# Post-fix `block.verify_hash()` + `verify_block_signature` run
-# BEFORE the cache insert + relay (genesis exempt).
+# RM-C closed the block-gossip half: `block.verify_hash()` +
+# `verify_block_signature` run BEFORE the cache insert + relay
+# (genesis exempt).
+#
+# RM-I / WP-I1.7 closed the tx-gossip half: the re-audit's Stream 2
+# noted that `transaction_gossip::handle_new_transaction` had no
+# validate-before-relay step. Post-fix
+# `Self::validate_transaction_static(&tx, MAX)` runs BEFORE any
+# state mutation (seen_txs, peer_inventory, relay_transaction).
 #
 # This rule fires on any path that broadcasts / inserts into
-# `header_cache` before calling `verify_hash`. Heuristic — false
-# positives possible — so severity WARNING.
+# `header_cache` before calling `verify_hash`, OR on any path that
+# touches `seen_txs.insert` / `peer_inventory.insert` /
+# `relay_transaction` before calling `validate_transaction_static`.
+# Heuristic — false positives possible — so severity WARNING.
 
 rules:
   - id: h-net-01-broadcast-before-verify-hash
@@ -42,3 +52,36 @@ rules:
       - pattern-not-inside: |
           if !$BLOCK.verify_hash() { ... }
           ...
+
+  # RM-I / WP-I1.7: tx-gossip half of H-NET-01.
+  - id: h-net-01-tx-gossip-relay-before-validate
+    message: >-
+      Transaction gossip path mutates `seen_txs` / `peer_inventory`
+      or calls `relay_transaction` before
+      `Self::validate_transaction_static`. Pre-RM-I-1.7 this allowed an
+      attacker peer to flood the network with garbage transactions and
+      have them relayed before any node validated them. Validate first,
+      then mutate state and relay. See
+      core/network/src/transaction_gossip.rs::handle_new_transaction.
+    languages: [rust]
+    severity: WARNING
+    paths:
+      include:
+        - "core/network/src/transaction_gossip.rs"
+      exclude:
+        - "**/tests/**"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              self.relay_transaction($TX, $_).await
+          - pattern: |
+              self.seen_txs.write().await.insert($_, $_)
+      - pattern-not-inside: |
+          if !Self::validate_transaction_static(&$TX, ...) { ... }
+          ...
+    metadata:
+      audit-id: H-NET-01
+      severity: high
+      sprint: RM-C / RM-I-1
+      wp: WP-C2.1 (block) + WP-I1.7 (tx)
+      reaudit-finding: 'Stream 2 partial-closure'

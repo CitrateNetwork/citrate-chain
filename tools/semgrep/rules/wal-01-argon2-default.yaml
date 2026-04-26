@@ -61,7 +61,14 @@ rules:
         - "**/benches/**"
         - "**/examples/**"
     patterns:
-      - pattern: Argon2::default()
+      - pattern-either:
+          # The original literal pattern.
+          - pattern: Argon2::default()
+          # TRP-11 broadenings (RM-H1.4): bypass equivalents.
+          - pattern: <argon2::Argon2 as Default>::default()
+          - pattern: <Argon2 as Default>::default()
+          - pattern: <argon2::Argon2 as core::default::Default>::default()
+          - pattern: argon2::Argon2::default()
       # Permit the deliberate legacy branch in argon2_for_version.
       # That single line is the documented exception per KDF_POLICY.md.
       - pattern-not-inside: |
@@ -73,5 +80,65 @@ rules:
       severity: critical
       sprint: RM-A1
       wp: WP-A1.1
+      reaudit-finding: TRP-11
+      reaudit-sprint: RM-H1
+      reaudit-wp: WP-H1.4
+      structural-defense: 'argon2_for_version dispatcher (single production constructor)'
       spec: citrate_v0.01.1/docs/security/KDF_POLICY.md
       reference: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+
+  # TRP-11 (RM-H1.4): a knowledgeable adversary can bypass the literal
+  # `Argon2::default()` pattern by constructing weak parameters
+  # explicitly via `Params::new(19456, 2, 1, _)` (the OWASP floor) and
+  # passing them to `Argon2::new`. This second rule flags any
+  # `Params::new` construction outside the dispatcher whose first
+  # argument (memory cost in KiB) is below the OWASP-recommended
+  # 65536 floor. Catches: `Params::new(19456, ...)`, `Params::new(46336, ...)`
+  # outside the low-memory dispatcher branch, etc.
+  - id: wal-01-weak-explicit-argon2-params
+    message: >-
+      Constructing `argon2::Params` directly with memory cost below 65536
+      KiB outside the `argon2_for_version` dispatcher is forbidden
+      (WAL-01 / TRP-11). The dispatcher exists because production keystore
+      paths must use OWASP-recommended params (m=65536, t=3, p>=1, out=32).
+      If you need a non-default keystore param set, add it as a new
+      KDF_VERSION constant in `wallet-core/src/keys.rs` and a matching
+      branch in `argon2_for_version`. Do NOT roll your own `Params::new`
+      in production code.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "wallet-core/src/**/*.rs"
+        - "wallet/src/**/*.rs"
+        - "wallet-sdk/src/**/*.rs"
+        - "wallet-extension/**/*.rs"
+        - "gui/**/*.rs"
+        - "faucet/src/**/*.rs"
+        - "agent-core/src/**/*.rs"
+        - "core/**/*.rs"
+        - "node/src/**/*.rs"
+        - "node-app/src/**/*.rs"
+        - "gateway/src/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
+        - "**/*_tests.rs"
+        - "**/benches/**"
+        - "**/examples/**"
+    patterns:
+      - pattern-either:
+          - pattern-regex: 'Params::new\(\s*(0|[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3})\s*,'
+          - pattern-regex: 'argon2::Params::new\(\s*(0|[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3})\s*,'
+      - pattern-not-inside: |
+          fn argon2_for_version(...) -> ... {
+            ...
+          }
+    metadata:
+      audit-id: WAL-01
+      severity: critical
+      sprint: RM-H1
+      wp: WP-H1.4
+      reaudit-finding: TRP-11
+      structural-defense: 'argon2_for_version dispatcher; numeric guard for memory parameter'

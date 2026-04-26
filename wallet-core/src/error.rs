@@ -61,6 +61,14 @@ pub enum WalletError {
     #[error("Session expired")]
     SessionExpired,
 
+    /// RM-I / WP-I1.1 (RA-WAL-01): the SDK requires fresh password
+    /// verification before signing a high-value transaction. The
+    /// caller (extension, CLI, GUI) must prompt the user for the
+    /// password, verify it, and call
+    /// `SessionManager::refresh_password_timestamp` before retrying.
+    #[error("Re-authentication required: this operation requires a fresh password verification")]
+    ReauthRequired,
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

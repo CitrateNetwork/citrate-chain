@@ -309,6 +309,9 @@ async fn test_sdk_config_roundtrip() {
         session_timeout_secs: 60,
         max_failed_attempts: 10,
         lockout_duration_secs: 600,
+        // RM-I / WP-I1.1: SDK config gained re-auth fields.
+        re_auth_threshold_wei: Some(10_000_000_000_000_000_000u128),
+        re_auth_freshness_secs: 60,
     };
     let json = serde_json::to_string(&config).expect("serialize");
     let deser: SdkConfig = serde_json::from_str(&json).expect("deserialize");

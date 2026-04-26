@@ -43,11 +43,31 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
     bytes32 public constant TRANSFER_WITH_AUTHORIZATION_TYPEHASH =
         keccak256("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
 
+    /// RFI-01 / WP-H1.1: distinct typehash for the fee-bearing flow.
+    /// Binds `(treasury, fee)` into the signed digest so a caller
+    /// cannot substitute either parameter at submission time. See
+    /// `transferWithFeeAuthorization` and the RFI-01 audit note in
+    /// `.audit/2026-04-25-reaudit/06_FINDINGS_SOLIDITY_CONTRACTS.md`.
+    bytes32 public constant TRANSFER_WITH_FEE_AUTHORIZATION_TYPEHASH =
+        keccak256("TransferWithFeeAuthorization(address from,address to,uint256 value,address treasury,uint256 fee,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
+
     bytes32 public constant RECEIVE_WITH_AUTHORIZATION_TYPEHASH =
         keccak256("ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
 
     bytes32 public constant CANCEL_AUTHORIZATION_TYPEHASH =
         keccak256("CancelAuthorization(address authorizer,bytes32 nonce)");
+
+    /// @notice Reverts when a caller invokes
+    ///         `transferWithFeeAuthorization` with `(treasury, fee)`
+    ///         values that do not match the EIP-712 digest signed by
+    ///         `from`. Specifically: signature recovery does not yield
+    ///         `from`, OR the recovered signer is `address(0)`.
+    /// @dev See RFI-01. The previous implementation reused the
+    ///      `TRANSFER_WITH_AUTHORIZATION_TYPEHASH` digest, which left
+    ///      `(treasury, fee)` outside the signed payload. The fix uses
+    ///      a distinct typehash; this error is the structural marker
+    ///      that the new typehash is in force.
+    error InvalidFeeAuthorization();
 
     // ERC-20 events
     event Transfer(address indexed from, address indexed to, uint256 value);
@@ -186,7 +206,8 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
     /// @notice Authorize a transfer of `value` from `from` and split
     ///         it internally into `value - fee` to `to` plus `fee` to
     ///         `treasury`. Single signed authorization for the FULL
-    ///         value — caller cannot route any other recipient.
+    ///         value — caller cannot route any other recipient OR
+    ///         redirect the fee leg.
     ///
     /// RM-B1 / WP-D2.1 (audit SOL-01): pre-fix the X402Facilitator
     /// settled `netValue` via `transferWithAuthorization` and pulled
@@ -201,6 +222,29 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
     ///   - `fee`         → `treasury`
     /// The user signs ONCE for `value` and the routing is done by
     /// the contract; no separate allowance required.
+    ///
+    /// RFI-01 / WP-H1.1 (re-audit Stream 4): the prior implementation
+    /// reused `TRANSFER_WITH_AUTHORIZATION_TYPEHASH`, which left
+    /// `(treasury, fee)` OUTSIDE the signed digest. A mempool watcher
+    /// could front-run any in-flight authorization with
+    /// `treasury=attacker, fee=value`, redirecting the entire payment.
+    /// The fix below uses a distinct typehash
+    /// `TRANSFER_WITH_FEE_AUTHORIZATION_TYPEHASH` that binds
+    /// `(treasury, fee)` into the digest — making the only valid call
+    /// shape one where the caller-supplied `(treasury, fee)` match the
+    /// values the user signed.
+    ///
+    /// @param from        Token holder authorizing the spend.
+    /// @param to          Net-value recipient.
+    /// @param treasury    Fee recipient. Bound to the EIP-712 digest.
+    /// @param value       Gross value debited from `from`.
+    /// @param fee         Amount routed to `treasury`. Bound to the digest.
+    /// @param validAfter  Earliest block timestamp at which the auth is valid.
+    /// @param validBefore Latest block timestamp at which the auth is valid.
+    /// @param nonce       Single-use authorization nonce.
+    /// @param v           ECDSA recovery id.
+    /// @param r           ECDSA signature r component.
+    /// @param s           ECDSA signature s component.
     function transferWithFeeAuthorization(
         address from,
         address to,
@@ -220,22 +264,20 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
         require(block.timestamp < validBefore, "wSALT: authorization expired");
         require(!_authorizationStates[from][nonce], "wSALT: authorization already used");
 
-        // The signed message authorizes the GROSS `value` to the
-        // recipient; the fee split is contract-enforced. We bind
-        // the typehash payload to (from, to, value, ...) — exactly
-        // the same shape as `transferWithAuthorization` — so a
-        // signature minted for one cannot be replayed against the
-        // other (different function entry, different `to`, but the
-        // signed digest is interchangeable with TWA on (from, to,
-        // value)). To prevent replay, we share the
-        // `_authorizationStates[from][nonce]` namespace.
+        // RFI-01: bind (treasury, fee) into the signed digest. Using
+        // the distinct TRANSFER_WITH_FEE_AUTHORIZATION_TYPEHASH means
+        // a signature minted for the legacy `transferWithAuthorization`
+        // path CANNOT be replayed against this entry, AND the caller
+        // cannot substitute `treasury` or `fee` at submission time.
         bytes32 structHash = keccak256(abi.encode(
-            TRANSFER_WITH_AUTHORIZATION_TYPEHASH,
-            from, to, value, validAfter, validBefore, nonce
+            TRANSFER_WITH_FEE_AUTHORIZATION_TYPEHASH,
+            from, to, value, treasury, fee, validAfter, validBefore, nonce
         ));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
         address signer = ecrecover(digest, v, r, s);
-        require(signer != address(0) && signer == from, "wSALT: invalid signature");
+        if (signer == address(0) || signer != from) {
+            revert InvalidFeeAuthorization();
+        }
 
         _authorizationStates[from][nonce] = true;
         emit AuthorizationUsed(from, nonce);

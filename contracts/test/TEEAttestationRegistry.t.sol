@@ -219,106 +219,26 @@ contract TEEAttestationRegistryTest is Test {
         registry.finalizeMaaRsaKey(MAA_KID_HASH);
     }
 
-    function test_strict_submit_accepts_valid_jwt_signature() public {
-        _registerMaaKey();
-        registry.setStrictCryptographicMode(true);
-
-        vm.prank(worker);
-        registry.submitAttestationStrict(
-            SIGNED_JWT,
-            MAA_RSA_SIGNATURE,
-            MAA_KID_HASH,
-            keccak256("vm-from-jwt"),
-            keccak256("gpu-from-nras"),
-            MODEL_HASH,
-            NRAS_KEY
-        );
-
-        assertTrue(registry.isAttested(worker, block.number));
-        TEEAttestationRegistry.AttestationRecord memory rec = registry.getAttestation(worker);
-        assertEq(rec.modelHash, MODEL_HASH);
-        assertEq(rec.vmMeasurement, keccak256("vm-from-jwt"));
-    }
-
-    function test_strict_submit_rejects_tampered_jwt() public {
-        _registerMaaKey();
-        registry.setStrictCryptographicMode(true);
-
-        bytes memory tampered = bytes("hello citrate compute marketplace tee attestation 2027"); // changed year
-
-        vm.prank(worker);
-        vm.expectRevert("TEERegistry: invalid MAA JWT signature");
-        registry.submitAttestationStrict(
-            tampered,
-            MAA_RSA_SIGNATURE,
-            MAA_KID_HASH,
-            keccak256("vm-from-jwt"),
-            keccak256("gpu-from-nras"),
-            MODEL_HASH,
-            NRAS_KEY
-        );
-    }
-
-    function test_strict_submit_rejects_unknown_kid() public {
-        _registerMaaKey();
-        registry.setStrictCryptographicMode(true);
-
-        vm.prank(worker);
-        vm.expectRevert("TEERegistry: unknown or inactive MAA kid");
-        registry.submitAttestationStrict(
-            SIGNED_JWT,
-            MAA_RSA_SIGNATURE,
-            keccak256("rotated-kid-not-yet-registered"),
-            keccak256("vm-from-jwt"),
-            keccak256("gpu-from-nras"),
-            MODEL_HASH,
-            NRAS_KEY
-        );
-    }
-
-    function test_strict_submit_rejects_inactive_kid() public {
-        _registerMaaKey();
-        // Emergency deactivation remains a single-step call so a
-        // compromised key can be killed instantly. Activation is
-        // what's gated, not deactivation. (audit SOL-05)
-        registry.setMaaRsaKeyActive(MAA_KID_HASH, false);
-        registry.setStrictCryptographicMode(true);
-
-        vm.prank(worker);
-        vm.expectRevert("TEERegistry: unknown or inactive MAA kid");
-        registry.submitAttestationStrict(
-            SIGNED_JWT,
-            MAA_RSA_SIGNATURE,
-            MAA_KID_HASH,
-            keccak256("vm-from-jwt"),
-            keccak256("gpu-from-nras"),
-            MODEL_HASH,
-            NRAS_KEY
-        );
-    }
-
-    function test_strict_submit_rejects_untrusted_nras() public {
-        _registerMaaKey();
-        registry.setStrictCryptographicMode(true);
-
-        vm.prank(worker);
-        vm.expectRevert("TEERegistry: untrusted NRAS signer");
-        registry.submitAttestationStrict(
-            SIGNED_JWT,
-            MAA_RSA_SIGNATURE,
-            MAA_KID_HASH,
-            keccak256("vm-from-jwt"),
-            keccak256("gpu-from-nras"),
-            MODEL_HASH,
-            keccak256("attacker-nras")
-        );
-    }
+    // RM-J3 (post-RM-I-3): the strict-mode tests previously here
+    // exercised the now-removed `submitAttestationStrict` against the
+    // `SIGNED_JWT` test fixture. Equivalent coverage of the
+    // **bound** variant (`submitAttestationStrictBound`) lives in
+    // `RmD3Bound.t.sol`, which has its own self-contained RSA key +
+    // signed-JWT + literal claim fixture and exercises:
+    //   * happy path with real claim
+    //   * fabricated-claim rejection (the SOL-05 fix)
+    //   * JWT replay rejection
+    //   * invalid-signature rejection
+    //   * empty-claim rejection
+    //   * unknown-kid rejection (+ inactive-kid added in RmD3Bound)
+    //   * untrusted-NRAS rejection (added in RmD3Bound)
+    // The v1 → strict-mode toggle path remains tested below.
 
     function test_strict_mode_disables_v1_path() public {
         registry.setStrictCryptographicMode(true);
 
         vm.prank(worker);
-        vm.expectRevert("TEERegistry: strict mode active, use submitAttestationStrict");
+        vm.expectRevert("TEERegistry: strict mode active, use submitAttestationStrictBound");
         registry.submitAttestation(
             keccak256("vm"),
             keccak256("gpu"),
