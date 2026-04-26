@@ -191,22 +191,37 @@ contract ReentrancyAttackTest is Test {
         sellerAttacker.setModelId(modelId);
         sellerAttacker.enableAttack();
 
-        // Buyer purchases: marketplace uses transfer() which sends ETH to
-        // the seller (attacker). transfer() only forwards 2300 gas which
-        // is not enough to re-enter, so the reentrancy attempt reverts.
-        // Since transfer() reverts on failure, the entire outer tx reverts too.
-        // This means the purchase itself is blocked.
+        // RM-L / WP-L1.3 — POST-MIGRATION SEMANTICS:
         //
-        // Actually: `payable(listing.owner).transfer(sellerAmount)` uses
-        // .transfer() which limits gas to 2300. The receive() fallback
-        // in the attacker contract tries to call marketplace.purchaseAccess
-        // which needs far more gas -> OOG -> transfer fails -> outer reverts.
+        // Pre-fix: marketplace used `payable(listing.owner).transfer(sellerAmount)`.
+        // The 2300 gas stipend made the attacker's `receive()` fallback OOG
+        // when it tried to re-enter `purchaseAccess`, so transfer() reverted
+        // and the OUTER purchase reverted too. The "reentrancy was blocked"
+        // assertion was via `vm.expectRevert()`. This was protection by
+        // accident — any legitimate multisig/smart-account seller with a
+        // non-trivial fallback would also break.
         //
-        // This IS a form of reentrancy protection (gas limit), but it means
-        // the purchase transaction reverts entirely.
+        // Post-fix: marketplace uses `Address.sendValue` which forwards full
+        // gas. The attacker's `receive()` fallback runs and ATTEMPTS the
+        // re-entrant `purchaseAccess` call. The `nonReentrant` modifier on
+        // `purchaseAccess` rejects the re-entry; the attacker's `try/catch`
+        // block sets `reentrancySucceeded = false`. The OUTER purchase
+        // succeeds because the inner call's revert is swallowed by the
+        // attacker's catch. This is the correct CEI + nonReentrant
+        // posture — the structural defense is the modifier, not a 2300-gas
+        // accident.
         vm.prank(alice);
-        vm.expectRevert();
         marketplace.purchaseAccess{value: 0.01 ether}(modelId, 1);
+
+        // Reentrancy attempt fired but did not succeed.
+        assertTrue(
+            sellerAttacker.reentrancyAttempted(),
+            "L1.3: attacker's receive() fallback must have been entered"
+        );
+        assertFalse(
+            sellerAttacker.reentrancySucceeded(),
+            "L1.3: nonReentrant must have blocked the re-entrant purchaseAccess call"
+        );
     }
 
     // ============================================================

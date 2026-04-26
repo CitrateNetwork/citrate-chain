@@ -1,0 +1,75 @@
+# RM-L / WP-L1.1 — hand-rolled governance / governor pattern tripwire.
+#
+# Audit: WP-L1.1.
+#
+# Pre-fix `SpecRegistry` and `AgentDecisionRegistry` shipped their
+# own `address public governor` + `transferGovernor(newGov)` shape,
+# which atomically writes the new address. A mistyped or
+# revoked-key successor silently locked governance forever. The
+# `Governable` mixin under `contracts/src/lib/Governable.sol`
+# implements the canonical two-step transfer pattern; every
+# governance-bearing contract should inherit from it.
+#
+# This rule fires on any new declaration of
+# `address public governor` or `address public governance` in a
+# contract that does NOT inherit from `Governable`. Tier 3
+# per-record ownership patterns (e.g. `models[modelId].owner` in
+# `ModelAccessControl`) are not flagged because they're not
+# protocol-level governance — see
+# `.agentile/docs/adr/ADR-RM-L-1-1-governance-coverage.md` for the
+# full classification.
+
+rules:
+  - id: l1-1-hand-rolled-governance
+    message: >-
+      `address public governor` / `address public governance` declared
+      outside the `Governable` mixin re-introduces the hand-rolled
+      pattern that RM-L / WP-L1.1 closed. Inherit from
+      `contracts/src/lib/Governable.sol` so the two-step transfer
+      semantics are uniform across every governable contract.
+      Audit: RM-L / WP-L1.1.
+    languages: [solidity]
+    severity: WARNING
+    paths:
+      include:
+        - "contracts/src/**/*.sol"
+      exclude:
+        - "contracts/src/lib/**"
+        - "contracts/lib/**"
+    patterns:
+      - pattern-either:
+          - pattern: address public governor;
+          - pattern: address public governance;
+      - pattern-not-inside: |
+          contract $C is $...PARENTS, Governable, $...REST {
+            ...
+          }
+      - pattern-not-inside: |
+          contract $C is Governable, $...REST {
+            ...
+          }
+      - pattern-not-inside: |
+          contract $C is $...PARENTS, Governable {
+            ...
+          }
+      - pattern-not-inside: |
+          contract $C is Governable {
+            ...
+          }
+    metadata:
+      audit-id: WP-L1.1
+      severity: medium
+      sprint: RM-L1
+      wp: WP-L1.1
+      spec: .agentile/docs/adr/ADR-RM-L-1-1-governance-coverage.md
+      remediation: >-
+        Migrate the contract to inherit `Governable` from
+        `contracts/src/lib/Governable.sol`. Remove the local
+        `governor` / `governance` field and any `transferGovernor`
+        / atomic-write helpers; use the inherited
+        `transferGovernance(newGov)` + `acceptGovernance()` +
+        `cancelGovernanceTransfer()` two-step pattern. If the role
+        machinery cannot fit the bare modifier shape (see
+        `ClassroomClusterV1` in the L1.1 ADR), implement the
+        equivalent two-step locally and document the rationale in
+        the ADR's Tier 2.
