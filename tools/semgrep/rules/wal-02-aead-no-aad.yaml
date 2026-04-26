@@ -21,10 +21,19 @@
 # Closed call sites (post-WP-A3.1 + WP-A3.2):
 #   - wallet-core/src/keys.rs::{encrypt_key_raw, decrypt_key} (v2 path)
 #   - gui/citrate_edu_app/src/encryption.rs::{encrypt, decrypt}
+#   - wallet/src/keystore.rs::{encrypt_key, decrypt_key} (v2 path) —
+#     RM-I-3 / WP-I1.2 (re-audit Stream 6 finding RA-WAL-02). Pre-fix
+#     the CLI's daily-write path produced v2 entries WITHOUT AAD; the
+#     prior remediation focused on the migrator (one-shot) and missed
+#     the daily writes. Now `cli_keystore_aad(kdf_version, public_key)`
+#     binds `(b"citrate-cli-keystore-v2", kdf_version, public_key)`
+#     into the GCM tag.
 #
 # Acceptable exceptions (Semgrep can't statically detect intent):
 #   - wallet-core/src/keys.rs::decrypt_key v1-legacy branch — must
 #     remain no-AAD for backward-compat unlock of pre-WAL-02 entries.
+#   - wallet/src/keystore.rs::decrypt_key v1-legacy branch — same
+#     reason; gated by `if encrypted.kdf_version == KDF_VERSION_LEGACY`.
 #     The match arm is documented; the rule's `pattern-not-inside`
 #     is intentionally absent because the dispatch shape `match
 #     entry.kdf_version { KDF_VERSION_LEGACY => cipher.decrypt(...) }`
