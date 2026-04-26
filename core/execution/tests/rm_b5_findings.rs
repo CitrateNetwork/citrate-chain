@@ -7,9 +7,10 @@
 // H-03 is exercised through the existing MVCC test suite plus the
 // `journal.requires_serial_commit()` gate in commit.rs.
 
-use citrate_execution::precompiles::inference::{InferencePrecompile, addresses as iaddr};
+use citrate_execution::precompiles::inference::{InferenceMode, InferencePrecompile, addresses as iaddr};
 use citrate_execution::types::Address;
 use citrate_execution::inference::metal_runtime::MetalRuntime;
+use citrate_execution::executor::Executor;
 use std::sync::Arc;
 
 fn make_inference(strict: bool) -> InferencePrecompile {
@@ -136,6 +137,71 @@ fn l02_push_range_round_trips_safely() {
         let opcode = EVMOpcode::try_from(byte).expect("PUSH variant");
         assert_eq!(opcode as u8, byte);
     }
+}
+
+/// REM-N-03 / WP-H1.2: the production `Executor` constructor MUST default
+/// to strict-inference mode. Pre-fix, `Executor::with_chain_id` built the
+/// `InferencePrecompile` via `InferencePrecompile::new()` only, leaving
+/// `allow_nondeterministic_inference = true` — meaning the C-01 gate
+/// shipped a mechanism but never engaged it on mainnet. This test pins
+/// the production default at the API surface so the gate cannot regress
+/// silently.
+#[test]
+fn test_rem_n_03_inference_disabled_in_production() {
+    // The canonical production constructor used by `node-app/src/main.rs`
+    // (via `Executor::new`) and `core/economics/src/genesis.rs` is
+    // `with_chain_id`. Its production default for the inference mode
+    // must be Strict.
+    let mode = Executor::production_inference_mode();
+    assert_eq!(
+        mode,
+        InferenceMode::Strict,
+        "REM-N-03: production Executor must default to InferenceMode::Strict; \
+         devnet must opt-in via with_chain_id_and_inference_mode"
+    );
+
+    // Belt + suspenders: build a precompile via the same construction path
+    // the executor uses for production, then invoke 0x0101 directly. It
+    // must short-circuit before any non-deterministic FP work runs.
+    let runtime = Arc::new(MetalRuntime::new().expect("metal runtime"));
+    let mut precompile = InferencePrecompile::new_with_mode(runtime, mode);
+    let addr = Address(iaddr::MODEL_INFERENCE);
+    let input = vec![0u8; 64];
+    let result = precompile.execute(&addr, &input, 100_000);
+    assert!(
+        result.is_err(),
+        "REM-N-03: 0x0101 must be disabled under the production default"
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("C-01") && msg.contains("0x0101"),
+        "REM-N-03: error must reference the C-01 gate; got {}",
+        msg
+    );
+}
+
+/// REM-N-03 / WP-H1.2: the explicit lenient constructor must remain
+/// available for devnet and tests, but it requires a deliberate opt-in.
+#[test]
+fn test_rem_n_03_devnet_opt_in_still_works() {
+    let runtime = Arc::new(MetalRuntime::new().expect("metal runtime"));
+    let p = InferencePrecompile::new_with_mode(runtime, InferenceMode::AllowNonDeterministic);
+    assert!(
+        !p.is_strict(),
+        "REM-N-03: AllowNonDeterministic mode must yield a non-strict precompile"
+    );
+}
+
+/// REM-N-03 / WP-H1.2: `is_strict()` must be a faithful predicate over
+/// the gate state — guards against an inverted boolean regressing the
+/// production default.
+#[test]
+fn test_rem_n_03_is_strict_predicate() {
+    let runtime = Arc::new(MetalRuntime::new().expect("metal runtime"));
+    let strict = InferencePrecompile::new_with_mode(runtime.clone(), InferenceMode::Strict);
+    assert!(strict.is_strict());
+    let lenient = InferencePrecompile::new_with_mode(runtime, InferenceMode::AllowNonDeterministic);
+    assert!(!lenient.is_strict());
 }
 
 #[test]
