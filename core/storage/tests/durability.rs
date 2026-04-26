@@ -193,7 +193,8 @@ fn test_rem_2_producer_finality_bundle_all_fsynced() {
     let receipt = make_receipt(tx.hash, block.hash());
 
     blocks.put_block(&block).expect("put_block");
-    txs.put_transactions(&[tx.clone()]).expect("put_transactions");
+    txs.put_transactions(std::slice::from_ref(&tx))
+        .expect("put_transactions");
     txs.put_receipts(&[(tx.hash, receipt)])
         .expect("put_receipts");
 
