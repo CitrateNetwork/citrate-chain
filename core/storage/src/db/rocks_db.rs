@@ -4,15 +4,29 @@ use super::column_families::all_column_families;
 use anyhow::Result;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tracing::{debug, info};
 
 // Simpler alias for iterator item type to reduce signature complexity
 type KvItem = (Box<[u8]>, Box<[u8]>);
 
-/// RocksDB wrapper for blockchain storage
+/// RocksDB wrapper for blockchain storage.
+///
+/// REM-2 / WP-H1.3 (audit M-API-01): the `*_count` atomic counters
+/// observe whether producer-path callers (block_store::put_block,
+/// transaction_store::put_receipts, persistent_dag::kv_write_batch)
+/// commit via the durable `write_batch_sync` path. Cost is one
+/// relaxed atomic add per write — negligible relative to a RocksDB
+/// commit. Tests assert `sync_count > 0` after a producer commit;
+/// the durability tripwire (`m-api-01-no-fsync.yaml`) catches the
+/// pattern at lint time.
 pub struct RocksDB {
     db: Arc<DB>,
+    /// Number of `write_batch` (non-fsync) calls — see struct doc.
+    write_batch_count: Arc<AtomicU64>,
+    /// Number of `write_batch_sync` (fsync) calls — see struct doc.
+    write_batch_sync_count: Arc<AtomicU64>,
 }
 
 impl RocksDB {
@@ -49,7 +63,25 @@ impl RocksDB {
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)?;
 
         info!("RocksDB opened successfully");
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            write_batch_count: Arc::new(AtomicU64::new(0)),
+            write_batch_sync_count: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// REM-2 / WP-H1.3: number of non-fsync `write_batch` calls observed
+    /// since open. Used by durability tests to assert that producer-path
+    /// commits go through `write_batch_sync` (fsync) rather than
+    /// `write_batch` (OS page cache only).
+    pub fn write_batch_count(&self) -> u64 {
+        self.write_batch_count.load(AtomicOrdering::Relaxed)
+    }
+
+    /// REM-2 / WP-H1.3: number of fsync `write_batch_sync` calls
+    /// observed since open. Used by durability tests.
+    pub fn write_batch_sync_count(&self) -> u64 {
+        self.write_batch_sync_count.load(AtomicOrdering::Relaxed)
     }
 
     /// Get a value from a column family
@@ -80,25 +112,37 @@ impl RocksDB {
     /// Write a batch of operations atomically with the default
     /// (non-sync) WriteOptions. WAL is on, but writes return as
     /// soon as the OS buffer accepts them.
+    ///
+    /// REM-2 / WP-H1.3 (audit M-API-01): producer-path writers
+    /// MUST NOT call this method — use `write_batch_sync` instead.
+    /// Acceptable callers: caches, metrics, GC/pruning, MVCC
+    /// version persistence (documented as conservatively-safe on
+    /// restart). The Semgrep tripwire `m-api-01-no-fsync.yaml`
+    /// enforces this at lint time across the producer paths.
     pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
         self.db.write(batch)?;
+        self.write_batch_count.fetch_add(1, AtomicOrdering::Relaxed);
         Ok(())
     }
 
     /// Write a batch of operations atomically with `sync=true`.
     ///
-    /// RM-B1 / WP-C3.1 (audit M-API-01): pre-fix all writes used
-    /// the default `WriteOptions { sync: false }`. A power loss
+    /// REM-2 / WP-H1.3 (audit M-API-01): producer write path MUST
+    /// use this. Forces fsync via `RocksDB::WriteOptions::set_sync(true)`.
+    /// Cost: ~1-2 ms p99 on testnet hardware (verified by
+    /// `bench_producer_durability` when present). Pre-fix all writes
+    /// used the default `WriteOptions { sync: false }`. A power loss
     /// between block commit and OS flush silently rolled back
-    /// finalised state. Use this method for the producer's
-    /// finalised-block commit batch — block, tx index, receipts,
-    /// and DAG persistence grouped into one super-batch. Other
-    /// writes such as caches and metrics can stay async via
-    /// `write_batch`.
+    /// finalised state. Use this method for the producer's finalised
+    /// commits — block, tx index, receipts, DAG persistence — and
+    /// any other write whose loss would cause a finality regression
+    /// or `eth_getTransactionReceipt`-returns-null gap.
     pub fn write_batch_sync(&self, batch: WriteBatch) -> Result<()> {
         let mut opts = rocksdb::WriteOptions::default();
         opts.set_sync(true);
         self.db.write_opt(batch, &opts)?;
+        self.write_batch_sync_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
         Ok(())
     }
 
@@ -188,6 +232,8 @@ impl Clone for RocksDB {
     fn clone(&self) -> Self {
         Self {
             db: Arc::clone(&self.db),
+            write_batch_count: Arc::clone(&self.write_batch_count),
+            write_batch_sync_count: Arc::clone(&self.write_batch_sync_count),
         }
     }
 }
