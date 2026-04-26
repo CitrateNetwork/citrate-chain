@@ -201,3 +201,77 @@ fn l_api_01_ws_config_supports_cors_allowlist() {
     assert_eq!(cfg.allowed_origins.len(), 1);
     assert_eq!(cfg.allowed_origins[0], "https://app.citrate.ai");
 }
+
+// ────────────────────────────────────────────────────────────────
+// RFI-A1 (regression of H-API-01) — RM-H1.4 / WP-H1.4 / TRP-15.
+//
+// Pre-fix economics_rpc.rs:181 registered `citrate_getMempoolSnapshot`
+// AFTER eth_rpc.rs:1903's auth-gated registration. jsonrpc-core's
+// IoHandler stores methods in a HashMap; `add_sync_method` is
+// last-write-wins. The duplicate registration silently overrode the
+// auth-gated handler, re-exposing aggregate mempool stats to
+// unauthenticated callers and defeating the H-API-01 closure shipped
+// in RM-C.
+//
+// Post-fix (RFI-A1): the economics_rpc method is renamed to
+// `citrate_getMempoolStats`. The auth-gated `citrate_getMempoolSnapshot`
+// is uniquely registered in eth_rpc.rs:1903.
+//
+// This test asserts the renamed source-string is no longer present in
+// economics_rpc.rs and that the new name is. It's a string-grep test
+// against a path inside the workspace — modest but sufficient as a
+// tripwire: any future PR that re-introduces the duplicate registration
+// flips the assertion.
+// ────────────────────────────────────────────────────────────────
+
+#[test]
+fn rfi_a1_economics_rpc_does_not_register_snapshot_method() {
+    let economics_rpc_src = include_str!("../src/economics_rpc.rs");
+    // The economics-rpc module MUST NOT register `citrate_getMempoolSnapshot`
+    // because the auth-gated handler in eth_rpc.rs has sole ownership of
+    // that method name. Pre-RFI-A1 this assertion failed; post-fix it holds.
+    let snapshot_registration = "add_sync_method(\"citrate_getMempoolSnapshot\"";
+    assert!(
+        !economics_rpc_src.contains(snapshot_registration),
+        "RFI-A1 / H-API-01: economics_rpc.rs must NOT register \
+         `citrate_getMempoolSnapshot`. The auth-gated handler in \
+         eth_rpc.rs has sole ownership of that method. Use \
+         `citrate_getMempoolStats` for the aggregate (unauth'd) endpoint. \
+         See .audit/2026-04-25-reaudit/14_TRIPWIRE_BYPASS_ATTEMPTS.md#trp-15."
+    );
+}
+
+#[test]
+fn rfi_a1_economics_rpc_registers_stats_method() {
+    let economics_rpc_src = include_str!("../src/economics_rpc.rs");
+    // The renamed method MUST be present so external monitoring (the
+    // metrics-bridge) keeps working without auth.
+    let stats_registration = "add_sync_method(\"citrate_getMempoolStats\"";
+    assert!(
+        economics_rpc_src.contains(stats_registration),
+        "RFI-A1 / H-API-01: economics_rpc.rs must register the \
+         renamed `citrate_getMempoolStats` aggregate-stats endpoint."
+    );
+}
+
+#[test]
+fn h_api_01_eth_rpc_snapshot_uses_require_operator_auth() {
+    // Belt-and-braces: the auth-gated snapshot handler in eth_rpc.rs
+    // must call `require_operator_auth` inside its closure body.
+    // Pre-fix this was absent; post-fix it is the first guard in the
+    // body. The string match is loose enough to survive comment edits
+    // but strict enough that removing the call site fails the test.
+    let eth_rpc_src = include_str!("../src/eth_rpc.rs");
+    let registration_idx = eth_rpc_src
+        .find("add_sync_method(\"citrate_getMempoolSnapshot\"")
+        .expect("eth_rpc.rs must register citrate_getMempoolSnapshot");
+    // Look ahead within the next ~2,000 chars (closure body) for the
+    // operator-auth call.
+    let window_end = (registration_idx + 2_000).min(eth_rpc_src.len());
+    let window = &eth_rpc_src[registration_idx..window_end];
+    assert!(
+        window.contains("require_operator_auth"),
+        "H-API-01: eth_rpc.rs::citrate_getMempoolSnapshot closure body \
+         must call require_operator_auth as its first guard."
+    );
+}
