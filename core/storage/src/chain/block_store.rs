@@ -98,11 +98,17 @@ impl BlockStore {
             )?;
         }
 
-        self.db.write_batch(batch)?;
+        // REM-2 / WP-H1.3 (audit M-API-01): producer-path commit MUST
+        // fsync. Pre-fix this used `write_batch` which returns as soon
+        // as the OS page cache accepts the write — a power loss between
+        // RPC ack and OS flush silently rolled back finalised state.
+        // `write_batch_sync` forces RocksDB::WriteOptions::set_sync(true).
+        self.db.write_batch_sync(batch)?;
 
         // Update the in-memory cache only after the batch commits.
         if new_height > prior_height {
-            self.cached_latest_height.store(new_height, AtomicOrdering::SeqCst);
+            self.cached_latest_height
+                .store(new_height, AtomicOrdering::SeqCst);
         }
 
         debug!("Stored block {} at height {}", hash, block.header.height);
@@ -178,7 +184,11 @@ impl BlockStore {
             let hk = height_to_key(max_height);
             if let Ok(Some(hash_bytes)) = self.db.get_cf(CF_METADATA, &hk) {
                 let hash = Hash::from_bytes(&hash_bytes);
-                if self.db.exists_cf(CF_BLOCKS, hash.as_bytes()).unwrap_or(false) {
+                if self
+                    .db
+                    .exists_cf(CF_BLOCKS, hash.as_bytes())
+                    .unwrap_or(false)
+                {
                     return Ok(max_height);
                 }
             }
@@ -223,7 +233,10 @@ impl BlockStore {
 
         let mut tips: Vec<(u64, Hash)> = Vec::new();
 
-        for hash in all_blocks.into_iter().filter(|h| !parents_with_children.contains(h)) {
+        for hash in all_blocks
+            .into_iter()
+            .filter(|h| !parents_with_children.contains(h))
+        {
             let height = self
                 .get_header(&hash)?
                 .map(|header| header.height)
