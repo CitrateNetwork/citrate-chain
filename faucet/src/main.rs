@@ -1,18 +1,24 @@
 use axum::{
-    extract::State,
-    http::StatusCode,
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post},
     Router,
 };
-use dashmap::DashMap;
 use citrate_execution::types::Address;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
+
+mod cooldowns;
+use cooldowns::{CooldownDenial, CooldownPolicy, Cooldowns};
+
+mod turnstile;
+use turnstile::TurnstileVerifier;
 
 #[derive(Clone)]
 struct FaucetState {
@@ -22,15 +28,24 @@ struct FaucetState {
     faucet_address: Address,
     /// Ed25519 signing key for the faucet account
     signing_key: Arc<ed25519_dalek::SigningKey>,
-    /// Per-address cooldown: tracks last request time (24h between requests)
-    address_cooldown: Arc<DashMap<String, Instant>>,
+    /// File-backed per-address + per-IP cooldown tracker (FAU-04).
+    cooldowns: Arc<Cooldowns>,
     /// Address whitelist: only these addresses can claim. Empty = no whitelist.
     address_whitelist: Arc<HashSet<String>>,
+    /// Cloudflare Turnstile verifier (FAU-03). When `None`, CAPTCHA
+    /// verification is skipped (used only in dev/local-CI builds).
+    turnstile: Option<Arc<TurnstileVerifier>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct FaucetRequest {
     address: String,
+    /// Cloudflare Turnstile token (FAU-03). Optional for backward
+    /// compatibility with dev clients; production deployments set
+    /// `FAUCET_TURNSTILE_SECRET` and `turnstile_token` becomes
+    /// effectively mandatory.
+    #[serde(default)]
+    turnstile_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,14 +158,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Address whitelist enabled: {} addresses", address_whitelist.len());
     }
 
+    // RM-B1 / WP-E6.3 (audit FAU-04): persistent cooldowns. When
+    // FAUCET_COOLDOWN_FILE is set we load + persist; otherwise the
+    // tracker stays in-memory (dev mode).
+    let cooldown_policy = CooldownPolicy::default();
+    let cooldowns = match std::env::var("FAUCET_COOLDOWN_FILE").ok() {
+        Some(path) if !path.is_empty() => {
+            let p = PathBuf::from(&path);
+            info!("Cooldowns persisted to {}", p.display());
+            Arc::new(Cooldowns::with_file(p, cooldown_policy))
+        }
+        _ => {
+            info!(
+                "Cooldowns in memory only (set FAUCET_COOLDOWN_FILE=<path> for persistence)"
+            );
+            Arc::new(Cooldowns::in_memory(cooldown_policy))
+        }
+    };
+
+    // RM-B1 / WP-E6.3 (audit FAU-03): Cloudflare Turnstile gate.
+    // Production deployments set FAUCET_TURNSTILE_SECRET; dev
+    // builds without it skip the CAPTCHA path with a WARN log.
+    let turnstile = match std::env::var("FAUCET_TURNSTILE_SECRET").ok() {
+        Some(secret) if !secret.is_empty() => {
+            info!("Cloudflare Turnstile CAPTCHA gate enabled");
+            Some(Arc::new(TurnstileVerifier::new(secret)))
+        }
+        _ => {
+            warn!(
+                "FAUCET_TURNSTILE_SECRET not set — CAPTCHA verification disabled (DEV ONLY)"
+            );
+            None
+        }
+    };
+
     let state = FaucetState {
         rpc_url,
         api_key,
         chain_id,
         faucet_address,
         signing_key: Arc::new(signing_key),
-        address_cooldown: Arc::new(DashMap::new()),
+        cooldowns,
         address_whitelist: Arc::new(address_whitelist),
+        turnstile,
     };
 
     // Build router
@@ -172,7 +222,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Faucet listening on http://0.0.0.0:{}", faucet_port);
     info!("Request test tokens: POST /faucet with {{\"address\": \"0x...\"}}");
 
-    if let Err(e) = axum::serve(listener, app).await {
+    // RM-B1 / WP-E6.3 (audit FAU-03): `into_make_service_with_connect_info`
+    // wires the SocketAddr into request extensions so handlers can
+    // extract the client IP for the per-IP cooldown leg.
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    {
         error!("Faucet server exited with error: {}", e);
     }
 
@@ -249,6 +307,8 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn request_tokens(
     State(state): State<FaucetState>,
+    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<FaucetRequest>,
 ) -> Result<Json<FaucetResponse>, StatusCode> {
     // Parse recipient address
@@ -276,31 +336,67 @@ async fn request_tokens(
         }));
     }
 
-    // Per-address cooldown: 24h between requests
-    let cooldown_secs = 24 * 3600; // 24 hours
-    if let Some(last_request) = state.address_cooldown.get(&recipient_hex) {
-        let elapsed = last_request.elapsed().as_secs();
-        if elapsed < cooldown_secs {
-            let remaining = cooldown_secs - elapsed;
-            let hours = remaining / 3600;
-            let minutes = (remaining % 3600) / 60;
-            return Ok(Json(FaucetResponse {
-                success: false,
-                tx_hash: None,
-                message: format!(
-                    "Rate limited: {}h {}m remaining before next claim",
-                    hours, minutes
-                ),
-                amount: "0".to_string(),
-            }));
+    // RM-B1 / WP-E6.3 (audit FAU-03): client IP (X-Forwarded-For
+    // honored when present, otherwise the socket peer). Used by the
+    // per-IP cooldown leg AND optionally by the Turnstile verifier
+    // for binding.
+    let client_ip = extract_client_ip(&headers, socket_addr);
+
+    // RM-B1 / WP-E6.3 (audit FAU-03): Turnstile CAPTCHA verification.
+    // When the verifier is configured, the request MUST carry a
+    // valid `turnstile_token`; absent / invalid tokens reject with
+    // a clear error.
+    if let Some(verifier) = state.turnstile.as_ref() {
+        let token = match payload.turnstile_token.as_deref() {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                return Ok(Json(FaucetResponse {
+                    success: false,
+                    tx_hash: None,
+                    message: "CAPTCHA required: turnstile_token missing".to_string(),
+                    amount: "0".to_string(),
+                }));
+            }
+        };
+        match verifier.verify(token, Some(&client_ip)).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(Json(FaucetResponse {
+                    success: false,
+                    tx_hash: None,
+                    message: "CAPTCHA verification failed".to_string(),
+                    amount: "0".to_string(),
+                }));
+            }
+            Err(e) => {
+                error!("Turnstile verification error: {}", e);
+                return Ok(Json(FaucetResponse {
+                    success: false,
+                    tx_hash: None,
+                    message: "CAPTCHA service unavailable, try again later".to_string(),
+                    amount: "0".to_string(),
+                }));
+            }
         }
+    }
+
+    // RM-B1 / WP-E6.4 (audit FAU-04): per-address + per-IP cooldown
+    // backed by a file (when FAUCET_COOLDOWN_FILE is set), so a
+    // process restart no longer launders the cooldown.
+    if let Err(denial) = state.cooldowns.check(&recipient_hex, &client_ip) {
+        return Ok(Json(FaucetResponse {
+            success: false,
+            tx_hash: None,
+            message: format!("Rate limited: {}", denial),
+            amount: "0".to_string(),
+        }));
     }
 
     let mut recipient_addr = [0u8; 20];
     recipient_addr.copy_from_slice(&recipient_bytes);
     let recipient = Address(recipient_addr);
 
-    info!("Faucet request for address: 0x{}", hex::encode(recipient.0));
+    info!("Faucet request for address: 0x{} (ip={})", hex::encode(recipient.0), client_ip);
 
     // Build and sign a real transaction using the faucet's ed25519 key.
     // This uses eth_sendRawTransaction — no unsigned tx support needed on the node.
@@ -422,12 +518,13 @@ async fn request_tokens(
             let json: serde_json::Value = res.json().await.unwrap_or_default();
 
             if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
-                // Success - record cooldown
-                state.address_cooldown.insert(recipient_hex, Instant::now());
+                // Success — record cooldowns (per-address + per-IP).
+                // RM-B1 / WP-E6.4 (audit FAU-04).
+                state.cooldowns.record_success(&recipient_hex, &client_ip);
 
                 info!(
-                    "Faucet sent 10 SALT to {} - tx: {}",
-                    payload.address, result
+                    "Faucet sent 10 SALT to {} (ip={}) - tx: {}",
+                    payload.address, client_ip, result
                 );
 
                 Ok(Json(FaucetResponse {
@@ -469,6 +566,32 @@ async fn request_tokens(
 /// Returns the normalized lowercase hex (without 0x) and the 20-byte address,
 /// or an error message string.
 #[allow(dead_code)]
+/// Extract the client IP. Honors the standard reverse-proxy
+/// headers (`X-Forwarded-For` first hop, then `X-Real-IP`) and
+/// falls back to the TCP socket peer when no header is present.
+///
+/// RM-B1 / WP-E6.3 (audit FAU-03): IP is used by the per-IP
+/// cooldown leg of the brute-force defense AND optionally bound
+/// into the Turnstile remoteip parameter.
+fn extract_client_ip(headers: &HeaderMap, socket_addr: SocketAddr) -> String {
+    // X-Forwarded-For: client, proxy1, proxy2 — take the first hop.
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = xff.split(',').next() {
+            let trimmed = first.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    if let Some(xri) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let trimmed = xri.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    socket_addr.ip().to_string()
+}
+
 fn validate_address(address: &str) -> Result<(String, [u8; 20]), &'static str> {
     let hex_str = address.trim_start_matches("0x").to_lowercase();
     let bytes = hex::decode(&hex_str).map_err(|_| "Invalid hex encoding")?;
