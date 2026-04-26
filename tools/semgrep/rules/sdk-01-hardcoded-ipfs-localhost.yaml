@@ -1,0 +1,50 @@
+# SDK-01 — hardcoded IPFS localhost endpoint tripwire.
+#
+# Audit: RM-G2.6 / SDK-01.
+#
+# Pre-RM-G2.6 the SDK silently dialed `http://localhost:5001/api/v0/add`
+# whenever a model artifact was uploaded. That worked for one
+# operator (the one running kubo locally) and silently failed for
+# everyone else, falling through to a stub "fallback_<hash>" string
+# that consumers persisted as if it were a real IPFS CID.
+#
+# Post-fix the IPFS endpoint is read from `CitrateClientConfig.ipfsApiUrl`;
+# when unset, the SDK returns a deterministic `sha256:<hex>` content
+# pointer instead.
+#
+# This rule fires if any new code re-introduces a hardcoded
+# `localhost:5001` (or any literal `localhost:<port>` with an
+# IPFS-shaped path) in the SDK source.
+
+rules:
+  - id: sdk-01-hardcoded-ipfs-localhost
+    message: >-
+      Hardcoded `localhost:5001` IPFS endpoint forbidden in SDK
+      source. Read the endpoint from a config field instead — see
+      `CitrateClientConfig.ipfsApiUrl`. Audit: RM-G2.6 / SDK-01.
+    languages: [javascript, typescript]
+    severity: ERROR
+    paths:
+      include:
+        - "sdks/**/*.ts"
+        - "sdks/**/*.js"
+      exclude:
+        - "sdks/**/tests/**"
+        - "sdks/**/*.test.ts"
+        - "sdks/**/*.spec.ts"
+        - "sdks/**/dist/**"
+        - "sdks/**/node_modules/**"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              "http://localhost:5001/api/v0/$X"
+          - pattern: |
+              'http://localhost:5001/api/v0/$X'
+          - pattern: |
+              `http://localhost:5001/api/v0/$X`
+    metadata:
+      audit-id: SDK-01
+      severity: medium
+      sprint: RM-G2
+      wp: WP-G2.6
+      spec: .agentile/planset/REMEDIATION_2026_04_24/16_PHASE_RM_G_CLEANUP.md
