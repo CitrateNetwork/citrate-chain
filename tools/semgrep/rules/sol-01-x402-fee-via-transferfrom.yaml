@@ -1,21 +1,35 @@
-# SOL-01 — X402 fee leg via `transferFrom` is forbidden.
+# SOL-01 / RFI-01 — X402 fee-leg integrity rules.
 #
-# Audit finding (CRITICAL):
-#   .audit/2026-04-24-full-repo-adversarial-audit/06_FINDINGS_SOLIDITY_CONTRACTS.md#sol-01
+# Audit findings:
+#   SOL-01 (CRITICAL): .audit/2026-04-24-full-repo-adversarial-audit/06_FINDINGS_SOLIDITY_CONTRACTS.md#sol-01
+#   RFI-01 (CRITICAL): .audit/2026-04-25-reaudit/06_FINDINGS_SOLIDITY_CONTRACTS.md#rfi-01
 #
-# Pre-fix `X402Facilitator.settlePayment` settled `netValue` via
-# EIP-3009 `transferWithAuthorization`, then pulled the fee via a
-# separate `wSALT.transferFrom(from, treasury, fee)`. That silently
-# required the user to have ERC-20-approved the facilitator —
-# breaking x402's gasless-UX claim.
+# This file holds two paired rules:
 #
-# Post-fix uses `wSALT.transferWithFeeAuthorization(from, to,
-# treasury, value, fee, ...)` which consumes ONE EIP-3009
-# authorization for the gross value and splits internally. No
-# pre-approval required.
+# 1. `sol-01-x402-fee-via-transferfrom` — fires on any path that
+#    routes a fee via `transferFrom` from x402 facilitator code.
+#    Pre-fix `X402Facilitator.settlePayment` settled `netValue` via
+#    EIP-3009 `transferWithAuthorization`, then pulled the fee via a
+#    separate `wSALT.transferFrom(from, treasury, fee)`. That silently
+#    required the user to have ERC-20-approved the facilitator —
+#    breaking x402's gasless-UX claim.
 #
-# This rule fires on `transferFrom` calls from x402 facilitator
-# code — flagging any path that resurrects the pre-fix shape.
+#    Post-fix uses `wSALT.transferWithFeeAuthorization(...)` which
+#    consumes ONE EIP-3009 authorization for the gross value and
+#    splits internally.
+#
+# 2. `rfi-01-fee-auth-typehash-must-bind-treasury-fee` — STRUCTURAL
+#    DEFENSE for the RFI-01 finding. The SOL-01 closure introduced
+#    `transferWithFeeAuthorization` whose signed digest covered ONLY
+#    `(from, to, value, validAfter, validBefore, nonce)` — `treasury`
+#    and `fee` were caller-supplied. A mempool watcher could replay
+#    the authorization with attacker-chosen treasury/fee.
+#
+#    The fix is a distinct `TRANSFER_WITH_FEE_AUTHORIZATION_TYPEHASH`
+#    that explicitly binds both `treasury` and `fee`. This rule
+#    ensures any future `*WithFeeAuthorization` / `*FeeAuthorization*`
+#    function declares (or re-uses) a typehash whose schema string
+#    contains the substrings `address treasury` AND `uint256 fee`.
 
 rules:
   - id: sol-01-x402-fee-via-transferfrom
@@ -36,3 +50,78 @@ rules:
         - "**/test/**"
     patterns:
       - pattern: $TOKEN.transferFrom($_, treasury, $_)
+
+  # RFI-01 structural defense: any typehash declared for a
+  # fee-bearing authorization MUST bind `address treasury` AND
+  # `uint256 fee`. This catches the regression class where a
+  # `*WithFeeAuthorization` function reuses a legacy typehash that
+  # leaves caller-supplied `(treasury, fee)` outside the signed
+  # digest. We match by typehash NAME (any constant whose name
+  # contains `FEE_AUTHORIZATION_TYPEHASH`) plus a schema string that
+  # OMITS one of the two required fields.
+  - id: rfi-01-fee-auth-typehash-missing-treasury-or-fee
+    message: >-
+      A fee-bearing authorization typehash MUST bind both
+      `address treasury` and `uint256 fee` into its EIP-712
+      schema string (RFI-01). Caller-supplied parameters that
+      affect the economic outcome but are NOT in the signed
+      payload are exploitable by mempool front-running. Define a
+      schema like:
+        keccak256("TransferWithFeeAuthorization(address from,
+        address to, uint256 value, address treasury, uint256 fee,
+        uint256 validAfter, uint256 validBefore, bytes32 nonce)")
+    languages: [solidity]
+    severity: ERROR
+    paths:
+      include:
+        - "contracts/src/**/*.sol"
+      exclude:
+        - "**/test/**"
+        - "contracts/src/interfaces/**"
+    patterns:
+      - pattern-either:
+          - pattern: bytes32 public constant $NAME = keccak256($SCHEMA);
+          - pattern: bytes32 internal constant $NAME = keccak256($SCHEMA);
+          - pattern: bytes32 private constant $NAME = keccak256($SCHEMA);
+          - pattern: bytes32 constant $NAME = keccak256($SCHEMA);
+      - metavariable-pattern:
+          metavariable: $NAME
+          patterns:
+            - pattern-regex: '(?i)FEE.*AUTH.*TYPEHASH|AUTH.*FEE.*TYPEHASH'
+      - metavariable-pattern:
+          metavariable: $SCHEMA
+          patterns:
+            - pattern-not-regex: 'address\s+treasury'
+      # Fee-auth typehash MUST also bind `uint256 fee`; the OR
+      # branch below catches the case where treasury IS bound but
+      # fee is not.
+  - id: rfi-01-fee-auth-typehash-missing-fee
+    message: >-
+      A fee-bearing authorization typehash binds `treasury` but
+      not `uint256 fee` (RFI-01). The fee amount is part of the
+      economic outcome and MUST participate in the EIP-712 digest;
+      otherwise an attacker can substitute any fee ≤ value at
+      submission time.
+    languages: [solidity]
+    severity: ERROR
+    paths:
+      include:
+        - "contracts/src/**/*.sol"
+      exclude:
+        - "**/test/**"
+        - "contracts/src/interfaces/**"
+    patterns:
+      - pattern-either:
+          - pattern: bytes32 public constant $NAME = keccak256($SCHEMA);
+          - pattern: bytes32 internal constant $NAME = keccak256($SCHEMA);
+          - pattern: bytes32 private constant $NAME = keccak256($SCHEMA);
+          - pattern: bytes32 constant $NAME = keccak256($SCHEMA);
+      - metavariable-pattern:
+          metavariable: $NAME
+          patterns:
+            - pattern-regex: '(?i)FEE.*AUTH.*TYPEHASH|AUTH.*FEE.*TYPEHASH'
+      - metavariable-pattern:
+          metavariable: $SCHEMA
+          patterns:
+            - pattern-regex: 'address\s+treasury'
+            - pattern-not-regex: 'uint256\s+fee'
