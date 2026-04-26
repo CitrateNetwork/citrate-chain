@@ -21,6 +21,12 @@ contract X402FacilitatorTest is Test {
     bytes32 constant TRANSFER_TYPEHASH =
         keccak256("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
 
+    /// RFI-01 / WP-H1.1: distinct typehash binding (treasury, fee) into
+    /// the signed digest. The facilitator now requires this typehash —
+    /// the legacy one is rejected by `transferWithFeeAuthorization`.
+    bytes32 constant FEE_AUTH_TYPEHASH =
+        keccak256("TransferWithFeeAuthorization(address from,address to,uint256 value,address treasury,uint256 fee,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
+
     function setUp() public {
         (admin, adminPk) = makeAddrAndKey("admin");
         (alice, alicePk) = makeAddrAndKey("alice");
@@ -60,10 +66,10 @@ contract X402FacilitatorTest is Test {
         uint256 validBefore = block.timestamp + 1 hours;
         bytes32 nonce = keccak256("settle-1");
 
-        // RM-B1 / WP-D2.1 (audit SOL-01): post-fix Alice signs the
-        // GROSS value; the facilitator + wSALT split internally.
-        (uint8 v, bytes32 r, bytes32 s) = _signTransferAuth(
-            alicePk, alice, bob, value, validAfter, validBefore, nonce
+        // RFI-01 / WP-H1.1: alice signs the FEE-AUTH typehash binding
+        // (treasury, fee) — the only shape the post-fix wSALT accepts.
+        (uint8 v, bytes32 r, bytes32 s) = _signFeeAuth(
+            alicePk, alice, bob, value, treasury, fee, validAfter, validBefore, nonce
         );
 
         vm.prank(admin);
@@ -102,12 +108,14 @@ contract X402FacilitatorTest is Test {
     function test_batchSettle() public {
         X402Facilitator.PaymentAuthorization[] memory payments = new X402Facilitator.PaymentAuthorization[](2);
 
-        // Payment 1 — SOL-01: sign over GROSS value.
+        // Payment 1 — RFI-01: alice signs FEE-AUTH typehash binding
+        // (treasury, fee).
         {
             uint256 value1 = 2 ether;
+            uint256 fee1 = (value1 * FEE_BPS) / 10000;
             bytes32 nonce1 = keccak256("batch-1");
-            (uint8 v1, bytes32 r1, bytes32 s1) = _signTransferAuth(
-                alicePk, alice, bob, value1, 0, block.timestamp + 1 hours, nonce1
+            (uint8 v1, bytes32 r1, bytes32 s1) = _signFeeAuth(
+                alicePk, alice, bob, value1, treasury, fee1, 0, block.timestamp + 1 hours, nonce1
             );
             payments[0] = X402Facilitator.PaymentAuthorization({
                 from: alice, to: bob, value: value1,
@@ -119,9 +127,10 @@ contract X402FacilitatorTest is Test {
         // Payment 2
         {
             uint256 value2 = 3 ether;
+            uint256 fee2 = (value2 * FEE_BPS) / 10000;
             bytes32 nonce2 = keccak256("batch-2");
-            (uint8 v2, bytes32 r2, bytes32 s2) = _signTransferAuth(
-                alicePk, alice, bob, value2, 0, block.timestamp + 1 hours, nonce2
+            (uint8 v2, bytes32 r2, bytes32 s2) = _signFeeAuth(
+                alicePk, alice, bob, value2, treasury, fee2, 0, block.timestamp + 1 hours, nonce2
             );
             payments[1] = X402Facilitator.PaymentAuthorization({
                 from: alice, to: bob, value: value2,
@@ -197,8 +206,9 @@ contract X402FacilitatorTest is Test {
         uint256 value = 4 ether;
         uint256 fee = (value * FEE_BPS) / 10000;
         bytes32 nonce = keccak256("sol01-no-approve");
-        (uint8 v, bytes32 r, bytes32 s) = _signTransferAuth(
-            alicePk, alice, bob, value, 0, block.timestamp + 1 hours, nonce
+        // RFI-01 / WP-H1.1: signed under FEE-AUTH typehash.
+        (uint8 v, bytes32 r, bytes32 s) = _signFeeAuth(
+            alicePk, alice, bob, value, treasury, fee, 0, block.timestamp + 1 hours, nonce
         );
 
         vm.prank(admin);
@@ -212,23 +222,28 @@ contract X402FacilitatorTest is Test {
         assertEq(wSALT.allowance(alice, address(facilitator)), 0);
     }
 
-    /// SOL-01.2: a signature minted with the pre-fix shape
-    /// (signed over `netValue` instead of `value`) must NOT be
-    /// accepted post-fix. This pins the structural bind.
+    /// SOL-01.2 / RFI-01: a signature minted under the legacy
+    /// `TRANSFER_WITH_AUTHORIZATION_TYPEHASH` (signed over `netValue`,
+    /// no treasury/fee bound) must NOT be accepted by the post-fix
+    /// `transferWithFeeAuthorization`. Post-fix the rejection is
+    /// `InvalidFeeAuthorization()` (the structural marker that the
+    /// new typehash is in force) instead of the legacy
+    /// `wSALT: invalid signature` string.
     function test_sol01_legacy_netvalue_signature_rejected() public {
         uint256 value = 4 ether;
         uint256 fee = (value * FEE_BPS) / 10000;
         uint256 netValue = value - fee;
         bytes32 nonce = keccak256("sol01-legacy");
 
-        // Sign over netValue (pre-fix shape).
+        // Sign over netValue under the legacy typehash (pre-fix shape).
         (uint8 v, bytes32 r, bytes32 s) = _signTransferAuth(
             alicePk, alice, bob, netValue, 0, block.timestamp + 1 hours, nonce
         );
 
-        // Submit gross `value` with the netValue signature — must reject.
+        // Submit gross `value` with the legacy-typehash signature —
+        // must reject under the new typehash.
         vm.prank(admin);
-        vm.expectRevert("wSALT: invalid signature");
+        vm.expectRevert(WrappedSALT.InvalidFeeAuthorization.selector);
         facilitator.settlePayment(
             alice, bob, value, 0, block.timestamp + 1 hours, nonce, v, r, s
         );
@@ -281,19 +296,25 @@ contract X402FacilitatorTest is Test {
 
     /// SOL-02.3: a signature minted under chainId A is REJECTED
     /// when verified under chainId B. Cross-fork replay closed.
+    /// RFI-01 / WP-H1.1: post-fix the rejection comes through the
+    /// `transferWithFeeAuthorization` path, so the revert is
+    /// `InvalidFeeAuthorization()`.
     function test_sol02_cross_chainid_signature_replay_rejected() public {
         uint256 value = 1 ether;
+        uint256 fee = (value * FEE_BPS) / 10000;
         bytes32 nonce = keccak256("sol02-cross-chain");
 
-        // Sign at the original chainId.
-        (uint8 v, bytes32 r, bytes32 s) = _signTransferAuth(
-            alicePk, alice, bob, value, 0, block.timestamp + 1 hours, nonce
+        // Sign at the original chainId — under the FEE-AUTH typehash,
+        // since that's the path the facilitator takes.
+        (uint8 v, bytes32 r, bytes32 s) = _signFeeAuth(
+            alicePk, alice, bob, value, treasury, fee, 0, block.timestamp + 1 hours, nonce
         );
 
-        // Switch chainId; the signature should now fail to verify.
+        // Switch chainId; the signature should now fail to verify
+        // because DOMAIN_SEPARATOR rebuilds.
         vm.chainId(99_999);
         vm.prank(admin);
-        vm.expectRevert("wSALT: invalid signature");
+        vm.expectRevert(WrappedSALT.InvalidFeeAuthorization.selector);
         facilitator.settlePayment(
             alice, bob, value, 0, block.timestamp + 1 hours, nonce, v, r, s
         );
@@ -315,6 +336,31 @@ contract X402FacilitatorTest is Test {
         bytes32 structHash = keccak256(abi.encode(
             TRANSFER_TYPEHASH,
             from, to, value, validAfter, validBefore, nonce
+        ));
+        bytes32 digest = keccak256(abi.encodePacked(
+            "\x19\x01", wSALT.DOMAIN_SEPARATOR(), structHash
+        ));
+        (v, r, s) = vm.sign(signerPk, digest);
+    }
+
+    /// RFI-01 / WP-H1.1: helper for the fee-authorization typehash.
+    /// Signs over `(from, to, value, treasury_, fee, validAfter,
+    /// validBefore, nonce)` — the post-fix shape required by
+    /// `transferWithFeeAuthorization`.
+    function _signFeeAuth(
+        uint256 signerPk,
+        address from,
+        address to,
+        uint256 value,
+        address treasury_,
+        uint256 fee,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce
+    ) internal view returns (uint8 v, bytes32 r, bytes32 s) {
+        bytes32 structHash = keccak256(abi.encode(
+            FEE_AUTH_TYPEHASH,
+            from, to, value, treasury_, fee, validAfter, validBefore, nonce
         ));
         bytes32 digest = keccak256(abi.encodePacked(
             "\x19\x01", wSALT.DOMAIN_SEPARATOR(), structHash
