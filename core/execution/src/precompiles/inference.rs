@@ -108,17 +108,22 @@ pub struct InferencePrecompile {
     model_cache: HashMap<H256, Arc<MetalModel>>,
     /// Access control map: model_id → (owner, policy)
     model_access: HashMap<H256, ModelAccessEntry>,
-    /// RM-B1 / WP-B5.1 (audit C-01): when false (mainnet
-    /// default), the non-deterministic inference precompiles
-    /// (0x0101 MODEL_INFERENCE, 0x0102 BATCH_INFERENCE) are
-    /// disabled — invoking them returns an error rather than
-    /// running floating-point hardware-dependent inference. This
-    /// closes the consensus-fork vector where Metal/CUDA/CPU
-    /// validators produced different bit-identical f32 outputs
-    /// from the same model + input. Devnet / testnet keep
-    /// `allow_nondeterministic_inference = true` for backward
-    /// compat with existing test suites; mainnet flips to false
-    /// pending TEE attestation (CM-08 path).
+    /// RM-B1 / WP-B5.1 (audit C-01) + REM-N-03 / WP-H1.2: when
+    /// false (production / mainnet default), the non-deterministic
+    /// inference precompiles (0x0101 MODEL_INFERENCE, 0x0102
+    /// BATCH_INFERENCE) are disabled — invoking them returns an
+    /// error rather than running floating-point hardware-dependent
+    /// inference. This closes the consensus-fork vector where
+    /// Metal / CUDA / CPU validators produced different bit-
+    /// identical f32 outputs from the same model + input.
+    ///
+    /// Production callers go through
+    /// `Executor::with_chain_id`, which forces this field to
+    /// `false` via `InferenceMode::Strict`. Devnet may opt in by
+    /// passing `InferenceMode::AllowNonDeterministic` to the
+    /// `*_and_inference_mode` constructors (gated by the
+    /// `dev-mode` cargo feature on `node-app`); mainnet flips back
+    /// to deterministic-only pending TEE attestation (CM-08 path).
     allow_nondeterministic_inference: bool,
 }
 

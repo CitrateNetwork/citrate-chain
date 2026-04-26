@@ -1,0 +1,71 @@
+# C-01 / REM-N-03 — `allow_nondeterministic_inference: true` must not
+# appear as a production default.
+#
+# Audit finding (HIGH, effective CRITICAL):
+#   .audit/2026-04-25-reaudit/03_FINDINGS_CONSENSUS_EXECUTION.md#rem-n-03
+#
+# Pre-fix, `Executor::with_chain_id` constructed
+# `InferencePrecompile::new(...)` (no `.with_strict_inference()`),
+# leaving `allow_nondeterministic_inference = true`. The first
+# 0x0101 / 0x0102 call on mainnet would fork consensus across
+# heterogeneous validator hardware (Metal / CoreML / CPU / CUDA all
+# emit different bit-identical f32 outputs from the same model + input).
+# C-01's closure shipped a mechanism (`with_strict_inference`) but
+# never engaged it.
+#
+# This rule catches the regression directly: any literal
+# `allow_nondeterministic_inference: true` (or `= true`) outside the
+# explicit `cfg(test)` and dev-mode-feature gates is forbidden.
+#
+# The production default is now `InferenceMode::Strict`, baked into
+# `Executor::production_inference_mode()` and `with_chain_id`. Devnet
+# may opt in via `--allow-nondeterministic-inference` on a node-app
+# binary built with `--features dev-mode`.
+#
+# See:
+#   - core/execution/src/precompiles/inference.rs::InferenceMode
+#   - core/execution/src/executor.rs::production_inference_mode
+#   - node-app/src/main.rs::resolve_inference_mode
+
+rules:
+  - id: c-01-allow-nondeterministic-default
+    message: >-
+      `allow_nondeterministic_inference: true` (or `= true`) is forbidden
+      in production paths (REM-N-03 / WP-H1.2). It re-opens the C-01
+      consensus-fork vector — non-deterministic FP inference across
+      heterogeneous validators. Construct the precompile via
+      `InferencePrecompile::new_with_mode(runtime, InferenceMode::Strict)`
+      (or via `Executor::with_chain_id`, which already defaults to
+      Strict). For devnet, gate the opt-in behind `--features dev-mode`
+      on `node-app` and use `InferenceMode::AllowNonDeterministic`
+      explicitly. See
+      core/execution/src/precompiles/inference.rs::InferenceMode and
+      core/execution/src/executor.rs::production_inference_mode.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/**/*.rs"
+        - "node/src/**/*.rs"
+        - "node-app/src/**/*.rs"
+        - "gui/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
+        - "**/*_tests.rs"
+        - "**/benches/**"
+        - "**/examples/**"
+    patterns:
+      - pattern-regex: 'allow_nondeterministic_inference\s*[:=]\s*true'
+      # Doc comments and inline comments that mention the field are
+      # documentation, not code — exclude them.
+      - pattern-not-regex: '^\s*//.*allow_nondeterministic_inference'
+      - pattern-not-regex: '^\s*///.*allow_nondeterministic_inference'
+    metadata:
+      audit-id: REM-N-03
+      severity: critical
+      sprint: RM-H
+      wp: WP-H1.2
+      cross-ref: C-01
+      spec: citrate_v0.01.1/core/execution/src/precompiles/inference.rs
