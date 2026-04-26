@@ -6,7 +6,7 @@ pragma solidity ^0.8.26;
 ///         using the EVM `modexp` precompile (0x05) for the
 ///         `sig^e mod N` operation. Designed to verify Azure
 ///         Microsoft Attestation (MAA) JWTs in
-///         `TEEAttestationRegistry.submitAttestationStrict`.
+///         `TEEAttestationRegistry.submitAttestationStrictBound`.
 ///
 /// @dev Gas cost per verify (RSA-2048): ~70-100k including modexp
 ///      (depends on exponent size; e=65537 is standard and cheap).
