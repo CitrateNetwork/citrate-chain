@@ -7,11 +7,19 @@
 //! ## KDF policy
 //!
 //! New entries are written with `kdf_version: KDF_VERSION_CURRENT` (= 2),
-//! using OWASP-recommended Argon2id parameters (m=65536 KiB, t=3, p=4,
+//! using OWASP-recommended Argon2id parameters (m=65536 KiB, t=3, p=1,
 //! output_len=32). Legacy entries on disk (`kdf_version: 1`) continue to
 //! decrypt under their original parameters via `argon2_for_version`. See
 //! `docs/security/KDF_POLICY.md` (canonical) and audit finding `WAL-01`
 //! (`.audit/2026-04-24-full-repo-adversarial-audit/08_FINDINGS_WALLET_AGENT_FAUCET.md`).
+//!
+//! Note (RM-I / WP-I2.3): the doc string above previously read `p=4`
+//! while the production code at `argon2_for_version(KDF_VERSION_CURRENT)`
+//! constructs with `p=1`. The 2026-04-25 re-audit caught the doc drift.
+//! OWASP 2024 still meets its security floor at `p=1` with the current
+//! `m=65536, t=3` settings, so the code is correct; the doc is now
+//! aligned to the code. If a future revision raises `p` to 4 or 8, this
+//! comment must be updated in lock-step.
 
 use crate::error::WalletError;
 use crate::types::{CreateAccountResult, EncryptedKeyEntry, KeyType};
@@ -32,7 +40,12 @@ use zeroize::Zeroizing;
 pub const KDF_VERSION_LEGACY: u32 = 1;
 
 /// Current production KDF version. OWASP 2024 recommended Argon2id
-/// parameters: m=65536 KiB (64 MiB), t=3, p=4, output_len=32.
+/// parameters: m=65536 KiB (64 MiB), t=3, p=1, output_len=32.
+///
+/// RM-I / WP-I2.3 doc-drift fix: this comment previously said `p=4`
+/// but the dispatcher constructs with `p=1`. OWASP's 2024 cheat-sheet
+/// lists `p=1` as acceptable at this `(m, t)` setting — the security
+/// floor is met. Comment now matches code.
 pub const KDF_VERSION_CURRENT: u32 = 2;
 
 /// Low-memory KDF version (OWASP "alternative"). Reserved for the
