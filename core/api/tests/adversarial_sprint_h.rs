@@ -205,7 +205,7 @@ async fn h6_vrf_proof_verifies_with_correct_proposer() {
         .unwrap();
 
     let valid = selector
-        .verify_vrf_proof(&proposer, &proof, &previous_vrf, slot)
+        .verify_vrf_math_only(&proposer, &proof, &previous_vrf, slot)
         .unwrap();
     assert!(valid, "H.6: VRF proof must verify with correct proposer key");
 }
@@ -228,13 +228,13 @@ async fn h6_vrf_proof_fails_with_wrong_proposer() {
 
     // Verify with proposer A — should pass
     let valid_a = selector
-        .verify_vrf_proof(&proposer_a, &proof, &previous_vrf, slot)
+        .verify_vrf_math_only(&proposer_a, &proof, &previous_vrf, slot)
         .unwrap();
     assert!(valid_a, "proof should verify with proposer A");
 
     // Verify with proposer B — should FAIL (key substitution attack)
     let valid_b = selector
-        .verify_vrf_proof(&proposer_b, &proof, &previous_vrf, slot)
+        .verify_vrf_math_only(&proposer_b, &proof, &previous_vrf, slot)
         .unwrap();
     assert!(
         !valid_b,
@@ -256,7 +256,7 @@ async fn h6_vrf_proof_fails_with_wrong_slot() {
 
     // Verify with different slot
     let valid = selector
-        .verify_vrf_proof(&proposer, &proof, &previous_vrf, 200)
+        .verify_vrf_math_only(&proposer, &proof, &previous_vrf, 200)
         .unwrap();
     assert!(
         !valid,
@@ -278,7 +278,7 @@ async fn h6_vrf_proof_fails_with_wrong_previous_vrf() {
         .unwrap();
 
     let valid = selector
-        .verify_vrf_proof(&proposer, &proof, &previous_vrf_b, 100)
+        .verify_vrf_math_only(&proposer, &proof, &previous_vrf_b, 100)
         .unwrap();
     assert!(
         !valid,
@@ -299,7 +299,7 @@ async fn h6_vrf_malformed_proof_rejected() {
         output: Hash::default(),
     };
     let valid = selector
-        .verify_vrf_proof(&proposer, &bad_proof, &previous_vrf, 100)
+        .verify_vrf_math_only(&proposer, &bad_proof, &previous_vrf, 100)
         .unwrap();
     assert!(
         !valid,

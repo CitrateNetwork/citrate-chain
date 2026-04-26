@@ -145,28 +145,23 @@ impl VrfProposerSelector {
     /// `proof.proof = anything; output = SHA3(proof || alpha)` and
     /// the verifier blindly accepts.
     ///
-    /// **RM-I-3 / WP-I1.5 (re-audit Stream 1 finding REM-N-01)**:
-    /// THIS METHOD DOES NOT BIND `proof.pk_p256` (the ECVRF P-256 key
-    /// embedded in the proof) TO THE CLAIMED `pubkey` (ed25519
-    /// proposer identity). An attacker with their own (sk_p256,
-    /// pk_p256) pair can produce a valid proof over alpha (which
-    /// includes the *victim's* ed25519 pubkey), submit
-    /// `proof.pk_p256 = attacker_pk`, and have the math accept.
-    /// The structural binding lives at admission time via the
-    /// block's ed25519 signature: only the holder of `pubkey`'s
-    /// ed25519 secret key can sign the block, so a forged ECVRF
-    /// proof is unreachable in practice — but only because the
-    /// admission path enforces both checks.
+    /// **Math-only verifier — do not call from production admission paths.**
     ///
-    /// **Use [`Self::verify_vrf_with_block_signature`] for new
-    /// callers** — it takes both the ECVRF proof AND the block's
-    /// ed25519 signature, making the identity binding structurally
-    /// inescapable. This raw-verify method is retained for callers
-    /// that genuinely need just the ECVRF math (e.g., internal
-    /// bench, tests, the consensus crate's own admission path which
-    /// performs the ed25519 check separately at
-    /// `dag_store::validate_block_admission`).
-    pub fn verify_vrf_proof(
+    /// The ECVRF math here attests "the holder of `proof.pk_p256`'s
+    /// secret key produced a VRF over alpha" — it does NOT attest
+    /// "the holder of the claimed proposer's ed25519 secret key
+    /// produced it" (audit finding REM-N-01). The structural
+    /// identity binding lives in [`Self::verify_vrf_with_block_signature`],
+    /// which combines this math with an ed25519 signature check
+    /// under the proposer's pubkey.
+    ///
+    /// Call sites that legitimately need just the math:
+    /// - This module (called by `verify_vrf_with_block_signature`).
+    /// - Tests and benches that exercise the math directly.
+    ///
+    /// Production admission MUST use `verify_vrf_with_block_signature`.
+    /// See `core/consensus/src/dag_store.rs::verify_block_vrf_crypto`.
+    pub fn verify_vrf_math_only(
         &self,
         pubkey: &PublicKey,
         proof: &VrfProof,
@@ -216,7 +211,7 @@ impl VrfProposerSelector {
     ///   check rejects them.
     ///
     /// This method is the **production-callable** entry point. The
-    /// raw `verify_vrf_proof` is retained for internal benches and
+    /// raw `verify_vrf_math_only` is retained for internal benches and
     /// tests; production code paths SHOULD use this method.
     ///
     /// Returns `Ok(true)` only when BOTH checks pass.
@@ -230,7 +225,7 @@ impl VrfProposerSelector {
         block_signature: &crate::types::Signature,
     ) -> Result<bool, VrfError> {
         // Step 1: ECVRF math (or legacy below cutoff).
-        if !self.verify_vrf_proof(pubkey, proof, previous_vrf, slot)? {
+        if !self.verify_vrf_math_only(pubkey, proof, previous_vrf, slot)? {
             return Ok(false);
         }
 
@@ -479,7 +474,7 @@ impl LeaderElection {
         // Verify VRF proof
         if !self
             .vrf_selector
-            .verify_vrf_proof(pubkey, proof, previous_vrf, slot)?
+            .verify_vrf_math_only(pubkey, proof, previous_vrf, slot)?
         {
             return Ok(false);
         }
@@ -529,7 +524,7 @@ mod tests {
 
         // Verify the proof roundtrips
         let verified = selector
-            .verify_vrf_proof(&proposer, &proof, &previous_vrf, slot)
+            .verify_vrf_math_only(&proposer, &proof, &previous_vrf, slot)
             .unwrap();
         assert!(verified, "ECVRF proof should verify against the proposer");
     }
@@ -667,11 +662,11 @@ mod tests {
 
         // Sanity: the raw verify accepts (the math is consistent).
         let raw = selector
-            .verify_vrf_proof(&victim_pubkey, &attacker_proof, &prev, slot)
+            .verify_vrf_math_only(&victim_pubkey, &attacker_proof, &prev, slot)
             .expect("raw verify");
         assert!(
             raw,
-            "REM-N-01: pre-fix raw verify_vrf_proof accepts the attacker's proof — \
+            "REM-N-01: raw verify_vrf_math_only accepts the attacker's proof — \
              this is the bug shape"
         );
 

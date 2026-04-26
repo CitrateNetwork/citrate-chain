@@ -55,7 +55,7 @@ fn h06_legacy_proof_accepted_below_cutoff() {
 
     let proof = legacy_forged_proof(&proposer, &prev_vrf, slot);
     let result = selector
-        .verify_vrf_proof(&proposer, &proof, &prev_vrf, slot)
+        .verify_vrf_math_only(&proposer, &proof, &prev_vrf, slot)
         .expect("verify");
     assert!(
         result,
@@ -75,7 +75,7 @@ fn h06_legacy_proof_rejected_at_or_above_cutoff() {
     let slot_at = DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT;
     let proof_at = legacy_forged_proof(&proposer, &prev_vrf, slot_at);
     let result_at = selector
-        .verify_vrf_proof(&proposer, &proof_at, &prev_vrf, slot_at)
+        .verify_vrf_math_only(&proposer, &proof_at, &prev_vrf, slot_at)
         .expect("verify");
     assert!(
         !result_at,
@@ -86,7 +86,7 @@ fn h06_legacy_proof_rejected_at_or_above_cutoff() {
     let slot_above = DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT + 50_000;
     let proof_above = legacy_forged_proof(&proposer, &prev_vrf, slot_above);
     let result_above = selector
-        .verify_vrf_proof(&proposer, &proof_above, &prev_vrf, slot_above)
+        .verify_vrf_math_only(&proposer, &proof_above, &prev_vrf, slot_above)
         .expect("verify");
     assert!(
         !result_above,
@@ -106,7 +106,7 @@ fn h06_with_zero_cutoff_rejects_all_legacy_proofs() {
 
     let proof = legacy_forged_proof(&proposer, &prev_vrf, 0);
     let result = selector
-        .verify_vrf_proof(&proposer, &proof, &prev_vrf, 0)
+        .verify_vrf_math_only(&proposer, &proof, &prev_vrf, 0)
         .expect("verify");
     assert!(
         !result,
@@ -129,7 +129,7 @@ fn h06_legacy_proof_alpha_binding_intact_below_cutoff() {
     let proof = legacy_forged_proof(&proposer, &prev_vrf, 10);
     assert!(
         selector
-            .verify_vrf_proof(&proposer, &proof, &prev_vrf, 10)
+            .verify_vrf_math_only(&proposer, &proof, &prev_vrf, 10)
             .expect("verify"),
         "self-consistent legacy proof must verify at slot 10"
     );
@@ -137,7 +137,7 @@ fn h06_legacy_proof_alpha_binding_intact_below_cutoff() {
     // Same proof, different slot — alpha binding broken.
     assert!(
         !selector
-            .verify_vrf_proof(&proposer, &proof, &prev_vrf, 11)
+            .verify_vrf_math_only(&proposer, &proof, &prev_vrf, 11)
             .expect("verify"),
         "same legacy proof at slot 11 must NOT verify (alpha binding)"
     );
@@ -145,7 +145,7 @@ fn h06_legacy_proof_alpha_binding_intact_below_cutoff() {
     // Same proof, different prev_vrf — alpha binding broken.
     assert!(
         !selector
-            .verify_vrf_proof(&proposer, &proof, &Hash::new([0xEE; 32]), 10)
+            .verify_vrf_math_only(&proposer, &proof, &Hash::new([0xEE; 32]), 10)
             .expect("verify"),
         "legacy proof with different prev_vrf must NOT verify"
     );
@@ -183,7 +183,7 @@ fn h06_ecvrf_proofs_accepted_at_any_height() {
             "ECVRF proof must be 114 bytes"
         );
         let ok = selector
-            .verify_vrf_proof(&proposer, &proof, &prev_vrf, slot)
+            .verify_vrf_math_only(&proposer, &proof, &prev_vrf, slot)
             .expect("verify");
         assert!(ok, "H-06: ECVRF proof at slot {slot} must be accepted");
     }
