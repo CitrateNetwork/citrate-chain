@@ -45,7 +45,34 @@ pub fn check_method_budget(method_cost: u32) -> Result<(), jsonrpc_core::Error> 
 
     let key = current_client_key();
     if key.is_empty() {
-        return Ok(()); // No client tracking available
+        // RM-I / WP-I1.6 (re-audit Stream 2 finding REM-3):
+        //   Pre-fix this returned Ok(()), silently failing OPEN when the
+        //   middleware couldn't attribute the request to a client (e.g.,
+        //   thread-local not populated, a non-HTTP transport, or a worker
+        //   thread that didn't carry the client_key forward). The audit
+        //   noted that this allowed a multi-threaded RPC consumer to bypass
+        //   the per-client method budget by routing requests through a
+        //   thread that didn't have the key set.
+        //
+        //   Post-fix: empty client_key fails CLOSED unless the operator
+        //   has explicitly opted into anonymous traffic via the env var
+        //   `CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT=1`. The opt-in exists so
+        //   devnet / single-node testing can still hit the RPC without
+        //   IP-based attribution, but production deployments fail-closed
+        //   by default.
+        if std::env::var("CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        return Err(jsonrpc_core::Error {
+            code: jsonrpc_core::ErrorCode::ServerError(-32007),
+            message: "Rate-limit attribution failed (no client key). Set \
+                      CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT=1 on devnet to bypass."
+                .into(),
+            data: None,
+        });
     }
 
     let now = Instant::now();
@@ -623,6 +650,9 @@ mod tests {
     #[test]
     fn test_method_budget_allows_within_limit() {
         // Budget limit is 1000 per second — 100 calls at cost=10 should pass
+        // RM-I / WP-I1.6: set a client key (REM-3 fix made empty key
+        // fail-closed by default; tests now must set a key explicitly).
+        CLIENT_KEY.with(|k| *k.borrow_mut() = "test_budget_within_limit".to_string());
         for _ in 0..100 {
             assert!(check_method_budget(10).is_ok());
         }
@@ -833,5 +863,51 @@ mod tests {
         }
         // Next call should exceed 1000 budget
         assert!(check_method_budget(10).is_err(), "Should reject after budget exceeded");
+    }
+
+    /// REM-3 (re-audit Stream 2 / RM-I WP-I1.6):
+    /// `check_method_budget` previously returned `Ok(())` when
+    /// `current_client_key()` was empty, silently failing OPEN. Post-fix:
+    /// fail CLOSED unless the operator explicitly opts into anonymous
+    /// traffic via `CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT=1`.
+    ///
+    /// The two assertions are combined into a single test because they
+    /// share global state (the env var). Splitting them across two
+    /// `#[test]` functions causes parallel-test races; this is the
+    /// standard discipline in this file (see also the operator-auth
+    /// tests above which use the same shape).
+    #[test]
+    fn test_rem_3_empty_client_key_fail_closed_or_opt_in() {
+        // Use a static mutex to serialise this test against any other
+        // test that touches the same env var.
+        use std::sync::Mutex;
+        static GUARD: Mutex<()> = Mutex::new(());
+        let _g = GUARD.lock().expect("REM-3 mutex");
+
+        // Sub-assertion 1: default behaviour is fail-closed.
+        std::env::remove_var("CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT");
+        CLIENT_KEY.with(|k| k.borrow_mut().clear());
+        let r = check_method_budget(1);
+        assert!(
+            r.is_err(),
+            "REM-3: empty client_key must fail closed by default"
+        );
+        let err = r.expect_err("REM-3 fail-closed");
+        assert_eq!(err.code, jsonrpc_core::ErrorCode::ServerError(-32007));
+        assert!(
+            err.message.contains("attribution failed"),
+            "REM-3 error must mention attribution failure; got: {}",
+            err.message
+        );
+
+        // Sub-assertion 2: explicit opt-in via env var lets the request through.
+        std::env::set_var("CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT", "1");
+        CLIENT_KEY.with(|k| k.borrow_mut().clear());
+        let r = check_method_budget(1);
+        std::env::remove_var("CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT");
+        assert!(
+            r.is_ok(),
+            "REM-3: with CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT=1, empty client_key allowed"
+        );
     }
 }
