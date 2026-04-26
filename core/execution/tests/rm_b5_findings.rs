@@ -168,11 +168,11 @@ fn test_rem_n_03_inference_disabled_in_production() {
     let addr = Address(iaddr::MODEL_INFERENCE);
     let input = vec![0u8; 64];
     let result = precompile.execute(&addr, &input, 100_000);
-    assert!(
-        result.is_err(),
-        "REM-N-03: 0x0101 must be disabled under the production default"
-    );
-    let msg = format!("{}", result.unwrap_err());
+    let err = match result {
+        Ok(_) => panic!("REM-N-03: 0x0101 must be disabled under the production default"),
+        Err(e) => e,
+    };
+    let msg = format!("{}", err);
     assert!(
         msg.contains("C-01") && msg.contains("0x0101"),
         "REM-N-03: error must reference the C-01 gate; got {}",
