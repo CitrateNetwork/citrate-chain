@@ -1,37 +1,67 @@
 # M-API-01 — Producer-finality writes MUST use write_batch_sync.
 #
-# Audit finding (MEDIUM):
+# Audit findings:
 #   .audit/2026-04-24-full-repo-adversarial-audit/04_FINDINGS_API_NETWORK_STORAGE.md#m-api-01
+#   .audit/2026-04-25-reaudit/04_FINDINGS_API_NETWORK_STORAGE.md#rem-2
 #
-# Pre-fix all RocksDB writes used the default `WriteOptions { sync:
-# false }`. WAL is on, but writes return as soon as the OS buffer
-# accepts them. A power loss between block commit and OS flush
-# silently rolled back finalised state.
+# History:
+#   - Original audit (2026-04-24): MEDIUM. All RocksDB writes used
+#     `WriteOptions { sync: false }`. A power loss between block commit
+#     and OS flush silently rolled back finalised state.
+#   - Phase C remediation: added `RocksDB::write_batch_sync`, claimed
+#     M-API-01 closed.
+#   - Re-audit (2026-04-25): false-closure found (REM-2). Production
+#     code never called `write_batch_sync`. WP-H1.3 wired the producer
+#     paths and raised this rule from WARNING to ERROR.
 #
-# Post-fix `RocksDB::write_batch_sync(batch)` is available for
-# finalised-block commits. The producer is expected to use it for
-# the super-batch encompassing block + tx index + receipts.
+# Post-fix `RocksDB::write_batch_sync(batch)` is mandatory for
+# finalised-block commits — block, tx index, receipts, DAG persistence.
+# Acceptable non-sync callers (carved out below): caches, metrics, GC/
+# pruning, MVCC version persistence, and post-finality cleanup paths
+# (`delete_block`, `delete_transaction`).
 #
-# This rule fires when `write_batch` is called from the producer
-# crate (`node`) — flagging it as potentially needing the sync
-# variant. It's a heuristic — not every write needs sync — so
-# severity is WARNING.
+# Tripwire severity ERROR — any new producer-finality write that uses
+# the non-fsync `write_batch` blocks the build.
 
 rules:
   - id: m-api-01-producer-write-batch-no-sync
     message: >-
-      Producer-finality `write_batch` should be `write_batch_sync`
-      for durability against power loss (M-API-01). Pre-fix a power
-      loss between block commit and OS flush silently rolled back
-      finalised state.
+      Producer-finality `write_batch` MUST be `write_batch_sync` for
+      durability against power loss (M-API-01 / REM-2). Pre-fix a
+      power loss between block commit and OS flush silently rolled back
+      finalised state. If this is a non-finality write (cache, GC,
+      MVCC versions, post-finality cleanup), wrap the function head in
+      a comment carve-out or move it to a file outside the producer-
+      finality path filter; otherwise switch to `write_batch_sync`.
     languages: [rust]
-    severity: WARNING
+    severity: ERROR
+    metadata:
+      audit-id: REM-2
+      original-audit-id: M-API-01
+      wp: WP-H1.3
+      category: durability
     paths:
       include:
-        - "node/src/producer.rs"
-        - "core/storage/src/chain/block_store.rs"
+        - "**/node/src/producer.rs"
+        - "**/node/src/persistent_dag.rs"
+        - "**/core/storage/src/chain/block_store.rs"
+        - "**/core/storage/src/chain/transaction_store.rs"
       exclude:
         - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
     patterns:
       - pattern: $DB.write_batch($BATCH)
       - pattern-not: $DB.write_batch_sync($BATCH)
+      # Carve-out: post-finality cleanup paths legitimately use
+      # the non-fsync `write_batch`. Losing a deletion leaves an
+      # orphan key, not a state rollback. Reviewers modifying these
+      # functions should still consider whether durability matters.
+      - pattern-not-inside: |
+          pub fn delete_block(...) -> Result<()> {
+              ...
+          }
+      - pattern-not-inside: |
+          pub fn delete_transaction(...) -> Result<()> {
+              ...
+          }
