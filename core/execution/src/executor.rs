@@ -2,7 +2,7 @@
 
 use crate::metrics::{PRECOMPILE_CALLS_TOTAL, VM_EXECUTIONS_TOTAL, VM_GAS_USED};
 use crate::mvcc::{CommitCoordinator, JournalHandle, ScratchJournal, WriteSet};
-use crate::precompiles::{PrecompileExecutor, inference::InferencePrecompile};
+use crate::precompiles::{PrecompileExecutor, inference::{InferenceMode, InferencePrecompile}};
 use crate::inference::metal_runtime::MetalRuntime;
 use crate::state::StateDB;
 use crate::types::{
@@ -244,13 +244,49 @@ impl Executor {
         Self::with_chain_id(state_db, chain_id)
     }
 
-    /// Create a new executor with explicit chain ID
+    /// REM-N-03 / WP-H1.2: the production-default determinism mode for
+    /// the inference precompile. Production callers
+    /// (`Executor::with_chain_id`, `Executor::with_storage_and_chain_id`,
+    /// and `Executor::new`) construct the precompile in this mode.
+    /// Devnet / tests opt out via the `*_and_inference_mode` constructors
+    /// or the `--allow-nondeterministic-inference` CLI flag (gated
+    /// behind the `dev-mode` cargo feature on the node binary).
+    pub const fn production_inference_mode() -> InferenceMode {
+        InferenceMode::Strict
+    }
+
+    /// Create a new executor with explicit chain ID.
+    ///
+    /// REM-N-03 / WP-H1.2: in production, the inference precompile
+    /// (0x0101 MODEL_INFERENCE, 0x0102 BATCH_INFERENCE) defaults to
+    /// `InferenceMode::Strict` — calls return the C-01 gate error
+    /// rather than running non-deterministic FP inference. Devnet may
+    /// opt in via `with_chain_id_and_inference_mode` or via the
+    /// `--allow-nondeterministic-inference` CLI flag (gated behind the
+    /// `dev-mode` cargo feature on `node-app`).
     pub fn with_chain_id(state_db: Arc<StateDB>, chain_id: u64) -> Self {
+        Self::with_chain_id_and_inference_mode(
+            state_db,
+            chain_id,
+            Self::production_inference_mode(),
+        )
+    }
+
+    /// REM-N-03 / WP-H1.2: explicit-mode constructor. Tests and devnet
+    /// pass `InferenceMode::AllowNonDeterministic`; the production
+    /// `with_chain_id` constructor delegates here with
+    /// `InferenceMode::Strict`.
+    pub fn with_chain_id_and_inference_mode(
+        state_db: Arc<StateDB>,
+        chain_id: u64,
+        inference_mode: InferenceMode,
+    ) -> Self {
         // Initialize Metal runtime and precompiles if available
         let precompile_executor = if cfg!(target_os = "macos") {
             match MetalRuntime::new() {
                 Ok(runtime) => {
-                    let inference_precompile = InferencePrecompile::new(Arc::new(runtime));
+                    let inference_precompile =
+                        InferencePrecompile::new_with_mode(Arc::new(runtime), inference_mode);
                     let executor = PrecompileExecutor::new()
                         .with_inference(inference_precompile);
                     Some(Arc::new(tokio::sync::RwLock::new(executor)))
@@ -264,7 +300,10 @@ impl Executor {
             None
         };
 
-        info!("Executor initialized with chain_id: {}", chain_id);
+        info!(
+            "Executor initialized with chain_id: {} inference_mode: {:?}",
+            chain_id, inference_mode
+        );
 
         Self {
             state_db,
@@ -314,16 +353,40 @@ impl Executor {
         Self::with_storage_and_chain_id(state_db, state_store, chain_id)
     }
 
+    /// REM-N-03 / WP-H1.2: production-default constructor with
+    /// persistent state store. Defaults inference mode to
+    /// `InferenceMode::Strict`; devnet must opt in via
+    /// `with_storage_and_chain_id_and_inference_mode`.
     pub fn with_storage_and_chain_id<S: StateStoreTrait + 'static>(
         state_db: Arc<StateDB>,
         state_store: Option<Arc<S>>,
         chain_id: u64,
     ) -> Self {
+        Self::with_storage_and_chain_id_and_inference_mode(
+            state_db,
+            state_store,
+            chain_id,
+            Self::production_inference_mode(),
+        )
+    }
+
+    /// REM-N-03 / WP-H1.2: explicit-mode constructor with persistent
+    /// state store. Devnet / tests pass
+    /// `InferenceMode::AllowNonDeterministic`; production callers use
+    /// `with_storage_and_chain_id` which forwards
+    /// `InferenceMode::Strict`.
+    pub fn with_storage_and_chain_id_and_inference_mode<S: StateStoreTrait + 'static>(
+        state_db: Arc<StateDB>,
+        state_store: Option<Arc<S>>,
+        chain_id: u64,
+        inference_mode: InferenceMode,
+    ) -> Self {
         // Initialize Metal runtime and precompiles if available
         let precompile_executor = if cfg!(target_os = "macos") {
             match MetalRuntime::new() {
                 Ok(runtime) => {
-                    let inference_precompile = InferencePrecompile::new(Arc::new(runtime));
+                    let inference_precompile =
+                        InferencePrecompile::new_with_mode(Arc::new(runtime), inference_mode);
                     let executor = PrecompileExecutor::new()
                         .with_inference(inference_precompile);
                     Some(Arc::new(tokio::sync::RwLock::new(executor)))
@@ -337,7 +400,10 @@ impl Executor {
             None
         };
 
-        info!("Executor initialized with chain_id: {}", chain_id);
+        info!(
+            "Executor initialized with chain_id: {} inference_mode: {:?}",
+            chain_id, inference_mode
+        );
 
         // Sprint P950-A-4 WP-A.4.3: eager-load persisted MVCC versions
         // from RocksDB so per-account versions survive restart. The tracker

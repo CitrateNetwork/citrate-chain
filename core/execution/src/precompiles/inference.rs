@@ -84,6 +84,24 @@ pub struct ModelAccessEntry {
     pub policy: crate::types::AccessPolicy,
 }
 
+/// REM-N-03 / WP-H1.2 (audit C-01 follow-up): the inference precompile's
+/// determinism mode. Production paths construct the precompile in
+/// `Strict` mode so the non-deterministic AI precompiles (0x0101
+/// MODEL_INFERENCE, 0x0102 BATCH_INFERENCE) refuse to run until
+/// TEE-attested deterministic inference lands (CM-08). Devnet may opt
+/// in to `AllowNonDeterministic` via the
+/// `--allow-nondeterministic-inference` CLI flag, which is itself
+/// gated behind the `dev-mode` cargo feature on the node binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceMode {
+    /// Production default. 0x0101 / 0x0102 return a C-01 gate error.
+    Strict,
+    /// Devnet opt-in. The non-deterministic FP path runs as-is. Must
+    /// never be the production default; gated by `dev-mode` on the
+    /// node CLI surface.
+    AllowNonDeterministic,
+}
+
 /// Inference precompile implementation
 pub struct InferencePrecompile {
     runtime: Arc<MetalRuntime>,
@@ -105,24 +123,49 @@ pub struct InferencePrecompile {
 }
 
 impl InferencePrecompile {
+    /// Construct an `InferencePrecompile` in the legacy lenient mode.
+    ///
+    /// Direct callers (test harnesses that bypass `Executor`) get the
+    /// historical permissive behaviour — devnet / testnet continue to
+    /// work without code changes. Production callers MUST use
+    /// `Executor::with_chain_id` (or `Executor::with_chain_id_and_inference_mode`)
+    /// rather than constructing the precompile directly; those paths
+    /// default to `InferenceMode::Strict` per REM-N-03 / WP-H1.2.
     pub fn new(runtime: Arc<MetalRuntime>) -> Self {
+        Self::new_with_mode(runtime, InferenceMode::AllowNonDeterministic)
+    }
+
+    /// REM-N-03 / WP-H1.2: construct the precompile with an explicit
+    /// determinism mode. The production `Executor` constructor calls
+    /// this with `InferenceMode::Strict`; devnet opts in via
+    /// `InferenceMode::AllowNonDeterministic`.
+    pub fn new_with_mode(runtime: Arc<MetalRuntime>, mode: InferenceMode) -> Self {
         Self {
             runtime,
             model_cache: HashMap::new(),
             model_access: HashMap::new(),
-            // Default to `true` for now — devnet / testnet
-            // continue working out of the box. Mainnet config
-            // will set this to `false` via `with_strict_inference`.
-            allow_nondeterministic_inference: true,
+            allow_nondeterministic_inference: matches!(mode, InferenceMode::AllowNonDeterministic),
         }
     }
 
     /// RM-B1 / WP-B5.1 (audit C-01): disable the non-deterministic
     /// inference precompiles. Use on mainnet block-validation paths
     /// until TEE-attested deterministic inference is wired (CM-08).
+    ///
+    /// Retained for backward compatibility with the original C-01
+    /// test surface (`rm_b5_findings::c01_*`). New call sites should
+    /// prefer `new_with_mode(runtime, InferenceMode::Strict)`.
     pub fn with_strict_inference(mut self) -> Self {
         self.allow_nondeterministic_inference = false;
         self
+    }
+
+    /// REM-N-03 / WP-H1.2: predicate that returns `true` when the
+    /// non-deterministic AI precompiles are disabled. Used by the
+    /// regression test to guard against an inverted-boolean
+    /// regression of the production default.
+    pub fn is_strict(&self) -> bool {
+        !self.allow_nondeterministic_inference
     }
 
     /// Register access policy for a model (called at deploy time)
