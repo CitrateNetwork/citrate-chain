@@ -1,0 +1,39 @@
+# EXT-05 — content-script `postMessage('*')` tripwire.
+#
+# Audit: RM-G1.3 / EXT-05.
+#
+# Pre-fix `wallet-extension/js/content.js` posted dApp responses
+# via `window.postMessage(..., '*')`, which broadcasts the payload
+# (account addresses, signatures, RPC results) to every frame on
+# the page. Fix targets `window.location.origin` instead.
+#
+# This rule fires on any `*.js` file under `wallet-extension/`
+# that re-introduces the wildcard origin. The legacy
+# `popup/index.html` page is excluded because its `*` use is for
+# extension-internal frames talking to themselves.
+
+rules:
+  - id: ext-05-postmessage-wildcard
+    message: >-
+      `window.postMessage(..., '*')` broadcasts to any frame on the
+      page. Use `window.location.origin` (or a fixed allow-listed
+      origin) so only the intended target receives the payload.
+      Audit: RM-G1.3 / EXT-05.
+    languages: [javascript]
+    severity: ERROR
+    paths:
+      include:
+        - "wallet-extension/**/*.js"
+      exclude:
+        - "wallet-extension/popup/**"
+        - "wallet-extension/tests/**"
+    patterns:
+      - pattern-either:
+          - pattern: window.postMessage($MSG, "*")
+          - pattern: window.postMessage($MSG, '*')
+    metadata:
+      audit-id: EXT-05
+      severity: high
+      sprint: RM-G1
+      wp: WP-G1.4
+      spec: .agentile/planset/REMEDIATION_2026_04_24/16_PHASE_RM_G_CLEANUP.md
