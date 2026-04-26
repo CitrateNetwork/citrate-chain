@@ -527,8 +527,17 @@ jobs:
     # the node binaries and the Learning Center pilot binary, so a GUI failure
     # must block publication rather than silently produce a partial release.
     if: always() && needs.build-developer-bundles.result == 'success' && needs.build-core-gui.result == 'success' && needs.build-learning-center.result == 'success' && needs.build-compute-provider-bundles.result == 'success'
+    # RM-B1 / WP-F2.1 (audit REL-01, REL-02): cosign keyless + SBOM
+    # require `id-token: write` so the runner can mint a short-lived
+    # OIDC token Sigstore validates against this repo + workflow.
+    # `attestations: write` lets us publish SLSA-style build provenance
+    # alongside the artifacts.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      hashes: ${{ steps.hashes.outputs.hashes }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -549,11 +558,129 @@ jobs:
             --output-md "artifacts/release-navigator-${RELEASE_TAG}.md" \
             --output-json "artifacts/release-manifest-${RELEASE_TAG}.json"
 
+      # RM-B1 / WP-F2.1 (audit REL-01): keyless Sigstore signature on
+      # every shipped artifact. The cert chain is pinned to the
+      # GitHub-Actions-hosted runner OIDC issuer, so consumers can
+      # verify a binary was built by this exact workflow on this
+      # exact tag with:
+      #   cosign verify-blob \
+      #     --certificate-identity-regexp \
+      #       'https://github.com/<repo>/.github/workflows/release.yml@.+' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #     --signature <file>.sig --certificate <file>.pem <file>
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Sign all release artifacts with cosign (keyless)
+        run: |
+          set -euo pipefail
+          # Sign every file shipped in the release except the
+          # signature/cert outputs we are about to produce.
+          while IFS= read -r -d '' f; do
+            case "$f" in
+              *.sig|*.pem|*.cert) continue ;;
+            esac
+            echo "Signing $f"
+            cosign sign-blob \
+              --yes \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem" \
+              "$f"
+          done < <(find artifacts -type f -print0)
+
+      # RM-B1 / WP-F2.2 (audit REL-02): CycloneDX SBOM for the Rust
+      # workspace, packaged alongside the binaries. anchore/sbom-action
+      # does language detection and emits SPDX + CycloneDX in one pass.
+      - name: Generate workspace SBOM (CycloneDX + SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: citrate_v0.01.1
+          format: cyclonedx-json
+          output-file: artifacts/citrate-${{ env.RELEASE_TAG }}.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate workspace SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: citrate_v0.01.1
+          format: spdx-json
+          output-file: artifacts/citrate-${{ env.RELEASE_TAG }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Sign SBOMs with cosign
+        run: |
+          set -euo pipefail
+          for sbom in \
+            "artifacts/citrate-${RELEASE_TAG}.cdx.json" \
+            "artifacts/citrate-${RELEASE_TAG}.spdx.json"; do
+            cosign sign-blob \
+              --yes \
+              --output-signature "${sbom}.sig" \
+              --output-certificate "${sbom}.pem" \
+              "$sbom"
+          done
+
+      # RM-B1 / WP-F2.4 (SLSA-style build provenance): emit attestations
+      # for every binary so downstream consumers can verify the build
+      # chain via `gh attestation verify`. This uses the GitHub-native
+      # attestation API (writes to GHCR + the release) rather than the
+      # external SLSA generator workflow, so we don't need to wire up
+      # a reusable workflow call.
+      - name: Compute artifact hashes for attestation
+        id: hashes
+        run: |
+          set -euo pipefail
+          # Collect SHA256 of every shippable file (skipping
+          # signatures, certs, manifests, and SBOMs themselves).
+          {
+            find artifacts -type f \
+              ! -name "*.sig" \
+              ! -name "*.pem" \
+              ! -name "*.cert" \
+              ! -name "release-navigator-*.md" \
+              ! -name "release-manifest-*.json" \
+              ! -name "SHA256SUMS-*.txt" \
+              -print0 \
+              | xargs -0 sha256sum
+          } | base64 -w0 > /tmp/hashes.b64
+          echo "hashes=$(cat /tmp/hashes.b64)" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance for binaries
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            artifacts/**/citrate-node*
+            artifacts/**/citrate-cli*
+            artifacts/**/citrate-faucet*
+            artifacts/**/citrate-wallet*
+            artifacts/**/citrate-gui-native*
+            artifacts/**/citrate-learning-center*
+            artifacts/**/*.deb
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+
+      # SHA256SUMS is now produced AFTER signing + SBOM generation so
+      # the manifest covers every byte that ships in the release —
+      # including the .sig / .pem / .cdx.json / .spdx.json files.
+      # Consumers verify the manifest with `cosign verify-blob` against
+      # `SHA256SUMS-<tag>.txt.sig`.
       - name: Generate top-level SHA256 file
         run: |
           find artifacts -type f ! -name "SHA256SUMS-${RELEASE_TAG}.txt" -print0 \
             | sort -z \
             | xargs -0 sha256sum > "artifacts/SHA256SUMS-${RELEASE_TAG}.txt"
+
+      - name: Sign SHA256SUMS
+        run: |
+          cosign sign-blob \
+            --yes \
+            --output-signature "artifacts/SHA256SUMS-${RELEASE_TAG}.txt.sig" \
+            --output-certificate "artifacts/SHA256SUMS-${RELEASE_TAG}.txt.pem" \
+            "artifacts/SHA256SUMS-${RELEASE_TAG}.txt"
 
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
