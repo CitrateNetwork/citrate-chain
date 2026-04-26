@@ -14,6 +14,14 @@ contract ClassroomClusterV1 is IClassroomCluster {
     // ── Storage ──
 
     address public governance; // Multi-sig vault or admin address
+    // RM-L / WP-L1.1: two-step governance transfer. Pre-fix the
+    // contract had no transfer mechanism at all — if the genesis
+    // multisig was lost or compromised, governance was permanently
+    // locked. Pattern matches `Governable` semantics: `transferGovernance`
+    // proposes, the proposed account calls `acceptGovernance` to take
+    // effect, current governance can `cancelGovernanceTransfer` before
+    // acceptance.
+    address public pendingGovernance;
 
     mapping(address => OrgRole) private _orgRoles;
     mapping(uint256 => mapping(address => ClassroomRole)) private _classroomRoles;
@@ -56,6 +64,9 @@ contract ClassroomClusterV1 is IClassroomCluster {
     error InvalidTransfer();
     error ZeroAddress();
     error SuperAdminRequiresGovernance();
+    // RM-L / WP-L1.1
+    error NotPendingGovernance();
+    error NoPendingTransfer();
 
     // ── Modifiers ──
 
@@ -93,6 +104,46 @@ contract ClassroomClusterV1 is IClassroomCluster {
         _orgRoles[_governance] = OrgRole.SuperAdmin;
         // Governance starts as Active
         _accountStatus[_governance] = AccountStatus.Active;
+    }
+
+    // ── Governance Transfer (RM-L / WP-L1.1 — two-step) ──
+
+    event GovernanceTransferProposed(address indexed currentGovernance, address indexed pendingGovernance);
+    event GovernanceTransferred(address indexed previousGovernance, address indexed newGovernance);
+    event GovernanceTransferCancelled(address indexed pendingGovernance);
+
+    /// @notice Propose a new governance address. Only the current
+    /// governance can call. The proposed address must call
+    /// `acceptGovernance` for the transfer to take effect — there
+    /// is no atomic transfer.
+    function transferGovernance(address newGovernance) external onlyGovernance {
+        if (newGovernance == address(0)) revert ZeroAddress();
+        pendingGovernance = newGovernance;
+        emit GovernanceTransferProposed(governance, newGovernance);
+    }
+
+    /// @notice Cancel a pending governance transfer. Only the
+    /// current governance can call.
+    function cancelGovernanceTransfer() external onlyGovernance {
+        address prev = pendingGovernance;
+        if (prev == address(0)) revert NoPendingTransfer();
+        pendingGovernance = address(0);
+        emit GovernanceTransferCancelled(prev);
+    }
+
+    /// @notice Accept the proposed governance role. Only the
+    /// pending governance address can call.
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert NotPendingGovernance();
+        address previous = governance;
+        // Demote the previous SuperAdmin role; the new governance
+        // becomes the institution's SuperAdmin.
+        _orgRoles[previous] = OrgRole.None;
+        governance = msg.sender;
+        pendingGovernance = address(0);
+        _orgRoles[msg.sender] = OrgRole.SuperAdmin;
+        _accountStatus[msg.sender] = AccountStatus.Active;
+        emit GovernanceTransferred(previous, msg.sender);
     }
 
     // ── Views ──

@@ -7,6 +7,7 @@ import "./interfaces/IModelRegistry.sol";
 import "./interfaces/IModelMarketplace.sol";
 import "./lib/AccessControl.sol";
 import "./lib/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
 
 /**
  * @title ModelMarketplace
@@ -14,6 +15,13 @@ import "./lib/ReentrancyGuard.sol";
  * @dev Integrates with ModelRegistry for model management and provides marketplace functionality
  */
 contract ModelMarketplace is IModelMarketplace, AccessControl, ReentrancyGuard {
+    // RM-L / WP-L1.3: post-Istanbul gas-stipend hardening. The 2300-gas
+    // stipend on `transfer()` breaks every recipient that has a
+    // non-trivial fallback (multisigs, smart-account wallets, paymasters).
+    // `Address.sendValue` uses `.call{value:}` with full gas, reverts
+    // on failure, and combined with the existing CEI ordering and
+    // `nonReentrant` modifier preserves the security posture.
+    using Address for address payable;
 
     // Constants
     uint256 public constant MARKETPLACE_FEE_BASIS_POINTS = 250; // 2.5%
@@ -182,12 +190,12 @@ contract ModelMarketplace is IModelMarketplace, AccessControl, ReentrancyGuard {
         userPurchases[msg.sender][modelId] += quantity;
 
         // Transfer payments
-        payable(listing.owner).transfer(sellerAmount);
-        payable(treasuryAddress).transfer(marketplaceFee);
+        payable(listing.owner).sendValue(sellerAmount);
+        payable(treasuryAddress).sendValue(marketplaceFee);
 
         // Refund excess payment
         if (msg.value > totalPrice) {
-            payable(msg.sender).transfer(msg.value - totalPrice);
+            payable(msg.sender).sendValue(msg.value - totalPrice);
         }
 
         emit ModelPurchased(modelId, msg.sender, pricePerInference, quantity, bulkDiscount);
@@ -268,7 +276,7 @@ contract ModelMarketplace is IModelMarketplace, AccessControl, ReentrancyGuard {
             require(msg.sender == listing.owner, "Only owner can pay to feature model");
             require(msg.value >= FEATURED_FEE, "Insufficient fee for featuring");
 
-            payable(treasuryAddress).transfer(msg.value);
+            payable(treasuryAddress).sendValue(msg.value);
         }
 
         if (!listing.featured) {

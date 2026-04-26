@@ -636,4 +636,121 @@ contract ClassroomClusterV1Test is Test {
             );
         }
     }
+
+    // ===================================================================
+    // RM-L / WP-L1.1 — two-step governance transfer
+    // ===================================================================
+
+    function test_l1_1_transferGovernance_is_two_step() public {
+        address newGov = address(0xABCD);
+
+        // Step 1: current governance proposes.
+        vm.prank(governance);
+        cluster.transferGovernance(newGov);
+
+        // Pre-accept: pending is set, but governance() unchanged.
+        assertEq(cluster.pendingGovernance(), newGov);
+        assertEq(cluster.governance(), governance);
+
+        // Step 2: pending account accepts.
+        vm.prank(newGov);
+        cluster.acceptGovernance();
+
+        // Post-accept: governance moved, pending cleared, role
+        // transferred.
+        assertEq(cluster.governance(), newGov);
+        assertEq(cluster.pendingGovernance(), address(0));
+        assertEq(
+            uint256(cluster.getOrgRole(newGov)),
+            uint256(IClassroomCluster.OrgRole.SuperAdmin),
+            "L1.1: new governance becomes SuperAdmin"
+        );
+        // Old governance demoted to None — no implicit lingering authority.
+        assertEq(
+            uint256(cluster.getOrgRole(governance)),
+            uint256(IClassroomCluster.OrgRole.None),
+            "L1.1: old governance demoted on accept"
+        );
+    }
+
+    function test_l1_1_only_pending_can_accept() public {
+        address newGov = address(0xABCD);
+        address other = address(0xDEAD);
+
+        vm.prank(governance);
+        cluster.transferGovernance(newGov);
+
+        // Random non-pending address cannot accept.
+        vm.prank(other);
+        vm.expectRevert(ClassroomClusterV1.NotPendingGovernance.selector);
+        cluster.acceptGovernance();
+
+        assertEq(cluster.governance(), governance);
+    }
+
+    function test_l1_1_cancel_governance_transfer() public {
+        address newGov = address(0xABCD);
+
+        vm.prank(governance);
+        cluster.transferGovernance(newGov);
+        assertEq(cluster.pendingGovernance(), newGov);
+
+        vm.prank(governance);
+        cluster.cancelGovernanceTransfer();
+        assertEq(cluster.pendingGovernance(), address(0));
+
+        // Now the pending address cannot accept.
+        vm.prank(newGov);
+        vm.expectRevert(ClassroomClusterV1.NotPendingGovernance.selector);
+        cluster.acceptGovernance();
+    }
+
+    function test_l1_1_only_governance_can_propose() public {
+        vm.prank(admin);
+        vm.expectRevert(ClassroomClusterV1.NotGovernance.selector);
+        cluster.transferGovernance(address(0xABCD));
+    }
+
+    function test_l1_1_only_governance_can_cancel() public {
+        vm.prank(governance);
+        cluster.transferGovernance(address(0xABCD));
+
+        vm.prank(admin);
+        vm.expectRevert(ClassroomClusterV1.NotGovernance.selector);
+        cluster.cancelGovernanceTransfer();
+    }
+
+    function test_l1_1_cannotTransferToZero() public {
+        vm.prank(governance);
+        vm.expectRevert(ClassroomClusterV1.ZeroAddress.selector);
+        cluster.transferGovernance(address(0));
+    }
+
+    function test_l1_1_cancel_with_no_pending_reverts() public {
+        vm.prank(governance);
+        vm.expectRevert(ClassroomClusterV1.NoPendingTransfer.selector);
+        cluster.cancelGovernanceTransfer();
+    }
+
+    function test_l1_1_old_governance_loses_authority_post_accept() public {
+        address newGov = address(0xABCD);
+        vm.prank(governance);
+        cluster.transferGovernance(newGov);
+        vm.prank(newGov);
+        cluster.acceptGovernance();
+
+        // The old governance address should no longer be able to
+        // grant SuperAdmin (which requires the governance modifier).
+        vm.prank(governance);
+        vm.expectRevert(ClassroomClusterV1.SuperAdminRequiresGovernance.selector);
+        cluster.grantOrgRole(address(0xCAFE), IClassroomCluster.OrgRole.SuperAdmin);
+
+        // The new governance can.
+        vm.prank(newGov);
+        cluster.grantOrgRole(address(0xCAFE), IClassroomCluster.OrgRole.SuperAdmin);
+        assertEq(
+            uint256(cluster.getOrgRole(address(0xCAFE))),
+            uint256(IClassroomCluster.OrgRole.SuperAdmin)
+        );
+    }
 }

@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import "../src/SpecRegistry.sol";
+import "../src/lib/Governable.sol";
 
 contract SpecRegistryTest is Test {
     SpecRegistry public registry;
@@ -12,7 +13,10 @@ contract SpecRegistryTest is Test {
     function setUp() public {
         governor = address(this);
         nonGovernor = address(0xBEEF);
-        registry = new SpecRegistry();
+        // RM-L / WP-L1.1: SpecRegistry now requires governance address
+        // at deploy. Pre-fix the constructor took no args and used
+        // msg.sender; now it inherits Governable's two-step transfer.
+        registry = new SpecRegistry(governor);
     }
 
     // ── Registration ────────────────────────────────────────────────
@@ -51,7 +55,7 @@ contract SpecRegistryTest is Test {
 
     function test_nonGovernorCannotRegister() public {
         vm.prank(nonGovernor);
-        vm.expectRevert("Only governor can modify specs");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         registry.registerSpec("test", "Qm1");
     }
 
@@ -109,25 +113,71 @@ contract SpecRegistryTest is Test {
         registry.reactivateSpec("test");
     }
 
-    // ── Governance ──────────────────────────────────────────────────
+    // ── Governance (RM-L / WP-L1.1 — two-step transfer) ─────────────
 
-    function test_transferGovernor() public {
+    function test_l1_1_transferGovernance_is_two_step() public {
         address newGov = address(0x1234);
-        registry.transferGovernor(newGov);
-        assertEq(registry.governor(), newGov);
-
-        // Old governor can no longer register
-        vm.expectRevert("Only governor can modify specs");
+        // Step 1: propose
+        registry.transferGovernance(newGov);
+        // Old governor still has authority — propose alone does not
+        // transfer.
+        assertEq(registry.governance(), governor, "L1.1: pre-accept governance unchanged");
+        // Old governor can still register specs (still authoritative).
         registry.registerSpec("test", "Qm1");
+        assertEq(registry.domainCount(), 1);
 
-        // New governor can
+        // Step 2: pending governance accepts
         vm.prank(newGov);
-        registry.registerSpec("test", "Qm1");
+        registry.acceptGovernance();
+        assertEq(registry.governance(), newGov, "L1.1: post-accept governance moved");
+
+        // Old governor can no longer register.
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
+        registry.registerSpec("test2", "Qm2");
+
+        // New governor can.
+        vm.prank(newGov);
+        registry.registerSpec("test2", "Qm2");
     }
 
-    function test_cannotTransferToZero() public {
-        vm.expectRevert("Cannot transfer to zero address");
-        registry.transferGovernor(address(0));
+    function test_l1_1_pending_only_accept_works() public {
+        address newGov = address(0x1234);
+        address other = address(0xCAFE);
+        registry.transferGovernance(newGov);
+
+        // Random non-pending address cannot accept.
+        vm.prank(other);
+        vm.expectRevert(Governable.Governable_NotPendingGovernance.selector);
+        registry.acceptGovernance();
+
+        // The pending address can.
+        vm.prank(newGov);
+        registry.acceptGovernance();
+        assertEq(registry.governance(), newGov);
+    }
+
+    function test_l1_1_cancel_governance_transfer() public {
+        address newGov = address(0x1234);
+        registry.transferGovernance(newGov);
+        // Current governor can cancel.
+        registry.cancelGovernanceTransfer();
+        // Now `acceptGovernance` from the proposed address fails.
+        vm.prank(newGov);
+        vm.expectRevert(Governable.Governable_NotPendingGovernance.selector);
+        registry.acceptGovernance();
+        // Original governor remains.
+        assertEq(registry.governance(), governor);
+    }
+
+    function test_l1_1_cannotTransferToZero() public {
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
+        registry.transferGovernance(address(0));
+    }
+
+    function test_l1_1_only_governance_can_propose() public {
+        vm.prank(nonGovernor);
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
+        registry.transferGovernance(address(0xBEEF));
     }
 
     // ── View Functions ──────────────────────────────────────────────

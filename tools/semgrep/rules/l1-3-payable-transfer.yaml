@@ -1,0 +1,52 @@
+# RM-L / WP-L1.3 — push-payment via `payable(_).transfer(_)` / `.send(_)` tripwire.
+#
+# Audit: WP-L1.3.
+#
+# Pre-fix `ModelMarketplace` and `ModelAccessControl` shipped seven
+# `payable(addr).transfer(amount)` call sites. The 2300-gas stipend
+# breaks any recipient that has a non-trivial fallback (multisigs,
+# smart-account wallets, paymasters). RM-L1.3 migrated all 7 to
+# `Address.sendValue` (full gas, revert-on-failure) paired with
+# `nonReentrant` + CEI ordering.
+#
+# This rule fires on any new `payable(_).transfer(_)` or
+# `address.send(_)` introduced in `contracts/src/`. Prefer
+# `Address.sendValue` from OpenZeppelin's `Address` library, or
+# the pull-payment pattern (`pendingWithdrawals[_]` + a separate
+# `withdraw()` function) for higher-stakes flows.
+
+rules:
+  - id: l1-3-payable-transfer
+    message: >-
+      `payable(addr).transfer(_)` and `addr.send(_)` forward only the
+      2300-gas stipend, which breaks recipients with non-trivial
+      fallbacks (multisigs, smart-account wallets). Use
+      `Address.sendValue` (OZ) inside a `nonReentrant` function with
+      CEI ordering, OR adopt the pull-payment pattern. Audit:
+      RM-L / WP-L1.3.
+    languages: [solidity]
+    severity: ERROR
+    paths:
+      include:
+        - "contracts/src/**/*.sol"
+      exclude:
+        # Vendored libraries.
+        - "contracts/src/lib/**"
+        # OpenZeppelin pulls in via foundry remappings; do not lint.
+        - "contracts/lib/**"
+    patterns:
+      - pattern-either:
+          - pattern: payable($X).transfer($Y)
+          - pattern: $X.send($Y)
+    metadata:
+      audit-id: WP-L1.3
+      severity: high
+      sprint: RM-L1
+      wp: WP-L1.3
+      spec: .agentile/planset/REMEDIATION_2026_04_26_PUBLIC_TESTNET/12_PHASE_RM_L_TIER_TWO_PRE_MAINNET.md
+      remediation: >-
+        Replace with `Address.sendValue(payable(addr), amount)` from
+        OpenZeppelin's `@openzeppelin/contracts/utils/Address.sol`,
+        ensuring the calling function carries `nonReentrant` and
+        follows checks-effects-interactions. For higher-stakes
+        recipients, prefer the pull-payment pattern.

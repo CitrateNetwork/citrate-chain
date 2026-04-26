@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /**
@@ -11,6 +12,11 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
  * @dev Integrates with state precompile at 0x...1000 and runtime precompiles at 0x0100-0x0106
  */
 contract ModelAccessControl is Ownable, ReentrancyGuard {
+    // RM-L / WP-L1.3: post-Istanbul gas-stipend hardening — see
+    // ModelMarketplace for the full rationale. `Address.sendValue`
+    // replaces `.transfer()` with `.call{value:}` + revert-on-failure
+    // and full-gas semantics so multisig recipients work.
+    using Address for address payable;
     using ECDSA for bytes32;
 
     // ============ Constants ============
@@ -425,10 +431,16 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
     /**
      * @notice Unstake tokens
      */
-    function unstake(bytes32 modelId, uint256 amount) external {
+    /// @dev RM-L / WP-L1.3: added `nonReentrant`. The state effect
+    /// (subtracting from `userStakes`) is followed by a value
+    /// transfer; without the reentrancy guard a malicious recipient
+    /// fallback could re-enter `unstake` between the storage write
+    /// and the tx commit. CEI ordering is correct (state before
+    /// transfer); `nonReentrant` is defense-in-depth.
+    function unstake(bytes32 modelId, uint256 amount) external nonReentrant {
         require(userStakes[msg.sender][modelId] >= amount, "Insufficient stake");
         userStakes[msg.sender][modelId] -= amount;
-        payable(msg.sender).transfer(amount);
+        payable(msg.sender).sendValue(amount);
     }
 
     // ============ Revenue Management ============
@@ -441,7 +453,7 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
         require(amount > 0, "No pending withdrawals");
 
         pendingWithdrawals[msg.sender] = 0;
-        payable(msg.sender).transfer(amount);
+        payable(msg.sender).sendValue(amount);
 
         emit RevenueWithdrawn(msg.sender, amount);
     }
@@ -525,8 +537,8 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
     /**
      * @notice Emergency pause (only owner)
      */
-    function emergencyWithdraw() external onlyOwner {
-        payable(owner()).transfer(address(this).balance);
+    function emergencyWithdraw() external onlyOwner nonReentrant {
+        payable(owner()).sendValue(address(this).balance);
     }
 
     /**

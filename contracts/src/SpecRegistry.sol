@@ -1,13 +1,22 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import "./lib/Governable.sol";
+
 /// @title SpecRegistry
 /// @notice On-chain registry mapping operation domains to behavioral specifications
 /// stored on IPFS as Gherkin feature files. Agents MUST check relevant specs
 /// before executing critical on-chain operations.
 ///
 /// Sprint HARDEN — WP-H.14
-contract SpecRegistry {
+/// RM-L / WP-L1.1: migrated to the standardized `Governable` two-step
+/// transfer mixin. Pre-migration the contract had its own
+/// `transferGovernor(newGovernor)` that wrote the new address atomically
+/// — a mistyped or revoked-key successor silently locked governance
+/// forever. Post-migration the new account must call
+/// `acceptGovernance()` to take effect; `cancelGovernanceTransfer()`
+/// is also available before acceptance.
+contract SpecRegistry is Governable {
     struct Spec {
         string domain;          // e.g., "contract_deploy", "token_transfer"
         string cid;             // IPFS CID of the Gherkin .feature file
@@ -26,8 +35,10 @@ contract SpecRegistry {
     /// Domain count
     uint256 public domainCount;
 
-    /// Governance: who can register/update specs
-    address public governor;
+    // RM-L / WP-L1.1: `governor` field removed; `governance()` from
+    // the Governable mixin is the single source of truth.
+    // `onlyGovernor` modifier removed; `onlyGovernance` from the mixin
+    // is used throughout.
 
     // ── Events ──────────────────────────────────────────────────────
 
@@ -35,20 +46,15 @@ contract SpecRegistry {
     event SpecUpdated(string indexed domain, string oldCid, string newCid, uint256 version);
     event SpecDeactivated(string indexed domain);
     event SpecReactivated(string indexed domain);
-    event GovernorTransferred(address indexed oldGovernor, address indexed newGovernor);
-
-    // ── Modifiers ───────────────────────────────────────────────────
-
-    modifier onlyGovernor() {
-        require(msg.sender == governor, "Only governor can modify specs");
-        _;
-    }
+    // RM-L / WP-L1.1: `GovernorTransferred` removed. Governable emits
+    // `GovernanceTransferProposed`, `GovernanceTransferred`, and
+    // `GovernanceTransferCancelled` for the two-step semantics.
 
     // ── Constructor ─────────────────────────────────────────────────
 
-    constructor() {
-        governor = msg.sender;
-    }
+    /// @param initialGovernance Initial governance address (typically the
+    /// deployer or the multisig per RM-L1.6 genesis runbook).
+    constructor(address initialGovernance) Governable(initialGovernance) {}
 
     // ── Core Functions ──────────────────────────────────────────────
 
@@ -58,7 +64,7 @@ contract SpecRegistry {
     function registerSpec(
         string calldata domain,
         string calldata cid
-    ) external onlyGovernor {
+    ) external onlyGovernance {
         require(bytes(domain).length > 0, "Domain cannot be empty");
         require(bytes(cid).length > 0, "CID cannot be empty");
         require(bytes(specs[domain].domain).length == 0, "Domain already registered");
@@ -84,7 +90,7 @@ contract SpecRegistry {
     function updateSpec(
         string calldata domain,
         string calldata newCid
-    ) external onlyGovernor {
+    ) external onlyGovernance {
         require(bytes(specs[domain].domain).length > 0, "Domain not registered");
         require(bytes(newCid).length > 0, "CID cannot be empty");
 
@@ -96,7 +102,7 @@ contract SpecRegistry {
     }
 
     /// @notice Deactivate a spec (agents should skip checking)
-    function deactivateSpec(string calldata domain) external onlyGovernor {
+    function deactivateSpec(string calldata domain) external onlyGovernance {
         require(bytes(specs[domain].domain).length > 0, "Domain not registered");
         require(specs[domain].active, "Already deactivated");
         specs[domain].active = false;
@@ -104,19 +110,21 @@ contract SpecRegistry {
     }
 
     /// @notice Reactivate a deactivated spec
-    function reactivateSpec(string calldata domain) external onlyGovernor {
+    function reactivateSpec(string calldata domain) external onlyGovernance {
         require(bytes(specs[domain].domain).length > 0, "Domain not registered");
         require(!specs[domain].active, "Already active");
         specs[domain].active = true;
         emit SpecReactivated(domain);
     }
 
-    /// @notice Transfer governance to a new address
-    function transferGovernor(address newGovernor) external onlyGovernor {
-        require(newGovernor != address(0), "Cannot transfer to zero address");
-        emit GovernorTransferred(governor, newGovernor);
-        governor = newGovernor;
-    }
+    // RM-L / WP-L1.1: legacy `transferGovernor` removed. Use the
+    // two-step pattern from `Governable`:
+    //   1. current governance calls `transferGovernance(newAddr)`
+    //      → emits `GovernanceTransferProposed`,
+    //   2. the proposed address calls `acceptGovernance()`
+    //      → emits `GovernanceTransferred`,
+    //   3. or current governance calls `cancelGovernanceTransfer()`
+    //      before acceptance.
 
     // ── View Functions ──────────────────────────────────────────────
 
