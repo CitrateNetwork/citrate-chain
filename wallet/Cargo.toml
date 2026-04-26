@@ -12,6 +12,15 @@ path = "src/main.rs"
 citrate-consensus = { path = "../core/consensus" }
 citrate-execution = { path = "../core/execution" }
 
+# RM-G2.1 (audit CX-01, WAL-03): the canonical keystore lives in
+# `citrate-wallet-core::KeyManager`. The legacy `wallet::KeyStore`
+# (this crate) is read-only as of RM-G2.1 — the migrator at
+# `wallet::keystore::migrate_to_unified_keystore` re-encrypts every
+# entry into the wallet-core format. Re-introducing
+# `wallet::KeyStore` writes in new code is forbidden by the
+# `wal-03-dual-keystore` Semgrep rule.
+citrate-wallet-core = { path = "../wallet-core" }
+
 # Crypto
 ed25519-dalek = "2.0"
 rand = { workspace = true }
@@ -68,3 +77,7 @@ path = "tests/known_answer_tests.rs"
 [[test]]
 name = "coverage_98"
 path = "tests/coverage_98.rs"
+
+[[test]]
+name = "rm_g2_1_keystore_migration"
+path = "tests/rm_g2_1_keystore_migration.rs"
