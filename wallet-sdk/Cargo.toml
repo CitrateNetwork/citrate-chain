@@ -24,6 +24,14 @@ tokio = { version = "1", features = ["sync"] }
 # WP-A1.5 (audit findings WAL-01, EXT-01).
 argon2 = "0.5"
 
+# RM-G1.5 (audit finding EXT-10): expose constant-time secp256k1
+# ECDSA signing + public-key derivation via WASM. Replaces the
+# hand-rolled BigInt secp256k1 in `wallet-extension/js/crypto.js`.
+# Same crate the desktop wallet (wallet-core) already uses, so the
+# resulting signatures are byte-for-byte compatible.
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
+
 # WP-A2.3 (audit finding WAL-04): expose Zeroizing<String> for the async
 # create_account / recover surfaces.
 zeroize = { version = "1.7", features = ["zeroize_derive"] }
