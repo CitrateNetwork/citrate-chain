@@ -1,0 +1,60 @@
+# EXT-06 — connect-flow tripwire: surface a popup confirm.
+#
+# Audit: RM-G1.3 / EXT-06.
+#
+# The pre-fix `connectDApp` returned `{ pending: true }` and
+# expected the user to approve via the Settings UI on their own
+# initiative. RM-G1.3 introduced an explicit popup at
+# `popup/connect.html`, opened via `chrome.windows.create` from
+# `background.js::openApprovalPopup`.
+#
+# This rule fires if any future change to the connect-flow code
+# removes the `chrome.windows.create` call, OR adds a new connect
+# handler that auto-resolves to `connected: true` without going
+# through the approval dance.
+
+rules:
+  - id: ext-06-connect-without-popup
+    message: >-
+      `connectDApp` (or any equivalent handler that approves a new
+      origin) MUST surface a popup confirm via
+      `chrome.windows.create`. Auto-approving is forbidden — the
+      user has to see the requesting origin before consenting.
+      Audit: RM-G1.3 / EXT-06.
+    languages: [javascript]
+    severity: ERROR
+    paths:
+      include:
+        - "wallet-extension/js/background.js"
+      exclude:
+        - "wallet-extension/tests/**"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              async function connectDApp($ORIGIN, $TAB) {
+                ...
+                connectedOrigins.add($ORIGIN);
+                return { connected: true, ... };
+              }
+          - pattern: |
+              function connectDApp($ORIGIN, $TAB) {
+                ...
+                connectedOrigins.add($ORIGIN);
+                return { connected: true, ... };
+              }
+      # Whitelist the legitimate happy path — when the origin was
+      # already in `approvedOrigins` we DO add it to the in-memory
+      # set without re-prompting. The patterns above don't match
+      # that branch because it goes through the early-return after
+      # `approved.includes(origin)`.
+      - pattern-not: |
+          if ($APPROVED.includes($ORIGIN)) {
+            connectedOrigins.add($ORIGIN);
+            return { connected: true, $... };
+          }
+    metadata:
+      audit-id: EXT-06
+      severity: high
+      sprint: RM-G1
+      wp: WP-G1.5
+      spec: .agentile/planset/REMEDIATION_2026_04_24/16_PHASE_RM_G_CLEANUP.md
