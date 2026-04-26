@@ -167,6 +167,10 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
         bytes32 modelHash,
         bytes32 indexed kidHash
     );
+    /// Emitted on every `submitAttestationStrict` call to give
+    /// off-chain monitors a signal for migration progress to the
+    /// `submitAttestationStrictBound` variant. Audit SOL-05 follow-on.
+    event UnboundStrictDeprecatedUsed(address indexed worker, bytes32 indexed kidHash);
 
     // `onlyGovernance` is inherited from Governable.
 
@@ -220,6 +224,16 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
     /// on-chain via RS256. The NRAS side is still a governance-trusted
     /// signer hash (P384 verification deferred — see ADR-010
     /// §"P384 deferred").
+    ///
+    /// @dev DEPRECATED — new integrations should call
+    ///      `submitAttestationStrictBound`, which additionally binds
+    ///      the on-chain `vmMeasurement` to actual JWT payload content
+    ///      via `JWTParser`. This unbound variant trusts the caller's
+    ///      `vmMeasurement` parameter; an attacker holding ANY valid
+    ///      MAA JWT could substitute an unrelated measurement (audit
+    ///      SOL-05). Existing callers (`training-worker/src/attestation.rs`)
+    ///      will be migrated in a coordinated rollout. New callers
+    ///      MUST use the Bound variant.
     ///
     /// The caller passes:
     /// - `signedJwtPayload`: the bytes that were RS256-signed. By
@@ -297,6 +311,10 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
             modelHash,
             kidHash
         );
+        // RM-D3 follow-on (audit SOL-05): off-chain migration
+        // signal — every legacy strict call emits this event so
+        // dashboards can track progress to the Bound variant.
+        emit UnboundStrictDeprecatedUsed(msg.sender, kidHash);
     }
 
     /// @notice JWT-content-bound strict submission. In addition to

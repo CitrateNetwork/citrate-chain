@@ -1,0 +1,66 @@
+# SOL-05 follow-on — new callers must use submitAttestationStrictBound.
+#
+# Audit finding (HIGH):
+#   .audit/2026-04-24-full-repo-adversarial-audit/06_FINDINGS_SOLIDITY_CONTRACTS.md#sol-05
+#
+# Spec (canonical):
+#   .agentile/planset/REMEDIATION_2026_04_24/13_PHASE_RM_D_CONTRACTS.md
+#   §"Sprint RM-D3 — TEE V2 JWT-payload binding + RS256 hardening"
+#
+# Phase D introduced `submitAttestationStrictBound`, which binds the
+# on-chain `vmMeasurement` to the JWT payload via `JWTParser`.
+# The pre-existing `submitAttestationStrict` was retained as a
+# transitional path so the existing `training-worker` consumer
+# wouldn't break.
+#
+# This rule fires when ANY new caller of `submitAttestationStrict`
+# is added in the workspace. The single permitted caller is
+# `training-worker/src/attestation.rs`, listed in `paths.exclude`.
+# When that caller migrates to the Bound variant, the exclude
+# entry should be deleted and this rule will catch any regression.
+
+rules:
+  - id: sol-05-prefer-strict-bound-rust
+    message: >-
+      `submitAttestationStrict` is deprecated. New Rust callers must
+      use `submitAttestationStrictBound`, which binds the on-chain
+      `vmMeasurement` to actual JWT payload content (audit SOL-05).
+      See .agentile/planset/REMEDIATION_2026_04_24/13_PHASE_RM_D_CONTRACTS.md.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/*_test.rs"
+        - "**/*_tests.rs"
+        - "training-worker/src/attestation.rs"  # legacy caller, migration tracked
+    patterns:
+      - pattern-either:
+          - pattern: |
+              "submitAttestationStrict(bytes,bytes,bytes32,bytes32,bytes32,bytes32,bytes32)"
+          - pattern: |
+              keccak256("submitAttestationStrict(bytes,bytes,bytes32,bytes32,bytes32,bytes32,bytes32)")
+
+  - id: sol-05-prefer-strict-bound-solidity
+    message: >-
+      `submitAttestationStrict` is deprecated. New Solidity integrations
+      must call `submitAttestationStrictBound` instead.
+    languages: [solidity]
+    severity: ERROR
+    paths:
+      include:
+        - "contracts/src/**/*.sol"
+      exclude:
+        - "contracts/src/TEEAttestationRegistry.sol"  # the function itself
+        - "contracts/test/**"
+    patterns:
+      - pattern: |
+          $REGISTRY.submitAttestationStrict($A, $B, $C, $D, $E, $F, $G)
+    metadata:
+      audit-id: SOL-05
+      severity: high
+      sprint: RM-D3
+      wp: WP-D3.4
+      spec: .agentile/planset/REMEDIATION_2026_04_24/13_PHASE_RM_D_CONTRACTS.md
