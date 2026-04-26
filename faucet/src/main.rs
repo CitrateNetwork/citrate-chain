@@ -15,7 +15,7 @@ use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
 mod cooldowns;
-use cooldowns::{CooldownDenial, CooldownPolicy, Cooldowns};
+use cooldowns::{CooldownPolicy, Cooldowns};
 
 mod turnstile;
 use turnstile::TurnstileVerifier;

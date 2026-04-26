@@ -2,11 +2,20 @@ name: Fuzz Testing (manual)
 
 on:
   workflow_dispatch:
+  # RM-B1 / WP-F3.6 (audit CI-13): nightly schedule.
+  schedule:
+    - cron: '0 2 * * *'
+
+# RM-B1 / WP-F1.1 (audit CI-01): minimum permissions at workflow level.
+permissions:
+  contents: read
 
 jobs:
   fuzz:
     name: Fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -20,7 +29,8 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+        # RM-B1 / WP-F1.4 (audit CI-08, CI-10): --locked install.
+        run: cargo install cargo-fuzz --locked
 
       - name: Run fuzzer (5 minutes)
         working-directory: citrate_v0.01.1/fuzz

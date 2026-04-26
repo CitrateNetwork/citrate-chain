@@ -1,12 +1,21 @@
-name: Security Audit (manual)
+name: Security Audit
 
 on:
   workflow_dispatch:
+  # RM-B1 / WP-F3.6 (audit CI-13): nightly schedule.
+  schedule:
+    - cron: '0 2 * * *'
+
+# RM-B1 / WP-F1.1 (audit CI-01): minimum permissions at workflow level.
+permissions:
+  contents: read
 
 jobs:
   cargo-audit:
     name: Dependency Vulnerability Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: citrate_v0.01.1
@@ -18,3 +27,22 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Run cargo-audit
         run: cargo audit
+
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: citrate_v0.01.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Run cargo-deny check
+        # RM-B1 / WP-F3.1 (audit SUP-10): fail closed on
+        # license / advisory / banned-dep violations.
+        run: cargo deny check

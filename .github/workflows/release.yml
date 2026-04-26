@@ -25,10 +25,17 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
   RELEASE_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true && 'false' || 'true' }}
 
+# RM-B1 / WP-F1.1 (audit CI-01): minimum permissions at workflow level.
+# The publish job widens to `contents: write` for the GitHub Release.
+permissions:
+  contents: read
+
 jobs:
   build-developer-bundles:
     name: Build Developer Bundle (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -65,8 +72,10 @@ jobs:
         run: choco install llvm cmake -y
 
       - name: Build release binaries
+        # RM-B1 / WP-F1.4 (audit REL-05): --locked for reproducible
+        # builds. Same Cargo.lock = same binary checksums.
         run: |
-          cargo build --release -p citrate-node -p citrate-cli -p citrate-wallet -p citrate-faucet
+          cargo build --locked --release -p citrate-node -p citrate-cli -p citrate-wallet -p citrate-faucet
 
       - name: Package developer bundle (Linux/macOS)
         if: runner.os != 'Windows'
@@ -143,6 +152,8 @@ jobs:
   build-core-gui:
     name: Build Core GUI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -264,6 +275,8 @@ jobs:
   build-learning-center:
     name: Build Learning Center (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -401,6 +414,8 @@ jobs:
   build-compute-provider-bundles:
     name: Build Compute Provider Bundle (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:

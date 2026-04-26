@@ -19,13 +19,16 @@ on:
       - 'citrate_v0.01.1/**/build.rs'
       - '.github/workflows/rust-ci.yml'
 
-<<<<<<< Updated upstream
+# RM-B1 / WP-F1.1 (audit CI-01): workflow-level minimum permissions.
+# `contents: read` is the default-deny baseline; jobs that need
+# more (release, sdk-publish) override at job level.
+permissions:
+  contents: read
+
 concurrency:
   group: rust-ci-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
-=======
->>>>>>> Stashed changes
 env:
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: 0
@@ -34,6 +37,8 @@ env:
 jobs:
   core-workspace:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: citrate_v0.01.1
@@ -62,18 +67,19 @@ jobs:
             ~/.cargo/git
           key: rust-ci-${{ runner.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
           restore-keys: rust-ci-${{ runner.os }}-
-<<<<<<< Updated upstream
-      - name: Run core workspace tests
-        run: cargo test --workspace --quiet --exclude citrate-edu-app --exclude citrate-learning-center
-=======
+      # RM-B1 / WP-F1.4 (audit CI-08, CI-10, REL-05): every cargo
+      # invocation runs `--locked` so a transient registry hiccup
+      # (or a malicious lockfile-bumping action) can't silently
+      # introduce a new dependency version.
       - name: Build tests (no run)
-        run: cargo test --workspace --no-run
-      - name: Run tests
-        run: cargo test --workspace --quiet
->>>>>>> Stashed changes
+        run: cargo test --workspace --no-run --locked --exclude citrate-edu-app --exclude citrate-learning-center
+      - name: Run core workspace tests
+        run: cargo test --workspace --quiet --locked --exclude citrate-edu-app --exclude citrate-learning-center
 
   verifier-tests:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: citrate_v0.01.1
@@ -88,12 +94,14 @@ jobs:
       - name: Show toolchain
         run: rustc -Vv && cargo -V
       - name: Build citrate-api with verifier feature
-        run: cargo build -p citrate-api --features verifier-ethers-solc
+        run: cargo build --locked -p citrate-api --features verifier-ethers-solc
       - name: Run citrate-api tests with verifier feature
-        run: cargo test -p citrate-api --features verifier-ethers-solc -- --nocapture
+        run: cargo test --locked -p citrate-api --features verifier-ethers-solc -- --nocapture
 
   learning-center:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: citrate_v0.01.1
@@ -104,11 +112,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-<<<<<<< Updated upstream
           sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config xvfb libfontconfig1-dev
-=======
-          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config xvfb
->>>>>>> Stashed changes
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -118,13 +122,13 @@ jobs:
           key: lc-ci-${{ runner.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
           restore-keys: lc-ci-${{ runner.os }}-
       - name: Check citrate-edu-app (0 warnings)
-        run: cargo check -p citrate-edu-app
+        run: cargo check --locked -p citrate-edu-app
       - name: Check citrate-learning-center (0 warnings)
-        run: cargo check -p citrate-learning-center
+        run: cargo check --locked -p citrate-learning-center
       - name: Test citrate-edu-app (127+ tests)
-        run: cargo test -p citrate-edu-app
+        run: cargo test --locked -p citrate-edu-app
       - name: Test citrate-learning-center visual snapshots
-        run: xvfb-run -a cargo test -p citrate-learning-center -- visual
+        run: xvfb-run -a cargo test --locked -p citrate-learning-center -- visual
       - name: Zero unwraps audit
         run: |
           count=$(grep -rn '\.unwrap()' gui/citrate_edu_app/src/ gui/citrate_learning_center/src/ 2>/dev/null | wc -l)
@@ -136,7 +140,7 @@ jobs:
           if [ "$count" -gt 0 ]; then echo "FAIL: $count stubs found"; exit 1; fi
           echo "PASS: 0 stubs"
       - name: Build release binary
-        run: cargo build --release -p citrate-learning-center
+        run: cargo build --locked --release -p citrate-learning-center
       - name: Checksum release artifact
         run: |
           sha256sum target/release/citrate-learning-center > target/release/SHA256SUMS.txt

@@ -124,15 +124,13 @@ impl Cooldowns {
         }
     }
 
+    /// Public for tests + future ops endpoints; the bin doesn't currently
+    /// reach into the policy after construction.
+    #[allow(dead_code)]
     pub fn policy(&self) -> &CooldownPolicy {
         &self.policy
     }
 
-    /// Test-only inspector.
-    #[cfg(test)]
-    pub fn snapshot(&self) -> CooldownState {
-        self.state.read().expect("cooldown lock poisoned").clone()
-    }
 }
 
 fn address_key(addr: &str) -> String {
