@@ -10,18 +10,44 @@ use serde::{Deserialize, Serialize};
 pub struct Address(pub [u8; 20]);
 
 impl Address {
+    /// Derive an `Address` from a 32-byte `PublicKey`.
+    ///
+    /// The chain accepts two encodings inside the same 32-byte slot
+    /// to support both ed25519 native callers and the EVM-style
+    /// 20-byte addresses dApps already know:
+    ///
+    /// 1. **Embedded EVM address** — first 20 bytes carry the
+    ///    address, last 12 bytes are all zero. Used directly. This
+    ///    is the format `eth_sendRawTransaction` produces after
+    ///    decoding an EIP-155 / EIP-1559 RLP and sender-recovery —
+    ///    the sender's secp256k1 derived address is left-aligned in
+    ///    the 32-byte field, padded with zeros. We recognise it by
+    ///    "trailing 12 zeros AND leading 20 bytes not all zero" so
+    ///    `PublicKey::default()` (which is all zeros) does not
+    ///    collide with a legitimate embedded address.
+    ///
+    /// 2. **Full ed25519 public key** — every byte non-zero (or any
+    ///    non-zero byte in the trailing 12). The address is the
+    ///    last 20 bytes of `keccak256(pubkey)` — the same shape
+    ///    Ethereum uses for secp256k1 keys, applied here to ed25519
+    ///    so a single `Address` type spans both schemes.
+    ///
+    /// Collision-freeness between the two paths is asserted by
+    /// `tests::test_dual_address_no_collision`: any 32-byte public
+    /// key with at least one non-zero trailing byte yields a
+    /// keccak-derived address that cannot equal the
+    /// embedded-address result of any *other* key (because keccak
+    /// over the full 32 bytes is preimage-resistant). C-02 in the
+    /// 2026-04-24 audit covers the same property.
     pub fn from_public_key(pubkey: &PublicKey) -> Self {
-        // Check if this is an embedded EVM address (first 20 bytes non-zero, last 12 bytes zero)
         let is_evm_address =
             pubkey.0[20..].iter().all(|&b| b == 0) && !pubkey.0[..20].iter().all(|&b| b == 0);
 
         if is_evm_address {
-            // This is an embedded 20-byte EVM address, use it directly
             let mut addr = [0u8; 20];
             addr.copy_from_slice(&pubkey.0[..20]);
             Address(addr)
         } else {
-            // This is a full 32-byte public key, derive address by hashing
             use sha3::{Digest, Keccak256};
             let mut hasher = Keccak256::default();
             hasher.update(pubkey.0);
