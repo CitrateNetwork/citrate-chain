@@ -176,9 +176,20 @@ pub fn register_economics_methods(
         }
     });
 
-    // citrate_getMempoolSnapshot - Get current mempool status (economics related)
+    // citrate_getMempoolStats - Aggregate mempool stats (economics related, no per-tx detail).
+    //
+    // RM-H1 / WP-H1.4 (audit RFI-A1, regression of H-API-01):
+    //   Pre-fix this method registered as `citrate_getMempoolSnapshot`, which
+    //   silently overrode the auth-gated handler in eth_rpc.rs (last-write-
+    //   wins on jsonrpc-core IoHandler::add_sync_method). The override
+    //   re-exposed mempool stats to unauthenticated callers, defeating the
+    //   H-API-01 closure shipped in RM-C.
+    //   Post-fix this method is renamed to `citrate_getMempoolStats` so the
+    //   auth-gated `citrate_getMempoolSnapshot` (eth_rpc.rs:1903) is the only
+    //   handler for that method name. The aggregate-stats return shape (no
+    //   per-tx detail) is intentionally unauthenticated for monitoring.
     let mempool_snap = mempool.clone();
-    io_handler.add_sync_method("citrate_getMempoolSnapshot", move |_params: Params| {
+    io_handler.add_sync_method("citrate_getMempoolStats", move |_params: Params| {
         if let Some(mempool) = &mempool_snap {
             let stats = block_on(mempool.stats());
                     let pending_txs = block_on(mempool.get_transactions(1000)); // Get up to 1000 transactions

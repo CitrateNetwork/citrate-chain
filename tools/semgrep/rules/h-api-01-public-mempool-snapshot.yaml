@@ -1,47 +1,121 @@
 # H-API-01 — `citrate_getMempoolSnapshot` must require operator auth.
 #
-# Audit finding (HIGH):
+# Audit findings:
 #   .audit/2026-04-24-full-repo-adversarial-audit/04_FINDINGS_API_NETWORK_STORAGE.md#h-api-01
+#   .audit/2026-04-25-reaudit/14_TRIPWIRE_BYPASS_ATTEMPTS.md#trp-15
+#   .audit/2026-04-25-reaudit/04_FINDINGS_API_NETWORK_STORAGE.md (REM-2)
 #
 # Pre-fix any unauthenticated caller could dump the full mempool —
 # sender, target, value, calldata, gas price — enabling generalised
 # frontrunning and deanonymisation. Post-fix the method calls
 # `crate::server::require_operator_auth(params)` before serving.
 #
-# This rule fires when a `citrate_*` JSON-RPC method that exposes
-# pending-tx detail is registered without a require_operator_auth
-# call in the same closure body. It's a heuristic — false positives
-# possible — so severity is WARNING.
+# RM-H1.4 (TRP-15) — broadened pattern coverage:
+#   1. Pre-broadening, the rule only matched the exact method name in
+#      core/api/src/eth_rpc.rs. A second `add_sync_method` registration
+#      with the SAME name in economics_rpc.rs silently overrode the
+#      auth-gated handler (HashMap last-write-wins). The bypass
+#      campaign (TRP-15) flagged this; manual verification on the
+#      remediation branch confirmed economics_rpc.rs:181 was
+#      registering an UNAUTHENTICATED handler that overrode the gate.
+#   2. RFI-A1 fix: economics_rpc.rs:181 renamed to
+#      `citrate_getMempoolStats` (aggregate stats, no per-tx detail).
+#      `citrate_getMempoolSnapshot` is now uniquely registered with
+#      auth in eth_rpc.rs:1903.
+#   3. This rule now covers ALL files that may register
+#      `citrate_getMempoolSnapshot` and also flags any new
+#      registration of the snapshot method without an operator-auth
+#      check in the same body.
 
 rules:
   - id: h-api-01-public-mempool-snapshot
     message: >-
-      The `citrate_getMempoolSnapshot` method (and similar mempool
-      read endpoints) MUST call `require_operator_auth` before
-      returning data (H-API-01). Pre-fix any caller could dump
-      pending txs.
+      The `citrate_getMempoolSnapshot` method MUST call
+      `require_operator_auth` before returning data (H-API-01). It exposes
+      pending-tx detail (sender, target, value, calldata, gas price). If
+      this method is registered in any file without the operator-auth
+      gate, frontrunning is enabled. RFI-A1 on 2026-04-26 confirmed a
+      regression of this kind via duplicate registration in
+      economics_rpc.rs (since renamed to `citrate_getMempoolStats`).
     languages: [rust]
-    severity: WARNING
+    severity: ERROR
     paths:
       include:
-        - "core/api/src/eth_rpc.rs"
+        - "core/api/src/**/*.rs"
+        - "node/src/**/*.rs"
+        - "node-app/src/**/*.rs"
       exclude:
         - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
+        - "**/*_tests.rs"
     patterns:
       - pattern-either:
           - pattern: |
               io_handler.add_sync_method("citrate_getMempoolSnapshot", $CB)
           - pattern: |
               io_handler.add_method("citrate_getMempoolSnapshot", $CB)
+          - pattern: |
+              $H.add_sync_method("citrate_getMempoolSnapshot", $CB)
+          - pattern: |
+              $H.add_method("citrate_getMempoolSnapshot", $CB)
       - pattern-not: |
-          io_handler.add_sync_method("citrate_getMempoolSnapshot", move |$P| {
+          $H.add_sync_method("citrate_getMempoolSnapshot", move |$P| {
               ...
               crate::server::require_operator_auth(...)?;
               ...
           })
       - pattern-not: |
-          io_handler.add_sync_method("citrate_getMempoolSnapshot", move |$P| {
+          $H.add_sync_method("citrate_getMempoolSnapshot", move |$P| {
               ...
               require_operator_auth(...)?;
               ...
           })
+      - pattern-not: |
+          $H.add_method("citrate_getMempoolSnapshot", move |$P| {
+              ...
+              require_operator_auth(...)?;
+              ...
+          })
+
+  # Capability-based pattern: any *new* RPC method whose name matches
+  # the mempool-detail pattern (Snapshot, Dump, GetTransactions,
+  # GetPending, Inspect) and is registered without an auth gate is
+  # almost certainly a re-introduction of H-API-01 under a renamed
+  # method. This guards the TRP-15 bypass technique (rename to escape).
+  - id: h-api-01-mempool-detail-method-name-pattern
+    message: >-
+      RPC method names matching the mempool-detail pattern (*Snapshot*,
+      *Dump*, *GetTransactions*, *GetPending*, *Inspect*) on the mempool
+      MUST require operator auth. This guards against the TRP-15 bypass
+      where a developer renames the method to escape the literal
+      H-API-01 rule. If you have a legitimate need for an unauthenticated
+      mempool method, name it `citrate_getMempool*Stats` (aggregate-only)
+      and ensure the return shape excludes per-tx detail.
+    languages: [rust]
+    severity: WARNING
+    paths:
+      include:
+        - "core/api/src/**/*.rs"
+        - "node/src/**/*.rs"
+        - "node-app/src/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
+        - "**/*_tests.rs"
+    patterns:
+      - pattern-either:
+          - pattern-regex: 'add_(sync_)?method\("citrate_getMempool(Snapshot|Dump|Inspect)[A-Za-z]*"'
+          - pattern-regex: 'add_(sync_)?method\("citrate_(getPending|inspectMempool)[A-Za-z]*"'
+      - pattern-not-regex: 'require_operator_auth'
+    metadata:
+      audit-id: H-API-01
+      severity: high
+      sprint: RM-C1
+      wp: WP-C1.1
+      reaudit-finding: RFI-A1
+      reaudit-sprint: RM-H1
+      reaudit-wp: WP-H1.4
+      structural-defense: 'capability-based name pattern + duplicate-registration guard'
+      reference: https://docs.rs/jsonrpc-core/0.18/jsonrpc_core/struct.MetaIoHandler.html
