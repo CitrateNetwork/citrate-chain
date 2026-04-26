@@ -62,6 +62,9 @@ contract StablecoinTreasury is ReentrancyGuard, Governable {
     mapping(uint256 => EpochRevenue) public epochRevenue;
     uint256 public currentEpoch;
 
+    /// @notice Protocol contracts allowed to record non-financial epoch activity.
+    mapping(address => bool) public authorizedActivityRecorders;
+
     /// @notice Block number when the first deposit was made (epoch anchor)
     uint256 public genesisBlock;
 
@@ -96,12 +99,28 @@ contract StablecoinTreasury is ReentrancyGuard, Governable {
     );
     // GovernanceTransferred event provided by Governable mixin.
     event EpochAdvanced(uint256 indexed epoch, uint256 startBlock, uint256 endBlock);
+    event ActivityRecorderSet(address indexed recorder, bool allowed);
+    event ActivityRecorded(
+        address indexed recorder,
+        uint256 indexed epoch,
+        uint256 jobCount,
+        uint256 inferenceCount
+    );
+
+    error NotAuthorizedActivityRecorder(address caller);
+    error ZeroActivityRecorderAddress();
 
     // ============================================================
     // Modifiers
     // ============================================================
 
     // `onlyGovernance` is inherited from Governable.
+    modifier onlyAuthorizedActivityRecorder() {
+        if (!authorizedActivityRecorders[msg.sender]) {
+            revert NotAuthorizedActivityRecorder(msg.sender);
+        }
+        _;
+    }
 
     // ============================================================
     // Constructor
@@ -110,6 +129,9 @@ contract StablecoinTreasury is ReentrancyGuard, Governable {
     /// @notice Deploy the treasury
     /// @param _governance Governance multisig or deployer address
     constructor(address _governance) Governable(_governance) {
+        authorizedActivityRecorders[_governance] = true;
+        emit ActivityRecorderSet(_governance, true);
+
         genesisBlock = block.number;
         // Initialize epoch 0
         epochRevenue[0] = EpochRevenue({
@@ -157,6 +179,16 @@ contract StablecoinTreasury is ReentrancyGuard, Governable {
         emit StablecoinRemoved(token);
     }
 
+    /// @notice Add or remove a protocol contract allowed to record activity.
+    function setAuthorizedActivityRecorder(address recorder, bool allowed)
+        external
+        onlyGovernance
+    {
+        if (recorder == address(0)) revert ZeroActivityRecorderAddress();
+        authorizedActivityRecorders[recorder] = allowed;
+        emit ActivityRecorderSet(recorder, allowed);
+    }
+
     // ============================================================
     // Deposit
     // ============================================================
@@ -188,10 +220,14 @@ contract StablecoinTreasury is ReentrancyGuard, Governable {
     /// @param jobCount Number of compute jobs completed
     /// @param inferenceCount Number of inference calls completed
     /// @dev Called by authorized protocol contracts (BulkComputeGateway)
-    function recordActivity(uint256 jobCount, uint256 inferenceCount) external {
+    function recordActivity(uint256 jobCount, uint256 inferenceCount)
+        external
+        onlyAuthorizedActivityRecorder
+    {
         _advanceEpochIfNeeded();
         epochRevenue[currentEpoch].computeJobsCount += jobCount;
         epochRevenue[currentEpoch].inferenceCalls += inferenceCount;
+        emit ActivityRecorded(msg.sender, currentEpoch, jobCount, inferenceCount);
     }
 
     // ============================================================

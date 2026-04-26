@@ -88,6 +88,7 @@ contract BulkComputeGatewayTest is Test {
             address(oracle),
             governance
         );
+        treasury.setAuthorizedActivityRecorder(address(gateway), true);
 
         // Authorize gateway as a spender and set up permissions
         gateway.authorizeSpender(marketplace);
@@ -344,6 +345,7 @@ contract BulkComputeGatewayTest is Test {
 
     function test_set_treasury() public {
         StablecoinTreasury newTreasury = new StablecoinTreasury(governance);
+        newTreasury.setAuthorizedActivityRecorder(address(gateway), true);
         gateway.setTreasury(address(newTreasury));
         assertEq(address(gateway.treasury()), address(newTreasury));
     }

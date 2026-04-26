@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import "forge-std/Test.sol";
 import "../src/AgentDecisionRegistry.sol";
 import "../src/SpecRegistry.sol";
+import "../src/lib/Governable.sol";
 import "../src/InferenceRouter.sol";
 import "../src/ModelRegistry.sol";
 import "../src/interfaces/IModelRegistry.sol";
@@ -31,8 +32,10 @@ contract AdversarialTest is Test {
         governor = address(this);
 
         // Deploy agent and spec registries
-        agentRegistry = new AgentDecisionRegistry();
-        specRegistry = new SpecRegistry();
+        agentRegistry = new AgentDecisionRegistry(governor);
+        agentRegistry.setAuthorizedRecorder(attacker, true);
+        agentRegistry.setAuthorizedDisputer(attacker, true);
+        specRegistry = new SpecRegistry(governor);
 
         // Deploy model registry and inference router
         modelRegistry = new ModelRegistry();
@@ -183,14 +186,14 @@ contract AdversarialTest is Test {
         specRegistry.registerSpec("contract_deploy", "QmValidCID123");
 
         vm.prank(attacker);
-        vm.expectRevert("Only governor can modify specs");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         specRegistry.updateSpec("contract_deploy", "QmMaliciousCID");
     }
 
     /// @notice Non-governor tries to register a new spec.
     function test_unauthorized_spec_register() public {
         vm.prank(attacker);
-        vm.expectRevert("Only governor can modify specs");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         specRegistry.registerSpec("malicious_domain", "QmBadCID");
     }
 
@@ -199,10 +202,10 @@ contract AdversarialTest is Test {
         specRegistry.registerSpec("test_domain", "QmCID");
 
         vm.startPrank(attacker);
-        vm.expectRevert("Only governor can modify specs");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         specRegistry.deactivateSpec("test_domain");
 
-        vm.expectRevert("Only governor can modify specs");
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
         specRegistry.reactivateSpec("test_domain");
         vm.stopPrank();
     }
@@ -262,10 +265,13 @@ contract AdversarialTest is Test {
         specRegistry.registerSpec("unique_domain", "QmCID2");
     }
 
-    /// @notice Transfer governor to zero address must revert.
+    /// @notice Transfer governance to zero address must revert.
+    /// RM-L / WP-L1.1: SpecRegistry now uses the Governable two-step
+    /// pattern; the legacy `transferGovernor` is gone, replaced with
+    /// `transferGovernance` which emits `Governable_ZeroAddress`.
     function test_transfer_governor_to_zero_rejected() public {
-        vm.expectRevert("Cannot transfer to zero address");
-        specRegistry.transferGovernor(address(0));
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
+        specRegistry.transferGovernance(address(0));
     }
 
     // =====================================================================
