@@ -50,12 +50,30 @@ binary config only.
 | `Transport` | `InProcessTransport` | `LibP2pTransport` | CM-07 WP-07.2 S1 | 3-machine LAN available |
 | `ChainClient` | `MockChainClient` | `HttpChainClient` | CM-07 WP-07.2 S1 | Anvil sidecar / testnet RPC |
 
-The `MockChainClient` enforces the same invariants as
-`ComputePoolTraining.sol` (epoch monotonicity, coordinator-only
-commitEpoch, challenge-window gate) — it IS a substitute backend,
-not a behavior mock. A bug caught against it catches the same bug
-against a live deployment. Per the CM-07/08 staged execution plan
-§4 safe-mock criteria, these meet all four safety conditions.
+The `MockChainClient` enforces the following invariants from
+`ComputePoolTraining.sol`, each with a parity test in
+`training-worker/src/chain.rs::tests`:
+
+| Invariant (contract) | Mock enforcement | Parity test |
+|---------------------|------------------|-------------|
+| `commitEpoch`: epoch monotonicity | `WrongEpoch` return | `epoch_monotonicity_enforced` |
+| `commitEpoch`: coordinator-only | `NotCoordinator` return | `non_coordinator_cannot_commit_epoch` |
+| `commitEpoch`: `root != bytes32(0)` (line 367) | `ZeroEpochRoot` return | `f4_commit_epoch_rejects_zero_root` |
+| `finalize`: challenge window gate | `ChallengeWindowOpen` return | `full_lifecycle_on_mock` |
+| `challengeStep`: `msg.value == CHALLENGE_BOND` (line 537) | `WrongChallengeBond` return | `f4_challenge_step_rejects_wrong_bond` |
+| `challengeStep`: `step < stepsPerEpoch` (line 538) | `StepOutOfRange` return | `f4_challenge_step_rejects_step_out_of_range` |
+| `challengeStep`: `epoch < epochCount` (line 539) | `ChallengeEpochOutOfRange` return | `f4_challenge_step_rejects_epoch_out_of_range` |
+
+If the contract gains a new `require(...)` and this list isn't
+updated, the mock drifts and a worker that passes against the
+mock can surprise-fail against the live deployment. Each row is
+the regression contract.
+
+Pre-RM-G2.4 the `commitEpoch` zero-root check and all three
+`challengeStep` checks were missing. Audit F-4 closed by adding
+them along with the parity tests above. Per the CM-07/08 staged
+execution plan §4 safe-mock criteria, the mock meets all four
+safety conditions.
 
 ## Known Limitations (not mocks)
 
