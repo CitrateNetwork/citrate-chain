@@ -75,34 +75,36 @@ them along with the parity tests above. Per the CM-07/08 staged
 execution plan §4 safe-mock criteria, the mock meets all four
 safety conditions.
 
-### Known parity gap — Merkle proof domain separators (RM-I / WP-I1.8)
+### Merkle proof domain separators — closed in RM-I / WP-I1.8
 
-The 2026-04-25 independent re-audit (Stream 3) caught a parity gap not
-listed in the table above:
+The 2026-04-25 independent re-audit (Stream 3) caught a parity gap:
 
 > **SOL-20 hardened the contract's Merkle proof with leaf and internal
 > node domain separators (`keccak256(0x00 || leaf_bytes)` for leaves
-> and `keccak256(0x01 || L || R)` for internal nodes) but the mock at
-> `training-worker/src/chain.rs::compute_merkle_root` (lines 688-706)
-> still does plain sorted-pair concatenation without prefixes.**
+> and `keccak256(0x01 || L || R)` for internal nodes) but the mock
+> at `training-worker/src/chain.rs::verify_merkle_proof` (lines
+> 688-706) still did plain sorted-pair concatenation without prefixes.**
 
-A worker that generates a proof against the mock and submits it
-on-chain will see the proof rejected: the contract recomputes the
-root using prefixed hashes, the worker computed it without prefixes,
-the roots disagree, and `verifyChallengeProof` fails.
+**Closed**: RM-I / WP-I1.8 (commit landed 2026-04-26).
 
-This is the exact "byte-for-byte" claim the prior table implied but
-that did NOT hold post-SOL-20. The status is **known gap**, scoped to
-**RM-I WP-I1.8** for closure with a Foundry round-trip test
-(`MockParityMerkleProof.t.sol::test_f_4_mock_merkle_proof_accepts_on_chain`)
-that constructs a proof in the worker and asserts on-chain
-acceptance.
+The mock's `verify_merkle_proof` now mirrors the contract's
+`_verifyMerkleProof` exactly:
+- Leaves: `keccak256(0x00 || leaf_bytes)` (`MERKLE_LEAF_PREFIX = 0x00`).
+- Internal nodes: `keccak256(0x01 || min(L,R) || max(L,R))` (`MERKLE_INTERNAL_PREFIX = 0x01`).
 
-Pending WP-I1.8 closure, downstream consumers should treat the
-"parity" claim above as **invariant parity verified by the listed
-tests**, not as a byte-for-byte equivalence over the full proof
-construction. Any new contract `require(...)` added between now and
-WP-I1.8 close needs an explicit row added to the table.
+Parity verified by three new tests in
+`training-worker/src/chain.rs::tests`:
+- `test_wp_i1_8_two_leaf_proof_verifies_with_prefixes` — a proof
+  built with the contract's prefix scheme verifies in the mock.
+- `test_wp_i1_8_unprefixed_proof_does_not_verify` — a proof built
+  WITHOUT the prefixes is rejected (catches the pre-fix shape).
+- `test_wp_i1_8_leaf_internal_collision_rejected` — the
+  second-preimage attack the prefixes prevent (a leaf hash treated as
+  a root by an attacker with no proof) is rejected.
+
+The "byte-for-byte" claim is now accurate. Any future contract change
+to the `_verifyMerkleProof` shape (different prefix bytes, different
+sort order, etc.) requires a matching change here.
 
 ## Known Limitations (not mocks)
 
