@@ -144,6 +144,28 @@ impl VrfProposerSelector {
     /// closing the downgrade vector where an attacker forges
     /// `proof.proof = anything; output = SHA3(proof || alpha)` and
     /// the verifier blindly accepts.
+    ///
+    /// **RM-I-3 / WP-I1.5 (re-audit Stream 1 finding REM-N-01)**:
+    /// THIS METHOD DOES NOT BIND `proof.pk_p256` (the ECVRF P-256 key
+    /// embedded in the proof) TO THE CLAIMED `pubkey` (ed25519
+    /// proposer identity). An attacker with their own (sk_p256,
+    /// pk_p256) pair can produce a valid proof over alpha (which
+    /// includes the *victim's* ed25519 pubkey), submit
+    /// `proof.pk_p256 = attacker_pk`, and have the math accept.
+    /// The structural binding lives at admission time via the
+    /// block's ed25519 signature: only the holder of `pubkey`'s
+    /// ed25519 secret key can sign the block, so a forged ECVRF
+    /// proof is unreachable in practice — but only because the
+    /// admission path enforces both checks.
+    ///
+    /// **Use [`Self::verify_vrf_with_block_signature`] for new
+    /// callers** — it takes both the ECVRF proof AND the block's
+    /// ed25519 signature, making the identity binding structurally
+    /// inescapable. This raw-verify method is retained for callers
+    /// that genuinely need just the ECVRF math (e.g., internal
+    /// bench, tests, the consensus crate's own admission path which
+    /// performs the ed25519 check separately at
+    /// `dag_store::validate_block_admission`).
     pub fn verify_vrf_proof(
         &self,
         pubkey: &PublicKey,
@@ -168,6 +190,64 @@ impl VrfProposerSelector {
             self.verify_legacy_proof(pubkey, proof, previous_vrf, slot)
         } else {
             Ok(false)
+        }
+    }
+
+    /// RM-I-3 / WP-I1.5 (re-audit Stream 1 finding REM-N-01): the
+    /// structurally-bound verifier. Combines the ECVRF math with an
+    /// ed25519 signature check that binds `proof.pk_p256` to the
+    /// claimed `pubkey` (ed25519 proposer identity) via the block's
+    /// own signature.
+    ///
+    /// Cryptographic argument:
+    /// - `proof` math is bound to `alpha = pubkey || previous_vrf || slot`.
+    ///   The ECVRF math is consistent only under whatever P-256 secret
+    ///   key signed the proof. An attacker can substitute a key they
+    ///   own, but the math then attests "the holder of attacker_sk
+    ///   produced a VRF output for alpha", NOT "the holder of pubkey's
+    ///   ed25519 secret key produced it".
+    /// - `block_signature` is an ed25519 signature over `signed_payload`
+    ///   verified against `pubkey`. Only the holder of pubkey's ed25519
+    ///   secret key can produce this signature.
+    /// - The combination of the two checks attests: the holder of
+    ///   pubkey's ed25519 secret key chose to associate this ECVRF
+    ///   proof with this slot. The attacker who substitutes pk_p256
+    ///   cannot also forge the ed25519 signature, so the combined
+    ///   check rejects them.
+    ///
+    /// This method is the **production-callable** entry point. The
+    /// raw `verify_vrf_proof` is retained for internal benches and
+    /// tests; production code paths SHOULD use this method.
+    ///
+    /// Returns `Ok(true)` only when BOTH checks pass.
+    pub fn verify_vrf_with_block_signature(
+        &self,
+        pubkey: &PublicKey,
+        proof: &VrfProof,
+        previous_vrf: &Hash,
+        slot: u64,
+        signed_payload: &[u8],
+        block_signature: &crate::types::Signature,
+    ) -> Result<bool, VrfError> {
+        // Step 1: ECVRF math (or legacy below cutoff).
+        if !self.verify_vrf_proof(pubkey, proof, previous_vrf, slot)? {
+            return Ok(false);
+        }
+
+        // Step 2: ed25519 signature binding the ECVRF proof to pubkey
+        // via the block's signed payload. The caller's responsibility
+        // is to ensure `signed_payload` covers the proof bytes (e.g.,
+        // it is or includes the block hash that commits to the proof).
+        // Without this check the math attests only that *some* P-256
+        // key signed alpha; with this check it attests that the
+        // ed25519 proposer identity claimed the proof.
+        use ed25519_dalek::Verifier;
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(pubkey.as_bytes())
+            .map_err(|_| VrfError::CryptoError("REM-N-01: invalid ed25519 pubkey".to_string()))?;
+        let dalek_sig = ed25519_dalek::Signature::from_bytes(block_signature.as_bytes());
+        match verifying_key.verify(signed_payload, &dalek_sig) {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
         }
     }
 
@@ -498,5 +578,158 @@ mod tests {
         assert!(leader.is_some());
         assert_eq!(leader_election.get_epoch(50), 0);
         assert_eq!(leader_election.get_slot_in_epoch(50), 50);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // RM-I-3 / WP-I1.5 — REM-N-01 ECVRF identity binding tests.
+    //
+    // The structurally-bound verifier
+    // `verify_vrf_with_block_signature` combines the ECVRF math
+    // with an ed25519 signature check. The ECVRF math alone accepts
+    // a forged proof under an attacker's pk_p256; combined with
+    // the ed25519 check it does not, because only the holder of the
+    // claimed proposer's ed25519 secret key can produce the
+    // signature.
+    // ────────────────────────────────────────────────────────────────
+
+    fn ed25519_sign_payload(
+        signing_key: &ed25519_dalek::SigningKey,
+        payload: &[u8],
+    ) -> crate::types::Signature {
+        use ed25519_dalek::Signer;
+        let sig = signing_key.sign(payload);
+        crate::types::Signature::new(sig.to_bytes())
+    }
+
+    #[tokio::test]
+    async fn test_rem_n_01_combined_check_accepts_legitimate_proposer() {
+        // Honest validator: derives ed25519 pubkey from a known
+        // signing key, signs the block payload with it, and produces
+        // an ECVRF proof from the same secret_key (treated as the
+        // ECVRF seed).
+        let secret = [0xAB; 32];
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
+        let pubkey_bytes = signing_key.verifying_key().to_bytes();
+        let proposer = PublicKey::new(pubkey_bytes);
+        let prev = Hash::new([0; 32]);
+        let slot = 100;
+
+        let selector = VrfProposerSelector::new();
+        let proof = selector
+            .generate_vrf_proof(&secret, &proposer, &prev, slot)
+            .expect("vrf");
+        let block_payload = b"block-payload-bytes";
+        let block_sig = ed25519_sign_payload(&signing_key, block_payload);
+
+        let r = selector
+            .verify_vrf_with_block_signature(
+                &proposer,
+                &proof,
+                &prev,
+                slot,
+                block_payload,
+                &block_sig,
+            )
+            .expect("verify");
+        assert!(
+            r,
+            "REM-N-01: legitimate proposer + signature must verify"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rem_n_01_combined_check_rejects_substituted_pk_p256() {
+        // Attacker scenario: the attacker has their own (sk, pk).
+        // They produce an ECVRF proof signed under their sk over
+        // alpha = (victim_ed25519 || prev || slot). The ECVRF math
+        // accepts because proof.pk_p256 = attacker's pk and the
+        // math is consistent. But the attacker cannot produce a
+        // valid ed25519 signature under the victim's identity, so
+        // the combined check rejects.
+        let victim_secret = [0xAB; 32];
+        let victim_signing_key = ed25519_dalek::SigningKey::from_bytes(&victim_secret);
+        let victim_pubkey = PublicKey::new(victim_signing_key.verifying_key().to_bytes());
+
+        let attacker_secret = [0xCD; 32];
+        let attacker_signing_key = ed25519_dalek::SigningKey::from_bytes(&attacker_secret);
+
+        let prev = Hash::new([0; 32]);
+        let slot = 100;
+
+        let selector = VrfProposerSelector::new();
+        // Attacker produces an ECVRF proof under attacker's secret
+        // but claims the victim's ed25519 pubkey is the proposer.
+        // Note: generate_vrf_proof uses `pubkey.as_bytes()` to build
+        // alpha, so the alpha will reference the victim's identity.
+        let attacker_proof = selector
+            .generate_vrf_proof(&attacker_secret, &victim_pubkey, &prev, slot)
+            .expect("vrf");
+
+        // Sanity: the raw verify accepts (the math is consistent).
+        let raw = selector
+            .verify_vrf_proof(&victim_pubkey, &attacker_proof, &prev, slot)
+            .expect("raw verify");
+        assert!(
+            raw,
+            "REM-N-01: pre-fix raw verify_vrf_proof accepts the attacker's proof — \
+             this is the bug shape"
+        );
+
+        // The structurally-bound verifier MUST reject because
+        // the attacker cannot sign a block payload under the
+        // victim's ed25519 identity.
+        let block_payload = b"block-payload-bytes";
+        let attacker_sig = ed25519_sign_payload(&attacker_signing_key, block_payload);
+        let r = selector
+            .verify_vrf_with_block_signature(
+                &victim_pubkey,
+                &attacker_proof,
+                &prev,
+                slot,
+                block_payload,
+                &attacker_sig,
+            )
+            .expect("verify");
+        assert!(
+            !r,
+            "REM-N-01: attacker's pk_p256 substitution + attacker's ed25519 \
+             signature MUST be rejected — the bound check requires the signature \
+             to verify under the claimed proposer's pubkey"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rem_n_01_combined_check_rejects_missing_block_signature() {
+        // A block whose signature is bytes of zeros (or any wrong
+        // signature) cannot pass the ed25519 check, regardless of
+        // ECVRF math validity.
+        let secret = [0xAB; 32];
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
+        let proposer = PublicKey::new(signing_key.verifying_key().to_bytes());
+        let prev = Hash::new([0; 32]);
+        let slot = 100;
+
+        let selector = VrfProposerSelector::new();
+        let proof = selector
+            .generate_vrf_proof(&secret, &proposer, &prev, slot)
+            .expect("vrf");
+        let block_payload = b"block-payload-bytes";
+        let bogus_sig = crate::types::Signature::new([0u8; 64]);
+
+        let r = selector
+            .verify_vrf_with_block_signature(
+                &proposer,
+                &proof,
+                &prev,
+                slot,
+                block_payload,
+                &bogus_sig,
+            )
+            .expect("verify");
+        assert!(
+            !r,
+            "REM-N-01: a block payload not actually signed by the proposer \
+             must fail the bound check"
+        );
     }
 }
