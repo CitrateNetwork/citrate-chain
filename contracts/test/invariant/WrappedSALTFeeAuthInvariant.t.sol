@@ -96,7 +96,7 @@ contract WrappedSALTFeeAuthInvariant is Test {
         // happily steals funds), so the test fails RED. Post-fix the
         // contract reverts with `InvalidFeeAuthorization()`.
         vm.prank(attacker);
-        vm.expectRevert();
+        vm.expectRevert(WrappedSALT.InvalidFeeAuthorization.selector);
         wSALT.transferWithFeeAuthorization(
             alice,
             bob,
@@ -187,7 +187,7 @@ contract WrappedSALTFeeAuthInvariant is Test {
 
         // Attacker submits with a different treasury.
         vm.prank(attacker);
-        vm.expectRevert();
+        vm.expectRevert(WrappedSALT.InvalidFeeAuthorization.selector);
         wSALT.transferWithFeeAuthorization(
             alice,
             bob,
@@ -224,7 +224,7 @@ contract WrappedSALTFeeAuthInvariant is Test {
 
         // Attacker bumps fee.
         vm.prank(attacker);
-        vm.expectRevert();
+        vm.expectRevert(WrappedSALT.InvalidFeeAuthorization.selector);
         wSALT.transferWithFeeAuthorization(
             alice,
             bob,
@@ -286,7 +286,7 @@ contract WrappedSALTFeeAuthInvariant is Test {
         // Caller substitutes (treasury_call, fee_call) — at least one
         // differs from the signed pair. The call MUST revert.
         vm.prank(attacker);
-        vm.expectRevert();
+        vm.expectRevert(WrappedSALT.InvalidFeeAuthorization.selector);
         wSALT.transferWithFeeAuthorization(
             alice,
             bob,
