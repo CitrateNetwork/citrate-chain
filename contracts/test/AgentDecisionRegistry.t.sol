@@ -8,9 +8,12 @@ contract AgentDecisionRegistryTest is Test {
     AgentDecisionRegistry public registry;
     bytes32 constant AGENT_1 = keccak256("agent_1");
     bytes32 constant AGENT_2 = keccak256("agent_2");
+    address constant RECORDER = address(0xA11CE);
+    address constant DISPUTER = address(0xB0B);
+    address constant ATTACKER = address(0xBAD);
 
     function setUp() public {
-        registry = new AgentDecisionRegistry();
+        registry = new AgentDecisionRegistry(address(this));
     }
 
     // ── Registration ────────────────────────────────────────────────
@@ -60,6 +63,84 @@ contract AgentDecisionRegistryTest is Test {
     function test_emptyHistoryForNewAgent() public view {
         uint256[] memory history = registry.getDecisionHistory(keccak256("unknown"));
         assertEq(history.length, 0);
+    }
+
+    // ── Authorization ────────────────────────────────────────────────
+
+    function test_k1_2_constructor_rejects_zero_governance() public {
+        vm.expectRevert(Governable.Governable_ZeroAddress.selector);
+        new AgentDecisionRegistry(address(0));
+    }
+
+    function test_k1_2_initial_governance_is_default_recorder_and_disputer() public view {
+        assertEq(registry.governance(), address(this));
+        assertTrue(registry.authorizedRecorders(address(this)));
+        assertTrue(registry.authorizedDisputers(address(this)));
+    }
+
+    function test_k1_2_non_recorder_cannot_register_decision() public {
+        vm.prank(ATTACKER);
+        vm.expectRevert(
+            abi.encodeWithSelector(AgentDecisionRegistry.NotAuthorizedRecorder.selector, ATTACKER)
+        );
+        registry.registerDecision(AGENT_1, "tool", keccak256("p"));
+    }
+
+    function test_k1_2_governance_can_authorize_recorder() public {
+        registry.setAuthorizedRecorder(RECORDER, true);
+        vm.prank(RECORDER);
+        uint256 id = registry.registerDecision(AGENT_1, "tool", keccak256("p"));
+
+        assertEq(id, 0);
+        (, , , , , address executor, , ) = registry.decisions(id);
+        assertEq(executor, RECORDER);
+    }
+
+    function test_k1_2_non_governance_cannot_authorize_recorder() public {
+        vm.prank(ATTACKER);
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
+        registry.setAuthorizedRecorder(RECORDER, true);
+    }
+
+    function test_k1_2_non_disputer_cannot_dispute_decision() public {
+        uint256 id = registry.registerDecision(AGENT_1, "tool", keccak256("p"));
+
+        vm.prank(ATTACKER);
+        vm.expectRevert(
+            abi.encodeWithSelector(AgentDecisionRegistry.NotAuthorizedDisputer.selector, ATTACKER)
+        );
+        registry.disputeDecision(id, "fake evidence");
+    }
+
+    function test_k1_2_governance_can_authorize_disputer() public {
+        uint256 id = registry.registerDecision(AGENT_1, "tool", keccak256("p"));
+        registry.setAuthorizedDisputer(DISPUTER, true);
+
+        vm.prank(DISPUTER);
+        registry.disputeDecision(id, "real evidence");
+
+        assertEq(registry.disputeCount(AGENT_1), 1);
+    }
+
+    function test_k1_2_non_governance_cannot_resolve_dispute() public {
+        uint256 id = registry.registerDecision(AGENT_1, "tool", keccak256("p"));
+        registry.disputeDecision(id, "evidence");
+
+        vm.prank(ATTACKER);
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
+        registry.resolveDispute(id, true);
+    }
+
+    function test_k1_2_governance_transfer_is_two_step() public {
+        registry.transferGovernance(RECORDER);
+        assertEq(registry.governance(), address(this));
+        assertEq(registry.pendingGovernance(), RECORDER);
+
+        vm.prank(RECORDER);
+        registry.acceptGovernance();
+
+        assertEq(registry.governance(), RECORDER);
+        assertEq(registry.pendingGovernance(), address(0));
     }
 
     // ── Disputes ────────────────────────────────────────────────────

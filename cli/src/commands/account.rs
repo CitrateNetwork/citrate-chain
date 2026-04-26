@@ -36,23 +36,62 @@ pub enum AccountCommands {
         address: String,
     },
 
-    /// Import an account from private key
+    /// Import an account from private key.
+    ///
+    /// RM-K / WP-K1.6: secrets MUST NOT be passed on the command line
+    /// in normal operation — argv is visible in the OS process list,
+    /// in shell history, and in command-audit logs. Default is to
+    /// prompt securely on stdin (no echo). `--key-file` reads from a
+    /// file (which the operator should `shred` or delete after).
+    /// `--insecure-key-from-arg` is the legacy opt-in that puts the
+    /// key on argv and emits a loud warning; it exists only for
+    /// scripts that have not yet migrated.
     Import {
-        /// Private key (hex encoded)
-        #[arg(short, long)]
-        key: String,
+        /// Read the 32-byte hex private key from stdin (no echo).
+        /// This is the recommended path for interactive imports.
+        #[arg(long, conflicts_with_all = ["key_file", "insecure_key_from_arg"])]
+        key_stdin: bool,
 
-        /// Password for the keystore
+        /// Read the 32-byte hex private key from a file. The file is
+        /// read once and not modified; operators should `shred` or
+        /// delete it after import.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["key_stdin", "insecure_key_from_arg"])]
+        key_file: Option<PathBuf>,
+
+        /// LEGACY: pass the private key on the command line. Visible
+        /// in argv, shell history, and process listings. Emits a
+        /// warning. Prefer --key-stdin or --key-file.
+        #[arg(long, value_name = "HEX", conflicts_with_all = ["key_stdin", "key_file"])]
+        insecure_key_from_arg: Option<String>,
+
+        /// Password for the keystore. If omitted, prompts on stdin.
         #[arg(short, long)]
         password: Option<String>,
     },
 
-    /// Export account private key
+    /// Export account private key.
+    ///
+    /// RM-K / WP-K1.6: prints the secret to stdout, which can be
+    /// captured in shell pipes, terminal scrollback, or screen
+    /// recordings. Use `--out <path>` to write to a file with 0600
+    /// perms instead. Add `--confirm-stdout` to keep the legacy
+    /// stdout behavior; without it the export refuses to print.
     Export {
         /// Account address
         address: String,
 
-        /// Password for the keystore
+        /// Write the exported key to this file (mode 0600 on Unix).
+        /// Recommended: pipe into `shred` or store on an offline
+        /// volume.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+
+        /// Explicit acknowledgement that the key will be printed to
+        /// stdout. Without this flag, stdout export is refused.
+        #[arg(long)]
+        confirm_stdout: bool,
+
+        /// Password for the keystore. If omitted, prompts on stdin.
         #[arg(short, long)]
         password: Option<String>,
     },
@@ -69,11 +108,22 @@ pub async fn execute(cmd: AccountCommands, config: &Config) -> Result<()> {
         AccountCommands::Balance { address } => {
             get_balance(config, &address).await?;
         }
-        AccountCommands::Import { key, password } => {
-            import_account(config, &key, password)?;
+        AccountCommands::Import {
+            key_stdin,
+            key_file,
+            insecure_key_from_arg,
+            password,
+        } => {
+            let key_hex = read_import_key(key_stdin, key_file, insecure_key_from_arg)?;
+            import_account(config, &key_hex, password)?;
         }
-        AccountCommands::Export { address, password } => {
-            export_account(config, &address, password)?;
+        AccountCommands::Export {
+            address,
+            out,
+            confirm_stdout,
+            password,
+        } => {
+            export_account(config, &address, out, confirm_stdout, password)?;
         }
     }
     Ok(())
@@ -234,12 +284,30 @@ fn import_account(config: &Config, private_key: &str, password: Option<String>) 
     Ok(())
 }
 
-fn export_account(config: &Config, address: &str, password: Option<String>) -> Result<()> {
+fn export_account(
+    config: &Config,
+    address: &str,
+    out: Option<PathBuf>,
+    confirm_stdout: bool,
+    password: Option<String>,
+) -> Result<()> {
     let address = address.trim_start_matches("0x");
     let keystore_path = config.keystore_path.join(format!("{}.json", address));
 
     if !keystore_path.exists() {
         anyhow::bail!("Account not found in keystore");
+    }
+
+    // RM-K / WP-K1.6: refuse to print to stdout unless the operator
+    // explicitly opts in OR redirects to a file. Without the gate the
+    // private key lands in terminal scrollback, shell pipes, and
+    // screen recordings.
+    if out.is_none() && !confirm_stdout {
+        anyhow::bail!(
+            "Refusing to print private key to stdout. \
+             Use --out <PATH> to write to a file (0600 on Unix), or \
+             --confirm-stdout to acknowledge stdout export and proceed."
+        );
     }
 
     // Get password
@@ -251,14 +319,229 @@ fn export_account(config: &Config, address: &str, password: Option<String>) -> R
 
     // Load and decrypt key
     let signing_key = keystore::load_key(&keystore_path, &password)?;
+    let key_hex = hex::encode(signing_key.to_bytes());
 
-    println!(
+    eprintln!(
         "{}",
         "⚠️  WARNING: Never share your private key!".red().bold()
     );
-    println!("Private key: {}", hex::encode(signing_key.to_bytes()));
+
+    if let Some(path) = out {
+        write_secret_file(&path, &key_hex)
+            .with_context(|| format!("Failed to write private key to {}", path.display()))?;
+        eprintln!(
+            "Private key written to {} (mode 0600 on Unix). Delete or `shred` after use.",
+            path.display()
+        );
+    } else {
+        // confirm_stdout is true here per the gate above.
+        println!("{}", key_hex);
+    }
 
     Ok(())
+}
+
+/// RM-K / WP-K1.6: helper for the `account import` private-key input
+/// modes. Returns the hex-encoded key (without `0x` prefix). Does not
+/// echo to terminal in the stdin path.
+fn read_import_key(
+    key_stdin: bool,
+    key_file: Option<PathBuf>,
+    insecure_key_from_arg: Option<String>,
+) -> Result<String> {
+    let raw = match (key_stdin, key_file, insecure_key_from_arg) {
+        (true, _, _) => rpassword::prompt_password("Paste 32-byte hex private key (no echo): ")
+            .context("Failed to read private key from stdin")?,
+        (_, Some(path), _) => {
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read key file {}", path.display()))?
+                .trim()
+                .to_string()
+        }
+        (_, _, Some(hex_arg)) => {
+            // Loud warning: argv is visible in the OS.
+            eprintln!(
+                "{}",
+                "⚠️  WARNING: --insecure-key-from-arg passes the private key on \
+                 the command line. argv is visible in `ps`, shell history, and \
+                 audit logs. Use --key-stdin or --key-file in production."
+                    .yellow()
+                    .bold()
+            );
+            hex_arg
+        }
+        (false, None, None) => anyhow::bail!(
+            "Provide one of --key-stdin (recommended), --key-file <PATH>, or \
+             --insecure-key-from-arg <HEX> (legacy)."
+        ),
+    };
+    Ok(raw.trim().trim_start_matches("0x").to_string())
+}
+
+/// RM-K / WP-K1.6: write secret material with 0600 perms on Unix.
+fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests_k1_6 {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    #[command(name = "test-cli")]
+    struct TestCli {
+        #[command(subcommand)]
+        cmd: AccountCommands,
+    }
+
+    #[test]
+    fn test_k1_6_import_requires_explicit_key_source() {
+        // No key source provided → argparse must succeed (cli accepts
+        // it) but the runtime must reject. We test the runtime path.
+        let result = read_import_key(false, None, None);
+        assert!(
+            result.is_err(),
+            "K1.6: import without --key-stdin / --key-file / \
+             --insecure-key-from-arg must fail at runtime"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("--key-stdin") && msg.contains("--key-file"),
+            "K1.6: error must name the secure alternatives, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_k1_6_import_key_file_path() {
+        // Write a hex key into a temp file and read it back.
+        let tmp = std::env::temp_dir().join(format!(
+            "k1_6_import_test_{}.key",
+            std::process::id()
+        ));
+        let hex_key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        std::fs::write(&tmp, format!("0x{}\n", hex_key)).expect("write test key file");
+
+        let read = read_import_key(false, Some(tmp.clone()), None).expect("read key file");
+        assert_eq!(read, hex_key);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_k1_6_argparse_rejects_legacy_short_flags() {
+        // Legacy `account import --key <hex>` MUST fail to parse.
+        // The new flags are `--key-stdin`, `--key-file`, and
+        // `--insecure-key-from-arg`. Plain `--key` was the L-05
+        // finding shape and should no longer be a recognized flag.
+        let result = TestCli::try_parse_from([
+            "test-cli",
+            "import",
+            "--key",
+            "abcd",
+        ]);
+        assert!(
+            result.is_err(),
+            "K1.6: legacy `--key` flag must no longer parse. The shape \
+             that put private keys on argv is what L-05 flagged."
+        );
+    }
+
+    #[test]
+    fn test_k1_6_argparse_accepts_stdin_flag() {
+        let result = TestCli::try_parse_from(["test-cli", "import", "--key-stdin"]);
+        assert!(
+            result.is_ok(),
+            "K1.6: `--key-stdin` is the recommended secure path and must parse"
+        );
+    }
+
+    #[test]
+    fn test_k1_6_argparse_accepts_key_file_flag() {
+        let result = TestCli::try_parse_from([
+            "test-cli",
+            "import",
+            "--key-file",
+            "/tmp/some.key",
+        ]);
+        assert!(result.is_ok(), "K1.6: --key-file must parse");
+    }
+
+    #[test]
+    fn test_k1_6_argparse_rejects_simultaneous_key_sources() {
+        // The `conflicts_with_all` annotation on each option must
+        // prevent two key sources from being supplied at once.
+        let result = TestCli::try_parse_from([
+            "test-cli",
+            "import",
+            "--key-stdin",
+            "--insecure-key-from-arg",
+            "abcd",
+        ]);
+        assert!(
+            result.is_err(),
+            "K1.6: --key-stdin and --insecure-key-from-arg must conflict"
+        );
+    }
+
+    #[test]
+    fn test_k1_6_export_argparse_accepts_out_flag() {
+        let result = TestCli::try_parse_from([
+            "test-cli",
+            "export",
+            "0x1234",
+            "--out",
+            "/tmp/key.txt",
+        ]);
+        assert!(result.is_ok(), "K1.6: export --out must parse");
+    }
+
+    #[test]
+    fn test_k1_6_export_argparse_accepts_confirm_stdout_flag() {
+        let result = TestCli::try_parse_from([
+            "test-cli",
+            "export",
+            "0x1234",
+            "--confirm-stdout",
+        ]);
+        assert!(
+            result.is_ok(),
+            "K1.6: export --confirm-stdout must parse"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_k1_6_write_secret_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!(
+            "k1_6_secret_perms_{}.key",
+            std::process::id()
+        ));
+        write_secret_file(&tmp, "deadbeef").expect("write secret file");
+        let meta = std::fs::metadata(&tmp).expect("stat tmp file");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "K1.6: exported key file must be mode 0600, got {:#o}",
+            mode
+        );
+        std::fs::remove_file(&tmp).ok();
+    }
 }
 
 /// Derive Ethereum-compatible address from ed25519 public key

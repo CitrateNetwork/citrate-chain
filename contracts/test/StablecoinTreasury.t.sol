@@ -93,6 +93,7 @@ contract StablecoinTreasuryTest is Test {
         assertEq(treasury.totalValueUsd(), 0);
         assertEq(treasury.currentEpoch(), 0);
         assertEq(treasury.stablecoinCount(), 2);
+        assertTrue(treasury.authorizedActivityRecorders(governance));
         assertTrue(treasury.acceptedStablecoins(address(usdc)));
         assertTrue(treasury.acceptedStablecoins(address(usdt)));
     }
@@ -404,6 +405,53 @@ contract StablecoinTreasuryTest is Test {
         StablecoinTreasury.EpochRevenue memory rev = treasury.getEpochRevenue(0);
         assertEq(rev.computeJobsCount, 5);
         assertEq(rev.inferenceCalls, 100);
+    }
+
+    function test_k1_3_non_recorder_cannot_record_activity() public {
+        vm.prank(outsider);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                StablecoinTreasury.NotAuthorizedActivityRecorder.selector,
+                outsider
+            )
+        );
+        treasury.recordActivity(5, 100);
+    }
+
+    function test_k1_3_governance_can_authorize_activity_recorder() public {
+        treasury.setAuthorizedActivityRecorder(alice, true);
+
+        vm.prank(alice);
+        treasury.recordActivity(7, 77);
+
+        StablecoinTreasury.EpochRevenue memory rev = treasury.getEpochRevenue(0);
+        assertEq(rev.computeJobsCount, 7);
+        assertEq(rev.inferenceCalls, 77);
+    }
+
+    function test_k1_3_non_governance_cannot_authorize_activity_recorder() public {
+        vm.prank(outsider);
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
+        treasury.setAuthorizedActivityRecorder(alice, true);
+    }
+
+    function test_k1_3_zero_activity_recorder_reverts() public {
+        vm.expectRevert(StablecoinTreasury.ZeroActivityRecorderAddress.selector);
+        treasury.setAuthorizedActivityRecorder(address(0), true);
+    }
+
+    function test_k1_3_remove_activity_recorder_blocks_future_records() public {
+        treasury.setAuthorizedActivityRecorder(alice, true);
+        treasury.setAuthorizedActivityRecorder(alice, false);
+
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                StablecoinTreasury.NotAuthorizedActivityRecorder.selector,
+                alice
+            )
+        );
+        treasury.recordActivity(1, 1);
     }
 
     // ============================================================

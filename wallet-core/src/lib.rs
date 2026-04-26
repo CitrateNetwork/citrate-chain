@@ -6,6 +6,7 @@
 //! This crate imports chain types (PublicKey, Hash, Transaction) from citrate-consensus
 //! and citrate-execution as READ-ONLY dependencies. It does NOT modify chain crates.
 
+pub mod address;
 pub mod error;
 pub mod format;
 pub mod keys;

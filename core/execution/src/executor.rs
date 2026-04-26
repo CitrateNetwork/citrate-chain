@@ -111,6 +111,15 @@ pub struct Executor {
     commit_coordinator: Arc<CommitCoordinator>,
 }
 
+/// Dirty contract storage mutation captured for a finalized state commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateStorageChange {
+    pub address: Address,
+    pub key: Vec<u8>,
+    /// `Some(value)` writes a slot; `None` deletes it.
+    pub value: Option<Vec<u8>>,
+}
+
 /// Trait for state storage to avoid circular dependency
 pub trait StateStoreTrait: Send + Sync {
     fn put_account(
@@ -124,6 +133,29 @@ pub trait StateStoreTrait: Send + Sync {
     fn put_storage(&self, address: &Address, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
     /// C6: Delete a contract storage slot
     fn delete_storage(&self, address: &Address, key: &[u8]) -> anyhow::Result<()>;
+
+    /// Persist all finalized account and storage mutations in one state batch.
+    ///
+    /// K1.1: producer-finalized state must be atomic and durable. The real
+    /// RocksDB-backed `StateStore` overrides this with one `WriteBatch`
+    /// committed via `write_batch_sync`. The default preserves compatibility
+    /// for test stores that implement only the older point-write methods.
+    fn write_state_batch_sync(
+        &self,
+        accounts: &[(Address, crate::types::AccountState)],
+        storage: &[StateStorageChange],
+    ) -> anyhow::Result<()> {
+        for (address, account) in accounts {
+            self.put_account(address, account)?;
+        }
+        for change in storage {
+            match &change.value {
+                Some(value) => self.put_storage(&change.address, &change.key, value)?,
+                None => self.delete_storage(&change.address, &change.key)?,
+            }
+        }
+        Ok(())
+    }
 
     // ------------------------------------------------------------------------
     // Sprint P950-A-4 WP-A.4.3: MVCC account-version persistence.
@@ -578,28 +610,33 @@ impl Executor {
         let _guard = self.commit_coordinator.acquire_exec_lock().await;
         if let Some(store) = &self.state_store {
             let dirty_accounts = self.state_db.accounts.get_dirty_accounts();
-            let mut count = dirty_accounts.len();
+            let mut account_changes = Vec::with_capacity(dirty_accounts.len());
 
             for address in dirty_accounts {
                 let account = self.state_db.accounts.get_account(&address);
-                store.put_account(&address, &account)?;
+                account_changes.push((address, account));
             }
 
-            // C6 fix: Also persist dirty contract storage slots
+            // C6 fix: Also persist dirty contract storage slots.
+            // K1.1: account and storage mutations are committed together by
+            // the storage backend, rather than by a loop of independent puts.
             let dirty_storage = self.state_db.take_dirty_storage();
-            count += dirty_storage.len();
-            for (address, key) in &dirty_storage {
-                if let Some(value) = self.state_db.get_storage(address, key) {
-                    store.put_storage(address, key, &value)?;
-                } else {
-                    // Slot was deleted — remove from persistent store too
-                    store.delete_storage(address, key)?;
-                }
+            let mut storage_changes = Vec::with_capacity(dirty_storage.len());
+            for (address, key) in dirty_storage {
+                storage_changes.push(StateStorageChange {
+                    value: self.state_db.get_storage(&address, &key),
+                    address,
+                    key,
+                });
+            }
+
+            let count = account_changes.len() + storage_changes.len();
+            if count > 0 {
+                store.write_state_batch_sync(&account_changes, &storage_changes)?;
             }
 
             // Commit state DB (clears dirty tracking)
             self.state_db.commit();
-
             Ok(count)
         } else {
             Ok(0) // No storage configured, nothing to persist

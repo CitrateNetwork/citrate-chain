@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import "./lib/Governable.sol";
+
 /// @title AgentDecisionRegistry
 /// @notice On-chain audit trail for AI agent tool executions.
 /// Every high-risk agent action (deploy, transfer, execute) is recorded
@@ -8,7 +10,7 @@ pragma solidity ^0.8.26;
 /// filed against any decision.
 ///
 /// Sprint HARDEN — WP-H.13
-contract AgentDecisionRegistry {
+contract AgentDecisionRegistry is Governable {
     // ── Types ───────────────────────────────────────────────────────
 
     enum DecisionStatus { Recorded, Disputed, Resolved }
@@ -38,6 +40,12 @@ contract AgentDecisionRegistry {
     /// Dispute count per agent (for trust scoring)
     mapping(bytes32 => uint256) public disputeCount;
 
+    /// Governance-approved addresses allowed to write decision records.
+    mapping(address => bool) public authorizedRecorders;
+
+    /// Governance-approved addresses allowed to open disputes.
+    mapping(address => bool) public authorizedDisputers;
+
     // ── Events ──────────────────────────────────────────────────────
 
     event DecisionRecorded(
@@ -61,6 +69,46 @@ contract AgentDecisionRegistry {
         DecisionStatus resolution
     );
 
+    event AuthorizedRecorderSet(address indexed recorder, bool allowed);
+    event AuthorizedDisputerSet(address indexed disputer, bool allowed);
+
+    error NotAuthorizedRecorder(address caller);
+    error NotAuthorizedDisputer(address caller);
+    error ZeroAddress();
+
+    modifier onlyAuthorizedRecorder() {
+        if (!authorizedRecorders[msg.sender]) revert NotAuthorizedRecorder(msg.sender);
+        _;
+    }
+
+    modifier onlyAuthorizedDisputer() {
+        if (!authorizedDisputers[msg.sender]) revert NotAuthorizedDisputer(msg.sender);
+        _;
+    }
+
+    constructor(address initialGovernance) Governable(initialGovernance) {
+        authorizedRecorders[initialGovernance] = true;
+        authorizedDisputers[initialGovernance] = true;
+        emit AuthorizedRecorderSet(initialGovernance, true);
+        emit AuthorizedDisputerSet(initialGovernance, true);
+    }
+
+    // ── Authorization ────────────────────────────────────────────────
+
+    /// @notice Allow or remove an address that may record agent decisions.
+    function setAuthorizedRecorder(address recorder, bool allowed) external onlyGovernance {
+        if (recorder == address(0)) revert ZeroAddress();
+        authorizedRecorders[recorder] = allowed;
+        emit AuthorizedRecorderSet(recorder, allowed);
+    }
+
+    /// @notice Allow or remove an address that may open disputes.
+    function setAuthorizedDisputer(address disputer, bool allowed) external onlyGovernance {
+        if (disputer == address(0)) revert ZeroAddress();
+        authorizedDisputers[disputer] = allowed;
+        emit AuthorizedDisputerSet(disputer, allowed);
+    }
+
     // ── Core Functions ──────────────────────────────────────────────
 
     /// @notice Record an agent decision on-chain
@@ -71,7 +119,7 @@ contract AgentDecisionRegistry {
         bytes32 agentId,
         string calldata toolName,
         bytes32 paramsHash
-    ) external returns (uint256 decisionId) {
+    ) external onlyAuthorizedRecorder returns (uint256 decisionId) {
         decisionId = decisionCount++;
 
         decisions[decisionId] = Decision({
@@ -96,7 +144,7 @@ contract AgentDecisionRegistry {
     function disputeDecision(
         uint256 decisionId,
         string calldata evidence
-    ) external {
+    ) external onlyAuthorizedDisputer {
         require(decisionId < decisionCount, "Decision does not exist");
         Decision storage d = decisions[decisionId];
         require(d.status == DecisionStatus.Recorded, "Decision already disputed or resolved");
@@ -114,7 +162,7 @@ contract AgentDecisionRegistry {
     function resolveDispute(
         uint256 decisionId,
         bool upheld
-    ) external {
+    ) external onlyGovernance {
         require(decisionId < decisionCount, "Decision does not exist");
         Decision storage d = decisions[decisionId];
         require(d.status == DecisionStatus.Disputed, "Decision not disputed");
@@ -184,7 +232,7 @@ contract AgentDecisionRegistry {
         bytes32 agentId,
         string calldata toolName,
         bytes32 paramsHash
-    ) external returns (uint256 decisionId) {
+    ) external onlyAuthorizedRecorder returns (uint256 decisionId) {
         string memory oldTier = _tierName(this.getTrustScore(agentId));
 
         decisionId = decisionCount++;
@@ -212,7 +260,7 @@ contract AgentDecisionRegistry {
     function disputeDecisionWithTierCheck(
         uint256 decisionId,
         string calldata evidence
-    ) external {
+    ) external onlyAuthorizedDisputer {
         require(decisionId < decisionCount, "Decision does not exist");
         Decision storage d = decisions[decisionId];
         require(d.status == DecisionStatus.Recorded, "Decision already disputed or resolved");

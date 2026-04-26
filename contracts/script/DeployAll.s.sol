@@ -73,10 +73,13 @@ contract DeployAll is ScriptEnv {
         WrappedSALT wsalt = new WrappedSALT();
         console.log("  WrappedSALT:", address(wsalt));
 
-        AgentDecisionRegistry agentRegistry = new AgentDecisionRegistry();
+        AgentDecisionRegistry agentRegistry = new AgentDecisionRegistry(deployer);
         console.log("  AgentDecisionRegistry:", address(agentRegistry));
 
-        SpecRegistry specRegistry = new SpecRegistry();
+        // RM-L / WP-L1.1: SpecRegistry now requires governance address
+        // at deploy. Pass `deployer` for testnet; production should pass
+        // the multisig per the L1.6 genesis runbook.
+        SpecRegistry specRegistry = new SpecRegistry(deployer);
         console.log("  SpecRegistry:", address(specRegistry));
 
         IPFSIncentives ipfs = new IPFSIncentives();
@@ -195,6 +198,7 @@ contract DeployAll is ScriptEnv {
             address(oracle),
             deployer   // admin
         );
+        treasury.setAuthorizedActivityRecorder(address(gateway), true);
         console.log("  BulkComputeGateway:", address(gateway));
 
         TestnetFarmingAccounting farming = new TestnetFarmingAccounting(

@@ -12,9 +12,13 @@
 //! `write_batch_sync` path, observed via the atomic counters on `RocksDB`.
 
 use citrate_consensus::types::{Block, BlockBuilder, Hash, PublicKey, Signature, Transaction};
+use citrate_execution::executor::Executor;
 use citrate_execution::types::{Address, TransactionReceipt};
+use citrate_execution::StateDB;
 use citrate_storage::chain::{BlockStore, TransactionStore};
 use citrate_storage::db::RocksDB;
+use citrate_storage::state::StateStore;
+use primitive_types::U256;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -101,6 +105,105 @@ fn test_rem_2_block_store_uses_write_batch_sync() {
          write_batch path on the producer-finality commit \
          (got sync_delta={}, nosync_delta={})",
         sync_delta, nosync_delta
+    );
+}
+
+/// K1.1: `Executor::persist_state_changes` is a producer-finalized state
+/// commit. Account and storage mutations must land in one durable RocksDB
+/// WriteBatch rather than a loop of point writes.
+#[tokio::test]
+async fn test_k1_1_executor_state_persist_uses_one_sync_batch() {
+    let (_temp, db) = fresh_db();
+    let store = Arc::new(StateStore::new(db.clone()));
+    let state_db = Arc::new(StateDB::new());
+    let executor = Executor::with_storage(state_db.clone(), Some(store.clone()));
+    let address = Address([0xAB; 20]);
+    let storage_key = vec![0x11; 32];
+    let storage_value = vec![0x22; 32];
+
+    state_db.accounts.set_balance(address, U256::from(1_234u64));
+    state_db.set_storage(address, storage_key.clone(), storage_value.clone());
+
+    let sync_before = db.write_batch_sync_count();
+    let nosync_before = db.write_batch_count();
+    let persisted = executor
+        .persist_state_changes()
+        .await
+        .expect("persist finalized state");
+
+    assert_eq!(persisted, 2, "one account plus one storage slot");
+    assert_eq!(
+        db.write_batch_sync_count() - sync_before,
+        1,
+        "K1.1: finalized account/storage state must commit as one sync batch"
+    );
+    assert_eq!(
+        db.write_batch_count() - nosync_before,
+        0,
+        "K1.1: finalized state must not use non-fsync write_batch"
+    );
+    assert_eq!(
+        store
+            .get_account(&address)
+            .expect("get account")
+            .expect("persisted account")
+            .balance,
+        U256::from(1_234u64)
+    );
+    assert_eq!(
+        store
+            .get_storage(&address, &storage_key)
+            .expect("get storage")
+            .expect("persisted storage"),
+        storage_value
+    );
+
+    state_db.delete_storage(address, &storage_key);
+    let sync_before_delete = db.write_batch_sync_count();
+    let deleted = executor
+        .persist_state_changes()
+        .await
+        .expect("persist storage delete");
+    assert_eq!(deleted, 1, "one storage deletion");
+    assert_eq!(
+        db.write_batch_sync_count() - sync_before_delete,
+        1,
+        "K1.1: storage deletion must also use the durable batch path"
+    );
+    assert!(
+        store
+            .get_storage(&address, &storage_key)
+            .expect("get deleted storage")
+            .is_none(),
+        "storage slot should be deleted after durable batch"
+    );
+}
+
+#[test]
+fn test_k1_1_executor_persist_state_changes_has_no_direct_point_writes() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../execution/src/executor.rs"
+    ))
+    .expect("read executor source");
+    let start = source
+        .find("pub async fn persist_state_changes")
+        .expect("persist_state_changes exists");
+    let end = source[start..]
+        .find("/// Store raw artifact bytes")
+        .map(|offset| start + offset)
+        .expect("persist_state_changes section end");
+    let body = &source[start..end];
+
+    assert!(
+        body.contains("write_state_batch_sync"),
+        "K1.1: Executor must route finalized state through the batch API"
+    );
+    assert!(
+        !body.contains("store.put_account(")
+            && !body.contains("store.put_storage(")
+            && !body.contains("store.delete_storage("),
+        "K1.1: Executor producer persistence must not use direct point writes"
     );
 }
 

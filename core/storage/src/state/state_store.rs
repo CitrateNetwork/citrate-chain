@@ -3,7 +3,7 @@
 use crate::db::{column_families::*, RocksDB};
 use anyhow::Result;
 use citrate_consensus::types::Hash;
-use citrate_execution::executor::StateStoreTrait;
+use citrate_execution::executor::{StateStorageChange, StateStoreTrait};
 use citrate_execution::types::{AccountState, Address, JobId, ModelId, ModelState, TrainingJob};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -43,6 +43,44 @@ impl StateStoreTrait for StateStore {
     fn delete_storage(&self, address: &Address, key: &[u8]) -> Result<()> {
         let storage_key = storage_key(address, key);
         self.db.delete_cf(CF_STORAGE, &storage_key)?;
+        Ok(())
+    }
+
+    fn write_state_batch_sync(
+        &self,
+        accounts: &[(Address, AccountState)],
+        storage: &[StateStorageChange],
+    ) -> Result<()> {
+        if accounts.is_empty() && storage.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = self.db.batch();
+        for (address, account) in accounts {
+            let account_bytes = bincode::serialize(account)?;
+            self.db
+                .batch_put_cf(&mut batch, CF_ACCOUNTS, &address.0, &account_bytes)?;
+        }
+        for change in storage {
+            let storage_key = storage_key(&change.address, &change.key);
+            match &change.value {
+                Some(value) => {
+                    self.db
+                        .batch_put_cf(&mut batch, CF_STORAGE, &storage_key, value)?;
+                }
+                None => {
+                    self.db
+                        .batch_delete_cf(&mut batch, CF_STORAGE, &storage_key)?;
+                }
+            }
+        }
+
+        self.db.write_batch_sync(batch)?;
+        debug!(
+            "Stored finalized state batch: {} account(s), {} storage mutation(s)",
+            accounts.len(),
+            storage.len()
+        );
         Ok(())
     }
 

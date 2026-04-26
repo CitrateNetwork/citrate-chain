@@ -106,6 +106,23 @@ const KDF_OUTPUT_LEN: usize = 32;
 /// **Errors** as a JS exception (`Error.message` set) on:
 ///   * `salt.len() < 8` — Argon2 minimum salt length
 ///   * `password.is_empty()` — empty passwords are rejected at this layer
+///
+/// **Lifetime contract (RM-K / WP-K1.9 — see ADR-RM-K-1-9)**: the
+/// returned `Vec<u8>` crosses the WASM-to-JS boundary as a
+/// `Uint8Array`. The Rust-side bytes are dropped on return; the JS
+/// caller holds the only live copy. This function CANNOT zeroize
+/// the JS-heap copy. Callers MUST:
+///
+///   1. Use the returned bytes immediately (e.g., import into a
+///      non-extractable `CryptoKey`).
+///   2. Call `.fill(0)` on the `Uint8Array` in a `finally` block
+///      and rebind the local to `null` after use.
+///   3. Prefer `crypto.subtle.importKey(..., extractable=false, ...)`
+///      so the key material lives in the browser's opaque crypto
+///      subsystem rather than scriptable JS memory.
+///
+/// See `ADR-RM-K-1-9-wasm-zeroize-and-js-lifetime.md` for the
+/// full policy and the static-grep test that pins it.
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 pub fn argon2_v2_derive_key(password: &[u8], salt: &[u8]) -> Result<Vec<u8>, JsError> {
