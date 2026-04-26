@@ -3,10 +3,16 @@ name: Perf Smoke (manual)
 on:
   workflow_dispatch: {}
 
+# RM-B1 / WP-F1.1 (audit CI-01): minimum permissions at workflow level.
+permissions:
+  contents: read
+
 jobs:
   perf-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4

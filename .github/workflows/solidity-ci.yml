@@ -11,6 +11,10 @@ on:
       - 'citrate_v0.01.1/contracts/**'
       - 'citrate_v0.01.1/foundry.toml'
 
+# RM-B1 / WP-F1.1 (audit CI-01): minimum permissions at workflow level.
+permissions:
+  contents: read
+
 concurrency:
   group: solidity-ci-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
@@ -18,6 +22,8 @@ concurrency:
 jobs:
   forge-tests:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Install Foundry
@@ -33,6 +39,8 @@ jobs:
   slither:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Install Python and Slither
