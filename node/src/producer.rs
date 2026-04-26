@@ -1613,7 +1613,7 @@ mod tests {
 
         assert_eq!(legacy_vrf.proof.len(), 32);
         // Verifier should accept 32-byte legacy proofs
-        let result = vrf_selector.verify_vrf_proof(&proposer, &legacy_vrf, &prev_vrf, 1);
+        let result = vrf_selector.verify_vrf_math_only(&proposer, &legacy_vrf, &prev_vrf, 1);
         assert!(result.is_ok(), "Legacy VRF verification should not error");
     }
 

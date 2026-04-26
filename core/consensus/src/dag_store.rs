@@ -398,6 +398,13 @@ impl DagStore {
 
     /// WP-W.2: Cryptographically verify a block's VRF proof against the parent block's VRF output.
     /// Requires the parent block to already be in the DAG store.
+    ///
+    /// RM-J1 (post-RM-I-3 cleanup): admission uses the
+    /// **structurally-bound** verifier `verify_vrf_with_block_signature`
+    /// — combines ECVRF math with the block's ed25519 signature so the
+    /// proposer identity is unspoofable at this layer (REM-N-01).
+    /// `signed_payload` is the block hash, which is what
+    /// `crypto::sign_block` signs.
     async fn verify_block_vrf_crypto(&self, block: &Block) -> Result<(), String> {
         if block.is_genesis() {
             return Ok(());
@@ -412,14 +419,16 @@ impl DagStore {
         let prev_vrf_output = parent.header.vrf_reveal.output;
         let vrf_selector = VrfProposerSelector::new();
 
-        match vrf_selector.verify_vrf_proof(
+        match vrf_selector.verify_vrf_with_block_signature(
             &block.header.proposer_pubkey,
             &block.header.vrf_reveal,
             &prev_vrf_output,
             block.header.height,
+            block.header.block_hash.as_bytes(),
+            &block.signature,
         ) {
             Ok(true) => Ok(()),
-            Ok(false) => Err("VRF proof verification failed: invalid proof".to_string()),
+            Ok(false) => Err("VRF proof verification failed: invalid proof or identity binding".to_string()),
             Err(e) => Err(format!("VRF verification error: {}", e)),
         }
     }
@@ -887,15 +896,32 @@ mod tests {
     }
 
     /// Helper: create a block with a valid legacy SHA3 VRF proof using the given parent VRF output.
+    ///
+    /// RM-J1 update: post-REM-N-01 the admission path uses the
+    /// structurally-bound `verify_vrf_with_block_signature`, which
+    /// requires the block's ed25519 signature to verify under the
+    /// proposer's pubkey over the block hash. This helper now signs
+    /// the block hash with a deterministic ed25519 key derived from
+    /// `hash` so the test fixture passes the binding.
     fn create_block_with_vrf_parent_output(
         hash: [u8; 32],
         height: u64,
         parent: Hash,
         parent_vrf_output: Hash,
     ) -> Block {
+        use ed25519_dalek::{Signer, SigningKey};
         use sha3::{Digest, Sha3_256};
 
-        let proposer = PublicKey::new([1; 32]);
+        // Deterministic ed25519 secret derived from `hash` so each
+        // test block gets a unique-but-reproducible (proposer, sig)
+        // pair. The proposer pubkey on the block is the
+        // verifying-key derived from this secret.
+        let mut secret = [0u8; 32];
+        secret[..32].copy_from_slice(&Sha3_256::digest(hash));
+        let signing_key = SigningKey::from_bytes(&secret);
+        let proposer_bytes = signing_key.verifying_key().to_bytes();
+        let proposer = PublicKey::new(proposer_bytes);
+
         let proof_bytes: [u8; 32] = [0x42; 32]; // arbitrary 32-byte proof
 
         // Reconstruct the alpha: SHA3(pubkey || prev_vrf || slot)
@@ -911,8 +937,12 @@ mod tests {
         output_hasher.update(input);
         let output = Hash::from_bytes(&output_hasher.finalize());
 
+        // Build the block first to know the block hash, then sign it.
+        let block_hash = Hash::new(hash);
+        let signature = Signature::new(signing_key.sign(block_hash.as_bytes()).to_bytes());
+
         BlockBuilder::new()
-            .hash(Hash::new(hash))
+            .hash(block_hash)
             .height(height)
             .parent(parent)
             .proposer(proposer)
@@ -920,7 +950,7 @@ mod tests {
                 proof: proof_bytes.to_vec(),
                 output,
             })
-            .signature(Signature::new([1; 64]))
+            .signature(signature)
             .build_unhashed()
     }
 

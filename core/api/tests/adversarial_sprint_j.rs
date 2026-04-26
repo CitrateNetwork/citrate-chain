@@ -496,13 +496,13 @@ async fn j3_vrf_proposer_binding_invariant() {
 
     // Must verify under correct proposer
     assert!(
-        selector.verify_vrf_proof(&proposer_a, &proof, &prev_vrf, slot).unwrap(),
+        selector.verify_vrf_math_only(&proposer_a, &proof, &prev_vrf, slot).unwrap(),
         "J.3: VRF must verify under correct proposer"
     );
 
     // Must NOT verify under different proposer
     assert!(
-        !selector.verify_vrf_proof(&proposer_b, &proof, &prev_vrf, slot).unwrap(),
+        !selector.verify_vrf_math_only(&proposer_b, &proof, &prev_vrf, slot).unwrap(),
         "J.3: VRF must not verify under different proposer"
     );
 }
