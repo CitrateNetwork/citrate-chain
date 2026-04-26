@@ -364,6 +364,96 @@ impl KeyStore {
     }
 }
 
+// =========================================================================
+// RM-G2.1 / audit CX-01 + WAL-03 — one-shot migration to wallet-core.
+//
+// The dual-keystore situation the audit flagged:
+//   - `wallet::KeyStore` (this file): JSON file, ed25519-only,
+//     home-rolled AAD-less AES-GCM envelope.
+//   - `citrate-wallet-core::KeyManager`: JSON file, ed25519 +
+//     secp256k1, AAD-bound AES-GCM envelope (WAL-02).
+//
+// Both implementations independently re-derive Argon2 parameters
+// against `docs/security/KDF_POLICY.md`. Any drift between them is
+// a silent split that turns into "my keystore won't open in the
+// other tool" support tickets — and worse, in a security update
+// the fix has to land twice.
+//
+// `migrate_to_unified_keystore` decrypts every entry under the
+// legacy KDF, then re-imports it via `KeyManager::import_account`,
+// which always writes a v2 (AAD-bound) entry. After migration the
+// caller can delete the legacy file.
+//
+// New code MUST NOT use `KeyStore` for writes. The Semgrep rule
+// `tools/semgrep/rules/wal-03-dual-keystore.yaml` enforces this.
+// =========================================================================
+
+/// Migrate every entry from this legacy `KeyStore` into a
+/// `citrate-wallet-core::KeyManager` at `target_path`. Returns the
+/// number of entries migrated.
+///
+/// Behaviour:
+///   - Unlocks self with `password` (so each entry is decrypted via
+///     the legacy KDF dispatcher — including any kdfVersion=1
+///     entries the user hasn't manually re-encrypted yet).
+///   - For each unlocked SigningKey, calls
+///     `KeyManager::import_account(hex(secret_bytes), password,
+///     label)` which encrypts under the wallet-core v2 envelope.
+///   - The legacy file is left untouched on disk; the caller
+///     decides whether to delete it (typical CLI flow renames it
+///     `<file>.legacy.bak`).
+///
+/// The same `password` MUST unlock both the legacy and the new
+/// keystore — that's the migration contract. If the caller wants
+/// to change passwords, they should run a second `change_password`
+/// against the unified keystore after migration.
+pub fn migrate_to_unified_keystore(
+    legacy: &mut KeyStore,
+    password: &str,
+    target_path: &std::path::Path,
+) -> Result<usize, WalletError> {
+    // Unlock the legacy keystore.
+    legacy.unlock(password)?;
+
+    let target = citrate_wallet_core::KeyManager::new(target_path);
+
+    let mut migrated = 0usize;
+    for (idx, entry) in legacy.keys.iter().enumerate() {
+        // We already unlocked, so the corresponding SigningKey is
+        // at the same index in `unlocked`.
+        let signing_key = legacy
+            .unlocked
+            .get(idx)
+            .ok_or_else(|| WalletError::Other(format!(
+                "RM-G2.1: unlocked SigningKey missing for entry {}",
+                idx,
+            )))?;
+
+        let secret_hex = hex::encode(signing_key.to_bytes());
+        let label = entry.alias.clone().unwrap_or_else(|| format!("Migrated #{}", idx));
+
+        // KeyManager::import_account hashes the password under v2,
+        // produces a fresh AAD-bound entry, and persists. Errors
+        // bubble up with full context.
+        citrate_wallet_core::KeyManager::import_account(
+            &target,
+            &secret_hex,
+            password,
+            &label,
+        )
+        .map_err(|e| WalletError::Other(format!(
+            "RM-G2.1: migration failed for entry {}: {}",
+            idx, e,
+        )))?;
+        migrated += 1;
+    }
+
+    // Re-lock the legacy keystore so the in-memory plaintext
+    // SigningKeys are dropped immediately after migration.
+    legacy.lock();
+    Ok(migrated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
