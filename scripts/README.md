@@ -26,7 +26,7 @@ Operational shell scripts for deployment, testing, and orchestration. We recomme
 | `health_check_bootstrap.sh` | Health check for bootstrap nodes |
 | `deploy_testnet.sh` | Deploy to testnet infrastructure |
 | `deploy_monitoring.sh` | Deploy Prometheus + Grafana monitoring stack |
-| `build-release.sh` | Build release binaries |
+| `build-release.sh` | Build local release binaries; GitHub Release publication is restricted to the root release workflow |
 
 ## Testing
 

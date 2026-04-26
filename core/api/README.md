@@ -37,7 +37,7 @@ The server includes production-grade infrastructure: per-client sliding-window r
 | `methods/state` | `src/methods/state.rs` | `StateApi`: balance, nonce, code, storage slot queries |
 | `methods/transaction` | `src/methods/transaction.rs` | `TransactionApi`: send transaction, get transaction, get receipt |
 | `methods/network` | `src/methods/network.rs` | `NetworkApi`: peer count, listening status, version |
-| `methods/mempool` | `src/methods/mempool.rs` | `MempoolApi`: `citrate_getMempoolSnapshot`, pending transaction queries |
+| `methods/mempool` | `src/methods/mempool.rs` | `MempoolApi`: public aggregate stats and operator-only bounded pending summaries |
 | `types/mod` | `src/types/mod.rs` | API types module root |
 | `types/error` | `src/types/error.rs` | `ApiError` enum with JSON-RPC error codes |
 | `types/request` | `src/types/request.rs` | `BlockId`, `BlockTag`, `CallRequest` request types |
@@ -79,7 +79,8 @@ The server includes production-grade infrastructure: per-client sliding-window r
 
 | Method | Description |
 |--------|-------------|
-| `citrate_getMempoolSnapshot` | Full mempool state |
+| `citrate_getMempoolStats` | Public aggregate mempool stats, no per-transaction detail |
+| `citrate_getMempoolSnapshot` | Operator-only bounded pending transaction summaries; requires `operator_token` |
 | `citrate_getTextEmbedding` | Generate text embeddings |
 | `citrate_chatCompletion` | Chat completion (OpenAI-compatible) |
 | `citrate_deployModel` | Deploy AI model on-chain |

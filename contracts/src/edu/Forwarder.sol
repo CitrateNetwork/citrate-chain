@@ -3,11 +3,22 @@ pragma solidity ^0.8.26;
 
 import {IForwarder} from "./interfaces/IForwarder.sol";
 import {IClassroomCluster} from "./interfaces/IClassroomCluster.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /// @title Forwarder
 /// @notice EIP-2771 meta-transaction forwarder for sponsored student actions.
 /// @dev Implements all 8 invariants from Q-006 ForwarderReplaySafety.tla.
 contract Forwarder is IForwarder {
+    // ── EIP-712 ──
+
+    bytes32 private constant _EIP712_DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 private constant _NAME_HASH = keccak256("CitrateEduForwarder");
+    bytes32 private constant _VERSION_HASH = keccak256("1");
+
+    bytes32 public constant FORWARD_REQUEST_TYPEHASH =
+        keccak256("ForwardRequest(bytes32 orgPrincipalId,uint256 classroomId,uint256 nonce,uint256 sessionExpiry,bytes32 deviceCertHash,address target,bytes32 dataHash)");
+
     // ── Storage ──
 
     address public governance;
@@ -15,6 +26,7 @@ contract Forwarder is IForwarder {
     address public vaultAddress;
 
     mapping(address => bool) private _authorizedRelayers;
+    mapping(address => bool) private _allowedTargets;
     mapping(bytes32 => mapping(uint256 => uint256)) private _nonces; // orgPrincipalId => classroomId => nonce
     mapping(bytes32 => bool) private _consumedTxHashes;
 
@@ -28,6 +40,8 @@ contract Forwarder is IForwarder {
     error DeviceRevoked();
     error PrincipalRevoked();
     error TargetIsVault();
+    error TargetNotAllowed();
+    error InvalidSignature();
     error CallFailed();
     error ZeroAddress();
 
@@ -62,6 +76,24 @@ contract Forwarder is IForwarder {
         return _authorizedRelayers[relayer];
     }
 
+    function isAllowedTarget(address target) external view returns (bool) {
+        return _allowedTargets[target];
+    }
+
+    function DOMAIN_SEPARATOR() public view returns (bytes32) {
+        return keccak256(abi.encode(
+            _EIP712_DOMAIN_TYPEHASH,
+            _NAME_HASH,
+            _VERSION_HASH,
+            block.chainid,
+            address(this)
+        ));
+    }
+
+    function hashForwardRequest(ForwardRequest calldata request) public view returns (bytes32) {
+        return _hashForwardRequest(request);
+    }
+
     // ── Execute ──
 
     /// @dev Invariants enforced:
@@ -74,10 +106,11 @@ contract Forwarder is IForwarder {
     ///   7. OfflineQueueFlushSafe — consumed tx hash prevents duplicate flush
     function execute(
         ForwardRequest calldata request,
-        bytes calldata /* relayerSignature */
+        bytes calldata signature
     ) external onlyRelayer returns (bool success) {
         // Invariant 6: RelayerCannotCallVault
         if (request.target == vaultAddress) revert TargetIsVault();
+        if (!_allowedTargets[request.target]) revert TargetNotAllowed();
 
         // Invariant 4: SessionExpiryEnforced
         if (block.timestamp > request.sessionExpiry) revert SessionExpired();
@@ -87,13 +120,7 @@ contract Forwarder is IForwarder {
         if (request.nonce != expectedNonce) revert InvalidNonce();
 
         // Invariant 2: NoReplayAccepted
-        bytes32 txHash = keccak256(abi.encode(
-            request.orgPrincipalId,
-            request.classroomId,
-            request.nonce,
-            request.target,
-            keccak256(request.data)
-        ));
+        bytes32 txHash = _hashForwardRequest(request);
         if (_consumedTxHashes[txHash]) revert ReplayDetected();
 
         // Invariant 5: RevocationBarrierDouble (on-chain check)
@@ -108,6 +135,9 @@ contract Forwarder is IForwarder {
         // For v1, we verify the device's user is still active
         address deviceUser = cluster.getDeviceUser(request.deviceCertHash);
         if (deviceUser == address(0)) revert PrincipalRevoked();
+
+        address signer = _recoverSigner(txHash, signature);
+        if (signer != deviceUser) revert InvalidSignature();
 
         // Consume nonce and tx hash (effects before interactions — CEI)
         _nonces[request.orgPrincipalId][request.classroomId] = expectedNonce + 1;
@@ -137,6 +167,13 @@ contract Forwarder is IForwarder {
         _authorizedRelayers[relayer] = false;
     }
 
+    function setTargetAllowed(address target, bool allowed) external onlyGovernance {
+        if (target == address(0)) revert ZeroAddress();
+        if (target == vaultAddress && allowed) revert TargetIsVault();
+        _allowedTargets[target] = allowed;
+        emit TargetAllowedUpdated(target, allowed);
+    }
+
     function setClusterContract(address cluster) external onlyGovernance {
         if (cluster == address(0)) revert ZeroAddress();
         clusterContract = cluster;
@@ -145,5 +182,30 @@ contract Forwarder is IForwarder {
     function setVaultAddress(address vault) external onlyGovernance {
         if (vault == address(0)) revert ZeroAddress();
         vaultAddress = vault;
+        _allowedTargets[vault] = false;
+    }
+
+    // ── Internal ──
+
+    function _hashForwardRequest(ForwardRequest calldata request) private view returns (bytes32) {
+        bytes32 structHash = keccak256(abi.encode(
+            FORWARD_REQUEST_TYPEHASH,
+            request.orgPrincipalId,
+            request.classroomId,
+            request.nonce,
+            request.sessionExpiry,
+            request.deviceCertHash,
+            request.target,
+            keccak256(request.data)
+        ));
+
+        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
+    }
+
+    function _recoverSigner(bytes32 digest, bytes calldata signature) private pure returns (address) {
+        bytes memory signatureBytes = signature;
+        (address recovered, ECDSA.RecoverError error,) = ECDSA.tryRecover(digest, signatureBytes);
+        if (error != ECDSA.RecoverError.NoError) revert InvalidSignature();
+        return recovered;
     }
 }

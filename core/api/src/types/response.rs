@@ -142,3 +142,58 @@ pub struct MempoolStatus {
     pub total_size: usize,
     pub max_size: usize,
 }
+
+/// Redacted pending transaction summary for operator mempool inspection.
+///
+/// This intentionally excludes raw calldata and access-list contents. Operators
+/// get enough information to inspect queue health and identify hashes without
+/// turning the RPC into a bulk calldata dump.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingTransactionSummary {
+    pub hash: String,
+    pub nonce: u64,
+    pub from: String,
+    pub to: Option<String>,
+    pub value: String,
+    pub gas_limit: String,
+    pub gas_price: String,
+    pub data_size: usize,
+    pub eth_tx_type: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<u64>,
+}
+
+impl From<Transaction> for PendingTransactionSummary {
+    fn from(tx: Transaction) -> Self {
+        let from_addr = citrate_execution::address_utils::normalize_address(&tx.from);
+        let to_addr = tx
+            .to
+            .map(|to| citrate_execution::address_utils::normalize_address(&to));
+        Self {
+            hash: format!("0x{}", hex::encode(tx.hash.as_bytes())),
+            nonce: tx.nonce,
+            from: format!("0x{}", hex::encode(from_addr.0)),
+            to: to_addr.map(|addr| format!("0x{}", hex::encode(addr.0))),
+            value: format!("0x{:x}", tx.value),
+            gas_limit: format!("0x{:x}", tx.gas_limit),
+            gas_price: format!("0x{:x}", tx.gas_price),
+            data_size: tx.data.len(),
+            eth_tx_type: tx.eth_tx_type,
+            chain_id: tx.chain_id,
+        }
+    }
+}
+
+/// Bounded response shape for pending mempool inspection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingTransactionsResponse {
+    pub pending: Vec<PendingTransactionSummary>,
+    pub total_transactions: usize,
+    pub total_bytes: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub returned: usize,
+    pub truncated: bool,
+}

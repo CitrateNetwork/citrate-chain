@@ -86,6 +86,8 @@ contract DeployEduStack is ScriptEnv {
         console.log("=== Edu Stack Deployed ===");
         console.log("Vault governance signers:", signer1, signer2, signer3);
         console.log("Relayer (add via vault.addRelayer on Forwarder):", relayer);
+        console.log("Forwarder targets are denied by default.");
+        console.log("Schedule vault txs: forwarder.setTargetAllowed(<audited target>, true).");
         console.log("SALT/USD rate (basis points):", saltUsdRate);
     }
 }

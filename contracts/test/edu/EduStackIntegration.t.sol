@@ -50,12 +50,17 @@ contract EduStackIntegrationTest is Test {
     address itDir = address(0x2001);      // IT director
     address relayer = address(0x3001);    // Institutional relayer
     address teacher1 = address(0x4001);   // Biology teacher
-    address student1 = address(0x5001);   // Student
+    uint256 student1Key = 0x5001;
+    uint256 student2Key = 0x5002;
+    uint256 student3Key = 0x5003;
+    address student1;                     // Student
 
     bytes32 device1Cert = keccak256("chromebook-bio-001");
     bytes32 studentPrincipal = keccak256("hmac-student-001");
 
     function setUp() public {
+        student1 = vm.addr(student1Key);
+
         // 1. Deploy vault with 3-of-3 multi-sig (principal, VP, CFO)
         address[] memory signers = new address[](3);
         signers[0] = principal;
@@ -83,7 +88,25 @@ contract EduStackIntegrationTest is Test {
         cluster.grantOrgRole(principal, IClassroomCluster.OrgRole.Admin);
         cluster.grantOrgRole(itDir, IClassroomCluster.OrgRole.IT);
         forwarder.addRelayer(relayer);
+        forwarder.setTargetAllowed(address(recorder), true);
         vm.stopPrank();
+    }
+
+    function _signForwardRequest(
+        IForwarder.ForwardRequest memory req,
+        uint256 privateKey
+    ) internal view returns (bytes memory) {
+        bytes32 digest = forwarder.hashForwardRequest(req);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _executeAsRelayer(
+        IForwarder.ForwardRequest memory req,
+        bytes memory signature
+    ) internal returns (bool) {
+        vm.prank(relayer);
+        return forwarder.execute(req, signature);
     }
 
     // ===================================================================
@@ -132,8 +155,7 @@ contract EduStackIntegrationTest is Test {
             data: trainingCall
         });
 
-        vm.prank(relayer);
-        bool success = forwarder.execute(req, "");
+        bool success = _executeAsRelayer(req, _signForwardRequest(req, student1Key));
         assertTrue(success);
         assertEq(recorder.getTupleCount(), 1);
 
@@ -160,8 +182,8 @@ contract EduStackIntegrationTest is Test {
         uint256 cid = cluster.createClassroom("Chemistry 201", teacher1, 11, 2026, "B");
 
         // Register 3 devices and students
-        address student2 = address(0x5002);
-        address student3 = address(0x5003);
+        address student2 = vm.addr(student2Key);
+        address student3 = vm.addr(student3Key);
         bytes32 dev2 = keccak256("chromebook-chem-002");
         bytes32 dev3 = keccak256("chromebook-chem-003");
         bytes32 principal2 = keccak256("hmac-student-002");
@@ -184,6 +206,7 @@ contract EduStackIntegrationTest is Test {
         // Each student submits a training contribution
         bytes32[3] memory principals = [studentPrincipal, principal2, principal3];
         bytes32[3] memory devices = [device1Cert, dev2, dev3];
+        uint256[3] memory keys = [student1Key, student2Key, student3Key];
 
         for (uint256 i = 0; i < 3; i++) {
             bytes memory call_ = abi.encodeWithSelector(
@@ -203,8 +226,7 @@ contract EduStackIntegrationTest is Test {
                 data: call_
             });
 
-            vm.prank(relayer);
-            forwarder.execute(req, "");
+            _executeAsRelayer(req, _signForwardRequest(req, keys[i]));
         }
 
         assertEq(recorder.getTupleCount(), 3);
@@ -237,8 +259,7 @@ contract EduStackIntegrationTest is Test {
             )
         });
 
-        vm.prank(relayer);
-        forwarder.execute(req1, "");
+        _executeAsRelayer(req1, _signForwardRequest(req1, student1Key));
         assertEq(recorder.getTupleCount(), 1);
 
         // IT revokes device (reported lost/stolen)
@@ -259,9 +280,9 @@ contract EduStackIntegrationTest is Test {
             )
         });
 
-        vm.prank(relayer);
+        bytes memory revokedDeviceSignature = _signForwardRequest(req2, student1Key);
         vm.expectRevert(); // DeviceRevoked
-        forwarder.execute(req2, "");
+        _executeAsRelayer(req2, revokedDeviceSignature);
 
         // Only 1 contribution recorded
         assertEq(recorder.getTupleCount(), 1);

@@ -46,6 +46,7 @@ interface IForwarder {
         uint256 nonce,
         string reason
     );
+    event TargetAllowedUpdated(address indexed target, bool allowed);
 
     // ── Views ──
 
@@ -55,19 +56,35 @@ interface IForwarder {
     /// @notice Check if a relayer address is authorized.
     function isAuthorizedRelayer(address relayer) external view returns (bool);
 
+    /// @notice Check if a target contract is allowed for forwarded calls.
+    function isAllowedTarget(address target) external view returns (bool);
+
+    /// @notice EIP-712 domain separator for the current chain ID and contract.
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+
+    /// @notice Typed-data digest that the active device user must sign.
+    function hashForwardRequest(ForwardRequest calldata request) external view returns (bytes32);
+
+    /// @notice ForwardRequest EIP-712 typehash.
+    function FORWARD_REQUEST_TYPEHASH() external view returns (bytes32);
+
     // ── Mutators ──
 
     /// @notice Execute a meta-transaction on behalf of a pseudonymous user.
     /// @dev Only callable by authorized relayers.
-    ///      Checks: nonce monotonic, not revoked, session not expired, device active.
+    ///      Checks: target allowed, nonce monotonic, not revoked, session not expired,
+    ///      device active, and typed request signed by the active device user.
     ///      Invariant: RelayerCannotCallVault — target must not be the vault contract.
-    function execute(ForwardRequest calldata request, bytes calldata relayerSignature) external returns (bool success);
+    function execute(ForwardRequest calldata request, bytes calldata signature) external returns (bool success);
 
     /// @notice Add an authorized relayer address (governance only).
     function addRelayer(address relayer) external;
 
     /// @notice Remove an authorized relayer address (governance only).
     function removeRelayer(address relayer) external;
+
+    /// @notice Set whether a target contract can receive forwarded calls.
+    function setTargetAllowed(address target, bool allowed) external;
 
     /// @notice Set the ClassroomCluster contract address for revocation checks.
     function setClusterContract(address cluster) external;

@@ -2,7 +2,7 @@
 
 use crate::eth_tx_decoder;
 use crate::filter::{FilterRegistry, FilterType};
-use crate::methods::{ChainApi, StateApi};
+use crate::methods::{mempool::PendingQuery, ChainApi, MempoolApi, StateApi};
 use futures::executor::block_on;
 use hex;
 use jsonrpc_core::{IoHandler, Params, Value};
@@ -1890,7 +1890,7 @@ pub fn register_eth_methods(
         }
     });
 
-    // citrate_getMempoolSnapshot - Get all pending transactions in mempool
+    // citrate_getMempoolSnapshot - Get bounded pending transaction summaries
     //
     // RM-B1 / WP-C1.1 (audit H-API-01): operator-auth gated. Pre-fix
     // any unauthenticated caller could dump the full mempool — sender,
@@ -1898,7 +1898,10 @@ pub fn register_eth_methods(
     // running and deanonymisation. Post-fix the method requires the
     // same `operator_token` that `setOperator` etc. require, gated by
     // `CITRATE_OPERATOR_TOKEN`. Without that env var set, the endpoint
-    // is fail-closed (returns 401-equivalent JSON-RPC error).
+    // is fail-closed (returns 401-equivalent JSON-RPC error). WP-J1.7
+    // additionally routes the response through the bounded/redacted
+    // pending-summary path so operator requests cannot produce an
+    // unbounded calldata dump.
     let mempool_snapshot = mempool.clone();
     io_handler.add_sync_method("citrate_getMempoolSnapshot", move |params: Params| {
         // Parse params as an object for the operator_token field.
@@ -1919,73 +1922,12 @@ pub fn register_eth_methods(
         // H-API-01 fix: operator-auth gate.
         crate::server::require_operator_auth(&params_map)?;
 
-        let mp = mempool_snapshot.clone();
-
-        // Get mempool stats to know how many transactions to fetch
-        let stats = block_on(mp.stats());
-        let total = stats.total_transactions;
-
-        // Get all transactions from mempool
-        let txs = block_on(mp.get_transactions(total));
-
-        // Convert to JSON format
-        let mut tx_list = Vec::new();
-        for tx in txs {
-            let mut tx_obj = serde_json::Map::new();
-            tx_obj.insert(
-                "hash".to_string(),
-                Value::String(format!("0x{}", hex::encode(tx.hash.as_bytes()))),
-            );
-
-            // Convert from address
-            let from_addr = citrate_execution::address_utils::normalize_address(&tx.from);
-            tx_obj.insert(
-                "from".to_string(),
-                Value::String(format!("0x{}", hex::encode(from_addr.0))),
-            );
-
-            // Convert to address
-            if let Some(to_pk) = tx.to {
-                let to_addr = citrate_execution::address_utils::normalize_address(&to_pk);
-                tx_obj.insert(
-                    "to".to_string(),
-                    Value::String(format!("0x{}", hex::encode(to_addr.0))),
-                );
-            } else {
-                tx_obj.insert("to".to_string(), Value::Null);
-            }
-
-            tx_obj.insert(
-                "value".to_string(),
-                Value::String(format!("0x{:x}", tx.value)),
-            );
-            tx_obj.insert(
-                "nonce".to_string(),
-                Value::String(format!("0x{:x}", tx.nonce)),
-            );
-            tx_obj.insert(
-                "gasPrice".to_string(),
-                Value::String(format!("0x{:x}", tx.gas_price)),
-            );
-            tx_obj.insert(
-                "gasLimit".to_string(),
-                Value::String(format!("0x{:x}", tx.gas_limit)),
-            );
-            tx_obj.insert("dataSize".to_string(), Value::Number(tx.data.len().into()));
-
-            tx_list.push(Value::Object(tx_obj));
+        let query = PendingQuery::from_params_map(&params_map)?;
+        let api = MempoolApi::new(mempool_snapshot.clone());
+        match block_on(api.get_pending(query)) {
+            Ok(snapshot) => Ok(serde_json::to_value(snapshot).unwrap_or(Value::Null)),
+            Err(err) => Err(err.into()),
         }
-
-        // Return mempool info
-        let mut result = serde_json::Map::new();
-        result.insert("pending".to_string(), Value::Array(tx_list));
-        result.insert("totalTransactions".to_string(), Value::Number(total.into()));
-        result.insert(
-            "totalBytes".to_string(),
-            Value::Number(stats.total_size.into()),
-        );
-
-        Ok(Value::Object(result))
     });
 
     // citrate_getTransactionStatus - Check if transaction is in mempool or mined

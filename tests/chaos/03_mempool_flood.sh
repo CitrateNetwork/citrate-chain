@@ -118,16 +118,15 @@ if [[ "$HEIGHT_FINAL" -le "$HEIGHT_AFTER" ]]; then
   echo "WARN: No new blocks produced after flood (may be acceptable under load)"
 fi
 
-# Test 5: Check mempool size if endpoint exists
-mempool_response=$(rpc_call "citrate_getMempoolSnapshot" || echo "")
+# Test 5: Check public aggregate mempool size if endpoint exists
+mempool_response=$(rpc_call "citrate_getMempoolStats" || echo "")
 if [[ -n "$mempool_response" ]]; then
   mempool_size=$(echo "$mempool_response" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 result = data.get('result', {})
 if isinstance(result, dict):
-    txs = result.get('transactions', result.get('pending', []))
-    print(len(txs) if isinstance(txs, list) else 0)
+    print(result.get('pendingTransactions', 0))
 else:
     print(0)
 " 2>/dev/null || echo "unknown")
