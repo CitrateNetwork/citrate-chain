@@ -101,6 +101,14 @@ pub enum DagStoreError {
     /// WP-K.5: Block failed VRF/proposer admission check
     #[error("Invalid VRF: {0}")]
     InvalidVrf(String),
+
+    /// RM-I / WP-I2.2 (REM-N-04): persistent backend rejected the
+    /// atomic write batch. The in-memory caches are NOT mutated when
+    /// this error returns, so the runtime stays consistent with disk.
+    /// Caller decides whether to retry, fail the operation, or surface
+    /// the error to the user.
+    #[error("Persistence error: {0}")]
+    Persistence(String),
 }
 
 /// DAG storage manager.
@@ -390,6 +398,13 @@ impl DagStore {
 
     /// WP-W.2: Cryptographically verify a block's VRF proof against the parent block's VRF output.
     /// Requires the parent block to already be in the DAG store.
+    ///
+    /// RM-J1 (post-RM-I-3 cleanup): admission uses the
+    /// **structurally-bound** verifier `verify_vrf_with_block_signature`
+    /// — combines ECVRF math with the block's ed25519 signature so the
+    /// proposer identity is unspoofable at this layer (REM-N-01).
+    /// `signed_payload` is the block hash, which is what
+    /// `crypto::sign_block` signs.
     async fn verify_block_vrf_crypto(&self, block: &Block) -> Result<(), String> {
         if block.is_genesis() {
             return Ok(());
@@ -404,14 +419,16 @@ impl DagStore {
         let prev_vrf_output = parent.header.vrf_reveal.output;
         let vrf_selector = VrfProposerSelector::new();
 
-        match vrf_selector.verify_vrf_proof(
+        match vrf_selector.verify_vrf_with_block_signature(
             &block.header.proposer_pubkey,
             &block.header.vrf_reveal,
             &prev_vrf_output,
             block.header.height,
+            block.header.block_hash.as_bytes(),
+            &block.signature,
         ) {
             Ok(true) => Ok(()),
-            Ok(false) => Err("VRF proof verification failed: invalid proof".to_string()),
+            Ok(false) => Err("VRF proof verification failed: invalid proof or identity binding".to_string()),
             Err(e) => Err(format!("VRF verification error: {}", e)),
         }
     }
@@ -451,9 +468,21 @@ impl DagStore {
             }
         }
 
-        // RM-B1 / WP-B1.3: collect every persistence op into one
-        // batch. The serialization happens here; on encode failure we
-        // log error! and skip persistence (M-06 pattern).
+        // RM-I / WP-I2.2 (re-audit Stream 1 finding REM-N-04):
+        //   Pre-fix this method mutated the in-memory caches (children,
+        //   tips, blocks_by_height) BEFORE invoking `kv_write_batch`. On
+        //   batch failure the runtime carried the mutation while disk did
+        //   not, producing split-brain on the next restart (memory said
+        //   the block was a tip; disk didn't have the entry).
+        //   Post-fix: build ops from immutable read-side snapshots, run
+        //   the batch, then mutate the in-memory state ONLY if the batch
+        //   succeeded (or no persistent backend is configured). On batch
+        //   failure the call returns Err and the in-memory state is
+        //   unchanged, matching the on-disk state.
+
+        // RM-B1 / WP-B1.3 + RM-I / WP-I2.2: collect every persistence op
+        // into one batch. The ops are built from read-side snapshots so
+        // failure leaves no in-memory residue.
         let mut ops: Vec<KvOp> = Vec::new();
 
         // 1. Block bytes.
@@ -471,59 +500,53 @@ impl DagStore {
             }
         }
 
-        // 2. Parent → child links (and self → empty children entry).
-        let mut children = self.children.write().await;
+        // 2. Snapshot children for parent + merge parents, project the
+        //    post-insert state, push ops. Do NOT mutate yet.
+        let children_read = self.children.read().await;
         if !block.is_genesis() {
-            let parent_children = children
-                .entry(block.selected_parent())
-                .or_insert_with(Vec::new);
-            parent_children.push(hash);
-            push_children_op(
-                &mut ops,
-                &block.selected_parent(),
-                parent_children,
-            );
+            let mut sp_children = children_read
+                .get(&block.selected_parent())
+                .cloned()
+                .unwrap_or_default();
+            sp_children.push(hash);
+            push_children_op(&mut ops, &block.selected_parent(), &sp_children);
 
             for merge_parent in &block.header.merge_parent_hashes {
-                let mp_children = children.entry(*merge_parent).or_insert_with(Vec::new);
+                let mut mp_children = children_read.get(merge_parent).cloned().unwrap_or_default();
                 mp_children.push(hash);
-                push_children_op(&mut ops, merge_parent, mp_children);
+                push_children_op(&mut ops, merge_parent, &mp_children);
             }
         }
-        children.insert(hash, Vec::new());
         push_children_op(&mut ops, &hash, &[]);
-        drop(children);
+        drop(children_read);
 
-        // 3. Tip set updates.
-        let mut tips = self.tips.write().await;
+        // 3. Tip set updates (no in-memory mutation yet — ops only).
         if !block.is_genesis() {
-            tips.remove(&block.selected_parent());
             ops.push(KvOp::Delete {
                 cf: cf::DAG_TIPS.to_string(),
                 key: block.selected_parent().as_bytes().to_vec(),
             });
             for merge_parent in &block.header.merge_parent_hashes {
-                tips.remove(merge_parent);
                 ops.push(KvOp::Delete {
                     cf: cf::DAG_TIPS.to_string(),
                     key: merge_parent.as_bytes().to_vec(),
                 });
             }
         }
-        tips.insert(hash);
         ops.push(KvOp::Put {
             cf: cf::DAG_TIPS.to_string(),
             key: hash.as_bytes().to_vec(),
             value: vec![1],
         });
-        drop(tips);
 
-        // 4. Height index.
+        // 4. Height index — snapshot, project the post-insert state, push op.
         let height = block.header.height;
-        let mut by_height = self.blocks_by_height.write().await;
-        let height_hashes = by_height.entry(height).or_insert_with(Vec::new);
+        let by_height_read = self.blocks_by_height.read().await;
+        let mut height_hashes = by_height_read.get(&height).cloned().unwrap_or_default();
         height_hashes.push(hash);
-        match bincode::serialize(&*height_hashes) {
+        let height_bytes_result = bincode::serialize(&height_hashes);
+        drop(by_height_read);
+        match height_bytes_result {
             Ok(bytes) => ops.push(KvOp::Put {
                 cf: cf::DAG_HEIGHT_INDEX.to_string(),
                 key: height.to_be_bytes().to_vec(),
@@ -536,22 +559,59 @@ impl DagStore {
                 );
             }
         }
-        drop(by_height);
 
-        // 5. Atomic commit. Either every op lands or none does.
+        // 5. Atomic commit. If a persistent backend is configured and the
+        // batch fails, return an error WITHOUT mutating the in-memory
+        // state. If no backend is configured (test stores), proceed
+        // straight to the in-memory mutation.
         if let Some(ref kv) = self.persistent {
             if let Err(e) = kv.kv_write_batch(&ops) {
                 warn!(
-                    "H-04: write_batch for block {} failed: {} — DAG persistence partial",
+                    "H-04 + REM-N-04: write_batch for block {} failed: {} — \
+                     in-memory caches NOT mutated (returning error to caller)",
                     hash, e
                 );
+                return Err(DagStoreError::Persistence(format!(
+                    "kv_write_batch failed for block {}: {}",
+                    hash, e
+                )));
             }
         }
 
-        // 6. Finally update the in-memory blocks map. Note: even if
-        // the batch above failed, the in-memory state still reflects
-        // the new block; the next restart will find missing
-        // persistent state and surface that as a load-time error.
+        // 6. Batch succeeded (or no backend). Now mutate the in-memory
+        //    caches under their write locks. The mutations match what was
+        //    just persisted, so memory and disk stay in sync.
+        if !block.is_genesis() {
+            let mut children = self.children.write().await;
+            children
+                .entry(block.selected_parent())
+                .or_insert_with(Vec::new)
+                .push(hash);
+            for merge_parent in &block.header.merge_parent_hashes {
+                children.entry(*merge_parent).or_insert_with(Vec::new).push(hash);
+            }
+            children.insert(hash, Vec::new());
+            drop(children);
+
+            let mut tips = self.tips.write().await;
+            tips.remove(&block.selected_parent());
+            for merge_parent in &block.header.merge_parent_hashes {
+                tips.remove(merge_parent);
+            }
+            tips.insert(hash);
+            drop(tips);
+        } else {
+            self.children.write().await.insert(hash, Vec::new());
+            self.tips.write().await.insert(hash);
+        }
+
+        self.blocks_by_height
+            .write()
+            .await
+            .entry(height)
+            .or_insert_with(Vec::new)
+            .push(hash);
+
         self.blocks.write().await.insert(hash, block.clone());
 
         info!("Stored block {} at height {}", hash, block.header.height);
@@ -836,15 +896,32 @@ mod tests {
     }
 
     /// Helper: create a block with a valid legacy SHA3 VRF proof using the given parent VRF output.
+    ///
+    /// RM-J1 update: post-REM-N-01 the admission path uses the
+    /// structurally-bound `verify_vrf_with_block_signature`, which
+    /// requires the block's ed25519 signature to verify under the
+    /// proposer's pubkey over the block hash. This helper now signs
+    /// the block hash with a deterministic ed25519 key derived from
+    /// `hash` so the test fixture passes the binding.
     fn create_block_with_vrf_parent_output(
         hash: [u8; 32],
         height: u64,
         parent: Hash,
         parent_vrf_output: Hash,
     ) -> Block {
+        use ed25519_dalek::{Signer, SigningKey};
         use sha3::{Digest, Sha3_256};
 
-        let proposer = PublicKey::new([1; 32]);
+        // Deterministic ed25519 secret derived from `hash` so each
+        // test block gets a unique-but-reproducible (proposer, sig)
+        // pair. The proposer pubkey on the block is the
+        // verifying-key derived from this secret.
+        let mut secret = [0u8; 32];
+        secret[..32].copy_from_slice(&Sha3_256::digest(hash));
+        let signing_key = SigningKey::from_bytes(&secret);
+        let proposer_bytes = signing_key.verifying_key().to_bytes();
+        let proposer = PublicKey::new(proposer_bytes);
+
         let proof_bytes: [u8; 32] = [0x42; 32]; // arbitrary 32-byte proof
 
         // Reconstruct the alpha: SHA3(pubkey || prev_vrf || slot)
@@ -860,8 +937,12 @@ mod tests {
         output_hasher.update(input);
         let output = Hash::from_bytes(&output_hasher.finalize());
 
+        // Build the block first to know the block hash, then sign it.
+        let block_hash = Hash::new(hash);
+        let signature = Signature::new(signing_key.sign(block_hash.as_bytes()).to_bytes());
+
         BlockBuilder::new()
-            .hash(Hash::new(hash))
+            .hash(block_hash)
             .height(height)
             .parent(parent)
             .proposer(proposer)
@@ -869,7 +950,7 @@ mod tests {
                 proof: proof_bytes.to_vec(),
                 output,
             })
-            .signature(Signature::new([1; 64]))
+            .signature(signature)
             .build_unhashed()
     }
 
@@ -1133,5 +1214,75 @@ mod tests {
         // Finalize also works
         store.finalize_block(&hash).await.unwrap();
         assert!(store.is_finalized(&hash).await);
+    }
+
+    // ========================================================================
+    // RM-I / WP-I2.2 — REM-N-04: in-memory cache rolls back on batch failure.
+    // ========================================================================
+
+    /// A KvStore that always fails `kv_write_batch` (and the batched writes).
+    /// Used to simulate a backend rejection at write time.
+    struct FailingKvStore {
+        inner: MemKvStore,
+    }
+
+    impl KvStore for FailingKvStore {
+        fn kv_get(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+            self.inner.kv_get(cf, key)
+        }
+        fn kv_put(&self, _cf: &str, _key: &[u8], _value: &[u8]) -> Result<(), String> {
+            Err("FailingKvStore: simulated write failure".to_string())
+        }
+        fn kv_delete(&self, _cf: &str, _key: &[u8]) -> Result<(), String> {
+            Err("FailingKvStore: simulated write failure".to_string())
+        }
+        fn kv_exists(&self, cf: &str, key: &[u8]) -> Result<bool, String> {
+            self.inner.kv_exists(cf, key)
+        }
+        fn kv_iter_cf(&self, cf: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+            self.inner.kv_iter_cf(cf)
+        }
+        fn kv_write_batch(&self, _ops: &[KvOp]) -> Result<(), String> {
+            Err("FailingKvStore: simulated batch failure".to_string())
+        }
+    }
+
+    /// REM-N-04: when `kv_write_batch` returns Err, `store_block` returns
+    /// the error AND the in-memory caches stay clean. Pre-fix the runtime
+    /// kept the new block / new tip / new children in memory while disk
+    /// did not, producing split-brain on the next restart.
+    #[tokio::test]
+    async fn test_rem_n_04_batch_failure_does_not_mutate_cache() {
+        let kv = Arc::new(FailingKvStore {
+            inner: MemKvStore::new(),
+        });
+        // Permissive VRF so we don't trip on missing VRF proof in the test block.
+        let store = DagStore::persistent_with_strict_vrf(kv, false).unwrap();
+
+        let block = create_test_block([0xC0; 32], 1, Hash::default());
+        let hash = block.hash();
+
+        let result = store.store_block(block).await;
+        assert!(
+            matches!(result, Err(DagStoreError::Persistence(_))),
+            "REM-N-04: a failing backend must surface as DagStoreError::Persistence; got: {:?}",
+            result
+        );
+
+        // The in-memory caches MUST NOT contain the failed block.
+        assert!(
+            !store.has_block(&hash).await,
+            "REM-N-04: failed store_block must not leave the block in the in-memory map"
+        );
+        let tips = store.get_tips().await;
+        assert!(
+            !tips.iter().any(|t| t.hash == hash),
+            "REM-N-04: failed store_block must not leave the block in the tip set"
+        );
+        let at_height = store.get_blocks_at_height(1).await;
+        assert!(
+            at_height.is_empty(),
+            "REM-N-04: failed store_block must not leave the block in the height index"
+        );
     }
 }

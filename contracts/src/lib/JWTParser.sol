@@ -6,7 +6,7 @@ pragma solidity ^0.8.26;
 ///         attestation to the actual content of an MAA JWT, not
 ///         just its signature.
 ///
-///         Pre-RM-D3: `submitAttestationStrict` verified the RS256
+///         Pre-RM-D3: `submitAttestationStrict` (removed in RM-J3) verified the RS256
 ///         signature but trusted the caller's `vmMeasurement` claim
 ///         — a worker holding ANY valid MAA JWT could substitute
 ///         a different on-chain measurement and the contract would

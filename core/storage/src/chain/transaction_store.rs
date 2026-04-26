@@ -46,7 +46,11 @@ impl TransactionStore {
                 .batch_put_cf(&mut batch, CF_METADATA, &sender_key, tx.hash.as_bytes())?;
         }
 
-        self.db.write_batch(batch)?;
+        // REM-2 / WP-H1.3 (audit M-API-01): producer-path commit MUST
+        // fsync. Pre-fix used the non-fsync `write_batch`; a power loss
+        // between RPC ack and OS flush could leave a block on disk with
+        // its tx index missing. `write_batch_sync` forces fsync.
+        self.db.write_batch_sync(batch)?;
         debug!("Stored {} transactions", txs.len());
         Ok(())
     }
@@ -54,20 +58,18 @@ impl TransactionStore {
     /// Get a transaction by hash
     pub fn get_transaction(&self, hash: &Hash) -> Result<Option<Transaction>> {
         match self.db.get_cf(CF_TRANSACTIONS, hash.as_bytes()) {
-            Ok(Some(bytes)) => {
-                match bincode::deserialize::<Transaction>(&bytes) {
-                    Ok(tx) => Ok(Some(tx)),
-                    Err(e) => {
-                        tracing::error!(
-                            "bincode deserialize failed for tx 0x{}: {} (data len={})",
-                            hex::encode(hash.as_bytes()),
-                            e,
-                            bytes.len()
-                        );
-                        Err(e.into())
-                    }
+            Ok(Some(bytes)) => match bincode::deserialize::<Transaction>(&bytes) {
+                Ok(tx) => Ok(Some(tx)),
+                Err(e) => {
+                    tracing::error!(
+                        "bincode deserialize failed for tx 0x{}: {} (data len={})",
+                        hex::encode(hash.as_bytes()),
+                        e,
+                        bytes.len()
+                    );
+                    Err(e.into())
                 }
-            }
+            },
             Ok(None) => {
                 tracing::debug!(
                     "tx 0x{} not found in CF_TRANSACTIONS",
@@ -121,7 +123,11 @@ impl TransactionStore {
                 .batch_put_cf(&mut batch, CF_METADATA, &block_tx_key, &[])?;
         }
 
-        self.db.write_batch(batch)?;
+        // REM-2 / WP-H1.3 (audit M-API-01): producer-path commit MUST
+        // fsync. Loss of a receipt for a finalised tx surfaces as
+        // `eth_getTransactionReceipt` returning null for a confirmed
+        // hash — exactly the cross-CF atomicity gap REM-2 calls out.
+        self.db.write_batch_sync(batch)?;
         debug!("Stored {} receipts", receipts.len());
         Ok(())
     }

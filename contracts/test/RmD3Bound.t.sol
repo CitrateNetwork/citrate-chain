@@ -95,9 +95,9 @@ contract RmD3BoundTest is Test {
 
     /// A worker holds a valid MAA JWT for measurement A. They try
     /// to claim measurement B on-chain by passing fake claim bytes.
-    /// Pre-fix `submitAttestationStrict` accepted this. Post-fix
-    /// `submitAttestationStrictBound` rejects: the fake claim isn't
-    /// in the JWT.
+    /// Pre-RM-D3 a `submitAttestationStrict` variant (since removed
+    /// in RM-J3) would have accepted this; the bound variant rejects
+    /// because the fake claim isn't in the JWT.
     function test_sol05_bound_rejects_fabricated_measurement_claim() public {
         bytes memory fakeClaim = bytes('"x-ms-vm-measurement":"0xfake_value_attacker_wants"');
 
@@ -187,6 +187,46 @@ contract RmD3BoundTest is Test {
             keccak256("gpu"),
             MODEL_HASH,
             NRAS_KEY
+        );
+    }
+
+    /// RM-J3 — coverage moved here from `TEEAttestationRegistry.t.sol`
+    /// when `submitAttestationStrict` was removed. An RSA key that's
+    /// been emergency-deactivated (e.g., compromised) is rejected
+    /// through the same `key.active` branch as an unknown kid; this
+    /// test asserts the deactivation flow specifically.
+    function test_sol05_bound_rejects_inactive_kid() public {
+        // Emergency deactivation remains a single-step governance
+        // call so a compromised key can be killed instantly.
+        registry.setMaaRsaKeyActive(MAA_KID_HASH, false);
+
+        vm.prank(worker);
+        vm.expectRevert("TEERegistry: unknown or inactive MAA kid");
+        registry.submitAttestationStrictBound(
+            SIGNED_JWT,
+            MAA_RSA_SIGNATURE,
+            MAA_KID_HASH,
+            VM_MEASUREMENT_CLAIM,
+            keccak256("gpu"),
+            MODEL_HASH,
+            NRAS_KEY
+        );
+    }
+
+    /// RM-J3 — coverage moved here from `TEEAttestationRegistry.t.sol`.
+    /// NRAS signer hashes are governance-curated; a hash not on the
+    /// trusted list is rejected before any signature work is done.
+    function test_sol05_bound_rejects_untrusted_nras() public {
+        vm.prank(worker);
+        vm.expectRevert("TEERegistry: untrusted NRAS signer");
+        registry.submitAttestationStrictBound(
+            SIGNED_JWT,
+            MAA_RSA_SIGNATURE,
+            MAA_KID_HASH,
+            VM_MEASUREMENT_CLAIM,
+            keccak256("gpu"),
+            MODEL_HASH,
+            keccak256("attacker-nras")
         );
     }
 }

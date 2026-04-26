@@ -74,10 +74,12 @@ def poll_metrics():
             if result:
                 metrics["citrate_gas_price_gwei"] = int(result, 16) / 1e9
 
-            # Mempool snapshot (custom)
-            result = rpc_call("citrate_getMempoolSnapshot")
+            # Mempool aggregate stats (RFI-A1 / RM-H1.4: renamed from
+            # citrate_getMempoolSnapshot to keep monitoring unauthenticated;
+            # the snapshot method is operator-auth-gated since H-API-01).
+            result = rpc_call("citrate_getMempoolStats")
             if result and isinstance(result, dict):
-                metrics["citrate_mempool_size"] = result.get("size", 0)
+                metrics["citrate_mempool_size"] = result.get("pendingTransactions", 0)
             else:
                 metrics["citrate_mempool_size"] = 0
 

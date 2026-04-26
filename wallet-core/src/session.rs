@@ -20,7 +20,13 @@ pub struct SessionManager {
 }
 
 struct SessionState {
-    _unlocked_at: Instant,
+    /// Last successful password verification (re-auth or initial unlock).
+    /// Renamed from `_unlocked_at` in RM-I / WP-I1.1 because it's now
+    /// load-bearing for the SDK-level re-auth check (RA-WAL-01).
+    /// `record_password_freshness` updates this on a fresh password
+    /// verification (e.g., the GUI prompts the user; the SDK consumer
+    /// passes the fresh timestamp through `record_success`).
+    unlocked_at: Instant,
     last_activity: Instant,
 }
 
@@ -106,9 +112,39 @@ impl SessionManager {
     pub fn record_success(&mut self, address: &str) {
         self.failed_attempts.remove(address);
         self.sessions.insert(address.to_string(), SessionState {
-            _unlocked_at: Instant::now(),
+            unlocked_at: Instant::now(),
             last_activity: Instant::now(),
         });
+    }
+
+    /// Refresh the password-verification timestamp without resetting
+    /// the session. Called after a successful re-auth prompt: the
+    /// session was already active (so we don't tear it down) but the
+    /// caller has just verified the password again.
+    ///
+    /// RM-I / WP-I1.1 (RA-WAL-01): the SDK-level re-auth check uses
+    /// `password_freshness_secs` to decide whether a high-value
+    /// transaction (>= RE_AUTH_THRESHOLD_WEI / 10 SALT) requires a
+    /// new password prompt. After the prompt verifies, the caller
+    /// invokes this method so the SDK sees the fresh timestamp.
+    pub fn refresh_password_timestamp(&mut self, address: &str) {
+        if let Some(session) = self.sessions.get_mut(address) {
+            session.unlocked_at = Instant::now();
+            session.last_activity = Instant::now();
+        }
+    }
+
+    /// Seconds since the most recent password verification for this
+    /// address. Returns `None` if the session is inactive.
+    ///
+    /// RM-I / WP-I1.1 (RA-WAL-01): used by `wallet-sdk::Wallet::sign_transaction`
+    /// to enforce re-auth on high-value transactions at the SDK boundary.
+    /// Pre-fix the GUI was the only enforcement layer; non-GUI SDK
+    /// consumers (extension, CLI scripts) bypassed the gate entirely.
+    pub fn password_freshness_secs(&self, address: &str) -> Option<u64> {
+        self.sessions
+            .get(address)
+            .map(|s| s.unlocked_at.elapsed().as_secs())
     }
 
     /// Check if a session is active (not timed out).

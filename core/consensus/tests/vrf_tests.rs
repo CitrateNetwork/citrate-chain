@@ -146,7 +146,7 @@ fn test_vrf_proof_verifies_roundtrip() {
 
     // Verify the proof against the same parameters
     let verified = selector
-        .verify_vrf_proof(&proposer, &proof, &previous_vrf, slot)
+        .verify_vrf_math_only(&proposer, &proof, &previous_vrf, slot)
         .expect("Verification must not error");
 
     assert!(verified, "Generated proof must verify successfully");
@@ -169,7 +169,7 @@ fn test_vrf_proof_fails_wrong_slot() {
 
     // Verify against a DIFFERENT slot
     let verified = selector
-        .verify_vrf_proof(&proposer, &proof, &previous_vrf, 999)
+        .verify_vrf_math_only(&proposer, &proof, &previous_vrf, 999)
         .expect("Verification must not error");
 
     assert!(

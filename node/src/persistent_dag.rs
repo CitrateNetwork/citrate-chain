@@ -35,10 +35,7 @@ impl KvStore for RocksDbKvStore {
     fn kv_iter_cf(&self, cf: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         self.db
             .iter_cf(cf)
-            .map(|iter| {
-                iter.map(|(k, v)| (k.to_vec(), v.to_vec()))
-                    .collect()
-            })
+            .map(|iter| iter.map(|(k, v)| (k.to_vec(), v.to_vec())).collect())
             .map_err(|e| e.to_string())
     }
 
@@ -46,6 +43,12 @@ impl KvStore for RocksDbKvStore {
     /// a real RocksDB `WriteBatch` so multi-op block-admission writes
     /// commit atomically. A power loss between two ops can no longer
     /// leave the DAG in a partial state.
+    ///
+    /// REM-2 / WP-H1.3 (audit M-API-01): commit via `write_batch_sync`
+    /// so the DAG persistence batch is fsynced. Pre-fix the non-fsync
+    /// `write_batch` could leave the DAG state on the OS page cache;
+    /// a power loss between RPC ack and OS flush would silently roll
+    /// back finalised DAG admissions.
     fn kv_write_batch(&self, ops: &[KvOp]) -> Result<(), String> {
         let mut batch = self.db.batch();
         for op in ops {
@@ -62,6 +65,6 @@ impl KvStore for RocksDbKvStore {
                 }
             }
         }
-        self.db.write_batch(batch).map_err(|e| e.to_string())
+        self.db.write_batch_sync(batch).map_err(|e| e.to_string())
     }
 }

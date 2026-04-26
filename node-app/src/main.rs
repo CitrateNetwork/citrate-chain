@@ -2,16 +2,50 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use axum::{response::IntoResponse, routing::get, Router};
 use citrate_api::{ApiService, RpcConfig};
+use citrate_execution::executor::DEFAULT_CHAIN_ID;
+use citrate_execution::precompiles::inference::InferenceMode;
 use citrate_execution::{Executor, StateDB};
 use citrate_network::peer::{PeerManager, PeerManagerConfig};
 use citrate_sequencer::mempool::{Mempool, MempoolConfig};
 use citrate_storage::pruning::PruningConfig;
 use citrate_storage::StorageManager;
 use prometheus::{gather, Encoder, TextEncoder};
+
+/// REM-N-03 / WP-H1.2: resolve the inference determinism mode from
+/// command-line arguments. The opt-out flag
+/// `--allow-nondeterministic-inference` is gated behind the `dev-mode`
+/// cargo feature: release / production builds do not even compile
+/// the flag, so an operator cannot disable the C-01 gate by accident.
+fn resolve_inference_mode(args: &[String]) -> InferenceMode {
+    let production_default = Executor::production_inference_mode();
+    #[cfg(feature = "dev-mode")]
+    {
+        if args.iter().any(|a| a == "--allow-nondeterministic-inference") {
+            warn!(
+                "REM-N-03: --allow-nondeterministic-inference is set; \
+                 the 0x0101 / 0x0102 inference precompiles will run \
+                 non-deterministic FP code. This is a devnet-only \
+                 opt-out and MUST NOT be used on mainnet validators."
+            );
+            return InferenceMode::AllowNonDeterministic;
+        }
+    }
+    #[cfg(not(feature = "dev-mode"))]
+    {
+        if args.iter().any(|a| a == "--allow-nondeterministic-inference") {
+            warn!(
+                "REM-N-03: --allow-nondeterministic-inference is only \
+                 available in builds compiled with the `dev-mode` \
+                 feature; ignoring on this production build."
+            );
+        }
+    }
+    production_default
+}
 
 /// Parse a hardcoded socket address literal. This is infallible for valid literals
 /// but avoids a bare `.unwrap()` call in production code.
@@ -71,9 +105,22 @@ async fn main() -> Result<()> {
     let pruning = PruningConfig::default();
     let storage = Arc::new(StorageManager::new(&data_dir, pruning)?);
 
-    // Executor
+    // Executor — REM-N-03 / WP-H1.2: production default is
+    // `InferenceMode::Strict`. Devnet may opt in to non-deterministic
+    // inference via `--allow-nondeterministic-inference`, but only
+    // when the binary was built with `--features dev-mode`.
+    let cli_args: Vec<String> = std::env::args().collect();
+    let inference_mode = resolve_inference_mode(&cli_args);
+    let chain_id = std::env::var("CITRATE_CHAIN_ID")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CHAIN_ID);
     let state_db = Arc::new(StateDB::new());
-    let executor = Arc::new(Executor::new(state_db));
+    let executor = Arc::new(Executor::with_chain_id_and_inference_mode(
+        state_db,
+        chain_id,
+        inference_mode,
+    ));
 
     // Mempool (default config)
     let mempool = Arc::new(Mempool::new(MempoolConfig::default()));

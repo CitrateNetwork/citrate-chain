@@ -1,5 +1,5 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit, OsRng, Payload},
     Aes256Gcm, Key, Nonce,
 };
 use argon2::{
@@ -18,6 +18,27 @@ use crate::errors::WalletError;
 // KDF version registry — mirrors citrate-wallet-core::keys
 // See docs/security/KDF_POLICY.md (canonical) and audit finding WAL-01.
 // =========================================================================
+
+/// RM-I-3 / WP-I1.2 (audit RA-WAL-02): AAD bound to every v2 entry the
+/// CLI writes. The byte string is included in the AES-GCM tag so an
+/// attacker who swaps the `kdf_version` field, copies a ciphertext to
+/// a different `public_key`, or transplants it into another keystore
+/// implementation gets an authentication failure on decrypt rather
+/// than silent acceptance under the wrong context.
+///
+/// Format: `b"citrate-cli-keystore-v2" || u32_le(kdf_version) || pubkey_bytes`.
+/// `wallet-core::KeyManager`'s v2 envelope uses the same shape with
+/// the `b"citrate-wallet-core-v2"` domain — keeping the CLI distinct
+/// avoids accidental cross-context decryption.
+const CLI_KEYSTORE_AAD_DOMAIN: &[u8] = b"citrate-cli-keystore-v2";
+
+fn cli_keystore_aad(kdf_version: u32, public_key: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(CLI_KEYSTORE_AAD_DOMAIN.len() + 4 + public_key.len());
+    aad.extend_from_slice(CLI_KEYSTORE_AAD_DOMAIN);
+    aad.extend_from_slice(&kdf_version.to_le_bytes());
+    aad.extend_from_slice(public_key);
+    aad
+}
 
 /// Legacy: pre-WAL-01 entries written with `Argon2::default()`.
 const KDF_VERSION_LEGACY: u32 = 1;
@@ -276,15 +297,30 @@ impl KeyStore {
         // WAL-04: hold the plaintext signing key bytes in Zeroizing so
         // they are erased after encryption.
         let plaintext: Zeroizing<[u8; 32]> = Zeroizing::new(signing_key.to_bytes());
+
+        // RM-I-3 / WP-I1.2 (RA-WAL-02): AAD-bind (domain, kdf_version,
+        // public_key) into the GCM tag. Any attacker who swaps the
+        // declared `kdf_version`, copies a ciphertext into a different
+        // `public_key` row, or moves it to a non-CLI keystore (e.g.,
+        // wallet-core's envelope) hits an authentication failure on
+        // decrypt rather than silent acceptance.
+        let public_key_bytes = signing_key.verifying_key().to_bytes().to_vec();
+        let aad = cli_keystore_aad(KDF_VERSION_CURRENT, &public_key_bytes);
         let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_ref(),
+                    aad: &aad,
+                },
+            )
             .map_err(|e| WalletError::Encryption(e.to_string()))?;
 
         Ok(EncryptedKey {
             ciphertext,
             salt: salt.to_string(),
             nonce: nonce_bytes.to_vec(),
-            public_key: signing_key.verifying_key().to_bytes().to_vec(),
+            public_key: public_key_bytes,
             alias: None,
             kdf_version: KDF_VERSION_CURRENT,
         })
@@ -324,12 +360,30 @@ impl KeyStore {
 
         // Decrypt
         let nonce = Nonce::from_slice(&encrypted.nonce);
+        // RM-I-3 / WP-I1.2 (RA-WAL-02): v2 entries have AAD bound; v1
+        // legacy entries do not. The branch is observable from the
+        // entry's declared `kdf_version`; no on-disk discriminator
+        // required since v1 and v2 envelopes are byte-distinguishable
+        // by the field.
         // WAL-04: decrypted private key plaintext erased on drop.
-        let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
+        let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(if encrypted.kdf_version
+            == KDF_VERSION_LEGACY
+        {
             cipher
                 .decrypt(nonce, encrypted.ciphertext.as_ref())
-                .map_err(|_| WalletError::InvalidPassword)?,
-        );
+                .map_err(|_| WalletError::InvalidPassword)?
+        } else {
+            let aad = cli_keystore_aad(encrypted.kdf_version, &encrypted.public_key);
+            cipher
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: encrypted.ciphertext.as_ref(),
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| WalletError::InvalidPassword)?
+        });
 
         // Convert to signing key (ed25519-dalek 2.x SigningKey is
         // ZeroizeOnDrop, so the resulting key wipes itself).
@@ -718,5 +772,72 @@ mod tests {
         let path = dir.path().join("nonexistent_keystore.json");
         let ks = KeyStore::new(&path).unwrap();
         assert_eq!(ks.list_accounts().len(), 0);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // RM-I-3 / WP-I1.2 — RA-WAL-02 AAD-binding tests.
+    // ────────────────────────────────────────────────────────────────
+
+    /// New entries are written with kdf_version=2 (current). Round-trip
+    /// must succeed because encrypt and decrypt agree on the AAD.
+    #[test]
+    fn test_ra_wal_02_v2_entry_round_trips() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("strongpassword", None).expect("generate");
+        // Pull the entry: it must declare kdf_version = 2.
+        let entry = &ks.keys[0];
+        assert_eq!(
+            entry.kdf_version, KDF_VERSION_CURRENT,
+            "RA-WAL-02: CLI new entries must declare KDF_VERSION_CURRENT (=2)"
+        );
+        // Round-trip via decrypt.
+        ks.unlock("strongpassword").expect("unlock fresh entry");
+        // Sanity: there is a usable signing key.
+        assert!(ks.get_signing_key(0).is_ok());
+    }
+
+    /// Tampering with the public_key field of a v2 entry must cause
+    /// decryption to fail. Pre-fix the AAD wasn't bound, so swapping
+    /// the public_key would silently decrypt under the wrong context.
+    #[test]
+    fn test_ra_wal_02_swapped_public_key_fails_decrypt() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("strongpassword", None).expect("generate");
+        // Swap the public_key bytes (corrupt the AAD context).
+        ks.keys[0].public_key = vec![0xAB; 32];
+        // unlock decrypts every entry; with bound AAD, the swap means
+        // the AAD on decrypt differs from encrypt → InvalidPassword.
+        let r = ks.unlock("strongpassword");
+        assert!(
+            matches!(r, Err(WalletError::InvalidPassword)),
+            "RA-WAL-02: AAD-bound entry must reject decryption when public_key is swapped, got: {:?}",
+            r
+        );
+    }
+
+    /// Tampering with the kdf_version field of a v2 entry must cause
+    /// decryption to fail. The kdf_version is part of the AAD; an
+    /// attacker who downgrades or upgrades the field is rejected.
+    #[test]
+    fn test_ra_wal_02_swapped_kdf_version_fails_decrypt() {
+        let (_dir, mut ks) = temp_keystore();
+        ks.generate_key("strongpassword", None).expect("generate");
+        // Mutate kdf_version to a different value (still in the
+        // dispatcher's accepted set).
+        // Note: KDF_VERSION_LEGACY = 1, KDF_VERSION_CURRENT = 2.
+        // We pick 99 which is unknown — `argon2_for_version` will
+        // surface an error. To distinguish from the AAD-binding
+        // failure, we instead try 1 (legacy): decrypt will use the
+        // legacy code path (no AAD), which will succeed in producing
+        // a candidate plaintext, but the underlying cipher tag will
+        // mismatch because the ciphertext was encrypted *with* AAD
+        // for version 2.
+        ks.keys[0].kdf_version = KDF_VERSION_LEGACY;
+        let r = ks.unlock("strongpassword");
+        assert!(
+            matches!(r, Err(WalletError::InvalidPassword)),
+            "RA-WAL-02: AAD-bound entry must reject decryption when kdf_version is downgraded, got: {:?}",
+            r
+        );
     }
 }

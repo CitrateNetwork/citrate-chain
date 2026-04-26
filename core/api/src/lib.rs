@@ -3,8 +3,6 @@
 
 pub mod ai_rpc;
 pub mod economics_rpc;
-pub mod eip1559_decoder;
-pub mod enhanced_tx_decoder;
 pub mod eth_rpc;
 pub mod eth_rpc_simple;
 pub mod eth_subscriptions;
@@ -17,18 +15,14 @@ pub mod openai_api;
 pub mod rate_limit;
 pub mod server;
 pub mod types;
-pub mod unified_tx_decoder;
 pub mod websocket;
 
-pub use eip1559_decoder::{Eip1559Decoder, TransactionStats};
-pub use enhanced_tx_decoder::{EnhancedTransactionDecoder, DecodedTransaction, DecoderConfig, TransactionType};
 pub use eth_subscriptions::EthSubscriptionServer;
 pub use filter::FilterRegistry;
 pub use openai_api::OpenAiRestServer;
 pub use server::{RpcConfig, RpcServer};
 pub use jsonrpc_http_server::CloseHandle as RpcCloseHandle;
 pub use types::{ApiError, BlockId, BlockTag};
-pub use unified_tx_decoder::{UnifiedTransactionDecoder, GlobalTransactionDecoder, DecoderFactory};
 pub use websocket::WebSocketServer;
 
 use anyhow::Result;

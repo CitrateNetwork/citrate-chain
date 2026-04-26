@@ -54,3 +54,43 @@ fn good_explicit_v2_params() {
 fn good_via_dispatcher() {
     let _argon2 = argon2_for_version(2);
 }
+
+// ============================================================================
+// TRP-11 (RM-H1.4) — broadening fixtures
+// ============================================================================
+
+fn bad_default_via_trait_path() {
+    // ruleid: wal-01-argon2-default
+    let _argon2: Argon2 = <Argon2 as Default>::default();
+}
+
+fn bad_qualified_path_default() {
+    // ruleid: wal-01-argon2-default
+    let _argon2 = argon2::Argon2::default();
+}
+
+fn bad_weak_explicit_params_below_floor() {
+    // ruleid: wal-01-weak-explicit-argon2-params
+    // OWASP floor (m=19456 KiB, t=2, p=1) — too weak.
+    let params = Params::new(19456, 2, 1, Some(32)).expect("statically valid");
+    let _argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+}
+
+fn bad_weak_explicit_params_just_below_floor() {
+    // ruleid: wal-01-weak-explicit-argon2-params
+    // 64 MiB - 1 = 65535 KiB — just under the 65536 floor.
+    let params = Params::new(65535, 3, 1, Some(32)).expect("statically valid");
+    let _argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+}
+
+// ok: wal-01-weak-explicit-argon2-params
+fn good_explicit_v2_params_at_floor() {
+    let params = Params::new(65536, 3, 1, Some(32)).expect("v2 params are statically valid");
+    let _argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+}
+
+// ok: wal-01-weak-explicit-argon2-params
+fn good_explicit_v2_params_above_floor() {
+    let params = Params::new(131072, 3, 1, Some(32)).expect("strong params");
+    let _argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+}
