@@ -30,3 +30,6 @@ default = []
 # is now gated behind a build-time flag. Local CI / dev contexts
 # can opt-in; release builds MUST NOT enable this feature.
 unsafe-deterministic-key = []
+
+[dev-dependencies]
+tempfile = "3"

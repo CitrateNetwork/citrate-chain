@@ -1,0 +1,44 @@
+# FAU-03 + FAU-04 — faucet cooldown must be persisted, not in-memory only.
+#
+# Audit findings (HIGH / MEDIUM):
+#   .audit/2026-04-24-full-repo-adversarial-audit/08_FINDINGS_WALLET_AGENT_FAUCET.md#fau-03
+#   .audit/2026-04-24-full-repo-adversarial-audit/08_FINDINGS_WALLET_AGENT_FAUCET.md#fau-04
+#
+# Spec (canonical):
+#   .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
+#   §"Sprint RM-E6 — Faucet + buyer-webapp + GUI-B"
+#
+# Pre-fix the faucet kept its rate-limit map in `DashMap<String,
+# Instant>` — a process restart wiped the map, letting an attacker
+# bypass the cooldown by crashing the binary or just waiting for a
+# deploy. Post-fix the cooldown lives in `Cooldowns` (file-backed
+# JSON) keyed by both address AND IP.
+#
+# This rule fires when faucet code re-introduces a `DashMap<String,
+# Instant>` in a place where the cooldown logic should live.
+
+rules:
+  - id: fau-03-04-no-inmemory-cooldown
+    message: >-
+      The faucet cooldown must be a file-backed `Cooldowns` instance,
+      not a fresh `DashMap<String, Instant>`. See audit FAU-04.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "faucet/src/main.rs"
+      exclude:
+        - "**/tests/**"
+    pattern-either:
+      - pattern: |
+          DashMap::<String, Instant>::new()
+      - pattern: |
+          Arc::new(DashMap::<String, Instant>::new())
+      - pattern: |
+          let $X: DashMap<String, Instant> = DashMap::new();
+    metadata:
+      audit-id: FAU-04
+      severity: medium
+      sprint: RM-E6
+      wp: WP-E6.3
+      spec: .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
