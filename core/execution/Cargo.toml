@@ -48,6 +48,11 @@ revm = { version = "=10", default-features = false, features = ["std", "serde"] 
 ndarray = "0.15"
 ndarray-rand = "0.14"
 
+# RM-M1b — Halo2-KZG inference-proof substrate. Optional, gated by
+# the `halo2-substrate` feature. See ADR-RM-M1b-1.
+halo2_proofs = { workspace = true, optional = true }
+halo2curves = { workspace = true, optional = true }
+
 # Zero-knowledge proofs (experimental — circuits are placeholder implementations)
 # Production Groth16 verification gated behind `zkp_production` in core/mcp
 # Arkworks suite — all crates pinned to the 0.4 line so the ecosystem
@@ -120,7 +125,7 @@ coreml = []  # Enable CoreML support on macOS
 # AND the `[dependencies]` section above gains optional entries for
 # both. See ADR-RM-M1b-1 for the chosen substrate (Aztec Ignition
 # SRS over BN254).
-halo2-substrate = []
+halo2-substrate = ["dep:halo2_proofs", "dep:halo2curves"]
 
 # Note: the former `mvcc` feature flag was removed in Sprint P950-A-3
 # (2026-04-21). MVCC is now the only execution path; the tokio::sync::Mutex
