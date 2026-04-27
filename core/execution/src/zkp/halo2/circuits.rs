@@ -323,6 +323,203 @@ mod tests {
         assert_inference_circuit_verifies(&w, &x, &b, 2, 2);
     }
 
+    /// Full KZG round-trip: setup ParamsKZG, keygen vk+pk, generate
+    /// a real Halo2 proof, verify it. Validates the full cryptographic
+    /// pipeline that 0x0108 INFERENCE_PROOF_VERIFY will run against.
+    ///
+    /// **Distinction from MockProver tests:** MockProver only checks
+    /// that constraints satisfy; it doesn't generate an actual SNARK
+    /// proof. This test exercises the prover and verifier paths
+    /// end-to-end. If keygen, proving, or verification has any
+    /// integration issue with the chip composition, this test
+    /// catches it.
+    #[test]
+    fn inference_circuit_kzg_round_trip() {
+        use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk};
+        use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
+        use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
+        use halo2_proofs::poly::kzg::strategy::SingleStrategy;
+        use halo2_proofs::transcript::{
+            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer,
+            TranscriptWriterBuffer,
+        };
+        use halo2curves::bn256::{Bn256, G1Affine};
+        use rand::rngs::OsRng;
+
+        // 1. Witness: y[0] = 1*3 + 0*4 + 5 = 8.
+        let w: Vec<Q16> = vec![Q16::from_int(1), Q16::from_int(0)];
+        let x: Vec<Q16> = vec![Q16::from_int(3), Q16::from_int(4)];
+        let b: Vec<Q16> = vec![Q16::from_int(5)];
+
+        // 2. Off-chain commitments.
+        let y_q16 = q16_ops::linear(&w, &x, &b, 1, 2);
+        let x_ark: Vec<ArkFr> = x.iter().copied().map(q16_to_ark_fr).collect();
+        let model_ark: Vec<ArkFr> = w
+            .iter()
+            .copied()
+            .chain(b.iter().copied())
+            .map(q16_to_ark_fr)
+            .collect();
+        let y_ark: Vec<ArkFr> = y_q16.iter().copied().map(q16_to_ark_fr).collect();
+        let input_commit = ark_fr_to_halo2_fr(&poseidon_hash(&x_ark));
+        let model_commit = ark_fr_to_halo2_fr(&poseidon_hash(&model_ark));
+        let output_commit = ark_fr_to_halo2_fr(&poseidon_hash(&y_ark));
+
+        // 3. Halo2 Fr witness vectors.
+        let weights_fr: Vec<Halo2Fr> = w.iter().copied().map(q16_to_halo2_fr).collect();
+        let inputs_fr: Vec<Halo2Fr> = x.iter().copied().map(q16_to_halo2_fr).collect();
+        let biases_fr: Vec<Halo2Fr> = b.iter().copied().map(q16_to_halo2_fr).collect();
+
+        let circuit = InferenceCircuit {
+            weights: weights_fr.iter().map(|v| Value::known(*v)).collect(),
+            inputs: inputs_fr.iter().map(|v| Value::known(*v)).collect(),
+            biases: biases_fr.iter().map(|v| Value::known(*v)).collect(),
+            out_dim: 1,
+            in_dim: 2,
+        };
+
+        // 4. SRS via ParamsKZG::setup (test-only — production uses
+        //    the .ptau-derived ParamsKZG from `halo2::ptau`).
+        let k = 12;
+        let mut rng = OsRng;
+        let params = ParamsKZG::<Bn256>::setup(k, &mut rng);
+
+        // 5. Keygen: VK and PK from circuit topology.
+        let vk = keygen_vk(&params, &circuit.without_witnesses()).expect("keygen_vk");
+        let pk = keygen_pk(&params, vk.clone(), &circuit.without_witnesses())
+            .expect("keygen_pk");
+
+        // 6. Prove.
+        let public_inputs: Vec<Vec<Halo2Fr>> =
+            vec![vec![input_commit, model_commit, output_commit]];
+        let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
+        create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(
+            &params,
+            &pk,
+            &[circuit],
+            &[public_inputs.clone()],
+            rng,
+            &mut transcript,
+        )
+        .expect("create_proof");
+        let proof_bytes = transcript.finalize();
+
+        // 7. Verify.
+        let verifier_params = params.verifier_params();
+        let mut verifier_transcript =
+            Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&proof_bytes[..]);
+        let verified = halo2_proofs::plonk::verify_proof_multi::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<Bn256>,
+            _,
+            _,
+            SingleStrategy<_>,
+        >(
+            &verifier_params,
+            &vk,
+            &[public_inputs],
+            &mut verifier_transcript,
+        );
+        assert!(verified, "InferenceCircuit KZG proof must verify");
+
+        // Sanity: report proof size.
+        eprintln!(
+            "RM-M1b InferenceCircuit v1 (out_dim=1, in_dim=2) proof: {} bytes (k={})",
+            proof_bytes.len(),
+            k
+        );
+    }
+
+    /// Same round-trip but with a tampered public input — must reject.
+    /// Validates that the KZG verifier (not just MockProver) catches
+    /// a wrong public input.
+    #[test]
+    fn inference_circuit_kzg_rejects_tampered_public_input() {
+        use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk};
+        use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
+        use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
+        use halo2_proofs::poly::kzg::strategy::SingleStrategy;
+        use halo2_proofs::transcript::{
+            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer,
+            TranscriptWriterBuffer,
+        };
+        use halo2curves::bn256::{Bn256, G1Affine};
+        use rand::rngs::OsRng;
+
+        let w: Vec<Q16> = vec![Q16::from_int(1), Q16::from_int(0)];
+        let x: Vec<Q16> = vec![Q16::from_int(3), Q16::from_int(4)];
+        let b: Vec<Q16> = vec![Q16::from_int(5)];
+
+        let y_q16 = q16_ops::linear(&w, &x, &b, 1, 2);
+        let x_ark: Vec<ArkFr> = x.iter().copied().map(q16_to_ark_fr).collect();
+        let model_ark: Vec<ArkFr> = w
+            .iter()
+            .copied()
+            .chain(b.iter().copied())
+            .map(q16_to_ark_fr)
+            .collect();
+        let y_ark: Vec<ArkFr> = y_q16.iter().copied().map(q16_to_ark_fr).collect();
+        let input_commit = ark_fr_to_halo2_fr(&poseidon_hash(&x_ark));
+        let model_commit = ark_fr_to_halo2_fr(&poseidon_hash(&model_ark));
+        let output_commit = ark_fr_to_halo2_fr(&poseidon_hash(&y_ark));
+
+        let weights_fr: Vec<Halo2Fr> = w.iter().copied().map(q16_to_halo2_fr).collect();
+        let inputs_fr: Vec<Halo2Fr> = x.iter().copied().map(q16_to_halo2_fr).collect();
+        let biases_fr: Vec<Halo2Fr> = b.iter().copied().map(q16_to_halo2_fr).collect();
+
+        let circuit = InferenceCircuit {
+            weights: weights_fr.iter().map(|v| Value::known(*v)).collect(),
+            inputs: inputs_fr.iter().map(|v| Value::known(*v)).collect(),
+            biases: biases_fr.iter().map(|v| Value::known(*v)).collect(),
+            out_dim: 1,
+            in_dim: 2,
+        };
+
+        let k = 12;
+        let mut rng = OsRng;
+        let params = ParamsKZG::<Bn256>::setup(k, &mut rng);
+        let vk = keygen_vk(&params, &circuit.without_witnesses()).expect("vk");
+        let pk = keygen_pk(&params, vk.clone(), &circuit.without_witnesses()).expect("pk");
+
+        let honest_public: Vec<Vec<Halo2Fr>> =
+            vec![vec![input_commit, model_commit, output_commit]];
+        let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
+        create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(
+            &params,
+            &pk,
+            &[circuit],
+            &[honest_public.clone()],
+            rng,
+            &mut transcript,
+        )
+        .expect("create_proof");
+        let proof_bytes = transcript.finalize();
+
+        // Tamper: swap input_commit to a bogus value.
+        let tampered: Vec<Vec<Halo2Fr>> =
+            vec![vec![Halo2Fr::from(0xDEADBEEFu64), model_commit, output_commit]];
+
+        let verifier_params = params.verifier_params();
+        let mut verifier_transcript =
+            Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&proof_bytes[..]);
+        let verified = halo2_proofs::plonk::verify_proof_multi::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<Bn256>,
+            _,
+            _,
+            SingleStrategy<_>,
+        >(
+            &verifier_params,
+            &vk,
+            &[tampered],
+            &mut verifier_transcript,
+        );
+        assert!(
+            !verified,
+            "tampered public input MUST fail KZG verification"
+        );
+    }
+
     #[test]
     fn inference_circuit_rejects_wrong_input_commit() {
         // Honest witness, but pass a wrong public input for input_commit.
