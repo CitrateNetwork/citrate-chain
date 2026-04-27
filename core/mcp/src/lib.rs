@@ -26,7 +26,6 @@ pub struct MCPService {
 impl MCPService {
     pub fn new(
         storage: Arc<citrate_storage::StorageManager>,
-        vm: Arc<citrate_execution::vm::VM>,
     ) -> Self {
         let model_registry = Arc::new(registry::ModelRegistry::new(storage.clone()));
         let provider_registry = Arc::new(provider::ProviderRegistry::new());
@@ -40,7 +39,6 @@ impl MCPService {
             .unwrap_or_else(|_| "http://127.0.0.1:5001".to_string());
         let ipfs_service = IPFSService::new(ipfs_endpoint);
         let executor = Arc::new(execution::ModelExecutor::new(
-            vm,
             cache,
             verifier.clone(),
             model_registry.clone(),
