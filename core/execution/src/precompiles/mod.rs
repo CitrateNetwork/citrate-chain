@@ -4,6 +4,7 @@
 // Standard Ethereum precompiles + Citrate AI extensions
 
 pub mod inference;
+pub mod q16;
 pub mod tensor_format;
 pub mod verify;
 pub mod x402;
