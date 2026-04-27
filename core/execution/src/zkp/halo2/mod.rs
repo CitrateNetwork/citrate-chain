@@ -136,6 +136,9 @@ pub fn verify_inference_proof(_input: &[u8]) -> Result<bool, VerifyError> {
 pub mod canary;
 
 #[cfg(feature = "halo2-substrate")]
+pub mod ptau;
+
+#[cfg(feature = "halo2-substrate")]
 pub mod chips;
 
 #[cfg(feature = "halo2-substrate")]
