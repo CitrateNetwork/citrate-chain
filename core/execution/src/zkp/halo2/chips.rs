@@ -531,6 +531,153 @@ impl PoseidonChip {
         Ok(state_vals)
     }
 
+    /// Variant of `hash_n` that takes already-assigned cells as inputs.
+    /// Used when composing PoseidonChip with another chip (e.g.,
+    /// LinearChip) — the source cells must equal the chip's input
+    /// witnesses by copy constraint, so the prover cannot pass
+    /// different values to the hash than to the linear layer.
+    ///
+    /// Implementation mirrors `hash_n` exactly except the absorb_in
+    /// columns receive their values via `copy_advice` (which
+    /// assigns the value AND adds a copy constraint to the source
+    /// cell) instead of `assign_advice` (no copy constraint).
+    pub fn hash_n_from_cells(
+        config: &PoseidonChipConfig,
+        layouter: &mut impl Layouter<Halo2Fr>,
+        inputs: &[AssignedCell<Halo2Fr, Halo2Fr>],
+    ) -> Result<AssignedCell<Halo2Fr, Halo2Fr>, ErrorFront> {
+        if inputs.is_empty() {
+            return layouter.assign_region(
+                || "poseidon_hash_n_from_cells_empty",
+                |mut region| {
+                    region.assign_advice(
+                        || "zero",
+                        config.state[1],
+                        0,
+                        || Value::known(Halo2Fr::ZERO),
+                    )
+                },
+            );
+        }
+
+        layouter.assign_region(
+            || "poseidon_hash_n_from_cells",
+            |mut region| {
+                let cfg = poseidon_config();
+                let mut row = 0usize;
+                let mut state_vals: [Value<Halo2Fr>; STATE_WIDTH] = [
+                    Value::known(Halo2Fr::ZERO),
+                    Value::known(Halo2Fr::ZERO),
+                    Value::known(Halo2Fr::ZERO),
+                ];
+
+                let total_chunks = inputs.len().div_ceil(RATE);
+                for chunk_idx in 0..total_chunks {
+                    let chunk_start = chunk_idx * RATE;
+                    let is_last_chunk = chunk_idx == total_chunks - 1;
+
+                    // Source cells for this chunk's two absorb slots.
+                    let in0_cell = inputs.get(chunk_start);
+                    let in1_cell = inputs.get(chunk_start + 1);
+
+                    // Witness-side values for state-update.
+                    let in0_val = in0_cell
+                        .map(|c| c.value().copied())
+                        .unwrap_or(Value::known(Halo2Fr::ZERO));
+                    let in1_val = in1_cell
+                        .map(|c| c.value().copied())
+                        .unwrap_or(Value::known(Halo2Fr::ZERO));
+
+                    // Assign current state cells (no copy constraint —
+                    // they're internal to the absorb gate).
+                    for j in 0..STATE_WIDTH {
+                        region.assign_advice(
+                            || format!("absorb_state[{}] r{}", j, row),
+                            config.state[j],
+                            row,
+                            || state_vals[j],
+                        )?;
+                    }
+
+                    // Bind absorb_in to source cells via copy_advice.
+                    if let Some(c) = in0_cell {
+                        c.copy_advice(
+                            || format!("absorb_in[0] r{} (cell-bound)", row),
+                            &mut region,
+                            config.absorb_in[0],
+                            row,
+                        )?;
+                    } else {
+                        region.assign_advice(
+                            || format!("absorb_in[0] r{} (zero pad)", row),
+                            config.absorb_in[0],
+                            row,
+                            || Value::known(Halo2Fr::ZERO),
+                        )?;
+                    }
+                    if let Some(c) = in1_cell {
+                        c.copy_advice(
+                            || format!("absorb_in[1] r{} (cell-bound)", row),
+                            &mut region,
+                            config.absorb_in[1],
+                            row,
+                        )?;
+                    } else {
+                        region.assign_advice(
+                            || format!("absorb_in[1] r{} (zero pad)", row),
+                            config.absorb_in[1],
+                            row,
+                            || Value::known(Halo2Fr::ZERO),
+                        )?;
+                    }
+                    config.s_absorb.enable(&mut region, row)?;
+
+                    // Compute post-absorb state (witness).
+                    let post_state: [Value<Halo2Fr>; STATE_WIDTH] = [
+                        state_vals[0],
+                        state_vals[1].zip(in0_val).map(|(s, x)| s + x),
+                        state_vals[2].zip(in1_val).map(|(s, x)| s + x),
+                    ];
+                    state_vals = post_state;
+                    row += 1;
+
+                    if !is_last_chunk {
+                        state_vals = Self::assign_permutation_rows(
+                            &mut region,
+                            config,
+                            cfg,
+                            &mut row,
+                            state_vals,
+                        )?;
+                    }
+                }
+
+                // Final permute (squeeze).
+                state_vals = Self::assign_permutation_rows(
+                    &mut region,
+                    config,
+                    cfg,
+                    &mut row,
+                    state_vals,
+                )?;
+
+                let mut output_cell: Option<AssignedCell<Halo2Fr, Halo2Fr>> = None;
+                for j in 0..STATE_WIDTH {
+                    let cell = region.assign_advice(
+                        || format!("final[{}]", j),
+                        config.state[j],
+                        row,
+                        || state_vals[j],
+                    )?;
+                    if j == 1 {
+                        output_cell = Some(cell);
+                    }
+                }
+                Ok(output_cell.expect("state[1] cell assigned"))
+            },
+        )
+    }
+
     /// Convenience wrapper for the leaf-hash case (2 inputs).
     /// Equivalent to `hash_n(layouter, &[a, b])` but slightly more
     /// efficient (skips the absorb gate row since rate=2 absorbs
@@ -964,6 +1111,135 @@ impl LinearChip {
                         || biases[i],
                     )?;
                     let y_val = biases[i].map(|b_fr| i64_to_halo2_fr(acc_signed) + b_fr);
+                    let y_cell = region.assign_advice(
+                        || format!("y[{}]", i),
+                        config.y,
+                        out_row,
+                        || y_val,
+                    )?;
+                    config.s_output.enable(&mut region, out_row)?;
+
+                    Ok(y_cell)
+                },
+            )?;
+            output_cells.push(cell);
+        }
+
+        Ok(output_cells)
+    }
+
+    /// Variant of `linear` that takes pre-witnessed AssignedCells for
+    /// W, x, b. Used in chip composition (InferenceCircuit) where the
+    /// W/x/b cells must be cell-equal to the cells fed into PoseidonChip
+    /// for commitment hashes — without copy constraints, a malicious
+    /// prover could feed different values to each chip.
+    ///
+    /// Layout is identical to `linear`. The only difference is that
+    /// W[i][j], x[j], b[i] cells are populated via `copy_advice` from
+    /// the caller's AssignedCells (binding by copy constraint) instead
+    /// of `assign_advice` from raw values.
+    pub fn linear_from_cells(
+        config: &LinearChipConfig,
+        layouter: &mut impl Layouter<Halo2Fr>,
+        weight_cells: &[AssignedCell<Halo2Fr, Halo2Fr>],
+        input_cells: &[AssignedCell<Halo2Fr, Halo2Fr>],
+        bias_cells: &[AssignedCell<Halo2Fr, Halo2Fr>],
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<Vec<AssignedCell<Halo2Fr, Halo2Fr>>, ErrorFront> {
+        debug_assert_eq!(weight_cells.len(), out_dim * in_dim);
+        debug_assert_eq!(input_cells.len(), in_dim);
+        debug_assert_eq!(bias_cells.len(), out_dim);
+        debug_assert!(in_dim >= 1);
+
+        let mut output_cells = Vec::with_capacity(out_dim);
+
+        for i in 0..out_dim {
+            let cell = layouter.assign_region(
+                || format!("linear_output_from_cells_{}", i),
+                |mut region| {
+                    let mut acc_signed: i64 = 0;
+
+                    for j in 0..in_dim {
+                        // copy_advice both assigns and adds copy constraint.
+                        let w_cell_assigned = weight_cells[i * in_dim + j].copy_advice(
+                            || format!("w[{},{}] (cell-bound)", i, j),
+                            &mut region,
+                            config.w,
+                            j,
+                        )?;
+                        let x_cell_assigned = input_cells[j].copy_advice(
+                            || format!("x[{}] (cell-bound)", j),
+                            &mut region,
+                            config.x,
+                            j,
+                        )?;
+
+                        // Now compute prod, hi, lo from the witness values.
+                        let w_val = w_cell_assigned.value().copied();
+                        let x_val = x_cell_assigned.value().copied();
+                        let prod_field = w_val.zip(x_val).map(|(w, x)| w * x);
+                        region.assign_advice(
+                            || format!("prod[{},{}]", i, j),
+                            config.prod,
+                            j,
+                            || prod_field,
+                        )?;
+
+                        let (hi_v, lo_v) = w_val.zip(x_val).map(|(w_fr, x_fr)| {
+                            let w_signed = halo2_fr_to_signed_i32(&w_fr) as i64;
+                            let x_signed = halo2_fr_to_signed_i32(&x_fr) as i64;
+                            let p_signed = w_signed * x_signed;
+                            signed_shift_decomp(p_signed)
+                        }).unzip();
+
+                        region.assign_advice(
+                            || format!("hi[{},{}]", i, j),
+                            config.hi,
+                            j,
+                            || hi_v,
+                        )?;
+                        region.assign_advice(
+                            || format!("lo[{},{}]", i, j),
+                            config.lo,
+                            j,
+                            || lo_v,
+                        )?;
+
+                        // Update i64 accumulator.
+                        let _: Value<()> = w_val.zip(x_val).map(|(w_fr, x_fr)| {
+                            let w_signed = halo2_fr_to_signed_i32(&w_fr) as i64;
+                            let x_signed = halo2_fr_to_signed_i32(&x_fr) as i64;
+                            let p = w_signed * x_signed;
+                            acc_signed = acc_signed.wrapping_add(p >> 16);
+                        });
+
+                        let acc_fr_val = w_val.zip(x_val).map(|_| i64_to_halo2_fr(acc_signed));
+                        region.assign_advice(
+                            || format!("acc[{},{}]", i, j),
+                            config.acc,
+                            j,
+                            || acc_fr_val,
+                        )?;
+
+                        config.s_prod.enable(&mut region, j)?;
+                        config.s_shift.enable(&mut region, j)?;
+                        if j == 0 {
+                            config.s_acc_init.enable(&mut region, j)?;
+                        } else {
+                            config.s_acc_step.enable(&mut region, j)?;
+                        }
+                    }
+
+                    let out_row = in_dim;
+                    let b_cell_assigned = bias_cells[i].copy_advice(
+                        || format!("b[{}] (cell-bound)", i),
+                        &mut region,
+                        config.b,
+                        out_row,
+                    )?;
+                    let b_val = b_cell_assigned.value().copied();
+                    let y_val = b_val.map(|b_fr| i64_to_halo2_fr(acc_signed) + b_fr);
                     let y_cell = region.assign_advice(
                         || format!("y[{}]", i),
                         config.y,
