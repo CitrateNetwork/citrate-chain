@@ -103,10 +103,131 @@ pub fn verify_inference_proof(_input: &[u8]) -> Result<bool, VerifyError> {
 }
 
 #[cfg(feature = "halo2-substrate")]
-pub fn verify_inference_proof(_input: &[u8]) -> Result<bool, VerifyError> {
-    // WP-M1b.4 fills this in. The stub here keeps the type-check on
-    // the feature-on path while the chips and SRS land.
-    Err(VerifyError::SubstrateAbsent)
+pub fn verify_inference_proof(input: &[u8]) -> Result<bool, VerifyError> {
+    use halo2_proofs::plonk::verify_proof_multi;
+    use halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme;
+    use halo2_proofs::poly::kzg::multiopen::VerifierSHPLONK;
+    use halo2_proofs::poly::kzg::strategy::SingleStrategy;
+    use halo2_proofs::transcript::{Blake2bRead, Challenge255, TranscriptReadBuffer};
+    use halo2curves::bn256::{Bn256, Fr as Halo2Fr, G1Affine};
+    use halo2curves::ff::PrimeField as _;
+
+    // Wire format:
+    //   [0..32]   input_commitment   (big-endian Fr)
+    //   [32..64]  model_commitment   (big-endian Fr)
+    //   [64..96]  output_commitment  (big-endian Fr)
+    //   [96..100] circuit_version    (big-endian u32)
+    //   [100..104] chain_id          (big-endian u32)
+    //   [104..]   proof_bytes        (variable)
+    const HEADER_LEN: usize = 32 * 3 + 4 + 4;
+    if input.len() < HEADER_LEN {
+        return Err(VerifyError::Truncated {
+            needed: HEADER_LEN,
+            got: input.len(),
+        });
+    }
+
+    let input_commit_be: [u8; 32] = input[0..32].try_into().expect("32B");
+    let model_commit_be: [u8; 32] = input[32..64].try_into().expect("32B");
+    let output_commit_be: [u8; 32] = input[64..96].try_into().expect("32B");
+    let circuit_version =
+        u32::from_be_bytes(input[96..100].try_into().expect("4B"));
+    let _chain_id = u32::from_be_bytes(input[100..104].try_into().expect("4B"));
+    let proof_bytes = &input[HEADER_LEN..];
+
+    if circuit_version != CIRCUIT_VERSION_LINEAR_Q16 {
+        return Err(VerifyError::UnknownCircuitVersion(circuit_version));
+    }
+
+    // Convert big-endian commitment bytes → Halo2 Fr (canonical repr is LE).
+    let to_fr = |be: [u8; 32]| -> Result<Halo2Fr, VerifyError> {
+        let mut le = be;
+        le.reverse();
+        Option::<Halo2Fr>::from(Halo2Fr::from_repr(le.into()))
+            .ok_or(VerifyError::PublicInputShape)
+    };
+    let input_commit = to_fr(input_commit_be)?;
+    let model_commit = to_fr(model_commit_be)?;
+    let output_commit = to_fr(output_commit_be)?;
+
+    // Lazy-init the SRS and v1 verifying key.
+    let (params, vk) = inference_kzg_artifacts_v1();
+
+    // Run the Halo2-KZG verifier.
+    let public_inputs: Vec<Vec<Halo2Fr>> =
+        vec![vec![input_commit, model_commit, output_commit]];
+    let verifier_params = params.verifier_params();
+    let mut transcript =
+        Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof_bytes);
+    let verified = verify_proof_multi::<
+        KZGCommitmentScheme<Bn256>,
+        VerifierSHPLONK<Bn256>,
+        _,
+        _,
+        SingleStrategy<_>,
+    >(
+        &verifier_params,
+        vk,
+        &[public_inputs],
+        &mut transcript,
+    );
+
+    Ok(verified)
+}
+
+/// Lazy-init the ParamsKZG (SRS) and VerifyingKey for the v1
+/// InferenceCircuit (`CIRCUIT_VERSION_LINEAR_Q16` = 1, out_dim=1,
+/// in_dim=2). Called on the first `verify_inference_proof` invocation;
+/// subsequent calls reuse the OnceLock-cached values.
+///
+/// **SRS source (RM-M1b v1):** deterministic `ParamsKZG::setup` with
+/// a hardcoded seed. This is INSECURE for production (the toxic
+/// waste from setup is reproducible) but DETERMINISTIC across all
+/// nodes (so they agree on whether a proof verifies). RM-M1b WP-M1b.7
+/// (testnet enable) replaces this with the .ptau-derived ParamsKZG
+/// via `crate::zkp::halo2::ptau::load_ptau_into_params_kzg`.
+///
+/// **VK derivation:** the VK is reproducibly derived from
+/// (ParamsKZG, InferenceCircuit topology) via halo2's `keygen_vk`.
+/// Because both inputs are deterministic, all nodes generate the
+/// SAME VK on first invocation, so they agree on proof validity.
+#[cfg(feature = "halo2-substrate")]
+fn inference_kzg_artifacts_v1() -> (
+    &'static halo2_proofs::poly::kzg::commitment::ParamsKZG<halo2curves::bn256::Bn256>,
+    &'static halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>,
+) {
+    use halo2_proofs::circuit::Value;
+    use halo2_proofs::plonk::keygen_vk;
+    use halo2_proofs::poly::kzg::commitment::ParamsKZG;
+    use halo2curves::bn256::Bn256;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use std::sync::OnceLock;
+
+    static PARAMS: OnceLock<ParamsKZG<Bn256>> = OnceLock::new();
+    static VK: OnceLock<
+        halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>,
+    > = OnceLock::new();
+
+    let params = PARAMS.get_or_init(|| {
+        // Deterministic seed: 32 bytes of 0x4D ('M' for "M1b"). All
+        // nodes use this same seed so the SRS is identical.
+        let mut rng = StdRng::from_seed([0x4D; 32]);
+        ParamsKZG::<Bn256>::setup(12, &mut rng)
+    });
+
+    let vk = VK.get_or_init(|| {
+        let circuit = crate::zkp::halo2::circuits::InferenceCircuit {
+            weights: vec![Value::unknown(); 2], // out_dim=1 * in_dim=2
+            inputs: vec![Value::unknown(); 2],
+            biases: vec![Value::unknown(); 1],
+            out_dim: 1,
+            in_dim: 2,
+        };
+        keygen_vk(params, &circuit).expect("VK keygen for InferenceCircuit v1")
+    });
+
+    (params, vk)
 }
 
 // ---------------------------------------------------------------------------

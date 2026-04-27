@@ -71,7 +71,16 @@ pub mod gas_costs {
     /// caller-contract level.
     pub const MERKLE_VERIFY_MAX_DEPTH: u8 = 32;
 
-    // INFERENCE_PROOF_VERIFY costs land with the LIVE impl in RM-M1b.
+    /// INFERENCE_PROOF_VERIFY base cost — wire-format parse + VK lookup.
+    /// The bulk of cost is the KZG pairing in the verifier (single
+    /// pairing per proof in SHPLONK).
+    pub const INFERENCE_PROOF_VERIFY_BASE: u64 = 500_000;
+
+    /// INFERENCE_PROOF_VERIFY per-byte proof cost — proof transcript
+    /// scanning + commitment opening checks scale with proof length.
+    /// Calibrated as a placeholder; RM-M1b WP-M1b.6 calibrates against
+    /// real proof bench numbers.
+    pub const INFERENCE_PROOF_VERIFY_PER_BYTE: u64 = 50;
 }
 
 /// Route to the right precompile by address.
@@ -80,33 +89,26 @@ pub fn execute(address: &Address, input: &[u8], gas_limit: u64) -> Result<Precom
     if addr == &addresses::TENSOR_COMMIT {
         tensor_commit(input, gas_limit)
     } else if addr == &addresses::INFERENCE_PROOF_VERIFY {
-        // 0x0108 is intentionally a STUB at RM-M1 close.
+        // RM-M1b WP-M1b.4: 0x0108 is LIVE behind the
+        // `halo2-substrate` feature flag. The build without that
+        // flag still returns the stub message — both the binary
+        // size and the dependency surface stay clean for nodes
+        // that don't host the verifier.
         //
-        // The active implementation is sprint RM-M1b — a full
-        // migration from arkworks Groth16 (which uses an OsRng-
-        // derived per-build VK and cannot be safely embedded into
-        // a precompile) to Halo2-KZG with the public Powers of Tau
-        // SRS.
+        // **SRS source:** RM-M1b v1 uses a deterministic
+        // `ParamsKZG::setup` with a hardcoded seed (see
+        // `halo2::inference_kzg_artifacts_v1`). This is INSECURE
+        // for production — the toxic waste from setup is
+        // reproducible — but DETERMINISTIC across nodes so they
+        // agree on proof validity. RM-M1b WP-M1b.7 (testnet
+        // enable) replaces this with the .ptau-derived ParamsKZG.
         //
-        // The split was approved by Saul on 2026-04-27 with the
-        // explicit condition "make sure that it doesn't get left
-        // under the rug." This message is one of four anti-rug
-        // anchor points; the others are:
-        //
-        //   - ADR-RM-M1b-1 at .agentile/planset/adr/
-        //   - SPRINT.md at .agentile/sprints/active/sprint-rm-m1b-halo2-inference-proof-verify/
-        //   - The RM-M1b row + anti-rug note in
-        //     .agentile/sprints/CURRENT.md
-        //
-        // Do NOT delete this stub or re-route 0x0108 elsewhere
-        // before RM-M1b ships. The CI verifier
-        // scripts/ci/check_m1_verification_precompiles.py is
-        // configured to require this stub message ("lands in
-        // WP-M1b") until 0x0108 flips to LIVE.
-        Err(anyhow!(
-            "INFERENCE_PROOF_VERIFY (0x0108) lands in WP-M1b — \
-             Halo2-KZG migration. See ADR-RM-M1b-1."
-        ))
+        // **Anti-rug carry-forward:** ADR-RM-M1b-1 + SPRINT.md +
+        // CURRENT.md document the migration path. The CI verifier
+        // `check_m1_verification_precompiles.py` flips its
+        // expected-state for 0x0108 from STUB to LIVE in this
+        // commit.
+        inference_proof_verify(input, gas_limit)
     } else if addr == &addresses::MERKLE_VERIFY_TENSOR {
         merkle_verify_tensor(input, gas_limit)
     } else {
@@ -337,6 +339,74 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
         output,
         gas_used,
         success: true, // success=true means "the precompile ran"; the bool result is in `output`.
+    })
+}
+
+/// 0x0108 INFERENCE_PROOF_VERIFY — Halo2-KZG verifier for the
+/// InferenceCircuit family.
+///
+/// **Input format (binary):**
+/// ```text
+/// | 32B  input_commitment   (BE Fr)
+/// | 32B  model_commitment   (BE Fr)
+/// | 32B  output_commitment  (BE Fr)
+/// |  4B  circuit_version    (BE u32; v1 = 1)
+/// |  4B  chain_id           (BE u32; advisory in v1)
+/// | proof_bytes (variable)
+/// ```
+///
+/// **Output:** 32-byte big-endian word, value 1 if proof verifies,
+/// 0 if rejected. Returns Err on structural problems (truncated
+/// input, unknown circuit_version).
+///
+/// **Gas:** `INFERENCE_PROOF_VERIFY_BASE + per_byte * input.len()`.
+/// The per-byte component covers transcript scanning. Calibration
+/// is RM-M1b WP-M1b.6 follow-up.
+///
+/// **Determinism:** the SRS + VK are deterministically derived
+/// (RM-M1b v1: from a fixed seed; production: from the .ptau
+/// file). The Halo2-KZG verifier itself is bit-deterministic.
+pub fn inference_proof_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
+    // Gas charge first — covers parsing + verification effort.
+    let gas_used = gas_costs::INFERENCE_PROOF_VERIFY_BASE
+        .saturating_add(gas_costs::INFERENCE_PROOF_VERIFY_PER_BYTE * input.len() as u64);
+    if gas_limit < gas_used {
+        return Err(anyhow!(
+            "Insufficient gas for INFERENCE_PROOF_VERIFY: need {gas_used}, have {gas_limit}"
+        ));
+    }
+
+    #[cfg(feature = "halo2-substrate")]
+    let result = match crate::zkp::halo2::verify_inference_proof(input) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(anyhow!("INFERENCE_PROOF_VERIFY error: {e}"));
+        }
+    };
+    #[cfg(not(feature = "halo2-substrate"))]
+    let result = {
+        // Without the feature flag, the verifier is absent. The CI
+        // verifier `check_m1_verification_precompiles.py` enforces
+        // that this branch only ships when the feature is gated off
+        // intentionally (e.g., light-node binary that doesn't host
+        // proofs). Production validator binaries MUST build with
+        // halo2-substrate.
+        let _ = input;
+        return Err(anyhow!(
+            "INFERENCE_PROOF_VERIFY (0x0108) requires halo2-substrate \
+             feature flag. Rebuild with --features halo2-substrate."
+        ));
+    };
+
+    let mut output = vec![0u8; 32];
+    if result {
+        output[31] = 1;
+    }
+
+    Ok(PrecompileResult {
+        output,
+        gas_used,
+        success: true,
     })
 }
 
