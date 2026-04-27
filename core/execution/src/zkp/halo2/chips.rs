@@ -663,6 +663,370 @@ impl PoseidonChip {
 }
 
 // ---------------------------------------------------------------------------
+// LinearChip — in-circuit Q16.16 linear layer: y[i] = sum_j (W[i][j] * x[j]) >> 16 + b[i].
+// ---------------------------------------------------------------------------
+//
+// **Goal:** prove that `y` matches `precompiles::q16::ops::linear(W, x, b)`
+// byte-for-byte for safe-range inputs (no Q16 saturation triggered).
+// This chip is the second half of the InferenceCircuit (the first half
+// being PoseidonChip, which commits the inputs/weights/outputs).
+//
+// **Encoding:** Q16.16 values are mapped to BN254 Fr via signed encoding:
+//   - non-negative v ∈ [0, 2^31)  → Fr(v as u64)
+//   - negative     v ∈ [-2^31, 0) → -Fr((-v) as u64)  (field negation)
+// Off-chain `precompiles::q16::Q16` values (i32 newtypes) round-trip
+// via this encoding. Field arithmetic on these encodings agrees with
+// signed integer arithmetic mod 2^254 (the field modulus); for safe-range
+// products this means the field product equals the signed product
+// exactly (no wraparound).
+//
+// **Decomposition gate:** for each (i, j) product row:
+//   prod = W[i][j] * x[j]            (field mul)
+//   prod = hi * 2^16 + lo            (shift constraint)
+//   acc_curr = acc_prev + hi         (accumulator step; init from hi at j=0)
+// then on the final row of each output:
+//   y[i] = acc_prev_row + b[i]
+//
+// **Saturation status:** this chip does NOT implement Q16 saturation
+// in-circuit. The differential test only exercises safe-range inputs
+// (small magnitudes that don't trigger saturation in `q16::ops::linear`).
+// Adding saturation requires range-checks on `lo` (∈ [0, 2^16)) and `hi`
+// (∈ [-2^31, 2^31)) via lookup tables, plus conditional clamping logic.
+// That upgrade is tracked as RM-M2 follow-up; for RM-M1b's InferenceCircuit
+// we constrain inputs to safe range at the prover side and document the
+// limitation. The chip's structural correctness for the linear-sum
+// portion is unaffected.
+//
+// **Soundness note:** without range checks on `lo`, a malicious prover
+// could choose any `(hi', lo')` satisfying `prod = hi' * 2^16 + lo'` in
+// field — infinitely many in p. For an honest prover (which this
+// differential test exercises), `lo = prod mod 2^16` and `hi = prod
+// floor-div 2^16` is the unique correct choice. Production InferenceCircuit
+// MUST add the lookup-based range checks before mainnet. The off-chain
+// witness generator embeds the correct values; the prototype trusts
+// that the prover follows the witness contract.
+
+#[derive(Clone, Debug)]
+pub struct LinearChipConfig {
+    /// W[i][j] cell on each product row.
+    pub w: Column<Advice>,
+    /// x[j] cell on each product row.
+    pub x: Column<Advice>,
+    /// W[i][j] * x[j] in field on each product row.
+    pub prod: Column<Advice>,
+    /// (W*x) >> 16 (signed Q16) on each product row.
+    pub hi: Column<Advice>,
+    /// (W*x) mod 2^16 (in [0, 2^16) for honest prover) on each product row.
+    pub lo: Column<Advice>,
+    /// Running accumulator: at row j, sum_{k <= j} hi[k].
+    pub acc: Column<Advice>,
+    /// b[i] cell on the output row.
+    pub b: Column<Advice>,
+    /// y[i] cell on the output row.
+    pub y: Column<Advice>,
+
+    /// Selector for "prod = w * x".
+    pub s_prod: Selector,
+    /// Selector for "prod = hi * 2^16 + lo".
+    pub s_shift: Selector,
+    /// Selector for "acc = hi" on the first product row.
+    pub s_acc_init: Selector,
+    /// Selector for "acc_curr = acc_prev + hi_curr" on subsequent product rows.
+    pub s_acc_step: Selector,
+    /// Selector for "y = acc_prev_row + b" on the output row.
+    pub s_output: Selector,
+}
+
+pub struct LinearChip;
+
+/// Q16-style "signed shift right 16" of a field-encoded product: returns
+/// (hi, lo) where prod_signed = hi * 2^16 + lo as signed i64, with lo in
+/// [0, 2^16). Both pieces are returned as halo2 Fr in signed encoding
+/// (lo is naturally non-negative; hi may be negative).
+fn signed_shift_decomp(prod_signed: i64) -> (Halo2Fr, Halo2Fr) {
+    let lo = (prod_signed & 0xFFFF) as u64;
+    let hi = prod_signed >> 16;
+    (i64_to_halo2_fr(hi), Halo2Fr::from(lo))
+}
+
+/// Map a signed i64 into BN254 Fr via the standard signed-into-field
+/// embedding.
+fn i64_to_halo2_fr(v: i64) -> Halo2Fr {
+    if v >= 0 {
+        Halo2Fr::from(v as u64)
+    } else {
+        // (-v) as u64 is unsigned-abs; -i64::MIN would overflow, but for
+        // Q16 products of i32 * i32 we never reach that bound (max
+        // |prod| < 2^62 < 2^63).
+        -Halo2Fr::from(v.unsigned_abs())
+    }
+}
+
+/// Map an off-chain `Q16` value to halo2 Fr in signed encoding.
+pub fn q16_to_halo2_fr(q: crate::precompiles::q16::Q16) -> Halo2Fr {
+    i64_to_halo2_fr(q.0 as i64)
+}
+
+impl LinearChip {
+    /// Configure the chip's gates.
+    pub fn configure(meta: &mut ConstraintSystem<Halo2Fr>) -> LinearChipConfig {
+        let w = meta.advice_column();
+        let x = meta.advice_column();
+        let prod = meta.advice_column();
+        let hi = meta.advice_column();
+        let lo = meta.advice_column();
+        let acc = meta.advice_column();
+        let b = meta.advice_column();
+        let y = meta.advice_column();
+        for col in [w, x, prod, hi, lo, acc, b, y].iter() {
+            meta.enable_equality(*col);
+        }
+
+        let s_prod = meta.selector();
+        let s_shift = meta.selector();
+        let s_acc_init = meta.selector();
+        let s_acc_step = meta.selector();
+        let s_output = meta.selector();
+
+        // Gate 1: prod = w * x
+        meta.create_gate("linear_prod", |meta| {
+            let s = meta.query_selector(s_prod);
+            let w_v = meta.query_advice(w, Rotation::cur());
+            let x_v = meta.query_advice(x, Rotation::cur());
+            let p_v = meta.query_advice(prod, Rotation::cur());
+            vec![s * (p_v - w_v * x_v)]
+        });
+
+        // Gate 2: prod = hi * 2^16 + lo
+        meta.create_gate("linear_shift", |meta| {
+            let s = meta.query_selector(s_shift);
+            let p_v = meta.query_advice(prod, Rotation::cur());
+            let hi_v = meta.query_advice(hi, Rotation::cur());
+            let lo_v = meta.query_advice(lo, Rotation::cur());
+            let two_pow_16 = Expression::Constant(Halo2Fr::from(1u64 << 16));
+            vec![s * (p_v - hi_v * two_pow_16 - lo_v)]
+        });
+
+        // Gate 3: acc = hi at j=0.
+        meta.create_gate("linear_acc_init", |meta| {
+            let s = meta.query_selector(s_acc_init);
+            let acc_v = meta.query_advice(acc, Rotation::cur());
+            let hi_v = meta.query_advice(hi, Rotation::cur());
+            vec![s * (acc_v - hi_v)]
+        });
+
+        // Gate 4: acc_curr = acc_prev + hi_curr (j > 0).
+        meta.create_gate("linear_acc_step", |meta| {
+            let s = meta.query_selector(s_acc_step);
+            let acc_curr = meta.query_advice(acc, Rotation::cur());
+            let acc_prev = meta.query_advice(acc, Rotation::prev());
+            let hi_curr = meta.query_advice(hi, Rotation::cur());
+            vec![s * (acc_curr - acc_prev - hi_curr)]
+        });
+
+        // Gate 5: output row — y = acc_prev_row + b.
+        meta.create_gate("linear_output", |meta| {
+            let s = meta.query_selector(s_output);
+            let y_v = meta.query_advice(y, Rotation::cur());
+            let b_v = meta.query_advice(b, Rotation::cur());
+            let acc_prev = meta.query_advice(acc, Rotation::prev());
+            vec![s * (y_v - acc_prev - b_v)]
+        });
+
+        LinearChipConfig {
+            w, x, prod, hi, lo, acc, b, y,
+            s_prod, s_shift, s_acc_init, s_acc_step, s_output,
+        }
+    }
+
+    /// Synthesize the linear layer for `out_dim` outputs of `in_dim`-vector
+    /// input. Each output gets its own region of `in_dim + 1` rows.
+    /// `weights[i*in_dim..(i+1)*in_dim]` is the row for output i.
+    ///
+    /// Returns the assigned y[i] cells in order.
+    pub fn linear(
+        config: &LinearChipConfig,
+        layouter: &mut impl Layouter<Halo2Fr>,
+        weights: &[Value<Halo2Fr>],
+        inputs: &[Value<Halo2Fr>],
+        biases: &[Value<Halo2Fr>],
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<Vec<AssignedCell<Halo2Fr, Halo2Fr>>, ErrorFront> {
+        debug_assert_eq!(weights.len(), out_dim * in_dim);
+        debug_assert_eq!(inputs.len(), in_dim);
+        debug_assert_eq!(biases.len(), out_dim);
+        debug_assert!(in_dim >= 1, "in_dim must be >= 1");
+
+        let two_pow_16_inv = {
+            // Compute as field element: needed for off-circuit witness derivation
+            // of (hi, lo). Not used here directly, but a helpful note.
+            let _ = Halo2Fr::from(1u64 << 16);
+        };
+        let _ = two_pow_16_inv;
+
+        let mut output_cells = Vec::with_capacity(out_dim);
+
+        for i in 0..out_dim {
+            let cell = layouter.assign_region(
+                || format!("linear_output_{}", i),
+                |mut region| {
+                    // Witness running accumulator (signed i64 in field).
+                    let mut acc_signed: i64 = 0;
+
+                    for j in 0..in_dim {
+                        // Assign w[i][j] and x[j].
+                        region.assign_advice(
+                            || format!("w[{},{}]", i, j),
+                            config.w,
+                            j,
+                            || weights[i * in_dim + j],
+                        )?;
+                        region.assign_advice(
+                            || format!("x[{}]", j),
+                            config.x,
+                            j,
+                            || inputs[j],
+                        )?;
+
+                        // Compute prod, hi, lo from the witnessed values.
+                        // Need to extract i64 from the Value<Halo2Fr>; the
+                        // Value::map handles unknown-witness mode for
+                        // halo2's verifier-only synthesis.
+                        let w_val = weights[i * in_dim + j];
+                        let x_val = inputs[j];
+                        let prod_field = w_val.zip(x_val).map(|(w, x)| w * x);
+                        region.assign_advice(
+                            || format!("prod[{},{}]", i, j),
+                            config.prod,
+                            j,
+                            || prod_field,
+                        )?;
+
+                        // Decompose prod into (hi, lo) using i64 arithmetic
+                        // on the witness side. We need to extract i64 from
+                        // Halo2Fr; we do this by checking the canonical
+                        // representation. For safe-range inputs the field
+                        // element fits in i64 (positive: low 64 bits;
+                        // negative: -((p - field) low 64 bits)).
+                        let (hi_v, lo_v) = w_val.zip(x_val).map(|(w_fr, x_fr)| {
+                            let w_signed = halo2_fr_to_signed_i32(&w_fr) as i64;
+                            let x_signed = halo2_fr_to_signed_i32(&x_fr) as i64;
+                            let p_signed = w_signed * x_signed;
+                            signed_shift_decomp(p_signed)
+                        }).unzip();
+
+                        region.assign_advice(
+                            || format!("hi[{},{}]", i, j),
+                            config.hi,
+                            j,
+                            || hi_v,
+                        )?;
+                        region.assign_advice(
+                            || format!("lo[{},{}]", i, j),
+                            config.lo,
+                            j,
+                            || lo_v,
+                        )?;
+
+                        // Update the i64 accumulator.
+                        let _: Value<()> = w_val.zip(x_val).map(|(w_fr, x_fr)| {
+                            let w_signed = halo2_fr_to_signed_i32(&w_fr) as i64;
+                            let x_signed = halo2_fr_to_signed_i32(&x_fr) as i64;
+                            let p = w_signed * x_signed;
+                            acc_signed = acc_signed.wrapping_add(p >> 16);
+                        });
+
+                        let acc_fr_val = w_val.zip(x_val).map(|_| i64_to_halo2_fr(acc_signed));
+                        region.assign_advice(
+                            || format!("acc[{},{}]", i, j),
+                            config.acc,
+                            j,
+                            || acc_fr_val,
+                        )?;
+
+                        // Selectors.
+                        config.s_prod.enable(&mut region, j)?;
+                        config.s_shift.enable(&mut region, j)?;
+                        if j == 0 {
+                            config.s_acc_init.enable(&mut region, j)?;
+                        } else {
+                            config.s_acc_step.enable(&mut region, j)?;
+                        }
+                    }
+
+                    // Output row at index in_dim.
+                    let out_row = in_dim;
+                    region.assign_advice(
+                        || format!("b[{}]", i),
+                        config.b,
+                        out_row,
+                        || biases[i],
+                    )?;
+                    let y_val = biases[i].map(|b_fr| i64_to_halo2_fr(acc_signed) + b_fr);
+                    let y_cell = region.assign_advice(
+                        || format!("y[{}]", i),
+                        config.y,
+                        out_row,
+                        || y_val,
+                    )?;
+                    config.s_output.enable(&mut region, out_row)?;
+
+                    Ok(y_cell)
+                },
+            )?;
+            output_cells.push(cell);
+        }
+
+        Ok(output_cells)
+    }
+}
+
+/// Recover the signed i32 represented by a Q16-encoded BN254 Fr.
+///
+/// Mirror of `q16_to_halo2_fr`: positive values in [0, 2^31) embed as
+/// themselves; negative values in [-2^31, 0) embed as p - |v| (i.e.,
+/// the field negation). We detect negative by comparing against p/2.
+///
+/// **Saturation note:** for in-range Q16 values this is exact. For
+/// Fr values outside the embedding (e.g., a malicious witness with
+/// arbitrary field elements), the result is undefined — the chip
+/// gates do not validate this, only the differential test contract.
+fn halo2_fr_to_signed_i32(v: &Halo2Fr) -> i32 {
+    use halo2curves::ff::PrimeField as _;
+    let bytes_le = v.to_repr();
+    let bytes_slice: &[u8] = bytes_le.as_ref();
+    let bytes: &[u8; 32] = bytes_slice.try_into().expect("Fr repr is 32 bytes");
+    // Check if v < (p+1)/2 → positive; else negative (p - v).
+    // BN254 Fr modulus p = 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+    // (p+1)/2 ≈ 0x18322739708d8d0...
+    // Easiest: check the high bit of the canonical LE bytes — for
+    // values < p/2, byte 31 < 0x18; for values > p/2, byte 31 ≥ 0x18.
+    let high = bytes[31];
+    if high < 0x18 {
+        // Non-negative; recover low 32 bits as i32.
+        let mut low4 = [0u8; 4];
+        low4.copy_from_slice(&bytes[..4]);
+        let u = u32::from_le_bytes(low4);
+        // For values exceeding i32 range (in Q16 multiplication
+        // intermediates, this only happens out-of-spec), reinterpret
+        // as i32; downstream consumers handle.
+        u as i32
+    } else {
+        // Negative; compute p - v in 4-byte low chunk.
+        // p_low = 0xf0000001 (low 32 bits of p)
+        // For Fr value V (with V > p/2), the represented signed value
+        // is V - p. low 32 bits of (V - p) = V_low - p_low (mod 2^32).
+        let mut low4 = [0u8; 4];
+        low4.copy_from_slice(&bytes[..4]);
+        let v_low = u32::from_le_bytes(low4);
+        let p_low: u32 = 0xf0000001;
+        let signed_low = v_low.wrapping_sub(p_low);
+        signed_low as i32
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Differential test against off-chain poseidon_bn254::poseidon_hash.
 // ---------------------------------------------------------------------------
 //
@@ -1080,5 +1444,174 @@ mod tests {
         let b = q16_tensor(&[3], &[1, 2, 4]);
         assert_tensor_commit_chip_matches(&a);
         assert_tensor_commit_chip_matches(&b);
+    }
+
+    // ---------------------------------------------------------
+    // LinearChip — Q16.16 linear layer differential test.
+    // ---------------------------------------------------------
+    //
+    // For a given (W, x, b) at safe-range Q16 magnitudes, prove that
+    // the in-circuit `linear` output equals the off-chain
+    // `precompiles::q16::ops::linear` output byte-for-byte.
+
+    use crate::precompiles::q16::Q16;
+
+    fn assert_linear_chip_matches(
+        weights: &[Q16],
+        inputs: &[Q16],
+        biases: &[Q16],
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        use halo2_proofs::{
+            circuit::{Layouter, SimpleFloorPlanner, Value},
+            dev::MockProver,
+            plonk::{Circuit, Column, ConstraintSystem, ErrorFront, Instance},
+        };
+
+        // Off-chain reference computes the truth.
+        let expected_q16 =
+            crate::precompiles::q16::ops::linear(weights, inputs, biases, out_dim, in_dim);
+        let expected_fr: Vec<Halo2Fr> =
+            expected_q16.iter().copied().map(q16_to_halo2_fr).collect();
+
+        // Circuit witnesses (signed-into-field).
+        let weights_fr: Vec<Halo2Fr> =
+            weights.iter().copied().map(q16_to_halo2_fr).collect();
+        let inputs_fr: Vec<Halo2Fr> = inputs.iter().copied().map(q16_to_halo2_fr).collect();
+        let biases_fr: Vec<Halo2Fr> = biases.iter().copied().map(q16_to_halo2_fr).collect();
+
+        #[derive(Default, Clone)]
+        struct LinearCircuit {
+            weights: Vec<Value<Halo2Fr>>,
+            inputs: Vec<Value<Halo2Fr>>,
+            biases: Vec<Value<Halo2Fr>>,
+            out_dim: usize,
+            in_dim: usize,
+        }
+
+        #[derive(Clone, Debug)]
+        struct LinearTestConfig {
+            linear: LinearChipConfig,
+            instance: Column<Instance>,
+        }
+
+        impl Circuit<Halo2Fr> for LinearCircuit {
+            type Config = LinearTestConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            #[cfg(feature = "circuit-params")]
+            type Params = ();
+
+            fn without_witnesses(&self) -> Self {
+                Self {
+                    weights: vec![Value::unknown(); self.weights.len()],
+                    inputs: vec![Value::unknown(); self.inputs.len()],
+                    biases: vec![Value::unknown(); self.biases.len()],
+                    out_dim: self.out_dim,
+                    in_dim: self.in_dim,
+                }
+            }
+
+            fn configure(meta: &mut ConstraintSystem<Halo2Fr>) -> Self::Config {
+                let linear = LinearChip::configure(meta);
+                let instance = meta.instance_column();
+                meta.enable_equality(instance);
+                LinearTestConfig { linear, instance }
+            }
+
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Halo2Fr>,
+            ) -> Result<(), ErrorFront> {
+                let outs = LinearChip::linear(
+                    &config.linear,
+                    &mut layouter,
+                    &self.weights,
+                    &self.inputs,
+                    &self.biases,
+                    self.out_dim,
+                    self.in_dim,
+                )?;
+                for (i, cell) in outs.iter().enumerate() {
+                    layouter.constrain_instance(cell.cell(), config.instance, i)?;
+                }
+                Ok(())
+            }
+        }
+
+        let circuit = LinearCircuit {
+            weights: weights_fr.iter().map(|v| Value::known(*v)).collect(),
+            inputs: inputs_fr.iter().map(|v| Value::known(*v)).collect(),
+            biases: biases_fr.iter().map(|v| Value::known(*v)).collect(),
+            out_dim,
+            in_dim,
+        };
+
+        // k=8 = 256 rows. Each output uses (in_dim + 1) rows. For tests
+        // with out_dim ≤ 4 and in_dim ≤ 16, total ≤ 68 rows, plenty of
+        // headroom.
+        let k = 8;
+        let prover = MockProver::run(k, &circuit, vec![expected_fr])
+            .expect("MockProver setup");
+        let r = prover.verify();
+        assert_eq!(
+            r,
+            Ok(()),
+            "LinearChip output does NOT match off-chain q16::ops::linear \
+             for out_dim={} in_dim={}",
+            out_dim,
+            in_dim
+        );
+    }
+
+    #[test]
+    fn linear_chip_identity_2x2() {
+        // y = I · [3, 4] + [10, 20] = [13, 24]
+        let w: Vec<Q16> = [1, 0, 0, 1].iter().map(|&n| Q16::from_int(n)).collect();
+        let x: Vec<Q16> = [3, 4].iter().map(|&n| Q16::from_int(n)).collect();
+        let b: Vec<Q16> = [10, 20].iter().map(|&n| Q16::from_int(n)).collect();
+        assert_linear_chip_matches(&w, &x, &b, 2, 2);
+    }
+
+    #[test]
+    fn linear_chip_basic_row() {
+        // y = [[1, 2, 3]] · [4, 5, 6] + [0] = [4 + 10 + 18] = [32]
+        let w: Vec<Q16> = [1, 2, 3].iter().map(|&n| Q16::from_int(n)).collect();
+        let x: Vec<Q16> = [4, 5, 6].iter().map(|&n| Q16::from_int(n)).collect();
+        let b: Vec<Q16> = vec![Q16::ZERO];
+        assert_linear_chip_matches(&w, &x, &b, 1, 3);
+    }
+
+    #[test]
+    fn linear_chip_negative_weights() {
+        // y = [[2, -1]] · [3, 5] + [0] = [6 - 5] = [1]
+        let w: Vec<Q16> = vec![Q16::from_int(2), Q16::from_int(-1)];
+        let x: Vec<Q16> = [3, 5].iter().map(|&n| Q16::from_int(n)).collect();
+        let b: Vec<Q16> = vec![Q16::ZERO];
+        assert_linear_chip_matches(&w, &x, &b, 1, 2);
+    }
+
+    #[test]
+    fn linear_chip_zero_input_returns_bias() {
+        // y = W · 0 + b = b for any W
+        let w: Vec<Q16> = [5, 7, 11, 13].iter().map(|&n| Q16::from_int(n)).collect();
+        let x: Vec<Q16> = vec![Q16::ZERO; 2];
+        let b: Vec<Q16> = vec![Q16::from_int(42), Q16::from_int(-17)];
+        assert_linear_chip_matches(&w, &x, &b, 2, 2);
+    }
+
+    #[test]
+    fn linear_chip_3x4() {
+        // 3-output, 4-input layer with mixed signs.
+        let w: Vec<Q16> = [
+            1, -2, 3, -4,    // row 0
+            5, 6, -7, -8,    // row 1
+            -9, 10, 11, -12, // row 2
+        ].iter().map(|&n| Q16::from_int(n)).collect();
+        let x: Vec<Q16> = [1, 2, 3, 4].iter().map(|&n| Q16::from_int(n)).collect();
+        let b: Vec<Q16> = [100, -200, 300].iter().map(|&n| Q16::from_int(n)).collect();
+        assert_linear_chip_matches(&w, &x, &b, 3, 4);
     }
 }
