@@ -13,6 +13,20 @@ use citrate_consensus::types::{
 use citrate_execution::types::{AccessPolicy, ModelId, ModelMetadata, ModelState};
 use citrate_execution::types::{Address, TransactionReceipt};
 
+/// RM-I added a fail-closed rate-limit attribution check (`rate_limit::charge`)
+/// that rejects requests with no client_key unless `CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT=1`.
+/// Production deployments set this via env; integration tests run in-process
+/// without the HTTP middleware, so the env var must be set before any RPC
+/// handler executes. Any test in this file that reaches the rate-limit
+/// gate must invoke this helper at the top of the test body — it is
+/// idempotent and safe to call from every test.
+fn ensure_test_rate_limit_bypass() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        std::env::set_var("CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT", "1");
+    });
+}
+
 fn make_block(height: u64, parent: Hash) -> Block {
     BlockBuilder::new()
         .hash(Hash::new([height as u8; 32]))
@@ -514,6 +528,7 @@ async fn test_eth_send_raw_transaction_error_path() {
 
 #[tokio::test]
 async fn test_eth_call_smoke() {
+    ensure_test_rate_limit_bypass();
     use primitive_types::U256;
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -559,6 +574,7 @@ async fn test_eth_call_smoke() {
 
 #[tokio::test]
 async fn test_eth_estimate_gas_minimal() {
+    ensure_test_rate_limit_bypass();
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
     let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
@@ -650,6 +666,7 @@ async fn test_eth_call_ai_tensor_opcode() {
 
 #[tokio::test]
 async fn test_eth_call_invalid_to_address_and_insufficient_balance() {
+    ensure_test_rate_limit_bypass();
     use primitive_types::U256;
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -707,6 +724,7 @@ async fn test_eth_call_invalid_to_address_and_insufficient_balance() {
 
 #[tokio::test]
 async fn test_eth_estimate_gas_with_object_returns_constant() {
+    ensure_test_rate_limit_bypass();
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
     let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
@@ -1065,6 +1083,7 @@ async fn test_eth_call_ai_model_load_path() {
 
 #[tokio::test]
 async fn test_eth_call_ai_model_exec_path() {
+    ensure_test_rate_limit_bypass();
     use primitive_types::U256;
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -1135,6 +1154,7 @@ async fn test_eth_call_ai_model_exec_path() {
 
 #[tokio::test]
 async fn test_eth_call_ai_model_exec_missing_model_errors() {
+    ensure_test_rate_limit_bypass();
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
     let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
@@ -1223,6 +1243,7 @@ async fn test_eth_chain_id_is_configurable() {
 /// Simple transfers should return 21000, while contract calls return actual gas used.
 #[tokio::test]
 async fn test_eth_estimate_gas_real_execution() {
+    ensure_test_rate_limit_bypass();
     use primitive_types::U256;
 
     let tmp = TempDir::new().unwrap();
@@ -1290,6 +1311,7 @@ async fn test_eth_estimate_gas_real_execution() {
 
 #[tokio::test]
 async fn test_eth_estimate_gas_contract_deploy_not_simple_transfer() {
+    ensure_test_rate_limit_bypass();
     use primitive_types::U256;
 
     let tmp = TempDir::new().unwrap();
