@@ -158,17 +158,32 @@ pub fn verify_inference_proof(input: &[u8]) -> Result<bool, VerifyError> {
 /// in_dim=2). Called on the first `verify_inference_proof` invocation;
 /// subsequent calls reuse the OnceLock-cached values.
 ///
-/// **SRS source (RM-M1b v1):** deterministic `ParamsKZG::setup` with
-/// a hardcoded seed. This is INSECURE for production (the toxic
-/// waste from setup is reproducible) but DETERMINISTIC across all
-/// nodes (so they agree on whether a proof verifies). RM-M1b WP-M1b.7
-/// (testnet enable) replaces this with the .ptau-derived ParamsKZG
-/// via `crate::zkp::halo2::ptau::load_ptau_into_params_kzg`.
+/// **SRS source resolution (RM-M1b WP-M1b.7):**
+///
+/// 1. If env var `CITRATE_PTAU_PATH` is set, load the SRS from the
+///    .ptau file at that path via `ptau::load_ptau_into_params_kzg`.
+///    The loader hash-verifies the file against the embedded
+///    PPoT k=18 SHA-256 (`srs::EXPECTED_PTAU_SHA256_K18`) BEFORE
+///    parsing; a tampered or wrong file is rejected fail-closed.
+///    This is the **production / testnet path**.
+///
+/// 2. Otherwise, fall back to a deterministic `ParamsKZG::setup`
+///    with seed `[0x4D; 32]`. This is INSECURE (toxic waste is
+///    reproducible) but DETERMINISTIC across nodes. **Dev / test
+///    only.** The fallback emits a one-time stderr warning so an
+///    operator who forgets the env var notices.
 ///
 /// **VK derivation:** the VK is reproducibly derived from
 /// (ParamsKZG, InferenceCircuit topology) via halo2's `keygen_vk`.
-/// Because both inputs are deterministic, all nodes generate the
-/// SAME VK on first invocation, so they agree on proof validity.
+/// Because both inputs are deterministic (under either source), all
+/// nodes generate the SAME VK and agree on proof validity — as long
+/// as they use the same SRS source. Mixing sources across the
+/// network would diverge.
+///
+/// **Production deployment:** every validator node MUST set
+/// `CITRATE_PTAU_PATH` before serving traffic. The runbook at
+/// `runbooks/RM_M1B_SOAK.md` covers acquisition, hash verification,
+/// and configuration.
 #[cfg(feature = "halo2-substrate")]
 fn inference_kzg_artifacts_v1() -> (
     &'static halo2_proofs::poly::kzg::commitment::ParamsKZG<halo2curves::bn256::Bn256>,
@@ -187,11 +202,48 @@ fn inference_kzg_artifacts_v1() -> (
         halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>,
     > = OnceLock::new();
 
+    const V1_K: u32 = 12;
+
     let params = PARAMS.get_or_init(|| {
-        // Deterministic seed: 32 bytes of 0x4D ('M' for "M1b"). All
-        // nodes use this same seed so the SRS is identical.
-        let mut rng = StdRng::from_seed([0x4D; 32]);
-        ParamsKZG::<Bn256>::setup(12, &mut rng)
+        match std::env::var("CITRATE_PTAU_PATH") {
+            Ok(path) if !path.is_empty() => {
+                // Production / testnet: load and hash-verify the .ptau.
+                // load_ptau_into_params_kzg returns an SrsLoadError on
+                // any failure (NotFound / HashMismatch / Parse). For
+                // an in-flight precompile call we have no way to
+                // surface a structured error, so log to stderr and
+                // panic — the verifier cannot continue without an
+                // SRS, and silently falling back to the insecure
+                // seed-based path would diverge this node from the
+                // network. Fail-closed.
+                eprintln!(
+                    "[citrate-execution] Loading InferenceCircuit SRS from CITRATE_PTAU_PATH={} (k={})",
+                    path, V1_K
+                );
+                crate::zkp::halo2::ptau::load_ptau_into_params_kzg(&path, V1_K)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "[citrate-execution] FATAL: failed to load SRS \
+                             from CITRATE_PTAU_PATH={path}: {e}. The node \
+                             cannot serve 0x0108 INFERENCE_PROOF_VERIFY \
+                             without a valid PPoT .ptau file. See \
+                             runbooks/RM_M1B_SOAK.md."
+                        )
+                    })
+            }
+            _ => {
+                // Dev / test fallback: deterministic seed. INSECURE.
+                eprintln!(
+                    "[citrate-execution] WARNING: CITRATE_PTAU_PATH not set; \
+                     using deterministic seed-based SRS for InferenceCircuit. \
+                     This is DEV/TEST ONLY — production validators must set \
+                     CITRATE_PTAU_PATH to a verified PPoT .ptau file. See \
+                     runbooks/RM_M1B_SOAK.md."
+                );
+                let mut rng = StdRng::from_seed([0x4D; 32]);
+                ParamsKZG::<Bn256>::setup(V1_K, &mut rng)
+            }
+        }
     });
 
     let vk = VK.get_or_init(|| {
