@@ -8,8 +8,8 @@
 //
 // - 0x0107 TENSOR_COMMIT: Poseidon commitment over a canonical-format
 //   tensor. Returns 32-byte field element.
-// - 0x0108 INFERENCE_PROOF_VERIFY: Groth16 verifier for the
-//   InferenceProof circuit family. Returns 32-byte 0/1 bool.
+// - 0x0108 INFERENCE_PROOF_VERIFY: Halo2-KZG verifier for the
+//   InferenceCircuit family (BN254). Returns 32-byte 0/1 bool.
 // - 0x0109 MERKLE_VERIFY_TENSOR: verify a tensor element is part of a
 //   committed tensor via a Merkle path. Returns 32-byte 0/1 bool.
 //
