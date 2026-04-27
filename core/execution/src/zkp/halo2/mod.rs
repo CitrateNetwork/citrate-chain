@@ -136,10 +136,7 @@ pub fn verify_inference_proof(_input: &[u8]) -> Result<bool, VerifyError> {
 pub mod canary;
 
 #[cfg(feature = "halo2-substrate")]
-pub mod chips {
-    //! Halo2 chip implementations — WP-M1b.3.
-    //! Empty until the inference circuit chips land.
-}
+pub mod chips;
 
 #[cfg(feature = "halo2-substrate")]
 pub mod circuits {
