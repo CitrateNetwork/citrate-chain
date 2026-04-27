@@ -125,6 +125,14 @@ pub struct InferencePrecompile {
     /// `dev-mode` cargo feature on `node-app`); mainnet flips back
     /// to deterministic-only pending TEE attestation (CM-08 path).
     allow_nondeterministic_inference: bool,
+
+    /// RM-M3 / WP-M3.3: attestation gate consulted when the
+    /// non-deterministic inference precompile is otherwise
+    /// blocked by Strict mode. In Phase 1 the default impl is
+    /// `AlwaysReject` (preserves the C-01 behavior); Phase 2
+    /// drops in a live MAA+NRAS verifier without touching this
+    /// file. See `attestation::AttestationGate`.
+    attestation_gate: Arc<dyn super::attestation::AttestationGate>,
 }
 
 impl InferencePrecompile {
@@ -145,11 +153,28 @@ impl InferencePrecompile {
     /// this with `InferenceMode::Strict`; devnet opts in via
     /// `InferenceMode::AllowNonDeterministic`.
     pub fn new_with_mode(runtime: Arc<MetalRuntime>, mode: InferenceMode) -> Self {
+        Self::new_with_mode_and_gate(
+            runtime,
+            mode,
+            Arc::new(super::attestation::AlwaysReject::new()),
+        )
+    }
+
+    /// RM-M3 / WP-M3.3: construct an `InferencePrecompile` with an
+    /// explicit `AttestationGate`. This is the surface Phase 2 (live
+    /// MAA+NRAS) wires through. Phase 1 callers all use the default
+    /// `AlwaysReject` via `new_with_mode`.
+    pub fn new_with_mode_and_gate(
+        runtime: Arc<MetalRuntime>,
+        mode: InferenceMode,
+        attestation_gate: Arc<dyn super::attestation::AttestationGate>,
+    ) -> Self {
         Self {
             runtime,
             model_cache: HashMap::new(),
             model_access: HashMap::new(),
             allow_nondeterministic_inference: matches!(mode, InferenceMode::AllowNonDeterministic),
+            attestation_gate,
         }
     }
 
@@ -214,25 +239,44 @@ impl InferencePrecompile {
         if addr == &addresses::MODEL_DEPLOY {
             self.deploy_model(input, gas_limit)
         } else if addr == &addresses::MODEL_INFERENCE {
-            // RM-B1 / WP-B5.1 (audit C-01): on strict-mode chains
-            // the non-deterministic inference precompile is
-            // disabled to prevent consensus forks from f32 / GPU
-            // kernel divergence across validators.
+            // RM-M3 / WP-M3.3: in Strict mode, consult the
+            // AttestationGate. Phase 1 default is AlwaysReject —
+            // identical surface to the prior C-01 hardcoded reject.
+            // Phase 2 plugs in MaaPlusNras here without touching
+            // this file.
             if !self.allow_nondeterministic_inference {
-                return Err(anyhow!(
-                    "C-01: non-deterministic inference precompile (0x0101) \
-                     is disabled on this chain (mainnet block-validation \
-                     mode); pending TEE attestation per CM-08"
-                ));
+                use super::attestation::AttestationDecision;
+                match self.attestation_gate.allow_inference(input) {
+                    AttestationDecision::Allow { .. } => {
+                        // Attestation passed (Phase 2 only). Run inference.
+                    }
+                    AttestationDecision::Reject { reason } => {
+                        return Err(anyhow!(
+                            "C-01 / RM-M3: non-deterministic inference \
+                             precompile (0x0101) gated by attestation. \
+                             Gate `{}` says: {}",
+                            self.attestation_gate.name(),
+                            reason
+                        ));
+                    }
+                }
             }
             self.run_inference(input, gas_limit)
         } else if addr == &addresses::BATCH_INFERENCE {
             if !self.allow_nondeterministic_inference {
-                return Err(anyhow!(
-                    "C-01: non-deterministic batch inference precompile \
-                     (0x0102) is disabled on this chain (mainnet block-\
-                     validation mode); pending TEE attestation per CM-08"
-                ));
+                use super::attestation::AttestationDecision;
+                match self.attestation_gate.allow_inference(input) {
+                    AttestationDecision::Allow { .. } => {}
+                    AttestationDecision::Reject { reason } => {
+                        return Err(anyhow!(
+                            "C-01 / RM-M3: non-deterministic batch \
+                             inference precompile (0x0102) gated by \
+                             attestation. Gate `{}` says: {}",
+                            self.attestation_gate.name(),
+                            reason
+                        ));
+                    }
+                }
             }
             self.run_batch_inference(input, gas_limit)
         } else if addr == &addresses::MODEL_METADATA {
