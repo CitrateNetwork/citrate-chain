@@ -108,6 +108,20 @@ metrics = []
 ai_zkp = []
 coreml = []  # Enable CoreML support on macOS
 
+# RM-M1b — Halo2-KZG inference-proof substrate.
+# OFF by default in RM-M1 close. The flag exists so dependent code
+# can be authored against `halo2::*` interfaces (see
+# core/execution/src/zkp/halo2/mod.rs) without pulling in the
+# halo2_proofs / halo2curves deps until a specific PSE Halo2
+# commit is pinned in WP-M1b.1.
+#
+# When the pin is set, this feature gains:
+#   halo2-substrate = ["dep:halo2_proofs", "dep:halo2curves"]
+# AND the `[dependencies]` section above gains optional entries for
+# both. See ADR-RM-M1b-1 for the chosen substrate (Aztec Ignition
+# SRS over BN254).
+halo2-substrate = []
+
 # Note: the former `mvcc` feature flag was removed in Sprint P950-A-3
 # (2026-04-21). MVCC is now the only execution path; the tokio::sync::Mutex
 # serialization was deleted. Verified by

@@ -107,8 +107,21 @@ impl TurnstileVerifier {
 mod tests {
     use super::*;
 
+    /// All three tests in this module mutate the process-global env var
+    /// `FAUCET_TURNSTILE_VERIFY_URL`. `cargo test` runs tests in a binary
+    /// in parallel by default, so without serialization one test can
+    /// observe another's set/remove and fail nondeterministically. This
+    /// surfaced during RM-M1 sprint-close baseline re-runs (4,967+
+    /// workspace tests; turnstile flakes ~10% of the time when target/
+    /// is rebuilt from clean and cargo's test schedule changes).
+    ///
+    /// Mutex acquired at the top of every test so they run one-at-a-time
+    /// within this binary. Cross-binary parallelism is unaffected.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
     async fn test_constructor_uses_env_url_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var(
             "FAUCET_TURNSTILE_VERIFY_URL",
             "http://example.invalid/verify",
@@ -121,6 +134,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_constructor_default_url_when_env_empty() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("FAUCET_TURNSTILE_VERIFY_URL");
         let v = TurnstileVerifier::new("test-secret");
         assert_eq!(v.verify_url, DEFAULT_VERIFY_URL);
@@ -131,6 +145,7 @@ mod tests {
     /// (transient outage vs. user failed CAPTCHA).
     #[tokio::test]
     async fn test_unreachable_endpoint_errors() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var(
             "FAUCET_TURNSTILE_VERIFY_URL",
             "http://127.0.0.1:1/verify",

@@ -15,6 +15,7 @@
 pub mod backend;
 pub mod ceremony;
 pub mod circuits;
+pub mod halo2;
 pub mod inference_proof;
 pub mod mimc;
 pub mod poseidon;
