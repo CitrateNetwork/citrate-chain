@@ -918,4 +918,167 @@ mod tests {
         let v: Vec<Halo2Fr> = (1u64..=10).map(Halo2Fr::from).collect();
         assert_hash_n_matches(&v);
     }
+
+    // ---------------------------------------------------------
+    // TensorCommitChip — composes hash_n with the same 31-byte
+    // chunking that off-chain `precompiles::verify::tensor_commit`
+    // uses. The byte-level differential test below is the gate
+    // that ties 0x0107 (off-chain commit) to 0x0108 (in-circuit
+    // recomputation of that commit).
+    // ---------------------------------------------------------
+
+    /// Off-chip helper: chunk arbitrary bytes into BN254 Fr
+    /// elements via 31-byte chunks (matching the off-chain
+    /// `tensor_commit`'s pack pattern). Public so callers
+    /// preparing witnesses use the same chunking the chip
+    /// expects.
+    pub fn chunk_bytes_into_fr(bytes: &[u8]) -> Vec<Halo2Fr> {
+        use ark_ff::PrimeField as _;
+        bytes
+            .chunks(31)
+            .map(|chunk| {
+                let ark = ArkFr::from_le_bytes_mod_order(chunk);
+                ark_to_halo2_fr(&ark)
+            })
+            .collect()
+    }
+
+    /// Differential test: prove the in-circuit commit (via
+    /// hash_n on chunked Fr elements) equals the off-chain
+    /// 0x0107 commit (via `precompiles::verify::tensor_commit`)
+    /// byte-for-byte.
+    fn assert_tensor_commit_chip_matches(canonical_input: &[u8]) {
+        use halo2_proofs::{
+            circuit::{Layouter, SimpleFloorPlanner, Value},
+            dev::MockProver,
+            plonk::{Circuit, Column, ConstraintSystem, ErrorFront, Instance},
+        };
+
+        // Off-chain commit (gate target).
+        let off_result = crate::precompiles::verify::tensor_commit(canonical_input, 100_000_000)
+            .expect("off-chain tensor_commit");
+        assert_eq!(off_result.output.len(), 32);
+        // The off-chain output is 32-byte big-endian Fr. Convert
+        // to halo2 Fr for comparison via instance column.
+        let mut be = [0u8; 32];
+        be.copy_from_slice(&off_result.output);
+        let mut le = be;
+        le.reverse();
+        let expected: Halo2Fr = {
+            use halo2curves::ff::PrimeField as _;
+            let opt: Option<Halo2Fr> = Halo2Fr::from_repr(le.into()).into();
+            opt.expect("from_repr on hash output")
+        };
+
+        // Chunk the input the same way off-chain commit does.
+        let chunks = chunk_bytes_into_fr(canonical_input);
+
+        #[derive(Default, Clone)]
+        struct CommitCircuit {
+            chunks: Vec<Value<Halo2Fr>>,
+        }
+
+        #[derive(Clone, Debug)]
+        struct CommitConfig {
+            poseidon: PoseidonChipConfig,
+            instance: Column<Instance>,
+        }
+
+        impl Circuit<Halo2Fr> for CommitCircuit {
+            type Config = CommitConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            #[cfg(feature = "circuit-params")]
+            type Params = ();
+
+            fn without_witnesses(&self) -> Self {
+                Self::default()
+            }
+
+            fn configure(meta: &mut ConstraintSystem<Halo2Fr>) -> Self::Config {
+                let poseidon = PoseidonChip::configure(meta);
+                let instance = meta.instance_column();
+                meta.enable_equality(instance);
+                CommitConfig { poseidon, instance }
+            }
+
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Halo2Fr>,
+            ) -> Result<(), ErrorFront> {
+                let out =
+                    PoseidonChip::hash_n(&config.poseidon, &mut layouter, &self.chunks)?;
+                layouter.constrain_instance(out.cell(), config.instance, 0)?;
+                Ok(())
+            }
+        }
+
+        let circuit = CommitCircuit {
+            chunks: chunks.iter().map(|c| Value::known(*c)).collect(),
+        };
+
+        // k=12 for headroom — small tensors fit at lower k, but
+        // a few-hundred-byte tensor needs ~10-30 chunks =
+        // ~5-15 permutations × 65 rows ≈ 325-975 rows. k=12
+        // (4096 rows) safely covers most reference inputs.
+        let k = 12;
+        let prover = MockProver::run(k, &circuit, vec![vec![expected]])
+            .expect("MockProver setup");
+        let r = prover.verify();
+        assert_eq!(
+            r,
+            Ok(()),
+            "tensor commit chip mismatch for input of {} bytes \
+             (off-chain output: 0x{})",
+            canonical_input.len(),
+            hex::encode(off_result.output)
+        );
+    }
+
+    fn q16_tensor(shape: &[u32], values: &[i32]) -> Vec<u8> {
+        use crate::precompiles::tensor_format::{encode, Dtype};
+        let mut data = Vec::with_capacity(values.len() * 4);
+        for &v in values {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        encode(shape, Dtype::Q16_16, &data).expect("encode")
+    }
+
+    #[test]
+    fn tensor_commit_chip_q16_single() {
+        let bytes = q16_tensor(&[1], &[0]);
+        assert_tensor_commit_chip_matches(&bytes);
+    }
+
+    #[test]
+    fn tensor_commit_chip_q16_vector() {
+        let bytes = q16_tensor(&[3], &[1, 2, 3]);
+        assert_tensor_commit_chip_matches(&bytes);
+    }
+
+    #[test]
+    fn tensor_commit_chip_q16_matrix_2x2() {
+        let bytes = q16_tensor(&[2, 2], &[1, 2, 3, 4]);
+        assert_tensor_commit_chip_matches(&bytes);
+    }
+
+    #[test]
+    fn tensor_commit_chip_field32() {
+        use crate::precompiles::tensor_format::{encode, Dtype};
+        let bytes = encode(&[1], Dtype::Field32, &[0xAA; 32]).expect("encode");
+        assert_tensor_commit_chip_matches(&bytes);
+    }
+
+    #[test]
+    fn tensor_commit_chip_distinguishes_data() {
+        // Same shape, different data → different commitments.
+        // The differential test runs both round-trips; if the
+        // chip were data-insensitive (or somehow incorrectly
+        // wrapping), one of the two would fail.
+        let a = q16_tensor(&[3], &[1, 2, 3]);
+        let b = q16_tensor(&[3], &[1, 2, 4]);
+        assert_tensor_commit_chip_matches(&a);
+        assert_tensor_commit_chip_matches(&b);
+    }
 }
