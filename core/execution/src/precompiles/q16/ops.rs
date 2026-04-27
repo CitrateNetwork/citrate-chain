@@ -89,6 +89,140 @@ pub fn relu(input: &[Q16]) -> Vec<Q16> {
         .collect()
 }
 
+/// Matrix transpose. `input` is `rows × cols`, output is
+/// `cols × rows`, both row-major. Caller validates
+/// `input.len() == rows * cols`.
+pub fn transpose(input: &[Q16], rows: usize, cols: usize) -> Vec<Q16> {
+    debug_assert_eq!(input.len(), rows * cols);
+    let mut out = vec![Q16::ZERO; rows * cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            out[j * rows + i] = input[i * cols + j];
+        }
+    }
+    out
+}
+
+/// Numerically stable softmax: `softmax(x)[i] = exp(x[i] - max(x))
+/// / Σ exp(x[k] - max(x))`.
+///
+/// **Determinism:** uses `q16::q16_exp` for exp, integer division
+/// for the normalization. All Q16 arithmetic is bit-identical
+/// across platforms.
+///
+/// **Edge cases:**
+/// - Empty input → empty output.
+/// - All elements identical → uniform distribution `1/n`.
+/// - Single non-zero, others very negative → near one-hot.
+/// - All-negative-saturated input where every `exp` rounds to 0:
+///   the sum is 0, division yields `Q16::MAX` (sign of numerator);
+///   we force the result to a uniform distribution to avoid
+///   propagating saturation pathology.
+pub fn softmax(input: &[Q16]) -> Vec<Q16> {
+    use super::q16_exp;
+    if input.is_empty() {
+        return Vec::new();
+    }
+    // Find max for numerical stability.
+    let max_val = input.iter().fold(input[0], |a, &b| {
+        if b.0 > a.0 { b } else { a }
+    });
+    // Compute exp(x[i] - max).
+    let exps: Vec<Q16> = input
+        .iter()
+        .map(|&x| q16_exp(x.saturating_sub(max_val)))
+        .collect();
+    // Sum (saturating).
+    let sum = exps.iter().fold(Q16::ZERO, |acc, &e| acc.saturating_add(e));
+    if sum.0 == 0 {
+        // Pathological: all exps rounded to zero. Return uniform.
+        let n = input.len() as i32;
+        let inv_n = Q16::ONE.saturating_div(Q16::from_int(n));
+        return vec![inv_n; input.len()];
+    }
+    // Normalize.
+    exps.iter().map(|&e| e.saturating_div(sum)).collect()
+}
+
+#[cfg(test)]
+mod ops_extra_tests {
+    use super::*;
+
+    #[test]
+    fn transpose_2x3() {
+        // [[1,2,3],[4,5,6]] → [[1,4],[2,5],[3,6]]
+        let a: Vec<Q16> = [1, 2, 3, 4, 5, 6].iter().map(|&n| Q16::from_int(n)).collect();
+        let out = transpose(&a, 2, 3);
+        let expected: Vec<Q16> =
+            [1, 4, 2, 5, 3, 6].iter().map(|&n| Q16::from_int(n)).collect();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn transpose_double_is_identity() {
+        let a: Vec<Q16> = [1, 2, 3, 4, 5, 6].iter().map(|&n| Q16::from_int(n)).collect();
+        let t = transpose(&a, 2, 3);
+        let tt = transpose(&t, 3, 2);
+        assert_eq!(tt, a);
+    }
+
+    #[test]
+    fn softmax_uniform_input() {
+        // softmax([5, 5, 5]) = [1/3, 1/3, 1/3]
+        let v: Vec<Q16> = vec![Q16::from_int(5); 3];
+        let s = softmax(&v);
+        assert_eq!(s.len(), 3);
+        // Each ≈ 0.333; Q16(0.333) = round(0.333 * 65536) = 21845.
+        let expected = Q16(21845);
+        for q in &s {
+            assert!(
+                (q.0 - expected.0).abs() <= 4,
+                "uniform softmax: expected ~{:?}, got {:?}",
+                expected,
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn softmax_one_hot_like() {
+        // softmax([10, 0, 0, 0]) → [≈1, ≈0, ≈0, ≈0]
+        let v: Vec<Q16> = vec![
+            Q16::from_int(10),
+            Q16::ZERO,
+            Q16::ZERO,
+            Q16::ZERO,
+        ];
+        let s = softmax(&v);
+        assert!(s[0].0 > Q16::from_f64(0.99).0, "first ~1; got {:?}", s[0]);
+        for i in 1..4 {
+            assert!(s[i].0 < Q16::from_f64(0.01).0, "others ~0; s[{i}] = {:?}", s[i]);
+        }
+    }
+
+    #[test]
+    fn softmax_sum_close_to_one() {
+        let v: Vec<Q16> = vec![
+            Q16::from_int(1),
+            Q16::from_int(2),
+            Q16::from_int(3),
+            Q16::from_int(4),
+        ];
+        let s = softmax(&v);
+        let sum = s.iter().fold(Q16::ZERO, |a, b| a.saturating_add(*b));
+        // Expected 1.0, allow ~16 ULP slop from summation rounding.
+        let diff = (sum.0 - Q16::ONE.0).abs();
+        assert!(diff <= 16, "softmax sum: {:?} vs ONE; diff = {}", sum, diff);
+    }
+
+    #[test]
+    fn softmax_empty() {
+        let v: Vec<Q16> = vec![];
+        let s = softmax(&v);
+        assert!(s.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,7 @@
 // EVM Precompiles Module
 // Standard Ethereum precompiles + Citrate AI extensions
 
+pub mod compute;
 pub mod inference;
 pub mod q16;
 pub mod tensor_format;
@@ -110,12 +111,15 @@ impl PrecompileExecutor {
             && addr_bytes[19] >= 1
             && addr_bytes[19] <= 9;
 
-        // Citrate AI precompiles (0x0100 - 0x0109)
-        // Address format: [0, 0, ..., 0, 1, 0, x] where x is 0-9
+        // Citrate AI precompiles (0x0100 - 0x010F)
+        // Address format: [0, 0, ..., 0, 1, 0, x] where x is 0x00-0x0F
+        // 0x0100-0x0106: inference runtime (RM-M0)
+        // 0x0107-0x0109: verification (RM-M1)
+        // 0x010A-0x010F: deterministic compute (RM-M2)
         let prefix_check = addr_bytes[..17].iter().all(|&b| b == 0);
         let byte17_check = addr_bytes[17] == 1; // This is the 0x01 part
         let byte18_check = addr_bytes[18] == 0; // This is the 00 part
-        let byte19_check = addr_bytes[19] <= 9; // This is the function selector (0-9)
+        let byte19_check = addr_bytes[19] <= 0x0F; // selector 0-15
         let is_ai = prefix_check && byte17_check && byte18_check && byte19_check;
 
 
@@ -147,15 +151,19 @@ impl PrecompileExecutor {
         if addr_bytes[..17].iter().all(|&b| b == 0) && addr_bytes[17] == 1 && addr_bytes[18] == 0 {
             // RM-M1: 0x0107–0x0109 are AI verification precompiles
             // (commitments / proof verification / Merkle paths).
-            // They route to the `verify` module, which has no
-            // dependency on the inference runtime — they're pure
-            // crypto and work even on nodes that don't host model
-            // weights. 0x0100–0x0106 continue to route to the
-            // existing `inference` precompile that requires the
-            // runtime.
+            // RM-M2: 0x010A–0x010F are AI deterministic compute
+            // precompiles (Q16.16 tensor primitives).
+            // Both modules are independent of the inference runtime
+            // — they're pure integer math + crypto and work even on
+            // nodes that don't host model weights. 0x0100–0x0106
+            // continue to route to the existing `inference` precompile
+            // that requires the runtime.
             let selector = addr_bytes[19];
             if (0x07..=0x09).contains(&selector) {
                 return verify::execute(address, input, gas_limit);
+            }
+            if (0x0A..=0x0F).contains(&selector) {
+                return compute::execute(address, input, gas_limit);
             }
 
             if let Some(ref mut inference) = self.inference {

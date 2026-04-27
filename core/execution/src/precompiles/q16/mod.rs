@@ -36,7 +36,10 @@
 
 #![allow(dead_code)]
 
+pub mod exp;
 pub mod ops;
+
+pub use exp::q16_exp;
 
 /// Q16.16 fixed-point value stored as `i32`. The canonical real-
 /// number value is `inner / 2¹⁶`.
