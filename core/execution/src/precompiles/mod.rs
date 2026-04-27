@@ -4,6 +4,8 @@
 // Standard Ethereum precompiles + Citrate AI extensions
 
 pub mod inference;
+pub mod tensor_format;
+pub mod verify;
 pub mod x402;
 
 use anyhow::Result;
@@ -142,6 +144,19 @@ impl PrecompileExecutor {
 
         // AI precompiles (byte 17 = 1, byte 18 = 0)
         if addr_bytes[..17].iter().all(|&b| b == 0) && addr_bytes[17] == 1 && addr_bytes[18] == 0 {
+            // RM-M1: 0x0107–0x0109 are AI verification precompiles
+            // (commitments / proof verification / Merkle paths).
+            // They route to the `verify` module, which has no
+            // dependency on the inference runtime — they're pure
+            // crypto and work even on nodes that don't host model
+            // weights. 0x0100–0x0106 continue to route to the
+            // existing `inference` precompile that requires the
+            // runtime.
+            let selector = addr_bytes[19];
+            if (0x07..=0x09).contains(&selector) {
+                return verify::execute(address, input, gas_limit);
+            }
+
             if let Some(ref mut inference) = self.inference {
                 let output = inference.execute(address, input, gas_limit)?;
                 return Ok(PrecompileResult {
@@ -884,6 +899,7 @@ pub fn recover_address(hash: &[u8], r: &[u8], s: &[u8], recovery_id: u8) -> Opti
 }
 
 /// Result from precompile execution
+#[derive(Debug, Clone)]
 pub struct PrecompileResult {
     pub output: Vec<u8>,
     pub gas_used: u64,
