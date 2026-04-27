@@ -133,22 +133,22 @@ pub fn verify_inference_proof(_input: &[u8]) -> Result<bool, VerifyError> {
 // gains the dep entries).
 
 #[cfg(feature = "halo2-substrate")]
+pub mod canary;
+
+#[cfg(feature = "halo2-substrate")]
 pub mod chips {
     //! Halo2 chip implementations — WP-M1b.3.
-    //! Empty until the dep pin lands.
+    //! Empty until the inference circuit chips land.
 }
 
 #[cfg(feature = "halo2-substrate")]
 pub mod circuits {
     //! Halo2 circuit compositions — WP-M1b.3.
-    //! Empty until the dep pin lands.
+    //! Empty until the inference circuit lands.
 }
 
 #[cfg(feature = "halo2-substrate")]
-pub mod srs {
-    //! Aztec Ignition SRS loader — WP-M1b.2.
-    //! Empty until the dep pin lands.
-}
+pub mod srs;
 
 // ---------------------------------------------------------------------------
 // Always-compiled tests — verify the scaffolding type-checks today.
