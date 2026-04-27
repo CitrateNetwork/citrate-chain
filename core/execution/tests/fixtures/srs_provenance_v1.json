@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "sha256": "9693220206afab749e3d88d4ab5fdf5d36120ea102e7e587ccea0e7a5208e711",
+  "curve": "bn254",
+  "k": 18,
+  "format": "snarkjs ptau (sections 1-7; we consume sections 1-3 only)",
+  "size_bytes": 302083218,
+  "filename": "ppot_0080_18.ptau",
+  "source_url": "https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/ppot_0080_18.ptau",
+  "source_mirror": "PSE (Privacy & Scaling Explorations) AWS S3, eu-central-1",
+  "fetched_at": "2026-04-27T13:02:00Z",
+  "ceremony": "Perpetual Powers of Tau",
+  "ceremony_repo": "https://github.com/privacy-scaling-explorations/perpetualpowersoftau",
+  "contribution_index": 80,
+  "contribution_author": "Carter Feldman",
+  "total_participants_at_fetch": 86,
+  "verification_command": "curl -L -o ppot_0080_18.ptau https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/ppot_0080_18.ptau && sha256sum ppot_0080_18.ptau",
+  "notes": [
+    "Anyone can re-derive the sha256 via verification_command above.",
+    "The .ptau format is SnarkJS-style binary with 7 sections; the WP-M1b.2 PHASE 2 parser consumes sections 1 (header), 2 (tauG1), and 3 (tauG2) only.",
+    "Trust model: 1-of-N — one honest contributor among 86 suffices for the SRS to be cryptographically safe."
+  ]
+}
