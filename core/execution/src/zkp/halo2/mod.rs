@@ -2,43 +2,21 @@
 //
 // RM-M1b — Halo2-KZG substrate.
 //
-// This module is the **scaffold** for the Halo2-KZG inference-proof
-// migration described in ADR-RM-M1b-1. The full implementation lands
-// across WP-M1b.1 → WP-M1b.4. Today (RM-M1 close) it provides:
+// **LIVE** — the Halo2-KZG inference-proof verifier. ADR-RM-M1b-1
+// describes the migration; commits `9c582fbe` through `d44c3450`
+// implement it. This module is what the 0x0108 INFERENCE_PROOF_VERIFY
+// precompile dispatches to.
 //
-//   1. The module path that the precompile dispatcher will import
-//      from once 0x0108 flips from STUB to LIVE.
-//   2. Public type stubs for `InferenceProof`, `VerifyingKey`,
-//      `Srs` so downstream signatures can be written before the
-//      crypto lands.
-//   3. A feature-gated zone (`halo2-substrate`) for the actual
-//      Halo2 integration. Off by default. When ON, the deps + chips
-//      compile in. When OFF, the workspace builds clean.
+// Layout:
+//   - Always-compiled: `CircuitVersion`, `CIRCUIT_VERSION_LINEAR_Q16`,
+//     `VerifyError`, the public `verify_inference_proof` function.
+//   - `cfg(feature = "halo2-substrate")`-gated: `chips`, `circuits`,
+//     `srs`, `ptau`, `canary`, plus the actual verifier body and the
+//     KZG artifact lazy-init (`inference_kzg_artifacts_v1`).
 //
-// Why this scaffold exists at RM-M1 close:
-//
-//   - Saul authorized autonomous progression through RM-M1b
-//     (2026-04-27). The first WP, WP-M1b.1, requires picking a
-//     specific commit hash for the PSE Halo2 fork. That selection
-//     needs verification against the current PSE main + Scroll's
-//     latest audited release; that verification is best done in a
-//     session with internet access to the PSE GitHub repo.
-//
-//   - Until the pin is set, this scaffold lets RM-M1b's other
-//     downstream WPs (M1b.2 SRS sourcing, M1b.4 precompile wiring,
-//     M1b.5 caller migration, M1b.6 audit-prep, M1b.7 testnet
-//     enable) be authored against a stable interface. Pin
-//     selection unblocks WP-M1b.3 (chip authoring) but doesn't
-//     block the surrounding work.
-//
-// **Anti-rug carry-forward:** the `STUB → LIVE` flip on 0x0108
-// happens in WP-M1b.4 by replacing the stub branch in
-// `precompiles/verify.rs::execute` with a call into
-// `halo2::verify_inference_proof(...)` (signature defined below).
-// Until the feature is enabled and the function is implemented,
-// the call site is unreachable; until 0x0108 is LIVE, the stub
-// message stays in place. The CI verifier
-// `check_m1_verification_precompiles.py` enforces this.
+// Without `halo2-substrate`, `verify_inference_proof` returns
+// `VerifyError::SubstrateAbsent` so a node that ships without the
+// feature gets a discoverable error rather than a silent success.
 
 // ---------------------------------------------------------------------------
 // Always-compiled type stubs.
@@ -276,6 +254,7 @@ pub mod srs;
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "halo2-substrate"))]
     #[test]
     fn substrate_absent_without_feature_flag() {
         // The default workspace build does NOT enable halo2-substrate.
@@ -284,6 +263,16 @@ mod tests {
         // gets a discoverable error rather than a silent success.
         let r = verify_inference_proof(b"any bytes");
         assert!(matches!(r, Err(VerifyError::SubstrateAbsent)));
+    }
+
+    #[cfg(feature = "halo2-substrate")]
+    #[test]
+    fn substrate_present_with_feature_flag_rejects_truncated() {
+        // When the feature IS on, the verifier is LIVE. A short
+        // input (< 104B header) must surface as a structured
+        // Truncated error, not as silent success.
+        let r = verify_inference_proof(b"too short");
+        assert!(matches!(r, Err(VerifyError::Truncated { .. })));
     }
 
     #[test]
