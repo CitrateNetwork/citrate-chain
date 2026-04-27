@@ -3,6 +3,7 @@
 // EVM Precompiles Module
 // Standard Ethereum precompiles + Citrate AI extensions
 
+pub mod attestation;
 pub mod compute;
 pub mod inference;
 pub mod q16;
