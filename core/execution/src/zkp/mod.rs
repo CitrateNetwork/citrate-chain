@@ -19,6 +19,7 @@ pub mod halo2;
 pub mod inference_proof;
 pub mod mimc;
 pub mod poseidon;
+pub mod poseidon_bn254;
 pub mod prover;
 pub mod types;
 pub mod verifier;
