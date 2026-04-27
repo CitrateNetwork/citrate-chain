@@ -101,6 +101,13 @@ pub struct PoseidonChipConfig {
     pub s_full: Selector,
     /// Selector for partial-round transitions (S-box only on state[0]).
     pub s_partial: Selector,
+
+    /// Selector for absorb transitions (linear add: state_next[cap..]
+    /// = state_curr[cap..] + inputs). Used by hash_n for inputs
+    /// longer than `rate`. Two extra advice columns hold the
+    /// absorbed input pair on each absorb row.
+    pub s_absorb: Selector,
+    pub absorb_in: [Column<Advice>; RATE],
 }
 
 pub struct PoseidonChip;
@@ -218,20 +225,316 @@ impl PoseidonChip {
             cs
         });
 
+        // ---- Absorb gate ----
+        // For absorb transitions in hash_n: row k+1 state =
+        // row k state + [0; absorb_in[0]; absorb_in[1]] (capacity
+        // unchanged; rate slots get the new inputs added).
+        //
+        // Constraints:
+        //   state_next[0] = state[0]                           (capacity unchanged)
+        //   state_next[1] = state[1] + absorb_in[0]            (rate slot 0)
+        //   state_next[2] = state[2] + absorb_in[1]            (rate slot 1)
+        let absorb_in = [meta.advice_column(), meta.advice_column()];
+        for col in absorb_in.iter() {
+            meta.enable_equality(*col);
+        }
+        let s_absorb = meta.selector();
+        meta.create_gate("poseidon_absorb", |meta| {
+            let s = meta.query_selector(s_absorb);
+            let s0_curr = meta.query_advice(state[0], Rotation::cur());
+            let s1_curr = meta.query_advice(state[1], Rotation::cur());
+            let s2_curr = meta.query_advice(state[2], Rotation::cur());
+            let s0_next = meta.query_advice(state[0], Rotation::next());
+            let s1_next = meta.query_advice(state[1], Rotation::next());
+            let s2_next = meta.query_advice(state[2], Rotation::next());
+            let in0 = meta.query_advice(absorb_in[0], Rotation::cur());
+            let in1 = meta.query_advice(absorb_in[1], Rotation::cur());
+            vec![
+                s.clone() * (s0_next - s0_curr),
+                s.clone() * (s1_next - (s1_curr + in0)),
+                s * (s2_next - (s2_curr + in1)),
+            ]
+        });
+
         PoseidonChipConfig {
             state,
             ark,
             s_full,
             s_partial,
+            s_absorb,
+            absorb_in,
         }
     }
 
-    /// In-circuit hash of exactly two field elements (the Merkle-
-    /// leaf-hash use case). State is initialized to `[a, b, 0]`,
-    /// permuted through 64 rounds, output is `state[0]`.
+    /// In-circuit hash of arbitrary-length input. Mirrors the
+    /// arkworks PoseidonSponge absorb-permute-squeeze cycle:
     ///
-    /// The differential test against `poseidon_hash([a, b])`
-    /// proves byte-equivalence to the off-chain primitive.
+    ///   state = [0; STATE_WIDTH]
+    ///   absorb inputs in chunks of RATE; permute between chunks
+    ///     (NOT after the last chunk per arkworks loop semantics)
+    ///   final permute (the squeeze trigger from Absorbing mode)
+    ///   output = state[capacity] = state[1]
+    ///
+    /// **Empty input → field zero.** Mirrors `poseidon_hash` early-out.
+    ///
+    /// **Differential test:** `assert_in_circuit_matches_off_chain_n`
+    /// in this module verifies byte-equality with
+    /// `zkp::poseidon_bn254::poseidon_hash` for several input lengths.
+    pub fn hash_n(
+        config: &PoseidonChipConfig,
+        layouter: &mut impl Layouter<Halo2Fr>,
+        inputs: &[Value<Halo2Fr>],
+    ) -> Result<AssignedCell<Halo2Fr, Halo2Fr>, ErrorFront> {
+        if inputs.is_empty() {
+            // Match `poseidon_hash([])` = field zero by assigning
+            // a constant zero cell. Use a dedicated region.
+            return layouter.assign_region(
+                || "poseidon_hash_n_empty",
+                |mut region| {
+                    let cell = region.assign_advice(
+                        || "zero",
+                        config.state[1],
+                        0,
+                        || Value::known(Halo2Fr::ZERO),
+                    )?;
+                    Ok(cell)
+                },
+            );
+        }
+
+        layouter.assign_region(
+            || "poseidon_hash_n",
+            |mut region| {
+                let cfg = poseidon_config();
+                // Walking the arkworks absorb_internal logic:
+                //
+                //   state := [0, 0, 0]
+                //   loop:
+                //     if rate_start_index + remaining.len() <= rate:
+                //         add remaining to state[capacity + rate_start_index..]
+                //         break out of absorb loop, mode=Absorbing
+                //     else:
+                //         add (rate - rate_start_index) elements to state[capacity..]
+                //         permute
+                //         remaining = remaining[(rate-rate_start_index)..]
+                //         rate_start_index = 0
+                //   squeeze: permute (transition Absorbing→Squeezing),
+                //            return state[capacity]
+                //
+                // For our rate=2, capacity=1, every absorb chunk is
+                // either the FINAL partial chunk (1 element if odd
+                // length) or a full pair. Let's enumerate the
+                // sequence of (absorb-pair, permute, absorb-pair,
+                // permute, ..., final-absorb) and lay it out.
+                let mut row = 0usize;
+                // Initial state at row 0 = [0, 0, 0].
+                let mut state_vals: [Value<Halo2Fr>; STATE_WIDTH] = [
+                    Value::known(Halo2Fr::ZERO),
+                    Value::known(Halo2Fr::ZERO),
+                    Value::known(Halo2Fr::ZERO),
+                ];
+
+                // Absorb loop. Process inputs in chunks of `rate`.
+                // After each non-final chunk, permute. After the
+                // final chunk, do NOT permute here — the squeeze
+                // step does it.
+                let total_chunks = inputs.len().div_ceil(RATE);
+                for chunk_idx in 0..total_chunks {
+                    let chunk_start = chunk_idx * RATE;
+                    let is_last_chunk = chunk_idx == total_chunks - 1;
+
+                    // Absorb step (1 row):
+                    //   row N: state = state_curr; absorb_in = [in0, in1 (or 0)]; s_absorb on
+                    //   row N+1: state = state_curr + [0, in0, in1]
+                    // Then if not last chunk, permutation occupies rows N+1..N+1+TOTAL_ROUNDS.
+                    let in0 = inputs.get(chunk_start).copied().unwrap_or(Value::known(Halo2Fr::ZERO));
+                    let in1 = if RATE >= 2 {
+                        inputs
+                            .get(chunk_start + 1)
+                            .copied()
+                            .unwrap_or(Value::known(Halo2Fr::ZERO))
+                    } else {
+                        Value::known(Halo2Fr::ZERO)
+                    };
+
+                    // Assign current state cells.
+                    for j in 0..STATE_WIDTH {
+                        region.assign_advice(
+                            || format!("absorb_state[{}] r{}", j, row),
+                            config.state[j],
+                            row,
+                            || state_vals[j],
+                        )?;
+                    }
+                    // Assign the absorb_in cells.
+                    region.assign_advice(
+                        || format!("absorb_in[0] r{}", row),
+                        config.absorb_in[0],
+                        row,
+                        || in0,
+                    )?;
+                    region.assign_advice(
+                        || format!("absorb_in[1] r{}", row),
+                        config.absorb_in[1],
+                        row,
+                        || in1,
+                    )?;
+                    // Enable absorb selector at this row.
+                    config.s_absorb.enable(&mut region, row)?;
+
+                    // Compute post-absorb state (witness):
+                    let post_state: [Value<Halo2Fr>; STATE_WIDTH] = [
+                        state_vals[0], // capacity unchanged
+                        state_vals[1].zip(in0).map(|(s, x)| s + x),
+                        state_vals[2].zip(in1).map(|(s, x)| s + x),
+                    ];
+                    state_vals = post_state;
+                    row += 1;
+
+                    // If not last chunk, run a permutation.
+                    if !is_last_chunk {
+                        state_vals = Self::assign_permutation_rows(
+                            &mut region,
+                            config,
+                            cfg,
+                            &mut row,
+                            state_vals,
+                        )?;
+                    }
+                }
+
+                // Final permute (squeeze trigger).
+                state_vals = Self::assign_permutation_rows(
+                    &mut region,
+                    config,
+                    cfg,
+                    &mut row,
+                    state_vals,
+                )?;
+
+                // Assign the final state row (no selector — terminal).
+                let mut output_cell: Option<AssignedCell<Halo2Fr, Halo2Fr>> = None;
+                for j in 0..STATE_WIDTH {
+                    let cell = region.assign_advice(
+                        || format!("final[{}]", j),
+                        config.state[j],
+                        row,
+                        || state_vals[j],
+                    )?;
+                    if j == 1 {
+                        output_cell = Some(cell);
+                    }
+                }
+                Ok(output_cell.expect("state[1] cell assigned"))
+            },
+        )
+    }
+
+    /// Helper: assign a 64-round permutation starting at the given
+    /// row. Caller has already placed the input state at `*row`;
+    /// this function places rows `*row..*row + TOTAL_ROUNDS`,
+    /// leaving the post-permutation state in `state_vals` and
+    /// advancing `*row` to where the next absorb step (or final
+    /// state assignment) will go.
+    ///
+    /// Note: the output state is written at row `*row + TOTAL_ROUNDS`
+    /// by the round-transition gate at row `*row + TOTAL_ROUNDS - 1`,
+    /// but the cell is NOT assigned by this function — the caller
+    /// is responsible for either assigning the next absorb's
+    /// state advice or assigning the final state row.
+    fn assign_permutation_rows(
+        region: &mut halo2_proofs::circuit::Region<Halo2Fr>,
+        config: &PoseidonChipConfig,
+        cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<ArkFr>,
+        row: &mut usize,
+        mut state_vals: [Value<Halo2Fr>; STATE_WIDTH],
+    ) -> Result<[Value<Halo2Fr>; STATE_WIDTH], ErrorFront> {
+        // Pre-compute MDS as halo2 Fr.
+        let mds: [[Halo2Fr; STATE_WIDTH]; STATE_WIDTH] = {
+            let mut out = [[Halo2Fr::ZERO; STATE_WIDTH]; STATE_WIDTH];
+            for i in 0..STATE_WIDTH {
+                for j in 0..STATE_WIDTH {
+                    out[i][j] = ark_to_halo2_fr(&cfg.mds[i][j]);
+                }
+            }
+            out
+        };
+
+        for round in 0..TOTAL_ROUNDS {
+            let cur_row = *row + round;
+            // Assign current-row state advice cells (input to this
+            // round). For round 0, the caller has already placed
+            // the same values at this row — re-assigning is a copy
+            // op equivalent. For round >= 1, this row was the
+            // "next" row for the previous round's gate; the gate
+            // constrains its values, but we still need to write
+            // them so the cells are assigned.
+            for j in 0..STATE_WIDTH {
+                region.assign_advice(
+                    || format!("state[{}] r{}", j, cur_row),
+                    config.state[j],
+                    cur_row,
+                    || state_vals[j],
+                )?;
+            }
+            // Assign current-row ARK fixed cells.
+            for j in 0..STATE_WIDTH {
+                let ark_val = ark_to_halo2_fr(&cfg.ark[round][j]);
+                region.assign_fixed(
+                    || format!("ark[{}] r{}", j, cur_row),
+                    config.ark[j],
+                    cur_row,
+                    || Value::known(ark_val),
+                )?;
+            }
+            // Selector.
+            let is_full = round < HALF_FULL_ROUNDS
+                || round >= HALF_FULL_ROUNDS + PARTIAL_ROUNDS;
+            if is_full {
+                config.s_full.enable(region, cur_row)?;
+            } else {
+                config.s_partial.enable(region, cur_row)?;
+            }
+            // Compute next state.
+            let ark_round: [Halo2Fr; STATE_WIDTH] = [
+                ark_to_halo2_fr(&cfg.ark[round][0]),
+                ark_to_halo2_fr(&cfg.ark[round][1]),
+                ark_to_halo2_fr(&cfg.ark[round][2]),
+            ];
+            let mut transformed: [Value<Halo2Fr>; STATE_WIDTH] =
+                [Value::known(Halo2Fr::ZERO); STATE_WIDTH];
+            for j in 0..STATE_WIDTH {
+                let pre = state_vals[j].map(|v| v + ark_round[j]);
+                if is_full || j == 0 {
+                    transformed[j] = pre.map(|x| {
+                        let x2 = x * x;
+                        let x4 = x2 * x2;
+                        x4 * x
+                    });
+                } else {
+                    transformed[j] = pre;
+                }
+            }
+            let mut new_state: [Value<Halo2Fr>; STATE_WIDTH] =
+                [Value::known(Halo2Fr::ZERO); STATE_WIDTH];
+            for i in 0..STATE_WIDTH {
+                let mut acc = Value::known(Halo2Fr::ZERO);
+                for j in 0..STATE_WIDTH {
+                    let mds_ij = mds[i][j];
+                    acc = acc.zip(transformed[j]).map(|(a, t)| a + mds_ij * t);
+                }
+                new_state[i] = acc;
+            }
+            state_vals = new_state;
+        }
+        *row += TOTAL_ROUNDS;
+        Ok(state_vals)
+    }
+
+    /// Convenience wrapper for the leaf-hash case (2 inputs).
+    /// Equivalent to `hash_n(layouter, &[a, b])` but slightly more
+    /// efficient (skips the absorb gate row since rate=2 absorbs
+    /// straight into the initial state).
     pub fn hash_pair(
         config: &PoseidonChipConfig,
         layouter: &mut impl Layouter<Halo2Fr>,
@@ -490,5 +793,129 @@ mod tests {
         let a = Halo2Fr::from(0xFEEDFACECAFEBEEFu64);
         let b = Halo2Fr::from(0xDEADBEEF12345678u64);
         assert_in_circuit_matches_off_chain_pair(a, b);
+    }
+
+    // ---------------------------------------------------------
+    // hash_n differential tests — arbitrary input length.
+    // ---------------------------------------------------------
+
+    fn assert_hash_n_matches(inputs_h: &[Halo2Fr]) {
+        use halo2_proofs::{
+            circuit::{Layouter, SimpleFloorPlanner, Value},
+            dev::MockProver,
+            plonk::{Circuit, Column, ConstraintSystem, ErrorFront, Instance},
+        };
+
+        #[derive(Default, Clone)]
+        struct NCircuit {
+            inputs: Vec<Value<Halo2Fr>>,
+        }
+
+        #[derive(Clone, Debug)]
+        struct NConfig {
+            poseidon: PoseidonChipConfig,
+            instance: Column<Instance>,
+        }
+
+        impl Circuit<Halo2Fr> for NCircuit {
+            type Config = NConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            #[cfg(feature = "circuit-params")]
+            type Params = ();
+
+            fn without_witnesses(&self) -> Self {
+                Self::default()
+            }
+
+            fn configure(meta: &mut ConstraintSystem<Halo2Fr>) -> Self::Config {
+                let poseidon = PoseidonChip::configure(meta);
+                let instance = meta.instance_column();
+                meta.enable_equality(instance);
+                NConfig { poseidon, instance }
+            }
+
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Halo2Fr>,
+            ) -> Result<(), ErrorFront> {
+                let out = PoseidonChip::hash_n(&config.poseidon, &mut layouter, &self.inputs)?;
+                layouter.constrain_instance(out.cell(), config.instance, 0)?;
+                Ok(())
+            }
+        }
+
+        // Compute expected via off-chain BN254 Poseidon.
+        let inputs_ark: Vec<ArkFr> = inputs_h.iter().map(halo2_to_ark_fr).collect();
+        let expected_ark = poseidon_hash(&inputs_ark);
+        let expected = ark_to_halo2_fr(&expected_ark);
+
+        let circuit = NCircuit {
+            inputs: inputs_h.iter().map(|v| Value::known(*v)).collect(),
+        };
+
+        // k=11 = 2048 rows: enough for ~30 permutation blocks
+        // (~30 × 65 ≈ 1950 rows). Larger k for very long inputs.
+        // For our tests with up to ~10 inputs (= 5 perms = ~325
+        // rows), k=10 suffices but we use k=11 for headroom.
+        let k = 11;
+        let prover =
+            MockProver::run(k, &circuit, vec![vec![expected]]).expect("mockprover setup");
+        let r = prover.verify();
+        assert_eq!(
+            r,
+            Ok(()),
+            "hash_n output mismatch for inputs of length {}",
+            inputs_h.len()
+        );
+    }
+
+    #[test]
+    fn hash_n_empty() {
+        // Empty input maps to field zero per arkworks early-out
+        // and our chip's matching short-circuit.
+        assert_hash_n_matches(&[]);
+    }
+
+    #[test]
+    fn hash_n_single() {
+        // L=1: one absorb (with implicit zero-pad in rate slot 1),
+        // one squeeze permute. Tests the odd-length absorb path.
+        assert_hash_n_matches(&[Halo2Fr::from(42u64)]);
+    }
+
+    #[test]
+    fn hash_n_two_matches_hash_pair() {
+        // L=2: should match hash_pair. Sanity that the two paths
+        // converge.
+        let a = Halo2Fr::from(7u64);
+        let b = Halo2Fr::from(11u64);
+        assert_hash_n_matches(&[a, b]);
+    }
+
+    #[test]
+    fn hash_n_three() {
+        // L=3: triggers absorb-permute cycle (1 mid-permute +
+        // 1 final permute = 2 permutations).
+        assert_hash_n_matches(&[
+            Halo2Fr::from(1u64),
+            Halo2Fr::from(2u64),
+            Halo2Fr::from(3u64),
+        ]);
+    }
+
+    #[test]
+    fn hash_n_six() {
+        // L=6: 3 chunks of rate=2; 2 mid-permutes + 1 final = 3 total.
+        let v: Vec<Halo2Fr> = (1u64..=6).map(Halo2Fr::from).collect();
+        assert_hash_n_matches(&v);
+    }
+
+    #[test]
+    fn hash_n_ten() {
+        // L=10: stress at the boundary of our k=11 budget.
+        let v: Vec<Halo2Fr> = (1u64..=10).map(Halo2Fr::from).collect();
+        assert_hash_n_matches(&v);
     }
 }
