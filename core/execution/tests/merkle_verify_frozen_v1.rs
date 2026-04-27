@@ -60,9 +60,10 @@ fn u64_as_be_bytes_32(n: u64) -> [u8; 32] {
 
 #[test]
 fn merkle_verify_frozen_4_leaf_tree_v1() {
-    // 4-leaf tree, leaves = [100, 101, 102, 103].
-    // Root + sibling paths captured from the reference impl at HEAD ~01c7ab9d.
-    let root = "0x137a5f3c67f58b3db5d929fbaf607db59e88d57c71c61bd556940d61e90fa0a6";
+    // 4-leaf tree, leaves = [100, 101, 102, 103]. **BN254 Fr**
+    // (RM-M1b WP-M1b.3 migration; v1 BLS12-381 hashes are in
+    // git history at commit 97b828ab).
+    let root = "0x129aeadd5df2aef48856bcbbf814a616e2f084314a9eda1d0dead1e20a46167c";
 
     // Leaf values as 32-byte big-endian u64s.
     let leaf_values = [
@@ -75,23 +76,23 @@ fn merkle_verify_frozen_4_leaf_tree_v1() {
     let paths = [
         // leaf 0
         [
-            "0x057dcfba52fb9ad6a6ee81da799da5c7ba26c977ef22f29d4948ea5d8390f7d2",
-            "0x36ffe8e43bbbb9605833ed837f0dfb6e16ec0cd6644363c77e84a6d50bf502de",
+            "0x0ab59ff4a0e6c38bec2c8cab5d66f766c4117eb394fee9665239d62cb0c30f3c",
+            "0x1687b2f746f7ab9bc635713fb7b2490dd973d6afe014ee522f145e26e506fd14",
         ],
         // leaf 1
         [
-            "0x3aed6acce1fd95e3a4add627e0fae8625d82444dd189f265f90a18fba8a8ff1a",
-            "0x36ffe8e43bbbb9605833ed837f0dfb6e16ec0cd6644363c77e84a6d50bf502de",
+            "0x1ed40e00f8476dfc6a27d8cfd8a72b32940cf92065db6c9bda31391d8c9cc510",
+            "0x1687b2f746f7ab9bc635713fb7b2490dd973d6afe014ee522f145e26e506fd14",
         ],
         // leaf 2
         [
-            "0x054f9b833ab9ec5273752be2d687d6bcba781c641647f30dc1ee84b866015057",
-            "0x70ab928a377974ca02a48b9579d475db2b8aa273959f277307040b31369a4f28",
+            "0x197106d2802ce0bb82ba16ce2f6934d274ea26aac4e380b03ced9571efd67eed",
+            "0x15ff70245acce3c47e450ee6955a4b0e55661c8975ccc6aa8959c60be1a79997",
         ],
         // leaf 3
         [
-            "0x0ee5640302b91ea2636892b7a826bbef49b95dcdab4d1456a332a7e506cf9072",
-            "0x70ab928a377974ca02a48b9579d475db2b8aa273959f277307040b31369a4f28",
+            "0x2e1a24b8daaf4d92fb8fa9bda069950a1812d8454bfd349503cfa83595e2d6cd",
+            "0x15ff70245acce3c47e450ee6955a4b0e55661c8975ccc6aa8959c60be1a79997",
         ],
     ];
 
