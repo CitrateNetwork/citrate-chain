@@ -395,56 +395,54 @@ pub fn parse_ptau_for_kzg(bytes: &[u8], k: u32) -> Result<PtauKzgRaw, PtauError>
 
 /// Construct halo2's `ParamsKZG<Bn256>` from parsed .ptau data.
 ///
-/// **WP-M1b.2 PHASE 2 (B):** halo2's ParamsKZG has a non-public
-/// constructor. We use the public `read_custom` round-trip:
-/// serialize our derived params into the halo2-kzg raw byte
-/// format that `read_custom` accepts, then have halo2 parse them
-/// back. This avoids depending on private fields.
+/// PSE Halo2 main HEAD exposes
+/// `ParamsKZG::from_parts(&self, k, g, g_lagrange, g2, s_g2)`
+/// as a public constructor. The `&self` is just a type-dispatch
+/// holder for the generic parameters — we pass any throwaway
+/// instance and discard. The caller-supplied `g`, `g2`, and
+/// `s_g2` populate the real fields; `g_lagrange = None` triggers
+/// halo2's internal FFT to derive it from `g`.
 ///
-/// The halo2-kzg raw format (RawBytes `SerdeFormat`) is:
-///   k (u32 LE)
-///   n = 2^k (u64 LE? — let halo2's writer determine)
-///   g[0..n] (compressed or uncompressed depending on format)
-///   g_lagrange[0..n] (derived via FFT)
-///   g2_gen
-///   s_g2
-///
-/// Computing g_lagrange requires FFT, which halo2's
-/// `commitment::params` module provides internally. Since we
-/// don't have access to those internals, we instead use the
-/// `setup`-style path with our pre-loaded `g` array:
-///
-///   ParamsKZG<Bn256>::setup_from_powers(k, g, g2_gen, s_g2)
-///
-/// halo2 may not expose this directly. If not, we fall back to
-/// constructing the params via byte-format roundtrip (which IS
-/// public). See the `from_ptau_kzg_raw` body for the exact path.
-#[allow(unused)]
-pub fn construct_params_kzg(_raw: &PtauKzgRaw) -> Result<ParamsKZG<Bn256>, PtauError> {
-    // Halo2 v0.4.0+ does NOT expose `setup_from_powers` or any
-    // public `from_g_g_lagrange_g2` constructor. The only public
-    // construction path is `setup(k, &mut rng)` (which generates
-    // params from RNG — exactly the unsafe path we're avoiding).
-    //
-    // The clean route is to write `g` + `g_lagrange` + g2_gen +
-    // s_g2 in halo2's `RawBytes` `SerdeFormat`, then use
-    // `ParamsKZG::read_custom`. To compute `g_lagrange` we need
-    // halo2's `commitment::params::g_to_lagrange` helper which
-    // is also `pub(crate)`.
-    //
-    // Two paths forward:
-    //   1. Vendor halo2's ParamsKZG construction logic (~50 LoC
-    //      copy of `from_g_g2` + `g_to_lagrange`). Lands in
-    //      WP-M1b.2 PHASE 3 alongside this file.
-    //   2. Submit a PR upstream exposing
-    //      `ParamsKZG::from_powers(...)`. Lands in WP-M1b-future.
-    //
-    // For now: the parser is shippable and tested standalone;
-    // ParamsKZG construction is an additional ~50 LoC follow-up.
-    // The on-curve check on every G1/G2 point provides the
-    // critical security gate (file is well-formed) regardless of
-    // which construction path lands.
-    Err(PtauError::G1NotOnCurve { index: usize::MAX })
+/// **Trust path:** the `g` and `g2`/`s_g2` come from
+/// `parse_ptau_for_kzg`, which on-curve-validated every point.
+/// The throwaway "stub" `ParamsKZG` we instantiate via
+/// `setup(0, ...)` is never read after `from_parts` returns —
+/// only its type-info is used for dispatch.
+pub fn construct_params_kzg(raw: &PtauKzgRaw, k: u32) -> Result<ParamsKZG<Bn256>, PtauError> {
+    // Stub instance for type-dispatch only. Discarded after
+    // from_parts returns.
+    use rand::rngs::OsRng;
+    let stub = ParamsKZG::<Bn256>::setup(0, OsRng);
+
+    // Build the real params from our parsed .ptau data.
+    // g.len() must equal 2^k + 1 (exactly the slice
+    // parse_ptau_for_kzg produces).
+    if raw.g.len() != (1usize << k) + 1 {
+        return Err(PtauError::PowerTooSmall { want: k, got: raw.power });
+    }
+
+    // Halo2's `from_parts` expects `g` of length `n = 2^k`, not
+    // `n + 1`. Slice off the last element (which is the (n+1)-th
+    // power that some KZG constructions use but halo2 doesn't).
+    let g_n = raw.g[..(1usize << k)].to_vec();
+
+    let params = stub.from_parts(k, g_n, None, raw.g2_gen, raw.s_g2);
+    drop(stub);
+    Ok(params)
+}
+
+/// Convenience: load a .ptau from path, verify hash, parse, and
+/// construct ParamsKZG in one shot. Production-grade entry point.
+pub fn load_ptau_into_params_kzg<P: AsRef<std::path::Path>>(
+    path: P,
+    k: u32,
+) -> Result<ParamsKZG<Bn256>, super::srs::SrsLoadError> {
+    use super::srs::{load_and_verify_ptau, SrsLoadError};
+    let bytes = load_and_verify_ptau(path)?;
+    let raw = parse_ptau_for_kzg(&bytes, k)
+        .map_err(|e| SrsLoadError::Parse(format!("{e}")))?;
+    construct_params_kzg(&raw, k)
+        .map_err(|e| SrsLoadError::Parse(format!("{e}")))
 }
 
 #[cfg(test)]
@@ -542,5 +540,21 @@ mod tests {
         assert_eq!(raw.g[0], g_gen, "tauG1[0] must equal G1 generator");
         // g2_gen (raw.g2_gen) must equal canonical G2 generator
         // — already validated inside parse_ptau_for_kzg.
+    }
+
+    /// End-to-end integration: parse + construct ParamsKZG.
+    /// Verifies the trust chain from .ptau bytes → on-curve G1/G2
+    /// points → halo2 ParamsKZG ready for keygen.
+    #[test]
+    #[ignore]
+    fn ptau_to_params_kzg_k18() {
+        let path = "/tmp/ppot/ppot_0080_18.ptau";
+        let params = load_ptau_into_params_kzg(path, 18)
+            .expect("load_ptau_into_params_kzg");
+        // Sanity: the params accept queries via the public
+        // ParamsProver/ParamsVerifier traits.
+        use halo2_proofs::poly::commitment::Params;
+        assert_eq!(params.k(), 18);
+        assert_eq!(params.n(), 1u64 << 18);
     }
 }
