@@ -142,10 +142,7 @@ pub mod ptau;
 pub mod chips;
 
 #[cfg(feature = "halo2-substrate")]
-pub mod circuits {
-    //! Halo2 circuit compositions — WP-M1b.3.
-    //! Empty until the inference circuit lands.
-}
+pub mod circuits;
 
 #[cfg(feature = "halo2-substrate")]
 pub mod srs;
