@@ -41,10 +41,13 @@ fn hex_be(bytes: &[u8]) -> String {
 #[test]
 fn tensor_commit_frozen_vectors_v1() {
     // Vector 1: single-element Q16 vector [0].
+    // BN254 Fr (RM-M1b WP-M1b.3 migration). v1 BLS12-381 hashes
+    // are in git history; pre-mainnet, no production commitments
+    // depended on the old hashes.
     let h1 = tensor_commit(&q16(&[1], &[0]), 1_000_000).unwrap();
     assert_eq!(
         hex_be(&h1.output),
-        "0x31bda1f3a748cd7f8b4ba7a792365ef7e6064945e8846a90965557f8991ac7aa",
+        "0x1ce5538e037b84f02d37f2c162ca9c5268e4489e4704516766cf3917f5461618",
         "TENSOR_COMMIT(Q16, [1], [0]) drifted"
     );
 
@@ -52,7 +55,7 @@ fn tensor_commit_frozen_vectors_v1() {
     let h2 = tensor_commit(&q16(&[3], &[1, 2, 3]), 1_000_000).unwrap();
     assert_eq!(
         hex_be(&h2.output),
-        "0x4a04927e172414e25239e2d025987a091f77b4fa28439cfbb308709b623b5677",
+        "0x2cf29c993ba8432a07811f765fada910b99cc477b56ac57b6e6197706a65a496",
         "TENSOR_COMMIT(Q16, [3], [1,2,3]) drifted"
     );
 
@@ -60,7 +63,7 @@ fn tensor_commit_frozen_vectors_v1() {
     let h3 = tensor_commit(&q16(&[2, 2], &[1, 2, 3, 4]), 1_000_000).unwrap();
     assert_eq!(
         hex_be(&h3.output),
-        "0x40363ec718d8fd1027f1fd627e2a16a57303541e16922f84816f65aa251324e4",
+        "0x18dfcf46ab947af444fa6b1a025f8c4dbd4002659431a7cbe3d5660338ef88db",
         "TENSOR_COMMIT(Q16, [2,2], [1,2,3,4]) drifted"
     );
 
@@ -69,7 +72,7 @@ fn tensor_commit_frozen_vectors_v1() {
     let h4 = tensor_commit(&f, 1_000_000).unwrap();
     assert_eq!(
         hex_be(&h4.output),
-        "0x11a78d86a5f3e359e6b759c358cdf16fd4b7c122d214d1a25bd1d0b66bda32c6",
+        "0x1e41d834581a6bd1801f690b8dc306c85aea21825a7499fdc8decfa696176d10",
         "TENSOR_COMMIT(Field32, [1], 0xAA…) drifted"
     );
 }

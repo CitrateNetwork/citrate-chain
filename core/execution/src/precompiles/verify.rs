@@ -23,13 +23,13 @@
 // to make it pass. See its top-of-file procedure block.
 
 use anyhow::{anyhow, Result};
-use ark_bls12_381::Fr;
+use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};
 
 use super::tensor_format::{self, TensorFormatError};
 use super::PrecompileResult;
 use crate::types::Address;
-use crate::zkp::poseidon::poseidon_hash;
+use crate::zkp::poseidon_bn254::poseidon_hash;
 
 /// Precompile addresses for AI verification operations.
 pub mod addresses {
@@ -115,7 +115,9 @@ pub fn execute(address: &Address, input: &[u8], gas_limit: u64) -> Result<Precom
 }
 
 /// 0x0107 TENSOR_COMMIT — Poseidon commitment over a canonical-format
-/// tensor.
+/// tensor. **BN254 Fr** as of RM-M1b WP-M1b.3 (migrated from
+/// BLS12-381 Fr to align with 0x0108 INFERENCE_PROOF_VERIFY's
+/// in-circuit Poseidon).
 ///
 /// **Input:** raw bytes produced by `tensor_format::encode`. The
 /// precompile decodes the header to validate well-formedness, then
@@ -132,10 +134,20 @@ pub fn execute(address: &Address, input: &[u8], gas_limit: u64) -> Result<Precom
 /// existing zkp/poseidon costing; one Fr absorb per 31-byte chunk plus
 /// the header path overhead.
 ///
-/// **Determinism:** Poseidon over BLS12-381 Fr is bit-deterministic
+/// **Determinism:** Poseidon over BN254 Fr is bit-deterministic
 /// across all hardware. The frozen-vectors test in
-/// `tests/poseidon_frozen_v1.rs` locks the byte output of six
+/// `tests/tensor_commit_frozen_v1.rs` locks the byte output of four
 /// reference inputs; this precompile inherits that guarantee.
+///
+/// **Curve migration note (2026-04-27):** v1 commitments derived
+/// from BLS12-381 Fr remain in the git history (commit `045dd59c`
+/// frozen vectors). The migration to BN254 was made BEFORE any
+/// production commitments were stored — the testnet soak in
+/// progress at the time predates 0x0107 use by any contract. So
+/// no on-chain commitments need a versioning byte to disambiguate
+/// curves; a single curve forever, BN254. Per ADR-RM-M1-1's
+/// versioning rule, if we ever need to migrate again the new
+/// commitment scheme ships at a new precompile address (0x0110+).
 pub fn tensor_commit(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     // Validate the canonical-format header before computing gas. A
     // malformed input pays only the parse cost (which is cheap) and
