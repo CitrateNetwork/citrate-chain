@@ -128,8 +128,10 @@ impl Q16 {
     }
 
     /// Convert to `f64` for diagnostics / external comparison.
-    /// **NOT used by any precompile or chip path** — purely
-    /// human-readable for debugging.
+    /// **TEST-ONLY** — gated behind `#[cfg(test)]` so the
+    /// production binary contains zero f64 in the Q16 path.
+    /// `check_m2_no_float_in_q16.py` enforces this.
+    #[cfg(test)]
     pub fn to_f64(self) -> f64 {
         (self.0 as f64) / (SCALE as f64)
     }

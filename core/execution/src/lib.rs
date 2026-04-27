@@ -12,7 +12,6 @@ pub mod revm_adapter;
 pub mod state;
 pub mod tensor;
 pub mod types;
-pub mod vm;
 
 // Multi-Version Concurrency Control (MVCC) primitives. Unconditional
 // as of Sprint P950-A-3 (2026-04-21): the former `mvcc` feature flag

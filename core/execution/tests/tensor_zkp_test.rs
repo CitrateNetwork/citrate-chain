@@ -43,28 +43,10 @@ mod ai_zkp_tests {
         assert!(!proof.public_inputs.is_empty());
     }
 
-    #[test]
-    fn test_vm_integration() {
-        use citrate_execution::vm::ai_opcodes::AIOpcode;
-        use citrate_execution::vm::VM;
-        let mut vm = VM::new(1_000_000);
-        let opcodes = vec![
-            (0xA0, Some(AIOpcode::LOAD_MODEL)),
-            (0xA1, Some(AIOpcode::UNLOAD_MODEL)),
-            (0xB0, Some(AIOpcode::TENSOR_NEW)),
-            (0xB1, Some(AIOpcode::TENSOR_ADD)),
-            (0xD0, Some(AIOpcode::VERIFY_PROOF)),
-        ];
-        for (opcode_byte, expected) in opcodes {
-            let bytecode = vec![opcode_byte, 0x00];
-            let result = vm.execute(&bytecode);
-            if let Err(e) = result {
-                if let citrate_execution::ExecutionError::InvalidOpcode(_) = e {
-                    if expected.is_some() {
-                        panic!("Valid opcode {:02x} treated as invalid", opcode_byte);
-                    }
-                }
-            }
-        }
-    }
+    // RM-M2 WP-M2.11 (2026-04-27): the test_vm_integration test was
+    // removed alongside core/execution/src/vm/. AI operations are no
+    // longer exposed as opcodes (0xA0–0xDF); they're precompiles
+    // 0x010A–0x010F. See `core/execution/src/precompiles/compute.rs`
+    // for the LIVE replacement and `tests/inference_proof_verify_e2e.rs`
+    // for proof verification (0x0108).
 }

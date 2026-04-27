@@ -127,17 +127,13 @@ fn l03_ecvrf_round_trip_does_not_panic() {
 
 /// L-02.1: every byte in the PUSH range round-trips through the
 /// opcode decoder (no UB from a removed enum variant). Pre-fix
-/// the unsafe transmute would compile cleanly even if a variant
-/// were removed; post-fix the explicit match arms reference
-/// each variant by name, so removal is a compile error.
-#[test]
-fn l02_push_range_round_trips_safely() {
-    use citrate_execution::vm::evm_opcodes::EVMOpcode;
-    for byte in 0x60u8..=0x7f {
-        let opcode = EVMOpcode::try_from(byte).expect("PUSH variant");
-        assert_eq!(opcode as u8, byte);
-    }
-}
+// l02_push_range_round_trips_safely was removed in RM-M2 WP-M2.11
+// (2026-04-27) along with `core/execution/src/vm/evm_opcodes.rs`.
+// The simple Citrate EVM the test exercised is no longer in the
+// tree — production execution uses REVM via `revm_adapter.rs`,
+// which has its own opcode safety. The L-02 finding's spirit
+// (safe opcode discrimination) is now satisfied by REVM's
+// well-audited dispatch.
 
 /// REM-N-03 / WP-H1.2: the production `Executor` constructor MUST default
 /// to strict-inference mode. Pre-fix, `Executor::with_chain_id` built the
@@ -204,22 +200,6 @@ fn test_rem_n_03_is_strict_predicate() {
     assert!(!lenient.is_strict());
 }
 
-#[test]
-fn l02_dup_swap_log_ranges_round_trip_safely() {
-    use citrate_execution::vm::evm_opcodes::EVMOpcode;
-    // DUP1..DUP16
-    for byte in 0x80u8..=0x8f {
-        let op = EVMOpcode::try_from(byte).expect("DUP");
-        assert_eq!(op as u8, byte);
-    }
-    // SWAP1..SWAP16
-    for byte in 0x90u8..=0x9f {
-        let op = EVMOpcode::try_from(byte).expect("SWAP");
-        assert_eq!(op as u8, byte);
-    }
-    // LOG0..LOG4
-    for byte in 0xa0u8..=0xa4 {
-        let op = EVMOpcode::try_from(byte).expect("LOG");
-        assert_eq!(op as u8, byte);
-    }
-}
+// l02_dup_swap_log_ranges_round_trip_safely was removed alongside
+// l02_push_range_round_trips_safely in RM-M2 WP-M2.11 — same reason
+// (simple Citrate EVM module deleted; production uses REVM).

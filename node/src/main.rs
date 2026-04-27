@@ -904,11 +904,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     }
 
     // MCP + inference service
-    let vm_for_mcp = Arc::new(citrate_execution::vm::VM::new(10_000_000));
-    let mcp = Arc::new(citrate_mcp::MCPService::new(
-        storage.clone(),
-        vm_for_mcp.clone(),
-    ));
+    let mcp = Arc::new(citrate_mcp::MCPService::new(storage.clone()));
     // Provider address from config.mining.coinbase (hex 0x...)
     let provider_addr = {
         let mut a = [0u8; 20];

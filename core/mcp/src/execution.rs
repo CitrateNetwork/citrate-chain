@@ -8,7 +8,6 @@ use crate::types::{ExecutionProof, ModelId};
 use crate::verification::ExecutionVerifier;
 use anyhow::{anyhow, Result};
 use hex;
-use citrate_execution::vm::VM;
 use citrate_execution::{Address, Hash};
 use citrate_storage::ipfs::{chunking, Cid, IPFSService};
 use serde_json;
@@ -26,10 +25,13 @@ pub struct InferenceResult {
     pub provider: Address,
 }
 
-/// Model executor for running AI models
+/// Model executor for running AI models. The actual inference path
+/// runs through the GGUF engine; the deterministic-compute path
+/// runs through the 0x010A–0x010F Q16 precompiles. The legacy
+/// `vm: Arc<VM>` field was removed in RM-M2 WP-M2.11 along with
+/// `core/execution/src/vm/`, which was unreferenced beyond
+/// holders.
 pub struct ModelExecutor {
-    #[allow(dead_code)]
-    vm: Arc<VM>,
     cache: Arc<ModelCache>,
     verifier: Arc<ExecutionVerifier>,
     registry: Arc<ModelRegistry>,
@@ -40,7 +42,6 @@ pub struct ModelExecutor {
 
 impl ModelExecutor {
     pub fn new(
-        vm: Arc<VM>,
         cache: Arc<ModelCache>,
         verifier: Arc<ExecutionVerifier>,
         registry: Arc<ModelRegistry>,
@@ -60,7 +61,6 @@ impl ModelExecutor {
         };
 
         Self {
-            vm,
             cache,
             verifier,
             registry,
