@@ -66,8 +66,32 @@ pub fn execute(address: &Address, input: &[u8], gas_limit: u64) -> Result<Precom
     if addr == &addresses::TENSOR_COMMIT {
         tensor_commit(input, gas_limit)
     } else if addr == &addresses::INFERENCE_PROOF_VERIFY {
+        // 0x0108 is intentionally a STUB at RM-M1 close.
+        //
+        // The active implementation is sprint RM-M1b — a full
+        // migration from arkworks Groth16 (which uses an OsRng-
+        // derived per-build VK and cannot be safely embedded into
+        // a precompile) to Halo2-KZG with the public Powers of Tau
+        // SRS.
+        //
+        // The split was approved by Saul on 2026-04-27 with the
+        // explicit condition "make sure that it doesn't get left
+        // under the rug." This message is one of four anti-rug
+        // anchor points; the others are:
+        //
+        //   - ADR-RM-M1b-1 at .agentile/planset/adr/
+        //   - SPRINT.md at .agentile/sprints/active/sprint-rm-m1b-halo2-inference-proof-verify/
+        //   - The RM-M1b row + anti-rug note in
+        //     .agentile/sprints/CURRENT.md
+        //
+        // Do NOT delete this stub or re-route 0x0108 elsewhere
+        // before RM-M1b ships. The CI verifier
+        // scripts/ci/check_m1_verification_precompiles.py is
+        // configured to require this stub message ("lands in
+        // WP-M1b") until 0x0108 flips to LIVE.
         Err(anyhow!(
-            "INFERENCE_PROOF_VERIFY (0x0108) lands in WP-M1.3"
+            "INFERENCE_PROOF_VERIFY (0x0108) lands in WP-M1b — \
+             Halo2-KZG migration. See ADR-RM-M1b-1."
         ))
     } else if addr == &addresses::MERKLE_VERIFY_TENSOR {
         Err(anyhow!("MERKLE_VERIFY_TENSOR (0x0109) lands in WP-M1.4"))
