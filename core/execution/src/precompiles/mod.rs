@@ -123,6 +123,14 @@ impl PrecompileExecutor {
         let byte19_check = addr_bytes[19] <= 0x0F; // selector 0-15
         let is_ai = prefix_check && byte17_check && byte18_check && byte19_check;
 
+        // Citrate Learning precompiles (0x0110 - 0x011F) — RM-FL-1+
+        // Address format: [0, 0, ..., 0, 1, 1, x] where x is 0x10-0x1F
+        // 0x0110: Belnap-FOUR aggregation (RM-FL-1, BELNAP_AGGREGATE)
+        // 0x0111: Routing-model inference (RM-FL-2, future)
+        let is_learning = prefix_check
+            && addr_bytes[17] == 1
+            && addr_bytes[18] == 1
+            && (0x10..=0x1F).contains(&addr_bytes[19]);
 
         // Citrate x402 payment precompiles (0x0200 - 0x0209)
         // Address format: [0, 0, ..., 0, 2, 0, x] where x is 0-9
@@ -131,7 +139,7 @@ impl PrecompileExecutor {
             && addr_bytes[18] == 0
             && addr_bytes[19] <= 9;
 
-        is_standard || is_ai || is_x402
+        is_standard || is_ai || is_learning || is_x402
     }
 
     /// Execute a precompile
@@ -146,6 +154,23 @@ impl PrecompileExecutor {
         // x402 payment precompiles (byte 17 = 2, byte 18 = 0)
         if addr_bytes[..17].iter().all(|&b| b == 0) && addr_bytes[17] == 2 && addr_bytes[18] == 0 {
             return x402::execute(address, input, gas_limit);
+        }
+
+        // Learning precompiles (byte 17 = 1, byte 18 = 1) — RM-FL-1+
+        // 0x0110 — Belnap aggregation. Future selectors in this page
+        // (routing-model 0x0111 in RM-FL-2) join below this branch.
+        if addr_bytes[..17].iter().all(|&b| b == 0)
+            && addr_bytes[17] == 1
+            && addr_bytes[18] == 1
+        {
+            let selector = addr_bytes[19];
+            if selector == 0x10 {
+                return q16::belnap::execute(input, gas_limit);
+            }
+            return Err(anyhow::anyhow!(
+                "Unknown learning precompile selector 0x{:02x}",
+                selector
+            ));
         }
 
         // AI precompiles (byte 17 = 1, byte 18 = 0)
@@ -1546,5 +1571,72 @@ mod tests {
         let unknown_x402 = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 2, 0, 9]);
         let result = executor.execute(&unknown_x402, &input, 10_000);
         assert!(result.is_err());
+    }
+
+    // ==================== Learning page (RM-FL-1) ====================
+
+    #[test]
+    fn test_is_precompile_learning_belnap_address() {
+        let executor = PrecompileExecutor::new();
+        let belnap_addr = Address(q16::belnap::BELNAP_AGGREGATE);
+        assert!(
+            executor.is_precompile(&belnap_addr),
+            "0x0110 (Belnap aggregation) must be recognized as a precompile"
+        );
+
+        // Future learning slots (0x0111 routing model, etc.) should
+        // also be recognized — the page reserves 0x0110-0x011F.
+        let future_routing = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1, 1, 0x11]);
+        assert!(executor.is_precompile(&future_routing));
+
+        // Just past the page (0x0120) MUST NOT be recognized — that
+        // would silently route to nothing and break the dispatcher
+        // contract.
+        let out_of_page = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1, 1, 0x20]);
+        assert!(!executor.is_precompile(&out_of_page));
+    }
+
+    #[test]
+    fn test_belnap_routing_via_executor() {
+        // PrecompileExecutor::execute(0x0110, ...) must route to
+        // q16::belnap::execute and produce a successful result for a
+        // valid input.
+        let mut executor = PrecompileExecutor::new();
+        let belnap_addr = Address(q16::belnap::BELNAP_AGGREGATE);
+
+        // Build a minimum valid input via the public encode_input is
+        // test-only; encode the bytes inline.
+        // dim=1, n=1, embedding=1.0 (Q16), conf=1.0, weight=1.0,
+        // threshold_pos=0.5, threshold_neg=-0.5.
+        let mut input = Vec::with_capacity(16 + 8 + 4);
+        input.extend_from_slice(&1u32.to_be_bytes()); // dim
+        input.extend_from_slice(&1u32.to_be_bytes()); // n
+        input.extend_from_slice(&q16::Q16::from_int(1).0.to_be_bytes()); // emb
+        input.extend_from_slice(&q16::Q16::from_int(1).0.to_be_bytes()); // conf
+        input.extend_from_slice(&q16::Q16::from_int(1).0.to_be_bytes()); // weight
+        // threshold_pos = Q16(0x4000) ≈ 0.5
+        input.extend_from_slice(&0x4000_i32.to_be_bytes());
+        input.extend_from_slice(&(-0x4000_i32).to_be_bytes());
+        assert_eq!(input.len(), 16 + 8 + 4); // header + body
+
+        let result = executor.execute(&belnap_addr, &input, 100_000).unwrap();
+        assert!(result.success);
+        // Output: 4 bytes Q16 value + 1 byte Belnap state = 5 bytes for dim=1.
+        assert_eq!(result.output.len(), 5);
+        // State byte is the last; True = 1.
+        assert_eq!(result.output[4], 1, "single-participant agree → state=True");
+        // Gas: 2000 + 50 * 1 = 2050.
+        assert_eq!(result.gas_used, 2050);
+    }
+
+    #[test]
+    fn test_belnap_unknown_learning_selector_errors() {
+        let mut executor = PrecompileExecutor::new();
+        // Within the learning page but not 0x10 — the dispatcher
+        // returns an "unknown selector" error rather than silently
+        // doing nothing.
+        let unknown = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1, 1, 0x1F]);
+        let result = executor.execute(&unknown, &[], 10_000);
+        assert!(result.is_err(), "unknown learning selector must error");
     }
 }

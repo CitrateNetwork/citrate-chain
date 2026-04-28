@@ -7,18 +7,19 @@
 // (b) a Belnap state per dim ∈ {Neither, True, Both, False}. Output is
 // bit-deterministic on every CPU.
 //
-// **Status (RM-FL-1, WP-1.3 — RED phase):**
+// **Status (RM-FL-1, WP-1.5 — GREEN):**
 //   - encode/decode: implemented + tested
 //   - validation:    implemented + tested
 //   - classify dim:  implemented + tested
-//   - aggregate():   STUB — returns `Err(BelnapError::NotImplemented)`.
-//                    The function exists with its final signature so
-//                    test-driven development can write the failing
-//                    behavior tests at this WP. The body is filled in
-//                    at WP-1.5 (GREEN) and the `NotImplemented` error
-//                    variant is removed at that close.
-//   - dispatch:      not wired into `precompiles/mod.rs`. WP-1.5
-//                    registers the address `0x0000…0110`.
+//   - aggregate():   **LIVE.** Q16-deterministic algorithm; matches
+//                    the off-chain reference in `core/learning/` at
+//                    the *semantic* level (sign+confidence regime),
+//                    not byte-equality (the reference uses f32).
+//   - execute():     precompile entry point with gas accounting
+//                    (`2000 + 50 * dim`).
+//   - dispatch:      wired in `precompiles/mod.rs` at address
+//                    `0x0000…0110` (Learning page, byte17=1, byte18=1,
+//                    byte19=0x10).
 //
 // **Reference (off-chain, f32):** `core/learning/src/belnap.rs`
 //   - `BelnapValue::{join, meet, negation}` — lattice
@@ -117,7 +118,10 @@ pub struct BelnapOutput {
     pub states: Vec<BelnapState>,
 }
 
-/// Decode/validate failures + the WP-1.3 stub indicator.
+/// Decode / validate failures.
+///
+/// At WP-1.3 there was a `NotImplemented` variant pinning the stub
+/// contract; WP-1.5 removed it together with the impl landing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BelnapError {
     /// Input shorter than the 16-byte header.
@@ -132,8 +136,6 @@ pub enum BelnapError {
     NTooLarge,
     /// Input length doesn't match the declared `(dim, n)`.
     LengthMismatch,
-    /// WP-1.3 stub. Removed at WP-1.5 GREEN.
-    NotImplemented,
 }
 
 impl std::fmt::Display for BelnapError {
@@ -145,7 +147,6 @@ impl std::fmt::Display for BelnapError {
             BelnapError::DimTooLarge => write!(f, "dim exceeds cap of {MAX_DIM}"),
             BelnapError::NTooLarge => write!(f, "n exceeds cap of {MAX_N}"),
             BelnapError::LengthMismatch => write!(f, "input length does not match declared (dim, n)"),
-            BelnapError::NotImplemented => write!(f, "aggregate() is a WP-1.3 stub; impl lands at WP-1.5"),
         }
     }
 }
@@ -367,26 +368,165 @@ pub fn validate(input: &BelnapInput) -> Result<(), BelnapError> {
 }
 
 // ---------------------------------------------------------------------------
-// Aggregate (WP-1.3 STUB — implemented at WP-1.5)
+// Precompile address (Learning page 0x01_01)
 // ---------------------------------------------------------------------------
 
-/// Aggregate per-validator Belnap contributions into a single state +
-/// weighted-mean value per dimension.
+/// 20-byte address `0x0000…0110` for Belnap-FOUR aggregation. The
+/// Learning page (byte17=1, byte18=1) is reserved for RM-FL precompiles:
+///   - 0x0110: Belnap aggregation        (RM-FL-1, this module)
+///   - 0x0111: Routing-model inference    (RM-FL-2, future)
+pub const BELNAP_AGGREGATE: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x01, 0x10,
+];
+
+/// Base gas cost (per Gherkin scenario 1).
+const GAS_BASE: u64 = 2000;
+/// Per-dimension gas cost.
+const GAS_PER_DIM: u64 = 50;
+
+// ---------------------------------------------------------------------------
+// Aggregate (WP-1.5 GREEN)
+// ---------------------------------------------------------------------------
+
+/// Aggregate per-validator Belnap contributions into a single state
+/// vector + Q16 weighted-sum value per dimension.
 ///
-/// **WP-1.3 status: RED stub.** Returns `Err(BelnapError::NotImplemented)`
-/// for every input. The real implementation lands at WP-1.5 along with
-/// the dispatcher registration at `0x0110`.
+/// Algorithm (Q16 throughout — no floats):
 ///
-/// The signature is final at WP-1.3 so failing tests can be written
-/// against the production-shape API.
+/// For each dimension `d ∈ 0..dim`:
+///   1. **Aggregated value**:
+///      `agg_value[d] = Σ saturating(weight[i] * embedding[i][d])`
+///      over `i ∈ 0..n`. Saturating arithmetic at every step; an
+///      adversarial max-magnitude input produces a saturated Q16 value,
+///      not a panic and not a wrap.
+///   2. **Per-participant classification** (only for participants with
+///      strictly positive weight — `weight[i].0 > 0`):
+///         conf < threshold_pos        → low-confidence (ignored)
+///         emb >= 0 AND conf >= thresh → "agree"  side
+///         emb <  0 AND conf >= thresh → "oppose" side
+///   3. **Reduced state** (Paper II §3.2 step 3 — lattice-join):
+///         no high-conf positive-weight at this dim → `Neither`
+///         only one side populated                  → `True`
+///         both sides populated                     → `Both`
+///       (`False` is impossible at the reduced level — a single
+///        dissenter joins with the majority's `True` to produce `Both`.)
+///
+/// Determinism: bit-identical output across CPUs because every step
+/// is integer Q16. Verified by tripwire `check_belnap_no_float.py`.
+///
+/// Symmetry: only `threshold_pos` is consulted at WP-1.5. `threshold_neg`
+/// is reserved for future asymmetric-threshold variants and is parsed
+/// from the wire format for forward compatibility.
 pub fn aggregate(input: &[u8]) -> Result<Vec<u8>, BelnapError> {
-    // Validate decode + caps even at the stub level — that part of the
-    // contract is already provable in WP-1.3 GREEN, and ensures a
-    // malformed input is rejected with the right error before we hit
-    // the unimplemented core.
     let decoded = decode(input)?;
     validate(&decoded)?;
-    Err(BelnapError::NotImplemented)
+    let output = aggregate_decoded(&decoded);
+    Ok(encode_output(&output))
+}
+
+/// Inner aggregation kernel against an already-decoded `BelnapInput`.
+/// Exposed to the test module + the (future) RM-FL-3 daemon path.
+pub fn aggregate_decoded(input: &BelnapInput) -> BelnapOutput {
+    let dim = input.dim;
+    let n = input.n;
+
+    let mut aggregated_values = Vec::with_capacity(dim);
+    let mut states = Vec::with_capacity(dim);
+
+    for d in 0..dim {
+        // ---- Step 1: weighted sum over participants ----
+        let mut acc = Q16::ZERO;
+        for i in 0..n {
+            let w = input.weights[i];
+            let e = input.embeddings[i * dim + d];
+            // saturating_mul → saturating_add, both Q16-pure.
+            acc = acc.saturating_add(w.saturating_mul(e));
+        }
+        aggregated_values.push(acc);
+
+        // ---- Step 2 + 3: classification + lattice reduction ----
+        let mut has_agree = false;
+        let mut has_oppose = false;
+        for i in 0..n {
+            // Filter zero-weight participants (BelnapAdversarial.tla
+            // ::WeightZeroIgnored). Negative weights would be a wire-
+            // format bug; we treat them as zero (no side contribution)
+            // for safety rather than panicking.
+            if input.weights[i].0 <= 0 {
+                continue;
+            }
+            let e = input.embeddings[i * dim + d];
+            let c = input.confidences[i * dim + d];
+            match classify_dim_threshold(e, c, input.threshold_pos) {
+                Some(true) => has_agree = true,
+                Some(false) => has_oppose = true,
+                None => {} // low-confidence — contributes Neither, absorbed
+            }
+            // Early termination: once both sides are populated, the
+            // per-dim state is locked at Both and further scanning
+            // can't change it. This gives O(n + early-out) instead of
+            // O(n) on the common adversarial case.
+            if has_agree && has_oppose {
+                break;
+            }
+        }
+
+        let state = match (has_agree, has_oppose) {
+            (false, false) => BelnapState::Neither,
+            (true, false) | (false, true) => BelnapState::True,
+            (true, true) => BelnapState::Both,
+        };
+        states.push(state);
+    }
+
+    BelnapOutput {
+        aggregated_values,
+        states,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Precompile entry point (called by the dispatcher in `precompiles/mod.rs`)
+// ---------------------------------------------------------------------------
+
+/// Precompile entry. Charges gas, then runs `aggregate()`.
+///
+/// Gas: `GAS_BASE + GAS_PER_DIM * dim` = `2000 + 50 * dim`.
+/// Decode failures (`InputTooShort`, malformed bytes) charge `GAS_BASE`
+/// so a malformed-input griefer still pays for the parse work.
+pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
+    use crate::precompiles::PrecompileResult;
+
+    if gas_limit < GAS_BASE {
+        return Err(anyhow::anyhow!(
+            "Belnap aggregate: insufficient gas (need {GAS_BASE}, got {gas_limit})"
+        ));
+    }
+
+    // Peek the dim from the header (without full-decoding) so we can
+    // gas-charge accurately. If the input is too short, decode() below
+    // catches it; we fall back to GAS_BASE.
+    let dim_hint = if input.len() >= 4 {
+        u32::from_be_bytes(input[0..4].try_into().expect("4 bytes")) as u64
+    } else {
+        0
+    };
+    let dim_hint = dim_hint.min(MAX_DIM as u64);
+    let total_gas = GAS_BASE.saturating_add(GAS_PER_DIM.saturating_mul(dim_hint));
+    if gas_limit < total_gas {
+        return Err(anyhow::anyhow!(
+            "Belnap aggregate: insufficient gas (need {total_gas}, got {gas_limit})"
+        ));
+    }
+
+    match aggregate(input) {
+        Ok(output) => Ok(PrecompileResult {
+            output,
+            gas_used: total_gas,
+            success: true,
+        }),
+        Err(e) => Err(anyhow::anyhow!("Belnap aggregate: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +559,31 @@ mod tests {
         bytes.extend_from_slice(&input.threshold_pos.0.to_be_bytes());
         bytes.extend_from_slice(&input.threshold_neg.0.to_be_bytes());
         bytes
+    }
+
+    /// Decode the wire-format output bytes back into a `BelnapOutput`.
+    /// Test-only — on-chain readers ABI-decode directly.
+    fn parse_output(bytes: &[u8], dim: usize) -> BelnapOutput {
+        assert_eq!(bytes.len(), 5 * dim, "output bytes length must be 5 * dim");
+        let mut aggregated_values = Vec::with_capacity(dim);
+        for d in 0..dim {
+            let raw = i32::from_be_bytes(
+                bytes[d * 4..(d + 1) * 4].try_into().expect("4 bytes"),
+            );
+            aggregated_values.push(Q16::from_raw(raw));
+        }
+        let states_off = 4 * dim;
+        let mut states = Vec::with_capacity(dim);
+        for d in 0..dim {
+            states.push(
+                BelnapState::from_u8(bytes[states_off + d])
+                    .expect("test fixture must produce valid state byte"),
+            );
+        }
+        BelnapOutput {
+            aggregated_values,
+            states,
+        }
     }
 
     fn make_input(
@@ -718,34 +883,34 @@ mod tests {
     }
 
     // ====================================================================
-    // ROUND 5 — aggregate() behavior (10 tests; mostly RED at WP-1.3)
+    // ROUND 5 — aggregate() behavior (10 tests, all GREEN at WP-1.5)
     //
-    // These tests assert what aggregate() MUST do once WP-1.5 lands.
-    // At WP-1.3, aggregate() returns Err(NotImplemented), so they all
-    // fail with the matching error. At WP-1.5 they flip to GREEN.
-    //
-    // The decode/validation paths are exercised even at WP-1.3 (they
-    // run before the Err) — that's why we can validate "decode rejects"
-    // tests fully GREEN here.
+    // At WP-1.3 these tests pinned the stub contract via
+    // Err(BelnapError::NotImplemented). WP-1.5 removed that variant
+    // and rewrote each test against the real Gherkin-derived
+    // expected output.
     // ====================================================================
 
     #[test]
     fn aggregate_three_honest_agree_state_true() {
         // Gherkin scenario 1 — happy path.
+        // 3 participants, dim=2, embedding=[+0.5, +0.5], conf=[0.9, 0.9],
+        // weight=1.0 each → state=[True, True].
         let input = make_input(2, 3, 0.5, 0.9, 1.0, 0.8);
         let bytes = encode_input(&input);
-        let result = aggregate(&bytes);
-        // RED at WP-1.3:
-        assert_eq!(
-            result,
-            Err(BelnapError::NotImplemented),
-            "WP-1.3 stub; this test flips to GREEN at WP-1.5 with state=[True,True]"
-        );
+        let bytes_out = aggregate(&bytes).expect("happy-path aggregates");
+        let out = parse_output(&bytes_out, input.dim);
+        assert_eq!(out.states, vec![BelnapState::True, BelnapState::True]);
+        // Aggregated value = Σ w_i * emb_i = 3 * (1.0 * 0.5) = 1.5 (Q16).
+        // Per-dim, identical because every participant submits the same vector.
+        for v in &out.aggregated_values {
+            assert!(v.0 > 0, "aggregated value sign must be positive");
+        }
     }
 
     #[test]
     fn aggregate_collusion_under_hda_state_both() {
-        // Gherkin scenario 2 — collusion. RED at WP-1.3.
+        // Gherkin scenario 2 — collusion under Honest Dominance.
         let input = BelnapInput {
             dim: 1,
             n: 4,
@@ -757,78 +922,86 @@ mod tests {
             ],
             confidences: vec![Q16::from_f64(0.9); 4],
             weights: vec![
-                Q16::from_f64(1.0), // honest A weight 1
-                Q16::from_f64(1.0), // honest B weight 1 (HDA: 2.0 > 1.0)
-                Q16::from_f64(0.5), // byz   C weight 0.5
-                Q16::from_f64(0.5), // byz   D weight 0.5
+                Q16::from_f64(1.0), // honest A
+                Q16::from_f64(1.0), // honest B (HDA: honest 2.0 > byz 1.0)
+                Q16::from_f64(0.5), // byz   C
+                Q16::from_f64(0.5), // byz   D
             ],
             threshold_pos: Q16::from_f64(0.8),
             threshold_neg: Q16::from_f64(-0.8),
         };
         let bytes = encode_input(&input);
-        assert_eq!(aggregate(&bytes), Err(BelnapError::NotImplemented));
+        let out = parse_output(&aggregate(&bytes).expect("aggregates"), input.dim);
+        assert_eq!(
+            out.states,
+            vec![BelnapState::Both],
+            "BelnapAdversarial.tla::AdversaryCannotFlipUnderHDA: state must be Both"
+        );
     }
 
     #[test]
     fn aggregate_threshold_edge_deterministic() {
-        // Gherkin scenario 3 — threshold edge. RED at WP-1.3.
+        // Gherkin scenario 3 — threshold edge.
+        // Participant A: conf == threshold_pos exactly (high-conf, inclusive).
+        // Participant B: conf == threshold_pos - 1 ULP (low-conf).
         let mut input = make_input(1, 2, 1.0, 0.0, 1.0, 0.8);
-        input.confidences[0] = Q16::from_f64(0.8); // exactly at threshold
-        input.confidences[1] = Q16::from_raw(Q16::from_f64(0.8).0 - 1); // one ULP below
+        input.confidences[0] = Q16::from_f64(0.8);
+        input.confidences[1] = Q16::from_raw(Q16::from_f64(0.8).0 - 1);
         let bytes = encode_input(&input);
-
-        // Determinism property: same bytes → same Err at WP-1.3, same
-        // output at WP-1.5. The point of the test is the bit-equality.
-        let r1 = aggregate(&bytes);
-        let r2 = aggregate(&bytes);
+        let r1 = aggregate(&bytes).expect("aggregates");
+        let r2 = aggregate(&bytes).expect("aggregates");
+        // Bit-determinism: identical bytes both calls.
         assert_eq!(r1, r2);
-        assert_eq!(r1, Err(BelnapError::NotImplemented));
+        // A is high-conf positive, B is low-conf — only the positive
+        // side has a participant → state=True.
+        let out = parse_output(&r1, input.dim);
+        assert_eq!(out.states, vec![BelnapState::True]);
     }
 
     #[test]
     fn aggregate_zero_weight_filtered() {
-        // Gherkin scenario 4 — weight=0 ignored. RED at WP-1.3.
+        // Gherkin scenario 4 — weight=0 ignored
+        // (BelnapAdversarial.tla::WeightZeroIgnored).
         let input = BelnapInput {
             dim: 1,
             n: 3,
             embeddings: vec![
                 Q16::from_f64(1.0),
                 Q16::from_f64(1.0),
-                Q16::from_f64(-9.0), // adversary sign
+                Q16::from_f64(-9.0), // adversary sign + magnitude
             ],
             confidences: vec![Q16::from_f64(0.9); 3],
             weights: vec![
                 Q16::from_f64(1.0),
                 Q16::from_f64(1.0),
-                Q16::ZERO, // adversary excluded
+                Q16::ZERO, // adversary excluded from classification
             ],
             threshold_pos: Q16::from_f64(0.8),
             threshold_neg: Q16::from_f64(-0.8),
         };
         let bytes = encode_input(&input);
-        assert_eq!(aggregate(&bytes), Err(BelnapError::NotImplemented));
+        let out = parse_output(&aggregate(&bytes).expect("aggregates"), input.dim);
+        // Zero-weight excluded → only the two positive-weight honest
+        // participants count → state=True.
+        assert_eq!(out.states, vec![BelnapState::True]);
+        // Aggregated value: Σ w*e = 1*1 + 1*1 + 0*(-9) = 2.0 (saturating).
+        // The zero-weight contribution is exactly Q16::ZERO so the
+        // aggregated value is unaffected by adversarial magnitude.
+        assert!(out.aggregated_values[0].0 > 0);
     }
 
     #[test]
     fn aggregate_dim_mismatch_reverts() {
-        // Gherkin scenario 5 — bounds rejection. GREEN at WP-1.3
-        // because decode() catches it before the stub.
+        // Gherkin scenario 5 — bounds rejection at decode().
         let input = make_input(2, 3, 0.5, 0.9, 1.0, 0.8);
         let mut bytes = encode_input(&input);
-        // Truncate one Q16 worth of bytes from the middle of the
-        // embeddings section.
         bytes.truncate(bytes.len() - 4);
-        let result = aggregate(&bytes);
-        // Length check fires before the stub.
-        assert_eq!(result, Err(BelnapError::LengthMismatch));
+        assert_eq!(aggregate(&bytes), Err(BelnapError::LengthMismatch));
     }
 
     #[test]
     fn aggregate_max_magnitude_no_panic() {
-        // Gherkin scenario 6 — max-magnitude inputs. RED at WP-1.3 but
-        // partially GREEN: the stub still accepts the input without
-        // panicking. Saturation correctness in the aggregator core is
-        // proved at WP-1.5 / WP-1.7 (fuzz).
+        // Gherkin scenario 6 — saturating Q16 over max-magnitude inputs.
         let input = BelnapInput {
             dim: 1,
             n: 2,
@@ -839,50 +1012,130 @@ mod tests {
             threshold_neg: Q16::from_f64(-0.8),
         };
         let bytes = encode_input(&input);
-        // Accepts decode + validate (max magnitudes are legal Q16 values).
-        let result = aggregate(&bytes);
-        assert_eq!(result, Err(BelnapError::NotImplemented));
-        // No panic — that's the WP-1.3 guarantee for this test.
+        let out = parse_output(&aggregate(&bytes).expect("aggregates without panic"), input.dim);
+        // Two high-conf positive-weight participants on opposing sides
+        // → state=Both. Aggregated value is well-defined Q16 (no panic,
+        // no wrap — saturating throughout).
+        assert_eq!(out.states, vec![BelnapState::Both]);
     }
 
     #[test]
     fn aggregate_cross_cpu_determinism_fixture() {
-        // Gherkin scenario 7 — cross-CPU determinism. The actual
-        // x86_64-vs-aarch64 assertion lands as a fixture in WP-1.5.
-        // At WP-1.3, two consecutive calls on this CPU must agree —
-        // any divergence here is an immediate red flag.
+        // Gherkin scenario 7 — bit-determinism on this CPU. Cross-CPU
+        // x86_64-vs-aarch64 fixture lives as a separate test in
+        // tests/cross_platform/ (TODO at sprint close).
         let input = make_input(4, 5, 0.25, 0.85, 1.0, 0.8);
         let bytes = encode_input(&input);
-        let r1 = aggregate(&bytes);
-        let r2 = aggregate(&bytes);
-        assert_eq!(r1, r2, "two calls with identical bytes must produce identical results");
+        let r1 = aggregate(&bytes).expect("aggregates");
+        let r2 = aggregate(&bytes).expect("aggregates");
+        assert_eq!(r1, r2, "identical bytes must produce identical results");
     }
 
     #[test]
     fn aggregate_unanimous_negative_agree_is_true() {
-        // All high-conf participants point in the SAME (negative)
-        // direction → state=True. Adversarial-TLA Q.E.D.: aggregator
-        // doesn't know ground truth, only inputs.
+        // All high-conf participants point negative → state=True.
+        // The aggregator doesn't know ground truth, only inputs.
         let input = make_input(1, 3, -0.5, 0.9, 1.0, 0.8);
         let bytes = encode_input(&input);
-        assert_eq!(aggregate(&bytes), Err(BelnapError::NotImplemented));
+        let out = parse_output(&aggregate(&bytes).expect("aggregates"), input.dim);
+        assert_eq!(out.states, vec![BelnapState::True]);
+        assert!(
+            out.aggregated_values[0].0 < 0,
+            "unanimous negative input → negative aggregated value"
+        );
     }
 
     #[test]
     fn aggregate_single_participant_state_true() {
-        // n=1 edge case — trivially consistent → True.
+        // n=1 — trivially consistent → True for every dim.
         let input = make_input(2, 1, 0.5, 0.9, 1.0, 0.8);
         let bytes = encode_input(&input);
-        assert_eq!(aggregate(&bytes), Err(BelnapError::NotImplemented));
+        let out = parse_output(&aggregate(&bytes).expect("aggregates"), input.dim);
+        assert_eq!(out.states, vec![BelnapState::True, BelnapState::True]);
     }
 
     #[test]
     fn aggregate_all_low_confidence_state_neither() {
-        // No high-conf positive-weight participant → Neither.
+        // No high-conf positive-weight participant → state=Neither.
         // (Source: BelnapAdversarial.tla::NeitherImpliesUnderconfidence)
         let input = make_input(1, 3, 0.5, 0.1, 1.0, 0.8);
         let bytes = encode_input(&input);
-        assert_eq!(aggregate(&bytes), Err(BelnapError::NotImplemented));
+        let out = parse_output(&aggregate(&bytes).expect("aggregates"), input.dim);
+        assert_eq!(out.states, vec![BelnapState::Neither]);
+    }
+
+    // ====================================================================
+    // ROUND 5b — execute() entry point + gas accounting (5 GREEN, new at WP-1.5)
+    // ====================================================================
+
+    #[test]
+    fn execute_happy_path_returns_precompile_result() {
+        let input = make_input(2, 3, 0.5, 0.9, 1.0, 0.8);
+        let bytes = encode_input(&input);
+        let gas_limit = 100_000;
+        let result = execute(&bytes, gas_limit).expect("executes");
+        assert!(result.success);
+        // Output bytes match aggregate() directly.
+        assert_eq!(result.output, aggregate(&bytes).unwrap());
+    }
+
+    #[test]
+    fn execute_gas_charged_per_dim() {
+        // Gas = 2000 + 50 * dim. dim=2 → 2100. dim=4 → 2200.
+        let input2 = make_input(2, 1, 0.5, 0.9, 1.0, 0.8);
+        let input4 = make_input(4, 1, 0.5, 0.9, 1.0, 0.8);
+        let g2 = execute(&encode_input(&input2), 100_000).unwrap().gas_used;
+        let g4 = execute(&encode_input(&input4), 100_000).unwrap().gas_used;
+        assert_eq!(g2, 2000 + 50 * 2);
+        assert_eq!(g4, 2000 + 50 * 4);
+    }
+
+    #[test]
+    fn execute_insufficient_gas_below_base() {
+        let input = make_input(1, 1, 0.5, 0.9, 1.0, 0.8);
+        let bytes = encode_input(&input);
+        let result = execute(&bytes, 1999); // below GAS_BASE
+        assert!(result.is_err(), "execute must reject below-base gas limit");
+    }
+
+    #[test]
+    fn execute_insufficient_gas_below_dim_total() {
+        let input = make_input(8, 1, 0.5, 0.9, 1.0, 0.8); // needs 2400 gas
+        let bytes = encode_input(&input);
+        let result = execute(&bytes, 2300); // above base, below total
+        assert!(result.is_err(), "execute must reject below-total gas limit");
+    }
+
+    #[test]
+    fn execute_dim_hint_clamped_to_max_dim() {
+        // A malicious caller crafts a header claiming dim = u32::MAX.
+        // The gas pre-charge clamps to MAX_DIM so the saturating math
+        // can't be tricked into asking for u64::MAX gas.
+        let mut bytes = vec![0u8; 16];
+        bytes[0..4].copy_from_slice(&u32::MAX.to_be_bytes()); // huge dim
+        bytes[4..8].copy_from_slice(&1u32.to_be_bytes()); // n=1
+        // input is too short for the actual decode; the gas pre-charge
+        // path will compute total_gas = GAS_BASE + GAS_PER_DIM * MAX_DIM
+        // = 2000 + 50*1024 = 53200. Pass 100_000.
+        let result = execute(&bytes, 100_000);
+        // Decode fails (length mismatch); execute surfaces it as anyhow.
+        assert!(result.is_err());
+    }
+
+    // ====================================================================
+    // ROUND 5c — Address constant (1 GREEN, new at WP-1.5)
+    // ====================================================================
+
+    #[test]
+    fn belnap_aggregate_address_byte_layout() {
+        // Wire-format invariant: the precompile lives at
+        // `0x0000…0110` — Learning page 0x01_01, selector 0x10.
+        // If anyone changes this, the dispatcher in mod.rs and the
+        // tripwire `check_belnap_address_allocated.py` break together.
+        assert_eq!(BELNAP_AGGREGATE[0..17], [0u8; 17]);
+        assert_eq!(BELNAP_AGGREGATE[17], 0x01);
+        assert_eq!(BELNAP_AGGREGATE[18], 0x01);
+        assert_eq!(BELNAP_AGGREGATE[19], 0x10);
     }
 
     // ====================================================================
