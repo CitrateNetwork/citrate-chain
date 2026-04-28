@@ -22,6 +22,9 @@ contract Forwarder is IForwarder {
     // ── Storage ──
 
     address public governance;
+    /// @notice Pending governance address awaiting acceptance.
+    /// Closes RFI26-05: 2-step transfer prevents permanent lock.
+    address public pendingGovernance;
     address public clusterContract;
     address public vaultAddress;
 
@@ -33,6 +36,7 @@ contract Forwarder is IForwarder {
     // ── Errors ──
 
     error NotGovernance();
+    error NotPendingGovernance();
     error NotAuthorizedRelayer();
     error InvalidNonce();
     error ReplayDetected();
@@ -183,6 +187,27 @@ contract Forwarder is IForwarder {
         if (vault == address(0)) revert ZeroAddress();
         vaultAddress = vault;
         _allowedTargets[vault] = false;
+    }
+
+    /// @notice Step 1 of governance transfer (closes RFI26-05).
+    /// Caller must be `governance`. The pending address must explicitly
+    /// accept via `acceptGovernance()` to take effect.
+    event GovernanceProposed(address indexed pending);
+    event GovernanceAccepted(address indexed previous, address indexed current);
+
+    function proposeGovernance(address newGovernance) external onlyGovernance {
+        if (newGovernance == address(0)) revert ZeroAddress();
+        pendingGovernance = newGovernance;
+        emit GovernanceProposed(newGovernance);
+    }
+
+    /// @notice Step 2 of governance transfer (closes RFI26-05).
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert NotPendingGovernance();
+        address previous = governance;
+        governance = pendingGovernance;
+        pendingGovernance = address(0);
+        emit GovernanceAccepted(previous, governance);
     }
 
     // ── Internal ──

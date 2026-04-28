@@ -60,6 +60,12 @@ contract ContributionAccounting is Governable {
     /// Number of blocks per epoch (informational)
     uint256 public constant EPOCH_LENGTH = 1000;
 
+    /// Maximum contributors retained in the active list. Bounds the
+    /// per-call gas of `distributeRewards` and `updateWeight`. Closes
+    /// RFI-03 (unbounded loop in distributeRewards). Sized for ~30M
+    /// gas at ~30K gas per iteration.
+    uint256 public constant MAX_CONTRIBUTORS = 1024;
+
     /// Active contributor list (for bounded iteration in distributeRewards)
     address[] public contributorList;
     mapping(address => bool) public isContributor;
@@ -129,8 +135,15 @@ contract ContributionAccounting is Governable {
 
         contributions[contributor][ctype] += amount;
 
-        // Track contributor for distribution iteration
+        // Track contributor for distribution iteration. Bounded to
+        // MAX_CONTRIBUTORS to prevent unbounded gas in
+        // `distributeRewards` and `updateWeight` (closes RFI-03 +
+        // RFI-04 / RFI26-08 in tandem). When the cap is hit, new
+        // contributors cannot be admitted; governance must either
+        // raise the cap (via a contract upgrade — non-upgradeable
+        // here, so via a redeploy) or rotate epochs.
         if (!isContributor[contributor]) {
+            require(contributorList.length < MAX_CONTRIBUTORS, "Contributor cap reached");
             isContributor[contributor] = true;
             contributorList.push(contributor);
         }
@@ -256,10 +269,29 @@ contract ContributionAccounting is Governable {
 
     // ── Governance Functions ────────────────────────────────────────
 
-    /// @notice Update the weight for a contribution type
+    /// @notice Update the weight for a contribution type. Closes
+    /// RFI-04 / RFI26-08 by recomputing every contributor's cached
+    /// score against the new weights, so the fairness invariant
+    /// (`score = SUM(contrib[t] * weight[t]/10000)`) holds across
+    /// weight changes. Bounded iteration is enforced by the cap on
+    /// `contributorList.length` (closes RFI-03 in tandem).
     function updateWeight(ContributionType ctype, uint256 newWeight) external onlyGovernance {
         uint256 old = weights[ctype];
         weights[ctype] = newWeight;
+
+        // RFI-04 / RFI26-08: refresh cached scores for all known
+        // contributors. This is O(N) on contributorList; the
+        // MAX_CONTRIBUTORS cap (RFI-03) bounds N.
+        uint256 newTotalScore = 0;
+        uint256 len = contributorList.length;
+        for (uint256 i = 0; i < len; i++) {
+            address c = contributorList[i];
+            uint256 newScore = _computeScore(c);
+            scores[c] = newScore;
+            newTotalScore += newScore;
+        }
+        totalScore = newTotalScore;
+
         emit WeightUpdated(ctype, old, newWeight);
     }
 

@@ -9,6 +9,11 @@ import {IBudgetAllocation} from "./interfaces/IBudgetAllocation.sol";
 contract BudgetAllocation is IBudgetAllocation {
     address public governance;
 
+    /// @notice Pending governance address awaiting acceptance.
+    /// Closes RFI26-05: 2-step transfer prevents permanent lock if
+    /// the new governance address is mistyped.
+    address public pendingGovernance;
+
     struct Budget {
         uint256 allocated;
         uint256 spent;
@@ -19,11 +24,16 @@ contract BudgetAllocation is IBudgetAllocation {
     mapping(uint256 => Budget) private _budgets;
 
     error NotGovernance();
+    error NotPendingGovernance();
+    error ZeroGovernance();
     error BudgetNotActive();
     error BudgetAlreadyActive();
     error InsufficientBudget();
     error ExceedsMonthlyLimit();
     error ZeroAmount();
+
+    event GovernanceProposed(address indexed pending);
+    event GovernanceAccepted(address indexed previous, address indexed current);
 
     modifier onlyGovernance() {
         if (msg.sender != governance) revert NotGovernance();
@@ -31,7 +41,29 @@ contract BudgetAllocation is IBudgetAllocation {
     }
 
     constructor(address _governance) {
+        if (_governance == address(0)) revert ZeroGovernance();
         governance = _governance;
+    }
+
+    /// @notice Step 1 of governance transfer: current governance proposes
+    /// a new address. Caller must be `governance`. To cancel, call again
+    /// with the same address — this is a no-op except for the event.
+    /// Closes RFI26-05.
+    function proposeGovernance(address newGovernance) external onlyGovernance {
+        if (newGovernance == address(0)) revert ZeroGovernance();
+        pendingGovernance = newGovernance;
+        emit GovernanceProposed(newGovernance);
+    }
+
+    /// @notice Step 2 of governance transfer: the proposed new address
+    /// accepts. This proves the address is reachable and signs.
+    /// Closes RFI26-05.
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert NotPendingGovernance();
+        address previous = governance;
+        governance = pendingGovernance;
+        pendingGovernance = address(0);
+        emit GovernanceAccepted(previous, governance);
     }
 
     function getRemaining(uint256 classroomId) external view returns (uint256) {

@@ -22,8 +22,11 @@ contract ColorCirclesNFT is ERC721, Ownable, ReentrancyGuard {
 
     /**
      * @dev Mint a new NFT
+     * @notice Protected by nonReentrant — symmetric with `mintBatch` to
+     *         prevent reentrancy via the recipient's `onERC721Received`
+     *         callback during `_safeMint`. Closes RFI-07.
      */
-    function mint() external returns (uint256) {
+    function mint() external nonReentrant returns (uint256) {
         require(_currentTokenId < MAX_SUPPLY, "Max supply reached");
 
         uint256 tokenId = _currentTokenId;
