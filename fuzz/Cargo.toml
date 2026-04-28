@@ -118,6 +118,13 @@ name = "fuzz_belnap_aggregate"
 path = "fuzz_targets/fuzz_belnap_aggregate.rs"
 doc = false
 
+# RM-FL-2 / WP-2.9 — Routing-model inference precompile (0x0111).
+# Run: `cargo +nightly fuzz run fuzz_routing_inference -- -runs=10000000`
+[[bin]]
+name = "fuzz_routing_inference"
+path = "fuzz_targets/fuzz_routing_inference.rs"
+doc = false
+
 [[bin]]
 name = "fuzz_bridge_oracle"
 path = "fuzz_targets/fuzz_bridge_oracle.rs"
