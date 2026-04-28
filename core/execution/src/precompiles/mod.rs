@@ -157,8 +157,8 @@ impl PrecompileExecutor {
         }
 
         // Learning precompiles (byte 17 = 1, byte 18 = 1) — RM-FL-1+
-        // 0x0110 — Belnap aggregation. Future selectors in this page
-        // (routing-model 0x0111 in RM-FL-2) join below this branch.
+        // 0x0110 — Belnap aggregation (RM-FL-1)
+        // 0x0111 — Routing-model inference (RM-FL-2)
         if addr_bytes[..17].iter().all(|&b| b == 0)
             && addr_bytes[17] == 1
             && addr_bytes[18] == 1
@@ -166,6 +166,9 @@ impl PrecompileExecutor {
             let selector = addr_bytes[19];
             if selector == 0x10 {
                 return q16::belnap::execute(input, gas_limit);
+            }
+            if selector == 0x11 {
+                return q16::routing::execute(input, gas_limit);
             }
             return Err(anyhow::anyhow!(
                 "Unknown learning precompile selector 0x{:02x}",
@@ -1638,5 +1641,49 @@ mod tests {
         let unknown = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1, 1, 0x1F]);
         let result = executor.execute(&unknown, &[], 10_000);
         assert!(result.is_err(), "unknown learning selector must error");
+    }
+
+    // ==================== Routing model (RM-FL-2 / WP-2.5+2.6) ====================
+
+    #[test]
+    fn test_routing_inference_address_recognized() {
+        let executor = PrecompileExecutor::new();
+        let routing_addr = Address(q16::routing::ROUTING_INFERENCE);
+        assert!(
+            executor.is_precompile(&routing_addr),
+            "0x0111 (routing inference) must be recognized as a precompile"
+        );
+        // Verify the byte layout: Learning page selector 0x11.
+        assert_eq!(q16::routing::ROUTING_INFERENCE[17], 0x01);
+        assert_eq!(q16::routing::ROUTING_INFERENCE[18], 0x01);
+        assert_eq!(q16::routing::ROUTING_INFERENCE[19], 0x11);
+    }
+
+    #[test]
+    fn test_routing_dispatcher_routes_to_routing_execute() {
+        // PrecompileExecutor::execute(0x0111, ...) must route to
+        // q16::routing::execute. We use a malformed-but-non-empty
+        // input so we exercise the dispatch + decode path without
+        // having to build the full 464 KB canonical-shape blob in a
+        // unit test. Decode fails on length mismatch; the dispatcher
+        // returns the error wrapped in anyhow.
+        let mut executor = PrecompileExecutor::new();
+        let routing_addr = Address(q16::routing::ROUTING_INFERENCE);
+
+        let mut input = vec![0u8; 16];
+        input[0..4].copy_from_slice(&1u32.to_be_bytes());   // arch_version
+        input[4..8].copy_from_slice(&768u32.to_be_bytes()); // input_dim
+        input[8..12].copy_from_slice(&128u32.to_be_bytes()); // hidden_dim
+        input[12..16].copy_from_slice(&3u32.to_be_bytes()); // output_dim
+
+        // gas_limit must be high enough to cover the full canonical
+        // params count's gas pre-charge (~465K). Pass 1M.
+        let result = executor.execute(&routing_addr, &input, 1_000_000);
+        assert!(result.is_err(), "decode fails on canonical-header empty body; dispatcher surfaces the error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Routing forward"),
+            "error message must come from routing::execute (got: {err})"
+        );
     }
 }

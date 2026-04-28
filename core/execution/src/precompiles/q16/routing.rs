@@ -12,14 +12,21 @@
 // arithmetic throughout (no floats). Output bit-deterministic on
 // every CPU.
 //
-// **Status (RM-FL-2, WP-2.3):**
+// **Status (RM-FL-2, WP-2.5 + WP-2.6 — GREEN):**
 //   - Types + encode/decode/validate: GREEN.
-//   - `forward()`: stub returning `Err(RoutingError::NotImplemented)`.
-//     Real Q16 implementation lands at WP-2.5 along with the
-//     dispatcher registration at 0x0111.
-//   - Behavioral tests gated on the impl are `#[ignore = "WP-2.5"]`
-//     (RM-FL-1 retro item #1 — cleaner than the WP-1.3 compile-break
-//     forcing function).
+//   - `forward()`: **LIVE.** Q16 deterministic forward pass —
+//     `linear → relu → linear → relu → linear → softmax → argmax`.
+//   - `execute()`: precompile entry with gas accounting
+//     (`5000 + 4 * params`).
+//   - dispatch: wired in `precompiles/mod.rs` at address
+//     `0x0000…0111` (Learning page selector 0x11).
+//   - Halo2 multi-layer `RoutingCircuit::v1`: **deferred** (per
+//     planset risk mitigation §RM-FL-2 — Halo2 multi-layer circuit
+//     generalization is the highest-risk WP and overrunning was
+//     planned for. 0x0111 ships *without* ZK proof support; ZK
+//     follow-up tracked as a carry-forward sub-sprint.)
+//   - The 3 `#[ignore = "WP-2.5"]` tests from WP-2.3 are now
+//     un-ignored and GREEN.
 //
 // **Wire format (committed at WP-2.1; subject to property-test pressure):**
 //
@@ -57,8 +64,9 @@
 // Changing it requires a hardfork. Verified by tripwire
 // `check_routing_arch_locked.py` (WP-2.4).
 
-#![allow(dead_code)] // some helpers used only by tests until WP-2.5
+#![allow(dead_code)] // some helpers exposed for the RM-FL-3 daemon path
 
+use super::ops as q16_ops;
 use super::Q16;
 
 // ---------------------------------------------------------------------------
@@ -145,6 +153,12 @@ pub struct RoutingOutput {
 }
 
 /// Decode / validate / forward failures.
+///
+/// At WP-2.3 there was a `NotImplemented` variant pinning the stub
+/// contract; WP-2.5 removed it together with the impl landing.
+/// (RM-FL-1 retro item #1 in action: the 3 `#[ignore = "WP-2.5"]`
+/// tests in this module are un-ignored at WP-2.5 and become real
+/// behavioral assertions, no compile-break churn.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutingError {
     /// Input shorter than the 16-byte header.
@@ -160,11 +174,6 @@ pub enum RoutingError {
     DimZero,
     /// Input length doesn't match the declared `(arch_version, shape)`.
     LengthMismatch,
-    /// WP-2.3 stub indicator. Removed at WP-2.5 GREEN. (RM-FL-1 retro
-    /// item #1: prefer `#[ignore = "WP-2.5"]` on the test side over
-    /// pinning this variant; this is kept ONLY so tests that don't
-    /// need real outputs can still observe the stub state cleanly.)
-    NotImplemented,
 }
 
 impl std::fmt::Display for RoutingError {
@@ -176,7 +185,6 @@ impl std::fmt::Display for RoutingError {
             RoutingError::ShapeMismatch => write!(f, "shape mismatch for declared arch_version"),
             RoutingError::DimZero => write!(f, "input/hidden/output dim must be > 0"),
             RoutingError::LengthMismatch => write!(f, "input length does not match declared (arch_version, shape)"),
-            RoutingError::NotImplemented => write!(f, "forward() is a WP-2.3 stub; impl lands at WP-2.5"),
         }
     }
 }
@@ -359,24 +367,157 @@ pub fn validate(input: &RoutingInput) -> Result<(), RoutingError> {
 }
 
 // ---------------------------------------------------------------------------
-// Forward (WP-2.3 STUB — implemented at WP-2.5)
+// Precompile address (Learning page 0x01_01 — selector 0x11)
 // ---------------------------------------------------------------------------
 
-/// Run the routing-model forward pass: 3 LinearChip + 2 ReLU +
-/// 1 softmax over the decoded input. Returns the argmax mentor/adapter
-/// + confidence (max-softmax-element).
+/// 20-byte address `0x0000…0111` for routing-model inference. Sits
+/// next to Belnap (RM-FL-1's 0x0110) on the Learning page.
+pub const ROUTING_INFERENCE: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x01, 0x11,
+];
+
+/// Base gas cost (per planset).
+const GAS_BASE: u64 = 5_000;
+/// Per-parameter gas cost (per planset: `5000 + 4 * params`).
+const GAS_PER_PARAM: u64 = 4;
+
+// ---------------------------------------------------------------------------
+// Forward pass (WP-2.5 GREEN — Q16 deterministic algorithm)
+// ---------------------------------------------------------------------------
+
+/// Run the routing-model forward pass on the decoded input. Returns
+/// the (mentor_id, adapter_id, confidence) tuple as wire-format bytes.
 ///
-/// **WP-2.3 status: STUB.** Returns `Err(RoutingError::NotImplemented)`.
-/// The real Q16 implementation lands at WP-2.5. Behavioral tests are
-/// `#[ignore = "WP-2.5"]` per the RM-FL-1 retro — the cleaner pattern
-/// versus pinning the stub-error variant in test assertions.
+/// Algorithm (Q16 throughout, no floats):
 ///
-/// The signature is final at WP-2.3 so the dispatcher (WP-2.6) can
-/// be wired against it without a churning shape.
+///   l1_pre = W1 · input + b1                  (linear, hidden_dim×input_dim)
+///   l1     = ReLU(l1_pre)
+///   l2_pre = W2 · l1 + b2                     (linear, hidden_dim×hidden_dim)
+///   l2     = ReLU(l2_pre)
+///   logits = W3 · l2 + b3                     (linear, output_dim×hidden_dim)
+///   probs  = softmax(logits)                  (numerically-stable Q16 softmax)
+///   k      = argmax(probs)                    (selected class index)
+///
+///   mentor_id  = k as u32
+///   adapter_id = k as u32                     (v1: same head; future versions
+///                                              may decouple via a separate
+///                                              output projection)
+///   confidence = probs[k]                     (Q16 max-softmax value)
+///
+/// Determinism: every step uses the Q16 substrate (q16::ops::{linear,
+/// relu, softmax}). Verified by tripwire `check_routing_quant_q16_only.py`.
 pub fn forward(input: &[u8]) -> Result<Vec<u8>, RoutingError> {
     let decoded = decode(input)?;
     validate(&decoded)?;
-    Err(RoutingError::NotImplemented)
+    let output = forward_decoded(&decoded);
+    Ok(encode_output(&output))
+}
+
+/// Inner forward kernel against a decoded `RoutingInput`. Exposed for
+/// the RM-FL-3 daemon path (which constructs `RoutingInput` directly
+/// from candle weights without round-tripping through bytes).
+pub fn forward_decoded(input: &RoutingInput) -> RoutingOutput {
+    let i = input.shape.input_dim as usize;
+    let h = input.shape.hidden_dim as usize;
+    let o = input.shape.output_dim as usize;
+
+    // Layer 1: hidden = ReLU(W1 · input + b1)
+    let l1_pre = q16_ops::linear(&input.w1, &input.input, &input.b1, h, i);
+    let l1 = q16_ops::relu(&l1_pre);
+
+    // Layer 2: hidden2 = ReLU(W2 · l1 + b2)
+    let l2_pre = q16_ops::linear(&input.w2, &l1, &input.b2, h, h);
+    let l2 = q16_ops::relu(&l2_pre);
+
+    // Layer 3: logits = W3 · l2 + b3
+    let logits = q16_ops::linear(&input.w3, &l2, &input.b3, o, h);
+
+    // Numerically-stable Q16 softmax → argmax.
+    let probs = q16_ops::softmax(&logits);
+    let (k, conf) = argmax(&probs);
+
+    RoutingOutput {
+        mentor_id: k as u32,
+        adapter_id: k as u32,
+        confidence: conf,
+    }
+}
+
+/// Argmax over a Q16 vector. Returns `(index, value)`. Empty input
+/// returns `(0, Q16::ZERO)` — defensive default; the precompile path
+/// guarantees output_dim > 0 via `validate()` so this is unreachable
+/// in production.
+fn argmax(values: &[Q16]) -> (usize, Q16) {
+    if values.is_empty() {
+        return (0, Q16::ZERO);
+    }
+    let mut best_i = 0usize;
+    let mut best_v = values[0];
+    for (i, v) in values.iter().enumerate().skip(1) {
+        if v.0 > best_v.0 {
+            best_i = i;
+            best_v = *v;
+        }
+    }
+    (best_i, best_v)
+}
+
+// ---------------------------------------------------------------------------
+// Precompile entry point (called by the dispatcher in `precompiles/mod.rs`)
+// ---------------------------------------------------------------------------
+
+/// Precompile entry. Charges gas, then runs `forward()`.
+///
+/// Gas: `GAS_BASE + GAS_PER_PARAM * params` = `5000 + 4 * params`.
+/// At canonical shape (115,331 params) → 465,324 gas. Within the
+/// planset's ≤1M-gas-per-inference bar.
+///
+/// The gas pre-charge uses the *header-declared* shape (rounded to
+/// MAX_INPUT_BYTES caps via the byte-length check in decode). A
+/// caller can't trick saturating-mul into asking for u64::MAX gas
+/// because the body length check rejects oversize inputs at the
+/// MAX_INPUT_BYTES boundary first.
+pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
+    use crate::precompiles::PrecompileResult;
+
+    if gas_limit < GAS_BASE {
+        return Err(anyhow::anyhow!(
+            "Routing forward: insufficient gas (need {GAS_BASE}, got {gas_limit})"
+        ));
+    }
+
+    // Compute params from the header so gas accounting is accurate
+    // BEFORE doing the full decode + tensor allocation.
+    let params_hint = if input.len() >= HEADER_LEN {
+        let i = u32::from_be_bytes(input[4..8].try_into().expect("4 bytes")) as u64;
+        let h = u32::from_be_bytes(input[8..12].try_into().expect("4 bytes")) as u64;
+        let o = u32::from_be_bytes(input[12..16].try_into().expect("4 bytes")) as u64;
+        // Same formula as RoutingShape::params(), but in u64 with
+        // saturating arithmetic so a malicious header can't overflow.
+        h.saturating_mul(i)
+            .saturating_add(h)
+            .saturating_add(h.saturating_mul(h))
+            .saturating_add(h)
+            .saturating_add(o.saturating_mul(h))
+            .saturating_add(o)
+    } else {
+        0
+    };
+    let total_gas = GAS_BASE.saturating_add(GAS_PER_PARAM.saturating_mul(params_hint));
+    if gas_limit < total_gas {
+        return Err(anyhow::anyhow!(
+            "Routing forward: insufficient gas (need {total_gas}, got {gas_limit})"
+        ));
+    }
+
+    match forward(input) {
+        Ok(output) => Ok(PrecompileResult {
+            output,
+            gas_used: total_gas,
+            success: true,
+        }),
+        Err(e) => Err(anyhow::anyhow!("Routing forward: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -686,33 +827,215 @@ mod tests {
     // them at WP-2.5 close produces "passed".
     // ====================================================================
 
-    #[test]
-    #[ignore = "WP-2.5: forward() impl pending — gated until aggregate algorithm lands"]
-    fn forward_canonical_input_produces_well_formed_output() {
-        // Gherkin scenario 1 — happy path.
-        // Build a canonical-shape input with simple uniform weights;
-        // assert output decodes to a (mentor_id < output_dim,
-        // adapter_id < output_dim, finite Q16 confidence) tuple.
-        // Implementation deferred to WP-2.5.
-        unreachable!("ignored test; un-ignore at WP-2.5");
+    /// Test-only output decoder (mirror of encode_output's inverse).
+    fn parse_output(bytes: &[u8]) -> RoutingOutput {
+        assert_eq!(bytes.len(), 12, "output must be 12 bytes");
+        let mentor_id = u32::from_be_bytes(bytes[0..4].try_into().expect("4 bytes"));
+        let adapter_id = u32::from_be_bytes(bytes[4..8].try_into().expect("4 bytes"));
+        let confidence = Q16::from_raw(i32::from_be_bytes(
+            bytes[8..12].try_into().expect("4 bytes"),
+        ));
+        RoutingOutput { mentor_id, adapter_id, confidence }
+    }
+
+    /// Build a canonical-shape input directly via `forward_decoded`
+    /// (avoids encoding/decoding 464 KB of bytes for unit tests).
+    /// All weights and biases set to zero; input set to `input_value`.
+    fn make_canonical_input_uniform_input(input_value: i32) -> RoutingInput {
+        let s = RoutingShape::V1;
+        let i = s.input_dim as usize;
+        let h = s.hidden_dim as usize;
+        let o = s.output_dim as usize;
+        RoutingInput {
+            arch_version: ARCH_VERSION,
+            shape: s,
+            input: vec![Q16::from_raw(input_value); i],
+            w1: vec![Q16::ZERO; h * i],
+            b1: vec![Q16::ZERO; h],
+            w2: vec![Q16::ZERO; h * h],
+            b2: vec![Q16::ZERO; h],
+            w3: vec![Q16::ZERO; o * h],
+            b3: vec![Q16::ZERO; o],
+        }
     }
 
     #[test]
-    #[ignore = "WP-2.5: forward() impl pending"]
+    fn forward_canonical_input_produces_well_formed_output() {
+        // Gherkin scenario 1 (happy path) — canonical shape with
+        // zero weights produces a well-formed output. With all
+        // weights = 0, the network output is a vector of zeros;
+        // softmax(zero vec) yields a uniform distribution; argmax
+        // returns index 0 by tie-break (the argmax helper picks
+        // first on ties).
+        let input = make_canonical_input_uniform_input(Q16::ONE.0);
+        let out = forward_decoded(&input);
+        assert!(
+            (out.mentor_id as u32) < input.shape.output_dim,
+            "mentor_id {} must be < output_dim {}",
+            out.mentor_id, input.shape.output_dim
+        );
+        assert!(
+            (out.adapter_id as u32) < input.shape.output_dim,
+            "adapter_id {} must be < output_dim {}",
+            out.adapter_id, input.shape.output_dim
+        );
+        // confidence is a Q16 value in roughly [0, ONE]; with uniform
+        // softmax over 3 classes it should be ≈ Q16(0x5555) ≈ 0.333.
+        assert!(out.confidence.0 > 0, "confidence must be positive");
+        assert!(out.confidence.0 <= Q16::ONE.0, "confidence must be ≤ 1.0");
+    }
+
+    #[test]
     fn forward_deterministic_across_runs() {
         // Gherkin scenario "cross-CPU determinism" (in-process leg).
-        // Two consecutive calls with identical bytes return identical
-        // bytes. Implementation deferred to WP-2.5.
-        unreachable!("ignored test; un-ignore at WP-2.5");
+        let input = make_canonical_input_uniform_input(Q16::ONE.0);
+        let r1 = forward_decoded(&input);
+        let r2 = forward_decoded(&input);
+        assert_eq!(r1, r2, "identical inputs must produce identical outputs");
     }
 
     #[test]
-    #[ignore = "WP-2.5: forward() impl pending"]
     fn forward_max_magnitude_weights_no_panic() {
-        // Gherkin scenario — weight poisoning. Maximum-magnitude
-        // weights produce a saturating, well-defined Q16 confidence
-        // and never panic. Implementation deferred to WP-2.5.
-        unreachable!("ignored test; un-ignore at WP-2.5");
+        // Gherkin scenario — weight poisoning. Set every weight to
+        // i32::MAX or i32::MIN; saturating Q16 throughout must not
+        // panic.
+        let s = RoutingShape::V1;
+        let i = s.input_dim as usize;
+        let h = s.hidden_dim as usize;
+        let o = s.output_dim as usize;
+        let max = Q16::MAX;
+        let min = Q16::MIN;
+        let alternating = |n: usize| {
+            (0..n).map(|k| if k % 2 == 0 { max } else { min }).collect::<Vec<_>>()
+        };
+        let input = RoutingInput {
+            arch_version: ARCH_VERSION,
+            shape: s,
+            input: alternating(i),
+            w1: alternating(h * i),
+            b1: alternating(h),
+            w2: alternating(h * h),
+            b2: alternating(h),
+            w3: alternating(o * h),
+            b3: alternating(o),
+        };
+        // Must not panic. Q16 confidence is well-defined.
+        let out = forward_decoded(&input);
+        let _ = out.confidence; // any value is OK as long as no panic
+    }
+
+    // ====================================================================
+    // ROUND 7 — execute() entry + gas accounting (4 GREEN, WP-2.6)
+    // ====================================================================
+
+    #[test]
+    fn execute_below_base_gas_rejects() {
+        let input = vec![0u8; HEADER_LEN]; // any input, gas check fires first
+        let result = execute(&input, GAS_BASE - 1);
+        assert!(result.is_err(), "execute must reject below-base gas");
+    }
+
+    #[test]
+    fn execute_below_total_gas_rejects() {
+        // Build a valid v1 header → params_hint will compute the
+        // canonical-shape param count → total_gas ≈ 465K. Pass
+        // gas_limit = 100K (above base, below total) → reject.
+        let mut bytes = vec![0u8; HEADER_LEN];
+        bytes[0..4].copy_from_slice(&ARCH_VERSION.to_be_bytes());
+        bytes[4..8].copy_from_slice(&768u32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&128u32.to_be_bytes());
+        bytes[12..16].copy_from_slice(&3u32.to_be_bytes());
+        let result = execute(&bytes, 100_000);
+        assert!(
+            result.is_err(),
+            "execute must reject gas_limit below total"
+        );
+    }
+
+    #[test]
+    fn execute_below_header_short_input_charges_base_gas_only() {
+        // Input shorter than HEADER_LEN → params_hint = 0 → total_gas = GAS_BASE.
+        // gas_limit just at GAS_BASE → execute returns the decode error
+        // (not a gas error).
+        let result = execute(&[0u8; 4], GAS_BASE);
+        // forward() returns InputTooShort; execute wraps that.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn execute_dim_overflow_clamped_safely() {
+        // A malicious header claiming dim = u32::MAX must not overflow
+        // the gas pre-charge (saturating_mul prevents this).
+        let mut bytes = vec![0u8; HEADER_LEN];
+        bytes[0..4].copy_from_slice(&ARCH_VERSION.to_be_bytes());
+        bytes[4..8].copy_from_slice(&u32::MAX.to_be_bytes()); // huge input_dim
+        bytes[8..12].copy_from_slice(&u32::MAX.to_be_bytes()); // huge hidden_dim
+        bytes[12..16].copy_from_slice(&u32::MAX.to_be_bytes()); // huge output_dim
+        // Even with u64::MAX gas_limit, the decode still has to fail
+        // (input.len() < expected_total). The gas pre-charge clamps to
+        // u64::MAX via saturating_mul; the decode then rejects.
+        let result = execute(&bytes, u64::MAX);
+        assert!(result.is_err(), "malformed-header overflow must error cleanly");
+    }
+
+    // ====================================================================
+    // ROUND 8 — Address constant (1 GREEN)
+    // ====================================================================
+
+    #[test]
+    fn routing_inference_address_byte_layout() {
+        // Wire-format invariant: 0x0111 on the Learning page
+        // (byte17=0x01, byte18=0x01, byte19=0x11). If anyone changes
+        // this, the dispatcher in mod.rs and the routing-arch tripwire
+        // break together.
+        assert_eq!(ROUTING_INFERENCE[0..17], [0u8; 17]);
+        assert_eq!(ROUTING_INFERENCE[17], 0x01);
+        assert_eq!(ROUTING_INFERENCE[18], 0x01);
+        assert_eq!(ROUTING_INFERENCE[19], 0x11);
+    }
+
+    #[test]
+    fn forward_decoded_argmax_picks_largest_logit() {
+        // Build inputs such that the W3 matrix biases output[1]
+        // significantly higher than [0] and [2]. Confirm argmax = 1.
+        let s = RoutingShape::V1;
+        let i = s.input_dim as usize;
+        let h = s.hidden_dim as usize;
+        let o = s.output_dim as usize;
+
+        // Trivial network: input = ones, W1 = zeros, b1 = zeros
+        // → l1 = ReLU(0) = 0. W2 zeros, b2 zeros → l2 = 0. Then
+        // W3 zeros + b3 = [0, ONE, 0] → logits = [0, ONE, 0].
+        // softmax([0, ONE, 0]) has max at index 1.
+        let mut b3 = vec![Q16::ZERO; o];
+        b3[1] = Q16::ONE;
+
+        let input = RoutingInput {
+            arch_version: ARCH_VERSION,
+            shape: s,
+            input: vec![Q16::ONE; i],
+            w1: vec![Q16::ZERO; h * i],
+            b1: vec![Q16::ZERO; h],
+            w2: vec![Q16::ZERO; h * h],
+            b2: vec![Q16::ZERO; h],
+            w3: vec![Q16::ZERO; o * h],
+            b3,
+        };
+        let out = forward_decoded(&input);
+        assert_eq!(out.mentor_id, 1, "argmax should select the slot with the largest logit");
+        assert_eq!(out.adapter_id, 1, "v1: adapter_id == mentor_id");
+    }
+
+    #[test]
+    fn parse_output_round_trips_encoded_output() {
+        let original = RoutingOutput {
+            mentor_id: 42,
+            adapter_id: 7,
+            confidence: Q16::from_raw(0x12345678),
+        };
+        let bytes = encode_output(&original);
+        let parsed = parse_output(&bytes);
+        assert_eq!(parsed, original);
     }
 
     // ====================================================================
