@@ -424,65 +424,99 @@ pub fn aggregate(input: &[u8]) -> Result<Vec<u8>, BelnapError> {
     Ok(encode_output(&output))
 }
 
+/// Pluggable Belnap aggregation strategy.
+///
+/// **Why a trait?** Paper II §3 names the FOUR-valued reduction as ONE
+/// algorithm, but Paper III §2 (mentor matching, RM-FL-4) and the
+/// hypothesis rigs in RM-FL-5 may want lattice variants — e.g. an
+/// asymmetric-threshold reduction that uses both `threshold_pos` and
+/// `threshold_neg`, or a meet-based "consensus" reduction. Pinning the
+/// surface here lets future variants slot in without touching
+/// `aggregate()` or its callers (the dispatcher in `precompiles/mod.rs`
+/// and the RM-FL-3 daemon path).
+///
+/// Implementors MUST be deterministic and Q16-only — no floats, no
+/// platform intrinsics, no randomness. The default
+/// [`StandardBelnap`] implements the WP-1.5 algorithm verbatim.
+pub trait BelnapStateMachine {
+    /// Aggregate a fully-decoded `BelnapInput` into a per-dimension
+    /// (value, state) output. Pure function; no allocation outside
+    /// the returned `BelnapOutput`.
+    fn aggregate(&self, input: &BelnapInput) -> BelnapOutput;
+}
+
+/// The WP-1.5 Belnap algorithm — `Σ saturating(w * e)` per dim plus
+/// agree/oppose classification with early lattice-join termination.
+///
+/// Equivalent to the inlined `aggregate_decoded` from before WP-1.6;
+/// the trait is a non-behavior-changing extraction.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StandardBelnap;
+
+impl BelnapStateMachine for StandardBelnap {
+    fn aggregate(&self, input: &BelnapInput) -> BelnapOutput {
+        let dim = input.dim;
+        let n = input.n;
+
+        let mut aggregated_values = Vec::with_capacity(dim);
+        let mut states = Vec::with_capacity(dim);
+
+        for d in 0..dim {
+            // ---- Step 1: weighted sum over participants ----
+            let mut acc = Q16::ZERO;
+            for i in 0..n {
+                let w = input.weights[i];
+                let e = input.embeddings[i * dim + d];
+                acc = acc.saturating_add(w.saturating_mul(e));
+            }
+            aggregated_values.push(acc);
+
+            // ---- Step 2 + 3: classification + lattice reduction ----
+            let mut has_agree = false;
+            let mut has_oppose = false;
+            for i in 0..n {
+                // Filter zero-weight participants
+                // (BelnapAdversarial.tla::WeightZeroIgnored).
+                // Negative weights are wire-format bugs; treat as zero.
+                if input.weights[i].0 <= 0 {
+                    continue;
+                }
+                let e = input.embeddings[i * dim + d];
+                let c = input.confidences[i * dim + d];
+                match classify_dim_threshold(e, c, input.threshold_pos) {
+                    Some(true) => has_agree = true,
+                    Some(false) => has_oppose = true,
+                    None => {}
+                }
+                // Early termination: once both sides are populated,
+                // the per-dim state is locked at Both. O(n + early-out)
+                // instead of O(n) on the common adversarial case.
+                if has_agree && has_oppose {
+                    break;
+                }
+            }
+
+            let state = match (has_agree, has_oppose) {
+                (false, false) => BelnapState::Neither,
+                (true, false) | (false, true) => BelnapState::True,
+                (true, true) => BelnapState::Both,
+            };
+            states.push(state);
+        }
+
+        BelnapOutput {
+            aggregated_values,
+            states,
+        }
+    }
+}
+
 /// Inner aggregation kernel against an already-decoded `BelnapInput`.
-/// Exposed to the test module + the (future) RM-FL-3 daemon path.
+/// Wrapper around `StandardBelnap::aggregate` — kept as a free
+/// function so existing callers (test code, RM-FL-3 daemon path)
+/// don't need to import the trait.
 pub fn aggregate_decoded(input: &BelnapInput) -> BelnapOutput {
-    let dim = input.dim;
-    let n = input.n;
-
-    let mut aggregated_values = Vec::with_capacity(dim);
-    let mut states = Vec::with_capacity(dim);
-
-    for d in 0..dim {
-        // ---- Step 1: weighted sum over participants ----
-        let mut acc = Q16::ZERO;
-        for i in 0..n {
-            let w = input.weights[i];
-            let e = input.embeddings[i * dim + d];
-            // saturating_mul → saturating_add, both Q16-pure.
-            acc = acc.saturating_add(w.saturating_mul(e));
-        }
-        aggregated_values.push(acc);
-
-        // ---- Step 2 + 3: classification + lattice reduction ----
-        let mut has_agree = false;
-        let mut has_oppose = false;
-        for i in 0..n {
-            // Filter zero-weight participants (BelnapAdversarial.tla
-            // ::WeightZeroIgnored). Negative weights would be a wire-
-            // format bug; we treat them as zero (no side contribution)
-            // for safety rather than panicking.
-            if input.weights[i].0 <= 0 {
-                continue;
-            }
-            let e = input.embeddings[i * dim + d];
-            let c = input.confidences[i * dim + d];
-            match classify_dim_threshold(e, c, input.threshold_pos) {
-                Some(true) => has_agree = true,
-                Some(false) => has_oppose = true,
-                None => {} // low-confidence — contributes Neither, absorbed
-            }
-            // Early termination: once both sides are populated, the
-            // per-dim state is locked at Both and further scanning
-            // can't change it. This gives O(n + early-out) instead of
-            // O(n) on the common adversarial case.
-            if has_agree && has_oppose {
-                break;
-            }
-        }
-
-        let state = match (has_agree, has_oppose) {
-            (false, false) => BelnapState::Neither,
-            (true, false) | (false, true) => BelnapState::True,
-            (true, true) => BelnapState::Both,
-        };
-        states.push(state);
-    }
-
-    BelnapOutput {
-        aggregated_values,
-        states,
-    }
+    StandardBelnap.aggregate(input)
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,6 +1159,43 @@ mod tests {
     // ====================================================================
     // ROUND 5c — Address constant (1 GREEN, new at WP-1.5)
     // ====================================================================
+
+    // ====================================================================
+    // ROUND 5d — BelnapStateMachine trait surface (3 GREEN, WP-1.6)
+    // ====================================================================
+
+    #[test]
+    fn standard_belnap_implements_state_machine_trait() {
+        // The trait is the load-bearing surface for future variants
+        // (RM-FL-4 mentor matching, RM-FL-5 hypothesis rigs). This
+        // test pins that StandardBelnap satisfies it — if a future
+        // refactor accidentally narrows the trait, this fails.
+        fn assert_impl<T: BelnapStateMachine>(_: &T) {}
+        assert_impl(&StandardBelnap);
+    }
+
+    #[test]
+    fn standard_belnap_matches_aggregate_decoded() {
+        // The free function `aggregate_decoded` must dispatch to
+        // `StandardBelnap`. If a future change introduces a different
+        // default, callers (RM-FL-3 daemon, tests) get unexpected
+        // behavior — this test catches that drift.
+        let input = make_input(2, 3, 0.5, 0.9, 1.0, 0.8);
+        let via_free = aggregate_decoded(&input);
+        let via_trait = StandardBelnap.aggregate(&input);
+        assert_eq!(via_free, via_trait);
+    }
+
+    #[test]
+    fn standard_belnap_via_trait_object() {
+        // Trait object dispatch works (object safety check). Future
+        // variant selection at the daemon level may want
+        // `Box<dyn BelnapStateMachine>` for runtime configuration.
+        let machine: &dyn BelnapStateMachine = &StandardBelnap;
+        let input = make_input(1, 1, 1.0, 1.0, 1.0, 0.5);
+        let out = machine.aggregate(&input);
+        assert_eq!(out.states, vec![BelnapState::True]);
+    }
 
     #[test]
     fn belnap_aggregate_address_byte_layout() {
