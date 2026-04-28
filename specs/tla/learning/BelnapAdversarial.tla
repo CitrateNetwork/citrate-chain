@@ -253,6 +253,51 @@ WeightZeroIgnored ==
         (submitted[v] /\ submission[v].weight = "zero")
             => v \notin HighConfSubmitted /\ v \notin PositiveWeightSubmitted
 
+\* ---- WP-1.8 — Stronger adversarial invariants ----
+\*
+\* The base 7 invariants pin safety under the existing
+\* HonestSubmit/ByzantineSubmit action set. WP-1.8 adds explicit
+\* coverage for two strawmen the planset (RM-FL §1.8) names:
+\*
+\*   1. Coordinated collusion under HDA — already implicit in the
+\*      free Byzantine choice over (sign, conf, weight). INV-6
+\*      AdversaryCannotFlipUnderHDA already pins the resilience.
+\*      INV-8 below adds the contrapositive: honest high-conf cannot
+\*      be silently dropped before classification.
+\*
+\*   2. Worst-case all-Byzantine — when HonestSet is empty, the
+\*      aggregator sees only Byzantine inputs. INV-9 pins that the
+\*      reduced state is always in {Neither, True, Both} — never
+\*      False — even with maximum adversary control.
+\*
+\* Threshold-edge attacks are NOT modeled here — they are a Q16
+\* numeric-precision concern, covered by:
+\*   - precompiles/q16/belnap.rs::tests::classify_one_ulp_below_threshold_is_neither
+\*   - precompiles/q16/belnap.rs::tests::classify_at_threshold_inclusive_passes
+\*   - the WP-1.7 cargo-fuzz target (fuzz_belnap_aggregate)
+\* This spec abstracts numeric thresholds; mixing the two layers
+\* would just duplicate the Rust property tests.
+
+\* INV-8: HonestHighConfImpliesAgreeSetNonEmpty
+\* If any honest validator submitted with positive weight + high
+\* confidence, the aggregator's "agree" set must be non-empty —
+\* contrapositive of "the adversary can ghost honest input".
+HonestHighConfImpliesAgreeSetNonEmpty ==
+    (phase = "aggregated"
+     /\ \E h \in HonestSet : h \in HighConfSubmitted)
+    => HighConfAgreeSet # {}
+
+\* INV-9: AllByzantineProducesAcceptableState
+\* Worst case: zero honest validators, all submissions Byzantine.
+\* The aggregator does NOT distinguish all-Byzantine-unanimous from
+\* all-honest-unanimous (both produce True). This is a known
+\* aggregator property (Paper II §3 acknowledges the aggregator is
+\* honest-trust-bounded), formalized here so the spec's behavior
+\* under maximum adversary control is explicit.
+AllByzantineProducesAcceptableState ==
+    (phase = "aggregated" /\ HonestSet = {})
+        => state \in {"Neither", "True", "Both"}  \* never False
+
 \* ---- Specification ----
 
 Spec == Init /\ [][Next]_vars
@@ -264,5 +309,7 @@ THEOREM BothTwoSides == Spec => []BothRequiresTwoSides
 THEOREM NeitherUnder == Spec => []NeitherImpliesUnderconfidence
 THEOREM AdvCannotFlip == Spec => []AdversaryCannotFlipUnderHDA
 THEOREM ZeroIgnored == Spec => []WeightZeroIgnored
+THEOREM AgreeNonEmpty == Spec => []HonestHighConfImpliesAgreeSetNonEmpty
+THEOREM AllByzAcceptable == Spec => []AllByzantineProducesAcceptableState
 
 =============================================================================
