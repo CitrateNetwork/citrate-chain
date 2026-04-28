@@ -36,6 +36,7 @@
 
 #![allow(dead_code)]
 
+pub mod belnap;
 pub mod exp;
 pub mod ops;
 
