@@ -652,5 +652,10 @@ contract LearningPoolTest is Test {
             LearningPool.AccessType.Open,
             minStake
         );
+        // RFI-05: pools require ≥1 whitelisted model to start a cycle.
+        // Whitelist a default test model so the existing tests don't
+        // need to be rewritten with explicit whitelisting.
+        vm.prank(creator);
+        lp.whitelistModel(poolId, keccak256("default-test-model"));
     }
 }

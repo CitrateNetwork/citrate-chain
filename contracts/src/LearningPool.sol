@@ -37,6 +37,12 @@ contract LearningPool is ReentrancyGuard {
     mapping(uint256 => mapping(address => bool)) public isMember;
     mapping(uint256 => mapping(address => uint256)) public stakes;
     mapping(uint256 => mapping(bytes32 => bool)) public whitelistedModels;
+
+    /// @notice Per-pool count of currently-whitelisted models.
+    /// Closes RFI-05: `startCycle` now requires this to be ≥ 1, so
+    /// the previously-decorative whitelist becomes load-bearing.
+    mapping(uint256 => uint256) public whitelistedModelCount;
+
     mapping(uint256 => mapping(bytes32 => bool)) public validInviteCodes;
 
     /// @notice Per-(pool, code) expiry timestamp for invite codes.
@@ -68,6 +74,8 @@ contract LearningPool is ReentrancyGuard {
     event InviteCodeAdded(uint256 indexed poolId, bytes32 codeHash);
     /// RM-B1 / WP-E3.2 (audit GUI-L-03).
     event InviteCodeTtlSet(uint256 indexed poolId, bytes32 indexed codeHash, uint64 expiresAt);
+    /// RFI26-09: invite code consumed by `joinWithInvite`. Single-use.
+    event InviteCodeConsumed(uint256 indexed poolId, bytes32 indexed codeHash, address indexed redeemer);
 
     // ============================================================
     // Modifiers
@@ -184,7 +192,15 @@ contract LearningPool is ReentrancyGuard {
         require(expiresAt != 0, "Invite code has no TTL recorded");
         require(block.timestamp <= uint256(expiresAt), "Invite code expired");
 
+        // RFI26-09: mark codeHash consumed BEFORE _addMember so a
+        // mempool watcher front-running with the same hash is
+        // rejected on the second join. The creator must mint a
+        // fresh code per intended invitee.
+        validInviteCodes[poolId][codeHash] = false;
+
         _addMember(poolId, msg.sender, msg.value);
+
+        emit InviteCodeConsumed(poolId, codeHash, msg.sender);
     }
 
     // ============================================================
@@ -243,6 +259,9 @@ contract LearningPool is ReentrancyGuard {
     function startCycle(uint256 poolId) external poolExists(poolId) onlyCreator(poolId) {
         require(pools[poolId].state == PoolState.Active, "Not active");
         require(pools[poolId].memberCount >= 2, "Need at least 2 members");
+        // RFI-05: require at least one whitelisted model so the
+        // whitelist is load-bearing rather than decorative metadata.
+        require(whitelistedModelCount[poolId] >= 1, "No whitelisted model");
         pools[poolId].state = PoolState.ActiveCycle;
         emit CycleStarted(poolId);
     }
@@ -265,7 +284,11 @@ contract LearningPool is ReentrancyGuard {
     /// @param poolId The pool ID
     /// @param modelHash Hash identifying the model
     function whitelistModel(uint256 poolId, bytes32 modelHash) external poolExists(poolId) onlyCreator(poolId) {
-        whitelistedModels[poolId][modelHash] = true;
+        // Idempotent: only count first-time additions.
+        if (!whitelistedModels[poolId][modelHash]) {
+            whitelistedModels[poolId][modelHash] = true;
+            whitelistedModelCount[poolId]++;
+        }
         emit ModelWhitelisted(poolId, modelHash);
     }
 
@@ -274,7 +297,10 @@ contract LearningPool is ReentrancyGuard {
     /// @param poolId The pool ID
     /// @param modelHash Hash identifying the model
     function removeModel(uint256 poolId, bytes32 modelHash) external poolExists(poolId) onlyCreator(poolId) {
-        whitelistedModels[poolId][modelHash] = false;
+        if (whitelistedModels[poolId][modelHash]) {
+            whitelistedModels[poolId][modelHash] = false;
+            whitelistedModelCount[poolId]--;
+        }
         emit ModelRemoved(poolId, modelHash);
     }
 

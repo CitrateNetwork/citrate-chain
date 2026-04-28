@@ -5,13 +5,18 @@ pragma solidity ^0.8.26;
 
 import "./interfaces/IModelRegistry.sol";
 import "./lib/AccessControl.sol";
+import "./lib/ReentrancyGuard.sol";
 
 /**
  * @title InferenceRouter
  * @notice Routes inference requests to appropriate models and compute providers
- * @dev Manages load balancing, caching, and payment distribution
+ * @dev Manages load balancing, caching, and payment distribution.
+ *      RFI26-07: nonReentrant guards on every state-mutating function
+ *      that issues an external call (refund, payout). The cache-hit
+ *      branch in `requestInference` follows CEI (state changes before
+ *      refund external call).
  */
-contract InferenceRouter is AccessControl {
+contract InferenceRouter is AccessControl, ReentrancyGuard {
     // Structs
     struct InferenceRequest {
         uint256 requestId;
@@ -167,25 +172,26 @@ contract InferenceRouter is AccessControl {
         bytes32 modelHash,
         bytes calldata inputData,
         uint256 maxPrice
-    ) external payable returns (uint256) {
+    ) external payable nonReentrant returns (uint256) {
         require(msg.value >= maxPrice, "Insufficient payment");
-        
+
         // Check cache first
         bytes32 inputHash = keccak256(inputData);
         bytes memory cachedResult = responseCache[modelHash][inputHash];
-        
+
         if (cachedResult.length > 0 && routes[modelHash].cachingEnabled) {
             // Return cached result
             emit CacheHit(modelHash, inputHash);
-            
-            // Refund most of the payment (keep small cache reward)
+
             uint256 cacheRewardAmount = (maxPrice * cacheReward) / 10000;
-            if (msg.value > cacheRewardAmount) {
-                (bool success, ) = msg.sender.call{value: msg.value - cacheRewardAmount}("");
-                require(success, "Refund failed");
-            }
-            
-            // Create completed request record
+            uint256 refundAmount = msg.value > cacheRewardAmount
+                ? msg.value - cacheRewardAmount
+                : 0;
+
+            // RFI26-07: complete ALL state changes before the external
+            // refund call (CEI). The previous order (call first, then
+            // bookkeeping) opened a reentrancy window via the receive()
+            // hook on the refund recipient.
             uint256 cachedRequestId = nextRequestId++;
             InferenceRequest storage cachedRequest = requests[cachedRequestId];
             cachedRequest.requestId = cachedRequestId;
@@ -197,9 +203,14 @@ contract InferenceRouter is AccessControl {
             cachedRequest.status = RequestStatus.Completed;
             cachedRequest.outputData = cachedResult;
             cachedRequest.pricePaid = cacheRewardAmount;
-            
             userRequests[msg.sender].push(cachedRequestId);
-            
+
+            // External call last (RFI26-07).
+            if (refundAmount > 0) {
+                (bool success, ) = msg.sender.call{value: refundAmount}("");
+                require(success, "Refund failed");
+            }
+
             return cachedRequestId;
         }
         

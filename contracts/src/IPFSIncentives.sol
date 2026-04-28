@@ -68,12 +68,37 @@ contract IPFSIncentives is AccessControl, ReentrancyGuard {
      * @param sizePinned Size of the data pinned in bytes.
      * @param modelType Model classification used to calculate multipliers.
      */
+    /// @notice Maximum bytes that any single (cid, reporter) pair can claim.
+    /// 1 TiB. This bounds the worst-case drain by a malicious or
+    /// compromised REPORTER_ROLE address that calls `reportPinning` in
+    /// a loop with the same CID. Closes RFI26-06.
+    uint256 public constant MAX_BYTES_PER_REPORTER_CID = 1 << 40; // 1 TiB
+
+    /// @notice Minimum gap (seconds) between successive reports of the
+    /// same CID by the same reporter. Stops a sigle-block burst.
+    /// Closes RFI26-06.
+    uint256 public constant MIN_REPORT_GAP = 1 hours;
+
+    /// @notice Per-(cid, reporter) timestamp of last report. Closes RFI26-06.
+    mapping(string => mapping(address => uint256)) public lastReportTime;
+
     function reportPinning(
         string calldata cid,
         uint256 sizePinned,
         ModelType modelType
     ) external onlyRole(REPORTER_ROLE) {
         require(sizePinned > 0, "Size required");
+
+        // RFI26-06: cap per-call size; cap total per (cid, reporter);
+        // enforce minimum gap between reports of same CID by same reporter.
+        require(sizePinned <= MAX_BYTES_PER_REPORTER_CID, "Size exceeds per-call cap");
+        uint256 lastTs = lastReportTime[cid][msg.sender];
+        if (lastTs != 0) {
+            require(
+                block.timestamp >= lastTs + MIN_REPORT_GAP,
+                "Report rate limit"
+            );
+        }
 
         ModelPinStats storage stats = modelStats[cid];
         if (!stats.initialised) {
@@ -93,6 +118,12 @@ contract IPFSIncentives is AccessControl, ReentrancyGuard {
             modelPinnerList[cid].push(msg.sender);
         }
 
+        // RFI26-06: cap total accumulated pinned size per (cid, reporter).
+        require(
+            info.totalPinned + sizePinned <= MAX_BYTES_PER_REPORTER_CID,
+            "Cumulative size exceeds per-(cid,reporter) cap"
+        );
+
         info.totalPinned += sizePinned;
         info.rewardsEarned += reward;
         info.reports += 1;
@@ -100,6 +131,8 @@ contract IPFSIncentives is AccessControl, ReentrancyGuard {
         pinnedStorage[msg.sender] += sizePinned;
         pendingRewards[msg.sender] += reward;
         totalPendingRewards += reward;
+
+        lastReportTime[cid][msg.sender] = block.timestamp;
 
         emit PinReported(cid, msg.sender, sizePinned, reward);
     }

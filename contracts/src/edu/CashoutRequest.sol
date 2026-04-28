@@ -9,6 +9,10 @@ import {ICashoutRequest} from "./interfaces/ICashoutRequest.sol";
 contract CashoutRequest is ICashoutRequest {
     address public governance;
 
+    /// @notice Pending governance address awaiting acceptance.
+    /// Closes RFI26-05: 2-step transfer prevents permanent lock.
+    address public pendingGovernance;
+
     struct Request {
         address teacher;
         uint256 classroomId;
@@ -23,10 +27,15 @@ contract CashoutRequest is ICashoutRequest {
     uint256 private _saltUsdRate; // basis points (100 = $0.01 per SALT)
 
     error NotGovernance();
+    error NotPendingGovernance();
+    error ZeroGovernance();
     error NotTeacher();
     error RequestNotPending();
     error SelfApproval();
     error ZeroAmount();
+
+    event GovernanceProposed(address indexed pending);
+    event GovernanceAccepted(address indexed previous, address indexed current);
 
     modifier onlyGovernance() {
         if (msg.sender != governance) revert NotGovernance();
@@ -34,8 +43,25 @@ contract CashoutRequest is ICashoutRequest {
     }
 
     constructor(address _governance, uint256 initialRate) {
+        if (_governance == address(0)) revert ZeroGovernance();
         governance = _governance;
         _saltUsdRate = initialRate;
+    }
+
+    /// @notice Step 1 of governance transfer (closes RFI26-05).
+    function proposeGovernance(address newGovernance) external onlyGovernance {
+        if (newGovernance == address(0)) revert ZeroGovernance();
+        pendingGovernance = newGovernance;
+        emit GovernanceProposed(newGovernance);
+    }
+
+    /// @notice Step 2 of governance transfer (closes RFI26-05).
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert NotPendingGovernance();
+        address previous = governance;
+        governance = pendingGovernance;
+        pendingGovernance = address(0);
+        emit GovernanceAccepted(previous, governance);
     }
 
     function getRequestStatus(uint256 requestId) external view returns (RequestStatus) {
