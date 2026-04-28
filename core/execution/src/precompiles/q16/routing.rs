@@ -1039,6 +1039,48 @@ mod tests {
     }
 
     // ====================================================================
+    // ROUND 9 — In-process determinism sweep (1 GREEN, WP-2.9 sibling)
+    //
+    // The cargo-fuzz target `fuzz_routing_inference` (added in WP-2.9
+    // as `citrate_v0.01.1/fuzz/fuzz_targets/fuzz_routing_inference.rs`)
+    // is the canonical 10M-input fuzzer. This test is its in-process
+    // sibling: a deterministic 50k-iteration sweep that runs every
+    // workspace test invocation. It catches panics on the same input
+    // shapes the fuzzer targets — overflow, dim mismatch, version
+    // edge cases, truncated/oversize buffers.
+    //
+    // 50k iterations vs Belnap's 100k — routing has more decode work
+    // per iteration (large weight tensor parsing on valid headers),
+    // so we cap the count to keep test runtime under ~3s.
+    // ====================================================================
+
+    #[test]
+    fn deterministic_sweep_50k_no_panic() {
+        // Lightweight LCG, deterministic seed (mnemonic ROUTING in
+        // hex-clean approximation: 0xR0_07_1N_6 → 0x_07_F0_07_17).
+        let mut state: u64 = 0x_07_F0_07_17_DE_AD_BE_EF_u64;
+        let next = |s: &mut u64| -> u64 {
+            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s
+        };
+
+        for _ in 0..50_000 {
+            // Choose an input length in [0, 8192]. Most randomly-
+            // generated headers will fail decode (arch_version
+            // mismatch, dim mismatch, length mismatch), exercising
+            // the fast-fail paths. A small fraction will land on
+            // canonical-header bytes by chance and exercise deeper
+            // paths.
+            let len = (next(&mut state) % 8193) as usize;
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                bytes.push((next(&mut state) & 0xFF) as u8);
+            }
+            let _ = forward(&bytes);
+        }
+    }
+
+    // ====================================================================
     // ROUND 6 — Property tests (4 GREEN, mixed coverage)
     // ====================================================================
 
