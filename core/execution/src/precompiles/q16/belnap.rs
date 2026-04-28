@@ -1197,6 +1197,52 @@ mod tests {
         assert_eq!(out.states, vec![BelnapState::True]);
     }
 
+    // ====================================================================
+    // ROUND 5e — Deterministic 100k-iteration sweep (1 GREEN, WP-1.7)
+    //
+    // The cargo-fuzz target `fuzz_belnap_aggregate` is the canonical
+    // 10M-input fuzzer (run as a long-running CI/operator job). This
+    // test is its in-process sibling: a deterministic 100k-iteration
+    // sweep that runs every workspace test invocation. It catches
+    // panics on the same input shapes the fuzzer targets — overflow,
+    // dim mismatch, weight=0 edge cases, threshold-edge confidence,
+    // truncated/oversize inputs.
+    //
+    // The seed is fixed (0xBE_1A_AF) so a regression that lands here
+    // reproduces bit-identically across machines.
+    // ====================================================================
+
+    #[test]
+    fn deterministic_sweep_100k_no_panic() {
+        // Lightweight LCG (deterministic, no external rand crate
+        // dependency at the unit-test level). Period covers far more
+        // than the 100k iterations we run.
+        let mut state: u64 = 0xBE_1A_AF_DE_AD_BE_EF_42;
+        let next = |s: &mut u64| -> u64 {
+            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s
+        };
+
+        for _ in 0..100_000 {
+            // Choose an input length in [0, 4096] — covers truncated
+            // headers, exact valid inputs, and oversize buffers.
+            let len = (next(&mut state) % 4097) as usize;
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                bytes.push((next(&mut state) & 0xFF) as u8);
+            }
+
+            // Surface 1: direct aggregate (decode + validate + algorithm).
+            // Surface 2: dispatcher path is exercised by the cargo-fuzz
+            //            target only — calling it 100k times here would
+            //            slow the unit test suite. The two surfaces
+            //            share the same code paths from `aggregate()`
+            //            inward, so direct calls are sufficient for
+            //            this sweep.
+            let _ = aggregate(&bytes);
+        }
+    }
+
     #[test]
     fn belnap_aggregate_address_byte_layout() {
         // Wire-format invariant: the precompile lives at

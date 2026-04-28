@@ -111,6 +111,13 @@ name = "fuzz_gossip_validation"
 path = "fuzz_targets/fuzz_gossip_validation.rs"
 doc = false
 
+# RM-FL-1 / WP-1.7 — Belnap aggregation precompile (0x0110).
+# Run: `cargo +nightly fuzz run fuzz_belnap_aggregate -- -runs=10000000`
+[[bin]]
+name = "fuzz_belnap_aggregate"
+path = "fuzz_targets/fuzz_belnap_aggregate.rs"
+doc = false
+
 [[bin]]
 name = "fuzz_bridge_oracle"
 path = "fuzz_targets/fuzz_bridge_oracle.rs"
