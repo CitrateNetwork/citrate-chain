@@ -633,6 +633,184 @@ contract MentorMatcherTest is Test {
     }
 }
 
+/// @title MentorMatcherFuzzTest — RM-FL-4 / WP-4.10
+/// @notice Adversarial fuzz against the pure validation helper
+///         extracted at WP-4.8. Forge's built-in fuzzer (256 runs
+///         per test by default) feeds randomized inputs; the tests
+///         assert invariants that hold across the entire input
+///         space, not just hand-picked cases. The helper is the
+///         single source of truth for matcher admissibility, so
+///         pinning its semantics here also pins the on-chain
+///         decision boundary.
+contract MentorMatcherFuzzTest is Test {
+    MentorMatcher internal mm;
+
+    function setUp() public {
+        mm = new MentorMatcher(address(this));
+    }
+
+    /// `mentor == mentee` always returns SELF_MENTOR, regardless of
+    /// the rest of the inputs. The check sits at the top of the
+    /// helper and short-circuits everything else; this fuzz pins
+    /// that ordering.
+    function testFuzz_self_mentor_always_returns_SELF_MENTOR(
+        address who,
+        uint32 mAcc,
+        uint32 eAcc,
+        uint256 load,
+        uint256 cap,
+        uint32 floor,
+        uint32 gap,
+        bool already
+    ) public view {
+        MentorMatcher.PairingValidity v =
+            mm.validatePairing(who, who, mAcc, eAcc);
+        // We can't pass load/cap/floor/gap to the public view, so
+        // exercise via the public path; the contract sources state
+        // for the rest. The helper's first check is the self check,
+        // so any state combination still returns SELF_MENTOR.
+        assertEq(
+            uint256(v),
+            uint256(MentorMatcher.PairingValidity.SELF_MENTOR)
+        );
+        // Touch the unused params so the fuzzer doesn't optimize
+        // them away (keeps the random distribution honest).
+        load; cap; floor; gap; already;
+    }
+
+    /// Determinism: identical inputs → identical output. Two calls
+    /// in the same block, same arguments, must agree.
+    function testFuzz_validatePairing_is_deterministic(
+        address mentor,
+        address mentee,
+        uint32 mAcc,
+        uint32 eAcc
+    ) public view {
+        MentorMatcher.PairingValidity a =
+            mm.validatePairing(mentor, mentee, mAcc, eAcc);
+        MentorMatcher.PairingValidity b =
+            mm.validatePairing(mentor, mentee, mAcc, eAcc);
+        assertEq(uint256(a), uint256(b));
+    }
+
+    /// Trust-floor monotonicity: if a (non-self) pair fails on
+    /// trust floor at floor=F1, raising the floor to F2 > F1 cannot
+    /// make it pass. Practical guard against governance accidents.
+    function testFuzz_raising_trust_floor_only_makes_things_stricter(
+        address mentor,
+        address mentee,
+        uint32 mAcc,
+        uint32 eAcc,
+        uint32 floor1,
+        uint32 floor2
+    ) public {
+        vm.assume(mentor != mentee);
+        vm.assume(mentor != address(0) && mentee != address(0));
+        vm.assume(floor1 <= 65536 && floor2 <= 65536);
+        vm.assume(floor2 > floor1);
+
+        mm.setTrustFloor(floor1);
+        MentorMatcher.PairingValidity v1 =
+            mm.validatePairing(mentor, mentee, mAcc, eAcc);
+
+        mm.setTrustFloor(floor2);
+        MentorMatcher.PairingValidity v2 =
+            mm.validatePairing(mentor, mentee, mAcc, eAcc);
+
+        // If v1 was MENTOR_BELOW_TRUST_FLOOR, v2 must still be that
+        // (or remain a non-OK code; raising the floor never opens
+        // new admissions).
+        if (
+            v1 == MentorMatcher.PairingValidity.MENTOR_BELOW_TRUST_FLOOR
+        ) {
+            assertEq(
+                uint256(v2),
+                uint256(MentorMatcher.PairingValidity.MENTOR_BELOW_TRUST_FLOOR)
+            );
+        }
+        // If v1 was OK, raising the floor can either keep OK (mAcc
+        // still clears the new floor) or flip to BELOW_FLOOR — but
+        // never to any other code (we didn't touch load/cap/gap).
+        if (v1 == MentorMatcher.PairingValidity.OK) {
+            assertTrue(
+                v2 == MentorMatcher.PairingValidity.OK
+                    || v2 == MentorMatcher.PairingValidity
+                        .MENTOR_BELOW_TRUST_FLOOR
+            );
+        }
+    }
+
+    /// Capacity overrun: setting load == cap and otherwise-valid
+    /// inputs always returns MENTOR_AT_CAPACITY. Crafted profile
+    /// distribution: every mentor is saturated.
+    function testFuzz_at_capacity_always_returns_AT_CAPACITY(
+        address mentor,
+        address mentee,
+        uint32 mAcc
+    ) public {
+        vm.assume(mentor != mentee);
+        vm.assume(mentor != address(0) && mentee != address(0));
+
+        // Saturate the mentor at the current cap by repeated
+        // assignment. Easier: directly set cap to 0 — equivalent
+        // semantically (load >= cap), and avoids needing to mint
+        // mentees.
+        mm.setMentorCap(0);
+
+        // Pin gap and floor to permissive values so other checks
+        // pass; only the capacity gate should fire.
+        mm.setTrustFloor(0);
+        mm.setMinAccuracyGap(0);
+
+        // mAcc must clear the gap check vs. some menteeAcc; pick
+        // menteeAcc < mAcc trivially.
+        uint32 eAcc = mAcc > 0 ? mAcc - 1 : 0;
+
+        MentorMatcher.PairingValidity v =
+            mm.validatePairing(mentor, mentee, mAcc, eAcc);
+
+        // If mAcc <= eAcc + gap (gap=0, so mAcc <= eAcc), helper
+        // returns ACCURACY_GAP_TOO_SMALL first (the helper's order
+        // is: self → floor → gap → cap → already-assigned). With
+        // mAcc > 0 and eAcc = mAcc - 1, the gap check passes
+        // (mAcc > eAcc + 0), then cap fires.
+        if (mAcc > 0) {
+            assertEq(
+                uint256(v),
+                uint256(MentorMatcher.PairingValidity.MENTOR_AT_CAPACITY)
+            );
+        } else {
+            // mAcc == 0 → eAcc == 0; gap check fires before cap.
+            assertEq(
+                uint256(v),
+                uint256(MentorMatcher.PairingValidity.ACCURACY_GAP_TOO_SMALL)
+            );
+        }
+    }
+
+    /// OK requires strict mentor advantage: if mentorAcc <=
+    /// menteeAcc, the helper cannot return OK (the gap check fails
+    /// because gap >= 0). The matcher is INTENTIONALLY asymmetric —
+    /// (mentor, mentee) is ordered, not commutative — so the right
+    /// invariant is "the weaker side cannot be the mentor", not
+    /// "swapping is forbidden".
+    function testFuzz_OK_requires_strict_mentor_advantage(
+        address mentor,
+        address mentee,
+        uint32 mAcc,
+        uint32 eAcc
+    ) public view {
+        vm.assume(mentor != mentee);
+        vm.assume(mentor != address(0) && mentee != address(0));
+        vm.assume(mAcc <= 65536 && eAcc <= 65536);
+        vm.assume(mAcc <= eAcc);
+
+        MentorMatcher.PairingValidity v =
+            mm.validatePairing(mentor, mentee, mAcc, eAcc);
+        assertTrue(v != MentorMatcher.PairingValidity.OK);
+    }
+}
+
 /// Minimal in-memory ContributionAccounting stub for WP-4.9 tests.
 /// Implements only `getDimensionScore` — the slice the matcher
 /// actually consumes. NOT a production type; lives in this test
