@@ -77,12 +77,31 @@ contract ContributionAccounting is Governable {
     /// Protocol contracts authorised to call recordContribution
     mapping(address => bool) public isRecorder;
 
+    /// Per-(contributor, dimension) running total. Used by the
+    /// MentorMatcher (RM-FL-4) to look up dimension-specific
+    /// expertise without iterating per-cycle records. Lazy in
+    /// the read sense: the matcher pays O(1) per dimension query;
+    /// the contract maintains the running total at write time.
+    /// Backwards-compatible — existing per-(addr, ContributionType)
+    /// flat scores remain unchanged. WP-4.6.
+    mapping(address => mapping(bytes32 => uint256)) public dimensionContributions;
+
     // ── Events ──────────────────────────────────────────────────────
 
     event ContributionRecorded(
         address indexed contributor,
         ContributionType ctype,
         uint256 amount
+    );
+
+    /// Emitted when a per-dimension contribution is recorded
+    /// (RM-FL-4 / WP-4.6). Indexed on contributor + dimension so
+    /// the matcher's daemon-side cache can subscribe efficiently.
+    event DimensionContributionRecorded(
+        address indexed contributor,
+        bytes32 indexed dimension,
+        uint256 amount,
+        uint256 newTotal
     );
 
     event RewardsDistributed(
@@ -208,6 +227,51 @@ contract ContributionAccounting is Governable {
         require(ok, "Transfer failed");
 
         emit RewardClaimed(msg.sender, amount);
+    }
+
+    // ── Dimension scoring (RM-FL-4 / WP-4.6) ────────────────────────
+
+    /// @notice Record a per-dimension contribution. Used by the
+    ///         MentorMatcher (and any per-cycle observer) to update
+    ///         per-(contributor, dimension) running totals. Lazy in
+    ///         the read sense: the matcher's `getDimensionScore` view
+    ///         is O(1) regardless of how many cycles the contributor
+    ///         has participated in.
+    /// @param contributor Address that performed the contribution
+    /// @param dimension   Application-defined dimension key (e.g. keccak256("finance"))
+    /// @param amount      Per-cycle contribution amount in this dimension
+    function recordDimensionContribution(
+        address contributor,
+        bytes32 dimension,
+        uint256 amount
+    ) external {
+        require(
+            isRecorder[msg.sender] || msg.sender == governance(),
+            "Not authorized"
+        );
+        require(amount > 0, "Zero amount");
+        require(dimension != bytes32(0), "Zero dimension");
+
+        dimensionContributions[contributor][dimension] += amount;
+        uint256 newTotal = dimensionContributions[contributor][dimension];
+
+        emit DimensionContributionRecorded(
+            contributor,
+            dimension,
+            amount,
+            newTotal
+        );
+    }
+
+    /// @notice Read a contributor's per-dimension running total. The
+    ///         matcher uses this to compute mentor accuracy on the
+    ///         specific dimension a mentee needs help with. Returns 0
+    ///         for unrecorded (contributor, dimension) pairs.
+    function getDimensionScore(
+        address contributor,
+        bytes32 dimension
+    ) external view returns (uint256) {
+        return dimensionContributions[contributor][dimension];
     }
 
     // ── View Functions ──────────────────────────────────────────────
