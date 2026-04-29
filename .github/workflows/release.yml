@@ -114,6 +114,27 @@ jobs:
           rm -rf "citrate-developer-${OS}-${ARCH}"
           echo "Created dist/citrate-developer-${OS}-${ARCH}.tar.gz"
 
+          if [[ "$OS" == "linux" ]]; then
+            # Rename wallet → citrate-wallet so the .deb installs
+            # /usr/bin/citrate-wallet (matches the tarball naming).
+            cp target/release/wallet target/release/citrate-wallet
+            ../scripts/release/build_deb.sh \
+              --binary target/release/citrate \
+              --binary target/release/citrate-cli \
+              --binary target/release/citrate-wallet \
+              --binary target/release/citrate-faucet \
+              --package citrate-developer \
+              --version "${RELEASE_TAG}" \
+              --arch "${ARCH}" \
+              --output-dir dist \
+              --description "Citrate node, CLI, wallet, and faucet — full developer bundle" \
+              --doc ../LICENSE \
+              --doc README.md \
+              --doc CHANGELOG.md \
+              --doc ../RELEASE_PACKAGE_MATRIX.md \
+              --doc ../PRECOMPILE_DEVELOPER_CHEATSHEET.md
+          fi
+
       - name: Package developer bundle (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

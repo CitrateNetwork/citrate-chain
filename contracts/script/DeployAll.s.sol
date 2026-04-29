@@ -40,6 +40,7 @@ import "../src/TreasuryGovernor.sol";
 import "../src/LearningPool.sol";
 import "../src/LearningCycleManager.sol";
 import "../src/ClassroomRegistry.sol";
+import "../src/MentorMatcher.sol";
 
 // Agent
 import "../src/AgentDecisionRegistry.sol";
@@ -47,8 +48,17 @@ import "../src/SpecRegistry.sol";
 
 /**
  * @title DeployAll
- * @notice Deploys all 31 Citrate production contracts in dependency order.
+ * @notice Deploys the core Citrate production contracts in dependency order.
  *         Run: forge script script/DeployAll.s.sol --rpc-url http://localhost:8545 --broadcast -vvvv
+ *
+ *         This is one of six ceremony steps. The full reroll runs:
+ *           1. DeployAll.s.sol                  (this script — 28 contracts)
+ *           2. DeployModelAccessControl.s.sol   (1 contract — separated due to OZ deps)
+ *           3. DeployTEEAttestationRegistry.s.sol (1 contract — CM-08)
+ *           4. DeployComputePoolTraining.s.sol  (1 contract — CM-07)
+ *           5. DeployEduStack.s.sol             (5 contracts — Learning Center)
+ *           6. DeployAIGateway.s.sol            (3 contracts — edu/ai-gateway)
+ *         Total: 39 contracts. See scripts/regenesis.sh for the orchestration.
  */
 contract DeployAll is ScriptEnv {
     function run() external {
@@ -149,6 +159,15 @@ contract DeployAll is ScriptEnv {
         ClassroomRegistry classroom = new ClassroomRegistry();
         console.log("  ClassroomRegistry:", address(classroom));
 
+        // RM-FL-4: MentorMatcher pairs mentors↔mentees from the
+        // federated learning cohort. Wires to ContributionAccounting
+        // for lazy per-(addr, dim) score reads — the matcher does not
+        // mirror that state; it staticcalls it on demand. Governance
+        // is the deployer for testnet; mainnet should use the multisig.
+        MentorMatcher mentorMatcher = new MentorMatcher(deployer);
+        mentorMatcher.setContributionAccounting(address(contributions));
+        console.log("  MentorMatcher:", address(mentorMatcher));
+
         // =====================================================================
         // Layer 5: Compute Marketplace
         // =====================================================================
@@ -224,7 +243,7 @@ contract DeployAll is ScriptEnv {
         console.log("");
         console.log("=== DEPLOYMENT COMPLETE ===");
         console.log("Chain ID:", block.chainid);
-        console.log("Total contracts deployed: 27");
+        console.log("Total contracts deployed: 28");
         console.log("");
         console.log("--- Contract Addresses ---");
         console.log("ModelRegistry         :", address(registry));
@@ -245,6 +264,7 @@ contract DeployAll is ScriptEnv {
         console.log("LearningPool          :", address(learningPool));
         console.log("LearningCycleManager  :", address(cycleManager));
         console.log("ClassroomRegistry     :", address(classroom));
+        console.log("MentorMatcher         :", address(mentorMatcher));
         console.log("ComputeMarketplace    :", address(computeMarketplace));
         console.log("ComputeVerifier       :", address(verifier));
         console.log("ComputePool           :", address(computePool));
