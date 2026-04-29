@@ -36,8 +36,10 @@
 
 #![allow(dead_code)]
 
+pub mod belnap;
 pub mod exp;
 pub mod ops;
+pub mod routing;
 
 pub use exp::q16_exp;
 

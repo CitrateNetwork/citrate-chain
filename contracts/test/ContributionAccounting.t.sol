@@ -440,4 +440,86 @@ contract ContributionAccountingTest is Test {
         _record(alice, ContributionAccounting.ContributionType.ModelHosting, 1);
         assertEq(accounting.contributorCount(), 2);
     }
+
+    // ── Per-dimension scoring (RM-FL-4 / WP-4.6) ────────────────────
+
+    bytes32 internal constant DIM_FINANCE = keccak256("finance");
+    bytes32 internal constant DIM_TECH = keccak256("tech");
+
+    function _recordDim(
+        address contributor,
+        bytes32 dimension,
+        uint256 amount
+    ) internal {
+        vm.prank(recorder);
+        accounting.recordDimensionContribution(contributor, dimension, amount);
+    }
+
+    function test_dimension_score_zero_for_unrecorded() public view {
+        // No record yet — should return 0 in O(1).
+        assertEq(accounting.getDimensionScore(alice, DIM_FINANCE), 0);
+        assertEq(accounting.getDimensionScore(alice, DIM_TECH), 0);
+    }
+
+    function test_dimension_score_accumulates() public {
+        _recordDim(alice, DIM_FINANCE, 5);
+        _recordDim(alice, DIM_FINANCE, 7);
+        _recordDim(alice, DIM_TECH, 2);
+
+        assertEq(accounting.getDimensionScore(alice, DIM_FINANCE), 12);
+        assertEq(accounting.getDimensionScore(alice, DIM_TECH), 2);
+        // Different contributor untouched.
+        assertEq(accounting.getDimensionScore(bob, DIM_FINANCE), 0);
+    }
+
+    function test_dimension_score_emits_event() public {
+        vm.expectEmit(true, true, false, true);
+        emit ContributionAccounting.DimensionContributionRecorded(
+            alice,
+            DIM_FINANCE,
+            5,
+            5
+        );
+        _recordDim(alice, DIM_FINANCE, 5);
+
+        // Second record: amount 3, newTotal 8.
+        vm.expectEmit(true, true, false, true);
+        emit ContributionAccounting.DimensionContributionRecorded(
+            alice,
+            DIM_FINANCE,
+            3,
+            8
+        );
+        _recordDim(alice, DIM_FINANCE, 3);
+    }
+
+    function test_dimension_record_unauthorized_reverts() public {
+        vm.prank(outsider);
+        vm.expectRevert("Not authorized");
+        accounting.recordDimensionContribution(alice, DIM_FINANCE, 5);
+    }
+
+    function test_dimension_record_zero_amount_reverts() public {
+        vm.prank(recorder);
+        vm.expectRevert("Zero amount");
+        accounting.recordDimensionContribution(alice, DIM_FINANCE, 0);
+    }
+
+    function test_dimension_record_zero_dimension_reverts() public {
+        vm.prank(recorder);
+        vm.expectRevert("Zero dimension");
+        accounting.recordDimensionContribution(alice, bytes32(0), 5);
+    }
+
+    function test_dimension_score_independent_of_legacy_score() public {
+        // Legacy ContributionType score and per-dim score live in
+        // separate storage; updating one does not affect the other.
+        _record(alice, ContributionAccounting.ContributionType.Validation, 10);
+        uint256 legacyBefore = accounting.scores(alice);
+
+        _recordDim(alice, DIM_FINANCE, 100);
+
+        assertEq(accounting.scores(alice), legacyBefore, "legacy score unchanged");
+        assertEq(accounting.getDimensionScore(alice, DIM_FINANCE), 100);
+    }
 }
