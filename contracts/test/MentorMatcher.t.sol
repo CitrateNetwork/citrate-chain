@@ -435,4 +435,219 @@ contract MentorMatcherTest is Test {
         );
         mm.assignMentees(mentorC, single, q16(85), acc, DIM_FINANCE);
     }
+
+    // ====================================================================
+    // WP-4.9 — Lazy mentee profile (sourced from ContributionAccounting)
+    //
+    // The matcher does NOT mirror per-(addr, dim) scores in its own
+    // storage; it staticcalls a wired ContributionAccounting source
+    // on demand. Tests use a minimal in-memory stub that implements
+    // `getDimensionScore` so we exercise the cross-contract path
+    // without booting the real ContributionAccounting (which has its
+    // own much larger test surface).
+    // ====================================================================
+
+    function _setCAFromGov(address ca) internal {
+        // gov is `address(this)` per setUp().
+        mm.setContributionAccounting(ca);
+    }
+
+    function _makeStubCA(
+        address[] memory addrs,
+        bytes32[] memory dims,
+        uint256[] memory scores
+    ) internal returns (StubContributionAccounting) {
+        StubContributionAccounting stub = new StubContributionAccounting();
+        require(
+            addrs.length == dims.length
+                && dims.length == scores.length,
+            "stub: length mismatch"
+        );
+        for (uint256 i = 0; i < addrs.length; i++) {
+            stub.set(addrs[i], dims[i], scores[i]);
+        }
+        return stub;
+    }
+
+    function test_lazy_setContributionAccounting_authz_and_event() public {
+        // Non-governance cannot set.
+        vm.prank(address(0xBAD));
+        vm.expectRevert(MentorMatcher.NotGovernance.selector);
+        mm.setContributionAccounting(address(0xC0FFEE));
+
+        // Governance can; event fires; storage updates.
+        vm.expectEmit(false, false, false, true, address(mm));
+        emit MentorMatcher.ContributionAccountingSet(
+            address(0),
+            address(0xC0FFEE)
+        );
+        mm.setContributionAccounting(address(0xC0FFEE));
+        assertEq(mm.contributionAccounting(), address(0xC0FFEE));
+    }
+
+    function test_lazy_getMenteeProfile_reverts_if_CA_unset() public {
+        bytes32[] memory dims = new bytes32[](1);
+        dims[0] = DIM_FINANCE;
+        vm.expectRevert(
+            MentorMatcher.ContributionAccountingNotSet.selector
+        );
+        mm.getMenteeProfile(menteeB, dims, 0, 1);
+    }
+
+    function test_lazy_getMenteeProfile_returns_window_from_CA() public {
+        // Stub CA with menteeB scoring 100, 250, 30 across three dims.
+        address[] memory addrs = new address[](3);
+        bytes32[] memory dims = new bytes32[](3);
+        uint256[] memory scores = new uint256[](3);
+        addrs[0] = menteeB; dims[0] = DIM_FINANCE; scores[0] = 100;
+        addrs[1] = menteeB; dims[1] = DIM_TECH;    scores[1] = 250;
+        addrs[2] = menteeB; dims[2] = keccak256("ops"); scores[2] = 30;
+        StubContributionAccounting ca = _makeStubCA(addrs, dims, scores);
+        _setCAFromGov(address(ca));
+
+        bytes32[] memory window = new bytes32[](3);
+        window[0] = DIM_FINANCE;
+        window[1] = DIM_TECH;
+        window[2] = keccak256("ops");
+
+        // Full window.
+        uint256[] memory profile = mm.getMenteeProfile(menteeB, window, 0, 3);
+        assertEq(profile.length, 3);
+        assertEq(profile[0], 100);
+        assertEq(profile[1], 250);
+        assertEq(profile[2], 30);
+
+        // Partial window [1,3): 250, 30.
+        uint256[] memory tail = mm.getMenteeProfile(menteeB, window, 1, 3);
+        assertEq(tail.length, 2);
+        assertEq(tail[0], 250);
+        assertEq(tail[1], 30);
+    }
+
+    function test_lazy_getMenteeProfile_empty_or_oob_reverts() public {
+        StubContributionAccounting ca = new StubContributionAccounting();
+        _setCAFromGov(address(ca));
+
+        bytes32[] memory window = new bytes32[](2);
+        window[0] = DIM_FINANCE;
+        window[1] = DIM_TECH;
+
+        // Empty window.
+        vm.expectRevert(MentorMatcher.EmptyDimensionWindow.selector);
+        mm.getMenteeProfile(menteeB, window, 1, 1);
+
+        // Out-of-bounds window.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                MentorMatcher.PaginationOutOfRange.selector,
+                uint256(0), uint256(3), uint256(2)
+            )
+        );
+        mm.getMenteeProfile(menteeB, window, 0, 3);
+    }
+
+    function test_lazy_selectBestDimension_picks_largest_gap() public {
+        // mentorA stronger than menteeB across 3 dims with gaps
+        // (finance: 800-100=700), (tech: 400-250=150), (ops: 90-30=60).
+        // Best dim = finance.
+        StubContributionAccounting ca = new StubContributionAccounting();
+        ca.set(mentorA, DIM_FINANCE, 800);
+        ca.set(mentorA, DIM_TECH, 400);
+        ca.set(mentorA, keccak256("ops"), 90);
+        ca.set(menteeB, DIM_FINANCE, 100);
+        ca.set(menteeB, DIM_TECH, 250);
+        ca.set(menteeB, keccak256("ops"), 30);
+        _setCAFromGov(address(ca));
+
+        bytes32[] memory window = new bytes32[](3);
+        window[0] = DIM_FINANCE;
+        window[1] = DIM_TECH;
+        window[2] = keccak256("ops");
+
+        (
+            bytes32 bestDim,
+            uint256 mScore,
+            uint256 eScore,
+            uint256 idx
+        ) = mm.selectBestDimension(mentorA, menteeB, window, 0, 3);
+        assertEq(bestDim, DIM_FINANCE);
+        assertEq(mScore, 800);
+        assertEq(eScore, 100);
+        assertEq(idx, 0);
+    }
+
+    function test_lazy_selectBestDimension_negative_gap_treated_as_zero()
+        public
+    {
+        // mentor LOSES to mentee on every dim: gaps clamp to 0.
+        // The function still returns the first dim (deterministic
+        // tie-break to lowest index when all gaps are zero).
+        StubContributionAccounting ca = new StubContributionAccounting();
+        ca.set(mentorA, DIM_FINANCE, 10);
+        ca.set(mentorA, DIM_TECH, 20);
+        ca.set(menteeB, DIM_FINANCE, 100);
+        ca.set(menteeB, DIM_TECH, 200);
+        _setCAFromGov(address(ca));
+
+        bytes32[] memory window = new bytes32[](2);
+        window[0] = DIM_FINANCE;
+        window[1] = DIM_TECH;
+
+        (bytes32 bestDim, uint256 mScore, uint256 eScore, uint256 idx) =
+            mm.selectBestDimension(mentorA, menteeB, window, 0, 2);
+        // Tie at gap=0: lowest index wins.
+        assertEq(bestDim, DIM_FINANCE);
+        assertEq(mScore, 10);
+        assertEq(eScore, 100);
+        assertEq(idx, 0);
+    }
+
+    function test_lazy_selectBestDimension_reverts_if_CA_unset() public {
+        bytes32[] memory window = new bytes32[](1);
+        window[0] = DIM_FINANCE;
+        vm.expectRevert(
+            MentorMatcher.ContributionAccountingNotSet.selector
+        );
+        mm.selectBestDimension(mentorA, menteeB, window, 0, 1);
+    }
+
+    function test_lazy_no_per_cycle_storage_writes() public {
+        // The matcher's lazy views must not mutate matcher state.
+        // Snapshot mentorLoad + pairings.length before & after a
+        // sequence of profile reads and assert no change.
+        StubContributionAccounting ca = new StubContributionAccounting();
+        ca.set(mentorA, DIM_FINANCE, 800);
+        ca.set(menteeB, DIM_FINANCE, 100);
+        _setCAFromGov(address(ca));
+
+        uint256 loadBefore = mm.mentorLoad(mentorA);
+        uint256 countBefore = mm.pairingCount();
+
+        bytes32[] memory window = new bytes32[](1);
+        window[0] = DIM_FINANCE;
+        mm.getMenteeProfile(menteeB, window, 0, 1);
+        mm.selectBestDimension(mentorA, menteeB, window, 0, 1);
+
+        assertEq(mm.mentorLoad(mentorA), loadBefore);
+        assertEq(mm.pairingCount(), countBefore);
+    }
+}
+
+/// Minimal in-memory ContributionAccounting stub for WP-4.9 tests.
+/// Implements only `getDimensionScore` — the slice the matcher
+/// actually consumes. NOT a production type; lives in this test
+/// file only.
+contract StubContributionAccounting {
+    mapping(address => mapping(bytes32 => uint256)) internal _score;
+
+    function set(address who, bytes32 dim, uint256 v) external {
+        _score[who][dim] = v;
+    }
+
+    function getDimensionScore(
+        address contributor,
+        bytes32 dimension
+    ) external view returns (uint256) {
+        return _score[contributor][dimension];
+    }
 }
