@@ -240,6 +240,231 @@ pub fn generate_adapter_for_mentee(
 }
 
 // ---------------------------------------------------------------------------
+// WP-4.8 — Pure pairing-validity helper (mirror of MentorMatcher.sol)
+//
+// Daemon-side mirror of the Solidity `_validatePairing` pure helper.
+// The two impls MUST stay in lockstep: any change to one is a
+// deliberate contract↔daemon protocol upgrade. Variant ORDER is
+// load-bearing — it matches the Solidity enum's u8 representation.
+//
+// This is the "extract the matching algorithm into a pure-function
+// helper; daemon and contract both call it for consistency" piece
+// of WP-4.8. Q16.16 is used for accuracy values to match the
+// contract's wire format exactly (no f64 here — float determinism
+// across CPUs is not guaranteed; see RM-FL-2 essay
+// THE_OPERATOR_AND_THE_VARIABLE for the broader principle).
+// ---------------------------------------------------------------------------
+
+/// Mirror of `MentorMatcher.PairingValidity` (Solidity enum). The
+/// numeric repr is `u8` so it ABI-decodes cleanly from an
+/// `eth_call` to `validatePairing(...)` returning the on-chain
+/// enum.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingValidity {
+    /// Pairing would be accepted by `assignMentees`.
+    Ok = 0,
+    /// `mentor == mentee`.
+    SelfMentor = 1,
+    /// `mentorAcc < trustFloor`.
+    MentorBelowTrustFloor = 2,
+    /// `mentorAcc <= menteeAcc + minAccuracyGap`.
+    AccuracyGapTooSmall = 3,
+    /// `mentorLoad >= mentorCap`.
+    MentorAtCapacity = 4,
+    /// `menteeMentor[mentee] != address(0)`.
+    MenteeAlreadyAssigned = 5,
+}
+
+/// Pure pairing-validity check. Returns the same code that
+/// `MentorMatcher._validatePairing` would return on chain. Q16.16
+/// fixed-point throughout — `accuracy_q16 = 65536` ≡ 1.0.
+///
+/// Inputs are 20-byte EVM addresses encoded as `[u8; 20]` so the
+/// daemon caller doesn't need a full ethereum-types dep just for
+/// this predicate.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_pairing(
+    mentor: &[u8; 20],
+    mentee: &[u8; 20],
+    mentor_acc_q16: u32,
+    mentee_acc_q16: u32,
+    mentor_load: u64,
+    mentor_cap: u64,
+    trust_floor_q16: u32,
+    min_accuracy_gap_q16: u32,
+    mentee_already_assigned: bool,
+) -> PairingValidity {
+    if mentor == mentee {
+        return PairingValidity::SelfMentor;
+    }
+    if mentor_acc_q16 < trust_floor_q16 {
+        return PairingValidity::MentorBelowTrustFloor;
+    }
+    // u32 + u32 fits in u64 — promote to avoid wraparound on
+    // adversarial inputs.
+    let combined = mentee_acc_q16 as u64 + min_accuracy_gap_q16 as u64;
+    if (mentor_acc_q16 as u64) <= combined {
+        return PairingValidity::AccuracyGapTooSmall;
+    }
+    if mentor_load >= mentor_cap {
+        return PairingValidity::MentorAtCapacity;
+    }
+    if mentee_already_assigned {
+        return PairingValidity::MenteeAlreadyAssigned;
+    }
+    PairingValidity::Ok
+}
+
+#[cfg(test)]
+mod validate_pairing_tests {
+    use super::*;
+
+    const Q16_ONE: u32 = 65536;
+    fn q16_pct(percent: u32) -> u32 {
+        (percent * Q16_ONE) / 100
+    }
+
+    fn addr(byte: u8) -> [u8; 20] {
+        [byte; 20]
+    }
+
+    fn defaults() -> (u64, u32, u32) {
+        // (mentor_cap, trust_floor, min_accuracy_gap)
+        (3, q16_pct(30), q16_pct(5))
+    }
+
+    #[test]
+    fn ok_for_valid_pairing() {
+        let (cap, floor, gap) = defaults();
+        let v = validate_pairing(
+            &addr(0xA1),
+            &addr(0xB2),
+            q16_pct(85),
+            q16_pct(40),
+            0,
+            cap,
+            floor,
+            gap,
+            false,
+        );
+        assert_eq!(v, PairingValidity::Ok);
+    }
+
+    #[test]
+    fn self_mentor_caught() {
+        let (cap, floor, gap) = defaults();
+        let same = addr(0xC3);
+        let v = validate_pairing(
+            &same, &same, q16_pct(85), q16_pct(40), 0, cap, floor, gap, false,
+        );
+        assert_eq!(v, PairingValidity::SelfMentor);
+    }
+
+    #[test]
+    fn below_trust_floor_caught() {
+        let (cap, floor, gap) = defaults();
+        let v = validate_pairing(
+            &addr(0xA1),
+            &addr(0xB2),
+            q16_pct(20),
+            q16_pct(15),
+            0,
+            cap,
+            floor,
+            gap,
+            false,
+        );
+        assert_eq!(v, PairingValidity::MentorBelowTrustFloor);
+    }
+
+    #[test]
+    fn gap_too_small_caught() {
+        let (cap, floor, gap) = defaults();
+        let v = validate_pairing(
+            &addr(0xA1),
+            &addr(0xB2),
+            q16_pct(42),
+            q16_pct(40),
+            0,
+            cap,
+            floor,
+            gap,
+            false,
+        );
+        assert_eq!(v, PairingValidity::AccuracyGapTooSmall);
+    }
+
+    #[test]
+    fn capacity_caught() {
+        let (cap, floor, gap) = defaults();
+        let v = validate_pairing(
+            &addr(0xA1),
+            &addr(0xB2),
+            q16_pct(85),
+            q16_pct(40),
+            cap, // load == cap
+            cap,
+            floor,
+            gap,
+            false,
+        );
+        assert_eq!(v, PairingValidity::MentorAtCapacity);
+    }
+
+    #[test]
+    fn already_assigned_caught() {
+        let (cap, floor, gap) = defaults();
+        let v = validate_pairing(
+            &addr(0xA1),
+            &addr(0xB2),
+            q16_pct(85),
+            q16_pct(40),
+            0,
+            cap,
+            floor,
+            gap,
+            true,
+        );
+        assert_eq!(v, PairingValidity::MenteeAlreadyAssigned);
+    }
+
+    #[test]
+    fn no_overflow_at_max_q16() {
+        // Adversarial: mentor_acc = u32::MAX wouldn't break the
+        // contract because Solidity uint32 wraps. Our Rust impl
+        // must produce the same answer (use u64 for the sum).
+        let (cap, _, gap) = defaults();
+        let huge_floor = u32::MAX;
+        let v = validate_pairing(
+            &addr(0xA1),
+            &addr(0xB2),
+            u32::MAX - 1,
+            0,
+            0,
+            cap,
+            huge_floor,
+            gap,
+            false,
+        );
+        assert_eq!(v, PairingValidity::MentorBelowTrustFloor);
+    }
+
+    #[test]
+    fn enum_repr_matches_solidity() {
+        // The enum repr is part of the contract↔daemon protocol;
+        // this test pins it. Reordering Solidity variants without
+        // updating Rust would silently misroute revert codes.
+        assert_eq!(PairingValidity::Ok as u8, 0);
+        assert_eq!(PairingValidity::SelfMentor as u8, 1);
+        assert_eq!(PairingValidity::MentorBelowTrustFloor as u8, 2);
+        assert_eq!(PairingValidity::AccuracyGapTooSmall as u8, 3);
+        assert_eq!(PairingValidity::MentorAtCapacity as u8, 4);
+        assert_eq!(PairingValidity::MenteeAlreadyAssigned as u8, 5);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

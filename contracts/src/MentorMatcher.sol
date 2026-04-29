@@ -27,6 +27,22 @@ contract MentorMatcher {
     /// Q16.16 fixed-point representation of 1.0.
     uint32 internal constant Q16_ONE = 65536;
 
+    /// Validity codes returned by `validatePairing` (WP-4.8). The
+    /// enum is the contract↔daemon contract: an off-chain matcher
+    /// can call `validatePairing` via `eth_call` to ask "would this
+    /// pairing be accepted?" without submitting a tx, and parse the
+    /// answer the same way the daemon does. Adding a new variant
+    /// is a contract upgrade (the daemon must learn the new code);
+    /// reordering existing variants is FORBIDDEN.
+    enum PairingValidity {
+        OK,
+        SELF_MENTOR,
+        MENTOR_BELOW_TRUST_FLOOR,
+        ACCURACY_GAP_TOO_SMALL,
+        MENTOR_AT_CAPACITY,
+        MENTEE_ALREADY_ASSIGNED
+    }
+
     /// Pairing record. `mentorAccAtPair` is the mentor's accuracy
     /// (Q16.16, 0..Q16_ONE) at the moment the pairing was
     /// committed. It is NOT updated when the mentor's overall
@@ -150,6 +166,77 @@ contract MentorMatcher {
     // Governance — mutate cap, trust floor, accuracy gap
     // ============================================================
 
+    // ============================================================
+    // Pure helper — pairing validity (WP-4.8)
+    //
+    // The matching algorithm is the same logic on chain and off
+    // chain. Extracting it into a pure function gives the daemon
+    // a way to call `eth_call validatePairing(...)` and get the
+    // exact same answer as the contract's internal write path
+    // would. This eliminates a class of "the daemon thought it
+    // was a valid pairing but the contract rejected it" desync
+    // bugs without a round-trip to chain.
+    //
+    // Pure: no state reads, no events, no side effects. The
+    // function takes the entire context as arguments — the
+    // caller (whether the contract or the daemon) is responsible
+    // for sourcing those values.
+    // ============================================================
+
+    /// Internal pure variant — returns the validity code.
+    function _validatePairing(
+        address mentor,
+        address mentee,
+        uint32 mentorAcc,
+        uint32 menteeAcc,
+        uint256 mentorLoad_,
+        uint256 mentorCap_,
+        uint32 trustFloor_,
+        uint32 minAccuracyGap_,
+        bool menteeAlreadyAssigned
+    ) internal pure returns (PairingValidity) {
+        if (mentor == mentee) return PairingValidity.SELF_MENTOR;
+        if (mentorAcc < trustFloor_) {
+            return PairingValidity.MENTOR_BELOW_TRUST_FLOOR;
+        }
+        if (mentorAcc <= menteeAcc + minAccuracyGap_) {
+            return PairingValidity.ACCURACY_GAP_TOO_SMALL;
+        }
+        if (mentorLoad_ >= mentorCap_) {
+            return PairingValidity.MENTOR_AT_CAPACITY;
+        }
+        if (menteeAlreadyAssigned) {
+            return PairingValidity.MENTEE_ALREADY_ASSIGNED;
+        }
+        return PairingValidity.OK;
+    }
+
+    /// Public read-only preview. The off-chain daemon calls this
+    /// via `eth_call` to ask "would this pairing be accepted right
+    /// now?" — the contract sources `mentorLoad`, the cap, the
+    /// trust floor, the gap, and the mentee's existing assignment
+    /// from its own state, so the daemon does not need to mirror
+    /// every storage variable.
+    function validatePairing(
+        address mentor,
+        address mentee,
+        uint32 mentorAcc,
+        uint32 menteeAcc
+    ) external view returns (PairingValidity) {
+        return
+            _validatePairing(
+                mentor,
+                mentee,
+                mentorAcc,
+                menteeAcc,
+                mentorLoad[mentor],
+                mentorCap,
+                trustFloor,
+                minAccuracyGap,
+                menteeMentor[mentee] != address(0)
+            );
+    }
+
     /// Set the per-mentor cap. Existing pairings above the new cap
     /// are NOT unwound; only future `assignMentees` calls see the
     /// new bound. This mirrors the chain-canonical principle: state
@@ -209,35 +296,39 @@ contract MentorMatcher {
             mentees.length == menteeAccs.length,
             "MentorMatcher: length mismatch"
         );
-        // Trust floor first — this catches sybil mentors regardless
-        // of their relative gap claims.
-        if (mentorAcc < trustFloor) {
-            revert MentorBelowTrustFloor(mentor, mentorAcc);
-        }
         // Bounded by `mentees.length` (caller-supplied; tripwire
         // permits this — caller controls the bound, gas pays for
-        // the iteration).
+        // the iteration). Each mentee runs through the same pure
+        // helper that the daemon uses — see WP-4.8.
         for (uint256 i = 0; i < mentees.length; i++) {
             address mentee = mentees[i];
             uint32 menteeAcc = menteeAccs[i];
-
-            if (mentor == mentee) revert SelfMentor(mentor);
-
-            // Capacity check — must not exceed mentorCap.
-            if (mentorLoad[mentor] >= mentorCap) {
-                revert MentorAtCapacity(mentor);
-            }
-
-            // Accuracy gap check.
-            if (mentorAcc <= menteeAcc + minAccuracyGap) {
-                revert AccuracyGapTooSmall(mentorAcc, menteeAcc);
-            }
-
-            // Mentee at-most-one check.
             address existing = menteeMentor[mentee];
-            if (existing != address(0)) {
+
+            PairingValidity v = _validatePairing(
+                mentor,
+                mentee,
+                mentorAcc,
+                menteeAcc,
+                mentorLoad[mentor],
+                mentorCap,
+                trustFloor,
+                minAccuracyGap,
+                existing != address(0)
+            );
+
+            if (v == PairingValidity.SELF_MENTOR) {
+                revert SelfMentor(mentor);
+            } else if (v == PairingValidity.MENTOR_BELOW_TRUST_FLOOR) {
+                revert MentorBelowTrustFloor(mentor, mentorAcc);
+            } else if (v == PairingValidity.ACCURACY_GAP_TOO_SMALL) {
+                revert AccuracyGapTooSmall(mentorAcc, menteeAcc);
+            } else if (v == PairingValidity.MENTOR_AT_CAPACITY) {
+                revert MentorAtCapacity(mentor);
+            } else if (v == PairingValidity.MENTEE_ALREADY_ASSIGNED) {
                 revert MenteeAlreadyAssigned(mentee, existing);
             }
+            // PairingValidity.OK — fall through to commit.
 
             // Commit pairing.
             pairings.push(
