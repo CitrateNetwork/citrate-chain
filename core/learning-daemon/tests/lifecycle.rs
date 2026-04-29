@@ -265,13 +265,46 @@ async fn scenario_3b_killed_during_aggregation_resumes_correctly() {
 }
 
 // ====================================================================
-// Scenario 4 — Two daemons against one cycle (GATED — needs WP-3.8)
+// Scenario 4 — Two daemons against one cycle (WP-3.8 GREEN)
 // ====================================================================
 
 #[tokio::test]
-#[ignore = "WP-3.8: finalizer impl pending"]
 async fn scenario_4_two_daemons_no_double_finalize() {
-    unreachable!("ignored test; un-ignore at WP-3.8");
+    use citrate_learning_daemon::finalizer::try_finalize_cycle;
+
+    // Shared chain (mirrors a single live testnet); two daemons
+    // with separate RocksDB paths.
+    let chain = Arc::new(FakeChain::new());
+    let dir_a = TempDir::new().expect("tempdir A");
+    let dir_b = TempDir::new().expect("tempdir B");
+    let state_a = Arc::new(DaemonState::open(dir_a.path()).expect("A open"));
+    let state_b = Arc::new(DaemonState::open(dir_b.path()).expect("B open"));
+
+    // Both daemons observed the cycle as Committed (real flow:
+    // both saw the AggregationCommitted event).
+    state_a.set_cycle_status(1, CycleStatus::Computed).expect("ok");
+    state_a.set_cycle_status(1, CycleStatus::Committed).expect("ok");
+    state_b.set_cycle_status(1, CycleStatus::Computed).expect("ok");
+    state_b.set_cycle_status(1, CycleStatus::Committed).expect("ok");
+
+    // Daemon A wins the race.
+    try_finalize_cycle(chain.clone(), state_a.clone(), 1)
+        .await
+        .expect("A finalizes");
+
+    // Daemon B's tx reverts on chain with "already finalized" —
+    // the finalizer treats this as success-equivalent and lets B
+    // mark its local state to match the chain truth.
+    try_finalize_cycle(chain.clone(), state_b.clone(), 1)
+        .await
+        .expect("B treats race-loss as success");
+
+    // Exactly ONE finalize submitted on chain (the second's revert
+    // means it wasn't accepted).
+    assert_eq!(chain.submitted_finalizes(), vec![1]);
+    // Both daemons' local state agrees: cycle 1 is Called.
+    assert_eq!(state_a.finalize_status(1), FinalizeStatus::Called);
+    assert_eq!(state_b.finalize_status(1), FinalizeStatus::Called);
 }
 
 // ====================================================================
