@@ -1,0 +1,54 @@
+[package]
+name = "citrate-experiment-runner"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared rig harness for federated-learning hypothesis experiments (RM-FL-5). H1 (Belnap vs flat-mean), H2 (adapter composition power-law), H3 (Byzantine convergence) all share dataset loading, seed management, daemon orchestration, and outcome aggregation through this crate."
+
+# See:
+# - .agentile/sprints/active/sprint-rm-fl-5-hypothesis-rigs/SPRINT.md
+# - .agentile/formal/specs/learning/HypothesisH1.tla   (5 inv)
+# - .agentile/formal/specs/learning/HypothesisH2.tla   (6 inv)
+# - .agentile/formal/specs/learning/HypothesisH3.tla   (5 inv)
+# - citrate_v0.01.1/specs/gherkin/hypothesis_h{1,2,3}.feature
+
+[lib]
+name = "citrate_experiment_runner"
+path = "src/lib.rs"
+
+[dependencies]
+# Async + concurrency
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = "0.3"
+
+# Errors
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Serialization — outcome rows live in CSV under
+# experiments_2026_04/h{1,2,3}_*.csv per the Gherkin scenarios
+serde = { workspace = true }
+serde_json = { workspace = true }
+csv = "1.3"
+
+# Deterministic RNG — every experiment seeds a SmallRng for
+# Byzantine selection / mislabel injection / training seeds
+rand = "0.8"
+rand_chacha = "0.3"
+
+# Daemon orchestration: we drive citrate-learning-daemon's chain
+# trait directly so rig + daemon agree on cycle status
+citrate-learning-daemon = { path = "../learning-daemon" }
+citrate-learning = { path = "../learning" }
+primitives = { path = "../primitives" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+proptest = { workspace = true }
+tempfile = "3.10"
