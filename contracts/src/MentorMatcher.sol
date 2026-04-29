@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+/// Minimal slice of the ContributionAccounting interface used by
+/// the matcher's lazy-profile views (WP-4.9). The matcher does NOT
+/// mirror the per-(addr, dim) score in its own storage; instead it
+/// `staticcall`s the live total on demand. This trades O(N×D)
+/// per-cycle write cost for O(D) per-query read cost, paid by the
+/// matcher caller (the off-chain daemon or a dashboard view).
+interface IContributionAccountingDimRead {
+    function getDimensionScore(
+        address contributor,
+        bytes32 dimension
+    ) external view returns (uint256);
+}
+
 /// @title MentorMatcher — RM-FL-4 / WP-4.5
 /// @notice On-chain mentor-mentee assignment for the federated
 ///         learning network. Pairs higher-accuracy mentors with
@@ -94,6 +107,12 @@ contract MentorMatcher {
     /// this is at-most-one.
     mapping(address => address) public menteeMentor;
 
+    /// Address of the ContributionAccounting contract used by the
+    /// lazy-profile views (WP-4.9). Zero until wired by governance —
+    /// the matcher otherwise functions normally; only the lazy
+    /// profile views revert when this is unset.
+    address public contributionAccounting;
+
     // ============================================================
     // Events
     // ============================================================
@@ -129,6 +148,11 @@ contract MentorMatcher {
     /// Emitted when governance changes the minimum accuracy gap.
     event MinAccuracyGapUpdated(uint32 oldGap, uint32 newGap);
 
+    /// Emitted when governance wires (or rewires) the
+    /// ContributionAccounting source contract used by the lazy
+    /// profile views.
+    event ContributionAccountingSet(address oldAddr, address newAddr);
+
     // ============================================================
     // Errors
     // ============================================================
@@ -142,6 +166,8 @@ contract MentorMatcher {
     error PairingNotFound(address mentor, address mentee);
     error InvalidGovernance(address proposed);
     error PaginationOutOfRange(uint256 from_, uint256 to_, uint256 length);
+    error ContributionAccountingNotSet();
+    error EmptyDimensionWindow();
 
     // ============================================================
     // Modifiers
@@ -271,6 +297,17 @@ contract MentorMatcher {
         governance = newGovernance;
     }
 
+    /// Wire (or rewire) the ContributionAccounting contract used by
+    /// the lazy-profile views. Setting to address(0) intentionally
+    /// disables those views. Idempotent.
+    function setContributionAccounting(
+        address newAddr
+    ) external onlyGovernance {
+        address old = contributionAccounting;
+        contributionAccounting = newAddr;
+        emit ContributionAccountingSet(old, newAddr);
+    }
+
     // ============================================================
     // Assignment — write
     // ============================================================
@@ -386,6 +423,110 @@ contract MentorMatcher {
         uint256 cycleId
     ) external {
         emit NoQualifiedMentor(mentee, cycleId);
+    }
+
+    // ============================================================
+    // Lazy mentee profile (WP-4.9)
+    //
+    // The matcher does NOT precompute and cache per-(addr, dim)
+    // profiles inside its own storage. Doing so would cost
+    // O(N participants × D dimensions) state writes every cycle,
+    // most of which would never be read. Instead, profiles are
+    // sourced on demand from `ContributionAccounting`: the matcher
+    // is a window onto the live total, not a duplicate of it.
+    //
+    // The cost model inverts: write-heavy → read-heavy. The reader
+    // (the daemon, a dashboard, a wallet) pays the staticcall gas
+    // for the dimensions they actually want, and the contract pays
+    // nothing per cycle to keep mirrored state in sync.
+    //
+    // Both views are paginated over the caller-supplied
+    // `dimensions[]` calldata array via `from_/to_` (capacity-
+    // bounded tripwire enforces this on dynamic-return views).
+    // Empty windows revert because they have no useful semantic.
+    // ============================================================
+
+    /// Read a window of a mentee's per-dimension scores. The
+    /// returned array is `to_ - from_` long. Reverts if the
+    /// ContributionAccounting source is unset, the window is empty,
+    /// or the window is out of bounds. The matcher pays no per-
+    /// cycle gas to keep this in sync — the data is the live total
+    /// in `ContributionAccounting.dimensionContributions`.
+    function getMenteeProfile(
+        address mentee,
+        bytes32[] calldata dimensions,
+        uint256 from_,
+        uint256 to_
+    ) external view returns (uint256[] memory profile) {
+        address ca = contributionAccounting;
+        if (ca == address(0)) revert ContributionAccountingNotSet();
+        if (to_ < from_ || to_ > dimensions.length) {
+            revert PaginationOutOfRange(from_, to_, dimensions.length);
+        }
+        uint256 n = to_ - from_;
+        if (n == 0) revert EmptyDimensionWindow();
+        profile = new uint256[](n);
+        // Caller-bounded by `n = to_ - from_`; both tripwires permit.
+        for (uint256 i = 0; i < n; i++) {
+            profile[i] = IContributionAccountingDimRead(ca)
+                .getDimensionScore(mentee, dimensions[from_ + i]);
+        }
+    }
+
+    /// Pick the dimension within `dimensions[from_:to_]` where the
+    /// (mentor, mentee) score gap is largest. Returns the dimension
+    /// key, both scores, and the index within the supplied window.
+    /// Ties resolve to the lower-index dimension (deterministic).
+    /// Reverts under the same conditions as `getMenteeProfile`. A
+    /// gap of zero is a valid result — caller decides whether that's
+    /// useful (typically: it isn't, and the caller falls back to
+    /// `recordNoQualifiedMentor`).
+    function selectBestDimension(
+        address mentor,
+        address mentee,
+        bytes32[] calldata dimensions,
+        uint256 from_,
+        uint256 to_
+    )
+        external
+        view
+        returns (
+            bytes32 bestDimension,
+            uint256 mentorScore,
+            uint256 menteeScore,
+            uint256 windowIndex
+        )
+    {
+        address ca = contributionAccounting;
+        if (ca == address(0)) revert ContributionAccountingNotSet();
+        if (to_ < from_ || to_ > dimensions.length) {
+            revert PaginationOutOfRange(from_, to_, dimensions.length);
+        }
+        uint256 n = to_ - from_;
+        if (n == 0) revert EmptyDimensionWindow();
+
+        IContributionAccountingDimRead src =
+            IContributionAccountingDimRead(ca);
+        uint256 bestGap = 0;
+        bool anyGap = false;
+        // Caller-bounded by `n = to_ - from_`.
+        for (uint256 i = 0; i < n; i++) {
+            bytes32 dim = dimensions[from_ + i];
+            uint256 mScore = src.getDimensionScore(mentor, dim);
+            uint256 eScore = src.getDimensionScore(mentee, dim);
+            // Gap is positive only when mentor outscores mentee on
+            // this dimension; otherwise treat as zero so we never
+            // suggest a "negative-gap" dimension as best.
+            uint256 gap = mScore > eScore ? mScore - eScore : 0;
+            if (!anyGap || gap > bestGap) {
+                anyGap = true;
+                bestGap = gap;
+                bestDimension = dim;
+                mentorScore = mScore;
+                menteeScore = eScore;
+                windowIndex = i;
+            }
+        }
     }
 
     // ============================================================
