@@ -38,11 +38,18 @@ contract DeployEduStack is ScriptEnv {
     function run() external {
         address deployer = deployerAddress();
 
-        // Vault signers default to the deployer only for rehearsal convenience.
-        // Real ceremony runs should pass distinct operator-controlled addresses.
+        // Vault signers MUST be three distinct addresses — the 2-of-3 multisig
+        // rejects duplicate signers (`AlreadySigner()`). The reroll script
+        // (scripts/regenesis.sh) sets SIGNER_1=DEPLOYER, SIGNER_2=TEAM,
+        // SIGNER_3=TREASURY by default. Production ceremony runs should pass
+        // three distinct operator-controlled addresses.
         address signer1 = envAddressOr("SIGNER_1", deployer);
         address signer2 = envAddressOr("SIGNER_2", deployer);
         address signer3 = envAddressOr("SIGNER_3", deployer);
+        require(
+            signer1 != signer2 && signer2 != signer3 && signer1 != signer3,
+            "DeployEduStack: SIGNER_1, SIGNER_2, SIGNER_3 must be three distinct addresses"
+        );
         address relayer = envAddressOr("RELAYER", deployer);
         uint256 saltUsdRate = envUintOr("SALT_USD_RATE", uint256(100));
 
