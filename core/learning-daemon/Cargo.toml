@@ -1,0 +1,71 @@
+[package]
+name = "citrate-learning-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Off-chain learning daemon (RM-FL-3). Orchestrates the federated learning loop: watches finalized blocks, aggregates embeddings via 0x0110 (Belnap), retrains the routing model (off-chain SGD → Q16 quantize → IPFS pin → 0x0111 consumes), dispatches mentor assignments, finalizes cycles via LearningCycleManager."
+
+# See:
+# - .agentile/sprints/active/sprint-rm-fl-3-learning-daemon/SPRINT.md
+# - .agentile/formal/specs/learning/LearningDaemon.tla       (9 invariants)
+# - citrate_v0.01.1/specs/gherkin/learning_daemon.feature   (8 scenarios)
+# - .agentile/planset/RM_FL_2026_04_28/00_PLANSET.md §RM-FL-3
+#
+# Crate layout follows the pool-coordinator pattern (CM-05): trait
+# abstraction over the chain in `chain.rs` so the orchestrator is
+# unit-testable against a `FakeChain`. The HTTP-backed adapter lives
+# in `http_chain.rs` (added at WP-3.5+ slice 2 — for now, only the
+# trait + fake impl).
+
+[lib]
+name = "citrate_learning_daemon"
+path = "src/lib.rs"
+
+# Daemon binary lands at WP-3.5 slice 2 (after the lib + integration
+# tests prove the orchestrator logic).
+# [[bin]]
+# name = "citrate-learning-daemon"
+# path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = "0.3"
+
+# Errors
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Persistence — direct rocksdb for simplicity; the daemon owns its
+# own DB separate from the node's chain store
+rocksdb = { workspace = true }
+
+# Serialization for cycle state
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+hex = "0.4"
+
+# Crypto for Keccak (event-topic computation, address checksums)
+sha3 = { workspace = true }
+
+# Ethereum types (H160, H256, U256)
+ethereum-types = "0.14"
+
+# Local dependencies — daemon consumes the Belnap + routing
+# precompile types directly so the aggregator + trainer paths can
+# call them programmatically (the production path goes through the
+# RPC dispatcher; these in-process types are for unit tests +
+# the daemon's local sanity-check pass).
+citrate-execution = { path = "../execution" }
+citrate-learning = { path = "../learning" }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = { workspace = true }
