@@ -100,10 +100,22 @@ impl<C: ChainAdapter> BlockWatcher<C> {
 
         let from = hwm + 1;
         let to = chain_head;
-        debug!(from, to, "fetching learning events");
+        debug!(from, to, "fetching learning events + new HWM hash in parallel");
 
-        let events = self.chain.learning_events(from, to).await?;
-        let new_head_hash = self.chain.block_hash(to).await?;
+        // WP-3.10: parallelize the two independent RPCs that the
+        // watcher needs after the reorg check passes — fetching the
+        // event range and the new HWM hash. These are independent
+        // (events come from a log query, hash comes from a header
+        // lookup) so a `tokio::join!` saves one round-trip on every
+        // advance step. Errors propagate naturally: if either fails
+        // the `?` short-circuits and HWM stays where it was, so the
+        // next tick will retry the whole advance from `hwm + 1`.
+        let (events_res, hash_res) = tokio::join!(
+            self.chain.learning_events(from, to),
+            self.chain.block_hash(to),
+        );
+        let events = events_res?;
+        let new_head_hash = hash_res?;
 
         // Advance HWM atomically.
         self.state.set_last_processed_block(to)?;

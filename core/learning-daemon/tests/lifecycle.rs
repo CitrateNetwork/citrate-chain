@@ -534,3 +534,60 @@ async fn embedding_submission_roundtrip_via_event() {
         panic!("expected Advanced");
     }
 }
+
+// ====================================================================
+// WP-3.10 — Watcher RPC parallelization
+//
+// After parallelizing `learning_events` and `block_hash(to)` via
+// `tokio::join!`, an advance step should issue exactly 3 RPCs to
+// the chain: `finalized_block_number`, `learning_events`,
+// `block_hash`. (Reorg detection adds one more `block_hash` if
+// `hwm > 0` — the first step has `hwm == 0` so the reorg check
+// short-circuits.)
+//
+// The behavior under the previous sequential implementation was
+// the same call count, but the calls happened serially. This test
+// pins the call count so a future refactor can't quietly add
+// extra round-trips. A timing-based concurrency test is in the
+// orchestrator's unit tests (deterministic via tokio's test
+// scheduler).
+// ====================================================================
+
+#[tokio::test]
+async fn watcher_advance_uses_three_rpcs_first_step() {
+    let (chain, state, _dir) = fixture();
+    let watcher = BlockWatcher::new(chain.clone(), state.clone());
+
+    chain.produce_block();
+    chain.produce_block();
+
+    let baseline = chain.rpc_call_count();
+    let _ = watcher.step().await.expect("step");
+    let advance_calls = chain.rpc_call_count() - baseline;
+    // First step (hwm == 0): no reorg-check call. Three RPCs:
+    // finalized_block_number + learning_events + block_hash.
+    assert_eq!(
+        advance_calls, 3,
+        "first advance should issue exactly 3 RPCs, got {advance_calls}"
+    );
+}
+
+#[tokio::test]
+async fn watcher_advance_uses_four_rpcs_subsequent_step() {
+    let (chain, state, _dir) = fixture();
+    let watcher = BlockWatcher::new(chain.clone(), state.clone());
+
+    chain.produce_block();
+    let _ = watcher.step().await.expect("first step");
+
+    chain.produce_block();
+    let baseline = chain.rpc_call_count();
+    let _ = watcher.step().await.expect("second step");
+    let advance_calls = chain.rpc_call_count() - baseline;
+    // Subsequent step (hwm > 0): reorg-check adds one block_hash
+    // call. Four RPCs total.
+    assert_eq!(
+        advance_calls, 4,
+        "subsequent advance should issue exactly 4 RPCs, got {advance_calls}"
+    );
+}
