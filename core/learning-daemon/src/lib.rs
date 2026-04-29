@@ -52,6 +52,7 @@
 
 pub mod aggregator;
 pub mod chain;
+pub mod dashboard;
 pub mod error;
 pub mod finalizer;
 pub mod orchestrator;
@@ -62,6 +63,7 @@ pub mod watcher;
 
 pub use aggregator::{BelnapAggregator, EmbeddingCache, EmbeddingEntry, MemoryEmbeddingCache};
 pub use chain::{ChainAdapter, FakeChain, LearningEvent, RoutingWeightsCommit};
+pub use dashboard::{router as dashboard_router, DashboardState};
 pub use error::DaemonError;
 pub use finalizer::{try_finalize_cycle, ChainFinalizer};
 pub use orchestrator::Orchestrator;
