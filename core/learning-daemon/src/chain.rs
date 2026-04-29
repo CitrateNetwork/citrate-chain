@@ -160,6 +160,10 @@ struct FakeChainInner {
     /// (one-shot — cleared after firing). Models a transient RPC
     /// outage (Gherkin scenario 5).
     next_error: Option<String>,
+    /// Number of RPC method invocations against this fake. Used by
+    /// WP-3.10 tests to verify the watcher's round-trip count after
+    /// parallelizing independent RPCs.
+    rpc_call_count: usize,
 }
 
 /// Test helper struct: one routing-weights commit observed by the
@@ -185,6 +189,7 @@ impl FakeChain {
             submitted_finalizes: Vec::new(),
             submitted_routing_weights: Vec::new(),
             next_error: None,
+            rpc_call_count: 0,
         };
         // Genesis hash is deterministic.
         inner
@@ -248,9 +253,20 @@ impl FakeChain {
         inner.submitted_routing_weights.clone()
     }
 
-    /// Take and clear an armed error if one is pending.
+    /// Test helper: total number of RPC method invocations against
+    /// this fake. Used by WP-3.10 to verify the watcher's
+    /// round-trip count after parallelization.
+    pub fn rpc_call_count(&self) -> usize {
+        let inner = self.inner.lock().expect("lock");
+        inner.rpc_call_count
+    }
+
+    /// Take and clear an armed error if one is pending. Increments
+    /// the RPC call counter as a side effect so it's accurate
+    /// even on failed calls.
     fn take_armed_error(&self) -> Option<String> {
         let mut inner = self.inner.lock().expect("lock");
+        inner.rpc_call_count += 1;
         inner.next_error.take()
     }
 }

@@ -199,6 +199,48 @@ impl<C: ChainAdapter + 'static> Orchestrator<C> {
         self.trainer.train(cycle_id).await
     }
 
+    /// Pipelined cycle step: aggregate cycle `current` and train on
+    /// the previous cycle's already-aggregated embeddings
+    /// concurrently. WP-3.10 optimization. Idempotent: the
+    /// `Aggregator` and `Trainer` impls each guard their own
+    /// `cycle_status` precondition checks, so re-running on the
+    /// same cycle pair is a no-op.
+    ///
+    /// Safety: aggregation of cycle N is independent of training on
+    /// cycle N-1 — they touch disjoint cycle ids in the state
+    /// machine, and the routing-weights commit from training on
+    /// N-1 has no read dependency on N's aggregation.
+    ///
+    /// Errors propagate as a tuple: if aggregation fails, training
+    /// may still have succeeded (or vice versa). The caller can
+    /// inspect both arms; the orchestrator's main `tick()` loop
+    /// surfaces them via `warn!` and retries on the next tick.
+    /// Returns `(aggregate_result, train_result)`.
+    pub async fn aggregate_and_train_pipeline(
+        &self,
+        current: CycleId,
+        previous: Option<CycleId>,
+    ) -> (DaemonResult<()>, DaemonResult<()>) {
+        // Idempotency: the underlying `Aggregator` impl guards on
+        // `cycle_status` per LearningDaemon.tla::AggregationIdempotent;
+        // the `Trainer` impl guards on `Committed` precondition per
+        // its own contract. This wrapper adds no extra side effects.
+        match previous {
+            Some(prev) => {
+                tokio::join!(
+                    self.aggregator.aggregate(current),
+                    self.trainer.train(prev),
+                )
+            }
+            None => {
+                // Bootstrap case: no previous cycle to train on yet.
+                // Run aggregation alone; training is a no-op.
+                let agg = self.aggregator.aggregate(current).await;
+                (agg, Ok(()))
+            }
+        }
+    }
+
     /// Drive the orchestrator until `shutdown` resolves, sleeping
     /// `tick_interval` between ticks. Used by the production daemon
     /// binary (WP-3.5 slice 2). Tests prefer to drive `tick()`
@@ -348,6 +390,121 @@ mod tests {
             .expect("join")
             .expect("run_loop returned Err");
         let _ = result;
+    }
+
+    /// Aggregator that sleeps for `delay` then records the cycle id
+    /// in a shared vec. Used to verify pipeline concurrency timing.
+    struct DelayAggregator {
+        delay: Duration,
+        seen: Arc<std::sync::Mutex<Vec<(CycleId, std::time::Instant)>>>,
+    }
+
+    #[async_trait]
+    impl Aggregator for DelayAggregator {
+        /// Idempotent by construction: tests only call once per cycle.
+        async fn aggregate(&self, cycle_id: CycleId) -> DaemonResult<()> {
+            tokio::time::sleep(self.delay).await;
+            self.seen
+                .lock()
+                .expect("lock")
+                .push((cycle_id, std::time::Instant::now()));
+            Ok(())
+        }
+    }
+
+    /// Trainer twin of `DelayAggregator`.
+    struct DelayTrainer {
+        delay: Duration,
+        seen: Arc<std::sync::Mutex<Vec<(CycleId, std::time::Instant)>>>,
+    }
+
+    #[async_trait]
+    impl Trainer for DelayTrainer {
+        async fn train(&self, cycle_id: CycleId) -> DaemonResult<()> {
+            tokio::time::sleep(self.delay).await;
+            self.seen
+                .lock()
+                .expect("lock")
+                .push((cycle_id, std::time::Instant::now()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipeline_overlaps_two_ops_concurrently() {
+        // Idempotent test: aggregate(N) + train(N-1) under tokio::join!.
+        // If aggregate(N) and train(N-1) ran sequentially, total
+        // wall-clock would be ≥ 2*delay. tokio::join! must overlap
+        // them so total wall-clock is closer to 1*delay.
+        let chain = Arc::new(FakeChain::new());
+        let dir = TempDir::new().expect("tempdir");
+        let state =
+            Arc::new(DaemonState::open(dir.path()).expect("state open"));
+        let agg_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let train_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let delay = Duration::from_millis(50);
+        let agg = Arc::new(DelayAggregator {
+            delay,
+            seen: agg_seen.clone(),
+        });
+        let train = Arc::new(DelayTrainer {
+            delay,
+            seen: train_seen.clone(),
+        });
+        let orch = Orchestrator::new(
+            chain,
+            state,
+            agg,
+            train,
+            Arc::new(StubFinalizer),
+        );
+
+        let start = std::time::Instant::now();
+        let (a, t) = orch.aggregate_and_train_pipeline(2, Some(1)).await;
+        let elapsed = start.elapsed();
+        a.expect("aggregate ok");
+        t.expect("train ok");
+
+        // Allow generous slack but require at least some
+        // overlap: elapsed must be < 2*delay (sequential lower
+        // bound). Tightening below 1.5*delay catches any future
+        // refactor that accidentally serializes the pipeline.
+        assert!(
+            elapsed < Duration::from_millis(95),
+            "pipeline ran sequentially? elapsed={elapsed:?} \
+             (delay={delay:?}, sequential bound = 2*delay)"
+        );
+        assert_eq!(agg_seen.lock().expect("lock").len(), 1);
+        assert_eq!(train_seen.lock().expect("lock").len(), 1);
+        assert_eq!(agg_seen.lock().expect("lock")[0].0, 2);
+        assert_eq!(train_seen.lock().expect("lock")[0].0, 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_bootstrap_case_no_previous_cycle() {
+        // First cycle (no previous): only aggregation runs;
+        // training is a no-op.
+        let chain = Arc::new(FakeChain::new());
+        let dir = TempDir::new().expect("tempdir");
+        let state =
+            Arc::new(DaemonState::open(dir.path()).expect("state open"));
+        let train_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let train = Arc::new(DelayTrainer {
+            delay: Duration::from_millis(0),
+            seen: train_seen.clone(),
+        });
+        let orch = Orchestrator::new(
+            chain,
+            state,
+            Arc::new(StubAggregator),
+            train,
+            Arc::new(StubFinalizer),
+        );
+        let (a, t) = orch.aggregate_and_train_pipeline(1, None).await;
+        a.expect("aggregate ok");
+        t.expect("train ok");
+        // Trainer was NOT invoked.
+        assert_eq!(train_seen.lock().expect("lock").len(), 0);
     }
 
     #[tokio::test]
