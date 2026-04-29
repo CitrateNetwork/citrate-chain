@@ -56,14 +56,19 @@ pub mod error;
 pub mod finalizer;
 pub mod orchestrator;
 pub mod state;
+pub mod trainer;
 pub mod types;
 pub mod watcher;
 
 pub use aggregator::{BelnapAggregator, EmbeddingCache, EmbeddingEntry, MemoryEmbeddingCache};
-pub use chain::{ChainAdapter, FakeChain, LearningEvent};
+pub use chain::{ChainAdapter, FakeChain, LearningEvent, RoutingWeightsCommit};
 pub use error::DaemonError;
 pub use finalizer::{try_finalize_cycle, ChainFinalizer};
 pub use orchestrator::Orchestrator;
 pub use state::{CycleStatus, DaemonState, FinalizeStatus};
+pub use trainer::{
+    weights_record, IpfsClient, MemoryIpfsClient, Q16Weights, RoutingTrainer,
+    StubTrainingBackend, TrainingBackend,
+};
 pub use types::{BlockNumber, CycleId, EmbeddingSubmission};
 pub use watcher::BlockWatcher;

@@ -25,13 +25,16 @@ use crate::types::CycleId;
 /// Real finalizer. Replaces `StubFinalizer` once WP-3.8 lands.
 pub struct ChainFinalizer<C: ChainAdapter> {
     chain: Arc<C>,
-    state: Arc<DaemonState>,
+    /// `state` is held for symmetry with the helper API + future
+    /// extension (operator-level preconditions before submitting);
+    /// the chain-side guard is the actual safety mechanism.
+    _state: Arc<DaemonState>,
 }
 
 impl<C: ChainAdapter> ChainFinalizer<C> {
     /// Construct a new finalizer.
     pub fn new(chain: Arc<C>, state: Arc<DaemonState>) -> Self {
-        Self { chain, state }
+        Self { chain, _state: state }
     }
 }
 
