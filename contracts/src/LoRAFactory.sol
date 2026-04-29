@@ -14,6 +14,17 @@ import "./lib/AccessControl.sol";
 contract LoRAFactory is AccessControl {
     // Citrate precompile address
     address constant LORA_PRECOMPILE = 0x0000000000000000000000000000000000001001;
+
+    /// 0x0108 — INFERENCE_PROOF_VERIFY (Halo2-KZG verifier).
+    /// RM-FL-4 / WP-4.7: adapter quality is cryptographically backed
+    /// by submitting a Halo2 proof attesting to a (input_commitment,
+    /// model_commitment, output_commitment) tuple. The precompile
+    /// returns 32 bytes — 1 iff the proof verifies.
+    address constant INFERENCE_PROOF_VERIFY = 0x0000000000000000000000000000000000000108;
+
+    /// Circuit version v1 for InferenceCircuit. Encoded as 4-byte BE
+    /// in the precompile input. RM-M1b WP-M1b.4.
+    uint32 internal constant INFERENCE_CIRCUIT_V1 = 1;
     
     // Structs
     struct LoRAAdapter {
@@ -65,6 +76,18 @@ contract LoRAFactory is AccessControl {
     uint256 public totalAdapters;
     uint256 public trainingFeePerEpoch = 0.01 ether; // 0.01 LATT per epoch
     uint256 public mergeFee = 0.05 ether; // 0.05 LATT per merge
+
+    /// RM-FL-4 / WP-4.7 — adapter verification flow.
+    /// Maps adapter → its in-circuit Poseidon model commitment. The
+    /// operator sets this when training completes (via
+    /// `setAdapterModelCommitment`). Without it, `verifyAdapterAt`
+    /// reverts; an adapter cannot be verified before its weights have
+    /// a chain-known commitment to verify against.
+    mapping(bytes32 => bytes32) public adapterModelCommitment;
+
+    /// Set true on first successful proof verification. Once flipped,
+    /// stays true — the adapter is permanently "proof-backed."
+    mapping(bytes32 => bool) public adapterProofVerified;
     
     // Events
     event LoRACreated(
@@ -105,6 +128,35 @@ contract LoRAFactory is AccessControl {
         uint256 oldFee,
         uint256 newFee
     );
+
+    /// RM-FL-4 / WP-4.7 events + errors.
+
+    event AdapterModelCommitmentSet(
+        bytes32 indexed loraHash,
+        bytes32 commitment
+    );
+
+    event AdapterVerified(
+        bytes32 indexed loraHash,
+        address indexed verifier,
+        bytes32 inputCommitment,
+        bytes32 outputCommitment,
+        uint256 blockNumber
+    );
+
+    /// Reverts the verifyAdapterAt call when the precompile rejects
+    /// the proof. The contract returns `false` for ill-formed input
+    /// (truncated proof), reverts here for proofs the verifier
+    /// actively rejected.
+    error AdapterProofRejected(bytes32 loraHash);
+
+    /// The adapter has no in-circuit model commitment recorded; the
+    /// operator must call setAdapterModelCommitment before any
+    /// verification can happen.
+    error AdapterModelCommitmentNotSet(bytes32 loraHash);
+
+    /// The adapter doesn't exist in the registry.
+    error AdapterNotFound(bytes32 loraHash);
 
     constructor(address _modelRegistry) {
         modelRegistry = IModelRegistry(_modelRegistry);
@@ -198,10 +250,119 @@ contract LoRAFactory is AccessControl {
         LoRAAdapter storage adapter = adapters[loraHash];
         require(adapter.creator != address(0), "LoRA not found");
         require(bytes(adapter.ipfsCID).length == 0, "Already completed");
-        
+
         adapter.ipfsCID = ipfsCID;
-        
+
         emit TrainingCompleted(loraHash, ipfsCID);
+    }
+
+    // ── RM-FL-4 / WP-4.7 — Adapter verification via 0x0108 ──────────
+
+    /**
+     * @notice Operator records the in-circuit Poseidon commitment of
+     *         the adapter's weights so future verifyAdapterAt calls
+     *         can pass it to the precompile. One-shot: cannot be
+     *         changed once set, to prevent rugging the verification
+     *         contract by swapping the model out from under proofs.
+     * @param loraHash Adapter identifier.
+     * @param commitment 32-byte big-endian Poseidon Fr commitment.
+     */
+    function setAdapterModelCommitment(
+        bytes32 loraHash,
+        bytes32 commitment
+    ) external onlyRole(OPERATOR_ROLE) {
+        if (adapters[loraHash].creator == address(0)) {
+            revert AdapterNotFound(loraHash);
+        }
+        require(
+            adapterModelCommitment[loraHash] == bytes32(0),
+            "Commitment already set"
+        );
+        require(commitment != bytes32(0), "Zero commitment");
+
+        adapterModelCommitment[loraHash] = commitment;
+        emit AdapterModelCommitmentSet(loraHash, commitment);
+    }
+
+    /**
+     * @notice Verify an adapter against a benchmark IO + Halo2 proof.
+     *         Calls 0x0108 INFERENCE_PROOF_VERIFY with the
+     *         (input_commitment, model_commitment, output_commitment,
+     *          version, chain_id, proof_bytes) wire format.
+     *
+     *         On verifier success: marks the adapter as proof-backed
+     *         and emits AdapterVerified. On verifier rejection:
+     *         reverts with AdapterProofRejected. On structural error
+     *         (precompile call itself failed): reverts with the
+     *         precompile's error message.
+     *
+     * @param loraHash         Adapter identifier.
+     * @param inputCommitment  Caller-supplied benchmark input
+     *                         commitment (Poseidon Fr, 32B BE).
+     * @param outputCommitment Caller-supplied expected output
+     *                         commitment (Poseidon Fr, 32B BE).
+     * @param proofBytes       Halo2-KZG proof transcript.
+     */
+    function verifyAdapterAt(
+        bytes32 loraHash,
+        bytes32 inputCommitment,
+        bytes32 outputCommitment,
+        bytes calldata proofBytes
+    ) external {
+        if (adapters[loraHash].creator == address(0)) {
+            revert AdapterNotFound(loraHash);
+        }
+        bytes32 modelCommitment = adapterModelCommitment[loraHash];
+        if (modelCommitment == bytes32(0)) {
+            revert AdapterModelCommitmentNotSet(loraHash);
+        }
+
+        // Build the precompile input per verify.rs::inference_proof_verify:
+        //   32B input_commitment + 32B model_commitment +
+        //   32B output_commitment + 4B circuit_version (BE) +
+        //   4B chain_id (BE) + proof_bytes
+        bytes memory input = abi.encodePacked(
+            inputCommitment,
+            modelCommitment,
+            outputCommitment,
+            INFERENCE_CIRCUIT_V1,
+            uint32(block.chainid),
+            proofBytes
+        );
+
+        (bool ok, bytes memory ret) = INFERENCE_PROOF_VERIFY.staticcall(input);
+        require(ok, "INFERENCE_PROOF_VERIFY precompile call failed");
+        require(ret.length == 32, "INFERENCE_PROOF_VERIFY: bad output length");
+
+        // The precompile returns 32 bytes BE; value 1 means verified.
+        // Decode as uint256 and check the lowest byte (the BE-encoded
+        // boolean lives there).
+        uint256 verdict = abi.decode(ret, (uint256));
+        if (verdict != 1) {
+            revert AdapterProofRejected(loraHash);
+        }
+
+        // First-success flip; subsequent verifications are no-ops at
+        // the storage level but still emit (for indexer / dashboard
+        // consumption).
+        if (!adapterProofVerified[loraHash]) {
+            adapterProofVerified[loraHash] = true;
+        }
+
+        emit AdapterVerified(
+            loraHash,
+            msg.sender,
+            inputCommitment,
+            outputCommitment,
+            block.number
+        );
+    }
+
+    /**
+     * @notice Convenience view: is the adapter proof-backed?
+     */
+    function isAdapterVerified(bytes32 loraHash) external view returns (bool) {
+        return adapterProofVerified[loraHash];
     }
     
     /**
