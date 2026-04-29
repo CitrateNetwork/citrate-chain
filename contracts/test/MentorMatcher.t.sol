@@ -324,4 +324,115 @@ contract MentorMatcherTest is Test {
         vm.expectRevert("MentorMatcher: unauthorized");
         mm.unassignMentee(mentorA, menteeB);
     }
+
+    // ====================================================================
+    // WP-4.8 — Pure helper: validatePairing
+    //
+    // The contract↔daemon contract. The off-chain matcher should be
+    // able to call validatePairing via eth_call and get the same
+    // answer the on-chain assignMentees write path would produce.
+    // ====================================================================
+
+    function test_helper_returns_OK_for_valid_pairing() public view {
+        MentorMatcher.PairingValidity v =
+            mm.validatePairing(mentorA, menteeB, q16(85), q16(40));
+        assertEq(uint256(v), uint256(MentorMatcher.PairingValidity.OK));
+    }
+
+    function test_helper_self_mentor_code() public view {
+        MentorMatcher.PairingValidity v =
+            mm.validatePairing(mentorA, mentorA, q16(85), q16(40));
+        assertEq(
+            uint256(v),
+            uint256(MentorMatcher.PairingValidity.SELF_MENTOR)
+        );
+    }
+
+    function test_helper_below_trust_floor_code() public view {
+        MentorMatcher.PairingValidity v =
+            mm.validatePairing(mentorA, menteeB, q16(20), q16(15));
+        assertEq(
+            uint256(v),
+            uint256(MentorMatcher.PairingValidity.MENTOR_BELOW_TRUST_FLOOR)
+        );
+    }
+
+    function test_helper_gap_too_small_code() public view {
+        // Mentor 0.42, mentee 0.40 — gap 0.02 < 0.05 floor.
+        MentorMatcher.PairingValidity v =
+            mm.validatePairing(mentorA, menteeB, q16(42), q16(40));
+        assertEq(
+            uint256(v),
+            uint256(MentorMatcher.PairingValidity.ACCURACY_GAP_TOO_SMALL)
+        );
+    }
+
+    function test_helper_at_capacity_code() public {
+        // Saturate mentorA at cap.
+        address[] memory three = new address[](3);
+        three[0] = address(0x1);
+        three[1] = address(0x2);
+        three[2] = address(0x3);
+        uint32[] memory accs = new uint32[](3);
+        accs[0] = q16(40);
+        accs[1] = q16(40);
+        accs[2] = q16(40);
+        mm.assignMentees(mentorA, three, q16(85), accs, DIM_FINANCE);
+
+        MentorMatcher.PairingValidity v =
+            mm.validatePairing(mentorA, menteeB, q16(85), q16(40));
+        assertEq(
+            uint256(v),
+            uint256(MentorMatcher.PairingValidity.MENTOR_AT_CAPACITY)
+        );
+    }
+
+    function test_helper_mentee_already_assigned_code() public {
+        address[] memory mentees = new address[](1);
+        mentees[0] = menteeB;
+        uint32[] memory accs = new uint32[](1);
+        accs[0] = q16(40);
+        mm.assignMentees(mentorA, mentees, q16(85), accs, DIM_FINANCE);
+
+        // Different mentor checks the same mentee.
+        MentorMatcher.PairingValidity v =
+            mm.validatePairing(mentorC, menteeB, q16(78), q16(40));
+        assertEq(
+            uint256(v),
+            uint256(MentorMatcher.PairingValidity.MENTEE_ALREADY_ASSIGNED)
+        );
+    }
+
+    function test_helper_agrees_with_assignMentees_path() public {
+        // Property test: every code the helper returns must match
+        // the actual revert (or success) of assignMentees. This
+        // pins the contract↔daemon agreement.
+        MentorMatcher.PairingValidity v;
+        address[] memory single = new address[](1);
+        uint32[] memory acc = new uint32[](1);
+
+        // OK case → assignMentees succeeds.
+        single[0] = menteeB;
+        acc[0] = q16(40);
+        v = mm.validatePairing(mentorA, menteeB, q16(85), q16(40));
+        assertEq(uint256(v), uint256(MentorMatcher.PairingValidity.OK));
+        mm.assignMentees(mentorA, single, q16(85), acc, DIM_FINANCE);
+        assertTrue(mm.isPaired(mentorA, menteeB));
+
+        // SELF_MENTOR case → assignMentees reverts SelfMentor.
+        single[0] = mentorC;
+        acc[0] = q16(40);
+        v = mm.validatePairing(mentorC, mentorC, q16(85), q16(40));
+        assertEq(
+            uint256(v),
+            uint256(MentorMatcher.PairingValidity.SELF_MENTOR)
+        );
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                MentorMatcher.SelfMentor.selector,
+                mentorC
+            )
+        );
+        mm.assignMentees(mentorC, single, q16(85), acc, DIM_FINANCE);
+    }
 }
