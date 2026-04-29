@@ -117,6 +117,20 @@ pub trait ChainAdapter: Send + Sync {
     /// guard rejects the second call; the daemon accepts the
     /// resulting revert as confirmation that finalization happened.
     async fn finalize_cycle(&self, cycle_id: CycleId) -> DaemonResult<H256>;
+
+    /// Submit a `setRoutingWeights(cycleId, ipfsCid, contentSha256)`
+    /// transaction. The daemon's trainer (WP-3.7) calls this after
+    /// pinning new weights to IPFS. Returns the tx hash on success.
+    ///
+    /// The chain-side contract may de-duplicate by `(cycle_id, cid)`
+    /// or accept multiple — the daemon's trainer is idempotent
+    /// either way (deterministic backend + deterministic CID).
+    async fn commit_routing_weights(
+        &self,
+        cycle_id: CycleId,
+        ipfs_cid: &str,
+        content_sha256: H256,
+    ) -> DaemonResult<H256>;
 }
 
 /// In-memory `ChainAdapter` for unit tests. Tests inject events +
@@ -140,10 +154,24 @@ struct FakeChainInner {
     submitted_commits: Vec<(CycleId, Vec<u8>)>,
     /// Finalize-cycle calls the orchestrator has submitted.
     submitted_finalizes: Vec<CycleId>,
+    /// Routing-weights commits (cycle_id, ipfs_cid, content_sha256).
+    submitted_routing_weights: Vec<RoutingWeightsCommit>,
     /// If set, the next call to any RPC method returns this error
     /// (one-shot — cleared after firing). Models a transient RPC
     /// outage (Gherkin scenario 5).
     next_error: Option<String>,
+}
+
+/// Test helper struct: one routing-weights commit observed by the
+/// fake chain. Used by `routing_weights_commits()` for assertions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingWeightsCommit {
+    /// Cycle the commit was for.
+    pub cycle_id: CycleId,
+    /// IPFS CID submitted.
+    pub ipfs_cid: String,
+    /// Content hash submitted.
+    pub content_sha256: H256,
 }
 
 impl FakeChain {
@@ -155,6 +183,7 @@ impl FakeChain {
             timeline: Vec::new(),
             submitted_commits: Vec::new(),
             submitted_finalizes: Vec::new(),
+            submitted_routing_weights: Vec::new(),
             next_error: None,
         };
         // Genesis hash is deterministic.
@@ -211,6 +240,12 @@ impl FakeChain {
     pub fn submitted_finalizes(&self) -> Vec<CycleId> {
         let inner = self.inner.lock().expect("lock");
         inner.submitted_finalizes.clone()
+    }
+
+    /// Test helper: read out the daemon's submitted routing-weights commits.
+    pub fn routing_weights_commits(&self) -> Vec<RoutingWeightsCommit> {
+        let inner = self.inner.lock().expect("lock");
+        inner.submitted_routing_weights.clone()
     }
 
     /// Take and clear an armed error if one is pending.
@@ -298,6 +333,27 @@ impl ChainAdapter for FakeChain {
         }
         inner.submitted_finalizes.push(cycle_id);
         Ok(H256::from_low_u64_be(0xF1_00 + cycle_id))
+    }
+
+    async fn commit_routing_weights(
+        &self,
+        cycle_id: CycleId,
+        ipfs_cid: &str,
+        content_sha256: H256,
+    ) -> DaemonResult<H256> {
+        if let Some(msg) = self.take_armed_error() {
+            return Err(crate::error::DaemonError::Chain(msg));
+        }
+        let mut inner = self.inner.lock().expect("lock");
+        // The fake doesn't de-duplicate — production may. The
+        // daemon's trainer is idempotent regardless via
+        // deterministic CID.
+        inner.submitted_routing_weights.push(RoutingWeightsCommit {
+            cycle_id,
+            ipfs_cid: ipfs_cid.to_string(),
+            content_sha256,
+        });
+        Ok(H256::from_low_u64_be(0xC1_D0 + cycle_id))
     }
 }
 
