@@ -462,6 +462,134 @@ mod validate_pairing_tests {
         assert_eq!(PairingValidity::MentorAtCapacity as u8, 4);
         assert_eq!(PairingValidity::MenteeAlreadyAssigned as u8, 5);
     }
+
+    // -----------------------------------------------------------------
+    // WP-4.10 — Adversarial property tests via proptest
+    //
+    // These exercise the same invariants as the Forge fuzz tests at
+    // contracts/test/MentorMatcher.t.sol::MentorMatcherFuzzTest. The
+    // mirror tests are not redundant: they catch desync between the
+    // two impls before code review, not after deploy. proptest's
+    // shrinker also produces minimal counterexamples on failure,
+    // which is gold for debugging Q16 boundary conditions.
+    // -----------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Self-mentor short-circuits everything else.
+        #[test]
+        fn proptest_self_mentor_always_returns_self_mentor(
+            who in any::<u8>(),
+            m_acc in any::<u32>(),
+            e_acc in any::<u32>(),
+            load in any::<u64>(),
+            cap in any::<u64>(),
+            floor in any::<u32>(),
+            gap in any::<u32>(),
+            already in any::<bool>(),
+        ) {
+            let a = addr(who);
+            let v = validate_pairing(
+                &a, &a, m_acc, e_acc, load, cap, floor, gap, already,
+            );
+            prop_assert_eq!(v, PairingValidity::SelfMentor);
+        }
+
+        /// Determinism over the full input space.
+        #[test]
+        fn proptest_validate_pairing_is_deterministic(
+            mentor_byte in any::<u8>(),
+            mentee_byte in any::<u8>(),
+            m_acc in any::<u32>(),
+            e_acc in any::<u32>(),
+            load in any::<u64>(),
+            cap in any::<u64>(),
+            floor in any::<u32>(),
+            gap in any::<u32>(),
+            already in any::<bool>(),
+        ) {
+            prop_assume!(mentor_byte != mentee_byte);
+            let m = addr(mentor_byte);
+            let e = addr(mentee_byte);
+            let a = validate_pairing(&m, &e, m_acc, e_acc, load, cap, floor, gap, already);
+            let b = validate_pairing(&m, &e, m_acc, e_acc, load, cap, floor, gap, already);
+            prop_assert_eq!(a, b);
+        }
+
+        /// OK requires strict mentor advantage. The matcher's gap
+        /// rule is `mentor_acc > mentee_acc + gap` with gap ≥ 0, so
+        /// `mentor_acc <= mentee_acc` cannot yield OK regardless of
+        /// other parameters.
+        #[test]
+        fn proptest_ok_requires_strict_mentor_advantage(
+            mentor_byte in any::<u8>(),
+            mentee_byte in any::<u8>(),
+            m_acc in 0u32..=Q16_ONE,
+            e_acc in 0u32..=Q16_ONE,
+            load in 0u64..1024,
+            floor in 0u32..=Q16_ONE,
+            gap in 0u32..=Q16_ONE,
+        ) {
+            prop_assume!(mentor_byte != mentee_byte);
+            prop_assume!(m_acc <= e_acc);
+            let m = addr(mentor_byte);
+            let e = addr(mentee_byte);
+            let cap = 1024u64;  // not the gate we're isolating
+            let v = validate_pairing(&m, &e, m_acc, e_acc, load, cap, floor, gap, false);
+            prop_assert_ne!(v, PairingValidity::Ok);
+        }
+
+        /// Capacity is a strict bound: `load >= cap` rejects.
+        /// Crafted profile: every mentor saturated.
+        #[test]
+        fn proptest_at_capacity_always_rejects(
+            mentor_byte in any::<u8>(),
+            mentee_byte in any::<u8>(),
+            m_acc in (Q16_ONE / 2)..=Q16_ONE,  // clears default floor
+            cap in 0u64..1024,
+        ) {
+            prop_assume!(mentor_byte != mentee_byte);
+            let m = addr(mentor_byte);
+            let e = addr(mentee_byte);
+            let load = cap;  // saturated by construction
+            let e_acc = 0u32;  // wide gap
+            let floor = Q16_ONE / 4;
+            let gap = Q16_ONE / 20;
+            let v = validate_pairing(&m, &e, m_acc, e_acc, load, cap, floor, gap, false);
+            prop_assert_ne!(v, PairingValidity::Ok);
+            // The exact code is MentorAtCapacity unless the gap rule
+            // fires first. With m_acc >= Q16/2 and e_acc = 0 and
+            // gap = Q16/20, we have m_acc > e_acc + gap, so cap
+            // is the operative gate.
+            prop_assert_eq!(v, PairingValidity::MentorAtCapacity);
+        }
+
+        /// No panic over the full input space — the helper must be
+        /// total. (Rust impl uses u64 for the sum, so the Solidity
+        /// fuzzer's overflow finding doesn't reproduce here, but
+        /// pinning total-ness with a property test guards against
+        /// future regressions if someone "optimizes" the cast away.)
+        #[test]
+        fn proptest_no_panic_on_arbitrary_inputs(
+            mentor_byte in any::<u8>(),
+            mentee_byte in any::<u8>(),
+            m_acc in any::<u32>(),
+            e_acc in any::<u32>(),
+            load in any::<u64>(),
+            cap in any::<u64>(),
+            floor in any::<u32>(),
+            gap in any::<u32>(),
+            already in any::<bool>(),
+        ) {
+            let m = addr(mentor_byte);
+            let e = addr(mentee_byte);
+            // Just running it without a panic is the property.
+            let _ = validate_pairing(
+                &m, &e, m_acc, e_acc, load, cap, floor, gap, already,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

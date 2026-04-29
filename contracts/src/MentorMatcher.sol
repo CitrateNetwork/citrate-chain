@@ -225,7 +225,15 @@ contract MentorMatcher {
         if (mentorAcc < trustFloor_) {
             return PairingValidity.MENTOR_BELOW_TRUST_FLOOR;
         }
-        if (mentorAcc <= menteeAcc + minAccuracyGap_) {
+        // Cast to uint256 so a near-uint32.max menteeAcc + gap does
+        // NOT silently wrap. Found by WP-4.10 fuzzer: with Q16.16
+        // semantics inputs SHOULD be ≤ 65536, but the helper can't
+        // assume well-formedness and must remain panic-free over
+        // the full uint32 domain.
+        if (
+            uint256(mentorAcc)
+                <= uint256(menteeAcc) + uint256(minAccuracyGap_)
+        ) {
             return PairingValidity.ACCURACY_GAP_TOO_SMALL;
         }
         if (mentorLoad_ >= mentorCap_) {
