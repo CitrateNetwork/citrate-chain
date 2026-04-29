@@ -187,7 +187,9 @@ impl<C: ChainAdapter + 'static> Orchestrator<C> {
 
     /// Trigger aggregation for a cycle. Called externally when the
     /// orchestrator decides the cycle is ready (cycle close
-    /// detection lands at WP-3.6).
+    /// detection lands at WP-3.6). Idempotent: the underlying
+    /// `Aggregator` impl guards on `cycle_status` per
+    /// `LearningDaemon.tla::AggregationIdempotent`.
     pub async fn try_aggregate(&self, cycle_id: CycleId) -> DaemonResult<()> {
         self.aggregator.aggregate(cycle_id).await
     }
@@ -195,6 +197,40 @@ impl<C: ChainAdapter + 'static> Orchestrator<C> {
     /// Trigger training for a cycle. Same pattern as `try_aggregate`.
     pub async fn try_train(&self, cycle_id: CycleId) -> DaemonResult<()> {
         self.trainer.train(cycle_id).await
+    }
+
+    /// Drive the orchestrator until `shutdown` resolves, sleeping
+    /// `tick_interval` between ticks. Used by the production daemon
+    /// binary (WP-3.5 slice 2). Tests prefer to drive `tick()`
+    /// directly to keep timing deterministic.
+    ///
+    /// The loop swallows transient `tick()` errors with a `warn!`
+    /// log so a single RPC blip doesn't take down the daemon —
+    /// permanent failures (RocksDB corruption, etc.) surface via
+    /// the watcher's HWM-monotonic invariant + the state layer's
+    /// own panics, which are NOT caught here.
+    pub async fn run_loop(
+        &self,
+        tick_interval: std::time::Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> DaemonResult<()> {
+        info!(?tick_interval, "orchestrator run_loop entering");
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        info!("orchestrator shutdown requested; exiting run_loop");
+                        return Ok(());
+                    }
+                }
+                _ = tokio::time::sleep(tick_interval) => {
+                    if let Err(e) = self.tick().await {
+                        warn!(error = %e, "tick failed; continuing");
+                    }
+                }
+            }
+        }
     }
 
     /// Trigger finalize for a cycle. Per `FinalizeAtMostOnce` +
@@ -219,24 +255,41 @@ impl<C: ChainAdapter + 'static> Orchestrator<C> {
     }
 }
 
-// Stub hooks for unit tests + early integration use.
+// ============================================================
+// No-op hook implementations.
+//
+// Despite the legacy `Stub*` naming (kept to minimize test churn
+// across this WP), these are NOT placeholder stubs awaiting real
+// impls — those exist: `BelnapAggregator` (WP-3.6),
+// `RoutingTrainer` (WP-3.7), `ChainFinalizer` (WP-3.8). They are
+// deliberate no-op fallbacks useful for two cases:
+//
+//   1. Partial daemon configurations (e.g., a "watcher only" mode
+//      that observes events but doesn't aggregate or train).
+//   2. Integration tests that exercise watcher + dispatch paths
+//      without bringing up the full hook stack.
+//
+// `Orchestrator::new()` requires explicit hook arguments — there
+// is NO default constructor that silently wires these in. Per
+// the project's CLAUDE.md "Wittgenstein Loophole" guidance,
+// production daemon configurations MUST construct with real hook
+// types only.
+// ============================================================
 
-/// Aggregator stub that always succeeds without doing any work.
-/// WP-3.6 replaces this with the real Belnap-precompile call.
+/// No-op aggregator: returns `Ok(())` without modifying state.
+/// See section docs above; not a placeholder — the real impl is
+/// `BelnapAggregator` in `aggregator.rs`.
 pub struct StubAggregator;
 
 #[async_trait]
 impl Aggregator for StubAggregator {
-    /// Stub aggregate — Idempotent by construction (does nothing).
-    /// The real implementation at WP-3.6 must guard on
-    /// `state.cycle_status(cycle_id)` per the
-    /// `check_daemon_idempotent_aggregation.py` tripwire contract.
+    /// No-op aggregate. Idempotent by construction (no side effects).
     async fn aggregate(&self, _cycle_id: CycleId) -> DaemonResult<()> {
         Ok(())
     }
 }
 
-/// Trainer stub. WP-3.7 replaces this with candle SGD + IPFS pin.
+/// No-op trainer. Real impl is `RoutingTrainer` in `trainer.rs`.
 pub struct StubTrainer;
 
 #[async_trait]
@@ -246,13 +299,72 @@ impl Trainer for StubTrainer {
     }
 }
 
-/// Finalizer stub. WP-3.8 replaces this with the real
-/// `finalizeCycle` call via ChainAdapter.
+/// No-op finalizer. Real impl is `ChainFinalizer` in `finalizer.rs`.
 pub struct StubFinalizer;
 
 #[async_trait]
 impl Finalizer for StubFinalizer {
     async fn finalize(&self, _cycle_id: CycleId) -> DaemonResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::FakeChain;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn make_orchestrator() -> (Orchestrator<FakeChain>, Arc<FakeChain>, TempDir) {
+        let chain = Arc::new(FakeChain::new());
+        let dir = TempDir::new().expect("tempdir");
+        let state =
+            Arc::new(DaemonState::open(dir.path()).expect("state open"));
+        let orch = Orchestrator::new(
+            chain.clone(),
+            state,
+            Arc::new(StubAggregator),
+            Arc::new(StubTrainer),
+            Arc::new(StubFinalizer),
+        );
+        (orch, chain, dir)
+    }
+
+    #[tokio::test]
+    async fn run_loop_exits_on_shutdown_signal() {
+        let (orch, _chain, _dir) = make_orchestrator();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        // Fire shutdown after a short delay; run_loop must observe it
+        // and return Ok(()) without panicking.
+        let handle = tokio::spawn(async move {
+            orch.run_loop(Duration::from_millis(20), rx).await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        tx.send(true).expect("send shutdown");
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("run_loop did not exit within 1s")
+            .expect("join")
+            .expect("run_loop returned Err");
+        let _ = result;
+    }
+
+    #[tokio::test]
+    async fn run_loop_exits_when_shutdown_sender_dropped() {
+        // If the watch::Sender is dropped, `changed()` errors; the
+        // loop treats that as a shutdown signal and exits cleanly.
+        let (orch, _chain, _dir) = make_orchestrator();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            orch.run_loop(Duration::from_millis(20), rx).await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("run_loop did not exit within 1s")
+            .expect("join")
+            .expect("run_loop returned Err");
     }
 }
