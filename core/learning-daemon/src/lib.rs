@@ -50,6 +50,7 @@
 
 #![warn(missing_docs)]
 
+pub mod aggregator;
 pub mod chain;
 pub mod error;
 pub mod orchestrator;
@@ -57,6 +58,7 @@ pub mod state;
 pub mod types;
 pub mod watcher;
 
+pub use aggregator::{BelnapAggregator, EmbeddingCache, EmbeddingEntry, MemoryEmbeddingCache};
 pub use chain::{ChainAdapter, FakeChain, LearningEvent};
 pub use error::DaemonError;
 pub use orchestrator::Orchestrator;
