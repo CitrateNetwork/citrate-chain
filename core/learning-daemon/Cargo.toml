@@ -66,6 +66,13 @@ ethereum-types = "0.14"
 citrate-execution = { path = "../execution" }
 citrate-learning = { path = "../learning" }
 
+# WP-3.16: public read-only dashboard backend at federated.citrate.ai.
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
 [dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
 tempfile = "3"
+hyper = "1"
 proptest = { workspace = true }
