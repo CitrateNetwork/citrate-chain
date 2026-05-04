@@ -422,11 +422,87 @@ jobs:
           Remove-Item $stage -Recurse -Force
           Write-Host "Created $zip"
 
+      # ===========================================================
+      # WP-A2.6: native installer matrix legs (MSI / pkg / deb-LC / rpm)
+      # ===========================================================
+      # The steps above produce raw tar.gz / zip bundles. The steps below
+      # produce the IT-friendly installers (MSI for Windows GPO/Intune,
+      # .pkg for macOS Jamf/MDM, LC-specific .deb + .rpm for Linux fleet
+      # tools). All builders read templates from
+      # gui/citrate_learning_center/release/packaging/<os>/ and emit into
+      # citrate_v0.01.1/dist/.
+
+      - name: Install Linux LC packaging tools (rpm)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y rpm
+
+      - name: Build Linux LC .deb (WP-A2.1)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -eux
+          scripts/packaging/linux/create-learning-center-deb.sh \
+            --version "${RELEASE_TAG#v}" \
+            --output dist
+          ls dist/
+
+      - name: Validate Linux LC .deb (WP-A2.1)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -eux
+          DEB="$(ls dist/citrate-learning-center_*.deb | head -n 1)"
+          scripts/packaging/lab/validate-learning-center-deb.sh "$DEB"
+
+      - name: Build Linux LC .rpm (WP-A2.1)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -eux
+          scripts/packaging/linux/create-learning-center-rpm.sh \
+            --version "${RELEASE_TAG#v}" \
+            --output dist
+          ls dist/
+
+      - name: Build macOS LC .pkg (WP-A2.2)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -eux
+          scripts/packaging/macos/create-learning-center-pkg.sh \
+            --version "${RELEASE_TAG#v}" \
+            --output dist
+          ls dist/
+
+      - name: Install WiX toolset (WP-A2.3)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install wixtoolset -y --no-progress
+          # WiX 3.x default install path; fall back to glob if version differs.
+          $wixBin = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+          if (Test-Path $wixBin) {
+            "$wixBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          } else {
+            Get-ChildItem "C:\Program Files (x86)\WiX*\bin" -ErrorAction SilentlyContinue |
+              Select-Object -First 1 |
+              ForEach-Object { "$($_.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append }
+          }
+
+      - name: Build Windows LC MSI (WP-A2.3)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\scripts\packaging\windows\build-learning-center-msi.ps1 -Version $env:RELEASE_TAG -OutputDir dist
+          Get-ChildItem dist
+
       - name: Upload Learning Center artifact
         uses: actions/upload-artifact@v4
         with:
           name: learning-center-${{ matrix.os }}
-          path: citrate_v0.01.1/dist/*
+          # Use ** to recurse so dist/learning-center/<arch>/... installer
+          # subdirs the builders may create are also captured.
+          path: citrate_v0.01.1/dist/**
           if-no-files-found: error  # LC is the pilot binary — fail hard if missing
 
   # ============================================================================
