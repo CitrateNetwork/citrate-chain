@@ -62,7 +62,10 @@ mkdir -p "$STAGING_DIR/usr/local/bin" "$DOC_DIR/ai" "$DOC_DIR/examples"
 install -m 0755 "$BINARY" "$STAGING_DIR/usr/local/bin/citrate-learning-center"
 cp "$RELEASE_PACKET_DIR/INSTALL.md" "$DOC_DIR/"
 cp "$RELEASE_PACKET_DIR/P2_RELEASE_MANIFEST.toml" "$DOC_DIR/"
-cp "$RELEASE_PACKET_DIR/P2_CLOSURE_REPORT_2026-04-10.md" "$DOC_DIR/"
+# Note: P2_CLOSURE_REPORT_2026-04-10.md was branch-historical
+# (feat/learning-center-phase-a's local closure record) and is intentionally
+# not carried forward to main per WP-A5 port. P2_RELEASE_MANIFEST.toml +
+# CLEAN_MACHINE_INSTALL_PROTOCOL.md (in the active sprint dir) supersede it.
 cp "$RELEASE_PACKET_DIR/AI_GUIDE_MANIFEST.toml" "$DOC_DIR/"
 cp "$RELEASE_PACKET_DIR/IT_DEPLOYMENT_RUNBOOK.md" "$DOC_DIR/"
 cp "$RELEASE_PACKET_DIR/INCIDENT_RESPONSE_RUNBOOK.md" "$DOC_DIR/"
