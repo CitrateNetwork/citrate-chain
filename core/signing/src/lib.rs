@@ -11,6 +11,7 @@ pub mod models;
 pub mod provider;
 pub mod providers;
 pub mod webhook;
+pub mod webhook_server;
 
 pub use error::SigningError;
 pub use models::{
@@ -18,3 +19,4 @@ pub use models::{
     SignedDocumentBytes, Signer, SignerRole,
 };
 pub use provider::SigningProvider;
+pub use webhook_server::{build_docusign_webhook_router, EventSink, DOCUSIGN_SIGNATURE_HEADER};
