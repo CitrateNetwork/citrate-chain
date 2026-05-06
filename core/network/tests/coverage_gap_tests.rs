@@ -26,8 +26,13 @@ async fn test_peer_info_stale_detection() {
     let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let info = PeerInfo::new(peer_id, addr, Direction::Inbound);
 
-    // With a zero timeout, the peer should immediately be stale
-    assert!(info.is_stale(Duration::from_secs(0)));
+    // is_stale uses strict `>`, so a 0ns elapsed against a 0ns timeout
+    // returns false. Sleep past a tiny threshold to make this assertion
+    // meaningful on any clock resolution. (Original `from_secs(0)`
+    // immediately after `PeerInfo::new()` was racy on fast machines —
+    // tracked as Track-P4 WP-P4-16(b).)
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(info.is_stale(Duration::from_millis(1)));
 
     // With a long timeout, the peer should not be stale
     assert!(!info.is_stale(Duration::from_secs(3600)));
