@@ -249,8 +249,11 @@ ghostdag_k = 18
 [network]
 listen_addr = "0.0.0.0:$P2P_PORT"
 bootstrap_nodes = [
-    # Add known bootstrap node addresses here, e.g.:
-    # "noise_<pubkey>@boot1.testnet.citrate.network:30303",
+    # This bootnode does not bootstrap from itself; partners point HERE.
+    # Canonical partner multiaddr (mirrored in node/config/testnet.toml):
+    #   noise_24402d5e3009b8004bef53a7a29c4b34138afe4d59cb52e1ba353bb08108eb2e@159.65.227.42:30303
+    # Pubkey derived from /var/lib/citrate/noise.key on droplet 560906847 (nyc1).
+    # Track-DISCOVERY will replace static IP with HTTPS-fetched seed list.
 ]
 max_peers = 50
 
