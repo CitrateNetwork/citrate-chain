@@ -10,10 +10,13 @@ ghostdag_k = 18
 [network]
 listen_addr = "0.0.0.0:30303"
 bootstrap_nodes = [
-    # Public testnet bootstrap nodes (update with actual addresses)
-    # "noise_<pubkey_hex>@boot1.testnet.citrate.network:30303",
-    # "noise_<pubkey_hex>@boot2.testnet.citrate.network:30303",
-    # "noise_<pubkey_hex>@boot3.testnet.citrate.network:30303",
+    # citrate-bootnode-1 (DigitalOcean nyc1, droplet 560906847).
+    # Direct IP because rpc.citrate.ai is Cloudflare-proxied (HTTPS only) —
+    # P2P on :30303 won't traverse Cloudflare's TCP proxy. Track-DISCOVERY
+    # will replace this with a non-CF subdomain (e.g. boot.citrate.ai)
+    # plus an HTTPS-fetched well-known seed list for rotation. Until then,
+    # this multiaddr is the canonical bootstrap for chain-id 40204 (testnet beta).
+    "noise_24402d5e3009b8004bef53a7a29c4b34138afe4d59cb52e1ba353bb08108eb2e@159.65.227.42:30303",
 ]
 max_peers = 50
 
