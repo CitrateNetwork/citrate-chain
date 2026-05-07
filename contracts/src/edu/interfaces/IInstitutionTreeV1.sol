@@ -40,4 +40,10 @@ interface IInstitutionTreeV1 {
 
     /// @notice Enumerate child schools under a district.
     function listSchoolsForDistrict(bytes32 districtIdHash) external view returns (bytes32[] memory);
+
+    /// @notice Walk all districts under a CMO and return the flat union of
+    ///         their schools. Convenience read for CMO-portal clients that
+    ///         need a single RPC round-trip to enumerate the CMO's school
+    ///         portfolio. Returns empty for unknown CMOs.
+    function listAllSchoolsForCmo(bytes32 cmoIdHash) external view returns (bytes32[] memory);
 }
