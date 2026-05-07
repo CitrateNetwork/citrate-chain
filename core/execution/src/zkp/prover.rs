@@ -5,11 +5,53 @@ use super::circuits::{DataIntegrityCircuit, StateTransitionCircuit};
 use super::types::{ProofType, ProvingKey, SerializableProof, ZKPError};
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_groth16::{prepare_verifying_key, Groth16, PreparedVerifyingKey};
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
 use ark_snark::SNARK;
 use parking_lot::RwLock;
 use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Pre-flight: synthesize the circuit into a fresh ConstraintSystem and verify
+/// that all constraints are satisfied by the provided witness BEFORE invoking
+/// `Groth16::prove`.
+///
+/// arkworks' Groth16::prove produces a non-verifying proof from unsatisfiable
+/// constraints rather than returning Err — a known footgun. Without this
+/// pre-flight check, a caller doing `let proof = backend.generate_proof(req)?;`
+/// receives `Ok(proof)` even when their inputs violate circuit invariants;
+/// the failure only surfaces later during verification (or never, if the
+/// caller never verifies).
+///
+/// This helper closes that gap: any witness inconsistency surfaces as a
+/// `ZKPError::SynthesisError` from `generate_proof`, with the same diagnostic
+/// shape as a literal synthesis error from arkworks. WP-P4-16(a) closure
+/// (CIF-16a in 2026-03-26 audit closure record).
+///
+/// Performance: synthesizes the circuit twice (here + Groth16::prove). The
+/// constraint count for current ZKP circuits (model exec, gradient, state
+/// transition, data integrity) is small relative to the prover's MSM cost,
+/// so the overhead is well under 5%.
+fn check_circuit_satisfied<C>(circuit: C) -> Result<(), ZKPError>
+where
+    C: ConstraintSynthesizer<Fr>,
+{
+    let cs = ConstraintSystem::<Fr>::new_ref();
+    circuit
+        .generate_constraints(cs.clone())
+        .map_err(|e| ZKPError::SynthesisError(e.to_string()))?;
+    cs.finalize();
+    let satisfied = cs
+        .is_satisfied()
+        .map_err(|e| ZKPError::SynthesisError(e.to_string()))?;
+    if !satisfied {
+        return Err(ZKPError::SynthesisError(
+            "circuit constraints not satisfied: witness is inconsistent with public inputs"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Proof generator for ZKP operations
 pub struct Prover {
@@ -114,6 +156,9 @@ impl Prover {
             computation_trace,
         };
 
+        // WP-P4-16(a): pre-flight constraint-satisfaction check before Groth16::prove
+        check_circuit_satisfied(circuit.clone())?;
+
         let pk = self
             .proving_keys
             .read()
@@ -159,6 +204,9 @@ impl Prover {
             num_samples,
         };
 
+        // WP-P4-16(a): pre-flight constraint-satisfaction check before Groth16::prove
+        check_circuit_satisfied(circuit.clone())?;
+
         let pk = self
             .proving_keys
             .read()
@@ -200,6 +248,9 @@ impl Prover {
             transaction_hash: transaction_hash.clone(),
         };
 
+        // WP-P4-16(a): pre-flight constraint-satisfaction check before Groth16::prove
+        check_circuit_satisfied(circuit.clone())?;
+
         let pk = self
             .proving_keys
             .read()
@@ -239,6 +290,11 @@ impl Prover {
             merkle_root: merkle_root.clone(),
             leaf_index,
         };
+
+        // WP-P4-16(a): pre-flight constraint-satisfaction check before Groth16::prove.
+        // This is the case the audit specifically flagged: a wrong merkle_root
+        // would silently produce a non-verifying proof here. Now it returns Err.
+        check_circuit_satisfied(circuit.clone())?;
 
         let pk = self
             .proving_keys
@@ -295,6 +351,8 @@ impl Prover {
         let mut proofs = Vec::new();
 
         for (circuit, public_inputs) in circuits.into_iter().zip(public_inputs_per_circuit) {
+            // WP-P4-16(a): pre-flight constraint-satisfaction check before Groth16::prove
+            check_circuit_satisfied(circuit.clone())?;
             let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng)
                 .map_err(|e| ZKPError::ProvingError(e.to_string()))?;
 

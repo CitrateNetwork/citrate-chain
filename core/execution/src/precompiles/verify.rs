@@ -37,7 +37,11 @@ pub mod addresses {
     pub const TENSOR_COMMIT: [u8; 20] =
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 7];
 
-    /// 0x0108 — Groth16 verifier for inference proofs.
+    /// 0x0108 — Halo2-KZG verifier for inference proofs (post-RM-M1b
+    /// migration; was Groth16 pre-RM-M1b). Dispatches to
+    /// `crate::zkp::halo2::verify_inference_proof` when the
+    /// `halo2-substrate` feature is enabled; returns a discoverable
+    /// `SubstrateAbsent` error otherwise.
     pub const INFERENCE_PROOF_VERIFY: [u8; 20] =
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 8];
 
