@@ -273,6 +273,99 @@ contract InstitutionTreeV1Test is Test {
         tree.acceptGovernance();
     }
 
+    // ── listAllSchoolsForCmo (CMO-portal helper) ──
+
+    function test_listAllSchoolsForCmo_emptyForUnknownCmo() public view {
+        bytes32[] memory schools = tree.listAllSchoolsForCmo(keccak256("unknown"));
+        assertEq(schools.length, 0);
+    }
+
+    function test_listAllSchoolsForCmo_emptyForCmoWithNoDistricts() public {
+        vm.prank(governance);
+        tree.registerCmo(CMO_HASH, cmoAdmin, STATE_CA);
+        bytes32[] memory schools = tree.listAllSchoolsForCmo(CMO_HASH);
+        assertEq(schools.length, 0);
+    }
+
+    function test_listAllSchoolsForCmo_singleDistrictSingleSchool() public {
+        vm.prank(governance);
+        tree.registerCmo(CMO_HASH, cmoAdmin, STATE_CA);
+        vm.prank(cmoAdmin);
+        tree.registerDistrict(CMO_HASH, DISTRICT_DC_HASH, districtAdmin, STATE_NY);
+        vm.prank(districtAdmin);
+        tree.registerSchool(DISTRICT_DC_HASH, SCHOOL_PROMISE_HASH, schoolAdmin, STATE_NY);
+
+        bytes32[] memory schools = tree.listAllSchoolsForCmo(CMO_HASH);
+        assertEq(schools.length, 1);
+        assertEq(schools[0], SCHOOL_PROMISE_HASH);
+    }
+
+    function test_listAllSchoolsForCmo_multiDistrictMultiSchool() public {
+        // 1 CMO → 2 districts → 3 schools (2 in DC, 1 in NYC)
+        bytes32 SCH_DC_2 = keccak256("KIPP-DC-EAST");
+        bytes32 SCH_NYC_1 = keccak256("KIPP-NYC-AMP");
+
+        vm.prank(governance);
+        tree.registerCmo(CMO_HASH, cmoAdmin, STATE_CA);
+        vm.startPrank(cmoAdmin);
+        tree.registerDistrict(CMO_HASH, DISTRICT_DC_HASH, districtAdmin, STATE_NY);
+        tree.registerDistrict(CMO_HASH, DISTRICT_NYC_HASH, districtAdmin, STATE_NY);
+        vm.stopPrank();
+        vm.startPrank(districtAdmin);
+        tree.registerSchool(DISTRICT_DC_HASH, SCHOOL_PROMISE_HASH, schoolAdmin, STATE_NY);
+        tree.registerSchool(DISTRICT_DC_HASH, SCH_DC_2, schoolAdmin, STATE_NY);
+        tree.registerSchool(DISTRICT_NYC_HASH, SCH_NYC_1, schoolAdmin, STATE_NY);
+        vm.stopPrank();
+
+        bytes32[] memory schools = tree.listAllSchoolsForCmo(CMO_HASH);
+        assertEq(schools.length, 3);
+        // Order: districts iterated in registration order; schools within
+        // each district in registration order. Verify the expected sequence.
+        assertEq(schools[0], SCHOOL_PROMISE_HASH);
+        assertEq(schools[1], SCH_DC_2);
+        assertEq(schools[2], SCH_NYC_1);
+    }
+
+    function test_listAllSchoolsForCmo_excludesStandaloneDistricts() public {
+        // Standalone district (no CMO parent) — its schools must NOT appear
+        // in any CMO's enumeration.
+        vm.prank(governance);
+        tree.registerCmo(CMO_HASH, cmoAdmin, STATE_CA);
+        vm.prank(cmoAdmin);
+        tree.registerDistrict(CMO_HASH, DISTRICT_DC_HASH, districtAdmin, STATE_NY);
+        vm.prank(districtAdmin);
+        tree.registerSchool(DISTRICT_DC_HASH, SCHOOL_PROMISE_HASH, schoolAdmin, STATE_NY);
+
+        // Standalone district + school
+        vm.prank(governance);
+        tree.registerDistrict(bytes32(0), STANDALONE_DISTRICT_HASH, districtAdmin, STATE_CA);
+        vm.prank(districtAdmin);
+        tree.registerSchool(STANDALONE_DISTRICT_HASH, STANDALONE_SCHOOL_HASH, schoolAdmin, STATE_CA);
+
+        bytes32[] memory schools = tree.listAllSchoolsForCmo(CMO_HASH);
+        assertEq(schools.length, 1);
+        assertEq(schools[0], SCHOOL_PROMISE_HASH);
+        // Standalone school not in the CMO list
+        for (uint256 i = 0; i < schools.length; i++) {
+            assertTrue(schools[i] != STANDALONE_SCHOOL_HASH);
+        }
+    }
+
+    function test_listAllSchoolsForCmo_isReadOnly() public {
+        vm.prank(governance);
+        tree.registerCmo(CMO_HASH, cmoAdmin, STATE_CA);
+        vm.prank(cmoAdmin);
+        tree.registerDistrict(CMO_HASH, DISTRICT_DC_HASH, districtAdmin, STATE_NY);
+        vm.prank(districtAdmin);
+        tree.registerSchool(DISTRICT_DC_HASH, SCHOOL_PROMISE_HASH, schoolAdmin, STATE_NY);
+
+        // Snapshot length, call helper twice, verify state unchanged
+        uint256 totalBefore = tree.totalNodes();
+        tree.listAllSchoolsForCmo(CMO_HASH);
+        tree.listAllSchoolsForCmo(CMO_HASH);
+        assertEq(tree.totalNodes(), totalBefore);
+    }
+
     // ── Multi-state CMO scenario (S4 from scenario analysis) ──
 
     function test_multiStateCmo_districtsCanBeInDifferentStates() public {
