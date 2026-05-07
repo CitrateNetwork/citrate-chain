@@ -866,4 +866,104 @@ mod tests {
         };
         assert!(config.validate().is_ok());
     }
+
+    /// WP-P4-3 regression: CIF-03 — every initialized balance for testnet_beta()
+    /// must come from a declared `config.accounts` entry, with no drift.
+    ///
+    /// The 2026-03-26 internal-final audit (CIF-03, High) flagged a concern
+    /// that `initialize_shared_genesis_state()` was seeding extra balances
+    /// outside `config.accounts`, making the declared GenesisConfig not the
+    /// full economic truth. The defect was resolved (verified at HEAD: the
+    /// initializer at lines ~516-529 only iterates `config.accounts`).
+    ///
+    /// This regression covers the actual production testnet config — the
+    /// existing `test_shared_genesis_does_not_seed_undeclared_accounts`
+    /// uses a synthetic 1-account config; this asserts the same property
+    /// for the live `testnet_beta()` config that runs chain-id 40204.
+    ///
+    /// Acceptance: for each declared account, `get_balance` matches
+    /// `account.balance` byte-for-byte; sum of observed balances equals
+    /// `config.total_preallocation()`.
+    #[test]
+    fn test_p4_3_testnet_beta_declared_equals_initialized() {
+        use citrate_execution::state::state_db::StateDB;
+
+        let config = GenesisConfig::testnet_beta();
+        config
+            .validate()
+            .expect("testnet_beta config must validate");
+
+        let state_db = Arc::new(StateDB::new());
+        let executor = Arc::new(Executor::with_chain_id(state_db, config.chain_id));
+        let _root = initialize_shared_genesis_state(&executor, &config);
+
+        let mut total_observed = U256::zero();
+        for account in &config.accounts {
+            let observed = executor.get_balance(&account.address);
+            assert_eq!(
+                observed,
+                account.balance,
+                "testnet_beta balance drift for 0x{}: declared {} wei, initialized {} wei",
+                hex::encode(account.address.0),
+                account.balance,
+                observed
+            );
+            total_observed += observed;
+        }
+
+        // U256 doesn't implement std::iter::Sum, so fold by hand.
+        let declared_total: U256 = config
+            .accounts
+            .iter()
+            .fold(U256::zero(), |acc, a| acc + a.balance);
+        assert_eq!(
+            declared_total, total_observed,
+            "sum of initialized balances must equal sum of declared balances"
+        );
+        assert_eq!(
+            declared_total,
+            config.total_preallocation(),
+            "declared total must equal config.total_preallocation()"
+        );
+    }
+
+    /// WP-P4-3 regression: same property for team_testnet_genesis(), which
+    /// has 16 accounts (3 base + 10 validators + 3 deployer/faucet keys).
+    /// This config is more complex than testnet_beta and covers the
+    /// `accounts.push(...)` paths in `team_testnet_genesis()`.
+    #[test]
+    fn test_p4_3_team_testnet_declared_equals_initialized() {
+        use citrate_execution::state::state_db::StateDB;
+
+        let config = GenesisConfig::team_testnet_genesis();
+        config
+            .validate()
+            .expect("team_testnet_genesis config must validate");
+
+        let state_db = Arc::new(StateDB::new());
+        let executor = Arc::new(Executor::with_chain_id(state_db, config.chain_id));
+        let _root = initialize_shared_genesis_state(&executor, &config);
+
+        let mut total_observed = U256::zero();
+        for account in &config.accounts {
+            let observed = executor.get_balance(&account.address);
+            assert_eq!(
+                observed,
+                account.balance,
+                "team_testnet balance drift for 0x{}: declared {} wei, initialized {} wei",
+                hex::encode(account.address.0),
+                account.balance,
+                observed
+            );
+            total_observed += observed;
+        }
+
+        // U256 doesn't implement std::iter::Sum, so fold by hand.
+        let declared_total: U256 = config
+            .accounts
+            .iter()
+            .fold(U256::zero(), |acc, a| acc + a.balance);
+        assert_eq!(declared_total, total_observed);
+        assert_eq!(declared_total, config.total_preallocation());
+    }
 }
