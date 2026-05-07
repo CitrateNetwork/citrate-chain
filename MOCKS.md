@@ -117,3 +117,28 @@ These are documented technical limitations, not mocks:
 3. **`learning_get_classroom` whitelisted models**: Returns empty list for `whitelisted_models` because iterating an on-chain array requires a dedicated `getWhitelistedModels(address)` view function or event scanning. Tracked as a backlog item.
 
 4. **`learning_get_cycle_status` time remaining**: `time_remaining_ms` returns 0 because the on-chain contract doesn't track phase durations. Requires off-chain phase-start timestamp tracking.
+
+## UI-level synthetic data — none in active GUI (WP-P4-7 disclosure)
+
+The 2026-03-26 internal-final audit (CIF-07) flagged that `MOCKS.md`'s "0 mocks remaining" claim only covered backend IPC mocks and missed UI-level synthetic data — specifically `generateMockPeers` in the retired Tauri/React `gui_v2/` PeerGraph component.
+
+**Status at HEAD (verified 2026-05-06):**
+
+- `citrate_v0.01.1/gui/citrate_gui_v2/` — **retired** (no source files, no CI build path, no workspace member). The `generateMockPeers` and `<PeerGraph peers={generateMockPeers(peers)} />` cited in the audit no longer exist. Same structural-by-replacement closure pattern as CIF-01, CIF-04, CIF-05, CIF-06.
+- Active Slint apps (`citrate_gui_native/`, `citrate_learning_center/`, `citrate_edu_app/`, `citrate_desktop_app/`) — no UI-level synthetic peer generators or visualization mocks. Verified by:
+  ```bash
+  grep -rn "mock_peer\|MockPeer\|generate_mock\|MOCK_DATA\|synthetic_peer" citrate_v0.01.1/gui/
+  ```
+  returning zero hits.
+- DAG / peer visualization in the Slint operator GUI uses real chain state from RPC + the P2P peer list — no synthetic data path.
+
+**Distinction explicit (per CIF-07 recommended fix #2):**
+
+| Layer | Mocks at HEAD |
+|---|---|
+| Backend contract-call IPC commands (LearningPool, ClassroomRegistry, etc.) | **0** — all 15 wired to real `eth_call`/`eth_sendTransaction` |
+| UI-level synthetic visualization data (peer graphs, charts, dashboards) | **0** — Slint apps render real RPC + chain state |
+| Trait-boundary backend substitutions (CM-07 training-worker S0) | **3 registered** — explicitly listed above with replacement WPs and gates per Rule 11 |
+| AI API placeholder endpoints (CIF-08 scope) | **3 surfaces flagged** — see [`.agentile/audits/AI_ENDPOINT_INVENTORY_2026_05.md`](../.agentile/audits/AI_ENDPOINT_INVENTORY_2026_05.md) for the inventory |
+
+If this distinction grows or shrinks, update this table; the four-row form is the canonical "claim-reality matrix" the audit's recommended fix #3 asked for, indexed alongside the assurance baseline.
