@@ -1887,6 +1887,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-defense_prime-suppliers-proof"
+version = "0.1.0"
+dependencies = [
+ "citrate-defense_prime-suppliers",
+ "image",
+ "slint",
+ "slint-build",
+]
+
+[[package]]
 name = "citrate-bridge"
 version = "0.4.0"
 dependencies = [
