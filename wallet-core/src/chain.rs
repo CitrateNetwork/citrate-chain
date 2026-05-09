@@ -431,6 +431,43 @@ impl RpcClient {
         parse_hex_u64(&result)
     }
 
+    /// Issue an `eth_call` against a contract address with raw calldata.
+    ///
+    /// Returns the contract's return-data bytes. Used by typed binding
+    /// crates (e.g., `citrate-rbac-bindings`) to call deployed contract
+    /// view functions without bringing in `ethabi`/`alloy` dependencies.
+    ///
+    /// # Arguments
+    ///
+    /// - `to` — 0x-prefixed 20-byte EVM address (e.g., `"0xABC..."`).
+    /// - `data` — raw calldata: 4-byte selector + ABI-encoded args.
+    ///
+    /// # Errors
+    ///
+    /// - [`WalletError::Rpc`] if the JSON-RPC call fails.
+    /// - [`WalletError::Rpc`] if the response is not a hex string.
+    /// - [`WalletError::Rpc`] if the hex decode fails.
+    pub async fn eth_call(&self, to: &str, data: &[u8]) -> Result<Vec<u8>, WalletError> {
+        let hex_data = format!("0x{}", hex::encode(data));
+        let result = self
+            .call(
+                "eth_call",
+                serde_json::json!([
+                    {
+                        "to": to,
+                        "data": hex_data,
+                    },
+                    "latest",
+                ]),
+            )
+            .await?;
+        let s = result
+            .as_str()
+            .ok_or_else(|| WalletError::Rpc("Expected hex string from eth_call".into()))?;
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        hex::decode(s).map_err(|e| WalletError::Rpc(format!("Invalid hex from eth_call: {}", e)))
+    }
+
     /// Get a transaction receipt.
     pub async fn get_transaction_receipt(
         &self,
@@ -619,6 +656,136 @@ mod tests {
         let id1 = client.next_id();
         let id2 = client.next_id();
         assert_eq!(id2, id1 + 1);
+    }
+
+    #[tokio::test]
+    async fn test_eth_call_constructs_request_body() {
+        // Spin up a tiny mock server that captures the request body and
+        // replies with a known hex string. This validates the request
+        // shape without depending on a real chain.
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let port = listener.local_addr().expect("local addr").port();
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).expect("read");
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Strip headers, keep body.
+            if let Some(idx) = req.find("\r\n\r\n") {
+                let body = &req[idx + 4..];
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                    *captured_clone.lock().expect("capture lock") = Some(v);
+                }
+            }
+            // Reply with a 32-byte hex value.
+            let response_body = r#"{"jsonrpc":"2.0","id":1,"result":"0x000000000000000000000000000000000000000000000000000000000000002a"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(resp.as_bytes()).expect("write");
+            stream.flush().expect("flush");
+        });
+
+        let client = RpcClient::new(&format!("http://127.0.0.1:{}", port));
+        let result = client
+            .eth_call(
+                "0xdead000000000000000000000000000000000000",
+                &[0xde, 0xad, 0xbe, 0xef],
+            )
+            .await
+            .expect("eth_call should succeed");
+
+        // Returns 32 bytes, last byte == 42.
+        assert_eq!(result.len(), 32);
+        assert_eq!(result[31], 0x2a);
+
+        // Verify the request body shape.
+        let body = captured
+            .lock()
+            .expect("capture lock")
+            .clone()
+            .expect("captured request body");
+        assert_eq!(body["method"], "eth_call");
+        assert_eq!(body["params"][0]["to"], "0xdead000000000000000000000000000000000000");
+        assert_eq!(body["params"][0]["data"], "0xdeadbeef");
+        assert_eq!(body["params"][1], "latest");
+    }
+
+    #[tokio::test]
+    async fn test_eth_call_rejects_non_hex_result() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).expect("read");
+            // Reply with a non-string result (boolean).
+            let response_body = r#"{"jsonrpc":"2.0","id":1,"result":true}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(resp.as_bytes()).expect("write");
+            stream.flush().expect("flush");
+        });
+
+        let client = RpcClient::new(&format!("http://127.0.0.1:{}", port));
+        let err = client
+            .eth_call("0x0000000000000000000000000000000000000000", &[])
+            .await
+            .expect_err("non-hex result must error");
+        match err {
+            WalletError::Rpc(msg) => assert!(msg.contains("hex string")),
+            other => panic!("expected Rpc error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_eth_call_rejects_invalid_hex() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).expect("read");
+            // Odd-length hex (invalid).
+            let response_body = r#"{"jsonrpc":"2.0","id":1,"result":"0xabc"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(resp.as_bytes()).expect("write");
+            stream.flush().expect("flush");
+        });
+
+        let client = RpcClient::new(&format!("http://127.0.0.1:{}", port));
+        let err = client
+            .eth_call("0x0000000000000000000000000000000000000000", &[])
+            .await
+            .expect_err("invalid hex must error");
+        match err {
+            WalletError::Rpc(msg) => assert!(msg.to_lowercase().contains("hex")),
+            other => panic!("expected Rpc error, got {:?}", other),
+        }
     }
 
     #[test]
