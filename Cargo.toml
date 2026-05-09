@@ -27,6 +27,7 @@ members = [
     "gui/citrate_defense_prime_kit",
     "gui/citrate_rbac_bindings",
     "gui/citrate_defense_prime_overview",
+    "gui/citrate_defense_prime_overview_proof",
     "agent-core",
     "agent-chain",
     "agent-cron",
