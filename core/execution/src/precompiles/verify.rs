@@ -380,38 +380,41 @@ pub fn inference_proof_verify(input: &[u8], gas_limit: u64) -> Result<Precompile
         ));
     }
 
-    #[cfg(feature = "halo2-substrate")]
-    let result = match crate::zkp::halo2::verify_inference_proof(input) {
-        Ok(b) => b,
-        Err(e) => {
-            return Err(anyhow!("INFERENCE_PROOF_VERIFY error: {e}"));
-        }
-    };
+    // Without the halo2-substrate feature flag, the verifier is absent.
+    // The CI verifier `check_m1_verification_precompiles.py` enforces
+    // that this branch only ships when the feature is gated off
+    // intentionally (e.g., light-node binary that doesn't host proofs).
+    // Production validator binaries MUST build with halo2-substrate.
     #[cfg(not(feature = "halo2-substrate"))]
-    let result = {
-        // Without the feature flag, the verifier is absent. The CI
-        // verifier `check_m1_verification_precompiles.py` enforces
-        // that this branch only ships when the feature is gated off
-        // intentionally (e.g., light-node binary that doesn't host
-        // proofs). Production validator binaries MUST build with
-        // halo2-substrate.
+    {
         let _ = input;
-        return Err(anyhow!(
+        let _ = gas_used;
+        Err(anyhow!(
             "INFERENCE_PROOF_VERIFY (0x0108) requires halo2-substrate \
              feature flag. Rebuild with --features halo2-substrate."
-        ));
-    };
-
-    let mut output = vec![0u8; 32];
-    if result {
-        output[31] = 1;
+        ))
     }
 
-    Ok(PrecompileResult {
-        output,
-        gas_used,
-        success: true,
-    })
+    #[cfg(feature = "halo2-substrate")]
+    {
+        let result = match crate::zkp::halo2::verify_inference_proof(input) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(anyhow!("INFERENCE_PROOF_VERIFY error: {e}"));
+            }
+        };
+
+        let mut output = vec![0u8; 32];
+        if result {
+            output[31] = 1;
+        }
+
+        Ok(PrecompileResult {
+            output,
+            gas_used,
+            success: true,
+        })
+    }
 }
 
 #[cfg(test)]

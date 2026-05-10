@@ -401,15 +401,15 @@ const GAS_PER_DIM: u64 = 50;
 ///      not a panic and not a wrap.
 ///   2. **Per-participant classification** (only for participants with
 ///      strictly positive weight — `weight[i].0 > 0`):
-///         conf < threshold_pos        → low-confidence (ignored)
-///         emb >= 0 AND conf >= thresh → "agree"  side
-///         emb <  0 AND conf >= thresh → "oppose" side
+///      conf < threshold_pos        → low-confidence (ignored)
+///      emb >= 0 AND conf >= thresh → "agree"  side
+///      emb <  0 AND conf >= thresh → "oppose" side
 ///   3. **Reduced state** (Paper II §3.2 step 3 — lattice-join):
-///         no high-conf positive-weight at this dim → `Neither`
-///         only one side populated                  → `True`
-///         both sides populated                     → `Both`
-///       (`False` is impossible at the reduced level — a single
-///        dissenter joins with the majority's `True` to produce `Both`.)
+///      no high-conf positive-weight at this dim → `Neither`
+///      only one side populated                  → `True`
+///      both sides populated                     → `Both`
+///      (`False` is impossible at the reduced level — a single
+///      dissenter joins with the majority's `True` to produce `Both`.)
 ///
 /// Determinism: bit-identical output across CPUs because every step
 /// is integer Q16. Verified by tripwire `check_belnap_no_float.py`.
