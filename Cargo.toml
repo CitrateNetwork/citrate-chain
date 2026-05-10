@@ -34,6 +34,8 @@ members = [
     "gui/citrate_defense_prime_suppliers_proof",
     "gui/citrate_defense_prime_fl",
     "gui/citrate_defense_prime_fl_proof",
+    "gui/citrate_defense_prime_models_compute",
+    "gui/citrate_defense_prime_models_compute_proof",
     "agent-core",
     "agent-chain",
     "agent-cron",
