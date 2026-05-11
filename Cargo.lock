@@ -1825,6 +1825,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-defense_prime-apps-contracts-proof"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "slint",
+ "slint-build",
+]
+
+[[package]]
 name = "citrate-defense_prime-fl"
 version = "0.1.0"
 dependencies = [
