@@ -46,6 +46,7 @@ members = [
     "gui/citrate_defense_prime_ontology_proof",
     "gui/citrate_defense_prime_procurement",
     "gui/citrate_defense_prime_inter_org",
+    "gui/citrate_defense_prime_compliance",
     "crates/citrate-hkdf-chain",
     "agent-core",
     "agent-chain",
