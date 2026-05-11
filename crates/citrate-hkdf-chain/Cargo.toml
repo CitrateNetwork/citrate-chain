@@ -1,0 +1,14 @@
+[package]
+name = "citrate-hkdf-chain"
+version = "0.1.0"
+edition = "2021"
+description = "BFR-14 — HKDF sub-secret chain (client-side derivation per HKDFSubSecretDerivation.tla). Each TenantHierarchy child node derives a sub-secret from (parent_secret, hkdf_salt, label) via HKDF-SHA-256."
+
+[dependencies]
+hkdf = "0.12"
+sha2 = "0.10"
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = "0.4"
