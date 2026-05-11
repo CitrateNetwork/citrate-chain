@@ -1,0 +1,378 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import "forge-std/Test.sol";
+import {CrossOrgEnvelope} from "../../src/boeing/CrossOrgEnvelope.sol";
+
+contract CrossOrgEnvelopeTest is Test {
+    CrossOrgEnvelope internal env;
+    address internal governance;
+    address internal recorder;
+    address internal nobody;
+
+    bytes32 internal constant ENV_1 = keccak256("env-1");
+    bytes32 internal constant ART_ROOT = keccak256("artifact-root");
+    bytes32 internal constant ART_CID = keccak256("ipfs-cid");
+    bytes32 internal constant SCOPE = keccak256("scope-bca");
+    bytes32 internal constant BOEING = keccak256("boeing-root");
+    bytes32 internal constant TIER1 = keccak256("tier1-root");
+    bytes32 internal constant DOD = keccak256("dod-root");
+
+    bytes32 internal constant SIG_B1 = keccak256("boeing-co");
+    bytes32 internal constant SIG_B2 = keccak256("boeing-pm");
+    bytes32 internal constant SIG_T1 = keccak256("tier1-sales");
+    bytes32 internal constant SIG_T2 = keccak256("tier1-pm");
+    bytes32 internal constant SIG_D1 = keccak256("dod-pm");
+
+    function setUp() public {
+        governance = makeAddr("governance");
+        recorder = makeAddr("recorder");
+        nobody = makeAddr("nobody");
+        vm.prank(governance);
+        env = new CrossOrgEnvelope(governance);
+        vm.prank(governance);
+        env.setRecorder(recorder, true);
+    }
+
+    function _draft_2org_2of2() internal {
+        bytes32[] memory orgs = new bytes32[](2);
+        orgs[0] = BOEING;
+        orgs[1] = TIER1;
+        uint8[] memory ths = new uint8[](2);
+        ths[0] = 2;
+        ths[1] = 2;
+        bytes32[][] memory signers = new bytes32[][](2);
+        signers[0] = new bytes32[](2);
+        signers[0][0] = SIG_B1;
+        signers[0][1] = SIG_B2;
+        signers[1] = new bytes32[](2);
+        signers[1][0] = SIG_T1;
+        signers[1][1] = SIG_T2;
+        vm.prank(recorder);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+    }
+
+    // ── Constructor / governance ────────────────────────────────────
+
+    function test_constructor_rejects_zero_governance() public {
+        vm.expectRevert(CrossOrgEnvelope.ZeroGovernance.selector);
+        new CrossOrgEnvelope(address(0));
+    }
+
+    function test_setRecorder_only_governance() public {
+        vm.prank(nobody);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.NotGovernance.selector, nobody)
+        );
+        env.setRecorder(nobody, true);
+    }
+
+    // ── Draft validation ────────────────────────────────────────────
+
+    function test_draft_only_recorder() public {
+        bytes32[] memory orgs = new bytes32[](1);
+        orgs[0] = BOEING;
+        uint8[] memory ths = new uint8[](1);
+        ths[0] = 1;
+        bytes32[][] memory signers = new bytes32[][](1);
+        signers[0] = new bytes32[](1);
+        signers[0][0] = SIG_B1;
+        vm.prank(nobody);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.NotRecorder.selector, nobody)
+        );
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+    }
+
+    function test_draft_rejects_empty_orgs() public {
+        bytes32[] memory orgs = new bytes32[](0);
+        uint8[] memory ths = new uint8[](0);
+        bytes32[][] memory signers = new bytes32[][](0);
+        vm.prank(recorder);
+        vm.expectRevert(CrossOrgEnvelope.EmptyOrgRoots.selector);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+    }
+
+    function test_draft_rejects_length_mismatch() public {
+        bytes32[] memory orgs = new bytes32[](2);
+        orgs[0] = BOEING;
+        orgs[1] = TIER1;
+        uint8[] memory ths = new uint8[](1); // wrong length
+        ths[0] = 1;
+        bytes32[][] memory signers = new bytes32[][](2);
+        signers[0] = new bytes32[](1);
+        signers[0][0] = SIG_B1;
+        signers[1] = new bytes32[](1);
+        signers[1][0] = SIG_T1;
+        vm.prank(recorder);
+        vm.expectRevert(CrossOrgEnvelope.MismatchedThresholdLength.selector);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+    }
+
+    function test_draft_rejects_zero_threshold() public {
+        bytes32[] memory orgs = new bytes32[](1);
+        orgs[0] = BOEING;
+        uint8[] memory ths = new uint8[](1);
+        ths[0] = 0; // zero
+        bytes32[][] memory signers = new bytes32[][](1);
+        signers[0] = new bytes32[](1);
+        signers[0][0] = SIG_B1;
+        vm.prank(recorder);
+        vm.expectRevert(CrossOrgEnvelope.ZeroThreshold.selector);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+    }
+
+    function test_draft_creates_envelope_in_drafted_state() public {
+        _draft_2org_2of2();
+        CrossOrgEnvelope.CrossOrgEnvelopeRecord memory e = env.getEnvelope(ENV_1);
+        assertEq(e.state, 1);
+        assertEq(env.orgRoots(ENV_1).length, 2);
+        assertEq(env.requiredSigners(ENV_1, BOEING).length, 2);
+    }
+
+    function test_draft_rejects_duplicate() public {
+        _draft_2org_2of2();
+        bytes32[] memory orgs = new bytes32[](1);
+        orgs[0] = BOEING;
+        uint8[] memory ths = new uint8[](1);
+        ths[0] = 1;
+        bytes32[][] memory signers = new bytes32[][](1);
+        signers[0] = new bytes32[](1);
+        signers[0][0] = SIG_B1;
+        vm.prank(recorder);
+        vm.expectRevert(abi.encodeWithSelector(CrossOrgEnvelope.AlreadyDrafted.selector, ENV_1));
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+    }
+
+    // ── Signature flow ─────────────────────────────────────────────
+
+    function test_first_signature_transitions_drafted_to_signing() public {
+        _draft_2org_2of2();
+        vm.prank(recorder);
+        env.sign(ENV_1, BOEING, SIG_B1);
+        assertEq(env.getEnvelope(ENV_1).state, 2);
+        assertEq(env.signedCountOf(ENV_1, BOEING), 1);
+    }
+
+    function test_sign_rejects_non_required_signer() public {
+        _draft_2org_2of2();
+        vm.prank(recorder);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CrossOrgEnvelope.NotRequiredSigner.selector,
+                ENV_1,
+                BOEING,
+                SIG_T1
+            )
+        );
+        env.sign(ENV_1, BOEING, SIG_T1);
+    }
+
+    function test_sign_rejects_unknown_org() public {
+        _draft_2org_2of2();
+        vm.prank(recorder);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.UnknownOrg.selector, ENV_1, DOD)
+        );
+        env.sign(ENV_1, DOD, SIG_D1);
+    }
+
+    function test_sign_rejects_duplicate_signer() public {
+        _draft_2org_2of2();
+        vm.startPrank(recorder);
+        env.sign(ENV_1, BOEING, SIG_B1);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.AlreadySigned.selector, ENV_1, SIG_B1)
+        );
+        env.sign(ENV_1, BOEING, SIG_B1);
+        vm.stopPrank();
+    }
+
+    function test_all_orgs_met_transitions_to_signed() public {
+        _draft_2org_2of2();
+        vm.startPrank(recorder);
+        env.sign(ENV_1, BOEING, SIG_B1);
+        env.sign(ENV_1, BOEING, SIG_B2);
+        // Boeing threshold met, Tier-1 not yet; state stays Signing.
+        assertEq(env.getEnvelope(ENV_1).state, 2);
+        assertTrue(env.isOrgThresholdMet(ENV_1, BOEING));
+        assertFalse(env.isAllOrgsMet(ENV_1));
+
+        env.sign(ENV_1, TIER1, SIG_T1);
+        env.sign(ENV_1, TIER1, SIG_T2);
+        vm.stopPrank();
+        // Both orgs met → Signed.
+        assertEq(env.getEnvelope(ENV_1).state, 3);
+        assertTrue(env.isAllOrgsMet(ENV_1));
+    }
+
+    function test_sign_after_expiry_reverts() public {
+        bytes32[] memory orgs = new bytes32[](1);
+        orgs[0] = BOEING;
+        uint8[] memory ths = new uint8[](1);
+        ths[0] = 1;
+        bytes32[][] memory signers = new bytes32[][](1);
+        signers[0] = new bytes32[](1);
+        signers[0][0] = SIG_B1;
+        uint256 deadline = block.number + 5;
+        vm.prank(recorder);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, deadline, SCOPE);
+        vm.roll(deadline + 1);
+        vm.prank(recorder);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.Expired.selector, deadline, deadline + 1)
+        );
+        env.sign(ENV_1, BOEING, SIG_B1);
+    }
+
+    // ── Lifecycle progression ──────────────────────────────────────
+
+    function _all_signed() internal {
+        _draft_2org_2of2();
+        vm.startPrank(recorder);
+        env.sign(ENV_1, BOEING, SIG_B1);
+        env.sign(ENV_1, BOEING, SIG_B2);
+        env.sign(ENV_1, TIER1, SIG_T1);
+        env.sign(ENV_1, TIER1, SIG_T2);
+        vm.stopPrank();
+    }
+
+    function test_markDelivered_only_from_signed() public {
+        _draft_2org_2of2();
+        // From Drafted: rejected.
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.NotInState.selector, ENV_1, 3, 1)
+        );
+        env.markDelivered(ENV_1);
+    }
+
+    function test_full_happy_path() public {
+        _all_signed();
+        env.markDelivered(ENV_1);
+        assertEq(env.getEnvelope(ENV_1).state, 4);
+        env.accept(ENV_1);
+        assertEq(env.getEnvelope(ENV_1).state, 5);
+        env.close(ENV_1);
+        assertEq(env.getEnvelope(ENV_1).state, 7);
+    }
+
+    function test_accept_only_from_delivered() public {
+        _all_signed();
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.NotInState.selector, ENV_1, 4, 3)
+        );
+        env.accept(ENV_1);
+    }
+
+    function test_close_only_from_accepted() public {
+        _all_signed();
+        env.markDelivered(ENV_1);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.NotInState.selector, ENV_1, 5, 4)
+        );
+        env.close(ENV_1);
+    }
+
+    // ── Reject flow ────────────────────────────────────────────────
+
+    function test_reject_from_drafted_is_terminal() public {
+        _draft_2org_2of2();
+        vm.prank(recorder);
+        env.reject(ENV_1, BOEING, "missing-evidence");
+        assertEq(env.getEnvelope(ENV_1).state, 6);
+        assertEq(env.getEnvelope(ENV_1).rejected_by_org, BOEING);
+    }
+
+    function test_reject_from_signed_is_terminal() public {
+        _all_signed();
+        vm.prank(recorder);
+        env.reject(ENV_1, TIER1, "withdrawing");
+        assertEq(env.getEnvelope(ENV_1).state, 6);
+    }
+
+    function test_cannot_sign_after_reject() public {
+        _draft_2org_2of2();
+        vm.startPrank(recorder);
+        env.reject(ENV_1, BOEING, "x");
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.NotInState.selector, ENV_1, 1, 6)
+        );
+        env.sign(ENV_1, BOEING, SIG_B1);
+        vm.stopPrank();
+    }
+
+    function test_cannot_reject_terminal() public {
+        _all_signed();
+        env.markDelivered(ENV_1);
+        env.accept(ENV_1);
+        env.close(ENV_1);
+        vm.prank(recorder);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.NotInState.selector, ENV_1, 1, 7)
+        );
+        env.reject(ENV_1, BOEING, "too-late");
+    }
+
+    function test_reject_only_recorder() public {
+        _draft_2org_2of2();
+        vm.prank(nobody);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.NotRecorder.selector, nobody)
+        );
+        env.reject(ENV_1, BOEING, "x");
+    }
+
+    function test_reject_unknown_org_reverts() public {
+        _draft_2org_2of2();
+        vm.prank(recorder);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.UnknownOrg.selector, ENV_1, DOD)
+        );
+        env.reject(ENV_1, DOD, "x");
+    }
+
+    // ── Indices ─────────────────────────────────────────────────────
+
+    function test_byScope_appends() public {
+        _draft_2org_2of2();
+        bytes32 env2 = keccak256("env-2");
+        bytes32[] memory orgs = new bytes32[](1);
+        orgs[0] = BOEING;
+        uint8[] memory ths = new uint8[](1);
+        ths[0] = 1;
+        bytes32[][] memory signers = new bytes32[][](1);
+        signers[0] = new bytes32[](1);
+        signers[0][0] = SIG_B1;
+        vm.prank(recorder);
+        env.draft(env2, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+
+        assertEq(env.byScope(SCOPE).length, 2);
+        assertEq(env.envelopeCount(), 2);
+    }
+
+    function test_3org_chain() public {
+        // Boeing → Tier1 → DOD: 1/1/1 thresholds.
+        bytes32[] memory orgs = new bytes32[](3);
+        orgs[0] = BOEING;
+        orgs[1] = TIER1;
+        orgs[2] = DOD;
+        uint8[] memory ths = new uint8[](3);
+        ths[0] = 1;
+        ths[1] = 1;
+        ths[2] = 1;
+        bytes32[][] memory signers = new bytes32[][](3);
+        signers[0] = new bytes32[](1);
+        signers[0][0] = SIG_B1;
+        signers[1] = new bytes32[](1);
+        signers[1][0] = SIG_T1;
+        signers[2] = new bytes32[](1);
+        signers[2][0] = SIG_D1;
+        vm.startPrank(recorder);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+        env.sign(ENV_1, BOEING, SIG_B1);
+        env.sign(ENV_1, TIER1, SIG_T1);
+        env.sign(ENV_1, DOD, SIG_D1);
+        vm.stopPrank();
+        assertEq(env.getEnvelope(ENV_1).state, 3); // Signed
+    }
+}
