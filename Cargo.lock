@@ -1940,6 +1940,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-defense_prime-ontology"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "citrate-rbac-bindings",
+ "hex",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "citrate-defense_prime-ontology-proof"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "slint",
+ "slint-build",
+]
+
+[[package]]
 name = "citrate-defense_prime-overview"
 version = "0.1.0"
 dependencies = [
