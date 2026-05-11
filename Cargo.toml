@@ -43,6 +43,7 @@ members = [
     "gui/citrate_defense_prime_governance",
     "gui/citrate_defense_prime_governance_proof",
     "gui/citrate_defense_prime_ontology",
+    "gui/citrate_defense_prime_ontology_proof",
     "agent-core",
     "agent-chain",
     "agent-cron",
