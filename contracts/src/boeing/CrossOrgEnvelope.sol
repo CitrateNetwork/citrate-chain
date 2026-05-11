@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+/// @notice Minimal read interface for ClassificationRegistry.
+///         Mirrors `rbac/ClassificationRegistry.sol::clearanceOrdinal`.
+///         0=Public, 1=Proprietary, 2=CUI, 3=ITAR.
+interface IClassificationOracle {
+    function clearanceOrdinal(bytes32 user) external view returns (uint8);
+}
+
 /// @title CrossOrgEnvelope — Multi-org envelope flow for BFR-14.
 /// @notice Per planset 09_INTER_ORG_TRANSFER.md § Architecture +
 ///         InterOrgEnvelopeChain.tla. Generalizes the single-org
@@ -47,6 +54,10 @@ contract CrossOrgEnvelope {
     error MismatchedThresholdLength();
     error ZeroThreshold();
     error Expired(uint256 expires_at, uint256 block_number);
+    /// @notice Raised when a required signer's max clearance is below
+    ///         the artifact's classification level. Enforced when
+    ///         `classification_oracle` is set and `artifact_max_class > 0`.
+    error InsufficientClearance(bytes32 signer, uint8 required, uint8 actual);
 
     // ── Types ──────────────────────────────────────────────────────────
 
@@ -66,6 +77,18 @@ contract CrossOrgEnvelope {
 
     address public governance;
     mapping(address => bool) public is_recorder;
+
+    /// @notice Optional classification oracle (typically the deployed
+    ///         `ClassificationRegistry`). When set, `draft(...)` reads
+    ///         each required signer's clearance and enforces
+    ///         `clearanceOrdinal(signer) >= artifact_max_class`.
+    ///         Zero address disables the gate (pre-migration default).
+    address public classification_oracle;
+
+    /// @notice envelope_id → recorded artifact classification level
+    ///         that was enforced at draft time (0..3). Surfaced for
+    ///         downstream audit + replay.
+    mapping(bytes32 => uint8) public artifactClassOf;
 
     mapping(bytes32 => CrossOrgEnvelopeRecord) public envelopes;
     mapping(bytes32 => bool) public exists;
@@ -111,6 +134,7 @@ contract CrossOrgEnvelope {
     );
     event StateChanged(bytes32 indexed envelope_id, uint8 from_state, uint8 to_state);
     event Rejected(bytes32 indexed envelope_id, bytes32 indexed org_root, string reason);
+    event ClassificationOracleSet(address indexed oracle);
 
     // ── Constructor ────────────────────────────────────────────────────
 
@@ -125,9 +149,24 @@ contract CrossOrgEnvelope {
         emit RecorderSet(recorder, authorized);
     }
 
+    /// @notice Governance-only. Set or clear the classification oracle.
+    ///         Pass `address(0)` to disable the gate.
+    function setClassificationOracle(address oracle) external {
+        if (msg.sender != governance) revert NotGovernance(msg.sender);
+        classification_oracle = oracle;
+        emit ClassificationOracleSet(oracle);
+    }
+
     // ── Mutators ───────────────────────────────────────────────────────
 
     /// @notice Draft a new cross-org envelope.
+    /// @param artifact_max_class Classification level of the artifact
+    ///        being transferred (0=Public..3=ITAR). When the
+    ///        `classification_oracle` is set and `artifact_max_class > 0`,
+    ///        every required signer in every org must have
+    ///        `clearanceOrdinal(signer) >= artifact_max_class`, or the
+    ///        call reverts with `InsufficientClearance`. Pass `0` (and
+    ///        leave the oracle unset) to disable the gate.
     function draft(
         bytes32 envelope_id,
         bytes32 artifact_root,
@@ -136,7 +175,8 @@ contract CrossOrgEnvelope {
         uint8[] calldata thresholds,
         bytes32[][] calldata signers_per_org,
         uint256 expires_at_block,
-        bytes32 scope
+        bytes32 scope,
+        uint8 artifact_max_class
     ) external {
         if (!is_recorder[msg.sender]) revert NotRecorder(msg.sender);
         if (exists[envelope_id]) revert AlreadyDrafted(envelope_id);
@@ -158,8 +198,16 @@ contract CrossOrgEnvelope {
             rejected_by_org: bytes32(0)
         });
         exists[envelope_id] = true;
+        artifactClassOf[envelope_id] = artifact_max_class;
         envelopesByScope[scope].push(envelope_id);
         allEnvelopeIds.push(envelope_id);
+
+        // The gate is active only when both (a) governance has wired
+        // an oracle and (b) the artifact has a non-zero classification.
+        // Reading the oracle once before the loop avoids repeated
+        // SLOAD of the storage variable.
+        address oracle = classification_oracle;
+        bool enforceGate = oracle != address(0) && artifact_max_class > 0;
 
         for (uint256 i = 0; i < n; i++) {
             if (thresholds[i] == 0) revert ZeroThreshold();
@@ -168,6 +216,12 @@ contract CrossOrgEnvelope {
             thresholdOf[envelope_id][org] = thresholds[i];
             for (uint256 j = 0; j < signers_per_org[i].length; j++) {
                 bytes32 s = signers_per_org[i][j];
+                if (enforceGate) {
+                    uint8 ord = IClassificationOracle(oracle).clearanceOrdinal(s);
+                    if (ord < artifact_max_class) {
+                        revert InsufficientClearance(s, artifact_max_class, ord);
+                    }
+                }
                 requiredSignersOf[envelope_id][org].push(s);
                 isRequiredSigner[envelope_id][org][s] = true;
             }

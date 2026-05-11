@@ -49,7 +49,7 @@ contract CrossOrgEnvelopeTest is Test {
         signers[1][0] = SIG_T1;
         signers[1][1] = SIG_T2;
         vm.prank(recorder);
-        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE, 0);
     }
 
     // ── Constructor / governance ────────────────────────────────────
@@ -81,7 +81,7 @@ contract CrossOrgEnvelopeTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(CrossOrgEnvelope.NotRecorder.selector, nobody)
         );
-        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE, 0);
     }
 
     function test_draft_rejects_empty_orgs() public {
@@ -90,7 +90,7 @@ contract CrossOrgEnvelopeTest is Test {
         bytes32[][] memory signers = new bytes32[][](0);
         vm.prank(recorder);
         vm.expectRevert(CrossOrgEnvelope.EmptyOrgRoots.selector);
-        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE, 0);
     }
 
     function test_draft_rejects_length_mismatch() public {
@@ -106,7 +106,7 @@ contract CrossOrgEnvelopeTest is Test {
         signers[1][0] = SIG_T1;
         vm.prank(recorder);
         vm.expectRevert(CrossOrgEnvelope.MismatchedThresholdLength.selector);
-        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE, 0);
     }
 
     function test_draft_rejects_zero_threshold() public {
@@ -119,7 +119,7 @@ contract CrossOrgEnvelopeTest is Test {
         signers[0][0] = SIG_B1;
         vm.prank(recorder);
         vm.expectRevert(CrossOrgEnvelope.ZeroThreshold.selector);
-        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE, 0);
     }
 
     function test_draft_creates_envelope_in_drafted_state() public {
@@ -141,7 +141,7 @@ contract CrossOrgEnvelopeTest is Test {
         signers[0][0] = SIG_B1;
         vm.prank(recorder);
         vm.expectRevert(abi.encodeWithSelector(CrossOrgEnvelope.AlreadyDrafted.selector, ENV_1));
-        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE, 0);
     }
 
     // ── Signature flow ─────────────────────────────────────────────
@@ -216,7 +216,7 @@ contract CrossOrgEnvelopeTest is Test {
         signers[0][0] = SIG_B1;
         uint256 deadline = block.number + 5;
         vm.prank(recorder);
-        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, deadline, SCOPE);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, deadline, SCOPE, 0);
         vm.roll(deadline + 1);
         vm.prank(recorder);
         vm.expectRevert(
@@ -344,7 +344,7 @@ contract CrossOrgEnvelopeTest is Test {
         signers[0] = new bytes32[](1);
         signers[0][0] = SIG_B1;
         vm.prank(recorder);
-        env.draft(env2, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+        env.draft(env2, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE, 0);
 
         assertEq(env.byScope(SCOPE).length, 2);
         assertEq(env.envelopeCount(), 2);
@@ -368,11 +368,114 @@ contract CrossOrgEnvelopeTest is Test {
         signers[2] = new bytes32[](1);
         signers[2][0] = SIG_D1;
         vm.startPrank(recorder);
-        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE, 0);
         env.sign(ENV_1, BOEING, SIG_B1);
         env.sign(ENV_1, TIER1, SIG_T1);
         env.sign(ENV_1, DOD, SIG_D1);
         vm.stopPrank();
         assertEq(env.getEnvelope(ENV_1).state, 3); // Signed
+    }
+
+    // ── Classification-boundary gating (BFR-14b close) ──────────────
+
+    function test_classification_gate_disabled_by_default() public {
+        // No oracle wired → max_class=2 (CUI) should still draft even
+        // though no clearance records exist (gate inactive).
+        _draft_2org_2of2();
+        assertEq(env.getEnvelope(ENV_1).state, 1);
+        assertEq(env.artifactClassOf(ENV_1), 0);
+    }
+
+    function test_classification_gate_allows_when_signers_clear() public {
+        MockClearance oracle = new MockClearance();
+        oracle.set(SIG_B1, 2);
+        oracle.set(SIG_B2, 2);
+        oracle.set(SIG_T1, 2);
+        oracle.set(SIG_T2, 2);
+        vm.prank(governance);
+        env.setClassificationOracle(address(oracle));
+
+        bytes32[] memory orgs = new bytes32[](2);
+        orgs[0] = BOEING;
+        orgs[1] = TIER1;
+        uint8[] memory ths = new uint8[](2);
+        ths[0] = 2;
+        ths[1] = 2;
+        bytes32[][] memory signers = new bytes32[][](2);
+        signers[0] = new bytes32[](2);
+        signers[0][0] = SIG_B1;
+        signers[0][1] = SIG_B2;
+        signers[1] = new bytes32[](2);
+        signers[1][0] = SIG_T1;
+        signers[1][1] = SIG_T2;
+        vm.prank(recorder);
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE, 2);
+        assertEq(env.getEnvelope(ENV_1).state, 1);
+        assertEq(env.artifactClassOf(ENV_1), 2);
+    }
+
+    function test_classification_gate_rejects_under_cleared_signer() public {
+        MockClearance oracle = new MockClearance();
+        oracle.set(SIG_B1, 3);
+        oracle.set(SIG_B2, 2);
+        oracle.set(SIG_T1, 2);
+        oracle.set(SIG_T2, 1); // under-cleared
+        vm.prank(governance);
+        env.setClassificationOracle(address(oracle));
+
+        bytes32[] memory orgs = new bytes32[](2);
+        orgs[0] = BOEING;
+        orgs[1] = TIER1;
+        uint8[] memory ths = new uint8[](2);
+        ths[0] = 2;
+        ths[1] = 2;
+        bytes32[][] memory signers = new bytes32[][](2);
+        signers[0] = new bytes32[](2);
+        signers[0][0] = SIG_B1;
+        signers[0][1] = SIG_B2;
+        signers[1] = new bytes32[](2);
+        signers[1][0] = SIG_T1;
+        signers[1][1] = SIG_T2;
+        vm.prank(recorder);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CrossOrgEnvelope.InsufficientClearance.selector,
+                SIG_T2,
+                uint8(2),
+                uint8(1)
+            )
+        );
+        env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE, 2);
+    }
+
+    function test_classification_gate_skipped_when_max_class_zero() public {
+        // Oracle wired but artifact_max_class=0 → gate inactive, even
+        // for signers with no clearance record.
+        MockClearance oracle = new MockClearance();
+        vm.prank(governance);
+        env.setClassificationOracle(address(oracle));
+        _draft_2org_2of2(); // passes 0 for max_class
+        assertEq(env.getEnvelope(ENV_1).state, 1);
+    }
+
+    function test_setClassificationOracle_governance_only() public {
+        vm.prank(nobody);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossOrgEnvelope.NotGovernance.selector, nobody)
+        );
+        env.setClassificationOracle(address(0xdeadbeef));
+    }
+}
+
+/// @notice Minimal IClassificationOracle test fixture. Returns the
+///         ordinal that `set()` recorded for the queried user; 0 for
+///         unset users (mirrors the production registry's default).
+contract MockClearance {
+    mapping(bytes32 => uint8) private _ord;
+    function set(bytes32 user, uint8 ord) external {
+        _ord[user] = ord;
+    }
+    function clearanceOrdinal(bytes32 user) external view returns (uint8) {
+        return _ord[user];
     }
 }
