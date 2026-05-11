@@ -48,6 +48,7 @@ members = [
     "gui/citrate_defense_prime_inter_org",
     "gui/citrate_defense_prime_compliance",
     "gui/citrate_defense_prime_sponsor",
+    "gui/citrate_defense_prime_release",
     "crates/citrate-hkdf-chain",
     "agent-core",
     "agent-chain",
