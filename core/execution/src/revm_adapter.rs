@@ -383,7 +383,14 @@ pub fn execute_contract_create_with_context(
         .modify_cfg_env(|cfg| {
             cfg.chain_id = chain_id;
         })
-        .with_spec_id(SpecId::SHANGHAI)
+        // BFR-VM-1 — CANCUN enables MCOPY (EIP-5656) which Solidity
+        // 0.8.25+ emits for dynamic-bytes ABI return encoding. Pre-
+        // CANCUN halted with InvalidOpcode, which the executor's
+        // status-bit pattern silently swallowed as Ok(receipt{status:
+        // false, output:vec![]}); eth_call then hex-encoded empty
+        // bytes → "0x" with no JSON-RPC error to surface the bug.
+        // See `.agentile/sprints/active/2026-05-12-bfr-vm-1-dynamic-returns/SPRINT.md`.
+        .with_spec_id(SpecId::CANCUN)
         .modify_tx_env(|tx| {
             tx.caller = RevmAddress::from_slice(&deployer.0);
             tx.transact_to = TransactTo::Create;
@@ -516,7 +523,14 @@ pub fn execute_contract_call_with_context(
         .modify_cfg_env(|cfg| {
             cfg.chain_id = chain_id;
         })
-        .with_spec_id(SpecId::SHANGHAI)
+        // BFR-VM-1 — CANCUN enables MCOPY (EIP-5656) which Solidity
+        // 0.8.25+ emits for dynamic-bytes ABI return encoding. Pre-
+        // CANCUN halted with InvalidOpcode, which the executor's
+        // status-bit pattern silently swallowed as Ok(receipt{status:
+        // false, output:vec![]}); eth_call then hex-encoded empty
+        // bytes → "0x" with no JSON-RPC error to surface the bug.
+        // See `.agentile/sprints/active/2026-05-12-bfr-vm-1-dynamic-returns/SPRINT.md`.
+        .with_spec_id(SpecId::CANCUN)
         .modify_tx_env(|tx| {
             tx.caller = RevmAddress::from_slice(&caller.0);
             tx.transact_to = TransactTo::Call(RevmAddress::from_slice(&contract.0));
