@@ -291,6 +291,125 @@ jobs:
           if-no-files-found: warn
 
   # ============================================================================
+  # Citrate Boeing Shell — first-client (Boeing) FedRAMP AppShell binary
+  # ============================================================================
+  # Gate: BFR-INT-4. Splits the Boeing federated surface out of
+  # citrate-gui-native into its own binary so the operator GUI and the
+  # Boeing pilot ship independently from the same workspace.
+  # ============================================================================
+  build-boeing-shell:
+    name: Build Boeing Shell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        working-directory: citrate_v0.01.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: boeing-shell-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          restore-keys: boeing-shell-${{ matrix.os }}-
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libclang-dev cmake pkg-config
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        run: choco install llvm cmake -y
+
+      - name: Build Boeing Shell binary
+        run: cargo build --locked --release -p citrate-boeing-shell
+
+      - name: Package Boeing Shell artifact (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -eux
+          case "$(uname -s)" in
+            Linux) OS=linux ;;
+            Darwin) OS=macos ;;
+            *) OS=$(uname -s | tr '[:upper:]' '[:lower:]') ;;
+          esac
+          ARCH=$(uname -m)
+          STAGE="dist/citrate-boeing-shell-${OS}-${ARCH}"
+          mkdir -p "${STAGE}"
+          cp target/release/citrate-boeing-shell "${STAGE}/"
+          cp ../LICENSE "${STAGE}/"
+          cp gui/citrate_boeing_shell/README.md "${STAGE}/"
+          cp README.md "${STAGE}/PROJECT_README.md"
+          cp ../RELEASE_PACKAGE_MATRIX.md "${STAGE}/"
+          cd "${STAGE}"
+          if command -v sha256sum &>/dev/null; then
+            sha256sum citrate-boeing-shell > SHA256SUMS.txt
+          else
+            shasum -a 256 citrate-boeing-shell > SHA256SUMS.txt
+          fi
+          cd ..
+          tar -czf "citrate-boeing-shell-${OS}-${ARCH}.tar.gz" "citrate-boeing-shell-${OS}-${ARCH}"
+          rm -rf "citrate-boeing-shell-${OS}-${ARCH}"
+
+          if [[ "$OS" == "linux" ]]; then
+            ../scripts/release/build_deb.sh \
+              --binary target/release/citrate-boeing-shell \
+              --package citrate-boeing-shell \
+              --version "${RELEASE_TAG}" \
+              --arch "${ARCH}" \
+              --output-dir dist \
+              --description "Citrate Boeing AppShell — FedRAMP federated surface" \
+              --doc ../LICENSE \
+              --doc README.md \
+              --doc gui/citrate_boeing_shell/README.md \
+              --doc ../RELEASE_PACKAGE_MATRIX.md \
+              --icon gui/citrate_gui_native/assets/images/citrate-icon.png \
+              --desktop-name "Citrate Boeing AppShell" \
+              --desktop-comment "Citrate Boeing AppShell — FedRAMP federated surface"
+          fi
+
+      - name: Package Boeing Shell artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "dist\citrate-boeing-shell-windows-$env:PROCESSOR_ARCHITECTURE"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\release\citrate-boeing-shell.exe $stage\
+          Copy-Item ..\LICENSE $stage\
+          Copy-Item gui\citrate_boeing_shell\README.md $stage\
+          Copy-Item README.md "$stage\PROJECT_README.md"
+          Copy-Item ..\RELEASE_PACKAGE_MATRIX.md $stage\
+          $hash = (Get-FileHash "$stage\citrate-boeing-shell.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  citrate-boeing-shell.exe" | Set-Content "$stage\SHA256SUMS.txt"
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\citrate-boeing-shell-windows-$arch.zip"
+          Remove-Item $stage -Recurse -Force
+
+      - name: Upload Boeing Shell artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boeing-shell-${{ matrix.os }}
+          path: citrate_v0.01.1/dist/*
+          if-no-files-found: warn
+
+  # ============================================================================
   # Citrate Learning Center — the school client pilot binary
   # ============================================================================
   # Gate: B-1/B-2/B-3/B-5 landed. This job packages citrate-learning-center
@@ -629,13 +748,15 @@ jobs:
   publish:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-developer-bundles, build-core-gui, build-learning-center, build-compute-provider-bundles]
+    needs: [build-developer-bundles, build-core-gui, build-boeing-shell, build-learning-center, build-compute-provider-bundles]
     environment: github-release
-    # All three upstream jobs must succeed before we publish a release. The
-    # operator GUI (citrate-gui-native) ships in the release surface alongside
-    # the node binaries and the Learning Center pilot binary, so a GUI failure
-    # must block publication rather than silently produce a partial release.
-    if: always() && needs.build-developer-bundles.result == 'success' && needs.build-core-gui.result == 'success' && needs.build-learning-center.result == 'success' && needs.build-compute-provider-bundles.result == 'success'
+    # All upstream jobs must succeed before we publish a release. The
+    # operator GUI (citrate-gui-native) and the Boeing AppShell
+    # (citrate-boeing-shell) both ship in the release surface alongside
+    # the node binaries, the Learning Center pilot binary, and the
+    # compute-provider bundles, so any GUI failure must block
+    # publication rather than silently produce a partial release.
+    if: always() && needs.build-developer-bundles.result == 'success' && needs.build-core-gui.result == 'success' && needs.build-boeing-shell.result == 'success' && needs.build-learning-center.result == 'success' && needs.build-compute-provider-bundles.result == 'success'
     # RM-B1 / WP-F2.1 (audit REL-01, REL-02): cosign keyless + SBOM
     # require `id-token: write` so the runner can mint a short-lived
     # OIDC token Sigstore validates against this repo + workflow.
@@ -767,6 +888,7 @@ jobs:
             artifacts/**/citrate-faucet*
             artifacts/**/citrate-wallet*
             artifacts/**/citrate-gui-native*
+            artifacts/**/citrate-boeing-shell*
             artifacts/**/citrate-learning-center*
             artifacts/**/*.deb
             artifacts/**/*.tar.gz
