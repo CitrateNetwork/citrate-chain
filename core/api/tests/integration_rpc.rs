@@ -225,6 +225,7 @@ async fn test_eth_get_tx_and_receipt_by_hash() {
         output: vec![],
         eth_tx_type: 0,
         effective_gas_price: 0,
+        revert_reason: None,
     };
     storage.transactions.put_receipt(&tx.hash, &rcpt).unwrap();
 
@@ -1144,11 +1145,22 @@ async fn test_eth_call_ai_model_exec_path() {
     .to_string();
     let resp = io.handle_request(&req).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let out = v["result"].as_str().unwrap();
-    // execute_inference sets output to 0x01020304; allow empty output in minimal builds
-    if out != "0x01020304" {
-        // Accept minimal path where output is empty string hex
-        assert_eq!(out, "0x");
+    // DPF-VM-1 WP-8 — eth_call now surfaces execution failures as
+    // JSON-RPC errors instead of returning `"0x"` silently. Accept
+    // either: real output bytes when MODEL_EXEC ran successfully, OR
+    // an error response when the minimal-test path lacked the AI
+    // backend.
+    if let Some(out) = v["result"].as_str() {
+        // Success path — execute_inference sets output to 0x01020304
+        // in full builds; minimal builds may leave it empty.
+        if out != "0x01020304" {
+            assert_eq!(out, "0x");
+        }
+    } else {
+        // Failure path — pre-WP-8 this was hidden as `"0x"`; now it
+        // surfaces as a structured error which is the correct
+        // semantic for a view call that couldn't execute.
+        assert!(v["error"].is_object(), "response must carry either a result or an error: {v}");
     }
 }
 
@@ -1190,8 +1202,20 @@ async fn test_eth_call_ai_model_exec_missing_model_errors() {
     .to_string();
     let resp = io.handle_request(&req).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    // Execution failure is represented as empty output hex
-    assert_eq!(v["result"], "0x");
+    // DPF-VM-1 WP-8 — Execution failure (MODEL_EXEC against an
+    // unregistered model) is now surfaced as a JSON-RPC error
+    // instead of `result: "0x"`. The pre-WP-8 behaviour silently
+    // dropped halt reasons; this assertion encodes the new correct
+    // semantic.
+    assert!(
+        v["error"].is_object(),
+        "missing-model MODEL_EXEC should surface as JSON-RPC error, got: {v}"
+    );
+    let err_msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        err_msg.contains("revert") || err_msg.contains("execution"),
+        "error message should mention reverted/execution, got: {err_msg}"
+    );
 }
 
 /// Test that eth_chainId returns the configured chain ID, not a hardcoded value.

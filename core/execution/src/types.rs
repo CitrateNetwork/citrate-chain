@@ -440,6 +440,25 @@ pub struct TransactionReceipt {
     /// Effective gas price actually paid (gas_price for legacy, computed for EIP-1559)
     #[serde(default)]
     pub effective_gas_price: u64,
+    /// DPF-VM-1 WP-8 — when `status` is `false`, this carries the
+    /// human-readable reason (REVM halt detail, executor error, or
+    /// custom revert string). `None` on successful execution.
+    ///
+    /// Before this field existed, in-EVM halts were silently absorbed
+    /// as `Ok(receipt{ status: false, output: vec![] })` and surfaced
+    /// to `eth_call` as `"0x"` with no error visible to the caller —
+    /// which is exactly how the CANCUN/MCOPY bug stayed undiagnosed
+    /// for so long. Now `eth_call` reads this field and propagates
+    /// the reason as a JSON-RPC error so the next silent-failure-bug
+    /// is detectable from a single RPC call.
+    ///
+    /// The field is always serialised — `skip_serializing_if` would
+    /// confuse bincode's positional encoding, leaving older receipt
+    /// blobs unable to round-trip. JSON consumers still get `null`
+    /// for unset values; the small overhead (1 byte per receipt in
+    /// bincode) is the right price for forward-compat.
+    #[serde(default)]
+    pub revert_reason: Option<String>,
 }
 
 /// Event log

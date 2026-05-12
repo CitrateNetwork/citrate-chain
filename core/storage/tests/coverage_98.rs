@@ -134,6 +134,7 @@ fn make_receipt(tx_hash: Hash, block_hash: Hash, block_number: u64) -> Transacti
         output: vec![],
         eth_tx_type: 0,
         effective_gas_price: 0,
+        revert_reason: None,
     }
 }
 

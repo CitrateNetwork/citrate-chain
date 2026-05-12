@@ -973,6 +973,17 @@ impl Executor {
             .execute_transaction_type(tx_type, context, from)
             .await;
 
+        // DPF-VM-1 WP-8 — capture the human-readable failure reason
+        // before `result` is moved into the match below. Surfaced
+        // via `receipt.revert_reason` so eth_call / eth_estimateGas
+        // can propagate it as a JSON-RPC error instead of returning
+        // `0x` with no signal (which is exactly how the CANCUN bug
+        // stayed undiagnosed).
+        let revert_reason: Option<String> = match &result {
+            Ok(()) => None,
+            Err(e) => Some(format!("{}", e)),
+        };
+
         // Handle execution result — all journal-routed.
         let status = match result {
             Ok(()) => {
@@ -1017,6 +1028,7 @@ impl Executor {
             output: context.output.clone(),
             eth_tx_type: tx.eth_tx_type,
             effective_gas_price: tx.gas_price,
+            revert_reason,
         };
 
         info!(
