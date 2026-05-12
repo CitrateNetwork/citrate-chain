@@ -910,7 +910,28 @@ pub fn register_eth_methods(
         let res = block_on(exec.simulate_transaction(&blk, &tx));
 
         match res {
-            Ok(receipt) => Ok(Value::String(format!("0x{}", hex::encode(receipt.output)))),
+            Ok(receipt) => {
+                // BFR-VM-1 WP-8 — surface in-EVM halts and reverts as
+                // JSON-RPC errors instead of returning `0x` with no
+                // signal. The CANCUN/MCOPY bug stayed undiagnosed for
+                // months because eth_call swallowed REVM's
+                // `InvalidOpcode` halt into an empty Ok response. Now
+                // any `status: false` receipt with a populated
+                // `revert_reason` propagates here as
+                // jsonrpc_core::Error code -32000 ("execution
+                // reverted") with the reason in the message.
+                if !receipt.status {
+                    let mut err = jsonrpc_core::Error::new(
+                        jsonrpc_core::ErrorCode::ServerError(-32000),
+                    );
+                    err.message = match receipt.revert_reason.as_deref() {
+                        Some(r) => format!("execution reverted: {r}"),
+                        None => "execution reverted (no reason)".to_string(),
+                    };
+                    return Err(err);
+                }
+                Ok(Value::String(format!("0x{}", hex::encode(receipt.output))))
+            }
             Err(e) => Err(jsonrpc_core::Error::invalid_params(format!(
                 "eth_call failed: {}",
                 e

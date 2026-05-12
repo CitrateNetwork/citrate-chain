@@ -227,6 +227,30 @@ fn dynamic_string_return_via_mcopy() {
 // 3. Pure-scalar return continues to work (control)
 // ──────────────────────────────────────────────────────────────────
 
+/// BFR-VM-1 WP-8 regression: REVM halts must propagate up through
+/// `execute_contract_call` as `Err(ExecutionError::Reverted(...))`
+/// carrying a non-empty halt reason — pre-WP-8 the reason was
+/// discarded into an empty receipt output and `eth_call` returned
+/// `0x` with no signal that a halt happened. This test exercises
+/// the same INVALID-opcode path the CANCUN/MCOPY bug took, but
+/// for an opcode CANCUN still doesn't recognise (0xFE, INVALID).
+#[test]
+fn invalid_opcode_halt_surfaces_as_err_with_reason() {
+    #[rustfmt::skip]
+    let bytecode = vec![
+        0xfe, // INVALID — universally illegal across every spec
+    ];
+
+    let err = call(bytecode).expect_err("INVALID opcode must produce Err, not silent Ok");
+    let citrate_execution::types::ExecutionError::Reverted(msg) = &err else {
+        panic!("expected ExecutionError::Reverted, got {err:?}");
+    };
+    assert!(
+        msg.contains("halt") || msg.contains("Halt") || msg.contains("Invalid"),
+        "halt reason should be carried in the error message, got: {msg}"
+    );
+}
+
 /// Control case: scalar `uint256` return must still work after the
 /// spec bump. This was never broken; we include it so a future
 /// regression that broke scalar returns under CANCUN would surface
