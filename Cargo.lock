@@ -2051,6 +2051,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-defense_prime-shell"
+version = "0.4.0"
+dependencies = [
+ "arboard",
+ "citrate-defense_prime-apps-contracts",
+ "citrate-defense_prime-assistant",
+ "citrate-defense_prime-fl",
+ "citrate-defense_prime-governance",
+ "citrate-defense_prime-models-compute",
+ "citrate-defense_prime-ontology",
+ "citrate-defense_prime-overview",
+ "citrate-defense_prime-provenance",
+ "citrate-defense_prime-suppliers",
+ "citrate-rbac-bindings",
+ "dirs",
+ "hex",
+ "sha3 0.10.9",
+ "slint",
+ "slint-build",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "citrate-defense_prime-sponsor"
 version = "0.1.0"
 dependencies = [
@@ -2367,18 +2393,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "citrate-agent-core",
- "citrate-defense_prime-apps-contracts",
- "citrate-defense_prime-assistant",
- "citrate-defense_prime-fl",
- "citrate-defense_prime-governance",
- "citrate-defense_prime-models-compute",
- "citrate-defense_prime-ontology",
- "citrate-defense_prime-overview",
- "citrate-defense_prime-provenance",
- "citrate-defense_prime-suppliers",
  "citrate-desktop-app",
  "citrate-edu-app",
- "citrate-rbac-bindings",
  "citrate-storage",
  "citrate-wallet-core",
  "dirs",
