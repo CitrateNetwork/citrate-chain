@@ -2065,6 +2065,7 @@ dependencies = [
  "citrate-defense_prime-provenance",
  "citrate-defense_prime-suppliers",
  "citrate-rbac-bindings",
+ "citrate-wallet-core",
  "dirs",
  "hex",
  "sha3 0.10.9",
