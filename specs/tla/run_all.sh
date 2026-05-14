@@ -23,9 +23,12 @@ fi
 
 pass=0; fail=0; total=0
 
-for dir in "$SCRIPT_DIR"/consensus "$SCRIPT_DIR"/zk "$SCRIPT_DIR"/learning "$SCRIPT_DIR"/contracts "$SCRIPT_DIR"/compute "$SCRIPT_DIR"/gui; do
+AGENT_DIR="$(cd "$SCRIPT_DIR/../../../.agentile/formal/specs/agent" 2>/dev/null && pwd || true)"
+
+for dir in "$SCRIPT_DIR"/consensus "$SCRIPT_DIR"/zk "$SCRIPT_DIR"/learning "$SCRIPT_DIR"/contracts "$SCRIPT_DIR"/compute "$SCRIPT_DIR"/gui ${AGENT_DIR:+"$AGENT_DIR"}; do
     [ -d "$dir" ] || continue
     category=$(basename "$dir")
+    [ "$category" = "agent" ] && category="cit-agent"
     echo ""
     echo "=== ${category^^} ==="
 
