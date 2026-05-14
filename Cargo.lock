@@ -2066,6 +2066,7 @@ dependencies = [
  "citrate-defense_prime-overview",
  "citrate-defense_prime-provenance",
  "citrate-defense_prime-suppliers",
+ "citrate-desktop-app",
  "citrate-rbac-bindings",
  "citrate-wallet-core",
  "dirs",
