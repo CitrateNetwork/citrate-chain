@@ -1,0 +1,40 @@
+# CIT-AGENT-9c-host — echo-chain capsule source.
+#
+# Capsule that imports `citrate:chain/eth-call@0.1.0` and re-exports
+# `query(to, data) -> result<list<u8>, string>`. Used by the
+# integration tests to verify:
+#   (1) authorized address calls succeed through the host fn
+#   (2) unauthorized address calls return ChainCallNotAuthorized
+
+[package]
+name = "echo-chain-capsule"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.36", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "citrate:echo-chain-capsule"
+
+[package.metadata.component.target]
+path = "wit"
+world = "echo-chain"
+
+[package.metadata.component.target.dependencies]
+"citrate:chain" = { path = "wit/deps/chain" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Standalone build profile — not a workspace member.
+[workspace]
