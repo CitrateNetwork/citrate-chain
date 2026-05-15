@@ -1,0 +1,36 @@
+# CIT-AGENT-9c-write-host — test capsule for the eth-send host
+# fn family. Imports citrate:chain/eth-send and re-exports a
+# `send` function so integration tests can drive the three-layer
+# write path (allow-list + HITL gate + dispatcher).
+
+[package]
+name = "eth-sender-test-capsule"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.36", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "citrate:eth-sender-test"
+
+[package.metadata.component.target]
+path = "wit"
+world = "eth-sender-test"
+
+[package.metadata.component.target.dependencies]
+"citrate:chain" = { path = "wit/deps/chain" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]
