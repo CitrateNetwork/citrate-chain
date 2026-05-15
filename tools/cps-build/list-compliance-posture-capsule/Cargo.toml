@@ -1,0 +1,41 @@
+# CIT-AGENT-9c-1 — list-compliance-posture capsule source.
+#
+# Calls BoeingComplianceRegistry.framework(bytes32, bytes32) via
+# the citrate:chain/eth-call host fn and decodes the 288-byte
+# Row response into a structured WIT record.
+
+[package]
+name = "list-compliance-posture-capsule"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.36", features = ["bitflags"] }
+# Keccak-256 for function selector + framework slug hashing.
+# `default-features = false` avoids pulling in std-only paths
+# that wasm32-unknown-unknown doesn't support.
+sha3 = { version = "0.10", default-features = false }
+
+[package.metadata.component]
+package = "citrate:list-compliance-posture"
+
+[package.metadata.component.target]
+path = "wit"
+world = "list-compliance-posture"
+
+[package.metadata.component.target.dependencies]
+"citrate:chain" = { path = "wit/deps/chain" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]
