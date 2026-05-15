@@ -1,0 +1,23 @@
+package citrate:provision-user@0.1.0;
+
+interface action {
+    /// Request a tier-elevation role grant on RoleEscalation.
+    /// `user`, `tenant`, `role` are 32-byte hex hashes. `duration-sec`
+    /// is capped at u32::MAX inside the capsule. `reauth-kind` is a
+    /// short string identifier ("kba" / "piv" / "fido2"); the capsule
+    /// passes a minimal placeholder reauth_proof byte until the
+    /// real PIV/CAC signing surface lands in CIT-AGENT-10.
+    /// Returns the 32-byte transaction hash.
+    provision: func(
+        user: string,
+        tenant: string,
+        role: string,
+        duration-sec: u32,
+        reauth-kind: string,
+    ) -> result<list<u8>, string>;
+}
+
+world provision-user {
+    import citrate:chain/eth-send@0.1.0;
+    export action;
+}
