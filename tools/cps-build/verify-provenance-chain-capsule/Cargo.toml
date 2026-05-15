@@ -1,0 +1,36 @@
+# CIT-AGENT-9c-4 — verify-provenance-chain capsule source.
+# Single eth_call to verifyChain(bytes32), decodes mixed
+# (bool, bytes32[]) return.
+
+[package]
+name = "verify-provenance-chain-capsule"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.36", features = ["bitflags"] }
+sha3 = { version = "0.10", default-features = false }
+
+[package.metadata.component]
+package = "citrate:verify-provenance-chain"
+
+[package.metadata.component.target]
+path = "wit"
+world = "verify-provenance-chain"
+
+[package.metadata.component.target.dependencies]
+"citrate:chain" = { path = "wit/deps/chain" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]

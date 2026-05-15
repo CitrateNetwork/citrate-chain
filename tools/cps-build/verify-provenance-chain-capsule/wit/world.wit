@@ -1,0 +1,23 @@
+package citrate:verify-provenance-chain@0.1.0;
+
+interface query {
+    record verify-result {
+        /// Whether the chain verified end-to-end against the
+        /// registry's invariants (no flagged steps, intact tail).
+        ok: bool,
+        /// Variable-length list of step IDs (bytes32 each), in
+        /// traversal order from head to tail.
+        chain: list<list<u8>>,
+    }
+
+    /// Verify the provenance chain for `part-hash` against
+    /// PartProvenanceRegistry. Returns the chain steps + an
+    /// overall ok flag. Empty `chain` with `ok = false` is a
+    /// valid response (unknown part).
+    query: func(part-hash: string) -> result<verify-result, string>;
+}
+
+world verify-provenance-chain {
+    import citrate:chain/eth-call@0.1.0;
+    export query;
+}
