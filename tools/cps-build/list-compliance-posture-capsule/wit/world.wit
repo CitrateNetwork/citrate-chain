@@ -1,0 +1,30 @@
+package citrate:list-compliance-posture@0.1.0;
+
+interface query {
+    /// 9-field decoded row from the DefensePrimeComplianceRegistry contract.
+    /// Matches the existing Rust `ComplianceRowView` shape one-for-one
+    /// so the WIT consumer sees the same data the DPF-INT-12b tool
+    /// returned.
+    record posture-row {
+        row-id: list<u8>,           // bytes32
+        framework: list<u8>,        // bytes32 — keccak256(framework_slug)
+        scope: list<u8>,            // bytes32 — tenant scope
+        evidence-cid: list<u8>,     // bytes32
+        attestor: list<u8>,         // bytes32 (address left-padded)
+        posture: u8,                // 0=NotAttempted .. 4=Revoked
+        expired: bool,
+        attested-at-block: u64,
+        expires-at-block: u64,
+    }
+
+    /// Read the compliance row for (framework_slug, scope) from the
+    /// configured registry. `framework` is a slug like "fedramp-moderate"
+    /// (the capsule keccak256-hashes it); `scope` is a 32-byte tenant
+    /// hash as `0x<64-hex>` (parsed inside the capsule).
+    query: func(framework: string, scope: string) -> result<posture-row, string>;
+}
+
+world list-compliance-posture {
+    import citrate:chain/eth-call@0.1.0;
+    export query;
+}
