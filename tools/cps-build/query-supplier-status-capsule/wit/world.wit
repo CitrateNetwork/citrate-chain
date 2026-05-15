@@ -1,0 +1,20 @@
+package citrate:query-supplier-status@0.1.0;
+
+interface query {
+    record supplier-view {
+        supplier-id: list<u8>,                  // bytes32
+        scope: list<u8>,                        // bytes32
+        state: u8,                              // 0=Unregistered .. SupplierState enum
+        registered-at: u64,                     // block number
+        qualification-period-days: u64,
+    }
+
+    /// Read a supplier row from SupplierRegistry. `supplier_id` is a
+    /// 32-byte hash as `0x<64-hex>` (parsed inside the capsule).
+    query: func(supplier-id: string) -> result<supplier-view, string>;
+}
+
+world query-supplier-status {
+    import citrate:chain/eth-call@0.1.0;
+    export query;
+}
