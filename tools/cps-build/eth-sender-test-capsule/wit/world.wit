@@ -1,0 +1,13 @@
+package citrate:eth-sender-test@0.1.0;
+
+interface action {
+    /// Forwards (to, data) to the host's citrate:chain/eth-send
+    /// import. Used by cit-agent-core integration tests to verify
+    /// the three-layer write-path enforcement.
+    send: func(to: list<u8>, data: list<u8>) -> result<list<u8>, string>;
+}
+
+world eth-sender-test {
+    import citrate:chain/eth-send@0.1.0;
+    export action;
+}
