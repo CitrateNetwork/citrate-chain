@@ -1,0 +1,10 @@
+package citrate:chain@0.1.0;
+
+interface eth-send {
+    /// Submit a signed state-changing transaction. `to` is a
+    /// 20-byte EVM address, `data` is ABI-encoded calldata. On
+    /// success returns the 32-byte transaction hash; on rejection
+    /// (allow-list miss, HITL deny, dispatcher failure) returns
+    /// an error string starting with `ChainSend...`.
+    send: func(to: list<u8>, data: list<u8>) -> result<list<u8>, string>;
+}
