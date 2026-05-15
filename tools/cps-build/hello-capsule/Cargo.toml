@@ -1,0 +1,40 @@
+# CIT-AGENT-9b — first proof-of-pipeline capsule source crate.
+#
+# Compiles to a WASI-preview2 WASM component via `cargo component
+# build --release` (cargo-component). The output .wasm is staged
+# under `citrate_v0.01.1/capsules/hello/capsule.wasm` as the
+# bundled-tier capsule artifact.
+#
+# Intentionally NOT a workspace member. Building this crate
+# requires the wasm32-wasip2 target, which would force the entire
+# workspace into a wasi build profile on `cargo build`. Build it
+# explicitly from this directory.
+[package]
+name = "hello-capsule"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.36", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "citrate:hello-capsule"
+
+[package.metadata.component.target]
+path = "wit"
+world = "hello"
+
+[profile.release]
+opt-level = "s"      # size — capsules pay archive cost per byte
+lto = true
+codegen-units = 1
+panic = "abort"      # smaller binary; no unwind machinery
+strip = true         # strip symbols for reproducible content_hash
+
+# Standalone build profile — this crate is NOT in the workspace.
+[workspace]
