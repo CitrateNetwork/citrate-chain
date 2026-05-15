@@ -1,0 +1,22 @@
+package citrate:anchor-session@0.1.0;
+
+interface action {
+    /// Anchor an audit-session merkle root to AuditBundleRegistry.
+    /// `kind` is the bundle class (0..2), bytes32 args are hex.
+    /// `bundle_id` is computed inside the capsule as
+    /// keccak256(session-id || merkle-root) for deterministic
+    /// retries. Returns the 32-byte transaction hash.
+    anchor: func(
+        kind: u8,
+        session-id: string,
+        scope: string,
+        merkle-root: string,
+        ipfs-cid: string,
+        entry-count: u64,
+    ) -> result<list<u8>, string>;
+}
+
+world anchor-session {
+    import citrate:chain/eth-send@0.1.0;
+    export action;
+}

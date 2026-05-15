@@ -1,0 +1,15 @@
+package citrate:revoke-role@0.1.0;
+
+interface action {
+    /// Revoke a user's role grant on a tenant. `user` and `tenant`
+    /// are 32-byte hex hashes; `reason` is a free-form string that
+    /// the capsule keccak256-hashes into the on-chain bytes32 field.
+    /// Returns the 32-byte transaction hash.
+    revoke: func(user: string, tenant: string, reason: string)
+        -> result<list<u8>, string>;
+}
+
+world revoke-role {
+    import citrate:chain/eth-send@0.1.0;
+    export action;
+}
