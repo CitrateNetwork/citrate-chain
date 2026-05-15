@@ -280,6 +280,45 @@ BulkComputeGateway + ComputePricingOracle contracts.
 
 ---
 
+## Cit-Agent contracts — pending broadcast
+
+CIT-AGENT-6c lands the deployment script
+[`script/DeployCitAgent.s.sol`](script/DeployCitAgent.s.sol). The
+5 cit-agent contracts (RFC-CIT-AGENT-0001 §3.1) + the 2-of-3 multisig
+timelock are deployed together; the SBT contracts' admin is
+transferred to the timelock as the final step.
+
+| Contract | Role | Address (testnet beta) |
+|---|---|---|
+| `MultisigTimelock2of3` | Admin control layer (2-of-3 + min delay) | pending broadcast |
+| `OrganizationSBT` | Org identity (non-transferable ERC-721) | pending broadcast |
+| `AgentSBT` | Agent identity (non-transferable; references OrganizationSBT) | pending broadcast |
+| `CapsuleRegistry` | Capsule directory (ERC-1155) | pending broadcast |
+| `AnchorRegistry` | Audit-chain anchor commitments | pending broadcast |
+| `BenchmarkRegistry` | Public benchmark observations | pending broadcast |
+
+Operator runbook (broadcast):
+
+```bash
+export DEPLOYER_ADDRESS=0x...                 # ceremony signer
+export CIT_AGENT_TIMELOCK_OWNER_0=0x...        # first multisig owner
+export CIT_AGENT_TIMELOCK_OWNER_1=0x...        # second multisig owner
+export CIT_AGENT_TIMELOCK_OWNER_2=0x...        # third multisig owner
+export CIT_AGENT_TIMELOCK_DELAY=172800         # 2 days (default)
+
+forge script script/DeployCitAgent.s.sol \
+    --rpc-url $TESTNET_RPC_URL \
+    --private-key $DEPLOYER_PRIVATE_KEY \
+    --broadcast --slow
+```
+
+After broadcast, paste the deployed addresses into the table above
+and commit. The forge broadcast JSON at
+`broadcast/DeployCitAgent.s.sol/40204/run-latest.json` is the
+canonical source of truth per the BFR-program convention.
+
+---
+
 ## See Also
 
 - `.agentile/docs/journals/2026-04-08T14_DROPLET_STANDUP_SPARK_RETIRED.md`
