@@ -1,0 +1,11 @@
+package citrate:hello-capsule@0.1.0;
+
+interface greeter {
+    /// Return a greeting for the supplied name. Pure compute —
+    /// no host imports needed.
+    greet: func(name: string) -> string;
+}
+
+world hello {
+    export greeter;
+}
