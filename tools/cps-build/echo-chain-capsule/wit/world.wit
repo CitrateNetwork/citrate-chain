@@ -1,0 +1,12 @@
+package citrate:echo-chain-capsule@0.1.0;
+
+interface query {
+    /// Forwards `(to, data)` to the host's `citrate:chain/eth-call`
+    /// import and returns the raw chain response (or the err string).
+    query: func(to: list<u8>, data: list<u8>) -> result<list<u8>, string>;
+}
+
+world echo-chain {
+    import citrate:chain/eth-call@0.1.0;
+    export query;
+}

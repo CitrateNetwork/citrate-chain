@@ -1,0 +1,9 @@
+package citrate:chain@0.1.0;
+
+interface eth-call {
+    /// Read-only chain call. `to` is a 20-byte EVM address, `data`
+    /// is ABI-encoded calldata. On success the result is the raw
+    /// return bytes; on revert (or capability rejection), the err
+    /// string carries the reason.
+    call: func(to: list<u8>, data: list<u8>) -> result<list<u8>, string>;
+}
