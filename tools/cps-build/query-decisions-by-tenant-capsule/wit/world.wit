@@ -1,0 +1,26 @@
+package citrate:query-decisions-by-tenant@0.1.0;
+
+interface query {
+    /// One decision summary as returned by AgentDecisionRegistryV2.
+    /// Mirrors `DecisionEntryView` in the existing rbac_bindings —
+    /// the 6 fields visible to the chat tool consumer.
+    record decision-summary {
+        decision-id: list<u8>,        // bytes32
+        user: list<u8>,               // bytes32 (address left-padded)
+        tenant: list<u8>,             // bytes32 (scope hash)
+        corr-id: list<u8>,            // bytes32
+        class: u8,                    // DecisionClass enum (0..N)
+        recorded-at-block: u64,
+    }
+
+    /// Read the N most-recent decisions for tenant. `tenant` is a
+    /// 32-byte hash as `0x<64-hex>`. `n` is capped at 50 inside the
+    /// capsule per BFR-INT-12 contract; values above 50 silently
+    /// clamp (the LLM passes intent, the capsule enforces bounds).
+    query: func(tenant: string, n: u32) -> result<list<decision-summary>, string>;
+}
+
+world query-decisions-by-tenant {
+    import citrate:chain/eth-call@0.1.0;
+    export query;
+}
