@@ -71,6 +71,7 @@ fn test_k1_9_wasm_argon2_docstring_documents_lifetime_contract() {
 }
 
 #[test]
+#[ignore = "moved to citrate-wallet-extension repo post 2026-05-18 split; tripwire belongs there now"]
 fn test_k1_9_extension_consumer_zeroes_derived_buffer() {
     let src = read_text("wallet-extension/js/crypto.js");
 
@@ -124,6 +125,7 @@ fn test_k1_9_extension_consumer_zeroes_derived_buffer() {
 }
 
 #[test]
+#[ignore = "ADR moved to citrate-agentile-archive repo post 2026-05-18 split; tripwire belongs there now"]
 fn test_k1_9_adr_exists_and_is_active() {
     let adr = read_text(
         "../.agentile/docs/adr/ADR-RM-K-1-9-wasm-zeroize-and-js-lifetime.md",
@@ -148,6 +150,7 @@ fn test_k1_9_adr_exists_and_is_active() {
 }
 
 #[test]
+#[ignore = "moved to citrate-wallet-extension repo post 2026-05-18 split; tripwire belongs there now"]
 fn test_k1_9_password_bytes_also_zeroed() {
     // The TextEncoder().encode(password) buffer is also a JS-heap
     // copy of secret material. After the WASM call returns, the
