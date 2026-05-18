@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'citrate_v0.01.1/contracts/**'
-      - 'citrate_v0.01.1/foundry.toml'
+      - 'contracts/**'
+      - 'foundry.toml'
   pull_request:
     paths:
-      - 'citrate_v0.01.1/contracts/**'
-      - 'citrate_v0.01.1/foundry.toml'
+      - 'contracts/**'
+      - 'foundry.toml'
 
 # RM-B1 / WP-F1.1 (audit CI-01): minimum permissions at workflow level.
 permissions:
@@ -26,12 +26,13 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
       - name: Run Forge tests
-        working-directory: citrate_v0.01.1
         run: |
           forge --version
           forge test -vvv
@@ -43,12 +44,13 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install Python and Slither
         run: |
           sudo apt-get update && sudo apt-get install -y python3-pip
           pip3 install slither-analyzer solc-select
           solc-select install 0.8.26 && solc-select use 0.8.26
       - name: Run Slither
-        working-directory: citrate_v0.01.1
         run: |
           slither . --solc-remaps @openzeppelin/=lib/openzeppelin-contracts/
