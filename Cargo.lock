@@ -1258,9 +1258,9 @@ dependencies = [
  "async-trait",
  "citrate-learning",
  "citrate-learning-daemon",
+ "citrate-primitives",
  "csv",
  "futures",
- "primitives",
  "proptest",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
@@ -1486,6 +1486,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
 ]
+
+[[package]]
+name = "citrate-primitives"
+version = "0.4.0"
 
 [[package]]
 name = "citrate-security"
@@ -4981,10 +4985,6 @@ dependencies = [
  "scale-info",
  "uint",
 ]
-
-[[package]]
-name = "primitives"
-version = "0.4.0"
 
 [[package]]
 name = "priority-queue"
