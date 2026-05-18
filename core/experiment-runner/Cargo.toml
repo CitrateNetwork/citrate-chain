@@ -46,7 +46,7 @@ rand_chacha = "0.3"
 # trait directly so rig + daemon agree on cycle status
 citrate-learning-daemon = { path = "../learning-daemon" }
 citrate-learning = { path = "../learning" }
-primitives = { path = "../primitives" }
+citrate-primitives = { path = "../primitives", package = "citrate-primitives" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
