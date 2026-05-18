@@ -47,7 +47,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: citrate_v0.01.1
+        working-directory: 
 
     steps:
       - name: Checkout
@@ -62,7 +62,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: release-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          key: release-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: release-${{ matrix.os }}-
 
       - name: Install Linux dependencies
@@ -171,7 +171,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: developer-${{ matrix.os }}
-          path: citrate_v0.01.1/dist/*
+          path: dist/*
           if-no-files-found: warn
 
   build-core-gui:
@@ -186,7 +186,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: citrate_v0.01.1
+        working-directory: 
 
     steps:
       - name: Checkout
@@ -201,7 +201,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: gui-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          key: gui-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: gui-${{ matrix.os }}-
 
       - name: Install Linux dependencies
@@ -287,7 +287,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: core-gui-${{ matrix.os }}
-          path: citrate_v0.01.1/dist/*
+          path: dist/*
           if-no-files-found: warn
 
   # ============================================================================
@@ -309,7 +309,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: citrate_v0.01.1
+        working-directory: 
 
     steps:
       - name: Checkout
@@ -324,7 +324,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: boeing-shell-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          key: boeing-shell-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: boeing-shell-${{ matrix.os }}-
 
       - name: Install Linux dependencies
@@ -406,7 +406,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: boeing-shell-${{ matrix.os }}
-          path: citrate_v0.01.1/dist/*
+          path: dist/*
           if-no-files-found: warn
 
   # ============================================================================
@@ -435,7 +435,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: citrate_v0.01.1
+        working-directory: 
 
     steps:
       - name: Checkout
@@ -450,7 +450,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: lc-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          key: lc-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: lc-${{ matrix.os }}-
 
       - name: Install Linux dependencies
@@ -549,7 +549,7 @@ jobs:
       # .pkg for macOS Jamf/MDM, LC-specific .deb + .rpm for Linux fleet
       # tools). All builders read templates from
       # gui/citrate_learning_center/release/packaging/<os>/ and emit into
-      # citrate_v0.01.1/dist/.
+      # dist/.
 
       - name: Install Linux LC packaging tools (rpm)
         if: runner.os == 'Linux'
@@ -621,7 +621,7 @@ jobs:
           name: learning-center-${{ matrix.os }}
           # Use ** to recurse so dist/learning-center/<arch>/... installer
           # subdirs the builders may create are also captured.
-          path: citrate_v0.01.1/dist/**
+          path: dist/**
           if-no-files-found: error  # LC is the pilot binary — fail hard if missing
 
   # ============================================================================
@@ -649,7 +649,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: citrate_v0.01.1
+        working-directory: 
 
     steps:
       - name: Checkout
@@ -664,7 +664,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cp-${{ matrix.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          key: cp-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cp-${{ matrix.os }}-
 
       - name: Install Linux dependencies
@@ -742,7 +742,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: compute-provider-${{ matrix.os }}
-          path: citrate_v0.01.1/dist/*
+          path: dist/*
           if-no-files-found: error
 
   publish:
@@ -826,7 +826,7 @@ jobs:
       - name: Generate workspace SBOM (CycloneDX + SPDX)
         uses: anchore/sbom-action@v0
         with:
-          path: citrate_v0.01.1
+          path: 
           format: cyclonedx-json
           output-file: artifacts/citrate-${{ env.RELEASE_TAG }}.cdx.json
           upload-artifact: false
@@ -835,7 +835,7 @@ jobs:
       - name: Generate workspace SBOM (SPDX)
         uses: anchore/sbom-action@v0
         with:
-          path: citrate_v0.01.1
+          path: 
           format: spdx-json
           output-file: artifacts/citrate-${{ env.RELEASE_TAG }}.spdx.json
           upload-artifact: false

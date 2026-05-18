@@ -34,7 +34,7 @@ jobs:
       contents: read
     defaults:
       run:
-        working-directory: citrate_v0.01.1
+        working-directory: 
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -51,7 +51,7 @@ jobs:
       contents: read
     defaults:
       run:
-        working-directory: citrate_v0.01.1
+        working-directory: 
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
