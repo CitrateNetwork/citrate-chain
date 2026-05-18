@@ -1,0 +1,65 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Foundry / Solidity compilation
+out/
+cache/
+
+# Foundry broadcast (allow root /broadcast manifest but ignore deployments)
+!/broadcast
+/broadcast/*/31337/
+/broadcast/**/dry-run/
+
+# Local devnet / state
+.citrate-devnet/
+.citrate-*/
+run-logs/
+dist/
+release/
+releases/
+
+# Test artifacts
+**/test-output/
+test-reports/
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/settings.json.example
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Node (in case any contracts dir uses npm)
+node_modules/
+
+# Logs
+*.log
+logs/
+
+# TLA+ model checker output (regenerable)
+**/states/
+**/*.st
+**/*.fp
+
+# Python virtual envs (in case tools/ has pyenvs)
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Coverage
+*.profraw
+*.profdata
+lcov.info
+coverage/

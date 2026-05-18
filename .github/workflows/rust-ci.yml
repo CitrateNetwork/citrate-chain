@@ -4,24 +4,20 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'citrate_v0.01.1/**/Cargo.toml'
-      - 'citrate_v0.01.1/Cargo.lock'
-      - 'citrate_v0.01.1/**/*.rs'
-      - 'citrate_v0.01.1/**/*.slint'
-      - 'citrate_v0.01.1/**/build.rs'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - '**/*.rs'
+      - '**/build.rs'
       - '.github/workflows/rust-ci.yml'
   pull_request:
     paths:
-      - 'citrate_v0.01.1/**/Cargo.toml'
-      - 'citrate_v0.01.1/Cargo.lock'
-      - 'citrate_v0.01.1/**/*.rs'
-      - 'citrate_v0.01.1/**/*.slint'
-      - 'citrate_v0.01.1/**/build.rs'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - '**/*.rs'
+      - '**/build.rs'
       - '.github/workflows/rust-ci.yml'
 
 # RM-B1 / WP-F1.1 (audit CI-01): workflow-level minimum permissions.
-# `contents: read` is the default-deny baseline; jobs that need
-# more (release, sdk-publish) override at job level.
 permissions:
   contents: read
 
@@ -39,24 +35,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    defaults:
-      run:
-        working-directory: citrate_v0.01.1
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install system dependencies
-        # libfontconfig1-dev is required by yeslogic-fontconfig-sys, pulled
-        # transitively by Slint's image crate. Even though `--exclude
-        # citrate-edu-app --exclude citrate-learning-center` skips those
-        # crates from test, cargo still resolves and compiles their
-        # workspace dependencies before `--exclude` filters what gets
-        # actually tested. So this job needs the same system deps as the
-        # Slint GUI crates.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config libfontconfig1-dev
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
       - name: Show toolchain
         run: rustc -Vv && cargo -V
       - name: Cache cargo registry
@@ -65,24 +51,21 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: rust-ci-${{ runner.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
+          key: rust-ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: rust-ci-${{ runner.os }}-
       # RM-B1 / WP-F1.4 (audit CI-08, CI-10, REL-05): every cargo
       # invocation runs `--locked` so a transient registry hiccup
       # (or a malicious lockfile-bumping action) can't silently
       # introduce a new dependency version.
       - name: Build tests (no run)
-        run: cargo test --workspace --no-run --locked --exclude citrate-edu-app --exclude citrate-learning-center
+        run: cargo test --workspace --no-run --locked
       - name: Run core workspace tests
-        run: cargo test --workspace --quiet --locked --exclude citrate-edu-app --exclude citrate-learning-center
+        run: cargo test --workspace --quiet --locked
 
   verifier-tests:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    defaults:
-      run:
-        working-directory: citrate_v0.01.1
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -90,65 +73,10 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config libfontconfig1-dev
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
       - name: Show toolchain
         run: rustc -Vv && cargo -V
       - name: Build citrate-api with verifier feature
         run: cargo build --locked -p citrate-api --features verifier-ethers-solc
       - name: Run citrate-api tests with verifier feature
         run: cargo test --locked -p citrate-api --features verifier-ethers-solc -- --nocapture
-
-  learning-center:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    defaults:
-      run:
-        working-directory: citrate_v0.01.1
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config xvfb libfontconfig1-dev
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: lc-ci-${{ runner.os }}-${{ hashFiles('citrate_v0.01.1/Cargo.lock') }}
-          restore-keys: lc-ci-${{ runner.os }}-
-      - name: Check citrate-edu-app (0 warnings)
-        run: cargo check --locked -p citrate-edu-app
-      - name: Check citrate-learning-center (0 warnings)
-        run: cargo check --locked -p citrate-learning-center
-      - name: Test citrate-edu-app (127+ tests)
-        run: cargo test --locked -p citrate-edu-app
-      - name: Test citrate-learning-center visual snapshots
-        run: xvfb-run -a cargo test --locked -p citrate-learning-center -- visual
-      - name: Zero unwraps audit
-        run: |
-          count=$(grep -rn '\.unwrap()' gui/citrate_edu_app/src/ gui/citrate_learning_center/src/ 2>/dev/null | wc -l)
-          if [ "$count" -gt 0 ]; then echo "FAIL: $count unwraps found"; exit 1; fi
-          echo "PASS: 0 unwraps"
-      - name: Zero stubs audit
-        run: |
-          count=$(grep -rni 'todo\|fixme\|stub\|placeholder\|limitation' gui/citrate_edu_app/src/ gui/citrate_learning_center/src/ 2>/dev/null | grep -v 'No mocks' | grep -v 'cfg.test' | wc -l)
-          if [ "$count" -gt 0 ]; then echo "FAIL: $count stubs found"; exit 1; fi
-          echo "PASS: 0 stubs"
-      - name: Build release binary
-        run: cargo build --locked --release -p citrate-learning-center
-      - name: Checksum release artifact
-        run: |
-          sha256sum target/release/citrate-learning-center > target/release/SHA256SUMS.txt
-          cat target/release/SHA256SUMS.txt
-      - name: Upload release artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: citrate-learning-center-linux
-          path: |
-            citrate_v0.01.1/target/release/citrate-learning-center
-            citrate_v0.01.1/target/release/SHA256SUMS.txt

@@ -23,11 +23,11 @@ jobs:
           node-version: '20'
 
       - name: Build node image
-        run: docker build -t citrate:latest -f citrate_v0.01.1/Dockerfile citrate_v0.01.1
+        run: docker build -t citrate:latest -f Dockerfile 
 
       - name: Start devnet and monitoring
         run: |
-          docker compose -f citrate_v0.01.1/docker-compose.yml up -d --profile devnet --profile monitoring citrate-node-devnet prometheus
+          docker compose -f docker-compose.yml up -d --profile devnet --profile monitoring citrate-node-devnet prometheus
 
       - name: Wait for node and Prometheus
         run: |
@@ -52,4 +52,4 @@ jobs:
       - name: Teardown
         if: always()
         run: |
-          docker compose -f citrate_v0.01.1/docker-compose.yml down -v || true
+          docker compose -f docker-compose.yml down -v || true

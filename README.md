@@ -1,378 +1,148 @@
-<div align="center">
-  <img src="docs/assets/citrate-logo.svg" alt="Citrate" width="400"/>
-
-  # Citrate — AI-Native BlockDAG
-
-  [![Release](https://img.shields.io/github/v/release/SaulBuilds/citrate?include_prereleases&label=release)](https://github.com/SaulBuilds/citrate/releases)
-  [![License](https://img.shields.io/badge/License-BUSL--1.1%20%2B%20AUG-blue.svg)](../LICENSE)
-  [![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
-  [![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](#testing)
-  [![TLA+](https://img.shields.io/badge/TLA%2B-specs-purple.svg)](#formal-verification)
-  [![Contracts](https://img.shields.io/badge/contracts-30%2B-blue.svg)](#smart-contracts)
-
-  **High-Performance BlockDAG with Native AI Inference • SALT Token**
-
-  [Contributing](#contributing) | [Quick Start](#quick-start) | [Architecture](#architecture) | [Releases](https://github.com/SaulBuilds/citrate/releases)
-</div>
-
+---
+created: 2026-05-18T01:00:00Z
+branch: main
+author: monorepo-split
+status: active
+split-from-monorepo-at: b3ccd5c7
+split-from-monorepo-tag: pre-split-v0.4.0
+archived-monorepo: https://github.com/CitrateNetwork/citrate-monorepo-archive
+agentile-archive: https://github.com/CitrateNetwork/citrate-agentile-archive
 ---
 
-> **Contributors (human and AI): Start here.** We use the **Agentile** methodology under the **Cnidarian Foundation** for all development. Read [`.agentile/AGENT_ENTRY.md`](../.agentile/AGENT_ENTRY.md) for the contributor decision tree, and read [`.agentile/SPIRIT.md`](../.agentile/SPIRIT.md), [`.agentile/SOUL.md`](../.agentile/SOUL.md), and [`.agentile/AGENT.md`](../.agentile/AGENT.md) for the institutional rule, value, and cooperation layers before writing code.
+# citrate-chain
 
----
+> The **AI-native Layer-1 BlockDAG blockchain** with GhostDAG consensus, EVM-compatible execution (LVM), and a standardized Model Context Protocol (MCP) layer. Makes AI models first-class on-chain assets — registries, weights, training and eval logs, verifiable provenance.
 
-## Overview
+## What's in this repo
 
-Citrate is an AI-native Layer-1 BlockDAG blockchain combining **GhostDAG consensus** with an **EVM-compatible execution environment** and native **AI model inference**. AI models are first-class on-chain assets with verifiable execution, distributed storage (IPFS), and economic incentives powered by the **SALT** token.
+The chain itself — everything that makes Citrate a blockchain:
 
-### Key Features
+| Path | Crate | Role |
+|---|---|---|
+| `core/consensus` | `citrate-consensus` | GhostDAG engine, tip selection, finality, ECVRF proposer election, BFT committee checkpoints |
+| `core/execution` | `citrate-execution` | LVM (EVM-compatible via REVM) + AI/ZKP precompiles |
+| `core/storage` | `citrate-storage` | State DB (MPT), block store, artifact pinning, RocksDB |
+| `core/sequencer` | `citrate-sequencer` | Mempool policy, bundling, parent selection |
+| `core/primitives` | `primitives` | Core types and utilities |
+| `core/api` | `citrate-api` | JSON-RPC, REST, OpenAI/Anthropic-compatible endpoints |
+| `core/network` | `citrate-network` | libp2p networking, block + tx propagation |
+| `core/mcp` | `citrate-mcp` | Model Context Protocol layer |
+| `core/economics` | `citrate-economics` | Rewards, tokenomics, fee router |
+| `core/marketplace` | `citrate-marketplace` | Marketplace contracts integration |
+| `core/learning` | `citrate-learning` | Federated learning pool primitives |
+| `core/learning-daemon` | `citrate-learning-daemon` | Background learning coordinator |
+| `core/experiment-runner` | `citrate-experiment-runner` | Training experiment harness |
+| `core/bridge` | `citrate-bridge` | Cross-chain bridge primitives |
+| `core/security` | `citrate-security` | Security primitives, attestation gates |
+| `core/signing` | `citrate-signing` | Multi-sig + threshold signing |
+| `node` | `citrate-node` | Main node binary |
+| `node-app` | (node-app) | Node application wrapper |
+| `cli` | `citrate-cli` | CLI tools |
+| `wallet` | `citrate-wallet` | CLI wallet (ed25519) |
+| `wallet-core` | `citrate-wallet-core` | Wallet substrate |
+| `wallet-sdk` | `citrate-wallet-sdk` | Higher-level wallet SDK |
+| `faucet` | `citrate-faucet` | Test token faucet |
+| `crates/citrate-hkdf-chain` | `citrate-hkdf-chain` | HKDF-based chain key derivation |
+| `contracts/` | (Solidity, Foundry) | 37+ on-chain contracts |
+| `specs/tla/` | TLA+ specs | Formal verification of consensus + safety properties |
+| `specs/gherkin/` | BDD scenarios | Behavior-driven specifications |
+| `tests/` | Integration tests | Workspace-level + load tests |
+| `fuzz/` | Fuzz targets | Continuous fuzzing |
+| `tools/` | Operator tooling | Misc CLI tools, devnet helpers |
 
-- **High Throughput** — BlockDAG architecture with parallel block processing; 5,000 TPS sustained, 10,000 TPS ceiling ([run `./bench` to verify](#benchmark--can-you-break-it))
-- **Fast Finality** — BFT committee checkpoints with optimistic confirmation ≤ 12s
-- **Native AI Inference** — On-chain model registry, deployment, and execution
-- **EVM Compatible** — Deploy Solidity contracts without modification
-- **IPFS Storage** — Distributed model weights with pinning incentives
-- **SALT Token** — Native token powering staking, governance, and inference fees
-- **RPC API Key Auth** — Bearer token / X-API-Key header authentication
-- **P2P Peer Whitelist** — Noise public key based access control
+## Network parameters
 
-### Live Testnet
+- **Chain ID**: `40204` (testnet beta)
+- **Token**: SALT (1 B supply, 18 decimals)
+- **VM**: Lattice Virtual Machine (LVM) — EVM-compatible via REVM
+- **Consensus**: GhostDAG with `k=18`, max-parents=10
+- **Proposer election**: ECVRF-P256-SHA256 (RFC 9381)
+- **Finality**: Committee BFT checkpoints, 100 validators, 67 quorum, 50-block interval
+- **Performance**: 5,000 TPS sustained (10,000 ceiling); ≤12 s finality
 
-| Resource | URL |
-|----------|-----|
-| **JSON-RPC** | `https://rpc.citrate.ai` (POST) |
-| **Block Explorer** | `https://explorer.citrate.ai` |
-| **Faucet** | [`https://faucet.citrate.ai`](https://faucet.citrate.ai) |
-| **Chain ID** | `40204` |
+See [`config/`](config/) for devnet/testnet TOML samples.
 
-## Forking and Licensing
-
-- Small private learning networks, classrooms, labs, and research forks are encouraged.
-- Commercial use, branded deployments, and public product launches are not granted by default.
-- See [../LICENSE](../LICENSE), [docs/guides/forking-and-small-networks.md](docs/guides/forking-and-small-networks.md), [docs/guides/licensing-and-commercial-use.md](docs/guides/licensing-and-commercial-use.md), [LICENSING_FRAMEWORK.md](LICENSING_FRAMEWORK.md), [TRADEMARK_POLICY.md](TRADEMARK_POLICY.md), and [../PATENT_NOTICE.md](../PATENT_NOTICE.md).
-- Commercial and partnership inquiries: **Partnerships@Citrate.ai**
-
-## Quick Start
-
-### Option 0: One-Line Bootstrap
-
-```bash
-# Developer workstation
-curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile developer
-
-# Agent workstation
-curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile agent
-```
-
-This is the cleanest terminal-first path for open-source contributors. It installs the common toolchain, clones the repo, prepares current config profiles, and builds the main binaries.
-
-### Option A: Download Binary (Recommended)
-
-Grab the latest release for your platform from [GitHub Releases](https://github.com/SaulBuilds/citrate/releases).
-
-```bash
-# macOS / Linux — download, make executable, move to PATH
-curl -LO https://github.com/SaulBuilds/citrate/releases/latest/download/citrate-$(uname -s | tr A-Z a-z)-$(uname -m).tar.gz
-tar xzf citrate-*.tar.gz
-chmod +x citrate
-sudo mv citrate /usr/local/bin/
-
-# Generate an EVM-compatible keypair (secp256k1 by default)
-citrate keygen
-
-# Start a local development network (RPC on 127.0.0.1:8545)
-citrate devnet
-
-# Connect MetaMask: http://localhost:8545
-# For localhost profiles, query eth_chainId first instead of assuming 40204
-```
-
-### Option B: Build from Source
-
-```bash
-git clone https://github.com/SaulBuilds/citrate.git
-cd citrate/citrate_v0.01.1
-
-# Build node + wallet + CLI
-cargo build --release -p citrate-node -p citrate-wallet -p citrate-cli
-
-# Start devnet
-./target/release/citrate devnet
-```
-
-### Option C: GUI Desktop App
-
-```bash
-cd gui/citrate_gui_native
-cargo build --release    # Build native Slint GUI
-```
-
-### Option D: Docker
-
-```bash
-docker pull citrateai/citrate:latest
-docker run -p 8545:8545 -p 30303:30303 citrateai/citrate devnet
-```
-
-## Genesis Accounts (Devnet)
-
-| Address | Balance | Purpose |
-|---------|---------|---------|
-| `0x1111...1111` | 100M SALT | Treasury |
-| `0x2222...2222` | 250M SALT | Ecosystem fund |
-| `0x3333...3333` | 10M SALT | Faucet |
-| `0xf39F...2266` | 100 ETH | Hardhat default deployer |
-
-## Architecture
-
-```
-citrate_v0.01.1/
-├── core/
-│   ├── consensus/       # GhostDAG engine, tip selection, finality
-│   ├── execution/       # LVM (EVM-compatible) + precompiles
-│   ├── sequencer/       # Mempool, bundling, parent selection
-│   ├── storage/         # State DB (MPT), block store, artifact pinning
-│   ├── api/             # JSON-RPC + REST (OpenAI/Anthropic-compatible)
-│   ├── network/         # P2P networking (Noise protocol)
-│   ├── mcp/             # Model Context Protocol layer
-│   ├── learning/        # Paraconsensus (Belnap FOUR, LoRA, safety)
-│   ├── bridge/          # Cross-chain bridge relay
-│   ├── marketplace/     # Model discovery, search, ratings
-│   └── economics/       # SALT token, rewards, governance
-├── node/                # Main node binary (`citrate`)
-├── wallet/              # CLI wallet
-├── wallet-core/         # Key management, tx signing (Ed25519+secp256k1)
-├── cli/                 # CLI tools
-├── faucet/              # Testnet faucet with rate limiting
-├── gui/
-│   ├── citrate_gui_native/  # Native desktop GUI (Slint 1.9)
-│   └── citrate_desktop_app/ # Headless service layer for desktop GUI
-├── sdks/
-│   ├── javascript/citrate-js/  # JavaScript SDK v0.2.0
-│   └── python/                 # Python SDK v0.5.0
-├── contracts/           # 30+ Solidity contracts (Foundry)
-├── specs/tla/           # TLA+ formal specs (subset; canonical set in .agentile/formal/specs/)
-└── scripts/             # Orchestration & deployment
-```
-
-### Consensus: GhostDAG
-
-- **k-cluster tolerance**: k=18
-- **Block time**: 1-2 seconds
-- **Finality**: Committee BFT checkpoints, optimistic confirmation ≤ 12s
-- **DAG width**: Supports 100+ parallel blocks
-
-### Token Economics (SALT)
-
-| Parameter | Value |
-|-----------|-------|
-| Total Supply | 1B SALT |
-| Block Reward | 10 SALT (90% validator, 10% treasury) |
-| Halving Interval | ~2.1M blocks (~4 years) |
-| Min Validator Stake | 32,000 SALT |
-| Decimals | 18 |
-
-## Smart Contracts
-
-Foundry-based Solidity contracts across four domains:
-
-| Domain | Contracts |
-|--------|-----------|
-| **AI & Marketplace** | ModelRegistry, ModelMarketplace, ModelAccessControl, InferenceRouter, LoRAFactory, AgentDecisionRegistry, SpecRegistry |
-| **Compute Marketplace** | ComputeMarketplace, ComputeVerifier, ComputePool, HeartbeatMonitor, DisputeResolution |
-| **Learning Center** | LearningPool, LearningCycleManager, ClassroomRegistry, ContributionAccounting, NematocystSlashing |
-| **Staking & Infra** | LiquidStakingPool, WrappedSALT, IPFSIncentives, MarketMakerAllocation, TreasuryGovernor |
-
-```bash
-cd contracts && forge test -vv   # Run all Forge tests
-```
-
-## Formal Verification (TLA+ Specs)
-
-The canonical TLA+ spec collection lives in `.agentile/formal/specs/` (101 authored specs today across all domains). A local subset of 46 specs is available in `specs/tla/`, organized into six domains:
-
-| Domain | Description |
-|--------|-------------|
-| `consensus/` | GhostDAG, VRF, Prevrandao, Mempool, TX execution, VRF chain |
-| `zk/` | ZK proof lifecycle, key management (Poseidon, MiMC) |
-| `learning/` | Belnap lattice, OODA cycle, Byzantine detection, mentor selection |
-| `contracts/` | Staking, slashing, trust scoring, contributions, classroom registry |
-| `compute/` | Marketplace lifecycle, verification, provider, dispute, heartbeat |
-| `gui/` | Onboarding flow, model lifecycle, SDK connection |
-
-For current counts and verification status, see `.agentile/formal/specs/INDEX.md`.
-
-```bash
-cd specs/tla && bash run_all.sh      # Standard run (local subset)
-cd specs/tla && bash run_deep.sh     # Deep verification (16 workers, 45min timeout)
-```
-
-## SDKs
-
-### JavaScript (citrate-js v0.2.0)
-
-```bash
-cd sdks/javascript/citrate-js
-npm install && npm run build
-```
-
-See [`sdks/javascript/citrate-js/`](sdks/javascript/citrate-js/) for full documentation.
-
-### Python (v0.5.0)
-
-```bash
-cd sdks/python
-pip install -e .
-pytest
-```
-
-See [`sdks/python/`](sdks/python/) for full documentation.
-
-## API Endpoints
-
-### JSON-RPC (port 8545)
-
-Standard `eth_*` methods plus:
-
-```bash
-# DAG statistics
-curl -X POST http://localhost:8545 -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"citrate_getDagStats","params":[],"id":1}'
-
-# Mempool snapshot
-curl -X POST http://localhost:8545 -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"citrate_getMempoolSnapshot","params":[],"id":1}'
-
-# Deploy model, get model, list models, run inference
-# See docs/guides/ for full RPC reference
-```
-
-### MCP REST API
-
-```
-/v1/models              # Model registry
-/v1/chat/completions    # OpenAI-compatible
-/v1/embeddings          # Embeddings API
-```
-
-## Development
+## Quick start
 
 ```bash
 # Build everything
 cargo build --release
 
-# Run tests
-cargo test --workspace
+# Run a local devnet
+cargo run --bin citrate-node -- devnet
 
-# Format + lint
-cargo fmt --all
-cargo clippy --all-targets --all-features
+# Or use the orchestration script
+scripts/lattice.sh dev up
 
-# Smart contracts
-cd contracts && forge build && forge test
+# Run all workspace tests
+cargo test --workspace --locked
 
-# GUI (native Slint)
-cd gui/citrate_gui_native && cargo build --release
-```
+# Build + test Solidity contracts
+forge build && forge test
 
-## Transaction Signing
-
-```bash
-# Devnet (skip signature validation for convenience)
-CITRATE_REQUIRE_VALID_SIGNATURE=false citrate devnet
-
-# Production: always use eth_sendRawTransaction with client-side signing
-```
-
-Citrate supports legacy, EIP-2930, and EIP-1559 transaction types.
-
-## Benchmark — Can You Break It?
-
-Citrate ships with a live benchmark tool that fires real transactions at the chain and shows every one landing in real time. No simulations, no mocks -- these are actual on-chain state transitions.
-
-### Quick Start
-
-```bash
-# Terminal 1: Start a local node
-cargo run --release -p citrate-node -- devnet
-
-# Terminal 2: Run the benchmark
-./bench
-```
-
-You'll see a live dashboard streaming TPS, latency, and success rate every second.
-
-### Push Harder
-
-```bash
-./bench 5000                  # 5,000 TPS for 30 seconds
-./bench 10000 60              # 10K TPS for 1 minute
-./bench 20000 60              # 20K TPS — find the ceiling
-```
-
-### Against the Live Testnet
-
-```bash
-./bench 2000 30 https://rpc.citrate.ai
-```
-
-### What You'll See
-
-```
-  ╔══════════════════════════════════════════════════════════╗
-  ║  ⛏  CITRATE LIVE BENCHMARK                               ║
-  ╚══════════════════════════════════════════════════════════╝
-
-    Time │   Sent │   OK │ Fail │ TPS (now) │ TPS (avg) │ Latency
-  ───────┼────────┼──────┼──────┼───────────┼───────────┼────────
-      1s │   1042 │ 1038 │    0 │      1038 │      1038 │    4ms  ████░░░░░░░░░░░░░░░░
-      2s │   2105 │ 2099 │    0 │      1061 │      1049 │    3ms  ████████░░░░░░░░░░░░
-      3s │   3148 │ 3140 │    0 │      1041 │      1046 │    4ms  ████████████░░░░░░░░
-      ...
-```
-
-The tool grades your run (A+ through F) and challenges you to double the TPS. Our baseline on a single node: **5,000 TPS sustained, 10,000 TPS ceiling**.
-
-### Full Benchmark Suite
-
-For a comprehensive report across 6 test types (transfers, contract deploys, storage writes, state reads, mixed workload, burst test):
-
-```bash
+# Run benchmark suite (after node is up)
 cd tests/load
-cargo build --release --bin benchmark-suite
 ./target/release/benchmark-suite http://127.0.0.1:8545 10000 60 ../../benchmarks/
 ```
 
-This generates a timestamped Markdown report in `benchmarks/`.
+For full developer instructions, see [`CLAUDE.md`](CLAUDE.md) — it documents the workspace, commands, and conventions in depth.
 
-### How It Works
+## Repository context
 
-The benchmark is a compiled Rust binary using tokio + reqwest with HTTP connection pooling (500 concurrent connections). It sends real `eth_sendTransaction` calls from the genesis faucet account (`0x3333...3333`), paced to your target TPS with sub-millisecond scheduling. Every transaction creates actual state -- not a dry run.
+This repo was split from the **Citrate monorepo** on 2026-05-18. For the full history of decisions, sprints, audits, remediations, and ADRs that led to the split, see:
 
-## Testing
+- **Monorepo archive**: https://github.com/CitrateNetwork/citrate-monorepo-archive
+- **Agentile archive**: https://github.com/CitrateNetwork/citrate-agentile-archive — methodology corpus (rules, planset, sprints, audits)
 
-| Suite | Command |
-|-------|---------|
-| Rust unit + integration | `cargo test --workspace` |
-| GUI (Slint native) | `cd gui/citrate_gui_native && cargo test` |
-| Desktop app services | `cd gui/citrate_desktop_app && cargo test` |
-| Solidity (Forge) | `cd contracts && forge test` |
-| Python SDK | `cd sdks/python && pytest` |
-| TLA+ Formal Verification | `cd specs/tla && bash run_all.sh` |
-| Live benchmark | `./bench [TPS] [DURATION]` |
+Other components of the Citrate Network live in sibling repos:
 
-For current counts, see `.agentile/sprints/CURRENT.md`.
+- **`citrate-gui-native`** — Slint desktop wallet + DAG explorer
+- **`citrate-learning-center`** — School pilot desktop app
+- **`citrate-wallet-extension`** — Browser wallet extension
+- **`citrate-agent-runtime`** — Agent execution runtime + capsules
+- **`citrate-inference-gateway`** — x402-compatible inference gateway
+- **`citrate-compute-pool`** — Training pool coordinator + worker
+- **`citrate-buyer-webapp`** — Buyer-side marketplace webapp
+- **`citrate-dashboard`** — Network monitoring dashboard
+- **`citrate-sdk-js`** / **`citrate-sdk-python`** / **`citrate-sdk-marketplace`** — Client SDKs
+- **`citrate-docs`** — User docs, tutorials, public-goods, Gradient Papers v3
 
-## Community & Support
+## Crates.io publishes (staged — not yet pushed)
 
-- **GitHub**: [github.com/SaulBuilds/citrate](https://github.com/SaulBuilds/citrate)
-- **Issues**: [github.com/SaulBuilds/citrate/issues](https://github.com/SaulBuilds/citrate/issues)
-- **Discord**: [discord.gg/A3Uwe4BvdN](https://discord.gg/A3Uwe4BvdN)
+When the first audited release tag (`v0.5.0`) ships, these 4 crates publish to crates.io for downstream consumption:
 
-## Author
+- `citrate-wallet-core` (wallet substrate)
+- `citrate-wallet-sdk` (higher-level wrapper)
+- `citrate-api` types (JSON-RPC type definitions)
+- A rename of `primitives` → `citrate-primitives` is required first (current name is too generic for crates.io)
 
-Built by **Larry Klosowski** ([@Saul_loveman](https://twitter.com/Saul_loveman)) with Claude Code.
+Internal crates (`consensus`, `execution`, `storage`, `network`, `mcp`, `bridge`, `marketplace`, `learning*`, `economics`, `security`, `signing`) stay path-only inside this workspace. Downstream repos shouldn't depend on implementation internals.
+
+## On-chain contracts
+
+37+ Solidity contracts in [`contracts/src/`](contracts/src/), built with Foundry. Solidity ABIs publish to npm as `@CitrateNetwork/contracts-abi` when a release tag ships.
+
+```bash
+cd contracts
+forge build
+forge test -vvv
+```
+
+## Releases
+
+This repo versions **independently** from other CitrateNetwork repos.
+
+- **Current**: `v0.4.0` (pre-split heritage tag; see `pre-split-v0.4.0` on the monorepo archive)
+- **Next**: `v0.5.0` (chain-only release after audit pass)
+
+Audit gate: per the CitrateNetwork release policy, **every stable release tag requires a re-audit pass**. Prerelease tags (`v0.5.0-rc.N`) can ship without re-audit; stable tags cannot.
+
+## Contributing
+
+This repo follows the **Agentile methodology**. The 13 non-negotiable rules (CORE_RULES) live in the archive at https://github.com/CitrateNetwork/citrate-agentile-archive/blob/main/rules/CORE_RULES.md. Active sprints for chain work live in this repo's local `.agentile/sprints/` (post-split).
+
+See [`CLAUDE.md`](CLAUDE.md) for the workspace conventions and [`CHANGELOG.md`](CHANGELOG.md) for the change log.
 
 ## License
 
-Business Source License 1.1 with a project-specific Additional Use Grant. See [../LICENSE](../LICENSE), [../PATENT_NOTICE.md](../PATENT_NOTICE.md), [TRADEMARK_POLICY.md](TRADEMARK_POLICY.md), and [docs/guides/licensing-and-commercial-use.md](docs/guides/licensing-and-commercial-use.md).
+[MIT](LICENSE). See [`LICENSING_FRAMEWORK.md`](LICENSING_FRAMEWORK.md) and [`TRADEMARK_POLICY.md`](TRADEMARK_POLICY.md) for the full licensing posture.

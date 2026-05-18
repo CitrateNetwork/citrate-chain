@@ -33,7 +33,7 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       - name: Run fuzzer (5 minutes)
-        working-directory: citrate_v0.01.1/fuzz
+        working-directory: fuzz
         run: |
           cargo +nightly fuzz run ${{ matrix.target }} -- \
             -max_total_time=300 \
@@ -46,4 +46,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-crashes-${{ matrix.target }}
-          path: citrate_v0.01.1/fuzz/artifacts/${{ matrix.target }}/
+          path: fuzz/artifacts/${{ matrix.target }}/
