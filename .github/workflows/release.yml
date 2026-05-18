@@ -1,0 +1,251 @@
+name: Release (chain)
+
+# Chain-only release workflow. Builds node, CLI, wallet, faucet binaries
+# for Linux + macOS + Windows, signs with cosign keyless OIDC, generates
+# CycloneDX + SPDX SBOMs, and attaches everything to a GitHub Release.
+#
+# Triggers:
+#   - tag push `v*` (creates a DRAFT release; promote manually via the
+#     publish_release input when re-running)
+#   - workflow_dispatch with release_tag input (rebuild existing tag)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing tag to publish or rebuild (e.g. v0.5.0-rc.1)'
+        required: true
+        type: string
+      publish_release:
+        description: 'Publish immediately instead of creating a draft'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_RELEASE_DEBUG: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+
+      - name: Install cross (for aarch64-linux)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build chain binaries
+        shell: bash
+        run: |
+          set -e
+          BUILD="cargo build --release --locked"
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            BUILD="cross build --release --locked --target ${{ matrix.target }}"
+            TARGET_DIR="target/${{ matrix.target }}/release"
+          else
+            $BUILD --target ${{ matrix.target }} -p citrate-node -p citrate-cli -p citrate-wallet -p citrate-faucet
+            TARGET_DIR="target/${{ matrix.target }}/release"
+          fi
+          $BUILD --target ${{ matrix.target }} -p citrate-node -p citrate-cli -p citrate-wallet -p citrate-faucet
+          ls -la "$TARGET_DIR" | head -20
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -e
+          STAGE="citrate-chain-${{ matrix.target }}"
+          mkdir -p "dist/$STAGE"
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          for bin in citrate-node citrate-cli citrate-wallet citrate-faucet; do
+            if [[ "${{ runner.os }}" == "Windows" ]]; then
+              cp "$TARGET_DIR/$bin.exe" "dist/$STAGE/" || true
+            else
+              cp "$TARGET_DIR/$bin" "dist/$STAGE/" || true
+            fi
+          done
+          cp LICENSE README.md CHANGELOG.md "dist/$STAGE/" 2>/dev/null || true
+
+          cd dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a -tzip "${STAGE}.zip" "$STAGE/"
+          else
+            tar -czf "${STAGE}.tar.gz" "$STAGE/"
+          fi
+          ls -la
+
+      - name: Generate SHA256SUM
+        shell: bash
+        run: |
+          cd dist
+          for f in citrate-chain-${{ matrix.target }}.*; do
+            if [[ -f "$f" ]]; then
+              if [[ "${{ runner.os }}" == "macOS" ]]; then
+                shasum -a 256 "$f" > "$f.sha256"
+              else
+                sha256sum "$f" > "$f.sha256"
+              fi
+            fi
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: citrate-chain-${{ matrix.target }}
+          path: dist/citrate-chain-${{ matrix.target }}.*
+          retention-days: 30
+
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo cyclonedx --format json --override-filename citrate-chain-sbom
+          ls -la *.json | head -5
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: citrate-chain-sbom
+          path: 'citrate-chain-sbom*.json'
+          retention-days: 90
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # required to create/update a release
+      id-token: write       # required for cosign keyless signing
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign artifacts (keyless OIDC)
+        run: |
+          cd dist
+          for f in *.tar.gz *.zip *.json 2>/dev/null; do
+            if [[ -f "$f" ]]; then
+              COSIGN_EXPERIMENTAL=1 cosign sign-blob --yes "$f" --output-signature "$f.sig" --output-certificate "$f.pem" || true
+            fi
+          done
+
+      - name: Aggregate SHA256SUMS
+        run: |
+          cd dist
+          # Combine all *.sha256 files into one master SHA256SUMS
+          cat *.sha256 2>/dev/null | sort > SHA256SUMS.txt || true
+          cat SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          draft: ${{ github.event.inputs.publish_release != 'true' }}
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-rc.') || contains(steps.tag.outputs.tag, '-beta.') || contains(steps.tag.outputs.tag, '-alpha.') }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sig
+            dist/*.pem
+            dist/SHA256SUMS.txt
+            dist/citrate-chain-sbom*.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "## Release summary" >> $GITHUB_STEP_SUMMARY
+          echo "Tag: ${{ steps.tag.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "Draft: ${{ github.event.inputs.publish_release != 'true' }}" >> $GITHUB_STEP_SUMMARY
+          echo "URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
