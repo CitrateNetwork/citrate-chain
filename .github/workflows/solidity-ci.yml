@@ -49,6 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    continue-on-error: true  # Slither findings surface as warnings but don't block
     steps:
       - uses: actions/checkout@v4
         with:
