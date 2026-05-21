@@ -76,7 +76,16 @@ jobs:
           sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
       - name: Show toolchain
         run: rustc -Vv && cargo -V
-      - name: Build citrate-api with verifier feature
-        run: cargo build --locked -p citrate-api --features verifier-ethers-solc
-      - name: Run citrate-api tests with verifier feature
-        run: cargo test --locked -p citrate-api --features verifier-ethers-solc -- --nocapture
+      # REM-13b (2026-05-20): removed `--features verifier-ethers-solc`.
+      # The feature flag has been deleted from core/api/Cargo.toml
+      # because the ethers-solc + semver deps were never imported in
+      # source. Both compile_runtime_bytecode variants delegated to
+      # the same external `solc` Command path. The previously-gated
+      # tests (test_compile_single_contract_opt_and_unopt +
+      # test_compile_multi_contract_select_by_name) are now part of
+      # the default test suite and run unconditionally below (they
+      # skip themselves if solc is not on PATH).
+      - name: Build citrate-api (default features)
+        run: cargo build --locked -p citrate-api
+      - name: Run citrate-api tests (default features)
+        run: cargo test --locked -p citrate-api -- --nocapture
