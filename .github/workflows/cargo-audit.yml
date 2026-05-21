@@ -55,8 +55,8 @@ jobs:
         #   POSITIVE for citrate-chain; alloy-primitives normalizes
         #   the divisor before reaching the unsafe path).
         #
-        # REM-16 (TP Low; closes with workspace tracing-subscriber 0.2→0.3 bump):
-        #   RUSTSEC-2025-0055 — tracing-subscriber ANSI log injection.
+        # REM-16b (deferred — arkworks 0.4 → 0.6 bump needed, ZK-eng decision):
+        #   RUSTSEC-2025-0055 — tracing-subscriber ANSI log injection via ark-relations 0.4 transitive (direct deps already on 0.3).
         run: |
           cargo audit \
             --color always \
