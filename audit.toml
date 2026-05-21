@@ -1,0 +1,47 @@
+# cargo-audit configuration
+# REM-13b tripwire — 2026-05-20 federation-split audit
+#
+# Per the SOP at citrate-agentile-archive/sops/vulnerability-scanning.md
+# every dep advisory must either be (a) closed by a dep bump/removal,
+# or (b) ignored here with a documented REM tracker + reason.
+#
+# cargo-audit reads ~/.cargo/audit.toml NOT project-local, so the
+# actual ignore list is passed via --ignore flags in
+# .github/workflows/cargo-audit.yml. This file is the documentation
+# source-of-truth for assessors.
+
+[advisories]
+ignore = [
+    # ─────────────────────────────────────────────────────────────────
+    # REM-14 — ruint reciprocal_mg10 (fp-check verified FALSE POSITIVE)
+    # ─────────────────────────────────────────────────────────────────
+    # RUSTSEC-2025-0137 — ruint 1.12.4 release-mode OOB read on TABLE
+    # when caller violates the `d >= 2^63` precondition.
+    # fp-check verdict: FALSE POSITIVE for citrate-chain.
+    # Evidence: alloy-primitives' Uint::div_rem always normalizes the
+    # divisor via `<< leading_zeros()` before invoking reciprocal_mg10
+    # (ruint-1.12.4/src/algorithms/div/small.rs:57-62). citrate-chain
+    # has zero direct `use ruint::*` imports. Closes mechanically when
+    # alloy-primitives bumps ruint; tracked as REM-14 hygiene.
+    # See: per-repo/citrate-chain/F-06_FP_CHECK.md + evidence/F-06_negative_poc.{md,rs,sh}
+    "RUSTSEC-2025-0137",
+
+    # ─────────────────────────────────────────────────────────────────
+    # REM-16 — tracing-subscriber ANSI log poisoning
+    # ─────────────────────────────────────────────────────────────────
+    # RUSTSEC-2025-0055 — tracing-subscriber <0.3.20 allows ANSI
+    # escape injection from logged user input (CWE-117).
+    # fp-check verdict: TRUE POSITIVE Low.
+    # Affects 6 of 7 Rust repos pinned at 0.2.25 (EOL branch).
+    # Remediation is a workspace-wide 0.2 → 0.3 major bump (~5-10
+    # lines of init code per repo). Tracked as REM-16; ignored here
+    # until that bump lands across the federation.
+    # See: per-repo/citrate-chain/F-08_FP_CHECK.md
+    "RUSTSEC-2025-0055",
+]
+
+# ─── Unmaintained-warning ignores (REM-21 hygiene) ─────────────────
+# These appear as `warning:` in cargo-audit output and don't fail
+# the build under the default policy. Tracked under REM-21 for
+# rolling replacement (bincode→postcard, derivative→std,
+# instant→std::time, net2→socket2, paste→pastey, etc.).

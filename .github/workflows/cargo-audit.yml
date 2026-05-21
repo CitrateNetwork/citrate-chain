@@ -1,0 +1,64 @@
+name: cargo audit (tripwire)
+
+# REM-13b tripwire (2026-05-20 federation-split audit):
+# Catches regression of the closed F-05 (rustls-webpki) advisory
+# cluster (closed by deleting the dead ethers-solc dep tree) and
+# surfaces new advisories early. Runs per-PR + weekly per the cadence
+# in citrate-agentile-archive/sops/vulnerability-scanning.md.
+#
+# Failure policy:
+#   * `cargo audit` fails on any unallowed advisory.
+#   * Known-deferred advisories listed in `audit.toml` with REM
+#     tracker references; actual ignores are passed inline below
+#     (cargo-audit reads only ~/.cargo/audit.toml, not project-local).
+#   * Adding a new --ignore here requires a deliberate PR that
+#     points at an open REM tracker.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly Monday 08:00 UTC.
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-audit-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        # Documented ignores live in audit.toml (assessor-friendly).
+        # When either of these closes upstream, REMOVE the --ignore
+        # flag here + the entry in audit.toml. Failure is the
+        # tripwire that catches regression.
+        #
+        # REM-14 (FP-confirmed; closes with alloy-primitives ruint bump):
+        #   RUSTSEC-2025-0137 — ruint reciprocal_mg10 OOB (FALSE
+        #   POSITIVE for citrate-chain; alloy-primitives normalizes
+        #   the divisor before reaching the unsafe path).
+        #
+        # REM-16 (TP Low; closes with workspace tracing-subscriber 0.2→0.3 bump):
+        #   RUSTSEC-2025-0055 — tracing-subscriber ANSI log injection.
+        run: |
+          cargo audit \
+            --color always \
+            --ignore RUSTSEC-2025-0137 \
+            --ignore RUSTSEC-2025-0055
