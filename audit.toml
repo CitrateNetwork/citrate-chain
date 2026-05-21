@@ -27,15 +27,24 @@ ignore = [
     "RUSTSEC-2025-0137",
 
     # ─────────────────────────────────────────────────────────────────
-    # REM-16 — tracing-subscriber ANSI log poisoning
+    # REM-16b — tracing-subscriber 0.2.25 via arkworks (deferred)
     # ─────────────────────────────────────────────────────────────────
-    # RUSTSEC-2025-0055 — tracing-subscriber <0.3.20 allows ANSI
-    # escape injection from logged user input (CWE-117).
+    # RUSTSEC-2025-0055 — tracing-subscriber <0.3.20 ANSI escape
+    # injection (CWE-117 log injection).
     # fp-check verdict: TRUE POSITIVE Low.
-    # Affects 6 of 7 Rust repos pinned at 0.2.25 (EOL branch).
-    # Remediation is a workspace-wide 0.2 → 0.3 major bump (~5-10
-    # lines of init code per repo). Tracked as REM-16; ignored here
-    # until that bump lands across the federation.
+    #
+    # REM-16a (closed by audit framing): direct deps in this repo's
+    # Cargo.toml are already on "0.3" everywhere; the audit's
+    # original "workspace 0.2→0.3 bump" recommendation was based on
+    # stale lockfile data.
+    #
+    # REM-16b (deferred — the actual remaining work): the vulnerable
+    # 0.2.25 in the lockfile is pulled transitively by ark-relations
+    # 0.4.0's `std` feature (ark-groth16 0.4 → ark-crypto-primitives
+    # 0.4 → ark-relations 0.4 → tracing-subscriber 0.2 when std is
+    # on, which is the default). Closing requires bumping arkworks
+    # 0.4 → 0.6 across the chain dep tree — a cryptographic
+    # compatibility decision needing ZK-engineering review.
     # See: per-repo/citrate-chain/F-08_FP_CHECK.md
     "RUSTSEC-2025-0055",
 ]
