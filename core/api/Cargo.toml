@@ -57,13 +57,26 @@ uuid = { version = "1.0", features = ["v4"] }
 base64 = "0.21"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart"] }
 
-# Optional verifier tooling
-ethers-solc = { version = "2", optional = true }
-semver = { version = "1", optional = true }
+# REM-13b (2026-05-20 federation-split audit): removed `ethers-solc`
+# + `semver` optional deps and their `verifier-ethers-solc` feature
+# flag. Both were dead weight:
+#   * `ethers-solc` was never `use`'d in any source file. Earlier
+#     attempts to call ethers_solc's API were abandoned; a comment
+#     at server.rs:266 explained the route went to external `solc`
+#     "for compatibility with ethers-solc v2 API changes".
+#   * `semver` was only declared because the `verifier-ethers-solc`
+#     feature listed it; it was never imported either.
+#   * Both feature-gated and ungated `compile_runtime_bytecode`
+#     variants delegated to `compile_runtime_bytecode_external`,
+#     which shells out to `solc` via `std::process::Command`.
+# Removing the feature drops the entire transitive vulnerable dep
+# tree (reqwest 0.11 → tokio-rustls 0.24 → rustls-webpki 0.101.7 →
+# 4 RUSTSEC advisories per F-05) without changing runtime behavior.
+# See REM-13b in:
+# citrate-agentile-archive/audits/2026-05/2026-05-19-federation-split-audit/06_REMEDIATION_PLAN.md
 
 [features]
 default = []
-verifier-ethers-solc = ["ethers-solc", "semver"]
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

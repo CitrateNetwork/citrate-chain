@@ -255,20 +255,12 @@ fn apply_pagination<T: Clone>(mut items: Vec<T>, offset: usize, limit: Option<us
     items
 }
 
-// Phase 2 compilation helper (feature-gated)
-#[cfg(feature = "verifier-ethers-solc")]
-fn compile_runtime_bytecode(
-    source: &str,
-    _compiler: &str,
-    optimized: bool,
-    contract_name: Option<&str>,
-) -> Result<Vec<u8>, String> {
-    // Temporarily route to external solc path for compatibility with ethers-solc v2 API changes.
-    // This preserves the verifier feature build in CI without relying on specific crate APIs.
-    compile_runtime_bytecode_external(source, optimized, contract_name)
-}
-
-#[cfg(not(feature = "verifier-ethers-solc"))]
+// REM-13b (2026-05-20): collapsed two identical feature-gated and
+// ungated variants of this function into one. The previous
+// `verifier-ethers-solc` feature gate has been removed entirely
+// (see core/api/Cargo.toml for rationale). Both variants
+// delegated to `compile_runtime_bytecode_external`, which is the
+// production path.
 fn compile_runtime_bytecode(
     source: &str,
     _compiler: &str,
@@ -2697,7 +2689,9 @@ mod tests {
         // Note: tx submission path is covered via integration tests elsewhere.
     }
 
-    #[cfg(feature = "verifier-ethers-solc")]
+    // REM-13b: was gated on `verifier-ethers-solc`. The feature
+    // gate has been removed; the test still skips itself if solc
+    // is not on PATH.
     #[test]
     fn test_compile_single_contract_opt_and_unopt() {
         // Skip if solc is not available on PATH
@@ -2726,7 +2720,9 @@ mod tests {
         assert!(!bin_unopt.is_empty());
     }
 
-    #[cfg(feature = "verifier-ethers-solc")]
+    // REM-13b: was gated on `verifier-ethers-solc`. The feature
+    // gate has been removed; the test still skips itself if solc
+    // is not on PATH.
     #[test]
     fn test_compile_multi_contract_select_by_name() {
         // Skip if solc is not available on PATH
