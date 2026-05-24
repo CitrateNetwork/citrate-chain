@@ -867,10 +867,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_cors_explicit_origin_allowed() {
-        let app = make_test_server(vec!["https://app.citrate.network".to_string()], None);
+        let app = make_test_server(vec!["https://app.citrate.ai".to_string()], None);
         let req = HttpRequest::builder()
             .uri("/health")
-            .header("Origin", "https://app.citrate.network")
+            .header("Origin", "https://app.citrate.ai")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -880,7 +880,7 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string());
         assert_eq!(
             cors_header.as_deref(),
-            Some("https://app.citrate.network")
+            Some("https://app.citrate.ai")
         );
     }
 
