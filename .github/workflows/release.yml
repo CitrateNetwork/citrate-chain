@@ -46,10 +46,6 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             archive: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            archive: tar.gz
-            cross: true
           - target: x86_64-apple-darwin
             runner: macos-latest
             archive: tar.gz
