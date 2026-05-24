@@ -14,16 +14,16 @@ listen_addr = "0.0.0.0:30303"
 # Format: "noise_<hex>@<host>:<port>" — trusted form per core/network: the
 # node verifies the remote's Noise static key matches the declared identity
 # at handshake time (WP-H.2). Hosts resolve via DNS A-records on
-# boot{1,2,3}.citrate.network (one per DigitalOcean droplet, regions
+# boot{1,2,3}.citrate.ai (one per DigitalOcean droplet, regions
 # nyc1/sfo3/fra1). Peer IDs were generated in advance with
 # `cargo run --release --example gen_bootnode_keys -p citrate-network`;
 # matching noise.key files are uploaded to each droplet's data dir at
 # provisioning time so peer IDs stay stable across droplet rebuilds.
 # Provenance: 2026-05-23 fresh-chain release ceremony (v0.5.0-beta1).
 bootstrap_nodes = [
-    "noise_f356d3ebb07371eaad371b3960272f9d58fc457cde409c34549ef03776b78141@boot1.citrate.network:30303",
-    "noise_4ed281386422f6a65b92d8760d24baa82bb1b476e9dd3e21d5a070d026802c07@boot2.citrate.network:30303",
-    "noise_2b4924671e0babc9f52eb1695c72141a9c639e17ad95a2a2d2a715eae34a420e@boot3.citrate.network:30303",
+    "noise_f356d3ebb07371eaad371b3960272f9d58fc457cde409c34549ef03776b78141@boot1.citrate.ai:30303",
+    "noise_4ed281386422f6a65b92d8760d24baa82bb1b476e9dd3e21d5a070d026802c07@boot2.citrate.ai:30303",
+    "noise_2b4924671e0babc9f52eb1695c72141a9c639e17ad95a2a2d2a715eae34a420e@boot3.citrate.ai:30303",
 ]
 max_peers = 50
 allowed_peers = []             # Beta tester Noise public keys (hex-encoded); empty = open beta

@@ -14,9 +14,9 @@ ghostdag_k = 18
 listen_addr = "0.0.0.0:30303"
 # Bootstrap nodes peer with each other (fill in after keygen on each VM)
 bootstrap_nodes = [
-    # "noise_<pubkey_hex>@boot1.testnet.citrate.network:30303",
-    # "noise_<pubkey_hex>@boot2.testnet.citrate.network:30303",
-    # "noise_<pubkey_hex>@boot3.testnet.citrate.network:30303",
+    # "noise_<pubkey_hex>@boot1.testnet.citrate.ai:30303",
+    # "noise_<pubkey_hex>@boot2.testnet.citrate.ai:30303",
+    # "noise_<pubkey_hex>@boot3.testnet.citrate.ai:30303",
 ]
 max_peers = 500            # Higher limit — bootstrap nodes accept many connections
 # enable_relay = true      # WP-S.4: Act as relay for NAT-bound peers (field not yet in NetworkConfig)

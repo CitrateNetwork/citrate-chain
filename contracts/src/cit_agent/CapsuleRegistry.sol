@@ -48,7 +48,7 @@ contract CapsuleRegistry is ERC1155, Ownable {
     event CapsuleRevoked(uint256 indexed capsule_id);
 
     constructor(address initialOwner)
-        ERC1155("https://citrate.network/capsule/{id}")
+        ERC1155("https://citrate.ai/capsule/{id}")
         Ownable(initialOwner)
     {}
 

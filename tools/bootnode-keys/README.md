@@ -26,7 +26,7 @@ If you ever need to regenerate (new chain, key compromise, key loss):
 cargo run --release --example gen_bootnode_keys -p citrate-network -- \
     --count 3 \
     --out-dir ./tools/bootnode-keys \
-    --host-template 'boot{i}.citrate.network' \
+    --host-template 'boot{i}.citrate.ai' \
     --port 30303
 ```
 
