@@ -14,9 +14,9 @@
 #   - RPC (8545/8546) bound to loopback — expose via nginx/ngrok
 #
 # Examples:
-#   ./scripts/deploy_bootstrap.sh root@boot1.testnet.citrate.network 1
-#   ./scripts/deploy_bootstrap.sh root@boot2.testnet.citrate.network 2
-#   ./scripts/deploy_bootstrap.sh root@boot3.testnet.citrate.network 3
+#   ./scripts/deploy_bootstrap.sh root@boot1.testnet.citrate.ai 1
+#   ./scripts/deploy_bootstrap.sh root@boot2.testnet.citrate.ai 2
+#   ./scripts/deploy_bootstrap.sh root@boot3.testnet.citrate.ai 3
 #
 set -euo pipefail
 

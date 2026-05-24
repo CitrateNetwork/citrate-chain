@@ -8,7 +8,7 @@
 //! Usage:
 //!
 //!     cargo run --release --example gen_bootnode_keys -p citrate-network -- \
-//!         --count 3 --out-dir ./tools/bootnode-keys --host-template boot{i}.citrate.network --port 30303
+//!         --count 3 --out-dir ./tools/bootnode-keys --host-template boot{i}.citrate.ai --port 30303
 //!
 //! The keys are the EXACT same format the production code generates and reads
 //! (`<data_dir>/noise.key`). Upload `boot<i>.noise.key` to droplet `i` as
@@ -32,7 +32,7 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut count: usize = 3;
     let mut out_dir = PathBuf::from("./tools/bootnode-keys");
-    let mut host_template = String::from("boot{i}.citrate.network");
+    let mut host_template = String::from("boot{i}.citrate.ai");
     let mut port: u16 = 30303;
 
     let mut it = env::args().skip(1);
@@ -79,7 +79,7 @@ fn parse_args() -> Result<Args, String> {
 fn print_usage() {
     eprintln!(
         "Usage: gen_bootnode_keys [--count N] [--out-dir PATH] [--host-template TPL] [--port P]\n\
-         Defaults: --count 3 --out-dir ./tools/bootnode-keys --host-template boot{{i}}.citrate.network --port 30303\n\
+         Defaults: --count 3 --out-dir ./tools/bootnode-keys --host-template boot{{i}}.citrate.ai --port 30303\n\
          {{i}} in --host-template is replaced with 1..=N."
     );
 }
