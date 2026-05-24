@@ -209,7 +209,12 @@ jobs:
       - name: Sign artifacts (keyless OIDC)
         run: |
           cd dist
-          for f in *.tar.gz *.zip *.json 2>/dev/null; do
+          # nullglob: unmatched globs expand to nothing instead of literal.
+          # The previous `for f in *.tar.gz *.zip *.json 2>/dev/null` syntax
+          # placed `2>/dev/null` inside the for-loop word-list (not allowed
+          # by bash); the whole step aborted with a syntax error.
+          shopt -s nullglob
+          for f in *.tar.gz *.zip *.json; do
             if [[ -f "$f" ]]; then
               COSIGN_EXPERIMENTAL=1 cosign sign-blob --yes "$f" --output-signature "$f.sig" --output-certificate "$f.pem" || true
             fi
