@@ -290,11 +290,49 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Load or create config
+    // Load or create config.
+    //
+    // Resolution order (first match wins):
+    //   1. --config <path>                         (explicit CLI flag)
+    //   2. $CITRATE_CONFIG                          (environment override)
+    //   3. ~/.citrate/node.toml                     (per-user default)
+    //   4. /etc/citrate/node.toml                   (system-wide default)
+    //   5. NodeConfig::default() (dev/empty)        (final fallback)
+    //
+    // Steps 3-4 are the "2-click install" path: the installer drops
+    // testnet-beta.toml at ~/.citrate/node.toml so the bare
+    // `citrate-node` invocation auto-joins the testnet mesh via the
+    // baked-in bootnodes.
     let has_config_file = cli.config.is_some();
-    let config = if let Some(config_path) = cli.config {
+    let resolved_config_path: Option<std::path::PathBuf> = cli.config.clone().or_else(|| {
+        if let Ok(env_path) = std::env::var("CITRATE_CONFIG") {
+            let p = std::path::PathBuf::from(env_path);
+            if p.exists() {
+                tracing::info!("config: using $CITRATE_CONFIG → {}", p.display());
+                return Some(p);
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            let p = home.join(".citrate").join("node.toml");
+            if p.exists() {
+                tracing::info!("config: auto-loading {}", p.display());
+                return Some(p);
+            }
+        }
+        let p = std::path::PathBuf::from("/etc/citrate/node.toml");
+        if p.exists() {
+            tracing::info!("config: auto-loading {}", p.display());
+            return Some(p);
+        }
+        None
+    });
+    let config = if let Some(config_path) = resolved_config_path {
         NodeConfig::from_file(&config_path)?
     } else {
+        tracing::warn!(
+            "No --config, $CITRATE_CONFIG, ~/.citrate/node.toml, or /etc/citrate/node.toml \
+             found — running with empty defaults (no bootnodes, dev/devnet only)."
+        );
         NodeConfig::default()
     };
 
