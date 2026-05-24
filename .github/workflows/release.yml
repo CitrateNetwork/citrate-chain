@@ -107,14 +107,24 @@ jobs:
           STAGE="citrate-chain-${{ matrix.target }}"
           mkdir -p "dist/$STAGE"
           TARGET_DIR="target/${{ matrix.target }}/release"
-          for bin in citrate-node citrate-cli citrate-wallet citrate-faucet; do
-            if [[ "${{ runner.os }}" == "Windows" ]]; then
-              cp "$TARGET_DIR/$bin.exe" "dist/$STAGE/" || true
-            else
-              cp "$TARGET_DIR/$bin" "dist/$STAGE/" || true
-            fi
-          done
+          EXE=""
+          [[ "${{ runner.os }}" == "Windows" ]] && EXE=".exe"
+          # Bin name mapping: package → actual [[bin]].name in source
+          # citrate-node    → citrate
+          # citrate-cli     → citrate-cli
+          # citrate-wallet  → wallet
+          # citrate-faucet  → citrate-faucet
+          # The cp renames on copy so the tarball ships user-friendly
+          # filenames (citrate-node, citrate-wallet) regardless of the
+          # underlying bin name. Removed `|| true` — missing binaries
+          # are a hard failure now (previously masked a release that
+          # silently shipped without the node binary).
+          cp "$TARGET_DIR/citrate$EXE"        "dist/$STAGE/citrate-node$EXE"
+          cp "$TARGET_DIR/citrate-cli$EXE"    "dist/$STAGE/"
+          cp "$TARGET_DIR/wallet$EXE"         "dist/$STAGE/citrate-wallet$EXE"
+          cp "$TARGET_DIR/citrate-faucet$EXE" "dist/$STAGE/"
           cp LICENSE README.md CHANGELOG.md "dist/$STAGE/" 2>/dev/null || true
+          ls -la "dist/$STAGE/"
 
           cd dist
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
