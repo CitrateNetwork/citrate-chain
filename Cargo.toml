@@ -58,6 +58,16 @@ repository = "https://github.com/CitrateNetwork/citrate-chain"
 tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
 
+# OpenSSL: vendored at the workspace level so the build is portable
+# regardless of system OpenSSL version. Cross-rs's debian:bullseye
+# image ships libssl1.0 which openssl-sys 0.9.114+ rejects ("only
+# compatible with 1.1.0, 1.1.1, 3.x, or 4.x"). Vendored compiles
+# OpenSSL 3.x from source into the binary; static linking means
+# partners don't need to install libssl on their machines either.
+# Slight build-time cost (~30s) per cold cache build; one-time, then
+# cached.
+openssl = { version = "0.10", features = ["vendored"] }
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
