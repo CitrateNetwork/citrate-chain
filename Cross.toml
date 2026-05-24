@@ -1,0 +1,22 @@
+# cross-rs configuration for x86_64-unknown-linux-gnu release builds.
+# The default debian:bullseye image lacks the system libraries that
+# openssl-sys + rocksdb-sys + libclang-dev linkage all want.
+# pre-build installs them inside the container before cargo runs.
+#
+# REM-12 release ceremony (Batch 4 of citrate-labs/RELEASE_CEREMONY_HANDOFF.md):
+# we use cross for x86_64-linux specifically to get a binary linked
+# against debian:bullseye's GLIBC 2.31 — the runner-host's newer GLIBC
+# emitted __isoc23_* symbols that didn't resolve on partner droplets.
+
+[target.x86_64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update",
+    "apt-get install -y --no-install-recommends libssl-dev pkg-config libclang-dev cmake",
+]
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update",
+    "apt-get install -y --no-install-recommends libssl-dev:$CROSS_DEB_ARCH pkg-config libclang-dev cmake",
+]
