@@ -43,8 +43,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Pin Linux build to ubuntu-22.04 (GLIBC 2.35) so the binary
+          # runs on the broadest set of partner distros — Ubuntu 22.04+,
+          # Debian 12+, RHEL 9+, Amazon Linux 2023, and NVIDIA DGX
+          # (Ubuntu 22.04 base). ubuntu-latest (currently 24.04, GLIBC
+          # 2.39) produces a binary that fails to start on 22.04
+          # bootnodes with "GLIBC_2.38/2.39 not found".
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             archive: tar.gz
           - target: x86_64-apple-darwin
             runner: macos-latest
