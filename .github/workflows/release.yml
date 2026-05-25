@@ -285,6 +285,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.sha256
             dist/*.sig
             dist/*.pem
             dist/SHA256SUMS.txt
