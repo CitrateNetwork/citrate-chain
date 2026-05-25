@@ -57,6 +57,18 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             archive: tar.gz
+          # aarch64-linux: native ARM build on GitHub-hosted ubuntu-22.04-arm
+          # runner. GLIBC 2.35 floor (Ubuntu 22.04+, Debian 12+, RHEL 9+).
+          # ARM hosted runners are paid on private repos (separate billing
+          # tier from x86 runners); if cost or runner availability becomes
+          # an issue, fall back to `cross build` + qemu on a standard
+          # x86 ubuntu runner — the boot-1 manual ceremony build proved
+          # cross-rs/aarch64 works once docker buildx + qemu-user-static
+          # are installed (`docker run --rm --privileged
+          # multiarch/qemu-user-static --reset -p yes`).
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            archive: tar.gz
           - target: x86_64-apple-darwin
             runner: macos-latest
             archive: tar.gz
