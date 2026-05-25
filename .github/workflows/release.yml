@@ -43,20 +43,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Build x86_64-linux via `cross` (containerized debian:bullseye,
-          # GLIBC 2.31) so the resulting binary runs on partner distros
-          # all the way back to Ubuntu 20.04 / Debian 11 / RHEL 8 — and
-          # forward through Ubuntu 22.04 (NVIDIA DGX) and Ubuntu 24.04.
-          # ubuntu-latest (24.04, GLIBC 2.39) emits __isoc23_* symbols
-          # that don't link on 22.04. ubuntu-22.04 (GLIBC 2.35) trips
-          # on rocksdb-sys's bundled C++ also referencing __isoc23_*
-          # via newer libstdc++ headers. `cross`'s sealed container is
-          # the only path that gives broadly-portable Linux binaries
-          # without hand-managing a docker image.
+          # x86_64-linux: native build on ubuntu-22.04 (GLIBC 2.35).
+          # An earlier attempt used `cross` against debian:bullseye for
+          # GLIBC 2.31 portability, but that route persistently failed:
+          # the cross image has libclang 3.8.x (clang-sys 1.8 needs ≥5.0)
+          # and is missing libc6-dev headers (zstd-sys's bindgen can't
+          # find <stddef.h>). Workspace-vendored OpenSSL (see workspace
+          # Cargo.toml) makes the binary fully portable across distros
+          # with GLIBC ≥ 2.35 — Ubuntu 22.04+, Debian 12+, RHEL 9+,
+          # which covers the partner fleet as of 2026-05.
+          # If GLIBC 2.31 support is needed again, prefer
+          # `manylinux_2_31` Docker over cross-rs's stale toolchain.
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             archive: tar.gz
-            cross: true
           - target: x86_64-apple-darwin
             runner: macos-latest
             archive: tar.gz
@@ -109,10 +109,6 @@ jobs:
           C:/Strawberry/perl/bin/perl.exe -e 'use Locale::Maketext::Simple; print "Locale::Maketext::Simple OK\n";'
           C:/Strawberry/perl/bin/perl.exe -v | head -2
 
-      - name: Install cross (for aarch64-linux)
-        if: matrix.cross
-        run: cargo install cross --locked
-
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -126,16 +122,9 @@ jobs:
         shell: bash
         run: |
           set -e
-          BUILD="cargo build --release --locked"
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            BUILD="cross build --release --locked --target ${{ matrix.target }}"
-            TARGET_DIR="target/${{ matrix.target }}/release"
-          else
-            $BUILD --target ${{ matrix.target }} -p citrate-node -p citrate-cli -p citrate-wallet -p citrate-faucet
-            TARGET_DIR="target/${{ matrix.target }}/release"
-          fi
-          $BUILD --target ${{ matrix.target }} -p citrate-node -p citrate-cli -p citrate-wallet -p citrate-faucet
-          ls -la "$TARGET_DIR" | head -20
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p citrate-node -p citrate-cli -p citrate-wallet -p citrate-faucet
+          ls -la "target/${{ matrix.target }}/release" | head -20
 
       - name: Package release archive
         shell: bash
