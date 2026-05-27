@@ -44,10 +44,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
-            packager-formats: deb,rpm,appimage
+            packager-formats: deb,appimage
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
-            packager-formats: deb,rpm,appimage
+            packager-formats: deb,appimage
           - target: x86_64-apple-darwin
             runner: macos-latest
             packager-formats: app,dmg
@@ -56,7 +56,7 @@ jobs:
             packager-formats: app,dmg
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            packager-formats: msi,nsis
+            packager-formats: wix,nsis
     steps:
       - uses: actions/checkout@v4
         with:
