@@ -1225,32 +1225,28 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!(format!("Failed to start P2P listener: {}", e)))?;
 
-        // Dial configured bootstrap nodes (ip:port or noise_<hex>@ip:port)
+        // Dial configured bootstrap nodes. Accepts ip:port, hostname:port, and
+        // an optional `noise_<hex>@` / `peer_id@` identity prefix. Hostnames are
+        // resolved via DNS by the shared resolver so the baked hostname-based
+        // testnet-beta.toml connects out of the box.
         // WP-H.2: When a bootnode declares its Noise identity, use connect_to_trusted
         // to verify the remote's Noise key matches the declared trust root.
         for s in &config.network.bootstrap_nodes {
-            if let Some((pid, addr)) = parse_bootnode(s) {
-                if pid.0.starts_with("noise_") {
+            match citrate_network::resolve_bootnode(s).await {
+                Some((Some(pid), addr)) if pid.0.starts_with("noise_") => {
                     info!("Connecting to trusted bootnode {} (identity={})", addr, pid);
                     let _ = transport.connect_to_trusted(addr, pid).await;
-                } else {
+                }
+                Some((Some(_), addr)) => {
                     warn!("Bootnode {} has no Noise identity — cannot verify trust root", addr);
                     let _ = transport.connect_to(addr).await;
                 }
-                continue;
-            }
-            // Try numeric IP:port
-            if let Ok(addr) = s.parse() {
-                let _ = transport.connect_to(addr).await;
-                continue;
-            }
-            // Resolve hostname:port
-            if let Ok(mut addrs) = tokio::net::lookup_host(s).await {
-                if let Some(addr) = addrs.next() {
+                Some((None, addr)) => {
                     let _ = transport.connect_to(addr).await;
                 }
-            } else {
-                tracing::warn!("Could not resolve bootstrap node: {}", s);
+                None => {
+                    warn!("Could not resolve bootstrap node: {}", s);
+                }
             }
         }
 
@@ -1929,18 +1925,6 @@ fn load_or_create_peer_id(data_dir: &std::path::Path) -> anyhow::Result<citrate_
     Ok(citrate_network::peer::PeerId::new(id))
 }
 
-/// Parse bootnode strings in formats like:
-/// - peer123@203.0.113.10:30303
-/// - 203.0.113.10:30303 (peer id will be generated)
-fn parse_bootnode(s: &str) -> Option<(PeerId, std::net::SocketAddr)> {
-    let (peer_part, addr_part) = if let Some((pid, rest)) = s.split_once('@') {
-        (Some(pid.trim()), rest.trim())
-    } else {
-        (None, s.trim())
-    };
-    let addr: std::net::SocketAddr = addr_part.parse().ok()?;
-    let peer_id = peer_part
-        .map(|p| PeerId::new(p.to_string()))
-        .unwrap_or_else(PeerId::random);
-    Some((peer_id, addr))
-}
+// Bootnode parsing + DNS resolution now lives in the shared
+// `citrate_network::resolve_bootnode` so the node daemon, discovery, and the
+// embedded-node GUIs all handle hostname bootnodes identically.
