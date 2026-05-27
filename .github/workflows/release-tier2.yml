@@ -161,12 +161,20 @@ jobs:
           try: import tomllib
           except ImportError: import tomli as tomllib
           with open('packager.toml','rb') as f: d = tomllib.load(f)
+          # The --binaries-dir CLI flag is ignored when --config is a raw JSON
+          # string, so packager defaults to out-dir and the binary copy fails
+          # with 'No such file or directory'. Inject binaries-dir into the config.
+          d['binaries-dir'] = '../target/${{ matrix.target }}/release'
+          # An empty macOS signing-identity makes codesign run with an empty
+          # identity and fail; drop it so unsigned builds skip signing. Signed
+          # builds are driven by the APPLE_SIGNING_IDENTITY env var instead.
+          m = d.get('macos', {})
+          if not m.get('signing-identity'): m.pop('signing-identity', None)
           print(json.dumps(d))
           ")
           cargo packager --release --target ${{ matrix.target }} \
             --formats ${{ matrix.packager-formats }} \
             --config "$CONFIG_JSON" \
-            --binaries-dir ../target/${{ matrix.target }}/release \
             --out-dir ../target/${{ matrix.target }}/release/packages
 
       - name: Notarize macOS artefacts
