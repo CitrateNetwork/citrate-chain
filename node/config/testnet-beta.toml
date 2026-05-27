@@ -24,6 +24,13 @@ bootstrap_nodes = [
     "noise_f356d3ebb07371eaad371b3960272f9d58fc457cde409c34549ef03776b78141@boot1.citrate.ai:30303",
     "noise_4ed281386422f6a65b92d8760d24baa82bb1b476e9dd3e21d5a070d026802c07@boot2.citrate.ai:30303",
     "noise_2b4924671e0babc9f52eb1695c72141a9c639e17ad95a2a2d2a715eae34a420e@boot3.citrate.ai:30303",
+    # The sequencer is the block producer and the only peer that follows the
+    # real chain head; boot{1,2,3} are discovery-only and advertise height 0,
+    # so a fresh node never triggers sync from them alone. Including the
+    # sequencer here makes a fresh node sync genesis→head out of the box
+    # (verified 2026-05-27: 0→131k blocks in ~15s). Identity captured from the
+    # live handshake; rpc.citrate.ai resolves to the sequencer droplet.
+    "noise_6ee549718d522c9ccc122585dfedef72aea8df24f4a2bb0264e7658a91118b4a@rpc.citrate.ai:30303",
 ]
 max_peers = 50
 allowed_peers = []             # Beta tester Noise public keys (hex-encoded); empty = open beta

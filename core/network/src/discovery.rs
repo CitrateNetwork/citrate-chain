@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::time;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
@@ -78,33 +78,29 @@ impl Discovery {
 
     /// Initialize with bootstrap nodes.
     ///
-    /// A-10/B-6: Parse multiple bootstrap address formats:
+    /// Parses every supported bootstrap address format and resolves hostnames
+    /// via DNS through the shared [`crate::bootnode::resolve_bootnode`] helper:
     ///   - `ip:port` (e.g., `203.0.113.10:30303`)
-    ///   - `noise_<hex>@ip:port` (trusted identity — stripped and addr used)
-    ///   - `peer_id@ip:port` (non-noise identity — stripped)
+    ///   - `hostname:port` (e.g., `boot1.citrate.ai:30303`)
+    ///   - `noise_<hex>@<host>:port` (trusted identity — host resolved, addr used)
+    ///   - `peer_id@<host>:port` (non-noise identity — host resolved)
     ///
-    /// Hostnames are NOT resolved here (that happens at the transport layer in
-    /// `node/src/main.rs:1156` via `tokio::net::lookup_host`). Only literal
-    /// SocketAddrs are added to the discovery known_peers set; hostnames are
-    /// still dialed via the node-level bootstrap loop for the initial connect.
+    /// Both literal IPs and hostnames are resolved to concrete SocketAddrs and
+    /// added to the discovery known_peers set, so a fresh node with the baked
+    /// hostname-based `testnet-beta.toml` populates discovery correctly.
     pub async fn init(&self) -> Result<(), NetworkError> {
         let mut added = 0usize;
         for node in &self.config.bootstrap_nodes {
-            // Strip any `<identity>@` prefix
-            let addr_part = node.split_once('@').map(|(_, rest)| rest).unwrap_or(node);
-            if let Ok(addr) = addr_part.parse::<SocketAddr>() {
-                self.add_bootstrap_peer(
-                    format!("bootstrap_{}", node),
-                    addr,
-                ).await;
+            if let Some((_, addr)) = crate::bootnode::resolve_bootnode(node).await {
+                self.add_bootstrap_peer(format!("bootstrap_{}", node), addr).await;
                 added += 1;
             } else {
-                debug!("Bootstrap node is not a literal SocketAddr (possibly hostname): {}", node);
+                warn!("Could not resolve bootstrap node: {}", node);
             }
         }
 
         info!(
-            "Initialized discovery with {} bootstrap nodes ({} added as protected, {} deferred to hostname resolution)",
+            "Initialized discovery with {} bootstrap nodes ({} resolved as protected, {} unresolved)",
             self.config.bootstrap_nodes.len(),
             added,
             self.config.bootstrap_nodes.len() - added,

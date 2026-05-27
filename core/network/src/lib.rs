@@ -56,6 +56,7 @@
 //     peer_manager.get_peer_counts() which acquires stats.read() — safe (Level 1 read-read).
 pub mod ai_handler;
 pub mod block_propagation;
+pub mod bootnode;
 pub mod discovery;
 pub mod gossip;
 pub mod learning_messages;
@@ -71,6 +72,7 @@ pub mod types;
 
 pub use ai_handler::{AINetworkHandler, NetworkInferenceExecutor, NetworkInferenceResult};
 pub use block_propagation::BlockPropagation;
+pub use bootnode::{resolve_bootnode, split_bootnode};
 pub use discovery::{Discovery, DiscoveryConfig};
 pub use gossip::{CheckpointLearningData, GossipConfig, GossipProtocol, LearningDedup};
 pub use learning_messages::{
