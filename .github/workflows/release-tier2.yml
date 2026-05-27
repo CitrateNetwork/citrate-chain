@@ -155,16 +155,20 @@ jobs:
         # Windows) so this stays portable.
         run: |
           set -e
+          # Absolute repo-root target dir — cargo builds the workspace here
+          # regardless of how deep node is, so this is correct
+          # for chain (node/), gui (gui/citrate_desktop_app/), and pool (.).
+          TARGET_DIR="$GITHUB_WORKSPACE/target/${{ matrix.target }}/release"
           cd node
-          CONFIG_JSON=$(python3 -c "
-          import json
+          CONFIG_JSON=$(CITRATE_TARGET_DIR="$TARGET_DIR" python3 -c "
+          import json, os
           try: import tomllib
           except ImportError: import tomli as tomllib
           with open('packager.toml','rb') as f: d = tomllib.load(f)
           # The --binaries-dir CLI flag is ignored when --config is a raw JSON
           # string, so packager defaults to out-dir and the binary copy fails
-          # with 'No such file or directory'. Inject binaries-dir into the config.
-          d['binaries-dir'] = '../target/${{ matrix.target }}/release'
+          # with 'No such file or directory'. Inject an absolute binaries-dir.
+          d['binaries-dir'] = os.environ['CITRATE_TARGET_DIR']
           # An empty macOS signing-identity makes codesign run with an empty
           # identity and fail; drop it so unsigned builds skip signing. Signed
           # builds are driven by the APPLE_SIGNING_IDENTITY env var instead.
@@ -175,7 +179,7 @@ jobs:
           cargo packager --release --target ${{ matrix.target }} \
             --formats ${{ matrix.packager-formats }} \
             --config "$CONFIG_JSON" \
-            --out-dir ../target/${{ matrix.target }}/release/packages
+            --out-dir "$TARGET_DIR/packages"
 
       - name: Notarize macOS artefacts
         if: runner.os == 'macOS' && env.APPLE_NOTARY_USER != ''
