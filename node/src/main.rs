@@ -40,6 +40,78 @@ use citrate_consensus::types::GhostDagParams;
 use genesis::{initialize_genesis_state, initialize_genesis_state_with_profile, GenesisConfig};
 use producer::BlockProducer;
 
+/// The canonical public testnet config, embedded at compile time so a fresh
+/// install joins the testnet without install.sh having to drop a file
+/// (turnkey onboarding, workstream D). On first run with no config present the
+/// node materialises this to ~/.citrate/node.toml after the network choice.
+const TESTNET_BETA_CONFIG: &str = include_str!("../config/testnet-beta.toml");
+
+/// First-run network selection. Returns the chosen [`NodeConfig`] and persists
+/// it to `~/.citrate/node.toml` so the choice is sticky on subsequent launches.
+///
+/// Selection precedence: explicit `--network`, else an interactive prompt when
+/// stdin is a TTY, else a testnet default for non-interactive (service) starts.
+fn first_run_select_config(network_flag: Option<&str>) -> anyhow::Result<NodeConfig> {
+    use std::io::IsTerminal;
+
+    let join_testnet = match network_flag.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if s == "testnet" => true,
+        Some(s) if s == "local" || s == "devnet" => false,
+        Some(other) => {
+            anyhow::bail!("--network must be 'testnet' or 'local', got '{}'", other);
+        }
+        None => {
+            if std::io::stdin().is_terminal() {
+                prompt_join_testnet()
+            } else {
+                tracing::info!(
+                    "First run, no config, non-interactive — defaulting to the public testnet. \
+                     Pass --network local for an isolated devnet."
+                );
+                true
+            }
+        }
+    };
+
+    let config = if join_testnet {
+        toml::from_str::<NodeConfig>(TESTNET_BETA_CONFIG)
+            .map_err(|e| anyhow::anyhow!("embedded testnet config is invalid: {}", e))?
+    } else {
+        NodeConfig::default()
+    };
+
+    // Persist the choice so the next launch auto-loads it (and the user can edit it).
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".citrate").join("node.toml");
+        match config.save(&path) {
+            Ok(()) => tracing::info!(
+                "First-run setup: wrote {} config to {}",
+                if join_testnet { "testnet" } else { "local devnet" },
+                path.display()
+            ),
+            Err(e) => tracing::warn!("Could not persist first-run config to {}: {}", path.display(), e),
+        }
+    }
+    Ok(config)
+}
+
+/// Interactive testnet-vs-local prompt for first run on a TTY.
+fn prompt_join_testnet() -> bool {
+    use std::io::Write;
+    print!(
+        "\nWelcome to Citrate. This looks like a first run.\n\
+         Join the public Citrate testnet, or run an isolated local devnet?\n\
+         \n  [T] Join testnet  (connect to the live network and sync)  (default)\n  \
+         [L] Local devnet  (a private chain on this machine)\n\nChoice [T/L]: "
+    );
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return true; // default to testnet on read error
+    }
+    !matches!(line.trim().to_ascii_lowercase().as_str(), "l" | "local" | "devnet")
+}
+
 #[derive(Parser)]
 #[command(name = "citrate")]
 #[command(about = "Citrate blockchain node")]
@@ -47,6 +119,12 @@ struct Cli {
     /// Configuration file path
     #[arg(short, long, value_name = "FILE")]
     config: Option<PathBuf>,
+
+    /// Network to join on first run when no config exists: "testnet" or "local".
+    /// Skips the interactive prompt. If unset and stdin is a TTY the node asks;
+    /// non-interactively (service/daemon) it defaults to testnet.
+    #[arg(long, value_name = "testnet|local")]
+    network: Option<String>,
 
     /// Data directory
     #[arg(short, long, value_name = "DIR")]
@@ -329,11 +407,12 @@ async fn main() -> Result<()> {
     let config = if let Some(config_path) = resolved_config_path {
         NodeConfig::from_file(&config_path)?
     } else {
-        tracing::warn!(
-            "No --config, $CITRATE_CONFIG, ~/.citrate/node.toml, or /etc/citrate/node.toml \
-             found — running with empty defaults (no bootnodes, dev/devnet only)."
-        );
-        NodeConfig::default()
+        // First run: no config anywhere. Ask the operator whether to join the
+        // public testnet or run a local devnet (honoring --network / TTY /
+        // non-interactive-default), then persist the choice to
+        // ~/.citrate/node.toml so it's a one-time decision. This is what makes
+        // a double-clicked install auto-join + sync without manual setup.
+        first_run_select_config(cli.network.as_deref())?
     };
 
     // Override with CLI args
