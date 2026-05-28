@@ -57,11 +57,65 @@ jobs:
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             packager-formats: wix,nsis
+    env:
+      # Exposed so the SSH-setup steps below can self-skip on repos that have
+      # no cross-repo SSH git deps (e.g. citrate-chain). Repos that consume
+      # private sibling crates via ssh:// host aliases (gui-native, boeing-shell)
+      # set these deploy-key secrets and the steps activate.
+      CHAIN_DEPLOY_KEY: ${{ secrets.CHAIN_DEPLOY_KEY }}
+      LEARNING_CENTER_DEPLOY_KEY: ${{ secrets.LEARNING_CENTER_DEPLOY_KEY }}
+      AGENT_RUNTIME_DEPLOY_KEY: ${{ secrets.AGENT_RUNTIME_DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.release_tag || github.ref }}
           submodules: recursive
+
+      # Cross-repo private git deps (citrate-agent-runtime, citrate-chain,
+      # citrate-learning-center) are pulled via ssh:// host aliases. Set up the
+      # deploy keys + host aliases exactly like the regular CI so `cargo build`
+      # can clone them. Skipped when the deploy-key secrets are absent (chain).
+      - name: Setup SSH agent (cross-repo deploy keys)
+        if: ${{ env.AGENT_RUNTIME_DEPLOY_KEY != '' }}
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.CHAIN_DEPLOY_KEY }}
+            ${{ secrets.LEARNING_CENTER_DEPLOY_KEY }}
+            ${{ secrets.AGENT_RUNTIME_DEPLOY_KEY }}
+
+      - name: Configure SSH host aliases
+        if: ${{ env.AGENT_RUNTIME_DEPLOY_KEY != '' }}
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          umask 077
+          echo "${{ secrets.CHAIN_DEPLOY_KEY }}"           > ~/.ssh/citrate-chain-readonly
+          echo "${{ secrets.LEARNING_CENTER_DEPLOY_KEY }}" > ~/.ssh/citrate-learning-center-readonly
+          echo "${{ secrets.AGENT_RUNTIME_DEPLOY_KEY }}"   > ~/.ssh/citrate-agent-runtime-readonly
+          chmod 600 ~/.ssh/citrate-*-readonly
+          cat > ~/.ssh/config <<'SSHEOF'
+          Host github-citrate-chain
+              HostName github.com
+              User git
+              IdentityFile ~/.ssh/citrate-chain-readonly
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+          Host github-citrate-learning-center
+              HostName github.com
+              User git
+              IdentityFile ~/.ssh/citrate-learning-center-readonly
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+          Host github-citrate-agent-runtime
+              HostName github.com
+              User git
+              IdentityFile ~/.ssh/citrate-agent-runtime-readonly
+              IdentitiesOnly yes
+              StrictHostKeyChecking accept-new
+          SSHEOF
+          chmod 600 ~/.ssh/config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -169,11 +223,18 @@ jobs:
           # string, so packager defaults to out-dir and the binary copy fails
           # with 'No such file or directory'. Inject an absolute binaries-dir.
           d['binaries-dir'] = os.environ['CITRATE_TARGET_DIR']
-          # An empty macOS signing-identity makes codesign run with an empty
-          # identity and fail; drop it so unsigned builds skip signing. Signed
-          # builds are driven by the APPLE_SIGNING_IDENTITY env var instead.
-          m = d.get('macos', {})
-          if not m.get('signing-identity'): m.pop('signing-identity', None)
+          # macOS signing-identity. cargo-packager only signs when the config
+          # has a non-empty signing-identity, so:
+          #   - signed build  (APPLE_SIGNING_IDENTITY env set): inject the real
+          #     identity into the config; without it, codesign runs with "" and
+          #     fails OR (worse) packager silently emits an unsigned .app.
+          #   - unsigned build (env unset, packager.toml has identity = ""):
+          #     drop the empty value entirely so packager skips signing cleanly.
+          m = d.setdefault('macos', {})
+          if os.environ.get('APPLE_SIGNING_IDENTITY'):
+              m['signing-identity'] = os.environ['APPLE_SIGNING_IDENTITY']
+          elif not m.get('signing-identity'):
+              m.pop('signing-identity', None)
           print(json.dumps(d))
           ")
           cargo packager --release --target ${{ matrix.target }} \
