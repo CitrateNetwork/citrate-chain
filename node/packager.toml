@@ -26,7 +26,6 @@ The Citrate Node bundles the libp2p networking stack, GhostDAG consensus, LVM ex
 """
 authors  = ["Citrate Labs <support@citrate.ai>"]
 homepage = "https://citrate.ai"
-license-file = "../LICENSE"
 category = "Utility"
 copyright = "© 2026 Citrate Labs. BUSL-1.1."
 # Output formats. cargo-packager skips formats whose toolchain isn't
