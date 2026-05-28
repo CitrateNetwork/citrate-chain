@@ -65,6 +65,13 @@ jobs:
       CHAIN_DEPLOY_KEY: ${{ secrets.CHAIN_DEPLOY_KEY }}
       LEARNING_CENTER_DEPLOY_KEY: ${{ secrets.LEARNING_CENTER_DEPLOY_KEY }}
       AGENT_RUNTIME_DEPLOY_KEY: ${{ secrets.AGENT_RUNTIME_DEPLOY_KEY }}
+      # Force lzma-sys / xz2 to build liblzma from source and link it
+      # statically. Otherwise the macOS runner's Homebrew xz gets dynamically
+      # linked into the binary (load path `/opt/homebrew/opt/xz/lib/liblzma.5.dylib`)
+      # and the hardened-runtime + Developer-ID-signed app refuses to load it
+      # on user machines because it's signed by a different Team ID — crashing
+      # at launch with "Library not loaded: …liblzma.5.dylib … different Team IDs".
+      LZMA_API_STATIC: "1"
     steps:
       - uses: actions/checkout@v4
         with:
