@@ -1,6 +1,7 @@
 // citrate/core/api/src/economics_rpc.rs
 
-use futures::executor::block_on;
+// PIL-49: shared Tokio runtime so block_on can drive tokio::sync::* wakers.
+use crate::rpc_runtime::block_on;
 use jsonrpc_core::{IoHandler, Params, Value};
 use citrate_economics::UnifiedEconomicsManager;
 use citrate_sequencer::mempool::Mempool;

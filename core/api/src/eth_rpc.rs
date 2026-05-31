@@ -3,7 +3,12 @@
 use crate::eth_tx_decoder;
 use crate::filter::{FilterRegistry, FilterType};
 use crate::methods::{mempool::PendingQuery, ChainApi, MempoolApi, StateApi};
-use futures::executor::block_on;
+// PIL-49: route block_on through a shared multi-threaded Tokio runtime so
+// futures awaiting tokio::sync::* / tokio::time::* / reqwest can wake.
+// `futures::executor::block_on` lacks a Tokio reactor, so any such future
+// deadlocks — under chatbot load this stranded the RPC accept queue and
+// rpc.citrate.ai went silent while the node was still producing blocks.
+use crate::rpc_runtime::block_on;
 use hex;
 use jsonrpc_core::{IoHandler, Params, Value};
 use citrate_consensus::types::{Hash, Transaction};
