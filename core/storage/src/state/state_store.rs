@@ -34,10 +34,29 @@ impl StateStoreTrait for StateStore {
         Ok(())
     }
 
+    /// PIL-13b: override the default `Ok(None)` so the REVM Database
+    /// adapter can fall through to disk for code reads on cold cache.
+    /// Forwards to the inherent [`StateStore::get_code`] (reads from
+    /// RocksDB column family `CF_CODE`). Before this override the
+    /// trait default returned `Ok(None)` and REVM saw all deployed
+    /// contracts as having no bytecode after a restart, silently
+    /// emitting `0x` from `eth_call`.
+    fn get_code(&self, code_hash: &Hash) -> Result<Option<Vec<u8>>> {
+        StateStore::get_code(self, code_hash)
+    }
+
     fn put_storage(&self, address: &Address, key: &[u8], value: &[u8]) -> Result<()> {
         let storage_key = storage_key(address, key);
         self.db.put_cf(CF_STORAGE, &storage_key, value)?;
         Ok(())
+    }
+
+    /// PIL-13b: override the default `Ok(None)` so the REVM Database
+    /// adapter can fall through to disk for storage reads on cold cache.
+    /// Forwards to the inherent [`StateStore::get_storage`] (reads from
+    /// RocksDB column family `CF_STORAGE`).
+    fn get_storage(&self, address: &Address, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        StateStore::get_storage(self, address, key)
     }
 
     fn delete_storage(&self, address: &Address, key: &[u8]) -> Result<()> {

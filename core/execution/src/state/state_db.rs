@@ -65,6 +65,18 @@ impl StateDB {
             .insert(key, value);
     }
 
+    /// PIL-13b: warm the in-memory storage cache from the persistent
+    /// store. Unlike `set_storage`, this does NOT mark the slot dirty —
+    /// the value we just loaded is already what's on disk, so re-writing
+    /// it would create a no-op flush at next commit. Used by the REVM
+    /// Database adapter to hydrate cold-cache misses for view calls.
+    pub fn cache_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
+        self.storage_tries
+            .entry(address)
+            .or_default()
+            .insert(key, value);
+    }
+
     /// Delete storage value
     pub fn delete_storage(&self, address: Address, key: &[u8]) {
         self.dirty_storage.insert((address, key.to_vec()));
@@ -91,6 +103,17 @@ impl StateDB {
         self.code_storage.insert(code_hash, code);
         self.accounts.set_code_hash(address, code_hash);
         code_hash
+    }
+
+    /// PIL-13b: warm the in-memory code cache with bytecode loaded from
+    /// the persistent store. Unlike `set_code`, this takes the already-
+    /// known `code_hash` (the store keys code by hash) and does not
+    /// touch any account's `code_hash` — the caller has already
+    /// determined which account owns this code. Used by the REVM
+    /// Database adapter to hydrate cold-cache misses without recomputing
+    /// the hash.
+    pub fn cache_code(&self, code_hash: Hash, code: Vec<u8>) {
+        self.code_storage.insert(code_hash, code);
     }
 
     /// Register model

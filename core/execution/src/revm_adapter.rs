@@ -30,6 +30,21 @@ pub use crate::mvcc::JournalHandle as RevmJournalHandle;
 /// Adapter to make StateDB compatible with revm's Database trait
 pub struct StateDBAdapter {
     state_db: Arc<StateDB>,
+    /// PIL-13b: persistent state store, queried on `state_db` cache miss.
+    ///
+    /// `state_db` is an in-memory cache, not the source of truth. After
+    /// a node restart it is empty. The Database trait impl below was
+    /// returning empty data on cache miss (eth_call → `0x` despite the
+    /// contract being deployed on disk), which silently broke every
+    /// view function for chatbot / SDK developers querying state after
+    /// the chain came back up.
+    ///
+    /// When set, every cache-miss in `basic` / `code_by_hash` / `storage`
+    /// falls through to this store; the result is then written into
+    /// `state_db` so subsequent reads in the same execution hit the
+    /// cache. `None` preserves legacy in-memory-only behaviour for
+    /// standalone tests that don't wire up a real store.
+    state_store: Option<Arc<dyn crate::executor::StateStoreTrait>>,
     /// WP-X.4: Block number → block hash mapping for BLOCKHASH opcode.
     /// EVM spec: BLOCKHASH returns the hash for the 256 most recent blocks.
     block_hashes: HashMap<u64, [u8; 32]>,
@@ -59,10 +74,25 @@ impl StateDBAdapter {
     pub fn new(state_db: Arc<StateDB>) -> Self {
         Self {
             state_db,
+            state_store: None,
             block_hashes: HashMap::new(),
             writes: None,
             journal: None,
         }
+    }
+
+    /// PIL-13b: attach a persistent state store for cold-cache fallback.
+    ///
+    /// When set, the Database trait methods (`basic`, `code_by_hash`,
+    /// `storage`) consult this store on cache miss instead of returning
+    /// empty / default values. Hydrated entries are written back to
+    /// `state_db` so further reads in the same execution are fast.
+    pub fn with_state_store(
+        mut self,
+        state_store: Arc<dyn crate::executor::StateStoreTrait>,
+    ) -> Self {
+        self.state_store = Some(state_store);
+        self
     }
 
     /// Set block hashes for BLOCKHASH opcode support (WP-X.4).
@@ -131,6 +161,22 @@ impl Database for StateDBAdapter {
             )
         };
 
+        // PIL-13b: on cold cache, hydrate balance/nonce/code_hash from
+        // the persistent state store. Pre-fix, a fresh-restart node had
+        // empty state_db.accounts and every account looked uninitialised
+        // — `eth_call` against deployed contracts returned `0x` because
+        // REVM thought the account had no code, and `eth_getBalance` was
+        // only working because it goes through `executor.get_balance`
+        // which has its own storage-load wrapper. After this hydration,
+        // REVM sees the real on-chain account and contract code.
+        if !self.state_db.accounts.exists(&addr) {
+            if let Some(store) = &self.state_store {
+                if let Ok(Some(account)) = store.get_account(&addr) {
+                    self.state_db.accounts.load_account(addr, account);
+                }
+            }
+        }
+
         let code_hash = self.state_db.accounts.get_code_hash(&addr);
 
         // Convert to revm types
@@ -170,10 +216,23 @@ impl Database for StateDBAdapter {
             j.mark_requires_serial_commit();
         }
 
-        let code = self
-            .state_db
-            .get_code(&hash)
-            .unwrap_or_default();
+        // PIL-13b: try in-memory cache first, fall through to persistent
+        // store on miss, warm cache with the result.
+        let code = if let Some(c) = self.state_db.get_code(&hash) {
+            c
+        } else if let Some(store) = &self.state_store {
+            match store.get_code(&hash) {
+                Ok(Some(bytes)) => {
+                    // Insert into state_db.code_storage so subsequent
+                    // reads in this execution hit the cache.
+                    self.state_db.cache_code(hash, bytes.clone());
+                    bytes
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
 
         Ok(Bytecode::new_raw(Bytes::from(code)))
     }
@@ -201,11 +260,26 @@ impl Database for StateDBAdapter {
             }
         }
 
-        // Get storage value as bytes from committed state
-        let value_bytes = self
-            .state_db
-            .get_storage(&addr, &key_bytes)
-            .unwrap_or_else(|| vec![0u8; 32]);
+        // Get storage value as bytes from committed state.
+        // PIL-13b: in-memory cache miss falls through to the persistent
+        // store. The store returns Ok(None) for slots that have never
+        // been written; treat those as zero (canonical EVM semantics).
+        // On a hit, warm the in-memory cache so subsequent reads in this
+        // execution are fast.
+        let value_bytes = if let Some(v) = self.state_db.get_storage(&addr, &key_bytes) {
+            v
+        } else if let Some(store) = &self.state_store {
+            match store.get_storage(&addr, &key_bytes) {
+                Ok(Some(bytes)) => {
+                    self.state_db
+                        .cache_storage(addr, key_bytes.to_vec(), bytes.clone());
+                    bytes
+                }
+                _ => vec![0u8; 32],
+            }
+        } else {
+            vec![0u8; 32]
+        };
 
         // Pad to 32 bytes if needed
         let mut padded = [0u8; 32];
@@ -478,12 +552,17 @@ pub fn execute_contract_call(
     execute_contract_call_with_context(
         state_db, caller, contract, calldata, value, gas_limit, gas_price,
         chain_id, block_number, block_timestamp, BlockContext::default(), None, None,
+        // PIL-13b: legacy convenience wrapper used by benches + tests
+        // that don't wire a state store. Cold-cache loads are skipped;
+        // the call falls back to the in-memory state_db only.
+        None,
     )
 }
 
 /// Execute contract call using revm with full block context (WP-X.4),
 /// optional WriteSet capture (Sprint P950-A-4, WP-A.4.1), and optional
 /// journal for buffered storage writes (Sprint P950-A-5, WP-A.5.1).
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn execute_contract_call_with_context(
     state_db: Arc<StateDB>,
@@ -499,6 +578,12 @@ pub fn execute_contract_call_with_context(
     block_ctx: BlockContext,
     writes_handle: Option<WriteSetHandle>,
     journal_handle: Option<JournalHandle>,
+    // PIL-13b: optional persistent state store for cold-cache fallback.
+    // None preserves legacy behaviour for tests + bench paths that don't
+    // wire a real store; Some hydrates account / code / storage misses
+    // from RocksDB so eth_call against deployed contracts works on a
+    // freshly-restarted node.
+    state_store: Option<Arc<dyn crate::executor::StateStoreTrait>>,
 ) -> Result<(Vec<u8>, u64), ExecutionError> {
     debug!("Executing contract call with revm");
     debug!("  Caller: {}", caller);
@@ -513,6 +598,9 @@ pub fn execute_contract_call_with_context(
     }
     if let Some(j) = journal_handle {
         db = db.with_journal(j);
+    }
+    if let Some(s) = state_store {
+        db = db.with_state_store(s);
     }
 
     // Build EVM with transaction
@@ -691,6 +779,7 @@ mod tests {
             ctx,
             None, // No WriteSet capture in this test
             None, // No journal buffering in this test
+            None, // PIL-13b: no state store — test uses in-memory state_db only
         );
 
         assert!(result.is_ok(), "Contract call with block context should succeed: {:?}", result.err());
