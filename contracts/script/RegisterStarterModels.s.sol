@@ -73,8 +73,8 @@ contract RegisterStarterModels is Script {
             name:           "gemma-4-E4B-it-Q4_K_M",
             framework:      "llama.cpp",
             version:        "1.0.0",
-            ipfsCID:        "", // TODO: pin gemma-4-E4B-it-Q4_K_M.gguf, paste CID
-            sizeBytes:      5335289824,                       // 4.96 GB
+            ipfsCID:        "QmS6EeHFQbUudT9HEBYAt5JMwjk5ugGSCvvPFLkxk7rhJ3", // CIDv0, default `ipfs add` — verify against the droplet's `ipfs add` output before broadcast
+            sizeBytes:      5335289824,                       // 4.96 GB (5,335,289,824 bytes; sha256 90ce98…0313e9f)
             inferencePrice: 0,
             description:    "Google Gemma 4 E4B-it (4-bit Q4_K_M). Multimodal, 128K ctx, native function-calling. Default chat model bundled with the wallet.",
             license:        "Gemma-Terms-of-Use-2025",
