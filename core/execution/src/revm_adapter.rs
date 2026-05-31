@@ -2,19 +2,34 @@
 
 use crate::mvcc::{JournalHandle, WriteSet};
 use crate::state::StateDB;
-use crate::types::{Address, ExecutionError};
+use crate::types::{Address, ExecutionError, Log as CitrateLog};
+use citrate_consensus::types::Hash;
 use parking_lot::Mutex;
 use primitive_types::U256;
 use revm::{
     primitives::{
-        AccountInfo, Address as RevmAddress, Bytecode, Bytes, ExecutionResult, Output,
-        TransactTo, B256, U256 as RevmU256, SpecId, KECCAK_EMPTY,
+        AccountInfo, Address as RevmAddress, Bytecode, Bytes, ExecutionResult, Log as RevmLog,
+        Output, TransactTo, B256, U256 as RevmU256, SpecId, KECCAK_EMPTY,
     },
     Database, DatabaseCommit, Evm,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+// PIL-48: Convert REVM's emitted log (alloy_primitives::Log) into citrate's
+// receipt-log shape. Previously the executor discarded REVM logs entirely
+// and synthesised a single hardcoded "ContractExecuted0000..." topic per
+// call, so eth_getLogs for a real event signature (e.g. ProviderRegistered)
+// returned nothing — silently breaking subgraphs, Foundry test assertions
+// on events, and any off-chain indexer.
+fn convert_revm_log(rlog: &RevmLog) -> CitrateLog {
+    CitrateLog {
+        address: Address(rlog.address.0 .0),
+        topics: rlog.data.topics().iter().map(|t| Hash::new(t.0)).collect(),
+        data: rlog.data.data.to_vec(),
+    }
+}
 
 /// Shared handle for per-tx WriteSet capture (Sprint P950-A-4, WP-A.4.1).
 ///
@@ -410,10 +425,13 @@ pub fn execute_contract_create(
     block_number: u64,
     block_timestamp: u64,
 ) -> Result<(Address, Vec<u8>, u64), ExecutionError> {
+    // PIL-48 backward-compat wrapper: drop the logs Vec for the legacy
+    // 3-tuple signature used by tests + bench paths.
     execute_contract_create_with_context(
         state_db, deployer, init_code, value, gas_limit, gas_price,
         chain_id, block_number, block_timestamp, BlockContext::default(), None, None,
     )
+    .map(|(addr, code, gas, _logs)| (addr, code, gas))
 }
 
 /// Execute contract creation using revm with full block context (WP-X.4),
@@ -433,7 +451,7 @@ pub fn execute_contract_create_with_context(
     block_ctx: BlockContext,
     writes_handle: Option<WriteSetHandle>,
     journal_handle: Option<JournalHandle>,
-) -> Result<(Address, Vec<u8>, u64), ExecutionError> {
+) -> Result<(Address, Vec<u8>, u64, Vec<CitrateLog>), ExecutionError> {
     debug!("Executing contract creation with revm");
     debug!("  Deployer: {}", deployer);
     debug!("  Init code size: {} bytes", init_code.len());
@@ -492,8 +510,14 @@ pub fn execute_contract_create_with_context(
         ExecutionResult::Success {
             output,
             gas_used,
+            logs,
             ..
         } => {
+            // PIL-48: forward REVM-emitted logs (correctly-hashed event topics)
+            // up to the executor so they land in the receipt and become visible
+            // via eth_getLogs. Constructor events (e.g. OpenZeppelin's
+            // Initialized()) are emitted here.
+            let citrate_logs: Vec<CitrateLog> = logs.iter().map(convert_revm_log).collect();
             match output {
                 Output::Create(runtime_code, Some(contract_address)) => {
                     let addr = Address(contract_address.0 .0);
@@ -505,7 +529,7 @@ pub fn execute_contract_create_with_context(
                         code.len()
                     );
 
-                    Ok((addr, code, gas_used))
+                    Ok((addr, code, gas_used, citrate_logs))
                 }
                 Output::Create(_, None) => {
                     Err(ExecutionError::Reverted(
@@ -549,6 +573,8 @@ pub fn execute_contract_call(
     block_number: u64,
     block_timestamp: u64,
 ) -> Result<(Vec<u8>, u64), ExecutionError> {
+    // PIL-48 backward-compat wrapper: drop the logs Vec for the legacy
+    // 2-tuple signature used by tests + bench paths.
     execute_contract_call_with_context(
         state_db, caller, contract, calldata, value, gas_limit, gas_price,
         chain_id, block_number, block_timestamp, BlockContext::default(), None, None,
@@ -557,6 +583,7 @@ pub fn execute_contract_call(
         // the call falls back to the in-memory state_db only.
         None,
     )
+    .map(|(output, gas, _logs)| (output, gas))
 }
 
 /// Execute contract call using revm with full block context (WP-X.4),
@@ -584,7 +611,7 @@ pub fn execute_contract_call_with_context(
     // from RocksDB so eth_call against deployed contracts works on a
     // freshly-restarted node.
     state_store: Option<Arc<dyn crate::executor::StateStoreTrait>>,
-) -> Result<(Vec<u8>, u64), ExecutionError> {
+) -> Result<(Vec<u8>, u64, Vec<CitrateLog>), ExecutionError> {
     debug!("Executing contract call with revm");
     debug!("  Caller: {}", caller);
     debug!("  Contract: {}", contract);
@@ -644,13 +671,21 @@ pub fn execute_contract_call_with_context(
 
     match result {
         ExecutionResult::Success {
-            output, gas_used, ..
-        } => match output {
-            Output::Call(return_data) => Ok((return_data.to_vec(), gas_used)),
-            _ => Err(ExecutionError::Reverted(
-                "Unexpected output type for contract call".to_string(),
-            )),
-        },
+            output, gas_used, logs, ..
+        } => {
+            // PIL-48: forward REVM-emitted logs (correctly-hashed event topics)
+            // up to the executor so they land in the receipt and become visible
+            // via eth_getLogs. Without this, real Solidity events emitted by
+            // the contract were silently discarded and replaced with a single
+            // synthetic "ContractExecuted00..." topic.
+            let citrate_logs: Vec<CitrateLog> = logs.iter().map(convert_revm_log).collect();
+            match output {
+                Output::Call(return_data) => Ok((return_data.to_vec(), gas_used, citrate_logs)),
+                _ => Err(ExecutionError::Reverted(
+                    "Unexpected output type for contract call".to_string(),
+                )),
+            }
+        }
         ExecutionResult::Revert { gas_used, output } => {
             let reason = if !output.is_empty() {
                 format!("0x{}", hex::encode(&output))
@@ -783,6 +818,76 @@ mod tests {
         );
 
         assert!(result.is_ok(), "Contract call with block context should succeed: {:?}", result.err());
+    }
+
+    /// PIL-48 regression: REVM-emitted log topics must round-trip up to the
+    /// executor instead of being silently discarded. Pre-fix, every contract
+    /// execution returned a single hand-rolled `"ContractExecuted0000..."`
+    /// ASCII topic, so `eth_getLogs` against a real keccak256 event signature
+    /// (ProviderRegistered, Transfer, etc.) was guaranteed to miss everything
+    /// — invisible to Foundry, The Graph, and any off-chain listener.
+    #[test]
+    fn test_pil48_revm_log_topics_round_trip() {
+        let state_db = Arc::new(StateDB::new());
+        let caller = Address([1u8; 20]);
+        let contract = Address([2u8; 20]);
+        state_db
+            .accounts
+            .set_balance(caller, U256::from(10u64).pow(U256::from(18u64)));
+
+        // Deterministic 32-byte topic. Picked to be obviously NOT the keccak256
+        // of any string, AND obviously NOT ASCII — if the pre-fix synthetic
+        // path returns, neither this test's assertion nor a naive ASCII check
+        // could pass.
+        let expected_topic: [u8; 32] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+        ];
+
+        // Bytecode: PUSH32 <topic> + PUSH1 0 (length) + PUSH1 0 (offset) +
+        // LOG1 + STOP. LOG1 pops offset, length, topic in that order off the
+        // stack (offset at top), so we push topic first.
+        let mut runtime_code = vec![0x7f]; // PUSH32
+        runtime_code.extend_from_slice(&expected_topic);
+        runtime_code.extend_from_slice(&[
+            0x60, 0x00, // PUSH1 0  (length)
+            0x60, 0x00, // PUSH1 0  (offset)
+            0xa1,       // LOG1
+            0x00,       // STOP
+        ]);
+        state_db.set_code(contract, runtime_code);
+
+        let (_output, _gas, logs) = execute_contract_call_with_context(
+            state_db,
+            caller,
+            contract,
+            vec![],
+            U256::zero(),
+            1_000_000,
+            U256::from(1_000_000_000u64),
+            40204,
+            1,
+            1_000_000,
+            BlockContext::default(),
+            None,
+            None,
+            None,
+        )
+        .expect("LOG1 contract call should succeed");
+
+        assert_eq!(logs.len(), 1, "Expected exactly one log emitted by LOG1");
+        let log = &logs[0];
+        assert_eq!(log.address, contract, "log address should be the contract");
+        assert_eq!(log.topics.len(), 1, "LOG1 emits one topic");
+        assert_eq!(
+            log.topics[0],
+            citrate_consensus::types::Hash::new(expected_topic),
+            "REVM-emitted topic must round-trip exactly. Pre-fix, this came \
+             back as ASCII bytes for \"ContractExecuted0000...\"."
+        );
+        assert!(log.data.is_empty(), "LOG1 with length=0 must have no data");
     }
 
     /// Sprint EL-1 regression (Issue #19): Verify that SSTORE values persist
