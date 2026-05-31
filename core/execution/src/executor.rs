@@ -1625,7 +1625,7 @@ impl Executor {
         );
 
         match result {
-            Ok((deployed_address, runtime_code, gas_used)) => {
+            Ok((deployed_address, runtime_code, gas_used, revm_logs)) => {
                 // Charge gas for execution
                 context.use_gas(gas_used)?;
 
@@ -1652,12 +1652,16 @@ impl Executor {
                 // Set contract address in output
                 context.output = deployed_address.0.to_vec();
 
-                // Add deployment log
-                context.add_log(Log {
-                    address: deployed_address,
-                    topics: vec![Hash::new(*b"ContractDeployed0000000000000000")],
-                    data: deployed_address.0.to_vec(),
-                });
+                // PIL-48: forward REVM-emitted logs from constructor execution
+                // (e.g. OpenZeppelin's Initialized() event) so they land in the
+                // receipt and are indexable via eth_getLogs. The prior synthetic
+                // "ContractDeployed0000..." topic was a hand-rolled ASCII string
+                // that never matched any real keccak256 event signature; tools
+                // looking for the contract's actual constructor events silently
+                // saw nothing.
+                for log in revm_logs {
+                    context.add_log(log);
+                }
 
                 Ok(())
             }
@@ -1760,7 +1764,7 @@ impl Executor {
                 // hydrate account / code / storage on cold cache miss.
                 self.state_store.clone(),
             ) {
-                Ok((output, gas_used)) => {
+                Ok((output, gas_used, revm_logs)) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["ok"]).inc();
                     if gas_used > 0 {
                         context.use_gas(gas_used)?;
@@ -1775,19 +1779,22 @@ impl Executor {
                     if value > U256::zero() {
                         self.journal_transfer(from, to, value, context)?;
                     }
+
+                    // PIL-48: forward REVM-emitted logs to the receipt with their
+                    // real keccak256 event topics. Pre-fix, all REVM logs were
+                    // discarded and a single hardcoded "ContractExecuted0000..."
+                    // topic was synthesised per call — making eth_getLogs useless
+                    // for real Solidity events (ProviderRegistered, Transfer,
+                    // Approval, ChatRegistered, etc.).
+                    for log in revm_logs {
+                        context.add_log(log);
+                    }
                 }
                 Err(e) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["err"]).inc();
                     return Err(e);
                 }
             }
-
-            // Add execution log
-            context.add_log(Log {
-                address: to,
-                topics: vec![Hash::new(*b"ContractExecuted0000000000000000")],
-                data: data.clone(),
-            });
         }
 
         Ok(())
