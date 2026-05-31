@@ -463,6 +463,81 @@ impl GhostDag {
         })
     }
 
+    /// Register an EXISTING block whose `blue_score`/`blue_work` are already
+    /// recorded in the block header.
+    ///
+    /// PIL-13: the eager DAG-load loop in `BlockProducer::with_shared_dag`
+    /// previously called [`Self::add_block`] for every persisted block on
+    /// startup. `add_block` recomputes the full BlueSet, which (because
+    /// `BlueSet.blocks` is the cumulative O(chain-length) blue ancestry)
+    /// allocates O(N²) memory across N=281k blocks. The 16 GB RPC droplet
+    /// kernel-OOM'd within 30 s of every restart.
+    ///
+    /// For blocks already on disk the score + work are durable in the
+    /// header (BlockHeader.blue_score is u64, blue_work is u128, both
+    /// transmitted on the wire too). Loading them is an O(1) read; no
+    /// recomputation needed.
+    ///
+    /// **What this method does NOT do that [`Self::add_block`] does:**
+    /// - It does not populate `blue_cache` with cumulative ancestry sets.
+    /// - It stores a lightweight `BlueSet` (empty `blocks` HashSet, just
+    ///   `score` + `work` from the header) in `relations`.
+    ///
+    /// **Why that's safe:** the only reader of `relations[*].blue_set` is
+    /// [`Self::select_tip`], which only touches `.score`. The cumulative
+    /// `.blocks` HashSet is never read out of `relations` anywhere in the
+    /// tree (verified by grep at the time this method was added, PIL-13).
+    ///
+    /// **Where the full BlueSet IS needed:** validator-side
+    /// `count_blue_anticone` (k-cluster anticone counting). That path goes
+    /// through [`Self::calculate_blue_set`], which lazily walks the chain
+    /// on demand and is unaffected by this lightweight registration.
+    pub async fn register_existing_block(&self, block: &Block) -> Result<(), GhostDagError> {
+        if !block.is_genesis() && block.selected_parent() == Hash::default() {
+            return Err(GhostDagError::InvalidParents);
+        }
+
+        // Lightweight blue_set — score + work from the header, no
+        // cumulative ancestry materialised.
+        let mut blue_set = BlueSet::new();
+        blue_set.score = block.header.blue_score;
+        blue_set.work = block.header.blue_work;
+
+        let relation = DagRelation {
+            block: block.hash(),
+            selected_parent: block.selected_parent(),
+            merge_parents: block.header.merge_parent_hashes.clone(),
+            children: Vec::new(),
+            blue_set,
+            is_chain_block: true,
+            height: block.header.height,
+        };
+
+        let mut relations = self.relations.write().await;
+        relations.insert(block.hash(), relation);
+
+        // Update parent's children link (matches add_block semantics)
+        if let Some(parent_relation) = relations.get_mut(&block.selected_parent()) {
+            parent_relation.children.push(block.hash());
+        }
+        for merge_parent in &block.header.merge_parent_hashes {
+            if let Some(parent_relation) = relations.get_mut(merge_parent) {
+                parent_relation.children.push(block.hash());
+            }
+        }
+        drop(relations);
+
+        // Tips bookkeeping (same as add_block)
+        let mut tips = self.tips.write().await;
+        tips.remove(&block.selected_parent());
+        for merge_parent in &block.header.merge_parent_hashes {
+            tips.remove(merge_parent);
+        }
+        tips.insert(block.hash());
+
+        Ok(())
+    }
+
     /// Add a block to the DAG
     pub async fn add_block(&self, block: &Block) -> Result<(), GhostDagError> {
         // Validate parent structure
