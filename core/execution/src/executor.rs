@@ -129,8 +129,34 @@ pub trait StateStoreTrait: Send + Sync {
     ) -> anyhow::Result<()>;
     fn get_account(&self, address: &Address) -> anyhow::Result<Option<crate::types::AccountState>>;
     fn put_code(&self, code_hash: &Hash, code: &[u8]) -> anyhow::Result<()>;
+    /// Read contract bytecode by `code_hash`. Default `Ok(None)` so test
+    /// stores that don't persist code keep compiling.
+    ///
+    /// PIL-13b: the executor's in-memory `state_db` is a cache, not the
+    /// source of truth — after restart it is empty until something
+    /// warms it. The REVM Database trait impl
+    /// (`crate::revm_adapter::StateDBAdapter::code_by_hash`) was reading
+    /// directly from `state_db.get_code` and returning empty bytecode on
+    /// miss, which silently turned every `eth_call` into a no-op (REVM
+    /// saw the contract had no code, returned no output, the JSON-RPC
+    /// handler emitted `0x`). The Database impl now falls through to
+    /// this method on cache miss and warms `state_db` with what it
+    /// finds.
+    fn get_code(&self, _code_hash: &Hash) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
     /// C6: Persist a contract storage slot
     fn put_storage(&self, address: &Address, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
+    /// Read a contract storage slot. Default `Ok(None)` so test stores
+    /// that don't persist storage keep compiling.
+    ///
+    /// PIL-13b: same rationale as `get_code` above — REVM's `storage`
+    /// trait method was hitting `state_db.get_storage` and returning
+    /// zero on cache miss, masking real on-chain state. Now falls
+    /// through to this method.
+    fn get_storage(&self, _address: &Address, _key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
     /// C6: Delete a contract storage slot
     fn delete_storage(&self, address: &Address, key: &[u8]) -> anyhow::Result<()>;
 
@@ -1664,11 +1690,44 @@ impl Executor {
             return Ok(());
         }
 
-        // Execute contract code with VM (unified path)
-        if let Some(code) = self
-            .state_db
-            .get_code(&self.state_db.accounts.get_code_hash(&to))
-        {
+        // Execute contract code with VM (unified path).
+        //
+        // PIL-13b: route the code lookup through the storage-loading
+        // wrappers, not the in-memory cache directly. Pre-fix this gate
+        // used `state_db.accounts.get_code_hash(&to)` (in-memory only),
+        // which returned the zero hash on cold cache after a node
+        // restart. `state_db.get_code(zero_hash)` then returned `None`,
+        // and the whole `if let` branch was silently skipped — REVM
+        // never ran, `context.output` stayed empty, and `eth_call`
+        // emitted `0x` for every view function against every deployed
+        // contract.
+        //
+        // `get_code_hash` (executor wrapper at line 686) already loads
+        // the account from the persistent store on cache miss. Pairing
+        // it with a parallel `state_store.get_code` fallback hydrates
+        // the bytecode cache before REVM needs it.
+        let code_hash = self.get_code_hash(&to);
+        let cached_code = self.state_db.get_code(&code_hash);
+        let code_opt = match cached_code {
+            Some(c) => Some(c),
+            None => {
+                if code_hash == Hash::default() {
+                    None
+                } else if let Some(store) = &self.state_store {
+                    match store.get_code(&code_hash) {
+                        Ok(Some(bytes)) => {
+                            self.state_db.cache_code(code_hash, bytes.clone());
+                            Some(bytes)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(code) = code_opt {
             // Route standard EVM calls through REVM for correct CALL/CREATE/DELEGATECALL.
             //
             // Sprint EL-1 Fix (Issue #19): REVM handles gas/value/nonce internally
@@ -1697,6 +1756,9 @@ impl Executor {
                 self.get_block_context(),
                 Some(context.writes_handle.clone()),
                 Some(context.journal.clone()),
+                // PIL-13b: pass the executor's state store so REVM can
+                // hydrate account / code / storage on cold cache miss.
+                self.state_store.clone(),
             ) {
                 Ok((output, gas_used)) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["ok"]).inc();
