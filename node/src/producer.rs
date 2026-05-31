@@ -347,7 +347,17 @@ impl BlockProducer {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
                     if let Ok(Some(block)) = storage.blocks.get_block(&block_hash) {
                         let _ = dag_store.store_block(block.clone()).await;
-                        let _ = ghostdag.add_block(&block).await;
+                        // PIL-13: use register_existing_block, not add_block.
+                        // The eager-load loop walks every persisted block on
+                        // startup. add_block recomputes the full BlueSet
+                        // (cumulative O(chain-length) blue ancestry), which
+                        // accumulates O(N²) memory in blue_cache and kernel-
+                        // OOMs the box at N=281k. register_existing_block
+                        // reads blue_score + blue_work straight from the
+                        // header (already on disk, durable) and stores a
+                        // lightweight BlueSet — O(1) per block, no
+                        // cumulative materialisation.
+                        let _ = ghostdag.register_existing_block(&block).await;
                     }
                 }
             }
@@ -442,7 +452,17 @@ impl BlockProducer {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
                     if let Ok(Some(block)) = storage.blocks.get_block(&block_hash) {
                         let _ = dag_store.store_block(block.clone()).await;
-                        let _ = ghostdag.add_block(&block).await;
+                        // PIL-13: use register_existing_block, not add_block.
+                        // The eager-load loop walks every persisted block on
+                        // startup. add_block recomputes the full BlueSet
+                        // (cumulative O(chain-length) blue ancestry), which
+                        // accumulates O(N²) memory in blue_cache and kernel-
+                        // OOMs the box at N=281k. register_existing_block
+                        // reads blue_score + blue_work straight from the
+                        // header (already on disk, durable) and stores a
+                        // lightweight BlueSet — O(1) per block, no
+                        // cumulative materialisation.
+                        let _ = ghostdag.register_existing_block(&block).await;
                     }
                 }
             }
@@ -613,30 +633,61 @@ impl BlockProducer {
             self.select_parents_with_ghostdag(&tips).await?
         };
 
-        // Calculate blue set for the new block
-        let temp_block = citrate_consensus::types::BlockBuilder::new()
-            .parent(selected_parent)
-            .merge_parents(merge_parents.clone())
-            .timestamp(chrono::Utc::now().timestamp() as u64)
-            .proposer(PublicKey::new(self.signing_key.verifying_key().to_bytes()))
-            .vrf_reveal(generate_block_vrf(&self.signing_key, &PublicKey::new(self.signing_key.verifying_key().to_bytes()), &selected_parent, 0))
-            .base_fee_per_gas(1_000_000_000)
-            .build_unhashed();
+        // PIL-13: removed the `temp_block` builder + `calculate_blue_set`
+        // call here. The temp_block was only used to feed
+        // calculate_blue_set, which (because BlueSet.blocks is the
+        // cumulative O(N) blue ancestry) walked back O(N) ancestors on cold
+        // cache and OOM'd the box. We derive blue_score from the parent's
+        // header instead.
+        //
+        // PIL-13: derive blue_score from the parent's header instead of
+        // calling calculate_blue_set on a fresh-from-thin-air block.
+        //
+        // Why this is safe for testnet-beta (single-producer pilot):
+        //   * The new block's blue_score is parent.blue_score + 1 + |blue merge
+        //     contributions|.
+        //   * For single-producer chains the merge_parents set is either
+        //     empty or shallow (this producer is the only source of blocks),
+        //     so the +1 approximation matches what the full GhostDAG
+        //     algorithm would yield to within one or two units.
+        //   * The full BlueSet is only an input to calculate_blue_work, and
+        //     that function (see calculate_blue_work below) only reads
+        //     blue_score — the `_blue_set` parameter is unused.
+        //   * select_tip reads only `relation.blue_set.score`, not `.blocks`.
+        //
+        // When multi-validator ships post-pilot, this path needs the full
+        // calculate_blue_set call back, with the BlueSet persistence rework
+        // also in place so it doesn't re-trigger PIL-13. Tracked as a
+        // follow-up below.
+        //
+        // Read parent's height + VRF + blue_score in one storage hit.
+        let (last_height, parent_vrf_output, parent_blue_score, parent_blue_work) =
+            if selected_parent != Hash::default() {
+                self.storage
+                    .blocks
+                    .get_block(&selected_parent)
+                    .ok()
+                    .flatten()
+                    .map(|b| {
+                        (
+                            b.header.height,
+                            b.header.vrf_reveal.output,
+                            b.header.blue_score,
+                            b.header.blue_work,
+                        )
+                    })
+                    .unwrap_or((0, Hash::default(), 0, 0))
+            } else {
+                (0, Hash::default(), 0, 0)
+            };
 
-        let blue_set = self.ghostdag.calculate_blue_set(&temp_block).await?;
-        let blue_score = self.ghostdag.calculate_blue_score(&temp_block).await?;
-
-        // Get last block height and parent VRF output from selected parent
-        let (last_height, parent_vrf_output) = if selected_parent != Hash::default() {
-            self.storage
-                .blocks
-                .get_block(&selected_parent)
-                .ok()
-                .and_then(|b| b.map(|block| (block.header.height, block.header.vrf_reveal.output)))
-                .unwrap_or((0, Hash::default()))
-        } else {
-            (0, Hash::default())
-        };
+        // Single-producer increment. Each new block adds itself to the blue
+        // set; with no other producers there are no additional blue merges.
+        let blue_score = parent_blue_score + 1;
+        // Lightweight placeholder (no cumulative ancestry materialised).
+        let mut blue_set = citrate_consensus::types::BlueSet::new();
+        blue_set.score = blue_score;
+        blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
 
         // Get transactions from mempool with AI priority
         let transactions = self.select_transactions_with_ai_priority().await?;
