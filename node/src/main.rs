@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use citrate_api::{RpcConfig, RpcServer};
+use citrate_api::{EthSubscriptionServer, RpcConfig, RpcServer};
 use citrate_consensus::crypto;
 use citrate_execution::{Executor, StateDB};
 use citrate_economics::{UnifiedEconomicsManager, UnifiedEconomicsConfig, StakeholderType};
@@ -1871,6 +1871,44 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             Some(pause_flag.clone()),
         );
 
+        // PIL-12: spawn the Ethereum-compatible subscription server next
+        // to the RPC server. Until this commit, main.rs constructed
+        // `RpcServer` directly via `RpcServer::with_economics_and_pause`
+        // and called `.spawn()` — which only binds the HTTP RPC socket.
+        // Nothing ever bound `config.rpc.ws_addr`, so `wss://rpc.citrate.ai`
+        // returned HTTP 405 because Caddy proxied the upgrade to the
+        // HTTP JSON-RPC port instead of a real WS endpoint. Spec — and
+        // `node/config/testnet-beta.toml` — both say WS lives on `:8546`.
+        //
+        // We use `EthSubscriptionServer` rather than `WebSocketServer`
+        // because the partner expectation is standard Ethereum
+        // `eth_subscribe('newHeads' | 'logs' | 'newPendingTransactions' |
+        // 'syncing')` — i.e. the same JSON-RPC envelope as HTTP RPC,
+        // not citrate-specific `Subscribe { id, subscription: SubscriptionType }`
+        // messages (which the older WebSocketServer speaks for AI streaming).
+        // `EthSubscriptionServer` exposes the standard subscriptions plus
+        // a broadcast channel that the block producer hooks into via
+        // `new_heads_sender()` so newly-produced blocks push to all
+        // subscribers in real time.
+        let ws_addr = config.rpc.ws_addr;
+        let eth_subs = std::sync::Arc::new(EthSubscriptionServer::new(
+            ws_addr,
+            storage.clone(),
+            mempool.clone(),
+        ));
+        // Save the new-heads broadcast sender so the producer (started
+        // below) can wire blocks into the subscription feed via
+        // `BlockProducer::with_new_heads_sender`. PIL-12 follow-up wires
+        // this; today's commit only binds the port so the 405 stops.
+        let _new_heads_sender = eth_subs.new_heads_sender();
+        let eth_subs_for_spawn = eth_subs.clone();
+        let ws_handle = tokio::spawn(async move {
+            info!("Starting Ethereum subscription WebSocket server on {}", ws_addr);
+            if let Err(e) = eth_subs_for_spawn.start().await {
+                error!("Ethereum subscription server error: {}", e);
+            }
+        });
+
         Some(tokio::spawn(async move {
             match rpc_server.spawn() {
                 Ok((close_handle, join_handle)) => {
@@ -1884,9 +1922,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     })
                     .await
                     .ok();
+                    // PIL-12: shut the WS task down with the rest of the
+                    // RPC stack on Ctrl-C so the integration tests don't
+                    // leave a dangling :8546 listener on dev boxes.
+                    ws_handle.abort();
                 }
                 Err(e) => {
                     error!("Failed to start RPC server: {}", e);
+                    ws_handle.abort();
                 }
             }
         }))
