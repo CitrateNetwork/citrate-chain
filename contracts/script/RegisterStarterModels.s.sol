@@ -36,7 +36,7 @@ contract RegisterStarterModels is Script {
     /// @notice ModelRegistry deployed at this address on chain id 40204.
     /// Bumped here so we don't ask `vm.envAddress` and keep the script
     /// runnable from CI without env wiring.
-    address public constant REGISTRY_ADDR = 0x077FBc3338A9e6Bad90a3a041e6B7425689754ef;
+    address public constant REGISTRY_ADDR = 0x077Fbc3338A9e6BAD90A3A041E6b7425689754Ef;
 
     /// @notice Per-call fee charged by ModelRegistry.registerModel.
     uint256 public constant REGISTRATION_FEE = 0.1 ether;
@@ -73,8 +73,13 @@ contract RegisterStarterModels is Script {
             name:           "gemma-4-E4B-it-Q4_K_M",
             framework:      "llama.cpp",
             version:        "1.0.0",
+<<<<<<< Updated upstream
             ipfsCID:        "QmS6EeHFQbUudT9HEBYAt5JMwjk5ugGSCvvPFLkxk7rhJ3", // CIDv0, default `ipfs add` — verify against the droplet's `ipfs add` output before broadcast
             sizeBytes:      5335289824,                       // 4.96 GB (5,335,289,824 bytes; sha256 90ce98…0313e9f)
+=======
+            ipfsCID:        "QmS6EeHFQbUudT9HEBYAt5JMwjk5ugGSCvvPFLkxk7rhJ3",
+            sizeBytes:      5335289824,                       // 4.96 GB
+>>>>>>> Stashed changes
             inferencePrice: 0,
             description:    "Google Gemma 4 E4B-it (4-bit Q4_K_M). Multimodal, 128K ctx, native function-calling. Default chat model bundled with the wallet.",
             license:        "Gemma-Terms-of-Use-2025",
@@ -158,7 +163,7 @@ contract RegisterStarterModels is Script {
             ipfsCID:        "", // TODO
             sizeBytes:      60000000,
             inferencePrice: 0,
-            description:    "Magicoder-S-DS LoRA — instruction-tuned coding adapter.",
+            description:    "Magicoder-S-DS LoRA - instruction-tuned coding adapter.",
             license:        "Apache-2.0",
             tags:           _tags2("lora", "code")
         });
@@ -182,7 +187,7 @@ contract RegisterStarterModels is Script {
             ipfsCID:        "", // TODO
             sizeBytes:      55000000,
             inferencePrice: 0,
-            description:    "DeepSeek-Coder 1.3B LoRA — compact, code-completion focused.",
+            description:    "DeepSeek-Coder 1.3B LoRA - compact, code-completion focused.",
             license:        "DeepSeek-License",
             tags:           _tags2("lora", "code")
         });
@@ -227,7 +232,7 @@ contract RegisterStarterModels is Script {
             StarterModel memory m = items[i];
 
             if (bytes(m.ipfsCID).length == 0) {
-                console.log("skip %s [%s]: empty CID — pin to IPFS and edit the script", label, m.name);
+                console.log("skip %s [%s]: empty CID - pin to IPFS and edit the script", label, m.name);
                 continue;
             }
 
