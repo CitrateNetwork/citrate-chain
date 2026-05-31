@@ -2018,6 +2018,328 @@ pub fn register_eth_methods(
         }))
     });
 
+    // =========================================================================
+    // PIL-12.5: Foundry / forge tooling compatibility.
+    //
+    // Methods that forge script, cast, hardhat, and common SDK probes
+    // expect at connection time. Before this commit:
+    //   * `forge script --broadcast` failed in the simulation phase with
+    //     `-32601: Method not found` on eth_getStorageAt; that's how
+    //     PIL-03 originally landed via `cast send` instead of forge.
+    //   * Hardhat / ethers / viem startup probes emitted noisy errors
+    //     for eth_accounts / eth_mining / eth_protocolVersion even
+    //     though they don't actually need the result.
+    //   * `cast block --index N` could not introspect tx-by-index.
+    //
+    // What we don't add here (intentionally):
+    //   * debug_traceTransaction / debug_traceCall — heavy, requires REVM
+    //     tracing wiring; tracked as a follow-up sprint.
+    //   * trace_call / trace_block — Parity-style; same reasoning.
+    //   * anvil_* — testnet RPC is not a dev simulator.
+    //   * eth_getProof — state-proof generation needs trie wiring we
+    //     don't have yet.
+    // =========================================================================
+
+    // eth_getStorageAt(address, slot, blockTag) — read a storage slot.
+    //
+    // forge script uses this in its simulation phase to compute state
+    // diffs before broadcast. Returns a left-padded 32-byte hex value;
+    // cast call decodes a `uint256` from it directly.
+    //
+    // We currently only serve "latest" semantics; historical state
+    // requires pruning-point-aware storage that we don't have yet.
+    // forge tolerates this because it caches the block height itself
+    // and re-reads "latest" each call.
+    let storage_gsat = storage.clone();
+    let executor_gsat = executor.clone();
+    io_handler.add_sync_method("eth_getStorageAt", move |params: Params| {
+        let state_api = StateApi::new(storage_gsat.clone(), executor_gsat.clone());
+
+        let parsed: Vec<Value> = params
+            .parse()
+            .map_err(|e: jsonrpc_core::Error| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+        if parsed.len() < 2 {
+            return Err(jsonrpc_core::Error::invalid_params(
+                "eth_getStorageAt: expected [address, slot, blockTag]",
+            ));
+        }
+
+        // address (required, 20 bytes)
+        let addr_str = parsed[0]
+            .as_str()
+            .ok_or_else(|| jsonrpc_core::Error::invalid_params("address must be a hex string"))?;
+        let addr_hex = addr_str.trim_start_matches("0x");
+        let addr_bytes = hex::decode(addr_hex).map_err(|e| {
+            jsonrpc_core::Error::invalid_params(format!("bad address hex: {e}"))
+        })?;
+        if addr_bytes.len() != 20 {
+            return Err(jsonrpc_core::Error::invalid_params(
+                "address must be 20 bytes",
+            ));
+        }
+        let mut addr_arr = [0u8; 20];
+        addr_arr.copy_from_slice(&addr_bytes);
+        let address = Address(addr_arr);
+
+        // slot (required, up to 32 bytes — left-pad if shorter). Foundry
+        // sends both `"0x0"` and `"0x00000…0001"` interchangeably.
+        let slot_str = parsed[1]
+            .as_str()
+            .ok_or_else(|| jsonrpc_core::Error::invalid_params("slot must be a hex string"))?;
+        let slot_hex = slot_str.trim_start_matches("0x");
+        let slot_padded_hex = if slot_hex.len() % 2 == 1 {
+            format!("0{slot_hex}")
+        } else {
+            slot_hex.to_string()
+        };
+        let mut slot_bytes = hex::decode(&slot_padded_hex).map_err(|e| {
+            jsonrpc_core::Error::invalid_params(format!("bad slot hex: {e}"))
+        })?;
+        if slot_bytes.len() > 32 {
+            return Err(jsonrpc_core::Error::invalid_params(
+                "slot must be ≤ 32 bytes",
+            ));
+        }
+        let mut slot_key = vec![0u8; 32 - slot_bytes.len()];
+        slot_key.append(&mut slot_bytes);
+
+        // The 3rd param (blockTag) is parsed for forwards-compat with the
+        // standard signature but we always serve latest.
+
+        match block_on(state_api.get_storage(address, slot_key)) {
+            Ok(value) => {
+                // Always return left-padded 32-byte hex.
+                let mut padded = vec![0u8; 32];
+                let len = value.len().min(32);
+                if len > 0 {
+                    let src_start = value.len().saturating_sub(len);
+                    padded[32 - len..].copy_from_slice(&value[src_start..]);
+                }
+                Ok(Value::String(format!("0x{}", hex::encode(padded))))
+            }
+            Err(_) => Ok(Value::String(format!("0x{}", "0".repeat(64)))),
+        }
+    });
+
+    // eth_getBlockTransactionCountByNumber(blockTag) — uint count.
+    let storage_btcbn = storage.clone();
+    io_handler.add_sync_method(
+        "eth_getBlockTransactionCountByNumber",
+        move |params: Params| {
+            let api = ChainApi::new(storage_btcbn.clone());
+            let parsed: Vec<Value> = params
+                .parse()
+                .map_err(|e: jsonrpc_core::Error| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+            if parsed.is_empty() {
+                return Err(jsonrpc_core::Error::invalid_params("missing block tag"));
+            }
+            let number = match parsed[0].as_str() {
+                Some("latest") | Some("pending") => block_on(api.get_height()).unwrap_or(0),
+                Some("earliest") => 0,
+                Some(s) if s.starts_with("0x") => u64::from_str_radix(&s[2..], 16)
+                    .map_err(|_| jsonrpc_core::Error::invalid_params("bad hex block number"))?,
+                _ => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
+            };
+            match block_on(api.get_block(crate::types::request::BlockId::Number(number))) {
+                Ok(block) => Ok(Value::String(format!("0x{:x}", block.transactions.len()))),
+                Err(_) => Ok(Value::Null),
+            }
+        },
+    );
+
+    // eth_getBlockTransactionCountByHash(blockHash) — uint count.
+    let storage_btcbh = storage.clone();
+    io_handler.add_sync_method(
+        "eth_getBlockTransactionCountByHash",
+        move |params: Params| {
+            let api = ChainApi::new(storage_btcbh.clone());
+            let parsed: Vec<Value> = params
+                .parse()
+                .map_err(|e: jsonrpc_core::Error| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+            if parsed.is_empty() {
+                return Err(jsonrpc_core::Error::invalid_params("missing block hash"));
+            }
+            let hex_str = parsed[0]
+                .as_str()
+                .map(|s| s.trim_start_matches("0x"))
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("hash must be a string"))?;
+            let bytes = hex::decode(hex_str)
+                .map_err(|e| jsonrpc_core::Error::invalid_params(format!("bad hash hex: {e}")))?;
+            if bytes.len() != 32 {
+                return Err(jsonrpc_core::Error::invalid_params("hash must be 32 bytes"));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            let hash = Hash::new(arr);
+            match block_on(api.get_block(crate::types::request::BlockId::Hash(hash))) {
+                Ok(block) => Ok(Value::String(format!("0x{:x}", block.transactions.len()))),
+                Err(_) => Ok(Value::Null),
+            }
+        },
+    );
+
+    // eth_getTransactionByBlockNumberAndIndex(blockTag, index) — full tx
+    // object at position `index` of the block. Used by `cast block --index`
+    // and Foundry's broadcast verification.
+    let storage_tbni = storage.clone();
+    io_handler.add_sync_method(
+        "eth_getTransactionByBlockNumberAndIndex",
+        move |params: Params| {
+            let api = ChainApi::new(storage_tbni.clone());
+            let parsed: Vec<Value> = params
+                .parse()
+                .map_err(|e: jsonrpc_core::Error| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+            if parsed.len() < 2 {
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "expected [blockTag, index]",
+                ));
+            }
+            let number = match parsed[0].as_str() {
+                Some("latest") | Some("pending") => block_on(api.get_height()).unwrap_or(0),
+                Some("earliest") => 0,
+                Some(s) if s.starts_with("0x") => u64::from_str_radix(&s[2..], 16)
+                    .map_err(|_| jsonrpc_core::Error::invalid_params("bad hex block number"))?,
+                _ => return Err(jsonrpc_core::Error::invalid_params("bad block tag")),
+            };
+            let idx_str = parsed[1]
+                .as_str()
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("index must be hex string"))?;
+            let idx = usize::from_str_radix(idx_str.trim_start_matches("0x"), 16)
+                .map_err(|_| jsonrpc_core::Error::invalid_params("bad hex index"))?;
+            let block = match block_on(api.get_block(crate::types::request::BlockId::Number(number)))
+            {
+                Ok(b) => b,
+                Err(_) => return Ok(Value::Null),
+            };
+            if let Some(tx) = block.transactions.get(idx) {
+                Ok(json!({
+                    "hash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
+                    "from": pubkey_hex_to_evm_address(&tx.from),
+                    "to": pubkey_hex_opt_to_evm_address(tx.to.as_ref()),
+                    "value": format!("0x{:x}", tx.value),
+                    "gas": format!("0x{:x}", tx.gas_limit),
+                    "gasPrice": format!("0x{:x}", tx.gas_price),
+                    "nonce": format!("0x{:x}", tx.nonce),
+                    "input": format!("0x{}", hex::encode(&tx.data)),
+                    "blockHash": format!("0x{}", hex::encode(block.hash.as_bytes())),
+                    "blockNumber": format!("0x{:x}", block.height),
+                    "transactionIndex": format!("0x{:x}", idx),
+                }))
+            } else {
+                Ok(Value::Null)
+            }
+        },
+    );
+
+    // eth_getTransactionByBlockHashAndIndex(blockHash, index) — same
+    // shape, address by block hash.
+    let storage_tbhi = storage.clone();
+    io_handler.add_sync_method(
+        "eth_getTransactionByBlockHashAndIndex",
+        move |params: Params| {
+            let api = ChainApi::new(storage_tbhi.clone());
+            let parsed: Vec<Value> = params
+                .parse()
+                .map_err(|e: jsonrpc_core::Error| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+            if parsed.len() < 2 {
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "expected [blockHash, index]",
+                ));
+            }
+            let hex_str = parsed[0]
+                .as_str()
+                .map(|s| s.trim_start_matches("0x"))
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("hash must be a string"))?;
+            let bytes = hex::decode(hex_str)
+                .map_err(|e| jsonrpc_core::Error::invalid_params(format!("bad hash hex: {e}")))?;
+            if bytes.len() != 32 {
+                return Err(jsonrpc_core::Error::invalid_params("hash must be 32 bytes"));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            let hash = Hash::new(arr);
+            let idx_str = parsed[1]
+                .as_str()
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("index must be hex string"))?;
+            let idx = usize::from_str_radix(idx_str.trim_start_matches("0x"), 16)
+                .map_err(|_| jsonrpc_core::Error::invalid_params("bad hex index"))?;
+            let block = match block_on(api.get_block(crate::types::request::BlockId::Hash(hash))) {
+                Ok(b) => b,
+                Err(_) => return Ok(Value::Null),
+            };
+            if let Some(tx) = block.transactions.get(idx) {
+                Ok(json!({
+                    "hash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
+                    "from": pubkey_hex_to_evm_address(&tx.from),
+                    "to": pubkey_hex_opt_to_evm_address(tx.to.as_ref()),
+                    "value": format!("0x{:x}", tx.value),
+                    "gas": format!("0x{:x}", tx.gas_limit),
+                    "gasPrice": format!("0x{:x}", tx.gas_price),
+                    "nonce": format!("0x{:x}", tx.nonce),
+                    "input": format!("0x{}", hex::encode(&tx.data)),
+                    "blockHash": format!("0x{}", hex::encode(block.hash.as_bytes())),
+                    "blockNumber": format!("0x{:x}", block.height),
+                    "transactionIndex": format!("0x{:x}", idx),
+                }))
+            } else {
+                Ok(Value::Null)
+            }
+        },
+    );
+
+    // eth_accounts — read-only RPC always returns []. Wallets that
+    // expect "the node has unlocked accounts" should look elsewhere
+    // (and shouldn't — partners sign client-side and submit raw).
+    io_handler.add_sync_method("eth_accounts", |_params: Params| {
+        Ok(Value::Array(vec![]))
+    });
+
+    // eth_mining — block production is internal; RPC doesn't expose it.
+    // Returning false stops tools from probing eth_hashrate / pendingWork.
+    io_handler.add_sync_method("eth_mining", |_params: Params| {
+        Ok(Value::Bool(false))
+    });
+
+    // eth_hashrate — we're not PoW; canonical zero.
+    io_handler.add_sync_method("eth_hashrate", |_params: Params| {
+        Ok(Value::String("0x0".to_string()))
+    });
+
+    // eth_protocolVersion — Ethereum wire-protocol version. 0x41 = 65,
+    // the modern post-merge eth/68 number. Cosmetic; some old clients
+    // refuse to connect if this is missing.
+    io_handler.add_sync_method("eth_protocolVersion", |_params: Params| {
+        Ok(Value::String("0x41".to_string()))
+    });
+
+    // eth_coinbase — current block producer's address. Read from the
+    // executor's block context (set by the producer on each block).
+    let executor_cb = executor.clone();
+    io_handler.add_sync_method("eth_coinbase", move |_params: Params| {
+        let cb = executor_cb.get_block_context().coinbase;
+        Ok(Value::String(format!("0x{}", hex::encode(cb))))
+    });
+
+    // web3_sha3(data) — keccak256(data). Pure utility; some scripts
+    // use it instead of computing locally.
+    io_handler.add_sync_method("web3_sha3", |params: Params| {
+        use sha3::{Digest, Keccak256};
+        let parsed: Vec<Value> = params
+            .parse()
+            .map_err(|e: jsonrpc_core::Error| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+        if parsed.is_empty() {
+            return Err(jsonrpc_core::Error::invalid_params("missing data"));
+        }
+        let hex_str = parsed[0]
+            .as_str()
+            .map(|s| s.trim_start_matches("0x"))
+            .ok_or_else(|| jsonrpc_core::Error::invalid_params("data must be hex string"))?;
+        let bytes = hex::decode(hex_str)
+            .map_err(|e| jsonrpc_core::Error::invalid_params(format!("bad hex: {e}")))?;
+        let hash = Keccak256::digest(&bytes);
+        Ok(Value::String(format!("0x{}", hex::encode(hash))))
+    });
+
     // citrate_getDagStats - Get DAG statistics including tips, height, and GhostDAG parameters
     let storage_dag = storage.clone();
     io_handler.add_sync_method("citrate_getDagStats", move |_params: Params| {
