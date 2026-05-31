@@ -13,7 +13,8 @@ use crate::types::{
 };
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use futures::executor::block_on;
+// PIL-49: shared Tokio runtime so block_on can drive tokio::sync::* wakers.
+use crate::rpc_runtime::block_on;
 use jsonrpc_core::{IoHandler, Params, Value};
 use jsonrpc_http_server::CloseHandle;
 use jsonrpc_http_server::{AccessControlAllowOrigin, DomainsValidation, ServerBuilder};
@@ -432,7 +433,12 @@ impl Default for RpcConfig {
             max_connections: 100,
             // C-02 FIX: No wildcard CORS by default — prevents browser-to-localhost abuse
             cors_origins: vec!["http://localhost:*".to_string()],
-            threads: 4,
+            // PIL-49: bumped from 4 → 16. 4 sync workers were trivially saturated
+            // by ~4 concurrent slow eth_call requests (chatbot + Foundry bursts);
+            // once full, the kernel listen queue piled up and rpc.citrate.ai
+            // went silent until restart. 16 gives 4× headroom while staying
+            // small enough to fit on the 4 vCPU droplet without thrash.
+            threads: 16,
             rate_limit: RateLimitConfig::default(),
             allow_eth_send_transaction: false, // Secure default: reject unsigned tx
         }
@@ -2652,14 +2658,18 @@ mod tests {
     }
 
     fn add_test_tx(mempool: &Arc<Mempool>, nonce: u64, data: Vec<u8>) {
-        futures::executor::block_on(mempool.add_transaction(
+        // PIL-49: use the shared rpc_runtime so block_on can drive
+        // tokio::sync::* wakers used inside Mempool::add_transaction.
+        block_on(mempool.add_transaction(
             make_test_tx(nonce, data),
             TxClass::Standard,
         ))
         .expect("test transaction admitted to relaxed mempool");
     }
 
-    #[tokio::test]
+    // PIL-49: needs multi_thread so rpc_runtime::block_on can use
+    // block_in_place under the existing test runtime context.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_rpc_chain_height_and_tx_submit() {
         let temp_dir = TempDir::new().unwrap();
         let storage =

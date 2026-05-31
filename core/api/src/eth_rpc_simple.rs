@@ -1,7 +1,8 @@
 // citrate/core/api/src/eth_rpc_simple.rs
 
 use crate::methods::{ChainApi, StateApi};
-use futures::executor::block_on;
+// PIL-49: shared Tokio runtime so block_on can drive tokio::sync::* wakers.
+use crate::rpc_runtime::block_on;
 use jsonrpc_core::{IoHandler, Params, Value};
 use citrate_consensus::types::Hash;
 use citrate_execution::executor::Executor;

@@ -1,7 +1,8 @@
 // citrate/core/api/src/ai_rpc.rs
 
 use crate::methods::ai::{AiApi, ChatCompletionRequest, EmbeddingsRequest};
-use futures::executor::block_on;
+// PIL-49: shared Tokio runtime so block_on can drive tokio::sync::* wakers.
+use crate::rpc_runtime::block_on;
 use jsonrpc_core::{IoHandler, Params};
 use citrate_execution::executor::Executor;
 use citrate_sequencer::mempool::Mempool;
