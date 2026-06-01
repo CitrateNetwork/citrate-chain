@@ -52,9 +52,15 @@ fn setup_relay() -> BridgeRelay {
     relay
 }
 
-fn attest_event(relay: &BridgeRelay, event_id: &[u8; 32]) {
+fn attest_event(relay: &BridgeRelay, event: &BridgeEvent) {
+    let event_id = *event.event_id();
+    // Post-RM-A: deposits are attested with their canonical field-binding hash
+    // so the relay's binding gate accepts the honest deposit.
+    let event_hash = match event {
+        BridgeEvent::Deposit(d) => d.canonical_hash(),
+        _ => compute_event_hash(&event_id, b"deposit"),
+    };
     let sk = default_oracle_key();
-    let event_hash = compute_event_hash(event_id, b"deposit");
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -62,14 +68,14 @@ fn attest_event(relay: &BridgeRelay, event_id: &[u8; 32]) {
 
     let mut message = Vec::with_capacity(89);
     message.extend_from_slice(b"citrate-bridge-v1");
-    message.extend_from_slice(event_id);
+    message.extend_from_slice(&event_id);
     message.extend_from_slice(&event_hash);
     message.extend_from_slice(&timestamp.to_le_bytes());
     let sig = sk.sign(&message);
 
     let att = OracleAttestation {
         oracle_id: sk.verifying_key().to_bytes(),
-        event_id: *event_id,
+        event_id,
         event_hash,
         signature: sig.to_bytes().to_vec(),
         timestamp,
@@ -697,8 +703,7 @@ async fn test_relay_processes_oracle_update_event() {
     let source = MockEventSource::new();
 
     let event = make_oracle_update_event(1, true);
-    let event_id = *event.event_id();
-    attest_event(&relay, &event_id);
+    attest_event(&relay, &event);
     source.add_event(event);
 
     let results = relay.poll_cycle(&source).await.unwrap();
@@ -722,9 +727,9 @@ async fn test_relay_mixed_event_types_in_one_cycle() {
     let orc = make_oracle_update_event(12, false);
 
     // Attest all
-    attest_event(&relay, dep.event_id());
-    attest_event(&relay, wdl.event_id());
-    attest_event(&relay, orc.event_id());
+    attest_event(&relay, &dep);
+    attest_event(&relay, &wdl);
+    attest_event(&relay, &orc);
 
     source.add_event(dep);
     source.add_event(wdl);
@@ -759,8 +764,7 @@ async fn test_relay_metrics_after_withdrawal() {
     let relay = setup_relay();
     let source = MockEventSource::new();
     let event = make_withdrawal_event(20, 8000);
-    let event_id = *event.event_id();
-    attest_event(&relay, &event_id);
+    attest_event(&relay, &event);
     source.add_event(event);
 
     relay.poll_cycle(&source).await.unwrap();
@@ -800,7 +804,7 @@ async fn test_relay_retry_non_failed_event_rejected() {
 
     let event = make_deposit_event(30, 1.0);
     let event_id = *event.event_id();
-    attest_event(&relay, &event_id);
+    attest_event(&relay, &event);
     source.add_event(event);
 
     // Process it successfully
@@ -833,7 +837,7 @@ async fn test_relay_retry_exhausted() {
         amount_eth: 0.01,
         timestamp: 1000,
     });
-    attest_event(&relay, &event_id);
+    attest_event(&relay, &event);
     source.add_event(event);
 
     // Process — will fail due to deposit too small
@@ -1093,7 +1097,7 @@ async fn test_relay_deposit_exceeds_cap() {
         amount_eth: 11.0,
         timestamp: 1000,
     });
-    attest_event(&relay, &event_id);
+    attest_event(&relay, &event);
     source.add_event(event);
 
     let results = relay.poll_cycle(&source).await.unwrap();
@@ -1153,7 +1157,7 @@ async fn test_relay_failed_deposit_metric() {
         amount_eth: 0.001,
         timestamp: 1000,
     });
-    attest_event(&relay, &event_id);
+    attest_event(&relay, &event);
     source.add_event(event);
 
     relay.poll_cycle(&source).await.unwrap();
