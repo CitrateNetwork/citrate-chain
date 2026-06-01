@@ -127,6 +127,17 @@ coreml = []  # Enable CoreML support on macOS
 # SRS over BN254).
 halo2-substrate = ["dep:halo2_proofs", "dep:halo2curves"]
 
+# RM-E.1 / CHAIN-003 — explicit opt-in for the INSECURE deterministic
+# seed-based KZG SRS (`StdRng::from_seed([0x4D;32])`) used by the 0x0108
+# verifier when no ceremony `.ptau` is configured. The toxic waste of a
+# seeded SRS is reproducible, so it must NEVER be reachable in a
+# production validator. The seed path is allowed only in debug builds
+# (`debug_assertions`, i.e. tests/local) OR when this feature is set
+# explicitly for a release devnet build. A release build with neither
+# REFUSES to serve 0x0108 unless CITRATE_PTAU_PATH points at a verified
+# ceremony file (fail closed). Never enable this in production.
+insecure-dev-srs = []
+
 # Note: the former `mvcc` feature flag was removed in Sprint P950-A-3
 # (2026-04-21). MVCC is now the only execution path; the tokio::sync::Mutex
 # serialization was deleted. Verified by
