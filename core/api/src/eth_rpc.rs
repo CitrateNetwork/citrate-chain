@@ -1083,6 +1083,11 @@ pub fn register_eth_methods(
         let sender_addr = citrate_execution::address_utils::normalize_address(&from_pk);
         let sender_nonce = exec.get_nonce(&sender_addr);
 
+        // PIL-47b: capture whether this is a contract call before `data`
+        // gets moved into the pseudo-transaction. Needed below for the
+        // SSTORE-refund-aware buffer logic on the estimate result.
+        let data_is_empty = data.is_empty();
+
         // Create a pseudo-transaction for estimation
         let mut tx = citrate_consensus::types::Transaction {
             hash: citrate_consensus::types::Hash::default(),
@@ -1107,8 +1112,36 @@ pub fn register_eth_methods(
 
         match res {
             Ok(receipt) => {
-                // Return gas used plus 10% buffer for safety margin
-                let gas_with_buffer = receipt.gas_used.saturating_add(receipt.gas_used / 10);
+                // PIL-47b: `simulate_transaction` returns the *net*
+                // gas_used after EIP-2200 SSTORE refunds. The REAL tx
+                // front-loads the gross SSTORE charge (up to ~42k for a
+                // cold-slot write) before any refunds apply, so a tx
+                // whose gas-limit equals the net estimate hits OOG before
+                // reaching the SSTORE — observed in the wild as
+                // `updateProviderStatus(true→false)` returning
+                // `status=0, gasUsed=700` with a 10%-buffered estimate.
+                //
+                // For any state-mutating call (`!data.is_empty()` and
+                // `to_pk.is_some()`), we need enough headroom upfront for
+                // the worst-case un-refunded SSTORE plus the cold-access
+                // surcharge. Doubling the simulated net cost is the
+                // simplest formula that covers all SSTORE refund cases
+                // without a binary-search re-simulation loop; the cost
+                // is just a slightly inflated gas-limit on the tx (the
+                // EVM still bills only what was actually used).
+                //
+                // Simple transfers and pure view calls keep the tight
+                // +10% margin so block-gas-budgeting stays useful for
+                // ordinary value sends.
+                let is_state_mutating_call = to_pk.is_some() && !data_is_empty;
+                let gas_with_buffer = if is_state_mutating_call {
+                    receipt
+                        .gas_used
+                        .saturating_mul(2)
+                        .max(receipt.gas_used.saturating_add(50_000))
+                } else {
+                    receipt.gas_used.saturating_add(receipt.gas_used / 10)
+                };
                 let final_gas = gas_with_buffer
                     .max(calldata_floor)
                     .max(deployment_floor.unwrap_or(21_000));

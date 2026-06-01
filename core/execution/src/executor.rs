@@ -1532,16 +1532,13 @@ impl Executor {
             j.record_balance(to, to_balance + value);
         }
 
-        // Add transfer log
-        context.add_log(Log {
-            address: to,
-            topics: vec![Hash::new(*b"Transfer000000000000000000000000")],
-            data: {
-                let mut bytes = [0u8; 32];
-                value.to_big_endian(&mut bytes);
-                bytes.to_vec()
-            },
-        });
+        // PIL-48b: Native value transfers emit no logs — that's how Ethereum
+        // mainnet works. Pre-fix, this site emitted a hand-rolled `Log` with
+        // a 32-byte ASCII string `"Transfer000…"` as the topic. The bytes were
+        // never the keccak256 of any real event signature, so any indexer
+        // filtering on the standard ERC20 `Transfer(address,address,uint256)`
+        // topic silently saw nothing. Block explorers should track native
+        // transfers via call traces (`debug_traceTransaction`), not logs.
 
         debug!("Transfer: {} -> {} : {}", from, to, value);
         Ok(())
@@ -2681,10 +2678,21 @@ impl Executor {
             }
         }
 
-        // Add registration log
+        // PIL-48c: emit a properly-hashed event topic for the model-registry
+        // precompile path. PIL-48's REVM-side fix doesn't reach here because
+        // this code synthesises the log directly (the precompile bypasses
+        // REVM). The hash below is `keccak256("ModelRegistered(bytes32)")`,
+        // matching the Solidity event signature an indexer would filter on.
+        // The model hash sits in topics[1] as the indexed field.
+        const MODEL_REGISTERED_TOPIC: [u8; 32] = [
+            0xa4, 0xb0, 0xaf, 0x38, 0xd0, 0x49, 0xba, 0x81,
+            0x70, 0x3a, 0x0d, 0x0e, 0x46, 0xcc, 0x2f, 0xf3,
+            0x96, 0x81, 0x21, 0x03, 0x02, 0x13, 0x40, 0x46,
+            0x23, 0x71, 0x11, 0xa8, 0xfb, 0x7d, 0xee, 0x72,
+        ];
         context.add_log(Log {
             address: from,
-            topics: vec![Hash::new(*b"ModelRegistered00000000000000000"), model_hash],
+            topics: vec![Hash::new(MODEL_REGISTERED_TOPIC), model_hash],
             data: vec![],
         });
 
