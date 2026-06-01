@@ -360,7 +360,11 @@ async fn handle_inbound(
                 } else {
                     bytes.to_vec()
                 };
-                match bincode::deserialize::<NetworkMessage>(&plaintext) {
+                // SECURITY (C-01 network variant): decode_inbound strips any
+                // peer-asserted `ecdsa_verified` flag at the deserialization
+                // boundary, so a gossiped tx can never claim a verification
+                // this node did not perform.
+                match NetworkMessage::decode_inbound(&plaintext) {
                     Ok(msg) => {
                         peer_manager
                             .forward_incoming(remote_id.clone(), msg)
@@ -598,7 +602,8 @@ async fn handle_outbound(
                     } else {
                         bytes.to_vec()
                     };
-                    match bincode::deserialize::<NetworkMessage>(&plaintext) {
+                    // SECURITY (C-01 network variant): sanitize at decode.
+                    match NetworkMessage::decode_inbound(&plaintext) {
                         Ok(msg) => {
                             peer_manager
                                 .forward_incoming(remote_id.clone(), msg)

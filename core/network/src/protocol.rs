@@ -380,11 +380,100 @@ impl NetworkMessage {
                 | Self::GetBlocksByHeight { .. }
         )
     }
+
+    /// Strip peer-asserted trust from a message deserialized off the wire.
+    ///
+    /// SECURITY (C-01 network variant): `Transaction::ecdsa_verified` is a
+    /// LOCAL trust flag — it means "this node's decoder cryptographically
+    /// recovered the ECDSA signer." It is also a serialized struct field, so
+    /// a peer can set it to `true` on a gossiped transaction with a forged
+    /// signature and a victim `from` address. The mempool gate
+    /// (`mempool.rs`) and `crypto::verify_transaction` accept an EVM-shaped
+    /// transaction purely on this flag, so a trusted-but-unverified gossip
+    /// tx would be accepted into the mempool/validation path with a forged
+    /// sender. The `eth_sendRawTransaction` RPC ingress was hardened (C-01)
+    /// but the P2P transaction ingress was not.
+    ///
+    /// This resets `ecdsa_verified = false` on every transaction carried by
+    /// an inbound message, at the deserialization boundary, so a peer can
+    /// never assert verification this node did not perform. An EVM-shaped
+    /// gossip tx must then be re-verified locally (follow-up: re-recover the
+    /// signer at ingress) before it can enter the mempool — fail closed.
+    /// Native (ed25519) transactions are unaffected: their signature is
+    /// verified independently by `verify_ed25519_transaction`.
+    pub fn sanitize_inbound(&mut self) {
+        match self {
+            Self::NewTransaction { transaction } => {
+                transaction.ecdsa_verified = false;
+            }
+            Self::Transactions { transactions } => {
+                for tx in transactions.iter_mut() {
+                    tx.ecdsa_verified = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Deserialize a `NetworkMessage` from the wire and immediately strip
+    /// peer-asserted trust (`sanitize_inbound`). EVERY inbound decode path
+    /// MUST use this rather than `bincode::deserialize` directly, so a new
+    /// ingress can never reintroduce the C-01 network-variant bypass.
+    pub fn decode_inbound(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        let mut msg: Self = bincode::deserialize(bytes)?;
+        msg.sanitize_inbound();
+        Ok(msg)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CIT-NET-C01b tripwire (blind-pass NEW-FROM-B2): a transaction
+    /// gossiped with a peer-asserted `ecdsa_verified = true` MUST have that
+    /// flag stripped when decoded off the wire, so a forged-sender EVM tx
+    /// can never reach the mempool's flag-gated acceptance path. Pre-fix the
+    /// P2P ingress trusted the wire flag (the C-01 RPC fix did not cover it).
+    #[test]
+    fn decode_inbound_strips_peer_asserted_ecdsa_verified() {
+        use citrate_consensus::types::{PublicKey, Transaction};
+
+        let mut from = [0u8; 32];
+        from[..20].copy_from_slice(&[0xAA; 20]); // EVM-shaped (20B + 12 zero)
+        let forged = Transaction {
+            from: PublicKey::new(from),
+            ecdsa_verified: true, // attacker-asserted over the wire
+            chain_id: Some(40204),
+            ..Default::default()
+        };
+
+        // Single-tx gossip (NewTransaction).
+        let wire = bincode::serialize(&NetworkMessage::NewTransaction {
+            transaction: forged.clone(),
+        })
+        .expect("serialize");
+        match NetworkMessage::decode_inbound(&wire).expect("decode_inbound") {
+            NetworkMessage::NewTransaction { transaction } => assert!(
+                !transaction.ecdsa_verified,
+                "peer-asserted ecdsa_verified must be stripped at decode"
+            ),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Batch gossip (Transactions).
+        let wire = bincode::serialize(&NetworkMessage::Transactions {
+            transactions: vec![forged.clone(), forged],
+        })
+        .expect("serialize");
+        match NetworkMessage::decode_inbound(&wire).expect("decode_inbound") {
+            NetworkMessage::Transactions { transactions } => assert!(
+                transactions.iter().all(|t| !t.ecdsa_verified),
+                "every tx in a gossiped batch must be stripped"
+            ),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
 
     #[test]
     fn test_protocol_version_compatibility() {
