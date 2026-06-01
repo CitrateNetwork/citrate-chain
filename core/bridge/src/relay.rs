@@ -298,6 +298,45 @@ impl BridgeRelay {
     async fn process_deposit(&self, deposit: DepositEvent) -> ProcessingResult {
         let event_id = deposit.event_id;
 
+        // RM-A WP-CHAIN-001 (CRITICAL): bind the threshold attestation to the
+        // deposit's mint-critical fields. Oracles sign
+        // `event_hash = deposit.canonical_hash()`; an attacker presenting a
+        // different amount/recipient/depositor (or source coordinate) under the
+        // same `event_id` produces a different canonical hash and is rejected
+        // here, before any mint. Zero-threshold mode (test/dev only) has no
+        // attestations to bind against and is unaffected; production runs with
+        // `oracle_threshold >= 1`. Attestation-hash consistency across oracles
+        // is already enforced in `submit_attestation`/`is_threshold_met`.
+        if self.config.oracle_threshold > 0 {
+            let expected = deposit.canonical_hash();
+            let attested = self
+                .oracle_registry
+                .read()
+                .get_attestations(&event_id)
+                .and_then(|atts| atts.first().map(|a| a.event_hash));
+            if !matches!(attested, Some(h) if h == expected) {
+                let err = BridgeError::AttestationFieldMismatch {
+                    event_id: hex::encode(event_id),
+                };
+                warn!(
+                    event_id = hex::encode(event_id),
+                    "Deposit rejected: attestation does not bind deposit fields"
+                );
+                self.state.write().update_event_status(
+                    &event_id,
+                    EventStatus::Rejected,
+                    Some(err.to_string()),
+                );
+                self.metrics.record_deposit_failure();
+                return ProcessingResult {
+                    event_id,
+                    status: EventStatus::Rejected,
+                    salt_amount: None,
+                    error: Some(err.to_string()),
+                };
+            }
+        }
+
         match self.minter.write().process_deposit(&deposit) {
             Ok(receipt) => {
                 let salt = receipt.salt_credited;
@@ -651,6 +690,149 @@ mod tests {
 
         // Verify threshold is now met
         assert!(relay.oracle_registry().read().is_threshold_met(&event_id));
+    }
+
+    // ── RM-A WP-CHAIN-001 tripwires (red on the unfixed relay) ──
+    fn rm_a_register_oracles(
+        relay: &BridgeRelay,
+        sk1: &ed25519_dalek::SigningKey,
+        sk2: &ed25519_dalek::SigningKey,
+    ) -> ([u8; 32], [u8; 32]) {
+        let o1 = sk1.verifying_key().to_bytes();
+        let o2 = sk2.verifying_key().to_bytes();
+        let mut reg = relay.oracle_registry().write();
+        reg.register_oracle(o1, "O1".to_string()).expect("register o1");
+        reg.register_oracle(o2, "O2".to_string()).expect("register o2");
+        (o1, o2)
+    }
+
+    fn rm_a_attest_hash(
+        relay: &BridgeRelay,
+        event_id: &[u8; 32],
+        bound_hash: [u8; 32],
+        keys: &[(&ed25519_dalek::SigningKey, [u8; 32])],
+    ) {
+        use ed25519_dalek::Signer;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let base = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_secs();
+        for (i, (sk, oid)) in keys.iter().enumerate() {
+            let ts = base + i as u64;
+            let mut msg = Vec::with_capacity(89);
+            msg.extend_from_slice(b"citrate-bridge-v1");
+            msg.extend_from_slice(event_id);
+            msg.extend_from_slice(&bound_hash);
+            msg.extend_from_slice(&ts.to_le_bytes());
+            let sig = sk.sign(&msg);
+            relay
+                .oracle_registry()
+                .write()
+                .submit_attestation(OracleAttestation {
+                    oracle_id: *oid,
+                    event_id: *event_id,
+                    event_hash: bound_hash,
+                    signature: sig.to_bytes().to_vec(),
+                    timestamp: ts,
+                })
+                .expect("submit attestation");
+        }
+    }
+
+    #[tokio::test]
+    async fn tripwire_deposit_rejected_when_attestation_unbound_to_fields() {
+        use ed25519_dalek::SigningKey;
+        let config = BridgeConfig {
+            confirmation_depth: 0,
+            oracle_threshold: 2,
+            ..Default::default()
+        };
+        let relay = BridgeRelay::new(config);
+        let sk1 = SigningKey::from_bytes(&[11u8; 32]);
+        let sk2 = SigningKey::from_bytes(&[12u8; 32]);
+        let (o1, o2) = rm_a_register_oracles(&relay, &sk1, &sk2);
+
+        let eth_tx = [7u8; 32];
+        let event_id = DepositEvent::compute_event_id(&eth_tx, 0);
+        let honest = DepositEvent {
+            event_id,
+            eth_tx_hash: eth_tx,
+            log_index: 0,
+            eth_block_number: 50,
+            depositor: [7u8; 20],
+            recipient: [70u8; 20],
+            amount_wei: 1_000_000_000_000_000_000,
+            amount_eth: 1.0,
+            timestamp: 1000,
+        };
+        // Oracles attest to the HONEST deposit's canonical hash.
+        rm_a_attest_hash(&relay, &event_id, honest.canonical_hash(), &[(&sk1, o1), (&sk2, o2)]);
+        assert!(relay.oracle_registry().read().is_threshold_met(&event_id));
+
+        // Attacker presents a TAMPERED deposit under the same event_id.
+        let tampered = DepositEvent {
+            recipient: [0xAAu8; 20],
+            amount_wei: 5_000_000_000_000_000_000,
+            amount_eth: 5.0,
+            ..honest.clone()
+        };
+        let rejected = relay.process_event(BridgeEvent::Deposit(tampered)).await;
+        assert_eq!(
+            rejected.status,
+            EventStatus::Rejected,
+            "tampered deposit must be rejected, not minted"
+        );
+        assert!(
+            rejected.salt_amount.is_none(),
+            "no SALT may be minted for an unbound deposit"
+        );
+        assert!(
+            rejected
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("bind"),
+            "rejection must cite the attestation-binding failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn tripwire_deposit_accepted_when_attestation_binds_fields() {
+        use ed25519_dalek::SigningKey;
+        let config = BridgeConfig {
+            confirmation_depth: 0,
+            oracle_threshold: 2,
+            ..Default::default()
+        };
+        let relay = BridgeRelay::new(config);
+        let sk1 = SigningKey::from_bytes(&[21u8; 32]);
+        let sk2 = SigningKey::from_bytes(&[22u8; 32]);
+        let (o1, o2) = rm_a_register_oracles(&relay, &sk1, &sk2);
+
+        let eth_tx = [9u8; 32];
+        let event_id = DepositEvent::compute_event_id(&eth_tx, 0);
+        let honest = DepositEvent {
+            event_id,
+            eth_tx_hash: eth_tx,
+            log_index: 0,
+            eth_block_number: 50,
+            depositor: [9u8; 20],
+            recipient: [90u8; 20],
+            amount_wei: 1_000_000_000_000_000_000,
+            amount_eth: 1.0,
+            timestamp: 1000,
+        };
+        rm_a_attest_hash(&relay, &event_id, honest.canonical_hash(), &[(&sk1, o1), (&sk2, o2)]);
+
+        let ok = relay.process_event(BridgeEvent::Deposit(honest)).await;
+        assert_eq!(
+            ok.status,
+            EventStatus::Processed,
+            "a deposit whose fields the attestation binds must mint"
+        );
+        assert!(ok.salt_amount.is_some(), "bound deposit must credit SALT");
     }
 
     #[tokio::test]

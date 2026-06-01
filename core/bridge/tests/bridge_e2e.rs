@@ -56,9 +56,17 @@ fn setup_relay() -> BridgeRelay {
 }
 
 /// Attest to an event with the default oracle so it passes threshold.
-fn attest_event(relay: &BridgeRelay, event_id: &[u8; 32]) {
+///
+/// Post-RM-A: oracles attest the deposit's canonical field-binding hash
+/// (`DepositEvent::canonical_hash`), not a constant domain tag, so the relay's
+/// attestation→deposit binding gate accepts the honest deposit.
+fn attest_event(relay: &BridgeRelay, event: &BridgeEvent) {
+    let event_id = *event.event_id();
+    let event_hash = match event {
+        BridgeEvent::Deposit(d) => d.canonical_hash(),
+        _ => compute_event_hash(&event_id, b"deposit"),
+    };
     let sk = default_oracle_key();
-    let event_hash = compute_event_hash(event_id, b"deposit");
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -66,14 +74,14 @@ fn attest_event(relay: &BridgeRelay, event_id: &[u8; 32]) {
 
     let mut message = Vec::with_capacity(89);
     message.extend_from_slice(b"citrate-bridge-v1");
-    message.extend_from_slice(event_id);
+    message.extend_from_slice(&event_id);
     message.extend_from_slice(&event_hash);
     message.extend_from_slice(&timestamp.to_le_bytes());
     let sig = sk.sign(&message);
 
     let att = OracleAttestation {
         oracle_id: sk.verifying_key().to_bytes(),
-        event_id: *event_id,
+        event_id,
         event_hash,
         signature: sig.to_bytes().to_vec(),
         timestamp,
@@ -148,10 +156,9 @@ async fn test_relay_processes_deposit_event() {
     let relay = setup_relay();
     let source = MockEventSource::new();
     let event = make_deposit_event(1, 1.0);
-    let event_id = *event.event_id();
 
-    // Pre-attest so threshold is met
-    attest_event(&relay, &event_id);
+    // Pre-attest so threshold is met (oracles bind the deposit's fields)
+    attest_event(&relay, &event);
     source.add_event(event);
 
     let results = relay.poll_cycle(&source).await.unwrap();
@@ -175,9 +182,8 @@ async fn test_relay_double_process_prevention() {
     let source = MockEventSource::new();
 
     let event = make_deposit_event(2, 1.0);
-    let event_id = *event.event_id();
 
-    attest_event(&relay, &event_id);
+    attest_event(&relay, &event);
     source.add_event(event.clone());
 
     // First poll: event is processed
@@ -208,8 +214,7 @@ async fn test_relay_state_persistence() {
     let relay = setup_relay();
     let source = MockEventSource::new();
     let event = make_deposit_event(3, 2.0);
-    let event_id = *event.event_id();
-    attest_event(&relay, &event_id);
+    attest_event(&relay, &event);
     source.add_event(event);
 
     relay.poll_cycle(&source).await.unwrap();
@@ -318,7 +323,6 @@ async fn test_withdrawal_event_creation() {
 
     let salt_amount = 7_500u64;
     let event = make_withdrawal_event(5, salt_amount);
-    let event_id = *event.event_id();
 
     // Verify the event fields before processing
     if let BridgeEvent::Withdrawal(ref w) = event {
@@ -333,7 +337,7 @@ async fn test_withdrawal_event_creation() {
     }
 
     // Attest for the withdrawal event too
-    attest_event(&relay, &event_id);
+    attest_event(&relay, &event);
     source.add_event(event);
 
     let results = relay.poll_cycle(&source).await.unwrap();

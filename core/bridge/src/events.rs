@@ -166,6 +166,34 @@ impl BridgeEvent {
 }
 
 impl DepositEvent {
+    /// Canonical attestation digest binding every mint-critical field.
+    ///
+    /// Oracles MUST sign `event_hash = deposit.canonical_hash()`. The relay
+    /// recomputes this from the presented deposit and rejects the mint unless
+    /// the attested hash matches — so a tampered amount/recipient/depositor or
+    /// source coordinate (under any `event_id`) cannot pass. `amount_eth` is
+    /// deliberately excluded: it is display-only and unbound at the source;
+    /// minting derives value from the integer `amount_wei` and the minter
+    /// independently rejects an `amount_eth` inconsistent with it.
+    ///
+    /// Domain-separated: `"citrate-bridge-deposit-v1" || eth_tx_hash(32) ||
+    /// log_index(4 LE) || eth_block_number(8 LE) || depositor(20) ||
+    /// recipient(20) || amount_wei(16 LE)`.
+    pub fn canonical_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"citrate-bridge-deposit-v1");
+        hasher.update(self.eth_tx_hash);
+        hasher.update(self.log_index.to_le_bytes());
+        hasher.update(self.eth_block_number.to_le_bytes());
+        hasher.update(self.depositor);
+        hasher.update(self.recipient);
+        hasher.update(self.amount_wei.to_le_bytes());
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
+
     /// Compute the event ID from tx_hash and log_index.
     pub fn compute_event_id(eth_tx_hash: &[u8; 32], log_index: u32) -> EventId {
         let mut hasher = Sha3_256::new();
