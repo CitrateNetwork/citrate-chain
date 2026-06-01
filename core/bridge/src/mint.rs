@@ -91,8 +91,12 @@ pub struct SnapMinter {
     /// Bonding curve configuration.
     curve: BondingCurveConfig,
 
-    /// Total ETH deposited so far (in ETH, floating point).
+    /// Total ETH deposited so far (in ETH, floating point — display/curve input).
     total_deposited_eth: f64,
+
+    /// Total ETH deposited so far in integer wei — the authoritative accumulator
+    /// used for the hard-cap check (no float drift).
+    total_deposited_wei: u128,
 
     /// Total SALT minted so far.
     total_salt_minted: u64,
@@ -107,6 +111,7 @@ impl SnapMinter {
         Self {
             curve,
             total_deposited_eth: 0.0,
+            total_deposited_wei: 0,
             total_salt_minted: 0,
             total_deposits: 0,
         }
@@ -126,6 +131,47 @@ impl SnapMinter {
             return Err(BridgeError::DepositExceedsCap {
                 amount_wei: deposit.amount_wei,
                 max_wei: MAX_DEPOSIT_WEI,
+            });
+        }
+
+        // RM-A WP-CHAIN-002 (HIGH): the bonding curve consumes the display
+        // float `amount_eth`, but only the integer `amount_wei` is attestation-
+        // bound (events.rs::canonical_hash). Reject any deposit whose float is
+        // non-finite/negative or inconsistent with the bound integer, so the
+        // economic input cannot diverge from what the oracles attested. The
+        // curve math itself is unchanged (no economic regression).
+        if !deposit.amount_eth.is_finite() || deposit.amount_eth < 0.0 {
+            return Err(BridgeError::InvalidEventData {
+                reason: format!(
+                    "amount_eth must be finite and non-negative, got {}",
+                    deposit.amount_eth
+                ),
+            });
+        }
+        let derived_eth = deposit.amount_wei as f64 / 1e18;
+        let tolerance = derived_eth * 1e-6 + 1e-9;
+        if (deposit.amount_eth - derived_eth).abs() > tolerance {
+            return Err(BridgeError::InvalidEventData {
+                reason: format!(
+                    "amount_eth {} inconsistent with amount_wei {} (~{} ETH)",
+                    deposit.amount_eth, deposit.amount_wei, derived_eth
+                ),
+            });
+        }
+
+        // RM-A WP-CHAIN-002 (HIGH): enforce the global HARD_CAP on the integer
+        // wei accumulator (previously declared but unenforced). Checked before
+        // any state mutation so a rejected deposit leaves totals untouched.
+        let new_total_wei = self
+            .total_deposited_wei
+            .checked_add(deposit.amount_wei)
+            .ok_or_else(|| BridgeError::ConversionError {
+                reason: "total deposited wei overflow".to_string(),
+            })?;
+        if new_total_wei > HARD_CAP_WEI {
+            return Err(BridgeError::DepositExceedsCap {
+                amount_wei: deposit.amount_wei,
+                max_wei: HARD_CAP_WEI.saturating_sub(self.total_deposited_wei),
             });
         }
 
@@ -171,6 +217,7 @@ impl SnapMinter {
 
         // Update running totals
         self.total_deposited_eth += deposit.amount_eth;
+        self.total_deposited_wei = new_total_wei;
         self.total_salt_minted += salt_amount;
         self.total_deposits += 1;
 
@@ -274,6 +321,40 @@ mod tests {
         let deposit = make_deposit(11.0, 11_000_000_000_000_000_000);
 
         let err = minter.process_deposit(&deposit).unwrap_err();
+        assert!(matches!(err, BridgeError::DepositExceedsCap { .. }));
+    }
+
+    // ── RM-A WP-CHAIN-002 tripwires (red on the unfixed minter) ──
+    #[test]
+    fn tripwire_rejects_non_finite_amount_eth() {
+        let mut minter = SnapMinter::new(BondingCurveConfig::default());
+        let deposit = make_deposit(f64::NAN, 1_000_000_000_000_000_000);
+        let err = minter
+            .process_deposit(&deposit)
+            .expect_err("non-finite amount_eth must be rejected");
+        assert!(matches!(err, BridgeError::InvalidEventData { .. }));
+    }
+
+    #[test]
+    fn tripwire_rejects_amount_eth_inconsistent_with_wei() {
+        let mut minter = SnapMinter::new(BondingCurveConfig::default());
+        // wei says 1 ETH; the unbound display float claims 1000 ETH — reject.
+        let deposit = make_deposit(1000.0, 1_000_000_000_000_000_000);
+        let err = minter
+            .process_deposit(&deposit)
+            .expect_err("amount_eth inconsistent with amount_wei must be rejected");
+        assert!(matches!(err, BridgeError::InvalidEventData { .. }));
+    }
+
+    #[test]
+    fn tripwire_enforces_hard_cap() {
+        let mut minter = SnapMinter::new(BondingCurveConfig::default());
+        // Drive the integer accumulator to the cap; a valid deposit then overflows it.
+        minter.total_deposited_wei = HARD_CAP_WEI;
+        let deposit = make_deposit(0.02, MIN_DEPOSIT_WEI);
+        let err = minter
+            .process_deposit(&deposit)
+            .expect_err("deposit beyond HARD_CAP must be rejected");
         assert!(matches!(err, BridgeError::DepositExceedsCap { .. }));
     }
 

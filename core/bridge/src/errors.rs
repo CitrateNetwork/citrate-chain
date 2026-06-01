@@ -29,6 +29,9 @@ pub enum BridgeError {
     #[error("Attestation consistency error: oracles disagree on event hash for {event_id}")]
     AttestationInconsistency { event_id: String },
 
+    #[error("Attestation does not bind the deposit's mint-critical fields for event {event_id}")]
+    AttestationFieldMismatch { event_id: String },
+
     #[error("Event not confirmed: block {block} needs {confirmations} confirmations, only {current} available")]
     EventNotConfirmed {
         block: u64,
