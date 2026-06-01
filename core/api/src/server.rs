@@ -102,36 +102,32 @@ fn ipfs_add_blocking(data: Vec<u8>) -> Result<String, String> {
         .and_then(|list| list.split(',').next().map(|s| s.trim().to_string()))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:5001".to_string());
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+    // PIL-49b: use the shared rpc_runtime::block_on instead of the
+    // per-call `std::thread::spawn + new_current_thread runtime` dance.
+    // Functional equivalence — same multi-thread reactor backs the
+    // reqwest internals — without the per-call thread spin-up cost.
+    block_on(async move {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| format!("runtime error: {}", e))?;
-        rt.block_on(async {
-            let client = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(3))
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|e| format!("client error: {}", e))?;
-            let url = format!("{}/api/v0/add?pin=true", api_base);
-            let part = reqwest::multipart::Part::bytes(data).file_name("artifact.bin");
-            let form = reqwest::multipart::Form::new().part("file", part);
-            let resp = client.post(&url).multipart(form).send().await
-                .map_err(|e| format!("IPFS upload error: {}", e))?;
-            if !resp.status().is_success() {
-                return Err(format!("IPFS status: {}", resp.status()));
-            }
-            let json: serde_json::Value = resp.json().await
-                .map_err(|e| format!("IPFS parse error: {}", e))?;
-            let cid = json["Hash"].as_str().unwrap_or("").to_string();
-            if cid.is_empty() {
-                return Err("IPFS returned empty CID".to_string());
-            }
-            Ok(cid)
-        })
+            .map_err(|e| format!("client error: {}", e))?;
+        let url = format!("{}/api/v0/add?pin=true", api_base);
+        let part = reqwest::multipart::Part::bytes(data).file_name("artifact.bin");
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let resp = client.post(&url).multipart(form).send().await
+            .map_err(|e| format!("IPFS upload error: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("IPFS status: {}", resp.status()));
+        }
+        let json: serde_json::Value = resp.json().await
+            .map_err(|e| format!("IPFS parse error: {}", e))?;
+        let cid = json["Hash"].as_str().unwrap_or("").to_string();
+        if cid.is_empty() {
+            return Err("IPFS returned empty CID".to_string());
+        }
+        Ok(cid)
     })
-    .join()
-    .map_err(|_| "IPFS upload thread panicked".to_string())?
 }
 
 /// Pin artifact on IPFS from a sync context.
@@ -142,28 +138,21 @@ fn ipfs_pin_blocking(cid: &str) -> Result<(), String> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:5001".to_string());
     let cid_owned = cid.to_string();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+    // PIL-49b: shared rpc_runtime — see ipfs_add_blocking comment above.
+    block_on(async move {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(8))
             .build()
-            .map_err(|e| format!("runtime error: {}", e))?;
-        rt.block_on(async {
-            let client = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(3))
-                .timeout(std::time::Duration::from_secs(8))
-                .build()
-                .map_err(|e| format!("client error: {}", e))?;
-            let url = format!("{}/api/v0/pin/add?arg={}&timeout=5s", api_base, cid_owned);
-            let resp = client.post(&url).send().await
-                .map_err(|e| format!("IPFS pin error: {}", e))?;
-            if !resp.status().is_success() {
-                return Err(format!("IPFS pin status: {}", resp.status()));
-            }
-            Ok(())
-        })
+            .map_err(|e| format!("client error: {}", e))?;
+        let url = format!("{}/api/v0/pin/add?arg={}&timeout=5s", api_base, cid_owned);
+        let resp = client.post(&url).send().await
+            .map_err(|e| format!("IPFS pin error: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("IPFS pin status: {}", resp.status()));
+        }
+        Ok(())
     })
-    .join()
-    .map_err(|_| "IPFS pin thread panicked".to_string())?
 }
 
 /// Get artifact status from IPFS from a sync context.
@@ -174,32 +163,25 @@ fn ipfs_status_blocking(cid: &str) -> Result<String, String> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:5001".to_string());
     let cid_owned = cid.to_string();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+    // PIL-49b: shared rpc_runtime — see ipfs_add_blocking comment above.
+    block_on(async move {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(8))
             .build()
-            .map_err(|e| format!("runtime error: {}", e))?;
-        rt.block_on(async {
-            let client = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(3))
-                .timeout(std::time::Duration::from_secs(8))
-                .build()
-                .map_err(|e| format!("client error: {}", e))?;
-            let url = format!("{}/api/v0/pin/ls?arg={}", api_base, cid_owned);
-            let status = match client.post(&url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.text().await {
-                        Ok(body) if body.contains(&cid_owned) => "pinned",
-                        _ => "unpinned",
-                    }
+            .map_err(|e| format!("client error: {}", e))?;
+        let url = format!("{}/api/v0/pin/ls?arg={}", api_base, cid_owned);
+        let status = match client.post(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.text().await {
+                    Ok(body) if body.contains(&cid_owned) => "pinned",
+                    _ => "unpinned",
                 }
-                _ => "unknown",
-            };
-            Ok(serde_json::json!([{"provider": api_base, "status": status}]).to_string())
-        })
+            }
+            _ => "unknown",
+        };
+        Ok(serde_json::json!([{"provider": api_base, "status": status}]).to_string())
     })
-    .join()
-    .map_err(|_| "IPFS status thread panicked".to_string())?
 }
 
 // In-memory verification store (address -> record)
@@ -2264,34 +2246,25 @@ impl RpcServer {
             // optional with_proof (not used in preview other than returning proof if available)
             let _with_proof = obj.get("with_proof").and_then(|v| v.as_bool()).unwrap_or(false);
 
-            // Spawn a dedicated thread with its own tokio runtime to avoid
-            // deadlocking on tokio::sync::RwLock/Mutex inside the MCP layer
-            // (futures::executor::block_on cannot drive tokio primitives).
+            // PIL-49b: use the shared rpc_runtime::block_on instead of the
+            // per-call `std::thread::spawn + new_current_thread` dance. The
+            // shared runtime is multi-threaded and Tokio-reactor-backed, so
+            // tokio::sync::RwLock/Mutex inside the MCP layer wake correctly
+            // — the exact deadlock this workaround was originally protecting
+            // against is now structurally fixed by [[PIL-49]].
             let exec_inf = executor_ai_preview.clone();
-            let res = match std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("runtime: {}", e))?;
-                rt.block_on(exec_inf.run_inference_preview(
-                    from_addr,
-                    model_id,
-                    input_bytes,
-                    max_gas,
-                ))
-                .map_err(|e| format!("{}", e))
-            })
-            .join()
-            {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
+            let res = match block_on(exec_inf.run_inference_preview(
+                from_addr,
+                model_id,
+                input_bytes,
+                max_gas,
+            )) {
+                Ok(r) => r,
+                Err(e) => {
                     return Err(jsonrpc_core::Error::invalid_params(format!(
                         "Inference failed: {}",
                         e
                     )))
-                }
-                Err(_) => {
-                    return Err(jsonrpc_core::Error::internal_error())
                 }
             };
 
@@ -2506,6 +2479,12 @@ impl RpcServer {
         let cors_origins = self.config.cors_origins.clone();
         let rate_limit_config = self.config.rate_limit.clone();
         let io = self.io_handler;
+
+        // PIL-49c: surface the kernel accept-backlog as a Prometheus gauge
+        // so ops can alert before the next deadlock-class regression hangs
+        // the public endpoint. Sampler thread is independent of the RPC
+        // worker pool so it keeps reporting even when workers are stalled.
+        crate::metrics::spawn_accept_queue_sampler(listen_addr.port(), 5);
 
         // Channel to report startup result (CloseHandle or error string)
         let (result_tx, result_rx) =
