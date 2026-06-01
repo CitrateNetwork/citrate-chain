@@ -153,6 +153,67 @@ pub fn verify_inference_proof(input: &[u8]) -> Result<bool, VerifyError> {
     Ok(verified)
 }
 
+/// RM-E.1 / CHAIN-003 — SRS source policy for the 0x0108 verifier.
+///
+/// A seeded KZG SRS has reproducible toxic waste, so the deterministic
+/// dev seed must NEVER be the source in a production validator. This
+/// pure decision is factored out so the fail-closed policy is locked by
+/// a unit test (which runs even in builds without `halo2-substrate`).
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "halo2-substrate"), allow(dead_code))]
+enum SrsSource {
+    /// Load + hash-verify the ceremony `.ptau` at this path (production).
+    Ceremony(String),
+    /// Deterministic INSECURE dev seed — only when explicitly allowed.
+    InsecureDevSeed,
+    /// No ceremony params and the dev seed is not allowed → refuse (fail closed).
+    Refuse,
+}
+
+/// Resolve which SRS the verifier may use. A non-empty `CITRATE_PTAU_PATH`
+/// always wins (production). Otherwise the insecure dev seed is permitted
+/// ONLY when `insecure_dev_allowed` is set (debug/test builds, or the
+/// explicit `insecure-dev-srs` feature); a production release build with
+/// neither refuses rather than verifying against reproducible toxic waste.
+#[cfg_attr(not(feature = "halo2-substrate"), allow(dead_code))]
+fn resolve_srs_source(ptau_path: Option<String>, insecure_dev_allowed: bool) -> SrsSource {
+    match ptau_path {
+        Some(p) if !p.is_empty() => SrsSource::Ceremony(p),
+        _ if insecure_dev_allowed => SrsSource::InsecureDevSeed,
+        _ => SrsSource::Refuse,
+    }
+}
+
+#[cfg(test)]
+mod chain_003_srs_policy_tests {
+    use super::{resolve_srs_source, SrsSource};
+
+    /// RM-E.1 / CHAIN-003 tripwire: the insecure deterministic dev SRS
+    /// must be unreachable unless explicitly allowed. Pre-fix the verifier
+    /// unconditionally fell back to the seed whenever CITRATE_PTAU_PATH was
+    /// unset — this asserts that path now FAILS CLOSED (Refuse).
+    #[test]
+    fn tripwire_003_insecure_seed_refused_without_optin() {
+        // No ceremony params + dev NOT allowed → refuse (the production
+        // forgot-the-env-var case must not silently use toxic-waste SRS).
+        assert_eq!(resolve_srs_source(None, false), SrsSource::Refuse);
+        assert_eq!(resolve_srs_source(Some(String::new()), false), SrsSource::Refuse);
+
+        // Dev/test opt-in (debug_assertions or insecure-dev-srs) → seed ok.
+        assert_eq!(resolve_srs_source(None, true), SrsSource::InsecureDevSeed);
+
+        // A configured ceremony path always wins, regardless of the flag.
+        assert_eq!(
+            resolve_srs_source(Some("/srs/ppot_0080_18.ptau".into()), false),
+            SrsSource::Ceremony("/srs/ppot_0080_18.ptau".into())
+        );
+        assert_eq!(
+            resolve_srs_source(Some("/srs/ppot_0080_18.ptau".into()), true),
+            SrsSource::Ceremony("/srs/ppot_0080_18.ptau".into())
+        );
+    }
+}
+
 /// Lazy-init the ParamsKZG (SRS) and VerifyingKey for the v1
 /// InferenceCircuit (`CIRCUIT_VERSION_LINEAR_Q16` = 1, out_dim=1,
 /// in_dim=2). Called on the first `verify_inference_proof` invocation;
@@ -204,9 +265,21 @@ fn inference_kzg_artifacts_v1() -> (
 
     const V1_K: u32 = 12;
 
+    // RM-E.1 / CHAIN-003: the insecure deterministic dev seed is reachable
+    // ONLY in debug builds (tests/local) or under the explicit
+    // `insecure-dev-srs` feature. A production release build with neither
+    // and no CITRATE_PTAU_PATH refuses to construct an SRS at all, rather
+    // than silently using a reproducible-toxic-waste SRS.
+    let insecure_dev_allowed =
+        cfg!(debug_assertions) || cfg!(feature = "insecure-dev-srs");
+    let source = resolve_srs_source(
+        std::env::var("CITRATE_PTAU_PATH").ok(),
+        insecure_dev_allowed,
+    );
+
     let params = PARAMS.get_or_init(|| {
-        match std::env::var("CITRATE_PTAU_PATH") {
-            Ok(path) if !path.is_empty() => {
+        match source {
+            SrsSource::Ceremony(path) => {
                 // Production / testnet: load and hash-verify the .ptau.
                 // load_ptau_into_params_kzg returns an SrsLoadError on
                 // any failure (NotFound / HashMismatch / Parse). For
@@ -231,7 +304,7 @@ fn inference_kzg_artifacts_v1() -> (
                         )
                     })
             }
-            _ => {
+            SrsSource::InsecureDevSeed => {
                 // Dev / test fallback: deterministic seed. INSECURE.
                 eprintln!(
                     "[citrate-execution] WARNING: CITRATE_PTAU_PATH not set; \
@@ -242,6 +315,19 @@ fn inference_kzg_artifacts_v1() -> (
                 );
                 let mut rng = StdRng::from_seed([0x4D; 32]);
                 ParamsKZG::<Bn256>::setup(V1_K, &mut rng)
+            }
+            SrsSource::Refuse => {
+                // RM-E.1 / CHAIN-003 fail-closed: a production release build
+                // with no ceremony .ptau and no explicit dev opt-in must NOT
+                // verify proofs against a reproducible-toxic-waste SRS.
+                panic!(
+                    "[citrate-execution] FATAL (CHAIN-003 fail-closed): 0x0108 \
+                     INFERENCE_PROOF_VERIFY requires a ceremony SRS. Set \
+                     CITRATE_PTAU_PATH to a verified PPoT .ptau file. The \
+                     insecure deterministic dev SRS is NOT available in this \
+                     build (rebuild with --features insecure-dev-srs for local \
+                     dev ONLY). See runbooks/RM_M1B_SOAK.md."
+                );
             }
         }
     });
