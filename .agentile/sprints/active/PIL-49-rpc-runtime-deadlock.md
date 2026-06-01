@@ -135,18 +135,29 @@ can drive the now-runtime-aware `block_on` via `block_in_place`.
 4. While the burst runs, observe `ss -tlnp ... | grep 8545` — RecvQ stays at 0 (or briefly spikes but drains).
 5. Compare to pre-fix: previous tests showed RecvQ climbing to 110-145 and not draining.
 
-## Follow-ups (not in this fix)
+## Follow-ups
 
-- **PIL-49b** — collapse the four ad-hoc "spawn a thread + spin up a
-  current_thread runtime" workarounds (server.rs lines 101–116,
-  140–158, 172–190, 2262–2284) onto the new `rpc_runtime::block_on`.
-  Functional equivalence; just cleanup.
-- **PIL-49c** — add an `rpc_pending_requests` gauge + an
-  `rpc_accept_queue_depth` gauge sampled from `ss` so we can alert
-  *before* the next regression hangs the public endpoint.
-- **PIL-49d** — consider migrating away from `jsonrpc-http-server` v18
-  (unmaintained upstream) to `jsonrpsee`, which is async-native and
-  removes the whole sync-worker-pool failure mode. Larger scope.
+- **PIL-49b ✅ shipped** (audit-freeze sweep): all four ad-hoc
+  `std::thread::spawn + new_current_thread runtime` workarounds in
+  `server.rs` (the three `ipfs_*_blocking` helpers and the MCP
+  inference preview path) now call `crate::rpc_runtime::block_on`
+  directly. Functional equivalence preserved; the per-call thread
+  spin-up cost is gone and the comment "futures::executor::block_on
+  cannot drive tokio primitives" is no longer a foot-gun for the next
+  contributor to step on.
+- **PIL-49c ✅ shipped** (audit-freeze sweep): new
+  `citrate_rpc_accept_queue_depth` Prometheus gauge, sampled every 5 s
+  by a dedicated `rpc-accept-q-sampler` thread that parses
+  `/proc/net/tcp`. Healthy depth under load is 0; a sustained `> 1`
+  reading means worker threads are stalled and lets ops alert *before*
+  the next deadlock-class regression hangs the public endpoint. The
+  sampler is independent of the RPC worker pool so it keeps reporting
+  even when workers are stuck.
+- **PIL-49d** — `jsonrpsee` migration. Out of scope for the audit-
+  freeze sweep; documented as deferred at
+  [`.agentile/sprints/active/PIL-49d-jsonrpsee-migration.md`](PIL-49d-jsonrpsee-migration.md)
+  with full motivation, staged rollout plan, and acceptance criteria
+  for the next session.
 
 ## Related
 

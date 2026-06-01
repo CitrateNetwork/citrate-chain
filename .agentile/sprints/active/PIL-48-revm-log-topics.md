@@ -119,18 +119,22 @@ root delta.
    different operator key) and confirm via `cast logs` that the topic
    now matches keccak256 of the event signature
 
-## Follow-ups (not in this fix)
+## Follow-ups
 
-- **PIL-48b — `journal_transfer` Transfer log:** still emits a synthetic
-  `"Transfer0000…"` topic. Ethereum-mainnet behaviour: native value
-  transfers emit **no** logs. Recommend: delete the synthetic. Trace-based
-  block explorers handle native-transfer visibility, not logs.
-- **PIL-48c — ModelRegistry precompile log:** the precompile path doesn't
-  go through REVM, so this fix doesn't touch it. Topic should become
-  `keccak256("ModelRegistered(bytes32)")` instead of the ASCII string.
-- **PIL-48d — historical-receipt note:** add a brief operator note that
-  blocks ≤ N have synthetic log topics and won't be useful for off-chain
-  indexing; only blocks > N are real.
+- **PIL-48b ✅ shipped** (audit-freeze sweep): synthetic `"Transfer000…"`
+  log in `journal_transfer` deleted. Native value transfers now emit
+  zero logs, matching Ethereum-mainnet behaviour. Indexers that filter
+  on real ERC20 `Transfer(address,address,uint256)` topics now see
+  exactly what they expect — the source contracts' actual events.
+- **PIL-48c ✅ shipped** (audit-freeze sweep): ModelRegistry precompile
+  path replaced its synthetic `"ModelRegistered000…"` topic with a real
+  `keccak256("ModelRegistered(bytes32)")` const (`0xa4b0af38…dee72`).
+  Precompile bypasses REVM, so this needed its own hardcoded const.
+- **PIL-48d — historical-receipt note** (operator-facing, not code):
+  blocks ≤ ~296,743 (pre-PIL-48 deploy) keep synthetic topics
+  permanently. Off-chain indexers backfilling history have to skip
+  that range or special-case the ASCII topics. Going forward (block
+  ~296,744+) every receipt has real keccak256 topics.
 
 ## Related
 
