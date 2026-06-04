@@ -88,6 +88,20 @@ fn pubkey_hex_opt_to_evm_address(hex_opt: Option<&String>) -> Option<String> {
 }
 
 fn eth_block_json(block: &crate::types::response::BlockResponse, transactions: Vec<Value>) -> Value {
+    // PIL-50: GHOSTDAG topology fields. The consensus header already
+    // carries blue_score / blue_work / selected_parent_hash /
+    // merge_parent_hashes, but the public RPC was stripping them down to
+    // pure Ethereum-shape fields, which blocked the explorer + indexer
+    // from rendering the DAG. Add them as additional camelCase fields
+    // (Ethereum-spec callers ignore unknown fields, so this is
+    // backwards-compatible). `selectedParentHash` is the same value as
+    // `parentHash` — duplicated under both names so DAG-aware callers
+    // don't have to special-case the Citrate spelling.
+    let merge_parents_json: Vec<Value> = block
+        .merge_parent_hashes
+        .iter()
+        .map(|h| Value::String(format!("0x{}", hex::encode(h.as_bytes()))))
+        .collect();
     json!({
         "number": format!("0x{:x}", block.height),
         "hash": format!("0x{}", hex::encode(block.hash.as_bytes())),
@@ -109,7 +123,12 @@ fn eth_block_json(block: &crate::types::response::BlockResponse, transactions: V
         "size": format!("0x{:x}", 1000),
         "extraData": "0x",
         "baseFeePerGas": format!("0x{:x}", block.base_fee_per_gas),
-        "uncles": []
+        "uncles": [],
+        // PIL-50: GHOSTDAG fields (see explorer handoff RPC_DAG_FIELDS_HANDOFF.md).
+        "blueScore": format!("0x{:x}", block.blue_score),
+        "blueWork": format!("0x{:x}", block.blue_work),
+        "selectedParentHash": format!("0x{}", hex::encode(block.parent_hash.as_bytes())),
+        "mergeParentHashes": merge_parents_json
     })
 }
 

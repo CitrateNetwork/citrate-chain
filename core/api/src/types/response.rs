@@ -13,6 +13,12 @@ pub struct BlockResponse {
     pub timestamp: u64,
     pub blue_score: u64,
     pub blue_work: u128,
+    /// PIL-50: GHOSTDAG merge parents (the non-selected-parent tips the
+    /// proposer rolled into this block). Empty when the block extended a
+    /// single tip; non-empty when it merged sibling tips back into the
+    /// selected chain. Serialized as `mergeParentHashes` in the JSON-RPC
+    /// block response so explorer + indexer can render the DAG topology.
+    pub merge_parent_hashes: Vec<Hash>,
     pub gas_used: u64,
     pub gas_limit: u64,
     pub base_fee_per_gas: u64,
@@ -32,6 +38,8 @@ impl From<Block> for BlockResponse {
             timestamp: block.header.timestamp,
             blue_score: block.header.blue_score,
             blue_work: block.header.blue_work,
+            // PIL-50: carry merge parents through to the RPC layer.
+            merge_parent_hashes: block.header.merge_parent_hashes.clone(),
             gas_used: block.header.gas_used,
             gas_limit: block.header.gas_limit,
             base_fee_per_gas: block.header.base_fee_per_gas,
