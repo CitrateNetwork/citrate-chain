@@ -119,10 +119,31 @@ pub struct BlockHeader {
     pub gas_used: String,
     pub timestamp: String,
     pub base_fee_per_gas: Option<String>,
+    // PIL-50: GHOSTDAG topology surfaced on the live newHeads stream so
+    // the explorer's live-DAG worker can render spine + merge edges
+    // without re-fetching each block via eth_getBlockByHash. Field
+    // names match the explorer parser
+    // (citrate-explorer/src/lib/citrate/rpc.ts).
+    /// `header.blue_score` as a hex u64 string.
+    pub blue_score: String,
+    /// `header.blue_work` as a hex u128 string.
+    pub blue_work: String,
+    /// Duplicates `parent_hash` under the Citrate-spec name so DAG-aware
+    /// callers don't have to special-case the spelling.
+    pub selected_parent_hash: String,
+    /// Sibling tips this block merged into the selected chain. Empty
+    /// when the block extended a single tip.
+    pub merge_parent_hashes: Vec<String>,
 }
 
 impl From<&Block> for BlockHeader {
     fn from(block: &Block) -> Self {
+        let merge_parents: Vec<String> = block
+            .header
+            .merge_parent_hashes
+            .iter()
+            .map(|h| format!("0x{}", hex::encode(h.as_bytes())))
+            .collect();
         Self {
             number: format!("0x{:x}", block.header.height),
             hash: format!("0x{}", hex::encode(block.header.block_hash.as_bytes())),
@@ -142,6 +163,14 @@ impl From<&Block> for BlockHeader {
             gas_used: "0x0".to_string(),
             timestamp: format!("0x{:x}", block.header.timestamp),
             base_fee_per_gas: Some("0x7".to_string()),
+            // PIL-50: GHOSTDAG fields.
+            blue_score: format!("0x{:x}", block.header.blue_score),
+            blue_work: format!("0x{:x}", block.header.blue_work),
+            selected_parent_hash: format!(
+                "0x{}",
+                hex::encode(block.header.selected_parent_hash.as_bytes())
+            ),
+            merge_parent_hashes: merge_parents,
         }
     }
 }
