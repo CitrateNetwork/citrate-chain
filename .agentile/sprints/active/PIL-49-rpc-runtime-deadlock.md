@@ -158,6 +158,14 @@ can drive the now-runtime-aware `block_on` via `block_in_place`.
   [`.agentile/sprints/active/PIL-49d-jsonrpsee-migration.md`](PIL-49d-jsonrpsee-migration.md)
   with full motivation, staged rollout plan, and acceptance criteria
   for the next session.
+- **PIL-49e** — *new (2026-06-04)*: a **different** saturation class
+  observed after the citratescan indexer + CitratePulse beacon
+  started hammering the same RPC. PIL-49's fix is in the running
+  binary (verified) but doesn't catch this — `RecvQ` climbs to the
+  kernel ceiling (1025), not the 110-145 we saw pre-PIL-49. Seen
+  twice in ~7 hours, recovers via `systemctl restart citrate-node`.
+  Full diagnostic plan + hypotheses at
+  [`.agentile/sprints/active/PIL-49e-recurring-hang-under-indexer-beacon-load.md`](PIL-49e-recurring-hang-under-indexer-beacon-load.md).
 
 ## Related
 
