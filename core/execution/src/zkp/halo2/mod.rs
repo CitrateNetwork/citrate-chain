@@ -381,6 +381,11 @@ pub mod chips;
 #[cfg(feature = "halo2-substrate")]
 pub mod circuits;
 
+/// PIN-P1 — Stacked-DRG PoRep circuit (reduced instance). Additive; does
+/// NOT touch the inference circuit or the live 0x0108 verifier.
+#[cfg(feature = "halo2-substrate")]
+pub mod porep;
+
 #[cfg(feature = "halo2-substrate")]
 pub mod srs;
 
