@@ -730,8 +730,20 @@ impl BlockProducer {
             gas_limit: 30_000_000, // 30M gas default
         };
 
-        // WP-Z.3: Set block context with VRF output before executing transactions.
-        // This ensures `block.prevrandao` returns the real VRF randomness in Solidity.
+        // WP-Z.3 / PIN-P1(d): Set block context with the consensus ECVRF
+        // randomness before executing transactions. `header.vrf_reveal.output`
+        // is the RFC 9381 ECVRF beacon for THIS block (`core/consensus/src/vrf.rs`),
+        // and feeding it here is what makes the standard EVM `block.prevrandao`
+        // opcode (0x44) return real consensus randomness in Solidity instead of
+        // the all-zeros default.
+        //
+        // Semantics: this exposes this block's OWN randomness. That is the
+        // idiomatic `block.prevrandao` contract — but a value derived from the
+        // block currently producing it is inherently grindable by the proposer.
+        // Grind-resistant challenge selection (committing now, then reading a
+        // FINALIZED/future block's prevrandao when the challenge resolves) is the
+        // CONSUMER CONTRACT's responsibility (PIN `IPFSIncentives v2`, step (e)).
+        // We intentionally do NOT attempt to solve finality at the VM layer.
         self.executor.set_block_context(BlockContext {
             coinbase: self.coinbase.0[0..20].try_into().unwrap_or([0; 20]),
             prevrandao: *header.vrf_reveal.output.as_bytes(),
