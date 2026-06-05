@@ -166,7 +166,7 @@ impl KFoldChallengeWitness {
         }
     }
 
-    fn unknown_for_params(params: &PoRepParams) -> Self {
+    pub(crate) fn unknown_for_params(params: &PoRepParams) -> Self {
         let l = params.l;
         let depth = params.merkle_depth();
         let drg_d = params.d_drg;
