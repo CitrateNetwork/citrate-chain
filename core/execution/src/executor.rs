@@ -3058,6 +3058,77 @@ mod tests {
         assert_eq!(state_db.accounts.get_balance(&bob_addr), U256::from(1000));
     }
 
+    /// PIN-P1(d): end-to-end proof that the block-execution entrypoint surfaces
+    /// consensus randomness via the standard EVM `block.prevrandao` opcode.
+    ///
+    /// The block producer (`node/src/producer.rs::produce_block`) calls
+    /// `executor.set_block_context(BlockContext { prevrandao:
+    /// *header.vrf_reveal.output.as_bytes(), .. })` before executing the block's
+    /// transactions. This test reproduces that wiring at the executor boundary:
+    /// it sets a block context carrying a known (non-zero) VRF output, then runs
+    /// a real transaction through `execute_transaction` to a contract whose
+    /// runtime returns `block.prevrandao`. The receipt output must equal the VRF
+    /// bytes — proving `set_block_context` → `get_block_context` → REVM block env
+    /// → PREVRANDAO opcode is intact for the production execution path (not just
+    /// the revm adapter in isolation).
+    #[tokio::test]
+    async fn test_prevrandao_from_block_context_e2e() {
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+
+        let alice = PublicKey::new([1; 32]);
+        let contract_pk = PublicKey::new([7; 32]);
+        let alice_addr = Address::from_public_key(&alice);
+        let contract_addr = Address::from_public_key(&contract_pk);
+
+        state_db
+            .accounts
+            .set_balance(alice_addr, U256::from(1_000_000_000_000_000u128));
+
+        // Runtime: PREVRANDAO; PUSH1 0; MSTORE; PUSH1 0x20; PUSH1 0; RETURN
+        // -> returns the 32-byte block.prevrandao value.
+        let runtime_code = vec![0x44, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        executor.set_code(&contract_addr, runtime_code);
+
+        // Known VRF output (stands in for header.vrf_reveal.output).
+        let vrf_output: [u8; 32] = [
+            0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x02, 0x03, 0x04,
+            0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+            0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14,
+            0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+        ];
+
+        // This mirrors exactly what produce_block does with the block header.
+        executor.set_block_context(crate::revm_adapter::BlockContext {
+            coinbase: [0x42; 20],
+            prevrandao: vrf_output,
+            block_hashes: std::collections::HashMap::new(),
+        });
+
+        let block = create_test_block();
+        // Non-empty, non-reserved calldata so the executor routes to a contract
+        // Call (empty data is a plain Transfer that never runs code). The
+        // contract ignores calldata and returns block.prevrandao unconditionally.
+        let tx = Transaction {
+            data: vec![0xAA, 0xBB, 0xCC, 0xDD],
+            ..create_test_tx(alice, Some(contract_pk), 0, 0)
+        };
+
+        let receipt = executor.execute_transaction(&block, &tx).await.unwrap();
+
+        assert!(receipt.status, "contract call should succeed");
+        assert_eq!(
+            receipt.output.as_slice(),
+            &vrf_output[..],
+            "block.prevrandao surfaced by the executor must equal the VRF output set via set_block_context"
+        );
+        assert_ne!(
+            receipt.output.as_slice(),
+            &[0u8; 32][..],
+            "VRF-fed prevrandao must be non-zero (regression guard against the old always-zero default)"
+        );
+    }
+
     #[tokio::test]
     async fn test_register_model_via_transaction_payload() {
         let state_db = Arc::new(StateDB::new());
