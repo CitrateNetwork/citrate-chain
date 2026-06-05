@@ -917,6 +917,13 @@ pub mod porep;
 #[cfg(feature = "halo2-substrate")]
 pub mod porep_generic;
 
+/// PIN-P1 (f.2b) — Parameterised in-circuit PoRep lift. Halo2 `Circuit`
+/// impl at arbitrary `(N, L)` for one challenge per proof, consuming the
+/// shape contract from [`porep_generic`]. Reduced `porep::PoRepCircuit`
+/// is untouched; on-chain v2/v3 VKs unchanged until (f.6).
+#[cfg(feature = "halo2-substrate")]
+pub mod porep_circuit_generic;
+
 /// PIN-P1 step (b) — Proof-of-Spacetime (PoSt) circuit (reduced instance).
 /// Additive; reuses `porep`'s native sealing + topology. Does NOT touch
 /// the inference (v1) or PoRep (v2) verification paths.
