@@ -910,6 +910,13 @@ pub mod circuits;
 #[cfg(feature = "halo2-substrate")]
 pub mod porep;
 
+/// PIN-P1 (f.2a) — Parameterised native PoRep sealing on `(N, L, K)`,
+/// using the real DRG + expander samplers from [`samplers`]. Defines the
+/// contract the in-circuit lift (f.2b) will honour. The reduced `porep`
+/// circuit + on-chain VKs are untouched until (f.6).
+#[cfg(feature = "halo2-substrate")]
+pub mod porep_generic;
+
 /// PIN-P1 step (b) — Proof-of-Spacetime (PoSt) circuit (reduced instance).
 /// Additive; reuses `porep`'s native sealing + topology. Does NOT touch
 /// the inference (v1) or PoRep (v2) verification paths.
