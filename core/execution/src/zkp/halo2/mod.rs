@@ -924,6 +924,14 @@ pub mod porep_generic;
 #[cfg(feature = "halo2-substrate")]
 pub mod porep_circuit_generic;
 
+/// PIN-P1 (f.2c) — K-fold parameterised in-circuit PoRep. Replicates the
+/// f.2b per-challenge gate-set K times in one `Circuit`. v0 takes the K
+/// indices as additional public inputs (8 + K layout); the f.2c.1
+/// follow-up derives them in-circuit from `challengeNonce_seed`. Ships
+/// as a NEW circuit_version (v4); v2's 8-element ABI is untouched.
+#[cfg(feature = "halo2-substrate")]
+pub mod porep_circuit_kfold;
+
 /// PIN-P1 step (b) — Proof-of-Spacetime (PoSt) circuit (reduced instance).
 /// Additive; reuses `porep`'s native sealing + topology. Does NOT touch
 /// the inference (v1) or PoRep (v2) verification paths.
