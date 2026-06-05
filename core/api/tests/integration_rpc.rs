@@ -44,7 +44,7 @@ fn embedded_pubkey(address: Address) -> PublicKey {
     PublicKey::new(bytes)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_block_number_and_get_block() {
     // Storage
     let tmp = TempDir::new().unwrap();
@@ -93,7 +93,7 @@ async fn test_eth_block_number_and_get_block() {
     assert!(vgbn["result"].is_object());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_get_block_by_hash() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -136,7 +136,7 @@ async fn test_eth_get_block_by_hash() {
     assert_eq!(v["result"]["number"], "0x1");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_get_block_reports_persisted_gas_and_receipt_fields() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -190,7 +190,7 @@ async fn test_eth_get_block_reports_persisted_gas_and_receipt_fields() {
     assert_eq!(v["result"]["miner"], "0xabababababababababababababababababababab");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_get_tx_and_receipt_by_hash() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -275,7 +275,7 @@ async fn test_eth_get_tx_and_receipt_by_hash() {
     assert_eq!(vrc["result"]["blockNumber"], "0x7");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_get_transaction_count_latest_vs_pending() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -359,7 +359,7 @@ async fn test_eth_get_transaction_count_latest_vs_pending() {
     assert_eq!(vp["result"], "0x2");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_get_balance_and_code_smoke() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -408,7 +408,7 @@ async fn test_eth_get_balance_and_code_smoke() {
     assert!(code_hex.len() > 2); // non-empty code
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_latest_reads_survive_simulation_before_persist() {
     use primitive_types::U256;
 
@@ -498,7 +498,7 @@ async fn test_eth_latest_reads_survive_simulation_before_persist() {
     assert_eq!(nonce_json["result"], "0x1");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_send_raw_transaction_error_path() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -527,7 +527,7 @@ async fn test_eth_send_raw_transaction_error_path() {
     assert!(v.get("error").is_some());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_call_smoke() {
     ensure_test_rate_limit_bypass();
     use primitive_types::U256;
@@ -573,7 +573,7 @@ async fn test_eth_call_smoke() {
     assert!(v["result"].as_str().unwrap().starts_with("0x"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_estimate_gas_minimal() {
     ensure_test_rate_limit_bypass();
     let tmp = TempDir::new().unwrap();
@@ -603,7 +603,7 @@ async fn test_eth_estimate_gas_minimal() {
     assert_eq!(v["result"], "0x5208");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_call_ai_tensor_opcode() {
     use primitive_types::U256;
     // Storage/executor/mempool setup
@@ -665,7 +665,7 @@ async fn test_eth_call_ai_tensor_opcode() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_call_invalid_to_address_and_insufficient_balance() {
     ensure_test_rate_limit_bypass();
     use primitive_types::U256;
@@ -723,7 +723,7 @@ async fn test_eth_call_invalid_to_address_and_insufficient_balance() {
     assert!(v_low.get("result").is_some());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_estimate_gas_with_object_returns_constant() {
     ensure_test_rate_limit_bypass();
     let tmp = TempDir::new().unwrap();
@@ -753,7 +753,7 @@ async fn test_eth_estimate_gas_with_object_returns_constant() {
     assert_eq!(v["result"], "0x5208");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_call_ai_zk_verify_valid_proof() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -809,7 +809,7 @@ async fn test_eth_call_ai_zk_verify_valid_proof() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_call_ai_zk_verify_invalid_proof() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -865,7 +865,7 @@ async fn test_eth_call_ai_zk_verify_invalid_proof() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_call_ai_zk_prove_output_length() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -920,7 +920,7 @@ async fn test_eth_call_ai_zk_prove_output_length() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_call_invalid_data_shapes_error() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -1005,7 +1005,7 @@ async fn test_eth_call_invalid_data_shapes_error() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_call_ai_model_load_path() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -1082,7 +1082,7 @@ async fn test_eth_call_ai_model_load_path() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_call_ai_model_exec_path() {
     ensure_test_rate_limit_bypass();
     use primitive_types::U256;
@@ -1164,7 +1164,7 @@ async fn test_eth_call_ai_model_exec_path() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_call_ai_model_exec_missing_model_errors() {
     ensure_test_rate_limit_bypass();
     let tmp = TempDir::new().unwrap();
@@ -1220,7 +1220,7 @@ async fn test_eth_call_ai_model_exec_missing_model_errors() {
 
 /// Test that eth_chainId returns the configured chain ID, not a hardcoded value.
 /// This is critical for preventing replay attacks across different networks.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_chain_id_is_configurable() {
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).unwrap());
@@ -1265,7 +1265,7 @@ async fn test_eth_chain_id_is_configurable() {
 
 /// Test that eth_estimateGas performs real gas estimation for contract calls.
 /// Simple transfers should return 21000, while contract calls return actual gas used.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_estimate_gas_real_execution() {
     ensure_test_rate_limit_bypass();
     use primitive_types::U256;
@@ -1333,7 +1333,7 @@ async fn test_eth_estimate_gas_real_execution() {
     assert_eq!(v_empty["result"], "0x5208", "Empty params should default to 21000");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_eth_estimate_gas_contract_deploy_not_simple_transfer() {
     ensure_test_rate_limit_bypass();
     use primitive_types::U256;
