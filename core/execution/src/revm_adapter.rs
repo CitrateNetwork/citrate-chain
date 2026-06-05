@@ -820,6 +820,115 @@ mod tests {
         assert!(result.is_ok(), "Contract call with block context should succeed: {:?}", result.err());
     }
 
+    /// PIN-P1(d): prove the EVM `block.prevrandao` opcode (0x44) returns the
+    /// exact 32 bytes carried in `BlockContext.prevrandao` — i.e. the consensus
+    /// ECVRF `vrf_reveal.output` once wired at the block-execution entrypoint.
+    /// The pre-existing `test_execute_contract_call_with_context` only asserts
+    /// "does not panic"; it never reads the value PREVRANDAO actually yields.
+    /// This test executes a contract that returns `block.prevrandao` and asserts
+    /// the returned 32 bytes equal the supplied VRF output.
+    #[test]
+    fn test_prevrandao_opcode_returns_vrf_output() {
+        let state_db = Arc::new(StateDB::new());
+        let caller = Address([1u8; 20]);
+        let contract = Address([2u8; 20]);
+        state_db
+            .accounts
+            .set_balance(caller, U256::from(10u64).pow(U256::from(18u64)));
+
+        // Runtime bytecode:
+        //   0x44             PREVRANDAO   (pushes block.prevrandao onto stack)
+        //   0x60 0x00        PUSH1 0x00
+        //   0x52             MSTORE       (store prevrandao at memory[0..32])
+        //   0x60 0x20        PUSH1 0x20   (length = 32)
+        //   0x60 0x00        PUSH1 0x00   (offset = 0)
+        //   0xf3             RETURN       (return memory[0..32])
+        let runtime_code = vec![0x44, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        state_db.set_code(contract, runtime_code);
+
+        // A known, non-zero VRF output (stands in for header.vrf_reveal.output).
+        let vrf_output: [u8; 32] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+            0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78,
+            0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0,
+        ];
+
+        let ctx = BlockContext {
+            coinbase: [0x42; 20],
+            prevrandao: vrf_output,
+            block_hashes: HashMap::new(),
+        };
+
+        let (output, _gas, _logs) = execute_contract_call_with_context(
+            state_db,
+            caller,
+            contract,
+            vec![],
+            U256::zero(),
+            1_000_000,
+            U256::from(1_000_000_000u64),
+            40204,
+            100,
+            1_000_000,
+            ctx,
+            None,
+            None,
+            None,
+        )
+        .expect("call returning block.prevrandao should succeed");
+
+        assert_eq!(
+            output.as_slice(),
+            &vrf_output[..],
+            "block.prevrandao must equal the BlockContext (VRF) output bytes"
+        );
+        // Sanity: a real VRF output is non-zero, distinguishing it from the
+        // pre-wiring default (all zeros).
+        assert_ne!(output.as_slice(), &[0u8; 32][..], "prevrandao should be non-zero");
+    }
+
+    /// PIN-P1(d): a default/zero `BlockContext` (e.g. a header whose
+    /// `vrf_reveal.output` is all zeros, or any path that has not set a
+    /// context) must still execute without panicking and yield zero — proving
+    /// the wiring is additive and degrades safely.
+    #[test]
+    fn test_prevrandao_opcode_zero_default_is_safe() {
+        let state_db = Arc::new(StateDB::new());
+        let caller = Address([1u8; 20]);
+        let contract = Address([2u8; 20]);
+        state_db
+            .accounts
+            .set_balance(caller, U256::from(10u64).pow(U256::from(18u64)));
+
+        let runtime_code = vec![0x44, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        state_db.set_code(contract, runtime_code);
+
+        let (output, _gas, _logs) = execute_contract_call_with_context(
+            state_db,
+            caller,
+            contract,
+            vec![],
+            U256::zero(),
+            1_000_000,
+            U256::from(1_000_000_000u64),
+            40204,
+            100,
+            1_000_000,
+            BlockContext::default(),
+            None,
+            None,
+            None,
+        )
+        .expect("call with default block context should not panic");
+
+        assert_eq!(
+            output.as_slice(),
+            &[0u8; 32][..],
+            "default BlockContext must yield zero prevrandao (no panic, no garbage)"
+        );
+    }
+
     /// PIL-48 regression: REVM-emitted log topics must round-trip up to the
     /// executor instead of being silently discarded. Pre-fix, every contract
     /// execution returned a single hand-rolled `"ContractExecuted0000..."`
