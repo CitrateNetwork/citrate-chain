@@ -2561,6 +2561,30 @@ mod tests {
 
     static OPERATOR_ENV_GUARD: Mutex<()> = Mutex::new(());
 
+    /// Returns `true` only when a working `solc --version` is on PATH.
+    ///
+    /// The prior skip check used `Command::output().is_err()`, which
+    /// returns Err only when the OS fails to SPAWN the binary. A stale
+    /// `solc-select` wrapper that spawns successfully but then can't exec
+    /// the versioned artifact (the classic `Exec format error: solc-X.Y.Z`)
+    /// passed that check and then blew the test up at compile-time. This
+    /// helper additionally requires:
+    ///   - exit status was clean (`success() == true`)
+    ///   - stdout contains a `Version:` line (canonical solc output)
+    ///
+    /// Anything else, we skip — both locally on a broken solc-select install
+    /// and on a CI runner that doesn't ship a usable solc.
+    fn solc_is_usable() -> bool {
+        let Ok(out) = std::process::Command::new("solc").arg("--version").output() else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout.contains("Version:")
+    }
+
     struct EnvGuard {
         key: &'static str,
         old: Option<std::ffi::OsString>,
@@ -2680,16 +2704,13 @@ mod tests {
 
     // REM-13b: was gated on `verifier-ethers-solc`. The feature
     // gate has been removed; the test still skips itself if solc
-    // is not on PATH.
+    // is not USABLE (CI-fix 2026-06-05: the hardened guard now also
+    // catches the case where the spawn succeeds but the wrapper
+    // can't exec a versioned artifact — see `solc_is_usable`).
     #[test]
     fn test_compile_single_contract_opt_and_unopt() {
-        // Skip if solc is not available on PATH
-        if std::process::Command::new("solc")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("solc not installed; skipping verifier test");
+        if !solc_is_usable() {
+            eprintln!("solc not usable (missing, broken wrapper, or version exec failed); skipping verifier test");
             return;
         }
         let src = r#"// SPDX-License-Identifier: MIT
@@ -2714,13 +2735,8 @@ mod tests {
     // is not on PATH.
     #[test]
     fn test_compile_multi_contract_select_by_name() {
-        // Skip if solc is not available on PATH
-        if std::process::Command::new("solc")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("solc not installed; skipping verifier test");
+        if !solc_is_usable() {
+            eprintln!("solc not usable (missing, broken wrapper, or version exec failed); skipping verifier test");
             return;
         }
         let src = r#"// SPDX-License-Identifier: MIT
