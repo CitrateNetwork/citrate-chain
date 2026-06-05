@@ -74,6 +74,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+      # CI-fix (2026-06-05): install a real `solc` binary so the verifier
+      # tests EXERCISE compile_runtime_bytecode instead of skipping via
+      # the solc_is_usable() guard in server.rs. We pull the canonical
+      # linux-amd64 static build of solc 0.8.24 (the version the tests
+      # pin) directly from the ethereum/solidity GitHub release and put
+      # it on PATH as `solc`. The SHA-256 is pinned so a tampered mirror
+      # / replaced asset fails the install step.
+      #
+      # Why not solc-select / apt: the ubuntu-latest image's solc-select
+      # wrapper was the source of the original "Exec format error" — its
+      # versioned artifact got into a bad state. Pulling the static
+      # binary straight from the release skips that whole layer.
+      - name: Install solc 0.8.24
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/solc \
+            https://github.com/ethereum/solidity/releases/download/v0.8.24/solc-static-linux
+          echo "fb03a29a517452b9f12bcf459ef37d0a543765bb3bbc911e70a87d6a37c30d5f  /tmp/solc" \
+            | sha256sum -c -
+          sudo install -m 0755 /tmp/solc /usr/local/bin/solc
+          solc --version
       - name: Show toolchain
         run: rustc -Vv && cargo -V
       # REM-13b (2026-05-20): removed `--features verifier-ethers-solc`.
@@ -84,7 +105,9 @@ jobs:
       # tests (test_compile_single_contract_opt_and_unopt +
       # test_compile_multi_contract_select_by_name) are now part of
       # the default test suite and run unconditionally below (they
-      # skip themselves if solc is not on PATH).
+      # skip themselves via solc_is_usable() if solc is not present
+      # on PATH or its wrapper can't produce a real version line —
+      # see the helper in server.rs).
       - name: Build citrate-api (default features)
         run: cargo build --locked -p citrate-api
       - name: Run citrate-api tests (default features)
