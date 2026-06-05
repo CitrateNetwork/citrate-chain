@@ -97,6 +97,21 @@ pub mod gas_costs {
     /// the inference per-byte (transcript scanning scales with proof
     /// length).
     pub const POREP_PROOF_VERIFY_PER_BYTE: u64 = 50;
+
+    /// PIN-P1 step (b): 0x0108 circuit_version=3 (reduced PoSt) base cost.
+    /// Mirrors the PoRep/inference base — same single-pairing SHPLONK
+    /// verifier shape; the PoSt VK is a different (and structurally
+    /// smaller) circuit, but the verification cost class is identical, so
+    /// it shares the 500k base. (PoSt is actually lighter to PROVE than
+    /// PoRep, but the on-chain VERIFY cost is pairing-dominated and the
+    /// same class; calibration against real PoSt benches is a PIN-P1
+    /// follow-up.)
+    pub const POST_PROOF_VERIFY_BASE: u64 = 500_000;
+
+    /// PIN-P1 step (b): 0x0108 circuit_version=3 per-byte cost. Mirrors
+    /// the inference/PoRep per-byte (transcript scanning scales with proof
+    /// length).
+    pub const POST_PROOF_VERIFY_PER_BYTE: u64 = 50;
 }
 
 /// Route to the right precompile by address.
@@ -385,8 +400,21 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
 ///   | proof_bytes |
 ///   ```
 ///
-/// - **v3 (PoSt) reserved** + any other version → rejected (no VK
-///   registered), exactly as an unknown version was rejected before.
+/// - **v3 — reduced PoSt** (`CIRCUIT_VERSION_POST`). PIN-P1 step (b): the
+///   recurring proof-of-spacetime. 7 PoSt public-input field elements
+///   (NO CommD), PoSt VK. The version field sits at the SAME offset
+///   (96..100); everything else is the PoSt ABI (see
+///   `zkp::halo2::verify_post_proof` for the byte layout).
+///
+///   ```text
+///   | 32B replicaID | 32B cid | 32B sectorIndex |
+///   | 4B circuit_version=3 | 4B chain_id |
+///   | 32B CommR | 32B CommC | 32B challengeNonce | 32B epoch |
+///   | proof_bytes |
+///   ```
+///
+/// - Any other version → rejected (no VK registered), exactly as an
+///   unknown version was rejected before.
 ///
 /// **Output:** 32-byte big-endian word, 1 if the proof verifies, 0 if
 /// rejected. Returns Err on structural problems (truncated input,
@@ -394,10 +422,11 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
 ///
 /// **Gas:** version-specific base + per-byte. v1 keeps its exact
 /// `INFERENCE_PROOF_VERIFY_BASE + per_byte·len` formula (unchanged); v2
-/// mirrors it (`POREP_PROOF_VERIFY_BASE + per_byte·len`). The version
-/// is read before metering so the right formula applies; an
-/// unknown/short input is charged the inference formula (its base
-/// dominates) before the structured rejection.
+/// mirrors it (`POREP_PROOF_VERIFY_BASE + per_byte·len`); v3 mirrors it
+/// too (`POST_PROOF_VERIFY_BASE + per_byte·len`). The version is read
+/// before metering so the right formula applies; an unknown/short input
+/// is charged the inference formula (its base dominates) before the
+/// structured rejection.
 pub fn inference_proof_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     // Peek the circuit_version (bytes 96..100) to pick the gas formula.
     // A short input (< 100 bytes) can't carry a version; charge the
@@ -419,6 +448,10 @@ pub fn inference_proof_verify(input: &[u8], gas_limit: u64) -> Result<Precompile
         crate::zkp::halo2::CIRCUIT_VERSION_POREP_REDUCED => (
             gas_costs::POREP_PROOF_VERIFY_BASE,
             gas_costs::POREP_PROOF_VERIFY_PER_BYTE,
+        ),
+        crate::zkp::halo2::CIRCUIT_VERSION_POST => (
+            gas_costs::POST_PROOF_VERIFY_BASE,
+            gas_costs::POST_PROOF_VERIFY_PER_BYTE,
         ),
         // v1 and everything else use the inference schedule (v1 is the
         // historical default; unknown versions are rejected by the
