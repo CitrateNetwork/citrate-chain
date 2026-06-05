@@ -53,12 +53,27 @@ pub const CIRCUIT_VERSION_LINEAR_Q16: CircuitVersion = 1;
 /// the VK in place is safe.
 pub const CIRCUIT_VERSION_POREP_REDUCED: CircuitVersion = 2;
 
-/// PIN-P1: reserved circuit version for the PoSt (Proof-of-Spacetime)
-/// circuit. **NOT implemented this step** — allocated and documented so
-/// the dispatch + registry know v3 is spoken-for and a v3 proof is
-/// rejected as "no VK registered" rather than silently colliding with a
-/// future allocation. Wiring lands in a later PIN-P1 step.
-pub const CIRCUIT_VERSION_POST_RESERVED: CircuitVersion = 3;
+/// PIN-P1 step (b): circuit version for the **reduced** Proof-of-Spacetime
+/// (PoSt) circuit (`zkp::halo2::post::PoStCircuit`, same N=4/L=2 topology
+/// as PoRep). **ACTIVATED this step** (was RESERVED-but-rejected): a v3
+/// proof now verifies on-chain through 0x0108 with the PoSt VK and the
+/// 7-input PoSt public-input parsing (NO CommD) — domain-separated from
+/// the inference circuit (v1, 3 commitments) and PoRep (v2, 8 inputs).
+///
+/// PoSt is the recurring, LIGHT proof: it re-derives the challenged node's
+/// labels and checks R[v]∈CommR + column(v)∈CommC, but drops PoRep's
+/// CommD inclusion and the encoding relation. Per-challenge VK pattern is
+/// identical to PoRep (the v=0 labeling-seed copy constraint + Merkle
+/// branch directions are fixed topology).
+///
+/// **Backward-compat alias:** the old `CIRCUIT_VERSION_POST_RESERVED`
+/// name is retained (re-exported below) so any caller that referenced the
+/// reserved constant keeps compiling; both resolve to 3.
+pub const CIRCUIT_VERSION_POST: CircuitVersion = 3;
+
+/// Deprecated alias for `CIRCUIT_VERSION_POST` — PoSt is no longer
+/// "reserved", it is live. Kept so the prior name still resolves.
+pub const CIRCUIT_VERSION_POST_RESERVED: CircuitVersion = CIRCUIT_VERSION_POST;
 
 /// Errors that can surface from the verifier path. These are stable
 /// across Halo2 backend changes — wrappers above the verifier should
@@ -117,7 +132,7 @@ pub fn verify_inference_proof(_input: &[u8]) -> Result<bool, VerifyError> {
 /// |---------|-------------------------|-----------------------------|---------------------------|
 /// | 1       | InferenceCircuit (Q16)  | 3 commitments (existing)    | `inference_kzg_artifacts_v1` |
 /// | 2       | reduced PoRepCircuit    | 8 PoRep field elements      | `porep_kzg_artifacts_v2`  |
-/// | 3       | PoSt (reserved)         | — (rejected: no VK)         | — (not implemented)       |
+/// | 3       | reduced PoStCircuit     | 7 PoSt field elements       | `post_kzg_artifacts_v3`   |
 /// | other   | unknown                 | — (rejected)                | —                         |
 ///
 /// The **v1 path is behaviorally identical to calling
@@ -155,8 +170,10 @@ pub fn verify_proof_dispatch(input: &[u8]) -> Result<bool, VerifyError> {
         // v2 — reduced PoRep. Different VK, different 8-field public-input
         // parsing.
         CIRCUIT_VERSION_POREP_REDUCED => verify_porep_proof(input),
-        // v3 (PoSt) reserved-but-unimplemented and everything else:
-        // reject as an unknown version (no VK registered).
+        // v3 — reduced PoSt. Different VK again, different 7-field
+        // public-input parsing (NO CommD). Domain-separated from v1/v2.
+        CIRCUIT_VERSION_POST => verify_post_proof(input),
+        // Everything else: reject as an unknown version (no VK registered).
         other => Err(VerifyError::UnknownCircuitVersion(other)),
     }
 }
@@ -659,6 +676,219 @@ fn porep_kzg_artifacts_v2(
     (params, vk)
 }
 
+/// PIN-P1 step (b): verify a **reduced PoSt** proof (circuit_version 3)
+/// submitted to 0x0108. Mirrors `verify_porep_proof`'s structure but with
+/// the lighter 7-input PoSt ABI (NO CommD) and the PoSt VK, so all three
+/// of v1/v2/v3 are mutually domain-separated.
+///
+/// **v3 wire format (the PoSt ABI — documented byte layout):**
+///
+/// ```text
+/// | [0..32)    replicaID       (BE Fr)   — public input slot 0
+/// | [32..64)   cid             (BE Fr)   — public input slot 1
+/// | [64..96)   sectorIndex     (BE Fr)   — public input slot 2
+/// | [96..100)  circuit_version (BE u32)  — MUST be 3 here
+/// | [100..104) chain_id        (BE u32)  — advisory (carried, not used)
+/// | [104..136) CommR           (BE Fr)   — public input slot 3
+/// | [136..168) CommC           (BE Fr)   — public input slot 4
+/// | [168..200) challengeNonce  (BE Fr)   — public input slot 5
+/// | [200..232) epoch           (BE Fr)   — public input slot 6
+/// | [232..]    proof_bytes     (variable, Halo2-KZG SHPLONK transcript)
+/// ```
+///
+/// The first three 32-byte words (`replicaID`/`cid`/`sectorIndex`) place
+/// the version field at the SAME offset (96..100) as v1/v2 — that is the
+/// only shared structure. After the version/chain_id words come the PoSt
+/// commitments: **CommR then CommC** (and NO CommD), which is the byte
+/// layout that distinguishes v3 from v2 (where bytes [104..136) are CommD
+/// and there are five trailing words, not four). The public inputs are
+/// fed in `post::pi::{REPLICA_ID, CID, SECTOR_INDEX, COMM_R, COMM_C,
+/// CHALLENGE_NONCE, EPOCH}` order to match what the prover committed.
+///
+/// **Domain separation:** a PoRep proof presented as v3 fails because the
+/// PoRep VK expects 8 public inputs but the PoSt VK expects 7 (and the
+/// keys differ); a PoSt proof presented as v2 fails symmetrically; an
+/// inference proof (3 inputs) fails against either. No proof + public-
+/// input pair satisfies more than one circuit.
+#[cfg(feature = "halo2-substrate")]
+pub fn verify_post_proof(input: &[u8]) -> Result<bool, VerifyError> {
+    use halo2_proofs::plonk::verify_proof_multi;
+    use halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme;
+    use halo2_proofs::poly::kzg::multiopen::VerifierSHPLONK;
+    use halo2_proofs::poly::kzg::strategy::SingleStrategy;
+    use halo2_proofs::transcript::{Blake2bRead, Challenge255, TranscriptReadBuffer};
+    use halo2curves::bn256::{Bn256, Fr as Halo2Fr, G1Affine};
+    use halo2curves::ff::PrimeField as _;
+
+    // 7 public-input field elements × 32B + circuit_version(4B) +
+    // chain_id(4B). The first 3 field elements precede the version/chain_id
+    // words; the last 4 (CommR, CommC, challengeNonce, epoch) follow them.
+    const HEADER_LEN: usize = 32 * 3 + 4 + 4 + 32 * 4;
+    if input.len() < HEADER_LEN {
+        return Err(VerifyError::Truncated {
+            needed: HEADER_LEN,
+            got: input.len(),
+        });
+    }
+
+    let circuit_version = u32::from_be_bytes(input[96..100].try_into().expect("4B"));
+    if circuit_version != CIRCUIT_VERSION_POST {
+        return Err(VerifyError::UnknownCircuitVersion(circuit_version));
+    }
+    let _chain_id = u32::from_be_bytes(input[100..104].try_into().expect("4B"));
+
+    // Big-endian 32-byte word → Halo2 Fr (canonical repr is LE).
+    let to_fr = |be: &[u8]| -> Result<Halo2Fr, VerifyError> {
+        let mut le: [u8; 32] = be.try_into().map_err(|_| VerifyError::PublicInputShape)?;
+        le.reverse();
+        Option::<Halo2Fr>::from(Halo2Fr::from_repr(le.into()))
+            .ok_or(VerifyError::PublicInputShape)
+    };
+
+    // Parse the 7 PoSt public inputs from their fixed offsets (NO CommD).
+    let replica_id = to_fr(&input[0..32])?;
+    let cid = to_fr(&input[32..64])?;
+    let sector_index = to_fr(&input[64..96])?;
+    let comm_r = to_fr(&input[104..136])?;
+    let comm_c = to_fr(&input[136..168])?;
+    let challenge_nonce = to_fr(&input[168..200])?;
+    let epoch = to_fr(&input[200..232])?;
+    let proof_bytes = &input[HEADER_LEN..];
+
+    // Assemble the instance column in post::pi slot order. This MUST match
+    // `PoStCircuit::public_inputs` exactly or the proof fails.
+    let mut public_row = vec![Halo2Fr::default(); post::pi::COUNT];
+    public_row[post::pi::REPLICA_ID] = replica_id;
+    public_row[post::pi::CID] = cid;
+    public_row[post::pi::SECTOR_INDEX] = sector_index;
+    public_row[post::pi::COMM_R] = comm_r;
+    public_row[post::pi::COMM_C] = comm_c;
+    public_row[post::pi::CHALLENGE_NONCE] = challenge_nonce;
+    public_row[post::pi::EPOCH] = epoch;
+
+    // Per-challenge VK (same pattern as PoRep): the PoSt circuit's fixed
+    // topology depends on the challenged node index (v=0 labeling-seed copy
+    // constraint + Merkle branch directions). Derive the VK keyed on the
+    // public `challengeNonce`; an out-of-range nonce (≥ N) is rejected.
+    let challenge_index = {
+        let repr = challenge_nonce.to_repr();
+        let bytes: &[u8] = repr.as_ref();
+        if bytes[1..].iter().any(|&b| b != 0) {
+            return Err(VerifyError::PublicInputShape);
+        }
+        bytes[0] as usize
+    };
+    if challenge_index >= porep::N {
+        return Err(VerifyError::PublicInputShape);
+    }
+
+    let (params, vk) = post_kzg_artifacts_v3(challenge_index);
+    let public_inputs: Vec<Vec<Halo2Fr>> = vec![public_row];
+    let verifier_params = params.verifier_params();
+    let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof_bytes);
+    let verified = verify_proof_multi::<
+        KZGCommitmentScheme<Bn256>,
+        VerifierSHPLONK<Bn256>,
+        _,
+        _,
+        SingleStrategy<_>,
+    >(&verifier_params, vk, &[public_inputs], &mut transcript);
+
+    Ok(verified)
+}
+
+/// PIN-P1 step (b): lazy-init the ParamsKZG (SRS) and VerifyingKey for the
+/// v3 reduced PoStCircuit. Mirrors `porep_kzg_artifacts_v2` exactly — same
+/// CHAIN-003 fail-closed SRS-source policy, same per-challenge VK pattern,
+/// same `k`. The ONLY difference is the circuit (PoSt, not PoRep).
+///
+/// **k:** the reduced PoSt circuit is LIGHTER than PoRep (no encoding
+/// bridge, no CommD inclusion) so it fits comfortably at the same k=13 the
+/// PoRep circuit uses; keeping `k` uniform across v2/v3 lets a node size a
+/// single SRS for both. (The v3 ParamsKZG is built independently of v2's so
+/// each VK derivation stays deterministic and isolated.)
+///
+/// **Per-challenge VK:** one VK per challenge index (`0..N`), all sharing
+/// the single k=13 ParamsKZG. `challenge_index` is bounded `< N` by the
+/// caller.
+#[cfg(feature = "halo2-substrate")]
+fn post_kzg_artifacts_v3(
+    challenge_index: usize,
+) -> (
+    &'static halo2_proofs::poly::kzg::commitment::ParamsKZG<halo2curves::bn256::Bn256>,
+    &'static halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>,
+) {
+    use halo2_proofs::plonk::{keygen_vk, Circuit as _};
+    use halo2_proofs::poly::kzg::commitment::ParamsKZG;
+    use halo2curves::bn256::Bn256;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use std::sync::OnceLock;
+
+    assert!(
+        challenge_index < crate::zkp::halo2::porep::N,
+        "post_kzg_artifacts_v3: challenge_index {challenge_index} out of range (N={})",
+        crate::zkp::halo2::porep::N
+    );
+
+    static PARAMS: OnceLock<ParamsKZG<Bn256>> = OnceLock::new();
+    // One VK slot per challenge index (N is a small compile-time const).
+    static VKS: [OnceLock<halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>>;
+        crate::zkp::halo2::porep::N] =
+        [const { OnceLock::new() }; crate::zkp::halo2::porep::N];
+
+    // Reduced PoSt circuit degree (matches the PoRep k for uniform SRS).
+    const V3_K: u32 = 13;
+
+    // SAME CHAIN-003 fail-closed policy as the inference + PoRep paths.
+    let insecure_dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-srs");
+    let source =
+        resolve_srs_source(std::env::var("CITRATE_PTAU_PATH").ok(), insecure_dev_allowed);
+
+    let params = PARAMS.get_or_init(|| match source {
+        SrsSource::Ceremony(path) => {
+            eprintln!(
+                "[citrate-execution] Loading reduced-PoSt SRS from CITRATE_PTAU_PATH={} (k={})",
+                path, V3_K
+            );
+            crate::zkp::halo2::ptau::load_ptau_into_params_kzg(&path, V3_K).unwrap_or_else(|e| {
+                panic!(
+                    "[citrate-execution] FATAL: failed to load SRS from \
+                     CITRATE_PTAU_PATH={path}: {e}. The node cannot serve \
+                     0x0108 circuit_version=3 (reduced PoSt) without a valid \
+                     PPoT .ptau file. See runbooks/RM_M1B_SOAK.md."
+                )
+            })
+        }
+        SrsSource::InsecureDevSeed => {
+            eprintln!(
+                "[citrate-execution] WARNING: CITRATE_PTAU_PATH not set; using \
+                 deterministic seed-based SRS for reduced PoSt (circuit_version=3). \
+                 DEV/TEST ONLY — production validators must set CITRATE_PTAU_PATH."
+            );
+            let mut rng = StdRng::from_seed([0x4D; 32]);
+            ParamsKZG::<Bn256>::setup(V3_K, &mut rng)
+        }
+        SrsSource::Refuse => {
+            panic!(
+                "[citrate-execution] FATAL (CHAIN-003 fail-closed): 0x0108 \
+                 circuit_version=3 (reduced PoSt) requires a ceremony SRS. Set \
+                 CITRATE_PTAU_PATH to a verified PPoT .ptau file (rebuild with \
+                 --features insecure-dev-srs for local dev ONLY). See \
+                 runbooks/RM_M1B_SOAK.md."
+            );
+        }
+    });
+
+    let vk = VKS[challenge_index].get_or_init(|| {
+        let circuit = crate::zkp::halo2::post::PoStCircuit::for_keygen(challenge_index);
+        keygen_vk(params, &circuit.without_witnesses())
+            .expect("VK keygen for reduced PoStCircuit v3")
+    });
+
+    (params, vk)
+}
+
 // ---------------------------------------------------------------------------
 // Feature-gated body — Halo2 deps and chips.
 // ---------------------------------------------------------------------------
@@ -698,6 +928,12 @@ pub mod circuits;
 /// NOT touch the inference circuit or the live 0x0108 verifier.
 #[cfg(feature = "halo2-substrate")]
 pub mod porep;
+
+/// PIN-P1 step (b) — Proof-of-Spacetime (PoSt) circuit (reduced instance).
+/// Additive; reuses `porep`'s native sealing + topology. Does NOT touch
+/// the inference (v1) or PoRep (v2) verification paths.
+#[cfg(feature = "halo2-substrate")]
+pub mod post;
 
 #[cfg(feature = "halo2-substrate")]
 pub mod srs;
