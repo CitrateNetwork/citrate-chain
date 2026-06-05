@@ -5,6 +5,35 @@ import {Test} from "forge-std/Test.sol";
 import {ComputeVerifier} from "../src/ComputeVerifier.sol";
 import {Governable} from "../src/lib/Governable.sol";
 
+/// @dev Controllable mock of the live 0x0108 INFERENCE_PROOF_VERIFY precompile.
+///      Returns a configurable 32-byte big-endian verdict (1 == valid, 0 ==
+///      reject), exactly like the real Halo2-KZG verifier. `vm.etch`'d over
+///      address(0x0108). It is STATICCALL-safe: the fallback performs no storage
+///      writes, so it works under ComputeVerifier's view staticcall. Tests assert
+///      the exact wire-format bytes via `vm.expectCall`, not via the mock.
+contract MockInferenceVerifier {
+    /// @dev The verdict byte (1 or 0) lives in the runtime code's returndata via
+    ///      a constant set at etch time. Since storage writes are illegal under
+    ///      STATICCALL, we expose two flavors by deploying two distinct mocks.
+    bytes32 private immutable VERDICT;
+
+    constructor(bool valid) {
+        VERDICT = bytes32(valid ? uint256(1) : uint256(0));
+    }
+
+    fallback(bytes calldata) external returns (bytes memory) {
+        return abi.encode(VERDICT);
+    }
+}
+
+/// @dev A mock 0x0108 that always reverts, to exercise the staticcall-failure
+///      path (=> Invalid). STATICCALL-safe (no writes).
+contract RevertingInferenceVerifier {
+    fallback(bytes calldata) external returns (bytes memory) {
+        revert("verifier exploded");
+    }
+}
+
 /// @title ComputeVerifierTest — 20+ tests covering all 9 ComputeVerification.tla invariants
 /// @dev Tests tiered verification dispatch: Commitment, ZKProof, TEE
 ///      INV-1: TypeOK
@@ -194,48 +223,76 @@ contract ComputeVerifierTest is Test {
     }
 
     // ============================================================
-    // ZK Proof Verification Tests (Tier 2)
+    // ZK Proof Verification Tests (Tier 2) — D2 fix: live 0x0108 verifier
     // ============================================================
+    //
+    // The ZK tier now targets the live Halo2-KZG inference verifier at 0x0108
+    // (was the 0x0104 SHA3-commitment STUB). publicInputs MUST be exactly 96
+    // bytes: input_commitment(32) ‖ model_commitment(32) ‖ output_commitment(32).
+    // These tests etch a controllable mock over 0x0108. The two pre-existing
+    // ZK-tier tests (test_verifyZKProof_valid / _invalid) were updated from the
+    // 0x0104 `abi.encode(bool)` mock to the 0x0108 `uint256` BE verdict + the
+    // 96-byte publicInputs ABI; the rest of this section is new.
 
-    /// @dev INV-4: ZKProofValid — test ZK verification path (uses precompile mock)
-    function test_verifyZKProof_valid() public {
-        _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
-        // Force tier to ZKProof (auto-upgraded from Commitment)
-        _submitCommitment(1);
+    address internal constant INFERENCE_PRECOMPILE = address(0x0108);
 
-        // Mock the ZK precompile to return true
-        bytes memory anyCalldata = new bytes(0);
-        bytes memory mockReturn = abi.encode(true);
-        vm.mockCall(
-            address(0x0104),
-            anyCalldata,
-            mockReturn
-        );
+    // Canonical inference public inputs (3 × 32B BE Fr commitments).
+    bytes32 internal inputCommitment = keccak256("input-commitment");
+    bytes32 internal modelCommitment = keccak256("model-commitment");
+    bytes32 internal outputCommitment = keccak256("output-commitment");
 
-        bytes memory proof = hex"AABBCCDD";
-        bytes memory publicInputs = hex"1122";
-        bool valid = verifier.verifyZKProof(1, proof, publicInputs);
-        assertTrue(valid, "Mocked ZK proof should be valid");
+    /// @dev Etch a verdict-returning mock (1 or 0) over the 0x0108 address.
+    function _etch0x0108(bool valid) internal {
+        MockInferenceVerifier mock = new MockInferenceVerifier(valid);
+        vm.etch(INFERENCE_PRECOMPILE, address(mock).code);
     }
 
-    /// @dev ZK proof failure path
+    /// @dev Build a well-formed 96-byte ZK-tier publicInputs blob.
+    function _publicInputs96() internal view returns (bytes memory) {
+        return abi.encodePacked(inputCommitment, modelCommitment, outputCommitment);
+    }
+
+    /// @dev The exact bytes ComputeVerifier must STATICCALL 0x0108 with, per the
+    ///      v1 inference wire format:
+    ///        commitments(96) ‖ circuit_version=1 (BE u32) ‖ chain_id (BE u32) ‖ proof
+    function _expected0x0108Input(bytes memory proof) internal view returns (bytes memory) {
+        return abi.encodePacked(
+            inputCommitment,
+            modelCommitment,
+            outputCommitment,
+            uint32(1),
+            uint32(block.chainid),
+            proof
+        );
+    }
+
+    /// @dev INV-4: ZKProofValid — verifyZKProof() happy path against live 0x0108.
+    ///      Updated from the legacy 0x0104 bool-mock to the 0x0108 uint256 verdict
+    ///      + 96-byte publicInputs ABI.
+    function test_verifyZKProof_valid() public {
+        _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
+        _submitCommitment(1);
+        _etch0x0108(true);
+
+        bool valid = verifier.verifyZKProof(1, hex"AABBCCDD", _publicInputs96());
+        assertTrue(valid, "Valid 0x0108 verdict should pass");
+
+        ComputeVerifier.VerificationResult result = verifier.getResult(1);
+        assertEq(uint(result), uint(ComputeVerifier.VerificationResult.Valid), "Result Valid");
+    }
+
+    /// @dev ZK proof failure path: 0x0108 returns 0 => Invalid. Updated from the
+    ///      legacy 0x0104 mock.
     function test_verifyZKProof_invalid() public {
         _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
         _submitCommitment(1);
+        _etch0x0108(false);
 
-        // Mock the ZK precompile to return false
-        bytes memory anyCalldata2 = new bytes(0);
-        bytes memory mockReturn = abi.encode(false);
-        vm.mockCall(
-            address(0x0104),
-            anyCalldata2,
-            mockReturn
-        );
+        bool valid = verifier.verifyZKProof(1, hex"BADD0001", _publicInputs96());
+        assertFalse(valid, "0x0108 reject (0) should be invalid");
 
-        bytes memory proof = hex"BADD0001";
-        bytes memory publicInputs = hex"1122";
-        bool valid = verifier.verifyZKProof(1, proof, publicInputs);
-        assertFalse(valid, "Failed ZK proof should be invalid");
+        ComputeVerifier.VerificationResult result = verifier.getResult(1);
+        assertEq(uint(result), uint(ComputeVerifier.VerificationResult.Invalid), "Result Invalid");
     }
 
     function test_verifyZKProof_wrongTier_reverts() public {
@@ -243,7 +300,105 @@ contract ComputeVerifierTest is Test {
         _submitCommitment(1);
 
         vm.expectRevert("ComputeVerifier: wrong tier");
-        verifier.verifyZKProof(1, hex"AABB", hex"1122");
+        verifier.verifyZKProof(1, hex"AABB", _publicInputs96());
+    }
+
+    /// @dev D2 fix: the ZK tier must STATICCALL 0x0108 (NOT the 0x0104 stub) with
+    ///      the exact v1 inference ABI. Asserts the precompile address AND the
+    ///      exact calldata bytes via vm.expectCall.
+    function test_verifyZKProof_callsLive0x0108_withCorrectABI() public {
+        _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
+        _submitCommitment(1);
+        _etch0x0108(true);
+
+        bytes memory proof = hex"DEADBEEFCAFE";
+        bytes memory expectedInput = _expected0x0108Input(proof);
+
+        // Exact-calldata expectation against the LIVE precompile address.
+        vm.expectCall(INFERENCE_PRECOMPILE, expectedInput);
+
+        bool valid = verifier.verifyZKProof(1, proof, _publicInputs96());
+        assertTrue(valid, "Should verify via 0x0108 with correct ABI");
+    }
+
+    /// @dev The legacy 0x0104 stub must NOT be called any more (D2 regression).
+    function test_verifyZKProof_neverCalls0x0104Stub() public {
+        _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
+        _submitCommitment(1);
+        _etch0x0108(true);
+
+        // expectCall with count 0 => the 0x0104 stub address is never called.
+        vm.expectCall(address(0x0104), bytes(""), 0);
+        verifier.verifyZKProof(1, hex"AABBCCDD", _publicInputs96());
+    }
+
+    /// @dev ZK-tier ABI guard: publicInputs that is not exactly 96 bytes reverts.
+    function test_verifyZKProof_badPublicInputsLength_reverts() public {
+        _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
+        _submitCommitment(1);
+        _etch0x0108(true);
+
+        // 95 bytes (one short) — must revert before touching the precompile.
+        bytes memory shortInputs = new bytes(95);
+        vm.expectRevert("ComputeVerifier: bad publicInputs length");
+        verifier.verifyZKProof(1, hex"AABB", shortInputs);
+
+        // 97 bytes (one long) — also reverts. Re-configure a fresh job since the
+        // prior call marked job 1's proof submitted via the revert? No: a revert
+        // rolls back state, so job 1 is still pending. Reuse it.
+        bytes memory longInputs = new bytes(97);
+        vm.expectRevert("ComputeVerifier: bad publicInputs length");
+        verifier.verifyZKProof(1, hex"AABB", longInputs);
+    }
+
+    /// @dev staticcall failure (0x0108 reverts) => Invalid, no revert at caller.
+    function test_verifyZKProof_precompileReverts_isInvalid() public {
+        _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
+        _submitCommitment(1);
+
+        RevertingInferenceVerifier boom = new RevertingInferenceVerifier();
+        vm.etch(INFERENCE_PRECOMPILE, address(boom).code);
+
+        bool valid = verifier.verifyZKProof(1, hex"AABBCCDD", _publicInputs96());
+        assertFalse(valid, "Precompile revert => Invalid");
+
+        ComputeVerifier.VerificationResult result = verifier.getResult(1);
+        assertEq(uint(result), uint(ComputeVerifier.VerificationResult.Invalid), "Result Invalid on revert");
+    }
+
+    /// @dev ZK tier via the verify() dispatcher with well-formed proofData
+    ///      (proofLen ‖ proof ‖ 96-byte commitments) => Valid, calling 0x0108
+    ///      with the correct ABI.
+    function test_verify_zkTier_dispatch_valid() public {
+        _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
+        _submitCommitment(1);
+        _etch0x0108(true);
+
+        bytes memory proof = hex"0102030405060708";
+        bytes memory publicInputs = _publicInputs96();
+        // proofData = proofLen(32) ‖ proof ‖ publicInputs
+        bytes memory proofData = abi.encodePacked(uint256(proof.length), proof, publicInputs);
+
+        vm.expectCall(INFERENCE_PRECOMPILE, _expected0x0108Input(proof));
+
+        ComputeVerifier.VerificationResult result = verifier.verify(
+            1, ComputeVerifier.VerificationTier.ZKProof, proofData
+        );
+        assertEq(uint(result), uint(ComputeVerifier.VerificationResult.Valid), "ZK dispatch => Valid");
+    }
+
+    /// @dev verify() ZK dispatch with a non-96-byte publicInputs slice reverts.
+    function test_verify_zkTier_dispatch_badPublicInputs_reverts() public {
+        _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
+        _submitCommitment(1);
+        _etch0x0108(true);
+
+        bytes memory proof = hex"0102030405060708";
+        bytes memory badPublicInputs = new bytes(64); // not 96
+        bytes memory proofData = abi.encodePacked(uint256(proof.length), proof, badPublicInputs);
+
+        vm.expectRevert("ComputeVerifier: bad publicInputs length");
+        verifier.verify(1, ComputeVerifier.VerificationTier.ZKProof, proofData);
     }
 
     // ============================================================

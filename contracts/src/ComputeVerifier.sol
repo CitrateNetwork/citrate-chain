@@ -52,8 +52,23 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     /// @notice Maximum bisection rounds for dispute resolution (INV-6: BisectionTerminates)
     uint256 public constant MAX_BISECTION_ROUNDS = 10;
 
-    /// @notice ZK proof verification precompile address (Citrate precompile 0x0104)
-    address public constant ZK_VERIFY_PRECOMPILE = address(0x0104);
+    /// @notice Live Citrate INFERENCE_PROOF_VERIFY precompile (Halo2-KZG), 0x0108.
+    /// @dev The Citrate compute marketplace IS an inference marketplace: a compute
+    ///      job's ZK proof is an inference proof whose 3 public commitments are
+    ///      (input, model, output). This precompile is the live Halo2-KZG verifier
+    ///      (core/execution/src/precompiles/verify.rs). It supersedes the legacy
+    ///      0x0104 SHA3-commitment STUB, which never performed real ZK verification
+    ///      (D2 defect): high-value jobs routed to 0x0104 fell back to fake
+    ///      verification. The ZK tier now targets 0x0108.
+    address public constant INFERENCE_PROOF_VERIFY = address(0x0108);
+
+    /// @notice circuit_version selecting the v1 inference VK + 3-commitment layout
+    ///         on 0x0108 (see verify.rs CIRCUIT_VERSION_LINEAR_Q16).
+    uint32 internal constant INFERENCE_CIRCUIT_V1 = 1;
+
+    /// @notice Exact byte length of the ZK-tier publicInputs blob:
+    ///         input_commitment(32) ‖ model_commitment(32) ‖ output_commitment(32).
+    uint256 internal constant ZK_PUBLIC_INPUTS_LEN = 96;
 
     // ============================================================
     // State
@@ -521,7 +536,15 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         return VerificationResult.Valid;
     }
 
-    /// @dev Verify ZK proof via precompile (Tier 2)
+    /// @dev Verify ZK proof via the live 0x0108 inference verifier (Tier 2).
+    /// @dev ZK-tier proofData ABI:
+    ///        proofData = proofLen(32) ‖ proof ‖ publicInputs
+    ///      where `proof` is `proofLen` bytes of the Halo2-KZG transcript and
+    ///      `publicInputs` is EXACTLY 96 bytes:
+    ///        input_commitment(32) ‖ model_commitment(32) ‖ output_commitment(32)
+    ///      (32-byte big-endian Fr field elements). These three commitments are
+    ///      the public inputs the inference circuit binds. See
+    ///      _callZKVerifyPrecompile for how they are framed for 0x0108.
     function _verifyZKProof(
         uint256 /* jobId */,
         bytes calldata proofData
@@ -557,25 +580,47 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         return valid ? VerificationResult.Valid : VerificationResult.Invalid;
     }
 
-    /// @dev Call the ZK proof verification precompile
+    /// @dev STATICCALL the live 0x0108 inference verifier with the v1 inference
+    ///      wire format and return true iff the proof verifies.
+    ///
+    ///      `publicInputs` MUST be exactly 96 bytes:
+    ///        input_commitment(32) ‖ model_commitment(32) ‖ output_commitment(32)
+    ///
+    ///      The 0x0108 input is then framed per verify.rs::inference_proof_verify:
+    ///        | 32B input_commitment | 32B model_commitment | 32B output_commitment |
+    ///        | 4B circuit_version=1 (BE) | 4B chain_id (BE) | proof_bytes |
+    ///
+    ///      The precompile returns a 32-byte big-endian word: 1 == valid, 0 ==
+    ///      reject. A revert / wrong-length return / non-1 verdict => false (the
+    ///      "no proof" verdict), mirroring IPFSIncentivesV2._verify. NO state
+    ///      changes (view).
     function _callZKVerifyPrecompile(
         bytes calldata proof,
         bytes calldata publicInputs
     ) internal view returns (bool) {
-        bytes memory input = abi.encodePacked(
-            uint256(proof.length),
-            proof,
-            publicInputs
+        require(
+            publicInputs.length == ZK_PUBLIC_INPUTS_LEN,
+            "ComputeVerifier: bad publicInputs length"
         );
 
-        // Call precompile at 0x0104
-        (bool success, bytes memory result) = ZK_VERIFY_PRECOMPILE.staticcall(input);
+        // publicInputs = input_commitment ‖ model_commitment ‖ output_commitment.
+        // Frame for 0x0108: commitments ‖ circuit_version(BE) ‖ chain_id(BE) ‖ proof.
+        bytes memory input = abi.encodePacked(
+            publicInputs,
+            INFERENCE_CIRCUIT_V1,
+            uint32(block.chainid),
+            proof
+        );
 
-        if (!success || result.length < 32) {
+        (bool success, bytes memory result) = INFERENCE_PROOF_VERIFY.staticcall(input);
+
+        // Safe decode (mirrors IPFSIncentivesV2._verify): a structural failure or
+        // a non-1 verdict is treated as "not verified" => Invalid at the caller.
+        if (!success || result.length != 32) {
             return false;
         }
 
-        return abi.decode(result, (bool));
+        return abi.decode(result, (uint256)) == 1;
     }
 
     /// @dev Verify TEE attestation signature from a trusted oracle
