@@ -412,15 +412,28 @@ fn domain_sep_porep_tampered_public_input_rejected() {
     );
 }
 
-/// (d) Unknown circuit_version (including the reserved-but-unimplemented
-/// PoSt v3) must error — unchanged behavior.
+/// (d) Unknown circuit_version must error — unchanged behavior.
+///
+/// PIN-P1 step (b) note: v3 is NO LONGER in this rejected set — it was
+/// activated as the reduced PoSt circuit. Feeding a PoRep proof as v3
+/// here would route to the PoSt verifier (different VK/ABI) and either
+/// cryptographically reject (0) or error on the shorter PoSt header, NOT
+/// silently verify; the dedicated cross-version rejection is covered in
+/// `post_proof_verify_e2e.rs`. This test now asserts only the TRULY
+/// unknown versions (≥ 4) still hard-error as before.
 #[test]
-fn domain_sep_unknown_and_reserved_versions_rejected() {
+fn domain_sep_unknown_versions_rejected() {
     let v = 0usize;
     let (sealed, proof_bytes) = generate_porep_proof(v);
     let addr = Address(addresses::INFERENCE_PROOF_VERIFY);
 
-    for bad_version in [CIRCUIT_VERSION_POST_RESERVED, 4u32, 999u32, u32::MAX] {
+    // CIRCUIT_VERSION_POST_RESERVED (== 3) is intentionally EXCLUDED: it
+    // is now the live PoSt version. The first unknown version is 4.
+    assert_eq!(
+        CIRCUIT_VERSION_POST_RESERVED, 3,
+        "v3 is the (now-live) PoSt version; unknown set starts at 4"
+    );
+    for bad_version in [4u32, 999u32, u32::MAX] {
         let wire = build_porep_wire(&sealed, v, bad_version, 40204, &proof_bytes);
         let result = execute(&addr, &wire, 100_000_000);
         assert!(
