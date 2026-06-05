@@ -85,6 +85,18 @@ pub mod gas_costs {
     /// Calibrated as a placeholder; RM-M1b WP-M1b.6 calibrates against
     /// real proof bench numbers.
     pub const INFERENCE_PROOF_VERIFY_PER_BYTE: u64 = 50;
+
+    /// PIN-P1 step (a): 0x0108 circuit_version=2 (reduced PoRep) base
+    /// cost. Mirrors the inference base — same single-pairing SHPLONK
+    /// verifier shape; the PoRep VK is a different key but the
+    /// verification cost class is identical. Calibration against real
+    /// PoRep proof benches is a PIN-P1 follow-up.
+    pub const POREP_PROOF_VERIFY_BASE: u64 = 500_000;
+
+    /// PIN-P1 step (a): 0x0108 circuit_version=2 per-byte cost. Mirrors
+    /// the inference per-byte (transcript scanning scales with proof
+    /// length).
+    pub const POREP_PROOF_VERIFY_PER_BYTE: u64 = 50;
 }
 
 /// Route to the right precompile by address.
@@ -346,34 +358,79 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
     })
 }
 
-/// 0x0108 INFERENCE_PROOF_VERIFY — Halo2-KZG verifier for the
-/// InferenceCircuit family.
+/// 0x0108 INFERENCE_PROOF_VERIFY — Halo2-KZG verifier, **version-
+/// dispatched** (PIN-P1 step (a)).
 ///
-/// **Input format (binary):**
-/// ```text
-/// | 32B  input_commitment   (BE Fr)
-/// | 32B  model_commitment   (BE Fr)
-/// | 32B  output_commitment  (BE Fr)
-/// |  4B  circuit_version    (BE u32; v1 = 1)
-/// |  4B  chain_id           (BE u32; advisory in v1)
-/// | proof_bytes (variable)
-/// ```
+/// The `circuit_version` field (bytes 96..100, BE u32) selects BOTH the
+/// verifying key AND the public-input parsing layout, so a proof built
+/// for one circuit cannot be confused with another:
 ///
-/// **Output:** 32-byte big-endian word, value 1 if proof verifies,
-/// 0 if rejected. Returns Err on structural problems (truncated
-/// input, unknown circuit_version).
+/// - **v1 — inference** (`CIRCUIT_VERSION_LINEAR_Q16`). UNCHANGED from
+///   the original 0x0108: 3-commitment layout, inference VK.
 ///
-/// **Gas:** `INFERENCE_PROOF_VERIFY_BASE + per_byte * input.len()`.
-/// The per-byte component covers transcript scanning. Calibration
-/// is RM-M1b WP-M1b.6 follow-up.
+///   ```text
+///   | 32B input_commitment | 32B model_commitment | 32B output_commitment |
+///   | 4B circuit_version=1 | 4B chain_id | proof_bytes |
+///   ```
 ///
-/// **Determinism:** the SRS + VK are deterministically derived
-/// (RM-M1b v1: from a fixed seed; production: from the .ptau
-/// file). The Halo2-KZG verifier itself is bit-deterministic.
+/// - **v2 — reduced PoRep** (`CIRCUIT_VERSION_POREP_REDUCED`). The 8
+///   PoRep public-input field elements, PoRep VK. The version field
+///   sits at the SAME offset (96..100); everything else is the PoRep
+///   ABI (see `zkp::halo2::verify_porep_proof` for the byte layout).
+///
+///   ```text
+///   | 32B replicaID | 32B cid | 32B sectorIndex |
+///   | 4B circuit_version=2 | 4B chain_id |
+///   | 32B CommD | 32B CommR | 32B CommC | 32B challengeNonce | 32B epoch |
+///   | proof_bytes |
+///   ```
+///
+/// - **v3 (PoSt) reserved** + any other version → rejected (no VK
+///   registered), exactly as an unknown version was rejected before.
+///
+/// **Output:** 32-byte big-endian word, 1 if the proof verifies, 0 if
+/// rejected. Returns Err on structural problems (truncated input,
+/// unknown circuit_version, insufficient gas).
+///
+/// **Gas:** version-specific base + per-byte. v1 keeps its exact
+/// `INFERENCE_PROOF_VERIFY_BASE + per_byte·len` formula (unchanged); v2
+/// mirrors it (`POREP_PROOF_VERIFY_BASE + per_byte·len`). The version
+/// is read before metering so the right formula applies; an
+/// unknown/short input is charged the inference formula (its base
+/// dominates) before the structured rejection.
 pub fn inference_proof_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
+    // Peek the circuit_version (bytes 96..100) to pick the gas formula.
+    // A short input (< 100 bytes) can't carry a version; charge the
+    // inference base (the historical default) and let the verifier
+    // surface the structured Truncated error.
+    const VERSION_OFFSET: usize = 96;
+    let version = if input.len() >= VERSION_OFFSET + 4 {
+        u32::from_be_bytes(
+            input[VERSION_OFFSET..VERSION_OFFSET + 4]
+                .try_into()
+                .expect("4B"),
+        )
+    } else {
+        // Unknown — default to the inference (v1) gas schedule.
+        crate::zkp::halo2::CIRCUIT_VERSION_LINEAR_Q16
+    };
+
+    let (base, per_byte) = match version {
+        crate::zkp::halo2::CIRCUIT_VERSION_POREP_REDUCED => (
+            gas_costs::POREP_PROOF_VERIFY_BASE,
+            gas_costs::POREP_PROOF_VERIFY_PER_BYTE,
+        ),
+        // v1 and everything else use the inference schedule (v1 is the
+        // historical default; unknown versions are rejected by the
+        // verifier after paying the base, preserving prior behavior).
+        _ => (
+            gas_costs::INFERENCE_PROOF_VERIFY_BASE,
+            gas_costs::INFERENCE_PROOF_VERIFY_PER_BYTE,
+        ),
+    };
+
     // Gas charge first — covers parsing + verification effort.
-    let gas_used = gas_costs::INFERENCE_PROOF_VERIFY_BASE
-        .saturating_add(gas_costs::INFERENCE_PROOF_VERIFY_PER_BYTE * input.len() as u64);
+    let gas_used = base.saturating_add(per_byte * input.len() as u64);
     if gas_limit < gas_used {
         return Err(anyhow!(
             "Insufficient gas for INFERENCE_PROOF_VERIFY: need {gas_used}, have {gas_limit}"
@@ -397,7 +454,9 @@ pub fn inference_proof_verify(input: &[u8], gas_limit: u64) -> Result<Precompile
 
     #[cfg(feature = "halo2-substrate")]
     {
-        let result = match crate::zkp::halo2::verify_inference_proof(input) {
+        // Version-dispatching verifier. v1 routes to the UNCHANGED
+        // inference path; v2 routes to the PoRep path; unknown rejects.
+        let result = match crate::zkp::halo2::verify_proof_dispatch(input) {
             Ok(b) => b,
             Err(e) => {
                 return Err(anyhow!("INFERENCE_PROOF_VERIFY error: {e}"));
