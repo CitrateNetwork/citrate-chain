@@ -537,12 +537,14 @@ pub fn verify_porep_proof(input: &[u8]) -> Result<bool, VerifyError> {
     public_row[porep::pi::CHALLENGE_NONCE] = challenge_nonce;
     public_row[porep::pi::EPOCH] = epoch;
 
-    // The reduced PoRep circuit's VK depends on the challenged node
-    // index, because the v=0 case copy-constrains the labeling seed to
-    // replicaID (vs. the DRG-parent cell for v≥1) and the Merkle branch
-    // directions are part of the circuit's fixed topology. We therefore
-    // derive the VK keyed on the public `challengeNonce`. An out-of-range
-    // nonce (≥ N) has no honest circuit and is rejected.
+    // PIN-P1 step (c1): the reduced PoRep circuit is now INDEX-AGNOSTIC —
+    // the challenge index is a witness, bit-decomposed in-circuit and bound
+    // to the public `challengeNonce`, and the Merkle directions are derived
+    // in-circuit via conditional swap. So ONE VK verifies every index
+    // (TD-18 killed; no per-index cache). We still range-check the public
+    // `challengeNonce` here: an out-of-range nonce (≥ N) has no honest
+    // circuit (the witness's bit-decomposition cannot satisfy a value ≥ N
+    // with only MERKLE_DEPTH bits), and we reject it early before the VK.
     let challenge_index = {
         // challengeNonce is a small node index in 0..N; read it from the
         // canonical LE repr's low bytes. Anything ≥ N is invalid.
@@ -559,7 +561,7 @@ pub fn verify_porep_proof(input: &[u8]) -> Result<bool, VerifyError> {
         return Err(VerifyError::PublicInputShape);
     }
 
-    let (params, vk) = porep_kzg_artifacts_v2(challenge_index);
+    let (params, vk) = porep_kzg_artifacts_v2();
     let public_inputs: Vec<Vec<Halo2Fr>> = vec![public_row];
     let verifier_params = params.verifier_params();
     let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof_bytes);
@@ -586,16 +588,14 @@ pub fn verify_porep_proof(input: &[u8]) -> Result<bool, VerifyError> {
 /// circuit's VK derivation deterministic and isolated. (When loading
 /// from a real .ptau, `load_ptau_into_params_kzg` is given the v2 `k`.)
 ///
-/// **Per-challenge VK:** the reduced PoRep circuit's fixed topology
-/// depends on the challenged node index (the v=0 labeling-seed copy
-/// constraint differs from v≥1, and Merkle branch directions are
-/// baked in). So one VK is derived and cached PER challenge index
-/// (`0..N`), all sharing the single k=13 ParamsKZG. `challenge_index`
-/// is bounded `< N` by the caller.
+/// **Single VK (PIN-P1 step c1):** the reduced PoRep circuit is now
+/// index-agnostic (the challenge index is a witness, bit-decomposed +
+/// conditionally-swapped in-circuit). ONE VK is derived from the
+/// `PoRepCircuit::default().without_witnesses()` shape and verifies
+/// honest proofs for ALL challenge indices — TD-18 (the per-challenge VK
+/// cache) is killed. No `challenge_index` argument remains.
 #[cfg(feature = "halo2-substrate")]
-fn porep_kzg_artifacts_v2(
-    challenge_index: usize,
-) -> (
+fn porep_kzg_artifacts_v2() -> (
     &'static halo2_proofs::poly::kzg::commitment::ParamsKZG<halo2curves::bn256::Bn256>,
     &'static halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>,
 ) {
@@ -606,20 +606,13 @@ fn porep_kzg_artifacts_v2(
     use rand::SeedableRng;
     use std::sync::OnceLock;
 
-    assert!(
-        challenge_index < crate::zkp::halo2::porep::N,
-        "porep_kzg_artifacts_v2: challenge_index {challenge_index} out of range (N={})",
-        crate::zkp::halo2::porep::N
-    );
-
     static PARAMS: OnceLock<ParamsKZG<Bn256>> = OnceLock::new();
-    // One VK slot per challenge index (N is a small compile-time const).
-    static VKS: [OnceLock<halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>>;
-        crate::zkp::halo2::porep::N] =
-        [const { OnceLock::new() }; crate::zkp::halo2::porep::N];
+    // A SINGLE VK (no longer one-per-index).
+    static VK: OnceLock<halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>> =
+        OnceLock::new();
 
     // Reduced PoRep circuit degree (see porep::tests::K).
-    const V2_K: u32 = 13;
+    const V2_K: u32 = 14;
 
     // SAME CHAIN-003 fail-closed policy as the inference path.
     let insecure_dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-srs");
@@ -661,14 +654,11 @@ fn porep_kzg_artifacts_v2(
         }
     });
 
-    let vk = VKS[challenge_index].get_or_init(|| {
-        // Derive the VK from the circuit topology for THIS challenge
-        // index under `without_witnesses()` so it matches what the
-        // prover's keygen produced. `from_challenge_index` builds a
-        // witness-free circuit whose fixed structure (labeling-seed
-        // copy constraint + Merkle branch directions) matches challenge
-        // `challenge_index`.
-        let circuit = crate::zkp::halo2::porep::PoRepCircuit::for_keygen(challenge_index);
+    let vk = VK.get_or_init(|| {
+        // Derive the SINGLE VK from the index-agnostic circuit shape under
+        // `without_witnesses()`. The shape is identical for every challenge
+        // index, so this one VK verifies all of them.
+        let circuit = crate::zkp::halo2::porep::PoRepCircuit::default();
         keygen_vk(params, &circuit.without_witnesses())
             .expect("VK keygen for reduced PoRepCircuit v2")
     });
@@ -766,10 +756,9 @@ pub fn verify_post_proof(input: &[u8]) -> Result<bool, VerifyError> {
     public_row[post::pi::CHALLENGE_NONCE] = challenge_nonce;
     public_row[post::pi::EPOCH] = epoch;
 
-    // Per-challenge VK (same pattern as PoRep): the PoSt circuit's fixed
-    // topology depends on the challenged node index (v=0 labeling-seed copy
-    // constraint + Merkle branch directions). Derive the VK keyed on the
-    // public `challengeNonce`; an out-of-range nonce (≥ N) is rejected.
+    // PIN-P1 step (c1): like PoRep, the PoSt circuit is now INDEX-AGNOSTIC,
+    // so ONE VK verifies every index (TD-18 killed). We still range-check
+    // the public `challengeNonce` (≥ N has no honest circuit) before the VK.
     let challenge_index = {
         let repr = challenge_nonce.to_repr();
         let bytes: &[u8] = repr.as_ref();
@@ -782,7 +771,7 @@ pub fn verify_post_proof(input: &[u8]) -> Result<bool, VerifyError> {
         return Err(VerifyError::PublicInputShape);
     }
 
-    let (params, vk) = post_kzg_artifacts_v3(challenge_index);
+    let (params, vk) = post_kzg_artifacts_v3();
     let public_inputs: Vec<Vec<Halo2Fr>> = vec![public_row];
     let verifier_params = params.verifier_params();
     let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof_bytes);
@@ -799,22 +788,21 @@ pub fn verify_post_proof(input: &[u8]) -> Result<bool, VerifyError> {
 
 /// PIN-P1 step (b): lazy-init the ParamsKZG (SRS) and VerifyingKey for the
 /// v3 reduced PoStCircuit. Mirrors `porep_kzg_artifacts_v2` exactly — same
-/// CHAIN-003 fail-closed SRS-source policy, same per-challenge VK pattern,
-/// same `k`. The ONLY difference is the circuit (PoSt, not PoRep).
+/// CHAIN-003 fail-closed SRS-source policy, same SINGLE index-agnostic VK
+/// (PIN-P1 step c1), same `k`. The ONLY difference is the circuit (PoSt).
 ///
 /// **k:** the reduced PoSt circuit is LIGHTER than PoRep (no encoding
-/// bridge, no CommD inclusion) so it fits comfortably at the same k=13 the
-/// PoRep circuit uses; keeping `k` uniform across v2/v3 lets a node size a
-/// single SRS for both. (The v3 ParamsKZG is built independently of v2's so
+/// bridge, no CommD inclusion) but the index-agnostic Merkle + parent
+/// inclusion bring it to the same k=14 the PoRep circuit uses; keeping `k`
+/// uniform across v2/v3 lets a node size a single SRS for both. (The v3
+/// ParamsKZG is built independently of v2's so
 /// each VK derivation stays deterministic and isolated.)
 ///
-/// **Per-challenge VK:** one VK per challenge index (`0..N`), all sharing
-/// the single k=13 ParamsKZG. `challenge_index` is bounded `< N` by the
-/// caller.
+/// **Single VK (PIN-P1 step c1):** like PoRep, one index-agnostic VK
+/// verifies all challenge indices — TD-18 killed. No `challenge_index`
+/// argument remains.
 #[cfg(feature = "halo2-substrate")]
-fn post_kzg_artifacts_v3(
-    challenge_index: usize,
-) -> (
+fn post_kzg_artifacts_v3() -> (
     &'static halo2_proofs::poly::kzg::commitment::ParamsKZG<halo2curves::bn256::Bn256>,
     &'static halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>,
 ) {
@@ -825,20 +813,13 @@ fn post_kzg_artifacts_v3(
     use rand::SeedableRng;
     use std::sync::OnceLock;
 
-    assert!(
-        challenge_index < crate::zkp::halo2::porep::N,
-        "post_kzg_artifacts_v3: challenge_index {challenge_index} out of range (N={})",
-        crate::zkp::halo2::porep::N
-    );
-
     static PARAMS: OnceLock<ParamsKZG<Bn256>> = OnceLock::new();
-    // One VK slot per challenge index (N is a small compile-time const).
-    static VKS: [OnceLock<halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>>;
-        crate::zkp::halo2::porep::N] =
-        [const { OnceLock::new() }; crate::zkp::halo2::porep::N];
+    // A SINGLE VK (no longer one-per-index).
+    static VK: OnceLock<halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>> =
+        OnceLock::new();
 
     // Reduced PoSt circuit degree (matches the PoRep k for uniform SRS).
-    const V3_K: u32 = 13;
+    const V3_K: u32 = 14;
 
     // SAME CHAIN-003 fail-closed policy as the inference + PoRep paths.
     let insecure_dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-srs");
@@ -880,8 +861,8 @@ fn post_kzg_artifacts_v3(
         }
     });
 
-    let vk = VKS[challenge_index].get_or_init(|| {
-        let circuit = crate::zkp::halo2::post::PoStCircuit::for_keygen(challenge_index);
+    let vk = VK.get_or_init(|| {
+        let circuit = crate::zkp::halo2::post::PoStCircuit::default();
         keygen_vk(params, &circuit.without_witnesses())
             .expect("VK keygen for reduced PoStCircuit v3")
     });
