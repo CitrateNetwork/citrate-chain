@@ -36,6 +36,30 @@ pub type CircuitVersion = u32;
 /// landing in WP-M1b.3 (linear-layer Q16.16).
 pub const CIRCUIT_VERSION_LINEAR_Q16: CircuitVersion = 1;
 
+/// PIN-P1 step (a): circuit version for the **reduced** Stacked-DRG
+/// PoRep circuit (`zkp::halo2::porep::PoRepCircuit`, N=4 nodes, L=2
+/// layers). Allocated here so a PoRep proof verifies on-chain through
+/// 0x0108 with a DIFFERENT verifying key AND a DIFFERENT public-input
+/// parsing than the inference circuit — domain separation by version.
+///
+/// **Size note:** v2 currently uses the *reduced* PoRep circuit's VK.
+/// When the full-size PoRep circuit lands (real DRG/expander samplers,
+/// Filecoin-scale d_DRG/d_EXP/L), the VK behind v2 swaps to the
+/// full-size one. Per ADR-RM-M1-1's versioning rule, if the public
+/// input layout or proof semantics change in a way that breaks
+/// already-anchored v2 proofs, the full circuit ships at a NEW version
+/// (e.g. v4) rather than mutating v2. For the reduced-circuit
+/// pre-mainnet phase no v2 proofs are anchored on-chain, so swapping
+/// the VK in place is safe.
+pub const CIRCUIT_VERSION_POREP_REDUCED: CircuitVersion = 2;
+
+/// PIN-P1: reserved circuit version for the PoSt (Proof-of-Spacetime)
+/// circuit. **NOT implemented this step** — allocated and documented so
+/// the dispatch + registry know v3 is spoken-for and a v3 proof is
+/// rejected as "no VK registered" rather than silently colliding with a
+/// future allocation. Wiring lands in a later PIN-P1 step.
+pub const CIRCUIT_VERSION_POST_RESERVED: CircuitVersion = 3;
+
 /// Errors that can surface from the verifier path. These are stable
 /// across Halo2 backend changes — wrappers above the verifier should
 /// pattern-match these, not the underlying `halo2_proofs::Error`.
@@ -78,6 +102,63 @@ pub enum VerifyError {
 #[cfg(not(feature = "halo2-substrate"))]
 pub fn verify_inference_proof(_input: &[u8]) -> Result<bool, VerifyError> {
     Err(VerifyError::SubstrateAbsent)
+}
+
+/// PIN-P1 step (a): **version-dispatching** entry point for the 0x0108
+/// precompile. Reads `circuit_version` (bytes 96..100, BE u32) FIRST,
+/// then routes to the circuit-specific verifier. Each version selects
+/// BOTH the verifying key AND the public-input parsing layout, so a
+/// proof + public inputs built for one circuit cannot satisfy another
+/// (domain separation by version).
+///
+/// Routing table (the compiled-in circuit-version registry):
+///
+/// | version | circuit                 | public-input ABI            | VK source                 |
+/// |---------|-------------------------|-----------------------------|---------------------------|
+/// | 1       | InferenceCircuit (Q16)  | 3 commitments (existing)    | `inference_kzg_artifacts_v1` |
+/// | 2       | reduced PoRepCircuit    | 8 PoRep field elements      | `porep_kzg_artifacts_v2`  |
+/// | 3       | PoSt (reserved)         | — (rejected: no VK)         | — (not implemented)       |
+/// | other   | unknown                 | — (rejected)                | —                         |
+///
+/// The **v1 path is behaviorally identical to calling
+/// `verify_inference_proof` directly** — this dispatcher peeks the
+/// version and, for v1, hands the FULL original `input` (header +
+/// proof) to `verify_inference_proof` unchanged. The inference wire
+/// format, VK, and result are untouched.
+#[cfg(not(feature = "halo2-substrate"))]
+pub fn verify_proof_dispatch(_input: &[u8]) -> Result<bool, VerifyError> {
+    Err(VerifyError::SubstrateAbsent)
+}
+
+#[cfg(feature = "halo2-substrate")]
+pub fn verify_proof_dispatch(input: &[u8]) -> Result<bool, VerifyError> {
+    // The version field lives at bytes 96..100 in EVERY circuit's wire
+    // format (the 3 leading 32-byte words are commitments for v1, or
+    // the first 3 of the 8 PoRep field elements for v2 — either way the
+    // version is at the same fixed offset). Read it before committing to
+    // any layout so an unknown/short input is rejected uniformly.
+    const VERSION_OFFSET: usize = 96;
+    if input.len() < VERSION_OFFSET + 4 {
+        return Err(VerifyError::Truncated {
+            needed: VERSION_OFFSET + 4,
+            got: input.len(),
+        });
+    }
+    let circuit_version =
+        u32::from_be_bytes(input[VERSION_OFFSET..VERSION_OFFSET + 4].try_into().expect("4B"));
+
+    match circuit_version {
+        // v1 — UNCHANGED inference path. Hand the original input straight
+        // to the existing verifier; it re-parses the 3-commitment layout,
+        // re-checks the version == 1, and verifies with the inference VK.
+        CIRCUIT_VERSION_LINEAR_Q16 => verify_inference_proof(input),
+        // v2 — reduced PoRep. Different VK, different 8-field public-input
+        // parsing.
+        CIRCUIT_VERSION_POREP_REDUCED => verify_porep_proof(input),
+        // v3 (PoSt) reserved-but-unimplemented and everything else:
+        // reject as an unknown version (no VK registered).
+        other => Err(VerifyError::UnknownCircuitVersion(other)),
+    }
 }
 
 #[cfg(feature = "halo2-substrate")]
@@ -341,6 +422,238 @@ fn inference_kzg_artifacts_v1() -> (
             in_dim: 2,
         };
         keygen_vk(params, &circuit).expect("VK keygen for InferenceCircuit v1")
+    });
+
+    (params, vk)
+}
+
+/// PIN-P1 step (a): verify a **reduced PoRep** proof (circuit_version
+/// 2) submitted to 0x0108. Mirrors `verify_inference_proof`'s
+/// structure but with the PoRep public-input ABI and the PoRep VK, so
+/// the two paths are domain-separated.
+///
+/// **v2 wire format (the PoRep ABI — documented byte layout):**
+///
+/// ```text
+/// | [0..32)    replicaID       (BE Fr)   — public input slot 0
+/// | [32..64)   cid             (BE Fr)   — public input slot 1
+/// | [64..96)   sectorIndex     (BE Fr)   — public input slot 2
+/// | [96..100)  circuit_version (BE u32)  — MUST be 2 here
+/// | [100..104) chain_id        (BE u32)  — advisory (carried, not used)
+/// | [104..136) CommD           (BE Fr)   — public input slot 3
+/// | [136..168) CommR           (BE Fr)   — public input slot 4
+/// | [168..200) CommC           (BE Fr)   — public input slot 5
+/// | [200..232) challengeNonce  (BE Fr)   — public input slot 6
+/// | [232..264) epoch           (BE Fr)   — public input slot 7
+/// | [264..]    proof_bytes     (variable, Halo2-KZG SHPLONK transcript)
+/// ```
+///
+/// The first three 32-byte words double as the version-bearing prefix
+/// (`replicaID`/`cid`/`sectorIndex` occupy bytes 0..96), so the version
+/// field sits at the SAME offset (96..100) as the inference layout —
+/// that is the *only* shared structure; everything after is parsed
+/// against the PoRep public-input vector. The public inputs are fed in
+/// the exact slot order `porep::pi::{REPLICA_ID, CID, SECTOR_INDEX,
+/// COMM_D, COMM_R, COMM_C, CHALLENGE_NONCE, EPOCH}` so the verifier
+/// instance column matches what the prover committed.
+///
+/// **Domain separation:** an inference proof presented as v2 fails
+/// because (a) the inference proof has only 3 public inputs but the
+/// PoRep VK expects 8, and (b) the PoRep VK is a different key than the
+/// inference VK. A PoRep proof presented as v1 fails symmetrically. No
+/// proof + public-input pair can satisfy both circuits.
+#[cfg(feature = "halo2-substrate")]
+pub fn verify_porep_proof(input: &[u8]) -> Result<bool, VerifyError> {
+    use halo2_proofs::plonk::verify_proof_multi;
+    use halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme;
+    use halo2_proofs::poly::kzg::multiopen::VerifierSHPLONK;
+    use halo2_proofs::poly::kzg::strategy::SingleStrategy;
+    use halo2_proofs::transcript::{Blake2bRead, Challenge255, TranscriptReadBuffer};
+    use halo2curves::bn256::{Bn256, Fr as Halo2Fr, G1Affine};
+    use halo2curves::ff::PrimeField as _;
+
+    // 8 public-input field elements × 32B + circuit_version(4B) +
+    // chain_id(4B). The version/chain_id sit *between* the first three
+    // and the last five field elements, matching the documented layout.
+    const HEADER_LEN: usize = 32 * 3 + 4 + 4 + 32 * 5;
+    if input.len() < HEADER_LEN {
+        return Err(VerifyError::Truncated {
+            needed: HEADER_LEN,
+            got: input.len(),
+        });
+    }
+
+    let circuit_version = u32::from_be_bytes(input[96..100].try_into().expect("4B"));
+    if circuit_version != CIRCUIT_VERSION_POREP_REDUCED {
+        return Err(VerifyError::UnknownCircuitVersion(circuit_version));
+    }
+    let _chain_id = u32::from_be_bytes(input[100..104].try_into().expect("4B"));
+
+    // Big-endian 32-byte word → Halo2 Fr (canonical repr is LE).
+    let to_fr = |be: &[u8]| -> Result<Halo2Fr, VerifyError> {
+        let mut le: [u8; 32] = be.try_into().map_err(|_| VerifyError::PublicInputShape)?;
+        le.reverse();
+        Option::<Halo2Fr>::from(Halo2Fr::from_repr(le.into()))
+            .ok_or(VerifyError::PublicInputShape)
+    };
+
+    // Parse the 8 PoRep public inputs from their fixed offsets.
+    let replica_id = to_fr(&input[0..32])?;
+    let cid = to_fr(&input[32..64])?;
+    let sector_index = to_fr(&input[64..96])?;
+    let comm_d = to_fr(&input[104..136])?;
+    let comm_r = to_fr(&input[136..168])?;
+    let comm_c = to_fr(&input[168..200])?;
+    let challenge_nonce = to_fr(&input[200..232])?;
+    let epoch = to_fr(&input[232..264])?;
+    let proof_bytes = &input[HEADER_LEN..];
+
+    // Assemble the instance column in porep::pi slot order. This MUST
+    // match `PoRepCircuit::public_inputs` exactly or the proof fails.
+    let mut public_row = vec![Halo2Fr::default(); porep::pi::COUNT];
+    public_row[porep::pi::REPLICA_ID] = replica_id;
+    public_row[porep::pi::CID] = cid;
+    public_row[porep::pi::SECTOR_INDEX] = sector_index;
+    public_row[porep::pi::COMM_D] = comm_d;
+    public_row[porep::pi::COMM_R] = comm_r;
+    public_row[porep::pi::COMM_C] = comm_c;
+    public_row[porep::pi::CHALLENGE_NONCE] = challenge_nonce;
+    public_row[porep::pi::EPOCH] = epoch;
+
+    // The reduced PoRep circuit's VK depends on the challenged node
+    // index, because the v=0 case copy-constrains the labeling seed to
+    // replicaID (vs. the DRG-parent cell for v≥1) and the Merkle branch
+    // directions are part of the circuit's fixed topology. We therefore
+    // derive the VK keyed on the public `challengeNonce`. An out-of-range
+    // nonce (≥ N) has no honest circuit and is rejected.
+    let challenge_index = {
+        // challengeNonce is a small node index in 0..N; read it from the
+        // canonical LE repr's low bytes. Anything ≥ N is invalid.
+        let repr = challenge_nonce.to_repr();
+        let bytes: &[u8] = repr.as_ref();
+        // Reject if any high byte is set (the index must fit in usize and
+        // be < N); N is tiny so only byte 0 can legitimately be nonzero.
+        if bytes[1..].iter().any(|&b| b != 0) {
+            return Err(VerifyError::PublicInputShape);
+        }
+        bytes[0] as usize
+    };
+    if challenge_index >= porep::N {
+        return Err(VerifyError::PublicInputShape);
+    }
+
+    let (params, vk) = porep_kzg_artifacts_v2(challenge_index);
+    let public_inputs: Vec<Vec<Halo2Fr>> = vec![public_row];
+    let verifier_params = params.verifier_params();
+    let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof_bytes);
+    let verified = verify_proof_multi::<
+        KZGCommitmentScheme<Bn256>,
+        VerifierSHPLONK<Bn256>,
+        _,
+        _,
+        SingleStrategy<_>,
+    >(&verifier_params, vk, &[public_inputs], &mut transcript);
+
+    Ok(verified)
+}
+
+/// PIN-P1 step (a): lazy-init the ParamsKZG (SRS) and VerifyingKey for
+/// the v2 reduced PoRepCircuit. Mirrors `inference_kzg_artifacts_v1`'s
+/// SRS-source policy (CHAIN-003 fail-closed) exactly — the ONLY
+/// differences are the circuit (PoRep, not inference) and `k`.
+///
+/// **k:** the reduced PoRep circuit needs k=13 (see
+/// `porep::tests::K`); the inference circuit used k=12. The SRS is
+/// sized to the larger of the circuits a node serves; loading the v1
+/// k=12 ParamsKZG and the v2 k=13 ParamsKZG independently keeps each
+/// circuit's VK derivation deterministic and isolated. (When loading
+/// from a real .ptau, `load_ptau_into_params_kzg` is given the v2 `k`.)
+///
+/// **Per-challenge VK:** the reduced PoRep circuit's fixed topology
+/// depends on the challenged node index (the v=0 labeling-seed copy
+/// constraint differs from v≥1, and Merkle branch directions are
+/// baked in). So one VK is derived and cached PER challenge index
+/// (`0..N`), all sharing the single k=13 ParamsKZG. `challenge_index`
+/// is bounded `< N` by the caller.
+#[cfg(feature = "halo2-substrate")]
+fn porep_kzg_artifacts_v2(
+    challenge_index: usize,
+) -> (
+    &'static halo2_proofs::poly::kzg::commitment::ParamsKZG<halo2curves::bn256::Bn256>,
+    &'static halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>,
+) {
+    use halo2_proofs::plonk::{keygen_vk, Circuit as _};
+    use halo2_proofs::poly::kzg::commitment::ParamsKZG;
+    use halo2curves::bn256::Bn256;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use std::sync::OnceLock;
+
+    assert!(
+        challenge_index < crate::zkp::halo2::porep::N,
+        "porep_kzg_artifacts_v2: challenge_index {challenge_index} out of range (N={})",
+        crate::zkp::halo2::porep::N
+    );
+
+    static PARAMS: OnceLock<ParamsKZG<Bn256>> = OnceLock::new();
+    // One VK slot per challenge index (N is a small compile-time const).
+    static VKS: [OnceLock<halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>>;
+        crate::zkp::halo2::porep::N] =
+        [const { OnceLock::new() }; crate::zkp::halo2::porep::N];
+
+    // Reduced PoRep circuit degree (see porep::tests::K).
+    const V2_K: u32 = 13;
+
+    // SAME CHAIN-003 fail-closed policy as the inference path.
+    let insecure_dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-srs");
+    let source =
+        resolve_srs_source(std::env::var("CITRATE_PTAU_PATH").ok(), insecure_dev_allowed);
+
+    let params = PARAMS.get_or_init(|| match source {
+        SrsSource::Ceremony(path) => {
+            eprintln!(
+                "[citrate-execution] Loading reduced-PoRep SRS from CITRATE_PTAU_PATH={} (k={})",
+                path, V2_K
+            );
+            crate::zkp::halo2::ptau::load_ptau_into_params_kzg(&path, V2_K).unwrap_or_else(|e| {
+                panic!(
+                    "[citrate-execution] FATAL: failed to load SRS from \
+                     CITRATE_PTAU_PATH={path}: {e}. The node cannot serve \
+                     0x0108 circuit_version=2 (reduced PoRep) without a valid \
+                     PPoT .ptau file. See runbooks/RM_M1B_SOAK.md."
+                )
+            })
+        }
+        SrsSource::InsecureDevSeed => {
+            eprintln!(
+                "[citrate-execution] WARNING: CITRATE_PTAU_PATH not set; using \
+                 deterministic seed-based SRS for reduced PoRep (circuit_version=2). \
+                 DEV/TEST ONLY — production validators must set CITRATE_PTAU_PATH."
+            );
+            let mut rng = StdRng::from_seed([0x4D; 32]);
+            ParamsKZG::<Bn256>::setup(V2_K, &mut rng)
+        }
+        SrsSource::Refuse => {
+            panic!(
+                "[citrate-execution] FATAL (CHAIN-003 fail-closed): 0x0108 \
+                 circuit_version=2 (reduced PoRep) requires a ceremony SRS. Set \
+                 CITRATE_PTAU_PATH to a verified PPoT .ptau file (rebuild with \
+                 --features insecure-dev-srs for local dev ONLY). See \
+                 runbooks/RM_M1B_SOAK.md."
+            );
+        }
+    });
+
+    let vk = VKS[challenge_index].get_or_init(|| {
+        // Derive the VK from the circuit topology for THIS challenge
+        // index under `without_witnesses()` so it matches what the
+        // prover's keygen produced. `from_challenge_index` builds a
+        // witness-free circuit whose fixed structure (labeling-seed
+        // copy constraint + Merkle branch directions) matches challenge
+        // `challenge_index`.
+        let circuit = crate::zkp::halo2::porep::PoRepCircuit::for_keygen(challenge_index);
+        keygen_vk(params, &circuit.without_witnesses())
+            .expect("VK keygen for reduced PoRepCircuit v2")
     });
 
     (params, vk)
