@@ -42,9 +42,10 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 // k for the reduced PoRep circuit — MUST match V2_K in
-// `halo2::porep_kzg_artifacts_v2` (k=13) so the prover and the
+// `halo2::porep_kzg_artifacts_v2` (k=14 after PIN-P1 step (c1) added the
+// index-agnostic Merkle + parent inclusion) so the prover and the
 // precompile-side verifier derive identical VKs.
-const POREP_K: u32 = 13;
+const POREP_K: u32 = 14;
 
 // ---------------------------------------------------------------------------
 // Wire-format + Fr helpers (shared shape with the inference e2e test).
