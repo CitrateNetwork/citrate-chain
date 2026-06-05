@@ -41,7 +41,7 @@ use rand::SeedableRng;
 // k for the reduced PoSt circuit — MUST match V3_K in
 // `halo2::post_kzg_artifacts_v3` (k=13) so the prover and the
 // precompile-side verifier derive identical VKs.
-const POST_K: u32 = 13;
+const POST_K: u32 = 14;
 
 // ---------------------------------------------------------------------------
 // Fr / wire-format helpers.
@@ -147,7 +147,7 @@ fn generate_porep_proof(challenge_index: usize) -> (SealedReplica, Vec<u8>) {
     let pis = PoRepCircuit::public_inputs(&sealed, challenge_index);
 
     let mut params_rng = StdRng::from_seed([0x4D; 32]);
-    let params = ParamsKZG::<Bn256>::setup(13, &mut params_rng);
+    let params = ParamsKZG::<Bn256>::setup(14, &mut params_rng);
     let vk = keygen_vk(&params, &circuit.without_witnesses()).expect("keygen_vk");
     let pk = keygen_pk(&params, vk.clone(), &circuit.without_witnesses()).expect("keygen_pk");
 
