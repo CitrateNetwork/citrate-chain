@@ -916,6 +916,16 @@ pub mod porep;
 #[cfg(feature = "halo2-substrate")]
 pub mod post;
 
+/// PIN-P1 (f.1) — Real-size DRG + expander samplers (Filecoin SDR analysed
+/// values). Native only; the in-circuit equivalent + parameterised
+/// integration into `porep` lands in (f.2). The toy path-graph + identity
+/// expander used by the reduced circuit stay in `porep.rs` unchanged.
+///
+/// Compiled unconditionally — no feature gate — because the samplers are
+/// pure-native helpers usable by off-chain tooling (e.g. a seal benchmark
+/// harness) without the halo2 substrate.
+pub mod samplers;
+
 #[cfg(feature = "halo2-substrate")]
 pub mod srs;
 
