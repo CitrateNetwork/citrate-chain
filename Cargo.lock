@@ -1610,6 +1610,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-wallet-aa"
+version = "0.4.0"
+dependencies = [
+ "ethabi",
+ "ethereum-types",
+ "hex",
+ "k256",
+ "proptest",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha3 0.10.9",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "citrate-wallet-core"
 version = "0.4.0"
 dependencies = [
@@ -2323,6 +2339,23 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ethabi"
+version = "18.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7413c5f74cc903ea37386a8965a936cbeb334bd270862fdece542c1b2dcbc898"
+dependencies = [
+ "ethereum-types",
+ "hex",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha3 0.10.9",
+ "thiserror 1.0.69",
+ "uint",
 ]
 
 [[package]]

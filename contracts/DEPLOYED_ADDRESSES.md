@@ -109,3 +109,48 @@ DEPLOYER_ADDRESS=0x4250675F9015E65fC866F3a373F82bb9DFc000c6 \
   contracts/broadcast/_address_table/30_address_table.json \
   /path/to/citrate-learning-center
 ```
+
+---
+
+## EW-S1 — ERC-4337 Embedded Wallet Stack (chain 40204)
+
+Per `citrate-federation/.agentile/sprints/active/2026-06-05-ew-s1-passkey-aa.md`.
+Deployed via `script/aa/DeployAA.s.sol`. **Pre-audit; ship with
+"small-value only" UI copy until external audit lands.**
+
+| Contract | Address | Role |
+|---|---|---|
+| `WebAuthnP256Validator` | _pending broadcast_ | Kernel plug-in: gate UserOps on a registered WebAuthn passkey |
+| `CitrateECDSAValidator` | _pending broadcast_ | Kernel plug-in: secondary validator for gui-native / wallet-extension EOA enrollment |
+| `GuardianRecoveryModule` | _pending broadcast_ | M-of-N social-guardian "rotate signer" recovery |
+| `Kernel implementation` | _pending broadcast_ | ZeroDev Kernel v3 (vendored from `lib/kernel`) implementation behind every CREATE2 ERC-1967 proxy clone |
+| `CitrateWalletFactory` | _pending broadcast_ | Identity-keyed CREATE2 (`salt = keccak256(userId)`) + EIP-191 permit gate |
+| `CitratePaymaster` | _pending broadcast_ | Per-user-per-day cap (100k default) + recovery budget (200k/event) + first-op budget (300k once/wallet) |
+| `EntryPoint` (external) | **set via `CITRATE_AA_ENTRY_POINT` env at deploy** | eth-infinitism v0.7 reference EntryPoint; must be deployed separately before AA stack |
+
+### Required env at deploy
+
+| Var | Note |
+|---|---|
+| `CITRATE_AA_ENTRY_POINT` | EntryPoint v0.7 address on chain 40204 (deploy via `eth-infinitism/account-abstraction`'s own script first) |
+| `CITRATE_AA_IDENTITY_SIGNER` | Operator EOA whose signature authorises factory deploys (lives in auth.citrate.ai env) |
+| `CITRATE_AA_OWNER` | Owner of factory + paymaster — operator multisig in prod |
+| `CITRATE_AA_DAILY_CAP` | Default `100000` (gas units) |
+| `CITRATE_AA_RECOVERY_CAP` | Default `200000` |
+| `CITRATE_AA_FIRST_OP_CAP` | Default `300000` |
+
+Run after the EntryPoint is on chain:
+
+```bash
+CITRATE_AA_ENTRY_POINT=0x... \
+CITRATE_AA_IDENTITY_SIGNER=0x... \
+CITRATE_AA_OWNER=0x... \
+forge script script/aa/DeployAA.s.sol \
+  --rpc-url https://rpc.citrate.ai \
+  --account ceremony-deployer \
+  --sender 0x4250675F9015E65fC866F3a373F82bb9DFc000c6 \
+  --broadcast
+```
+
+Addresses populate in `contracts/broadcast/aa/DeployAA.s.sol/40204/run-latest.json`
+and this table updates with the canonical values after the broadcast lands.
