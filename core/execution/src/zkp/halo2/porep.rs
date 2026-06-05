@@ -420,6 +420,45 @@ impl PoRepCircuit {
         }
     }
 
+    /// Build a witness-free circuit whose **fixed topology** matches an
+    /// honest proof for `challenge_index`, suitable for `keygen_vk`.
+    ///
+    /// PIN-P1 step (a): the verifying key the 0x0108 precompile uses for
+    /// circuit_version=2 must be derived from the SAME challenge index
+    /// the prover used — the v=0 labeling-seed copy constraint differs
+    /// from v≥1, and the Merkle branch directions (`sibling_is_left`)
+    /// are part of the fixed structure. This constructor pins exactly
+    /// those topology bits (siblings are `Value::unknown()`; only the
+    /// `bool` directions, which come from the deterministic
+    /// `merkle_path_4` direction rule, matter for the VK).
+    pub fn for_keygen(challenge_index: usize) -> Self {
+        debug_assert!(challenge_index < N, "challenge_index must be < N");
+        // The direction booleans depend only on the index, not on the
+        // leaf values, so derive them from a dummy set of leaves.
+        let dummy = [Halo2Fr::from(0u64); N];
+        let dir = |p: [(Halo2Fr, bool); MERKLE_DEPTH]| {
+            [
+                (Value::<Halo2Fr>::unknown(), p[0].1),
+                (Value::<Halo2Fr>::unknown(), p[1].1),
+            ]
+        };
+        Self {
+            pinner_identity: Value::unknown(),
+            cid: Value::unknown(),
+            sector_index: Value::unknown(),
+            epoch: Value::unknown(),
+            challenge_index,
+            data_challenged: Value::unknown(),
+            label_l1: Value::unknown(),
+            label_l2: Value::unknown(),
+            drg_parent_l1: Value::unknown(),
+            drg_parent_l2: Value::unknown(),
+            path_d: dir(merkle_path_4(&dummy, challenge_index)),
+            path_r: dir(merkle_path_4(&dummy, challenge_index)),
+            path_c: dir(merkle_path_4(&dummy, challenge_index)),
+        }
+    }
+
     /// The public-input vector for a sealed replica + challenge index.
     pub fn public_inputs(sealed: &SealedReplica, challenge_index: usize) -> Vec<Halo2Fr> {
         let mut pis = vec![Halo2Fr::from(0u64); pi::COUNT];
