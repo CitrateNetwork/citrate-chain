@@ -68,16 +68,21 @@ proptest! {
     }
 
     /// Property: when circuit_version field (bytes 96..100, BE u32)
-    /// is anything other than 1 (CIRCUIT_VERSION_LINEAR_Q16), the
-    /// dispatcher must surface a structured error.
+    /// is an UNKNOWN version (not 1 = inference, not 2 = reduced PoRep),
+    /// the dispatcher must surface a structured error.
     ///
-    /// We build a 200-byte buffer with random commitments + a chosen
-    /// non-1 version, ensuring the >= 104B header gate is passed
-    /// and the version check is the rejection point.
+    /// PIN-P1 step (a): version 2 is now a REGISTERED circuit (reduced
+    /// PoRep), so it is excluded from this "unknown version" range —
+    /// it has its own happy-path + domain-separation coverage in
+    /// `porep_proof_verify_e2e.rs`. The reserved PoSt version 3 stays in
+    /// range (reserved-but-unimplemented ⇒ rejected as unknown). We
+    /// build a 200-byte buffer with random commitments + a chosen
+    /// unknown version, ensuring the >= 104B header gate is passed and
+    /// the version check is the rejection point.
     #[test]
     fn precompile_0x0108_unknown_circuit_version_always_errors(
         commits in prop::array::uniform32(any::<u8>()),
-        version_seed in 2u32..=u32::MAX,
+        version_seed in 3u32..=u32::MAX,
         proof_bytes in prop::collection::vec(any::<u8>(), 0..256)
     ) {
         let mut wire = Vec::with_capacity(200 + proof_bytes.len());
