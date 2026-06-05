@@ -242,7 +242,7 @@ fn merkle_root_4(leaves: &[Halo2Fr; N]) -> Halo2Fr {
 /// The Merkle authentication path for `leaf_index` in a depth-2 binary
 /// tree of 4 leaves. Returns `[(sibling, is_left_sibling); 2]` from leaf
 /// level up to (but excluding) the root.
-fn merkle_path_4(leaves: &[Halo2Fr; N], leaf_index: usize) -> [(Halo2Fr, bool); MERKLE_DEPTH] {
+pub fn merkle_path_4(leaves: &[Halo2Fr; N], leaf_index: usize) -> [(Halo2Fr, bool); MERKLE_DEPTH] {
     debug_assert!(leaf_index < N);
     let l01 = native_hash(&[leaves[0], leaves[1]]);
     let l23 = native_hash(&[leaves[2], leaves[3]]);
