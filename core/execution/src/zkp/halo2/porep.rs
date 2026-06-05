@@ -685,6 +685,18 @@ impl SwapMerkleConfig {
         )
     }
 
+    /// Column accessors so sibling circuits (e.g. `porep_circuit_generic`)
+    /// can share the gadget's equality-enabled advice columns when copying
+    /// cells across regions for cross-Poseidon equality assertions.
+    #[inline]
+    pub fn a(&self) -> Column<Advice> {
+        self.a
+    }
+    #[inline]
+    pub fn b(&self) -> Column<Advice> {
+        self.b
+    }
+
     /// Witness a known constant into a fresh equality-enabled cell.
     pub(crate) fn assign_const(
         &self,
@@ -732,6 +744,148 @@ impl SwapMerkleConfig {
             cur = PoseidonChip::hash_n_from_cells(poseidon, layouter, &[lo, hi])?;
         }
         Ok(cur)
+    }
+
+    /// PIN-P1 (f.2b) — arbitrary-depth variant of `merkle_root`. Identical
+    /// per-level structure; just iterates `depth = bits.len()` rounds with
+    /// matching `siblings`. Same shape ⇒ single VK at any depth.
+    pub(crate) fn merkle_root_generic(
+        &self,
+        poseidon: &PoseidonChipConfig,
+        layouter: &mut impl Layouter<Halo2Fr>,
+        leaf: AssignedCell<Halo2Fr, Halo2Fr>,
+        bits: &[AssignedCell<Halo2Fr, Halo2Fr>],
+        siblings: &[AssignedCell<Halo2Fr, Halo2Fr>],
+    ) -> Result<AssignedCell<Halo2Fr, Halo2Fr>, ErrorFront> {
+        debug_assert_eq!(
+            bits.len(),
+            siblings.len(),
+            "merkle_root_generic: bits and siblings must have equal length"
+        );
+        let mut cur = leaf;
+        for level in 0..bits.len() {
+            let (lo, hi) = self.cond_swap(layouter, &cur, &siblings[level], &bits[level])?;
+            cur = PoseidonChip::hash_n_from_cells(poseidon, layouter, &[lo, hi])?;
+        }
+        Ok(cur)
+    }
+
+    /// PIN-P1 (f.2b) — Horner-style arbitrary-depth bit decomposition. Returns
+    /// the idx cell and `depth` boolean-constrained bit cells (low bit
+    /// first) such that `idx = sum(bits[i] * 2^i)`. Soundly enforced via a
+    /// chain of `s_recompose` gates expressing
+    ///   `horner_d-1 = bit_{d-1}`,
+    ///   `horner_i = bit_i + 2 * horner_{i+1}` for i in (0, d-1),
+    ///   `idx = horner_0`.
+    /// Each bit also gets `s_bool`. No new gates needed — reuses the existing
+    /// 2-bit recompose primitive.
+    pub(crate) fn decompose_index_generic(
+        &self,
+        layouter: &mut impl Layouter<Halo2Fr>,
+        idx: Value<Halo2Fr>,
+        depth: usize,
+    ) -> Result<
+        (
+            AssignedCell<Halo2Fr, Halo2Fr>,
+            Vec<AssignedCell<Halo2Fr, Halo2Fr>>,
+        ),
+        ErrorFront,
+    > {
+        debug_assert!(depth >= 1, "decompose_index_generic: depth ≥ 1");
+        if depth == 1 {
+            // Single-bit special case: idx itself must be the bit. Boolean-
+            // constrain it; no recompose needed.
+            return layouter.assign_region(
+                || "decompose_index_generic.depth1",
+                |mut region| {
+                    let idx_cell = region.assign_advice(|| "idx", self.b, 0, || idx)?;
+                    self.s_bool.enable(&mut region, 0)?;
+                    let bits = vec![idx_cell.clone()];
+                    Ok((idx_cell, bits))
+                },
+            );
+        }
+        // Extract bits from the (canonical, small) idx value.
+        let bit_vals: Vec<Value<Halo2Fr>> = (0..depth)
+            .map(|i| {
+                idx.map(|f| {
+                    let bytes = f.to_repr();
+                    let by = bytes.as_ref();
+                    let byte_idx = i / 8;
+                    let shift = (i % 8) as u8;
+                    if byte_idx < by.len() {
+                        Halo2Fr::from(((by[byte_idx] >> shift) & 1) as u64)
+                    } else {
+                        Halo2Fr::ZERO
+                    }
+                })
+            })
+            .collect();
+        // Compute Horner-form prefixes: horner[i] = sum_{j>=i} bit_j * 2^(j-i).
+        let horner_vals: Vec<Value<Halo2Fr>> = {
+            let mut acc: Vec<Value<Halo2Fr>> = vec![Value::known(Halo2Fr::ZERO); depth];
+            acc[depth - 1] = bit_vals[depth - 1];
+            for i in (0..depth - 1).rev() {
+                acc[i] = bit_vals[i]
+                    + Value::known(Halo2Fr::from(2u64)) * acc[i + 1];
+            }
+            acc
+        };
+        layouter.assign_region(
+            || "decompose_index_generic",
+            |mut region| {
+                // Lay out one row per bit. Row i carries:
+                //   a = horner[i], b = bit_i, c = horner[i+1] (or 0 for last).
+                // For i < depth-1: enable s_recompose (horner[i] = bit_i + 2*horner[i+1]).
+                // For every row: enable s_bool on column b (bit_i ∈ {0,1}).
+                // Then idx is constrained equal to horner[0] by copy.
+                let mut bit_cells: Vec<AssignedCell<Halo2Fr, Halo2Fr>> =
+                    Vec::with_capacity(depth);
+                let mut horner_cells: Vec<AssignedCell<Halo2Fr, Halo2Fr>> =
+                    Vec::with_capacity(depth);
+                for i in 0..depth {
+                    let h = region.assign_advice(
+                        || "horner",
+                        self.a,
+                        i,
+                        || horner_vals[i],
+                    )?;
+                    let bit = region.assign_advice(|| "bit", self.b, i, || bit_vals[i])?;
+                    self.s_bool.enable(&mut region, i)?;
+                    let next_val = if i + 1 < depth {
+                        horner_vals[i + 1]
+                    } else {
+                        Value::known(Halo2Fr::ZERO)
+                    };
+                    region.assign_advice(|| "horner_next", self.c, i, || next_val)?;
+                    if i + 1 < depth {
+                        self.s_recompose.enable(&mut region, i)?;
+                    }
+                    bit_cells.push(bit);
+                    horner_cells.push(h);
+                }
+                // For depth-1 row: horner[depth-1] must equal bit_{depth-1}. The
+                // recompose gate on row depth-2 enforces horner[depth-2] =
+                // bit_{depth-2} + 2*horner[depth-1]; to close the chain we need
+                // horner[depth-1] = bit_{depth-1} as well. The simplest way is
+                // to require the prover to copy the bit into the horner cell at
+                // row depth-1.
+                let last_h = horner_cells[depth - 1].clone();
+                let last_bit = bit_cells[depth - 1].clone();
+                region.constrain_equal(last_h.cell(), last_bit.cell())?;
+
+                // idx = horner[0]. We expose horner[0] as the canonical idx cell
+                // by copying it out: the caller holds a reference to this cell.
+                // (We DO NOT re-witness idx — horner[0] IS the idx cell.)
+                let idx_cell = horner_cells[0].clone();
+                // Sanity: if idx Value::known, horner[0] computed from bits
+                // matches it (host-side only — equality is the chain itself).
+                idx.zip(idx_cell.value().copied())
+                    .assert_if_known(|(lhs, rhs)| lhs == rhs);
+
+                Ok((idx_cell, bit_cells))
+            },
+        )
     }
 }
 
