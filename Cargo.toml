@@ -24,6 +24,7 @@ members = [
     "node",
     "node-app",
     "wallet",
+    "wallet-aa",
     "wallet-core",
     "wallet-sdk",
     "faucet",
