@@ -11,60 +11,36 @@
 // are still committed under CommR / CommC.
 //
 // Spec: `.agentile/gtm-spine/design/PIN-P1-sdr-replicaid-construction.md`
-//   "PoSt proof (recurring, light) — public inputs":
-//     { replicaID, cid, sectorIndex, CommR, CommC, challengeNonce, epoch }
-//   For K random nodes: prove R[v]∈CommR, column(v)∈CommC, and the
-//   layer-L labeling relation re-derives label(L,v) (touches the node +
-//   its parents, not the whole sector).
-//
-// **Scope of THIS module — a COMPLETE, WORKING circuit for the REDUCED
-// instance** (same N=4, L=2, d_DRG=1, d_EXP=1 topology as PoRep), not a
-// placeholder. Every relation PoSt needs (replicaID-keyed labeling of v +
-// parents, Poseidon-Merkle inclusion of R/column) is enforced in-circuit.
-// The path to full size mirrors PoRep's PIN-P1 follow-ups.
-//
-// **What is REUSED from porep.rs (not re-implemented):**
-//   - The native witness builder: `seal_reduced` produces the identical
-//     `SealedReplica` (labels, replica leaves, columns, CommR, CommC).
-//     PoSt's honest-prover constructor consumes that struct directly — a
-//     PoSt proof and a PoRep proof over the SAME sealed replica use the
-//     SAME labels/commitments, only the in-circuit relations differ.
-//   - Topology helpers `drg_parent`, `exp_parent`, `merkle_path_4`,
-//     `merkle_root_4` (via `SealedReplica`), the constants `N`, `L`,
-//     `MERKLE_DEPTH`.
-//   - `PoseidonChip` (chips.rs) — same in-circuit Poseidon-2 used for the
-//     labeling hash, the column hash, and the Merkle-node hash, byte-
-//     identical to the native `poseidon_bn254::poseidon_hash`.
-//   - The MockProver + KZG prove/verify harness pattern.
-//
-// **What is net-new:** the `PoStCircuit` composition (this file) — a
-// strict SUBSET of PoRepCircuit's synthesis (it drops the encoding gate
-// and the CommD inclusion). NO new chip, NO new native sealing routine.
 //
 // ---------------------------------------------------------------------------
-// Labeling relation re-derived in-circuit (the finding-1.1 core, light form)
+// PIN-P1 step (c) part 1 — index-agnostic circuit + parent soundness.
 // ---------------------------------------------------------------------------
 //
-// Identical keying to PoRep — every label's Poseidon preimage starts with
-// (replicaID, l, v), so changing replicaID changes EVERY label:
+// PoSt was hardened alongside PoRep in step (c1) with the SAME mechanism:
 //
-//   replicaID = Poseidon(pinnerIdentity, cid, sectorIndex)
-//   label(1, v) = Poseidon(replicaID, 1, v, prev_same1)
-//       prev_same1 = label(1, v-1)  (v≥1)  | replicaID (seed, v=0)
-//   label(2, v) = Poseidon(replicaID, 2, v, prev_same2, label(1, v))
-//       prev_same2 = label(2, v-1)  (v≥1)  | replicaID (seed, v=0)
+//   (1) SINGLE VK (kills TD-18): the challenge index is a WITNESS,
+//       bit-decomposed in-circuit and bound to the public `challengeNonce`;
+//       each Merkle level conditionally swaps (current, sibling) by the
+//       level's index bit (via the shared `SwapMerkleChip` from porep.rs).
+//       ONE circuit structure verifies ANY index → ONE VK.
 //
-// PoSt re-derives BOTH layers for the challenged node (label(1,v) is an
-// input to label(2,v), and column(v) = Poseidon(label(1,v), label(2,v))),
-// then checks:
-//   - R[v] ∈ CommR     (Poseidon-Merkle inclusion; R[v] is a witness leaf)
-//   - column(v) ∈ CommC (Poseidon-Merkle inclusion)
+//   (2) PARENT SOUNDNESS: the DRG parent labels (which previously were
+//       unconstrained witnesses) are now proven to be the committed node at
+//       index v*-1 — the parent's COLUMN (= Poseidon(parent_l1, parent_l2))
+//       is Merkle-included in CommC at the parent index. The base case
+//       (v*=0, no DRG parent) is handled uniformly: a CONSTRAINED
+//       `has_drg_parent = (challengeNonce ≠ 0)` boolean muxes `prev_same` to
+//       `replicaID` and gates the parent inclusion's root-equality off, so
+//       the circuit SHAPE is identical for every index.
 //
-// It does NOT check D[v]∈CommD and does NOT enforce R[v] = D[v]+label(2,v)
-// (that is PoRep's seal-time relation). PoSt only needs to show the held
-// replica's leaf and column are still the committed ones AND were derived
-// under THIS replicaID's labeling — proving continued possession of the
-// correctly-sealed bytes without re-opening the data.
+// **What is REUSED from porep.rs:** the native `seal_reduced` /
+// `SealedReplica` (a PoSt and a PoRep proof over the SAME replica agree on
+// replicaID/CommR/CommC), the `SwapMerkleConfig` index-agnostic gadget,
+// topology helpers (`drg_parent`, `merkle_siblings_4`), constants
+// (`N`, `L`, `MERKLE_DEPTH`), and `PoseidonChip`.
+//
+// **What is net-new:** the `PoStCircuit` composition — a strict SUBSET of
+// PoRep's relations (drops the encoding gate + the CommD inclusion).
 //
 // Public inputs (instance column), in this fixed layout (NO CommD):
 //   [0] replicaID
@@ -72,13 +48,8 @@
 //   [2] sectorIndex
 //   [3] CommR
 //   [4] CommC
-//   [5] challengeNonce      (challenged node index, reduced binding)
+//   [5] challengeNonce      (challenged node index v*, WITNESSED + bound)
 //   [6] epoch
-//
-// Domain separation from PoRep is structural: PoRep exposes 8 public
-// inputs (with CommD at slot 3), PoSt exposes 7 (CommR at slot 3) — a
-// PoRep proof's instance column cannot satisfy the PoSt VK and vice
-// versa, and both differ from the inference circuit's 3-commitment shape.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -87,10 +58,11 @@ use halo2_proofs::{
     plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance},
 };
 use halo2curves::bn256::Fr as Halo2Fr;
+use halo2curves::ff::Field as _;
 
 use super::chips::{PoseidonChip, PoseidonChipConfig};
-// Reuse the PoRep topology + native sealing wholesale.
-use super::porep::{drg_parent, merkle_path_4, SealedReplica, MERKLE_DEPTH, N};
+// Reuse the PoRep topology + native sealing + the index-agnostic gadget.
+use super::porep::{drg_parent, merkle_siblings_4, SealedReplica, SwapMerkleConfig, MERKLE_DEPTH, N};
 
 // ---------------------------------------------------------------------------
 // Public-input slot indices — the documented 7-slot PoSt layout (NO CommD).
@@ -109,23 +81,24 @@ pub mod pi {
 }
 
 // ---------------------------------------------------------------------------
-// PoStCircuit — the reduced in-circuit relation (lighter than PoRep).
+// PoStCircuit — the reduced in-circuit relation (index-agnostic, lighter).
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 pub struct PoStCircuitConfig {
     poseidon: PoseidonChipConfig,
-    /// Witness column for the private scalars that must be cell-bound
-    /// (pinner_identity, cid, sector_index, the sealed leaf R[v*], the
-    /// label/Merkle-sibling values).
+    swap: SwapMerkleConfig,
+    /// Witness column for the private scalars that must be cell-bound.
     witness: Column<Advice>,
     instance: Column<Instance>,
 }
 
 /// Reduced-instance PoSt circuit. Carries the sealed witness for the
-/// challenged node `challenge_index` (and the Merkle siblings its two
-/// inclusions need). No data leaf, no encoding gate — PoSt is a strict
-/// subset of PoRep's relations.
+/// challenged node `challenge_index` plus the Merkle siblings for the CommR
+/// and CommC inclusions of v*, and the DRG-parent column's CommC siblings.
+///
+/// **Index-agnostic:** `challenge_index` is carried only to derive honest
+/// WITNESS values; it is NOT baked into the circuit SHAPE → one VK.
 #[derive(Clone, Default)]
 pub struct PoStCircuit {
     // Private identity pre-image of replicaID.
@@ -134,35 +107,34 @@ pub struct PoStCircuit {
     pub sector_index: Value<Halo2Fr>,
     pub epoch: Value<Halo2Fr>,
 
-    /// The challenged node index v* (public via challengeNonce).
+    /// The challenged node index v* (public via challengeNonce). Witnessed.
     pub challenge_index: usize,
 
-    /// The sealed replica leaf R[v*] — proven to be in CommR. Unlike PoRep
-    /// there is NO data leaf and NO encoding gate: PoSt takes R[v*] as the
-    /// held leaf and proves its inclusion + that it sits under a column
-    /// derived from this replicaID's labeling.
+    /// The sealed replica leaf R[v*] — proven to be in CommR.
     pub replica_challenged: Value<Halo2Fr>,
 
     /// The two layer labels for v* (label(1,v*), label(2,v*)).
     pub label_l1: Value<Halo2Fr>,
     pub label_l2: Value<Halo2Fr>,
 
-    /// The DRG-same-layer parent labels needed to recompute v*'s labels.
-    /// For v*=0 the seed is replicaID (recomputed in-circuit); these are
-    /// then ignored.
-    pub drg_parent_l1: Value<Halo2Fr>, // label(1, v*-1)  (unused at v*=0)
-    pub drg_parent_l2: Value<Halo2Fr>, // label(2, v*-1)  (unused at v*=0)
+    /// The DRG-same-layer parent labels (label(1,v*-1), label(2,v*-1)).
+    /// For v*=0 they are unused (mux'd out by `has_drg_parent`=false).
+    pub drg_parent_l1: Value<Halo2Fr>,
+    pub drg_parent_l2: Value<Halo2Fr>,
 
-    /// Merkle authentication paths for CommR and CommC. Each entry is
-    /// (sibling, sibling_is_left).
-    pub path_r: [(Value<Halo2Fr>, bool); MERKLE_DEPTH],
-    pub path_c: [(Value<Halo2Fr>, bool); MERKLE_DEPTH],
+    /// Merkle sibling values for the CommR and CommC inclusions of node v*.
+    /// Directions are derived in-circuit from v*'s bits.
+    pub sib_r: [Value<Halo2Fr>; MERKLE_DEPTH],
+    pub sib_c: [Value<Halo2Fr>; MERKLE_DEPTH],
+
+    /// Merkle sibling values for the DRG-PARENT column inclusion (CommC at
+    /// index v*-1). For v*=0 these are benign dummies (gated off).
+    pub sib_parent_c: [Value<Halo2Fr>; MERKLE_DEPTH],
 }
 
 impl PoStCircuit {
     /// Build the PoSt circuit witness for the challenged node from a fully
-    /// sealed replica (the SAME `SealedReplica` PoRep seals). This is the
-    /// honest-prover constructor for the recurring proof.
+    /// sealed replica (the SAME `SealedReplica` PoRep seals).
     pub fn from_sealed(
         sealed: &SealedReplica,
         pinner_identity: Halo2Fr,
@@ -173,14 +145,10 @@ impl PoStCircuit {
             Some(p) => (sealed.labels[0][p], sealed.labels[1][p]),
             None => (Halo2Fr::from(0u64), Halo2Fr::from(0u64)),
         };
-        let path_r = merkle_path_4(&sealed.replica, v);
-        let path_c = merkle_path_4(&sealed.columns, v);
-        let to_vp = |p: [(Halo2Fr, bool); MERKLE_DEPTH]| {
-            [
-                (Value::known(p[0].0), p[0].1),
-                (Value::known(p[1].0), p[1].1),
-            ]
-        };
+        let parent_index = drg_parent(v).unwrap_or(0);
+        let sib_parent_c = merkle_siblings_4(&sealed.columns, parent_index).map(Value::known);
+        let sib_r = merkle_siblings_4(&sealed.replica, v).map(Value::known);
+        let sib_c = merkle_siblings_4(&sealed.columns, v).map(Value::known);
         Self {
             pinner_identity: Value::known(pinner_identity),
             cid: Value::known(sealed.cid),
@@ -192,42 +160,9 @@ impl PoStCircuit {
             label_l2: Value::known(sealed.labels[1][v]),
             drg_parent_l1: Value::known(drg_l1),
             drg_parent_l2: Value::known(drg_l2),
-            path_r: to_vp(path_r),
-            path_c: to_vp(path_c),
-        }
-    }
-
-    /// Build a witness-free circuit whose **fixed topology** matches an
-    /// honest PoSt proof for `challenge_index`, suitable for `keygen_vk`.
-    ///
-    /// Per the per-challenge VK pattern PoRep established: the v=0
-    /// labeling-seed copy constraint differs from v≥1, and the Merkle
-    /// branch directions (`sibling_is_left`) are part of the fixed
-    /// structure. This constructor pins exactly those topology bits
-    /// (siblings are `Value::unknown()`; only the deterministic `bool`
-    /// directions, derived from `merkle_path_4`, matter for the VK).
-    pub fn for_keygen(challenge_index: usize) -> Self {
-        debug_assert!(challenge_index < N, "challenge_index must be < N");
-        let dummy = [Halo2Fr::from(0u64); N];
-        let dir = |p: [(Halo2Fr, bool); MERKLE_DEPTH]| {
-            [
-                (Value::<Halo2Fr>::unknown(), p[0].1),
-                (Value::<Halo2Fr>::unknown(), p[1].1),
-            ]
-        };
-        Self {
-            pinner_identity: Value::unknown(),
-            cid: Value::unknown(),
-            sector_index: Value::unknown(),
-            epoch: Value::unknown(),
-            challenge_index,
-            replica_challenged: Value::unknown(),
-            label_l1: Value::unknown(),
-            label_l2: Value::unknown(),
-            drg_parent_l1: Value::unknown(),
-            drg_parent_l2: Value::unknown(),
-            path_r: dir(merkle_path_4(&dummy, challenge_index)),
-            path_c: dir(merkle_path_4(&dummy, challenge_index)),
+            sib_r,
+            sib_c,
+            sib_parent_c,
         }
     }
 
@@ -259,25 +194,21 @@ impl Circuit<Halo2Fr> for PoStCircuit {
             cid: Value::unknown(),
             sector_index: Value::unknown(),
             epoch: Value::unknown(),
-            challenge_index: self.challenge_index,
+            challenge_index: 0,
             replica_challenged: Value::unknown(),
             label_l1: Value::unknown(),
             label_l2: Value::unknown(),
             drg_parent_l1: Value::unknown(),
             drg_parent_l2: Value::unknown(),
-            path_r: [
-                (Value::unknown(), self.path_r[0].1),
-                (Value::unknown(), self.path_r[1].1),
-            ],
-            path_c: [
-                (Value::unknown(), self.path_c[0].1),
-                (Value::unknown(), self.path_c[1].1),
-            ],
+            sib_r: [Value::unknown(); MERKLE_DEPTH],
+            sib_c: [Value::unknown(); MERKLE_DEPTH],
+            sib_parent_c: [Value::unknown(); MERKLE_DEPTH],
         }
     }
 
     fn configure(meta: &mut ConstraintSystem<Halo2Fr>) -> Self::Config {
         let poseidon = PoseidonChip::configure(meta);
+        let swap = SwapMerkleConfig::configure(meta);
         let witness = meta.advice_column();
         meta.enable_equality(witness);
         let instance = meta.instance_column();
@@ -285,6 +216,7 @@ impl Circuit<Halo2Fr> for PoStCircuit {
         // NOTE: NO encoding (add) gate — PoSt does not enforce R = D + label.
         PoStCircuitConfig {
             poseidon,
+            swap,
             witness,
             instance,
         }
@@ -295,7 +227,7 @@ impl Circuit<Halo2Fr> for PoStCircuit {
         config: Self::Config,
         mut layouter: impl Layouter<Halo2Fr>,
     ) -> Result<(), ErrorFront> {
-        let v = self.challenge_index;
+        let swap = &config.swap;
 
         // ---- Step 1: witness the private scalars as canonical cells. ----
         let (pid_cell, cid_cell, sector_cell, epoch_cell, replica_cell, drg1_cell, drg2_cell) =
@@ -340,8 +272,6 @@ impl Circuit<Halo2Fr> for PoStCircuit {
             )?;
 
         // ---- Step 2: replicaID = Poseidon(pinnerIdentity, cid, sectorIndex). ----
-        // Bind cid + sector_index into replicaID (cell-bound), then expose
-        // replicaID, cid, sector_index, epoch as public inputs.
         let replica_id_cell = PoseidonChip::hash_n_from_cells(
             &config.poseidon,
             &mut layouter,
@@ -352,49 +282,40 @@ impl Circuit<Halo2Fr> for PoStCircuit {
         layouter.constrain_instance(sector_cell.cell(), config.instance, pi::SECTOR_INDEX)?;
         layouter.constrain_instance(epoch_cell.cell(), config.instance, pi::EPOCH)?;
 
-        // Constant cells for the layer/node indices used in labeling preimages.
-        let layer1_cell =
-            self.assign_constant(&config, &mut layouter, Halo2Fr::from(1u64), "layer=1")?;
-        let layer2_cell =
-            self.assign_constant(&config, &mut layouter, Halo2Fr::from(2u64), "layer=2")?;
-        let v_cell = self.assign_constant(&config, &mut layouter, Halo2Fr::from(v as u64), "v*")?;
-        // challengeNonce public input == v*.
-        layouter.constrain_instance(v_cell.cell(), config.instance, pi::CHALLENGE_NONCE)?;
+        // ---- Step 2b: witness + bind the challenge index (index-agnostic). ----
+        let idx_val = Value::known(Halo2Fr::from(self.challenge_index as u64));
+        let (idx_cell, bits) = swap.decompose_index(&mut layouter, idx_val)?;
+        layouter.constrain_instance(idx_cell.cell(), config.instance, pi::CHALLENGE_NONCE)?;
+
+        // has_drg_parent = (challengeNonce ≠ 0), CONSTRAINED.
+        let has_drg = swap.is_nonzero(&mut layouter, &idx_cell)?;
+
+        let layer1_cell = swap.assign_const(&mut layouter, Halo2Fr::from(1u64), "layer=1")?;
+        let layer2_cell = swap.assign_const(&mut layouter, Halo2Fr::from(2u64), "layer=2")?;
 
         // ---- Step 3: layer-L labeling relation (the finding-1.1 core). ----
-        // label(1, v*) = Poseidon(replicaID, 1, v*, prev_same1)
-        //   prev_same1 = label(1, v*-1) if v*≥1, else replicaID (seed).
-        let prev_same1_cell = if drg_parent(v).is_some() {
-            drg1_cell.clone()
-        } else {
-            replica_id_cell.clone()
-        };
+        let prev_same1_cell =
+            swap.mux(&mut layouter, &replica_id_cell, &drg1_cell, &has_drg)?;
         let label1_cell = PoseidonChip::hash_n_from_cells(
             &config.poseidon,
             &mut layouter,
             &[
                 replica_id_cell.clone(),
                 layer1_cell.clone(),
-                v_cell.clone(),
+                idx_cell.clone(),
                 prev_same1_cell,
             ],
         )?;
 
-        // label(2, v*) = Poseidon(replicaID, 2, v*, prev_same2, label(1, v*))
-        //   prev_same2 = label(2, v*-1) if v*≥1, else replicaID (seed).
-        //   expander parent (prev layer) = label(1, v*) (identity rule).
-        let prev_same2_cell = if drg_parent(v).is_some() {
-            drg2_cell.clone()
-        } else {
-            replica_id_cell.clone()
-        };
+        let prev_same2_cell =
+            swap.mux(&mut layouter, &replica_id_cell, &drg2_cell, &has_drg)?;
         let label2_cell = PoseidonChip::hash_n_from_cells(
             &config.poseidon,
             &mut layouter,
             &[
                 replica_id_cell.clone(),
                 layer2_cell.clone(),
-                v_cell.clone(),
+                idx_cell.clone(),
                 prev_same2_cell,
                 label1_cell.clone(),
             ],
@@ -407,72 +328,65 @@ impl Circuit<Halo2Fr> for PoStCircuit {
             &[label1_cell.clone(), label2_cell.clone()],
         )?;
 
-        // ---- Step 5: Merkle inclusions R[v*]∈CommR, column(v*)∈CommC. ----
-        // NO CommD inclusion — that is PoRep-only (data is not re-opened in
-        // the recurring PoSt). The R leaf is the witnessed sealed leaf; the
-        // column is the recomputed one (bound to label1/label2 above), so a
-        // prover cannot present a column that does not match the labeling.
-        self.merkle_verify(
-            &config,
+        // ---- Step 5: index-agnostic Merkle inclusions R[v*]∈CommR, col∈CommC. ----
+        let sib_r = self.assign_siblings(swap, &mut layouter, &self.sib_r, "sib_r")?;
+        let root_r = swap.merkle_root(&config.poseidon, &mut layouter, replica_cell, &bits, &sib_r)?;
+        layouter.constrain_instance(root_r.cell(), config.instance, pi::COMM_R)?;
+
+        let sib_c = self.assign_siblings(swap, &mut layouter, &self.sib_c, "sib_c")?;
+        let root_c = swap.merkle_root(&config.poseidon, &mut layouter, column_cell, &bits, &sib_c)?;
+        layouter.constrain_instance(root_c.cell(), config.instance, pi::COMM_C)?;
+
+        // ---- Step 6: PARENT SOUNDNESS — parent column ∈ CommC at v*-1. ----
+        let parent_col = PoseidonChip::hash_n_from_cells(
+            &config.poseidon,
             &mut layouter,
-            replica_cell,
-            &self.path_r,
-            pi::COMM_R,
+            &[drg1_cell.clone(), drg2_cell.clone()],
         )?;
-        self.merkle_verify(
-            &config,
+        let parent_index_val = self
+            .challenge_index
+            .checked_sub(1)
+            .map(|p| Halo2Fr::from(p as u64))
+            .unwrap_or(Halo2Fr::ZERO);
+        let (parent_idx_cell, parent_bits) =
+            swap.decompose_index(&mut layouter, Value::known(parent_index_val))?;
+        // p+1 via a small add region using the swap gadget's columns + a
+        // gated_eq: has_drg·((p+1) − v*) = 0. We compute p+1 with the
+        // recompose gate is not a fit; use a dedicated add through the swap
+        // mux gate's add-like form is also awkward, so we enforce p+1 = v*
+        // (when has_drg) by gate-equating `parent_idx + 1` to `idx` using an
+        // explicit add region anchored on the swap gadget's `a/b` columns.
+        let parent_idx_plus1 = swap.add_one(&mut layouter, &parent_idx_cell)?;
+        swap.gated_eq(&mut layouter, &parent_idx_plus1, &idx_cell, &has_drg)?;
+
+        let sib_parent =
+            self.assign_siblings(swap, &mut layouter, &self.sib_parent_c, "sib_parent_c")?;
+        let parent_root = swap.merkle_root(
+            &config.poseidon,
             &mut layouter,
-            column_cell,
-            &self.path_c,
-            pi::COMM_C,
+            parent_col,
+            &parent_bits,
+            &sib_parent,
         )?;
+        // has_drg·(parent_root − CommC) = 0, gate-equated against `root_c`
+        // (already constrained to the public CommC).
+        swap.gated_eq(&mut layouter, &parent_root, &root_c, &has_drg)?;
 
         Ok(())
     }
 }
 
 impl PoStCircuit {
-    /// Assign a public/known constant into a fresh equality-enabled cell.
-    fn assign_constant(
+    fn assign_siblings(
         &self,
-        config: &PoStCircuitConfig,
+        swap: &SwapMerkleConfig,
         layouter: &mut impl Layouter<Halo2Fr>,
-        c: Halo2Fr,
+        sibs: &[Value<Halo2Fr>; MERKLE_DEPTH],
         name: &'static str,
-    ) -> Result<AssignedCell<Halo2Fr, Halo2Fr>, ErrorFront> {
-        layouter.assign_region(
-            || name,
-            |mut region| region.assign_advice(|| name, config.witness, 0, || Value::known(c)),
-        )
-    }
-
-    /// Verify a depth-2 binary Poseidon-Merkle inclusion of `leaf` against
-    /// the public root at instance slot `root_pi`. Identical topology to
-    /// PoRep's `merkle_verify`: at each level the running digest is hashed
-    /// with its sibling in the correct order; the branch direction is a
-    /// public part of the topology (challenge index).
-    fn merkle_verify(
-        &self,
-        config: &PoStCircuitConfig,
-        layouter: &mut impl Layouter<Halo2Fr>,
-        leaf: AssignedCell<Halo2Fr, Halo2Fr>,
-        path: &[(Value<Halo2Fr>, bool); MERKLE_DEPTH],
-        root_pi: usize,
-    ) -> Result<(), ErrorFront> {
-        let mut cur = leaf;
-        for (level, (sib_val, sib_is_left)) in path.iter().enumerate() {
-            let sib_cell = layouter.assign_region(
-                || format!("merkle_sib_l{}", level),
-                |mut region| region.assign_advice(|| "sibling", config.witness, 0, || *sib_val),
-            )?;
-            cur = if *sib_is_left {
-                PoseidonChip::hash_n_from_cells(&config.poseidon, layouter, &[sib_cell, cur])?
-            } else {
-                PoseidonChip::hash_n_from_cells(&config.poseidon, layouter, &[cur, sib_cell])?
-            };
-        }
-        layouter.constrain_instance(cur.cell(), config.instance, root_pi)?;
-        Ok(())
+    ) -> Result<[AssignedCell<Halo2Fr, Halo2Fr>; MERKLE_DEPTH], ErrorFront> {
+        let s0 = swap.assign_value(layouter, sibs[0], name)?;
+        let s1 = swap.assign_value(layouter, sibs[1], name)?;
+        Ok([s0, s1])
     }
 }
 
@@ -487,11 +401,10 @@ mod tests {
     use halo2_proofs::dev::MockProver;
 
     /// k for the reduced PoSt instance. PoSt is LIGHTER than PoRep (no
-    /// encoding bridge hashes, no CommD Merkle inclusion): replicaID + 2
-    /// labels + column + 4 Merkle-node hashes ≈ 8 permutations, fewer than
-    /// PoRep's ~12. k=13 (8192 rows) is comfortable; we keep it equal to
-    /// PoRep's K so the v2/v3 SRS sizing stays uniform.
-    const K: u32 = 13;
+    /// encoding bridge, no CommD inclusion) but the index-agnostic Merkle +
+    /// parent inclusion add Poseidon permutations; k=14 keeps it uniform
+    /// with PoRep's k so the v2/v3 SRS sizing stays uniform.
+    const K: u32 = 14;
 
     fn sample_data() -> [Halo2Fr; N] {
         [
@@ -530,8 +443,7 @@ mod tests {
         }
     }
 
-    /// Positive — full KZG prove+verify round trip (the real pipeline the
-    /// 0x0108 circuit_version=3 path runs).
+    /// Positive — full KZG prove+verify round trip.
     #[test]
     fn post_reduced_positive_kzg_round_trip() {
         use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk, verify_proof_multi};
@@ -584,12 +496,63 @@ mod tests {
         );
     }
 
-    /// Soundness — wrong replicaID. Present pinner B's identity + B's
-    /// replicaID as public input, but A's sealed witness (labels/leaves).
-    /// The in-circuit labeling recomputes from the PUBLIC replicaID (B's),
-    /// so the recomputed column no longer matches A's CommC and the R-leaf
-    /// inclusion is against A's CommR while the proof claims B's replicaID
-    /// → MUST fail. B cannot reuse A's held replica.
+    /// SINGLE-VK (TD-18 killed): ONE keygen'd VK verifies honest PoSt proofs
+    /// for ALL 4 challenge indices.
+    #[test]
+    fn post_single_vk_verifies_all_indices() {
+        use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk, verify_proof_multi};
+        use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
+        use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
+        use halo2_proofs::poly::kzg::strategy::SingleStrategy;
+        use halo2_proofs::transcript::{
+            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
+        };
+        use halo2curves::bn256::{Bn256, G1Affine};
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let pinner = Halo2Fr::from(0xA11CEu64);
+        let sealed = seal_sample(pinner);
+
+        let mut params_rng = StdRng::from_seed([0x4D; 32]);
+        let params = ParamsKZG::<Bn256>::setup(K, &mut params_rng);
+        let shape = PoStCircuit::default().without_witnesses();
+        let vk = keygen_vk(&params, &shape).expect("single keygen_vk");
+        let pk = keygen_pk(&params, vk.clone(), &shape).expect("single keygen_pk");
+
+        for v in 0..N {
+            let circuit = PoStCircuit::from_sealed(&sealed, pinner, v);
+            let pis = PoStCircuit::public_inputs(&sealed, v);
+            let public_inputs: Vec<Vec<Halo2Fr>> = vec![pis];
+
+            let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
+            let prover_rng = StdRng::from_seed([0xAB; 32]);
+            create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(
+                &params,
+                &pk,
+                &[circuit],
+                &[public_inputs.clone()],
+                prover_rng,
+                &mut transcript,
+            )
+            .expect("create_proof");
+            let proof_bytes = transcript.finalize();
+
+            let verifier_params = params.verifier_params();
+            let mut vt = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&proof_bytes[..]);
+            let ok = verify_proof_multi::<
+                KZGCommitmentScheme<Bn256>,
+                VerifierSHPLONK<Bn256>,
+                _,
+                _,
+                SingleStrategy<_>,
+            >(&verifier_params, &vk, &[public_inputs], &mut vt);
+            assert!(ok, "the SINGLE PoSt VK must verify challenge index v={v}");
+        }
+    }
+
+    /// Soundness — wrong replicaID. B's identity + B's replicaID over A's
+    /// held replica → labeling recomputes from B's replicaID → mismatch.
     #[test]
     fn post_reduced_negative_wrong_replica_id() {
         let pinner_a = Halo2Fr::from(0xA11CEu64);
@@ -611,9 +574,7 @@ mod tests {
         );
     }
 
-    /// Soundness — tampered label. Corrupt the DRG parent label feeding
-    /// label(2,v*): the recomputed label(2,v*) (and thus column(v*))
-    /// diverges from the sealed one → column inclusion against CommC fails.
+    /// Soundness — tampered label (without rebuilding commitments).
     #[test]
     fn post_reduced_negative_tampered_label() {
         let pinner = Halo2Fr::from(0xA11CEu64);
@@ -631,10 +592,76 @@ mod tests {
         );
     }
 
-    /// Soundness — wrong/non-stored node value. Present an R leaf that is
-    /// not the one committed in CommR (a node the pinner no longer holds).
-    /// The Merkle inclusion of R[v*] against the public CommR MUST fail —
-    /// this is the core "is the replica STILL held" check.
+    /// PARENT FORGERY (new soundness test) — supply a forged but
+    /// relation-satisfying parent label; the parent-column inclusion against
+    /// CommC must reject.
+    #[test]
+    fn post_parent_forgery_rejected() {
+        use crate::zkp::halo2::porep::merkle_root_4_for_test;
+        let pinner = Halo2Fr::from(0xA11CEu64);
+        let mut sealed = seal_sample(pinner);
+        let v = 1usize;
+
+        let forged_p1 = sealed.labels[0][0] + Halo2Fr::from(777u64);
+        let forged_p2 = sealed.labels[1][0] + Halo2Fr::from(888u64);
+
+        // Recompute v*'s labels/column/replica from the forged parents.
+        let l1 = crate::zkp::halo2::porep::label_hash_for_test(
+            sealed.replica_id,
+            1,
+            v,
+            forged_p1,
+            None,
+        );
+        let l2 = crate::zkp::halo2::porep::label_hash_for_test(
+            sealed.replica_id,
+            2,
+            v,
+            forged_p2,
+            Some(l1),
+        );
+        let col = crate::zkp::halo2::porep::pair_hash_for_test(l1, l2);
+        let r = sealed.data[v] + l2;
+
+        sealed.labels[0][v] = l1;
+        sealed.labels[1][v] = l2;
+        sealed.columns[v] = col;
+        sealed.replica[v] = r;
+        sealed.comm_c = merkle_root_4_for_test(&sealed.columns);
+        sealed.comm_r = merkle_root_4_for_test(&sealed.replica);
+
+        let mut circuit = PoStCircuit::from_sealed(&sealed, pinner, v);
+        circuit.drg_parent_l1 = Value::known(forged_p1);
+        circuit.drg_parent_l2 = Value::known(forged_p2);
+
+        let pis = PoStCircuit::public_inputs(&sealed, v);
+        let prover = MockProver::run(K, &circuit, vec![pis]).expect("setup");
+        assert!(
+            prover.verify().is_err(),
+            "PoSt with a forged (relation-satisfying) parent label MUST be \
+             rejected by the parent-column inclusion against CommC"
+        );
+    }
+
+    /// Index-binding negative: witnessed index ≠ public challengeNonce.
+    #[test]
+    fn post_index_binding_negative() {
+        let pinner = Halo2Fr::from(0xA11CEu64);
+        let sealed = seal_sample(pinner);
+        let v = 2usize;
+
+        let circuit = PoStCircuit::from_sealed(&sealed, pinner, v);
+        let mut pis = PoStCircuit::public_inputs(&sealed, v);
+        pis[pi::CHALLENGE_NONCE] = Halo2Fr::from(1u64);
+
+        let prover = MockProver::run(K, &circuit, vec![pis]).expect("setup");
+        assert!(
+            prover.verify().is_err(),
+            "witnessed index must equal public challengeNonce or proof rejects"
+        );
+    }
+
+    /// Soundness — wrong/non-stored node value (R leaf not in CommR).
     #[test]
     fn post_reduced_negative_wrong_node_value() {
         let pinner = Halo2Fr::from(0xA11CEu64);
@@ -652,9 +679,7 @@ mod tests {
         );
     }
 
-    /// Soundness — tampered public input. Keep the honest witness but flip
-    /// the public CommR to a wrong root; the R-inclusion's recomputed root
-    /// can no longer equal the (tampered) public CommR → MUST fail.
+    /// Soundness — tampered public input (flip CommR).
     #[test]
     fn post_reduced_negative_tampered_public_input() {
         let pinner = Halo2Fr::from(0xA11CEu64);
@@ -673,23 +698,18 @@ mod tests {
     }
 
     /// The reduced PoSt public-input layout has 7 slots — distinct from
-    /// PoRep's 8 (no CommD) and from the inference circuit's 3-commitment
-    /// shape. Domain separation at the shape level.
+    /// PoRep's 8 (no CommD).
     #[test]
     fn post_reduced_public_input_shape() {
         assert_eq!(pi::COUNT, 7);
         let sealed = seal_sample(Halo2Fr::from(1u64));
         let pis = PoStCircuit::public_inputs(&sealed, 0);
         assert_eq!(pis.len(), 7);
-        // CommR sits at slot 3 where PoRep has CommD — the structural
-        // domain-separation point.
         assert_eq!(pi::COMM_R, 3);
         assert_eq!(super::super::porep::pi::COMM_D, 3);
     }
 
-    /// PoSt reuses PoRep's sealing: a PoSt proof and a PoRep proof over the
-    /// SAME replica agree on replicaID/CommR/CommC. This pins that the
-    /// recurring proof checks the SAME sealed bytes the one-time proof did.
+    /// PoSt reuses PoRep's sealing.
     #[test]
     fn post_shares_sealing_with_porep() {
         use crate::zkp::halo2::porep::PoRepCircuit;
@@ -700,7 +720,6 @@ mod tests {
         let post_pis = PoStCircuit::public_inputs(&sealed, v);
         let porep_pis = PoRepCircuit::public_inputs(&sealed, v);
 
-        // Same replicaID, CommR, CommC across the two proof systems.
         assert_eq!(
             post_pis[pi::REPLICA_ID],
             porep_pis[crate::zkp::halo2::porep::pi::REPLICA_ID]
