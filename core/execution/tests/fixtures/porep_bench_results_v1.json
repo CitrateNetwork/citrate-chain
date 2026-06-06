@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "schema": "PIN-P1 (f.5) — DGX benchmark suite results. The Criterion harness in `benches/porep_bench.rs` produces target/criterion/...; an operator appends one record per run here after each measured run.",
+  "schema_field_keys": [
+    "run_id",
+    "captured_at",
+    "host",
+    "sector_bytes",
+    "k_leaf",
+    "k_root",
+    "num_leaves",
+    "params",
+    "seal_secs",
+    "witness_build_secs",
+    "porep_prove_secs",
+    "post_prove_secs",
+    "proof_bytes",
+    "verify_gas",
+    "peak_host_ram_gib",
+    "peak_gpu_ram_gib",
+    "host_threads",
+    "gpu_id",
+    "halo2_features",
+    "git_sha",
+    "criterion_report_path",
+    "notes"
+  ],
+  "params_keys": ["n", "l", "d_drg", "d_exp", "k"],
+  "host_keys": ["cpu_model", "cpu_threads", "ram_gib", "gpu_model", "gpu_count", "os", "kernel"],
+  "runs": []
+}
