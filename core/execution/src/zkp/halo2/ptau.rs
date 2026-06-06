@@ -438,7 +438,7 @@ pub fn load_ptau_into_params_kzg<P: AsRef<std::path::Path>>(
     k: u32,
 ) -> Result<ParamsKZG<Bn256>, super::srs::SrsLoadError> {
     use super::srs::{load_and_verify_ptau, SrsLoadError};
-    let bytes = load_and_verify_ptau(path)?;
+    let bytes = load_and_verify_ptau(path, k)?;
     let raw = parse_ptau_for_kzg(&bytes, k)
         .map_err(|e| SrsLoadError::Parse(format!("{e}")))?;
     construct_params_kzg(&raw, k)
