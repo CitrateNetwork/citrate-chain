@@ -557,4 +557,35 @@ mod tests {
         assert_eq!(params.k(), 18);
         assert_eq!(params.n(), 1u64 << 18);
     }
+
+    /// PIN-P1 (f.4 ops PR) — same as `parses_real_ppot_k18_file` but
+    /// for the k=22 file pinned in the f.4 ops PR. Run via:
+    ///   `cargo test --features halo2-substrate parses_real_ppot_k22_file -- --ignored`
+    /// with the file staged at the default path. Validates the f.4
+    /// hash pin corresponds to a usable .ptau (per-point on-curve
+    /// checks + canonical G2 generator).
+    #[test]
+    #[ignore]
+    fn parses_real_ppot_k22_file() {
+        let path = "/tmp/ppot-downloads/ppot_0080_22.ptau";
+        let bytes = std::fs::read(path).expect("real .ptau file");
+        let raw = parse_ptau_for_kzg(&bytes, 22).expect("parse k=22");
+        assert_eq!(raw.power, 22);
+        assert_eq!(raw.g.len(), (1 << 22) + 1);
+        let g_gen = G1Affine::generator();
+        assert_eq!(raw.g[0], g_gen, "tauG1[0] must equal G1 generator");
+    }
+
+    /// PIN-P1 (f.4 ops PR) — full pipeline at k=22 (hash-verify +
+    /// parse + on-curve + construct halo2 ParamsKZG).
+    #[test]
+    #[ignore]
+    fn ptau_to_params_kzg_k22() {
+        let path = "/tmp/ppot-downloads/ppot_0080_22.ptau";
+        let params = load_ptau_into_params_kzg(path, 22)
+            .expect("load_ptau_into_params_kzg");
+        use halo2_proofs::poly::commitment::Params;
+        assert_eq!(params.k(), 22);
+        assert_eq!(params.n(), 1u64 << 22);
+    }
 }
