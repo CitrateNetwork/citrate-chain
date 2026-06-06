@@ -149,11 +149,19 @@ pub const PINNED: &[PinnedSrsK] = &[
     },
     PinnedSrsK {
         k: 25,
-        expected_sha256: None,
+        // PIN-P1 (f.4) k=25 hash captured 2026-06-06 from a fresh
+        // sha256sum of `ppot_0080_25.ptau` fetched from `canonical_url`.
+        // Re-derivable via: `curl -L -o ppot_0080_25.ptau {canonical_url}
+        // && sha256sum ppot_0080_25.ptau`.
+        expected_sha256: Some([
+            0xa9, 0x1f, 0xd8, 0xe8, 0xed, 0x33, 0x32, 0xb5, 0xeb, 0xaf, 0xc9, 0x0b, 0xc0, 0x53,
+            0x29, 0xc8, 0x74, 0x13, 0x3f, 0x7d, 0x47, 0xc6, 0xbf, 0xe3, 0x3e, 0x26, 0xdc, 0xa0,
+            0xc2, 0xd1, 0x1e, 0xe1,
+        ]),
         canonical_url:
             "https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/ppot_0080_25.ptau",
         default_path: "/var/lib/citrate/srs/ppot_0080_25.ptau",
-        captured_at: None,
+        captured_at: Some("2026-06-06"),
     },
 ];
 
@@ -415,29 +423,25 @@ mod tests {
     }
 
     #[test]
-    fn unpinned_k_rejects_with_url_for_ops() {
-        // f.4 adds k=22, k=24, k=25 entries. k=22 + k=24 are now pinned;
-        // k=25 stays unpinned until its ops PR lands. Loading at the
-        // unpinned k MUST fail closed with `HashNotPinned` + the
-        // canonical URL.
-        for k in [25u32] {
-            let r = load_and_verify_ptau("/nonexistent/file.ptau", k);
-            match r {
-                Err(SrsLoadError::HashNotPinned { k: rk, url }) => {
-                    assert_eq!(rk, k, "k field in error matches request");
-                    assert!(
-                        url.starts_with(
-                            "https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/"
-                        ),
-                        "url is the PSE canonical mirror: {url}"
-                    );
-                    assert!(
-                        url.ends_with(&format!("ppot_0080_{k}.ptau")),
-                        "url ends with the per-k file name: {url}"
-                    );
-                }
-                other => panic!("k={k} must return HashNotPinned; got {other:?}"),
-            }
+    fn all_pinned_entries_have_captured_hashes() {
+        // As of the k=25 ops PR (2026-06-06), every entry in `PINNED`
+        // has `expected_sha256: Some(..)` — no allocated-but-unpinned
+        // slots remain. New unpinned entries appended in the future
+        // should land with `expected_sha256: None`, at which point
+        // `unpinned_k_rejects_with_url_for_ops` (deleted in this PR)
+        // should be re-introduced.
+        for entry in PINNED {
+            assert!(
+                entry.expected_sha256.is_some(),
+                "k={} entry has unpinned hash; either pin it or re-introduce \
+                 the unpinned-k regression test",
+                entry.k
+            );
+            assert!(
+                entry.captured_at.is_some(),
+                "k={} entry has no captured_at timestamp",
+                entry.k
+            );
         }
     }
 
