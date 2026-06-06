@@ -588,4 +588,31 @@ mod tests {
         assert_eq!(params.k(), 22);
         assert_eq!(params.n(), 1u64 << 22);
     }
+
+    /// PIN-P1 (f.4 ops PR) — same as `parses_real_ppot_k22_file` for
+    /// k=24. Run via:
+    ///   `cargo test --features halo2-substrate parses_real_ppot_k24_file -- --ignored`
+    #[test]
+    #[ignore]
+    fn parses_real_ppot_k24_file() {
+        let path = "/tmp/ppot-downloads/ppot_0080_24.ptau";
+        let bytes = std::fs::read(path).expect("real .ptau file");
+        let raw = parse_ptau_for_kzg(&bytes, 24).expect("parse k=24");
+        assert_eq!(raw.power, 24);
+        assert_eq!(raw.g.len(), (1 << 24) + 1);
+        let g_gen = G1Affine::generator();
+        assert_eq!(raw.g[0], g_gen, "tauG1[0] must equal G1 generator");
+    }
+
+    /// PIN-P1 (f.4 ops PR) — full pipeline at k=24.
+    #[test]
+    #[ignore]
+    fn ptau_to_params_kzg_k24() {
+        let path = "/tmp/ppot-downloads/ppot_0080_24.ptau";
+        let params = load_ptau_into_params_kzg(path, 24)
+            .expect("load_ptau_into_params_kzg");
+        use halo2_proofs::poly::commitment::Params;
+        assert_eq!(params.k(), 24);
+        assert_eq!(params.n(), 1u64 << 24);
+    }
 }
