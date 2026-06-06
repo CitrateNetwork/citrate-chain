@@ -28,21 +28,24 @@
     },
     {
       "k": 22,
-      "sha256": null,
-      "pinned": false,
+      "sha256": "9f50df02e370796098cecbb025d46a44c7165cac8bc5ebedd76d97f1129d9653",
+      "pinned": true,
       "curve": "bn254",
-      "format": "snarkjs ptau (sections 1-7)",
+      "format": "snarkjs ptau (sections 1-7; we consume sections 1-3 only)",
+      "size_bytes": 4831931538,
       "filename": "ppot_0080_22.ptau",
       "source_url": "https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/ppot_0080_22.ptau",
       "source_mirror": "PSE (Privacy & Scaling Explorations) AWS S3, eu-central-1",
+      "fetched_at": "2026-06-06T04:39:00Z",
       "ceremony": "Perpetual Powers of Tau",
       "ceremony_repo": "https://github.com/privacy-scaling-explorations/perpetualpowersoftau",
       "contribution_index": 80,
+      "contribution_author": "Carter Feldman",
       "verification_command": "curl -L -o ppot_0080_22.ptau https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/ppot_0080_22.ptau && sha256sum ppot_0080_22.ptau",
       "consumes": "PIN-P1 (f.3) leaf circuit candidate (k_leaf ~21–22 depending on partition cost)",
       "notes": [
-        "PIN-P1 (f.4) allocation — hash unpinned until an operator fetches the file, captures sha256, and lands a follow-up PR per the WP-M1b.2 stability rule (srs.rs header).",
-        "load_srs(22, _) returns SrsLoadError::HashNotPinned with this URL until the hash lands here + in srs::PINNED."
+        "PIN-P1 (f.4) hash captured by direct sha256sum of the file fetched from the canonical URL on 2026-06-06. File size matches the bucket's Content-Length (4831931538 bytes).",
+        "Trust model unchanged from k=18: 1-of-N — one honest contributor among 86 (the same pot28_0080 chain that anchors v1 inference)."
       ]
     },
     {

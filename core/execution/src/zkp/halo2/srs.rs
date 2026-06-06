@@ -117,11 +117,19 @@ pub const PINNED: &[PinnedSrsK] = &[
     // entry + an ADR amendment per the WP-M1b.2 stability rule.
     PinnedSrsK {
         k: 22,
-        expected_sha256: None,
+        // PIN-P1 (f.4) k=22 hash captured 2026-06-06 from a fresh
+        // sha256sum of `ppot_0080_22.ptau` fetched from `canonical_url`.
+        // Re-derivable via: `curl -L -o ppot_0080_22.ptau {canonical_url}
+        // && sha256sum ppot_0080_22.ptau`.
+        expected_sha256: Some([
+            0x9f, 0x50, 0xdf, 0x02, 0xe3, 0x70, 0x79, 0x60, 0x98, 0xce, 0xcb, 0xb0, 0x25, 0xd4,
+            0x6a, 0x44, 0xc7, 0x16, 0x5c, 0xac, 0x8b, 0xc5, 0xeb, 0xed, 0xd7, 0x6d, 0x97, 0xf1,
+            0x12, 0x9d, 0x96, 0x53,
+        ]),
         canonical_url:
             "https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/ppot_0080_22.ptau",
         default_path: "/var/lib/citrate/srs/ppot_0080_22.ptau",
-        captured_at: None,
+        captured_at: Some("2026-06-06"),
     },
     PinnedSrsK {
         k: 24,
@@ -400,11 +408,11 @@ mod tests {
 
     #[test]
     fn unpinned_k_rejects_with_url_for_ops() {
-        // f.4 adds k=22, k=24, k=25 entries with no hash pinned yet.
-        // Loading at those k MUST fail closed with `HashNotPinned` +
-        // the canonical URL in the error so an operator can
-        // immediately see what file to fetch + sha256sum to capture.
-        for k in [22u32, 24, 25] {
+        // f.4 adds k=22, k=24, k=25 entries. k=22 is now pinned (ops PR
+        // ops/pin-p1-f4-k22-hash); k=24 and k=25 stay unpinned until
+        // their respective ops PRs land. Loading at the unpinned ks
+        // MUST fail closed with `HashNotPinned` + the canonical URL.
+        for k in [24u32, 25] {
             let r = load_and_verify_ptau("/nonexistent/file.ptau", k);
             match r {
                 Err(SrsLoadError::HashNotPinned { k: rk, url }) => {
