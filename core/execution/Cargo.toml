@@ -108,6 +108,15 @@ harness = false
 name = "tps_parallel"
 harness = false
 
+# PIN-P1 (f.5) — DGX benchmark suite.
+# Measures the per-stage costs that drive the feasibility inequalities
+# from `design/PIN-P1-feasibility-latency-budget.md`:
+#   honest_PoSt_prove + tx_latency < W < t_reseal
+[[bench]]
+name = "porep_bench"
+harness = false
+required-features = ["halo2-substrate"]
+
 [features]
 metrics = []
 ai_zkp = []
