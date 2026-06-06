@@ -486,6 +486,45 @@ pub fn derive_challenge_indices(
     out
 }
 
+/// PIN-P1 (f.2c.2) — simple K-index derivation WITHOUT rejection
+/// sampling. Mirrors the in-circuit
+/// [`super::porep_circuit_kfold_v1::PoRepCircuitKFoldV1`] derivation
+/// EXACTLY (Poseidon(seed, i) reduced mod N for i in 0..K). The
+/// distinctness contract is enforced IN-CIRCUIT by f.2c.2's pairwise
+/// inequality gate; a colliding `challenge_nonce` is then simply
+/// unprovable (the operator retries with the next block's
+/// `prevrandao`).
+///
+/// **Why not just use [`derive_challenge_indices`] for v1?** That
+/// helper rejects collisions and walks `draw` past them, producing K
+/// distinct indices but at NON-CONSECUTIVE `draw` positions. The
+/// in-circuit derivation uses CONSECUTIVE `draw = 0..K`, so the two
+/// drift apart whenever a native rejection happens. Using
+/// `_simple` for v1 keeps native and in-circuit byte-identical.
+///
+/// Collision probability for K=44 at N=2^25 is `K² / 2N ≈ 3×10⁻⁵`
+/// per nonce — vanishingly small at production sizes.
+pub fn derive_challenge_indices_simple(
+    n: usize,
+    k: usize,
+    challenge_nonce: Halo2Fr,
+    epoch: Halo2Fr,
+    replica_id: Halo2Fr,
+    sector_index: Halo2Fr,
+) -> Vec<usize> {
+    assert!(n > 0 && k > 0);
+    let seed = native_hash(&[challenge_nonce, epoch, replica_id, sector_index]);
+    (0..k as u64)
+        .map(|draw| {
+            let h = native_hash(&[seed, Halo2Fr::from(draw)]);
+            let bytes = h.to_repr();
+            let mut le = [0u8; 8];
+            le.copy_from_slice(&bytes.as_ref()[0..8]);
+            (u64::from_le_bytes(le) as usize) % n
+        })
+        .collect()
+}
+
 /// Build the per-challenge witness bundle for a single challenge index.
 pub fn build_challenge(
     sealed: &GenericSealedReplica,
