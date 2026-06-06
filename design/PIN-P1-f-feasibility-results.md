@@ -71,17 +71,102 @@ documented inline in that file; key fields:
 - `peak_host_ram_gib`, `peak_gpu_ram_gib`, `host_threads`, `gpu_id` —
   resource footprint.
 
-## Current results
+## Current results — first run (2026-06-06, dev machine, criterion `--quick`)
 
-> **No run captured yet.** First run captures the scaling curve at
-> `N ∈ {256, 1024, 4096}, L ∈ {3, 5, 11}, K ∈ {3, 11, 22}`.
+> **Host:** NVIDIA GB10 (DGX Spark). Native seal + Poseidon are
+> CPU-bound; this run is single-threaded host code. Criterion `--quick`
+> reduces sample count to 10 per case so the matrix completes in
+> minutes. Re-run without `--quick` for the locked numbers that feed
+> f.6.
 
-| Stage                | N=256, L=3 | N=1024, L=3 | N=4096, L=3 | N=1024, L=5 | N=1024, L=11 |
-|----------------------|------------|-------------|-------------|-------------|--------------|
-| `seal_secs`          | TBD        | TBD         | TBD         | TBD         | TBD          |
-| `witness_build_secs` (K=3) | TBD  | TBD         | TBD         | TBD         | TBD          |
-| `mockprover_k1_secs` | TBD        | TBD         | TBD         | TBD         | TBD          |
-| `mockprover_k3_secs` | TBD        | TBD         | TBD         | TBD         | TBD          |
+**Seal native** (`pin/seal_native`, `d_DRG=6, d_EXP=8`):
+
+| (N, L)        | seal_secs (median)  |
+|---------------|---------------------|
+| (1024, 11)    | 2.22 s              |
+| (4096, 3)     | 2.41 s              |
+| (4096, 5)     | 4.02 s              |
+| (4096, 11)    | 8.88 s              |
+
+Scaling check: at N=4096, going L=3→L=11 (3.7×) yields 2.41→8.88 s
+(3.7×). At L=11, N=1024→N=4096 (4×) yields 2.22→8.88 s (4×). The
+`O(N × L)` extrapolation law from the budget doc HOLDS empirically on
+the dev-machine run.
+
+**Witness build** (`pin/witness_build`, N=1024, L=3, `d_DRG=6, d_EXP=8`):
+
+| K   | witness_build_secs  | per-challenge |
+|-----|---------------------|---------------|
+| 3   | 1.18 s              | 0.39 s        |
+| 11  | 4.32 s              | 0.39 s        |
+| 22  | 8.63 s              | 0.39 s        |
+
+Linear in K, per-challenge cost stable at ~0.39 s — confirms the
+`O(K × (d_DRG + d_EXP) × log2 N)` model.
+
+**MockProver verify** (`pin/mockprover_k1` vs `pin/mockprover_kfold_k3`,
+N=1024, L=3):
+
+| Variant     | verify_ms | per-challenge |
+|-------------|-----------|---------------|
+| K=1 (f.2b)  | 78 ms     | 78 ms         |
+| K=3 (f.2c)  | 191 ms    | 64 ms         |
+
+K-fold per-challenge cost is 64 ms vs single-challenge 78 ms — the
+K-fold saves ~18% per challenge from sharing the replicaID hash +
+base PI bindings. Meaningful but not dominant; the per-challenge
+gate-set is the bulk of the cost.
+
+## Extrapolation to production
+
+**Seal time at the proposed sector sizes** (using L=11, the Filecoin
+SDR analysed value; native dev-machine CPU only, no GPU MSM yet):
+
+| Sector  | N (production) | Multiplier vs N=4096 | seal_secs (extrapolated) |
+|---------|----------------|----------------------|--------------------------|
+| 512 MiB | 2^24 = 16.8 M  | 4096×                | ~10 hours                |
+| 1 GiB   | 2^25 = 33.6 M  | 8192×                | ~20 hours                |
+| 2 GiB   | 2^26 = 67.1 M  | 16384×               | ~40 hours                |
+
+For comparison, Filecoin's seal time at a 32 GiB sector is ~30 hours
+on a regular server (with a much more optimised seal kernel). Our
+numbers are in the right ballpark; meaningful host-side optimisation
+(per-layer parallelism, SIMD Poseidon) should knock 5-10× off the
+above before production.
+
+**PoSt (recurring) cost extrapolation** at N=2^25, K=22, L=11:
+
+- witness build: 22 challenges × 0.39 s/challenge × (depth=25 vs 10
+  scaling factor) ≈ 21 s
+- MockProver verify at K=22 (proxy): 22 × 64 ms × (depth scaling) ≈
+  ~3.5 s
+- TOTAL honest PoSt prove time ≈ ~25 s (proxy; KZG prove is the real
+  number, lands once the SRS hashes pin)
+
+If the PoSt window W is set to 10 minutes (300 blocks at SECS_PER_BLOCK=2),
+the inequality `honest_PoSt_prove + tx_latency < W` holds with massive
+margin (25 s + ~10 s tx_latency vs 600 s W).
+
+The `t_reseal >> W` inequality holds trivially (hours of reseal vs
+minutes of window).
+
+**Conclusion (provisional):** the feasibility inequalities hold for
+the proposed parameters. Sector size 1 GiB (N=2^25) is the
+recommended lock unless GPU MSM cuts seal time more than 5×.
+
+## K-value advisement update
+
+The witness_build numbers (linear in K, per-challenge ~0.39 s) and the
+K-fold savings (~18% per challenge) confirm the advisement from the
+f.4 review:
+
+- **K_porep = 22** is comfortable inside the seal window (one-time
+  cost, hours).
+- **K_post = 44** keeps the steady-state PoSt prove time well inside
+  any reasonable W.
+
+If GPU MSM lands a 5-10× speedup, K=44 PoRep is also viable; the
+margin saved by K=22 → K=44 is small (linear in K).
 
 ## Decision rules (what each result implies for f.6)
 

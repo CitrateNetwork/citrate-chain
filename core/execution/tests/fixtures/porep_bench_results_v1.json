@@ -27,5 +27,55 @@
   ],
   "params_keys": ["n", "l", "d_drg", "d_exp", "k"],
   "host_keys": ["cpu_model", "cpu_threads", "ram_gib", "gpu_model", "gpu_count", "os", "kernel"],
-  "runs": []
+  "runs": [
+    {
+      "run_id": "f5-first-light-2026-06-06",
+      "captured_at": "2026-06-06T04:25:00Z",
+      "host": {
+        "cpu_model": "DGX Spark (GB10)",
+        "cpu_threads": "host-thread-default",
+        "ram_gib": null,
+        "gpu_model": "NVIDIA GB10",
+        "gpu_count": 1,
+        "os": "Linux 6.14.0-1015-nvidia",
+        "kernel": "6.14.0-1015"
+      },
+      "sector_bytes": null,
+      "k_leaf": null,
+      "k_root": null,
+      "num_leaves": 1,
+      "params": { "n": 1024, "l": 3, "d_drg": 6, "d_exp": 8, "k": 3 },
+      "seal_secs": null,
+      "witness_build_secs": 1.1782,
+      "porep_prove_secs": null,
+      "post_prove_secs": null,
+      "proof_bytes": null,
+      "verify_gas": null,
+      "peak_host_ram_gib": null,
+      "peak_gpu_ram_gib": null,
+      "host_threads": 1,
+      "gpu_id": null,
+      "halo2_features": ["halo2-substrate"],
+      "git_sha": "PR-#27 / f5 first run",
+      "criterion_report_path": "target/criterion/pin/",
+      "notes": "Criterion --quick run; 10 samples/case. Full numbers in design/PIN-P1-f-feasibility-results.md. Seal/L/N scaling laws (O(N×L)) and witness/K scaling (O(K)) confirmed empirically. K-fold per-challenge cost is 64ms vs single-challenge 78ms — ~18% shared-cost savings.",
+      "additional_cases": {
+        "seal_native": {
+          "(1024, 11)": "2.22 s",
+          "(4096, 3)":  "2.41 s",
+          "(4096, 5)":  "4.02 s",
+          "(4096, 11)": "8.88 s"
+        },
+        "witness_build_N1024_L3": {
+          "K=3":  "1.18 s",
+          "K=11": "4.32 s",
+          "K=22": "8.63 s"
+        },
+        "mockprover": {
+          "K=1 (f.2b)":  "78 ms",
+          "K=3 (f.2c)":  "191 ms"
+        }
+      }
+    }
+  ]
 }
