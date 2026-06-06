@@ -50,20 +50,24 @@
     },
     {
       "k": 24,
-      "sha256": null,
-      "pinned": false,
+      "sha256": "d21a509863a643b8fd15af9b2f6f8af9b5928b3138af591edc2b7a731b8c2938",
+      "pinned": true,
       "curve": "bn254",
-      "format": "snarkjs ptau (sections 1-7)",
+      "format": "snarkjs ptau (sections 1-7; we consume sections 1-3 only)",
+      "size_bytes": 19327446162,
       "filename": "ppot_0080_24.ptau",
       "source_url": "https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/ppot_0080_24.ptau",
       "source_mirror": "PSE (Privacy & Scaling Explorations) AWS S3, eu-central-1",
+      "fetched_at": "2026-06-06T05:34:00Z",
       "ceremony": "Perpetual Powers of Tau",
       "ceremony_repo": "https://github.com/privacy-scaling-explorations/perpetualpowersoftau",
       "contribution_index": 80,
+      "contribution_author": "Carter Feldman",
       "verification_command": "curl -L -o ppot_0080_24.ptau https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/ppot_0080_24.ptau && sha256sum ppot_0080_24.ptau",
       "consumes": "PIN-P1 (f.3) root circuit candidate (k_root ~22–24 depending on accumulator per-leaf row cost)",
       "notes": [
-        "PIN-P1 (f.4) allocation — hash unpinned until an operator fetches the file. Same gating semantics as k=22."
+        "PIN-P1 (f.4) hash captured by direct sha256sum of the file fetched from the canonical URL on 2026-06-06. File size matches the bucket's Content-Length (19327446162 bytes).",
+        "Trust model unchanged: same pot28_0080 chain that anchors v1 inference + k=18 + k=22."
       ]
     },
     {

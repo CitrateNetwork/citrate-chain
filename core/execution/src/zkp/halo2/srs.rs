@@ -133,11 +133,19 @@ pub const PINNED: &[PinnedSrsK] = &[
     },
     PinnedSrsK {
         k: 24,
-        expected_sha256: None,
+        // PIN-P1 (f.4) k=24 hash captured 2026-06-06 from a fresh
+        // sha256sum of `ppot_0080_24.ptau` fetched from `canonical_url`.
+        // Re-derivable via: `curl -L -o ppot_0080_24.ptau {canonical_url}
+        // && sha256sum ppot_0080_24.ptau`.
+        expected_sha256: Some([
+            0xd2, 0x1a, 0x50, 0x98, 0x63, 0xa6, 0x43, 0xb8, 0xfd, 0x15, 0xaf, 0x9b, 0x2f, 0x6f,
+            0x8a, 0xf9, 0xb5, 0x92, 0x8b, 0x31, 0x38, 0xaf, 0x59, 0x1e, 0xdc, 0x2b, 0x7a, 0x73,
+            0x1b, 0x8c, 0x29, 0x38,
+        ]),
         canonical_url:
             "https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/ppot_0080_24.ptau",
         default_path: "/var/lib/citrate/srs/ppot_0080_24.ptau",
-        captured_at: None,
+        captured_at: Some("2026-06-06"),
     },
     PinnedSrsK {
         k: 25,
@@ -408,11 +416,11 @@ mod tests {
 
     #[test]
     fn unpinned_k_rejects_with_url_for_ops() {
-        // f.4 adds k=22, k=24, k=25 entries. k=22 is now pinned (ops PR
-        // ops/pin-p1-f4-k22-hash); k=24 and k=25 stay unpinned until
-        // their respective ops PRs land. Loading at the unpinned ks
-        // MUST fail closed with `HashNotPinned` + the canonical URL.
-        for k in [24u32, 25] {
+        // f.4 adds k=22, k=24, k=25 entries. k=22 + k=24 are now pinned;
+        // k=25 stays unpinned until its ops PR lands. Loading at the
+        // unpinned k MUST fail closed with `HashNotPinned` + the
+        // canonical URL.
+        for k in [25u32] {
             let r = load_and_verify_ptau("/nonexistent/file.ptau", k);
             match r {
                 Err(SrsLoadError::HashNotPinned { k: rk, url }) => {
