@@ -113,6 +113,15 @@ contract ComputePool is ReentrancyGuard, Governable {
     /// liveness slashes.
     uint256 public constant LIVENESS_SLASH_BPS = 10;
 
+    /// @notice Hard job-level deadline, in blocks from `createdAt`, after
+    /// which the requester may reclaim escrowed payment for a job that
+    /// never reached a terminal state (INFER-S2 / WP-G2). Distinct from
+    /// the per-coordinator `COORDINATION_TIMEOUT`: that one rotates the
+    /// coordinator and slashes for liveness; this one is the backstop that
+    /// guarantees a buyer's funds are never stranded if the pool as a whole
+    /// fails to deliver. At ~12s/block this is ~2h.
+    uint256 public constant JOB_DEADLINE = 600;
+
     // ── State ───────────────────────────────────────────────────────
 
     /// @notice All pools.
@@ -157,6 +166,9 @@ contract ComputePool is ReentrancyGuard, Governable {
     event ComputeRequested(uint256 indexed poolId, uint256 indexed jobId, address indexed requester, uint256 payment);
     event JobCompleted(uint256 indexed jobId, uint256 indexed poolId);
     event JobFailed(uint256 indexed jobId, uint256 indexed poolId);
+    /// @notice Emitted when a requester reclaims escrow for a job that
+    /// passed `JOB_DEADLINE` without terminating (INFER-S2 / WP-G2).
+    event JobReclaimed(uint256 indexed jobId, uint256 indexed poolId, address indexed requester, uint256 refund);
     event SLAViolationReported(uint256 indexed poolId, uint256 actualThroughput, uint256 guaranteedThroughput);
     event SlashingContractUpdated(address oldContract, address newContract);
     // GovernanceTransferred event provided by Governable mixin.
@@ -404,8 +416,16 @@ contract ComputePool is ReentrancyGuard, Governable {
         return _requestPoolCompute(poolId, jobSpec, maxPrice);
     }
 
-    /// @notice Mark a job as completed (governance or pool creator).
+    /// @notice Mark a job as completed (governance, pool creator, or the
+    ///         elected coordinator that ran it).
     /// @dev Payment is distributed proportionally to pool members.
+    ///      INFER-S2 / WP-G1: `job.dispatchedBy` is the VRF-elected
+    ///      coordinator recorded by `recordDispatch` (gated to
+    ///      `coordinatorFor`), so adding it to the allow-list does not
+    ///      widen trust beyond "the member the VRF actually elected to run
+    ///      this job." The requester is deliberately left OUT — a buyer
+    ///      must never be able to trigger provider payment for unverified
+    ///      work.
     /// @param jobId The job to complete.
     function completeJob(uint256 jobId) external nonReentrant {
         PoolJob storage job = jobs[jobId];
@@ -413,7 +433,9 @@ contract ComputePool is ReentrancyGuard, Governable {
 
         Pool storage pool = pools[job.poolId];
         require(
-            msg.sender == governance() || msg.sender == pool.creator,
+            msg.sender == governance()
+                || msg.sender == pool.creator
+                || msg.sender == job.dispatchedBy,
             "Not authorized"
         );
 
@@ -426,7 +448,11 @@ contract ComputePool is ReentrancyGuard, Governable {
         emit JobCompleted(jobId, job.poolId);
     }
 
-    /// @notice Mark a job as failed (governance or pool creator). Payment refunded.
+    /// @notice Mark a job as failed (governance, pool creator, or the
+    ///         elected coordinator that ran it). Payment refunded.
+    /// @dev INFER-S2 / WP-G1: see `completeJob` — `job.dispatchedBy` is the
+    ///      executor of record and is added to the allow-list so the actor
+    ///      that ran the job can also close it as failed.
     /// @param jobId The job that failed.
     function failJob(uint256 jobId) external nonReentrant {
         PoolJob storage job = jobs[jobId];
@@ -434,7 +460,9 @@ contract ComputePool is ReentrancyGuard, Governable {
 
         Pool storage pool = pools[job.poolId];
         require(
-            msg.sender == governance() || msg.sender == pool.creator,
+            msg.sender == governance()
+                || msg.sender == pool.creator
+                || msg.sender == job.dispatchedBy,
             "Not authorized"
         );
 
@@ -450,6 +478,44 @@ contract ComputePool is ReentrancyGuard, Governable {
         }
 
         emit JobFailed(jobId, job.poolId);
+    }
+
+    /// @notice Requester reclaims escrowed payment for a job that never
+    ///         terminated (INFER-S2 / WP-G2).
+    /// @dev Refund-only — never pays providers. Callable only by the
+    ///      `requester`, only while the job is still `Pending`/`Executing`,
+    ///      and only after `JOB_DEADLINE` blocks have elapsed since
+    ///      `createdAt`. This is the on-chain primitive the gateway uses to
+    ///      refund a buyer's key balance when the pool fails to deliver, so
+    ///      escrow can never be stranded. Liveness slashing stays in
+    ///      `reassignCoordinator` (no double-jeopardy); this path is
+    ///      deliberately slash-free to keep the refund simple and safe.
+    ///      Sets a terminal `Failed` status BEFORE the external call (CEI)
+    ///      so a completed/failed job can never be reclaimed and the refund
+    ///      cannot be re-entered.
+    /// @param jobId The job whose escrow is being reclaimed.
+    function reclaimExpiredJob(uint256 jobId) external nonReentrant {
+        PoolJob storage job = jobs[jobId];
+        require(
+            job.status == JobStatus.Pending || job.status == JobStatus.Executing,
+            "Not open"
+        );
+        require(msg.sender == job.requester, "Not requester");
+        require(block.number > job.createdAt + JOB_DEADLINE, "Not expired");
+
+        // Effects before interaction (CEI). Terminal status guards against
+        // a reclaim-after-complete race and reentrancy.
+        job.status = JobStatus.Failed;
+        pools[job.poolId].activeJobCount--;
+
+        uint256 refund = job.payment;
+        job.payment = 0;
+        if (refund > 0) {
+            (bool success, ) = payable(job.requester).call{value: refund}("");
+            require(success, "Refund failed");
+        }
+
+        emit JobReclaimed(jobId, job.poolId, job.requester, refund);
     }
 
     // ── SLA Enforcement ─────────────────────────────────────────────
