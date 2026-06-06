@@ -55,7 +55,7 @@ use super::chips::{PoseidonChip, PoseidonChipConfig};
 use super::porep::{pi as porep_pi, SwapMerkleConfig};
 use super::porep_circuit_kfold::KFoldChallengeWitness;
 use super::porep_generic::{
-    build_challenge, derive_challenge_indices, GenericSealedReplica, PoRepParams,
+    build_challenge, derive_challenge_indices_simple, GenericSealedReplica, PoRepParams,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ impl PoRepCircuitKFoldV1 {
         pinner_identity: Halo2Fr,
         challenge_nonce: Halo2Fr,
     ) -> Self {
-        let indices = derive_challenge_indices(
+        let indices = derive_challenge_indices_simple(
             sealed.params.n,
             sealed.params.k,
             challenge_nonce,
@@ -285,6 +285,7 @@ impl Circuit<Halo2Fr> for PoRepCircuitKFoldV1 {
         // per-challenge gate-set with the derived (idx_cell, bits).
         // ───────────────────────────────────────────────────────────────
         debug_assert_eq!(self.challenges.len(), k);
+        let mut idx_cells: Vec<AssignedCell<Halo2Fr, Halo2Fr>> = Vec::with_capacity(k);
         for (i, ch) in self.challenges.iter().enumerate() {
             let (idx_cell, idx_bits) =
                 derive_index_in_circuit(&config, &mut layouter, &mixed_seed_cell, i, depth)?;
@@ -298,7 +299,17 @@ impl Circuit<Halo2Fr> for PoRepCircuitKFoldV1 {
                 ch,
                 l,
             )?;
+            idx_cells.push(idx_cell);
         }
+
+        // PIN-P1 (f.2c.2) — pairwise distinctness gate. Soundness for the
+        // K-fold proof relies on K *distinct* challenge indices; without
+        // this gate a colliding seed would let the proof pass at
+        // effective K' < K (weakening from f^K to f^K'). Enforced via the
+        // is_nonzero gadget on each pairwise difference. K · (K-1)/2 pairs
+        // — fine at K ≤ 44 (≤ 946 pairs ≈ ~20K rows; ~1 % of the k=18
+        // row budget).
+        assert_distinct_indices(&config, &mut layouter, &idx_cells)?;
 
         Ok(())
     }
@@ -537,6 +548,57 @@ fn per_challenge_run(
 // Helpers (same as f.2c).
 // ---------------------------------------------------------------------------
 
+/// PIN-P1 (f.2c.2) — pairwise inequality gate across `idx_cells`.
+/// For every pair (i, j) with i < j, enforces `idx_i ≠ idx_j`.
+///
+/// Mechanism per pair:
+/// 1. Compute `diff = idx_i - idx_j` via the encoding add gate
+///    (`add_c = add_a + add_b` ⇒ `idx_i = diff + idx_j` with
+///    `idx_i → add_c`, `diff → add_a`, `idx_j → add_b`).
+/// 2. Apply `is_nonzero(diff)` → a soundly-constrained `has_diff`
+///    boolean cell that is 1 iff `diff ≠ 0`.
+/// 3. Assert `has_diff == 1` by copy-equality to a witnessed `1` cell.
+fn assert_distinct_indices(
+    config: &PoRepKFoldV1Config,
+    layouter: &mut impl Layouter<Halo2Fr>,
+    idx_cells: &[AssignedCell<Halo2Fr, Halo2Fr>],
+) -> Result<(), ErrorFront> {
+    let swap = &config.swap;
+    let k = idx_cells.len();
+    if k < 2 {
+        return Ok(());
+    }
+    let one_cell = swap.assign_const(layouter, Halo2Fr::from(1u64), "one_for_distinct")?;
+    for i in 0..k {
+        for j in (i + 1)..k {
+            // diff = idx_i - idx_j  via  idx_i = diff + idx_j
+            let diff_cell = layouter.assign_region(
+                || "distinct_diff",
+                |mut region| {
+                    let lhs = idx_cells[i].copy_advice(|| "idx_i", &mut region, config.add_c, 0)?;
+                    let rhs = idx_cells[j].copy_advice(|| "idx_j", &mut region, config.add_b, 0)?;
+                    let diff_val = lhs.value().copied() - rhs.value().copied();
+                    let diff = region.assign_advice(|| "diff", config.add_a, 0, || diff_val)?;
+                    config.s_add.enable(&mut region, 0)?;
+                    Ok(diff)
+                },
+            )?;
+            let has_diff = swap.is_nonzero(layouter, &diff_cell)?;
+            // Enforce has_diff == 1.
+            layouter.assign_region(
+                || "distinct_eq_one",
+                |mut region| {
+                    let lhs = has_diff.copy_advice(|| "has", &mut region, swap.a(), 0)?;
+                    let rhs = one_cell.copy_advice(|| "one", &mut region, swap.b(), 0)?;
+                    region.constrain_equal(lhs.cell(), rhs.cell())?;
+                    Ok(())
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn assign_sibs(
     swap: &SwapMerkleConfig,
     layouter: &mut impl Layouter<Halo2Fr>,
@@ -656,7 +718,7 @@ mod tests {
         let mut chosen = None;
         for trial in 1u64..=200 {
             let candidate = Halo2Fr::from(trial);
-            let indices = derive_challenge_indices(
+            let indices = derive_challenge_indices_simple(
                 params.n,
                 params.k,
                 candidate,
@@ -708,7 +770,7 @@ mod tests {
         let mut nonce = Halo2Fr::from(1u64);
         for trial in 1u64..=200 {
             let candidate = Halo2Fr::from(trial);
-            let indices = derive_challenge_indices(
+            let indices = derive_challenge_indices_simple(
                 params.n,
                 params.k,
                 candidate,
@@ -761,7 +823,7 @@ mod tests {
         let mut nonce = Halo2Fr::from(1u64);
         for trial in 1u64..=200 {
             let candidate = Halo2Fr::from(trial);
-            let indices = derive_challenge_indices(
+            let indices = derive_challenge_indices_simple(
                 params.n,
                 params.k,
                 candidate,
@@ -790,6 +852,70 @@ mod tests {
         assert!(
             prover.verify().is_err(),
             "challenge witness at the wrong derived index MUST be rejected"
+        );
+    }
+
+    /// f.2c.2 — pairwise distinctness gate: at very small N=4 + K=4,
+    /// some `challengeNonce` values produce DUPLICATE indices under
+    /// `derive_challenge_indices_simple` (no rejection sampling). The
+    /// pairwise distinctness gate MUST reject those proofs even when the
+    /// witness is consistent with the colliding indices. The honest
+    /// constructor (which uses _simple) WILL build duplicate per-challenge
+    /// witnesses at such nonces — the test confirms the proof still
+    /// rejects.
+    #[test]
+    fn kfold_v1_distinctness_gate_rejects_colliding_nonce() {
+        let params = PoRepParams {
+            n: 4,
+            l: 2,
+            d_drg: 1,
+            d_exp: 1,
+            k: 4, // K=4 = N → forced collision under uniform sampling
+            graph_seed: seed_zero(),
+        };
+        let sealed = seal_generic(
+            params.clone(),
+            Halo2Fr::from(0xA1u64),
+            Halo2Fr::from(0xB2u64),
+            Halo2Fr::from(0xC3u64),
+            Halo2Fr::from(0xD4u64),
+            one_through(4),
+        )
+        .expect("seal");
+
+        // Find a nonce whose simple-derivation yields at least one
+        // collision. At N=4, K=4 with random sampling collisions are very
+        // common (1 - 4!/4^4 ≈ 91% per nonce); the search lands quickly.
+        let mut colliding_nonce: Option<Halo2Fr> = None;
+        for trial in 1u64..=400 {
+            let candidate = Halo2Fr::from(trial);
+            let indices = derive_challenge_indices_simple(
+                params.n,
+                params.k,
+                candidate,
+                sealed.epoch,
+                sealed.replica_id,
+                sealed.sector_index,
+            );
+            let mut sorted = indices.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.len() < params.k {
+                colliding_nonce = Some(candidate);
+                break;
+            }
+        }
+        let nonce = colliding_nonce.expect("found a nonce whose simple derivation collides");
+
+        // Use k=12 — small N + smallest L the test bench can do with K=4
+        // is well inside the k=12 row budget.
+        const K_DEG_SMALL: u32 = 14;
+        let circuit = PoRepCircuitKFoldV1::from_sealed(&sealed, Halo2Fr::from(0xA1u64), nonce);
+        let pis = PoRepCircuitKFoldV1::public_inputs(&sealed, nonce);
+        let prover = MockProver::run(K_DEG_SMALL, &circuit, vec![pis]).expect("setup");
+        assert!(
+            prover.verify().is_err(),
+            "colliding indices under simple derivation MUST be rejected by the pairwise distinctness gate"
         );
     }
 }
