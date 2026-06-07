@@ -15,7 +15,7 @@ import {CitratePaymaster} from "../../src/aa/paymaster/CitratePaymaster.sol";
 // NB: Kernel and @account-abstraction each ship their own IEntryPoint
 // interface (same signature, distinct Solidity types). Import each
 // under a distinct alias so the type checker can match constructors.
-import {Kernel} from "@kernel/Kernel.sol";
+import {CitrateWallet} from "../../src/aa/wallet/CitrateWallet.sol";
 import {IEntryPoint as IKernelEntryPoint} from "@kernel/interfaces/IEntryPoint.sol";
 import {IEntryPoint as IAaEntryPoint} from "@account-abstraction/interfaces/IEntryPoint.sol";
 
@@ -43,7 +43,7 @@ contract DeployAA is Script, ScriptEnv {
         WebAuthnP256Validator webauthn;
         CitrateECDSAValidator ecdsa;
         GuardianRecoveryModule recovery;
-        Kernel kernelImpl;
+        CitrateWallet walletImpl;
         CitrateWalletFactory factory;
         CitratePaymaster paymaster;
     }
@@ -66,13 +66,14 @@ contract DeployAA is Script, ScriptEnv {
         d.ecdsa = new CitrateECDSAValidator();
         d.recovery = new GuardianRecoveryModule();
 
-        // Kernel implementation: constructor takes the EntryPoint address
-        // (per @kernel/Kernel.sol). Each smart wallet is a minimal ERC-1967
-        // proxy of this implementation.
-        d.kernelImpl = new Kernel(IKernelEntryPoint(entryPoint));
+        // CitrateWallet implementation: thin adapter over Kernel v3.3 with
+        // EIP-712 domain separation (see contracts/src/aa/wallet/CitrateWallet.sol).
+        // Each user smart wallet is an ERC-1967 minimal proxy of this
+        // implementation, deployed via the factory.
+        d.walletImpl = new CitrateWallet(IKernelEntryPoint(entryPoint));
 
         // Factory needs the implementation address + identity signer + owner.
-        d.factory = new CitrateWalletFactory(address(d.kernelImpl), identitySigner, owner);
+        d.factory = new CitrateWalletFactory(address(d.walletImpl), identitySigner, owner);
 
         // Paymaster wired to the EntryPoint + factory as registrar.
         d.paymaster = new CitratePaymaster(
@@ -91,7 +92,7 @@ contract DeployAA is Script, ScriptEnv {
         console2.log("WebAuthnP256Validator: %s", address(d.webauthn));
         console2.log("CitrateECDSAValidator: %s", address(d.ecdsa));
         console2.log("GuardianRecoveryModule: %s", address(d.recovery));
-        console2.log("Kernel implementation: %s", address(d.kernelImpl));
+        console2.log("CitrateWallet implementation: %s", address(d.walletImpl));
         console2.log("CitrateWalletFactory: %s", address(d.factory));
         console2.log("CitratePaymaster: %s", address(d.paymaster));
         console2.log("EntryPoint (existing): %s", entryPoint);
