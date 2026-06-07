@@ -47,6 +47,10 @@ CEREMONIES=(
   "DeployTEEAttestationRegistry.s.sol"
   "DeployComputePoolTraining.s.sol"
   "DeployAA.s.sol"
+  # WP-D ceremony: same six AA contracts as DeployAA.s.sol but emitted via
+  # the pin-table wrapper. Listed AFTER DeployAA so its CREATEs override
+  # the older addresses (the merge step is last-write-wins).
+  "DeployAndPinAA.s.sol"
 )
 
 # Collect every CREATE transaction's (contractName, contractAddress) pair
@@ -75,7 +79,7 @@ for ceremony in "${CEREMONIES[@]}"; do
     | map({ key: .contractName, value: (.contractAddress | ascii_downcase) })
     | from_entries
   ' "$bc")
-  if [[ "$ceremony" == "DeployAA.s.sol" ]]; then
+  if [[ "$ceremony" == "DeployAA.s.sol" || "$ceremony" == "DeployAndPinAA.s.sol" ]]; then
     jq --argjson new "$pairs" '. + $new' "$aa_jq" > "${aa_jq}.tmp" && mv "${aa_jq}.tmp" "$aa_jq"
   else
     jq --argjson new "$pairs" '. + $new' "$contracts_jq" > "${contracts_jq}.tmp" && mv "${contracts_jq}.tmp" "$contracts_jq"
