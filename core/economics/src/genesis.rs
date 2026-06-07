@@ -74,6 +74,64 @@ fn account(address: Address, balance_latt: u64) -> GenesisAccount {
     }
 }
 
+/// Canonical address of Arachnid's deterministic CREATE2 deployer (EIP-2470).
+///
+/// Every modern Ethereum testnet (Holesky, Sepolia, …) ships this address
+/// with the same 69-byte runtime so deployment tooling that depends on
+/// CREATE2-at-a-known-address — including the eth-infinitism ERC-4337
+/// bundler — can find it. The bundler's boot path:
+///
+///   1. checks `eth_getCode(ARACHNID_DEPLOYER_ADDRESS)`
+///   2. if empty, broadcasts a pre-EIP-155 Nick's-method tx that deploys
+///      the contract at this exact address
+///
+/// Citrate strictly enforces `chain_id` on every signed tx, which rejects
+/// the pre-EIP-155 Nick's tx — so the bundler restart-loops forever. The
+/// canonical mitigation, used by every chain that hosts ERC-4337, is to
+/// stamp the deployer's runtime into genesis at this address. After that
+/// the bundler sees "already deployed" and proceeds.
+///
+/// Source of the bytecode: https://github.com/Arachnid/deterministic-deployment-proxy
+pub const ARACHNID_DETERMINISTIC_DEPLOYER_ADDRESS: Address = Address([
+    0x4e, 0x59, 0xb4, 0x48, 0x47, 0xb3, 0x79, 0x57, 0x85, 0x88,
+    0x92, 0x0c, 0xa7, 0x8f, 0xbf, 0x26, 0xc0, 0xb4, 0x95, 0x6c,
+]);
+
+/// 69-byte deployed runtime of {@link ARACHNID_DETERMINISTIC_DEPLOYER_ADDRESS}.
+///
+/// The literal bytes Arachnid's deterministic-deployment-proxy compiles to —
+/// the same payload every other chain stamps at the canonical address. Do NOT
+/// modify; the bundler's boot check compares against this exact runtime.
+pub const ARACHNID_DETERMINISTIC_DEPLOYER_BYTECODE: &[u8] = &[
+    // 7f               PUSH32                                                 (1 byte)
+    0x7f,
+    // ff..ff e0        immediate: 31 × 0xff then 0xe0                          (32 bytes)
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe0,
+    // 36 01 60 00 81 60 20 82 37 80 35 82 82 34 f5  — the CREATE2 prologue     (15 bytes)
+    0x36, 0x01, 0x60, 0x00, 0x81, 0x60, 0x20, 0x82, 0x37, 0x80, 0x35, 0x82, 0x82, 0x34, 0xf5,
+    // 80 15 15 60 39 57 81 82 fd 5b 80 82 52 50 50 50  — branch + epilogue    (16 bytes)
+    0x80, 0x15, 0x15, 0x60, 0x39, 0x57, 0x81, 0x82, 0xfd, 0x5b, 0x80, 0x82, 0x52, 0x50, 0x50, 0x50,
+    // 60 14 60 0c f3  — RETURN(0x0c, 0x14)                                    (5 bytes)
+    0x60, 0x14, 0x60, 0x0c, 0xf3,
+    // total 1 + 32 + 15 + 16 + 5 = 69 bytes
+];
+
+/// Genesis account that pre-deploys the Arachnid deterministic CREATE2
+/// deployer at its canonical address. Used by every chain preset so the
+/// ERC-4337 bundler boots regardless of which genesis profile is selected.
+fn arachnid_deterministic_deployer_account() -> GenesisAccount {
+    GenesisAccount {
+        address: ARACHNID_DETERMINISTIC_DEPLOYER_ADDRESS,
+        balance: U256::zero(),
+        // Nonce 1 marks the account as a contract per EIP-161 semantics.
+        // The real on-chain history is "0xMike deployed it once at nonce 0
+        // of the canonical pre-EIP-155 tx" — nonce 1 is post-deploy.
+        nonce: 1,
+        code: Some(ARACHNID_DETERMINISTIC_DEPLOYER_BYTECODE.to_vec()),
+    }
+}
+
 fn create_embedded_bge_m3() -> EmbeddedModel {
     // Post-WP-B (2026-04-21): the genesis block carries only a SHA-256
     // commitment to the off-chain weights, not the weights themselves.
@@ -186,6 +244,9 @@ impl Default for GenesisConfig {
             // Secondary and tertiary Hardhat accounts for SDK / wallet integration tests
             account(HARDHAT_SECONDARY_ADDRESS, 10_000),
             account(HARDHAT_TERTIARY_ADDRESS, 10_000),
+            // Arachnid deterministic CREATE2 deployer — required for the
+            // ERC-4337 bundler to boot (see helper docstring).
+            arachnid_deterministic_deployer_account(),
         ];
 
         Self {
@@ -228,6 +289,9 @@ impl GenesisConfig {
                     nonce: 0,
                     code: None,
                 },
+                // Arachnid deterministic CREATE2 deployer — required for the
+                // ERC-4337 bundler to boot on mainnet.
+                arachnid_deterministic_deployer_account(),
             ],
             treasury_address: treasury,
             team_allocations,
@@ -255,6 +319,9 @@ impl GenesisConfig {
                 account(TESTNET_TEAM_ADDRESS, 10_000_000),
                 // Validator — block production and staking (5M SALT)
                 account(TESTNET_VALIDATOR_ADDRESS, 5_000_000),
+                // Arachnid deterministic CREATE2 deployer — required for
+                // the ERC-4337 bundler to boot (EW-S1 unblocker).
+                arachnid_deterministic_deployer_account(),
             ],
             treasury_address: TESTNET_TREASURY_ADDRESS,
             team_allocations: HashMap::new(),
@@ -339,6 +406,10 @@ impl GenesisConfig {
             nonce: 0,
             code: None,
         });
+
+        // Arachnid deterministic CREATE2 deployer — required for the
+        // ERC-4337 bundler to boot. See helper docstring.
+        accounts.push(arachnid_deterministic_deployer_account());
 
         Self {
             chain_id: 40204,
@@ -594,12 +665,66 @@ mod tests {
         assert_eq!(config.chain_id, 1);
     }
 
+    /// WP-B: every genesis preset MUST pre-deploy Arachnid's deterministic
+    /// CREATE2 deployer at its canonical address with the canonical 69-byte
+    /// runtime. Without it the ERC-4337 bundler restart-loops at boot (its
+    /// pre-EIP-155 deploy tx is rejected by Citrate's strict chain_id gate).
+    /// See {@link arachnid_deterministic_deployer_account} docstring.
+    #[test]
+    fn test_arachnid_deployer_predeployed_in_every_preset() {
+        for (label, config) in [
+            ("default", GenesisConfig::default()),
+            ("mainnet", GenesisConfig::mainnet()),
+            ("testnet_beta", GenesisConfig::testnet_beta()),
+            ("team_testnet_genesis", GenesisConfig::team_testnet_genesis()),
+        ] {
+            let arachnid = config
+                .accounts
+                .iter()
+                .find(|a| a.address == ARACHNID_DETERMINISTIC_DEPLOYER_ADDRESS)
+                .unwrap_or_else(|| panic!("{label} genesis missing Arachnid deployer"));
+            assert_eq!(arachnid.balance, U256::zero(), "{label}: Arachnid balance");
+            assert_eq!(arachnid.nonce, 1, "{label}: Arachnid nonce");
+            let code = arachnid
+                .code
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label}: Arachnid has no code"));
+            assert_eq!(
+                code.as_slice(),
+                ARACHNID_DETERMINISTIC_DEPLOYER_BYTECODE,
+                "{label}: Arachnid runtime bytecode mismatch — \
+                 every Citrate chain MUST stamp the exact canonical 69-byte \
+                 deployed runtime so deployment tooling that depends on the \
+                 well-known address (notably the eth-infinitism ERC-4337 \
+                 bundler) finds the contract on boot"
+            );
+            assert_eq!(code.len(), 69, "{label}: Arachnid runtime is exactly 69 bytes");
+        }
+    }
+
+    /// The Arachnid deployer's canonical address is a fixed point of
+    /// every EVM chain that hosts CREATE2 tooling. Pin the address bytes
+    /// to the literal so a typo in the hardcoded `Address([...])` never
+    /// slips past review unnoticed.
+    #[test]
+    fn test_arachnid_deployer_address_is_canonical() {
+        // 0x4e59b44847b379578588920cA78FbF26c0B4956C (case-insensitive).
+        assert_eq!(
+            ARACHNID_DETERMINISTIC_DEPLOYER_ADDRESS.0,
+            [
+                0x4e, 0x59, 0xb4, 0x48, 0x47, 0xb3, 0x79, 0x57, 0x85, 0x88,
+                0x92, 0x0c, 0xa7, 0x8f, 0xbf, 0x26, 0xc0, 0xb4, 0x95, 0x6c,
+            ]
+        );
+    }
+
     #[test]
     fn test_testnet_beta_genesis_valid() {
         let config = GenesisConfig::testnet_beta();
         assert!(config.validate().is_ok());
         assert_eq!(config.chain_id, 40204);
-        assert_eq!(config.accounts.len(), 5);
+        // 5 funded accounts + the Arachnid deterministic CREATE2 deployer.
+        assert_eq!(config.accounts.len(), 6);
     }
 
     #[test]
@@ -631,8 +756,9 @@ mod tests {
         assert!(config.validate().is_ok());
         assert_eq!(config.chain_id, 40204);
 
-        // 3 system + 10 validators + 1 dev deployer + 1 Larry deployer + 1 faucet signing key = 16 total
-        assert_eq!(config.accounts.len(), 16);
+        // 3 system + 10 validators + 1 dev deployer + 1 Larry deployer + 1 faucet
+        // signing key + 1 Arachnid CREATE2 deployer = 17 total.
+        assert_eq!(config.accounts.len(), 17);
 
         // Verify validator funding: accounts[3..13] are validators at 100,000 SALT each
         for account in &config.accounts[3..13] {
@@ -749,11 +875,23 @@ mod tests {
         let executor_with = Arc::new(Executor::with_chain_id(state_db_with, config.chain_id));
         let root_with = initialize_shared_genesis_state(&executor_with, &config);
 
-        // Without model registration (manual account init only)
+        // Without model registration (manual account init only). Mirrors
+        // {@link initialize_shared_genesis_state} EXACTLY for the account
+        // setup phase — balance, nonce, and code — so the only difference
+        // between the two roots is whether model registration ran. Pre-WP-B
+        // every genesis account had `code: None` so the original test set
+        // only balance; the WP-B Arachnid pre-deploy has `code: Some(...)`,
+        // and that has to be set here too or the precondition slips.
         let state_db_without = Arc::new(StateDB::new());
         let executor_without = Arc::new(Executor::with_chain_id(state_db_without, config.chain_id));
         for account in &config.accounts {
             executor_without.set_balance(&account.address, account.balance);
+            if account.nonce > 0 {
+                executor_without.set_nonce(&account.address, account.nonce);
+            }
+            if let Some(code) = &account.code {
+                executor_without.set_code(&account.address, code.clone());
+            }
         }
         // Deliberately skip model registration
         let root_without = executor_without.state_db().commit();
