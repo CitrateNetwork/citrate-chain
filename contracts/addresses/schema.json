@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://citrate.ai/schemas/contract-address-table-v1.json",
+  "title": "Citrate canonical contract-address table",
+  "description": "Canonical, federation-wide source of truth for every Citrate contract deployed to a given chain. See contracts/addresses/README.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["chainId", "chainName", "deployer", "contracts", "aaStack", "genesis"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "chainId": {
+      "type": "integer",
+      "description": "EIP-155 chain id (40204 for Citrate testnet)."
+    },
+    "chainName": {
+      "type": "string",
+      "description": "Human-readable chain name."
+    },
+    "rpcUrl": {
+      "type": "string",
+      "format": "uri",
+      "description": "Public JSON-RPC endpoint."
+    },
+    "explorerUrl": {
+      "type": "string",
+      "format": "uri",
+      "description": "Public block explorer endpoint."
+    },
+    "deployer": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{40}$",
+      "description": "EOA that signed the deploy ceremonies."
+    },
+    "deployedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp of the most recent ceremony."
+    },
+    "regenerator": {
+      "type": "string",
+      "description": "Path (relative to citrate-chain repo root) of the script that regenerates this file."
+    },
+    "comment": {
+      "type": "string"
+    },
+    "contracts": {
+      "type": "object",
+      "description": "Map of contract name → deployed address. Names match the Solidity contract names exactly (case-sensitive).",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^0x[0-9a-fA-F]{40}$"
+      }
+    },
+    "aaStack": {
+      "type": "object",
+      "description": "ERC-4337 v0.7 stack (EW-S1). Sourced from .env.testnet + DeployAA.s.sol broadcast.",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^0x[0-9a-fA-F]{40}$"
+      }
+    },
+    "genesis": {
+      "type": "object",
+      "description": "Contracts allocated at genesis (e.g., Arachnid deterministic CREATE2 deployer).",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^0x[0-9a-fA-F]{40}$"
+      }
+    },
+    "precompiles": {
+      "type": "object",
+      "description": "Built-in executor addresses (state precompiles, runtime inference). NOT contracts — listed for consumer convenience.",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^0x[0-9a-fA-F]{40}$"
+      }
+    }
+  }
+}
