@@ -590,7 +590,7 @@ async fn handle_incoming(
             Ok(b) => b,
             Err(_) => break,
         };
-        if let Ok(msg) = bincode::deserialize::<NetworkMessage>(&bytes) {
+        if let Ok(msg) = NetworkMessage::decode_inbound(&bytes) { // SECURITY: C-01 network-variant sanitize at decode
             // Basic responses
             match msg {
                 NetworkMessage::Ping { nonce } => {
@@ -671,7 +671,7 @@ async fn perform_handshake_outbound(
     tokio::spawn(async move {
         while let Some(frame) = stream.next().await {
             if let Ok(bytes) = frame {
-                if let Ok(msg) = bincode::deserialize::<NetworkMessage>(&bytes) {
+                if let Ok(msg) = NetworkMessage::decode_inbound(&bytes) { // SECURITY: C-01 network-variant sanitize at decode
                     if let Some(tx) = pm2.incoming.read().await.clone() {
                         let _ = tx.send((peer_id.clone(), msg)).await;
                     }
