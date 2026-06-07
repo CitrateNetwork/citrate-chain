@@ -48,7 +48,17 @@ contract DeployAA is Script, ScriptEnv {
         CitratePaymaster paymaster;
     }
 
-    function run() external returns (Deployment memory d) {
+    function run() external virtual returns (Deployment memory d) {
+        d = _deploy();
+        _emitHumanTable(d);
+    }
+
+    // Deploy logic factored out so the WP-D redeploy wrapper
+    // (script/aa/DeployAndPinAA.s.sol) can reuse it without duplicating
+    // contract instantiation. The wrapper emits the machine-parseable
+    // `EW_S1_PIN:` lines the `scripts/ops/post-reroll-redeploy.sh`
+    // script greps for, in addition to the human table this script logs.
+    function _deploy() internal returns (Deployment memory d) {
         address entryPoint = envAddressOr("CITRATE_AA_ENTRY_POINT", address(0));
         address identitySigner = envAddressOr("CITRATE_AA_IDENTITY_SIGNER", address(0));
         address owner = envAddressOr("CITRATE_AA_OWNER", address(0));
@@ -86,8 +96,14 @@ contract DeployAA is Script, ScriptEnv {
         );
 
         vm.stopBroadcast();
+    }
 
-        // Emit a compact table for the operator runbook.
+    /// Human-readable summary the operator reads at the end of a ceremony.
+    function _emitHumanTable(Deployment memory d) internal view {
+        address entryPoint = envAddressOr("CITRATE_AA_ENTRY_POINT", address(0));
+        address identitySigner = envAddressOr("CITRATE_AA_IDENTITY_SIGNER", address(0));
+        address owner = envAddressOr("CITRATE_AA_OWNER", address(0));
+
         console2.log("=== EW-S1 AA stack deployed on chain", block.chainid, "===");
         console2.log("WebAuthnP256Validator: %s", address(d.webauthn));
         console2.log("CitrateECDSAValidator: %s", address(d.ecdsa));
