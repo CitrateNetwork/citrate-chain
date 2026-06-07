@@ -70,3 +70,6 @@ __pycache__/
 *.profdata
 lcov.info
 coverage/
+
+# TLC model checker (auto-downloaded by specs/tla/run_all.sh)
+specs/tla/tla2tools.jar

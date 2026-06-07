@@ -1,0 +1,109 @@
+# INFER-S2 — ComputePool settlement authority + requester-reclaim guards.
+#
+# Tech debt: citrate-federation/.agentile/gtm-spine/TECH_DEBT.md#TD-24
+# WP:        citrate-labs/handoffs/INFER_COMPUTEPOOL_SETTLEMENT_WP.md (PR #11)
+# Spec:      specs/tla/compute/ComputePoolSettlement.tla
+# Sprint:    .agentile/sprints/active/INFER-S2-computepool-settlement.md
+#
+# Bug-class this tripwire guards against (a regression re-introducing it):
+#
+#   G1 — settlement-authority asymmetry. completeJob / failJob originally
+#        authorized only `governance() || pool.creator`. The actor that
+#        actually runs the job is the VRF-elected coordinator recorded in
+#        `job.dispatchedBy` (set by recordDispatch, gated to coordinatorFor).
+#        Dropping `job.dispatchedBy` from the allow-list re-strands settlement
+#        on a fixed actor and makes gateway-initiated INFER unsettleable.
+#
+#   G2 — requester-reclaim guards. reclaimExpiredJob is the ONLY path that
+#        refunds a stranded buyer. If it loses the `msg.sender == job.requester`
+#        check, anyone can drain escrow; if it loses the `JOB_DEADLINE`
+#        check, a buyer can yank funds out from under an in-flight job. Both
+#        are catastrophic, so each guard is tripwired independently.
+
+rules:
+  - id: infer-s2-completeJob-omits-dispatchedBy
+    message: >-
+      ComputePool.completeJob must authorize `msg.sender == job.dispatchedBy`
+      (the VRF-elected coordinator of record) alongside governance/creator
+      (INFER-S2 / WP-G1). Removing it re-introduces the settlement-authority
+      asymmetry — the executor can no longer close the job it ran. See
+      specs/tla/compute/ComputePoolSettlement.tla (ExecutorOnlyCompletion).
+    languages: [generic]
+    severity: ERROR
+    paths:
+      include:
+        - "*ComputePool.sol"
+    patterns:
+      - pattern: |
+          function completeJob(...) external nonReentrant {
+            ...
+          }
+      - pattern-not: |
+          function completeJob(...) external nonReentrant {
+            ...
+            msg.sender == job.dispatchedBy
+            ...
+          }
+    metadata:
+      tech-debt: TD-24
+      sprint: INFER-S2-computepool-settlement
+      wp: WP-G1
+      spec: specs/tla/compute/ComputePoolSettlement.tla
+
+  - id: infer-s2-failJob-omits-dispatchedBy
+    message: >-
+      ComputePool.failJob must authorize `msg.sender == job.dispatchedBy`
+      alongside governance/creator (INFER-S2 / WP-G1). The executor of record
+      must be able to close (fail) the job it ran.
+    languages: [generic]
+    severity: ERROR
+    paths:
+      include:
+        - "*ComputePool.sol"
+    patterns:
+      - pattern: |
+          function failJob(...) external nonReentrant {
+            ...
+          }
+      - pattern-not: |
+          function failJob(...) external nonReentrant {
+            ...
+            msg.sender == job.dispatchedBy
+            ...
+          }
+    metadata:
+      tech-debt: TD-24
+      sprint: INFER-S2-computepool-settlement
+      wp: WP-G1
+      spec: specs/tla/compute/ComputePoolSettlement.tla
+
+  - id: infer-s2-reclaim-missing-requester-or-deadline-guard
+    message: >-
+      ComputePool.reclaimExpiredJob must gate on BOTH
+      `msg.sender == job.requester` AND `job.createdAt + JOB_DEADLINE`
+      (INFER-S2 / WP-G2). Dropping the requester check lets anyone drain
+      escrow; dropping the deadline check lets a buyer yank funds from an
+      in-flight job. Refund must stay requester-only and post-deadline.
+    languages: [generic]
+    severity: ERROR
+    paths:
+      include:
+        - "*ComputePool.sol"
+    patterns:
+      - pattern: |
+          function reclaimExpiredJob(...) external nonReentrant {
+            ...
+          }
+      - pattern-not: |
+          function reclaimExpiredJob(...) external nonReentrant {
+            ...
+            msg.sender == job.requester
+            ...
+            JOB_DEADLINE
+            ...
+          }
+    metadata:
+      tech-debt: TD-24
+      sprint: INFER-S2-computepool-settlement
+      wp: WP-G2
+      spec: specs/tla/compute/ComputePoolSettlement.tla
