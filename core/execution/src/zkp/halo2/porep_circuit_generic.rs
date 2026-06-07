@@ -125,12 +125,18 @@ pub struct PoRepCircuitGeneric {
 
     /// DRG (same-layer) parent column witnesses (one per parent), each
     /// `[label(1,p), …, label(L,p)]`. Length matches the sampler's output
-    /// at v* (may be < d_DRG for v* < d_DRG).
+    /// at v* (ALWAYS length `d_DRG` per the v*<d_DRG mux; padded slots
+    /// carry zero placeholder columns and are gated off via `drg_valid`).
     pub drg_parent_columns: Vec<Vec<Value<Halo2Fr>>>,
     /// Same for expander parents (length d_EXP).
     pub exp_parent_columns: Vec<Vec<Value<Halo2Fr>>>,
-    /// Parent indices (witnesses — bound by Merkle inclusion at the
-    /// honest-prover side; the in-circuit derivation matches them).
+    /// PIN-P1 v*<d_DRG mux — per-slot REAL/PADDED boolean. `true` = real
+    /// DRG parent (column included in CommC, slot value = honest label).
+    /// `false` = PADDED (column-inclusion gate OFF, slot value muxed to
+    /// `replicaID`). ALWAYS length `d_DRG`.
+    pub drg_valid: Vec<Value<Halo2Fr>>,
+    /// Parent indices (witnesses — bound by Merkle inclusion for REAL
+    /// slots; sentinel `0` for padded slots).
     pub drg_parent_indices: Vec<usize>,
     pub exp_parent_indices: Vec<usize>,
 
@@ -181,6 +187,11 @@ impl PoRepCircuitGeneric {
                 .map(|col| col.iter().copied().map(Value::known).collect())
                 .collect(),
             drg_parent_indices: challenge.drg_parent_indices.clone(),
+            drg_valid: challenge
+                .drg_valid
+                .iter()
+                .map(|&b| Value::known(Halo2Fr::from(b as u64)))
+                .collect(),
             exp_parent_indices: challenge.exp_parent_indices.clone(),
             sib_d: challenge.sib_d.iter().copied().map(Value::known).collect(),
             sib_r: challenge.sib_r.iter().copied().map(Value::known).collect(),
@@ -220,6 +231,7 @@ impl PoRepCircuitGeneric {
             data_challenged: Value::unknown(),
             drg_parent_columns: (0..drg_d).map(unknown_col).collect(),
             exp_parent_columns: (0..exp_d).map(unknown_col).collect(),
+            drg_valid: vec![Value::unknown(); drg_d],
             drg_parent_indices: vec![0; drg_d],
             exp_parent_indices: vec![0; exp_d],
             sib_d: unknown_sib(),
@@ -326,6 +338,33 @@ impl Circuit<Halo2Fr> for PoRepCircuitGeneric {
         let exp_columns_cells: Vec<Vec<AssignedCell<Halo2Fr, Halo2Fr>>> =
             assign_columns(swap, &mut layouter, &self.exp_parent_columns, "exp_col")?;
 
+        // PIN-P1 v*<d_DRG mux: assign + boolean-constrain `drg_valid` for
+        // each DRG slot. The `is_nonzero` gadget is soundly equal to its
+        // input when the input is in {0, 1} (idx·inv − has = 0 forces
+        // has = idx), so we use it to enforce booleanness without
+        // adding a new gate.
+        let drg_valid_cells: Vec<AssignedCell<Halo2Fr, Halo2Fr>> = {
+            let mut out = Vec::with_capacity(self.drg_valid.len());
+            for v in &self.drg_valid {
+                let cell = swap.assign_value(&mut layouter, *v, "drg_valid")?;
+                // Boolean-constrain via is_nonzero: returns a soundly-
+                // boolean has-cell equal to `(cell ≠ 0)`. For honest
+                // {0,1} input the returned has == input; we equate them.
+                let has = swap.is_nonzero(&mut layouter, &cell)?;
+                layouter.assign_region(
+                    || "drg_valid_bool",
+                    |mut region| {
+                        let lhs = cell.copy_advice(|| "v", &mut region, swap.a(), 0)?;
+                        let rhs = has.copy_advice(|| "has", &mut region, swap.b(), 0)?;
+                        region.constrain_equal(lhs.cell(), rhs.cell())?;
+                        Ok(())
+                    },
+                )?;
+                out.push(cell);
+            }
+            out
+        };
+
         // ---- Step 2: replicaID = Poseidon(pinnerIdentity, cid, sectorIndex). ----
         let replica_id_cell = PoseidonChip::hash_n_from_cells(
             &config.poseidon,
@@ -377,8 +416,13 @@ impl Circuit<Halo2Fr> for PoRepCircuitGeneric {
             preimage.push(replica_id_cell.clone());
             preimage.push(layer_consts[layer - 1].clone());
             preimage.push(idx_cell.clone());
-            for col in &drg_columns_cells {
-                preimage.push(col[layer - 1].clone());
+            // PIN-P1 v*<d_DRG mux: each DRG slot value is
+            // `valid_i ? col[layer-1] : replicaID`. Real slots
+            // contribute the honest parent label; padded slots contribute
+            // `replicaID` (matching the native sealer's padding).
+            for (col, valid) in drg_columns_cells.iter().zip(drg_valid_cells.iter()) {
+                let muxed = swap.mux(&mut layouter, &replica_id_cell, &col[layer - 1], valid)?;
+                preimage.push(muxed);
             }
             if layer >= 2 {
                 for col in &exp_columns_cells {
@@ -461,18 +505,26 @@ impl Circuit<Halo2Fr> for PoRepCircuitGeneric {
         // forge a new (column, sib_path) pair for the SAME CommC without
         // breaking Poseidon's collision resistance. Hence the prover is
         // forced to use the HONEST parent labels.
-        for (col_cells, (p, sibs)) in drg_columns_cells.iter().zip(
-            self.drg_parent_indices
-                .iter()
-                .zip(self.drg_parent_sib_c.iter()),
-        ) {
-            assert_parent_inclusion(
+        // DRG parent column inclusions — GATED by `drg_valid[j]` per the
+        // v*<d_DRG mux. Padded slots have no real column in CommC; the
+        // gate enforces inclusion only when the slot is real.
+        for ((col_cells, (p, sibs)), valid) in drg_columns_cells
+            .iter()
+            .zip(
+                self.drg_parent_indices
+                    .iter()
+                    .zip(self.drg_parent_sib_c.iter()),
+            )
+            .zip(drg_valid_cells.iter())
+        {
+            assert_parent_inclusion_gated(
                 &config,
                 &mut layouter,
                 col_cells,
                 *p,
                 sibs,
                 &root_c,
+                valid,
                 "drg_parent_inclusion",
             )?;
         }
@@ -566,6 +618,39 @@ fn assert_parent_inclusion(
     Ok(())
 }
 
+/// PIN-P1 v*<d_DRG mux variant of `assert_parent_inclusion` — the root
+/// equality is GATED by `valid` (the per-slot drg_valid bit). When
+/// `valid = 1`, enforce `recomputed_root == root_c`; when `valid = 0`,
+/// the gate is vacuous (column-inclusion check skipped for padded
+/// slots). The Poseidon column-hash + Merkle pathing still RUN
+/// in-circuit at every slot — same shape, single VK.
+fn assert_parent_inclusion_gated(
+    config: &PoRepGenericConfig,
+    layouter: &mut impl Layouter<Halo2Fr>,
+    column_cells: &[AssignedCell<Halo2Fr, Halo2Fr>],
+    parent_index: usize,
+    parent_sibs: &[Value<Halo2Fr>],
+    root_c: &AssignedCell<Halo2Fr, Halo2Fr>,
+    valid: &AssignedCell<Halo2Fr, Halo2Fr>,
+    label: &'static str,
+) -> Result<(), ErrorFront> {
+    let col_at_p = PoseidonChip::hash_n_from_cells(&config.poseidon, layouter, column_cells)?;
+    let depth = parent_sibs.len();
+    let (_p_idx_cell, p_bits) = config.swap.decompose_index_generic(
+        layouter,
+        Value::known(Halo2Fr::from(parent_index as u64)),
+        depth,
+    )?;
+    let p_sibs = assign_sibs(&config.swap, layouter, parent_sibs, label)?;
+    let recomputed =
+        config
+            .swap
+            .merkle_root_generic(&config.poseidon, layouter, col_at_p, &p_bits, &p_sibs)?;
+    // valid·(recomputed − root_c) = 0
+    config.swap.gated_eq(layouter, &recomputed, root_c, valid)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -620,7 +705,10 @@ mod tests {
         )
         .expect("seal");
 
-        for v in params.d_drg..params.n {
+        // PIN-P1 v*<d_DRG mux now lands — iterate the FULL range
+        // including v < d_DRG. Padded slots are gated off via
+        // `drg_valid` and muxed to `replicaID` in the labeling preimage.
+        for v in 0..params.n {
             let challenge = build_challenge(&sealed, v).expect("challenge");
             let circuit =
                 PoRepCircuitGeneric::from_sealed(&sealed, Halo2Fr::from(0xA11CEu64), &challenge);
