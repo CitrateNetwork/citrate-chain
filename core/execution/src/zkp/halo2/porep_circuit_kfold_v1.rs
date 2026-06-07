@@ -452,6 +452,26 @@ fn per_challenge_run(
     let drg_columns_cells = assign_columns(swap, layouter, &ch.drg_parent_columns, "drg_col")?;
     let exp_columns_cells = assign_columns(swap, layouter, &ch.exp_parent_columns, "exp_col")?;
 
+    // PIN-P1 v*<d_DRG mux — per-slot drg_valid (boolean-constrained).
+    let drg_valid_cells: Vec<AssignedCell<Halo2Fr, Halo2Fr>> = {
+        let mut out = Vec::with_capacity(ch.drg_valid.len());
+        for v in &ch.drg_valid {
+            let cell = swap.assign_value(layouter, *v, "drg_valid")?;
+            let has = swap.is_nonzero(layouter, &cell)?;
+            layouter.assign_region(
+                || "drg_valid_bool",
+                |mut region| {
+                    let lhs = cell.copy_advice(|| "v", &mut region, swap.a(), 0)?;
+                    let rhs = has.copy_advice(|| "has", &mut region, swap.b(), 0)?;
+                    region.constrain_equal(lhs.cell(), rhs.cell())?;
+                    Ok(())
+                },
+            )?;
+            out.push(cell);
+        }
+        out
+    };
+
     // Labeling per layer (mirrors f.2b/f.2c).
     for layer in 1..=l {
         let mut preimage: Vec<AssignedCell<Halo2Fr, Halo2Fr>> =
@@ -459,8 +479,10 @@ fn per_challenge_run(
         preimage.push(replica_id_cell.clone());
         preimage.push(layer_consts[layer - 1].clone());
         preimage.push(idx_cell.clone());
-        for col in &drg_columns_cells {
-            preimage.push(col[layer - 1].clone());
+        // PIN-P1 v*<d_DRG mux: muxed DRG slot values.
+        for (col, valid) in drg_columns_cells.iter().zip(drg_valid_cells.iter()) {
+            let muxed = swap.mux(layouter, replica_id_cell, &col[layer - 1], valid)?;
+            preimage.push(muxed);
         }
         if layer >= 2 {
             for col in &exp_columns_cells {
@@ -512,17 +534,20 @@ fn per_challenge_run(
     layouter.constrain_instance(root_c.cell(), config.instance, pi_v1::COMM_C)?;
 
     // Per-parent column inclusions against root_c (= public CommC).
-    for (col_cells, (p, sibs)) in drg_columns_cells
+    // DRG slots: GATED by drg_valid (PIN-P1 v*<d_DRG mux).
+    for ((col_cells, (p, sibs)), valid) in drg_columns_cells
         .iter()
         .zip(ch.drg_parent_indices.iter().zip(ch.drg_parent_sib_c.iter()))
+        .zip(drg_valid_cells.iter())
     {
-        assert_parent_inclusion(
+        assert_parent_inclusion_gated(
             config,
             layouter,
             col_cells,
             *p,
             sibs,
             &root_c,
+            valid,
             "drg_parent_inclusion",
         )?;
     }
@@ -659,6 +684,33 @@ fn assert_parent_inclusion(
             Ok(())
         },
     )?;
+    Ok(())
+}
+
+/// PIN-P1 v*<d_DRG mux — gated variant.
+fn assert_parent_inclusion_gated(
+    config: &PoRepKFoldV1Config,
+    layouter: &mut impl Layouter<Halo2Fr>,
+    column_cells: &[AssignedCell<Halo2Fr, Halo2Fr>],
+    parent_index: usize,
+    parent_sibs: &[Value<Halo2Fr>],
+    root_c: &AssignedCell<Halo2Fr, Halo2Fr>,
+    valid: &AssignedCell<Halo2Fr, Halo2Fr>,
+    label: &'static str,
+) -> Result<(), ErrorFront> {
+    let col_at_p = PoseidonChip::hash_n_from_cells(&config.poseidon, layouter, column_cells)?;
+    let depth = parent_sibs.len();
+    let (_p_idx_cell, p_bits) = config.swap.decompose_index_generic(
+        layouter,
+        Value::known(Halo2Fr::from(parent_index as u64)),
+        depth,
+    )?;
+    let p_sibs = assign_sibs(&config.swap, layouter, parent_sibs, label)?;
+    let recomputed =
+        config
+            .swap
+            .merkle_root_generic(&config.poseidon, layouter, col_at_p, &p_bits, &p_sibs)?;
+    config.swap.gated_eq(layouter, &recomputed, root_c, valid)?;
     Ok(())
 }
 

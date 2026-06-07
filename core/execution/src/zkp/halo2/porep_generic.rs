@@ -223,10 +223,19 @@ pub struct GenericChallenge {
     /// Layer labels for `v*`: `[label(1, v*), …, label(L, v*)]`.
     pub labels_at_v: Vec<Halo2Fr>,
 
-    /// DRG (same-layer) parent indices for `v*`.
+    /// DRG (same-layer) parent indices for `v*` — ALWAYS length `d_DRG`.
+    /// Real slots (`j < drg_n_active(v*, d_DRG)`) carry honest predecessor
+    /// indices; padded slots carry sentinel `0`. The companion
+    /// [`drg_valid`] flag distinguishes them.
     pub drg_parent_indices: Vec<usize>,
+    /// PIN-P1 `v*<d_DRG` mux: per-slot boolean — `true` for REAL DRG
+    /// parent slots, `false` for PADDED slots. The in-circuit lift gates
+    /// the column-inclusion check on this AND muxes `replicaID` into the
+    /// labeling preimage at padded slots.
+    pub drg_valid: Vec<bool>,
     /// Each entry: the column `(label(1, p), …, label(L, p))` for one DRG
-    /// parent `p`. Length matches `drg_parent_indices`.
+    /// parent `p`. Length matches `drg_parent_indices` (= `d_DRG`).
+    /// Padded slots carry zero-filled placeholder columns.
     pub drg_parent_columns: Vec<Vec<Halo2Fr>>,
 
     /// Expander (prev-layer) parent indices for `v*`.
@@ -326,18 +335,25 @@ pub fn merkle_siblings(leaves: &[Halo2Fr], leaf_index: usize) -> Vec<Halo2Fr> {
 // Labeling preimage.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Build the labeling preimage for `label(l, v)` matching the spec:
+/// Build the labeling preimage for `label(l, v)` at the **padded**
+/// fixed-arity shape introduced for the `v* < d_DRG` mux:
 ///
 /// ```text
 ///   preimage = [ replicaID, l, v,
-///                parents_same_layer..., parents_prev_layer... ]
+///                parents_same_layer[0..d_DRG]...,
+///                parents_prev_layer[0..d_EXP]... ]
 /// ```
 ///
-/// At layer 1 with no DRG parents (`drg_p` empty), `replicaID` is used as
-/// the seed-slot value (so the preimage is always at least
-/// `[replicaID, 1, v, replicaID]` for `v` whose DRG sampler returns empty;
-/// in the toy reduced case at `v = 0`, this matches `seal_reduced`'s
-/// `prev_same = replica_id` fallback).
+/// `parents_same` MUST be length `d_DRG` (no special-casing the empty
+/// case). When `v` has fewer than `d_DRG` strict-predecessor parents,
+/// the missing slots are padded with `replicaID` (the seed-slot
+/// sentinel from the spec). This makes the Poseidon arity invariant
+/// across `v`, so the in-circuit gates have a single shape and the
+/// `v* < d_DRG` case is handled by per-slot `valid_i` booleans in the
+/// circuit (with the column-inclusion gate gated by `valid_i`).
+///
+/// At layer 1, `parents_prev` is empty (no expander contribution). At
+/// layer ≥ 2, `parents_prev` is length `d_EXP`.
 pub fn label_preimage_generic(
     replica_id: Halo2Fr,
     layer: usize,
@@ -345,18 +361,68 @@ pub fn label_preimage_generic(
     parents_same: &[Halo2Fr],
     parents_prev: &[Halo2Fr],
 ) -> Vec<Halo2Fr> {
-    let mut pre = Vec::with_capacity(3 + parents_same.len() + parents_prev.len() + 1);
+    let mut pre = Vec::with_capacity(3 + parents_same.len() + parents_prev.len());
     pre.push(replica_id);
     pre.push(Halo2Fr::from(layer as u64));
     pre.push(Halo2Fr::from(v as u64));
-    if parents_same.is_empty() {
-        // Seed slot — bound to replicaID (matches the reduced fallback at v=0).
-        pre.push(replica_id);
-    } else {
-        pre.extend_from_slice(parents_same);
-    }
+    pre.extend_from_slice(parents_same);
     pre.extend_from_slice(parents_prev);
     pre
+}
+
+/// Sample DRG parent indices for `v` PADDED to length `d_DRG`. The
+/// first `min(v, d_DRG)` slots are honestly-sampled strict
+/// predecessors; the remaining slots are `0` (sentinel — paired with
+/// `replicaID` as the slot value in the preimage). The caller pairs
+/// these indices with the actual slot values via [`drg_parent_slots`].
+fn drg_parent_indices_padded(
+    seed: &[u8; 32],
+    v: usize,
+    n: usize,
+    d_drg: usize,
+) -> Result<Vec<usize>, SealError> {
+    let active = if v == 0 {
+        Vec::new()
+    } else {
+        drg_parents(seed, v, n, d_drg.min(v))?
+    };
+    Ok((0..d_drg)
+        .map(|j| if j < active.len() { active[j] } else { 0 })
+        .collect())
+}
+
+/// Convert padded parent indices into preimage slot values: real slots
+/// use `labels[layer_minus_one][p]`; padded slots use `replicaID`. The
+/// boolean returned per slot says whether the slot is REAL (true) or
+/// PADDED (false) — the in-circuit lift uses this as `valid_i`.
+fn drg_parent_slots(
+    labels_layer_minus_one: &[Halo2Fr],
+    drg_p_idx_padded: &[usize],
+    n_active: usize,
+    replica_id: Halo2Fr,
+) -> (Vec<Halo2Fr>, Vec<bool>) {
+    let mut slots = Vec::with_capacity(drg_p_idx_padded.len());
+    let mut valid = Vec::with_capacity(drg_p_idx_padded.len());
+    for (j, &p) in drg_p_idx_padded.iter().enumerate() {
+        if j < n_active {
+            slots.push(labels_layer_minus_one[p]);
+            valid.push(true);
+        } else {
+            slots.push(replica_id);
+            valid.push(false);
+        }
+    }
+    (slots, valid)
+}
+
+/// Number of REAL (non-padded) DRG parents at node `v` with degree `d_DRG`.
+#[inline]
+pub fn drg_n_active(v: usize, d_drg: usize) -> usize {
+    if v == 0 {
+        0
+    } else {
+        d_drg.min(v)
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -386,20 +452,23 @@ pub fn seal_generic(
     // replicaID = Poseidon(pinnerIdentity, cid, sectorIndex)
     let replica_id = native_hash(&[pinner_identity, cid, sector_index]);
 
-    // Labeling.
+    // Labeling — padded scheme: ALWAYS d_DRG parent slots in the
+    // labeling preimage, with replicaID padding for missing slots at
+    // v < d_DRG. The Poseidon arity is now constant across all v, so
+    // the in-circuit lift has a single shape; the v* < d_DRG case is
+    // handled by per-slot `valid_i` booleans in the circuit.
     let mut labels: Vec<Vec<Halo2Fr>> = vec![vec![Halo2Fr::from(0u64); params.n]; params.l];
     for layer in 1..=params.l {
         for v in 0..params.n {
-            // DRG (same-layer) parents.
-            let drg_p_idx = if v == 0 {
-                Vec::new()
-            } else {
-                drg_parents(&params.graph_seed, v, params.n, params.d_drg.min(v))?
-            };
-            let parents_same: Vec<Halo2Fr> =
-                drg_p_idx.iter().map(|&p| labels[layer - 1][p]).collect();
+            // DRG (same-layer) parents — padded to d_DRG slots.
+            let drg_p_idx_padded =
+                drg_parent_indices_padded(&params.graph_seed, v, params.n, params.d_drg)?;
+            let n_active = drg_n_active(v, params.d_drg);
+            let (parents_same, _valid) =
+                drg_parent_slots(&labels[layer - 1], &drg_p_idx_padded, n_active, replica_id);
 
             // Expander (previous-layer) parents — only contribute at layer ≥ 2.
+            // No padding needed; the sampler always returns exactly d_EXP.
             let parents_prev: Vec<Halo2Fr> = if layer >= 2 {
                 let exp_p_idx = expander_parents(&params.graph_seed, v, params.n, params.d_exp)?;
                 exp_p_idx.iter().map(|&e| labels[layer - 2][e]).collect()
@@ -526,6 +595,15 @@ pub fn derive_challenge_indices_simple(
 }
 
 /// Build the per-challenge witness bundle for a single challenge index.
+///
+/// PIN-P1 v*<d_DRG mux: the DRG parent arrays are ALWAYS length `d_DRG`.
+/// For `j < drg_n_active(v, d_DRG)` the slots carry the honestly-sampled
+/// strict predecessor + its column + its inclusion path. For
+/// `j >= drg_n_active(v, d_DRG)` the slots are PADDED — sentinel
+/// `parent_index = 0`, a placeholder column (zeros), and a placeholder
+/// sib path. The `drg_valid[j]` boolean tells the in-circuit lift which
+/// slots are real, gating the column-inclusion check AND muxing
+/// `replicaID` into the labeling preimage for padded slots.
 pub fn build_challenge(
     sealed: &GenericSealedReplica,
     v: usize,
@@ -538,28 +616,47 @@ pub fn build_challenge(
         .map(|l_idx| sealed.labels[l_idx][v])
         .collect();
 
-    // DRG parents (degree may be reduced for early v < d_DRG).
-    let drg_parent_indices = if v == 0 {
-        Vec::new()
-    } else {
-        drg_parents(
-            &sealed.params.graph_seed,
-            v,
-            sealed.params.n,
-            sealed.params.d_drg.min(v),
-        )?
-    };
+    // DRG parents — padded to d_DRG with sentinel index 0 for inactive
+    // slots. drg_valid encodes which are real.
+    let drg_parent_indices = drg_parent_indices_padded(
+        &sealed.params.graph_seed,
+        v,
+        sealed.params.n,
+        sealed.params.d_drg,
+    )?;
+    let n_active = drg_n_active(v, sealed.params.d_drg);
+    let drg_valid: Vec<bool> = (0..sealed.params.d_drg).map(|j| j < n_active).collect();
+
     let drg_parent_columns: Vec<Vec<Halo2Fr>> = drg_parent_indices
         .iter()
-        .map(|&p| {
-            (0..sealed.params.l)
-                .map(|l_idx| sealed.labels[l_idx][p])
-                .collect()
+        .enumerate()
+        .map(|(j, &p)| {
+            if j < n_active {
+                // Real slot — the honest column at parent index p.
+                (0..sealed.params.l)
+                    .map(|l_idx| sealed.labels[l_idx][p])
+                    .collect()
+            } else {
+                // Padded slot — zeros are a benign placeholder. The
+                // in-circuit column-inclusion gate is gated off via
+                // drg_valid[j]=false; the labeling preimage slot is
+                // muxed to `replicaID`.
+                vec![Halo2Fr::from(0u64); sealed.params.l]
+            }
         })
         .collect();
     let drg_parent_sib_c: Vec<Vec<Halo2Fr>> = drg_parent_indices
         .iter()
-        .map(|&p| merkle_siblings(&sealed.columns, p))
+        .enumerate()
+        .map(|(j, &p)| {
+            if j < n_active {
+                merkle_siblings(&sealed.columns, p)
+            } else {
+                // Padded — placeholder sib path (column-inclusion gate
+                // is gated off, so the values are irrelevant to soundness).
+                vec![Halo2Fr::from(0u64); sealed.params.merkle_depth()]
+            }
+        })
         .collect();
 
     // Expander parents (always layer ≥ 1; at layer 1 the gate ignores them
@@ -593,6 +690,7 @@ pub fn build_challenge(
         data_leaf: sealed.data[v],
         labels_at_v,
         drg_parent_indices,
+        drg_valid,
         drg_parent_columns,
         exp_parent_indices,
         exp_parent_columns,
