@@ -26,8 +26,11 @@ struct FaucetState {
     api_key: Option<String>,
     chain_id: u64,
     faucet_address: Address,
-    /// Ed25519 signing key for the faucet account
-    signing_key: Arc<ed25519_dalek::SigningKey>,
+    /// secp256k1 signing key for the faucet account. The faucet account is a
+    /// genesis-funded EVM account (0xF4ADb…), so it submits standard EIP-155
+    /// ECDSA transactions — the chain's native ed25519 account space can't be
+    /// funded via the 20-byte EVM/genesis model (see Address::from_public_key).
+    signing_key: Arc<k256::ecdsa::SigningKey>,
     /// File-backed per-address + per-IP cooldown tracker (FAU-04).
     cooldowns: Arc<Cooldowns>,
     /// Address whitelist: only these addresses can claim. Empty = no whitelist.
@@ -106,7 +109,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })?
                 .try_into()
                 .map_err(|_| "FAUCET_PRIVATE_KEY length conversion failed".to_string())?;
-            ed25519_dalek::SigningKey::from_bytes(&key_array)
+            k256::ecdsa::SigningKey::from_slice(&key_array)
+                .map_err(|e| format!("FAUCET_PRIVATE_KEY is not a valid secp256k1 key: {e}"))?
         } else {
             #[cfg(feature = "unsafe-deterministic-key")]
             {
@@ -115,7 +119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut key_bytes = [0u8; 32];
                 key_bytes.copy_from_slice(&seed);
                 info!("⚠ Using deterministic faucet key (unsafe-deterministic-key feature). Local CI ONLY.");
-                ed25519_dalek::SigningKey::from_bytes(&key_bytes)
+                k256::ecdsa::SigningKey::from_slice(&key_bytes)
+                    .map_err(|e| format!("deterministic key invalid: {e}"))?
             }
             #[cfg(not(feature = "unsafe-deterministic-key"))]
             {
@@ -129,18 +134,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Derive the faucet address from the signing key
+    // Derive the faucet's EVM address from the secp256k1 public key:
+    // keccak256(uncompressed_pubkey[1..65])[12..32]. This is the standard
+    // Ethereum address — and matches the genesis-funded faucet allocation.
     let faucet_pubkey = signing_key.verifying_key();
     let faucet_address = {
         use sha3::{Digest, Keccak256};
-        let hash = Keccak256::digest(faucet_pubkey.as_bytes());
+        let point = faucet_pubkey.to_encoded_point(false);
+        let hash = Keccak256::digest(&point.as_bytes()[1..]);
         let mut addr = [0u8; 20];
         addr.copy_from_slice(&hash[12..]);
         Address(addr)
     };
 
     info!("Faucet address: 0x{}", hex::encode(faucet_address.0));
-    info!("Faucet pubkey: {}", hex::encode(faucet_pubkey.as_bytes()));
     info!("RPC endpoint: {}", rpc_url);
     info!("Chain ID: {}", chain_id);
     if api_key.is_some() {
@@ -400,8 +407,6 @@ async fn request_tokens(
 
     // Build and sign a real transaction using the faucet's ed25519 key.
     // This uses eth_sendRawTransaction — no unsigned tx support needed on the node.
-    use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
-    use citrate_consensus::crypto as consensus_crypto;
 
     let from_hex = format!("0x{}", hex::encode(state.faucet_address.0));
     let client = reqwest::Client::new();
@@ -430,73 +435,65 @@ async fn request_tokens(
         }
     };
 
-    // Build the transaction
-    let faucet_pubkey = state.signing_key.verifying_key();
-    let from_pk = PublicKey::new(faucet_pubkey.to_bytes());
-    let to_pk = {
-        let mut pk_bytes = [0u8; 32];
-        pk_bytes[..20].copy_from_slice(&recipient.0);
-        PublicKey::new(pk_bytes)
-    };
+    // Build + sign a standard EIP-155 legacy transaction (secp256k1). The
+    // faucet account is the genesis-funded EVM account, so it must submit an
+    // ECDSA tx that the chain decodes via the eth_tx_decoder / ecrecover path
+    // (the native ed25519 path lands on an unfundable 32-byte-pubkey account).
+    use sha3::{Digest, Keccak256};
 
-    let mut tx = Transaction {
-        hash: Hash::default(),
-        from: from_pk,
-        to: Some(to_pk),
-        value: DRIP_AMOUNT,
-        data: Vec::new(),
-        nonce,
-        gas_price: 1_000_000_000,
-        gas_limit: 21_000,
-        signature: Signature::new([0; 64]),
-        tx_type: None,
-        chain_id: Some(state.chain_id),
-        ..Default::default()
-    };
-
-    // Calculate hash
-    {
-        use sha3::{Digest, Keccak256};
-        let mut hasher = Keccak256::new();
-        hasher.update(tx.nonce.to_le_bytes());
-        hasher.update(tx.from.as_bytes());
-        if let Some(ref to) = tx.to {
-            hasher.update(to.as_bytes());
-        }
-        hasher.update(tx.value.to_le_bytes());
-        hasher.update(state.chain_id.to_le_bytes());
-        let hash_bytes = hasher.finalize();
-        tx.hash = Hash::from_bytes(&hash_bytes);
+    // Append a uint as a minimal big-endian byte string (leading zeros stripped).
+    fn append_uint(s: &mut rlp::RlpStream, be: &[u8]) {
+        let i = be.iter().position(|&b| b != 0).unwrap_or(be.len());
+        s.append(&be[i..].to_vec());
     }
 
-    // Sign using consensus crypto (matches mempool verification)
-    if let Err(e) = consensus_crypto::sign_transaction(&mut tx, &state.signing_key) {
-        error!("Failed to sign faucet transaction: {}", e);
-        return Ok(Json(FaucetResponse {
-            success: false,
-            tx_hash: None,
-            message: format!("Signing failed: {}", e),
-            amount: "0".to_string(),
-        }));
-    }
+    let to_vec = recipient.0.to_vec(); // 20-byte EVM address
+    let value_be = (DRIP_AMOUNT).to_be_bytes();
+    let gas_price: u64 = 1_000_000_000;
+    let gas_limit: u64 = 21_000;
+    let chain_id = state.chain_id;
 
-    // Serialize and send as raw transaction.
-    // RM-B1 / WP-B1.5 (audit M-06): explicit error path replaces the
-    // prior `unwrap_or_default()` which silently emitted empty bytes
-    // on serialization failure (then the RPC reported a misleading
-    // decode error).
-    let tx_bytes = match bincode::serialize(&tx) {
-        Ok(bytes) => bytes,
+    // Signing payload: rlp([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0])
+    let mut sp = rlp::RlpStream::new_list(9);
+    sp.append(&nonce);
+    sp.append(&gas_price);
+    sp.append(&gas_limit);
+    sp.append(&to_vec);
+    append_uint(&mut sp, &value_be);
+    sp.append_empty_data();
+    sp.append(&chain_id);
+    sp.append(&0u8);
+    sp.append(&0u8);
+    let sighash = Keccak256::digest(&sp.out());
+
+    let (sig, recid) = match state.signing_key.sign_prehash_recoverable(&sighash) {
+        Ok(v) => v,
         Err(e) => {
+            error!("Failed to sign faucet transaction: {}", e);
             return Ok(Json(FaucetResponse {
                 success: false,
                 tx_hash: None,
-                message: format!("Transaction serialization failed: {}", e),
+                message: format!("Signing failed: {}", e),
                 amount: "0".to_string(),
             }));
         }
     };
-    let tx_hex = format!("0x{}", hex::encode(&tx_bytes));
+    let r = sig.r().to_bytes();
+    let s_ = sig.s().to_bytes();
+    let v = chain_id * 2 + 35 + recid.to_byte() as u64;
+
+    // Full tx: rlp([nonce, gasPrice, gasLimit, to, value, data, v, r, s])
+    let mut ft = rlp::RlpStream::new_list(9);
+    ft.append(&nonce);
+    ft.append(&gas_price);
+    ft.append(&gas_limit);
+    ft.append(&to_vec);
+    append_uint(&mut ft, &value_be);
+    ft.append_empty_data();
+    ft.append(&v);
+    append_uint(&mut ft, &r);
+    append_uint(&mut ft, &s_);
+    let tx_hex = format!("0x{}", hex::encode(ft.out()));
 
     let mut request = client
         .post(&state.rpc_url)
