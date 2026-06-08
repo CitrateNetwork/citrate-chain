@@ -75,7 +75,7 @@ for ceremony in "${CEREMONIES[@]}"; do
   # deployments and a .contractName that names the Solidity contract.
   pairs=$(jq -c '
     .transactions
-    | map(select(.transactionType == "CREATE" and .contractName != null and .contractAddress != null))
+    | map(select((.transactionType == "CREATE" or .transactionType == "CREATE2") and .contractName != null and .contractAddress != null))
     | map({ key: .contractName, value: (.contractAddress | ascii_downcase) })
     | from_entries
   ' "$bc")
