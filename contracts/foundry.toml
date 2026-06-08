@@ -8,6 +8,11 @@ optimizer_runs = 200
 via_ir = true
 gas_reports = ["*"]
 evm_version = "cancun"
+# Deterministic init_code for CREATE2 reroll-stable addresses (see script/Salts.sol):
+# strip the trailing solc metadata hash so creationCode is byte-reproducible and
+# independent of source-path/metadata noise. Pinned — changing these moves every address.
+bytecode_hash = "none"
+cbor_metadata = false
 
 [rpc_endpoints]
 citrate = "http://localhost:8545"

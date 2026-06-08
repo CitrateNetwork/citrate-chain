@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
+import "./Salts.sol";
 import "../src/TEEAttestationRegistry.sol";
 
 /// @title DeployTEEAttestationRegistry
@@ -20,7 +21,7 @@ contract DeployTEEAttestationRegistry is ScriptEnv {
         console.log("Chain ID:  ", block.chainid);
 
         vm.startBroadcast();
-        TEEAttestationRegistry registry = new TEEAttestationRegistry(governance);
+        TEEAttestationRegistry registry = new TEEAttestationRegistry{salt: Salts.salt("TEEAttestationRegistry")}(governance);
         vm.stopBroadcast();
 
         console.log("TEEAttestationRegistry:", address(registry));
