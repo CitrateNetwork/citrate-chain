@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
+import "./Salts.sol";
 
 // Core
 import "../src/ModelRegistry.sol";
@@ -77,22 +78,22 @@ contract DeployAll is ScriptEnv {
         // =====================================================================
         console.log("--- Layer 1: Core Infrastructure ---");
 
-        ModelRegistry registry = new ModelRegistry();
+        ModelRegistry registry = new ModelRegistry{salt: Salts.salt("ModelRegistry")}();
         console.log("  ModelRegistry:", address(registry));
 
-        WrappedSALT wsalt = new WrappedSALT();
+        WrappedSALT wsalt = new WrappedSALT{salt: Salts.salt("WrappedSALT")}();
         console.log("  WrappedSALT:", address(wsalt));
 
-        AgentDecisionRegistry agentRegistry = new AgentDecisionRegistry(deployer);
+        AgentDecisionRegistry agentRegistry = new AgentDecisionRegistry{salt: Salts.salt("AgentDecisionRegistry")}(deployer);
         console.log("  AgentDecisionRegistry:", address(agentRegistry));
 
         // RM-L / WP-L1.1: SpecRegistry now requires governance address
         // at deploy. Pass `deployer` for testnet; production should pass
         // the multisig per the L1.6 genesis runbook.
-        SpecRegistry specRegistry = new SpecRegistry(deployer);
+        SpecRegistry specRegistry = new SpecRegistry{salt: Salts.salt("SpecRegistry")}(deployer);
         console.log("  SpecRegistry:", address(specRegistry));
 
-        IPFSIncentives ipfs = new IPFSIncentives();
+        IPFSIncentives ipfs = new IPFSIncentives{salt: Salts.salt("IPFSIncentives")}();
         console.log("  IPFSIncentives:", address(ipfs));
 
         // =====================================================================
@@ -100,14 +101,14 @@ contract DeployAll is ScriptEnv {
         // =====================================================================
         console.log("--- Layer 2: Payment & Access ---");
 
-        X402Facilitator facilitator = new X402Facilitator(
+        X402Facilitator facilitator = new X402Facilitator{salt: Salts.salt("X402Facilitator")}(
             address(wsalt),
             deployer,  // treasury
             100        // 1% fee
         );
         console.log("  X402Facilitator:", address(facilitator));
 
-        X402Paywall paywall = new X402Paywall(address(wsalt), 1 ether);
+        X402Paywall paywall = new X402Paywall{salt: Salts.salt("X402Paywall")}(address(wsalt), 1 ether);
         console.log("  X402Paywall:", address(paywall));
 
         // ModelAccessControl is deployed by DeployModelAccessControl.s.sol
@@ -118,16 +119,16 @@ contract DeployAll is ScriptEnv {
         // =====================================================================
         console.log("--- Layer 3: Economics ---");
 
-        LiquidStakingPool stakingPool = new LiquidStakingPool();
+        LiquidStakingPool stakingPool = new LiquidStakingPool{salt: Salts.salt("LiquidStakingPool")}();
         console.log("  LiquidStakingPool:", address(stakingPool));
 
-        ContributionAccounting contributions = new ContributionAccounting();
+        ContributionAccounting contributions = new ContributionAccounting{salt: Salts.salt("ContributionAccounting")}();
         console.log("  ContributionAccounting:", address(contributions));
 
-        NematocystSlashing slashing = new NematocystSlashing();
+        NematocystSlashing slashing = new NematocystSlashing{salt: Salts.salt("NematocystSlashing")}();
         console.log("  NematocystSlashing:", address(slashing));
 
-        MarketMakerAllocation mmAlloc = new MarketMakerAllocation(
+        MarketMakerAllocation mmAlloc = new MarketMakerAllocation{salt: Salts.salt("MarketMakerAllocation")}(
             deployer,   // market maker (deployer for now, DAO changes later)
             deployer    // governance
         );
@@ -138,25 +139,25 @@ contract DeployAll is ScriptEnv {
         // =====================================================================
         console.log("--- Layer 4: AI & Learning ---");
 
-        ModelMarketplace modelMarketplace = new ModelMarketplace(
+        ModelMarketplace modelMarketplace = new ModelMarketplace{salt: Salts.salt("ModelMarketplace")}(
             address(registry),
             deployer   // treasury
         );
         console.log("  ModelMarketplace:", address(modelMarketplace));
 
-        InferenceRouter router = new InferenceRouter(address(registry));
+        InferenceRouter router = new InferenceRouter{salt: Salts.salt("InferenceRouter")}(address(registry));
         console.log("  InferenceRouter:", address(router));
 
-        LoRAFactory loraFactory = new LoRAFactory(address(registry));
+        LoRAFactory loraFactory = new LoRAFactory{salt: Salts.salt("LoRAFactory")}(address(registry));
         console.log("  LoRAFactory:", address(loraFactory));
 
-        LearningPool learningPool = new LearningPool();
+        LearningPool learningPool = new LearningPool{salt: Salts.salt("LearningPool")}();
         console.log("  LearningPool:", address(learningPool));
 
-        LearningCycleManager cycleManager = new LearningCycleManager();
+        LearningCycleManager cycleManager = new LearningCycleManager{salt: Salts.salt("LearningCycleManager")}();
         console.log("  LearningCycleManager:", address(cycleManager));
 
-        ClassroomRegistry classroom = new ClassroomRegistry();
+        ClassroomRegistry classroom = new ClassroomRegistry{salt: Salts.salt("ClassroomRegistry")}();
         console.log("  ClassroomRegistry:", address(classroom));
 
         // RM-FL-4: MentorMatcher pairs mentors↔mentees from the
@@ -164,7 +165,7 @@ contract DeployAll is ScriptEnv {
         // for lazy per-(addr, dim) score reads — the matcher does not
         // mirror that state; it staticcalls it on demand. Governance
         // is the deployer for testnet; mainnet should use the multisig.
-        MentorMatcher mentorMatcher = new MentorMatcher(deployer);
+        MentorMatcher mentorMatcher = new MentorMatcher{salt: Salts.salt("MentorMatcher")}(deployer);
         mentorMatcher.setContributionAccounting(address(contributions));
         console.log("  MentorMatcher:", address(mentorMatcher));
 
@@ -174,31 +175,31 @@ contract DeployAll is ScriptEnv {
         console.log("--- Layer 5: Compute Marketplace ---");
 
         // Deploy verifier first (ComputeMarketplace depends on it)
-        ComputeVerifier verifier = new ComputeVerifier(deployer);
+        ComputeVerifier verifier = new ComputeVerifier{salt: Salts.salt("ComputeVerifier")}(deployer);
         console.log("  ComputeVerifier:", address(verifier));
 
-        ComputeMarketplace computeMarketplace = new ComputeMarketplace(
+        ComputeMarketplace computeMarketplace = new ComputeMarketplace{salt: Salts.salt("ComputeMarketplace")}(
             address(verifier),
             deployer  // treasury
         );
         console.log("  ComputeMarketplace:", address(computeMarketplace));
 
-        ComputePool computePool = new ComputePool();
+        ComputePool computePool = new ComputePool{salt: Salts.salt("ComputePool")}();
         console.log("  ComputePool:", address(computePool));
 
-        HeartbeatMonitor heartbeat = new HeartbeatMonitor(
+        HeartbeatMonitor heartbeat = new HeartbeatMonitor{salt: Salts.salt("HeartbeatMonitor")}(
             50,   // heartbeat interval (blocks)
             3     // max missed before suspension
         );
         console.log("  HeartbeatMonitor:", address(heartbeat));
 
-        DisputeResolution dispute = new DisputeResolution(
+        DisputeResolution dispute = new DisputeResolution{salt: Salts.salt("DisputeResolution")}(
             10 ether,  // 10 SALT dispute bond
             10         // max bisection rounds
         );
         console.log("  DisputeResolution:", address(dispute));
 
-        ComputePricingOracle oracle = new ComputePricingOracle(
+        ComputePricingOracle oracle = new ComputePricingOracle{salt: Salts.salt("ComputePricingOracle")}(
             13,    // $0.13/PFLOP-hour
             100    // $1.00/SALT
         );
@@ -209,10 +210,10 @@ contract DeployAll is ScriptEnv {
         // =====================================================================
         console.log("--- Layer 6: Treasury & Governance ---");
 
-        StablecoinTreasury treasury = new StablecoinTreasury(deployer);
+        StablecoinTreasury treasury = new StablecoinTreasury{salt: Salts.salt("StablecoinTreasury")}(deployer);
         console.log("  StablecoinTreasury:", address(treasury));
 
-        BulkComputeGateway gateway = new BulkComputeGateway(
+        BulkComputeGateway gateway = new BulkComputeGateway{salt: Salts.salt("BulkComputeGateway")}(
             address(treasury),
             address(oracle),
             deployer   // admin
@@ -220,14 +221,14 @@ contract DeployAll is ScriptEnv {
         treasury.setAuthorizedActivityRecorder(address(gateway), true);
         console.log("  BulkComputeGateway:", address(gateway));
 
-        TestnetFarmingAccounting farming = new TestnetFarmingAccounting(
+        TestnetFarmingAccounting farming = new TestnetFarmingAccounting{salt: Salts.salt("TestnetFarmingAccounting")}(
             address(contributions),
             address(treasury),
             deployer   // governance
         );
         console.log("  TestnetFarmingAccounting:", address(farming));
 
-        TreasuryGovernor governor = new TreasuryGovernor(
+        TreasuryGovernor governor = new TreasuryGovernor{salt: Salts.salt("TreasuryGovernor")}(
             address(stakingPool),
             address(treasury),
             deployer,           // guardian

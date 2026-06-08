@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# regenesis.sh — full-stack CREATE2 deploy orchestration for chain 40204.
+#
+# Deploys EVERY business contract via the deterministic (CREATE2) scripts in
+# ceremony order, regenerates the canonical address table, and asserts every
+# address has code on-chain. Because every `new X{salt: Salts.salt("X")}(…)`
+# (see contracts/script/Salts.sol) routes through the genesis Arachnid CREATE2
+# deployer (0x4e59…), the resulting contracts/addresses/40204.json is
+# byte-identical across rerolls — no more address scramble.
+#
+# This is the single source of truth for "deploy the whole stack." Run it after
+# a fresh re-roll. It is idempotent on a given chain (CREATE2 redeploys revert
+# with "already deployed" — re-run on a FRESH chain only).
+#
+# Prerequisites:
+#   - Re-rolled chain live + reachable (chain id 40204).
+#   - Arachnid CREATE2 deployer present at 0x4e59… (genesis WP-B).
+#   - Deployer EOA funded (DEPLOYER_ADDRESS / DEPLOYER_PRIVATE_KEY).
+#   - For the AA step: EntryPoint v0.7 deployed + CITRATE_AA_* env set
+#     (handled by scripts/ops/post-reroll-redeploy.sh — run AFTER this, or
+#     pass --with-aa to chain it here).
+#   - foundry (forge/cast) + jq on PATH.
+#
+# Usage:
+#   ENV_TESTNET=/path/.env.testnet bash scripts/ops/regenesis.sh [--with-aa]
+#
+# Exit codes: 0 ok · 1 precondition failed · 2 a deploy failed · 3 verify failed.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+CONTRACTS_DIR="${REPO_ROOT}/contracts"
+ENV_TESTNET="${ENV_TESTNET:-/home/saul/Projects/Citrate-Labs/.env.testnet}"
+CHAIN_ID=40204
+ARACHNID=0x4e59b44847b379578588920cA78FbF26c0B4956C
+
+err() { echo "[regenesis] ERROR: $*" >&2; }
+log() { echo "[regenesis] $*"; }
+
+command -v forge >/dev/null || { err "forge (foundry) required"; exit 1; }
+command -v cast  >/dev/null || { err "cast (foundry) required"; exit 1; }
+command -v jq    >/dev/null || { err "jq required"; exit 1; }
+
+# --- config from .env.testnet (RPC + deployer) -----------------------
+get_env() { grep -E "^$1=" "$ENV_TESTNET" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'\'''; }
+RPC_URL="${RPC_URL:-$(get_env RPC_URL)}"
+RPC_URL="${RPC_URL:-https://rpc.citrate.ai}"
+DEPLOYER_ADDRESS="${DEPLOYER_ADDRESS:-$(get_env DEPLOYER_ADDRESS)}"
+DEPLOYER_PRIVATE_KEY="${DEPLOYER_PRIVATE_KEY:-$(get_env DEPLOYER_PRIVATE_KEY)}"
+[ -n "$DEPLOYER_ADDRESS" ] || { err "DEPLOYER_ADDRESS not set / not in $ENV_TESTNET"; exit 1; }
+[ -n "$DEPLOYER_PRIVATE_KEY" ] || { err "DEPLOYER_PRIVATE_KEY not set"; exit 1; }
+export DEPLOYER_ADDRESS   # ScriptEnv.deployerAddress() reads this
+
+# --- preconditions ---------------------------------------------------
+ON_CHAIN_ID=$(cast chain-id --rpc-url "$RPC_URL")
+[ "$ON_CHAIN_ID" = "$CHAIN_ID" ] || { err "chain id $ON_CHAIN_ID != $CHAIN_ID"; exit 1; }
+[ "$(cast code --rpc-url "$RPC_URL" "$ARACHNID" | wc -c)" -gt 10 ] || { err "Arachnid CREATE2 deployer missing at $ARACHNID — rebuild genesis (WP-B)"; exit 1; }
+BAL=$(cast balance --rpc-url "$RPC_URL" "$DEPLOYER_ADDRESS")
+[ "$(cast to-unit "$BAL" ether | cut -d. -f1)" -ge 1 ] 2>/dev/null || { err "deployer $DEPLOYER_ADDRESS has < 1 SALT"; exit 1; }
+log "chain $CHAIN_ID ✓  Arachnid ✓  deployer $DEPLOYER_ADDRESS funded ✓  rpc=$RPC_URL"
+
+# --- the business-contract ceremony, in dependency order -------------
+# Each script deploys via CREATE2 (deterministic). Order matters only for the
+# cross-script reads done by post-deploy wiring, not for the addresses.
+CEREMONY=(
+  "script/DeployAll.s.sol"                  # 28 core contracts
+  "script/DeployModelAccessControl.s.sol"   # 1 (OZ-isolated)
+  "script/DeployTEEAttestationRegistry.s.sol" # 1 (CM-08)
+  "script/DeployComputePoolTraining.s.sol"  # 1 (CM-07)
+  "script/DeployEduStack.s.sol"             # 5 (Learning Center)
+  "script/DeployAIGateway.s.sol"            # 3 (edu ai-gateway)
+)
+
+for s in "${CEREMONY[@]}"; do
+  log "deploying $s …"
+  if ! (cd "$CONTRACTS_DIR" && forge script "$s" \
+        --rpc-url "$RPC_URL" \
+        --private-key "$DEPLOYER_PRIVATE_KEY" \
+        --sender "$DEPLOYER_ADDRESS" \
+        --broadcast --skip-simulation 2>&1 | tail -3); then
+    err "deploy failed: $s"; exit 2
+  fi
+done
+
+# --- AA stack (optional; needs EntryPoint + CITRATE_AA_* env) ---------
+if [ "${1:-}" = "--with-aa" ]; then
+  log "running AA ceremony via post-reroll-redeploy.sh …"
+  ENV_TESTNET="$ENV_TESTNET" bash "${REPO_ROOT}/scripts/ops/post-reroll-redeploy.sh" || { err "AA ceremony failed"; exit 2; }
+fi
+
+# --- regenerate the canonical table ----------------------------------
+log "regenerating canonical contracts/addresses/40204.json …"
+ENV_TESTNET="$ENV_TESTNET" bash "${REPO_ROOT}/scripts/ops/emit-address-table.sh"
+
+# --- verify: every canonical address has code ------------------------
+log "verifying eth_getCode != 0x for every canonical contract …"
+TABLE="${CONTRACTS_DIR}/addresses/40204.json"
+FAIL=0
+while IFS=$'\t' read -r name addr; do
+  # precompiles + the genesis Arachnid are not CREATE2 contracts; skip empties
+  [ -z "$addr" ] && continue
+  CODELEN=$(cast code --rpc-url "$RPC_URL" "$addr" | wc -c)
+  if [ "$CODELEN" -le 4 ]; then err "NO CODE at $name = $addr"; FAIL=1; fi
+done < <(jq -r '.contracts | to_entries[] | "\(.key)\t\(.value)"' "$TABLE")
+[ "$FAIL" -eq 0 ] || { err "verification failed — some contracts have no code"; exit 3; }
+
+log "✅ full stack deployed + canonical table regenerated + all addresses have code."
+log "next: sync consumers (each repo's sync-addresses) + run the CREATE2 determinism gate (scripts/ci/check-create2-determinism.sh)."

@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
+import "./Salts.sol";
 import "../src/ModelAccessControl.sol";
 
 /// @title DeployModelAccessControl
@@ -17,7 +18,7 @@ contract DeployModelAccessControl is ScriptEnv {
 
         vm.startBroadcast();
 
-        ModelAccessControl accessControl = new ModelAccessControl();
+        ModelAccessControl accessControl = new ModelAccessControl{salt: Salts.salt("ModelAccessControl")}();
         console.log("ModelAccessControl:", address(accessControl));
 
         vm.stopBroadcast();
