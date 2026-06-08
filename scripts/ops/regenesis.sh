@@ -49,6 +49,11 @@ DEPLOYER_PRIVATE_KEY="${DEPLOYER_PRIVATE_KEY:-$(get_env DEPLOYER_PRIVATE_KEY)}"
 [ -n "$DEPLOYER_ADDRESS" ] || { err "DEPLOYER_ADDRESS not set / not in $ENV_TESTNET"; exit 1; }
 [ -n "$DEPLOYER_PRIVATE_KEY" ] || { err "DEPLOYER_PRIVATE_KEY not set"; exit 1; }
 export DEPLOYER_ADDRESS   # ScriptEnv.deployerAddress() reads this
+# EduStack's InstitutionalVault needs 3 DISTINCT multisig signers; pin them to
+# stable genesis EOAs so the CREATE2 addresses stay reroll-deterministic.
+export SIGNER_1="${SIGNER_1:-$DEPLOYER_ADDRESS}"
+export SIGNER_2="${SIGNER_2:-$(get_env TEAM_ADDRESS)}"
+export SIGNER_3="${SIGNER_3:-$(get_env TREASURY_ADDRESS)}"
 
 # --- preconditions ---------------------------------------------------
 ON_CHAIN_ID=$(cast chain-id --rpc-url "$RPC_URL")
@@ -72,11 +77,15 @@ CEREMONY=(
 
 for s in "${CEREMONY[@]}"; do
   log "deploying $s …"
+  # Simulate (for correct per-CREATE2 gas estimation) + --slow (one tx at a
+  # time, await each receipt — reliable on a 2s-block chain). Do NOT use
+  # --skip-simulation: it sends with a default gas limit too low for the
+  # proxy's CALLDATACOPY of a multi-KB init_code + the CREATE2.
   if ! (cd "$CONTRACTS_DIR" && forge script "$s" \
         --rpc-url "$RPC_URL" \
         --private-key "$DEPLOYER_PRIVATE_KEY" \
         --sender "$DEPLOYER_ADDRESS" \
-        --broadcast --skip-simulation 2>&1 | tail -3); then
+        --broadcast --slow --gas-estimate-multiplier 130 2>&1 | tail -4); then
     err "deploy failed: $s"; exit 2
   fi
 done
