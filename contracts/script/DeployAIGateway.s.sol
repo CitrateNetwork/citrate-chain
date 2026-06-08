@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
+import "./Salts.sol";
 
 import "../src/edu/ai-gateway/AIModelRegistryPortable.sol";
 import "../src/edu/ai-gateway/AIInferenceRouterPortable.sol";
@@ -34,18 +35,18 @@ contract DeployAIGateway is ScriptEnv {
         vm.startBroadcast();
 
         // L0 + L1: Model Registry (includes IAIBackendCapabilities)
-        AIModelRegistryPortable registry = new AIModelRegistryPortable();
+        AIModelRegistryPortable registry = new AIModelRegistryPortable{salt: Salts.salt("AIModelRegistryPortable")}();
         console.log("AIModelRegistryPortable (L0+L1):", address(registry));
 
         // L2: Inference Router
-        AIInferenceRouterPortable router = new AIInferenceRouterPortable(
+        AIInferenceRouterPortable router = new AIInferenceRouterPortable{salt: Salts.salt("AIInferenceRouterPortable")}(
             address(registry),
             governance
         );
         console.log("AIInferenceRouterPortable (L2):", address(router));
 
         // L3: Learning Cycle Core
-        AILearningCycleCorePortable learningCycle = new AILearningCycleCorePortable(governance);
+        AILearningCycleCorePortable learningCycle = new AILearningCycleCorePortable{salt: Salts.salt("AILearningCycleCorePortable")}(governance);
         console.log("AILearningCycleCorePortable (L3):", address(learningCycle));
 
         vm.stopBroadcast();

@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
+import "./Salts.sol";
 import "../src/ComputePoolTraining.sol";
 
 /// @title DeployComputePoolTraining
@@ -44,7 +45,7 @@ contract DeployComputePoolTraining is ScriptEnv {
         console.log("Governance: ", governance);
 
         vm.startBroadcast();
-        ComputePoolTraining pool = new ComputePoolTraining(governance);
+        ComputePoolTraining pool = new ComputePoolTraining{salt: Salts.salt("ComputePoolTraining")}(governance);
         vm.stopBroadcast();
 
         console.log("ComputePoolTraining deployed at:", address(pool));
