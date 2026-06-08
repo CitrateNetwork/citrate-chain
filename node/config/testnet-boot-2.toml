@@ -11,8 +11,10 @@ ghostdag_k = 18
 [network]
 listen_addr = "0.0.0.0:30304"
 bootstrap_nodes = [
-    "127.0.0.1:30303",
-    "127.0.0.1:30305",
+    "noise_f356d3ebb07371eaad371b3960272f9d58fc457cde409c34549ef03776b78141@boot1.citrate.ai:30303",
+    "noise_4ed281386422f6a65b92d8760d24baa82bb1b476e9dd3e21d5a070d026802c07@boot2.citrate.ai:30303",
+    "noise_2b4924671e0babc9f52eb1695c72141a9c639e17ad95a2a2d2a715eae34a420e@boot3.citrate.ai:30303",
+    "noise_6ee549718d522c9ccc122585dfedef72aea8df24f4a2bb0264e7658a91118b4a@rpc.citrate.ai:30303",
 ]
 max_peers = 200
 
