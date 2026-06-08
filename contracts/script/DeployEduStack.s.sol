@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
+import "./Salts.sol";
 
 import "../src/edu/InstitutionalVault.sol";
 import "../src/edu/ClassroomClusterV1.sol";
@@ -64,23 +65,23 @@ contract DeployEduStack is ScriptEnv {
         signers[0] = signer1;
         signers[1] = signer2;
         signers[2] = signer3;
-        InstitutionalVault vault = new InstitutionalVault(signers, 2);
+        InstitutionalVault vault = new InstitutionalVault{salt: Salts.salt("InstitutionalVault")}(signers, 2);
         console.log("InstitutionalVault:", address(vault));
 
         // 2. ClassroomClusterV1 — governance = vault
-        ClassroomClusterV1 cluster = new ClassroomClusterV1(address(vault));
+        ClassroomClusterV1 cluster = new ClassroomClusterV1{salt: Salts.salt("ClassroomClusterV1")}(address(vault));
         console.log("ClassroomClusterV1:", address(cluster));
 
         // 3. Forwarder — vault as governance, cluster for device/session validation
-        Forwarder forwarder = new Forwarder(address(vault), address(cluster), address(vault));
+        Forwarder forwarder = new Forwarder{salt: Salts.salt("Forwarder")}(address(vault), address(cluster), address(vault));
         console.log("Forwarder:", address(forwarder));
 
         // 4. BudgetAllocation — governance = vault
-        BudgetAllocation budget = new BudgetAllocation(address(vault));
+        BudgetAllocation budget = new BudgetAllocation{salt: Salts.salt("BudgetAllocation")}(address(vault));
         console.log("BudgetAllocation:", address(budget));
 
         // 5. CashoutRequest — governance = vault, initial SALT/USD rate
-        CashoutRequest cashout = new CashoutRequest(address(vault), saltUsdRate);
+        CashoutRequest cashout = new CashoutRequest{salt: Salts.salt("CashoutRequest")}(address(vault), saltUsdRate);
         console.log("CashoutRequest:", address(cashout));
 
         // Post-deploy: grant deployer Admin role so they can set up classrooms

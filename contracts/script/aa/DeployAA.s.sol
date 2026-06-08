@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import "../ScriptEnv.sol";
+import "../Salts.sol";
 
 // AA contracts shipped by WP-1
 import {WebAuthnP256Validator} from "../../src/aa/validators/WebAuthnP256Validator.sol";
@@ -72,21 +73,21 @@ contract DeployAA is Script, ScriptEnv {
 
         vm.startBroadcast();
 
-        d.webauthn = new WebAuthnP256Validator();
-        d.ecdsa = new CitrateECDSAValidator();
-        d.recovery = new GuardianRecoveryModule();
+        d.webauthn = new WebAuthnP256Validator{salt: Salts.salt("WebAuthnP256Validator")}();
+        d.ecdsa = new CitrateECDSAValidator{salt: Salts.salt("CitrateECDSAValidator")}();
+        d.recovery = new GuardianRecoveryModule{salt: Salts.salt("GuardianRecoveryModule")}();
 
         // CitrateWallet implementation: thin adapter over Kernel v3.3 with
         // EIP-712 domain separation (see contracts/src/aa/wallet/CitrateWallet.sol).
         // Each user smart wallet is an ERC-1967 minimal proxy of this
         // implementation, deployed via the factory.
-        d.walletImpl = new CitrateWallet(IKernelEntryPoint(entryPoint));
+        d.walletImpl = new CitrateWallet{salt: Salts.salt("CitrateWallet")}(IKernelEntryPoint(entryPoint));
 
         // Factory needs the implementation address + identity signer + owner.
-        d.factory = new CitrateWalletFactory(address(d.walletImpl), identitySigner, owner);
+        d.factory = new CitrateWalletFactory{salt: Salts.salt("CitrateWalletFactory")}(address(d.walletImpl), identitySigner, owner);
 
         // Paymaster wired to the EntryPoint + factory as registrar.
-        d.paymaster = new CitratePaymaster(
+        d.paymaster = new CitratePaymaster{salt: Salts.salt("CitratePaymaster")}(
             IAaEntryPoint(entryPoint),
             owner,
             address(d.factory),
