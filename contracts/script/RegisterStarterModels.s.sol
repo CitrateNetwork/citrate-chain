@@ -16,7 +16,7 @@ import {IModelRegistry} from "../src/interfaces/IModelRegistry.sol";
  *     and capture the resulting CIDs.
  *  2. Fill the CID strings into the MODELS / LORAS arrays below.
  *  3. Set REGISTRY_ADDR to the deployed ModelRegistry on the target chain
- *     (testnet-beta: 0x077fbc3338a9e6bad90a3a041e6b7425689754ef).
+ *     (testnet-beta, post-2026-06-08-reroll: 0x11a5e6f57751d8fa1c5b58ad2bf13528160985f0).
  *  4. Fund the deployer with at least 0.1 tCTR per artifact (registration
  *     fee is 0.1 ether per registerModel call).
  *  5. Run:
@@ -36,7 +36,10 @@ contract RegisterStarterModels is Script {
     /// @notice ModelRegistry deployed at this address on chain id 40204.
     /// Bumped here so we don't ask `vm.envAddress` and keep the script
     /// runnable from CI without env wiring.
-    address public constant REGISTRY_ADDR = 0x077Fbc3338A9e6BAD90A3A041E6b7425689754Ef;
+    /// Post-reroll (2026-06-08): the address book rotated — see
+    /// contracts/addresses/40204.json. Verify before each run:
+    ///   jq -r '.contracts.ModelRegistry' contracts/addresses/40204.json
+    address public constant REGISTRY_ADDR = 0x11a5e6F57751d8fa1c5b58ad2bf13528160985f0;
 
     /// @notice Per-call fee charged by ModelRegistry.registerModel.
     uint256 public constant REGISTRATION_FEE = 0.1 ether;
