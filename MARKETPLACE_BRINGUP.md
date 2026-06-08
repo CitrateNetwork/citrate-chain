@@ -5,14 +5,14 @@ gateway (`gateway.citrate.ai`) returns **no models** until models are
 registered in `ModelRegistry` **and** at least one provider is registered
 against `InferenceRouter`. This runbook gets a model serving end-to-end.
 
-## Addresses (chain 40204, per `contracts/DEPLOYED_ADDRESSES.md`)
+## Addresses (chain 40204, per `contracts/addresses/40204.json` — post-2026-06-08 reroll)
 
 | Contract | Address |
 |---|---|
-| ModelRegistry | `0x077fbc3338a9e6bad90a3a041e6b7425689754ef` |
-| InferenceRouter | `0xad7c3135c1b9b3189208fd617b6b058c1c0469f3` |
-| ComputePricingOracle | `0xa1eed6ae021504e2a1e310e6c0f7c1a0c5bf4647` |
-| WrappedSALT (wSALT) | `0x1f73bb479f397a34b5e3145e51d25bc5007273bf` |
+| ModelRegistry | `0x11a5e6f57751d8fa1c5b58ad2bf13528160985f0` |
+| InferenceRouter | `0x6884ef1907468a13265a0bbb67da20ef4b52199b` |
+| ComputePricingOracle | `0x4ee0bef59a87a9ea3f91b80fd68ebfe69e72075a` |
+| WrappedSALT (wSALT) | `0xad7c3135c1b9b3189208fd617b6b058c1c0469f3` |
 
 RPC `https://rpc.citrate.ai` · Faucet `https://faucet.citrate.ai` (10 SALT / 24h).
 
@@ -64,12 +64,12 @@ function registerProvider(string endpoint, uint256 minPrice, bytes32[] supported
 ```
 
 ```bash
-# read the current minimum stake
-cast call 0xad7c3135c1b9b3189208fd617b6b058c1c0469f3 \
+# read the current minimum stake (InferenceRouter)
+cast call 0x6884ef1907468a13265a0bbb67da20ef4b52199b \
   "minProviderStake()(uint256)" --rpc-url https://rpc.citrate.ai
 
 # the bytes32 model hash(es) come from ModelRegistry (step 1)
-cast send 0xad7c3135c1b9b3189208fd617b6b058c1c0469f3 \
+cast send 0x6884ef1907468a13265a0bbb67da20ef4b52199b \
   "registerProvider(string,uint256,bytes32[])" \
   "https://your-provider.example/infer" \
   <minPriceWei> \
