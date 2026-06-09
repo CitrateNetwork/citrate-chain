@@ -36,10 +36,10 @@ contract RegisterStarterModels is Script {
     /// @notice ModelRegistry deployed at this address on chain id 40204.
     /// Bumped here so we don't ask `vm.envAddress` and keep the script
     /// runnable from CI without env wiring.
-    /// Post-reroll (2026-06-08): the address book rotated — see
-    /// contracts/addresses/40204.json. Verify before each run:
+    /// CREATE2 reroll-stable address book (#41): this is now fixed across
+    /// rerolls unless Salts.VERSION is bumped. Source of truth + verify:
     ///   jq -r '.contracts.ModelRegistry' contracts/addresses/40204.json
-    address public constant REGISTRY_ADDR = 0x11a5e6F57751d8fa1c5b58ad2bf13528160985f0;
+    address public constant REGISTRY_ADDR = 0xF64636D56ec9e0C406149B34EA9c5C5D80B342c0;
 
     /// @notice Per-call fee charged by ModelRegistry.registerModel.
     uint256 public constant REGISTRATION_FEE = 0.1 ether;
