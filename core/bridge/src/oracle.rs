@@ -72,17 +72,59 @@ pub struct OracleRegistry {
 
     /// Collected attestations per event.
     attestations: HashMap<EventId, Vec<OracleAttestation>>,
+
+    /// SECREM-01 BRG-3: chain id bound into every attestation message.
+    /// Without it, an oracle's signature for deployment A replays
+    /// verbatim against deployment B wherever oracle keys are shared.
+    #[serde(default)]
+    chain_id: u64,
+
+    /// SECREM-01 BRG-3: bridge-instance binding (derived from the bridge
+    /// contract address by the relay), same replay rationale as chain_id.
+    #[serde(default)]
+    bridge_instance: [u8; 32],
 }
 
-/// Verify an attestation signature cryptographically (ed25519).
+/// SECREM-01 BRG-3: the canonical attestation signing message — the ONE
+/// constructor shared by verification, tests, and oracle clients (Rule 9).
 ///
-/// Domain-separated message: `"citrate-bridge-v1"(17) || event_id(32) || event_hash(32) || timestamp(8 LE)` = 89 bytes.
-fn verify_attestation_signature(attestation: &OracleAttestation) -> Result<(), BridgeError> {
-    let mut message = Vec::with_capacity(89);
-    message.extend_from_slice(b"citrate-bridge-v1");
-    message.extend_from_slice(&attestation.event_id);
-    message.extend_from_slice(&attestation.event_hash);
-    message.extend_from_slice(&attestation.timestamp.to_le_bytes());
+/// `"citrate-bridge-v2" || chain_id(8 LE) || bridge_instance(32) ||
+/// event_id(32) || event_hash(32) || timestamp(8 LE)`.
+///
+/// v2 supersedes v1 (which lacked the chain/instance binding). v1
+/// signatures are NOT accepted anywhere — the bridge is pre-production
+/// (ETH release stubbed), so the format break is deliberate and clean.
+pub fn attestation_message(
+    chain_id: u64,
+    bridge_instance: &[u8; 32],
+    event_id: &EventId,
+    event_hash: &[u8; 32],
+    timestamp: u64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(17 + 8 + 32 + 32 + 32 + 8);
+    message.extend_from_slice(b"citrate-bridge-v2");
+    message.extend_from_slice(&chain_id.to_le_bytes());
+    message.extend_from_slice(bridge_instance);
+    message.extend_from_slice(event_id);
+    message.extend_from_slice(event_hash);
+    message.extend_from_slice(&timestamp.to_le_bytes());
+    message
+}
+
+/// Verify an attestation signature cryptographically (ed25519) over the
+/// domain-separated v2 message (see [`attestation_message`]).
+fn verify_attestation_signature(
+    attestation: &OracleAttestation,
+    chain_id: u64,
+    bridge_instance: &[u8; 32],
+) -> Result<(), BridgeError> {
+    let message = attestation_message(
+        chain_id,
+        bridge_instance,
+        &attestation.event_id,
+        &attestation.event_hash,
+        attestation.timestamp,
+    );
 
     let pubkey = VerifyingKey::from_bytes(&attestation.oracle_id).map_err(|_| {
         BridgeError::InvalidSignature {
@@ -129,12 +171,32 @@ fn verify_attestation_freshness(attestation: &OracleAttestation) -> Result<(), B
 
 impl OracleRegistry {
     /// Create a new oracle registry with the given M-of-N threshold.
+    ///
+    /// Uses the zero signing domain (chain_id 0, zero instance) — suitable
+    /// for unit tests only. Production paths construct via
+    /// [`Self::with_domain`] so attestations are bound to one deployment
+    /// (SECREM-01 BRG-3).
     pub fn new(threshold: usize) -> Self {
+        Self::with_domain(threshold, 0, [0u8; 32])
+    }
+
+    /// Create a registry whose attestations are domain-bound to a specific
+    /// chain + bridge instance (SECREM-01 BRG-3).
+    pub fn with_domain(threshold: usize, chain_id: u64, bridge_instance: [u8; 32]) -> Self {
         Self {
             oracles: HashMap::new(),
             threshold,
             attestations: HashMap::new(),
+            chain_id,
+            bridge_instance,
         }
+    }
+
+    /// The signing domain `(chain_id, bridge_instance)` attestations must
+    /// be bound to. Exposed so oracle clients and tests build messages via
+    /// [`attestation_message`] with the exact verifier domain.
+    pub fn domain(&self) -> (u64, [u8; 32]) {
+        (self.chain_id, self.bridge_instance)
     }
 
     /// Register a new oracle.
@@ -213,6 +275,8 @@ impl OracleRegistry {
         &mut self,
         attestation: OracleAttestation,
     ) -> Result<usize, BridgeError> {
+        // SECREM-01 BRG-3: capture the signing domain before field borrows.
+        let (chain_id, bridge_instance) = (self.chain_id, self.bridge_instance);
         // Verify oracle is registered and active
         let oracle = self
             .oracles
@@ -247,7 +311,7 @@ impl OracleRegistry {
         verify_attestation_freshness(&attestation)?;
 
         // Cryptographic ed25519 signature verification
-        verify_attestation_signature(&attestation)?;
+        verify_attestation_signature(&attestation, chain_id, &bridge_instance)?;
 
         // Update oracle stats
         oracle.last_attestation = attestation.timestamp;
@@ -258,12 +322,76 @@ impl OracleRegistry {
         Ok(event_attestations.len())
     }
 
-    /// Check if an event has met the attestation threshold.
+    /// Check if an event has met the attestation threshold BY RAW COUNT.
+    ///
+    /// SECREM-01 BRG-1: this is a LIVENESS signal only ("are enough
+    /// attestations in to bother evaluating?"), NOT a security gate — it
+    /// counts attestations that may disagree about the event contents.
+    /// Every mint/release decision must use [`Self::is_threshold_met_for`],
+    /// which counts only active-oracle attestations binding the exact
+    /// canonical event hash.
     pub fn is_threshold_met(&self, event_id: &EventId) -> bool {
         self.attestations
             .get(event_id)
             .map(|a| a.len() >= self.threshold)
             .unwrap_or(false)
+    }
+
+    /// SECREM-01 BRG-1 + BRG-4: count attestations that actually vouch for
+    /// `expected_hash` — submitted by a CURRENTLY registered AND active
+    /// oracle (an oracle deactivated/removed after submitting no longer
+    /// counts), with `event_hash` exactly equal to the canonical hash the
+    /// relay recomputed from the presented event. Disagreeing attestations
+    /// are logged (a signed disagreement is evidence of a faulty or
+    /// malicious oracle) and NOT counted — but they also cannot veto the
+    /// honest quorum, so one bad oracle can't grief deposits.
+    pub fn matching_attestation_count(
+        &self,
+        event_id: &EventId,
+        expected_hash: &[u8; 32],
+    ) -> usize {
+        let Some(attestations) = self.attestations.get(event_id) else {
+            return 0;
+        };
+        let mut matching = 0usize;
+        for att in attestations {
+            let oracle_live = self
+                .oracles
+                .get(&att.oracle_id)
+                .map(|o| o.active)
+                .unwrap_or(false);
+            if !oracle_live {
+                tracing::warn!(
+                    event_id = hex::encode(event_id),
+                    oracle = hex::encode(att.oracle_id),
+                    "attestation from inactive/removed oracle excluded from threshold"
+                );
+                continue;
+            }
+            if &att.event_hash != expected_hash {
+                tracing::warn!(
+                    event_id = hex::encode(event_id),
+                    oracle = hex::encode(att.oracle_id),
+                    attested = hex::encode(att.event_hash),
+                    expected = hex::encode(expected_hash),
+                    "oracle attested a DIFFERENT event hash — excluded from \
+                     threshold and flagged (possible compromise)"
+                );
+                continue;
+            }
+            matching += 1;
+        }
+        matching
+    }
+
+    /// SECREM-01 BRG-1: the security-gating threshold check — M-of-N where
+    /// every counted attestation binds `expected_hash` exactly and comes
+    /// from an active oracle. This is what makes M independent oracles
+    /// attest the SAME event, instead of M signatures over possibly
+    /// different events (which silently degraded to 1-of-N for the
+    /// integrity-critical fields).
+    pub fn is_threshold_met_for(&self, event_id: &EventId, expected_hash: &[u8; 32]) -> bool {
+        self.matching_attestation_count(event_id, expected_hash) >= self.threshold
     }
 
     /// Get attestation count for an event.
@@ -345,12 +473,9 @@ mod tests {
             .unwrap()
             .as_secs();
 
-        // Sign the domain-separated message
-        let mut message = Vec::with_capacity(89);
-        message.extend_from_slice(b"citrate-bridge-v1");
-        message.extend_from_slice(&event_id);
-        message.extend_from_slice(&event_hash);
-        message.extend_from_slice(&now.to_le_bytes());
+        // Sign the domain-separated v2 message via the shared constructor
+        // (registry built with OracleRegistry::new → zero domain).
+        let message = attestation_message(0, &[0u8; 32], &event_id, &event_hash, now);
         let sig = sk.sign(&message);
 
         OracleAttestation {
@@ -568,11 +693,8 @@ mod tests {
             .as_secs()
             - 600; // 10 minutes ago
 
-        let mut message = Vec::with_capacity(89);
-        message.extend_from_slice(b"citrate-bridge-v1");
-        message.extend_from_slice(&event_id);
-        message.extend_from_slice(&event_hash);
-        message.extend_from_slice(&old_timestamp.to_le_bytes());
+        let message =
+            attestation_message(0, &[0u8; 32], &event_id, &event_hash, old_timestamp);
         let sig = sk.sign(&message);
 
         let att = OracleAttestation {

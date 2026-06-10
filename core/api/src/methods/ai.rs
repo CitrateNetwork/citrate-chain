@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use std::sync::Arc;
 
+/// SECREM-01 Phase-8 (NET-1 variant): per-request caps on attacker-driven
+/// batch sizes for the inference RPC surface — each entry spawns model
+/// work, so an unbounded array is an inference-cost DoS.
+const MAX_EMBEDDING_INPUTS: usize = 256;
+const MAX_CHAT_MESSAGES: usize = 256;
+
 /// OpenAI-compatible chat completion request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -702,6 +708,15 @@ impl AiApi {
         request: ChatCompletionRequest,
         _from: Option<Address>,
     ) -> Result<ChatCompletionResponse, ApiError> {
+        // SECREM-01 Phase-8 (NET-1 variant): cap the message count so an
+        // unbounded `messages` array can't drive unbounded prompt-build +
+        // inference work.
+        if request.messages.len() > MAX_CHAT_MESSAGES {
+            return Err(ApiError::InvalidParams(format!(
+                "too many messages: {} (max {MAX_CHAT_MESSAGES})",
+                request.messages.len()
+            )));
+        }
         // For streaming responses, we'd need WebSocket support
         if request.stream.unwrap_or(false) {
             return Err(ApiError::InternalError(
@@ -862,6 +877,14 @@ impl AiApi {
         request: EmbeddingsRequest,
         _from: Option<Address>,
     ) -> Result<EmbeddingsResponse, ApiError> {
+        // SECREM-01 Phase-8 (NET-1 variant): cap the input batch size so an
+        // unbounded `input` array can't drive unbounded embedding work.
+        if request.input.len() > MAX_EMBEDDING_INPUTS {
+            return Err(ApiError::InvalidParams(format!(
+                "too many inputs: {} (max {MAX_EMBEDDING_INPUTS})",
+                request.input.len()
+            )));
+        }
         // For now, use genesis embedding model (BGE-M3) by default
         // In production, would look up model by name from request.model
 

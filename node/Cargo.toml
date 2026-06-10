@@ -26,6 +26,8 @@ tokio = { version = "1.32", features = ["full"] }
 clap = { version = "4.0", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# SECREM-01 NET-1/NET-2: byte-budgeting in block_serve.rs.
+bincode = { workspace = true }
 toml = "0.8"
 tracing = "0.1"
 
@@ -53,6 +55,8 @@ metrics-exporter-prometheus = "0.12"
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 once_cell = "1.19"
 parking_lot = "0.12"
+# SECREM-01 CFG-1: wipe Noise P2P key bytes after handoff to the network layer.
+zeroize = "1.8"
 # Wallet interactive UI deps
 dialoguer = "0.11"
 console = "0.15"

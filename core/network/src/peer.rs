@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use citrate_consensus::types::Hash;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
@@ -151,6 +151,15 @@ pub struct PeerManager {
     peers: Arc<DashMap<PeerId, Arc<Peer>>>,
     /// Map of banned addresses to ban expiry time.
     banned_peers: Arc<DashMap<SocketAddr, Instant>>,
+    /// SECREM-01 NET-4(b): map of banned IPs to ban expiry time.
+    /// A SocketAddr-keyed ban is trivially evaded by reconnecting
+    /// from a different source port, so bans are also recorded
+    /// per-IP and `is_banned` consults this map.
+    banned_ips: Arc<DashMap<IpAddr, Instant>>,
+    /// SECREM-01 NET-4(b): map of banned peer IDs to ban expiry
+    /// time. Where the peer's identity is known at ban time, the
+    /// ban follows the identity even if the peer changes IPs.
+    banned_peer_ids: Arc<DashMap<PeerId, Instant>>,
     stats: Arc<RwLock<PeerStats>>,
     pub(crate) incoming: Arc<RwLock<Option<IncomingTx>>>,
 }
@@ -191,6 +200,9 @@ impl PeerManager {
             config,
             peers: Arc::new(DashMap::new()),
             banned_peers: Arc::new(DashMap::new()),
+            // SECREM-01 NET-4(b): IP-level and identity-level ban maps
+            banned_ips: Arc::new(DashMap::new()),
+            banned_peer_ids: Arc::new(DashMap::new()),
             stats: Arc::new(RwLock::new(PeerStats::default())),
             incoming: Arc::new(RwLock::new(None)),
         }
@@ -250,6 +262,21 @@ impl PeerManager {
         let info = peer.info.read().await;
         let peer_id = info.id.clone();
         let direction = info.direction.clone();
+        let addr = info.addr;
+
+        // SECREM-01 NET-4(b): enforce identity- and IP-level bans at
+        // the single choke point both inbound (transport handshake)
+        // and outbound (connect_to_peer) paths go through.
+        if self.is_peer_id_banned(&peer_id).await {
+            return Err(NetworkError::ConnectionFailed(
+                "Peer identity is banned".to_string(),
+            ));
+        }
+        if self.is_banned(&addr).await {
+            return Err(NetworkError::ConnectionFailed(
+                "Peer address is banned".to_string(),
+            ));
+        }
 
         // Check limits
         let stats = self.stats.read().await;
@@ -348,10 +375,28 @@ impl PeerManager {
     }
 
     /// Ban a peer for the configured ban duration.
+    ///
+    /// SECREM-01 NET-4(b): in addition to the legacy SocketAddr ban,
+    /// the IP is banned so the peer cannot evade the ban by simply
+    /// reconnecting from a different source port.
     pub async fn ban_peer(&self, addr: SocketAddr) {
         let expires = Instant::now() + self.config.ban_duration;
         self.banned_peers.insert(addr, expires);
+        self.banned_ips.insert(addr.ip(), expires);
         warn!("Banned peer {} until {:?} ({:?} from now)", addr, expires, self.config.ban_duration);
+    }
+
+    /// Ban a peer by identity AND address/IP.
+    ///
+    /// SECREM-01 NET-4(b): when the peer's identity is known at ban
+    /// time, record the ban against the peer ID as well so it
+    /// follows the identity across IP changes. Prefer this over
+    /// `ban_peer` whenever a PeerId is available.
+    pub async fn ban_peer_with_id(&self, peer_id: &PeerId, addr: SocketAddr) {
+        let expires = Instant::now() + self.config.ban_duration;
+        self.banned_peer_ids.insert(peer_id.clone(), expires);
+        self.ban_peer(addr).await;
+        warn!("Banned peer identity {} until {:?}", peer_id, expires);
     }
 
     /// Check if an address is currently banned (expired bans are removed).
@@ -364,6 +409,28 @@ impl PeerManager {
             drop(entry);
             self.banned_peers.remove(addr);
         }
+        // SECREM-01 NET-4(b): also enforce IP-level bans, so a new
+        // source port on a banned IP is still rejected.
+        if let Some(entry) = self.banned_ips.get(&addr.ip()) {
+            if Instant::now() < *entry.value() {
+                return true;
+            }
+            drop(entry);
+            self.banned_ips.remove(&addr.ip());
+        }
+        false
+    }
+
+    /// Check if a peer identity is currently banned (expired bans are removed).
+    /// SECREM-01 NET-4(b).
+    pub async fn is_peer_id_banned(&self, peer_id: &PeerId) -> bool {
+        if let Some(entry) = self.banned_peer_ids.get(peer_id) {
+            if Instant::now() < *entry.value() {
+                return true;
+            }
+            drop(entry);
+            self.banned_peer_ids.remove(peer_id);
+        }
         false
     }
 
@@ -371,6 +438,9 @@ impl PeerManager {
     pub fn cleanup_expired_bans(&self) {
         let now = Instant::now();
         self.banned_peers.retain(|_addr, expires| now < *expires);
+        // SECREM-01 NET-4(b)/NET-3: prune the IP and peer-ID ban maps too
+        self.banned_ips.retain(|_ip, expires| now < *expires);
+        self.banned_peer_ids.retain(|_id, expires| now < *expires);
     }
 
     /// Update peer score
@@ -382,7 +452,11 @@ impl PeerManager {
             // Ban if score too low
             if info.score < self.config.score_threshold {
                 drop(info);
-                self.ban_peer(peer.info.read().await.addr).await;
+                // SECREM-01 NET-4(b): identity is known here — ban
+                // peer ID and IP together so the ban survives both
+                // port changes and IP changes.
+                let addr = peer.info.read().await.addr;
+                self.ban_peer_with_id(peer_id, addr).await;
                 self.remove_peer(peer_id).await;
             }
         }
@@ -436,7 +510,15 @@ impl PeerManager {
         Ok(())
     }
 
-    /// Start a TCP listener for inbound peer connections
+    /// Start a TCP listener for inbound peer connections.
+    ///
+    /// SECREM-01 NET-6: this is the LEGACY PLAINTEXT P2P path — the
+    /// handshake here is unencrypted and trusts a self-asserted `PeerId`
+    /// (unlike the production `NetworkTransport`, which performs a Noise
+    /// handshake binding identity to a key). The node binary does NOT use
+    /// it (it wires `NetworkTransport`). It is fail-closed: it refuses to
+    /// run unless `CITRATE_ALLOW_PLAINTEXT_P2P=1` is set, so it can never
+    /// be accidentally exposed in production.
     pub async fn start_listener(
         self: &Arc<Self>,
         listen_addr: SocketAddr,
@@ -445,6 +527,7 @@ impl PeerManager {
         head_height: u64,
         head_hash: Hash,
     ) -> Result<(), NetworkError> {
+        guard_plaintext_p2p("start_listener")?;
         let listener = TcpListener::bind(listen_addr)
             .await
             .map_err(NetworkError::Io)?;
@@ -482,7 +565,10 @@ impl PeerManager {
         Ok(())
     }
 
-    /// Dial a remote peer and perform handshake
+    /// Dial a remote peer and perform handshake.
+    ///
+    /// SECREM-01 NET-6: legacy plaintext path (see `start_listener`) —
+    /// fail-closed behind `CITRATE_ALLOW_PLAINTEXT_P2P=1`.
     pub async fn connect_bootnode_real(
         self: Arc<Self>,
         peer_id_hint: Option<PeerId>,
@@ -492,6 +578,7 @@ impl PeerManager {
         head_height: u64,
         head_hash: Hash,
     ) -> Result<(), NetworkError> {
+        guard_plaintext_p2p("connect_bootnode_real")?;
         let stream = TcpStream::connect(addr).await.map_err(NetworkError::Io)?;
         let peer_id = peer_id_hint.unwrap_or_else(PeerId::random);
         perform_handshake_outbound(
@@ -616,6 +703,35 @@ async fn handle_incoming(
     Ok(())
 }
 
+/// SECREM-01 NET-6: fail-closed gate for the legacy plaintext P2P path.
+/// The Noise-encrypted `NetworkTransport` is the production transport;
+/// the plaintext `PeerManager` listener/dialer is opt-in only. Returns
+/// `Err` unless `CITRATE_ALLOW_PLAINTEXT_P2P=1`. Exempt under `cfg(test)`
+/// so the existing handshake unit tests still exercise the code.
+fn guard_plaintext_p2p(entry: &str) -> Result<(), NetworkError> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    match std::env::var("CITRATE_ALLOW_PLAINTEXT_P2P").as_deref() {
+        Ok("1") => {
+            warn!(
+                "SECREM-01 NET-6: plaintext P2P path '{}' enabled via \
+                 CITRATE_ALLOW_PLAINTEXT_P2P=1 — handshake is UNENCRYPTED \
+                 and trusts a self-asserted PeerId. Production must use \
+                 NetworkTransport (Noise).",
+                entry
+            );
+            Ok(())
+        }
+        _ => Err(NetworkError::ProtocolError(format!(
+            "plaintext P2P path '{}' is disabled (SECREM-01 NET-6); the node \
+             uses the Noise NetworkTransport. Set CITRATE_ALLOW_PLAINTEXT_P2P=1 \
+             only for a trusted local/test network.",
+            entry
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn perform_handshake_outbound(
     pm: Arc<PeerManager>,
@@ -705,6 +821,96 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SECREM-01 NET-4(b): banning a SocketAddr must ban the whole
+    /// IP — reconnecting from a different source port stays banned.
+    #[tokio::test]
+    async fn test_ban_applies_to_ip_not_just_port() {
+        let manager = PeerManager::new(PeerManagerConfig::default());
+
+        let addr: SocketAddr = "10.1.2.3:30303".parse().expect("valid addr");
+        manager.ban_peer(addr).await;
+
+        // Exact addr banned
+        assert!(manager.is_banned(&addr).await);
+        // Same IP, different port — still banned
+        let other_port: SocketAddr = "10.1.2.3:40404".parse().expect("valid addr");
+        assert!(
+            manager.is_banned(&other_port).await,
+            "ban must apply to the IP, not just the source port"
+        );
+        // Different IP — not banned
+        let other_ip: SocketAddr = "10.1.2.4:30303".parse().expect("valid addr");
+        assert!(!manager.is_banned(&other_ip).await);
+    }
+
+    /// SECREM-01 NET-4(b): ban_peer_with_id bans identity AND IP;
+    /// a banned identity is rejected by add_peer even from a fresh IP.
+    #[tokio::test]
+    async fn test_ban_peer_with_id_follows_identity() {
+        let manager = PeerManager::new(PeerManagerConfig::default());
+
+        let peer_id = PeerId::new("noise_attacker".to_string());
+        let addr: SocketAddr = "10.9.9.9:30303".parse().expect("valid addr");
+        manager.ban_peer_with_id(&peer_id, addr).await;
+
+        assert!(manager.is_peer_id_banned(&peer_id).await);
+        assert!(manager.is_banned(&addr).await);
+
+        // Same identity reconnecting from a brand-new IP must be
+        // rejected at add_peer.
+        let (send_tx, recv_rx) = mpsc::channel(10);
+        let fresh_addr: SocketAddr = "192.0.2.55:30303".parse().expect("valid addr");
+        let peer = Arc::new(Peer::new(
+            PeerInfo::new(peer_id.clone(), fresh_addr, Direction::Inbound),
+            send_tx,
+            recv_rx,
+        ));
+        assert!(
+            manager.add_peer(peer).await.is_err(),
+            "banned identity must be rejected regardless of IP"
+        );
+
+        // A different identity from the banned IP must also be rejected.
+        let (send_tx2, recv_rx2) = mpsc::channel(10);
+        let banned_ip_addr: SocketAddr = "10.9.9.9:55555".parse().expect("valid addr");
+        let peer2 = Arc::new(Peer::new(
+            PeerInfo::new(PeerId::random(), banned_ip_addr, Direction::Inbound),
+            send_tx2,
+            recv_rx2,
+        ));
+        assert!(
+            manager.add_peer(peer2).await.is_err(),
+            "banned IP must be rejected regardless of identity"
+        );
+    }
+
+    /// SECREM-01 NET-3/NET-4(b): cleanup_expired_bans prunes all
+    /// three ban maps once bans expire.
+    #[tokio::test]
+    async fn test_cleanup_expired_bans_prunes_all_maps() {
+        let config = PeerManagerConfig {
+            ban_duration: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let manager = PeerManager::new(config);
+
+        let peer_id = PeerId::new("short_ban".to_string());
+        let addr: SocketAddr = "10.4.4.4:30303".parse().expect("valid addr");
+        manager.ban_peer_with_id(&peer_id, addr).await;
+
+        assert!(manager.is_banned(&addr).await);
+        assert!(manager.is_peer_id_banned(&peer_id).await);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        manager.cleanup_expired_bans();
+
+        assert_eq!(manager.banned_peers.len(), 0, "SocketAddr bans must be pruned");
+        assert_eq!(manager.banned_ips.len(), 0, "IP bans must be pruned");
+        assert_eq!(manager.banned_peer_ids.len(), 0, "peer-ID bans must be pruned");
+        assert!(!manager.is_banned(&addr).await);
+        assert!(!manager.is_peer_id_banned(&peer_id).await);
+    }
 
     #[tokio::test]
     async fn test_peer_manager_limits() {

@@ -29,6 +29,7 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Errors for HKDF derivation.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -36,6 +37,12 @@ pub enum HkdfError {
     /// Underlying HKDF expand step failed (length too long).
     #[error("HKDF expand failed: {0}")]
     Expand(String),
+
+    /// SECREM-01 CRY-2: `derive_chain` was called with an empty step list.
+    /// Returning the root secret unchanged would be a domain-confusion
+    /// footgun (caller expects a derived child, gets the master secret).
+    #[error("derive_chain requires at least one step; empty chain rejected")]
+    EmptyChain,
 }
 
 /// Derive a 32-byte child sub-secret from a parent secret + HKDF salt +
@@ -49,16 +56,29 @@ pub enum HkdfError {
 /// - `label` — UTF-8 child label (e.g., `"BCA"`, `"Everett"`, `"777X"`).
 ///
 /// # Returns
-/// 32-byte child sub-secret.
+/// 32-byte child sub-secret, wrapped in [`Zeroizing`] so the key material
+/// is wiped from memory when the value is dropped (SECREM-01 CRY-1).
+///
+/// # Zeroization (SECREM-01 CRY-1)
+/// - The OKM is written directly into the `Zeroizing` return buffer —
+///   no unwiped intermediate copy exists in this crate.
+/// - The PRK copy returned by `Hkdf::extract` is explicitly zeroized
+///   before this function returns. (The HMAC state held inside the
+///   `hkdf`/`hmac` crates is outside our control; its zeroization is an
+///   upstream property.)
 pub fn derive(
     parent_secret: &[u8; 32],
     hkdf_salt: &[u8; 32],
     label: &[u8],
-) -> Result<[u8; 32], HkdfError> {
-    let hk = Hkdf::<Sha256>::new(Some(hkdf_salt), parent_secret);
-    let mut child = [0u8; 32];
-    hk.expand(label, &mut child)
-        .map_err(|e| HkdfError::Expand(e.to_string()))?;
+) -> Result<Zeroizing<[u8; 32]>, HkdfError> {
+    // SECREM-01 CRY-1: use `extract` (not `new`) so we hold the PRK copy
+    // and can wipe it; expand writes OKM straight into the Zeroizing buffer.
+    let (mut prk, hk) = Hkdf::<Sha256>::extract(Some(hkdf_salt), parent_secret);
+    let mut child = Zeroizing::new([0u8; 32]);
+    let expand_result = hk.expand(label, &mut child[..]);
+    drop(hk);
+    prk.as_mut_slice().zeroize();
+    expand_result.map_err(|e| HkdfError::Expand(e.to_string()))?;
     Ok(child)
 }
 
@@ -66,13 +86,24 @@ pub fn derive(
 ///
 /// `derive_chain(root, [salt_0, label_0, salt_1, label_1, ...])`
 /// applies `derive` left-to-right, returning the final descendant
-/// secret.
+/// secret wrapped in [`Zeroizing`] (SECREM-01 CRY-1). Every intermediate
+/// secret in the chain is also held in `Zeroizing` and is wiped as soon
+/// as the next derivation replaces it.
 pub fn derive_chain(
     root_secret: &[u8; 32],
     steps: &[(&[u8; 32], &[u8])],
-) -> Result<[u8; 32], HkdfError> {
-    let mut current = *root_secret;
+) -> Result<Zeroizing<[u8; 32]>, HkdfError> {
+    // SECREM-01 CRY-2: reject the empty chain. `derive_chain(root, &[])`
+    // previously returned the ROOT secret verbatim — a domain-confusion
+    // footgun where a caller expecting a derived child gets the master
+    // secret. An empty derivation path is a programming error.
+    if steps.is_empty() {
+        return Err(HkdfError::EmptyChain);
+    }
+    let mut current = Zeroizing::new(*root_secret);
     for (salt, label) in steps {
+        // SECREM-01 CRY-1: re-assignment drops (and thereby zeroizes) the
+        // previous intermediate secret.
         current = derive(&current, salt, label)?;
     }
     Ok(current)
@@ -93,7 +124,7 @@ mod tests {
         let label = b"BCA";
         let a = derive(&parent, &salt, label).expect("ok");
         let b = derive(&parent, &salt, label).expect("ok");
-        assert_eq!(a, b);
+        assert_eq!(*a, *b);
     }
 
     #[test]
@@ -102,7 +133,7 @@ mod tests {
         let salt = fill(0x11);
         let bca = derive(&parent, &salt, b"BCA").expect("ok");
         let bds = derive(&parent, &salt, b"BDS").expect("ok");
-        assert_ne!(bca, bds);
+        assert_ne!(*bca, *bds);
     }
 
     #[test]
@@ -111,7 +142,7 @@ mod tests {
         let label = b"BCA";
         let s1 = derive(&parent, &fill(0x11), label).expect("ok");
         let s2 = derive(&parent, &fill(0x22), label).expect("ok");
-        assert_ne!(s1, s2);
+        assert_ne!(*s1, *s2);
     }
 
     #[test]
@@ -120,7 +151,7 @@ mod tests {
         let salt = fill(0x11);
         let a = derive(&fill(0xAA), &salt, label).expect("ok");
         let b = derive(&fill(0xBB), &salt, label).expect("ok");
-        assert_ne!(a, b);
+        assert_ne!(*a, *b);
     }
 
     #[test]
@@ -141,7 +172,7 @@ mod tests {
             ],
         )
         .expect("ok");
-        assert_eq!(chain, manual_c);
+        assert_eq!(*chain, *manual_c);
     }
 
     #[test]
@@ -160,11 +191,12 @@ mod tests {
         assert!(shared_prefix < 16, "shared_prefix={shared_prefix}");
     }
 
+    /// SECREM-01 CRY-2: an empty chain is REJECTED, not silently
+    /// returned as the root secret (domain-confusion footgun).
     #[test]
-    fn derive_empty_chain_returns_root() {
+    fn derive_empty_chain_is_rejected() {
         let root = fill(0xCC);
-        let r = derive_chain(&root, &[]).expect("ok");
-        assert_eq!(r, root);
+        assert_eq!(derive_chain(&root, &[]), Err(HkdfError::EmptyChain));
     }
 
     #[test]
@@ -182,8 +214,8 @@ mod tests {
         )
         .expect("ok");
         // The team-level secret is non-zero and not equal to the root.
-        assert_ne!(r, root);
-        assert_ne!(r, [0u8; 32]);
+        assert_ne!(*r, root);
+        assert_ne!(*r, [0u8; 32]);
     }
 
     #[test]
@@ -192,6 +224,23 @@ mod tests {
         let salt = fill(0x11);
         let a = derive(&parent, &salt, b"").expect("ok");
         let b = derive(&parent, &salt, b"").expect("ok");
-        assert_eq!(a, b);
+        assert_eq!(*a, *b);
+    }
+
+    #[test]
+    fn derive_returns_zeroizing_key_material() {
+        // SECREM-01 CRY-1: type-level proof that both public derivation
+        // entry points return key material in a container that wipes
+        // itself on drop. If the return type regresses to a bare
+        // [u8; 32], this test fails to compile.
+        fn assert_is_zeroizing(_: &Zeroizing<[u8; 32]>) {}
+        let parent = fill(0xAA);
+        let salt = fill(0x11);
+        let child = derive(&parent, &salt, b"BCA").expect("ok");
+        assert_is_zeroizing(&child);
+        let chained = derive_chain(&parent, &[(&salt, b"BCA")]).expect("ok");
+        assert_is_zeroizing(&chained);
+        // Derived values are still real key material (non-zero).
+        assert_ne!(*child, [0u8; 32]);
     }
 }

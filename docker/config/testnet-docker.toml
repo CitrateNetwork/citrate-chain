@@ -1,0 +1,41 @@
+# Docker-only testnet profile (SECREM-01 CFG-2).
+#
+# This file intentionally binds RPC/WS to 0.0.0.0 because it runs INSIDE a
+# container: Docker's bridge network isolates the bind, and exposure to the
+# host is controlled exclusively by the `ports:` mapping in
+# docker-compose.yml. Do NOT use this file on a bare host — use the shipped
+# testnet-config.toml (loopback by default) instead. If the mapped ports are
+# published beyond localhost, set CITRATE_OPERATOR_TOKEN and front the node
+# with a TLS-terminating reverse proxy.
+
+[chain]
+chain_id = 40204
+genesis_hash = ""
+block_time = 2
+ghostdag_k = 18
+
+[network]
+listen_addr = "0.0.0.0:30303"
+bootstrap_nodes = []
+max_peers = 100
+
+[rpc]
+enabled = true
+listen_addr = "0.0.0.0:8545"
+ws_addr = "0.0.0.0:8546"
+
+[storage]
+data_dir = "/data/.citrate-testnet"
+pruning = false
+keep_blocks = 10000
+
+[mining]
+enabled = true
+# Validator: 0x47fb23137e0ee4248eb975848416e6632fa36090
+coinbase = "47fb23137e0ee4248eb975848416e6632fa36090000000000000000000000000"
+target_block_time = 2
+min_gas_price = 1000000000
+
+[explorer]
+enabled = false
+port = 3030

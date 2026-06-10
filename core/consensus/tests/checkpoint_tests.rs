@@ -55,6 +55,8 @@ fn make_block(hash: Hash, parent: Hash, merge: Vec<Hash>, height: u64, blue_scor
         .height(height)
         .timestamp(height)
         .blue_score(blue_score)
+        // SECREM-01: admission enforces the canonical score→work relation.
+        .blue_work(citrate_consensus::types::blue_work_for_score(blue_score))
         .build_unhashed()
 }
 

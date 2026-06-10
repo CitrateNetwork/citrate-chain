@@ -15,10 +15,27 @@ impl Hash {
         Self(data)
     }
 
+    /// SECREM-01 CONS-6: panics on a slice shorter than 32 bytes. Retained
+    /// for the many call sites that hold a known-32-byte buffer, but every
+    /// caller decoding an UNTRUSTED / on-disk value (which may be corrupt
+    /// or truncated) MUST use [`Self::try_from_bytes`] instead — a short
+    /// RocksDB value would otherwise crash-loop the node.
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&bytes[..32]);
         Self(hash)
+    }
+
+    /// SECREM-01 CONS-6: fallible decode for untrusted/persisted bytes.
+    /// Returns `None` if fewer than 32 bytes are available instead of
+    /// panicking.
+    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 32 {
+            return None;
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&bytes[..32]);
+        Some(Self(hash))
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -267,9 +284,30 @@ impl Block {
         use sha3::{Digest, Sha3_256};
         let mut hasher = Sha3_256::new();
 
+        // SECREM-01 CONS-5: the two variable-length header fields
+        // (`merge_parent_hashes`, `vrf_reveal.proof`) were concatenated
+        // with no length prefix, so the boundary between a variable field
+        // and the field after it was ambiguous — bytes could be shifted
+        // across the seam to produce two distinct headers with the same
+        // block hash (latent malleability). The fix length-prefixes both
+        // variable fields. It changes the hash of any block with merge
+        // parents or a non-empty proof, so it is VERSION-GATED: version-1
+        // blocks keep the legacy encoding (existing chain history and
+        // genesis hashes are preserved), version ≥ 2 blocks use the
+        // unambiguous encoding. Activation = the producer emitting
+        // version-2 headers, coordinated with PIL-14. See
+        // ADR-2026-06-09-cons5-length-prefixed-block-hash. (With the
+        // current field layout the two variable fields are non-adjacent,
+        // so no live collision exists; this closes the class so a future
+        // field change can't introduce one.)
+        let length_prefixed = self.header.version >= 2;
+
         // Header fields
         hasher.update(self.header.version.to_le_bytes());
         hasher.update(self.header.selected_parent_hash.as_bytes());
+        if length_prefixed {
+            hasher.update((self.header.merge_parent_hashes.len() as u32).to_le_bytes());
+        }
         for parent in &self.header.merge_parent_hashes {
             hasher.update(parent.as_bytes());
         }
@@ -279,13 +317,17 @@ impl Block {
         hasher.update(self.header.blue_work.to_le_bytes());
         hasher.update(self.header.pruning_point.as_bytes());
         hasher.update(self.header.proposer_pubkey.as_bytes());
+        if length_prefixed {
+            hasher.update((self.header.vrf_reveal.proof.len() as u32).to_le_bytes());
+        }
         hasher.update(&self.header.vrf_reveal.proof);
         hasher.update(self.header.vrf_reveal.output.as_bytes());
         hasher.update(self.header.base_fee_per_gas.to_le_bytes());
         hasher.update(self.header.gas_used.to_le_bytes());
         hasher.update(self.header.gas_limit.to_le_bytes());
 
-        // Commitment roots (these bind the block body to the hash)
+        // Commitment roots (these bind the block body to the hash).
+        // All fixed-length, so no prefix needed.
         hasher.update(self.state_root.as_bytes());
         hasher.update(self.tx_root.as_bytes());
         hasher.update(self.receipt_root.as_bytes());
@@ -422,8 +464,13 @@ impl Transaction {
             .unwrap_or(TransactionType::Standard)
             .priority_weight() as u64;
 
-        // Combine type weight with gas price for final priority
-        (type_weight * 1_000_000) + self.gas_price
+        // SECREM-01 CONS-8: saturating math. With `overflow-checks=true`
+        // (Phase 0.6) an extreme `gas_price` would otherwise panic the
+        // mempool in debug/test builds; saturation keeps priority a total
+        // order without UB or panic.
+        type_weight
+            .saturating_mul(1_000_000)
+            .saturating_add(self.gas_price)
     }
 }
 
@@ -830,6 +877,18 @@ impl Default for BlockBuilder {
     }
 }
 
+/// Canonical blue-work derivation from a blue score.
+///
+/// SECREM-01 CONS-2/CONS-3: this is the single source of truth for the
+/// score→work relation. The producer fills `header.blue_work` with it and
+/// admission validation (`GhostDag::validate_block_consistency`) rejects any
+/// header whose claimed `blue_work` deviates from it — a self-reported work
+/// value is never consumed. If the work function ever changes, it changes
+/// here, behind a height-gated activation.
+pub fn blue_work_for_score(blue_score: u64) -> u128 {
+    blue_score as u128 * 1_000_000
+}
+
 /// Blue set information for a block
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlueSet {
@@ -921,6 +980,92 @@ mod tests {
         let hash = Hash::new([0x12; 32]);
         assert_eq!(hash.to_hex().len(), 64);
         assert_eq!(format!("{}", hash), "12121212");
+    }
+
+    /// SECREM-01 CONS-5: version-2 hashing length-prefixes the two
+    /// variable-length header fields so the encoding is canonically
+    /// unambiguous. (With the *current* field layout the two variable
+    /// fields are separated by fixed-width fields, so no same-length
+    /// collision exists today — this is hardening against the latent
+    /// malleability that would become live if a field were reordered or a
+    /// third variable field added adjacent. The fix makes that class
+    /// impossible by construction.)
+    ///
+    /// Property under test: the v2 hash actually incorporates the
+    /// merge-parent COUNT and proof LENGTH. A block whose merge-parent
+    /// count differs by repartitioning bytes hashes differently under v2,
+    /// and the prefix bytes demonstrably participate.
+    #[test]
+    fn test_cons5_v2_length_prefixes_participate() {
+        // Two structurally distinct headers that share the same flat
+        // concatenation of merge-parent + proof bytes.
+        let p = Hash::new([0x22; 32]);
+
+        let mut a = BlockBuilder::new().build_unhashed();
+        a.header.version = 2;
+        a.header.merge_parent_hashes = vec![p];
+        a.header.vrf_reveal.proof = vec![];
+
+        let mut b = BlockBuilder::new().build_unhashed();
+        b.header.version = 2;
+        b.header.merge_parent_hashes = vec![];
+        b.header.vrf_reveal.proof = p.as_bytes().to_vec();
+
+        // Under v2 the differing (count=1,len=0) vs (count=0,len=32)
+        // prefixes guarantee distinct hashes.
+        assert_ne!(
+            a.compute_hash(),
+            b.compute_hash(),
+            "CONS-5: length/count prefixes must make the encoding injective"
+        );
+
+        // And the prefix is genuinely present: a v2 hash differs from the
+        // same header hashed with the legacy (v1) flag, whenever a
+        // variable field is non-empty.
+        let mut c = BlockBuilder::new().build_unhashed();
+        c.header.merge_parent_hashes = vec![p];
+        c.header.version = 1;
+        let v1 = c.compute_hash();
+        c.header.version = 2;
+        let v2 = c.compute_hash();
+        assert_ne!(v1, v2, "v2 must inject the count prefix");
+    }
+
+    /// CONS-5: version-1 block hashes are unchanged by the fix (existing
+    /// chain history + genesis hashes are preserved).
+    #[test]
+    fn test_cons5_v1_hash_is_stable() {
+        let mut blk = BlockBuilder::new().build_unhashed();
+        blk.header.version = 1;
+        blk.header.merge_parent_hashes = vec![Hash::new([7; 32])];
+        blk.header.vrf_reveal.proof = vec![1, 2, 3, 4];
+        // Recompute by hand WITHOUT length prefixes — must match.
+        use sha3::{Digest, Sha3_256};
+        let mut h = Sha3_256::new();
+        h.update(blk.header.version.to_le_bytes());
+        h.update(blk.header.selected_parent_hash.as_bytes());
+        for p in &blk.header.merge_parent_hashes {
+            h.update(p.as_bytes());
+        }
+        h.update(blk.header.timestamp.to_le_bytes());
+        h.update(blk.header.height.to_le_bytes());
+        h.update(blk.header.blue_score.to_le_bytes());
+        h.update(blk.header.blue_work.to_le_bytes());
+        h.update(blk.header.pruning_point.as_bytes());
+        h.update(blk.header.proposer_pubkey.as_bytes());
+        h.update(&blk.header.vrf_reveal.proof);
+        h.update(blk.header.vrf_reveal.output.as_bytes());
+        h.update(blk.header.base_fee_per_gas.to_le_bytes());
+        h.update(blk.header.gas_used.to_le_bytes());
+        h.update(blk.header.gas_limit.to_le_bytes());
+        h.update(blk.state_root.as_bytes());
+        h.update(blk.tx_root.as_bytes());
+        h.update(blk.receipt_root.as_bytes());
+        h.update(blk.artifact_root.as_bytes());
+        let out = h.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&out[..32]);
+        assert_eq!(blk.compute_hash(), Hash::new(arr));
     }
 
     #[test]

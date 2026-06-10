@@ -190,12 +190,24 @@ impl ChainSelector {
 
     /// Extend current chain with new block
     async fn extend_chain(&self, block: &Block) -> Result<(), ChainSelectionError> {
-        let mut chain = self.current_chain.write().await;
+        // SECREM-01 CONS-2: the chain-state baseline that future fork-choice
+        // comparisons run against is written from the RECOMPUTED GhostDAG
+        // score, never from the header. Pre-fix, one block claiming
+        // `blue_score = u64::MAX` poisoned this baseline and permanently
+        // suppressed reorgs (no honest block could ever exceed it). Both
+        // fork-choice operands (`on_new_block`'s candidate score and this
+        // baseline) now come from the same recomputation.
+        let recomputed_score = self
+            .ghostdag
+            .get_blue_score(&block.hash())
+            .await
+            .map_err(|e| ChainSelectionError::DagError(e.to_string()))?;
 
+        let mut chain = self.current_chain.write().await;
         chain.tip = block.hash();
         chain.height = block.header.height;
-        chain.blue_score = block.header.blue_score;
-        chain.blue_work = block.header.blue_work;
+        chain.blue_score = recomputed_score;
+        chain.blue_work = crate::types::blue_work_for_score(recomputed_score);
         chain.selected_chain.push(block.hash());
         drop(chain);
 
@@ -205,7 +217,14 @@ impl ChainSelector {
             block.header.height
         );
 
-        // Update finality on chain extension
+        // Update finality on chain extension.
+        // SECREM-01 CONS-1: safe to pass header.height here ONLY because
+        // GhostDag::validate_block_consistency enforced
+        // `height == selected_parent.height + 1` (inductively from genesis)
+        // before this block could enter the DAG — the value is the node's
+        // own computed height, merely carried in the header. A block
+        // claiming height 10M on a height-500 chain is rejected at
+        // admission and never reaches this call.
         if let Some(ref tracker) = self.finality_tracker {
             let _ = tracker
                 .update_finality(&block.hash(), block.header.height)
@@ -261,7 +280,8 @@ impl ChainSelector {
         self.perform_reorg(old_tip, new_tip_block.hash(), new_chain, reorg_depth)
             .await?;
 
-        // Update finality after successful reorg
+        // Update finality after successful reorg.
+        // SECREM-01 CONS-1: height is admission-validated (see extend_chain).
         if let Some(ref tracker) = self.finality_tracker {
             let _ = tracker
                 .update_finality(&new_tip_block.hash(), new_tip_block.header.height)
@@ -386,12 +406,20 @@ impl ChainSelector {
             .await
             .map_err(|_| ChainSelectionError::BlockNotFound(new_tip))?;
 
-        // Update chain state
+        // Update chain state.
+        // SECREM-01 CONS-2: same rule as extend_chain — the post-reorg
+        // baseline is the recomputed score, never the header claim.
+        let recomputed_score = self
+            .ghostdag
+            .get_blue_score(&new_tip)
+            .await
+            .map_err(|e| ChainSelectionError::DagError(e.to_string()))?;
+
         let mut chain = self.current_chain.write().await;
         chain.tip = new_tip;
         chain.height = new_tip_block.header.height;
-        chain.blue_score = new_tip_block.header.blue_score;
-        chain.blue_work = new_tip_block.header.blue_work;
+        chain.blue_score = recomputed_score;
+        chain.blue_work = crate::types::blue_work_for_score(recomputed_score);
         chain.selected_chain = new_chain;
         drop(chain);
 
@@ -496,7 +524,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_chain_extension() {
-        let (dag_store, _, _, chain_selector) = setup_test_env().await;
+        let (dag_store, ghostdag, _, chain_selector) = setup_test_env().await;
 
         // Create genesis block
         let genesis = BlockBuilder::new()
@@ -506,6 +534,10 @@ mod tests {
             .build_unhashed();
 
         dag_store.store_block(genesis.clone()).await.unwrap();
+        // SECREM-01 CONS-2: extend_chain reads the RECOMPUTED blue score
+        // from GhostDAG relations (never the header), so the block must be
+        // admitted to the DAG before chain selection sees it.
+        ghostdag.add_block(&genesis).await.unwrap();
 
         // Extend chain
         chain_selector.extend_chain(&genesis).await.unwrap();
