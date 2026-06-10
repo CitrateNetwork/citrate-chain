@@ -32,9 +32,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    defaults:
-      run:
-        working-directory: 
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -49,9 +46,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    defaults:
-      run:
-        working-directory: 
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -62,3 +56,40 @@ jobs:
         # RM-B1 / WP-F3.1 (audit SUP-10): fail closed on
         # license / advisory / banned-dep violations.
         run: cargo deny check
+
+  clippy:
+    # SECREM-01 Phase 0.3: clippy is a documented gate (CLAUDE.md:
+    # "must pass clean") but no workflow enforced it after the
+    # federation split archived this file. Restored fail-closed.
+    name: Clippy (deny warnings)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  semgrep:
+    # SECREM-01 Phase 8: the repo ships 40+ Semgrep regression rules in
+    # tools/semgrep/rules/ (each pinned to a prior audit finding) but NO
+    # workflow ran them — they were authored and orphaned, same gap as the
+    # archived CI. This job runs the full rule set, including the new
+    # secrem01-* class rules (NET-1 unbounded serve loop, BRG-1 bare
+    # threshold count, CONS-2 header-score baseline, CONS-6 unguarded
+    # Hash::from_bytes), so a fixed vulnerability class can't silently
+    # re-enter.
+    name: Semgrep regression rules
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep rule set
+        run: semgrep --error --config tools/semgrep/rules/

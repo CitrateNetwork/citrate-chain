@@ -27,6 +27,8 @@ fn make_block(
         .height(height)
         .timestamp(height)
         .blue_score(blue_score)
+        // SECREM-01: admission enforces the canonical score→work relation.
+        .blue_work(blue_work_for_score(blue_score))
         .build_unhashed()
 }
 

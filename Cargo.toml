@@ -144,6 +144,10 @@ halo2curves = { version = "0.7.0", default-features = false, features = ["bn256-
 opt-level = 3
 lto = true
 codegen-units = 1
+# SECREM-01 Phase 0.6: panic on integer overflow in release rather than
+# silently wrapping in gas/stake/priority arithmetic (pre-audit maturity
+# dim-4 gap; also the class behind CONS-8).
+overflow-checks = true
 
 [profile.dev]
 opt-level = 0

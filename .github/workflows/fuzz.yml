@@ -19,7 +19,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [fuzz_tx_decoder, fuzz_block_deser, fuzz_rpc_hex]
+        # SECREM-01 Phase 0.4: expanded from 3 to all existing targets —
+        # the archived matrix predated most of the fuzz/fuzz_targets/ set.
+        target:
+          - fuzz_belnap_aggregate
+          - fuzz_block_deser
+          - fuzz_bridge_attestation
+          - fuzz_bridge_oracle
+          - fuzz_checkpoint_vote
+          - fuzz_config_toml
+          - fuzz_dag_operations
+          - fuzz_gossip_validation
+          - fuzz_json_rpc
+          - fuzz_mempool_admission
+          - fuzz_mempool_logic
+          - fuzz_network_message
+          - fuzz_precompile_inputs
+          - fuzz_rlp_decoder
+          - fuzz_routing_inference
+          - fuzz_rpc_hex
+          - fuzz_state_key
+          - fuzz_tx_decoder
+          - fuzz_vrf_proof
 
     steps:
       - name: Checkout

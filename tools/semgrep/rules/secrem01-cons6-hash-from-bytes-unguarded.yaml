@@ -1,0 +1,37 @@
+# SECREM-01 CONS-6 — `Hash::from_bytes` on an untrusted/persisted slice.
+#
+# Pre-audit finding (MEDIUM):
+#   handoffs/PREAUDIT_ASSESSMENT_2026-06-09/00_VULNERABILITY_REPORT.md#cons-6
+#
+# `Hash::from_bytes` slices `[..32]` with no length check, so a corrupt
+# or truncated RocksDB value panics the node (crash-loop DoS). Any
+# decode of a value read out of storage must use the fallible
+# `Hash::try_from_bytes` (returns `Option`) instead.
+#
+# This rule flags `Hash::from_bytes` applied to a value pulled from the
+# DB in the storage layer.
+
+rules:
+  - id: secrem01-cons6-hash-from-bytes-on-db-value
+    message: >-
+      `Hash::from_bytes` on a value read from storage (SECREM-01 CONS-6)
+      panics on a short/corrupt slice — crash-loop DoS. Use
+      `Hash::try_from_bytes` and treat `None` as a missing entry.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/storage/src/**"
+      exclude:
+        - "**/tests/**"
+    patterns:
+      - pattern-either:
+          - pattern: Hash::from_bytes(&$BYTES)
+          - pattern: Hash::from_bytes($BYTES)
+      - metavariable-pattern:
+          metavariable: $BYTES
+          patterns:
+            - pattern-either:
+                - pattern: value
+                - pattern: bytes
+                - pattern: hash_bytes

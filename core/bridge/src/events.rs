@@ -219,6 +219,32 @@ impl WithdrawalEvent {
         id.copy_from_slice(&result);
         id
     }
+
+    /// SECREM-01 BRG-2: canonical attestation digest binding every
+    /// release-critical field — the withdrawal mirror of
+    /// `DepositEvent::canonical_hash`. Oracles MUST sign
+    /// `event_hash = withdrawal.canonical_hash()`; the relay refuses to
+    /// process a withdrawal unless ≥ threshold active oracles attested
+    /// exactly this hash. Pre-fix, withdrawal processing bound NO fields
+    /// to attestations (mitigated only by the stubbed ETH-release path).
+    ///
+    /// Domain-separated: `"citrate-bridge-withdrawal-v1" ||
+    /// citrate_tx_hash(32) || citrate_block_height(8 LE) || sender(20) ||
+    /// eth_recipient(20) || salt_amount(8 LE) || eth_amount_wei(16 LE)`.
+    pub fn canonical_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"citrate-bridge-withdrawal-v1");
+        hasher.update(self.citrate_tx_hash);
+        hasher.update(self.citrate_block_height.to_le_bytes());
+        hasher.update(self.sender);
+        hasher.update(self.eth_recipient);
+        hasher.update(self.salt_amount.to_le_bytes());
+        hasher.update(self.eth_amount_wei.to_le_bytes());
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
 }
 
 #[cfg(test)]

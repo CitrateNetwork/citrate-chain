@@ -199,13 +199,17 @@ impl EfficientSyncManager {
         // Calculate blue score iteratively
         let blue_score = self.calculate_blue_score_iterative(&block)?;
 
-        // Store block (synchronous storage call)
-        self.storage.blocks.put_block(&block)?;
-
-        // Update DAG state via GhostDag
+        // SECREM-01 CONS-1/2/3: DAG admission (add_block runs the
+        // consistency gate: parents, height linkage, blue score band,
+        // canonical work) BEFORE persistence — pre-fix the block was
+        // written to RocksDB first, poisoning the height/blue-score
+        // indexes on a forged header.
         self.ghostdag.add_block(&block).await.map_err(|e| {
             anyhow::anyhow!("Failed to add block to GhostDAG: {:?}", e)
         })?;
+
+        // Store block (synchronous storage call) — only after admission.
+        self.storage.blocks.put_block(&block)?;
 
         debug!(
             "Successfully processed block {} at height {} with blue score {}",

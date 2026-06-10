@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 
 mod adapters;
 mod artifact;
+mod block_serve;
 pub mod bundled_model;
 mod commands;
 mod config;
@@ -1268,18 +1269,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // WP-H.1: Derive PeerId from Noise static key so identity is cryptographically
         // bound. The old random `peer_{u64}` approach allowed identity spoofing.
         let noise_key_path = config.storage.data_dir.join("noise.key");
-        let noise_keypair = if noise_key_path.exists() {
-            let key_bytes = std::fs::read(&noise_key_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read noise key: {}", e))?;
-            citrate_network::NoiseKeypair::from_bytes(&key_bytes)
-                .map_err(|e| anyhow::anyhow!("Failed to parse noise key: {}", e))?
-        } else {
-            let kp = citrate_network::NoiseKeypair::generate();
-            std::fs::write(&noise_key_path, kp.to_bytes())
-                .map_err(|e| anyhow::anyhow!("Failed to write noise key: {}", e))?;
-            info!("Generated new persistent Noise identity at {:?}", noise_key_path);
-            kp
-        };
+        // SECREM-01 CFG-1: key file is created 0600, loose permissions on an
+        // existing file are tightened on load, and the serialized key bytes
+        // are held in `Zeroizing` until handed to the network layer.
+        let noise_keypair = load_or_generate_noise_keypair(&noise_key_path)?;
         let local_peer_id = noise_keypair.derive_peer_id();
         info!(
             "Noise identity: {}... (peer_id={})",
@@ -1339,6 +1332,33 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             peer_manager.clone(),
         ));
         discovery.init().await.ok();
+
+        // SECREM-01 NET-3: periodic network-cache maintenance.
+        // The gossip seen_* dedup caches, the peer-manager ban maps,
+        // and the discovery known-peer table all have cleanup
+        // helpers, but nothing ever scheduled them — so every cache
+        // grew without bound for the life of the node (slow OOM).
+        // Run all of them on a fixed 60s cadence; each helper is
+        // idempotent and TTL/size-bounded, so the cadence only
+        // affects how promptly memory is reclaimed.
+        {
+            let gossip_for_maint = gossip.clone();
+            let pm_for_maint = peer_manager.clone();
+            let discovery_for_maint = discovery.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    // TTL-prune + hard-cap the seen block/tx/learning caches
+                    gossip_for_maint.cleanup_seen_cache().await;
+                    // Drop expired addr/IP/peer-ID bans
+                    pm_for_maint.cleanup_expired_bans();
+                    // Expire stale non-bootstrap discovery entries
+                    discovery_for_maint.cleanup_expired().await;
+                }
+            });
+        }
 
         let discovery_for_loop = discovery.clone();
         let transport_for_loop = transport;
@@ -1439,7 +1459,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         if let Some(p) = pm_for_sync.get_peer(&pid) {
                             let addr = p.info.read().await.addr;
                             pm_for_sync.remove_peer(&pid).await;
-                            pm_for_sync.ban_peer(addr).await;
+                            // SECREM-01 NET-4(b): identity is known here —
+                            // ban peer ID and IP together.
+                            pm_for_sync.ban_peer_with_id(&pid, addr).await;
                             tracing::warn!("Banned peer {} due to repeated sync timeouts", pid.0);
                         }
                     }
@@ -1481,7 +1503,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let checkpoint_mgr_for_net = checkpoint_manager.clone();
 
         tokio::spawn(async move {
-            use citrate_consensus::types::Hash;
+            // SECREM-01 NET-1/2: the GetHeaders/GetBlocks handlers that used
+            // `Hash::new(...)` inline moved to block_serve.rs, so the bare
+            // Hash import is no longer needed here.
             use citrate_consensus::checkpoint::CheckpointVote;
             use citrate_network::NetworkMessage;
             use citrate_sequencer::mempool::TxClass;
@@ -1512,49 +1536,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // Requests are driven by periodic sync loop
                     }
                     NetworkMessage::GetBlocks { from, count, .. } => {
-                        tracing::info!("Received GetBlocks request from peer {} for {} blocks starting from {:?}", 
+                        tracing::info!("Received GetBlocks request from peer {} for {} blocks starting from {:?}",
                                      pid.0, count, from);
-                        let mut blocks = Vec::new();
-
-                        // Handle genesis request (zero hash)
-                        if from == Hash::new([0u8; 32]) {
-                            tracing::info!("Serving blocks from genesis");
-                            let mut h = 0u64;
-                            let end_h = count as u64;
-                            while h < end_h && blocks.len() < count as usize {
-                                if let Ok(Some(hash)) =
-                                    storage_for_handler.blocks.get_block_by_height(h)
-                                {
-                                    if let Ok(Some(block)) =
-                                        storage_for_handler.blocks.get_block(&hash)
-                                    {
-                                        blocks.push(block);
-                                    }
-                                }
-                                h += 1;
-                            }
-                        } else {
-                            // Get blocks after the specified hash
-                            if let Ok(Some(start_block)) =
-                                storage_for_handler.blocks.get_block(&from)
-                            {
-                                let start_h = start_block.header.height + 1;
-                                let end_h = start_h.saturating_add(count as u64);
-                                let mut h = start_h;
-                                while h < end_h && blocks.len() < count as usize {
-                                    if let Ok(Some(hash)) =
-                                        storage_for_handler.blocks.get_block_by_height(h)
-                                    {
-                                        if let Ok(Some(block)) =
-                                            storage_for_handler.blocks.get_block(&hash)
-                                        {
-                                            blocks.push(block);
-                                        }
-                                    }
-                                    h += 1;
-                                }
-                            }
-                        }
+                        // NET-2 (SECREM-01): `count` is attacker-supplied —
+                        // serve through the clamped, tip-bounded path only.
+                        let blocks =
+                            block_serve::serve_blocks(&storage_for_handler, &from, count);
 
                         tracing::info!("Sending {} blocks to peer {}", blocks.len(), pid.0);
                         let _ = pm_for_rx
@@ -1576,38 +1563,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             "Received GetHeaders request from peer {} starting {:?} count {}",
                             pid.0, from, count
                         );
-                        let mut headers = Vec::new();
-                        if from == Hash::new([0u8; 32]) {
-                            let mut h = 0u64;
-                            while headers.len() < count as usize {
-                                if let Ok(Some(hash)) =
-                                    storage_for_handler.blocks.get_block_by_height(h)
-                                {
-                                    if let Ok(Some(block)) =
-                                        storage_for_handler.blocks.get_block(&hash)
-                                    {
-                                        headers.push(block.header);
-                                    }
-                                }
-                                h += 1;
-                            }
-                        } else if let Ok(Some(start_block)) =
-                            storage_for_handler.blocks.get_block(&from)
-                        {
-                            let mut h = start_block.header.height + 1;
-                            while headers.len() < count as usize {
-                                if let Ok(Some(hash)) =
-                                    storage_for_handler.blocks.get_block_by_height(h)
-                                {
-                                    if let Ok(Some(block)) =
-                                        storage_for_handler.blocks.get_block(&hash)
-                                    {
-                                        headers.push(block.header);
-                                    }
-                                }
-                                h += 1;
-                            }
-                        }
+                        // NET-1 (SECREM-01 Critical): the previous inline
+                        // loop ran `while headers.len() < count` with no tip
+                        // bound and no break on missing heights — one packet
+                        // with a large `count` spun to u64::MAX storage
+                        // reads. All serving now goes through the clamped,
+                        // tip-bounded, gap-breaking path.
+                        let headers =
+                            block_serve::serve_headers(&storage_for_handler, &from, count);
                         let _ = pm_for_rx
                             .send_to_peers(
                                 std::slice::from_ref(&pid),
@@ -1633,16 +1596,35 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await;
                     }
                     NetworkMessage::NewTransaction { transaction } => {
-                        // Add to mempool if not already present
-                        if !mempool_for_handler.contains(&transaction.hash).await {
-                            let _ = mempool_for_handler
-                                .add_transaction(transaction.clone(), TxClass::Standard)
-                                .await;
+                        // SECREM-01 NET-5: validate via gossip BEFORE inserting
+                        // into the mempool. Pre-fix the tx was added to the
+                        // mempool first and only then handed to gossip
+                        // validation, so a peer could seed invalid txs into
+                        // local mempool state. Gossip `handle_new_transaction`
+                        // runs basic-validity checks + penalizes the peer on
+                        // failure; only a passing tx reaches `add_transaction`
+                        // (which applies the authoritative mempool validation).
+                        let hash = transaction.hash;
+                        match gossip_for_rx
+                            .handle_new_transaction(transaction.clone(), &pid)
+                            .await
+                        {
+                            Ok(()) => {
+                                if !mempool_for_handler.contains(&hash).await {
+                                    let _ = mempool_for_handler
+                                        .add_transaction(transaction, TxClass::Standard)
+                                        .await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Rejected gossiped tx {} from {}: {}",
+                                    hex::encode(&hash.as_bytes()[..8]),
+                                    pid,
+                                    e
+                                );
+                            }
                         }
-                        // Let gossip handle validation + propagation
-                        let _ = gossip_for_rx
-                            .handle_new_transaction(transaction, &pid)
-                            .await;
                     }
                     NetworkMessage::NewBlock { block } => {
                         // C3 fix: validate BEFORE persisting to prevent
@@ -1652,29 +1634,59 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .has_block(&block.header.block_hash)
                             .unwrap_or(false);
                         if !have {
-                            // Let gossip validate and propagate first
+                            // Let gossip validate (structure/signature) and propagate first
                             match gossip_for_rx.handle_new_block(block.clone(), &pid).await {
                                 Ok(_) => {
-                                    // Block passed validation — persist it
-                                    let _ = storage_for_handler.blocks.put_block(&block);
-                                    // WP-K.2: Feed validated block into live DAG for fork-choice
-                                    match dag_store_for_net.store_block(block.clone()).await {
-                                        Ok(_) => {
-                                            let _ = ghostdag_for_net.add_block(&block).await;
-                                            tracing::debug!(
-                                                "Added network block {} to live DAG",
-                                                hex::encode(&block.header.block_hash.as_bytes()[..8])
-                                            );
-                                        }
-                                        Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {
-                                            // Already in DAG (e.g., from local production) — safe to ignore
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Failed to add block {} to live DAG: {}",
-                                                hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                                e
-                                            );
+                                    // SECREM-01 CONS-1/2/3: consensus-consistency
+                                    // gate (parents exist, height linkage, blue
+                                    // score/work recomputation) runs BEFORE any
+                                    // persistence. Pre-fix, put_block ran first and
+                                    // wrote the RocksDB blue-score/height indexes
+                                    // from unvalidated header claims.
+                                    if let Err(e) = ghostdag_for_net
+                                        .validate_block_consistency(&block)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "Rejected inconsistent block {} from {}: {}",
+                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                            pid,
+                                            e
+                                        );
+                                    } else {
+                                        // WP-K.2: Feed validated block into live DAG for fork-choice
+                                        match dag_store_for_net.store_block(block.clone()).await {
+                                            Ok(_) => {
+                                                match ghostdag_for_net.add_block(&block).await {
+                                                    Ok(_) => {
+                                                        // Admission complete — only now persist.
+                                                        let _ = storage_for_handler
+                                                            .blocks
+                                                            .put_block(&block);
+                                                        tracing::debug!(
+                                                            "Added network block {} to live DAG",
+                                                            hex::encode(&block.header.block_hash.as_bytes()[..8])
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "Block {} failed DAG admission: {}",
+                                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {
+                                                // Already in DAG (e.g., from local production) — safe to ignore
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Failed to add block {} to live DAG: {}",
+                                                    hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                                    e
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -1703,18 +1715,42 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 .has_block(&hash)
                                 .unwrap_or(false);
                             if !have {
-                                if let Err(e) = storage_for_handler.blocks.put_block(&block) {
+                                // SECREM-01 CONS-1/2/3: consistency gate before
+                                // any persistence (same as the gossip path —
+                                // sync is an equally untrusted ingest).
+                                if let Err(e) = ghostdag_for_net
+                                    .validate_block_consistency(&block)
+                                    .await
+                                {
                                     tracing::warn!(
-                                        "Failed to persist synced block {}: {}",
+                                        "Rejected inconsistent synced block {}: {}",
                                         hex::encode(&hash.as_bytes()[..8]),
                                         e
                                     );
                                 } else {
                                     // WP-K.2: Feed synced block into live DAG for fork-choice
                                     match dag_store_for_net.store_block(block.clone()).await {
-                                        Ok(_) => {
-                                            let _ = ghostdag_for_net.add_block(&block).await;
-                                        }
+                                        Ok(_) => match ghostdag_for_net.add_block(&block).await {
+                                            Ok(_) => {
+                                                // Admission complete — only now persist.
+                                                if let Err(e) =
+                                                    storage_for_handler.blocks.put_block(&block)
+                                                {
+                                                    tracing::warn!(
+                                                        "Failed to persist synced block {}: {}",
+                                                        hex::encode(&hash.as_bytes()[..8]),
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Synced block {} failed DAG admission: {}",
+                                                    hex::encode(&hash.as_bytes()[..8]),
+                                                    e
+                                                );
+                                            }
+                                        },
                                         Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {}
                                         Err(e) => {
                                             tracing::warn!(
@@ -2050,3 +2086,135 @@ fn load_or_create_peer_id(data_dir: &std::path::Path) -> anyhow::Result<citrate_
 // Bootnode parsing + DNS resolution now lives in the shared
 // `citrate_network::resolve_bootnode` so the node daemon, discovery, and the
 // embedded-node GUIs all handle hostname bootnodes identically.
+
+/// SECREM-01 CFG-1: Load the persistent Noise P2P identity from
+/// `noise_key_path`, or generate and persist a new one.
+///
+/// Security properties:
+/// - New key files are written with `0600` permissions (owner read/write
+///   only) via `write_secret_file_0600`, never the umask default.
+/// - An existing key file with group/other permission bits set is
+///   tightened to `0600` on load, with a warning logged.
+/// - The serialized key bytes (read buffer on load, `to_bytes()` copy on
+///   generate) are held in `zeroize::Zeroizing<Vec<u8>>` and wiped when
+///   this function returns. Ownership of the raw private key leaves our
+///   control at `NoiseKeypair` construction: `citrate_network::NoiseKeypair`
+///   stores `private: Vec<u8>` and must live for the process lifetime
+///   inside `NetworkTransport` (handed off via `.with_noise()`) to perform
+///   Noise_XX handshakes, so it cannot be zeroized here.
+/// - Encrypt-at-rest for `noise.key` is OUT OF SCOPE for this pass and is
+///   a tracked SECREM-01 follow-up — it requires a key-wrapping decision
+///   (OS keychain vs. operator passphrase vs. KMS).
+fn load_or_generate_noise_keypair(
+    noise_key_path: &std::path::Path,
+) -> anyhow::Result<citrate_network::NoiseKeypair> {
+    use zeroize::Zeroizing;
+
+    if noise_key_path.exists() {
+        // SECREM-01 CFG-1 (a): tighten loose permissions on an existing key.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(noise_key_path)
+                .map_err(|e| anyhow::anyhow!("Failed to stat noise key: {}", e))?;
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                warn!(
+                    "Noise key file {:?} had permissions {:o}; tightening to 0600 (SECREM-01 CFG-1)",
+                    noise_key_path, mode
+                );
+                std::fs::set_permissions(
+                    noise_key_path,
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to chmod noise key to 0600: {}", e))?;
+            }
+        }
+        let key_bytes = Zeroizing::new(
+            std::fs::read(noise_key_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read noise key: {}", e))?,
+        );
+        citrate_network::NoiseKeypair::from_bytes(&key_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to parse noise key: {}", e))
+    } else {
+        let kp = citrate_network::NoiseKeypair::generate();
+        let key_bytes = Zeroizing::new(kp.to_bytes());
+        write_secret_file_0600(noise_key_path, &key_bytes)?;
+        info!("Generated new persistent Noise identity at {:?}", noise_key_path);
+        Ok(kp)
+    }
+}
+
+/// SECREM-01 CFG-1: Write `bytes` to a new file with `0600` permissions.
+///
+/// Uses `create_new` so an existing key file is never silently
+/// overwritten, and sets the mode at open time (no window where the file
+/// exists with umask-default permissions).
+fn write_secret_file_0600(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to create noise key file: {}", e))?;
+    file.write_all(bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to write noise key: {}", e))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod noise_key_file_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("stat noise key")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// SECREM-01 CFG-1: a freshly generated Noise key file must be 0600.
+    #[test]
+    #[cfg(unix)]
+    fn generated_noise_key_file_is_0600() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("noise.key");
+        let kp = load_or_generate_noise_keypair(&key_path).expect("generate noise key");
+        assert!(key_path.exists(), "key file should be persisted");
+        assert_eq!(
+            mode_of(&key_path),
+            0o600,
+            "noise key must be written with 0600 permissions"
+        );
+        // Round-trip: reloading yields the same identity.
+        let reloaded = load_or_generate_noise_keypair(&key_path).expect("reload noise key");
+        assert_eq!(kp.derive_peer_id(), reloaded.derive_peer_id());
+    }
+
+    /// SECREM-01 CFG-1: an existing key file with loose permissions is
+    /// tightened to 0600 on load without changing the identity.
+    #[test]
+    #[cfg(unix)]
+    fn loose_noise_key_permissions_are_tightened_on_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("noise.key");
+        let kp = load_or_generate_noise_keypair(&key_path).expect("generate noise key");
+        // Simulate the pre-fix 0644 world.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen permissions");
+        assert_eq!(mode_of(&key_path), 0o644);
+        let reloaded = load_or_generate_noise_keypair(&key_path).expect("reload noise key");
+        assert_eq!(mode_of(&key_path), 0o600, "loose permissions must be tightened");
+        assert_eq!(kp.derive_peer_id(), reloaded.derive_peer_id());
+    }
+}

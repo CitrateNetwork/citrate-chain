@@ -9,10 +9,8 @@
 //   I.3:  Emergency pause wired end-to-end — pause_flag shared with producer
 //   I.4:  Method-level resource budgets — expensive methods consume more budget
 
-use citrate_api::rate_limit::{
-    default_method_cost, is_operator_authenticated, RateLimitConfig,
-    RateLimiter,
-};
+use citrate_api::rate_limit::{default_method_cost, RateLimitConfig, RateLimiter};
+use citrate_api::server::require_operator_auth;
 use jsonrpc_http_server::hyper::{self, Body};
 use jsonrpc_http_server::{RequestMiddleware, RequestMiddlewareAction};
 use std::collections::HashSet;
@@ -147,100 +145,93 @@ fn i1_fallback_does_not_collapse_to_single_bucket() {
 // ===========================================================================
 // I.2: Privileged RPC surface policy
 // ===========================================================================
+//
+// SECREM-01 API-1 rewrote this section. The middleware thread-local
+// (`is_operator_authenticated`) is GONE — it was unsound across async
+// boundaries: a concurrent unauthenticated `citrate_emergencyPause`
+// could read another request's stale `true` and halt block production.
+// Operator auth is now `require_operator_auth` (CITRATE_OPERATOR_TOKEN
+// env + `operator_token` request param), checked inside each handler.
+//
+// These tests mutate process-global env, so they serialize on ENV_LOCK.
 
-/// Without an operator token configured, all requests are treated as
-/// operator-authenticated (devnet mode).
-#[test]
-fn i2_no_token_means_all_authenticated() {
-    let limiter = RateLimiter::new(RateLimitConfig::default());
-    let req = make_req();
-    match limiter.on_request(req) {
-        RequestMiddlewareAction::Proceed { .. } => {}
-        _ => panic!("Should proceed"),
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn with_env_token<R>(token: Option<&str>, f: impl FnOnce() -> R) -> R {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    match token {
+        Some(t) => std::env::set_var("CITRATE_OPERATOR_TOKEN", t),
+        None => std::env::remove_var("CITRATE_OPERATOR_TOKEN"),
     }
-    // After middleware runs, the thread-local should be set to true
-    assert!(
-        is_operator_authenticated(),
-        "I.2: No token configured → all requests are operator-authenticated"
-    );
+    let out = f();
+    std::env::remove_var("CITRATE_OPERATOR_TOKEN");
+    out
 }
 
-/// With an operator token configured, requests WITHOUT the Bearer header
-/// are NOT operator-authenticated.
-#[test]
-fn i2_missing_bearer_token_denied() {
-    let limiter = RateLimiter::new(RateLimitConfig {
-        operator_token: Some("secret-operator-token-123".to_string()),
-        ..Default::default()
-    });
-
-    let req = make_req(); // No Authorization header
-    match limiter.on_request(req) {
-        RequestMiddlewareAction::Proceed { .. } => {}
-        _ => panic!("Should still proceed (auth check is per-method, not per-request)"),
-    }
-    assert!(
-        !is_operator_authenticated(),
-        "I.2: Missing Bearer token → not operator-authenticated"
+fn params_with_token(token: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "operator_token".to_string(),
+        serde_json::Value::String(token.to_string()),
     );
+    m
 }
 
-/// With an operator token configured, requests with WRONG Bearer token
-/// are NOT operator-authenticated.
+/// FAIL CLOSED: with no token configured, operator methods are DENIED.
+/// (Pre-SECREM the middleware path was fail-OPEN here — a
+/// default-constructed config treated every caller as operator. That was
+/// finding API-2.)
 #[test]
-fn i2_wrong_bearer_token_denied() {
-    let limiter = RateLimiter::new(RateLimitConfig {
-        operator_token: Some("correct-token".to_string()),
-        ..Default::default()
+fn i2_no_token_configured_denies_operators() {
+    with_env_token(None, || {
+        let err = require_operator_auth(&serde_json::Map::new())
+            .expect_err("API-2 regression: unconfigured token must fail closed");
+        let _ = err;
+        // Even a caller supplying a token is denied when none is configured.
+        assert!(require_operator_auth(&params_with_token("anything")).is_err());
     });
-
-    let req = make_req_with_header("authorization", "Bearer wrong-token");
-    match limiter.on_request(req) {
-        RequestMiddlewareAction::Proceed { .. } => {}
-        _ => panic!("Should still proceed"),
-    }
-    assert!(
-        !is_operator_authenticated(),
-        "I.2: Wrong Bearer token → not operator-authenticated"
-    );
 }
 
-/// With correct Bearer token, request IS operator-authenticated.
+/// Empty env token counts as unconfigured — still fail closed.
 #[test]
-fn i2_correct_bearer_token_accepted() {
-    let limiter = RateLimiter::new(RateLimitConfig {
-        operator_token: Some("correct-token".to_string()),
-        ..Default::default()
+fn i2_empty_env_token_denies_operators() {
+    with_env_token(Some(""), || {
+        assert!(require_operator_auth(&params_with_token("")).is_err());
+        assert!(require_operator_auth(&serde_json::Map::new()).is_err());
     });
-
-    let req = make_req_with_header("authorization", "Bearer correct-token");
-    match limiter.on_request(req) {
-        RequestMiddlewareAction::Proceed { .. } => {}
-        _ => panic!("Should proceed"),
-    }
-    assert!(
-        is_operator_authenticated(),
-        "I.2: Correct Bearer token → operator-authenticated"
-    );
 }
 
-/// Basic auth format (not Bearer) should not authenticate.
+/// With a token configured, requests WITHOUT the param are denied.
 #[test]
-fn i2_basic_auth_format_rejected() {
-    let limiter = RateLimiter::new(RateLimitConfig {
-        operator_token: Some("correct-token".to_string()),
-        ..Default::default()
+fn i2_missing_param_token_denied() {
+    with_env_token(Some("secret-operator-token-123"), || {
+        assert!(
+            require_operator_auth(&serde_json::Map::new()).is_err(),
+            "I.2: missing operator_token param → denied"
+        );
     });
+}
 
-    let req = make_req_with_header("authorization", "Basic correct-token");
-    match limiter.on_request(req) {
-        RequestMiddlewareAction::Proceed { .. } => {}
-        _ => panic!("Should proceed"),
-    }
-    assert!(
-        !is_operator_authenticated(),
-        "I.2: Basic auth format must not pass Bearer check"
-    );
+/// With a token configured, a WRONG param token is denied.
+#[test]
+fn i2_wrong_param_token_denied() {
+    with_env_token(Some("correct-token"), || {
+        assert!(
+            require_operator_auth(&params_with_token("wrong-token")).is_err(),
+            "I.2: wrong operator_token → denied"
+        );
+    });
+}
+
+/// With a token configured, the CORRECT param token is accepted.
+#[test]
+fn i2_correct_param_token_accepted() {
+    with_env_token(Some("correct-token"), || {
+        assert!(
+            require_operator_auth(&params_with_token("correct-token")).is_ok(),
+            "I.2: correct operator_token → authenticated"
+        );
+    });
 }
 
 // ===========================================================================

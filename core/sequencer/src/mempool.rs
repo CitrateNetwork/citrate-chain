@@ -193,6 +193,77 @@ pub struct MempoolTx {
     pub size: usize,
 }
 
+/// SECREM-01 CONS-4: hard cap on the `evicted` dedup set.
+///
+/// Why the set exists: `remove_transaction` records every hash that
+/// leaves the mempool (block inclusion, eviction, expiry) so that
+/// `add_transaction` can cheaply reject a re-submission of the same
+/// tx (gossip echo, RPC retry) as `DuplicateTransaction`. Unbounded,
+/// it grew by one 32-byte hash per removed tx forever — a slow OOM
+/// on every steady-state validator (pre-audit finding CONS-4).
+///
+/// Why bounding is safe: the set is a fast-path dedup, not a
+/// consensus-level replay guard. Once a hash ages out (after
+/// `EVICTED_CAP` newer removals), a re-submitted copy still goes
+/// through full validation, the per-sender nonce-set checks here,
+/// and account-nonce checks at execution time, so it cannot
+/// double-spend; the only cost is transient mempool space. 100k
+/// entries is ~3.2 MB of hashes and, at a sustained 1k tx/s, gives
+/// ~100 s of dedup memory — far longer than gossip-echo or RPC
+/// retry windows.
+const EVICTED_CAP: usize = 100_000;
+
+/// SECREM-01 CONS-4: bounded insertion-ordered hash set.
+///
+/// O(1) insert/contains; once `cap` is exceeded the oldest inserted
+/// entry is evicted (FIFO). `order` and `set` always track the same
+/// membership 1:1.
+#[derive(Debug)]
+struct BoundedHashSet {
+    set: HashSet<Hash>,
+    order: VecDeque<Hash>,
+    cap: usize,
+}
+
+impl BoundedHashSet {
+    fn new(cap: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn insert(&mut self, hash: Hash) {
+        if self.set.insert(hash) {
+            self.order.push_back(hash);
+            while self.set.len() > self.cap {
+                match self.order.pop_front() {
+                    Some(oldest) => {
+                        self.set.remove(&oldest);
+                    }
+                    // Unreachable: order mirrors set membership.
+                    None => break,
+                }
+            }
+        }
+    }
+
+    fn contains(&self, hash: &Hash) -> bool {
+        self.set.contains(hash)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    fn clear(&mut self) {
+        self.set.clear();
+        self.order.clear();
+    }
+}
+
 /// Transaction mempool
 pub struct Mempool {
     /// Configuration
@@ -232,8 +303,10 @@ pub struct Mempool {
     /// Empty sets are pruned from the map eagerly.
     sender_nonces: Arc<RwLock<HashMap<PublicKey, BTreeSet<u64>>>>,
 
-    /// Recently evicted transaction hashes (for duplicate detection)
-    evicted: Arc<RwLock<HashSet<Hash>>>,
+    /// Recently evicted transaction hashes (for duplicate detection).
+    /// SECREM-01 CONS-4: bounded to `EVICTED_CAP` entries (FIFO
+    /// aging) so steady-state operation no longer leaks memory.
+    evicted: Arc<RwLock<BoundedHashSet>>,
 
     /// Total size of transactions in bytes
     total_size: Arc<RwLock<usize>>,
@@ -251,7 +324,8 @@ impl Mempool {
             priority_queue: Arc::new(RwLock::new(PriorityQueue::new())),
             by_sender: Arc::new(RwLock::new(HashMap::new())),
             sender_nonces: Arc::new(RwLock::new(HashMap::new())),
-            evicted: Arc::new(RwLock::new(HashSet::new())),
+            // SECREM-01 CONS-4: bounded dedup set (was an unbounded HashSet)
+            evicted: Arc::new(RwLock::new(BoundedHashSet::new(EVICTED_CAP))),
             total_size: Arc::new(RwLock::new(0)),
         }
     }
@@ -1160,6 +1234,86 @@ mod tests {
             chain_id: Some(40204), // M-01: chain domain binding — matches canonical default
             ..Default::default()
         }
+    }
+
+    /// SECREM-01 CONS-4: the bounded evicted-set structure must cap
+    /// its size and age out the OLDEST entries first (FIFO), while
+    /// still answering `contains` correctly for retained entries.
+    #[test]
+    fn test_bounded_hashset_caps_size_and_ages_out_oldest() {
+        const CAP: usize = 64;
+        const EXTRA: usize = 16;
+        let mut set = BoundedHashSet::new(CAP);
+
+        let hash_for = |i: usize| {
+            let mut data = [0u8; 32];
+            data[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            Hash::new(data)
+        };
+
+        // Insert CAP + EXTRA distinct entries.
+        for i in 0..(CAP + EXTRA) {
+            set.insert(hash_for(i));
+            assert!(
+                set.len() <= CAP,
+                "bounded set exceeded cap after insert {}: len={}",
+                i,
+                set.len()
+            );
+        }
+
+        assert_eq!(set.len(), CAP, "set must sit exactly at cap");
+
+        // The EXTRA oldest entries must have aged out...
+        for i in 0..EXTRA {
+            assert!(
+                !set.contains(&hash_for(i)),
+                "oldest entry {} should have aged out",
+                i
+            );
+        }
+        // ...and the CAP newest entries must all be retained.
+        for i in EXTRA..(CAP + EXTRA) {
+            assert!(set.contains(&hash_for(i)), "newest entry {} must be retained", i);
+        }
+
+        // Duplicate insert must not grow the set or perturb ordering.
+        set.insert(hash_for(CAP + EXTRA - 1));
+        assert_eq!(set.len(), CAP);
+        assert!(set.contains(&hash_for(EXTRA)), "duplicate insert must not evict");
+
+        // clear() empties both the set and the order queue.
+        set.clear();
+        assert_eq!(set.len(), 0);
+        set.insert(hash_for(0));
+        assert!(set.contains(&hash_for(0)));
+    }
+
+    /// SECREM-01 CONS-4: semantic contract preserved — a tx removed
+    /// from the mempool is still rejected as a duplicate when
+    /// re-submitted (the whole point of the evicted set).
+    #[tokio::test]
+    async fn test_evicted_tx_still_rejected_after_bounding() {
+        let config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+
+        let tx = create_test_tx(0, 2_000_000_000, [7; 32]);
+        mempool
+            .add_transaction(tx.clone(), TxClass::Standard)
+            .await
+            .expect("first add should succeed");
+
+        mempool.remove_transaction(&tx.hash).await;
+        assert!(!mempool.contains(&tx.hash).await);
+
+        let err = mempool
+            .add_transaction(tx.clone(), TxClass::Standard)
+            .await
+            .expect_err("re-adding a removed tx must be rejected");
+        assert!(matches!(err, MempoolError::DuplicateTransaction(h) if h == tx.hash));
     }
 
     #[tokio::test]

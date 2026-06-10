@@ -6,6 +6,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use anyhow::Result;
 
+/// SECREM-01 ECON-1: deterministically quantize an f64 reputation score
+/// to an integer weight in micro-units (×1e6, rounded to nearest, ties to
+/// even via `f64::round` semantics). Negative / NaN / infinite inputs
+/// clamp to 0 so a malformed score cannot mint or invert a share. Used so
+/// the value distribution is integer math even though the score *inputs*
+/// are floating point.
+fn weight_micro(score: f64) -> u128 {
+    if !score.is_finite() || score <= 0.0 {
+        return 0;
+    }
+    // Cap before the cast so an absurd score can't overflow u128 or hit
+    // the saturating-cast boundary nondeterministically.
+    let scaled = (score * 1_000_000.0).round();
+    if scaled >= u128::MAX as f64 {
+        return u128::MAX;
+    }
+    scaled as u128
+}
+
 /// Multi-party revenue sharing configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevenueShareConfig {
@@ -416,24 +435,46 @@ impl RevenueShareManager {
             return;
         }
 
-        // Calculate total contribution score for normalization
-        let total_score: f64 = stakeholders
+        // SECREM-01 ECON-1: distribute with INTEGER math. Each
+        // stakeholder's f64 reputation score is quantized once to a
+        // deterministic integer weight, and the value split is
+        // `total_amount * weight_i / total_weight` in U256 — no
+        // per-recipient `(ratio * 10000.0) as u64` cast (which lost
+        // precision at 1bp granularity and risked platform-dependent
+        // float→int truncation). The integer remainder is swept to the
+        // last recipient so the full pool is always distributed.
+        let weights: Vec<(Address, u128)> = stakeholders
             .iter()
-            .map(|(_, contrib)| self.calculate_weighted_contribution(contrib))
-            .sum();
+            .map(|(addr, contrib)| {
+                (**addr, weight_micro(self.calculate_weighted_contribution(contrib)))
+            })
+            .collect();
+        let total_weight: u128 = weights.iter().map(|(_, w)| *w).sum();
 
-        if total_score == 0.0 {
-            // Equal distribution if no contributions recorded
-            let equal_share = total_amount / U256::from(stakeholders.len());
-            for (address, _) in stakeholders {
-                *distributions.entry(*address).or_insert(U256::zero()) += equal_share;
+        if total_weight == 0 {
+            // Equal distribution if no contributions recorded.
+            let equal_share = total_amount / U256::from(weights.len());
+            let mut handed_out = U256::zero();
+            for (i, (address, _)) in weights.iter().enumerate() {
+                let amount = if i + 1 == weights.len() {
+                    total_amount - handed_out
+                } else {
+                    handed_out += equal_share;
+                    equal_share
+                };
+                *distributions.entry(*address).or_insert(U256::zero()) += amount;
             }
         } else {
-            // Proportional distribution based on weighted contributions
-            for (address, contrib) in stakeholders {
-                let contribution_weight = self.calculate_weighted_contribution(contrib);
-                let share_ratio = contribution_weight / total_score;
-                let amount = total_amount * U256::from((share_ratio * 10000.0) as u64) / U256::from(10000);
+            let total_weight_u = U256::from(total_weight);
+            let mut handed_out = U256::zero();
+            for (i, (address, weight)) in weights.iter().enumerate() {
+                let amount = if i + 1 == weights.len() {
+                    total_amount - handed_out
+                } else {
+                    let a = total_amount * U256::from(*weight) / total_weight_u;
+                    handed_out += a;
+                    a
+                };
                 *distributions.entry(*address).or_insert(U256::zero()) += amount;
             }
         }
@@ -549,6 +590,22 @@ impl RevenueShareManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SECREM-01 ECON-1: `weight_micro` is a deterministic, total
+    /// quantization — finite positive scores map to integer micro-units,
+    /// and malformed (negative / NaN / inf) scores clamp to 0 so they
+    /// cannot mint or invert a share.
+    #[test]
+    fn test_econ1_weight_micro_is_deterministic_and_clamps() {
+        assert_eq!(weight_micro(1.0), 1_000_000);
+        assert_eq!(weight_micro(0.5), 500_000);
+        assert_eq!(weight_micro(0.0), 0);
+        assert_eq!(weight_micro(-3.0), 0);
+        assert_eq!(weight_micro(f64::NAN), 0);
+        assert_eq!(weight_micro(f64::INFINITY), 0);
+        // Determinism: same input, same output, no platform float→int UB.
+        assert_eq!(weight_micro(0.333333), weight_micro(0.333333));
+    }
 
     #[test]
     fn test_revenue_collection_and_distribution() {

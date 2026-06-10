@@ -85,3 +85,6 @@ tempfile = "3.0"
 tower = { version = "0.4", features = ["util"] }
 proptest = { workspace = true }
 hex = "0.4"
+# SECREM-01 INFER-1: signing test vectors for inference_auth (matches the
+# k256 recovery used by citrate-execution's recover_address).
+k256 = { version = "0.13", features = ["ecdsa"] }
