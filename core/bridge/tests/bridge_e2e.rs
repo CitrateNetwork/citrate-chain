@@ -64,6 +64,8 @@ fn attest_event(relay: &BridgeRelay, event: &BridgeEvent) {
     let event_id = *event.event_id();
     let event_hash = match event {
         BridgeEvent::Deposit(d) => d.canonical_hash(),
+        // SECREM-01 BRG-2: withdrawals are field-bound too.
+        BridgeEvent::Withdrawal(w) => w.canonical_hash(),
         _ => compute_event_hash(&event_id, b"deposit"),
     };
     let sk = default_oracle_key();
@@ -72,11 +74,10 @@ fn attest_event(relay: &BridgeRelay, event: &BridgeEvent) {
         .unwrap()
         .as_secs();
 
-    let mut message = Vec::with_capacity(89);
-    message.extend_from_slice(b"citrate-bridge-v1");
-    message.extend_from_slice(&event_id);
-    message.extend_from_slice(&event_hash);
-    message.extend_from_slice(&timestamp.to_le_bytes());
+    // SECREM-01 BRG-3: sign the v2 message bound to the relay's domain.
+    let (cid, inst) = relay.oracle_registry().read().domain();
+    let message =
+        citrate_bridge::oracle::attestation_message(cid, &inst, &event_id, &event_hash, timestamp);
     let sig = sk.sign(&message);
 
     let att = OracleAttestation {
@@ -130,11 +131,16 @@ fn create_signed_attestation(
         .expect("system clock")
         .as_secs();
 
-    let mut message = Vec::with_capacity(89);
-    message.extend_from_slice(b"citrate-bridge-v1");
-    message.extend_from_slice(&event_id);
-    message.extend_from_slice(&event_hash);
-    message.extend_from_slice(&timestamp.to_le_bytes());
+    // SECREM-01 BRG-3: relay-based tests sign with the deployment domain
+    // derived from the default test config (chain 40204 + contract hash).
+    let (cid, inst) = test_config().attestation_domain();
+    let message = citrate_bridge::oracle::attestation_message(
+        cid,
+        &inst,
+        &event_id,
+        &event_hash,
+        timestamp,
+    );
 
     let signature = signing_key.sign(&message);
 

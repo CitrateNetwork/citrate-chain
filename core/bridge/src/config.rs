@@ -34,6 +34,35 @@ pub struct BridgeConfig {
 
     /// Bridge relay polling interval (ms).
     pub poll_interval_ms: u64,
+
+    /// SECREM-01 BRG-3: Citrate chain id bound into every oracle
+    /// attestation message, so attestations cannot replay across
+    /// deployments that share oracle keys. Defaults to mainnet/testnet
+    /// chain id 40204 for configs written before this field existed.
+    #[serde(default = "default_attestation_chain_id")]
+    pub chain_id: u64,
+}
+
+/// Serde default for [`BridgeConfig::chain_id`] (Citrate = 40204).
+fn default_attestation_chain_id() -> u64 {
+    40204
+}
+
+impl BridgeConfig {
+    /// SECREM-01 BRG-3: the attestation signing domain for this deployment
+    /// — `(chain_id, sha3("citrate-bridge-instance-v1" || lowercase
+    /// contract address))`. Single source of truth shared by the relay's
+    /// registry construction, oracle clients, and tests.
+    pub fn attestation_domain(&self) -> (u64, [u8; 32]) {
+        use sha3::{Digest, Sha3_256};
+        let mut h = Sha3_256::new();
+        h.update(b"citrate-bridge-instance-v1");
+        h.update(self.bridge_contract.trim().to_lowercase().as_bytes());
+        let out = h.finalize();
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&out);
+        (self.chain_id, id)
+    }
 }
 
 /// Bonding curve pricing configuration per Paper VI.
@@ -70,6 +99,7 @@ impl Default for BridgeConfig {
             retry_base_delay_ms: 1000,
             bonding_curve: BondingCurveConfig::default(),
             poll_interval_ms: 5000,
+            chain_id: default_attestation_chain_id(),
         }
     }
 }

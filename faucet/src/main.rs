@@ -38,6 +38,14 @@ struct FaucetState {
     /// Cloudflare Turnstile verifier (FAU-03). When `None`, CAPTCHA
     /// verification is skipped (used only in dev/local-CI builds).
     turnstile: Option<Arc<TurnstileVerifier>>,
+    /// SECREM-01 FAUCET-2: reverse proxies whose forwarding headers we
+    /// trust (`FAUCET_TRUSTED_PROXIES`, comma-separated IPs). When the
+    /// TCP peer is NOT in this set, X-Forwarded-For / X-Real-IP are
+    /// IGNORED — pre-fix any direct client could spoof a fresh XFF per
+    /// request and launder the per-IP cooldown. Empty set (default) =
+    /// trust no headers, use the socket peer (mirrors the RPC layer's
+    /// WP-I.1 trust-boundary rule).
+    trusted_proxies: Arc<HashSet<std::net::IpAddr>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +207,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // SECREM-01 FAUCET-2: trusted reverse proxies for forwarding headers.
+    let trusted_proxies: HashSet<std::net::IpAddr> = std::env::var("FAUCET_TRUSTED_PROXIES")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|p| p.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if trusted_proxies.is_empty() {
+        info!(
+            "FAUCET_TRUSTED_PROXIES unset — forwarding headers ignored; \
+             per-IP cooldown keys on the TCP peer address"
+        );
+    }
+
     let state = FaucetState {
         rpc_url,
         api_key,
@@ -208,6 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cooldowns,
         address_whitelist: Arc::new(address_whitelist),
         turnstile,
+        trusted_proxies: Arc::new(trusted_proxies),
     };
 
     // Build router
@@ -347,7 +372,7 @@ async fn request_tokens(
     // honored when present, otherwise the socket peer). Used by the
     // per-IP cooldown leg AND optionally by the Turnstile verifier
     // for binding.
-    let client_ip = extract_client_ip(&headers, socket_addr);
+    let client_ip = extract_client_ip(&headers, socket_addr, &state.trusted_proxies);
 
     // RM-B1 / WP-E6.3 (audit FAU-03): Turnstile CAPTCHA verification.
     // When the verifier is configured, the request MUST carry a
@@ -390,7 +415,13 @@ async fn request_tokens(
     // RM-B1 / WP-E6.4 (audit FAU-04): per-address + per-IP cooldown
     // backed by a file (when FAUCET_COOLDOWN_FILE is set), so a
     // process restart no longer launders the cooldown.
-    if let Err(denial) = state.cooldowns.check(&recipient_hex, &client_ip) {
+    //
+    // SECREM-01 FAUCET-1: the slot is RESERVED atomically here, not
+    // merely checked — pre-fix, `check()` and `record_success()` had an
+    // RPC round-trip between them, so N concurrent requests for one
+    // address all passed and all dripped. Every failure path below must
+    // `release()` the reservation so legitimate users can retry.
+    if let Err(denial) = state.cooldowns.try_reserve(&recipient_hex, &client_ip) {
         return Ok(Json(FaucetResponse {
             success: false,
             tx_hash: None,
@@ -470,6 +501,8 @@ async fn request_tokens(
         Ok(v) => v,
         Err(e) => {
             error!("Failed to sign faucet transaction: {}", e);
+            // SECREM-01 FAUCET-1: failed before send — return the slot.
+            state.cooldowns.release(&recipient_hex, &client_ip);
             return Ok(Json(FaucetResponse {
                 success: false,
                 tx_hash: None,
@@ -532,6 +565,8 @@ async fn request_tokens(
                 }))
             } else if let Some(error) = json.get("error") {
                 error!("RPC error: {:?}", error);
+                // SECREM-01 FAUCET-1: drip failed — return the slot.
+                state.cooldowns.release(&recipient_hex, &client_ip);
                 Ok(Json(FaucetResponse {
                     success: false,
                     tx_hash: None,
@@ -539,6 +574,10 @@ async fn request_tokens(
                     amount: "0".to_string(),
                 }))
             } else {
+                // SECREM-01 FAUCET-1: ambiguous RPC response — the tx may
+                // or may not have landed. Keep the reservation (do NOT
+                // release): the cost of a false hold is one cooldown
+                // window; the cost of a false release is a double drip.
                 Ok(Json(FaucetResponse {
                     success: false,
                     tx_hash: None,
@@ -549,6 +588,9 @@ async fn request_tokens(
         }
         Err(e) => {
             error!("Failed to send transaction: {}", e);
+            // SECREM-01 FAUCET-1: connection failure — the request never
+            // reached the node; return the slot.
+            state.cooldowns.release(&recipient_hex, &client_ip);
             Ok(Json(FaucetResponse {
                 success: false,
                 tx_hash: None,
@@ -563,14 +605,24 @@ async fn request_tokens(
 /// Returns the normalized lowercase hex (without 0x) and the 20-byte address,
 /// or an error message string.
 #[allow(dead_code)]
-/// Extract the client IP. Honors the standard reverse-proxy
-/// headers (`X-Forwarded-For` first hop, then `X-Real-IP`) and
-/// falls back to the TCP socket peer when no header is present.
+/// Extract the client IP for the per-IP cooldown leg + Turnstile remoteip.
 ///
-/// RM-B1 / WP-E6.3 (audit FAU-03): IP is used by the per-IP
-/// cooldown leg of the brute-force defense AND optionally bound
-/// into the Turnstile remoteip parameter.
-fn extract_client_ip(headers: &HeaderMap, socket_addr: SocketAddr) -> String {
+/// SECREM-01 FAUCET-2 (was RM-B1 / WP-E6.3, audit FAU-03): forwarding
+/// headers (`X-Forwarded-For` first hop, then `X-Real-IP`) are honored
+/// ONLY when the TCP peer is a configured trusted proxy. Pre-fix the
+/// headers were trusted unconditionally, so any direct client could
+/// send a fresh spoofed XFF per request and launder the per-IP
+/// cooldown entirely. Mirrors the RPC layer's WP-I.1 trust boundary.
+fn extract_client_ip(
+    headers: &HeaderMap,
+    socket_addr: SocketAddr,
+    trusted_proxies: &HashSet<std::net::IpAddr>,
+) -> String {
+    if !trusted_proxies.contains(&socket_addr.ip()) {
+        // Direct connection (or untrusted hop): headers are
+        // attacker-controlled input — use the socket peer.
+        return socket_addr.ip().to_string();
+    }
     // X-Forwarded-For: client, proxy1, proxy2 — take the first hop.
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         if let Some(first) = xff.split(',').next() {
@@ -653,6 +705,45 @@ const DRIP_AMOUNT: u128 = 10_000_000_000_000_000_000;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SECREM-01 FAUCET-2 red test: pre-fix, a direct client could spoof
+    /// a fresh X-Forwarded-For per request and launder the per-IP
+    /// cooldown. Headers are now ignored unless the TCP peer is a
+    /// configured trusted proxy.
+    #[test]
+    fn test_faucet2_xff_ignored_from_untrusted_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "6.6.6.6".parse().expect("hv"));
+        let peer: SocketAddr = "203.0.113.9:55555".parse().expect("addr");
+        let trusted = HashSet::new();
+        assert_eq!(
+            extract_client_ip(&headers, peer, &trusted),
+            "203.0.113.9",
+            "FAUCET-2 regression: spoofed XFF honored from a direct client"
+        );
+    }
+
+    /// SECREM-01 FAUCET-2: behind a configured trusted proxy the first
+    /// XFF hop is honored (legitimate reverse-proxy deployment), and
+    /// X-Real-IP works as the fallback.
+    #[test]
+    fn test_faucet2_xff_honored_from_trusted_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.7, 10.0.0.1".parse().expect("hv"));
+        let peer: SocketAddr = "10.0.0.1:443".parse().expect("addr");
+        let trusted: HashSet<std::net::IpAddr> =
+            ["10.0.0.1".parse().expect("ip")].into_iter().collect();
+        assert_eq!(extract_client_ip(&headers, peer, &trusted), "198.51.100.7");
+
+        let mut xri_only = HeaderMap::new();
+        xri_only.insert("x-real-ip", "198.51.100.8".parse().expect("hv"));
+        assert_eq!(extract_client_ip(&xri_only, peer, &trusted), "198.51.100.8");
+        // Trusted proxy, no headers at all → proxy's own address.
+        assert_eq!(
+            extract_client_ip(&HeaderMap::new(), peer, &trusted),
+            "10.0.0.1"
+        );
+    }
 
     #[test]
     fn test_validate_address_valid_with_prefix() {

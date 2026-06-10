@@ -25,7 +25,8 @@ fn make_block(hash_byte: u8, height: u64, blue_score: u64, parent: Hash) -> Bloc
         .hash(Hash::new([hash_byte; 32]))
         .height(height)
         .blue_score(blue_score)
-        .blue_work(blue_score as u128)
+        // SECREM-01: admission enforces the canonical score→work relation.
+        .blue_work(citrate_consensus::types::blue_work_for_score(blue_score))
         .parent(parent)
         .timestamp(height * 1000)
         .build_unhashed()
@@ -204,7 +205,7 @@ async fn test_find_common_ancestor_deep_fork() {
     let mut fork_blocks = Vec::new();
     let mut parent = chain_a[0].hash(); // genesis
     for i in 0..4u8 {
-        let block = make_block(0xB0 + i, (i + 1) as u64, 10, parent);
+        let block = make_block(0xB0 + i, (i + 1) as u64, (i + 2) as u64, parent);
         dag_store.store_block(block.clone()).await.unwrap();
         ghostdag.add_block(&block).await.unwrap();
         fork_blocks.push(block.clone());
@@ -263,42 +264,51 @@ async fn test_extends_current_chain_via_merge_parent() {
     ));
     let cs = ChainSelector::new(dag_store.clone(), ghostdag.clone(), tip_selector, 100);
 
-    // Build a longer chain so current tip has high score
-    // Chain: genesis(0x40) -> B1(0x41) -> B2(0x42) -> B3(0x43) -> B4(0x44)
-    let chain = build_linear_chain(&dag_store, &ghostdag, 5, 0x40).await;
+    // SECREM-01 restructure: admission now enforces the selected-parent
+    // rule (no merge parent may out-score the selected parent), so the old
+    // fixture — light selected parent B1 merging the heavy tip — is exactly
+    // the manipulation the gate rejects. The merge-parent branch of
+    // extends_current_chain is instead exercised with two EQUAL-weight
+    // tips: the new block selects one and merges the other (legal: equal
+    // scores), and the merged one is the current tip.
+    //
+    // Chain A: genesis(0x40) -> A1(0x41) -> A2(0x42), tip score 3.
+    let chain = build_linear_chain(&dag_store, &ghostdag, 3, 0x40).await;
     for b in &chain {
         let _ = cs.on_new_block(b).await;
     }
     let current_tip = cs.get_chain_state().await.tip;
-    // Current tip is chain[4], ghostdag score = 5
+    assert_eq!(current_tip, chain[2].hash());
 
-    // Create a fork block from B1 (score would be 3: genesis + B1 + fork)
-    // Its merge parent is the current tip (chain[4])
-    // The merge parent doesn't add to blue score much (since those blocks are already
-    // in the anticone). Score will be <= 5 so it won't trigger reorg.
-    // But extends_current_chain checks if any parent == current_tip.
+    // Fork B from genesis with equal weight: B1(claims 2) -> B2(claims 3).
+    let b1 = make_block(0x51, 1, 2, chain[0].hash());
+    dag_store.store_block(b1.clone()).await.unwrap();
+    ghostdag.add_block(&b1).await.unwrap();
+    let b2 = make_block(0x52, 2, 3, b1.hash());
+    dag_store.store_block(b2.clone()).await.unwrap();
+    ghostdag.add_block(&b2).await.unwrap();
+    // Equal score → no reorg; current tip is still A2.
+    let _ = cs.on_new_block(&b2).await;
+    assert_eq!(cs.get_chain_state().await.tip, current_tip);
+
+    // The probe block: selected parent is B2 (NOT the current tip), merge
+    // parent IS the current tip, equal scores so the merge is admissible.
+    // Band for one merge parent: [4, 5] — claim 4.
     let merge_block = make_block_with_merge(
         0x50,
-        2,
-        1,
-        chain[1].hash(),     // selected parent is B1
-        vec![current_tip],   // merge parent is current tip
+        3,
+        4,
+        b2.hash(),           // selected parent is fork tip B2
+        vec![current_tip],   // merge parent is current tip A2
     );
     dag_store.store_block(merge_block.clone()).await.unwrap();
     ghostdag.add_block(&merge_block).await.unwrap();
 
-    // ghostdag score for merge_block includes genesis + B1 + merge_block = 3,
-    // plus any blue blocks from merge parent's blue set that are compatible.
-    // Current score is 5. If merge_block score <= 5, extends path is taken.
-    // The merge_block blue set includes current_tip's ancestry if they're compatible.
-    // Actually, the merge_block's blue set = selected_parent(B1) blue set + blue merge parents.
-    // B1's blue set = {genesis, B1} = 2. The merge parent (B4) adds its blue set if compatible.
-    // Since B4's blue set = {genesis, B1, B2, B3, B4}, and they're all ancestors of B4 which
-    // is in the anticone of merge_block... it depends on k-cluster calculation.
-    // The exact score depends on GhostDag internals. Let's just verify the behavior:
     let result = cs.on_new_block(&merge_block).await.unwrap();
-    // Either it extends (false) or reorgs (true). Either way the merge parent path is exercised.
+    // The merge-parent branch of extends_current_chain is exercised either
+    // way (extend → false, reorg → true); the block must end up as tip.
     let _ = result;
+    assert_eq!(cs.get_chain_state().await.tip, merge_block.hash());
 }
 
 // --- extend_chain with and without finality tracker ---
@@ -372,7 +382,7 @@ async fn test_attempt_reorganization_depth_exceeded() {
     let mut parent = chain_a[0].hash(); // genesis
     let mut fork_blocks = Vec::new();
     for i in 0..5u8 {
-        let block = make_block(0xD0 + i, (i + 1) as u64, 10, parent);
+        let block = make_block(0xD0 + i, (i + 1) as u64, (i + 2) as u64, parent);
         dag_store.store_block(block.clone()).await.unwrap();
         ghostdag.add_block(&block).await.unwrap();
         fork_blocks.push(block.clone());
@@ -437,7 +447,7 @@ async fn test_attempt_reorganization_finality_blocks_reorg() {
     let mut parent = chain[0].hash(); // genesis
     let mut fork_blocks = Vec::new();
     for i in 0..8u8 {
-        let block = make_block(0xE0 + i, (i + 1) as u64, 10, parent);
+        let block = make_block(0xE0 + i, (i + 1) as u64, (i + 2) as u64, parent);
         dag_store.store_block(block.clone()).await.unwrap();
         ghostdag.add_block(&block).await.unwrap();
         fork_blocks.push(block.clone());
@@ -500,7 +510,7 @@ async fn test_on_new_block_higher_score_triggers_reorg() {
     let mut parent = chain_a[0].hash();
     let mut fork_tip = parent;
     for i in 0..4u8 {
-        let block = make_block(0xC0 + i, (i + 1) as u64, 10, parent);
+        let block = make_block(0xC0 + i, (i + 1) as u64, (i + 2) as u64, parent);
         dag_store.store_block(block.clone()).await.unwrap();
         ghostdag.add_block(&block).await.unwrap();
         fork_tip = block.hash();
@@ -544,8 +554,8 @@ async fn test_on_new_block_lower_score_returns_false() {
     }
     // Tip is blocks[4], ghostdag score = 5
 
-    // Create child of genesis. Its score = 2 < 5.
-    let low = make_block(0xF1, 1, 1, blocks[0].hash());
+    // Create child of genesis. Its score = 2 < 5 (claims the in-band 2).
+    let low = make_block(0xF1, 1, 2, blocks[0].hash());
     dag_store.store_block(low.clone()).await.unwrap();
     ghostdag.add_block(&low).await.unwrap();
 
@@ -580,7 +590,7 @@ async fn test_reorg_history_populated() {
     let mut parent = chain[0].hash();
     let mut fork_tip_block = chain[0].clone();
     for i in 0..4u8 {
-        let block = make_block(0xF5 + i, (i + 1) as u64, 10, parent);
+        let block = make_block(0xF5 + i, (i + 1) as u64, (i + 2) as u64, parent);
         dag_store.store_block(block.clone()).await.unwrap();
         ghostdag.add_block(&block).await.unwrap();
         fork_tip_block = block.clone();
@@ -632,8 +642,12 @@ async fn test_select_highest_blue_score_multiple_tips() {
     ghostdag.add_block(&gen).await.unwrap();
 
     // Two children of genesis (both tips with same score)
-    let child1 = make_block(0x01, 1, 5, gen.hash());
-    let child2 = make_block(0x02, 1, 10, gen.hash());
+    // SECREM-01: header scores must be in the feasible band (genesis header
+    // score 1 → children claim exactly 2). The selection property under test
+    // (recomputed-score-driven tip choice) is unchanged — both children's
+    // ghostdag score is 2 either way.
+    let child1 = make_block(0x01, 1, 2, gen.hash());
+    let child2 = make_block(0x02, 1, 2, gen.hash());
     dag_store.store_block(child1.clone()).await.unwrap();
     dag_store.store_block(child2.clone()).await.unwrap();
     ghostdag.add_block(&child1).await.unwrap();
@@ -662,8 +676,8 @@ async fn test_select_highest_blue_score_with_tiebreak_hash_ordering() {
     ghostdag.add_block(&gen).await.unwrap();
 
     // Two children with same ghostdag score (both 2), different hashes
-    let child1 = make_block(0x10, 1, 5, gen.hash());
-    let child2 = make_block(0x20, 1, 5, gen.hash());
+    let child1 = make_block(0x10, 1, 2, gen.hash());
+    let child2 = make_block(0x20, 1, 2, gen.hash());
     dag_store.store_block(child1.clone()).await.unwrap();
     dag_store.store_block(child2.clone()).await.unwrap();
     ghostdag.add_block(&child1).await.unwrap();
@@ -710,8 +724,12 @@ async fn test_select_weighted_random_multiple_tips() {
     dag_store.store_block(gen.clone()).await.unwrap();
     ghostdag.add_block(&gen).await.unwrap();
 
-    let child1 = make_block(0x01, 1, 5, gen.hash());
-    let child2 = make_block(0x02, 1, 10, gen.hash());
+    // SECREM-01: header scores must be in the feasible band (genesis header
+    // score 1 → children claim exactly 2). The selection property under test
+    // (recomputed-score-driven tip choice) is unchanged — both children's
+    // ghostdag score is 2 either way.
+    let child1 = make_block(0x01, 1, 2, gen.hash());
+    let child2 = make_block(0x02, 1, 2, gen.hash());
     dag_store.store_block(child1.clone()).await.unwrap();
     dag_store.store_block(child2.clone()).await.unwrap();
     ghostdag.add_block(&child1).await.unwrap();
@@ -794,7 +812,7 @@ async fn test_select_parents_limits_to_max() {
     ghostdag.add_block(&gen).await.unwrap();
 
     for i in 1..=5u8 {
-        let child = make_block(i, 1, i as u64, gen.hash());
+        let child = make_block(i, 1, 2, gen.hash());
         dag_store.store_block(child.clone()).await.unwrap();
         ghostdag.add_block(&child).await.unwrap();
     }
@@ -884,7 +902,7 @@ async fn test_parent_selector_with_multiple_tips() {
     ghostdag.add_block(&gen).await.unwrap();
 
     for i in 1..=4u8 {
-        let child = make_block(i, 1, i as u64, gen.hash());
+        let child = make_block(i, 1, 2, gen.hash());
         dag_store.store_block(child.clone()).await.unwrap();
         ghostdag.add_block(&child).await.unwrap();
     }

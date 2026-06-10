@@ -691,6 +691,27 @@ impl GossipProtocol {
                 self.seen_transactions.remove(&hash);
             }
         }
+
+        // SECREM-01 NET-3: seen_learning previously had TTL-only
+        // cleanup. An attacker flooding unique (checkpoint_height,
+        // participant) pairs faster than the TTL expires them could
+        // still grow the map without bound between cleanups, so
+        // enforce the same hard max-size eviction (oldest first) as
+        // the block/tx caches.
+        if self.seen_learning.len() > self.config.max_seen_cache {
+            let mut items: Vec<_> = self
+                .seen_learning
+                .iter()
+                .map(|e| (*e.key(), *e.value()))
+                .collect();
+
+            items.sort_by_key(|&(_, time)| time);
+
+            let to_remove = items.len() - self.config.max_seen_cache;
+            for (key, _) in items.into_iter().take(to_remove) {
+                self.seen_learning.remove(&key);
+            }
+        }
     }
 
     /// Get gossip statistics.
@@ -770,5 +791,54 @@ mod tests {
 
         // Should only keep max_seen_cache items
         assert!(gossip.seen_blocks.len() <= 3);
+    }
+
+    /// SECREM-01 NET-3: seen_learning must be hard-capped at
+    /// max_seen_cache (oldest evicted first), not just TTL-pruned —
+    /// an attacker can mint unique (height, participant) pairs
+    /// faster than the TTL expires them.
+    #[tokio::test]
+    async fn test_seen_learning_max_size_eviction() {
+        let config = GossipConfig {
+            max_seen_cache: 3,
+            // Long TTL so only the max-size path can evict
+            seen_cache_ttl: Duration::from_secs(3600),
+            ..Default::default()
+        };
+
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let gossip = GossipProtocol::new(config, peer_manager);
+
+        // Add more entries than max; entry i is i seconds old, so
+        // higher i = older = evicted first.
+        for i in 0..6u8 {
+            let key = LearningDedup {
+                checkpoint_height: i as u64,
+                participant: PublicKey::new([i; 32]),
+            };
+            gossip
+                .seen_learning
+                .insert(key, Instant::now() - Duration::from_secs(i as u64));
+        }
+
+        gossip.cleanup_seen_cache().await;
+
+        assert!(
+            gossip.seen_learning.len() <= 3,
+            "seen_learning must be capped at max_seen_cache, got {}",
+            gossip.seen_learning.len()
+        );
+        // Newest entries (smallest age) survive
+        for i in 0..3u8 {
+            let key = LearningDedup {
+                checkpoint_height: i as u64,
+                participant: PublicKey::new([i; 32]),
+            };
+            assert!(
+                gossip.seen_learning.contains_key(&key),
+                "newest learning entry {} must survive eviction",
+                i
+            );
+        }
     }
 }

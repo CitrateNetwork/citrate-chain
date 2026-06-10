@@ -112,12 +112,22 @@ impl BridgeRelay {
             );
         }
         let oracle_threshold = config.oracle_threshold;
+        // SECREM-01 BRG-3: bind the attestation signing domain to this
+        // deployment — chain id from config, instance derived from the
+        // bridge contract address (BridgeConfig::attestation_domain).
+        // Attestations for any other deployment fail signature
+        // verification here.
+        let (domain_chain_id, bridge_instance) = config.attestation_domain();
         Self {
             minter: Arc::new(RwLock::new(SnapMinter::new(
                 config.bonding_curve.clone(),
             ))),
             state: Arc::new(RwLock::new(RelayState::default())),
-            oracle_registry: Arc::new(RwLock::new(OracleRegistry::new(oracle_threshold))),
+            oracle_registry: Arc::new(RwLock::new(OracleRegistry::with_domain(
+                oracle_threshold,
+                domain_chain_id,
+                bridge_instance,
+            ))),
             metrics: Arc::new(BridgeMetrics::new()),
             paused: false,
             config,
@@ -246,8 +256,55 @@ impl BridgeRelay {
         };
         self.state.write().track_event(tracked);
 
-        // Check oracle attestations
-        let oracle_met = self.oracle_registry.read().is_threshold_met(&event_id);
+        // Check oracle attestations.
+        // SECREM-01 BRG-1: the threshold is met only by attestations that
+        // bind THIS event's canonical hash (and come from active oracles)
+        // — raw signature count is not a security signal.
+        let expected_hash = match &event {
+            BridgeEvent::Deposit(d) => Some(d.canonical_hash()),
+            BridgeEvent::Withdrawal(w) => Some(w.canonical_hash()),
+            _ => None,
+        };
+        let oracle_met = match &expected_hash {
+            Some(h) => {
+                let registry = self.oracle_registry.read();
+                let bound_met = registry.is_threshold_met_for(&event_id, h);
+                if !bound_met
+                    && self.config.oracle_threshold > 0
+                    && registry.is_threshold_met(&event_id)
+                {
+                    // Enough signatures exist for this event_id, but they do
+                    // NOT bind the presented event's canonical fields — this
+                    // is the BRG-1 attack shape (tampered fields under a
+                    // valid event_id, or oracles in disagreement). Reject
+                    // explicitly rather than waiting forever.
+                    drop(registry);
+                    let err = BridgeError::AttestationFieldMismatch {
+                        event_id: hex::encode(event_id),
+                    };
+                    warn!(
+                        event_id = hex::encode(event_id),
+                        "Event rejected: threshold signatures present but they \
+                         do not bind the presented event's canonical hash"
+                    );
+                    self.state.write().update_event_status(
+                        &event_id,
+                        EventStatus::Rejected,
+                        Some(err.to_string()),
+                    );
+                    return ProcessingResult {
+                        event_id,
+                        status: EventStatus::Rejected,
+                        salt_amount: None,
+                        error: Some(err.to_string()),
+                    };
+                }
+                bound_met
+            }
+            // Non-value-moving events (oracle set updates) keep the
+            // count-based liveness check.
+            None => self.oracle_registry.read().is_threshold_met(&event_id),
+        };
         if !oracle_met {
             // In testing / 0-threshold mode, auto-proceed
             if self.config.oracle_threshold == 0 {
@@ -298,23 +355,26 @@ impl BridgeRelay {
     async fn process_deposit(&self, deposit: DepositEvent) -> ProcessingResult {
         let event_id = deposit.event_id;
 
-        // RM-A WP-CHAIN-001 (CRITICAL): bind the threshold attestation to the
-        // deposit's mint-critical fields. Oracles sign
-        // `event_hash = deposit.canonical_hash()`; an attacker presenting a
-        // different amount/recipient/depositor (or source coordinate) under the
-        // same `event_id` produces a different canonical hash and is rejected
-        // here, before any mint. Zero-threshold mode (test/dev only) has no
-        // attestations to bind against and is unaffected; production runs with
-        // `oracle_threshold >= 1`. Attestation-hash consistency across oracles
-        // is already enforced in `submit_attestation`/`is_threshold_met`.
+        // RM-A WP-CHAIN-001 (CRITICAL) + SECREM-01 BRG-1: bind the threshold
+        // attestation to the deposit's mint-critical fields. Oracles sign
+        // `event_hash = deposit.canonical_hash()`. Pre-SECREM this gate
+        // checked only the FIRST stored attestation against the canonical
+        // hash while the threshold was a raw count — so M-of-N degraded to
+        // 1-of-N for the integrity-critical fields (a malicious oracle
+        // landing first bound an attacker-chosen hash, and any second
+        // attestation over a *different* hash still satisfied the count).
+        // Now the mint requires ≥ threshold attestations from ACTIVE
+        // oracles each binding the recomputed canonical hash EXACTLY
+        // (`is_threshold_met_for`); disagreeing attestations are flagged
+        // and never counted. Zero-threshold mode (test/dev only) has no
+        // attestations to bind against and is unaffected.
         if self.config.oracle_threshold > 0 {
             let expected = deposit.canonical_hash();
-            let attested = self
+            if !self
                 .oracle_registry
                 .read()
-                .get_attestations(&event_id)
-                .and_then(|atts| atts.first().map(|a| a.event_hash));
-            if !matches!(attested, Some(h) if h == expected) {
+                .is_threshold_met_for(&event_id, &expected)
+            {
                 let err = BridgeError::AttestationFieldMismatch {
                     event_id: hex::encode(event_id),
                 };
@@ -390,6 +450,39 @@ impl BridgeRelay {
     /// Process a withdrawal event.
     async fn process_withdrawal(&self, withdrawal: WithdrawalEvent) -> ProcessingResult {
         let event_id = withdrawal.event_id;
+
+        // SECREM-01 BRG-2: bind release-critical fields to attestations —
+        // the withdrawal mirror of the deposit gate above. Pre-fix this
+        // path bound NOTHING (mitigated only because the ETH-release leg
+        // is stubbed); the gate must exist BEFORE that leg un-stubs.
+        if self.config.oracle_threshold > 0 {
+            let expected = withdrawal.canonical_hash();
+            if !self
+                .oracle_registry
+                .read()
+                .is_threshold_met_for(&event_id, &expected)
+            {
+                let err = BridgeError::AttestationFieldMismatch {
+                    event_id: hex::encode(event_id),
+                };
+                warn!(
+                    event_id = hex::encode(event_id),
+                    "Withdrawal rejected: attestations do not bind withdrawal fields"
+                );
+                self.state.write().update_event_status(
+                    &event_id,
+                    EventStatus::Rejected,
+                    Some(err.to_string()),
+                );
+                return ProcessingResult {
+                    event_id,
+                    status: EventStatus::Rejected,
+                    salt_amount: None,
+                    error: Some(err.to_string()),
+                };
+            }
+        }
+
         info!(
             event_id = hex::encode(event_id),
             salt = withdrawal.salt_amount,
@@ -652,12 +745,10 @@ mod tests {
                 .unwrap()
                 .as_secs();
 
-            // Sign attestation 1
-            let mut msg1 = Vec::with_capacity(89);
-            msg1.extend_from_slice(b"citrate-bridge-v1");
-            msg1.extend_from_slice(&event_id);
-            msg1.extend_from_slice(&event_hash);
-            msg1.extend_from_slice(&now.to_le_bytes());
+            // Sign attestation 1 (v2 message, bound to the relay's domain)
+            let (cid, inst) = reg.domain();
+            let msg1 =
+                crate::oracle::attestation_message(cid, &inst, &event_id, &event_hash, now);
             let sig1 = sk1.sign(&msg1);
 
             reg.submit_attestation(OracleAttestation {
@@ -671,11 +762,8 @@ mod tests {
 
             // Sign attestation 2
             let now2 = now + 1;
-            let mut msg2 = Vec::with_capacity(89);
-            msg2.extend_from_slice(b"citrate-bridge-v1");
-            msg2.extend_from_slice(&event_id);
-            msg2.extend_from_slice(&event_hash);
-            msg2.extend_from_slice(&now2.to_le_bytes());
+            let msg2 =
+                crate::oracle::attestation_message(cid, &inst, &event_id, &event_hash, now2);
             let sig2 = sk2.sign(&msg2);
 
             reg.submit_attestation(OracleAttestation {
@@ -718,13 +806,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_secs();
+        let (cid, inst) = relay.oracle_registry().read().domain();
         for (i, (sk, oid)) in keys.iter().enumerate() {
             let ts = base + i as u64;
-            let mut msg = Vec::with_capacity(89);
-            msg.extend_from_slice(b"citrate-bridge-v1");
-            msg.extend_from_slice(event_id);
-            msg.extend_from_slice(&bound_hash);
-            msg.extend_from_slice(&ts.to_le_bytes());
+            let msg =
+                crate::oracle::attestation_message(cid, &inst, event_id, &bound_hash, ts);
             let sig = sk.sign(&msg);
             relay
                 .oracle_registry()

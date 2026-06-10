@@ -1262,9 +1262,11 @@ impl BlockProducer {
         _blue_set: &citrate_consensus::types::BlueSet,
         blue_score: u64,
     ) -> anyhow::Result<u128> {
-        // Simplified calculation: blue_work = blue_score * difficulty
-        // In production, this would consider actual proof-of-work
-        Ok(blue_score as u128 * 1_000_000)
+        // SECREM-01 CONS-2/3: delegate to the canonical score→work function
+        // in citrate-consensus. Admission validation rejects any header
+        // whose blue_work deviates from it, so the producer MUST use the
+        // same source of truth or fork itself off.
+        Ok(citrate_consensus::types::blue_work_for_score(blue_score))
     }
 
     /// Apply basic rewards (fallback when economics system is not available)

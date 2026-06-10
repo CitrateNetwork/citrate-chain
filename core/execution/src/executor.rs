@@ -2373,6 +2373,16 @@ impl Executor {
             .get_model(&model_id)
             .ok_or(ExecutionError::ModelNotFound(model_id))?;
 
+        // SECREM-01 INFER-1 (defense in depth): the zero address is the
+        // ANONYMOUS caller — the RPC layer maps every unsigned request to
+        // it (inference_auth.rs). Anonymous callers reach Public models
+        // only, even if a model's owner or allow-list somehow contains
+        // the zero address. The signature check lives at the RPC boundary;
+        // this guard makes the executor safe even for callers that skip it.
+        if from == Address([0u8; 20]) && !matches!(model.access_policy, AccessPolicy::Public) {
+            return Err(ExecutionError::AccessDenied);
+        }
+
         match &model.access_policy {
             AccessPolicy::Public => {}
             AccessPolicy::Private if model.owner == from => {}

@@ -9,6 +9,9 @@ hkdf = "0.12"
 sha2 = "0.10"
 serde = { workspace = true }
 thiserror = { workspace = true }
+# SECREM-01 CRY-1: derived child key material must be wiped on drop.
+# (Not in [workspace.dependencies] as of this sprint — pinned here.)
+zeroize = "1.8"
 
 [dev-dependencies]
 hex = "0.4"
