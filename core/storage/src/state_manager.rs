@@ -70,7 +70,7 @@ impl StateManager {
 
         // Sort accounts by address for deterministic ordering
         let mut sorted_accounts: Vec<_> = accounts.into_iter().collect();
-        sorted_accounts.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        sorted_accounts.sort_by_key(|a| a.0 .0);
 
         // Hash each account's state
         for (address, account) in sorted_accounts {

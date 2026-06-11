@@ -296,7 +296,7 @@ impl PerformanceTracker {
             .get(model_id)
             .map(|entry| {
                 let mut results = entry.clone();
-                results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                results.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
                 results.truncate(limit);
                 results
             })
