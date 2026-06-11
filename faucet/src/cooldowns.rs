@@ -89,7 +89,10 @@ impl Cooldowns {
     /// drip path must use [`Self::try_reserve`] instead; check-then-
     /// send-then-record leaves an RPC round-trip between the check
     /// and the record, during which N concurrent requests for the
-    /// same address all pass.
+    /// same address all pass. Retained as a read-only probe (used by
+    /// tests); `#[allow(dead_code)]` because the bin's production path
+    /// now goes through `try_reserve`.
+    #[allow(dead_code)]
     pub fn check(&self, address: &str, ip: &str) -> Result<(), CooldownDenial> {
         let state = self.state.read().expect("cooldown lock poisoned");
         check_in_state(&state, &self.policy, address, ip, unix_seconds())
@@ -234,6 +237,27 @@ fn persist_to_disk(path: &PathBuf, state: &CooldownState) -> std::io::Result<()>
     Ok(())
 }
 
+// Manual `Debug` impl for `CooldownDenial` — derived would suffice
+// but spelling it out makes panic messages stable.
+impl std::fmt::Display for CooldownDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddressCooldown { remaining_secs } => write!(
+                f,
+                "address cooldown: {}h {}m remaining",
+                remaining_secs / 3600,
+                (remaining_secs % 3600) / 60
+            ),
+            Self::IpCooldown { remaining_secs } => write!(
+                f,
+                "ip cooldown: {}h {}m remaining",
+                remaining_secs / 3600,
+                (remaining_secs % 3600) / 60
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,26 +400,5 @@ mod tests {
         });
         cd.record_success("0xabc", "1.2.3.4");
         cd.check("0xabc", "1.2.3.4").expect("zero policy = no cooldown");
-    }
-}
-
-// Manual `Debug` impl for `CooldownDenial` — derived would suffice
-// but spelling it out makes panic messages stable.
-impl std::fmt::Display for CooldownDenial {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AddressCooldown { remaining_secs } => write!(
-                f,
-                "address cooldown: {}h {}m remaining",
-                remaining_secs / 3600,
-                (remaining_secs % 3600) / 60
-            ),
-            Self::IpCooldown { remaining_secs } => write!(
-                f,
-                "ip cooldown: {}h {}m remaining",
-                remaining_secs / 3600,
-                (remaining_secs % 3600) / 60
-            ),
-        }
     }
 }

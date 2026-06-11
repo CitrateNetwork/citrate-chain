@@ -356,6 +356,9 @@ async fn handle_connection(
     // it against `config.allowed_origins`. Empty allowlist = allow
     // all (devnet / testnet).
     let allowed_origins = config.allowed_origins.clone();
+    // The tungstenite callback signature fixes the (large) ErrorResponse
+    // type; boxing it would break the API. (clippy::result_large_err)
+    #[allow(clippy::result_large_err)]
     let origin_callback = move |req: &Request, response: Response|
         -> Result<Response, ErrorResponse>
     {

@@ -125,8 +125,8 @@ fn l03_ecvrf_round_trip_does_not_panic() {
     assert_eq!(beta, beta_check);
 }
 
-/// L-02.1: every byte in the PUSH range round-trips through the
-/// opcode decoder (no UB from a removed enum variant). Pre-fix
+// L-02.1: every byte in the PUSH range round-trips through the
+// opcode decoder (no UB from a removed enum variant). Pre-fix
 // l02_push_range_round_trips_safely was removed in RM-M2 WP-M2.11
 // (2026-04-27) along with `core/execution/src/vm/evm_opcodes.rs`.
 // The simple Citrate EVM the test exercised is no longer in the

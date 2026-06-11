@@ -708,6 +708,9 @@ mod tests {
         for leaf_idx in 0..leaf_hashes.len() {
             let mut path = Vec::with_capacity(depth);
             let mut idx = leaf_idx;
+            // `level` indexes `levels` while `idx` walks independently; the
+            // range loop is the clearest form here.
+            #[allow(clippy::needless_range_loop)]
             for level in 0..depth {
                 let sibling_idx = idx ^ 1;
                 path.push(levels[level][sibling_idx]);

@@ -84,6 +84,10 @@ impl DocusignProvider {
         Self { config, http }
     }
 
+    // Retained so the DocuSign Bearer header is built in one place once the
+    // envelope-send calls are wired. #[allow] for the restored clippy
+    // -D warnings gate (SECREM-01 Phase 0).
+    #[allow(dead_code)]
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.config.access_token)
     }
