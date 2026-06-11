@@ -2,7 +2,7 @@
 name = "node-app"
 version = "0.4.0"
 edition = "2021"
-
+license.workspace = true
 [features]
 # REM-N-03 / WP-H1.2: gate the `--allow-nondeterministic-inference`
 # CLI flag behind `dev-mode`. Production / release builds without this

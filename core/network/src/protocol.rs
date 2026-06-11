@@ -419,12 +419,34 @@ impl NetworkMessage {
     /// peer-asserted trust (`sanitize_inbound`). EVERY inbound decode path
     /// MUST use this rather than `bincode::deserialize` directly, so a new
     /// ingress can never reintroduce the C-01 network-variant bypass.
+    ///
+    /// SECREM-01 CONS-9: decode with a hard byte limit equal to the
+    /// transport frame cap (1 MiB). Plain `bincode::deserialize` honors
+    /// length prefixes inside the payload *before* the whole message is
+    /// bounded — a 20-byte frame declaring a 4 GB `Vec` would pre-allocate
+    /// from the declared length and OOM. `with_limit` makes bincode refuse
+    /// to allocate past the cap during decode, so a small hostile frame
+    /// can't trigger a giant allocation.
     pub fn decode_inbound(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        let mut msg: Self = bincode::deserialize(bytes)?;
+        use bincode::Options;
+        // Match the default bincode wire format (fixint, little-endian,
+        // no trailing-bytes tolerance) so this is a drop-in for the
+        // existing `bincode::serialize`/`deserialize` pair — only a byte
+        // limit is added.
+        let mut msg: Self = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_little_endian()
+            .reject_trailing_bytes()
+            .with_limit(MAX_INBOUND_MESSAGE_BYTES)
+            .deserialize(bytes)?;
         msg.sanitize_inbound();
         Ok(msg)
     }
 }
+
+/// SECREM-01 CONS-9: hard cap on inbound message size during bincode
+/// decode — equal to the transport's `MAX_FRAME_LEN` (1 MiB).
+pub const MAX_INBOUND_MESSAGE_BYTES: u64 = 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -473,6 +495,32 @@ mod tests {
             ),
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// SECREM-01 CONS-9: a small hostile frame that declares a giant
+    /// length must be rejected at decode without attempting the giant
+    /// allocation. We forge a `Headers` message whose Vec length prefix
+    /// claims ~4 billion elements while the frame is only a few bytes.
+    /// Plain `bincode::deserialize` would try to reserve that capacity;
+    /// the limited decoder refuses.
+    #[test]
+    fn decode_inbound_rejects_oversized_length_prefix() {
+        // Re-serialize a real empty Headers message, then overwrite its
+        // 8-byte little-endian Vec length prefix with a huge value.
+        let mut wire = bincode::serialize(&NetworkMessage::Headers { headers: vec![] })
+            .expect("serialize");
+        // The variant discriminant (u32) precedes the Vec length (u64).
+        // Find the length field: it's the 8 bytes right after the 4-byte
+        // discriminant for this single-field variant.
+        assert!(wire.len() >= 12);
+        let huge: u64 = 4_000_000_000;
+        wire[4..12].copy_from_slice(&huge.to_le_bytes());
+
+        let result = NetworkMessage::decode_inbound(&wire);
+        assert!(
+            result.is_err(),
+            "CONS-9 regression: oversized length prefix was not rejected"
+        );
     }
 
     #[test]

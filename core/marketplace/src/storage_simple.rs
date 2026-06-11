@@ -195,7 +195,7 @@ impl MarketplaceStorage {
         stats.total_reviews = self.reviews.len() as u64;
 
         let mut top_models: Vec<(ModelId, u64)> = model_interaction_counts.into_iter().collect();
-        top_models.sort_by(|a, b| b.1.cmp(&a.1));
+        top_models.sort_by_key(|m| std::cmp::Reverse(m.1));
         stats.top_models = top_models.into_iter().take(10).map(|(id, _)| id).collect();
 
         // Calculate category distribution

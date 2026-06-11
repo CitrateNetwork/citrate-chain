@@ -84,27 +84,47 @@ impl Cooldowns {
 
     /// Check whether a drip is allowed for `(address, ip)` right
     /// now. Returns `Ok(())` or the specific cooldown denial.
+    ///
+    /// SECREM-01 FAUCET-1: read-only — does NOT claim the slot. The
+    /// drip path must use [`Self::try_reserve`] instead; check-then-
+    /// send-then-record leaves an RPC round-trip between the check
+    /// and the record, during which N concurrent requests for the
+    /// same address all pass. Retained as a read-only probe (used by
+    /// tests); `#[allow(dead_code)]` because the bin's production path
+    /// now goes through `try_reserve`.
+    #[allow(dead_code)]
     pub fn check(&self, address: &str, ip: &str) -> Result<(), CooldownDenial> {
-        let now = unix_seconds();
         let state = self.state.read().expect("cooldown lock poisoned");
+        check_in_state(&state, &self.policy, address, ip, unix_seconds())
+    }
 
-        if let Some(&last) = state.address_last.get(&address_key(address)) {
-            let elapsed = now.saturating_sub(last);
-            if elapsed < self.policy.address_cooldown_secs {
-                return Err(CooldownDenial::AddressCooldown {
-                    remaining_secs: self.policy.address_cooldown_secs - elapsed,
-                });
-            }
-        }
-        if let Some(&last) = state.ip_last.get(ip) {
-            let elapsed = now.saturating_sub(last);
-            if elapsed < self.policy.ip_cooldown_secs {
-                return Err(CooldownDenial::IpCooldown {
-                    remaining_secs: self.policy.ip_cooldown_secs - elapsed,
-                });
-            }
-        }
+    /// SECREM-01 FAUCET-1: atomically check AND claim the cooldown
+    /// slot under one write lock — concurrent requests for the same
+    /// address/IP see the reservation immediately, so exactly one
+    /// in-flight drip can hold it. On send failure the caller MUST
+    /// call [`Self::release`] to return the slot; on success,
+    /// [`Self::record_success`] re-stamps and persists it.
+    ///
+    /// The reservation is in-memory only (not persisted): a crash
+    /// between reserve and outcome forgets the reservation, which
+    /// matches the pre-fix exposure and only risks one extra drip.
+    pub fn try_reserve(&self, address: &str, ip: &str) -> Result<(), CooldownDenial> {
+        let now = unix_seconds();
+        let mut state = self.state.write().expect("cooldown lock poisoned");
+        check_in_state(&state, &self.policy, address, ip, now)?;
+        state.address_last.insert(address_key(address), now);
+        state.ip_last.insert(ip.to_string(), now);
         Ok(())
+    }
+
+    /// SECREM-01 FAUCET-1: return a reserved slot after a failed
+    /// send so the user can retry. Removes the in-memory entries for
+    /// this (address, ip); safe because while the reservation is
+    /// held no other request can have claimed the same keys.
+    pub fn release(&self, address: &str, ip: &str) {
+        let mut state = self.state.write().expect("cooldown lock poisoned");
+        state.address_last.remove(&address_key(address));
+        state.ip_last.remove(ip);
     }
 
     /// Record a successful drip and persist. Caller must have
@@ -131,6 +151,34 @@ impl Cooldowns {
         &self.policy
     }
 
+}
+
+/// Shared cooldown evaluation used by both the read-only `check` and
+/// the atomic `try_reserve` (single source of truth for the policy).
+fn check_in_state(
+    state: &CooldownState,
+    policy: &CooldownPolicy,
+    address: &str,
+    ip: &str,
+    now: u64,
+) -> Result<(), CooldownDenial> {
+    if let Some(&last) = state.address_last.get(&address_key(address)) {
+        let elapsed = now.saturating_sub(last);
+        if elapsed < policy.address_cooldown_secs {
+            return Err(CooldownDenial::AddressCooldown {
+                remaining_secs: policy.address_cooldown_secs - elapsed,
+            });
+        }
+    }
+    if let Some(&last) = state.ip_last.get(ip) {
+        let elapsed = now.saturating_sub(last);
+        if elapsed < policy.ip_cooldown_secs {
+            return Err(CooldownDenial::IpCooldown {
+                remaining_secs: policy.ip_cooldown_secs - elapsed,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn address_key(addr: &str) -> String {
@@ -187,6 +235,27 @@ fn persist_to_disk(path: &PathBuf, state: &CooldownState) -> std::io::Result<()>
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+// Manual `Debug` impl for `CooldownDenial` — derived would suffice
+// but spelling it out makes panic messages stable.
+impl std::fmt::Display for CooldownDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddressCooldown { remaining_secs } => write!(
+                f,
+                "address cooldown: {}h {}m remaining",
+                remaining_secs / 3600,
+                (remaining_secs % 3600) / 60
+            ),
+            Self::IpCooldown { remaining_secs } => write!(
+                f,
+                "ip cooldown: {}h {}m remaining",
+                remaining_secs / 3600,
+                (remaining_secs % 3600) / 60
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -282,6 +351,45 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
+    /// SECREM-01 FAUCET-1 red test: pre-fix, N concurrent requests for
+    /// one address all passed `check` before any `record_success` (the
+    /// RPC round-trip sat between them). With `try_reserve`, exactly
+    /// one of N concurrent reservations can win.
+    #[test]
+    fn test_faucet1_concurrent_reservations_only_one_wins() {
+        use std::sync::Arc;
+        let cd = Arc::new(Cooldowns::in_memory(CooldownPolicy::default()));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let cd = cd.clone();
+            handles.push(std::thread::spawn(move || {
+                cd.try_reserve("0xabc", "1.2.3.4").is_ok()
+            }));
+        }
+        let wins = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            wins, 1,
+            "FAUCET-1 regression: {wins} concurrent requests passed the cooldown gate"
+        );
+    }
+
+    /// SECREM-01 FAUCET-1: a failed send releases the slot so the user
+    /// can retry; a successful send keeps it claimed.
+    #[test]
+    fn test_faucet1_release_returns_slot_success_keeps_it() {
+        let cd = Cooldowns::in_memory(CooldownPolicy::default());
+        cd.try_reserve("0xabc", "1.2.3.4").expect("first reserve");
+        cd.check("0xabc", "1.2.3.4").expect_err("slot held while reserved");
+        cd.release("0xabc", "1.2.3.4");
+        cd.try_reserve("0xabc", "1.2.3.4").expect("reserve again after release");
+        cd.record_success("0xabc", "1.2.3.4");
+        cd.check("0xabc", "5.6.7.8").expect_err("claimed after success");
+    }
+
     /// Tight policy: zero cooldown means every request passes.
     /// Tests that the policy is honored, not hard-coded.
     #[test]
@@ -292,26 +400,5 @@ mod tests {
         });
         cd.record_success("0xabc", "1.2.3.4");
         cd.check("0xabc", "1.2.3.4").expect("zero policy = no cooldown");
-    }
-}
-
-// Manual `Debug` impl for `CooldownDenial` — derived would suffice
-// but spelling it out makes panic messages stable.
-impl std::fmt::Display for CooldownDenial {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AddressCooldown { remaining_secs } => write!(
-                f,
-                "address cooldown: {}h {}m remaining",
-                remaining_secs / 3600,
-                (remaining_secs % 3600) / 60
-            ),
-            Self::IpCooldown { remaining_secs } => write!(
-                f,
-                "ip cooldown: {}h {}m remaining",
-                remaining_secs / 3600,
-                (remaining_secs % 3600) / 60
-            ),
-        }
     }
 }

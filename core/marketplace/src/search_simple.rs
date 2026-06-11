@@ -402,18 +402,18 @@ impl SearchEngine {
                 results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
             }
             SortOrder::Price => {
-                results.sort_by(|a, b| a.model.base_price.cmp(&b.model.base_price));
+                results.sort_by_key(|a| a.model.base_price);
             }
             SortOrder::Rating => {
                 // For now, sort by model ID as a proxy
-                results.sort_by(|a, b| a.model.model_id.cmp(&b.model.model_id));
+                results.sort_by_key(|a| a.model.model_id);
             }
             SortOrder::Recent => {
-                results.sort_by(|a, b| b.model.created_at.cmp(&a.model.created_at));
+                results.sort_by_key(|r| std::cmp::Reverse(r.model.created_at));
             }
             SortOrder::Downloads => {
                 // For now, sort by model ID as a proxy
-                results.sort_by(|a, b| a.model.model_id.cmp(&b.model.model_id));
+                results.sort_by_key(|a| a.model.model_id);
             }
         }
     }

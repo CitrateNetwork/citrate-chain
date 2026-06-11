@@ -590,7 +590,6 @@ pub fn execute_contract_call(
 /// optional WriteSet capture (Sprint P950-A-4, WP-A.4.1), and optional
 /// journal for buffered storage writes (Sprint P950-A-5, WP-A.5.1).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn execute_contract_call_with_context(
     state_db: Arc<StateDB>,
     caller: Address,

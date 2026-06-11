@@ -27,12 +27,15 @@ fn create_signed_attestation(
         .expect("system clock")
         .as_secs();
 
-    // Domain-separated message: "citrate-bridge-v1" || event_id || event_hash || timestamp
-    let mut message = Vec::with_capacity(89);
-    message.extend_from_slice(b"citrate-bridge-v1");
-    message.extend_from_slice(&event_id);
-    message.extend_from_slice(&event_hash);
-    message.extend_from_slice(&timestamp.to_le_bytes());
+    // SECREM-01 BRG-3: v2 domain-separated message via the shared
+    // constructor. These tests use `OracleRegistry::new` (zero domain).
+    let message = citrate_bridge::oracle::attestation_message(
+        0,
+        &[0u8; 32],
+        &event_id,
+        &event_hash,
+        timestamp,
+    );
 
     let signature = signing_key.sign(&message);
 

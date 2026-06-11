@@ -12,7 +12,6 @@ use dashmap::DashMap;
 use jsonrpc_http_server::hyper::{self, Body};
 use jsonrpc_http_server::{RequestMiddleware, RequestMiddlewareAction};
 use once_cell::sync::Lazy;
-use std::cell::Cell;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -119,42 +118,29 @@ pub fn default_method_cost(method: &str) -> u32 {
     }
 }
 
-// WP-I.2: Thread-local operator authentication state.
-// The middleware sets this before the JSON-RPC method handler runs.
-// Method handlers check `is_operator_authenticated()` to gate privileged ops.
+// SECREM-01 API-1 (closes audit M-API-03): the `OPERATOR_AUTH`
+// thread-local is GONE. Request-scoped authorization must never ride a
+// thread-local across an async boundary — on a multi-threaded tokio
+// runtime the handler can resume on a different worker than the one
+// that ran `on_request`, so the flag reflected whichever request last
+// touched that thread; a concurrent unauthenticated
+// `citrate_emergencyPause` could observe a stale `true` and halt block
+// production. Privileged methods now authenticate INSIDE the handler
+// via `crate::server::require_operator_auth` (CITRATE_OPERATOR_TOKEN +
+// `operator_token` request param) — fail-closed when unconfigured,
+// thread-safe by construction. The Semgrep rule
+// `m-api-03-thread-local-rate.yaml` keeps firing CI on any new
+// `thread_local!` introductions in this module.
 //
-// RM-B1 / WP-C2.2 (audit M-API-03): the thread-local approach is
-// load-bearing on the assumption that `jsonrpc-http-server`'s
-// middleware + `add_sync_method` handler run on the same OS thread
-// for a given request. Under v18.0's hyper-based executor with
-// `.threads(threads)` worker-pool config, this assumption holds in
-// practice — the middleware uses `block_on` to dispatch synchronously
-// before the handler runs on the same worker.
-//
-// **Full audit closure** requires migrating to `MetaIoHandler<RpcContext>`
-// + per-request `Metadata`. That refactor is invasive (~50 handler
-// signatures touched) and is deferred to **RM-G2 cleanup pass**.
-// In the interim, the canonical recommendation is: production
-// deployments behind a single-threaded RPC executor (`threads(1)`)
-// fully eliminate the failure mode. The Semgrep rule
-// `m-api-03-thread-local-rate.yaml` fires CI on any new
-// `thread_local!` introductions in this module to bound the
-// risk while the full fix lands.
+// CLIENT_KEY remains: it carries rate-limit budget attribution (not
+// authorization). It shares the same cross-thread caveat — worst case
+// is budget misattribution between concurrent requests, not an authz
+// bypass. Migrating it to `MetaIoHandler` metadata stays tracked under
+// the RM-G2 cleanup pass.
 thread_local! {
-    static OPERATOR_AUTH: Cell<bool> = const { Cell::new(false) };
     // WP-I.4: Thread-local client key for method-level budget enforcement.
     // Set by the middleware before method dispatch.
     static CLIENT_KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-}
-
-/// Check if the current request is operator-authenticated.
-/// Privileged RPC methods (emergency pause/resume, debug_*, admin_*)
-/// must call this and reject with -32600 if false.
-///
-/// WP-I.2: This is set by the RateLimiter middleware from the
-/// Authorization header before the method handler executes.
-pub fn is_operator_authenticated() -> bool {
-    OPERATOR_AUTH.with(|a| a.get())
 }
 
 /// Get the current request's client key (for method-level budget tracking).
@@ -184,14 +170,12 @@ pub struct RateLimitConfig {
     ///
     /// WP-I.4: Default costs are applied if this map is empty.
     pub method_costs: Vec<(String, u32)>,
-    /// Operator bearer token for privileged RPC methods.
-    /// When set, methods like citrate_emergencyPause, citrate_emergencyResume,
-    /// debug_*, and admin_* require an `Authorization: Bearer <token>` header.
-    /// When None (default), privileged methods are unrestricted (suitable for
-    /// single-operator devnets only).
-    ///
-    /// WP-I.2: Secure default is None — operators must explicitly set a token
-    /// for production deployments.
+    /// DEPRECATED (SECREM-01 API-1): no longer consumed. Operator auth is
+    /// `crate::server::require_operator_auth` — the CITRATE_OPERATOR_TOKEN
+    /// environment variable checked against the `operator_token` request
+    /// param inside each privileged handler, fail-closed when unset. The
+    /// field is retained so existing config plumbing keeps deserializing;
+    /// setting it logs a startup warning pointing at the env var.
     pub operator_token: Option<String>,
     /// API key for gating all JSON-RPC requests (Sprint 03 — closed beta).
     /// When set, every request must present this key via:
@@ -201,9 +185,12 @@ pub struct RateLimitConfig {
     ///     `/health` and `/ready` endpoints are exempt.
     ///     When None (default), all requests are allowed (open mode / devnet).
     pub api_key: Option<String>,
-    /// WP-K.4: Whether the RPC server is bound to a public (non-loopback) interface.
-    /// When true and no operator_token is set, operator methods are DENIED
-    /// (fail-closed) rather than allowed to everyone.
+    /// WP-K.4: Whether the RPC server is bound to a public (non-loopback)
+    /// interface. SECREM-01 API-1/API-2 note: this flag no longer gates
+    /// operator auth (which is unconditionally fail-closed via
+    /// `require_operator_auth` regardless of bind) — it remains for
+    /// deployment diagnostics (the node binary warns when publicly bound
+    /// without an operator token configured).
     pub is_public_bind: bool,
 }
 
@@ -237,10 +224,7 @@ pub struct RateLimiter {
     config: RateLimitConfig,
     buckets: Arc<DashMap<String, BucketEntry>>,
     trusted_set: HashSet<IpAddr>,
-    operator_token: Option<String>,
     api_key: Option<String>,
-    /// WP-K.4: Whether RPC is bound to a public interface
-    is_public_bind: bool,
     /// WP-K.3: Last time stale buckets were evicted
     last_eviction: Arc<std::sync::Mutex<Instant>>,
 }
@@ -248,16 +232,24 @@ pub struct RateLimiter {
 impl RateLimiter {
     pub fn new(config: RateLimitConfig) -> Self {
         let trusted_set: HashSet<IpAddr> = config.trusted_proxies.iter().cloned().collect();
-        let operator_token = config.operator_token.clone();
         let api_key = config.api_key.clone();
-        let is_public_bind = config.is_public_bind;
+        // SECREM-01 API-1: `operator_token`/`is_public_bind` are no longer
+        // consumed here — operator auth moved into the handlers
+        // (require_operator_auth, env-token). Warn loudly if a deployment
+        // still sets the config token so the operator knows where auth
+        // actually lives now.
+        if config.operator_token.is_some() {
+            warn!(
+                "RateLimitConfig.operator_token is no longer used for RPC \
+                 operator auth (SECREM-01 API-1). Set CITRATE_OPERATOR_TOKEN \
+                 and pass `operator_token` in request params instead."
+            );
+        }
         Self {
             config,
             buckets: Arc::new(DashMap::new()),
             trusted_set,
-            operator_token,
             api_key,
-            is_public_bind,
             last_eviction: Arc::new(std::sync::Mutex::new(Instant::now())),
         }
     }
@@ -342,24 +334,11 @@ impl RequestMiddleware for RateLimiter {
             }
         }
 
-        // WP-I.2 + WP-K.4: Set operator authentication state for this request.
-        // Method handlers check is_operator_authenticated() for privileged ops.
-        let authenticated = match &self.operator_token {
-            Some(expected) => {
-                request.headers().get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("Bearer "))
-                    .map(|token| token == expected.as_str())
-                    .unwrap_or(false)
-            }
-            None => {
-                // WP-K.4: Fail-closed — if no token configured on a public interface,
-                // deny operator access rather than granting it to everyone.
-                // Localhost-only: allow for devnet convenience.
-                !self.is_public_bind
-            }
-        };
-        OPERATOR_AUTH.with(|a| a.set(authenticated));
+        // SECREM-01 API-1: operator authentication no longer happens in
+        // middleware (the thread-local it fed was unsound across async
+        // boundaries, and its no-token-on-localhost branch was fail-OPEN
+        // for default-constructed configs — API-2). Privileged handlers
+        // call `crate::server::require_operator_auth` themselves.
 
         // WP-I.1: Extract client identity with trust-boundary enforcement.
         // Forwarding headers are ONLY trusted from configured proxies.
@@ -817,40 +796,56 @@ mod tests {
             "Bucket count should be capped at MAX_BUCKETS after eviction");
     }
 
+    // SECREM-01 API-1/API-2: the K-4 trio below replaced tests of the
+    // removed middleware thread-local. The old "localhost + no token →
+    // operator allowed" devnet convenience was finding API-2's fail-open
+    // mode for default-constructed configs; the new model is
+    // unconditionally fail-closed and lives in
+    // `crate::server::require_operator_auth`. Env mutation serializes on
+    // K4_ENV_LOCK (lib tests run in one process).
+    static K4_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn test_k4_public_bind_no_token_denies_operator() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            operator_token: None,
-            is_public_bind: true, // Public interface
-            ..Default::default()
-        });
-        // No token configured on public interface → operator methods denied
-        let _ = limiter.on_request(make_req());
-        assert!(!is_operator_authenticated(), "Public bind + no token must deny operator access");
+    fn test_k4_middleware_grants_no_operator_state() {
+        // The middleware must proceed without conferring ANY operator
+        // privilege — even in the old fail-open configuration (localhost,
+        // no token). Auth happens only inside privileged handlers.
+        for public in [true, false] {
+            let limiter = RateLimiter::new(RateLimitConfig {
+                operator_token: None,
+                is_public_bind: public,
+                ..Default::default()
+            });
+            match limiter.on_request(make_req()) {
+                RequestMiddlewareAction::Proceed { .. } => {}
+                _ => panic!("plain request must proceed (auth is per-method now)"),
+            }
+        }
     }
 
     #[test]
-    fn test_k4_localhost_no_token_allows_operator() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            operator_token: None,
-            is_public_bind: false, // Localhost
-            ..Default::default()
-        });
-        // Localhost + no token → operator methods allowed (devnet convenience)
-        let _ = limiter.on_request(make_req());
-        assert!(is_operator_authenticated(), "Localhost + no token must allow operator access");
+    fn test_k4_operator_auth_fail_closed_when_unconfigured() {
+        let _guard = K4_ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("CITRATE_OPERATOR_TOKEN");
+        // API-2 regression guard: with nothing configured, operator
+        // methods are DENIED — there is no fail-open devnet branch.
+        assert!(
+            crate::server::require_operator_auth(&serde_json::Map::new()).is_err(),
+            "unconfigured operator token must fail closed"
+        );
     }
 
     #[test]
-    fn test_k4_public_bind_valid_token_allows_operator() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            operator_token: Some("my-secret".to_string()),
-            is_public_bind: true, // Public interface
-            ..Default::default()
-        });
-        let req = make_req_with_header("authorization", "Bearer my-secret");
-        let _ = limiter.on_request(req);
-        assert!(is_operator_authenticated(), "Public bind + valid token must allow operator access");
+    fn test_k4_operator_auth_param_token_roundtrip() {
+        let _guard = K4_ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("CITRATE_OPERATOR_TOKEN", "my-secret");
+        let mut ok = serde_json::Map::new();
+        ok.insert("operator_token".into(), serde_json::Value::String("my-secret".into()));
+        let mut bad = serde_json::Map::new();
+        bad.insert("operator_token".into(), serde_json::Value::String("wrong".into()));
+        assert!(crate::server::require_operator_auth(&ok).is_ok());
+        assert!(crate::server::require_operator_auth(&bad).is_err());
+        std::env::remove_var("CITRATE_OPERATOR_TOKEN");
     }
 
     #[test]

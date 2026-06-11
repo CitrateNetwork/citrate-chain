@@ -140,7 +140,11 @@ impl BlockStore {
     pub fn get_block_by_height(&self, height: u64) -> Result<Option<Hash>> {
         let height_key = height_to_key(height);
         match self.db.get_cf(CF_METADATA, &height_key)? {
-            Some(bytes) => Ok(Some(Hash::from_bytes(&bytes))),
+            // SECREM-01 CONS-6: a corrupt/truncated index value must not
+            // panic the node (crash-loop DoS). Treat a short value as a
+            // missing entry — the height behaves as a gap, which the
+            // bounded serve paths (NET-1/2) already handle.
+            Some(bytes) => Ok(Hash::try_from_bytes(&bytes)),
             None => Ok(None),
         }
     }
@@ -183,13 +187,15 @@ impl BlockStore {
         while max_height > 0 {
             let hk = height_to_key(max_height);
             if let Ok(Some(hash_bytes)) = self.db.get_cf(CF_METADATA, &hk) {
-                let hash = Hash::from_bytes(&hash_bytes);
-                if self
-                    .db
-                    .exists_cf(CF_BLOCKS, hash.as_bytes())
-                    .unwrap_or(false)
-                {
-                    return Ok(max_height);
+                // SECREM-01 CONS-6: corrupt short value → treat as missing.
+                if let Some(hash) = Hash::try_from_bytes(&hash_bytes) {
+                    if self
+                        .db
+                        .exists_cf(CF_BLOCKS, hash.as_bytes())
+                        .unwrap_or(false)
+                    {
+                        return Ok(max_height);
+                    }
                 }
             }
             max_height -= 1;
@@ -205,7 +211,10 @@ impl BlockStore {
 
         for (key, value) in self.db.iter_cf(CF_BLUE_SET)? {
             if key.as_ref() >= start_key.as_slice() && key.as_ref() <= end_key.as_slice() {
-                blocks.push(Hash::from_bytes(&value));
+                // SECREM-01 CONS-6: skip corrupt short values, don't panic.
+                if let Some(h) = Hash::try_from_bytes(&value) {
+                    blocks.push(h);
+                }
             }
         }
 
@@ -226,8 +235,12 @@ impl BlockStore {
         for (key, value) in self.db.iter_cf(CF_DAG_RELATIONS)? {
             let key_bytes = key.as_ref();
             if key_bytes.len() == 33 && key_bytes[0] == b'c' && !value.is_empty() {
-                let parent_hash = Hash::from_bytes(&key_bytes[1..]);
-                parents_with_children.insert(parent_hash);
+                // SECREM-01 CONS-6: key length checked above (33), so the
+                // 32-byte tail is sound; use the fallible decode anyway to
+                // keep the no-panic invariant uniform across this module.
+                if let Some(parent_hash) = Hash::try_from_bytes(&key_bytes[1..]) {
+                    parents_with_children.insert(parent_hash);
+                }
             }
         }
 
@@ -339,6 +352,28 @@ mod tests {
             .blue_work(height as u128 * 100)
             .proposer(PublicKey::new([1; 32]))
             .build_unhashed()
+    }
+
+    /// SECREM-01 CONS-6: a corrupt/truncated height-index value must not
+    /// panic the node (crash-loop DoS). The decode path returns the height
+    /// as absent instead of slicing `[..32]` on a short buffer.
+    #[test]
+    fn test_cons6_corrupt_height_index_does_not_panic() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = BlockStore::new(db.clone());
+
+        // Write a deliberately short (5-byte) value at the height index key.
+        let short = [1u8, 2, 3, 4, 5];
+        db.put_cf(CF_METADATA, &height_to_key(7), &short).unwrap();
+
+        // Must return Ok(None), not panic.
+        let got = store.get_block_by_height(7).expect("no panic on corrupt value");
+        assert_eq!(got, None);
+
+        // try_from_bytes contract.
+        assert_eq!(Hash::try_from_bytes(&short), None);
+        assert!(Hash::try_from_bytes(&[9u8; 32]).is_some());
     }
 
     #[test]

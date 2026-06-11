@@ -354,7 +354,9 @@ impl StateStore {
     pub fn get_state_root(&self, block_hash: &Hash) -> Result<Option<Hash>> {
         let key = state_root_key(block_hash);
         match self.db.get_cf(CF_STATE, &key)? {
-            Some(bytes) => Ok(Some(Hash::from_bytes(&bytes))),
+            // SECREM-01 CONS-6: a corrupt/truncated state-root value must
+            // not panic the node — treat it as absent.
+            Some(bytes) => Ok(Hash::try_from_bytes(&bytes)),
             None => Ok(None),
         }
     }
