@@ -838,7 +838,7 @@ impl Mempool {
         let mut sorted: Vec<(Hash, TxPriority)> =
             priority_queue.iter().map(|(h, p)| (*h, *p)).collect();
         drop(priority_queue);
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|x| std::cmp::Reverse(x.1));
 
         loop {
             let mut progressed = false;

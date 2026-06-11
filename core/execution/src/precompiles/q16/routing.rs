@@ -870,12 +870,12 @@ mod tests {
         let input = make_canonical_input_uniform_input(Q16::ONE.0);
         let out = forward_decoded(&input);
         assert!(
-            (out.mentor_id as u32) < input.shape.output_dim,
+            out.mentor_id < input.shape.output_dim,
             "mentor_id {} must be < output_dim {}",
             out.mentor_id, input.shape.output_dim
         );
         assert!(
-            (out.adapter_id as u32) < input.shape.output_dim,
+            out.adapter_id < input.shape.output_dim,
             "adapter_id {} must be < output_dim {}",
             out.adapter_id, input.shape.output_dim
         );
