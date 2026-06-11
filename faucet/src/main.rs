@@ -495,7 +495,7 @@ async fn request_tokens(
     sp.append(&chain_id);
     sp.append(&0u8);
     sp.append(&0u8);
-    let sighash = Keccak256::digest(&sp.out());
+    let sighash = Keccak256::digest(sp.out());
 
     let (sig, recid) = match state.signing_key.sign_prehash_recoverable(&sighash) {
         Ok(v) => v,
@@ -641,6 +641,9 @@ fn extract_client_ip(
     socket_addr.ip().to_string()
 }
 
+// Used by the test suite; the production handler validates inline.
+// #[allow] for the restored clippy -D warnings gate (SECREM-01 Phase 0).
+#[allow(dead_code)]
 fn validate_address(address: &str) -> Result<(String, [u8; 20]), &'static str> {
     let hex_str = address.trim_start_matches("0x").to_lowercase();
     let bytes = hex::decode(&hex_str).map_err(|_| "Invalid hex encoding")?;
