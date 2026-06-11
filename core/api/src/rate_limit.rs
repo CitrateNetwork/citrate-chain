@@ -315,8 +315,12 @@ impl RequestMiddleware for RateLimiter {
         if let Some(ref expected_key) = self.api_key {
             let path = request.uri().path();
             if path != "/health" && path != "/ready" {
+                // SECREM-02 5.6: constant-time compare — same class as the
+                // operator-token fix in server.rs (2026-05-31 audit -006).
                 let key_valid = Self::extract_api_key(&request)
-                    .map(|k| k == *expected_key)
+                    .map(|k| {
+                        crate::server::constant_time_eq(k.as_bytes(), expected_key.as_bytes())
+                    })
                     .unwrap_or(false);
                 if !key_valid {
                     warn!("API key authentication failed for {}", path);
