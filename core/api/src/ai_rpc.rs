@@ -10,6 +10,11 @@ use citrate_storage::StorageManager;
 use serde_json::json;
 use std::sync::Arc;
 
+/// SECREM-01 Phase-8 variant of NET-1: cap the number of texts/documents
+/// an embeddings/search RPC will process in one request. Each entry
+/// spawns embedding work, so an unbounded array is an inference-cost DoS.
+const MAX_EMBEDDING_INPUTS: usize = 256;
+
 /// Register AI-related RPC methods
 pub fn register_ai_methods(
     io_handler: &mut IoHandler,
@@ -38,10 +43,17 @@ pub fn register_ai_methods(
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("Invalid text parameter"))?
                 .to_string()]
         } else if params_value[0].is_array() {
-            params_value[0]
+            let arr = params_value[0]
                 .as_array()
-                .ok_or_else(|| jsonrpc_core::Error::invalid_params("Invalid array parameter"))?
-                .iter()
+                .ok_or_else(|| jsonrpc_core::Error::invalid_params("Invalid array parameter"))?;
+            // SECREM-01 Phase-8 (NET-1 variant): clamp the batch size.
+            if arr.len() > MAX_EMBEDDING_INPUTS {
+                return Err(jsonrpc_core::Error::invalid_params(format!(
+                    "too many texts: {} (max {MAX_EMBEDDING_INPUTS})",
+                    arr.len()
+                )));
+            }
+            arr.iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect()
         } else {
@@ -100,9 +112,17 @@ pub fn register_ai_methods(
             .ok_or_else(|| jsonrpc_core::Error::invalid_params("Query must be a string"))?
             .to_string();
 
-        let documents: Vec<String> = params_value[1]
+        let documents_arr = params_value[1]
             .as_array()
-            .ok_or_else(|| jsonrpc_core::Error::invalid_params("Documents must be an array"))?
+            .ok_or_else(|| jsonrpc_core::Error::invalid_params("Documents must be an array"))?;
+        // SECREM-01 Phase-8 (NET-1 variant): clamp the document batch size.
+        if documents_arr.len() > MAX_EMBEDDING_INPUTS {
+            return Err(jsonrpc_core::Error::invalid_params(format!(
+                "too many documents: {} (max {MAX_EMBEDDING_INPUTS})",
+                documents_arr.len()
+            )));
+        }
+        let documents: Vec<String> = documents_arr
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();

@@ -1,0 +1,39 @@
+# SECREM-01 BRG-1 — threshold-by-count without content agreement.
+#
+# Pre-audit finding (HIGH):
+#   handoffs/PREAUDIT_ASSESSMENT_2026-06-09/00_VULNERABILITY_REPORT.md#brg-1
+#
+# `is_threshold_met` was a pure `attestations.len() >= threshold`,
+# so M-of-N oracle agreement degraded to 1-of-N for the mint-critical
+# fields (only the first attestation bound the canonical hash). The
+# fix counts only attestations that bind the recomputed canonical hash
+# AND come from active oracles (`matching_attestation_count` /
+# `is_threshold_met_for`); the bare-count function is a documented
+# liveness-only signal and must NOT gate a mint/release.
+#
+# This rule flags any NEW threshold gate in the bridge that compares a
+# raw `.len()` against a threshold for a value-moving decision.
+
+rules:
+  - id: secrem01-brg1-bare-threshold-count
+    message: >-
+      Threshold checked by raw attestation count (SECREM-01 BRG-1).
+      A mint/release decision must use `is_threshold_met_for(event_id,
+      &canonical_hash)` so only attestations binding the recomputed
+      canonical hash (from active oracles) are counted. `is_threshold_met`
+      is a liveness signal only.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/bridge/src/relay.rs"
+      exclude:
+        - "**/tests/**"
+    patterns:
+      - pattern-either:
+          - pattern: $ATTS.len() >= self.config.oracle_threshold
+          - pattern: $ATTS.len() >= $THRESH
+      - pattern-not-inside: |
+          fn is_threshold_met(...) {
+              ...
+          }

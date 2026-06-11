@@ -1,0 +1,36 @@
+# Docker-only devnet profile (SECREM-01 CFG-2).
+#
+# This file intentionally binds RPC/WS to 0.0.0.0 because it runs INSIDE a
+# container: Docker's bridge network isolates the bind, and exposure to the
+# host is controlled exclusively by the `ports:` mapping in
+# docker-compose.yml. Do NOT use this file on a bare host — use the shipped
+# devnet-config.toml (loopback by default) instead.
+
+[chain]
+chain_id = 40204
+genesis_hash = ""
+block_time = 1
+ghostdag_k = 8
+genesis_profile = "default"
+
+[network]
+listen_addr = "0.0.0.0:30303"
+bootstrap_nodes = []
+max_peers = 50
+
+[rpc]
+enabled = true
+listen_addr = "0.0.0.0:8545"
+ws_addr = "0.0.0.0:8546"
+
+[storage]
+data_dir = "/data/.citrate-devnet"
+pruning = false
+keep_blocks = 1000
+
+[mining]
+enabled = true
+# Hardhat account #0 — receives block rewards on devnet
+coinbase = "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+target_block_time = 1
+min_gas_price = 1000000000

@@ -248,10 +248,10 @@ impl RatingSystem {
                 reviews.sort_by(|a, b| b.quality.helpfulness_score.partial_cmp(&a.quality.helpfulness_score).unwrap_or(std::cmp::Ordering::Equal));
             }
             ReviewSortOrder::Newest => {
-                reviews.sort_by(|a, b| b.review.created_at.cmp(&a.review.created_at));
+                reviews.sort_by_key(|r| std::cmp::Reverse(r.review.created_at));
             }
             ReviewSortOrder::Oldest => {
-                reviews.sort_by(|a, b| a.review.created_at.cmp(&b.review.created_at));
+                reviews.sort_by_key(|a| a.review.created_at);
             }
             ReviewSortOrder::HighestRating => {
                 reviews.sort_by(|a, b| b.review.rating.partial_cmp(&a.review.rating).unwrap_or(std::cmp::Ordering::Equal));

@@ -1,0 +1,32 @@
+# SECREM-01 CONS-2 — fork-choice baseline written from a header value.
+#
+# Pre-audit finding (HIGH):
+#   handoffs/PREAUDIT_ASSESSMENT_2026-06-09/00_VULNERABILITY_REPORT.md#cons-2
+#
+# `chain.blue_score = block.header.blue_score` poisoned the fork-choice
+# baseline: a block claiming `blue_score = u64::MAX` made every honest
+# competitor lose, permanently suppressing reorgs. The fix writes the
+# chain-state baseline from the RECOMPUTED GhostDAG score
+# (`ghostdag.get_blue_score(&block.hash())`), never the header.
+#
+# This rule flags any assignment of a `header.blue_score` /
+# `header.blue_work` directly into the ChainState baseline.
+
+rules:
+  - id: secrem01-cons2-header-score-in-chainstate
+    message: >-
+      Fork-choice baseline assigned from a self-reported header value
+      (SECREM-01 CONS-2). Write `chain.blue_score` / `chain.blue_work`
+      from the recomputed GhostDAG score (`get_blue_score`) and the
+      canonical `blue_work_for_score`, never from `block.header.*`.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "core/consensus/src/chain_selection.rs"
+      exclude:
+        - "**/tests/**"
+    patterns:
+      - pattern-either:
+          - pattern: $CHAIN.blue_score = $BLK.header.blue_score;
+          - pattern: $CHAIN.blue_work = $BLK.header.blue_work;

@@ -8,7 +8,17 @@
 // Fix (WP-B4.1): the sort key is now the *locally recomputed*
 // `ghostdag.calculate_blue_score(&block)`. The header value is
 // ignored for ordering purposes.
+//
+// SECREM-01 (pre-audit 2026-06-09, CONS-2/3) strengthened the model:
+// `GhostDag::add_block` now REJECTS out-of-band header scores at
+// admission (`validate_block_consistency`), so a u64::MAX header lie
+// can no longer even enter the DAG. These tests were updated from
+// "lying blocks are admitted but ordering ignores the lie" to the
+// stronger property "lying blocks are rejected at admission, and the
+// recomputed score remains structural for everything admitted."
 
+use citrate_consensus::ghostdag::GhostDagError;
+use citrate_consensus::types::blue_work_for_score;
 use citrate_consensus::*;
 use std::sync::Arc;
 
@@ -22,7 +32,9 @@ fn block_with_header_score(seed: u8, height: u64, parent: Hash, header_score: u6
         .height(height)
         .timestamp(1_000_000 + height * 10)
         .blue_score(header_score)
-        .blue_work((height + 1) as u128 * 100)
+        // Work must be the canonical derivation or admission rejects it
+        // before the score check is even interesting.
+        .blue_work(blue_work_for_score(header_score))
         .proposer(PublicKey::new([0xAB; 32]))
         .vrf_reveal(VrfProof {
             proof: vec![0u8; 80],
@@ -31,9 +43,11 @@ fn block_with_header_score(seed: u8, height: u64, parent: Hash, header_score: u6
         .build_unhashed()
 }
 
-/// C-03.1: malicious proposer claims `header.blue_score = u64::MAX`
-/// for their own block. The locally-recomputed blue score is what
-/// the ordering uses, so the malicious value is ignored.
+/// C-03.1 (strengthened by SECREM-01): a malicious proposer claiming
+/// `header.blue_score = u64::MAX` is rejected at ADMISSION — the ordering
+/// layer (whose sort key is the recomputed score, WP-B4.1) never sees the
+/// block at all. Honest siblings are admitted and their recomputed scores
+/// are structural.
 #[tokio::test]
 async fn c03_malicious_blue_score_ignored_by_ordering() {
     let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
@@ -45,32 +59,37 @@ async fn c03_malicious_blue_score_ignored_by_ordering() {
     dag.store_block(genesis.clone()).await.expect("genesis");
     ghostdag.add_block(&genesis).await.expect("ghostdag genesis");
 
-    // Two children at height 1, both pointing to genesis.
-    // Child A claims an honest blue score (2 = genesis_blue + self).
+    // Honest child at height 1 (band for a child of genesis is exactly
+    // genesis.header.blue_score + 1 = 2).
     let child_a = block_with_header_score(0x01, 1, g_hash, 2);
     dag.store_block(child_a.clone()).await.expect("child a");
     ghostdag.add_block(&child_a).await.expect("ghostdag a");
 
-    // Child B claims `u64::MAX` to bias mergeset ordering.
+    // Child B claims `u64::MAX` to bias mergeset ordering. Pre-SECREM it
+    // was admitted (ordering ignored the lie); now it dies at the gate.
     let child_b = block_with_header_score(0x02, 1, g_hash, u64::MAX);
     dag.store_block(child_b.clone()).await.expect("child b");
-    ghostdag.add_block(&child_b).await.expect("ghostdag b");
+    let err = ghostdag
+        .add_block(&child_b)
+        .await
+        .expect_err("C-03/CONS-2 regression: u64::MAX header score admitted");
+    assert!(
+        matches!(err, GhostDagError::BlueScoreOutOfRange { claimed: u64::MAX, .. }),
+        "wrong rejection reason: {err:?}"
+    );
 
-    // Both children's locally-recomputed blue score is 2 (genesis +
-    // self on a linear branch). The malicious header on child_b is
-    // not consulted by ordering.
+    // The admitted honest child's score is structural.
     let score_a = ghostdag.get_blue_score(&child_a.hash()).await.expect("a");
-    let score_b = ghostdag.get_blue_score(&child_b.hash()).await.expect("b");
     assert_eq!(score_a, 2);
-    assert_eq!(score_b, 2);
+    // The malicious block never entered the relations the ordering reads.
+    assert!(ghostdag.get_blue_score(&child_b.hash()).await.is_err());
 }
 
-/// C-03.2: the locally-recomputed blue score is invariant under
-/// proposer-supplied header values. We compute the score for a
-/// block that claims header.blue_score = 0, then again with
-/// header.blue_score = 12345, and assert the result is identical
-/// (and equal to the structural value 2 for a linear height-1
-/// child).
+/// C-03.2 (strengthened by SECREM-01): the recomputed blue score is
+/// invariant under proposer-supplied header values, and out-of-band header
+/// claims (0, 12345 on a height-1 child) are rejected at admission. The
+/// recomputation itself — `calculate_blue_set`, which never reads the
+/// header score — still yields the structural value for any block shape.
 #[tokio::test]
 async fn c03_recomputed_score_invariant_under_header_lies() {
     let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
@@ -81,14 +100,32 @@ async fn c03_recomputed_score_invariant_under_header_lies() {
     dag.store_block(genesis.clone()).await.expect("genesis");
     ghostdag.add_block(&genesis).await.expect("g add");
 
-    // Child claiming header score 0.
-    let child = block_with_header_score(0x01, 1, g_hash, 0);
-    dag.store_block(child.clone()).await.expect("child");
-    ghostdag.add_block(&child).await.expect("c add");
+    // Out-of-band claims are rejected at admission (band is exactly {2}).
+    for lie in [0u64, 1, 3, 12_345] {
+        let liar = block_with_header_score(0x10 + (lie % 200) as u8, 1, g_hash, lie);
+        dag.store_block(liar.clone()).await.expect("store liar");
+        assert!(
+            matches!(
+                ghostdag.add_block(&liar).await,
+                Err(GhostDagError::BlueScoreOutOfRange { .. })
+            ),
+            "header score {lie} admitted on a child of genesis (band is {{2}})"
+        );
+        // The recomputation is structural regardless of the header claim —
+        // calculate_blue_score never consults header.blue_score.
+        let recomputed = ghostdag.calculate_blue_score(&liar).await.expect("score");
+        assert_eq!(
+            recomputed, 2,
+            "C-03: locally-recomputed score is structural (genesis + self), not {lie}"
+        );
+    }
 
-    let recomputed = ghostdag.calculate_blue_score(&child).await.expect("score");
+    // The honest claim is admitted and matches the recomputation.
+    let honest = block_with_header_score(0x01, 1, g_hash, 2);
+    dag.store_block(honest.clone()).await.expect("honest");
+    ghostdag.add_block(&honest).await.expect("honest admitted");
     assert_eq!(
-        recomputed, 2,
-        "C-03: locally-recomputed score is structural (genesis + self), not 0"
+        ghostdag.get_blue_score(&honest.hash()).await.expect("score"),
+        2
     );
 }

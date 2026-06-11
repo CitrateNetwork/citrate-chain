@@ -28,6 +28,17 @@ pub struct GenesisConfig {
 pub const CANONICAL_GENESIS_TIMESTAMP: u64 = shared_genesis::CANONICAL_GENESIS_TIMESTAMP;
 
 impl Default for GenesisConfig {
+    /// SECREM-01 CONS-7: this default is the **testnet-beta / dev genesis**
+    /// — it ships well-known dev accounts (the Forge default deployer, the
+    /// deterministic faucet key) with large pre-funded balances so a local
+    /// or testnet node boots usable. It MUST NOT be used as a mainnet
+    /// genesis: a mainnet deployment supplies its own `GenesisConfig` with
+    /// real allocations. The accounts below are public, deterministic
+    /// testnet keys, not a production validator set, so there is no secret
+    /// material here — but the pre-funded dev balances make the
+    /// testnet-vs-mainnet distinction load-bearing. Documented rather than
+    /// `#[cfg(test)]`-gated because the live testnet boots from exactly
+    /// this config.
     fn default() -> Self {
         Self {
             chain_id: 40204,

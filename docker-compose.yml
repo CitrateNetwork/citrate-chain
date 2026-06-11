@@ -14,7 +14,10 @@ services:
       - "9100:9100"   # Prometheus metrics
     volumes:
       - citrate-data:/data
-      - ./devnet-config.toml:/data/config.toml:ro
+      # SECREM-01 CFG-2: shipped devnet-config.toml now binds RPC to loopback;
+      # containers need 0.0.0.0 behind Docker's port mapping, so they use the
+      # docker-only profile instead.
+      - ./docker/config/devnet-docker.toml:/data/config.toml:ro
     environment:
       - RUST_LOG=info,citrate_api=debug
       - CITRATE_METRICS=1
@@ -41,7 +44,10 @@ services:
       - "19100:9100"   # Metrics (testnet)
     volumes:
       - citrate-testnet-data:/data
-      - ./testnet-config.toml:/data/config.toml:ro
+      # SECREM-01 CFG-2: shipped testnet-config.toml now binds RPC to loopback;
+      # containers need 0.0.0.0 behind Docker's port mapping, so they use the
+      # docker-only profile instead.
+      - ./docker/config/testnet-docker.toml:/data/config.toml:ro
     environment:
       - RUST_LOG=info
       - CITRATE_METRICS=1

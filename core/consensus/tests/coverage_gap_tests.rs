@@ -20,7 +20,8 @@ fn make_block(hash_byte: u8, height: u64, blue_score: u64, parent: Hash) -> Bloc
         .hash(Hash::new([hash_byte; 32]))
         .height(height)
         .blue_score(blue_score)
-        .blue_work(blue_score as u128)
+        // SECREM-01: admission enforces the canonical score→work relation.
+        .blue_work(citrate_consensus::types::blue_work_for_score(blue_score))
         .parent(parent)
         .timestamp(height * 1000)
         .build_unhashed()
@@ -183,16 +184,26 @@ async fn test_on_new_block_extends_current_tip() {
 async fn test_on_new_block_lower_score_no_change() {
     let (dag_store, ghostdag, _ts, cs) = setup_chain_selector().await;
 
-    // Genesis with score 10
-    let mut gen = genesis_block();
-    gen.header.blue_score = 10;
+    // SECREM-01 restructure: header scores can no longer be arbitrary
+    // (admission enforces the feasible band), so "lower score" is now built
+    // structurally — a short side branch against a longer current chain.
+    let gen = genesis_block();
     dag_store.store_block(gen.clone()).await.unwrap();
     ghostdag.add_block(&gen).await.unwrap();
     cs.on_new_block(&gen).await.unwrap();
 
-    // A block with lower score that doesn't extend the chain
-    // Use genesis as parent so add_block doesn't fail on missing parent
-    let low = make_block(0x02, 1, 5, gen.hash());
+    let a1 = make_block(0x11, 1, 2, gen.hash());
+    let a2 = make_block(0x12, 2, 3, a1.hash());
+    for b in [&a1, &a2] {
+        dag_store.store_block((*b).clone()).await.unwrap();
+        ghostdag.add_block(b).await.unwrap();
+        cs.on_new_block(b).await.unwrap();
+    }
+    // Current tip A2, recomputed score 3.
+
+    // A genesis child on a side branch: recomputed score 2 < 3, and it
+    // does not extend the current tip.
+    let low = make_block(0x02, 1, 2, gen.hash());
     dag_store.store_block(low.clone()).await.unwrap();
     ghostdag.add_block(&low).await.unwrap();
 
@@ -200,10 +211,7 @@ async fn test_on_new_block_lower_score_no_change() {
     assert!(!result, "Lower score block should not cause reorg");
 
     let state = cs.get_chain_state().await;
-    // The genesis had blue_score=10 in header, but the actual calculated score is 1
-    // (genesis always gets score 1). So low block with calculated score ~ 2 may beat it.
-    // What matters is the test exercises the code path.
-    let _ = state;
+    assert_eq!(state.tip, a2.hash(), "tip must remain the heavier chain");
 }
 
 #[tokio::test]
