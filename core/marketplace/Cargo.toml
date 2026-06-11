@@ -2,7 +2,7 @@
 name = "citrate-marketplace"
 version = "0.4.0"
 edition = "2021"
-
+license.workspace = true
 [dependencies]
 # Core dependencies (using workspace versions)
 tokio = { workspace = true }

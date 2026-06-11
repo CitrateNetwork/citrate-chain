@@ -2,7 +2,7 @@
 name = "citrate-node"
 version = "0.4.0"
 edition = "2021"
-
+license.workspace = true
 [[bin]]
 name = "citrate"
 path = "src/main.rs"
