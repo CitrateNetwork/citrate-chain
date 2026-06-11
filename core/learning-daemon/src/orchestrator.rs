@@ -384,12 +384,14 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(40)).await;
         tx.send(true).expect("send shutdown");
-        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+        // run_loop returns Ok(()) on clean shutdown; the triple-expect
+        // asserts timeout/join/result all succeeded (the unit value is
+        // intentional — no binding, clippy::let_unit_value).
+        tokio::time::timeout(Duration::from_secs(1), handle)
             .await
             .expect("run_loop did not exit within 1s")
             .expect("join")
             .expect("run_loop returned Err");
-        let _ = result;
     }
 
     /// Aggregator that sleeps for `delay` then records the cycle id

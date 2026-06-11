@@ -183,14 +183,18 @@ async fn brg1_honest_quorum_still_mints_despite_one_liar() {
     let lie = [0xEE; 32];
 
     let ts = now_secs();
-    let mut reg = relay.oracle_registry().write();
-    reg.submit_attestation(signed_att(&sk_evil, domain, event_id, lie, ts))
-        .expect("liar's att stored");
-    reg.submit_attestation(signed_att(&sk_h1, domain, event_id, honest.canonical_hash(), ts + 1))
-        .expect("h1");
-    reg.submit_attestation(signed_att(&sk_h2, domain, event_id, honest.canonical_hash(), ts + 2))
-        .expect("h2");
-    drop(reg);
+    // Scope the write guard so it is dropped before the await below
+    // (clippy::await_holding_lock — a parking_lot guard must not be live
+    // across an .await).
+    {
+        let mut reg = relay.oracle_registry().write();
+        reg.submit_attestation(signed_att(&sk_evil, domain, event_id, lie, ts))
+            .expect("liar's att stored");
+        reg.submit_attestation(signed_att(&sk_h1, domain, event_id, honest.canonical_hash(), ts + 1))
+            .expect("h1");
+        reg.submit_attestation(signed_att(&sk_h2, domain, event_id, honest.canonical_hash(), ts + 2))
+            .expect("h2");
+    }
 
     let result = process_one(&relay, BridgeEvent::Deposit(honest)).await;
     assert_eq!(

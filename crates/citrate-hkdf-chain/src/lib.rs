@@ -76,7 +76,9 @@ pub fn derive(
     let (mut prk, hk) = Hkdf::<Sha256>::extract(Some(hkdf_salt), parent_secret);
     let mut child = Zeroizing::new([0u8; 32]);
     let expand_result = hk.expand(label, &mut child[..]);
-    drop(hk);
+    // `hk` (Hkdf) holds no secret state of its own beyond `prk`, which we
+    // wipe next; it does not implement Drop, so an explicit drop() is a
+    // no-op (clippy::drop_non_drop). Let it fall out of scope naturally.
     prk.as_mut_slice().zeroize();
     expand_result.map_err(|e| HkdfError::Expand(e.to_string()))?;
     Ok(child)

@@ -144,6 +144,9 @@ mod tests {
     /// `Ok(false)` — the faucet's caller treats those differently
     /// (transient outage vs. user failed CAPTCHA).
     #[tokio::test]
+    // The env-lock is intentionally held across the await to serialize
+    // env-var access between tests; a tokio Mutex isn't warranted here.
+    #[allow(clippy::await_holding_lock)]
     async fn test_unreachable_endpoint_errors() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var(
