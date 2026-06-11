@@ -23,6 +23,14 @@ pub struct BlockStore {
     /// many milliseconds and got compounded by the 50K-req/s
     /// rate limit into a self-DoS amplifier.
     cached_latest_height: Arc<AtomicU64>,
+    /// FUA-CHAIN-01: serializes `put_block`'s read-modify-writes.
+    /// The per-parent children list and the latest-height key are both
+    /// RMW against RocksDB state — producer, network ingest, and sync
+    /// all call `put_block` from distinct tokio tasks, so without this
+    /// lock two sibling puts could each read `children=[…]`, append,
+    /// and last-writer-wins a child link out of CF_DAG_RELATIONS.
+    /// Reads stay lock-free.
+    put_lock: std::sync::Mutex<()>,
 }
 
 impl BlockStore {
@@ -38,11 +46,20 @@ impl BlockStore {
         Self {
             db,
             cached_latest_height: Arc::new(AtomicU64::new(initial)),
+            put_lock: std::sync::Mutex::new(()),
         }
     }
 
     /// Store a complete block
     pub fn put_block(&self, block: &Block) -> Result<()> {
+        // FUA-CHAIN-01: hold the put lock across the read-modify-writes
+        // (children lists + latest height) and the batch commit so
+        // concurrent ingest cannot lose DAG child links or regress the
+        // height. A poisoned lock means another put panicked mid-call;
+        // batch commits are atomic so the store is still consistent —
+        // recover rather than poisoning every later caller.
+        let _put_guard = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
+
         let hash = block.hash();
         let block_bytes = bincode::serialize(block)?;
 
@@ -62,10 +79,15 @@ impl BlockStore {
         self.db
             .batch_put_cf(&mut batch, CF_METADATA, &height_key, hash.as_bytes())?;
 
-        // Store parent -> children mappings for DAG
+        // Store parent -> children mappings for DAG.
+        // FUA-CHAIN-01: skip if already linked so a re-put of the same
+        // block (producer retry, sync overlap) can't duplicate the link.
         for parent in block.parents() {
             let parent_children_key = parent_children_key(&parent);
             let mut children = self.get_children(&parent)?;
+            if children.contains(&hash) {
+                continue;
+            }
             children.push(hash);
             let children_bytes = bincode::serialize(&children)?;
             self.db.batch_put_cf(
@@ -406,5 +428,90 @@ mod tests {
         let children = store.get_children(&block1.hash()).unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0], block2.hash());
+    }
+
+    /// FUA-CHAIN-01 red test (idempotency half): re-putting the same
+    /// block must not duplicate its child link under the parent.
+    #[test]
+    fn test_fua_chain_01_duplicate_put_does_not_duplicate_child_link() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let db = Arc::new(RocksDB::open(temp_dir.path()).expect("open db"));
+        let store = BlockStore::new(db);
+
+        let parent = Hash::new([0xAA; 32]);
+        let block = create_test_block(1, parent);
+        store.put_block(&block).expect("put");
+        store.put_block(&block).expect("put");
+
+        let children = store.get_children(&parent).expect("children");
+        assert_eq!(children.len(), 1, "duplicate put must not duplicate the child link");
+    }
+
+    /// FUA-CHAIN-01 red test (race half): concurrent puts of sibling
+    /// blocks sharing one parent must keep EVERY child link. Pre-fix the
+    /// children list was a lockless read-modify-write — last writer wins
+    /// and sibling links silently vanish from CF_DAG_RELATIONS.
+    #[test]
+    fn test_fua_chain_01_concurrent_sibling_puts_keep_all_child_links() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let db = Arc::new(RocksDB::open(temp_dir.path()).expect("open db"));
+        let store = Arc::new(BlockStore::new(db));
+
+        let parent = Hash::new([0xBB; 32]);
+        let mut handles = Vec::new();
+        for i in 0..8u8 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                let block = BlockBuilder::new()
+                    .hash(Hash::new([0xC0 + i; 32]))
+                    .parent(parent)
+                    .height(1)
+                    .timestamp(1_000_000 + i as u64)
+                    .blue_score(10)
+                    .blue_work(100)
+                    .proposer(PublicKey::new([1; 32]))
+                    .build_unhashed();
+                store.put_block(&block).expect("put");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        let children = store.get_children(&parent).expect("children");
+        assert_eq!(children.len(), 8, "every sibling child link must survive concurrent ingest");
+    }
+
+    /// FUA-CHAIN-01 red test (height half): the cached latest height must
+    /// be monotone under concurrent out-of-order ingest — a lower block
+    /// committing after a higher one must never regress it.
+    #[test]
+    fn test_fua_chain_01_height_never_regresses_under_concurrency() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let db = Arc::new(RocksDB::open(temp_dir.path()).expect("open db"));
+        let store = Arc::new(BlockStore::new(db));
+
+        let parent = Hash::new([0xDD; 32]);
+        let mut handles = Vec::new();
+        for i in 1..=16u64 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                let block = BlockBuilder::new()
+                    .hash(Hash::new([i as u8; 32]))
+                    .parent(parent)
+                    .height(i)
+                    .timestamp(1_000_000 + i)
+                    .blue_score(i * 10)
+                    .blue_work(i as u128 * 100)
+                    .proposer(PublicKey::new([1; 32]))
+                    .build_unhashed();
+                store.put_block(&block).expect("put");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        assert_eq!(store.get_latest_height().expect("height"), 16, "height must equal the max ingested");
     }
 }
