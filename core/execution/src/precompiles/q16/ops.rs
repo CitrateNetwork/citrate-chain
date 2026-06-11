@@ -195,6 +195,8 @@ mod ops_extra_tests {
         ];
         let s = softmax(&v);
         assert!(s[0].0 > Q16::from_f64(0.99).0, "first ~1; got {:?}", s[0]);
+        // index is meaningful in the assertion message; keep the range loop.
+        #[allow(clippy::needless_range_loop)]
         for i in 1..4 {
             assert!(s[i].0 < Q16::from_f64(0.01).0, "others ~0; s[{i}] = {:?}", s[i]);
         }

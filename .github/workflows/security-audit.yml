@@ -1,0 +1,92 @@
+name: Security Audit
+
+on:
+  workflow_dispatch:
+  # RM-B1 / WP-F3.6 (audit CI-13): nightly schedule.
+  schedule:
+    - cron: '0 2 * * *'
+  # RM-B1 / WP-F3.1 (audit CI-04, CI-06, SUP-10): also run on every
+  # push to a long-lived branch and on every PR. The previous
+  # workflow only ran nightly — a malicious dep introduced in a PR
+  # could merge before the next 02:00 UTC scan caught it.
+  # No path filter: the RUSTSEC advisory DB updates daily, so a PR
+  # that touches no Cargo.toml can still need to fail today because
+  # an advisory dropped against a transitive dep.
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# RM-B1 / WP-F1.1 (audit CI-01): minimum permissions at workflow level.
+permissions:
+  contents: read
+
+# RM-B1 / WP-F3.5 (audit CI-12): cancel in-flight runs on the same ref.
+concurrency:
+  group: security-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # SECREM-01: the dependency-advisory scan is already covered by the
+  # dedicated `cargo-audit.yml` workflow (which passes the documented
+  # `--ignore RUSTSEC-…` flags and is green on main). The archived copy of
+  # this file carried a duplicate, ignore-less cargo-audit job; it is
+  # removed here to avoid a second, mis-configured advisory gate. Advisory
+  # coverage = cargo-audit.yml; this file owns cargo-deny + clippy + the
+  # SECREM-01 semgrep class rules.
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Run cargo-deny check
+        # RM-B1 / WP-F3.1 (audit SUP-10): fail closed on
+        # license / advisory / banned-dep violations.
+        run: cargo deny check
+
+  clippy:
+    # SECREM-01 Phase 0.3: clippy is a documented gate (CLAUDE.md:
+    # "must pass clean") but no workflow enforced it after the
+    # federation split archived this file. Restored fail-closed.
+    name: Clippy (deny warnings)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  semgrep:
+    # SECREM-01 Phase 8: the repo ships 40+ Semgrep regression rules in
+    # tools/semgrep/rules/ (each pinned to a prior audit finding) but NO
+    # workflow ran them — authored and orphaned, same gap as the archived
+    # CI. Wiring them up revealed that a chunk of the corpus no longer
+    # parses under the current semgrep (PatternParseError / Semgrepignore
+    # v2 anchoring changes). Validating + repairing the full corpus is a
+    # tracked follow-up; until then this job is ADVISORY (continue-on-error)
+    # so it reports without blocking, and runs only the new secrem01-*
+    # class rules (NET-1 serve loop, BRG-1 bare threshold, CONS-2 header
+    # baseline, CONS-6 unguarded Hash::from_bytes). It will be made
+    # blocking + broadened to the full corpus once the corpus is green.
+    name: Semgrep regression rules (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run SECREM-01 class rules
+        run: semgrep --error --config tools/semgrep/rules/secrem01-net1-unbounded-serve-loop.yaml --config tools/semgrep/rules/secrem01-brg1-bare-threshold-count.yaml --config tools/semgrep/rules/secrem01-cons2-header-score-in-chainstate.yaml --config tools/semgrep/rules/secrem01-cons6-hash-from-bytes-unguarded.yaml .

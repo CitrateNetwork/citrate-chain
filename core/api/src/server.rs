@@ -40,10 +40,13 @@ use tracing::{info, warn};
 ///
 /// Data source: `CITRATE_OPERATOR_TOKEN` environment variable.
 ///
-/// `pub(crate)` so other modules in this crate (e.g., `eth_rpc.rs`) can
-/// gate operator-only endpoints — RM-B1 / WP-C1.1 (audit H-API-01)
-/// uses this for `citrate_getMempoolSnapshot`.
-pub(crate) fn require_operator_auth(params: &serde_json::Map<String, Value>) -> Result<(), jsonrpc_core::Error> {
+/// SECREM-01 API-1: this is THE operator-auth mechanism — privileged
+/// handlers call it inline (thread-safe by construction; the old
+/// middleware thread-local is gone). `pub` so integration tests can
+/// exercise the gate directly. RM-B1 / WP-C1.1 (audit H-API-01) uses
+/// this for `citrate_getMempoolSnapshot`; the emergency pause/resume/
+/// status methods use it as of SECREM-01.
+pub fn require_operator_auth(params: &serde_json::Map<String, Value>) -> Result<(), jsonrpc_core::Error> {
     let configured_token = std::env::var("CITRATE_OPERATOR_TOKEN").ok().filter(|t| !t.is_empty());
     let supplied_token = params.get("operator_token").and_then(|v| v.as_str());
 
@@ -2085,8 +2088,12 @@ impl RpcServer {
             let input_bytes = serde_json::to_vec(&input_val)
                 .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid 'input' JSON"))?;
 
-            // optional from (hex 20-byte)
-            let from_addr = if let Some(s) = obj.get("from").and_then(|v| v.as_str()) {
+            // SECREM-01 INFER-1: `from` is an identity CLAIM, not an
+            // identity. It authenticates only when the request carries a
+            // secp256k1 signature binding {chain_id, model_id, input,
+            // timestamp} to it (inference_auth.rs). Unsigned requests are
+            // anonymous and can only reach Public models.
+            let claimed_from = if let Some(s) = obj.get("from").and_then(|v| v.as_str()) {
                 let b = hex::decode(s.trim_start_matches("0x"))
                     .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid 'from'"))?;
                 if b.len() != 20 {
@@ -2096,10 +2103,28 @@ impl RpcServer {
                 }
                 let mut a = [0u8; 20];
                 a.copy_from_slice(&b);
-                Address(a)
+                Some(Address(a))
             } else {
-                Address([0u8; 20])
+                None
             };
+            let signature = obj.get("signature").and_then(|v| v.as_str());
+            let timestamp = obj.get("timestamp").and_then(|v| v.as_u64());
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let from_addr = crate::inference_auth::resolve_identity(
+                chain_id,
+                &model_arr,
+                &input_bytes,
+                claimed_from,
+                signature,
+                timestamp,
+                now_secs,
+            )
+            .map_err(|e| {
+                jsonrpc_core::Error::invalid_params(format!("inference auth: {e}"))
+            })?;
 
             // optional max_gas
             let max_gas = parse_optional_u64_field(obj.get("max_gas"), "max_gas")?
@@ -2223,8 +2248,10 @@ impl RpcServer {
             let input_bytes = serde_json::to_vec(&input_val)
                 .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid 'input' JSON"))?;
 
-            // optional from (hex 20‑byte)
-            let from_addr = if let Some(s) = obj.get("from").and_then(|v| v.as_str()) {
+            // SECREM-01 INFER-1: same authenticated-identity rule as
+            // citrate_requestInference (see inference_auth.rs) — a bare
+            // `from` claim is anonymous input.
+            let claimed_from = if let Some(s) = obj.get("from").and_then(|v| v.as_str()) {
                 let b = hex::decode(s.trim_start_matches("0x"))
                     .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid 'from'"))?;
                 if b.len() != 20 {
@@ -2234,10 +2261,28 @@ impl RpcServer {
                 }
                 let mut a = [0u8; 20];
                 a.copy_from_slice(&b);
-                Address(a)
+                Some(Address(a))
             } else {
-                Address([0u8; 20])
+                None
             };
+            let signature = obj.get("signature").and_then(|v| v.as_str());
+            let timestamp = obj.get("timestamp").and_then(|v| v.as_u64());
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let from_addr = crate::inference_auth::resolve_identity(
+                chain_id,
+                &model_arr,
+                &input_bytes,
+                claimed_from,
+                signature,
+                timestamp,
+                now_secs,
+            )
+            .map_err(|e| {
+                jsonrpc_core::Error::invalid_params(format!("inference auth: {e}"))
+            })?;
 
             // optional max_gas
             let max_gas = parse_optional_u64_field(obj.get("max_gas"), "max_gas")?

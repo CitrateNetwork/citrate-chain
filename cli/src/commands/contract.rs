@@ -697,7 +697,7 @@ fn encode_method_call(method_sig: &str, args: serde_json::Value) -> Result<Strin
 
     // Encode static arguments (subset of ABI: address, uint{8,16,32,64,128,256}, bool, bytes32)
     let mut encoded: Vec<u8> = Vec::new();
-    for (ty, val) in types.iter().zip(args_arr.into_iter()) {
+    for (ty, val) in types.iter().zip(args_arr) {
         match ty.as_str() {
             // address: 20 bytes, left-padded to 32
             "address" => {

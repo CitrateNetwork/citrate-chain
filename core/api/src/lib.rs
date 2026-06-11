@@ -4,6 +4,7 @@
 pub mod ai_rpc;
 pub mod economics_rpc;
 pub mod eth_rpc;
+pub mod inference_auth;
 pub mod eth_rpc_simple;
 pub mod eth_subscriptions;
 pub mod eth_tx_decoder;

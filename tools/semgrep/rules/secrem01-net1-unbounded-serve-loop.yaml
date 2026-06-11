@@ -1,0 +1,35 @@
+# SECREM-01 NET-1/NET-2 — unbounded attacker-driven serve loop.
+#
+# Pre-audit finding (CRITICAL/HIGH):
+#   handoffs/PREAUDIT_ASSESSMENT_2026-06-09/00_VULNERABILITY_REPORT.md#net-1
+#
+# The GetHeaders/GetBlocks handlers ran `while out.len() < count`
+# where `count` is an attacker-supplied u32 with no chain-height
+# ceiling and no break on a missing height — one packet spun the
+# loop toward u64::MAX storage reads. The fix moved all serving to
+# the bounded `block_serve` module (clamp + tip bound + break).
+#
+# This rule fires if a `while … .len() < count` loop pattern is
+# reintroduced into the node message handlers, where `count` is a
+# peer-supplied request field.
+
+rules:
+  - id: secrem01-net1-unbounded-serve-loop
+    message: >-
+      Unbounded serve loop driven by a peer-supplied `count`
+      (SECREM-01 NET-1/NET-2). Serve through `block_serve::serve_headers`
+      / `serve_blocks`, which clamp `count` to a protocol max, bound the
+      walk by the local tip height, and break on the first missing height.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "node/src/main.rs"
+      exclude:
+        - "**/tests/**"
+        - "node/src/block_serve.rs"
+    patterns:
+      - pattern: |
+          while $V.len() < $COUNT as usize {
+              ...
+          }

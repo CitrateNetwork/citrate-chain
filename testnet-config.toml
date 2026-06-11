@@ -9,10 +9,20 @@ listen_addr = "0.0.0.0:30303"
 bootstrap_nodes = []
 max_peers = 100
 
+# SECREM-01 CFG-2: RPC/WS bind to loopback (127.0.0.1) by default.
+# The JSON-RPC and WebSocket endpoints ship with NO TLS and NO
+# authentication, so binding them to 0.0.0.0 exposes them to anyone who
+# can reach the host. To expose this node remotely you MUST do ALL of:
+#   1. Explicitly change listen_addr / ws_addr below (e.g. "0.0.0.0:8545");
+#   2. Set CITRATE_OPERATOR_TOKEN in the node's environment — operator
+#      methods fail closed on a non-loopback bind without it, and the
+#      node logs a warning at startup;
+#   3. Front the endpoints with a TLS-terminating reverse proxy
+#      (nginx/caddy) and keep cors_origins restricted to explicit origins.
 [rpc]
 enabled = true
-listen_addr = "0.0.0.0:8545"
-ws_addr = "0.0.0.0:8546"
+listen_addr = "127.0.0.1:8545"
+ws_addr = "127.0.0.1:8546"
 
 [storage]
 data_dir = ".citrate-testnet"

@@ -27,7 +27,8 @@ fn block(seed: u8, height: u64, parent: Hash) -> Block {
         .height(height)
         .timestamp(1_000_000 + height * 10)
         .blue_score(height + 1)
-        .blue_work((height + 1) as u128 * 100)
+        // SECREM-01: admission enforces the canonical score→work relation.
+        .blue_work(citrate_consensus::types::blue_work_for_score(height + 1))
         .proposer(PublicKey::new([0xAB; 32]))
         .vrf_reveal(VrfProof {
             proof: vec![0u8; 80],

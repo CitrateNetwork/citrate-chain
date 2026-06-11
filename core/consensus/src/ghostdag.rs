@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Error, Debug)]
 pub enum GhostDagError {
@@ -21,6 +21,24 @@ pub enum GhostDagError {
 
     #[error("K-cluster violation")]
     KClusterViolation,
+
+    // SECREM-01 CONS-1/2/3: admission-consistency rejections. A block
+    // carrying any of these is structurally inadmissible regardless of
+    // signature validity — a signature proves origin, not truth.
+    #[error("Missing parent at admission: {0}")]
+    MissingParent(Hash),
+
+    #[error("Header height {claimed} != selected parent height + 1 ({expected})")]
+    HeightMismatch { claimed: u64, expected: u64 },
+
+    #[error("Header blue_score {claimed} outside feasible range [{min}, {max}]")]
+    BlueScoreOutOfRange { claimed: u64, min: u64, max: u64 },
+
+    #[error("Header blue_work {claimed} != canonical work for score ({expected})")]
+    BlueWorkMismatch { claimed: u128, expected: u128 },
+
+    #[error("Invalid linkage: {0}")]
+    InvalidLinkage(String),
 }
 
 /// GhostDAG consensus engine
@@ -99,6 +117,9 @@ impl GhostDag {
         // Add current block to blue set and recompute score from set size
         blue_set.blocks.insert(block.hash());
         blue_set.score = blue_set.blocks.len() as u64;
+        // SECREM-01 CONS-2: work is always derived from the recomputed
+        // score (canonical fn in types.rs) — never copied from a header.
+        blue_set.work = crate::types::blue_work_for_score(blue_set.score);
 
         // Cache the result
         self.blue_cache
@@ -539,14 +560,167 @@ impl GhostDag {
     }
 
     /// Add a block to the DAG
+    /// SECREM-01 CONS-3 (root cause of CONS-1 + CONS-2): validate the
+    /// structural linkage a header *claims* against what this node can
+    /// verify from its own already-admitted ancestors. Read-only — safe to
+    /// call before any persistence. `add_block` runs it unconditionally, so
+    /// every ingest path that builds DAG relations (gossip, sync,
+    /// efficient-sync) passes this gate and no future caller can forget it.
+    ///
+    /// What is enforced, and why each check exists:
+    /// - **parents exist** — an unknown parent means nothing below the
+    ///   block is verifiable; admitting it would let an attacker build on
+    ///   phantom history.
+    /// - **height == selected_parent.height + 1, exactly** — `header.height`
+    ///   drives the finality boundary (CONS-1): a forged height of 10M on a
+    ///   height-500 chain finalized still-reorg-eligible blocks. Heights are
+    ///   validated inductively from genesis.
+    /// - **selected-parent rule** — no merge parent may have a higher blue
+    ///   score than the selected parent; choosing a lighter selected parent
+    ///   while merging a heavier branch is a fork-choice manipulation.
+    /// - **blue_score within the feasible band** `[sp+1, sp+1+|merges|]` —
+    ///   each block adds itself plus at most its blue merge parents to the
+    ///   blue set, so any claim outside this band is arithmetically
+    ///   impossible. This kills the `u64::MAX` baseline-poisoning attack
+    ///   (CONS-2): inflation is capped at `max_parents` per VRF-elected
+    ///   block instead of unbounded per packet. (Exact k-cluster equality —
+    ///   pinning the score to one value inside the band — is deliberately
+    ///   deferred to the BlueSet-persistence rework tracked since PIL-13;
+    ///   the producer itself currently writes the parent+1 approximation.
+    ///   `add_block` logs any in-band drift as telemetry for that flip.)
+    /// - **blue_work == blue_work_for_score(blue_score)** — work is a pure
+    ///   function of score (single source of truth in `types.rs`); a
+    ///   self-reported work value is never stored.
+    pub async fn validate_block_consistency(&self, block: &Block) -> Result<(), GhostDagError> {
+        if block.is_genesis() {
+            return Ok(());
+        }
+
+        let header = &block.header;
+        let sp_hash = block.selected_parent();
+        if sp_hash == Hash::default() {
+            return Err(GhostDagError::InvalidParents);
+        }
+
+        // Merge-parent structural sanity: bounded count, no duplicates,
+        // no self-reference, no aliasing of the selected parent.
+        let merge_parents = &header.merge_parent_hashes;
+        // max_parents counts ALL parents: 1 selected + N merges.
+        if merge_parents.len() >= self.params.max_parents {
+            return Err(GhostDagError::InvalidLinkage(format!(
+                "{} total parents (1 selected + {} merges) exceeds max_parents {}",
+                merge_parents.len() + 1,
+                merge_parents.len(),
+                self.params.max_parents
+            )));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(merge_parents.len());
+        for mp in merge_parents {
+            if *mp == sp_hash {
+                return Err(GhostDagError::InvalidLinkage(
+                    "merge parent duplicates selected parent".to_string(),
+                ));
+            }
+            if *mp == block.hash() {
+                return Err(GhostDagError::InvalidLinkage(
+                    "block lists itself as a merge parent".to_string(),
+                ));
+            }
+            if !seen.insert(*mp) {
+                return Err(GhostDagError::InvalidLinkage(format!(
+                    "duplicate merge parent {mp}"
+                )));
+            }
+        }
+
+        // Parents must already be admitted locally.
+        let sp = self
+            .dag_store
+            .get_block(&sp_hash)
+            .await
+            .map_err(|_| GhostDagError::MissingParent(sp_hash))?;
+
+        // Height linkage is exact and inductive from genesis.
+        let expected_height = sp.header.height.checked_add(1).ok_or_else(|| {
+            GhostDagError::InvalidLinkage("selected parent height overflow".to_string())
+        })?;
+        if header.height != expected_height {
+            return Err(GhostDagError::HeightMismatch {
+                claimed: header.height,
+                expected: expected_height,
+            });
+        }
+
+        // Selected-parent rule + merge-parent existence.
+        for mp in merge_parents {
+            let mp_block = self
+                .dag_store
+                .get_block(mp)
+                .await
+                .map_err(|_| GhostDagError::MissingParent(*mp))?;
+            if mp_block.header.blue_score > sp.header.blue_score {
+                return Err(GhostDagError::InvalidLinkage(format!(
+                    "merge parent {} blue_score {} exceeds selected parent's {} — \
+                     selected parent must be the heaviest parent",
+                    mp, mp_block.header.blue_score, sp.header.blue_score
+                )));
+            }
+        }
+
+        // Blue-score feasibility band, computed from the validated parent.
+        let min_score = sp.header.blue_score.checked_add(1).ok_or_else(|| {
+            GhostDagError::InvalidLinkage("selected parent blue_score overflow".to_string())
+        })?;
+        let max_score = min_score
+            .checked_add(merge_parents.len() as u64)
+            .ok_or_else(|| {
+                GhostDagError::InvalidLinkage("blue_score band overflow".to_string())
+            })?;
+        if header.blue_score < min_score || header.blue_score > max_score {
+            return Err(GhostDagError::BlueScoreOutOfRange {
+                claimed: header.blue_score,
+                min: min_score,
+                max: max_score,
+            });
+        }
+
+        // Work is derived, never trusted.
+        let expected_work = crate::types::blue_work_for_score(header.blue_score);
+        if header.blue_work != expected_work {
+            return Err(GhostDagError::BlueWorkMismatch {
+                claimed: header.blue_work,
+                expected: expected_work,
+            });
+        }
+
+        Ok(())
+    }
+
     pub async fn add_block(&self, block: &Block) -> Result<(), GhostDagError> {
         // Validate parent structure
         if !block.is_genesis() && block.selected_parent() == Hash::default() {
             return Err(GhostDagError::InvalidParents);
         }
 
+        // SECREM-01 CONS-3: every relation-building path passes the
+        // consistency gate. Reject before any state mutation.
+        self.validate_block_consistency(block).await?;
+
         // Calculate blue set
         let blue_set = self.calculate_blue_set(block).await?;
+
+        // Telemetry for the strict-equality flip (see
+        // validate_block_consistency doc): in-band drift between the
+        // recomputed score and the header claim is logged, not fatal,
+        // until the PIL-13 BlueSet persistence rework lands.
+        if !block.is_genesis() && blue_set.score != block.header.blue_score {
+            warn!(
+                "blue_score drift on {}: header {} vs recomputed {} (in feasible band)",
+                block.hash(),
+                block.header.blue_score,
+                blue_set.score
+            );
+        }
 
         // Create DAG relation
         let relation = DagRelation {
@@ -641,11 +815,17 @@ mod tests {
         merge_parents: Vec<Hash>,
         blue_score: u64,
     ) -> Block {
+        // SECREM-01: add_block now enforces height linkage and the
+        // canonical score→work relation; these fixtures are all linear
+        // (or near-linear) chains where height == blue_score, and work
+        // must be the canonical derivation.
         BlockBuilder::new()
             .hash(Hash::new(hash))
             .parent(selected_parent)
             .merge_parents(merge_parents)
+            .height(blue_score)
             .blue_score(blue_score)
+            .blue_work(crate::types::blue_work_for_score(blue_score))
             .build_unhashed()
     }
 

@@ -2449,45 +2449,51 @@ pub fn register_eth_methods(
     });
 
     // citrate_emergencyPause - Pause block production
-    // WP-I.2: These methods require operator authentication via Bearer token.
+    // SECREM-01 API-1: these methods authenticate INSIDE the handler via
+    // the env-token path (`require_operator_auth`, CITRATE_OPERATOR_TOKEN).
+    // The previous gate read a `thread_local!` flag set by the rate-limit
+    // middleware — on a multi-threaded tokio runtime the handler can run
+    // on a different worker than `on_request`, so the flag reflected
+    // whichever request last touched that thread: a concurrent
+    // unauthenticated `citrate_emergencyPause` could observe a stale
+    // `true` and HALT BLOCK PRODUCTION. Request-scoped authz must never
+    // ride a thread-local across an async boundary.
     if let Some(ref flag) = pause_flag {
-        let pause_flag_pause = flag.clone();
-        io_handler.add_sync_method("citrate_emergencyPause", move |_params: Params| {
-            if !crate::rate_limit::is_operator_authenticated() {
-                return Err(jsonrpc_core::Error {
-                    code: jsonrpc_core::ErrorCode::ServerError(-32600),
-                    message: "Operator authentication required".into(),
-                    data: None,
-                });
+        fn emergency_params_map(
+            params: Params,
+        ) -> serde_json::Map<String, serde_json::Value> {
+            match params {
+                Params::Map(map) => map,
+                Params::None => serde_json::Map::new(),
+                Params::Array(arr) => {
+                    if let Some(serde_json::Value::Object(map)) = arr.into_iter().next() {
+                        map
+                    } else {
+                        serde_json::Map::new()
+                    }
+                }
             }
+        }
+
+        let pause_flag_pause = flag.clone();
+        io_handler.add_sync_method("citrate_emergencyPause", move |params: Params| {
+            crate::server::require_operator_auth(&emergency_params_map(params))?;
             pause_flag_pause.store(true, Ordering::Relaxed);
             tracing::warn!("EMERGENCY: Block production PAUSED via RPC");
             Ok(json!({"status": "paused", "message": "Block production paused"}))
         });
 
         let pause_flag_resume = flag.clone();
-        io_handler.add_sync_method("citrate_emergencyResume", move |_params: Params| {
-            if !crate::rate_limit::is_operator_authenticated() {
-                return Err(jsonrpc_core::Error {
-                    code: jsonrpc_core::ErrorCode::ServerError(-32600),
-                    message: "Operator authentication required".into(),
-                    data: None,
-                });
-            }
+        io_handler.add_sync_method("citrate_emergencyResume", move |params: Params| {
+            crate::server::require_operator_auth(&emergency_params_map(params))?;
             pause_flag_resume.store(false, Ordering::Relaxed);
             tracing::info!("Block production RESUMED via RPC");
             Ok(json!({"status": "resumed", "message": "Block production resumed"}))
         });
 
         let pause_flag_status = flag.clone();
-        io_handler.add_sync_method("citrate_emergencyStatus", move |_params: Params| {
-            if !crate::rate_limit::is_operator_authenticated() {
-                return Err(jsonrpc_core::Error {
-                    code: jsonrpc_core::ErrorCode::ServerError(-32600),
-                    message: "Operator authentication required".into(),
-                    data: None,
-                });
-            }
+        io_handler.add_sync_method("citrate_emergencyStatus", move |params: Params| {
+            crate::server::require_operator_auth(&emergency_params_map(params))?;
             let paused = pause_flag_status.load(Ordering::Relaxed);
             Ok(json!({"paused": paused}))
         });

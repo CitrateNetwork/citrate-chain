@@ -2,6 +2,7 @@
 name = "citrate-signing"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Signing-service provider abstraction for Citrate IT-Turnkey bootstrap. Default backend: Docusign + CLEAR Risk-Based Verification."
 
 [dependencies]

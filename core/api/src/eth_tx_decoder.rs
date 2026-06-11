@@ -166,6 +166,21 @@ pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
                 debug!("  Signature R: 0x{}", hex::encode(&rs_bytes[..32]));
                 debug!("  Signature S: 0x{}", hex::encode(&rs_bytes[32..]));
 
+                // SECREM-01 EXEC-1: enforce EIP-2 low-s. This legacy decode
+                // path uses `secp256k1` recovery, which (unlike the
+                // precompile's `recover_address`) does NOT reject high-s
+                // signatures — so `(r, s)` and `(r, n−s)` both recover the
+                // same signer, yielding two valid encodings (two tx hashes)
+                // for one transaction: malleability that breaks receipt
+                // polling. Reject high-s before recovery.
+                if is_high_s(&rs_bytes[32..]) {
+                    return Err(
+                        "EIP-2 violation: signature s-value is not in the low half-order \
+                         (malleable signature rejected)"
+                            .into(),
+                    );
+                }
+
                 // Recover the sender address from signature (fail-closed: C-03).
                 // Any failure in the recovery chain returns Err — never fabricate fallback addresses.
                 let recid = RecoveryId::from_i32(recovery_id)
@@ -368,6 +383,10 @@ fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
     let from_addr = {
         let recid = secp256k1::ecdsa::RecoveryId::from_i32((y_parity & 0x01) as i32)
             .map_err(|e| format!("bad recid: {}", e))?;
+        // SECREM-01 EXEC-1: enforce EIP-2 low-s on the typed-tx path too.
+        if is_high_s(s_h.as_bytes()) {
+            return Err("EIP-2 violation: high-s signature rejected".into());
+        }
         let recsig = secp256k1::ecdsa::RecoverableSignature::from_compact(
             &{
                 let mut rs = [0u8; 64];
@@ -637,6 +656,10 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
     let from_addr = {
         let recid = secp256k1::ecdsa::RecoveryId::from_i32((y_parity & 0x01) as i32)
             .map_err(|e| format!("bad recid: {}", e))?;
+        // SECREM-01 EXEC-1: enforce EIP-2 low-s on the typed-tx path too.
+        if is_high_s(s_h.as_bytes()) {
+            return Err("EIP-2 violation: high-s signature rejected".into());
+        }
         let recsig = secp256k1::ecdsa::RecoverableSignature::from_compact(
             &{
                 let mut rs = [0u8; 64];
@@ -737,3 +760,60 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
 // Note: Mock transaction creation has been removed for security reasons.
 // All transaction decoding must succeed or return an error.
 // Invalid transactions should never be fabricated and added to the mempool.
+
+/// SECREM-01 EXEC-1: EIP-2 low-s check. Returns true if the 32-byte
+/// big-endian `s` value is greater than half the secp256k1 curve order
+/// `n/2` — i.e. a malleable "high-s" signature that the Yellow Paper /
+/// EIP-2 require nodes to reject. The `secp256k1` recovery API does not
+/// enforce this (unlike the precompile's `recover_address`), so the
+/// transaction decoder must.
+fn is_high_s(s_be: &[u8]) -> bool {
+    // secp256k1 n/2 (half curve order), big-endian.
+    const HALF_N: [u8; 32] = [
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b,
+        0x20, 0xa0,
+    ];
+    if s_be.len() != 32 {
+        // Defensive: a non-canonical length can't be proven low-s; treat
+        // as high-s (reject) rather than silently accept.
+        return true;
+    }
+    // Lexicographic compare of equal-length big-endian integers == numeric
+    // compare. s > n/2 ⇒ high-s.
+    s_be > &HALF_N[..]
+}
+
+#[cfg(test)]
+mod secrem01_exec1_tests {
+    use super::is_high_s;
+
+    // secp256k1 n/2 big-endian.
+    const HALF_N: [u8; 32] = [
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b,
+        0x20, 0xa0,
+    ];
+
+    #[test]
+    fn low_s_accepted_high_s_rejected() {
+        // s = 1 → low.
+        let mut low = [0u8; 32];
+        low[31] = 1;
+        assert!(!is_high_s(&low));
+
+        // s = n/2 exactly → low (boundary is inclusive of n/2).
+        assert!(!is_high_s(&HALF_N));
+
+        // s = n/2 + 1 → high.
+        let mut high = HALF_N;
+        high[31] = high[31].wrapping_add(1);
+        assert!(is_high_s(&high));
+
+        // s = all 0xff (≈ n, definitely high).
+        assert!(is_high_s(&[0xffu8; 32]));
+
+        // Wrong length → reject (treated high).
+        assert!(is_high_s(&[0u8; 31]));
+    }
+}
