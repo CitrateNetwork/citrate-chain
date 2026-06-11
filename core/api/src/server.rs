@@ -35,6 +35,22 @@ use tracing::{info, warn};
 /// S-01 FIX: Require operator authentication for model mutation endpoints.
 ///
 /// Checks the `operator_token` parameter in the RPC request against the
+/// Constant-time byte-string equality (SECREM-02 5.6 / 2026-05-31 audit
+/// -006). XOR-accumulates over the full length with no early exit, so the
+/// comparison time is independent of how many leading bytes match. The
+/// length check is the only data-dependent branch — token length is not
+/// considered secret.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// `CITRATE_OPERATOR_TOKEN` environment variable. If no env var is set AND
 /// no token is provided, the request is REJECTED (fail-closed).
 ///
@@ -51,7 +67,15 @@ pub fn require_operator_auth(params: &serde_json::Map<String, Value>) -> Result<
     let supplied_token = params.get("operator_token").and_then(|v| v.as_str());
 
     match (configured_token, supplied_token) {
-        (Some(expected), Some(provided)) if provided == expected => Ok(()),
+        // SECREM-02 5.6 (2026-05-31 audit -006): constant-time compare —
+        // a short-circuiting `==` lets a remote caller measure how many
+        // leading bytes matched and brute-force the token byte-by-byte.
+        // This gates emergencyPause/resume, so the compare must not leak.
+        (Some(expected), Some(provided))
+            if constant_time_eq(provided.as_bytes(), expected.as_bytes()) =>
+        {
+            Ok(())
+        }
         (Some(_), Some(_)) => {
             warn!("operator auth failed: invalid operator_token");
             Err(jsonrpc_core::Error {
@@ -2937,6 +2961,54 @@ mod tests {
                 && snapshot_window.contains("PendingQuery::from_params_map")
                 && snapshot_window.contains("get_pending"),
             "T0-07: alternate pending-detail method must use the same bounded operator path"
+        );
+    }
+
+    // ── SECREM-02 5.6: constant-time token compare (audit -006) ─────
+
+    #[test]
+    fn constant_time_eq_semantics() {
+        assert!(constant_time_eq(b"secret-token", b"secret-token"));
+        assert!(!constant_time_eq(b"secret-token", b"secret-tokeX"));
+        assert!(!constant_time_eq(b"secret-token", b"Xecret-token"));
+        assert!(!constant_time_eq(b"short", b"longer-value"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    /// Source tripwire: the operator-token gate (emergencyPause et al.)
+    /// must compare via `constant_time_eq`, never a short-circuiting
+    /// `==`. A timing-leaking revert is semantically invisible to
+    /// behavioural tests, so pin the source.
+    #[test]
+    fn operator_token_compare_is_constant_time_source_tripwire() {
+        let src = include_str!("server.rs");
+        // Needle assembled at runtime so this test's own source cannot
+        // satisfy/violate it.
+        let banned = format!("if provided {} expected", "==");
+        assert!(
+            !src.contains(&banned),
+            "operator token must not use a short-circuiting compare"
+        );
+        assert!(
+            src.contains("constant_time_eq(provided.as_bytes(), expected.as_bytes())"),
+            "operator token must compare via constant_time_eq"
+        );
+    }
+
+    /// Source tripwire: the API-key middleware gate must also compare in
+    /// constant time (same class).
+    #[test]
+    fn api_key_compare_is_constant_time_source_tripwire() {
+        let src = include_str!("rate_limit.rs");
+        let banned = format!("k {} *expected_key", "==");
+        assert!(
+            !src.contains(&banned),
+            "API key must not use a short-circuiting compare"
+        );
+        assert!(
+            src.contains("constant_time_eq(k.as_bytes(), expected_key.as_bytes())"),
+            "API key must compare via constant_time_eq"
         );
     }
 }
