@@ -252,7 +252,7 @@ impl Discovery {
             })
             .collect();
 
-        peers.sort_by(|a, b| b.score.cmp(&a.score));
+        peers.sort_by_key(|p| std::cmp::Reverse(p.score));
         peers.truncate(self.config.peer_exchange_size);
 
         peers
