@@ -11,9 +11,46 @@ status: open
 
 ## Status
 
-**Open / not yet diagnosed.** A real recurring production failure
-that PIL-49 *does not* catch. Acknowledged here so the next session
-(or whoever is on call) doesn't start from scratch.
+**Re-scoped 2026-06-11 (Lane A): likely not-reproducible-post-reroll —
+pending one operator confirmation.** Originally: open / not yet
+diagnosed, a real recurring production failure PIL-49 does not catch.
+
+### 2026-06-11 post-re-roll observations (remote, Lane A)
+
+The failure was observed twice in ~7h on 2026-06-04 under combined
+indexer + beacon load. The 2026-06-07/08 re-roll restarted the world.
+Verified live on 2026-06-11 (~150 RPC calls during the session, two
+46-address `eth_getCode` sweeps included):
+
+- The citratescan indexer is **live at lag = 1 block** (explorer
+  `/api/health`: chain head 147,876, indexer head 147,875) — it has
+  been continuously hammering this RPC since the re-roll and is
+  current, which it could not be across an unresolved multi-hour hang
+  pattern.
+- The re-rolled chain has produced **147,784 blocks over 3.42
+  uninterrupted days** (2.00 s/block average).
+- RPC burst latency from a cold client: 0.23–0.41 s per call, no
+  timeouts, no accept stalls.
+- `RpcAcceptQueueBacklog` alert added (citrate-chain, same change as
+  this note): `citrate_rpc_accept_queue_depth > 1 for 1m` → critical,
+  with capture-before-restart instructions. This was the sprint's own
+  named alert path ("wire it before the next recurrence") — now wired.
+
+**The one check this session could not run** (no droplet SSH from this
+machine): confirm `citrate-node` was not restarted around hang windows
+since the re-roll —
+
+```bash
+ssh root@142.93.58.145 'journalctl -u citrate-node --since "2026-06-08" \
+  | grep -cE "Started|systemd.*restart"'
+# 1 (the re-roll deploy itself) → no hangs since re-roll → CLOSE this
+#   sprint as not-reproducible-post-reroll.
+# >1 unexplained → the hang survived the re-roll → run the diagnostic
+#   plan below at the next recurrence (capture BEFORE restart).
+```
+
+If the count is clean, close this sprint to `completed/` citing this
+entry; the structural fix remains [[PIL-49d]] (jsonrpsee), deferred.
 
 ## Symptom
 
