@@ -802,6 +802,26 @@ impl GhostDag {
             .map(|r| r.blue_set.score)
             .ok_or(GhostDagError::BlockNotFound(*hash))
     }
+
+    /// PIL-13 tripwire metric: the total number of cumulative blue-ancestry
+    /// entries materialised in memory, across every DAG relation's stored
+    /// `blue_set.blocks` plus the `blue_cache`.
+    ///
+    /// The PIL-13 producer leak was exactly this number growing O(N²): the
+    /// eager startup loop called `add_block` per persisted block, and each
+    /// call cached the FULL O(chain-length) blue ancestry. The steady-state
+    /// producer path ([`Self::register_existing_block`] + header-derived
+    /// scores) must keep the per-block contribution O(1) — the
+    /// `producer_steady_state` integration test (core/sequencer) asserts
+    /// this stays zero across an eager-load of a linear chain.
+    pub async fn materialised_blue_ancestry_entries(&self) -> usize {
+        let relations = self.relations.read().await;
+        let from_relations: usize = relations.values().map(|r| r.blue_set.blocks.len()).sum();
+        drop(relations);
+        let cache = self.blue_cache.read().await;
+        let from_cache: usize = cache.values().map(|b| b.blocks.len()).sum();
+        from_relations + from_cache
+    }
 }
 
 #[cfg(test)]
