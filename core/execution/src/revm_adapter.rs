@@ -7,11 +7,17 @@ use citrate_consensus::types::Hash;
 use parking_lot::Mutex;
 use primitive_types::U256;
 use revm::{
-    primitives::{
-        AccountInfo, Address as RevmAddress, Bytecode, Bytes, ExecutionResult, Log as RevmLog,
-        Output, TransactTo, B256, U256 as RevmU256, SpecId, KECCAK_EMPTY,
+    handler::register::EvmHandler,
+    precompile::{
+        Precompile, PrecompileError as RevmPrecompileError,
+        PrecompileErrors as RevmPrecompileErrors, PrecompileOutput as RevmPrecompileOutput,
+        PrecompileResult as RevmPrecompileResult, StatefulPrecompile,
     },
-    Database, DatabaseCommit, Evm,
+    primitives::{
+        AccountInfo, Address as RevmAddress, Bytecode, Bytes, Env, ExecutionResult,
+        Log as RevmLog, Output, TransactTo, B256, U256 as RevmU256, SpecId, KECCAK_EMPTY,
+    },
+    ContextPrecompile, Database, DatabaseCommit, Evm,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -412,6 +418,91 @@ pub struct BlockContext {
     pub block_hashes: HashMap<u64, [u8; 32]>,
 }
 
+// ---------------------------------------------------------------------------
+// WP-B0 (TD-28): REVM ↔ Citrate custom-precompile bridge.
+//
+// Until this bridge existed, `Evm::builder()` shipped only the standard
+// Ethereum precompiles (0x01–0x0a): a deployed contract's STATICCALL to the
+// Citrate verify family (e.g. `IPFSIncentivesV2._verify()` → 0x0108, or
+// `ComputeVerifier`'s ZK tier) hit an EMPTY ACCOUNT, returned `success=1`
+// with empty returndata, and the caller read that as "invalid proof" —
+// silently and forever. The Rust-side dispatch (`precompiles::execute`)
+// was only reachable from direct Rust callers (tests, the API layer), never
+// from EVM bytecode.
+//
+// The bridge registers the PURE precompile families
+// (`precompiles::PURE_PRECOMPILE_ADDRESSES`: verify 0x0107–0x0109, Q16
+// compute 0x010A–0x010F, learning 0x0110–0x0111, x402 0x0200–0x0202) as
+// REVM custom precompiles in BOTH execution entry points (call + create).
+// They are stateless, deterministic pure functions, safe in consensus on
+// every node build. The inference family (0x0100–0x0106) requires the
+// hosted model runtime and is deliberately NOT bridged.
+//
+// Error mapping: a precompile `Err` becomes
+// `PrecompileErrors::Error(Other)`, which REVM turns into
+// `InstructionResult::PrecompileError` — the calling frame fails
+// (STATICCALL pushes 0), exactly the "revert/0 ⇒ reject" semantics
+// `IPFSIncentivesV2._verify()` documents. Note 0x0108 itself is only LIVE
+// when the node is built with `halo2-substrate`; without it the verifier
+// returns its discoverable `SubstrateAbsent` error → the STATICCALL fails
+// closed. ALL VALIDATOR BINARIES MUST AGREE ON THE FEATURE SET or they
+// diverge on any tx that exercises 0x0108.
+// ---------------------------------------------------------------------------
+
+/// REVM adapter for one pure Citrate precompile address. Stateless — the
+/// `StatefulPrecompile` trait is used only to capture the address (REVM's
+/// `Precompile::Standard` is a bare fn pointer and cannot).
+struct CitratePurePrecompile {
+    addr: Address,
+}
+
+impl StatefulPrecompile for CitratePurePrecompile {
+    fn call(&self, bytes: &Bytes, gas_limit: u64, _env: &Env) -> RevmPrecompileResult {
+        match crate::precompiles::execute_pure(&self.addr, bytes.as_ref(), gas_limit) {
+            Ok(res) => {
+                if !res.success {
+                    // The pure families signal failure via Err; a
+                    // success=false Ok is a contract violation — fail the
+                    // frame rather than return ambiguous bytes.
+                    return Err(RevmPrecompileErrors::Error(RevmPrecompileError::other(
+                        "Citrate precompile reported failure",
+                    )));
+                }
+                Ok(RevmPrecompileOutput::new(res.gas_used, res.output.into()))
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("Insufficient gas") || msg.contains("Out of gas") {
+                    Err(RevmPrecompileErrors::Error(RevmPrecompileError::OutOfGas))
+                } else {
+                    Err(RevmPrecompileErrors::Error(RevmPrecompileError::other(msg)))
+                }
+            }
+        }
+    }
+}
+
+/// Handler register that extends REVM's spec precompiles with the pure
+/// Citrate families. Applied via `.append_handler_register(...)` on every
+/// `Evm::builder()` in this adapter — call AND create paths — so serial
+/// execution, `eth_call`, and deployment-time constructor code all see the
+/// same precompile set.
+fn register_citrate_precompiles<EXT, DB: Database>(handler: &mut EvmHandler<'_, EXT, DB>) {
+    let prev = handler.pre_execution.load_precompiles.clone();
+    handler.pre_execution.load_precompiles = Arc::new(move || {
+        let mut precompiles = prev();
+        precompiles.extend(crate::precompiles::PURE_PRECOMPILE_ADDRESSES.iter().map(|raw| {
+            (
+                RevmAddress::from_slice(raw),
+                ContextPrecompile::Ordinary(Precompile::Stateful(Arc::new(
+                    CitratePurePrecompile { addr: Address(*raw) },
+                ))),
+            )
+        }));
+        precompiles
+    });
+}
+
 /// Execute contract creation using revm
 #[allow(clippy::too_many_arguments)]
 pub fn execute_contract_create(
@@ -472,6 +563,11 @@ pub fn execute_contract_create_with_context(
     let prevrandao = block_ctx.prevrandao;
     let mut evm = Evm::builder()
         .with_db(&mut db)
+        // WP-B0 (TD-28): expose the pure Citrate precompile families
+        // (verify/compute/learning/x402) to contract code. Without this,
+        // STATICCALLs to e.g. 0x0108 hit an empty account and silently
+        // return success with no data.
+        .append_handler_register(register_citrate_precompiles)
         .modify_cfg_env(|cfg| {
             cfg.chain_id = chain_id;
         })
@@ -634,6 +730,11 @@ pub fn execute_contract_call_with_context(
     let prevrandao = block_ctx.prevrandao;
     let mut evm = Evm::builder()
         .with_db(&mut db)
+        // WP-B0 (TD-28): expose the pure Citrate precompile families
+        // (verify/compute/learning/x402) to contract code. Without this,
+        // STATICCALLs to e.g. 0x0108 hit an empty account and silently
+        // return success with no data.
+        .append_handler_register(register_citrate_precompiles)
         .modify_cfg_env(|cfg| {
             cfg.chain_id = chain_id;
         })

@@ -69,6 +69,12 @@ tempfile = "3.15"
 [features]
 default = []
 devnet = []
+# WP-B0: build the node with the live Halo2-KZG verifier at 0x0108
+# (circuit_version 1 inference / 2 PoRep / 3 PoSt). Without this feature the
+# 0x0108 precompile fails closed with a discoverable `SubstrateAbsent` error.
+# ALL VALIDATORS MUST AGREE ON THIS FEATURE or they diverge on any
+# transaction that exercises 0x0108 — coordinate via a release, never mix.
+halo2-verifier = ["citrate-execution/halo2-substrate"]
 # Feature flag for embedding BGE-M3 model at compile time
 # Only needed when creating a new genesis block
 # Contributors can build without this feature

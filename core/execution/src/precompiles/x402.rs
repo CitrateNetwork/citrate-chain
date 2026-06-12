@@ -24,17 +24,17 @@ pub mod addresses {
     /// 0x0200: EIP-712 Typed Data Signature Verification
     /// Recovers signer from an EIP-712 typed data signature.
     pub const EIP712_VERIFY: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0];
 
     /// 0x0201: EIP-3009 TransferWithAuthorization Verification
     /// Verifies a transferWithAuthorization signature and checks signer == from.
     pub const TRANSFER_AUTH_VERIFY: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1];
 
     /// 0x0202: Batch Payment Verification
     /// Verifies multiple transferWithAuthorization signatures in a single call.
     pub const BATCH_PAYMENT_VERIFY: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2];
 }
 
 /// Gas costs for x402 operations
@@ -506,8 +506,9 @@ mod tests {
 
     #[test]
     fn test_precompile_addresses() {
-        assert_eq!(addresses::EIP712_VERIFY[17], 2);
-        assert_eq!(addresses::EIP712_VERIFY[18], 0);
+        // Canonical layout (WP-B0): x402 page is 0x…020X — byte 18 = 0x02.
+        assert_eq!(addresses::EIP712_VERIFY[17], 0);
+        assert_eq!(addresses::EIP712_VERIFY[18], 2);
         assert_eq!(addresses::EIP712_VERIFY[19], 0);
         assert_eq!(addresses::TRANSFER_AUTH_VERIFY[19], 1);
         assert_eq!(addresses::BATCH_PAYMENT_VERIFY[19], 2);
