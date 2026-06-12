@@ -151,6 +151,46 @@ fn prover_post_proof_verifies_through_0x0108() {
     assert!(verify_via_precompile(&wire), "sidecar PoSt proof must verify via 0x0108");
 }
 
+/// REGRESSION GUARD for the contract↔circuit replicaID binding (PIN-S6 finding):
+/// the circuit commits replicaID = Poseidon(pinner_identity, cid, sector), so the
+/// `0x0108` wire's first 32 bytes MUST be that Poseidon value. A keccak-derived
+/// replicaID (what IPFSIncentivesV2's `deriveReplicaId` historically put in the
+/// wire) is a DIFFERENT field element and makes the proof reject — which is why
+/// the v3 contract must carry the circuit's replicaID, not re-derive its own.
+#[test]
+fn wire_must_carry_the_circuits_poseidon_replica_id() {
+    use sha3::{Digest, Keccak256};
+    let (pinner, cid, sector, epoch, data) = sample_seal();
+    let sealed = seal_reduced(pinner, cid, sector, epoch, data);
+    let proof = prove_porep_reduced(&sealed, pinner, 1).expect("prove porep");
+
+    // (a) the circuit's Poseidon replicaID verifies.
+    let good = porep_wire(
+        &sealed.replica_id, &sealed.cid, &sealed.sector_index,
+        &sealed.comm_d, &sealed.comm_r, &sealed.comm_c, &sealed.epoch, 1, &proof,
+    );
+    assert!(verify_via_precompile(&good), "Poseidon replicaID must verify");
+
+    // (b) a keccak-derived replicaID (different field element) must NOT verify
+    //     with the same proof — demonstrating the contract cannot substitute its
+    //     own keccak binding.
+    let keccak_rid = {
+        let h = Keccak256::digest(b"any-keccak-derived-replica-id-binding");
+        let mut le = [0u8; 32];
+        for (i, b) in h.iter().enumerate() { le[31 - i] = *b; }
+        // reduce into the field via from_repr-or-mod isn't needed: just feed the
+        // raw 32 bytes through the same to_fr path the precompile uses.
+        let mut wire = good.clone();
+        wire[0..32].copy_from_slice(&h);
+        let _ = le;
+        wire
+    };
+    assert!(
+        !verify_via_precompile(&keccak_rid),
+        "a non-Poseidon replicaID in the wire must reject the proof"
+    );
+}
+
 #[test]
 fn tampered_sidecar_proof_rejected() {
     let (pinner, cid, sector, epoch, data) = sample_seal();
