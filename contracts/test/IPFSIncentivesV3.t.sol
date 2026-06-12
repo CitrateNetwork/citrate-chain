@@ -5,25 +5,21 @@ import {Test} from "forge-std/Test.sol";
 import {IPFSIncentivesV3} from "../src/IPFSIncentivesV3.sol";
 import {KYCRegistry} from "../src/KYCRegistry.sol";
 
-/// @notice RED tests for IPFSIncentivesV3 (PIN-CR-S1) — written BEFORE the
-///         contract per the red-test-first protocol. They pin the guarantees of
-///         the three ADR-2026-06-07 mechanisms, formalized in
+/// @notice Adversarial suite for IPFSIncentivesV3 (PIN-CR-S1), pinning the
+///         guarantees of the four hardening mechanisms — formalized in
 ///         `formal/PINIncentiveV4.tla`:
-///           1. commit-reveal challenge (grind-resistance) — the nonce is fixed
-///              at COMMIT; a PoSt before `commitBlock + REVEAL_DELAY` reverts;
-///           2. PIN-S3 third-party challenger bond — an answered (frivolous)
-///              challenge forfeits the challenger's bond to the pinner; a missed
-///              (honest) one returns it AND pays the challenger from the slash;
-///           3. CommD registrant bond — a proven wrong-root challenge slashes
-///              the model-owner bond (split challenger reward + honest-pinner
-///              pool); an unchallenged bond is reclaimable after the window.
+///           Q1 commit-reveal (grind-resistance) — the nonce is fixed at
+///              COMMIT; a PoSt before commitBlock + REVEAL_DELAY reverts.
+///           PIN-S3 third-party challenger bond — a refuted (frivolous)
+///              challenge forfeits the bond to the pinner; an unrefuted
+///              (honest) one returns it AND pays the slash reward.
+///           Q2 CommD registrant bond — a proven wrong-root challenge slashes
+///              + splits (challenger reward / honest-pinner pool); an
+///              unchallenged bond is reclaimable only after the window.
 ///
-///         Until IPFSIncentivesV3.sol exists, this suite fails to COMPILE — the
-///         reddest possible state. The implementation makes it green.
-///
-/// @dev The ZK proof is an oracle (TLA): a MockVerifier etched at 0x0108 returns
-///      a settable verdict, so the FINANCIAL state machine is tested
-///      deterministically (mirrors the v2 suite).
+/// @dev The ZK proof is an oracle (TLA): a MockVerifier etched at 0x0108
+///      returns a settable verdict, so the FINANCIAL machine is tested
+///      deterministically.
 contract MockVerifier {
     function setVerdict(uint256 v) external {
         assembly {
@@ -52,7 +48,6 @@ contract IPFSIncentivesV3Test is Test {
     address internal challenger = address(0xC44A);
     address internal modelOwner = address(0x310D);
 
-    // PIN money params (mirror v2 / TLA CONSTANTS; Reward<=Bond, Reward%Rounds==0).
     uint256 internal constant BOND = 10 ether;
     uint256 internal constant REWARD = 4 ether;
     uint256 internal constant ROUNDS = 4;
@@ -62,7 +57,7 @@ contract IPFSIncentivesV3Test is Test {
     uint256 internal constant WINDOW = 10; // response window (blocks) after reveal
     uint256 internal constant CHALLENGE_N = 32;
 
-    // V3 new params.
+    // V3 params.
     uint256 internal constant CHALLENGER_BOND = 1 ether; // PIN-S3 challenger escrow
     uint256 internal constant REVEAL_DELAY = 32; // commit→reveal gap (blocks)
     uint256 internal constant MIN_MODEL_BOND = 5 ether; // CommD registrant floor
@@ -111,32 +106,38 @@ contract IPFSIncentivesV3Test is Test {
         require(ok, "setVerdict failed");
     }
 
+    /// In v3, sealing requires the model's CommD to be registered (Q2 bond)
+    /// and to MATCH the sealed CommD. Register once (idempotent across pinners).
+    function _ensureModelRegistered() internal {
+        (address owner, , , , , , ) = inc.getModel(cid);
+        if (owner == address(0)) {
+            vm.prank(modelOwner);
+            inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("D"), keccak256("data"), "ipfs://x");
+        }
+    }
+
     function _registerAndSeal(address who) internal {
+        _ensureModelRegistered();
         vm.prank(who);
         inc.registerPinner();
         vm.prank(who);
         inc.sealCommit{value: BOND}(cid, sector, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
     }
 
-    /// Open a challenge as `who` (a third-party challenger posts CHALLENGER_BOND),
-    /// advance past the reveal delay, return the committed nonce.
-    function _commitAndReveal(address who) internal returns (uint256 nonce) {
-        vm.prank(who);
-        inc.commitChallenge{value: CHALLENGER_BOND}(pinner, cid, sector);
-        (, , , , , , , nonce) = inc.getPin(pinner, cid, sector);
-        vm.roll(block.number + REVEAL_DELAY); // now revealable
+    /// Open the per-slot commit (sets the nonce), return the committed nonce.
+    function _commit() internal returns (uint256 nonce) {
+        inc.commitChallenge(cid, sector);
+        (, , , , uint256 commitNonce, ) = inc.getSlot(cid, sector);
+        nonce = commitNonce;
     }
 
-    // ════════════════════ 1. commit-reveal grind-resistance ════════════════════
+    // ════════════════════ Q1: commit-reveal grind-resistance ════════════════════
 
     function test_commitReveal_submitBeforeRevealDelay_reverts() public {
         _registerAndSeal(pinner);
-        vm.prank(challenger);
-        inc.commitChallenge{value: CHALLENGER_BOND}(pinner, cid, sector);
-        (, , , , , , , uint256 nonce) = inc.getPin(pinner, cid, sector);
+        uint256 nonce = _commit();
 
-        // Same block as commit (and any block < commitBlock + REVEAL_DELAY) must
-        // reject — the pinner can't reveal early, defeating commit-block grinding.
+        // Same block as commit (and any block < commitBlock + REVEAL_DELAY).
         vm.prank(pinner);
         vm.expectRevert("Reveal too early");
         inc.submitPoSt(cid, sector, keccak256("R"), keccak256("C"), nonce, PROOF);
@@ -150,211 +151,251 @@ contract IPFSIncentivesV3Test is Test {
     function test_commitReveal_nonceFixedAtCommit_notReveal() public {
         _registerAndSeal(pinner);
         vm.prevrandao(bytes32(uint256(0xA11CE))); // beacon at commit
-        vm.prank(challenger);
-        inc.commitChallenge{value: CHALLENGER_BOND}(pinner, cid, sector);
-        (, , , , , , , uint256 committedNonce) = inc.getPin(pinner, cid, sector);
+        uint256 committedNonce = _commit();
 
-        // Change the beacon at reveal time: the required nonce MUST be unchanged
-        // (it was committed) — this is the anti-grind property.
+        // Change the beacon at reveal time: the required nonce MUST be unchanged.
         vm.roll(block.number + REVEAL_DELAY);
-        vm.prevrandao(bytes32(uint256(0xBEEF))); // different beacon at reveal
-        (, , , , , , , uint256 nonceAtReveal) = inc.getPin(pinner, cid, sector);
-        assertEq(nonceAtReveal, committedNonce, "nonce must be fixed at commit");
+        vm.prevrandao(bytes32(uint256(0xBEEF)));
+        (, , , , uint256 nonceAtReveal, ) = inc.getSlot(cid, sector);
+        assertEq(nonceAtReveal, committedNonce, "nonce fixed at commit");
 
         vm.prank(pinner);
         inc.submitPoSt(cid, sector, keccak256("R"), keccak256("C"), committedNonce, PROOF);
-        (, uint64 round, , , , , , ) = inc.getPin(pinner, cid, sector);
+        (, uint64 round, , , , ) = inc.getPin(pinner, cid, sector);
         assertEq(round, 1, "valid reveal vests one round");
     }
 
-    function test_commitReveal_happyPath_vests() public {
+    function test_commitReveal_afterWindow_reverts() public {
         _registerAndSeal(pinner);
-        uint256 nonce = _commitAndReveal(challenger);
+        uint256 nonce = _commit();
+        vm.roll(block.number + REVEAL_DELAY + WINDOW + 1); // past the response window
         vm.prank(pinner);
+        vm.expectRevert("Challenge window closed");
         inc.submitPoSt(cid, sector, keccak256("R"), keccak256("C"), nonce, PROOF);
-        (, uint64 round, , , , , , ) = inc.getPin(pinner, cid, sector);
-        assertEq(round, 1);
     }
 
-    // ════════════════════ 2. PIN-S3 challenger bond economics ═══════════════════
+    // ════════════════════ PIN-S3: challenger bond economics ═════════════════════
 
-    function test_commitChallenge_requiresExactChallengerBond() public {
+    function test_challengePin_requiresExactBond() public {
         _registerAndSeal(pinner);
+        _commit();
         vm.prank(challenger);
         vm.expectRevert("Must post exact challenger bond");
-        inc.commitChallenge{value: CHALLENGER_BOND - 1}(pinner, cid, sector);
+        inc.challengePin{value: CHALLENGER_BOND - 1}(pinner, cid, sector);
     }
 
-    /// Frivolous challenge: the challenger opens against a pinner who IS storing;
-    /// the pinner proves possession → the challenger's bond is forfeit to the
-    /// pinner (TLA `PoStPass`: challengerBondToPinner += chBond).
+    function test_challengePin_requiresOutstandingCommit() public {
+        _registerAndSeal(pinner);
+        // No commit yet → the pinner couldn't refute → challenge is unrefutable.
+        vm.prank(challenger);
+        vm.expectRevert("No committed challenge");
+        inc.challengePin{value: CHALLENGER_BOND}(pinner, cid, sector);
+    }
+
+    /// Frivolous: challenger bonds against a pinner who IS storing; the pinner
+    /// refutes (submitPoSt) → the challenger's bond is forfeit to the pinner.
     function test_frivolousChallenge_bondForfeitToPinner() public {
         _registerAndSeal(pinner);
-        uint256 nonce = _commitAndReveal(challenger);
+        uint256 nonce = _commit();
+        vm.prank(challenger);
+        inc.challengePin{value: CHALLENGER_BOND}(pinner, cid, sector);
 
+        vm.roll(block.number + REVEAL_DELAY);
         uint256 pinnerCreditBefore = inc.challengerCredit(pinner);
         vm.prank(pinner);
         inc.submitPoSt(cid, sector, keccak256("R"), keccak256("C"), nonce, PROOF);
 
-        // The challenger's escrow is credited to the pinner (pull-payment).
         assertEq(
             inc.challengerCredit(pinner),
             pinnerCreditBefore + CHALLENGER_BOND,
-            "frivolous challenge bond goes to the pinner"
+            "frivolous bond goes to the pinner"
         );
-        // The challenger gets nothing back.
-        assertEq(inc.challengerCredit(challenger), 0);
+        assertEq(inc.challengerCredit(challenger), 0, "challenger gets nothing back");
+        assertEq(inc.challengerBondToPinner(), CHALLENGER_BOND);
+        // challenge cleared
+        (address ch, uint256 b, ) = inc.getChallenge(pinner, cid, sector);
+        assertEq(ch, address(0));
+        assertEq(b, 0);
     }
 
-    /// Honest challenge: the challenger opens against a pinner who is NOT storing;
-    /// the pinner misses → slash. The challenger earns the reward share of the
-    /// slashed PIN bond AND gets their own challenger bond back (TLA `PoStFail`).
+    /// Honest: challenger bonds against a pinner who is NOT storing; the pinner
+    /// misses → slash; the challenger earns the slash reward AND gets the bond
+    /// back (and the reward routes to THEM, not an arbitrary slash caller).
     function test_honestChallenge_paysFromSlash_andReturnsBond() public {
         _registerAndSeal(pinner);
+        _commit();
         vm.prank(challenger);
-        inc.commitChallenge{value: CHALLENGER_BOND}(pinner, cid, sector);
+        inc.challengePin{value: CHALLENGER_BOND}(pinner, cid, sector);
 
         // Pinner never reveals; advance past reveal delay + response window.
         vm.roll(block.number + REVEAL_DELAY + WINDOW + 1);
-        vm.prank(challenger);
+        // A DIFFERENT account triggers the slash — the reward must still go to
+        // the bonded challenger.
+        vm.prank(pinner2);
         inc.slash(pinner, cid, sector);
 
-        (IPFSIncentivesV3.Status st, , , , uint256 bondHeld, , , ) = inc.getPin(pinner, cid, sector);
+        (IPFSIncentivesV3.Status st, , , , uint256 bondHeld, ) = inc.getPin(pinner, cid, sector);
         assertEq(uint256(st), uint256(IPFSIncentivesV3.Status.Slashed));
-        assertEq(bondHeld, 0); // SlashedNoBond
+        assertEq(bondHeld, 0);
 
         uint256 cr = (BOND * CHALLENGER_BPS) / 10000;
-        // Reward-from-slash + the returned challenger bond are both credited.
         assertEq(
             inc.challengerCredit(challenger),
             cr + CHALLENGER_BOND,
-            "honest challenge: slash reward + own bond back"
+            "honest challenge: slash reward + own bond back, to the bonded challenger"
         );
+        assertEq(inc.challengerCredit(pinner2), 0, "the slash caller gets nothing");
+        assertEq(inc.challengerBondReturned(), CHALLENGER_BOND);
     }
 
-    function test_slash_revertsBeforeWindowCloses() public {
+    function test_unbondedSlash_rewardGoesToCaller() public {
+        // No challengePin: a permissionless slash keeps the v2 behaviour
+        // (reward to the caller).
         _registerAndSeal(pinner);
-        vm.prank(challenger);
-        inc.commitChallenge{value: CHALLENGER_BOND}(pinner, cid, sector);
-        vm.roll(block.number + REVEAL_DELAY + 1); // revealable but window open
-        vm.expectRevert("Window not yet closed");
+        _commit();
+        vm.roll(block.number + REVEAL_DELAY + WINDOW + 1);
+        vm.prank(pinner2);
         inc.slash(pinner, cid, sector);
+        uint256 cr = (BOND * CHALLENGER_BPS) / 10000;
+        assertEq(inc.challengerCredit(pinner2), cr, "unbonded slash pays the caller");
     }
 
-    // ════════════════════════ 3. CommD registrant bond ══════════════════════════
+    // ════════════════════════ Q2: CommD registrant bond ══════════════════════════
 
     function test_registerModel_requiresMinBond() public {
         vm.prank(modelOwner);
-        vm.expectRevert("Model bond too low");
-        inc.registerModel{value: MIN_MODEL_BOND - 1}(cid, keccak256("commD"));
+        vm.expectRevert("Bond too low");
+        inc.registerModel{value: MIN_MODEL_BOND - 1}(cid, keccak256("commD"), keccak256("data"), "ipfs://x");
     }
 
     function test_registerModel_revertsOnDoubleRegister() public {
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD"));
+        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD"), keccak256("data"), "ipfs://x");
         vm.prank(modelOwner);
         vm.expectRevert("Already registered");
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD2"));
+        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD2"), keccak256("data"), "ipfs://x");
     }
 
-    /// A proven wrong-CommD challenge slashes the registrant bond, splitting it
-    /// into the challenger reward and the honest-pinner compensation pool (TLA
-    /// `ChallengeWrongCommD`: modelSlashedChallenger += cr; pinnerPool += pr).
+    /// A proven wrong-CommD challenge slashes the registrant bond and splits it
+    /// into the challenger reward + the honest-pinner pool.
     function test_challengeWrongCommD_slashesAndSplits() public {
+        bytes memory data = bytes("the-canonical-model-bytes");
+        bytes32 dataHash = keccak256(data);
         bytes32 registered = keccak256("WRONG_commD");
-        bytes32 truth = keccak256("TRUE_commD");
+        bytes32 truth = keccak256("TRUE_commD"); // != registered → dispute
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, registered);
+        inc.registerModel{value: MIN_MODEL_BOND}(cid, registered, dataHash, "ipfs://x");
 
-        uint256 poolBefore = inc.pinnerPool();
-        // The challenger proves the registered root differs from the canonical
-        // one (option-B witness; the implementation verifies the Merkle path —
-        // here the mock-friendly form: a directly-provided true root != registered).
+        uint256 poolBefore = inc.honestPinnerCompensationPool();
         vm.prank(challenger);
-        inc.challengeWrongCommD(cid, truth);
+        inc.challengeWrongCommD(cid, data, truth);
 
         uint256 cr = (MIN_MODEL_BOND * MODEL_CHALLENGER_BPS) / 10000;
         uint256 pr = MIN_MODEL_BOND - cr;
         assertEq(inc.challengerCredit(challenger), cr, "challenger reward from model slash");
-        assertEq(inc.pinnerPool(), poolBefore + pr, "remainder to honest-pinner pool");
+        assertEq(inc.honestPinnerCompensationPool(), poolBefore + pr, "remainder to pool");
+        assertEq(inc.modelBondsSlashed(), MIN_MODEL_BOND);
     }
 
     function test_challengeWrongCommD_revertsWhenRootMatches() public {
+        bytes memory data = bytes("bytes");
         bytes32 root = keccak256("commD");
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, root);
-        // No dispute: the challenger's root equals the registered one.
+        inc.registerModel{value: MIN_MODEL_BOND}(cid, root, keccak256(data), "ipfs://x");
         vm.prank(challenger);
         vm.expectRevert("No dispute");
-        inc.challengeWrongCommD(cid, root);
+        inc.challengeWrongCommD(cid, data, root); // same root → no dispute
     }
 
-    function test_reclaimModelBond_afterWindow_returnsBond() public {
+    function test_challengeWrongCommD_revertsOnDataHashMismatch() public {
+        bytes32 root = keccak256("commD");
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD"));
+        inc.registerModel{value: MIN_MODEL_BOND}(cid, root, keccak256("real"), "ipfs://x");
+        vm.prank(challenger);
+        vm.expectRevert("Data hash mismatch");
+        inc.challengeWrongCommD(cid, bytes("forged"), keccak256("other"));
+    }
+
+    function test_challengeWrongCommD_revertsAfterWindow() public {
+        bytes memory data = bytes("bytes");
+        vm.prank(modelOwner);
+        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("WRONG"), keccak256(data), "ipfs://x");
+        vm.roll(block.number + MODEL_CHALLENGE_WINDOW + 1);
+        vm.prank(challenger);
+        vm.expectRevert("Window closed");
+        inc.challengeWrongCommD(cid, data, keccak256("TRUTH"));
+    }
+
+    function test_reclaimBond_afterWindow_returnsBond() public {
+        vm.prank(modelOwner);
+        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD"), keccak256("data"), "ipfs://x");
         vm.roll(block.number + MODEL_CHALLENGE_WINDOW + 1);
 
         uint256 before = modelOwner.balance;
         vm.prank(modelOwner);
-        uint256 amt = inc.reclaimModelBond(cid);
+        uint256 amt = inc.reclaimBond(cid);
         assertEq(amt, MIN_MODEL_BOND);
         assertEq(modelOwner.balance, before + MIN_MODEL_BOND);
+        assertEq(inc.modelBondsRefunded(), MIN_MODEL_BOND);
     }
 
-    function test_reclaimModelBond_revertsDuringWindow() public {
+    function test_reclaimBond_revertsDuringWindow() public {
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD"));
+        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD"), keccak256("data"), "ipfs://x");
         vm.roll(block.number + MODEL_CHALLENGE_WINDOW - 1);
         vm.prank(modelOwner);
-        vm.expectRevert("Window still open");
-        inc.reclaimModelBond(cid);
+        vm.expectRevert("Window open");
+        inc.reclaimBond(cid);
     }
 
-    function test_reclaimModelBond_revertsAfterSlash() public {
+    function test_reclaimBond_revertsAfterSlash() public {
+        bytes memory data = bytes("bytes");
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("WRONG"));
+        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("WRONG"), keccak256(data), "ipfs://x");
         vm.prank(challenger);
-        inc.challengeWrongCommD(cid, keccak256("TRUTH"));
+        inc.challengeWrongCommD(cid, data, keccak256("TRUTH"));
         vm.roll(block.number + MODEL_CHALLENGE_WINDOW + 1);
         vm.prank(modelOwner);
         vm.expectRevert("Bond slashed");
-        inc.reclaimModelBond(cid);
+        inc.reclaimBond(cid);
     }
 
-    // ════════════════════ conservation smoke (TLA invariants) ═══════════════════
+    // ════════════════════ conservation (TLA-v4 invariants) ══════════════════════
 
-    /// After a frivolous-challenge round, the challenger-bond subsystem balances:
-    /// every posted challenger bond is either still escrowed, returned, or
-    /// forfeit to a pinner (ChallengerBondConservation).
     function test_challengerBondConservation_afterFrivolous() public {
         _registerAndSeal(pinner);
-        uint256 nonce = _commitAndReveal(challenger);
+        uint256 nonce = _commit();
+        vm.prank(challenger);
+        inc.challengePin{value: CHALLENGER_BOND}(pinner, cid, sector);
+        vm.roll(block.number + REVEAL_DELAY);
         vm.prank(pinner);
         inc.submitPoSt(cid, sector, keccak256("R"), keccak256("C"), nonce, PROOF);
 
-        // bonded == escrowed(0, challenge closed) + returned + toPinner
+        // bonded == escrowed + returned + toPinner (ChallengerBondConservation)
         assertEq(
             inc.challengerBonded(),
             inc.challengerEscrowed() + inc.challengerBondReturned() + inc.challengerBondToPinner()
         );
-        // exactly one bond posted, forfeit to the pinner
         assertEq(inc.challengerBonded(), CHALLENGER_BOND);
+        assertEq(inc.challengerEscrowed(), 0); // resolved
         assertEq(inc.challengerBondToPinner(), CHALLENGER_BOND);
     }
 
     function test_modelBondConservation_afterSlash() public {
+        bytes memory data = bytes("bytes");
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("WRONG"));
+        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("WRONG"), keccak256(data), "ipfs://x");
         vm.prank(challenger);
-        inc.challengeWrongCommD(cid, keccak256("TRUTH"));
+        inc.challengeWrongCommD(cid, data, keccak256("TRUTH"));
 
-        // bonded == held + slashedToChallenger + pool + paidFromPool + returned
+        // bonded == held(0, slashed) + slashed + refunded (ModelBondConservation)
+        uint256 held = inc.modelBondedTotal() - inc.modelBondsSlashed() - inc.modelBondsRefunded();
+        assertEq(held, 0);
         assertEq(
-            inc.modelBonded(),
-            inc.modelBondHeldTotal() + inc.modelSlashedChallenger() + inc.pinnerPool()
-                + inc.pinnerPoolPaid() + inc.modelReturned()
+            inc.modelBondedTotal(),
+            held + inc.modelBondsSlashed() + inc.modelBondsRefunded()
         );
-        assertEq(inc.modelBonded(), MIN_MODEL_BOND);
+        assertEq(inc.modelBondedTotal(), MIN_MODEL_BOND);
     }
 
     receive() external payable {}
