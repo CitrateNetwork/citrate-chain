@@ -18,7 +18,7 @@
 //   - execute():     precompile entry point with gas accounting
 //                    (`2000 + 50 * dim`).
 //   - dispatch:      wired in `precompiles/mod.rs` at address
-//                    `0x0000…0110` (Learning page, byte17=1, byte18=1,
+//                    `0x0000…0110` (Learning page, canonical WP-B0: byte18=1,
 //                    byte19=0x10).
 //
 // **Reference (off-chain, f32):** `core/learning/src/belnap.rs`
@@ -372,11 +372,12 @@ pub fn validate(input: &BelnapInput) -> Result<(), BelnapError> {
 // ---------------------------------------------------------------------------
 
 /// 20-byte address `0x0000…0110` for Belnap-FOUR aggregation. The
-/// Learning page (byte17=1, byte18=1) is reserved for RM-FL precompiles:
+/// Learning page (canonical byte18=1, selector 0x10–0x1F — WP-B0) is
+/// reserved for RM-FL precompiles:
 ///   - 0x0110: Belnap aggregation        (RM-FL-1, this module)
 ///   - 0x0111: Routing-model inference    (RM-FL-2, future)
 pub const BELNAP_AGGREGATE: [u8; 20] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x01, 0x10,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0x10,
 ];
 
 /// Base gas cost (per Gherkin scenario 1).
@@ -1245,12 +1246,12 @@ mod tests {
 
     #[test]
     fn belnap_aggregate_address_byte_layout() {
-        // Wire-format invariant: the precompile lives at
-        // `0x0000…0110` — Learning page 0x01_01, selector 0x10.
+        // Wire-format invariant: the precompile lives at the
+        // CANONICAL `0x0000…0110` (byte18=0x01, selector 0x10 — the
+        // address Solidity's `address(0x0110)` resolves to, WP-B0).
         // If anyone changes this, the dispatcher in mod.rs and the
-        // tripwire `check_belnap_address_allocated.py` break together.
-        assert_eq!(BELNAP_AGGREGATE[0..17], [0u8; 17]);
-        assert_eq!(BELNAP_AGGREGATE[17], 0x01);
+        // REVM bridge table (`PURE_PRECOMPILE_ADDRESSES`) break together.
+        assert_eq!(BELNAP_AGGREGATE[0..18], [0u8; 18]);
         assert_eq!(BELNAP_AGGREGATE[18], 0x01);
         assert_eq!(BELNAP_AGGREGATE[19], 0x10);
     }

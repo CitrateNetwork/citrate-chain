@@ -35,7 +35,7 @@ use crate::zkp::poseidon_bn254::poseidon_hash;
 pub mod addresses {
     /// 0x0107 — Poseidon commitment over a canonical-format tensor.
     pub const TENSOR_COMMIT: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 7];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 7];
 
     /// 0x0108 — Halo2-KZG verifier for inference proofs (post-RM-M1b
     /// migration; was Groth16 pre-RM-M1b). Dispatches to
@@ -43,11 +43,11 @@ pub mod addresses {
     /// `halo2-substrate` feature is enabled; returns a discoverable
     /// `SubstrateAbsent` error otherwise.
     pub const INFERENCE_PROOF_VERIFY: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 8];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 8];
 
     /// 0x0109 — Merkle inclusion check over a Poseidon-committed tensor.
     pub const MERKLE_VERIFY_TENSOR: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 9];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 9];
 }
 
 /// Gas costs.

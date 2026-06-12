@@ -17,31 +17,31 @@ use crate::inference::metal_runtime::{MetalModel, MetalModelFormat, MetalRuntime
 pub mod addresses {
     /// 0x0100: Model deployment and registration
     pub const MODEL_DEPLOY: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0];
 
     /// 0x0101: Model inference execution
     pub const MODEL_INFERENCE: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1];
 
     /// 0x0102: Batch inference for efficiency
     pub const BATCH_INFERENCE: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2];
 
     /// 0x0103: Model metadata query
     pub const MODEL_METADATA: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 3];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3];
 
     /// 0x0104: Proof verification for inference
     pub const PROOF_VERIFY: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 4];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 4];
 
     /// 0x0105: Model performance benchmarking
     pub const MODEL_BENCHMARK: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 5];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 5];
 
     /// 0x0106: Model encryption operations
     pub const MODEL_ENCRYPTION: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 6];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 6];
 }
 
 /// Gas costs for AI operations (in gas units)
