@@ -160,7 +160,19 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         uint64 missed;
         uint256 claimed;
         uint256 bondHeld;
+        /// @notice The circuit's replicaID = Poseidon(pinnerIdentity ‖ cid ‖
+        ///         sector) — the PoRep/PoSt proof's public input. SUPPLIED by the
+        ///         pinner at seal (the contract cannot recompute Poseidon), bound
+        ///         1:1 to the pinner via `replicaIdOwner`, and reused as the PoSt
+        ///         public input so every challenge response proves the SAME sealed
+        ///         replica. (A keccak re-derivation can never equal the circuit's
+        ///         Poseidon value — see the PIN-S6 binding regression test.)
         bytes32 replicaID;
+        /// @notice The epoch the pinner sealed at — the proof's `epoch` public
+        ///         input. Stored so submitPoSt re-uses the SAME value (the
+        ///         daemon cannot predict a future block.number, so epoch can't be
+        ///         block.number).
+        uint256 epoch;
         bytes32 commD;
         bytes32 commR;
         bytes32 commC;
@@ -181,6 +193,14 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
     }
 
     mapping(bytes32 => Pin) private _pins;
+
+    /// @notice replicaID → the pinner who first committed it (anti-theft). The
+    ///         circuit's replicaID binds the sealed bytes to a private identity
+    ///         the contract can't recompute; this map prevents a second pinner
+    ///         from re-submitting another pinner's (replicaID, proof) to seal a
+    ///         pin they didn't produce. Once owned, a replicaID is usable only by
+    ///         its owner.
+    mapping(bytes32 => address) public replicaIdOwner;
 
     // ──────────────────────────── Slot state ───────────────────────────────
     // v3 hoists the per-slot challenge state OUT of `Pin` and into `Slot`,
@@ -422,13 +442,11 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         return keccak256(abi.encode(cid, sector));
     }
 
-    function deriveReplicaId(address pinner, bytes32 cid, uint256 sector)
-        public
-        pure
-        returns (bytes32)
-    {
-        return keccak256(abi.encode("PIN-replicaID", pinner, cid, sector));
-    }
+    // NOTE: there is intentionally NO on-chain `deriveReplicaId`. The circuit's
+    // replicaID = Poseidon(pinnerIdentity ‖ cid ‖ sector) cannot be recomputed
+    // cheaply in the EVM, and a keccak stand-in can NEVER equal it (PIN-S6
+    // finding) — so the pinner SUPPLIES the circuit's replicaID at seal and the
+    // contract binds it 1:1 via `replicaIdOwner` (anti-theft).
 
     // ────── v3 NEW: model-owner CommD registration + bond / challenge ───────
 
@@ -574,6 +592,8 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
     function sealCommit(
         bytes32 cid,
         uint256 sector,
+        bytes32 replicaID,
+        uint256 epoch,
         bytes32 commD,
         bytes32 commR,
         bytes32 commC,
@@ -588,7 +608,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         require(commD == reg.commD, "CommD mismatch");
 
         bytes32 pid = pinId(msg.sender, cid, sector);
-        _doSeal(msg.sender, msg.sender, pid, cid, sector, commD, commR, commC, porepProof);
+        _doSeal(msg.sender, msg.sender, pid, cid, sector, replicaID, epoch, commD, commR, commC, porepProof);
         emit Sealed(pid, msg.sender, slotId(cid, sector), msg.sender, BOND);
     }
 
@@ -607,6 +627,8 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         address pinner,
         bytes32 cid,
         uint256 sector,
+        bytes32 replicaID,
+        uint256 epoch,
         bytes32 commD,
         bytes32 commR,
         bytes32 commC,
@@ -621,7 +643,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         require(commD == reg.commD, "CommD mismatch");
 
         bytes32 pid = pinId(pinner, cid, sector);
-        _doSeal(pinner, msg.sender, pid, cid, sector, commD, commR, commC, porepProof);
+        _doSeal(pinner, msg.sender, pid, cid, sector, replicaID, epoch, commD, commR, commC, porepProof);
         emit Sealed(pid, pinner, slotId(cid, sector), msg.sender, BOND);
     }
 
@@ -634,6 +656,8 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         bytes32 pid,
         bytes32 cid,
         uint256 sector,
+        bytes32 replicaID,
+        uint256 epoch,
         bytes32 commD,
         bytes32 commR,
         bytes32 commC,
@@ -646,8 +670,19 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         Slot storage s = _ensureSlotFunded(sid);
         require(s.liveCount < QUORUM, "Slot quorum reached");
 
-        bytes32 replicaID = deriveReplicaId(pinner, cid, sector);
+        // Anti-theft: a replicaID (the Poseidon binding of the pinner's private
+        // identity to the sealed bytes) is usable only by the pinner who first
+        // committed it — so a second pinner cannot re-submit another pinner's
+        // (replicaID, proof) to seal a pin they didn't produce.
+        address owner = replicaIdOwner[replicaID];
+        require(owner == address(0) || owner == pinner, "replicaID owned by another");
+        if (owner == address(0)) {
+            replicaIdOwner[replicaID] = pinner;
+        }
 
+        // The wire carries the CIRCUIT's replicaID (Poseidon, supplied) and the
+        // pinner's seal `epoch` — NOT a contract-derived keccak replicaID nor
+        // block.number — so a real proof's public inputs match (PIN-S6 finding).
         bytes memory input = abi.encodePacked(
             replicaID,
             cid,
@@ -657,8 +692,8 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             commD,
             commR,
             commC,
-            bytes32(0), // challengeNonce (none at seal)
-            bytes32(block.number), // epoch
+            bytes32(0), // challengeNonce (none at seal — index 0)
+            bytes32(epoch),
             porepProof
         );
         require(_verify(input), "PoRep proof invalid");
@@ -669,6 +704,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         p.claimed = 0;
         p.bondHeld = BOND;
         p.replicaID = replicaID;
+        p.epoch = epoch;
         p.commD = commD;
         p.commR = commR;
         p.commC = commC;
@@ -849,6 +885,10 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         require(challengeNonce == s.commitNonce, "Wrong challengeNonce");
         require(s.budget >= PER_ROUND, "Slot budget exhausted");
 
+        // The PoSt re-proves the SAME sealed replica, so the wire reuses the
+        // STORED replicaID + epoch (the daemon re-seals deterministically from
+        // the original inputs to prove). epoch != block.number — the daemon
+        // can't predict the submit block (PIN-S6 finding).
         bytes memory input = abi.encodePacked(
             p.replicaID,
             cid,
@@ -858,7 +898,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             commR,
             commC,
             bytes32(challengeNonce),
-            bytes32(block.number),
+            bytes32(p.epoch),
             postProof
         );
         require(_verify(input), "PoSt proof invalid");
