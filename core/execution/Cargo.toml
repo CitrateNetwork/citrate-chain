@@ -117,6 +117,14 @@ name = "porep_bench"
 harness = false
 required-features = ["halo2-substrate"]
 
+# PIN-S6 — the out-of-process sealing/proving sidecar the pinning daemon drives.
+# Carries the reduced-circuit prover, so it needs the halo2 feature; the default
+# build (and every node binary) does NOT include it.
+[[bin]]
+name = "citrate-sealer"
+path = "src/bin/citrate-sealer.rs"
+required-features = ["halo2-substrate"]
+
 [features]
 metrics = []
 ai_zkp = []
