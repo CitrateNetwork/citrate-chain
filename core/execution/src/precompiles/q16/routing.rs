@@ -370,10 +370,10 @@ pub fn validate(input: &RoutingInput) -> Result<(), RoutingError> {
 // Precompile address (Learning page 0x01_01 — selector 0x11)
 // ---------------------------------------------------------------------------
 
-/// 20-byte address `0x0000…0111` for routing-model inference. Sits
-/// next to Belnap (RM-FL-1's 0x0110) on the Learning page.
+/// 20-byte address `0x0000…0111` (canonical, WP-B0) for routing-model
+/// inference. Sits next to Belnap (RM-FL-1's 0x0110) on the Learning page.
 pub const ROUTING_INFERENCE: [u8; 20] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x01, 0x11,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0x11,
 ];
 
 /// Base gas cost (per planset).
@@ -985,11 +985,10 @@ mod tests {
     #[test]
     fn routing_inference_address_byte_layout() {
         // Wire-format invariant: 0x0111 on the Learning page
-        // (byte17=0x01, byte18=0x01, byte19=0x11). If anyone changes
+        // (canonical WP-B0: byte18=0x01, byte19=0x11). If anyone changes
         // this, the dispatcher in mod.rs and the routing-arch tripwire
         // break together.
-        assert_eq!(ROUTING_INFERENCE[0..17], [0u8; 17]);
-        assert_eq!(ROUTING_INFERENCE[17], 0x01);
+        assert_eq!(ROUTING_INFERENCE[0..18], [0u8; 18]);
         assert_eq!(ROUTING_INFERENCE[18], 0x01);
         assert_eq!(ROUTING_INFERENCE[19], 0x11);
     }
