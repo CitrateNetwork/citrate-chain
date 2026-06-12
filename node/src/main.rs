@@ -931,8 +931,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         info!("Metrics server started on http://{}/metrics", metrics_addr);
     }
 
-    // Record node start time for uptime tracking
-    let _node_start_time = std::time::Instant::now();
+    // Record node start time for uptime tracking, and sample uptime + process
+    // RSS every 15s. The RSS gauge (`process_resident_memory_bytes`) feeds the
+    // PIL-13 ProducerMemoryHigh alert (>3 GB sustained 2m) — at a 15s cadence
+    // the alert's `for: 2m` window always has fresh samples.
+    let node_start_time = std::time::Instant::now();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tick.tick().await;
+            metrics::record_uptime(node_start_time);
+            metrics::record_process_rss();
+        }
+    });
 
     // Create storage
     let storage = Arc::new(StorageManager::new(

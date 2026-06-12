@@ -41,6 +41,20 @@ groups:
           summary: "Low peer count on {{ $labels.instance }}"
           description: "Node {{ $labels.instance }} has only {{ $value }} connected peers."
 
+      # PIL-13 WP-13.5: producer memory tripwire. The healthy producer sits
+      # ~1.05 GB RSS; the PIL-13 O(N²) eager-load leak hit 15.8 GB and
+      # kernel-OOM'd. 3 GB sustained = the leak class is back (or a new one) —
+      # apply the mining=false circuit-breaker (docs/OPERATIONS.md, "Producer
+      # health") before the OOM killer decides for you.
+      - alert: ProducerMemoryHigh
+        expr: process_resident_memory_bytes{job="citrate-node"} > 3e9
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "citrate-node RSS over 3 GB on {{ $labels.instance }}"
+          description: "Resident memory is {{ $value | humanize1024 }}B on {{ $labels.instance }} — PIL-13 leak-class threshold (healthy ≈ 1 GB). See docs/OPERATIONS.md 'Producer health'."
+
       # RPC p99 latency > 2 seconds
       - alert: HighRpcLatency
         expr: histogram_quantile(0.99, rate(citrate_rpc_latency_seconds_bucket[5m])) > 2
