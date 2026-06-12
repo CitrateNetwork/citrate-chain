@@ -125,8 +125,9 @@ contract Handler is Test {
         if (st != IPFSIncentivesV3.Status.None) return;
         (, , uint256 live, , , ) = inc.getSlot(cid, SECTOR);
         if (live >= QUORUM) return;
+        bytes32 rid = keccak256(abi.encode("rid", who, cid));
         vm.prank(who);
-        try inc.sealCommit{value: BOND}(cid, SECTOR, COMM_D, keccak256("R"), keccak256("C"), hex"AA") {
+        try inc.sealCommit{value: BOND}(cid, SECTOR, rid, 1, COMM_D, keccak256("R"), keccak256("C"), hex"AA") {
             sealedCount++;
         } catch {}
     }

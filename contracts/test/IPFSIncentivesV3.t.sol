@@ -121,7 +121,16 @@ contract IPFSIncentivesV3Test is Test {
         vm.prank(who);
         inc.registerPinner();
         vm.prank(who);
-        inc.sealCommit{value: BOND}(cid, sector, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+        inc.sealCommit{value: BOND}(
+            cid, sector, _replicaId(who), 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF
+        );
+    }
+
+    /// A per-pinner circuit-replicaID stand-in (the real value is the prover's
+    /// Poseidon output; the mock verifier accepts any 32 bytes, so the test
+    /// exercises the contract's replicaID-owner binding, not the ZK).
+    function _replicaId(address who) internal pure returns (bytes32) {
+        return keccak256(abi.encode("rid", who));
     }
 
     /// Open the per-slot commit (sets the nonce), return the committed nonce.
@@ -129,6 +138,41 @@ contract IPFSIncentivesV3Test is Test {
         inc.commitChallenge(cid, sector);
         (, , , , uint256 commitNonce, ) = inc.getSlot(cid, sector);
         nonce = commitNonce;
+    }
+
+    // ════════════════════ replicaID binding (PIN-S6 finding) ════════════════════
+
+    /// A replicaID is owned by the first pinner who commits it; a second pinner
+    /// cannot re-submit another's (replicaID, proof) to seal a pin (anti-theft).
+    function test_replicaId_cannotBeReusedByAnotherPinner() public {
+        _ensureModelRegistered();
+        bytes32 rid = _replicaId(pinner); // pinner1 claims it
+        vm.prank(pinner);
+        inc.registerPinner();
+        vm.prank(pinner);
+        inc.sealCommit{value: BOND}(cid, sector, rid, 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+
+        // pinner2 (a different (cid,sector) sector so the slot has room) tries to
+        // reuse pinner1's replicaID -> rejected by the owner binding.
+        vm.prank(pinner2);
+        inc.registerPinner();
+        vm.prank(pinner2);
+        vm.expectRevert("replicaID owned by another");
+        inc.sealCommit{value: BOND}(cid, 1, rid, 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+    }
+
+    function test_replicaId_ownerCanReuseAcrossOwnSectors() public {
+        _ensureModelRegistered();
+        bytes32 rid = _replicaId(pinner);
+        vm.prank(pinner);
+        inc.registerPinner();
+        vm.prank(pinner);
+        inc.sealCommit{value: BOND}(cid, sector, rid, 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+        // The same owner reusing the same replicaID on another sector is allowed
+        // (the per-pin key differs; the owner binding only blocks OTHER pinners).
+        vm.prank(pinner);
+        inc.sealCommit{value: BOND}(cid, 1, rid, 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+        assertEq(inc.replicaIdOwner(rid), pinner);
     }
 
     // ════════════════════ Q1: commit-reveal grind-resistance ════════════════════
