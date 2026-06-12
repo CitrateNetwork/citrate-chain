@@ -50,6 +50,10 @@ The chain itself — everything that makes Citrate a blockchain:
 | `fuzz/` | Fuzz targets | Continuous fuzzing |
 | `tools/` | Operator tooling | Misc CLI tools, devnet helpers |
 
+> **Operators:** the production runbook lives at
+> [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — start with "Producer health"
+> (PIL-13 memory thresholds + the `mining = false` circuit-breaker).
+
 ## Network parameters
 
 - **Chain ID**: `40204` (testnet beta)

@@ -55,6 +55,19 @@ groups:
           summary: "citrate-node RSS over 3 GB on {{ $labels.instance }}"
           description: "Resident memory is {{ $value | humanize1024 }}B on {{ $labels.instance }} — PIL-13 leak-class threshold (healthy ≈ 1 GB). See docs/OPERATIONS.md 'Producer health'."
 
+      # PIL-49e: RPC accept-queue depth (the PIL-49c gauge). Anything > 1
+      # sustained means we are inside (or sliding into) an accept-loop hang —
+      # capture the hang-state stack trace (PIL-49e sprint file, "Diagnostic
+      # plan") BEFORE restarting; restart loses the evidence.
+      - alert: RpcAcceptQueueBacklog
+        expr: citrate_rpc_accept_queue_depth > 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RPC accept queue backing up on {{ $labels.instance }}"
+          description: "citrate_rpc_accept_queue_depth = {{ $value }} — PIL-49e hang signature. Capture stacks (gcore + gdb, see the PIL-49e sprint diagnostic plan) before any restart."
+
       # RPC p99 latency > 2 seconds
       - alert: HighRpcLatency
         expr: histogram_quantile(0.99, rate(citrate_rpc_latency_seconds_bucket[5m])) > 2
