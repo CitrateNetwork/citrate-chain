@@ -38,27 +38,27 @@ use crate::types::Address;
 pub mod addresses {
     /// 0x010A — TENSOR_MATMUL_Q16
     pub const TENSOR_MATMUL_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0x0A];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0A];
 
     /// 0x010B — TENSOR_DOT_Q16
     pub const TENSOR_DOT_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0x0B];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0B];
 
     /// 0x010C — TENSOR_SOFTMAX_Q16
     pub const TENSOR_SOFTMAX_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0x0C];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0C];
 
     /// 0x010D — TENSOR_RELU_Q16
     pub const TENSOR_RELU_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0x0D];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0D];
 
     /// 0x010E — TENSOR_LINEAR_Q16
     pub const TENSOR_LINEAR_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0x0E];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0E];
 
     /// 0x010F — TENSOR_TRANSPOSE_Q16
     pub const TENSOR_TRANSPOSE_Q16: [u8; 20] =
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0x0F];
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x0F];
 }
 
 /// Gas costs.
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn dispatch_unknown_address_errors() {
         let bogus = Address([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0xFF,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xFF,
         ]);
         let r = execute(&bogus, &[], 1_000_000);
         assert!(r.is_err());
