@@ -48,6 +48,11 @@ pub const METRIC_NODE_START_TIME: &str = "citrate_node_start_time_seconds";
 pub const METRIC_NODE_UPTIME: &str = "citrate_node_uptime_seconds";
 pub const METRIC_NODE_INFO: &str = "citrate_node_info";
 pub const METRIC_NODE_RESTARTS: &str = "citrate_node_restarts_total";
+/// Process RSS in bytes — the standard Prometheus name, exported by the node
+/// itself (the `metrics` facade has no process collector). PIL-13 WP-13.5:
+/// the `ProducerMemoryHigh` alert fires on this > 3e9 sustained 2m
+/// (`node/monitoring/alerts/citrate-alerts.yml`).
+pub const METRIC_PROCESS_RSS: &str = "process_resident_memory_bytes";
 
 // Peer Connections
 pub const METRIC_PEER_COUNT: &str = "citrate_peer_count";
@@ -161,6 +166,11 @@ fn register_metric_descriptions() {
     describe_counter!(
         METRIC_NODE_RESTARTS,
         "Total number of node restarts"
+    );
+    describe_gauge!(
+        METRIC_PROCESS_RSS,
+        Unit::Bytes,
+        "Process resident set size (PIL-13 producer-memory tripwire)"
     );
 
     // Peer Connections
@@ -344,6 +354,38 @@ fn register_metric_descriptions() {
 /// Record node uptime
 pub fn record_uptime(start_time: Instant) {
     gauge!(METRIC_NODE_UPTIME, start_time.elapsed().as_secs_f64());
+}
+
+/// Current process resident set size in bytes.
+///
+/// Data source: Linux `/proc/self/statm` field 2 (resident pages) × page
+/// size; macOS `ps -o rss=` (KiB). `None` when neither source is readable.
+pub fn process_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        // Page size is 4096 on every platform the node ships to; sysconf
+        // would need libc for no practical gain here.
+        Some(resident_pages * 4096)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()?;
+        let kib: u64 = String::from_utf8(out.stdout).ok()?.trim().parse().ok()?;
+        Some(kib * 1024)
+    }
+}
+
+/// Sample + export the process RSS gauge (PIL-13 WP-13.5). Returns the
+/// sampled value so callers/tests can assert on it.
+pub fn record_process_rss() -> Option<u64> {
+    let rss = process_rss_bytes()?;
+    gauge!(METRIC_PROCESS_RSS, rss as f64);
+    Some(rss)
 }
 
 /// Record peer count
@@ -544,5 +586,18 @@ mod tests {
         record_peer_count(5);
         record_block_height(100);
         record_mempool_size(10, 1000);
+    }
+
+    /// PIL-13 WP-13.5: the RSS sampler reads a real, plausible value from the
+    /// OS — the ProducerMemoryHigh alert is dead without this gauge.
+    #[test]
+    fn process_rss_samples_a_plausible_value() {
+        let rss = process_rss_bytes().expect("RSS readable on this platform");
+        // A running test binary holds at least 1 MiB and (sanity ceiling)
+        // under 100 GiB resident.
+        assert!(rss > 1024 * 1024, "RSS {rss} bytes is implausibly small");
+        assert!(rss < 100 * 1024 * 1024 * 1024, "RSS {rss} bytes is implausibly large");
+        // And the gauge path does not panic without an installed recorder.
+        let _ = record_process_rss();
     }
 }
