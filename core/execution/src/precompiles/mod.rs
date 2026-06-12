@@ -80,6 +80,75 @@ pub mod standard {
     ]);
 }
 
+/// Route the PURE (stateless) Citrate precompile families without a
+/// `PrecompileExecutor` instance — the entry point of the REVM
+/// custom-precompile bridge (WP-B0 / TD-28, see
+/// `revm_adapter::register_citrate_precompiles`).
+///
+/// Covered families (all read no chain state and host no runtime, so they
+/// are deterministic on every node build):
+///   - 0x0107–0x0109  verification  (`verify::execute` — Poseidon tensor
+///     commit, the 0x0108 Halo2-KZG proof verifier, Merkle tensor paths)
+///   - 0x010A–0x010F  deterministic compute (`compute::execute`, Q16.16)
+///   - 0x0110–0x0111  learning      (`q16::{belnap,routing}::execute`)
+///   - 0x0200–0x0209  x402          (`x402::execute`, signature checks)
+///
+/// The inference family (0x0100–0x0106) needs the hosted model runtime
+/// (non-deterministic across nodes) and is deliberately NOT routed here —
+/// it stays behind `PrecompileExecutor::execute`.
+pub fn execute_pure(address: &Address, input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
+    let addr_bytes = address.as_bytes();
+    if !addr_bytes[..18].iter().all(|&b| b == 0) {
+        return Err(anyhow::anyhow!("Not a Citrate pure precompile address"));
+    }
+    let family = addr_bytes[18];
+    let selector = addr_bytes[19];
+
+    if family == 2 && selector <= 9 {
+        return x402::execute(address, input, gas_limit);
+    }
+    if family == 1 {
+        if (0x07..=0x09).contains(&selector) {
+            return verify::execute(address, input, gas_limit);
+        }
+        if (0x0A..=0x0F).contains(&selector) {
+            return compute::execute(address, input, gas_limit);
+        }
+        if selector == 0x10 {
+            return q16::belnap::execute(input, gas_limit);
+        }
+        if selector == 0x11 {
+            return q16::routing::execute(input, gas_limit);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Not a Citrate pure precompile address: 0x{:02x}{:02x}",
+        family,
+        selector
+    ))
+}
+
+/// The pure Citrate precompile addresses the REVM bridge exposes to
+/// contract code (WP-B0). Kept next to `execute_pure` so the two cannot
+/// drift: every address listed here MUST route in `execute_pure`, and the
+/// `pure_precompile_table_routes` unit test enforces it.
+pub const PURE_PRECOMPILE_ADDRESSES: [[u8; 20]; 14] = [
+    verify::addresses::TENSOR_COMMIT,          // 0x0107
+    verify::addresses::INFERENCE_PROOF_VERIFY, // 0x0108
+    verify::addresses::MERKLE_VERIFY_TENSOR,   // 0x0109
+    compute::addresses::TENSOR_MATMUL_Q16,     // 0x010A
+    compute::addresses::TENSOR_DOT_Q16,        // 0x010B
+    compute::addresses::TENSOR_SOFTMAX_Q16,    // 0x010C
+    compute::addresses::TENSOR_RELU_Q16,       // 0x010D
+    compute::addresses::TENSOR_LINEAR_Q16,     // 0x010E
+    compute::addresses::TENSOR_TRANSPOSE_Q16,  // 0x010F
+    q16::belnap::BELNAP_AGGREGATE,             // 0x0110
+    q16::routing::ROUTING_INFERENCE,           // 0x0111
+    x402::addresses::EIP712_VERIFY,            // 0x0200
+    x402::addresses::TRANSFER_AUTH_VERIFY,     // 0x0201
+    x402::addresses::BATCH_PAYMENT_VERIFY,     // 0x0202
+];
+
 /// Precompile executor
 pub struct PrecompileExecutor {
     inference: Option<InferencePrecompile>,
@@ -112,32 +181,27 @@ impl PrecompileExecutor {
             && addr_bytes[19] >= 1
             && addr_bytes[19] <= 9;
 
-        // Citrate AI precompiles (0x0100 - 0x010F)
-        // Address format: [0, 0, ..., 0, 1, 0, x] where x is 0x00-0x0F
+        // Citrate AI precompiles (0x0100 - 0x010F) — WP-B0 canonical scheme:
+        // the EVM address IS the documented short name, e.g. 0x0108 =
+        // 0x…000108 (byte 18 = 0x01, byte 19 = selector). This matches the
+        // Solidity constants (`address(0x0108)`), `40204.json`'s
+        // `precompiles` table, and every design doc. The pre-WP-B0 layout
+        // (byte 17 = family, byte 18 = 0 → 0x…010008) was unreachable from
+        // contract code and matched nothing the contracts call (TD-28).
         // 0x0100-0x0106: inference runtime (RM-M0)
         // 0x0107-0x0109: verification (RM-M1)
         // 0x010A-0x010F: deterministic compute (RM-M2)
-        let prefix_check = addr_bytes[..17].iter().all(|&b| b == 0);
-        let byte17_check = addr_bytes[17] == 1; // This is the 0x01 part
-        let byte18_check = addr_bytes[18] == 0; // This is the 00 part
-        let byte19_check = addr_bytes[19] <= 0x0F; // selector 0-15
-        let is_ai = prefix_check && byte17_check && byte18_check && byte19_check;
+        let prefix_check = addr_bytes[..18].iter().all(|&b| b == 0);
+        let is_ai = prefix_check && addr_bytes[18] == 1 && addr_bytes[19] <= 0x0F;
 
         // Citrate Learning precompiles (0x0110 - 0x011F) — RM-FL-1+
-        // Address format: [0, 0, ..., 0, 1, 1, x] where x is 0x10-0x1F
         // 0x0110: Belnap-FOUR aggregation (RM-FL-1, BELNAP_AGGREGATE)
         // 0x0111: Routing-model inference (RM-FL-2, future)
-        let is_learning = prefix_check
-            && addr_bytes[17] == 1
-            && addr_bytes[18] == 1
-            && (0x10..=0x1F).contains(&addr_bytes[19]);
+        let is_learning =
+            prefix_check && addr_bytes[18] == 1 && (0x10..=0x1F).contains(&addr_bytes[19]);
 
         // Citrate x402 payment precompiles (0x0200 - 0x0209)
-        // Address format: [0, 0, ..., 0, 2, 0, x] where x is 0-9
-        let is_x402 = addr_bytes[..17].iter().all(|&b| b == 0)
-            && addr_bytes[17] == 2
-            && addr_bytes[18] == 0
-            && addr_bytes[19] <= 9;
+        let is_x402 = prefix_check && addr_bytes[18] == 2 && addr_bytes[19] <= 9;
 
         is_standard || is_ai || is_learning || is_x402
     }
@@ -151,17 +215,18 @@ impl PrecompileExecutor {
     ) -> Result<PrecompileResult> {
         let addr_bytes = address.as_bytes();
 
-        // x402 payment precompiles (byte 17 = 2, byte 18 = 0)
-        if addr_bytes[..17].iter().all(|&b| b == 0) && addr_bytes[17] == 2 && addr_bytes[18] == 0 {
+        // x402 payment precompiles (0x0200–0x0209; canonical byte 18 = 2)
+        if addr_bytes[..18].iter().all(|&b| b == 0) && addr_bytes[18] == 2 && addr_bytes[19] <= 9 {
             return x402::execute(address, input, gas_limit);
         }
 
-        // Learning precompiles (byte 17 = 1, byte 18 = 1) — RM-FL-1+
+        // Learning precompiles (0x0110–0x011F; canonical byte 18 = 1,
+        // selector 0x10–0x1F) — RM-FL-1+
         // 0x0110 — Belnap aggregation (RM-FL-1)
         // 0x0111 — Routing-model inference (RM-FL-2)
-        if addr_bytes[..17].iter().all(|&b| b == 0)
-            && addr_bytes[17] == 1
+        if addr_bytes[..18].iter().all(|&b| b == 0)
             && addr_bytes[18] == 1
+            && (0x10..=0x1F).contains(&addr_bytes[19])
         {
             let selector = addr_bytes[19];
             if selector == 0x10 {
@@ -176,8 +241,11 @@ impl PrecompileExecutor {
             ));
         }
 
-        // AI precompiles (byte 17 = 1, byte 18 = 0)
-        if addr_bytes[..17].iter().all(|&b| b == 0) && addr_bytes[17] == 1 && addr_bytes[18] == 0 {
+        // AI precompiles (0x0100–0x010F; canonical byte 18 = 1, selector ≤ 0x0F)
+        if addr_bytes[..18].iter().all(|&b| b == 0)
+            && addr_bytes[18] == 1
+            && addr_bytes[19] <= 0x0F
+        {
             // RM-M1: 0x0107–0x0109 are AI verification precompiles
             // (commitments / proof verification / Merkle paths).
             // RM-M2: 0x010A–0x010F are AI deterministic compute
@@ -1543,11 +1611,11 @@ mod tests {
         assert!(executor.is_precompile(&Address(x402::addresses::BATCH_PAYMENT_VERIFY)));
 
         // Future x402 slots (0x0203-0x0209) should also be recognized
-        let future_x402 = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 2, 0, 5]);
+        let future_x402 = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 2, 5]);
         assert!(executor.is_precompile(&future_x402));
 
         // 0x020A should NOT be recognized (out of range)
-        let out_of_range = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 2, 0, 10]);
+        let out_of_range = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 2, 10]);
         assert!(!executor.is_precompile(&out_of_range));
     }
 
@@ -1571,7 +1639,7 @@ mod tests {
         assert_eq!(result.gas_used, x402::gas_costs::TRANSFER_AUTH_VERIFY);
 
         // Unknown x402 address should error
-        let unknown_x402 = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 2, 0, 9]);
+        let unknown_x402 = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 2, 9]);
         let result = executor.execute(&unknown_x402, &input, 10_000);
         assert!(result.is_err());
     }
@@ -1589,13 +1657,13 @@ mod tests {
 
         // Future learning slots (0x0111 routing model, etc.) should
         // also be recognized — the page reserves 0x0110-0x011F.
-        let future_routing = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1, 1, 0x11]);
+        let future_routing = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 1, 0x11]);
         assert!(executor.is_precompile(&future_routing));
 
         // Just past the page (0x0120) MUST NOT be recognized — that
         // would silently route to nothing and break the dispatcher
         // contract.
-        let out_of_page = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1, 1, 0x20]);
+        let out_of_page = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 1, 0x20]);
         assert!(!executor.is_precompile(&out_of_page));
     }
 
@@ -1653,8 +1721,9 @@ mod tests {
             executor.is_precompile(&routing_addr),
             "0x0111 (routing inference) must be recognized as a precompile"
         );
-        // Verify the byte layout: Learning page selector 0x11.
-        assert_eq!(q16::routing::ROUTING_INFERENCE[17], 0x01);
+        // Verify the canonical byte layout (WP-B0): Learning page is
+        // 0x…0111 — byte 18 = 0x01, selector 0x11.
+        assert_eq!(q16::routing::ROUTING_INFERENCE[17], 0x00);
         assert_eq!(q16::routing::ROUTING_INFERENCE[18], 0x01);
         assert_eq!(q16::routing::ROUTING_INFERENCE[19], 0x11);
     }
@@ -1685,5 +1754,58 @@ mod tests {
             err.contains("Routing forward"),
             "error message must come from routing::execute (got: {err})"
         );
+    }
+
+    // ====================================================================
+    // WP-B0 (TD-28): the REVM-bridge table and `execute_pure` must agree.
+    // ====================================================================
+
+    /// Every address in `PURE_PRECOMPILE_ADDRESSES` must (a) be recognised
+    /// by `is_precompile`, (b) route somewhere real in `execute_pure`
+    /// (i.e. NOT fail with the "Not a Citrate pure precompile" sentinel),
+    /// and (c) use the canonical short-address layout (bytes 0..18 zero)
+    /// that the Solidity contracts and `40204.json` publish.
+    #[test]
+    fn pure_precompile_table_routes() {
+        let executor = PrecompileExecutor::new();
+        for raw in PURE_PRECOMPILE_ADDRESSES {
+            let addr = Address(raw);
+            assert!(
+                raw[..18].iter().all(|&b| b == 0),
+                "{addr:?} must use the canonical 0x…{:02x}{:02x} layout",
+                raw[18],
+                raw[19]
+            );
+            assert!(
+                executor.is_precompile(&addr),
+                "{addr:?} must be recognised by is_precompile"
+            );
+            // Junk input: each family must claim the address (reject the
+            // INPUT, not the address). The not-routed sentinel is the only
+            // disallowed outcome.
+            if let Err(e) = execute_pure(&addr, &[0xde, 0xad], 10_000_000) {
+                assert!(
+                    !e.to_string().contains("Not a Citrate pure precompile"),
+                    "{addr:?} is in PURE_PRECOMPILE_ADDRESSES but execute_pure does not route it"
+                );
+            }
+        }
+    }
+
+    /// The inference family needs the hosted runtime and must NOT be
+    /// routed by the pure bridge.
+    #[test]
+    fn execute_pure_refuses_inference_family() {
+        for selector in 0x00u8..=0x06 {
+            let mut raw = [0u8; 20];
+            raw[18] = 0x01;
+            raw[19] = selector;
+            let err = execute_pure(&Address(raw), &[], 10_000_000)
+                .expect_err("inference addresses must not route through the pure bridge");
+            assert!(
+                err.to_string().contains("Not a Citrate pure precompile"),
+                "0x01{selector:02x} must be refused by execute_pure (got: {err})"
+            );
+        }
     }
 }
