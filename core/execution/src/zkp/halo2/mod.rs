@@ -871,6 +871,126 @@ fn post_kzg_artifacts_v3() -> (
 }
 
 // ---------------------------------------------------------------------------
+// PIN-S6: reduced-circuit PROVERS (the seal/PoSt prover side).
+//
+// The verifier side (`verify_porep_proof` / `verify_post_proof` +
+// `*_kzg_artifacts_*`) ships in every node. The PROVER side ships only in the
+// `citrate-sealer` sidecar binary (PIN-S6) — the pinning daemon drives it
+// out-of-process so the halo2 prover never links into the daemon. These helpers
+// reuse the verifier's EXACT `ParamsKZG` (via `*_kzg_artifacts_*`), so a proof
+// they emit is guaranteed to verify under the same SRS the precompile uses —
+// no separate trusted-setup path to drift.
+//
+// REDUCED instance (N=4, L=2, K=1): testnet-functional. Real-size sealing is
+// PIN-P1 (f.6); these provers swap to the real circuit transparently when the
+// v2/v3 VKs are regenerated (the daemon + sidecar protocol are unchanged).
+// ---------------------------------------------------------------------------
+
+/// Error producing a reduced-circuit proof in the sealer sidecar.
+#[cfg(feature = "halo2-substrate")]
+#[derive(Debug)]
+pub enum ProveError {
+    /// `keygen_pk`/`keygen_vk` failed (should not happen for the fixed circuit).
+    Keygen(String),
+    /// `create_proof` failed.
+    Prove(String),
+}
+
+#[cfg(feature = "halo2-substrate")]
+impl std::fmt::Display for ProveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProveError::Keygen(e) => write!(f, "keygen failed: {e}"),
+            ProveError::Prove(e) => write!(f, "create_proof failed: {e}"),
+        }
+    }
+}
+
+#[cfg(feature = "halo2-substrate")]
+impl std::error::Error for ProveError {}
+
+/// Produce a reduced **PoRep** (circuit_version 2) proof for a sealed replica +
+/// challenge index, against the SAME `ParamsKZG` the `0x0108` v2 verifier uses.
+/// `pinner_identity` is the private pre-image of `replicaID` (witness-only).
+#[cfg(feature = "halo2-substrate")]
+pub fn prove_porep_reduced(
+    sealed: &crate::zkp::halo2::porep::SealedReplica,
+    pinner_identity: halo2curves::bn256::Fr,
+    challenge_index: usize,
+) -> Result<Vec<u8>, ProveError> {
+    use crate::zkp::halo2::porep::PoRepCircuit;
+    use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk, Circuit as _};
+    use halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme;
+    use halo2_proofs::poly::kzg::multiopen::ProverSHPLONK;
+    use halo2_proofs::transcript::{Blake2bWrite, Challenge255, TranscriptWriterBuffer};
+    use halo2curves::bn256::{Bn256, G1Affine};
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    let (params, _vk_ref) = porep_kzg_artifacts_v2();
+    let circuit = PoRepCircuit::from_sealed(sealed, pinner_identity, challenge_index);
+    let pis = PoRepCircuit::public_inputs(sealed, challenge_index);
+
+    let vk = keygen_vk(params, &circuit.without_witnesses())
+        .map_err(|e| ProveError::Keygen(format!("{e:?}")))?;
+    let pk = keygen_pk(params, vk, &circuit.without_witnesses())
+        .map_err(|e| ProveError::Keygen(format!("{e:?}")))?;
+
+    let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
+    let prover_rng = StdRng::from_seed([0xAB; 32]);
+    create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(
+        params,
+        &pk,
+        &[circuit],
+        &[vec![pis]],
+        prover_rng,
+        &mut transcript,
+    )
+    .map_err(|e| ProveError::Prove(format!("{e:?}")))?;
+    Ok(transcript.finalize())
+}
+
+/// Produce a reduced **PoSt** (circuit_version 3) proof for a sealed replica +
+/// challenge index, against the SAME `ParamsKZG` the `0x0108` v3 verifier uses.
+#[cfg(feature = "halo2-substrate")]
+pub fn prove_post_reduced(
+    sealed: &crate::zkp::halo2::porep::SealedReplica,
+    pinner_identity: halo2curves::bn256::Fr,
+    challenge_index: usize,
+) -> Result<Vec<u8>, ProveError> {
+    use crate::zkp::halo2::post::PoStCircuit;
+    use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk, Circuit as _};
+    use halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme;
+    use halo2_proofs::poly::kzg::multiopen::ProverSHPLONK;
+    use halo2_proofs::transcript::{Blake2bWrite, Challenge255, TranscriptWriterBuffer};
+    use halo2curves::bn256::{Bn256, G1Affine};
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    let (params, _vk_ref) = post_kzg_artifacts_v3();
+    let circuit = PoStCircuit::from_sealed(sealed, pinner_identity, challenge_index);
+    let pis = PoStCircuit::public_inputs(sealed, challenge_index);
+
+    let vk = keygen_vk(params, &circuit.without_witnesses())
+        .map_err(|e| ProveError::Keygen(format!("{e:?}")))?;
+    let pk = keygen_pk(params, vk, &circuit.without_witnesses())
+        .map_err(|e| ProveError::Keygen(format!("{e:?}")))?;
+
+    let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
+    let prover_rng = StdRng::from_seed([0xAB; 32]);
+    create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(
+        params,
+        &pk,
+        &[circuit],
+        &[vec![pis]],
+        prover_rng,
+        &mut transcript,
+    )
+    .map_err(|e| ProveError::Prove(format!("{e:?}")))?;
+    Ok(transcript.finalize())
+}
+
+// ---------------------------------------------------------------------------
 // Feature-gated body — Halo2 deps and chips.
 // ---------------------------------------------------------------------------
 //
