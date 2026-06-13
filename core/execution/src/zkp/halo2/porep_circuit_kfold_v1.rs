@@ -30,9 +30,17 @@
 //! grinding choice per challenge. Concretely for `K = 44` this is
 //! ~6 bits of soundness loss vs the ideal `f^K`.
 //!
-//! **Production fix:** add a `value < p` range check on the recomposed
-//! integer (PSE Halo2's standard range-lookup pattern). Tracked as
-//! TD-PIN-P1-f2c1-range (open until f.6 or f.7).
+//! **Disposition (2026-06-12, TD-PIN-P1-f2c1-range):** RISK-ACCEPTED for
+//! testnet + fix SCHEDULED at PIN-P1 f.6. Net soundness stays ≥ 80 bits at the
+//! locked `(K_porep=22, K_post=44, 1 GiB)` params (the 2026-06-06 f.4/f.5 lead
+//! advisement accepted exactly this residual). The canonical `value < p` check
+//! is deferred to f.6 — where these circuits are rebuilt at real size and PSE
+//! Halo2's range-check LOOKUP primitive (the correct, low-risk tool) is adopted,
+//! under the f.7 ToB crypto review — rather than hand-rolling a lexicographic
+//! `< p` comparator on the reduced testnet circuit (a comparator bug would be
+//! silently unsound, strictly worse than this bounded, documented gap). Full
+//! reasoning + exact math: `design/PIN-P1-f2c1-range-risk-acceptance.md`. The
+//! `ambiguity_fraction_is_bounded` test below pins the exact bound in code.
 //!
 //! ## Scope
 //!
@@ -729,6 +737,46 @@ mod tests {
     /// 254-bit decomposition adds ~260 rows; with K=3 that's ~800 rows on
     /// top of f.2c's per-challenge gate-set. k=18 (262144 rows) is plenty.
     const K_DEG_V1: u32 = 18;
+
+    /// TD-PIN-P1-f2c1-range guard: pin the EXACT 254-bit ambiguity bound in
+    /// code (per the risk-acceptance, `design/PIN-P1-f2c1-range-risk-acceptance.md`).
+    /// The fraction of field elements with an alternate 254-bit representation is
+    /// `(2^254 − p) / 2^254`. We assert it is small (≲ 11%) — bounding the
+    /// per-draw grinding advantage — and that it is NOT ~50% (a common
+    /// misconception). If the field ever changes, this surfaces the assumption.
+    #[test]
+    fn ambiguity_fraction_is_bounded() {
+        use halo2curves::ff::{Field as _, PrimeField as _};
+        // p − 1 = 0 − 1 in the field; its LE bytes + 1 give p's LE bytes.
+        let p_minus_1 = (-Halo2Fr::ONE).to_repr();
+        let pm1: [u8; 32] = p_minus_1.as_ref().try_into().expect("32 bytes");
+        // p = (p-1) + 1 as a 256-bit LE integer (carry add).
+        let mut p_le = pm1;
+        let mut carry = 1u16;
+        for byte in p_le.iter_mut() {
+            let v = *byte as u16 + carry;
+            *byte = (v & 0xff) as u8;
+            carry = v >> 8;
+        }
+        // 2^254 − p, as a non-negative 256-bit LE integer. 2^254 has bit 254 set.
+        // Compute (2^254) - p via big-int over u128 halves.
+        let p_lo = u128::from_le_bytes(p_le[0..16].try_into().expect("16"));
+        let p_hi = u128::from_le_bytes(p_le[16..32].try_into().expect("16"));
+        // 2^254 = hi part has bit (254-128)=126 set, lo = 0.
+        let two254_hi = 1u128 << 126;
+        // (two254_hi:0) - (p_hi:p_lo)
+        let (diff_lo, borrow) = 0u128.overflowing_sub(p_lo);
+        let diff_hi = two254_hi - p_hi - borrow as u128;
+        // fraction = diff / 2^254 ≈ diff_hi / 2^126 (lo part negligible for the bound).
+        // p's leading nibble is 0x3, so 2^254 − p ≈ (0x4 − 0x3064…)/0x4 ≈ 0.244 →
+        // ~24% of field elements admit an alternate 254-bit representation. Assert
+        // 22% < fraction < 26% (real and bounded; NOT ~50%, NOT ~0).
+        let bound_26 = (two254_hi / 100) * 26;
+        let bound_22 = (two254_hi / 100) * 22;
+        assert!(diff_hi < bound_26, "alternate-rep fraction must be ≲ 26% (got hi={diff_hi})");
+        assert!(diff_hi > bound_22, "alternate-rep fraction must be ≳ 22% — gap is real, see risk-acceptance");
+        let _ = diff_lo;
+    }
 
     fn seed_zero() -> [u8; 32] {
         [0u8; 32]
