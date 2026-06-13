@@ -140,6 +140,101 @@ contract IPFSIncentivesV3Test is Test {
         nonce = commitNonce;
     }
 
+    // ════════════════════ PIN-S4: Sybil binding (one identity / slot) ═══════════
+
+    function test_sybilBinding_defaultsOff() public view {
+        assertFalse(inc.sybilBindingActive());
+    }
+
+    function test_setSybilBinding_onlyAdmin() public {
+        vm.prank(pinner);
+        vm.expectRevert("AccessControl: account missing role");
+        inc.setSybilBinding(true);
+        inc.setSybilBinding(true); // admin (this) ok
+        assertTrue(inc.sybilBindingActive());
+    }
+
+    /// With binding ON, two addresses of the SAME identity cannot both occupy
+    /// one slot's replication quorum — one identity can't farm N rewards.
+    function test_sybilBinding_rejectsSameIdentityInSlot() public {
+        _ensureModelRegistered();
+        bytes32 sub = keccak256("sub:sybil");
+        // Link both pinner addresses to ONE identity (IDP-S3 wallet-linking).
+        kyc.setVerifiedWithIdentity(pinner, sub);
+        kyc.setVerifiedWithIdentity(pinner2, sub);
+        inc.setSybilBinding(true);
+
+        vm.prank(pinner);
+        inc.registerPinner();
+        vm.prank(pinner2);
+        inc.registerPinner();
+
+        vm.prank(pinner);
+        inc.sealCommit{value: BOND}(cid, sector, _replicaId(pinner), 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+        // pinner2 = same identity → rejected from the same slot.
+        vm.prank(pinner2);
+        vm.expectRevert("Identity already in slot");
+        inc.sealCommit{value: BOND}(cid, sector, _replicaId(pinner2), 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+    }
+
+    /// Distinct identities fill the quorum normally.
+    function test_sybilBinding_allowsDistinctIdentities() public {
+        _ensureModelRegistered();
+        kyc.setVerifiedWithIdentity(pinner, keccak256("sub:a"));
+        kyc.setVerifiedWithIdentity(pinner2, keccak256("sub:b"));
+        inc.setSybilBinding(true);
+        vm.prank(pinner);
+        inc.registerPinner();
+        vm.prank(pinner2);
+        inc.registerPinner();
+        vm.prank(pinner);
+        inc.sealCommit{value: BOND}(cid, sector, _replicaId(pinner), 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+        vm.prank(pinner2);
+        inc.sealCommit{value: BOND}(cid, sector, _replicaId(pinner2), 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+        (, , uint256 live, , , ) = inc.getSlot(cid, sector);
+        assertEq(live, 2);
+    }
+
+    /// Binding OFF (provisional, pre-IDP-S3): no identity check — current
+    /// behavior. (setUp KYC-verifies via plain setVerified = self-identities.)
+    function test_sybilBinding_inactive_isNoOp() public {
+        _ensureModelRegistered();
+        // binding stays off (default); two distinct addresses seal the slot.
+        vm.prank(pinner);
+        inc.registerPinner();
+        vm.prank(pinner2);
+        inc.registerPinner();
+        vm.prank(pinner);
+        inc.sealCommit{value: BOND}(cid, sector, _replicaId(pinner), 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+        vm.prank(pinner2);
+        inc.sealCommit{value: BOND}(cid, sector, _replicaId(pinner2), 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+        (, , uint256 live, , , ) = inc.getSlot(cid, sector);
+        assertEq(live, 2);
+    }
+
+    /// A slashed pin frees its identity slot so the person can re-seal.
+    function test_sybilBinding_slashFreesIdentity() public {
+        _ensureModelRegistered();
+        bytes32 sub = keccak256("sub:reseal");
+        kyc.setVerifiedWithIdentity(pinner, sub);
+        inc.setSybilBinding(true);
+        vm.prank(pinner);
+        inc.registerPinner();
+        vm.prank(pinner);
+        inc.sealCommit{value: BOND}(cid, sector, _replicaId(pinner), 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+        // Open a commit + miss the window → slash (MAX_MISSED=0).
+        inc.commitChallenge(cid, sector);
+        vm.roll(block.number + REVEAL_DELAY + WINDOW + 1);
+        inc.slash(pinner, cid, sector);
+        // Identity slot freed → the same person can clear + re-seal.
+        vm.prank(pinner);
+        inc.clearSlashed(cid, sector);
+        vm.prank(pinner);
+        inc.sealCommit{value: BOND}(cid, sector, _replicaId(pinner), 1, keccak256("D"), keccak256("R"), keccak256("C"), PROOF);
+        (IPFSIncentivesV3.Status st, , , , , ) = inc.getPin(pinner, cid, sector);
+        assertEq(uint256(st), uint256(IPFSIncentivesV3.Status.Active));
+    }
+
     // ════════════════════ replicaID binding (PIN-S6 finding) ════════════════════
 
     /// A replicaID is owned by the first pinner who commits it; a second pinner

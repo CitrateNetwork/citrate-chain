@@ -190,6 +190,10 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         /// @notice Block by which the pinner must refute (the slot reveal-window
         ///         end at challenge time); past it the pin is slashable.
         uint256 challengeDeadline;
+        /// @notice PIN-S4: the pinner's KYC identity (`subHash`) at seal, when
+        ///         the Sybil binding was active. Used to free the slot's
+        ///         identity slot on slash. 0 if binding was inactive at seal.
+        bytes32 identity;
     }
 
     mapping(bytes32 => Pin) private _pins;
@@ -201,6 +205,24 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
     ///         pin they didn't produce. Once owned, a replicaID is usable only by
     ///         its owner.
     mapping(bytes32 => address) public replicaIdOwner;
+
+    // ───────────────────── PIN-S4: Sybil binding (IDP) ──────────────────────
+
+    /// @notice When true, a seal requires the pinner's KYC IDENTITY (`subHash`
+    ///         from `kyc.identityOf`) to be DISTINCT from every other live pin
+    ///         in the slot — so a replication quorum is N distinct people, not N
+    ///         addresses of one person (PIN-S4). Admin-activatable so v3 deploys
+    ///         NOW with it OFF (the IDP issues only the provisional self-identity
+    ///         until IDP-S3 wallet-linking lands) and the authority flips it ON
+    ///         once real `sub` claims are populated. Gated, money-affecting →
+    ///         DEFAULT_ADMIN_ROLE + an event.
+    bool public sybilBindingActive;
+
+    /// @notice slotId → (identity → currently occupies a live pin in this slot).
+    ///         Set at seal, cleared when the pin leaves the live set (slash).
+    mapping(bytes32 => mapping(bytes32 => bool)) private _slotIdentity;
+
+    event SybilBindingSet(bool active);
 
     // ──────────────────────────── Slot state ───────────────────────────────
     // v3 hoists the per-slot challenge state OUT of `Pin` and into `Slot`,
@@ -426,6 +448,16 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         require(!registered[msg.sender], "Already registered");
         registered[msg.sender] = true;
         emit PinnerRegistered(msg.sender);
+    }
+
+    /// @notice PIN-S4: activate/deactivate the one-identity-per-slot Sybil
+    ///         binding. Flip ON once the IDP (Lane C, IDP-S3) is issuing real
+    ///         `sub`/`wallet_address` claims so `kyc.identityOf` links addresses;
+    ///         before that every address is its own (provisional self-)identity
+    ///         and the binding is a harmless no-op.
+    function setSybilBinding(bool active) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        sybilBindingActive = active;
+        emit SybilBindingSet(active);
     }
 
     function fund() external payable onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -680,6 +712,17 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             replicaIdOwner[replicaID] = pinner;
         }
 
+        // PIN-S4 Sybil binding (when active): the pinner's KYC identity must be
+        // DISTINCT from every other live pin in the slot, so a replication
+        // quorum is N distinct people, not N addresses of one person.
+        bytes32 identity = bytes32(0);
+        if (sybilBindingActive) {
+            identity = kyc.identityOf(pinner);
+            require(identity != bytes32(0), "No KYC identity");
+            require(!_slotIdentity[sid][identity], "Identity already in slot");
+            _slotIdentity[sid][identity] = true;
+        }
+
         // The wire carries the CIRCUIT's replicaID (Poseidon, supplied) and the
         // pinner's seal `epoch` — NOT a contract-derived keccak replicaID nor
         // block.number — so a real proof's public inputs match (PIN-S6 finding).
@@ -709,6 +752,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         p.commR = commR;
         p.commC = commC;
         p.sealer = sealerCaller;
+        p.identity = identity;
 
         bondedTotal += BOND;
         s.liveCount += 1;
@@ -981,6 +1025,11 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             p.missed += 1;
             if (s.liveCount > 0) {
                 s.liveCount -= 1;
+            }
+            // PIN-S4: the slashed pin leaves the live set → free its identity
+            // slot so the same person (or a re-seal) can re-occupy it.
+            if (p.identity != bytes32(0)) {
+                _slotIdentity[sid][p.identity] = false;
             }
 
             if (cr > 0) {
