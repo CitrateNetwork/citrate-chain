@@ -53,4 +53,45 @@ contract KYCRegistryTest is Test {
         vm.stopPrank();
         assertTrue(kyc.isVerified(user));
     }
+
+    // ───────────────────────── PIN-S4 identity binding ─────────────────────
+
+    function test_setVerified_bindsProvisionalSelfIdentity() public {
+        vm.prank(updater);
+        kyc.setVerified(user);
+        // Provisional: each address is its own distinct identity until linked.
+        assertEq(kyc.identityOf(user), keccak256(abi.encode("PIN-self", user)));
+        address other = address(0xC0FFEE);
+        vm.prank(updater);
+        kyc.setVerified(other);
+        assertTrue(kyc.identityOf(user) != kyc.identityOf(other), "self-identities distinct");
+    }
+
+    function test_setVerifiedWithIdentity_linksAddresses() public {
+        bytes32 sub = keccak256("sub:alice");
+        address w1 = address(0x1111);
+        address w2 = address(0x2222);
+        vm.startPrank(updater);
+        kyc.setVerifiedWithIdentity(w1, sub);
+        kyc.setVerifiedWithIdentity(w2, sub); // same person, two wallets
+        vm.stopPrank();
+        assertTrue(kyc.isVerified(w1) && kyc.isVerified(w2));
+        assertEq(kyc.identityOf(w1), sub);
+        assertEq(kyc.identityOf(w2), kyc.identityOf(w1), "linked addresses share one identity");
+    }
+
+    function test_setVerifiedWithIdentity_revertsZeroIdentity() public {
+        vm.prank(updater);
+        vm.expectRevert("KYC: zero identity");
+        kyc.setVerifiedWithIdentity(user, bytes32(0));
+    }
+
+    function test_realIdentity_notOverwrittenBySelfDefault() public {
+        bytes32 sub = keccak256("sub:bob");
+        vm.startPrank(updater);
+        kyc.setVerifiedWithIdentity(user, sub);
+        kyc.setVerified(user); // must NOT clobber the real identity with self
+        vm.stopPrank();
+        assertEq(kyc.identityOf(user), sub);
+    }
 }

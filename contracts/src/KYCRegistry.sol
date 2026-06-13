@@ -28,8 +28,26 @@ contract KYCRegistry is AccessControl {
     /// @notice Whether an address currently holds a valid (un-revoked) KYC claim.
     mapping(address => bool) private _verified;
 
+    /// @notice PIN-S4: the IDP IDENTITY (`subHash` = `keccak256(IDP `sub` claim)`)
+    ///         an address resolves to — the stable per-person id behind the OIDC
+    ///         token. Lane C's IDP-S3 wallet-linking maps many addresses to one
+    ///         `sub`; PIN's Sybil binding (`IPFSIncentivesV3`) uses it to require
+    ///         a replication quorum be N DISTINCT identities, not N addresses of
+    ///         one person. 0 = no identity bound.
+    ///
+    ///         **Provisional claim shape (until IDP-S3 lands):** `setVerified`
+    ///         binds each address to its OWN identity (`keccak("PIN-self", addr)`),
+    ///         so per-address KYC is unchanged and the Sybil binding is a no-op
+    ///         (every address is a distinct identity). When the IDP issues real
+    ///         `sub`/`wallet_address` claims, the authority calls
+    ///         `setVerifiedWithIdentity(addr, subHash)` to link addresses and the
+    ///         binding becomes meaningful. Matches `citrate-explorer-auth-seam`'s
+    ///         provisional `sub`/`wallet_address` claims.
+    mapping(address => bytes32) private _identity;
+
     event KYCVerified(address indexed account, address indexed updater);
     event KYCRevoked(address indexed account, address indexed updater);
+    event IdentityBound(address indexed account, bytes32 indexed subHash, address indexed updater);
 
     constructor(address updater) {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
@@ -52,11 +70,45 @@ contract KYCRegistry is AccessControl {
             _verified[account] = true;
             emit KYCVerified(account, msg.sender);
         }
+        // Provisional binding: each address is its own identity until the IDP
+        // links it to a real `sub` via setVerifiedWithIdentity. Never overwrite
+        // a real (already-linked) identity with the self-default.
+        if (_identity[account] == bytes32(0)) {
+            bytes32 self = keccak256(abi.encode("PIN-self", account));
+            _identity[account] = self;
+            emit IdentityBound(account, self, msg.sender);
+        }
+    }
+
+    /**
+     * @notice PIN-S4: verify `account` AND bind it to a real IDP identity
+     *         (`subHash = keccak256(sub)`) — Lane C's IDP-S3 wallet-linking. Two
+     *         addresses bound to the SAME `subHash` are the same person, so PIN's
+     *         Sybil binding will reject both filling one replication slot.
+     * @dev    `subHash` must be non-zero (0 is the "unbound" sentinel).
+     */
+    function setVerifiedWithIdentity(address account, bytes32 subHash)
+        external
+        onlyRole(KYC_UPDATER_ROLE)
+    {
+        require(account != address(0), "KYC: zero address");
+        require(subHash != bytes32(0), "KYC: zero identity");
+        if (!_verified[account]) {
+            _verified[account] = true;
+            emit KYCVerified(account, msg.sender);
+        }
+        if (_identity[account] != subHash) {
+            _identity[account] = subHash;
+            emit IdentityBound(account, subHash, msg.sender);
+        }
     }
 
     /**
      * @notice Revoke `account`'s KYC verification (mirrors an IDP claim
-     *         revocation; the revocation bus drives this on-chain write).
+     *         revocation; the revocation bus drives this on-chain write). The
+     *         identity binding is left intact (revocation is about the live KYC
+     *         claim, not the person↔wallet link); re-verification keeps the same
+     *         identity.
      */
     function revoke(address account) external onlyRole(KYC_UPDATER_ROLE) {
         if (_verified[account]) {
@@ -68,5 +120,12 @@ contract KYCRegistry is AccessControl {
     /// @notice View: is `account` currently KYC-verified?
     function isVerified(address account) external view returns (bool) {
         return _verified[account];
+    }
+
+    /// @notice PIN-S4: the IDP identity (`subHash`) `account` resolves to, or 0
+    ///         if unverified/unbound. Two addresses returning the same non-zero
+    ///         value are the same person.
+    function identityOf(address account) external view returns (bytes32) {
+        return _identity[account];
     }
 }
