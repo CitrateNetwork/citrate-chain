@@ -311,7 +311,10 @@ impl GenesisConfig {
             accounts: vec![
                 // Treasury — main supply, funds future allocations (500M SALT)
                 account(TESTNET_TREASURY_ADDRESS, 500_000_000),
-                // Faucet — dispenses 10 SALT per request to users (50M SALT)
+                // Reserve — legacy faucet wallet, retained as a reserve (50M SALT).
+                // The LIVE faucet service does NOT sign with this address; it
+                // derives its signer deterministically (see the faucet signing
+                // key below). Matches DEPLOYED_ADDRESSES.md ("Reserve").
                 account(TESTNET_FAUCET_ADDRESS, 50_000_000),
                 // Deployer — deploys all smart contracts (10M SALT)
                 account(TESTNET_DEPLOYER_ADDRESS, 10_000_000),
@@ -319,6 +322,12 @@ impl GenesisConfig {
                 account(TESTNET_TEAM_ADDRESS, 10_000_000),
                 // Validator — block production and staking (5M SALT)
                 account(TESTNET_VALIDATOR_ADDRESS, 5_000_000),
+                // Faucet signing key — the address the live faucet service derives
+                // from keccak256("citrate-faucet-testnet-v1") (faucet/src/main.rs).
+                // RELEASE R1 / OPS_DGX_HANDOFF D-2: fold the pre-fund into genesis
+                // so a re-roll no longer needs a manual `cast send` to top it up.
+                // (10M SALT — matches DEPLOYED_ADDRESSES.md + team_testnet_genesis.)
+                account(DETERMINISTIC_FAUCET_SIGNER_ADDRESS, 10_000_000),
                 // Arachnid deterministic CREATE2 deployer — required for
                 // the ERC-4337 bundler to boot (EW-S1 unblocker).
                 arachnid_deterministic_deployer_account(),
@@ -326,7 +335,9 @@ impl GenesisConfig {
             treasury_address: TESTNET_TREASURY_ADDRESS,
             team_allocations: HashMap::new(),
             ecosystem_fund: TESTNET_TREASURY_ADDRESS, // Treasury doubles as ecosystem fund
-            mining_pool_max: latt_to_wei(425_000_000), // Remaining 425M for mining rewards
+            // 585M pre-allocated (now incl. the 10M faucet signer) + 415M mining
+            // = the 1B supply cap. The faucet pre-fund comes out of the mining pool.
+            mining_pool_max: latt_to_wei(415_000_000),
         }
     }
 
@@ -723,8 +734,9 @@ mod tests {
         let config = GenesisConfig::testnet_beta();
         assert!(config.validate().is_ok());
         assert_eq!(config.chain_id, 40204);
-        // 5 funded accounts + the Arachnid deterministic CREATE2 deployer.
-        assert_eq!(config.accounts.len(), 6);
+        // 6 funded accounts (incl. the deterministic faucet signer) + the
+        // Arachnid deterministic CREATE2 deployer.
+        assert_eq!(config.accounts.len(), 7);
     }
 
     #[test]
@@ -740,13 +752,34 @@ mod tests {
         assert_eq!(faucet_account.balance, latt_to_wei(50_000_000));
     }
 
+    /// RELEASE R1 / OPS_DGX_HANDOFF D-2 regression: testnet_beta() MUST pre-fund
+    /// the DETERMINISTIC faucet signer (0x6680…, the address the live faucet
+    /// service derives from keccak256("citrate-faucet-testnet-v1")). Before this
+    /// fix the address had ZERO genesis balance and every re-roll required a
+    /// manual `cast send` to top it up. The legacy `node` config's
+    /// `initial_accounts` listed it but those are explicitly skipped — only this
+    /// economics config funds accounts.
+    #[test]
+    fn test_testnet_beta_funds_deterministic_faucet_signer() {
+        let config = GenesisConfig::testnet_beta();
+
+        let faucet_signer = config
+            .accounts
+            .iter()
+            .find(|account| account.address == DETERMINISTIC_FAUCET_SIGNER_ADDRESS)
+            .expect("testnet beta must pre-fund the deterministic faucet signer (R1/D-2)");
+
+        assert_eq!(faucet_signer.balance, latt_to_wei(10_000_000));
+    }
+
     #[test]
     fn test_testnet_beta_total_preallocation() {
         let config = GenesisConfig::testnet_beta();
         let total = config.total_preallocation();
 
-        // Re-genesis 2026-04-01: 500M treasury + 50M faucet + 10M deployer + 10M team + 5M validator
-        let expected = latt_to_wei(575_000_000);
+        // 500M treasury + 50M reserve + 10M deployer + 10M team + 5M validator
+        // + 10M deterministic faucet signer (R1/D-2) = 585M.
+        let expected = latt_to_wei(585_000_000);
         assert_eq!(total, expected);
     }
 
