@@ -189,8 +189,13 @@ contract ClassroomClusterV1Test is Test {
         cluster.grantClassroomRole(0, student1, IClassroomCluster.ClassroomRole.Student);
         assertEq(cluster.getStudentCount(0), 1);
 
-        // Transfer student from 0 to classroomB
-        vm.prank(teacher1);
+        // Transfer student from 0 to classroomB.
+        // FWA-C3-14: a cross-classroom transfer where the caller does not
+        // teach BOTH ends is now an admin-only operation (teacher1 teaches
+        // classroom 0 but not classroomB, which teacher2 teaches). Use the
+        // org admin — the legitimate cross-classroom authority — so the
+        // atomicity invariant is still exercised on a permitted transfer.
+        vm.prank(admin);
         cluster.transferStudent(student1, 0, classroomB);
 
         // Atomic: removed from 0, added to B
@@ -198,6 +203,50 @@ contract ClassroomClusterV1Test is Test {
         assertEq(uint256(cluster.getClassroomRole(classroomB, student1)), uint256(IClassroomCluster.ClassroomRole.Student));
         assertEq(cluster.getStudentCount(0), 0);
         assertEq(cluster.getStudentCount(classroomB), 1);
+    }
+
+    // FWA-C3-14: cross-classroom roster injection.
+    // Pre-fix: a teacher of the SOURCE classroom could inject a student into
+    // ANY destination classroom they don't control. Post-fix: a teacher must
+    // control BOTH ends (or be an admin).
+    function test_C3_14_teacher_cannot_inject_into_foreign_classroom() public {
+        // teacher2 owns classroomB; teacher1 owns classroom 0.
+        vm.prank(admin);
+        uint256 classroomB = cluster.createClassroom("Chemistry 201", teacher2, 0, 0, "");
+
+        vm.prank(teacher1);
+        cluster.grantClassroomRole(0, student1, IClassroomCluster.ClassroomRole.Student);
+
+        // teacher1 (teacher of source only) tries to push the student into
+        // teacher2's classroom → must revert.
+        vm.prank(teacher1);
+        vm.expectRevert(); // NotTeacherOf
+        cluster.transferStudent(student1, 0, classroomB);
+
+        // Student was NOT injected into classroomB.
+        assertEq(
+            uint256(cluster.getClassroomRole(classroomB, student1)),
+            uint256(IClassroomCluster.ClassroomRole.None),
+            "no cross-classroom injection"
+        );
+        assertEq(cluster.getStudentCount(classroomB), 0);
+    }
+
+    function test_C3_14_teacher_of_both_ends_can_transfer() public {
+        // teacher1 teaches BOTH classrooms.
+        vm.prank(admin);
+        uint256 classroomB = cluster.createClassroom("Chemistry 201", teacher1, 0, 0, "");
+
+        vm.prank(teacher1);
+        cluster.grantClassroomRole(0, student1, IClassroomCluster.ClassroomRole.Student);
+
+        vm.prank(teacher1);
+        cluster.transferStudent(student1, 0, classroomB);
+        assertEq(
+            uint256(cluster.getClassroomRole(classroomB, student1)),
+            uint256(IClassroomCluster.ClassroomRole.Student),
+            "teacher of both ends may transfer"
+        );
     }
 
     // Invariant 7: NoPrivilegeEscalation

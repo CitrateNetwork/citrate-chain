@@ -96,6 +96,12 @@ interface IInstitutionalVault {
     function rejectSignerChange(uint256 proposalId) external;
 
     /// @notice Change the signing threshold (requires k-of-n approval).
-    /// @dev Invariant: ThresholdBoundsValid — k > 0 and k <= n
-    function setThreshold(uint256 newThreshold) external;
+    /// @dev Invariant: ThresholdBoundsValid — k > 0 and k <= n.
+    ///      FWA-C3-16: a bare single-signer `setThreshold` let one signer
+    ///      unilaterally weaken the multisig; replaced with a quorum-gated
+    ///      propose/approve/execute flow mirroring the signer-change flow.
+    function proposeThresholdChange(uint256 newThreshold) external returns (uint256 proposalId);
+    function approveThresholdChange(uint256 proposalId) external;
+    function executeThresholdChange(uint256 proposalId) external;
+    function rejectThresholdChange(uint256 proposalId) external;
 }
