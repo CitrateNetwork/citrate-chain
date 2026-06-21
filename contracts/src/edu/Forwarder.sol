@@ -147,8 +147,15 @@ contract Forwarder is IForwarder {
         _nonces[request.orgPrincipalId][request.classroomId] = expectedNonce + 1;
         _consumedTxHashes[txHash] = true;
 
-        // Execute the inner call
-        (success,) = request.target.call(request.data);
+        // Execute the inner call.
+        // FWA-C3-03: EIP-2771 requires the trusted forwarder to APPEND the
+        // 20-byte authenticated sender to the calldata so a 2771-aware
+        // target recovers the real principal via `_msgSender()` instead of
+        // seeing `msg.sender == Forwarder`. The authenticated principal here
+        // is `deviceUser` — the address whose device-bound signature we just
+        // verified (line above). Mirrors citrate-chatbot/CitrateForwarder's
+        // `abi.encodePacked(req.data, req.from)` pattern.
+        (success,) = request.target.call(abi.encodePacked(request.data, deviceUser));
         if (!success) revert CallFailed();
 
         emit MetaTxExecuted(

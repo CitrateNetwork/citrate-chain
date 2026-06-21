@@ -62,6 +62,8 @@ contract CitratePaymaster is BasePaymaster {
     error UnknownCategory(uint8 tag);
     error MissingCategoryTag();
     error ZeroAddress();
+    /// @notice FWA-C3-04: too many recovery-tagged ops for this account today.
+    error RecoveryDailyCountExceeded(address account, uint256 usedToday, uint256 maxPerDay);
 
     // --- Events ---
     event WalletRegistered(address indexed account);
@@ -72,6 +74,7 @@ contract CitratePaymaster is BasePaymaster {
     event DailyCapSet(uint256 oldCap, uint256 newCap);
     event RecoveryEventCapSet(uint256 oldCap, uint256 newCap);
     event FirstOpCapSet(uint256 oldCap, uint256 newCap);
+    event RecoveryDailyCountCapSet(uint256 oldCap, uint256 newCap);
 
     // --- Storage ---
 
@@ -80,7 +83,18 @@ contract CitratePaymaster is BasePaymaster {
         uint64 dayKey; // unix day (block.timestamp / 86400) when `used` last reset
     }
 
+    /// FWA-C3-04: per-account daily recovery-op counter. The recovery
+    /// category deliberately bypasses the standard daily gas counter, but
+    /// without a cumulative bound a registered wallet could self-tag an
+    /// unlimited stream of recovery ops to drain the paymaster's deposit.
+    /// This caps the NUMBER of recovery-sponsored ops per account per day.
+    struct RecoveryUsage {
+        uint64 count;  // recovery ops sponsored today
+        uint64 dayKey; // unix day when `count` last reset
+    }
+
     mapping(address account => DailyUsage) public dailyUsage;
+    mapping(address account => RecoveryUsage) public recoveryUsage;
     mapping(address account => bool) public isRegistered;
     mapping(address account => bool) public hasUsedFirstOp;
 
@@ -100,6 +114,11 @@ contract CitratePaymaster is BasePaymaster {
     /// Per-call first-op budget. Bounds the deploy + first-action cost.
     uint256 public firstOpCap;
 
+    /// FWA-C3-04: max recovery-tagged ops sponsored per account per day.
+    /// 0 == unlimited (preserves prior behavior unless configured); the
+    /// deploy script and ADR-aligned default sets a small positive cap.
+    uint256 public recoveryDailyCountCap;
+
     constructor(
         IEntryPoint _entryPoint,
         address _owner,
@@ -114,6 +133,9 @@ contract CitratePaymaster is BasePaymaster {
         dailyCap = _dailyCap;
         recoveryEventCap = _recoveryEventCap;
         firstOpCap = _firstOpCap;
+        // Default cap: a wallet should never legitimately need many
+        // recovery ops in a single day. Owner can re-tune via setter.
+        recoveryDailyCountCap = 3;
     }
 
     // --- Admin ---
@@ -142,6 +164,12 @@ contract CitratePaymaster is BasePaymaster {
     function setFirstOpCap(uint256 v) external onlyOwner {
         emit FirstOpCapSet(firstOpCap, v);
         firstOpCap = v;
+    }
+
+    /// FWA-C3-04: tune the per-account daily recovery-op count cap.
+    function setRecoveryDailyCountCap(uint256 v) external onlyOwner {
+        emit RecoveryDailyCountCapSet(recoveryDailyCountCap, v);
+        recoveryDailyCountCap = v;
     }
 
     // --- Registrar ---
@@ -203,6 +231,19 @@ contract CitratePaymaster is BasePaymaster {
             if (recoveryEventCap == 0 || maxCost > recoveryEventCap) {
                 revert RecoveryCapExceeded(account, recoveryEventCap, maxCost);
             }
+            // FWA-C3-04: enforce a cumulative per-account daily recovery-op
+            // count so the recovery category cannot be abused to drain the
+            // deposit. Read-only here (validation rules limit storage
+            // writes); the counter is advanced in _postOp. Only this
+            // account's own slot is touched (ERC-4337 storage rule OK).
+            if (recoveryDailyCountCap != 0) {
+                RecoveryUsage memory ru = recoveryUsage[account];
+                uint64 today = todayKey();
+                uint256 usedToday = ru.dayKey == today ? ru.count : 0;
+                if (usedToday >= recoveryDailyCountCap) {
+                    revert RecoveryDailyCountExceeded(account, usedToday, recoveryDailyCountCap);
+                }
+            }
         } else if (category == CAT_FIRST_OP) {
             if (hasUsedFirstOp[account]) revert FirstOpAlreadyUsed(account);
             if (firstOpCap == 0 || maxCost > firstOpCap) {
@@ -243,8 +284,21 @@ contract CitratePaymaster is BasePaymaster {
             dailyUsage[account] = u;
         } else if (category == CAT_FIRST_OP) {
             hasUsedFirstOp[account] = true;
+        } else if (category == CAT_RECOVERY) {
+            // FWA-C3-04: advance the per-account daily recovery-op counter
+            // so the cumulative cap checked in validation is enforced.
+            RecoveryUsage memory ru = recoveryUsage[account];
+            uint64 today = todayKey();
+            if (ru.dayKey != today) {
+                ru.count = 0;
+                ru.dayKey = today;
+            }
+            // Saturating — once at max we stop counting up (cap already hit).
+            if (ru.count != type(uint64).max) {
+                ru.count += 1;
+            }
+            recoveryUsage[account] = ru;
         }
-        // CAT_RECOVERY: no counter; per-event budget already checked.
 
         emit SponsorshipUsed(account, category, actualGasCost);
     }

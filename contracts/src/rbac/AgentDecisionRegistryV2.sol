@@ -64,6 +64,15 @@ contract AgentDecisionRegistryV2 {
         string status;
         uint64 ts;
         bool exists;
+        // FWA-C3-09: the on-chain recorder that attested this decision
+        // (msg.sender at record time) and the hash of the off-chain
+        // decision signature bound to this exact record. Makes "every
+        // signed decision" verifiable: the attestor is on-chain, and the
+        // signature material is bound to (decision_id,user,tenant,corr_id,
+        // artifact_root) so a recorder cannot later claim a decision was
+        // unsigned or swap the signature.
+        address attestor;
+        bytes32 decision_sig_hash;
     }
 
     // ── State ───────────────────────────────────────────────────────
@@ -92,6 +101,15 @@ contract AgentDecisionRegistryV2 {
         EventClass class
     );
 
+    /// @notice FWA-C3-09: emits the on-chain attestor and the bound
+    ///         signature hash so off-chain verifiers can reconstruct and
+    ///         check the decision signature.
+    event DecisionAttested(
+        bytes32 indexed decision_id,
+        address indexed attestor,
+        bytes32 decision_sig_hash
+    );
+
     event DecisionDisputed(
         bytes32 indexed decision_id,
         bytes32 indexed corr_id,
@@ -117,6 +135,8 @@ contract AgentDecisionRegistryV2 {
     error EmptyAuthMode();
     error EmptyDescription();
     error InvalidClass(uint8 class_idx);
+    /// @notice FWA-C3-09: a decision must carry a non-empty signature.
+    error EmptyDecisionSig();
 
     // ── Constructor ─────────────────────────────────────────────────
 
@@ -136,6 +156,16 @@ contract AgentDecisionRegistryV2 {
     // ── Mutators ────────────────────────────────────────────────────
 
     /// @notice Record a new decision. Append-only.
+    /// @dev FWA-C3-09: every recorded decision MUST carry a non-empty
+    ///      `decision_sig` — the off-chain signature the agent runtime
+    ///      produced over the decision. Its keccak hash is bound into the
+    ///      stored record (so the recorder cannot later claim a decision
+    ///      was unsigned or substitute a different signature), and the
+    ///      on-chain `attestor` (msg.sender) is stored and emitted. The
+    ///      cryptographic verification of `decision_sig` against the
+    ///      agent's key happens off-chain (keys are bytes32 hashes here,
+    ///      not on-chain addresses), but the binding makes the claim
+    ///      "every signed decision" auditable and non-repudiable on-chain.
     function record(
         bytes32 decision_id,
         bytes32 user,
@@ -145,7 +175,8 @@ contract AgentDecisionRegistryV2 {
         string calldata description,
         string calldata auth_mode,
         bytes32 artifact_root,
-        string calldata status
+        string calldata status,
+        bytes calldata decision_sig
     ) external {
         if (!is_recorder[msg.sender]) revert NotRecorder(msg.sender);
         if (_decisions[decision_id].exists) {
@@ -156,6 +187,16 @@ contract AgentDecisionRegistryV2 {
         }
         if (bytes(auth_mode).length == 0) revert EmptyAuthMode();
         if (bytes(description).length == 0) revert EmptyDescription();
+        // FWA-C3-09: a decision must be signed.
+        if (decision_sig.length == 0) revert EmptyDecisionSig();
+
+        // Bind the signature to THIS exact decision tuple so it cannot be
+        // detached, swapped, or replayed onto a different record.
+        bytes32 sigHash = keccak256(
+            abi.encodePacked(
+                decision_id, user, tenant, corr_id, artifact_root, decision_sig
+            )
+        );
 
         _decisions[decision_id] = Decision({
             decision_id: decision_id,
@@ -168,7 +209,9 @@ contract AgentDecisionRegistryV2 {
             artifact_root: artifact_root,
             status: bytes(status).length == 0 ? STATUS_VERIFIED : status,
             ts: uint64(block.timestamp),
-            exists: true
+            exists: true,
+            attestor: msg.sender,
+            decision_sig_hash: sigHash
         });
 
         _by_corr_id[corr_id].push(decision_id);
@@ -177,6 +220,7 @@ contract AgentDecisionRegistryV2 {
         _by_class[uint8(class)].push(decision_id);
 
         emit DecisionRecorded(decision_id, user, tenant, corr_id, class);
+        emit DecisionAttested(decision_id, msg.sender, sigHash);
     }
 
     /// @notice Dispute a recorded decision. Admin-gated.

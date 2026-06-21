@@ -131,6 +131,9 @@ contract RoleEscalation {
     error AlreadyElevated(bytes32 user, bytes32 tenant);
     error NoActiveGrant(bytes32 user, bytes32 tenant);
     error InvalidThreshold();
+    /// @notice The subject has no base role set in this tenant, so there
+    ///         is nothing to elevate FROM. FWA-C3-01 hardening.
+    error NoBaseRole(bytes32 user, bytes32 tenant);
 
     // ── Constructor ─────────────────────────────────────────────────
 
@@ -175,6 +178,17 @@ contract RoleEscalation {
     /// @param corr_id Correlation id for audit replay.
     /// @param reauth_proof Non-empty proof bytes; only its hash persists.
     /// @param reauth_proof_kind Non-empty tag of the proof type.
+    ///
+    /// @dev FWA-C3-01 hardening. The off-chain orchestrator that
+    ///      cryptographically verifies the re-auth proof (HSM / oracle)
+    ///      is the system's single authorized elevation issuer; it is
+    ///      registered as a role-admin (`is_role_admin`). This function
+    ///      therefore requires `msg.sender` to be a role-admin so an
+    ///      arbitrary EOA can NO LONGER mint an active grant for any
+    ///      principal. It additionally requires the subject to hold a
+    ///      base role in this tenant — there is nothing to elevate FROM
+    ///      otherwise, and a missing base role signals the (user,tenant)
+    ///      pair was never provisioned.
     function requestElevation(
         bytes32 user,
         bytes32 tenant,
@@ -184,8 +198,14 @@ contract RoleEscalation {
         bytes calldata reauth_proof,
         string calldata reauth_proof_kind
     ) external {
+        // FWA-C3-01: gate on the authorized elevation issuer. The proof
+        // is verified off-chain by this same role-admin before it calls.
+        if (!is_role_admin[msg.sender]) revert NotRoleAdmin(msg.sender);
         if (reauth_proof.length == 0) revert EmptyReauthProof();
         if (bytes(reauth_proof_kind).length == 0) revert EmptyReauthProofKind();
+        // FWA-C3-01: the subject must already hold a base role in this
+        // tenant; elevation lifts an existing role, it cannot bootstrap one.
+        if (base_role[user][tenant] == bytes32(0)) revert NoBaseRole(user, tenant);
 
         uint32 dur = duration_sec == 0 ? DEFAULT_ELEVATION_SECONDS : duration_sec;
         if (dur > MAX_ELEVATION_SECONDS) {
@@ -222,7 +242,14 @@ contract RoleEscalation {
     /// @notice Voluntary step-down. Caller specifies the (user, tenant)
     ///         and corr_id; the active grant is exited with reason
     ///         "voluntary".
+    /// @dev FWA-C3-15 hardening. Because `user` is an opaque bytes32 hash
+    ///      (not an address), there is no on-chain way to prove the caller
+    ///      IS the subject. Gate on the role-admin so an arbitrary EOA can
+    ///      no longer deactivate any principal's active grant (griefing /
+    ///      availability DoS). The off-chain orchestrator acting on the
+    ///      user's behalf is a role-admin.
     function stepDown(bytes32 user, bytes32 tenant, bytes32 corr_id) external {
+        if (!is_role_admin[msg.sender]) revert NotRoleAdmin(msg.sender);
         uint256 idx = _findActive(user, tenant);
         if (idx == type(uint256).max) revert NoActiveGrant(user, tenant);
         RoleGrant storage g = _grants[user][tenant][idx];
