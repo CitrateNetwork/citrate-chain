@@ -651,6 +651,18 @@ impl GhostDag {
             });
         }
 
+        // FWA-C1-03: timestamp must be monotonic vs the selected parent.
+        // Previously only a future-bound was enforced (gossip.rs); nothing
+        // stopped a proposer from BACKDATING a block before its parent,
+        // skewing any time-based logic that reads header.timestamp. A block
+        // can never be older than the block it builds on.
+        if header.timestamp < sp.header.timestamp {
+            return Err(GhostDagError::InvalidLinkage(format!(
+                "timestamp {} precedes selected parent's {} — must be parent-monotonic",
+                header.timestamp, sp.header.timestamp
+            )));
+        }
+
         // Selected-parent rule + merge-parent existence.
         for mp in merge_parents {
             let mp_block = self
