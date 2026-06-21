@@ -271,19 +271,84 @@ contract InstitutionalVaultTest is Test {
     }
 
     // Invariant 8: ThresholdBoundsValid
+    // FWA-C3-16: threshold changes are now quorum-gated (propose/approve/
+    // execute), not a single-signer one-shot. Bounds still enforced at
+    // propose time; a single signer can no longer weaken the threshold.
     function test_invariant_threshold_bounds() public {
         vm.prank(signer1);
         vm.expectRevert(); // InvalidThreshold (0)
-        vault.setThreshold(0);
+        vault.proposeThresholdChange(0);
 
         vm.prank(signer1);
         vm.expectRevert(); // InvalidThreshold (>n)
-        vault.setThreshold(10);
+        vault.proposeThresholdChange(10);
 
-        // Valid change
+        // Valid change requires quorum (2-of-3).
         vm.prank(signer1);
-        vault.setThreshold(3);
+        uint256 pid = vault.proposeThresholdChange(3);
+        vm.prank(signer2);
+        vault.approveThresholdChange(pid);
+        vm.prank(signer1);
+        vault.executeThresholdChange(pid);
         assertEq(vault.getThreshold(), 3);
+    }
+
+    // FWA-C3-16 regression: a SINGLE signer cannot change the threshold.
+    function test_C3_16_single_signer_cannot_change_threshold() public {
+        vm.prank(signer1);
+        uint256 pid = vault.proposeThresholdChange(1);
+        // Only the proposer has approved (1 of required 2). Execute must
+        // revert — no unilateral threshold weakening.
+        vm.prank(signer1);
+        vm.expectRevert(InstitutionalVault.SignerProposalQuorumNotMet.selector);
+        vault.executeThresholdChange(pid);
+        assertEq(vault.getThreshold(), 2); // unchanged
+    }
+
+    // FWA-C3-17: stale-quorum — a removed signer's approval must NOT count.
+    // Pre-fix: executeCashout trusted the cached approvalCount, so a cashout
+    // could execute on ex-signer authority across a signer-set change.
+    // Post-fix: approvals are recounted over the CURRENT signer set.
+    function test_C3_17_removed_signer_approval_does_not_count() public {
+        // 2-of-3. signer1 proposes a cashout, signer2 + signer3 approve → 2.
+        vm.prank(signer1);
+        uint256 txId = vault.proposeCashout(recipient, 1 ether, keccak256("c"));
+        vm.prank(signer2);
+        vault.approveCashout(txId);
+        vm.prank(signer3);
+        vault.approveCashout(txId);
+        // approvalCount is now 2 (signer2, signer3).
+
+        // Now remove signer3 via the quorum flow (signer1 + signer2 approve).
+        vm.prank(signer1);
+        uint256 pid = vault.proposeSignerChange(signer3, false);
+        vm.prank(signer2);
+        vault.approveSignerChange(pid);
+        vm.prank(signer1);
+        vault.executeSignerChange(pid);
+        assertFalse(vault.isSigner(signer3));
+
+        // Live approvals are now only signer2 (1) < threshold 2 → execute reverts.
+        // (Pre-fix this would have executed on the cached count of 2.)
+        vm.prank(signer1);
+        vm.expectRevert(InstitutionalVault.QuorumNotMet.selector);
+        vault.executeCashout(txId);
+    }
+
+    // FWA-C3-17 positive: with all approvers still signers, the cashout
+    // executes — confirming the live recount didn't break the happy path.
+    function test_C3_17_live_quorum_still_executes() public {
+        vm.prank(signer1);
+        uint256 txId = vault.proposeCashout(recipient, 1 ether, keccak256("ok"));
+        vm.prank(signer2);
+        vault.approveCashout(txId);
+        vm.prank(signer3);
+        vault.approveCashout(txId);
+
+        uint256 balBefore = recipient.balance;
+        vm.prank(signer1);
+        vault.executeCashout(txId);
+        assertEq(recipient.balance, balBefore + 1 ether);
     }
 
     // ===================================================================
@@ -388,8 +453,9 @@ contract InstitutionalVaultTest is Test {
         vm.expectRevert();
         vault.proposeSignerChange(signer1, false);
 
+        // FWA-C3-16: a non-signer cannot even propose a threshold change.
         vm.expectRevert();
-        vault.setThreshold(1);
+        vault.proposeThresholdChange(1);
 
         vm.stopPrank();
     }
@@ -449,12 +515,18 @@ contract InstitutionalVaultTest is Test {
 
     function testFuzz_threshold_bounds(uint256 newThreshold) public {
         uint256 signerCount = vault.getSignerCount();
-        vm.prank(signer1);
         if (newThreshold == 0 || newThreshold > signerCount) {
+            vm.prank(signer1);
             vm.expectRevert();
-            vault.setThreshold(newThreshold);
+            vault.proposeThresholdChange(newThreshold);
         } else {
-            vault.setThreshold(newThreshold);
+            // FWA-C3-16: quorum-gated change (2-of-3).
+            vm.prank(signer1);
+            uint256 pid = vault.proposeThresholdChange(newThreshold);
+            vm.prank(signer2);
+            vault.approveThresholdChange(pid);
+            vm.prank(signer1);
+            vault.executeThresholdChange(pid);
             assertEq(vault.getThreshold(), newThreshold);
         }
     }

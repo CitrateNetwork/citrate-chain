@@ -57,6 +57,12 @@ contract TenantHierarchy {
     bytes32 public root;
     bool private _initialized;
 
+    /// @notice The deployer, authorized to perform the one-shot
+    ///         `initRoot`. FWA-C3-02: without this, the first caller
+    ///         (a mempool front-runner) could seize the RBAC root and
+    ///         set themselves as the root admin set.
+    address public immutable deployer;
+
     // ── Events ──────────────────────────────────────────────────────
 
     /// @notice Emitted when a new tenant node is created.
@@ -89,8 +95,17 @@ contract TenantHierarchy {
     error InvalidThreshold(uint8 threshold, uint256 admin_count);
     error EmptyAdmins();
     error HasChildren(bytes32 tenant_id);
+    /// @notice `initRoot` may be called only by the deployer. FWA-C3-02.
+    error NotDeployer(address caller);
 
     // ── Constructor / init ──────────────────────────────────────────
+
+    /// @notice Pins the deployer as the sole address allowed to run the
+    ///         one-shot `initRoot`. Closes the front-run window where any
+    ///         EOA could seize the RBAC root (FWA-C3-02).
+    constructor() {
+        deployer = msg.sender;
+    }
 
     /// @notice Initializes the root tenant node. Callable exactly once.
     /// @param self The root tenant id (typically `keccak256("Boeing")`).
@@ -107,6 +122,8 @@ contract TenantHierarchy {
         uint8 threshold,
         uint8 classification_max
     ) external {
+        // FWA-C3-02: only the deployer may seed the root, and only once.
+        if (msg.sender != deployer) revert NotDeployer(msg.sender);
         if (_initialized) revert AlreadyInitialized();
         if (admins.length == 0) revert EmptyAdmins();
         if (threshold == 0 || threshold > admins.length) {

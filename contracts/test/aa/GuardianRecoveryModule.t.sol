@@ -14,6 +14,32 @@ import {
 } from "@kernel/types/Constants.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
+/// FWA-C3-07: a smart-wallet (contract) guardian that authenticates via
+/// EIP-1271. It validates an ECDSA signature from a single owner key over
+/// the EXACT digest the module passes (the un-prefixed application digest).
+contract MockSmartWalletGuardian {
+    bytes4 internal constant MAGIC = 0x1626ba7e;
+    address public owner;
+
+    constructor(address _owner) {
+        owner = _owner;
+    }
+
+    function isValidSignature(bytes32 hash, bytes calldata sig) external view returns (bytes4) {
+        require(sig.length == 65, "bad sig len");
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(sig.offset)
+            s := calldataload(add(sig.offset, 32))
+            v := byte(0, calldataload(add(sig.offset, 64)))
+        }
+        address recovered = ecrecover(hash, v, r, s);
+        return recovered == owner ? MAGIC : bytes4(0xffffffff);
+    }
+}
+
 /// Tests for the M-of-N social-guardian recovery module.
 contract GuardianRecoveryModuleTest is Test {
     using MessageHashUtils for bytes32;
@@ -145,12 +171,18 @@ contract GuardianRecoveryModuleTest is Test {
 
     // ── Validation ──
 
-    function test_validate_twoOfThree_rawSigs_succeeds() public {
+    /// FWA-C3-06: EOA guardian signatures are now accepted ONLY over the
+    /// EIP-191 prefixed digest. The previously-accepted RAW-digest shape is
+    /// rejected (see RoleEscalation… no — see C3_06 red test below). This
+    /// test, formerly "rawSigs_succeeds", now signs the prefixed digest —
+    /// the canonical guardian signing scheme — and must still succeed.
+    function test_validate_twoOfThree_ethPrefixed_succeeds_canonical() public {
         _installFresh(kernel, 2, _threeGuardians());
         bytes32 userOpHash = keccak256("recover_to_new_passkey");
         bytes32 digest = _digest(userOpHash, kernel);
+        bytes32 ethDigest = digest.toEthSignedMessageHash();
 
-        bytes memory blob = bytes.concat(_sign(PK_A, digest), _sign(PK_B, digest));
+        bytes memory blob = bytes.concat(_sign(PK_A, ethDigest), _sign(PK_B, ethDigest));
 
         PackedUserOperation memory op = _op(blob);
         vm.prank(kernel);
@@ -227,7 +259,10 @@ contract GuardianRecoveryModuleTest is Test {
         _installFresh(kernelB, 2, g);
 
         bytes32 userOpHash = keccak256("op");
-        bytes32 digestForA = _digest(userOpHash, kernelA);
+        // FWA-C3-06: sign the EIP-191 prefixed digest (the only EOA shape
+        // now accepted). Replay protection is unchanged: the digest binds
+        // the account, so a signature for kernelA fails on kernelB.
+        bytes32 digestForA = _digest(userOpHash, kernelA).toEthSignedMessageHash();
         bytes memory blob = bytes.concat(_sign(PK_A, digestForA), _sign(PK_B, digestForA));
         PackedUserOperation memory op = _op(blob);
 
@@ -243,6 +278,58 @@ contract GuardianRecoveryModuleTest is Test {
         vm.prank(kernelA);
         res = module.validateUserOp(op, userOpHash);
         assertEq(res, SIG_VALIDATION_SUCCESS_UINT);
+    }
+
+    // ── FWA-C3-06: raw (un-prefixed) digest signatures must be REJECTED ──
+
+    /// Pre-fix: a guardian EOA signature over the RAW digest
+    /// keccak256(userOpHash, account) was accepted, re-opening
+    /// cross-protocol replay. Post-fix: only EIP-191 prefixed sigs match,
+    /// so a raw-digest signature no longer validates.
+    function test_C3_06_raw_digest_signature_rejected() public {
+        _installFresh(kernel, 2, _threeGuardians());
+        bytes32 userOpHash = keccak256("op");
+        bytes32 rawDigest = _digest(userOpHash, kernel); // NOT eth-prefixed
+
+        bytes memory blob = bytes.concat(_sign(PK_A, rawDigest), _sign(PK_B, rawDigest));
+        PackedUserOperation memory op = _op(blob);
+        vm.prank(kernel);
+        uint256 res = module.validateUserOp(op, userOpHash);
+        assertEq(res, SIG_VALIDATION_FAILED_UINT, "raw-digest guardian sig must be rejected");
+    }
+
+    // ── FWA-C3-07: contract (EIP-1271) guardians can complete recovery ──
+
+    /// Pre-fix: the module advertised smart-wallet guardians but only ran
+    /// ECDSA tryRecover, so a contract guardian could never satisfy
+    /// recovery → an M-of-N set including one was BRICKED. Post-fix: a
+    /// contract guardian is authenticated via isValidSignature.
+    function test_C3_07_smart_wallet_guardian_completes_recovery() public {
+        // Guardian set: one EOA (PK_A) + one smart-wallet guardian.
+        uint256 swOwnerPk = 0x5A7E;
+        address swOwner = vm.addr(swOwnerPk);
+        MockSmartWalletGuardian sw = new MockSmartWalletGuardian(swOwner);
+
+        address[] memory g = new address[](2);
+        g[0] = vm.addr(PK_A);
+        g[1] = address(sw);
+        _installFresh(kernel, 2, g); // 2-of-2
+
+        bytes32 userOpHash = keccak256("recover-with-sw");
+        bytes32 digest = _digest(userOpHash, kernel);
+        bytes32 ethDigest = digest.toEthSignedMessageHash();
+
+        // EOA guardian signs the EIP-191 prefixed digest; the smart-wallet
+        // guardian's owner signs the application digest (what isValidSignature
+        // receives). Blob is two 65-byte slots.
+        bytes memory eoaSig = _sign(PK_A, ethDigest);
+        bytes memory swSig = _sign(swOwnerPk, digest);
+        bytes memory blob = bytes.concat(eoaSig, swSig);
+
+        PackedUserOperation memory op = _op(blob);
+        vm.prank(kernel);
+        uint256 res = module.validateUserOp(op, userOpHash);
+        assertEq(res, SIG_VALIDATION_SUCCESS_UINT, "smart-wallet guardian must complete recovery");
     }
 
     // ── EIP-1271 ──

@@ -130,6 +130,11 @@ contract ClassificationRegistry {
             revert ClearanceNotFresher(ts, rec.last_updated);
         }
 
+        // FWA-C3-10: snapshot prior existence BEFORE the write below sets
+        // rec.exists = true, so the first-time foreign-national branch is
+        // actually reachable (the ITAR auto-revocation cascade fires for
+        // brand-new FN=true users, not just transitions on existing users).
+        bool existedBefore = rec.exists;
         ClassLevel oldMax = rec.exists ? rec.max_clearance : ClassLevel.Public;
         bool oldFn = rec.exists ? rec.foreign_national : false;
 
@@ -144,12 +149,14 @@ contract ClassificationRegistry {
             user, oldMax, max_clearance, oldFn, foreign_national, msg.sender
         );
 
-        if (rec.exists && oldFn != foreign_national) {
+        // FWA-C3-10: emit on any transition AND on first-time FN=true.
+        // `existedBefore` is the pre-write snapshot, so the second branch
+        // is now reachable for brand-new foreign-national users.
+        if (existedBefore && oldFn != foreign_national) {
             emit ForeignNationalChanged(user, foreign_national);
-        } else if (!rec.exists && foreign_national) {
-            // First-time record with FN=true: still emit so listeners
-            // can apply the cascade. (Defensive — the rec.exists check
-            // above guarantees we only get here on rec.exists==true.)
+        } else if (!existedBefore && foreign_national) {
+            // First-time record with FN=true: emit so the ITAR
+            // auto-revocation listener applies the cascade.
             emit ForeignNationalChanged(user, foreign_national);
         }
     }
