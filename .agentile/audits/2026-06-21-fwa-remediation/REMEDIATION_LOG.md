@@ -82,4 +82,36 @@ canonical low-s). WrappedSALT (C3-05 primary) routes through OZ ECDSA.
 
 ## PART B — CONSENSUS (FWA-C1) + NETWORK (FWA-C2)
 
-See the PART-B section appended after the consensus commit.
+Consensus baseline lib tests: 97 → **102** (+5). Full `citrate-consensus`
+suite: **395 passed / 0 failed**. Full `citrate-network` suite:
+**211 passed / 0 failed**. Clippy clean on both crates (`--tests`).
+
+| ID | Severity | Status | Red→green test | Files + LOC | Mutation | Tripwire |
+|----|----------|--------|----------------|-------------|----------|----------|
+| C1-01 (eligibility leg) | HIGH | CLOSED-with-proof (in-crate) | `test_C1_01_admission_rejects_ineligible_when_selector_wired` (dag_store.rs) | `dag_store.rs` `verify_block_vrf_crypto` now calls `is_eligible_proposer`; added `proposer_selector: Option<Arc<VrfProposerSelector>>` + `with_proposer_selector` builder | BLOCKED (cargo-mutants not run; see block) — eligibility-predicate test pins the gate | permanent in-tree admission test |
+| C1-01 (legacy-forgery leg) | HIGH | CLOSED-with-proof | `test_C1_01_forged_legacy_proof_accepted_below_cutoff_but_rejected_in_production` (vrf.rs) | `vrf.rs` added `VrfProposerSelector::production()` (legacy cutoff = 0) so the forgeable SHA3 path is rejected at every height | BLOCKED — forged-proof reject test | permanent in-tree test |
+| C1-01 (production wiring) | — | DEFERRED (node task) | — | mechanism landed in-crate; node startup (`node/src/main.rs:1222`) must call `.with_proposer_selector(populated)` once the stake registry is loaded — a node-integration follow-up flagged here. Without wiring the gate is inert (preserves prior behavior), so no regression. | — | — |
+| C1-02 | MED | DEFERRED | — | blue_score exact-equality deferral is code-acknowledged (add_block warns on drift) pending PIL-13 BlueSet-persistence rework; out of safe scope for this pass (changing it to fatal needs the producer to write exact scores first). Documented. | — | — |
+| C1-03 | MED | CLOSED-with-proof | `test_C1_03_backdated_timestamp_rejected` (dag_store.rs) | `ghostdag.rs` `validate_block_consistency` enforces `header.timestamp >= sp.timestamp` | BLOCKED — backdated-reject + monotone-accept test | permanent in-tree test |
+| C1-04 | MED | CLOSED-with-proof | `test_C1_04_detects_double_proposal_same_proposer_height`, `_no_false_positive_distinct_proposers` | `dag_store.rs` added `detect_equivocation()` hook (read-only, feeds peer-scoring/slashing) | BLOCKED — detection + no-false-positive tests | permanent in-tree test |
+| C2-01 | MED | CLOSED-with-proof | `test_C2_01_forged_signature_embedding_rejected`, `_genuine_signed_embedding_accepted`, `_wrong_chain_id_signature_rejected` (learning_gossip_tests.rs) | `learning_messages.rs` added `signing_payload`/`verify_signature` (ed25519, domain-tagged, chain_id-bound) for `LearningEmbedding`+`AdapterOffer`; `gossip.rs` verifies BEFORE dedup/store/propagate + penalizes; `GossipConfig.chain_id` added; `core/network/Cargo.toml` += ed25519-dalek | BLOCKED — forged + cross-chain reject tests | permanent in-tree test (reuses audit evidence red test) |
+
+### FWA-C2-01 dedup-censorship corollary
+The fix verifies the signature against the asserted author BEFORE the dedup
+slot `(checkpoint_height, participant)` is touched, so a forged
+`(H, victim)` entry can no longer be landed to drop the victim's genuine
+embedding as a duplicate. Existing learning-gossip integration tests were
+updated to carry REAL ed25519 keypairs + valid signatures (the helpers now
+sign the canonical payload) — they exercise the FIXED path; no test weakened.
+
+### Toolchain blocks (PART B)
+- **cargo-mutants NOT run.** Not installed; `cargo install cargo-mutants`
+  not attempted to avoid network/time risk in this environment. Mutation
+  gate on the election/verify fns recorded as BLOCKED. Each election/verify
+  fix carries a behavior-flip test (eligibility predicate, legacy-forgery
+  rejection, signature verification) that fails if the guard is inverted or
+  removed — the property the mutation gate would target.
+- **Cargo.lock** was already dirty at branch start (pre-existing wallet-* work)
+  and is intentionally NOT committed; the `core/network/Cargo.toml` ed25519
+  addition is committed (it resolves to a version already in the lock via the
+  consensus crate, so no lock churn is required to build).

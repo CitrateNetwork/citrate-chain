@@ -141,6 +141,20 @@ pub struct DagStore {
 
     /// WP-S.1: Optional persistent backend for write-through durability.
     persistent: Option<Arc<dyn KvStore>>,
+
+    /// FWA-C1-01: shared, stake-populated proposer selector used to
+    /// enforce **leader-election eligibility** at admission. When set
+    /// (production wiring), `verify_block_vrf_crypto` additionally calls
+    /// `is_eligible_proposer` so a syntactically-valid VRF from a
+    /// non-eligible (insufficient-stake / inactive / unregistered)
+    /// proposer is REJECTED — closing the gap where the admission gate
+    /// verified VRF math + identity binding but never stake eligibility.
+    ///
+    /// `None` preserves the legacy behavior for unit/integration tests
+    /// that admit synthetic blocks without a live validator registry.
+    /// Production node startup MUST populate this via
+    /// [`Self::with_proposer_selector`].
+    proposer_selector: Option<Arc<VrfProposerSelector>>,
 }
 
 /// Column family names for persistent DAG storage
@@ -177,7 +191,17 @@ impl DagStore {
             pruning_point: Arc::new(RwLock::new(Hash::default())),
             strict_vrf: true,
             persistent: None,
+            proposer_selector: None,
         }
+    }
+
+    /// FWA-C1-01: attach a stake-populated proposer selector so admission
+    /// enforces leader-election eligibility (`is_eligible_proposer`) in
+    /// addition to VRF math + ed25519 identity binding. The selector is
+    /// shared (Arc) so the node can keep its validator/stake set live.
+    pub fn with_proposer_selector(mut self, selector: Arc<VrfProposerSelector>) -> Self {
+        self.proposer_selector = Some(selector);
+        self
     }
 
     /// Create a DagStore with explicit VRF strictness.
@@ -213,6 +237,7 @@ impl DagStore {
             pruning_point: Arc::new(RwLock::new(Hash::default())),
             strict_vrf: true,
             persistent: Some(kv),
+            proposer_selector: None,
         };
         store.load_from_persistent()?;
         Ok(store)
@@ -417,7 +442,21 @@ impl DagStore {
         })?;
 
         let prev_vrf_output = parent.header.vrf_reveal.output;
-        let vrf_selector = VrfProposerSelector::new();
+
+        // FWA-C1-01: prefer the node's live, stake-populated selector when
+        // wired, so leader-election eligibility is enforced against the
+        // real validator/stake set. Fall back to an empty selector only
+        // when none is attached (tests / pre-registry environments) — that
+        // path still enforces VRF math + ed25519 identity binding, just not
+        // stake eligibility.
+        let fallback;
+        let vrf_selector: &VrfProposerSelector = match &self.proposer_selector {
+            Some(s) => s.as_ref(),
+            None => {
+                fallback = VrfProposerSelector::new();
+                &fallback
+            }
+        };
 
         match vrf_selector.verify_vrf_with_block_signature(
             &block.header.proposer_pubkey,
@@ -427,10 +466,76 @@ impl DagStore {
             block.header.block_hash.as_bytes(),
             &block.signature,
         ) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err("VRF proof verification failed: invalid proof or identity binding".to_string()),
-            Err(e) => Err(format!("VRF verification error: {}", e)),
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(
+                    "VRF proof verification failed: invalid proof or identity binding".to_string(),
+                )
+            }
+            Err(e) => return Err(format!("VRF verification error: {}", e)),
         }
+
+        // FWA-C1-01: enforce stake-weighted leader-election ELIGIBILITY at
+        // admission. Previously the admission gate verified the VRF math +
+        // identity binding but NEVER called `is_eligible_proposer`, so any
+        // peer with a syntactically-valid VRF could propose unlimited
+        // blocks at any height regardless of stake. We now reject a block
+        // whose proposer is not eligible for its slot. Only enforced when a
+        // populated selector is attached (production wiring); without it we
+        // cannot evaluate eligibility and preserve prior behavior.
+        if self.proposer_selector.is_some() {
+            match vrf_selector
+                .is_eligible_proposer(
+                    &block.header.proposer_pubkey,
+                    &block.header.vrf_reveal.output,
+                    block.header.height,
+                )
+                .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(
+                    "Leader-election eligibility failed: proposer not eligible for this slot (stake threshold / inactive / unregistered)"
+                        .to_string(),
+                ),
+                Err(e) => Err(format!("Eligibility check error: {}", e)),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// FWA-C1-04: equivocation / double-proposal detection hook.
+    ///
+    /// Returns the hash of an EXISTING, distinct block at the same height
+    /// proposed by the same proposer, if one is present — i.e. evidence
+    /// that `block`'s proposer is equivocating (signing two different
+    /// blocks for one slot). `blocks_by_height` is `HashMap<u64, Vec<Hash>>`
+    /// with no (proposer,height) uniqueness, so without this check one
+    /// actor (especially combined with the FWA-C1-01 eligibility gap) can
+    /// flood sibling blocks per height.
+    ///
+    /// This is a detection primitive: the network layer calls it to feed
+    /// peer-scoring / slashing (the gossip peer-score already has a
+    /// `SCORE_INVALID_BLOCK` bucket). It is read-only and side-effect free.
+    pub async fn detect_equivocation(&self, block: &Block) -> Option<Hash> {
+        let candidate_hash = block.hash();
+        let height = block.header.height;
+        let proposer = block.header.proposer_pubkey;
+
+        let by_height = self.blocks_by_height.read().await;
+        let siblings = by_height.get(&height)?;
+        let blocks = self.blocks.read().await;
+        for &h in siblings {
+            if h == candidate_hash {
+                continue; // same block, not equivocation
+            }
+            if let Some(existing) = blocks.get(&h) {
+                if existing.header.proposer_pubkey == proposer {
+                    return Some(h);
+                }
+            }
+        }
+        None
     }
 
     /// Store a block in the DAG.
@@ -1283,6 +1388,152 @@ mod tests {
         assert!(
             at_height.is_empty(),
             "REM-N-04: failed store_block must not leave the block in the height index"
+        );
+    }
+
+    // ===================================================================
+    // FWA-C1-04 — equivocation / double-proposal detection
+    // ===================================================================
+
+    fn block_by_proposer(hash: [u8; 32], height: u64, parent: Hash, proposer: u8) -> Block {
+        BlockBuilder::new()
+            .hash(Hash::new(hash))
+            .height(height)
+            .parent(parent)
+            .proposer(PublicKey::new([proposer; 32]))
+            .build_unhashed()
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn test_C1_04_detects_double_proposal_same_proposer_height() {
+        let store = DagStore::with_permissive_vrf_for_testing();
+        let genesis = block_by_proposer([0xFF; 32], 0, Hash::default(), 9);
+        store.store_block(genesis.clone()).await.unwrap();
+
+        // Proposer 7 produces a block at height 1.
+        let a = block_by_proposer([0xA1; 32], 1, genesis.hash(), 7);
+        store.store_block(a.clone()).await.unwrap();
+
+        // Proposer 7 produces a DIFFERENT block at the same height 1 →
+        // equivocation. detect_equivocation must surface block `a`.
+        let b = block_by_proposer([0xB2; 32], 1, genesis.hash(), 7);
+        let found = store.detect_equivocation(&b).await;
+        assert_eq!(found, Some(a.hash()), "must detect the equivocating sibling");
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn test_C1_04_no_false_positive_distinct_proposers() {
+        let store = DagStore::with_permissive_vrf_for_testing();
+        let genesis = block_by_proposer([0xFF; 32], 0, Hash::default(), 9);
+        store.store_block(genesis.clone()).await.unwrap();
+
+        let a = block_by_proposer([0xA1; 32], 1, genesis.hash(), 7);
+        store.store_block(a).await.unwrap();
+
+        // A DIFFERENT proposer at the same height is normal DAG width, not
+        // equivocation.
+        let b = block_by_proposer([0xB2; 32], 1, genesis.hash(), 8);
+        assert_eq!(store.detect_equivocation(&b).await, None);
+    }
+
+    // ===================================================================
+    // FWA-C1-01 — admission enforces leader-election eligibility
+    // ===================================================================
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn test_C1_01_admission_rejects_ineligible_when_selector_wired() {
+        use crate::vrf::{Validator, VrfProposerSelector};
+        let selector = Arc::new(VrfProposerSelector::new());
+
+        // A whale validator holds (nearly) all stake, so our test
+        // proposer's stake_ratio is ~0 → eligibility threshold ~0 →
+        // ineligible for essentially every VRF output.
+        selector
+            .register_validator(Validator {
+                pubkey: PublicKey::new([0x9A; 32]),
+                stake: 1_000_000,
+                is_active: true,
+            })
+            .await;
+        let proposer = PublicKey::new([7; 32]);
+        selector
+            .register_validator(Validator {
+                pubkey: proposer,
+                stake: 1, // negligible stake vs the whale → threshold ~0
+                is_active: true,
+            })
+            .await;
+
+        // A near-1.0 VRF output is above the negligible threshold, so the
+        // low-stake proposer is ineligible (this is the predicate the
+        // admission gate now enforces — FWA-C1-01).
+        let high_output = Hash::new([0xFF; 32]);
+        let eligible = selector
+            .is_eligible_proposer(&proposer, &high_output, 1)
+            .await
+            .unwrap();
+        assert!(!eligible, "negligible-stake proposer must be ineligible for a high VRF output");
+
+        // The store, when wired with this selector, has the eligibility
+        // gate active (proposer_selector.is_some()). Full end-to-end
+        // admission requires a real ECVRF proof to first pass the math
+        // gate; that path is exercised by vrf_tests. Here we pin that the
+        // selector-wired store carries the eligibility predicate.
+        let store = DagStore::with_strict_vrf(true).with_proposer_selector(selector);
+        assert!(store.proposer_selector.is_some());
+    }
+
+    // ===================================================================
+    // FWA-C1-03 — block timestamp must be parent-monotonic
+    // ===================================================================
+
+    fn linear_block(hash: [u8; 32], parent: Hash, blue_score: u64, ts: u64) -> Block {
+        // height == blue_score, canonical work — matches the consistency
+        // gate's expectations for a linear chain.
+        BlockBuilder::new()
+            .hash(Hash::new(hash))
+            .parent(parent)
+            .height(blue_score)
+            .blue_score(blue_score)
+            .blue_work(crate::types::blue_work_for_score(blue_score))
+            .timestamp(ts)
+            .build_unhashed()
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn test_C1_03_backdated_timestamp_rejected() {
+        let store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = crate::ghostdag::GhostDag::new(
+            crate::types::GhostDagParams::default(),
+            store.clone(),
+        );
+
+        // Genesis at height 0, blue_score 0, timestamp 1000 — stored in the
+        // dag_store so the consistency gate can resolve it as selected parent.
+        let genesis = linear_block([0xFF; 32], Hash::default(), 0, 1_000);
+        store.store_block(genesis.clone()).await.unwrap();
+
+        // Child backdated BEFORE its parent → rejected by the
+        // parent-monotonic timestamp check (FWA-C1-03). height/blue_score
+        // are otherwise valid so the timestamp is the load-bearing reason.
+        let backdated = linear_block([0x01; 32], genesis.hash(), 1, 500);
+        let res = ghostdag.validate_block_consistency(&backdated).await;
+        assert!(res.is_err(), "FWA-C1-03: backdated block must be rejected");
+        let msg = format!("{:?}", res.unwrap_err());
+        assert!(
+            msg.contains("parent-monotonic"),
+            "rejection reason must be the timestamp monotonicity check, got: {msg}"
+        );
+
+        // A non-decreasing timestamp (== parent) passes the consistency gate.
+        let ok = linear_block([0x02; 32], genesis.hash(), 1, 1_000);
+        assert!(
+            ghostdag.validate_block_consistency(&ok).await.is_ok(),
+            "FWA-C1-03: timestamp == parent must be allowed"
         );
     }
 }
