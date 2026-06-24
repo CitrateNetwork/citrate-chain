@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "./interfaces/IERC3009.sol";
 import "./lib/ReentrancyGuard.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /// @title WrappedSALT (wSALT)
 /// @notice ERC-20 wrapper around native SALT with EIP-3009 transferWithAuthorization support.
@@ -194,7 +195,7 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
             from, to, value, validAfter, validBefore, nonce
         ));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
-        address signer = ecrecover(digest, v, r, s);
+        address signer = _recoverCanonical(digest, v, r, s);
         require(signer != address(0) && signer == from, "wSALT: invalid signature");
 
         _authorizationStates[from][nonce] = true;
@@ -274,7 +275,7 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
             from, to, value, treasury, fee, validAfter, validBefore, nonce
         ));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
-        address signer = ecrecover(digest, v, r, s);
+        address signer = _recoverCanonical(digest, v, r, s);
         if (signer == address(0) || signer != from) {
             revert InvalidFeeAuthorization();
         }
@@ -314,7 +315,7 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
             from, to, value, validAfter, validBefore, nonce
         ));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
-        address signer = ecrecover(digest, v, r, s);
+        address signer = _recoverCanonical(digest, v, r, s);
         require(signer != address(0) && signer == from, "wSALT: invalid signature");
 
         _authorizationStates[from][nonce] = true;
@@ -338,7 +339,7 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
             authorizer, nonce
         ));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
-        address signer = ecrecover(digest, v, r, s);
+        address signer = _recoverCanonical(digest, v, r, s);
         require(signer != address(0) && signer == authorizer, "wSALT: invalid signature");
 
         _authorizationStates[authorizer][nonce] = true;
@@ -353,6 +354,26 @@ contract WrappedSALT is IERC3009, ReentrancyGuard {
     // ============================================================
     // Internal
     // ============================================================
+
+    /// @notice Malleability-safe ECDSA recovery (FWA-C3-05).
+    /// @dev Replaces the bare `ecrecover`, which accepted BOTH `(v,r,s)`
+    ///      and its complementary `(v^1, r, n-s)` form — a watcher could
+    ///      front-run an in-flight EIP-3009 relay with the malleated form
+    ///      (same nonce, different tx hash) and steal the relay leg /
+    ///      break off-chain sig-hash bookkeeping. OZ `ECDSA.tryRecover`
+    ///      enforces low-s (s <= secp256k1n/2, EIP-2) and v in {27,28},
+    ///      so only the canonical signature recovers a non-zero address.
+    ///      Returns `address(0)` on any malleable/invalid input, matching
+    ///      the existing `signer == address(0)` rejection at each callsite.
+    function _recoverCanonical(bytes32 digest, uint8 v, bytes32 r, bytes32 s)
+        internal
+        pure
+        returns (address)
+    {
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, v, r, s);
+        if (err != ECDSA.RecoverError.NoError) return address(0);
+        return recovered;
+    }
 
     function _transfer(address from, address to, uint256 amount) internal {
         require(from != address(0), "wSALT: transfer from zero address");

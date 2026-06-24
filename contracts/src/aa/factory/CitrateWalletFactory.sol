@@ -60,6 +60,12 @@ contract CitrateWalletFactory {
     /// In production this should be a multisig.
     address public owner;
 
+    /// FWA-C3-11: per-userId monotonic deploy nonce. Bound into the
+    /// permit digest and consumed on a successful (non-idempotent) deploy
+    /// so a captured permit cannot be replayed/front-run to grief the
+    /// sender's forwarded `msg.value`.
+    mapping(bytes32 userId => uint256) public deployNonce;
+
     constructor(address _implementation, address _identitySigner, address _owner) {
         if (_implementation == address(0) || _identitySigner == address(0) || _owner == address(0)) {
             revert ZeroAddress();
@@ -109,9 +115,23 @@ contract CitrateWalletFactory {
         uint256 expiresAt,
         bytes calldata signature
     ) external payable returns (address account) {
+        // Idempotent short-circuit (FWA-C3-11): the account address is
+        // derived from `userId` alone, so once it exists the deploy is a
+        // no-op that returns the existing address. We resolve that BEFORE
+        // permit validation because the consumed nonce has already moved
+        // past the permit that originally deployed the account — requiring
+        // a fresh signature here would break the documented idempotency.
+        // No state change and no `initData` execution happen on this path.
+        account = predictAddress(userId);
+        if (account.code.length != 0) {
+            return account;
+        }
+
         if (block.timestamp > expiresAt) revert PermitExpired();
 
-        // Bind permit to (this contract, chainId, userId, initData, expiresAt).
+        // Bind permit to (this contract, chainId, userId, initData,
+        // expiresAt, nonce). FWA-C3-11: the nonce makes each permit
+        // single-use so an observed permit cannot be front-run/replayed.
         bytes32 digest = permitDigest(userId, initData, expiresAt);
         bytes32 ethDigest = digest.toEthSignedMessageHash();
         (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(ethDigest, signature);
@@ -122,6 +142,9 @@ contract CitrateWalletFactory {
         bool alreadyDeployed;
         (alreadyDeployed, account) = LibClone.createDeterministicERC1967(msg.value, implementation, _salt(userId));
         if (!alreadyDeployed) {
+            // Consume the permit nonce ONLY on the deploy that actually
+            // initializes the account (effects before the init call — CEI).
+            deployNonce[userId] += 1;
             (bool ok,) = account.call(initData);
             if (!ok) revert InitializeFailed();
             emit AccountDeployed(userId, account, initialValidator);
@@ -131,6 +154,10 @@ contract CitrateWalletFactory {
     /// The digest the identity signer signs (off-chain, in
     /// auth.citrate.ai). Public so the SDK can reconstruct it locally
     /// when building a deploy permit.
+    /// @dev FWA-C3-11: includes the current per-userId `deployNonce` so
+    ///      each permit is single-use. The SDK reads `deployNonce(userId)`
+    ///      when building the permit; once a deploy lands the nonce
+    ///      increments and the old permit no longer validates.
     function permitDigest(bytes32 userId, bytes calldata initData, uint256 expiresAt)
         public
         view
@@ -142,7 +169,8 @@ contract CitrateWalletFactory {
                 block.chainid,
                 userId,
                 keccak256(initData),
-                expiresAt
+                expiresAt,
+                deployNonce[userId]
             )
         );
     }

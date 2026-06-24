@@ -15,6 +15,8 @@ bincode = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+# FWA-C2-01: ed25519 signature verification for learning-gossip messages.
+ed25519-dalek = { workspace = true }
 
 # Local dependencies
 citrate-consensus = { path = "../consensus" }

@@ -78,6 +78,17 @@ impl VrfProposerSelector {
         self
     }
 
+    /// FWA-C1-01: a selector with the legacy (forgeable SHA3) VRF path
+    /// **fully disabled** (`legacy_vrf_cutoff_height = 0`), so EVERY block
+    /// — at any height — must carry a real ECVRF proof. `verify_legacy_proof`
+    /// reconstructs `output == SHA3(proof || alpha)` with NO secret key, so
+    /// it is attacker-forgeable and grindable; mainnet must never accept it.
+    /// Production node startup should construct the proposer selector via
+    /// this builder (or call `with_legacy_cutoff_height(0)`).
+    pub fn production() -> Self {
+        Self::new().with_legacy_cutoff_height(0)
+    }
+
     /// Register a validator
     pub async fn register_validator(&self, validator: Validator) {
         let mut validators = self.validators.write().await;
@@ -725,6 +736,62 @@ mod tests {
             !r,
             "REM-N-01: a block payload not actually signed by the proposer \
              must fail the bound check"
+        );
+    }
+
+    // ===================================================================
+    // FWA-C1-01 — legacy SHA3 VRF path is attacker-forgeable; production
+    // selector (cutoff=0) must reject it at every height.
+    // ===================================================================
+
+    /// Forge a "legacy" 32-byte proof exactly as verify_legacy_proof
+    /// reconstructs it: output = SHA3(proof || SHA3(pubkey||prev||slot)).
+    /// No secret key participates — this is the forgery the legacy path
+    /// blindly accepts below the cutoff.
+    fn forge_legacy_proof(pubkey: &PublicKey, prev: &Hash, slot: u64) -> VrfProof {
+        let mut hasher = Sha3_256::new();
+        hasher.update(pubkey.as_bytes());
+        hasher.update(prev.as_bytes());
+        hasher.update(slot.to_le_bytes());
+        let input = hasher.finalize();
+
+        let attacker_proof = vec![0x42u8; 32]; // arbitrary, attacker-chosen
+        let mut oh = Sha3_256::new();
+        oh.update(&attacker_proof);
+        oh.update(input);
+        VrfProof {
+            proof: attacker_proof,
+            output: Hash::from_bytes(&oh.finalize()),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn test_C1_01_forged_legacy_proof_accepted_below_cutoff_but_rejected_in_production() {
+        let proposer = PublicKey::new([5; 32]);
+        let prev = Hash::new([0; 32]);
+        let slot = 10; // below the default 100k cutoff
+
+        let forged = forge_legacy_proof(&proposer, &prev, slot);
+
+        // Demonstrate the forgery: a default selector (cutoff 100k) accepts
+        // the no-secret-key legacy proof below the cutoff — the vulnerability.
+        let permissive = VrfProposerSelector::new();
+        assert!(
+            permissive
+                .verify_vrf_math_only(&proposer, &forged, &prev, slot)
+                .unwrap(),
+            "documents the forgery: legacy proof verifies with no secret key below cutoff"
+        );
+
+        // FWA-C1-01 fix: the PRODUCTION selector (legacy cutoff = 0) rejects
+        // the same forged legacy proof — every block must carry real ECVRF.
+        let production = VrfProposerSelector::production();
+        assert!(
+            !production
+                .verify_vrf_math_only(&proposer, &forged, &prev, slot)
+                .unwrap(),
+            "FWA-C1-01: production selector must reject the forgeable legacy SHA3 proof"
         );
     }
 }

@@ -7,7 +7,13 @@
 // LoRA adapter deltas without affecting consensus state.
 
 use citrate_consensus::types::{Hash, PublicKey, Signature};
+use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+
+/// FWA-C2-01: domain-separation tag for learning-gossip signatures, so a
+/// learning signature can never collide with a checkpoint-vote or block
+/// signature, and `chain_id` binding blocks cross-chain replay.
+const LEARNING_SIG_DOMAIN: &[u8] = b"CITRATE-LEARNING-GOSSIP-V1";
 
 // ---------------------------------------------------------------------------
 // Belnap confidence (network-local mirror of citrate_learning::BelnapValue)
@@ -124,6 +130,36 @@ impl LearningEmbedding {
 
         Ok(())
     }
+
+    /// FWA-C2-01: canonical bytes the `participant` signs. Binds the
+    /// domain tag + chain_id + checkpoint_height + embedding + confidence
+    /// so the embedding cannot be detached from its (height, participant)
+    /// identity, re-bound to another chain, or have its payload mutated.
+    pub fn signing_payload(&self, chain_id: u64) -> Vec<u8> {
+        let mut m = Vec::with_capacity(64 + self.embedding.len() * 4 + self.confidence.len());
+        m.extend_from_slice(LEARNING_SIG_DOMAIN);
+        m.extend_from_slice(&chain_id.to_le_bytes());
+        m.extend_from_slice(&self.checkpoint_height.to_le_bytes());
+        m.extend_from_slice(self.participant.as_bytes());
+        for &v in &self.embedding {
+            m.extend_from_slice(&v.to_le_bytes());
+        }
+        for c in &self.confidence {
+            m.push(*c as u8);
+        }
+        m
+    }
+
+    /// FWA-C2-01: verify the ed25519 signature against `participant`.
+    /// MUST be called before the message is stored / re-propagated.
+    pub fn verify_signature(&self, chain_id: u64) -> Result<(), String> {
+        let message = self.signing_payload(chain_id);
+        let vk = VerifyingKey::from_bytes(self.participant.as_bytes())
+            .map_err(|_| "invalid participant ed25519 key".to_string())?;
+        let sig = DalekSignature::from_bytes(self.signature.as_bytes());
+        vk.verify(&message, &sig)
+            .map_err(|_| "learning embedding signature verification failed".to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +221,32 @@ impl AdapterOffer {
 
         Ok(())
     }
+
+    /// FWA-C2-01: canonical bytes the `mentor` signs.
+    pub fn signing_payload(&self, chain_id: u64) -> Vec<u8> {
+        let mut m = Vec::with_capacity(128 + self.adapter_cid.len());
+        m.extend_from_slice(LEARNING_SIG_DOMAIN);
+        m.extend_from_slice(&chain_id.to_le_bytes());
+        m.extend_from_slice(&self.checkpoint_height.to_le_bytes());
+        m.extend_from_slice(self.mentor.as_bytes());
+        m.extend_from_slice(self.mentee.as_bytes());
+        m.extend_from_slice(self.adapter_cid.as_bytes());
+        m.extend_from_slice(self.adapter_hash.as_bytes());
+        for h in &self.provenance {
+            m.extend_from_slice(h.as_bytes());
+        }
+        m
+    }
+
+    /// FWA-C2-01: verify the ed25519 signature against `mentor`.
+    pub fn verify_signature(&self, chain_id: u64) -> Result<(), String> {
+        let message = self.signing_payload(chain_id);
+        let vk = VerifyingKey::from_bytes(self.mentor.as_bytes())
+            .map_err(|_| "invalid mentor ed25519 key".to_string())?;
+        let sig = DalekSignature::from_bytes(self.signature.as_bytes());
+        vk.verify(&message, &sig)
+            .map_err(|_| "adapter offer signature verification failed".to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +263,16 @@ pub enum LearningMessage {
 }
 
 impl LearningMessage {
+    /// FWA-C2-01: verify the inner message's ed25519 signature against the
+    /// asserted author (`participant` / `mentor`). MUST pass before the
+    /// message is deduped, stored, or re-propagated.
+    pub fn verify_signature(&self, chain_id: u64) -> Result<(), String> {
+        match self {
+            Self::Embedding(e) => e.verify_signature(chain_id),
+            Self::Adapter(a) => a.verify_signature(chain_id),
+        }
+    }
+
     /// Validate the inner message.
     pub fn validate(&self) -> Result<(), String> {
         match self {
