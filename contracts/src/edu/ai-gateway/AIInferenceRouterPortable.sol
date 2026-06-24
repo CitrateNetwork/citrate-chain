@@ -186,7 +186,12 @@ contract AIInferenceRouterPortable is IAIInferenceRouter {
 
         if (v < 27) v += 27;
         if (v != 27 && v != 28) return (false, address(0));
+        // FWA-C3-05 sweep: reject malleable high-s signatures (EIP-2).
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
+            return (false, address(0));
+        }
 
+        // nosemgrep: fwa-c3-05-raw-ecrecover-no-low-s-guard -- low-s enforced above
         signer = ecrecover(digest, v, r, s);
         valid = signer != address(0);
     }

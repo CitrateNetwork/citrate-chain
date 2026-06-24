@@ -14,6 +14,26 @@ contract Counter {
     function increment() external { count++; }
 }
 
+/// @notice FWA-C3-03: an ERC-2771-aware target that recovers the real
+/// sender from the trailing 20 bytes the trusted forwarder appends.
+contract Sender2771Target {
+    address public lastSeenSender;
+
+    function recordSender() external {
+        lastSeenSender = _msgSender();
+    }
+
+    function _msgSender() internal view returns (address sender) {
+        if (msg.data.length >= 20) {
+            assembly {
+                sender := shr(96, calldataload(sub(calldatasize(), 20)))
+            }
+        } else {
+            sender = msg.sender;
+        }
+    }
+}
+
 contract ForwarderTest is Test {
     Forwarder forwarder;
     ClassroomClusterV1 cluster;
@@ -125,6 +145,34 @@ contract ForwarderTest is Test {
         }
         assertEq(counter.count(), 5);
         assertEq(forwarder.getNonce(orgPrincipal, 0), 5);
+    }
+
+    // ── FWA-C3-03: EIP-2771 sender append ──
+
+    /// Pre-fix: execute() called `target.call(request.data)` with NO sender
+    /// appended, so a 2771-aware target saw msg.sender == Forwarder. Post-fix:
+    /// the authenticated principal (deviceUser == student) is appended, and a
+    /// 2771-aware target recovers it via _msgSender().
+    function test_C3_03_forwarder_appends_2771_sender() public {
+        Sender2771Target target = new Sender2771Target();
+        vm.prank(governance);
+        forwarder.setTargetAllowed(address(target), true);
+
+        IForwarder.ForwardRequest memory req = IForwarder.ForwardRequest({
+            orgPrincipalId: orgPrincipal,
+            classroomId: 0,
+            nonce: 0,
+            sessionExpiry: block.timestamp + 3600,
+            deviceCertHash: deviceCert,
+            target: address(target),
+            data: abi.encodeWithSelector(Sender2771Target.recordSender.selector)
+        });
+
+        _executeAsRelayer(req, _studentSignature(req));
+
+        // The target must see the real principal (student), NOT the forwarder.
+        assertEq(target.lastSeenSender(), student, "2771 sender appended == authenticated principal");
+        assertTrue(target.lastSeenSender() != address(forwarder), "target must NOT see forwarder as sender");
     }
 
     function test_non_relayer_reverts() public {

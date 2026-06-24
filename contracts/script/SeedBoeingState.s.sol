@@ -357,7 +357,8 @@ contract SeedBoeingState is Script {
                     string(abi.encodePacked("Auto-recorded decision ", _utoa(d))),
                     "PASSKEY",
                     keccak256(abi.encodePacked("artifact-", c, "-", d)),
-                    d % 4 == 0 ? "Verified" : "Pending"
+                    d % 4 == 0 ? "Verified" : "Pending",
+                    abi.encodePacked(keccak256(abi.encodePacked("seed-sig-", c, "-", d)))
                 );
             }
         }

@@ -221,6 +221,52 @@ contract CitratePaymasterTest is Test {
         assertEq(uint256(used), 80_000);
     }
 
+    // ── FWA-C3-04: recovery daily COUNT cap (deposit-drain bound) ──
+
+    /// Pre-fix: a registered wallet could self-tag UNLIMITED recovery ops
+    /// (each only checked the per-op cap, no cumulative counter) to drain
+    /// the paymaster deposit. Post-fix: a per-account daily recovery-op
+    /// COUNT cap (default 3) bounds it; the 4th op in a day reverts.
+    function test_C3_04_recovery_daily_count_cap_blocks_drain() public {
+        assertEq(pm.recoveryDailyCountCap(), 3);
+
+        // 3 recovery ops in the same day, each under the per-op cap.
+        for (uint256 i = 0; i < 3; i++) {
+            bytes memory ctx = _validate(account, _userOpCat(account, 1), 150_000);
+            _postOp(ctx, 150_000);
+        }
+
+        // 4th recovery op the same day is rejected at validation.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CitratePaymaster.RecoveryDailyCountExceeded.selector, account, uint256(3), uint256(3)
+            )
+        );
+        _validate(account, _userOpCat(account, 1), 150_000);
+    }
+
+    function test_C3_04_recovery_count_resets_next_day() public {
+        for (uint256 i = 0; i < 3; i++) {
+            bytes memory ctx = _validate(account, _userOpCat(account, 1), 150_000);
+            _postOp(ctx, 150_000);
+        }
+        // Advance one day; the counter resets and recovery works again.
+        vm.warp(block.timestamp + 1 days);
+        bytes memory ctx2 = _validate(account, _userOpCat(account, 1), 150_000);
+        (, uint8 c) = abi.decode(ctx2, (address, uint8));
+        assertEq(c, 1);
+    }
+
+    function test_C3_04_count_cap_zero_means_unlimited() public {
+        vm.prank(ownerAddr);
+        pm.setRecoveryDailyCountCap(0);
+        // Many recovery ops now allowed (per-op cap still applies).
+        for (uint256 i = 0; i < 10; i++) {
+            bytes memory ctx = _validate(account, _userOpCat(account, 1), 150_000);
+            _postOp(ctx, 150_000);
+        }
+    }
+
     // ── First-op category ──
 
     function test_validate_firstOp_passes() public {

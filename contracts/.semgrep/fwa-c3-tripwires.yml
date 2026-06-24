@@ -1,0 +1,40 @@
+# FWA-C3 remediation tripwires (Agentile-Audit v0.2, mandatory for the
+# Class-A signature-trust and access-control classes).
+#
+# Run:  semgrep --config contracts/.semgrep/fwa-c3-tripwires.yml contracts/src
+#
+# These permanently guard against silent re-introduction of the fixed bug
+# classes. CI should fail on any match. Audit ref:
+#   citrate-security/audits/2026-06-20-federation-wide-audit/per-chunk/FWA-C3
+rules:
+  - id: fwa-c3-05-raw-ecrecover-no-low-s-guard
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      Raw `ecrecover(...)` accepts signature-malleable (high-s) inputs
+      (FWA-C3-05). Use OpenZeppelin `ECDSA.tryRecover` / `ECDSA.recover`
+      which enforce low-s (EIP-2) and v in {27,28}. If a raw ecrecover is
+      genuinely required, wrap it in a low-s guard and justify with a
+      // nosemgrep comment.
+    patterns:
+      - pattern: ecrecover(...)
+    paths:
+      include:
+        - "src/**/*.sol"
+
+  - id: fwa-c3-03-forwarder-call-without-2771-sender
+    languages: [solidity]
+    severity: WARNING
+    message: >
+      A trusted EIP-2771 forwarder must append the authenticated 20-byte
+      sender to the forwarded calldata (FWA-C3-03):
+      `target.call(abi.encodePacked(data, sender))`. A bare
+      `target.call(data)` in a forwarder makes 2771-aware targets see the
+      forwarder as msg.sender. Verify the appended-sender pattern.
+    patterns:
+      - pattern: $T.call($DATA)
+      - pattern-not: $T.call(abi.encodePacked(...))
+      - pattern-not: $T.call{value: $V}(abi.encodePacked(...))
+    paths:
+      include:
+        - "src/edu/Forwarder.sol"

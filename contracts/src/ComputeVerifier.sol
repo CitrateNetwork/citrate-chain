@@ -647,7 +647,14 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
             v += 27;
         }
         require(v == 27 || v == 28, "ComputeVerifier: invalid v value");
+        // FWA-C3-05 sweep: enforce low-s (EIP-2) to reject signature
+        // malleability. secp256k1n/2.
+        require(
+            uint256(s) <= 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0,
+            "ComputeVerifier: invalid s value"
+        );
 
+        // nosemgrep: fwa-c3-05-raw-ecrecover-no-low-s-guard -- low-s enforced above
         address recovered = ecrecover(messageHash, v, r, s);
         return recovered != address(0) && teeOracles[recovered];
     }

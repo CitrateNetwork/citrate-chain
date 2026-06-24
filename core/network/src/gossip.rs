@@ -58,6 +58,10 @@ pub struct GossipConfig {
 
     /// Validation timeout
     pub validation_timeout: Duration,
+
+    /// FWA-C2-01: chain id bound into learning-gossip signature
+    /// verification (cross-chain replay defense). Citrate mainnet = 40204.
+    pub chain_id: u64,
 }
 
 impl Default for GossipConfig {
@@ -68,6 +72,7 @@ impl Default for GossipConfig {
             fanout: 8,
             max_message_size: 1024 * 1024, // 1MB
             validation_timeout: Duration::from_millis(100),
+            chain_id: 40204,
         }
     }
 }
@@ -323,6 +328,24 @@ impl GossipProtocol {
         if let Err(e) = msg.validate() {
             warn!(
                 "[INVALID_LEARNING] from={} error={}",
+                from_peer.0, e
+            );
+            self.peer_manager
+                .update_peer_score(from_peer, SCORE_INVALID_LEARNING)
+                .await;
+            return Err(NetworkError::InvalidMessage(e));
+        }
+
+        // 1b. FWA-C2-01: cryptographic signature verification BEFORE any
+        // dedup/store/propagate. Without this a peer could broadcast an
+        // embedding/adapter carrying ANY victim validator's PublicKey in
+        // `participant`/`mentor` with a junk signature; the node would
+        // store it under the victim's identity, re-gossip it, AND — because
+        // dedup keys on the attacker-chosen participant — censor the
+        // victim's genuine entry at that height. Fail closed + penalize.
+        if let Err(e) = msg.verify_signature(self.config.chain_id) {
+            warn!(
+                "[INVALID_LEARNING_SIG] from={} error={}",
                 from_peer.0, e
             );
             self.peer_manager

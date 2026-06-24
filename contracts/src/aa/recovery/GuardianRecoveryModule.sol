@@ -13,6 +13,7 @@ import {
 
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 
 /// WP-1 / EW-S1 — Social-guardian recovery module.
 ///
@@ -155,6 +156,17 @@ contract GuardianRecoveryModule is IValidator, IHook {
     /// Each signature is checked against the guardian list; a guardian
     /// can only contribute once per recovery (duplicate signers in the
     /// blob are rejected).
+    ///
+    /// @dev FWA-C3-06 hardening: EOA guardian signatures are recovered ONLY
+    ///      against the EIP-191 ("\x19Ethereum Signed Message") prefixed
+    ///      digest. The previously-accepted raw `keccak256(userOpHash,account)`
+    ///      shape is no longer honored — a guardian EOA signature produced
+    ///      for some unrelated protocol that happened to sign a 32-byte blob
+    ///      can no longer be replayed into a recovery.
+    /// @dev FWA-C3-07 hardening: contract (smart-wallet) guardians are
+    ///      authenticated via EIP-1271 `isValidSignature` against the same
+    ///      domain-separated digest, so an M-of-N set that includes a Safe /
+    ///      smart wallet is no longer unsatisfiable (recovery un-bricked).
     function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash)
         external
         payable
@@ -192,28 +204,48 @@ contract GuardianRecoveryModule is IValidator, IHook {
         return confirmed >= threshold ? SIG_VALIDATION_SUCCESS_UINT : SIG_VALIDATION_FAILED_UINT;
     }
 
-    /// Try to recover a guardian from either the raw digest or the
-    /// EIP-191 ("personal_sign") prefixed digest. Recover succeeds
-    /// silently against many digests; the only signal we trust is
-    /// "the recovered address is in this account's guardian set."
+    /// Match a single 65-byte guardian signature slot to a guardian.
+    ///
+    /// FWA-C3-06: EOA guardians are recovered ONLY against the EIP-191
+    /// prefixed `ethDigest`. The raw-digest acceptance path is removed,
+    /// closing the cross-protocol replay surface.
+    ///
+    /// FWA-C3-07: if the EOA path does not match, each guardian that is a
+    /// deployed contract is offered the signature via EIP-1271
+    /// `isValidSignature(digest, sig)`. The application digest (the
+    /// un-prefixed `keccak256(userOpHash, account)`) is what a smart-wallet
+    /// guardian's own validator binds, mirroring how Kernel/7579 wallets
+    /// receive a domain-separated hash. A contract guardian returning the
+    /// 0x1626ba7e magic value is accepted.
+    ///
     /// Returns the guardian's index in `cfg.guardians`, or
-    /// `type(uint8).max` if neither shape matches a guardian.
+    /// `type(uint8).max` if no guardian matches.
     function _matchGuardianAcrossShapes(
         RecoveryConfig storage cfg,
         bytes32 digest,
         bytes32 ethDigest,
         bytes calldata sig
     ) internal view returns (uint8) {
-        (address rawSigner, ECDSA.RecoverError rawErr,) = ECDSA.tryRecover(digest, sig);
-        if (rawErr == ECDSA.RecoverError.NoError && rawSigner != address(0)) {
-            uint8 idx = _guardianIndex(cfg, rawSigner);
-            if (idx != type(uint8).max) return idx;
-        }
-
+        // EOA path — EIP-191 prefixed digest ONLY (FWA-C3-06).
         (address ethSigner, ECDSA.RecoverError ethErr,) = ECDSA.tryRecover(ethDigest, sig);
         if (ethErr == ECDSA.RecoverError.NoError && ethSigner != address(0)) {
             uint8 idx = _guardianIndex(cfg, ethSigner);
             if (idx != type(uint8).max) return idx;
+        }
+
+        // EIP-1271 contract-guardian path (FWA-C3-07). Only reachable for
+        // guardians with deployed code; EOAs short-circuit above.
+        uint8 n = cfg.count;
+        for (uint8 i = 0; i < n; i++) {
+            address g = cfg.guardians[i];
+            if (g.code.length == 0) continue; // not a contract
+            // staticcall via the interface; any revert / non-magic answer
+            // simply means "this guardian did not sign", fail closed.
+            try IERC1271(g).isValidSignature(digest, sig) returns (bytes4 magic) {
+                if (magic == EIP1271_MAGIC) return i;
+            } catch {
+                // ignore — fall through, this guardian did not validate.
+            }
         }
 
         return type(uint8).max;

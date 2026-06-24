@@ -24,6 +24,19 @@ contract RoleEscalationTest is Test {
 
     function setUp() public {
         re = new RoleEscalation(admin);
+        // FWA-C3-01: requestElevation is now gated on the authorized
+        // elevation issuer (a role-admin) and requires the subject to
+        // already hold a base role. The test harness calls elevation as
+        // `address(this)`, so register it as a role-admin and seed base
+        // roles for the principals these tests elevate. (The dedicated
+        // C3-01 red test in RoleEscalationElevationPoC.t.sol asserts that
+        // an UNregistered EOA still cannot elevate.)
+        vm.prank(admin);
+        re.setRoleAdmin(address(this), true);
+        re.setBaseRole(USER, TENANT, ROLE_QA);
+        re.setBaseRole(USER, TENANT2, ROLE_QA);
+        re.setBaseRole(USER2, TENANT, ROLE_QA);
+        re.setBaseRole(USER2, TENANT2, ROLE_QA);
     }
 
     // ── Constructor ─────────────────────────────────────────────────

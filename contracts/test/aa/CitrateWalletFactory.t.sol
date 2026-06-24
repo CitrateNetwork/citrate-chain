@@ -260,9 +260,10 @@ contract CitrateWalletFactoryTest is Test {
         view
         returns (bytes memory)
     {
-        bytes32 digest = keccak256(
-            abi.encode(address(factory), block.chainid, userId, keccak256(initData), expiresAt)
-        );
+        // FWA-C3-11: use the contract's own digest builder so the current
+        // per-userId nonce is included; reconstructing it by hand would
+        // miss the nonce and the signature would no longer validate.
+        bytes32 digest = factory.permitDigest(userId, initData, expiresAt);
         return _signWith(SIGNER_PK, digest);
     }
 

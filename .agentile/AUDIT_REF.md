@@ -29,6 +29,14 @@ repo land **here**, next to the code, under
 `.agentile/audits/2026-05-31-federation-deep-audit/` and are linked back from the
 central finding.
 
+## FWA remediation (2026-06-21)
+
+Remediation of the **2026-06-20 federation-wide audit** (FWA-C3 contracts,
+FWA-C1 consensus, FWA-C2 network) lands locally under
+`.agentile/audits/2026-06-21-fwa-remediation/REMEDIATION_LOG.md` (per-finding
+rows, red→green evidence, tripwires, toolchain blocks). Central findings:
+`citrate-security/audits/2026-06-20-federation-wide-audit/per-chunk/{FWA-C1,FWA-C2,FWA-C3}`.
+
 ## Scope for this repo
 
 - Phase-1 mapping complete; see `per-repo/citrate-chain/MAP.md` for the mapped surface and

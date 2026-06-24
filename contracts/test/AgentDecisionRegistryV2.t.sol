@@ -90,7 +90,7 @@ contract AgentDecisionRegistryV2Test is Test {
         r.record(
             DEC_A, USER, TENANT, CORR,
             AgentDecisionRegistryV2.EventClass.Provenance,
-            "approval", "kba", ART_ROOT, ""
+            "approval", "kba", ART_ROOT, "", hex"01"
         );
     }
 
@@ -157,7 +157,7 @@ contract AgentDecisionRegistryV2Test is Test {
                 AgentDecisionRegistryV2.NotRecorder.selector, stranger
             )
         );
-        r.record(DEC_A, USER, TENANT, CORR, AgentDecisionRegistryV2.EventClass.Provenance, "x", "kba", ART_ROOT, "");
+        r.record(DEC_A, USER, TENANT, CORR, AgentDecisionRegistryV2.EventClass.Provenance, "x", "kba", ART_ROOT, "", hex"01");
     }
 
     /// @dev Cites `ListUnique` invariant.
@@ -169,19 +169,19 @@ contract AgentDecisionRegistryV2Test is Test {
                 AgentDecisionRegistryV2.DecisionAlreadyExists.selector, DEC_A
             )
         );
-        r.record(DEC_A, USER, TENANT, CORR, AgentDecisionRegistryV2.EventClass.Provenance, "y", "kba", ART_ROOT, "");
+        r.record(DEC_A, USER, TENANT, CORR, AgentDecisionRegistryV2.EventClass.Provenance, "y", "kba", ART_ROOT, "", hex"01");
     }
 
     function test_record_revertsOnEmptyAuthMode() public {
         vm.prank(recorder);
         vm.expectRevert(AgentDecisionRegistryV2.EmptyAuthMode.selector);
-        r.record(DEC_A, USER, TENANT, CORR, AgentDecisionRegistryV2.EventClass.Provenance, "x", "", ART_ROOT, "");
+        r.record(DEC_A, USER, TENANT, CORR, AgentDecisionRegistryV2.EventClass.Provenance, "x", "", ART_ROOT, "", hex"01");
     }
 
     function test_record_revertsOnEmptyDescription() public {
         vm.prank(recorder);
         vm.expectRevert(AgentDecisionRegistryV2.EmptyDescription.selector);
-        r.record(DEC_A, USER, TENANT, CORR, AgentDecisionRegistryV2.EventClass.Provenance, "", "kba", ART_ROOT, "");
+        r.record(DEC_A, USER, TENANT, CORR, AgentDecisionRegistryV2.EventClass.Provenance, "", "kba", ART_ROOT, "", hex"01");
     }
 
     // ── AppendOnly invariant ────────────────────────────────────────
@@ -191,7 +191,7 @@ contract AgentDecisionRegistryV2Test is Test {
         _record(DEC_A, USER, TENANT, CORR, AgentDecisionRegistryV2.EventClass.Provenance, "first", "kba", "");
         vm.prank(recorder);
         vm.expectRevert();
-        r.record(DEC_A, USER, TENANT, CORR, AgentDecisionRegistryV2.EventClass.Audit, "second", "kba", ART_ROOT, "");
+        r.record(DEC_A, USER, TENANT, CORR, AgentDecisionRegistryV2.EventClass.Audit, "second", "kba", ART_ROOT, "", hex"01");
         // Original record is preserved.
         assertEq(r.getDecision(DEC_A).description, "first");
     }
@@ -380,7 +380,7 @@ contract AgentDecisionRegistryV2Test is Test {
         r.record(
             DEC_A, USER, TENANT, CORR,
             AgentDecisionRegistryV2.EventClass.Provenance,
-            string(desc), "kba", ART_ROOT, ""
+            string(desc), "kba", ART_ROOT, "", hex"01"
         );
         AgentDecisionRegistryV2.Decision memory before_ = r.getDecision(DEC_A);
         vm.prank(recorder);
@@ -398,7 +398,7 @@ contract AgentDecisionRegistryV2Test is Test {
         r.record(
             dec_id, user, TENANT, CORR,
             AgentDecisionRegistryV2.EventClass.Provenance,
-            "x", "kba", ART_ROOT, ""
+            "x", "kba", ART_ROOT, "", hex"01"
         );
         bytes32[] memory ids = r.byUser(user);
         assertGt(ids.length, 0);
@@ -411,14 +411,14 @@ contract AgentDecisionRegistryV2Test is Test {
         r.record(
             dec_id, USER, TENANT, CORR,
             AgentDecisionRegistryV2.EventClass.Provenance,
-            "x", "kba", ART_ROOT, ""
+            "x", "kba", ART_ROOT, "", hex"01"
         );
         vm.prank(recorder);
         vm.expectRevert();
         r.record(
             dec_id, USER, TENANT, CORR,
             AgentDecisionRegistryV2.EventClass.Audit,
-            "y", "kba", ART_ROOT, ""
+            "y", "kba", ART_ROOT, "", hex"01"
         );
     }
 
@@ -435,6 +435,6 @@ contract AgentDecisionRegistryV2Test is Test {
         string memory status
     ) internal {
         vm.prank(recorder);
-        r.record(dec_id, user, tenant, corr_id, class, desc, auth_mode, ART_ROOT, status);
+        r.record(dec_id, user, tenant, corr_id, class, desc, auth_mode, ART_ROOT, status, hex"01");
     }
 }
