@@ -378,12 +378,20 @@ contract ClassroomClusterV1 is IClassroomCluster {
         if (!_classrooms[fromClassroom].exists || !_classrooms[toClassroom].exists) revert ClassroomNotFound();
         if (_classroomRoles[fromClassroom][student] != ClassroomRole.Student) revert InvalidTransfer();
 
-        // Caller must be teacher of source OR admin
-        bool isFromTeacher = _classroomRoles[fromClassroom][msg.sender] == ClassroomRole.Teacher;
+        // FWA-C3-14: an org-level admin may move a student between any two
+        // classrooms. A classroom TEACHER, however, must control BOTH ends
+        // of the transfer — being teacher of the source alone let a teacher
+        // inject a student into ANY destination classroom they have no
+        // authority over (cross-classroom roster injection). Require
+        // teacher-of-source AND teacher-of-destination for the non-admin path.
         bool isAdmin = _orgRoles[msg.sender] == OrgRole.Admin ||
                        _orgRoles[msg.sender] == OrgRole.SuperAdmin ||
                        msg.sender == governance;
-        if (!isFromTeacher && !isAdmin) revert NotTeacherOf();
+        if (!isAdmin) {
+            bool isFromTeacher = _classroomRoles[fromClassroom][msg.sender] == ClassroomRole.Teacher;
+            bool isToTeacher = _classroomRoles[toClassroom][msg.sender] == ClassroomRole.Teacher;
+            if (!isFromTeacher || !isToTeacher) revert NotTeacherOf();
+        }
 
         // Atomic: remove from old, add to new
         _classroomRoles[fromClassroom][student] = ClassroomRole.None;

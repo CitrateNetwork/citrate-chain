@@ -35,10 +35,29 @@ async fn register_peer(pm: &Arc<PeerManager>, id: &PeerId) {
     pm.add_peer(peer).await.unwrap();
 }
 
+/// FWA-C2-01: the chain id the gossip layer binds into learning-gossip
+/// signature verification (GossipConfig::default().chain_id == 40204).
+const TEST_CHAIN_ID: u64 = 40204;
+
+/// Deterministic ed25519 signing key from a seed byte, with its derived
+/// PublicKey — so test messages carry a REAL participant/mentor key whose
+/// signature actually verifies (the gossip handler now checks it).
+fn keypair_from_seed(seed: u8) -> (ed25519_dalek::SigningKey, PublicKey) {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let pk = PublicKey::new(sk.verifying_key().to_bytes());
+    (sk, pk)
+}
+
+fn sign(sk: &ed25519_dalek::SigningKey, payload: &[u8]) -> Signature {
+    use ed25519_dalek::Signer;
+    Signature::new(sk.sign(payload).to_bytes())
+}
+
 fn make_valid_embedding(checkpoint: u64, participant_id: u8) -> LearningEmbedding {
-    LearningEmbedding {
+    let (sk, pk) = keypair_from_seed(participant_id);
+    let mut emb = LearningEmbedding {
         checkpoint_height: checkpoint,
-        participant: PublicKey::new([participant_id; 32]),
+        participant: pk,
         embedding: vec![0.1, 0.2, 0.3, 0.4],
         confidence: vec![
             BelnapConfidence::True,
@@ -54,19 +73,25 @@ fn make_valid_embedding(checkpoint: u64, participant_id: u8) -> LearningEmbeddin
             adapter_count: 3,
         },
         signature: Signature::default(),
-    }
+    };
+    emb.signature = sign(&sk, &emb.signing_payload(TEST_CHAIN_ID));
+    emb
 }
 
 fn make_valid_adapter_offer(checkpoint: u64, mentor_id: u8, mentee_id: u8) -> AdapterOffer {
-    AdapterOffer {
+    let (sk, mentor_pk) = keypair_from_seed(mentor_id);
+    let (_, mentee_pk) = keypair_from_seed(mentee_id);
+    let mut offer = AdapterOffer {
         checkpoint_height: checkpoint,
-        mentor: PublicKey::new([mentor_id; 32]),
-        mentee: PublicKey::new([mentee_id; 32]),
+        mentor: mentor_pk,
+        mentee: mentee_pk,
         adapter_cid: "QmTestCid123456789".to_string(),
         adapter_hash: Hash::new([0xAA; 32]),
         provenance: vec![],
         signature: Signature::default(),
-    }
+    };
+    offer.signature = sign(&sk, &offer.signing_payload(TEST_CHAIN_ID));
+    offer
 }
 
 // ---------------------------------------------------------------------------
@@ -425,5 +450,82 @@ async fn test_multiple_embeddings_same_checkpoint() {
         data.embeddings.len(),
         5,
         "All 5 embeddings from different participants should be stored"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FWA-C2-01 red→green: forged-signature learning gossip must be rejected
+// before store/propagate, and must NOT poison the (height, participant)
+// dedup slot (censorship corollary).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn test_C2_01_forged_signature_embedding_rejected() {
+    let (gossip, pm) = make_gossip();
+    let peer_id = PeerId::new("c2-01-attacker".to_string());
+    register_peer(&pm, &peer_id).await;
+
+    // Attacker forges an embedding carrying a victim validator's key
+    // (seed 0x11) but a JUNK signature (default = all-zero, not valid).
+    let (_victim_sk, victim_pk) = keypair_from_seed(0x11);
+    let mut forged = make_valid_embedding(42, 0x11);
+    forged.participant = victim_pk; // assert victim identity
+    forged.signature = Signature::default(); // junk
+
+    let res = gossip
+        .handle_learning_message(LearningMessage::Embedding(forged), &peer_id)
+        .await;
+    assert!(
+        res.is_err(),
+        "FWA-C2-01: forged-signature embedding must be REJECTED at the gossip layer"
+    );
+
+    // Censorship corollary: the forged (42, victim) entry must NOT have
+    // poisoned the dedup slot — nothing was stored.
+    let stored = gossip.get_learning_data(42).await;
+    assert!(
+        stored.is_none(),
+        "FWA-C2-01: forged embedding must not occupy the (height, participant) dedup slot"
+    );
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn test_C2_01_genuine_signed_embedding_accepted() {
+    let (gossip, pm) = make_gossip();
+    let peer_id = PeerId::new("c2-01-honest".to_string());
+    register_peer(&pm, &peer_id).await;
+
+    // A properly-signed embedding (make_valid_embedding signs it) is accepted.
+    let emb = make_valid_embedding(42, 0x22);
+    let res = gossip
+        .handle_learning_message(LearningMessage::Embedding(emb), &peer_id)
+        .await;
+    assert!(res.is_ok(), "genuine signed embedding must be accepted");
+    assert!(gossip.get_learning_data(42).await.is_some());
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn test_C2_01_wrong_chain_id_signature_rejected() {
+    // A signature valid for a DIFFERENT chain must not verify here
+    // (cross-chain replay defense via chain_id binding).
+    let (gossip, pm) = make_gossip();
+    let peer_id = PeerId::new("c2-01-crosschain".to_string());
+    register_peer(&pm, &peer_id).await;
+
+    let (sk, pk) = keypair_from_seed(0x33);
+    let mut emb = make_valid_embedding(42, 0x33);
+    emb.participant = pk;
+    // Sign against a wrong chain id (1) instead of TEST_CHAIN_ID (40204).
+    emb.signature = sign(&sk, &emb.signing_payload(1));
+
+    let res = gossip
+        .handle_learning_message(LearningMessage::Embedding(emb), &peer_id)
+        .await;
+    assert!(
+        res.is_err(),
+        "FWA-C2-01: a signature bound to another chain id must be rejected"
     );
 }

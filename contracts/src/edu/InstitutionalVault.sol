@@ -45,6 +45,17 @@ contract InstitutionalVault is IInstitutionalVault {
     mapping(uint256 => mapping(address => bool)) private _signerProposalApprovals;
     uint256 private _nextSignerProposalId;
 
+    // Threshold change proposals (FWA-C3-16: quorum-gated)
+    struct ThresholdChangeProposal {
+        uint256 newThreshold;
+        uint256 approvalCount;
+        bool executed;
+        bool rejected;
+    }
+    mapping(uint256 => ThresholdChangeProposal) private _thresholdProposals;
+    mapping(uint256 => mapping(address => bool)) private _thresholdProposalApprovals;
+    uint256 private _nextThresholdProposalId;
+
     // ── Errors ──
 
     error NotSigner();
@@ -66,6 +77,12 @@ contract InstitutionalVault is IInstitutionalVault {
     error SignerProposalAlreadyRejected();
     error SignerProposalAlreadyApproved();
     error SignerProposalQuorumNotMet();
+
+    // ── Events (FWA-C3-16 threshold proposal flow) ──
+
+    event ThresholdChangeProposed(uint256 indexed proposalId, uint256 newThreshold, address proposer);
+    event ThresholdChangeApproved(uint256 indexed proposalId, address approver);
+    event ThresholdChangeRejected(uint256 indexed proposalId, address rejector);
 
     // ── Modifiers ──
 
@@ -194,7 +211,14 @@ contract InstitutionalVault is IInstitutionalVault {
         CashoutTx storage tx_ = _cashouts[txId];
         if (tx_.executed) revert AlreadyExecuted();
         if (tx_.rejected) revert AlreadyRejected();
-        if (tx_.approvalCount < _threshold) revert QuorumNotMet();
+        // FWA-C3-17: recount approvals over the CURRENT signer set at
+        // execution time. The cached `approvalCount` can include approvals
+        // from addresses that were since removed as signers; trusting it
+        // lets a cashout execute on ex-signer authority across a signer-set
+        // change (stale-quorum TOCTOU). We require `_threshold` approvals
+        // from addresses that are signers RIGHT NOW.
+        uint256 liveApprovals = _liveApprovalCount(txId);
+        if (liveApprovals < _threshold) revert QuorumNotMet();
         if (tx_.amount > address(this).balance) revert InsufficientBalance();
 
         tx_.executed = true;
@@ -320,13 +344,82 @@ contract InstitutionalVault is IInstitutionalVault {
         emit SignerChangeRejected(proposalId, msg.sender);
     }
 
-    /// @dev Invariant: ThresholdBoundsValid — k > 0 and k <= n
-    function setThreshold(uint256 newThreshold) external onlySigner {
+    /// @dev FWA-C3-16: threshold changes are quorum-gated, not a bare
+    ///      single-signer one-shot. The threshold is the core security
+    ///      parameter; allowing one signer to set it to 1 would let that
+    ///      signer unilaterally weaken (or capture) the multisig. Mirrors
+    ///      the signer-change proposal flow: propose → approve → execute.
+    ///
+    /// @notice Step 1: any signer proposes a new threshold (auto-approves).
+    function proposeThresholdChange(uint256 newThreshold) external onlySigner returns (uint256 proposalId) {
         if (newThreshold == 0 || newThreshold > _signerList.length) revert InvalidThreshold();
 
-        uint256 oldThreshold = _threshold;
-        _threshold = newThreshold;
+        proposalId = _nextThresholdProposalId++;
+        _thresholdProposals[proposalId] = ThresholdChangeProposal({
+            newThreshold: newThreshold,
+            approvalCount: 1,
+            executed: false,
+            rejected: false
+        });
+        _thresholdProposalApprovals[proposalId][msg.sender] = true;
 
-        emit ThresholdChanged(oldThreshold, newThreshold);
+        emit ThresholdChangeProposed(proposalId, newThreshold, msg.sender);
+    }
+
+    /// @notice Step 2: other signers approve.
+    function approveThresholdChange(uint256 proposalId) external onlySigner {
+        ThresholdChangeProposal storage p = _thresholdProposals[proposalId];
+        if (p.executed) revert SignerProposalAlreadyExecuted();
+        if (p.rejected) revert SignerProposalAlreadyRejected();
+        if (_thresholdProposalApprovals[proposalId][msg.sender]) revert SignerProposalAlreadyApproved();
+
+        _thresholdProposalApprovals[proposalId][msg.sender] = true;
+        p.approvalCount++;
+
+        emit ThresholdChangeApproved(proposalId, msg.sender);
+    }
+
+    /// @notice Step 3: execute once quorum reached. Re-validates the new
+    ///         threshold against the current signer count (it may have
+    ///         changed since proposal) — ThresholdBoundsValid.
+    function executeThresholdChange(uint256 proposalId) external onlySigner {
+        ThresholdChangeProposal storage p = _thresholdProposals[proposalId];
+        if (p.executed) revert SignerProposalAlreadyExecuted();
+        if (p.rejected) revert SignerProposalAlreadyRejected();
+        if (p.approvalCount < _threshold) revert SignerProposalQuorumNotMet();
+        if (p.newThreshold == 0 || p.newThreshold > _signerList.length) revert InvalidThreshold();
+
+        p.executed = true;
+        uint256 oldThreshold = _threshold;
+        _threshold = p.newThreshold;
+
+        emit ThresholdChanged(oldThreshold, p.newThreshold);
+    }
+
+    /// @notice Reject a threshold-change proposal (any signer).
+    function rejectThresholdChange(uint256 proposalId) external onlySigner {
+        ThresholdChangeProposal storage p = _thresholdProposals[proposalId];
+        if (p.executed) revert SignerProposalAlreadyExecuted();
+        if (p.rejected) revert SignerProposalAlreadyRejected();
+        p.rejected = true;
+        emit ThresholdChangeRejected(proposalId, msg.sender);
+    }
+
+    function getThresholdProposalApprovalCount(uint256 proposalId) external view returns (uint256) {
+        return _thresholdProposals[proposalId].approvalCount;
+    }
+
+    // ── Internal ──
+
+    /// @dev FWA-C3-17: count approvals for `txId` that come from addresses
+    ///      that are signers in the CURRENT set. Removed signers' historical
+    ///      approvals no longer count toward quorum.
+    function _liveApprovalCount(uint256 txId) internal view returns (uint256 count) {
+        uint256 n = _signerList.length;
+        for (uint256 i = 0; i < n; i++) {
+            if (_approvals[txId][_signerList[i]]) {
+                count++;
+            }
+        }
     }
 }
