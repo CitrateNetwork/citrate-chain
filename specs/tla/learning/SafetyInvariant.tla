@@ -24,9 +24,10 @@ VARIABLES
     consensus_state,    \* Current consensus state root (abstract)
     learning_state,     \* Current learning state (separate from consensus)
     mode_log,           \* Sequence of mode transitions: <<[from, to]>>
-    blocks_processed    \* Counter of blocks processed
+    blocks_processed,   \* Counter of blocks processed
+    agg_safe            \* ghost: TRUE iff no Aggregate step has ever changed consensus
 
-vars == <<learning_mode, consensus_state, learning_state, mode_log, blocks_processed>>
+vars == <<learning_mode, consensus_state, learning_state, mode_log, blocks_processed, agg_safe>>
 
 \* ---- Helper operators ----
 
@@ -50,6 +51,7 @@ Init ==
     /\ learning_state \in LearningStates
     /\ mode_log = << >>
     /\ blocks_processed = 0
+    /\ agg_safe = TRUE
 
 \* Switch learning mode with audit trail.
 \* Models SafetyGuard::switch_mode().
@@ -59,7 +61,7 @@ SwitchMode(new_mode) ==
     /\ Len(mode_log) < 2 * MaxBlocks               \* Bound log length for finite state space
     /\ mode_log' = Append(mode_log, [from |-> learning_mode, to |-> new_mode])
     /\ learning_mode' = new_mode
-    /\ UNCHANGED <<consensus_state, learning_state, blocks_processed>>
+    /\ UNCHANGED <<consensus_state, learning_state, blocks_processed, agg_safe>>
 
 \* Process a block: consensus execution + optional learning update.
 \* CRITICAL: consensus_state' depends ONLY on the execution result,
@@ -76,11 +78,27 @@ ProcessBlock(new_consensus, new_learning) ==
         THEN new_learning
         ELSE learning_state
     /\ blocks_processed' = blocks_processed + 1
-    /\ UNCHANGED <<learning_mode, mode_log>>
+    /\ UNCHANGED <<learning_mode, mode_log, agg_safe>>
+
+\* Run the gradient/Belnap AGGREGATION precompile (0x0110 / nat-aggregate) as a
+\* learning-layer operation. It folds contributions into the learning_state and MUST
+\* leave the consensus state root untouched — the on-chain image of
+\* GradientAggregation.tla::StateRootIndependent. `agg_safe` records, as a regression
+\* tripwire, that no Aggregate step ever changed consensus_state (if a future edit made
+\* it touch consensus, TLC would flip agg_safe to FALSE and AggregationConsensusNeutral
+\* would fail). Only runs when learning is Active.
+Aggregate(new_learning) ==
+    /\ learning_mode = "Active"
+    /\ new_learning \in LearningStates
+    /\ consensus_state' = consensus_state            \* aggregation does NOT touch consensus
+    /\ learning_state' = new_learning
+    /\ agg_safe' = (agg_safe /\ consensus_state' = consensus_state)
+    /\ UNCHANGED <<learning_mode, mode_log, blocks_processed>>
 
 Next ==
     \/ \E m \in Modes : SwitchMode(m)
     \/ \E nc \in StateRoots, nl \in LearningStates : ProcessBlock(nc, nl)
+    \/ \E nl \in LearningStates : Aggregate(nl)
 
 \* ---- Invariants ----
 
@@ -90,6 +108,7 @@ TypeOK ==
     /\ consensus_state \in StateRoots
     /\ learning_state \in LearningStates
     /\ blocks_processed \in 0..MaxBlocks
+    /\ agg_safe \in BOOLEAN
     /\ \A i \in 1..Len(mode_log) : mode_log[i].from \in Modes /\ mode_log[i].to \in Modes
 
 \* INV-2: State root independence (Theorem 3).
@@ -140,12 +159,20 @@ LogConsistency ==
     \A i \in 1..(Len(mode_log) - 1) :
         mode_log[i].to = mode_log[i+1].from
 
+\* INV-9: Aggregation is consensus-neutral (WP-1, AGG-S1). The aggregation precompile,
+\* run as a learning op, never modifies the consensus state root — the on-chain image of
+\* GradientAggregation.tla::StateRootIndependent. Holds across every reachable Aggregate
+\* step; a regression that made aggregation touch consensus would flip agg_safe.
+AggregationConsensusNeutral ==
+    agg_safe = TRUE
+
 \* ---- Specification ----
 
 Spec == Init /\ [][Next]_vars
 
 THEOREM TypeSafety == Spec => []TypeOK
 THEOREM Theorem3 == Spec => []StateRootIndependent
+THEOREM AggSafe == Spec => []AggregationConsensusNeutral
 THEOREM AuditTrail == Spec => []ModeTransitionLogged
 THEOREM DefaultMode == Spec => []DefaultDisabled
 THEOREM ModeConsistency == Spec => []ModePersistence
