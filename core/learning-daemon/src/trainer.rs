@@ -54,15 +54,15 @@ use crate::types::{CycleId, RoutingWeights};
 /// whatever the backend produces; the precompile validates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q16Weights {
-    /// Flat Q16 i32 values in row-major layer order:
+    /// Flat Q16 i64 values in row-major layer order:
     /// W1 || b1 || W2 || b2 || W3 || b3.
-    pub values: Vec<i32>,
+    pub values: Vec<i64>,
 }
 
 impl Q16Weights {
-    /// Encode as big-endian bytes (i32 each, total = 4 * values.len()).
+    /// Encode as big-endian bytes (i64 each, total = 8 * values.len()).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(4 * self.values.len());
+        let mut bytes = Vec::with_capacity(8 * self.values.len());
         for v in &self.values {
             bytes.extend_from_slice(&v.to_be_bytes());
         }
@@ -129,7 +129,7 @@ impl TrainingBackend for StubTrainingBackend {
         // same chain commit. That's the idempotency property the
         // trainer relies on.
         let values = (0..self.n_weights)
-            .map(|i| (cycle_id as i32).saturating_mul(1000).saturating_add(i as i32))
+            .map(|i| (cycle_id as i64).saturating_mul(1000).saturating_add(i as i64))
             .collect();
         Ok(Q16Weights { values })
     }
@@ -339,10 +339,10 @@ mod tests {
             values: vec![1, -1, 0x12345678],
         };
         let bytes = w.to_bytes();
-        assert_eq!(bytes.len(), 12);
-        assert_eq!(&bytes[0..4], &1i32.to_be_bytes());
-        assert_eq!(&bytes[4..8], &(-1i32).to_be_bytes());
-        assert_eq!(&bytes[8..12], &0x12345678i32.to_be_bytes());
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(&bytes[0..8], &1i64.to_be_bytes());
+        assert_eq!(&bytes[8..16], &(-1i64).to_be_bytes());
+        assert_eq!(&bytes[16..24], &0x12345678i64.to_be_bytes());
     }
 
     #[test]

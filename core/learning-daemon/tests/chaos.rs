@@ -35,7 +35,7 @@ use citrate_learning_daemon::trainer::{
 use ethereum_types::H160;
 use tempfile::TempDir;
 
-fn make_entry(submitter: u8, value_q16: i32) -> EmbeddingEntry {
+fn make_entry(submitter: u8, value_q16: i64) -> EmbeddingEntry {
     EmbeddingEntry {
         submitter: H160::repeat_byte(submitter),
         embedding: vec![value_q16],
