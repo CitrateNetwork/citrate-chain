@@ -8,22 +8,31 @@ EXTENDS Integers, FiniteSets, TLC
 \*
 \* Statement:
 \*   Q16 add, sub, mul, div, neg are TOTAL functions: for any
-\*   inputs in the i32 range, the result is in the i32 range —
+\*   inputs in the representable range, the result is in range —
 \*   saturation never produces an out-of-range value, division
 \*   by zero returns Q16_MAX or Q16_MIN, and neg(MIN) saturates
 \*   to MAX.
+\*
+\* I64-S1 (2026-06-28): the Q16 backing type widened i32 -> i64. This
+\* spec is UNAFFECTED at the model level — it is width-abstract (see
+\* Domain shrink below): it proves totality at a small Magnitude domain,
+\* which holds for ANY representation width by the induction argument.
+\* The mul/div intermediates that widened i64 -> i128 in the source are
+\* the abstract `a * b` / `a \div b` here (TLC's Integers are unbounded),
+\* so the same TLC run re-certifies the i64 implementation. Only the
+\* doc references to the concrete width changed.
 \*
 \* **Approach:** the spec is a single-step state machine that
 \* picks one (op, a, b) tuple, computes the result, and asserts
 \* the result is in range. TLC explores all possible (op, a, b)
 \* triples; the SafetyInvariant must hold for every one.
 \*
-\* **Domain shrink:** real Q16 values are i32 ∈ [-2³¹, 2³¹). To
-\* keep TLC's state space tiny, we model the i4-style domain
-\* [-Magnitude, Magnitude-1]. The saturation logic is identical
-\* (it doesn't depend on the magnitude); proving totality at i4
-\* implies totality at any scale by induction on representation
-\* width.
+\* **Domain shrink:** real Q16 values are i64 ∈ [-2⁶³, 2⁶³) post-I64-S1
+\* (was i32). To keep TLC's state space tiny, we model the i4-style
+\* domain [-Magnitude, Magnitude-1]. The saturation logic is identical
+\* (it doesn't depend on the magnitude); proving totality at i4 implies
+\* totality at any scale — i32, i64, or beyond — by induction on
+\* representation width.
 
 CONSTANTS
     Magnitude           \* e.g. 4 means range [-4, 3]; 8 means [-8, 7]

@@ -34,6 +34,18 @@ pub type CircuitVersion = u32;
 
 /// Reserved circuit version for the first production InferenceCircuit
 /// landing in WP-M1b.3 (linear-layer Q16.16).
+///
+/// **I64-S1 (2026-06-28):** the Q16 backing type widened i32 -> i64, so
+/// the in-circuit witness path now recovers i64 operands and carries the
+/// W·x product in i128 (see `chips::signed_shift_decomp` /
+/// `halo2_fr_to_signed_i64`). This version is DELIBERATELY NOT bumped:
+/// the constraint system (gates, columns, selectors) is unchanged — the
+/// gates are field-exact algebraic relations independent of integer
+/// width — so the verifying key is byte-identical and v1 still correctly
+/// identifies this circuit's VK. Per the policy above, a new version is
+/// reserved for a change in topology/sizes/commitment-encoding; an i64
+/// witness-domain widening at identical structure is none of those.
+/// (Versions 4/5 are already allocated to the porep k-fold circuits.)
 pub const CIRCUIT_VERSION_LINEAR_Q16: CircuitVersion = 1;
 
 /// PIN-P1 step (a): circuit version for the **reduced** Stacked-DRG
@@ -1114,6 +1126,10 @@ mod tests {
         // version 1. If this drifts, every proof anchored to v1
         // breaks (or worse — verifies against a different circuit
         // than the prover used).
+        //
+        // I64-S1: intentionally still 1. The Q16 i64 widening changed the
+        // witness arithmetic (i64 recovery / i128 product) but NOT the
+        // constraint system, so the VK is identical and v1 stays valid.
         assert_eq!(CIRCUIT_VERSION_LINEAR_Q16, 1);
     }
 }
