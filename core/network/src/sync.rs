@@ -283,6 +283,16 @@ impl SyncManager {
         let last_height = last.height;
         let first_hash = first.block_hash;
         let last_hash = last.block_hash;
+        // Retire the in-flight request this batch answers. The request anchor
+        // (`from`) is the selected-parent of the first served header — the
+        // server resolves `from` to the block at anchor.height+1, whose
+        // selected-parent IS `from` (genesis's is the all-zero sentinel, which
+        // is also the genesis-request anchor). Without this, pending_headers
+        // never drains, so `check_timeouts` eventually (falsely) flags the
+        // responding peer — the bug that let a bootnode ban its only block
+        // source and split-brain the fleet.
+        let answered_anchor = first.selected_parent_hash;
+        self.pending_headers.write().await.remove(&answered_anchor);
 
         // Store validated headers
         self.downloaded_headers.write().await.extend(headers);
@@ -337,6 +347,15 @@ impl SyncManager {
             Some(b) => b.header.height,
             None => return Ok(()),
         };
+        // Retire the in-flight block request this batch answers, keyed by the
+        // first block's selected-parent (== the `from` anchor we requested).
+        // The peer responded, so the request is no longer pending regardless of
+        // per-block validation below; leaving it pending would falsely time the
+        // peer out. See the matching note in `handle_headers`.
+        if let Some(first) = blocks.first() {
+            let answered_anchor = first.header.selected_parent_hash;
+            self.pending_blocks.write().await.remove(&answered_anchor);
+        }
         let mut validated = Vec::with_capacity(total);
         let mut rejected = 0usize;
 
@@ -606,5 +625,88 @@ mod tests {
         assert_eq!(current, 50);
         assert_eq!(target, 100);
         assert_eq!(progress, 50.0);
+    }
+
+    /// Liveness regression: a completed headers response must RETIRE its
+    /// pending request, keyed by the served batch's selected-parent (== the
+    /// `from` anchor). Pre-fix the entry was never removed, so `check_timeouts`
+    /// later flagged the responding peer as dead — the chain of events that let
+    /// a bootnode permanently ban its only block source and split-brain the
+    /// fleet. The anchor must be GONE from `pending_headers` after handling.
+    #[tokio::test]
+    async fn handle_headers_retires_pending_request() {
+        use crate::PeerId;
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+
+        let sync = SyncManager::new(SyncConfig::default());
+        *sync.current_height.write().await = 0;
+        *sync.target_height.write().await = 100;
+
+        // The request we sent: GetHeaders { from: anchor }.
+        let anchor = Hash::new([9u8; 32]);
+        sync.pending_headers.write().await.insert(
+            anchor,
+            BlockRequest {
+                hash: anchor,
+                peer_id: PeerId("peer-a".to_string()),
+                requested_at: Instant::now(),
+                retries: 0,
+            },
+        );
+        assert!(sync.pending_headers.read().await.contains_key(&anchor));
+
+        // The peer answers: the first served header's selected-parent IS the
+        // anchor (server resolves `from` to anchor.height+1).
+        let served = BlockBuilder::new()
+            .parent(anchor)
+            .height(5)
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed();
+        sync.handle_headers(vec![served.header])
+            .await
+            .expect("handle_headers");
+
+        assert!(
+            !sync.pending_headers.read().await.contains_key(&anchor),
+            "pending headers request must be retired once answered"
+        );
+    }
+
+    /// Same liveness guarantee for blocks. The pending entry is retired the
+    /// moment the peer responds — before per-block validation — so even a batch
+    /// that fails validation can never falsely time the peer out.
+    #[tokio::test]
+    async fn handle_blocks_retires_pending_request() {
+        use crate::PeerId;
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+
+        let sync = SyncManager::new(SyncConfig::default());
+        *sync.current_height.write().await = 0;
+        *sync.target_height.write().await = 100;
+
+        let anchor = Hash::new([4u8; 32]);
+        sync.pending_blocks.write().await.insert(
+            anchor,
+            BlockRequest {
+                hash: anchor,
+                peer_id: PeerId("peer-b".to_string()),
+                requested_at: Instant::now(),
+                retries: 0,
+            },
+        );
+        assert!(sync.pending_blocks.read().await.contains_key(&anchor));
+
+        // Unsigned block — fails validation, but the request is still retired.
+        let served = BlockBuilder::new()
+            .parent(anchor)
+            .height(1)
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed();
+        let _ = sync.handle_blocks(vec![served]).await;
+
+        assert!(
+            !sync.pending_blocks.read().await.contains_key(&anchor),
+            "pending blocks request must be retired once the peer responds"
+        );
     }
 }
