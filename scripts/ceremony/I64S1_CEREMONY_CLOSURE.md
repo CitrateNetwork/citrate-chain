@@ -112,9 +112,54 @@ The runbook expected `git diff 40204.json` = only new keys. Actual:
 
 ## Owner follow-ups (gated)
 
-1. Review the `40204.json` diff; decide commit + consumer `sync-addresses` for the
-   11 moved peripheral contracts (core apps unaffected → Vercel likely untouched).
-2. Redeploy AA (`post-reroll-redeploy.sh` / `regenesis.sh --with-aa`) with
-   `CITRATE_AA_*` env to restore wallet/bundler.
+1. ✅ **DONE** — `40204.json` reviewed + committed (citrate-chain `33c8e6e`), all 7
+   consumers synced/pushed; 3 `ops/post-reroll-create2-sync` branches merged to main.
+2. ✅ **DONE** — AA redeployed + wallet/bundler restored + wallet creation verified
+   end-to-end. See "AA stack restored + wallet creation verified" below.
 3. EIP-170 fix for CitrateCooperativeFactory (library extraction) before it can
-   re-enter the deterministic set.
+   re-enter the deterministic set. **STILL OPEN.**
+
+## AA stack restored + wallet creation verified (2026-06-29, later session)
+
+Deviation item 3 (AA stale) is resolved. The full `CITRATE_AA_*` env turned out to
+live in `.env.testnet.bak.20260608-100123` (repo root) — the live `.env.testnet`
+had none. Restored it, then ran the AA ceremony:
+
+- **EntryPoint re-vendored** via `forge create` (nonce-CREATE, NOT salt-deterministic)
+  → `0x575d0d85e272eca8784a4D11F4713C698082c807`. The pin updated in `.env.testnet`.
+  - **Gotcha:** this node's `eth_estimateGas` returns 21000 (base cost) for contract
+    creation, so `forge create` deployed with no gas for init code (status=0, no code)
+    until given an explicit `--gas-limit 6000000`. `forge script` is immune (it derives
+    gas from local simulation), which is why `DeployAndPinAA` and `regenesis` work.
+- **`post-reroll-redeploy.sh`** (`DeployAndPinAA`) deployed the 6 AA contracts; all 7
+  have code. New: WalletFactory `0xDd5F4f…`, Paymaster `0x7A9ADb…`, WalletImpl
+  `0x21AF0f…`, GuardianRecovery `0x381B58…` (all embed EntryPoint → moved). The ECDSA
+  `0xD2d354…` / WebAuthn `0x97FF6d…` validators are salt-deterministic and **held**.
+  - **Secrets:** the script's final `grep '^CITRATE_AA_'` echoes the `*_KEY`/`*_MNEMONIC`
+    lines — run it piped through a redactor.
+- Re-emitted `40204.json` (`c772e46`, aaStack-only diff, no business contract moved) +
+  re-synced all 7 consumers.
+
+**Prod-service propagation:**
+- Identity (`157.230.55.191`): patched the 5 moved AA addrs + `CITRATE_AA_KERNEL_IMPL`
+  (legacy alias for `WALLET_IMPL` per compose) in `/opt/citrate-identity/.env`,
+  `docker compose up -d identity` (recreate — compose does `${VAR}` substitution from
+  `.env`, so `restart` alone won't reload). Healthy.
+- Bundler (`159.223.174.220`): set `BUNDLER_ENTRYPOINT` to the new EntryPoint; healthy;
+  `eth_supportedEntryPoints` (`/rpc`) returns `0x575d0d85…`. The bundler's real signer is
+  the KEYSAFE-rotated `0x560B2a15…EAC9` (from `BUNDLER_MNEMONIC`, written into
+  `mnemonic.txt` by its entrypoint at boot — a `docker compose run --entrypoint sh` probe
+  bypasses that and misleadingly shows the default anvil acct). Post-reroll its balance is
+  0 → bundler crash-loops `insufficient funds` deploying its EntryPoint via Arachnid;
+  fixed by funding `…EAC9` from the deployer. Decode the true signer from the failing
+  `eth_sendRawTransaction` raw tx, not from `mnemonic.txt`.
+
+**Wallet creation verified end-to-end (live chain):** `CitrateWalletFactory.deployFor`
+with an identity-signed permit (ECDSA root-validator Kernel `initialize`) deployed a real
+smart account at the identity-predicted counterfactual address
+`0xBfee76E3b5781Fe0b4e6aF6705671bdFE8A454A0` (code 0 → ERC1967 proxy). Cross-checked
+against the product surface: identity `GET /aa/address` returns the same address and
+`GET /aa/validators` reports `deployed: true`. Permit digest =
+`keccak256(abi.encode(factory, chainid, userId, keccak256(initData), expiresAt,
+deployNonce[userId]))` → `toEthSignedMessageHash`, signed by the identity signer
+(== `factory.identitySigner()`). Verified via a throwaway forge script (removed after).
