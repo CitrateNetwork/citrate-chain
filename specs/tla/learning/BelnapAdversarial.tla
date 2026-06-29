@@ -3,6 +3,12 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 \* RM-FL-1 / WP-1.1 — Adversary model for Belnap-FOUR aggregation
 \*
+\* I64-S1 (2026-06-28): the Q16 backing type widened i32 -> i64 and the
+\* 0x0110 wire format went 4-byte -> 8-byte per Q16 value. This spec is
+\* UNAFFECTED: it models the lattice classification + state reduction and
+\* the adversary's control of validators — properties independent of the
+\* integer width or byte encoding. Same TLC run re-certifies i64.
+\*
 \* Models the per-dimension classification + state-vector reduction step
 \* (Paper II §3.1 Definition 5 + §3.2 Algorithm 1 step 3) under an
 \* adversary that controls a subset of the validators.

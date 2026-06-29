@@ -3,6 +3,14 @@ EXTENDS Naturals, FiniteSets, TLC
 
 \* RM-FL-2 / WP-2.1 — Routing-model inference precompile (0x0111)
 \*
+\* I64-S1 (2026-06-28): Q16 widened i32 -> i64 and the genesis
+\* ARCH_VERSION moved 1 -> 2. This spec is UNAFFECTED at the model level:
+\* it abstracts arch versions as the symbolic set `ArchVersions` with a
+\* monotonic `current_arch` pointer (the 1->2 move is exactly the
+\* never-goes-backward property), and it reasons over Q16 determinism,
+\* not byte width. Same TLC run re-certifies the i64 / ARCH_VERSION=2
+\* implementation.
+\*
 \* Models the architecture-version registry + inference-call dispatch
 \* for the routing-model precompile that returns
 \*   (mentor_id, adapter_id, confidence)

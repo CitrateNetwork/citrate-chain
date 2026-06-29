@@ -126,4 +126,8 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = [
+    # I64-S1: the Tier-1-audited federated/gradient Q16 kernel, consumed by
+    # the `citrate-federated` parity crate (dev-deps only; pinned rev).
+    "https://github.com/CitrateNetwork/citrate-fed-types",
+]

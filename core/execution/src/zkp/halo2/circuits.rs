@@ -323,6 +323,31 @@ mod tests {
         assert_inference_circuit_verifies(&w, &x, &b, 2, 2);
     }
 
+    /// I64-S1: a weight whose RAW Q16 representation exceeds i32 range
+    /// (`from_int(50_000)` = 50_000<<16 ≈ 3.28e9 > i32::MAX ≈ 2.15e9).
+    /// Under the old i32 in-circuit recovery this wrapped to a negative
+    /// value → a wrong witness that would not match the output commitment.
+    /// The widened i64 recovery + i128 product carries it correctly.
+    #[test]
+    fn inference_circuit_i64_range_weights() {
+        // y[0] = 50000*2 + 0 = 100000 (raw Q16 ≈ 6.55e9 — needs i64).
+        let w: Vec<Q16> = vec![Q16::from_int(50_000)];
+        let x: Vec<Q16> = vec![Q16::from_int(2)];
+        let b: Vec<Q16> = vec![Q16::ZERO];
+        assert_inference_circuit_verifies(&w, &x, &b, 1, 1);
+    }
+
+    /// I64-S1: large negative weight exercises the negative branch of the
+    /// widened i64 field recovery (`halo2_fr_to_signed_i64`).
+    #[test]
+    fn inference_circuit_i64_range_negative() {
+        // y[0] = (-50000)*3 + 1000 = -149000 (raw Q16 needs i64).
+        let w: Vec<Q16> = vec![Q16::from_int(-50_000)];
+        let x: Vec<Q16> = vec![Q16::from_int(3)];
+        let b: Vec<Q16> = vec![Q16::from_int(1000)];
+        assert_inference_circuit_verifies(&w, &x, &b, 1, 1);
+    }
+
     /// Full KZG round-trip: setup ParamsKZG, keygen vk+pk, generate
     /// a real Halo2 proof, verify it. Validates the full cryptographic
     /// pipeline that 0x0108 INFERENCE_PROOF_VERIFY will run against.

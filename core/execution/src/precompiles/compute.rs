@@ -130,7 +130,7 @@ fn map_format_error(e: TensorFormatError) -> anyhow::Error {
 }
 
 /// Convert a Q16-typed tensor's data bytes to a `Vec<Q16>`. Caller
-/// must have validated dtype is Q16_16 and length is `n × 4`.
+/// must have validated dtype is Q16_16 and length is `n × 8`.
 fn parse_q16_tensor(view: &TensorView<'_>) -> Result<Vec<Q16>> {
     if view.dtype != Dtype::Q16_16 {
         return Err(anyhow!(
@@ -139,30 +139,33 @@ fn parse_q16_tensor(view: &TensorView<'_>) -> Result<Vec<Q16>> {
         ));
     }
     let n = view.element_count();
-    if view.data.len() != n * 4 {
+    if view.data.len() != n * 8 {
         return Err(anyhow!(
             "tensor data length mismatch: expected {} bytes, got {}",
-            n * 4,
+            n * 8,
             view.data.len()
         ));
     }
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let bytes = [
-            view.data[i * 4],
-            view.data[i * 4 + 1],
-            view.data[i * 4 + 2],
-            view.data[i * 4 + 3],
-        ];
-        out.push(Q16(i32::from_le_bytes(bytes)));
+        // RM-M2 tensor wire format carries each Q16 element as 8 bytes
+        // (i64, little-endian) post-I64-S1 widening — a lossless decode
+        // of the i64-backed Q16 type.
+        let bytes: [u8; 8] = view.data[i * 8..i * 8 + 8]
+            .try_into()
+            .expect("8 bytes by construction (length validated above)");
+        out.push(Q16(i64::from_le_bytes(bytes)));
     }
     Ok(out)
 }
 
 /// Encode a `Vec<Q16>` as a Q16.16 tensor with given shape.
 fn encode_q16_tensor(shape: &[u32], data: &[Q16]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
+    let mut bytes = Vec::with_capacity(data.len() * 8);
     for q in data {
+        // Each Q16 element is written as 8 bytes (i64, little-endian)
+        // post-I64-S1 widening — the full i64 backing value with no
+        // saturation, so the wire faithfully carries the widened range.
         bytes.extend_from_slice(&q.0.to_le_bytes());
     }
     encode(shape, Dtype::Q16_16, &bytes).map_err(map_format_error)
@@ -520,8 +523,10 @@ mod tests {
     }
 
     fn q16_to_int(q: Q16) -> i32 {
-        // Recover integer if exactly representable.
-        q.0 >> 16
+        // Recover integer if exactly representable. The Q16 backing
+        // type is i64 post-I64-S1; these test values are small and fit
+        // i32, so narrow for the existing i32 assertions.
+        (q.0 >> 16) as i32
     }
 
     // ====== matmul tests ======
