@@ -7,7 +7,7 @@
   "deployer": "0x4250675F9015E65fC866F3a373F82bb9DFc000c6",
   "deployedAt": "2026-06-08T17:01:23Z",
   "regenerator": "scripts/ops/emit-address-table.sh",
-  "comment": "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
+  "comment": "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md. I64-S1 WP-B1: the final five entries (KYCRegistry, IPFSIncentivesV2, IPFSIncentivesV3, AggregationChallenge, ComputePoolPipeline) are pre-ceremony DETERMINISTIC PROJECTIONS from DeployFederatedLearning.s.sol simulated with deployer=0x4250675F…, governance=deployer, teeRegistry=canonical, and the pinned economic params. They become broadcast-confirmed at the reroll; the dry-run table diff validates them. See contracts/addresses/I64S1_PROJECTION.md for the determinism contract.",
   "contracts": {
     "ModelRegistry": "0xf64636d56ec9e0c406149b34ea9c5c5d80b342c0",
     "WrappedSALT": "0x61bc737f67b430fe2567630823694032a049253e",
@@ -47,7 +47,12 @@
     "ModelAccessControl": "0x8e5967da44b9797c1cccaeb297a452e061faa9cd",
     "TEEAttestationRegistry": "0xc1c0d8587a2a36ca8a7e95275c5cad0d523e777e",
     "ComputePoolTraining": "0x7c4f7109db40b70aa03de0f6cd59d9b8a6487aa6",
-    "EduForwarder": "0x1a5edc14de730da103e128cee94fc1efda9b4462"
+    "EduForwarder": "0x1a5edc14de730da103e128cee94fc1efda9b4462",
+    "KYCRegistry": "0x2a82a9e18adb79e2e2306243bd5df13fbfb949fa",
+    "IPFSIncentivesV2": "0x7e3c937af313e06e648e26e98f251684c4d82b4d",
+    "IPFSIncentivesV3": "0x629f7cd4aeade49e4b27c9a39237d132f9ff39f4",
+    "AggregationChallenge": "0xe7d7ebe1242feec29d514b00c9272fbffc9e69be",
+    "ComputePoolPipeline": "0xc2ddf9dd186781697ed9c16af3bb36e42a79f4ad"
   },
   "aaStack": {
     "EntryPoint": "0x4a86659BDab24dc444C72fbbaD4cd83491820E40",
