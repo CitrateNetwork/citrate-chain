@@ -113,8 +113,19 @@ get_env() { grep -E "^${1}=" "$ENV_TESTNET" 2>/dev/null | head -1 | cut -d= -f2-
 # lands at (no-arg constructor → sender-independent).
 coop_factory=$(get_env "CITRATE_COOP_FACTORY" || true)
 coop_factory=${coop_factory:-0xa9ded8dbfca510cca8f5896c3f6144b30ad98c6d}
-jq --arg cf "$coop_factory" '.CitrateCooperativeFactory = ($cf | ascii_downcase)' \
-  "$contracts_jq" > "${contracts_jq}.tmp" && mv "${contracts_jq}.tmp" "$contracts_jq"
+# Only inject if the factory actually has code on-chain. WP-B2's
+# CitrateCooperativeFactory currently exceeds the EIP-170 24576-byte limit
+# (31694 bytes) and cannot deploy as-is, so injecting it unconditionally would
+# make the regenesis verify fail on a contract that was never deployed.
+_rpc_for_coop="${RPC_URL:-$(get_env RPC_URL)}"
+if [[ -n "$_rpc_for_coop" ]] && command -v cast >/dev/null 2>&1 \
+   && [[ "$(cast code "$coop_factory" --rpc-url "$_rpc_for_coop" 2>/dev/null | wc -c)" -gt 4 ]]; then
+  jq --arg cf "$coop_factory" '.CitrateCooperativeFactory = ($cf | ascii_downcase)' \
+    "$contracts_jq" > "${contracts_jq}.tmp" && mv "${contracts_jq}.tmp" "$contracts_jq"
+  log "injected CitrateCooperativeFactory ${coop_factory}"
+else
+  log "skip CitrateCooperativeFactory (no code on-chain — exceeds EIP-170 size limit)"
+fi
 
 aa_entrypoint=$(get_env "CITRATE_AA_ENTRY_POINT" || true)
 aa_webauthn=$(get_env "CITRATE_AA_WEBAUTHN_VALIDATOR" || true)
