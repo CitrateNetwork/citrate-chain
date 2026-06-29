@@ -45,6 +45,15 @@ default-members = [
     "core/marketplace",
     "node",
 ]
+# I64-S1: the `citrate-federated` Q16 parity crate is EXCLUDED from the
+# workspace so the consensus build never depends on the private
+# `citrate-fed-types` git repo. (The toolchain is now unified — the chain is
+# pinned to 1.96.0, matching the kernel MSRV — so the proof runs with plain
+# cargo, no toolchain override:)
+#   cargo test --manifest-path core/federated/Cargo.toml
+# Phase B (WP-B3) brings the kernel into chain code via the federated-verify
+# surfaces; revisit membership then.
+exclude = ["core/federated"]
 resolver = "2"
 
 [workspace.package]

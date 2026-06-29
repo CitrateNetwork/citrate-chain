@@ -1,3 +1,8 @@
+# Pinned for build reproducibility across all node operators (a consensus
+# chain wants every binary built with the same compiler) and to match the
+# citrate-fed-types kernel MSRV (1.96.0) — so the chain, the kernel, and nat
+# all share one toolchain. Verified 2026-06-28: `check`/`clippy --workspace`
+# clean under 1.96.0 (I64-S1). Bump deliberately, with a full re-test.
 [toolchain]
-channel = "stable"
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]

@@ -77,7 +77,7 @@ pub const MAX_ELEMENTS: usize = 1_048_576;
 
 /// Total data-byte cap = 16 MiB. Bounds the worst-case across dtypes:
 ///
-/// - Q16 (4 bytes/elem): 16 MiB / 4 = 4,194,304 elements (more than
+/// - Q16 (8 bytes/elem): 16 MiB / 8 = 2,097,152 elements (more than
 ///   `MAX_ELEMENTS` allows, so element cap binds first for Q16).
 /// - Field32 (32 bytes/elem): 16 MiB / 32 = 524,288 elements (so
 ///   Field32 is implicitly capped well below the element cap, which
@@ -98,10 +98,11 @@ pub const MAX_DATA_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Dtype {
-    /// Q16.16 fixed-point, little-endian i32.
-    /// 16 integer bits + 16 fractional bits. Range ≈ ±32,767.99998…,
-    /// resolution ≈ 1.526 × 10⁻⁵. Bit-identical across all hardware.
-    /// Used by RM-M2 deterministic compute precompiles.
+    /// Q16.16 fixed-point, little-endian i64 (8 bytes on the wire).
+    /// 16 fractional bits over an i64 backing (I64-S1 widening), so the
+    /// integer part spans ≈ ±1.4 × 10¹⁴, resolution ≈ 1.526 × 10⁻⁵.
+    /// Bit-identical across all hardware. Used by RM-M2 deterministic
+    /// compute precompiles.
     Q16_16 = 0x01,
 
     /// 32-byte big-endian field element (BLS12-381 Fr). Used by
@@ -114,7 +115,7 @@ impl Dtype {
     /// Bytes per element for this dtype.
     pub const fn byte_size(self) -> usize {
         match self {
-            Dtype::Q16_16 => 4,
+            Dtype::Q16_16 => 8,
             Dtype::Field32 => 32,
         }
     }
@@ -329,8 +330,8 @@ pub fn encode(shape: &[u32], dtype: Dtype, data: &[u8]) -> Result<Vec<u8>, Tenso
 mod tests {
     use super::*;
 
-    fn build_q16_tensor(shape: &[u32], values: &[i32]) -> Vec<u8> {
-        let mut data = Vec::with_capacity(values.len() * 4);
+    fn build_q16_tensor(shape: &[u32], values: &[i64]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(values.len() * 8);
         for &v in values {
             data.extend_from_slice(&v.to_le_bytes());
         }
@@ -339,14 +340,14 @@ mod tests {
 
     #[test]
     fn roundtrip_rank_2_q16() {
-        let values: Vec<i32> = (1..=6).collect();
+        let values: Vec<i64> = (1..=6).collect();
         let bytes = build_q16_tensor(&[2, 3], &values);
         let view = decode_exact(&bytes).expect("decode");
         assert_eq!(view.shape, vec![2, 3]);
         assert_eq!(view.dtype, Dtype::Q16_16);
         assert_eq!(view.element_count(), 6);
-        assert_eq!(view.data_byte_count(), 24);
-        assert_eq!(view.data.len(), 24);
+        assert_eq!(view.data_byte_count(), 48);
+        assert_eq!(view.data.len(), 48);
     }
 
     #[test]
@@ -374,7 +375,7 @@ mod tests {
 
     #[test]
     fn rejects_truncated_data() {
-        // rank=1 shape=[3] dtype=Q16 but only 8 bytes data instead of 12
+        // rank=1 shape=[3] dtype=Q16 but only 8 bytes data instead of 24
         let mut bytes = vec![1u8];
         bytes.extend_from_slice(&3u32.to_be_bytes());
         bytes.push(Dtype::Q16_16.to_byte());
@@ -488,7 +489,7 @@ mod tests {
 
     #[test]
     fn dtype_byte_size_constants() {
-        assert_eq!(Dtype::Q16_16.byte_size(), 4);
+        assert_eq!(Dtype::Q16_16.byte_size(), 8);
         assert_eq!(Dtype::Field32.byte_size(), 32);
     }
 
@@ -504,19 +505,19 @@ mod tests {
         // rank=0 → shape is empty, element_count=1, single Q16 value.
         let mut bytes = vec![0u8]; // rank 0
         bytes.push(Dtype::Q16_16.to_byte());
-        bytes.extend_from_slice(&42i32.to_le_bytes());
+        bytes.extend_from_slice(&42i64.to_le_bytes());
         let view = decode_exact(&bytes).unwrap();
         assert_eq!(view.shape, Vec::<u32>::new());
         assert_eq!(view.element_count(), 1);
-        assert_eq!(view.data, &42i32.to_le_bytes()[..]);
+        assert_eq!(view.data, &42i64.to_le_bytes()[..]);
     }
 
     #[test]
     fn encode_rejects_data_length_mismatch() {
-        // shape=[2,3] = 6 elements; q16 expects 24 bytes but we pass 8.
+        // shape=[2,3] = 6 elements; q16 expects 48 bytes but we pass 8.
         let bad = vec![0u8; 8];
         let err = encode(&[2, 3], Dtype::Q16_16, &bad).unwrap_err();
-        assert!(matches!(err, TensorFormatError::DataLengthMismatch { expected: 24, got: 8 }));
+        assert!(matches!(err, TensorFormatError::DataLengthMismatch { expected: 48, got: 8 }));
     }
 
     // ----- Property-based: roundtrip ALWAYS holds. -----
@@ -529,7 +530,7 @@ mod tests {
             shape in proptest::collection::vec(1u32..=8, 1..=4),
         ) {
             let element_count: usize = shape.iter().fold(1usize, |a, &b| a * b as usize);
-            let data: Vec<u8> = (0..element_count * 4).map(|i| i as u8).collect();
+            let data: Vec<u8> = (0..element_count * 8).map(|i| i as u8).collect();
             let bytes = encode(&shape, Dtype::Q16_16, &data).unwrap();
             let view = decode_exact(&bytes).unwrap();
             proptest::prop_assert_eq!(view.shape, shape);

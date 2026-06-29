@@ -1679,24 +1679,26 @@ mod tests {
         // test-only; encode the bytes inline.
         // dim=1, n=1, embedding=1.0 (Q16), conf=1.0, weight=1.0,
         // threshold_pos=0.5, threshold_neg=-0.5.
-        let mut input = Vec::with_capacity(16 + 8 + 4);
+        // I64-S1: Q16 values are 8 bytes on the wire. Layout for dim=1,n=1:
+        // dim(4) + n(4) + emb(8) + conf(8) + weight(8) + thr_pos(8) + thr_neg(8) = 48.
+        let mut input = Vec::with_capacity(48);
         input.extend_from_slice(&1u32.to_be_bytes()); // dim
         input.extend_from_slice(&1u32.to_be_bytes()); // n
-        input.extend_from_slice(&q16::Q16::from_int(1).0.to_be_bytes()); // emb
+        input.extend_from_slice(&q16::Q16::from_int(1).0.to_be_bytes()); // emb (8 bytes)
         input.extend_from_slice(&q16::Q16::from_int(1).0.to_be_bytes()); // conf
         input.extend_from_slice(&q16::Q16::from_int(1).0.to_be_bytes()); // weight
-        // threshold_pos = Q16(0x4000) ≈ 0.5
-        input.extend_from_slice(&0x4000_i32.to_be_bytes());
-        input.extend_from_slice(&(-0x4000_i32).to_be_bytes());
-        assert_eq!(input.len(), 16 + 8 + 4); // header + body
+        // threshold_pos = Q16(0x4000) ≈ 0.5, threshold_neg ≈ -0.5 (8 bytes each)
+        input.extend_from_slice(&0x4000_i64.to_be_bytes());
+        input.extend_from_slice(&(-0x4000_i64).to_be_bytes());
+        assert_eq!(input.len(), 48); // header + body, 8-byte Q16
 
         let result = executor.execute(&belnap_addr, &input, 100_000).unwrap();
         assert!(result.success);
-        // Output: 4 bytes Q16 value + 1 byte Belnap state = 5 bytes for dim=1.
-        assert_eq!(result.output.len(), 5);
+        // Output: 8 bytes Q16 value + 1 byte Belnap state = 9 bytes for dim=1.
+        assert_eq!(result.output.len(), 9);
         // State byte is the last; True = 1.
-        assert_eq!(result.output[4], 1, "single-participant agree → state=True");
-        // Gas: 2000 + 50 * 1 = 2050.
+        assert_eq!(result.output[8], 1, "single-participant agree → state=True");
+        // Gas: 2000 + 50 * 1 = 2050 (per-dim, unchanged by byte width).
         assert_eq!(result.gas_used, 2050);
     }
 

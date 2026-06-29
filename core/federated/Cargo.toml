@@ -1,0 +1,25 @@
+[package]
+name = "citrate-federated"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# I64-S1 WP-A1/WP-B3 — the seam where the chain's consensus Q16 meets the
+# `citrate-fed-types` kernel Q16. This crate exists ONLY to host the
+# bit-parity proof between the two implementations; it is intentionally
+# NOT in the workspace `default-members`, so the everyday
+# `cargo build`/`cargo test` (default-members) stays free of the kernel
+# git dependency. Run the parity proof with `cargo test -p citrate-federated`.
+[dependencies]
+
+[dev-dependencies]
+# The chain's consensus Q16 (the type compiled into the node binary).
+citrate-execution = { path = "../execution" }
+# The Tier-1-audited federated/gradient kernel Q16. Pinned to the
+# remediated rev so the parity proof is reproducible. CI needs read
+# access to CitrateNetwork/citrate-fed-types (split-key / token) plus
+# `[net] git-fetch-with-cli = true` (see .cargo/config.toml).
+citrate-fed-types = { git = "https://github.com/CitrateNetwork/citrate-fed-types.git", rev = "dbbfbff29a5053aa8324a866d52215c2f2281c31" }
+
+[lib]
+path = "src/lib.rs"
