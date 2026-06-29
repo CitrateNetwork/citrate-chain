@@ -1425,23 +1425,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     }
                 }
                 if let Some(peer) = best {
-                    // Determine current local head hash
-                    let start_from = if let Some(h) = sync_for_loop.last_requested_header().await {
-                        h
-                    } else if let Some(h) = sync_for_loop.last_received_header().await {
-                        h
+                    // Anchor every request on our current PERSISTED tip so sync
+                    // walks forward batch by batch. The pre-fix logic preferred
+                    // `last_requested_header`, which latched onto the first anchor
+                    // (the genesis zero-hash) and never advanced — so any chain
+                    // longer than one batch stalled at the first batch forever
+                    // even once pending-clearing let requests complete. The tip
+                    // advances as synced blocks persist (Blocks handler →
+                    // put_block), so this drives forward progress to the head.
+                    let local_h = storage_for_sync.blocks.get_latest_height().unwrap_or(0);
+                    let start_from = if local_h > 0 {
+                        storage_for_sync
+                            .blocks
+                            .get_block_by_height(local_h)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| citrate_consensus::types::Hash::new([0u8; 32]))
                     } else {
-                        let local_h = storage_for_sync.blocks.get_latest_height().unwrap_or(0);
-                        if local_h > 0 {
-                            storage_for_sync
-                                .blocks
-                                .get_block_by_height(local_h)
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| citrate_consensus::types::Hash::new([0u8; 32]))
-                        } else {
-                            citrate_consensus::types::Hash::new([0u8; 32])
-                        }
+                        citrate_consensus::types::Hash::new([0u8; 32])
                     };
                     // Request next headers and blocks from our last known point only if not saturated
                     let (ph, pb) = sync_for_loop.pending_counts().await;
@@ -1465,15 +1466,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     *pf = pf.saturating_add(1);
                     // Lower peer score
                     pm_for_sync.update_peer_score(&pid, -5).await;
-                    // Remove peer if too many failures
+                    // Drop (do NOT ban) a peer after repeated sync timeouts.
+                    // A sync timeout is not evidence of malice, and permanently
+                    // banning a pinned bootstrap/producer for one is exactly how
+                    // the fleet split-brained: a bootnode banned its only block
+                    // source and could never re-sync. Removing the peer lets it
+                    // re-handshake fresh; we reset the failure counter so the
+                    // reconnection starts from a clean slate.
                     if *pf >= 5 {
-                        if let Some(p) = pm_for_sync.get_peer(&pid) {
-                            let addr = p.info.read().await.addr;
+                        if pm_for_sync.get_peer(&pid).is_some() {
                             pm_for_sync.remove_peer(&pid).await;
-                            // SECREM-01 NET-4(b): identity is known here —
-                            // ban peer ID and IP together.
-                            pm_for_sync.ban_peer_with_id(&pid, addr).await;
-                            tracing::warn!("Banned peer {} due to repeated sync timeouts", pid.0);
+                            *pf = 0;
+                            tracing::warn!(
+                                "Dropped peer {} after repeated sync timeouts (will re-handshake)",
+                                pid.0
+                            );
                         }
                     }
                 }
