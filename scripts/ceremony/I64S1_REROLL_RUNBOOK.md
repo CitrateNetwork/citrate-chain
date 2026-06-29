@@ -30,8 +30,8 @@ Do not start until every box in §0 is checked.
 
 | Gate | Check |
 |---|---|
-| **Owner confirms economic params** | The 15 pinned constants in `DeployFederatedLearning.s.sol` are signed off — they fix both economics AND the 5 addresses. See `contracts/addresses/I64S1_PROJECTION.md`. |
-| **Owner confirms governance = deployer** | `ComputePoolPipeline` governance defaults to the deployer. If a separate governance address is intended, set `GOVERNANCE`, re-run the WP-B1 dry-run, and update `I64S1_PROJECTION.md` + `40204.json` BEFORE the ceremony (the Pipeline address moves). |
+| **Owner confirms economic params** | ✅ CONFIRMED 2026-06-29 — all 15 pinned constants in `DeployFederatedLearning.s.sol` signed off as-is. The projected addresses in `contracts/addresses/I64S1_PROJECTION.md` are final. |
+| **Owner confirms governance = deployer** | ✅ CONFIRMED 2026-06-29 — `ComputePoolPipeline` governance = deployer (`0x4250675F…`); `GOVERNANCE` env left unset. Pipeline lands at the projected `0xc2ddf9…`. Governance transferable post-deploy. |
 | **Phase A/B/C merged** | `feat/i64-s1-phase-a-q16-widening`, `…-phase-b-deterministic-deploy`, `…-phase-c-ceremony` merged to `main`. |
 | **Parity proof green** | `cargo test --manifest-path core/federated/Cargo.toml` → 9/9 (Q16 ops + the 3 frozen goldens at the pinned kernel rev). |
 | **Backups taken** | Validator data dirs archived (ceremony-reroll.sh does this per host); `.env.testnet` backed up. ⚠️ **comms relay master key is NOT yet backed up off-box** (per memory) — back it up before the ceremony or accept the loss-of-relay risk. |
