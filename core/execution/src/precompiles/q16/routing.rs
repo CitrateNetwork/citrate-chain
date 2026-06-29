@@ -4,7 +4,7 @@
 //
 // RM-FL-2: routes a query embedding through a fixed 3-layer MLP and
 // returns `(mentor_id, adapter_id, confidence)`. The architecture is
-// hardfork-locked at `ARCH_VERSION = 1` with shape:
+// hardfork-locked at `ARCH_VERSION = 2` with shape:
 //   input_dim = 768, hidden_dim = 128, output_dim = 3
 //   (canonical params: 115,331 — fits the planset's 100K–500K window).
 //
@@ -35,24 +35,24 @@
 //     input_dim:    u32        (4 bytes; must equal 768)
 //     hidden_dim:   u32        (4 bytes; must equal 128)
 //     output_dim:   u32        (4 bytes; must equal 3)
-//     input:        input_dim * i32     (3072 bytes at canonical shape)
-//     W1:           hidden_dim * input_dim * i32     (393_216 at canonical)
-//     b1:           hidden_dim * i32                 (512 bytes)
-//     W2:           hidden_dim * hidden_dim * i32    (65_536 bytes)
-//     b2:           hidden_dim * i32                 (512 bytes)
-//     W3:           output_dim * hidden_dim * i32    (1_536 bytes)
-//     b3:           output_dim * i32                 (12 bytes)
-//   Total at canonical shape: ~464 KB.
+//     input:        input_dim * i64     (6_144 bytes at canonical shape)
+//     W1:           hidden_dim * input_dim * i64     (786_432 at canonical)
+//     b1:           hidden_dim * i64                 (1_024 bytes)
+//     W2:           hidden_dim * hidden_dim * i64    (131_072 bytes)
+//     b2:           hidden_dim * i64                 (1_024 bytes)
+//     W3:           output_dim * hidden_dim * i64    (3_072 bytes)
+//     b3:           output_dim * i64                 (24 bytes)
+//   Total at canonical shape: ~907 KB.
 //
 //   Output bytes (big-endian):
 //     mentor_id:    u32       (argmax of softmax over output)
 //     adapter_id:   u32       (argmax-derived adapter slot)
-//     confidence:   i32       (Q16; max-element of softmax)
-//   Total = 12 bytes.
+//     confidence:   i64       (Q16; max-element of softmax)
+//   Total = 16 bytes.
 //
 // **Caps (DoS protection):**
 //   - Strict shape: input_dim == 768, hidden_dim == 128, output_dim == 3
-//     (per ARCH_VERSION 1). Any other shape rejected at decode.
+//     (per ARCH_VERSION 2). Any other shape rejected at decode.
 //   - MAX_INPUT_BYTES: 1 MiB (cap on the total input length the
 //     precompile will ever consider; prevents pathological allocations).
 //
@@ -78,15 +78,18 @@ use super::Q16;
 /// tripwire `check_routing_arch_locked.py` (WP-2.4) and by on-chain
 /// governance refusing to register a new version without an
 /// associated upgrade proposal.
-pub const ARCH_VERSION: u32 = 1;
+///
+/// I64-S1: bumped 1 → 2 to signal the i64-backed Q16 wire format
+/// (every Q16 param widened from 4 → 8 bytes).
+pub const ARCH_VERSION: u32 = 2;
 
-/// Required input dimensionality at ARCH_VERSION 1.
+/// Required input dimensionality at the registered ARCH_VERSION (2).
 pub const ARCH_V1_INPUT_DIM: u32 = 768;
 
-/// Required hidden dimensionality at ARCH_VERSION 1.
+/// Required hidden dimensionality at the registered ARCH_VERSION (2).
 pub const ARCH_V1_HIDDEN_DIM: u32 = 128;
 
-/// Required output dimensionality at ARCH_VERSION 1.
+/// Required output dimensionality at the registered ARCH_VERSION (2).
 pub const ARCH_V1_OUTPUT_DIM: u32 = 3;
 
 // ---------------------------------------------------------------------------
@@ -112,7 +115,7 @@ pub struct RoutingShape {
 }
 
 impl RoutingShape {
-    /// Canonical ARCH_VERSION 1 shape. Locked at hardfork.
+    /// Canonical shape for the registered ARCH_VERSION (2). Locked at hardfork.
     pub const V1: RoutingShape = RoutingShape {
         input_dim: ARCH_V1_INPUT_DIM,
         hidden_dim: ARCH_V1_HIDDEN_DIM,
@@ -220,7 +223,7 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
         return Err(RoutingError::DimZero);
     }
 
-    // Arch-version check. Currently only ARCH_VERSION 1 is registered.
+    // Arch-version check. Currently only ARCH_VERSION 2 is registered.
     // RoutingModelInference.tla::AllInferencesUseRegisteredArch.
     if arch_version != ARCH_VERSION {
         return Err(RoutingError::ArchVersionUnregistered);
@@ -228,9 +231,9 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
 
     let shape = RoutingShape { input_dim, hidden_dim, output_dim };
 
-    // Shape check for the declared version. v1 requires the canonical
-    // shape; future versions plug in here.
-    if arch_version == 1 && shape != RoutingShape::V1 {
+    // Shape check for the declared version. The registered version
+    // requires the canonical shape; future versions plug in here.
+    if arch_version == ARCH_VERSION && shape != RoutingShape::V1 {
         return Err(RoutingError::ShapeMismatch);
     }
 
@@ -255,7 +258,7 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
         .checked_add(o).ok_or_else(lm)?;          // b3
 
     let body_bytes = body_q16_count
-        .checked_mul(4)
+        .checked_mul(8)
         .ok_or(RoutingError::LengthMismatch)?;
     let expected_total = HEADER_LEN
         .checked_add(body_bytes)
@@ -267,33 +270,33 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
 
     let mut cursor = HEADER_LEN;
 
-    let input_vec = decode_q16_slice(&input[cursor..cursor + i * 4])
+    let input_vec = decode_q16_slice(&input[cursor..cursor + i * 8])
         .ok_or(RoutingError::LengthMismatch)?;
-    cursor += i * 4;
+    cursor += i * 8;
 
-    let w1 = decode_q16_slice(&input[cursor..cursor + h * i * 4])
+    let w1 = decode_q16_slice(&input[cursor..cursor + h * i * 8])
         .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * i * 4;
+    cursor += h * i * 8;
 
-    let b1 = decode_q16_slice(&input[cursor..cursor + h * 4])
+    let b1 = decode_q16_slice(&input[cursor..cursor + h * 8])
         .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * 4;
+    cursor += h * 8;
 
-    let w2 = decode_q16_slice(&input[cursor..cursor + h * h * 4])
+    let w2 = decode_q16_slice(&input[cursor..cursor + h * h * 8])
         .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * h * 4;
+    cursor += h * h * 8;
 
-    let b2 = decode_q16_slice(&input[cursor..cursor + h * 4])
+    let b2 = decode_q16_slice(&input[cursor..cursor + h * 8])
         .ok_or(RoutingError::LengthMismatch)?;
-    cursor += h * 4;
+    cursor += h * 8;
 
-    let w3 = decode_q16_slice(&input[cursor..cursor + o * h * 4])
+    let w3 = decode_q16_slice(&input[cursor..cursor + o * h * 8])
         .ok_or(RoutingError::LengthMismatch)?;
-    cursor += o * h * 4;
+    cursor += o * h * 8;
 
-    let b3 = decode_q16_slice(&input[cursor..cursor + o * 4])
+    let b3 = decode_q16_slice(&input[cursor..cursor + o * 8])
         .ok_or(RoutingError::LengthMismatch)?;
-    cursor += o * 4;
+    cursor += o * 8;
 
     debug_assert_eq!(cursor, input.len());
 
@@ -311,19 +314,19 @@ pub fn decode(input: &[u8]) -> Result<RoutingInput, RoutingError> {
 }
 
 fn decode_q16_slice(bytes: &[u8]) -> Option<Vec<Q16>> {
-    if !bytes.len().is_multiple_of(4) {
+    if !bytes.len().is_multiple_of(8) {
         return None;
     }
-    let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        out.push(Q16::from_raw(i32::from_be_bytes(chunk.try_into().expect("4 bytes"))));
+    let mut out = Vec::with_capacity(bytes.len() / 8);
+    for chunk in bytes.chunks_exact(8) {
+        out.push(Q16::from_raw(i64::from_be_bytes(chunk.try_into().expect("8 bytes"))));
     }
     Some(out)
 }
 
-/// Encode a `RoutingOutput` into wire-format bytes (12 bytes total).
+/// Encode a `RoutingOutput` into wire-format bytes (16 bytes total).
 pub fn encode_output(output: &RoutingOutput) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(12);
+    let mut bytes = Vec::with_capacity(16);
     bytes.extend_from_slice(&output.mentor_id.to_be_bytes());
     bytes.extend_from_slice(&output.adapter_id.to_be_bytes());
     bytes.extend_from_slice(&output.confidence.0.to_be_bytes());
@@ -343,7 +346,7 @@ pub fn validate(input: &RoutingInput) -> Result<(), RoutingError> {
     {
         return Err(RoutingError::DimZero);
     }
-    if input.arch_version == 1 && input.shape != RoutingShape::V1 {
+    if input.arch_version == ARCH_VERSION && input.shape != RoutingShape::V1 {
         return Err(RoutingError::ShapeMismatch);
     }
 
@@ -530,7 +533,7 @@ mod tests {
 
     /// Build a wire-format input bytes blob for a given shape, using
     /// uniform values for input/weights/biases. Test-only.
-    fn encode_input_uniform(shape: RoutingShape, value: i32) -> Vec<u8> {
+    fn encode_input_uniform(shape: RoutingShape, value: i64) -> Vec<u8> {
         let i = shape.input_dim as usize;
         let h = shape.hidden_dim as usize;
         let o = shape.output_dim as usize;
@@ -541,7 +544,7 @@ mod tests {
         bytes.extend_from_slice(&shape.hidden_dim.to_be_bytes());
         bytes.extend_from_slice(&shape.output_dim.to_be_bytes());
 
-        let push = |bytes: &mut Vec<u8>, n: usize, v: i32| {
+        let push = |bytes: &mut Vec<u8>, n: usize, v: i64| {
             for _ in 0..n {
                 bytes.extend_from_slice(&v.to_be_bytes());
             }
@@ -571,11 +574,12 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn arch_version_locked_at_one() {
-        // Wire-format invariant: ARCH_VERSION = 1. If anyone bumps it
-        // without a hardfork, the tripwire `check_routing_arch_locked.py`
-        // will catch it; this test is the in-tree pin.
-        assert_eq!(ARCH_VERSION, 1);
+    fn arch_version_locked_at_two() {
+        // Wire-format invariant: ARCH_VERSION = 2 (I64-S1 i64 wire
+        // format). If anyone bumps it without a hardfork, the tripwire
+        // `check_routing_arch_locked.py` will catch it; this test is the
+        // in-tree pin.
+        assert_eq!(ARCH_VERSION, 2);
     }
 
     #[test]
@@ -636,9 +640,9 @@ mod tests {
     }
 
     #[test]
-    fn decode_arch_version_two_rejected() {
+    fn decode_arch_version_three_rejected() {
         let mut bytes = vec![0u8; HEADER_LEN];
-        bytes[0..4].copy_from_slice(&2u32.to_be_bytes()); // arch_version=2 (not registered)
+        bytes[0..4].copy_from_slice(&3u32.to_be_bytes()); // arch_version=3 (not registered)
         bytes[4..8].copy_from_slice(&1u32.to_be_bytes());
         bytes[8..12].copy_from_slice(&1u32.to_be_bytes());
         bytes[12..16].copy_from_slice(&1u32.to_be_bytes());
@@ -721,10 +725,10 @@ mod tests {
             confidence: Q16::from_int(1),
         };
         let bytes = encode_output(&out);
-        assert_eq!(bytes.len(), 12);
+        assert_eq!(bytes.len(), 16);
         assert_eq!(&bytes[0..4], &7u32.to_be_bytes());
         assert_eq!(&bytes[4..8], &13u32.to_be_bytes());
-        assert_eq!(&bytes[8..12], &Q16::from_int(1).0.to_be_bytes());
+        assert_eq!(&bytes[8..16], &Q16::from_int(1).0.to_be_bytes());
     }
 
     // ====================================================================
@@ -829,11 +833,11 @@ mod tests {
 
     /// Test-only output decoder (mirror of encode_output's inverse).
     fn parse_output(bytes: &[u8]) -> RoutingOutput {
-        assert_eq!(bytes.len(), 12, "output must be 12 bytes");
+        assert_eq!(bytes.len(), 16, "output must be 16 bytes");
         let mentor_id = u32::from_be_bytes(bytes[0..4].try_into().expect("4 bytes"));
         let adapter_id = u32::from_be_bytes(bytes[4..8].try_into().expect("4 bytes"));
-        let confidence = Q16::from_raw(i32::from_be_bytes(
-            bytes[8..12].try_into().expect("4 bytes"),
+        let confidence = Q16::from_raw(i64::from_be_bytes(
+            bytes[8..16].try_into().expect("8 bytes"),
         ));
         RoutingOutput { mentor_id, adapter_id, confidence }
     }
@@ -841,7 +845,7 @@ mod tests {
     /// Build a canonical-shape input directly via `forward_decoded`
     /// (avoids encoding/decoding 464 KB of bytes for unit tests).
     /// All weights and biases set to zero; input set to `input_value`.
-    fn make_canonical_input_uniform_input(input_value: i32) -> RoutingInput {
+    fn make_canonical_input_uniform_input(input_value: i64) -> RoutingInput {
         let s = RoutingShape::V1;
         let i = s.input_dim as usize;
         let h = s.hidden_dim as usize;
@@ -1116,19 +1120,19 @@ mod tests {
             proptest::prop_assert!(s_high.params() >= s_low.params());
         }
 
-        /// `encode_output()` always produces 12 bytes.
+        /// `encode_output()` always produces 16 bytes.
         #[test]
-        fn proptest_encode_output_always_12_bytes(
+        fn proptest_encode_output_always_16_bytes(
             mentor in 0u32..u32::MAX,
             adapter in 0u32..u32::MAX,
-            conf_raw in i32::MIN..=i32::MAX,
+            conf_raw in i64::MIN..=i64::MAX,
         ) {
             let out = RoutingOutput {
                 mentor_id: mentor,
                 adapter_id: adapter,
                 confidence: Q16::from_raw(conf_raw),
             };
-            proptest::prop_assert_eq!(encode_output(&out).len(), 12);
+            proptest::prop_assert_eq!(encode_output(&out).len(), 16);
         }
     }
 }

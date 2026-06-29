@@ -13,10 +13,17 @@
 //   hard fork: every contract using these precompiles assumed
 //   these exact bytes for its proof / commitment / etc.
 // - The cross-platform property is that `q16_exp(x).0` and
-//   `q16_ops::matmul(...)[i].0` produce IDENTICAL i32 bytes on
+//   `q16_ops::matmul(...)[i].0` produce IDENTICAL i64 bytes on
 //   every CPU architecture. Q16 is integer-only by construction
 //   (`check_m2_no_float_in_q16.py` enforces no-floats), so this
 //   should hold trivially — the fixtures are belt-and-suspenders.
+//
+// **I64-S1 re-freeze (2026-06-28):** Q16 widened i32→i64. In-range
+// values are byte-identical; exp(11) and exp(16) — which previously
+// gate-saturated to i32::MAX — are now representable and carry their
+// true computed values. The mul-saturation anchor moved from
+// 20_000² (now representable) to 20_000_000² (overflows the i64
+// ceiling ≈1.407e14).
 
 use citrate_execution::precompiles::q16::{ops as q16_ops, q16_exp, Q16};
 
@@ -25,7 +32,7 @@ use citrate_execution::precompiles::q16::{ops as q16_ops, q16_exp, Q16};
 /// **Frozen** 2026-04-27 from this implementation running on
 /// linux-aarch64 (DGX Spark). Any divergence on another platform
 /// is a CROSS-PLATFORM DETERMINISM BUG — surface it loudly.
-const EXP_FIXTURES: &[(i32, i32)] = &[
+const EXP_FIXTURES: &[(i64, i64)] = &[
     (0, 65_536),                    // exp(0) = 1.0 in Q16
     (65_536, 178_146),              // exp(1)  ≈ 2.71828
     (-65_536, 24_110),              // exp(-1) ≈ 0.36788
@@ -34,8 +41,11 @@ const EXP_FIXTURES: &[(i32, i32)] = &[
     (327_680, 9_726_336),           // exp(5)  ≈ 148.413
     (-327_680, 442),                // exp(-5) ≈ 0.00674 → 442/65536
     (655_360, 1_443_528_704),       // exp(10) ≈ 22026.4 in Q16
-    (720_896, i32::MAX),            // exp(11) saturates (cap)
-    (1_048_576, i32::MAX),          // exp(16) saturates
+    // exp(11) ≈ 59874.14 — now representable under i64 (was i32::MAX).
+    (720_896, 3_923_968_000),       // 3923968000/65536 = 59874.02
+    // exp(16) ≈ 8.886e6 — now representable under i64 (was i32::MAX);
+    // raw 5.82e11 > i32::MAX, so this value genuinely requires i64.
+    (1_048_576, 582_362_333_184),   // 582362333184/65536 = 8886261
     (-1_048_576, 0),                // exp(-16) underflows to 0
 ];
 
@@ -71,11 +81,11 @@ fn q16_matmul_2x2_fixtures() {
     let a: Vec<Q16> = [1, 2, 3, 4].iter().map(|&n| Q16::from_int(n)).collect();
     let b: Vec<Q16> = [5, 6, 7, 8].iter().map(|&n| Q16::from_int(n)).collect();
     let out = q16_ops::matmul(&a, &b, 2, 2, 2);
-    let expected: Vec<i32> = vec![19, 22, 43, 50]
+    let expected: Vec<i64> = vec![19i64, 22, 43, 50]
         .into_iter()
         .map(|n| n << 16)
         .collect();
-    let actual: Vec<i32> = out.iter().map(|q| q.0).collect();
+    let actual: Vec<i64> = out.iter().map(|q| q.0).collect();
     assert_eq!(
         actual, expected,
         "q16_matmul fixture diverged. Frozen bytes are part of \
@@ -89,7 +99,7 @@ fn q16_dot_fixtures() {
     let a: Vec<Q16> = [1, 2, 3].iter().map(|&n| Q16::from_int(n)).collect();
     let b: Vec<Q16> = [4, 5, 6].iter().map(|&n| Q16::from_int(n)).collect();
     let out = q16_ops::dot(&a, &b);
-    assert_eq!(out.0, 32 << 16);
+    assert_eq!(out.0, 32_i64 << 16);
 }
 
 #[test]
@@ -119,8 +129,8 @@ fn q16_softmax_uniform_fixture() {
 fn q16_relu_fixtures() {
     let v: Vec<Q16> = [-2, -1, 0, 1, 2].iter().map(|&n| Q16::from_int(n)).collect();
     let out = q16_ops::relu(&v);
-    let expected: Vec<i32> = vec![0, 0, 0, 1, 2].into_iter().map(|n| n << 16).collect();
-    let actual: Vec<i32> = out.iter().map(|q| q.0).collect();
+    let expected: Vec<i64> = vec![0i64, 0, 0, 1, 2].into_iter().map(|n| n << 16).collect();
+    let actual: Vec<i64> = out.iter().map(|q| q.0).collect();
     assert_eq!(actual, expected);
 }
 
@@ -131,8 +141,8 @@ fn q16_linear_fixtures() {
     let x: Vec<Q16> = [3, 4].iter().map(|&n| Q16::from_int(n)).collect();
     let b: Vec<Q16> = [10, 20].iter().map(|&n| Q16::from_int(n)).collect();
     let out = q16_ops::linear(&w, &x, &b, 2, 2);
-    let expected: Vec<i32> = vec![13, 24].into_iter().map(|n| n << 16).collect();
-    let actual: Vec<i32> = out.iter().map(|q| q.0).collect();
+    let expected: Vec<i64> = vec![13i64, 24].into_iter().map(|n| n << 16).collect();
+    let actual: Vec<i64> = out.iter().map(|q| q.0).collect();
     assert_eq!(actual, expected);
 }
 
@@ -141,8 +151,8 @@ fn q16_transpose_fixtures() {
     // [[1,2,3],[4,5,6]] → [[1,4],[2,5],[3,6]]
     let m: Vec<Q16> = [1, 2, 3, 4, 5, 6].iter().map(|&n| Q16::from_int(n)).collect();
     let out = q16_ops::transpose(&m, 2, 3);
-    let expected: Vec<i32> = vec![1, 4, 2, 5, 3, 6].into_iter().map(|n| n << 16).collect();
-    let actual: Vec<i32> = out.iter().map(|q| q.0).collect();
+    let expected: Vec<i64> = vec![1i64, 4, 2, 5, 3, 6].into_iter().map(|n| n << 16).collect();
+    let actual: Vec<i64> = out.iter().map(|q| q.0).collect();
     assert_eq!(actual, expected);
 }
 
@@ -154,8 +164,9 @@ fn q16_saturation_fixtures() {
     assert_eq!((Q16::MAX + Q16::ONE).0, Q16::MAX.0);
     // MIN - ONE = MIN
     assert_eq!((Q16::MIN - Q16::ONE).0, Q16::MIN.0);
-    // 20000 * 20000 = MAX (overflow saturates)
-    let big = Q16::from_int(20_000);
+    // 20M * 20M = MAX (overflow saturates the i64 ceiling ≈1.407e14;
+    // 20_000² = 4e8 is now representable, so the anchor moved up).
+    let big = Q16::from_int(20_000_000);
     assert_eq!((big * big).0, Q16::MAX.0);
     // 5 / 0 = MAX (sign of numerator)
     assert_eq!((Q16::from_int(5) / Q16::ZERO).0, Q16::MAX.0);

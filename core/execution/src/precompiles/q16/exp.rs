@@ -7,10 +7,12 @@
 // around zero, evaluate a Taylor polynomial there, then scale
 // back via integer shifts.
 //
-//   1. If x ≥ 11.0 (real), return Q16::MAX (exp(11) ≈ 59874 already
-//      overflows Q16's max ≈ 32768).
+//   1. If x ≥ 34.0 (real), return Q16::MAX (exp(34) ≈ 5.8e14 overflows
+//      the i64 Q16 ceiling ≈ 1.407e14; the true boundary is x ≈ 32.6,
+//      and inputs in [32.6, 34) saturate naturally via the scale step).
 //   2. If x ≤ -16.0 (real), return Q16::ZERO (exp(-16) ≈ 1.1e-7
-//      rounds to zero at Q16's resolution of ~1.5e-5).
+//      rounds to zero at Q16's resolution of ~1.5e-5 — UNCHANGED by the
+//      i64 widening, which only adds integer headroom, not resolution).
 //   3. Otherwise, write x = k·ln(2) + r where:
 //        k = round(x / ln(2))            (signed integer)
 //        r = x - k·ln(2) ∈ [-ln(2)/2, ln(2)/2]
@@ -22,7 +24,7 @@
 //      of 1.526 × 10⁻⁵.
 //   5. Scale by 2^k via left or right shift; saturate on overflow.
 //
-// **All arithmetic is i32/i64 only.** No floats, no `unsafe`.
+// **All arithmetic is i64/i128 only.** No floats, no `unsafe`.
 //
 // **Determinism:** every step is bit-identical across CPUs.
 // `i64::checked_mul`, integer division, and the `>>`/`<<`
@@ -45,13 +47,16 @@ const LN_2_Q32: i64 = 2_977_044_471;
 /// `(1 / ln(2)) × 2¹⁶`, rounded. = 94_548.4... → 94_548.
 /// Reference: `((1.0 / 2_f64.ln()) * 65536.0).round() == 94548.0`.
 /// This is `log₂(e) × 2¹⁶`.
-const INV_LN_2_Q16: i32 = 94_548;
+const INV_LN_2_Q16: i64 = 94_548;
 
-/// `Q16` for real value 11. Max safe input above which exp overflows.
-const X_MAX_Q16: i32 = 11 * (1 << 16);
+/// `Q16` (raw) for real value 34. Above this `exp` definitively overflows
+/// the i64 Q16 ceiling (≈1.407e14); inputs in [32.6, 34) still run the
+/// full path and saturate via the scale-step bound check.
+const X_MAX_Q16: i64 = 34 * (1 << 16);
 
-/// `Q16` for real value -16. Min safe input below which exp rounds to zero.
-const X_MIN_Q16: i32 = -16 * (1 << 16);
+/// `Q16` (raw) for real value -16. Min safe input below which exp rounds
+/// to zero (resolution-bound, unchanged by the i64 widening).
+const X_MIN_Q16: i64 = -16 * (1 << 16);
 
 /// Compute `exp(x)` over Q16.16 fixed-point inputs. Saturates to
 /// `Q16::MAX` for x ≥ 11.0, returns `Q16::ZERO` for x ≤ -16.0.
@@ -96,7 +101,9 @@ pub fn q16_exp(x: Q16) -> Q16 {
     //   k_int = round(k_q16 / 2^16)         (extract integer part)
     // Combining: k_int = round(x.0 * INV_LN_2_Q16 / 2^32).
     // Use a +2^31 offset for round-to-nearest with arithmetic shift.
-    let prod: i64 = (x_raw as i64) * (INV_LN_2_Q16 as i64);
+    // `x_raw` is gated to [X_MIN, X_MAX) above, so this product stays
+    // well within i64 (|x_raw| < 2.23e6, × 94_548 ≈ 2.1e11).
+    let prod: i64 = x_raw * INV_LN_2_Q16;
     // Round-to-nearest-even via add half-of-divisor. Half of 2^32 is 2^31.
     // For negative numbers, (prod + sign(prod) * 2^31) >> 32 rounds correctly.
     let k_int: i32 = if prod >= 0 {
@@ -124,7 +131,9 @@ pub fn q16_exp(x: Q16) -> Q16 {
     } else {
         (k_times_ln2_q32 - half_q16) >> 16
     };
-    let r_raw: i32 = (x_raw as i64).saturating_sub(k_times_ln2_q16 as i64) as i32;
+    // r ∈ [-ln(2)/2, ln(2)/2] by construction, so it always fits the
+    // low range comfortably; computed in i64 to avoid any truncation.
+    let r_raw: i64 = x_raw.saturating_sub(k_times_ln2_q16 as i64);
 
     // exp(r) via 7-term Taylor:
     //   exp(r) ≈ 1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120 + r⁶/720 + r⁷/5040
@@ -171,15 +180,18 @@ pub fn q16_exp(x: Q16) -> Q16 {
 
     // Now `sum` is exp(r) in Q16, scale ≈ [exp(-ln(2)/2), exp(ln(2)/2)] ≈ [0.707, 1.414].
     // Multiply by 2^k_int via shift; saturate on overflow.
-    let result = if k_int >= 0 {
+    let result: i64 = if k_int >= 0 {
         // exp(x) = sum << k_int (logical left shift, since values
         // are signed but we already have the correct sign in sum).
         let shift = k_int as u32;
-        if shift >= 32 {
+        if shift >= 63 {
+            // sum << 63 always overflows i64 for sum ≥ 1; saturate.
             return Q16::MAX;
         }
-        let bound_high: i64 = (i32::MAX as i64) >> shift;
-        let bound_low: i64 = (i32::MIN as i64) >> shift;
+        // Saturate against the i64 ceiling instead of i32: an output of
+        // up to ≈1.407e14 (raw i64::MAX) is now representable.
+        let bound_high: i64 = i64::MAX >> shift;
+        let bound_low: i64 = i64::MIN >> shift;
         if sum > bound_high {
             return Q16::MAX;
         } else if sum < bound_low {
@@ -189,7 +201,7 @@ pub fn q16_exp(x: Q16) -> Q16 {
     } else {
         // exp(x) = sum >> |k_int|. Round to nearest.
         let shift = (-k_int) as u32;
-        if shift >= 32 {
+        if shift >= 63 {
             // Result is negligibly small; return zero.
             return Q16::ZERO;
         }
@@ -199,13 +211,9 @@ pub fn q16_exp(x: Q16) -> Q16 {
         s >> shift
     };
 
-    if result > i32::MAX as i64 {
-        Q16::MAX
-    } else if result < i32::MIN as i64 {
-        Q16::MIN
-    } else {
-        Q16(result as i32)
-    }
+    // The branches above already saturate to the i64 range, so `result`
+    // is guaranteed in-range here; this is the final Q16.
+    Q16(result)
 }
 
 #[cfg(test)]
@@ -249,18 +257,35 @@ mod tests {
         );
     }
 
-    /// exp(11) saturates to MAX.
+    /// exp(11) ≈ 59874 — under i32 Q16 this overflowed and saturated to
+    /// MAX; under i64 it is represented (within the algorithm's ULP
+    /// budget). This is the headroom the widening buys.
     #[test]
-    fn exp_at_eleven_saturates() {
+    fn exp_at_eleven_is_now_representable() {
         let r = q16_exp(Q16::from_int(11));
-        assert_eq!(r, Q16::MAX);
+        assert_ne!(r, Q16::MAX, "exp(11) must no longer saturate under i64");
+        let expected = 11.0_f64.exp(); // ≈ 59874.14
+        let rel = (r.to_f64() - expected).abs() / expected;
+        assert!(rel < 0.005, "exp(11) ≈ {expected}, got {} (rel {rel:.5})", r.to_f64());
     }
 
-    /// exp(12) saturates to MAX.
+    /// exp(12) ≈ 162754 — also representable under i64.
     #[test]
-    fn exp_at_twelve_saturates() {
+    fn exp_at_twelve_is_now_representable() {
         let r = q16_exp(Q16::from_int(12));
-        assert_eq!(r, Q16::MAX);
+        assert_ne!(r, Q16::MAX, "exp(12) must no longer saturate under i64");
+        let expected = 12.0_f64.exp(); // ≈ 162754.79
+        let rel = (r.to_f64() - expected).abs() / expected;
+        assert!(rel < 0.005, "exp(12) ≈ {expected}, got {} (rel {rel:.5})", r.to_f64());
+    }
+
+    /// exp still saturates once the true i64 ceiling (≈1.407e14) is
+    /// exceeded: e^34 ≈ 5.8e14 > ceiling → MAX.
+    #[test]
+    fn exp_saturates_above_i64_ceiling() {
+        assert_eq!(q16_exp(Q16::from_int(34)), Q16::MAX);
+        assert_eq!(q16_exp(Q16::from_int(40)), Q16::MAX);
+        assert_eq!(q16_exp(Q16::from_int(100)), Q16::MAX);
     }
 
     /// exp(-16) is zero.
@@ -326,13 +351,14 @@ mod tests {
         // (input.0 [Q16 raw], expected output.0 [Q16 raw])
         // Generated by running this implementation; freeze for
         // consensus stability.
-        let fixtures: &[(i32, i32)] = &[
+        let fixtures: &[(i64, i64)] = &[
             (Q16::ZERO.0, Q16::ONE.0),                    // exp(0) = 1
             (Q16::ONE.0, q16_exp(Q16::ONE).0),            // exp(1)
             (-Q16::ONE.0, q16_exp(-Q16::ONE).0),          // exp(-1)
             (Q16::from_int(5).0, q16_exp(Q16::from_int(5)).0),
             (Q16::from_int(-5).0, q16_exp(Q16::from_int(-5)).0),
-            (Q16::from_int(11).0, Q16::MAX.0),            // saturated
+            (Q16::from_int(11).0, q16_exp(Q16::from_int(11)).0), // now representable (i64)
+            (Q16::from_int(40).0, Q16::MAX.0),            // saturated above i64 ceiling
         ];
         // The first round of this test "discovers" the canonical
         // bytes by re-evaluating; subsequent runs must match. To
@@ -368,7 +394,7 @@ mod tests {
         /// — exp is monotone, so the Q16 implementation must be too
         /// (modulo saturation at the high end).
         #[test]
-        fn proptest_exp_monotone(x_raw in -15i32 * 65536..11_i32 * 65536) {
+        fn proptest_exp_monotone(x_raw in -15i64 * 65536..11i64 * 65536) {
             // Compare x and x+1 (one ULP up).
             let x = Q16(x_raw);
             let x_next = Q16(x_raw + 1);
@@ -384,7 +410,7 @@ mod tests {
         /// Property: exp produces only non-negative outputs.
         /// (For real exp this is also true; saturation must preserve it.)
         #[test]
-        fn proptest_exp_non_negative(x_raw: i32) {
+        fn proptest_exp_non_negative(x_raw: i64) {
             let r = q16_exp(Q16(x_raw));
             proptest::prop_assert!(
                 r.0 >= 0,

@@ -50,7 +50,7 @@ use crate::types::CycleId;
 pub trait EmbeddingCache: Send + Sync {
     /// Return all embedding submissions observed for this cycle.
     /// Each tuple: `(submitter, embedding[dim], confidence[dim], weight)`.
-    /// All values are raw Q16 (i32) bits; dim is consistent across
+    /// All values are raw Q16 (i64) bits; dim is consistent across
     /// participants (the aggregator validates).
     fn embeddings_for_cycle(
         &self,
@@ -64,11 +64,11 @@ pub struct EmbeddingEntry {
     /// Validator's reward address.
     pub submitter: H160,
     /// Per-dimension embedding values, raw Q16 bits.
-    pub embedding: Vec<i32>,
+    pub embedding: Vec<i64>,
     /// Per-dimension confidence values, raw Q16 bits.
-    pub confidence: Vec<i32>,
+    pub confidence: Vec<i64>,
     /// Trust weight for this participant, raw Q16 bits.
-    pub weight: i32,
+    pub weight: i64,
 }
 
 /// In-memory `EmbeddingCache` for tests.
@@ -112,10 +112,10 @@ pub struct BelnapAggregator<C: ChainAdapter> {
     cache: Arc<dyn EmbeddingCache>,
     /// Confidence threshold for the Belnap classifier (Q16).
     /// Default ≈ 0.8 (`0x0000_CCCC`).
-    threshold_pos_q16: i32,
+    threshold_pos_q16: i64,
     /// Reserved for asymmetric thresholds (currently unused — see
     /// `belnap.rs` WP-1.5 commentary).
-    threshold_neg_q16: i32,
+    threshold_neg_q16: i64,
 }
 
 impl<C: ChainAdapter> BelnapAggregator<C> {
@@ -126,7 +126,7 @@ impl<C: ChainAdapter> BelnapAggregator<C> {
         cache: Arc<dyn EmbeddingCache>,
     ) -> Self {
         // Default Q16(0.8) ≈ 0x0000_CCCC = 52428.
-        let q16_zero_point_eight: i32 = 52428;
+        let q16_zero_point_eight: i64 = 52428;
         Self {
             chain,
             state,
@@ -137,7 +137,7 @@ impl<C: ChainAdapter> BelnapAggregator<C> {
     }
 
     /// Override thresholds (test helper / governance hook).
-    pub fn with_thresholds(mut self, pos: i32, neg: i32) -> Self {
+    pub fn with_thresholds(mut self, pos: i64, neg: i64) -> Self {
         self.threshold_pos_q16 = pos;
         self.threshold_neg_q16 = neg;
         self
@@ -180,7 +180,7 @@ impl<C: ChainAdapter> BelnapAggregator<C> {
             )));
         }
 
-        let mut bytes = Vec::with_capacity(16 + 8 * n * dim + 4 * n);
+        let mut bytes = Vec::with_capacity(24 + 16 * n * dim + 8 * n);
         bytes.extend_from_slice(&(dim as u32).to_be_bytes());
         bytes.extend_from_slice(&(n as u32).to_be_bytes());
         for e in entries {
@@ -272,7 +272,7 @@ mod tests {
         (chain, state, dir)
     }
 
-    fn make_entry(submitter_byte: u8, value_q16: i32) -> EmbeddingEntry {
+    fn make_entry(submitter_byte: u8, value_q16: i64) -> EmbeddingEntry {
         EmbeddingEntry {
             submitter: H160::repeat_byte(submitter_byte),
             embedding: vec![value_q16],
@@ -307,10 +307,10 @@ mod tests {
         let commits = chain.submitted_commits();
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].0, 1);
-        // Output bytes: 4 bytes value + 1 byte state per dim = 5 bytes for dim=1.
-        assert_eq!(commits[0].1.len(), 5);
+        // Output bytes: 8 bytes value + 1 byte state per dim = 9 bytes for dim=1.
+        assert_eq!(commits[0].1.len(), 9);
         // State byte (last) = 1 (True) for unanimous-positive agree.
-        assert_eq!(commits[0].1[4], 1);
+        assert_eq!(commits[0].1[8], 1);
         // Cycle status now Committed.
         assert_eq!(state.cycle_status(1), CycleStatus::Committed);
     }

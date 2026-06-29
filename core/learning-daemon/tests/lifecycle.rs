@@ -116,7 +116,7 @@ async fn watcher_idempotent_step_after_full_advance() {
 // (Trainer + finalizer paths still gated — those are WP-3.7 / WP-3.8.)
 // ====================================================================
 
-fn make_entry(submitter: u8, value_q16: i32) -> EmbeddingEntry {
+fn make_entry(submitter: u8, value_q16: i64) -> EmbeddingEntry {
     EmbeddingEntry {
         submitter: H160::repeat_byte(submitter),
         embedding: vec![value_q16],
@@ -156,7 +156,7 @@ async fn scenario_1_happy_cycle_aggregator_path() {
     assert_eq!(commits.len(), 1);
     assert_eq!(commits[0].0, 1);
     // State reduced to True (unanimous positive).
-    assert_eq!(commits[0].1[4], 1);
+    assert_eq!(commits[0].1[8], 1);
     assert_eq!(state.cycle_status(1), CycleStatus::Committed);
 }
 
@@ -187,7 +187,7 @@ async fn scenario_2_missed_checkpoint_aggregator_processes_all_observed() {
     let commits = chain.submitted_commits();
     assert_eq!(commits.len(), 1);
     // 4 unanimous-positive submissions → state = True.
-    assert_eq!(commits[0].1[4], 1);
+    assert_eq!(commits[0].1[8], 1);
     assert_eq!(state.cycle_status(1), CycleStatus::Committed);
 }
 

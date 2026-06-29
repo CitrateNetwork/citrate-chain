@@ -887,25 +887,50 @@ pub struct LinearChipConfig {
 pub struct LinearChip;
 
 /// Q16-style "signed shift right 16" of a field-encoded product: returns
-/// (hi, lo) where prod_signed = hi * 2^16 + lo as signed i64, with lo in
+/// (hi, lo) where prod_signed = hi * 2^16 + lo as signed i128, with lo in
 /// [0, 2^16). Both pieces are returned as halo2 Fr in signed encoding
 /// (lo is naturally non-negative; hi may be negative).
-fn signed_shift_decomp(prod_signed: i64) -> (Halo2Fr, Halo2Fr) {
+///
+/// I64-S1: `prod_signed` is i128 because under i64 Q16 the product of two
+/// raw values (each up to ±9.2e18) reaches ~8.5e37 — far beyond i64. The
+/// product still embeds in BN254 Fr (|prod| < p/2 ≈ 1.1e76), so the
+/// `prod = hi*2^16 + lo` gate over Fr remains exact.
+fn signed_shift_decomp(prod_signed: i128) -> (Halo2Fr, Halo2Fr) {
     let lo = (prod_signed & 0xFFFF) as u64;
     let hi = prod_signed >> 16;
-    (i64_to_halo2_fr(hi), Halo2Fr::from(lo))
+    (i128_to_halo2_fr(hi), Halo2Fr::from(lo))
 }
 
 /// Map a signed i64 into BN254 Fr via the standard signed-into-field
-/// embedding.
+/// embedding. Used for the Q16 *input* values (weights/inputs/biases),
+/// whose raw representation is i64 post-I64-S1.
 fn i64_to_halo2_fr(v: i64) -> Halo2Fr {
     if v >= 0 {
         Halo2Fr::from(v as u64)
     } else {
-        // (-v) as u64 is unsigned-abs; -i64::MIN would overflow, but for
-        // Q16 products of i32 * i32 we never reach that bound (max
-        // |prod| < 2^62 < 2^63).
+        // `unsigned_abs()` handles i64::MIN without overflow.
         -Halo2Fr::from(v.unsigned_abs())
+    }
+}
+
+/// Map an unsigned u128 into BN254 Fr by splitting into two u64 limbs
+/// (`Halo2Fr` only implements `From<u64>`).
+fn u128_to_halo2_fr(v: u128) -> Halo2Fr {
+    let lo = (v & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+    let hi = (v >> 64) as u64;
+    let two_pow_64 = Halo2Fr::from(1u64 << 32) * Halo2Fr::from(1u64 << 32);
+    Halo2Fr::from(hi) * two_pow_64 + Halo2Fr::from(lo)
+}
+
+/// Map a signed i128 into BN254 Fr via the standard signed-into-field
+/// embedding. Needed for the widened product/accumulator path: `hi`
+/// (= prod >> 16) and the running accumulator can exceed i64 under i64 Q16.
+fn i128_to_halo2_fr(v: i128) -> Halo2Fr {
+    if v >= 0 {
+        u128_to_halo2_fr(v as u128)
+    } else {
+        // `unsigned_abs()` handles i128::MIN without overflow.
+        -u128_to_halo2_fr(v.unsigned_abs())
     }
 }
 
@@ -1019,7 +1044,7 @@ impl LinearChip {
                 || format!("linear_output_{}", i),
                 |mut region| {
                     // Witness running accumulator (signed i64 in field).
-                    let mut acc_signed: i64 = 0;
+                    let mut acc_signed: i128 = 0;
 
                     for j in 0..in_dim {
                         // Assign w[i][j] and x[j].
@@ -1057,9 +1082,9 @@ impl LinearChip {
                         // element fits in i64 (positive: low 64 bits;
                         // negative: -((p - field) low 64 bits)).
                         let (hi_v, lo_v) = w_val.zip(x_val).map(|(w_fr, x_fr)| {
-                            let w_signed = halo2_fr_to_signed_i32(&w_fr) as i64;
-                            let x_signed = halo2_fr_to_signed_i32(&x_fr) as i64;
-                            let p_signed = w_signed * x_signed;
+                            let w_signed = halo2_fr_to_signed_i64(&w_fr);
+                            let x_signed = halo2_fr_to_signed_i64(&x_fr);
+                            let p_signed: i128 = (w_signed as i128) * (x_signed as i128);
                             signed_shift_decomp(p_signed)
                         }).unzip();
 
@@ -1078,13 +1103,13 @@ impl LinearChip {
 
                         // Update the i64 accumulator.
                         let _: Value<()> = w_val.zip(x_val).map(|(w_fr, x_fr)| {
-                            let w_signed = halo2_fr_to_signed_i32(&w_fr) as i64;
-                            let x_signed = halo2_fr_to_signed_i32(&x_fr) as i64;
-                            let p = w_signed * x_signed;
+                            let w_signed = halo2_fr_to_signed_i64(&w_fr);
+                            let x_signed = halo2_fr_to_signed_i64(&x_fr);
+                            let p: i128 = (w_signed as i128) * (x_signed as i128);
                             acc_signed = acc_signed.wrapping_add(p >> 16);
                         });
 
-                        let acc_fr_val = w_val.zip(x_val).map(|_| i64_to_halo2_fr(acc_signed));
+                        let acc_fr_val = w_val.zip(x_val).map(|_| i128_to_halo2_fr(acc_signed));
                         region.assign_advice(
                             || format!("acc[{},{}]", i, j),
                             config.acc,
@@ -1110,7 +1135,7 @@ impl LinearChip {
                         out_row,
                         || biases[i],
                     )?;
-                    let y_val = biases[i].map(|b_fr| i64_to_halo2_fr(acc_signed) + b_fr);
+                    let y_val = biases[i].map(|b_fr| i128_to_halo2_fr(acc_signed) + b_fr);
                     let y_cell = region.assign_advice(
                         || format!("y[{}]", i),
                         config.y,
@@ -1158,7 +1183,7 @@ impl LinearChip {
             let cell = layouter.assign_region(
                 || format!("linear_output_from_cells_{}", i),
                 |mut region| {
-                    let mut acc_signed: i64 = 0;
+                    let mut acc_signed: i128 = 0;
 
                     for j in 0..in_dim {
                         // copy_advice both assigns and adds copy constraint.
@@ -1187,9 +1212,9 @@ impl LinearChip {
                         )?;
 
                         let (hi_v, lo_v) = w_val.zip(x_val).map(|(w_fr, x_fr)| {
-                            let w_signed = halo2_fr_to_signed_i32(&w_fr) as i64;
-                            let x_signed = halo2_fr_to_signed_i32(&x_fr) as i64;
-                            let p_signed = w_signed * x_signed;
+                            let w_signed = halo2_fr_to_signed_i64(&w_fr);
+                            let x_signed = halo2_fr_to_signed_i64(&x_fr);
+                            let p_signed: i128 = (w_signed as i128) * (x_signed as i128);
                             signed_shift_decomp(p_signed)
                         }).unzip();
 
@@ -1208,13 +1233,13 @@ impl LinearChip {
 
                         // Update i64 accumulator.
                         let _: Value<()> = w_val.zip(x_val).map(|(w_fr, x_fr)| {
-                            let w_signed = halo2_fr_to_signed_i32(&w_fr) as i64;
-                            let x_signed = halo2_fr_to_signed_i32(&x_fr) as i64;
-                            let p = w_signed * x_signed;
+                            let w_signed = halo2_fr_to_signed_i64(&w_fr);
+                            let x_signed = halo2_fr_to_signed_i64(&x_fr);
+                            let p: i128 = (w_signed as i128) * (x_signed as i128);
                             acc_signed = acc_signed.wrapping_add(p >> 16);
                         });
 
-                        let acc_fr_val = w_val.zip(x_val).map(|_| i64_to_halo2_fr(acc_signed));
+                        let acc_fr_val = w_val.zip(x_val).map(|_| i128_to_halo2_fr(acc_signed));
                         region.assign_advice(
                             || format!("acc[{},{}]", i, j),
                             config.acc,
@@ -1239,7 +1264,7 @@ impl LinearChip {
                         out_row,
                     )?;
                     let b_val = b_cell_assigned.value().copied();
-                    let y_val = b_val.map(|b_fr| i64_to_halo2_fr(acc_signed) + b_fr);
+                    let y_val = b_val.map(|b_fr| i128_to_halo2_fr(acc_signed) + b_fr);
                     let y_cell = region.assign_advice(
                         || format!("y[{}]", i),
                         config.y,
@@ -1258,47 +1283,42 @@ impl LinearChip {
     }
 }
 
-/// Recover the signed i32 represented by a Q16-encoded BN254 Fr.
+/// Recover the signed i64 represented by a Q16-encoded BN254 Fr.
 ///
-/// Mirror of `q16_to_halo2_fr`: positive values in [0, 2^31) embed as
-/// themselves; negative values in [-2^31, 0) embed as p - |v| (i.e.,
-/// the field negation). We detect negative by comparing against p/2.
+/// Mirror of `q16_to_halo2_fr` / `i64_to_halo2_fr`: positive values in
+/// [0, 2^63) embed as themselves; negative values in [-2^63, 0) embed as
+/// p - |v| (field negation). We detect negative by comparing against p/2.
 ///
-/// **Saturation note:** for in-range Q16 values this is exact. For
-/// Fr values outside the embedding (e.g., a malicious witness with
-/// arbitrary field elements), the result is undefined — the chip
-/// gates do not validate this, only the differential test contract.
-fn halo2_fr_to_signed_i32(v: &Halo2Fr) -> i32 {
+/// I64-S1: widened from i32 to i64. The Q16 *input* values recovered here
+/// (weights / inputs) are i64-range raw; their product is taken in i128
+/// by the caller, so this recovery must carry the full i64 magnitude.
+///
+/// **Soundness note:** for in-range Q16 values this is exact. For Fr
+/// values outside the embedding (e.g., a malicious witness with arbitrary
+/// field elements), the result is undefined — the chip gates do not
+/// range-validate this (a pre-existing property, unchanged by I64-S1);
+/// only the differential test contract pins honest behavior.
+fn halo2_fr_to_signed_i64(v: &Halo2Fr) -> i64 {
     use halo2curves::ff::PrimeField as _;
     let bytes_le = v.to_repr();
     let bytes_slice: &[u8] = bytes_le.as_ref();
     let bytes: &[u8; 32] = bytes_slice.try_into().expect("Fr repr is 32 bytes");
     // Check if v < (p+1)/2 → positive; else negative (p - v).
     // BN254 Fr modulus p = 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
-    // (p+1)/2 ≈ 0x18322739708d8d0...
-    // Easiest: check the high bit of the canonical LE bytes — for
-    // values < p/2, byte 31 < 0x18; for values > p/2, byte 31 ≥ 0x18.
+    // For values < p/2, byte 31 < 0x18; for values > p/2, byte 31 ≥ 0x18.
     let high = bytes[31];
+    let mut low8 = [0u8; 8];
+    low8.copy_from_slice(&bytes[..8]);
+    let v_low = u64::from_le_bytes(low8);
     if high < 0x18 {
-        // Non-negative; recover low 32 bits as i32.
-        let mut low4 = [0u8; 4];
-        low4.copy_from_slice(&bytes[..4]);
-        let u = u32::from_le_bytes(low4);
-        // For values exceeding i32 range (in Q16 multiplication
-        // intermediates, this only happens out-of-spec), reinterpret
-        // as i32; downstream consumers handle.
-        u as i32
+        // Non-negative; recover low 64 bits as i64.
+        v_low as i64
     } else {
-        // Negative; compute p - v in 4-byte low chunk.
-        // p_low = 0xf0000001 (low 32 bits of p)
-        // For Fr value V (with V > p/2), the represented signed value
-        // is V - p. low 32 bits of (V - p) = V_low - p_low (mod 2^32).
-        let mut low4 = [0u8; 4];
-        low4.copy_from_slice(&bytes[..4]);
-        let v_low = u32::from_le_bytes(low4);
-        let p_low: u32 = 0xf0000001;
-        let signed_low = v_low.wrapping_sub(p_low);
-        signed_low as i32
+        // Negative; the represented signed value is V - p. The low 64 bits
+        // of (V - p) = V_low - p_low (mod 2^64), where p_low is the low
+        // 64 bits of the BN254 Fr modulus.
+        const P_LOW_64: u64 = 0x43e1_f593_f000_0001;
+        v_low.wrapping_sub(P_LOW_64) as i64
     }
 }
 
@@ -1676,9 +1696,10 @@ mod tests {
         );
     }
 
-    fn q16_tensor(shape: &[u32], values: &[i32]) -> Vec<u8> {
+    fn q16_tensor(shape: &[u32], values: &[i64]) -> Vec<u8> {
+        // I64-S1: Q16 elements are 8 bytes (i64, little-endian) on the wire.
         use crate::precompiles::tensor_format::{encode, Dtype};
-        let mut data = Vec::with_capacity(values.len() * 4);
+        let mut data = Vec::with_capacity(values.len() * 8);
         for &v in values {
             data.extend_from_slice(&v.to_le_bytes());
         }

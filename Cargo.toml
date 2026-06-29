@@ -45,6 +45,13 @@ default-members = [
     "core/marketplace",
     "node",
 ]
+# I64-S1: the `citrate-federated` Q16 parity crate is EXCLUDED from the
+# workspace. It dev-depends on `citrate-fed-types`, whose MSRV (1.96) is
+# ahead of the chain's default stable toolchain, and it pulls a private git
+# dep — neither of which should burden the consensus `cargo build
+# --workspace`. Run the parity proof on demand:
+#   cargo +1.96.0 test --manifest-path core/federated/Cargo.toml
+exclude = ["core/federated"]
 resolver = "2"
 
 [workspace.package]
