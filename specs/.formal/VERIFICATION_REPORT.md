@@ -131,4 +131,30 @@ The `run_deep.sh` script uses 16 TLC workers with extended state exploration lim
 | Strategy | `citrate_v0.01.1/specs/.formal/STRATEGY.md` |
 | CI workflow | `.github/workflows/tla-check.yml` |
 
-*Last updated: 2026-03-22*
+---
+
+## I64-S1 re-verification addendum (2026-06-28)
+
+The chain-wide Q16.16 widening (i32 → i64) and the routing `ARCH_VERSION`
+bump (1 → 2) touch three specs. All were re-run on this machine with
+TLC 1.7.1 (tla2tools.jar, OpenJDK, x86_64/aarch64 DGX) and pass with
+**0 violations**. The models are width/version-abstract by construction
+(see each spec's header note), so the i64 implementation re-certifies
+against the unchanged models:
+
+| Spec | Path | States Generated | Distinct States | Result |
+|------|------|-----------------|-----------------|--------|
+| **Q16ArithmeticDeterminism** | `specs/tla/compute/` | 69,961 | 265 | ✅ No error found |
+| **BelnapAdversarial** | `specs/tla/learning/` | 736,000 | 319,984 | ✅ No error found |
+| **RoutingModelInference** | `specs/tla/learning/` | 628,240 | 98,049 | ✅ No error found |
+
+Rationale, per spec header: `Q16ArithmeticDeterminism` proves saturation
+totality at a small `Magnitude` domain → holds at any width by induction;
+`BelnapAdversarial` reasons over the lattice + adversary, independent of
+byte encoding; `RoutingModelInference` models the arch-version *registry*
+(symbolic `ArchVersions` set, monotonic `current_arch`) so 1→2 is the
+already-proven never-goes-backward move. (Note: this 2026-03-22 report's
+spec inventory predates the RM-M2/RM-FL specs above; the addendum is the
+authoritative record for the I64-S1 re-run.)
+
+*Last updated: 2026-06-28 (I64-S1 addendum); base report 2026-03-22*

@@ -515,8 +515,9 @@ mod tests {
     use super::super::tensor_format::{encode, Dtype};
 
     /// Build a valid Q16 encoded tensor for use in tests.
-    fn q16_tensor(shape: &[u32], values: &[i32]) -> Vec<u8> {
-        let mut data = Vec::with_capacity(values.len() * 4);
+    /// I64-S1: Q16 elements are 8 bytes (i64, little-endian) on the wire.
+    fn q16_tensor(shape: &[u32], values: &[i64]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(values.len() * 8);
         for &v in values {
             data.extend_from_slice(&v.to_le_bytes());
         }
@@ -568,10 +569,11 @@ mod tests {
 
     #[test]
     fn tensor_commit_distinguishes_dtype() {
-        // Encode the same logical bytes once as Q16 (rank 1, n=8), once
-        // as Field32 (rank 1, n=1, 32 bytes). Different headers, same
-        // payload bytes — commitment must differ.
-        let q16 = encode(&[8], Dtype::Q16_16, &[1u8; 32]).unwrap();
+        // Encode the same logical bytes once as Q16 (rank 1, n=4 — 8-byte
+        // elements post-I64-S1, so 4×8=32 bytes), once as Field32 (rank 1,
+        // n=1, 32 bytes). Different headers, same payload bytes —
+        // commitment must differ.
+        let q16 = encode(&[4], Dtype::Q16_16, &[1u8; 32]).unwrap();
         let f32_t = encode(&[1], Dtype::Field32, &[1u8; 32]).unwrap();
         let r_q = tensor_commit(&q16, 1_000_000).unwrap();
         let r_f = tensor_commit(&f32_t, 1_000_000).unwrap();
@@ -642,7 +644,7 @@ mod tests {
     fn tensor_commit_avalanche_rough() {
         let mut commits = std::collections::HashSet::new();
         for i in 0u32..256 {
-            let t = q16_tensor(&[1], &[i as i32]);
+            let t = q16_tensor(&[1], &[i as i64]);
             let r = tensor_commit(&t, 1_000_000).unwrap();
             assert!(
                 commits.insert(r.output),

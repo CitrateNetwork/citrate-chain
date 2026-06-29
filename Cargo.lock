@@ -1406,6 +1406,7 @@ dependencies = [
  "citrate-sequencer",
  "citrate-storage",
  "dashmap",
+ "ed25519-dalek",
  "futures",
  "hex",
  "parking_lot 0.12.5",

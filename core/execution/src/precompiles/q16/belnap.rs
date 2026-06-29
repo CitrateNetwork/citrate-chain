@@ -35,17 +35,17 @@
 //   Input bytes (big-endian throughout):
 //     dim:           u32           (4 bytes)
 //     n:             u32           (4 bytes)
-//     embeddings:    n*dim*i32     (4*n*dim bytes)
-//     confidences:   n*dim*i32     (4*n*dim bytes)
-//     weights:       n*i32         (4*n bytes)
-//     threshold_pos: i32           (4 bytes)
-//     threshold_neg: i32           (4 bytes)
-//   Total = 16 + 8*n*dim + 4*n bytes.
+//     embeddings:    n*dim*i64     (8*n*dim bytes)
+//     confidences:   n*dim*i64     (8*n*dim bytes)
+//     weights:       n*i64         (8*n bytes)
+//     threshold_pos: i64           (8 bytes)
+//     threshold_neg: i64           (8 bytes)
+//   Total = 24 + 16*n*dim + 8*n bytes.
 //
 //   Output bytes (big-endian):
-//     aggregated:    dim*i32       (4*dim bytes)
+//     aggregated:    dim*i64       (8*dim bytes)
 //     states:        dim*u8        (1 byte per dim)
-//   Total = 5*dim bytes.
+//   Total = 9*dim bytes.
 //
 // **Caps (DoS protection):**
 //   - MAX_N: 1024 participants per call
@@ -124,7 +124,7 @@ pub struct BelnapOutput {
 /// contract; WP-1.5 removed it together with the impl landing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BelnapError {
-    /// Input shorter than the 16-byte header.
+    /// Input shorter than the 24-byte header.
     InputTooShort,
     /// `dim == 0`.
     DimZero,
@@ -141,7 +141,7 @@ pub enum BelnapError {
 impl std::fmt::Display for BelnapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BelnapError::InputTooShort => write!(f, "input shorter than 16-byte header"),
+            BelnapError::InputTooShort => write!(f, "input shorter than 24-byte header"),
             BelnapError::DimZero => write!(f, "dim must be > 0"),
             BelnapError::NZero => write!(f, "n must be > 0"),
             BelnapError::DimTooLarge => write!(f, "dim exceeds cap of {MAX_DIM}"),
@@ -163,8 +163,9 @@ pub const MAX_N: usize = 1024;
 /// Maximum embedding dimensionality per call. Matches RM-M2 cap convention.
 pub const MAX_DIM: usize = 1024;
 
-/// Header length in bytes: `dim:u32 || n:u32` + threshold pair.
-const HEADER_LEN: usize = 16;
+/// Header length in bytes: `dim:u32 || n:u32` (8 bytes) + threshold
+/// pair `threshold_pos:i64 || threshold_neg:i64` (16 bytes) = 24.
+const HEADER_LEN: usize = 24;
 
 // ---------------------------------------------------------------------------
 // Decode / encode (fully implemented at WP-1.3)
@@ -199,8 +200,8 @@ pub fn decode(input: &[u8]) -> Result<BelnapInput, BelnapError> {
     // length check.
     let body_len = n
         .checked_mul(dim)
-        .and_then(|nd| nd.checked_mul(8)) // embeddings + confidences = 2 * 4 bytes
-        .and_then(|nd8| nd8.checked_add(n.checked_mul(4)?)) // + weights
+        .and_then(|nd| nd.checked_mul(16)) // embeddings + confidences = 2 * 8 bytes
+        .and_then(|nd16| nd16.checked_add(n.checked_mul(8)?)) // + weights
         .ok_or(BelnapError::LengthMismatch)?;
     let expected_total = HEADER_LEN.checked_add(body_len).ok_or(BelnapError::LengthMismatch)?;
 
@@ -215,24 +216,24 @@ pub fn decode(input: &[u8]) -> Result<BelnapInput, BelnapError> {
     // so the precompile can reuse them per call without dispatching to
     // governance state. (See WP-1.5 for the on-chain governance hook.)
     //
-    // Wait — re-reading the wire format docstring: thresholds are 8
+    // Wait — re-reading the wire format docstring: thresholds are 16
     // bytes total at the END. body_len already accounts for that via
-    // HEADER_LEN = 16 (dim+n+two thresholds). Recompute body_len:
+    // HEADER_LEN = 24 (dim+n+two thresholds). Recompute body_len:
 
-    // Section 1: embeddings (n*dim*i32)
-    let emb_bytes = n * dim * 4;
+    // Section 1: embeddings (n*dim*i64)
+    let emb_bytes = n * dim * 8;
     let embeddings = decode_q16_slice(&input[cursor..cursor + emb_bytes])
         .ok_or(BelnapError::LengthMismatch)?;
     cursor += emb_bytes;
 
-    // Section 2: confidences (n*dim*i32)
-    let conf_bytes = n * dim * 4;
+    // Section 2: confidences (n*dim*i64)
+    let conf_bytes = n * dim * 8;
     let confidences = decode_q16_slice(&input[cursor..cursor + conf_bytes])
         .ok_or(BelnapError::LengthMismatch)?;
     cursor += conf_bytes;
 
-    // Section 3: weights (n*i32)
-    let w_bytes = n * 4;
+    // Section 3: weights (n*i64)
+    let w_bytes = n * 8;
     let weights = decode_q16_slice(&input[cursor..cursor + w_bytes])
         .ok_or(BelnapError::LengthMismatch)?;
     cursor += w_bytes;
@@ -247,23 +248,23 @@ pub fn decode(input: &[u8]) -> Result<BelnapInput, BelnapError> {
     //   [8..8+emb]                   embeddings
     //   [8+emb..8+emb+conf]          confidences
     //   [8+emb+conf..8+emb+conf+w]   weights
-    //   [last 8 bytes]               threshold_pos, threshold_neg
+    //   [last 16 bytes]              threshold_pos, threshold_neg
     //
-    // So the trailing 8 bytes carry the thresholds.
+    // So the trailing 16 bytes carry the thresholds.
     // The corrected expected_total is:
-    //   8 (dim+n) + 4*n*dim*2 (emb+conf) + 4*n (weights) + 8 (thresholds)
-    // = 16 + 8*n*dim + 4*n
-    // which matches our body_len + HEADER_LEN = 8 + (8*n*dim + 4*n) + 8.
+    //   8 (dim+n) + 8*n*dim*2 (emb+conf) + 8*n (weights) + 16 (thresholds)
+    // = 24 + 16*n*dim + 8*n
+    // which matches our body_len + HEADER_LEN = 8 + (16*n*dim + 8*n) + 16.
 
-    if cursor + 8 != input.len() {
+    if cursor + 16 != input.len() {
         return Err(BelnapError::LengthMismatch);
     }
 
-    let threshold_pos = Q16::from_raw(i32::from_be_bytes(
-        input[cursor..cursor + 4].try_into().expect("4 bytes"),
+    let threshold_pos = Q16::from_raw(i64::from_be_bytes(
+        input[cursor..cursor + 8].try_into().expect("8 bytes"),
     ));
-    let threshold_neg = Q16::from_raw(i32::from_be_bytes(
-        input[cursor + 4..cursor + 8].try_into().expect("4 bytes"),
+    let threshold_neg = Q16::from_raw(i64::from_be_bytes(
+        input[cursor + 8..cursor + 16].try_into().expect("8 bytes"),
     ));
 
     Ok(BelnapInput {
@@ -278,14 +279,14 @@ pub fn decode(input: &[u8]) -> Result<BelnapInput, BelnapError> {
 }
 
 /// Decode a contiguous run of big-endian Q16 values. Returns `None` if
-/// the slice length is not a multiple of 4.
+/// the slice length is not a multiple of 8.
 fn decode_q16_slice(bytes: &[u8]) -> Option<Vec<Q16>> {
-    if !bytes.len().is_multiple_of(4) {
+    if !bytes.len().is_multiple_of(8) {
         return None;
     }
-    let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        let raw = i32::from_be_bytes(chunk.try_into().expect("4 bytes"));
+    let mut out = Vec::with_capacity(bytes.len() / 8);
+    for chunk in bytes.chunks_exact(8) {
+        let raw = i64::from_be_bytes(chunk.try_into().expect("8 bytes"));
         out.push(Q16::from_raw(raw));
     }
     Some(out)
@@ -301,7 +302,7 @@ pub fn encode_output(output: &BelnapOutput) -> Vec<u8> {
         "BelnapOutput: aggregated_values and states length mismatch"
     );
     let dim = output.aggregated_values.len();
-    let mut bytes = Vec::with_capacity(5 * dim);
+    let mut bytes = Vec::with_capacity(9 * dim);
     for v in &output.aggregated_values {
         bytes.extend_from_slice(&v.0.to_be_bytes());
     }
@@ -599,15 +600,15 @@ mod tests {
     /// Decode the wire-format output bytes back into a `BelnapOutput`.
     /// Test-only — on-chain readers ABI-decode directly.
     fn parse_output(bytes: &[u8], dim: usize) -> BelnapOutput {
-        assert_eq!(bytes.len(), 5 * dim, "output bytes length must be 5 * dim");
+        assert_eq!(bytes.len(), 9 * dim, "output bytes length must be 9 * dim");
         let mut aggregated_values = Vec::with_capacity(dim);
         for d in 0..dim {
-            let raw = i32::from_be_bytes(
-                bytes[d * 4..(d + 1) * 4].try_into().expect("4 bytes"),
+            let raw = i64::from_be_bytes(
+                bytes[d * 8..(d + 1) * 8].try_into().expect("8 bytes"),
             );
             aggregated_values.push(Q16::from_raw(raw));
         }
-        let states_off = 4 * dim;
+        let states_off = 8 * dim;
         let mut states = Vec::with_capacity(dim);
         for d in 0..dim {
             states.push(
@@ -667,7 +668,7 @@ mod tests {
 
     #[test]
     fn decode_n_zero_returns_n_zero() {
-        let mut bytes = vec![0u8; 16];
+        let mut bytes = vec![0u8; HEADER_LEN];
         bytes[0..4].copy_from_slice(&1u32.to_be_bytes()); // dim=1
         bytes[4..8].copy_from_slice(&0u32.to_be_bytes()); // n=0
         assert_eq!(decode(&bytes), Err(BelnapError::NZero));
@@ -675,7 +676,7 @@ mod tests {
 
     #[test]
     fn decode_dim_zero_returns_dim_zero() {
-        let mut bytes = vec![0u8; 16];
+        let mut bytes = vec![0u8; HEADER_LEN];
         bytes[0..4].copy_from_slice(&0u32.to_be_bytes()); // dim=0
         bytes[4..8].copy_from_slice(&1u32.to_be_bytes()); // n=1
         assert_eq!(decode(&bytes), Err(BelnapError::DimZero));
@@ -741,15 +742,15 @@ mod tests {
             states: vec![BelnapState::True, BelnapState::Both],
         };
         let bytes = encode_output(&out);
-        // 4*2 (values) + 1*2 (states) = 10 bytes
-        assert_eq!(bytes.len(), 10);
-        // First 4 bytes: BE-encoded Q16 of 7
-        assert_eq!(&bytes[0..4], &Q16::from_int(7).0.to_be_bytes());
-        // Next 4 bytes: BE-encoded Q16 of -7
-        assert_eq!(&bytes[4..8], &Q16::from_int(-7).0.to_be_bytes());
+        // 8*2 (values) + 1*2 (states) = 18 bytes
+        assert_eq!(bytes.len(), 18);
+        // First 8 bytes: BE-encoded Q16 of 7
+        assert_eq!(&bytes[0..8], &Q16::from_int(7).0.to_be_bytes());
+        // Next 8 bytes: BE-encoded Q16 of -7
+        assert_eq!(&bytes[8..16], &Q16::from_int(-7).0.to_be_bytes());
         // Last 2 bytes: state codes
-        assert_eq!(bytes[8], BelnapState::True.as_u8());
-        assert_eq!(bytes[9], BelnapState::Both.as_u8());
+        assert_eq!(bytes[16], BelnapState::True.as_u8());
+        assert_eq!(bytes[17], BelnapState::Both.as_u8());
     }
 
     #[test]
@@ -1297,10 +1298,10 @@ mod tests {
         /// threshold cannot move the classification back to `None`.
         #[test]
         fn proptest_classify_monotone_in_confidence(
-            embedding_raw: i32,
-            base_conf_raw: i32,
-            delta_raw in 0i32..i32::MAX,
-            threshold_raw: i32,
+            embedding_raw: i64,
+            base_conf_raw: i64,
+            delta_raw in 0i64..i64::MAX,
+            threshold_raw: i64,
         ) {
             let emb = Q16::from_raw(embedding_raw);
             let base_conf = Q16::from_raw(base_conf_raw);
@@ -1334,7 +1335,7 @@ mod tests {
             };
             let bytes = encode_input(&input);
             if let Ok(output) = aggregate(&bytes) {
-                proptest::prop_assert_eq!(output.len(), 5 * dim);
+                proptest::prop_assert_eq!(output.len(), 9 * dim);
             }
             // No assert on Err branch — the WP-1.3 stub returns Err here.
         }

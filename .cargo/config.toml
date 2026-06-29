@@ -1,0 +1,7 @@
+# I64-S1: the `citrate-federated` parity crate (and any future federation
+# crate) pulls `citrate-fed-types` from a private CitrateNetwork git repo.
+# Use the system git client so it picks up the operator's credential helper /
+# split read-only deploy key instead of cargo's built-in git (which can't see
+# them). CI must provide read access to CitrateNetwork/citrate-fed-types.
+[net]
+git-fetch-with-cli = true
