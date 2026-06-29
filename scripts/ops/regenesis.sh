@@ -67,10 +67,15 @@ log "chain $CHAIN_ID ✓  Arachnid ✓  deployer $DEPLOYER_ADDRESS funded ✓  r
 # Each script deploys via CREATE2 (deterministic). Order matters only for the
 # cross-script reads done by post-deploy wiring, not for the addresses.
 CEREMONY=(
-  "script/DeployAll.s.sol"                  # 28 core contracts
+  "script/DeployAll.s.sol"                  # 28 core contracts (incl. NematocystSlashing)
   "script/DeployModelAccessControl.s.sol"   # 1 (OZ-isolated)
   "script/DeployTEEAttestationRegistry.s.sol" # 1 (CM-08)
   "script/DeployComputePoolTraining.s.sol"  # 1 (CM-07)
+  # I64-S1 WP-B1: 5 federated-learning contracts. After DeployAll (so
+  # NematocystSlashing exists for the post-deploy setSlashingContract wiring)
+  # and after TEE (ComputePoolPipeline references its address). Self-deploys
+  # KYCRegistry → IPFS V2/V3 → AggregationChallenge → ComputePoolPipeline.
+  "script/DeployFederatedLearning.s.sol"    # 5 (KYC, IPFS V2/V3, AggChal, Pipeline)
   "script/DeployEduStack.s.sol"             # 5 (Learning Center)
   "script/DeployAIGateway.s.sol"            # 3 (edu ai-gateway)
 )

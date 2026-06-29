@@ -51,6 +51,12 @@ CEREMONIES=(
   # the pin-table wrapper. Listed AFTER DeployAA so its CREATEs override
   # the older addresses (the merge step is last-write-wins).
   "DeployAndPinAA.s.sol"
+  # I64-S1 WP-B1: the five federated-learning contracts (KYCRegistry,
+  # IPFSIncentivesV2/V3, AggregationChallenge, ComputePoolPipeline) that
+  # joined the surface after the last re-roll. Picked up post-ceremony from
+  # this broadcast; pre-ceremony their deterministic projection lives in
+  # contracts/addresses/I64S1_PROJECTION.md.
+  "DeployFederatedLearning.s.sol"
 )
 
 # Collect every CREATE transaction's (contractName, contractAddress) pair
@@ -97,6 +103,18 @@ rm -f "${contracts_jq}.orig"
 # is vendored (from eth-infinitism) so it's not in DeployAA's broadcast as
 # a CREATE; pull it from .env.testnet.
 get_env() { grep -E "^${1}=" "$ENV_TESTNET" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' '; }
+
+# I64-S1 WP-B2: the co-op `CitrateCooperativeFactory` is deployed from the
+# SEPARATE citrate-coop repo (its own foundry project + "citrate.coop.v1."
+# salt namespace), so there is no broadcast for it under this repo's
+# contracts/broadcast — it can't be auto-merged like the ceremonies above.
+# Inject it as a pinned entry: prefer a CITRATE_COOP_FACTORY override in
+# .env.testnet, else the deterministic CREATE2 address the coop DeployCoop.s.sol
+# lands at (no-arg constructor → sender-independent).
+coop_factory=$(get_env "CITRATE_COOP_FACTORY" || true)
+coop_factory=${coop_factory:-0xa9ded8dbfca510cca8f5896c3f6144b30ad98c6d}
+jq --arg cf "$coop_factory" '.CitrateCooperativeFactory = ($cf | ascii_downcase)' \
+  "$contracts_jq" > "${contracts_jq}.tmp" && mv "${contracts_jq}.tmp" "$contracts_jq"
 
 aa_entrypoint=$(get_env "CITRATE_AA_ENTRY_POINT" || true)
 aa_webauthn=$(get_env "CITRATE_AA_WEBAUTHN_VALIDATOR" || true)

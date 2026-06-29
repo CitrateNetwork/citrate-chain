@@ -52,7 +52,8 @@
     "IPFSIncentivesV2": "0x7e3c937af313e06e648e26e98f251684c4d82b4d",
     "IPFSIncentivesV3": "0x629f7cd4aeade49e4b27c9a39237d132f9ff39f4",
     "AggregationChallenge": "0xe7d7ebe1242feec29d514b00c9272fbffc9e69be",
-    "ComputePoolPipeline": "0xc2ddf9dd186781697ed9c16af3bb36e42a79f4ad"
+    "ComputePoolPipeline": "0xc2ddf9dd186781697ed9c16af3bb36e42a79f4ad",
+    "CitrateCooperativeFactory": "0xa9ded8dbfca510cca8f5896c3f6144b30ad98c6d"
   },
   "aaStack": {
     "EntryPoint": "0x4a86659BDab24dc444C72fbbaD4cd83491820E40",
