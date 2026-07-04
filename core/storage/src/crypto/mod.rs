@@ -5,6 +5,7 @@
 // It provides defense against "Harvest Now, Decrypt Later" (HNDL) attacks by using
 // hybrid classical + post-quantum encryption schemes.
 
+pub mod at_rest;
 pub mod quantum_safe;
 pub mod database_encryption;
 pub mod key_derivation;
@@ -14,6 +15,10 @@ pub mod key_commitment;
 #[cfg(test)]
 mod benchmarks;
 
+pub use at_rest::{
+    AtRestCipher, AtRestError, AtRestStats, EncryptionAtRestConfig, EncryptionKey,
+    EncryptionMeta, KdfMeta, KeySource, PasswordKdf, ENCRYPTION_META_FILE,
+};
 pub use quantum_safe::{
     HybridKEM, HybridEncapsulation, QuantumSafeConfig,
     KeyEncapsulationMechanism, SecurityLevel,
