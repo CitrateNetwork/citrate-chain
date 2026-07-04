@@ -1542,6 +1542,7 @@ version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "argon2",
  "async-trait",
  "bincode",
  "blake3",
