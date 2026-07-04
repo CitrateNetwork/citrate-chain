@@ -6,7 +6,7 @@
 // with metadata about the encryption scheme used.
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use sha3::{Sha3_256, Digest};
@@ -204,11 +204,19 @@ impl EncryptionEnvelope {
         let cipher = Aes256Gcm::new_from_slice(key.key_bytes())
             .map_err(|_| EnvelopeError::CipherInitFailed)?;
 
-        // Include header as additional authenticated data (reserved for AAD binding)
-        let _aad = header.to_bytes();
+        // Bind the header into the ciphertext as additional authenticated
+        // data: tampering with any header field (key version, algorithm,
+        // column-family hash, ...) makes decryption fail authentication.
+        let aad = header.to_bytes();
 
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| EnvelopeError::EncryptionFailed)?;
 
         Ok(Self {
@@ -229,9 +237,17 @@ impl EncryptionEnvelope {
         let cipher = Aes256Gcm::new_from_slice(key.key_bytes())
             .map_err(|_| EnvelopeError::CipherInitFailed)?;
 
-        // Decrypt
+        // Decrypt, authenticating the stored header as AAD (must match
+        // the header bytes bound at encryption time).
+        let aad = self.header.to_bytes();
         cipher
-            .decrypt(Nonce::from_slice(&self.nonce), self.ciphertext.as_ref())
+            .decrypt(
+                Nonce::from_slice(&self.nonce),
+                Payload {
+                    msg: self.ciphertext.as_ref(),
+                    aad: &aad,
+                },
+            )
             .map_err(|_| EnvelopeError::DecryptionFailed)
     }
 
