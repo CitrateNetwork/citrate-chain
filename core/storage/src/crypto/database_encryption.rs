@@ -407,14 +407,28 @@ impl EncryptedDatabase {
         aad
     }
 
+    /// Compress with zstd (marker 0x02) before encryption. Falls back to
+    /// the raw marker (0x00) when compression does not shrink the payload
+    /// (already-compressed or high-entropy data).
+    ///
+    /// Data source: `zstd::bulk` (crate dependency, level 3) — replaces the
+    /// pre-wiring placeholder that only ever wrote the 0x00 marker and
+    /// errored on real algorithms at decompress time.
     fn compress(&self, data: &[u8]) -> Result<Vec<u8>, DatabaseEncryptionError> {
-        // Simple LZ4-style compression placeholder
-        // In production, use lz4 or zstd crate
-        // For now, just prepend a "not compressed" marker
-        let mut result = Vec::with_capacity(data.len() + 1);
-        result.push(0x00); // 0 = not compressed, 1 = LZ4, 2 = zstd
-        result.extend_from_slice(data);
-        Ok(result)
+        let compressed = zstd::bulk::compress(data, 3)
+            .map_err(|e| DatabaseEncryptionError::CompressionFailed(e.to_string()))?;
+
+        if compressed.len() < data.len() {
+            let mut result = Vec::with_capacity(compressed.len() + 1);
+            result.push(0x02); // 0 = not compressed, 1 = LZ4 (unused), 2 = zstd
+            result.extend_from_slice(&compressed);
+            Ok(result)
+        } else {
+            let mut result = Vec::with_capacity(data.len() + 1);
+            result.push(0x00);
+            result.extend_from_slice(data);
+            Ok(result)
+        }
     }
 
     fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, DatabaseEncryptionError> {
@@ -425,9 +439,14 @@ impl EncryptedDatabase {
         let compression_type = data[0];
         match compression_type {
             0x00 => Ok(data[1..].to_vec()), // Not compressed
-            0x01 => Err(DatabaseEncryptionError::CompressionNotSupported("LZ4".to_string())),
-            0x02 => Err(DatabaseEncryptionError::CompressionNotSupported("zstd".to_string())),
-            _ => Err(DatabaseEncryptionError::InvalidCompressionType(compression_type)),
+            0x02 => zstd::stream::decode_all(&data[1..])
+                .map_err(|e| DatabaseEncryptionError::CompressionFailed(e.to_string())),
+            0x01 => Err(DatabaseEncryptionError::CompressionNotSupported(
+                "LZ4".to_string(),
+            )),
+            _ => Err(DatabaseEncryptionError::InvalidCompressionType(
+                compression_type,
+            )),
         }
     }
 }
@@ -442,6 +461,7 @@ pub enum DatabaseEncryptionError {
     ColumnFamilyNotFound(String),
     RotationFailed,
     CompressionNotSupported(String),
+    CompressionFailed(String),
     InvalidCompressionType(u8),
 }
 
@@ -455,6 +475,7 @@ impl std::fmt::Display for DatabaseEncryptionError {
             Self::ColumnFamilyNotFound(cf) => write!(f, "Column family not found: {}", cf),
             Self::RotationFailed => write!(f, "Key rotation failed"),
             Self::CompressionNotSupported(alg) => write!(f, "Compression not supported: {}", alg),
+            Self::CompressionFailed(e) => write!(f, "Compression failed: {}", e),
             Self::InvalidCompressionType(t) => write!(f, "Invalid compression type: {}", t),
         }
     }
