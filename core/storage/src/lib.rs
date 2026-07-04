@@ -1,13 +1,16 @@
 // citrate/core/storage/src/lib.rs
 //
-// Citrate Storage Layer with Quantum-Safe Encryption
+// Citrate Storage Layer
 //
 // Features:
 // - RocksDB-based persistent storage
-// - Quantum-resistant encryption at rest (QSSP protocol)
-// - Hybrid classical + post-quantum key encapsulation
-// - Crypto-agile envelope encryption for algorithm upgrades
-// - On-chain key commitment anchoring
+// - Opt-in encryption at rest (STOR-EAR): AES-256-GCM value encryption
+//   wired into the RocksDB access layer (get/put/batch/iterators), with
+//   per-column-family subkeys, encryption.meta key/salt persistence and
+//   wrong-key rejection at open. Default OFF — server deployments keep
+//   the raw plaintext path and its performance.
+// - QSSP crypto library (envelope encryption, hybrid PQ KEM, key
+//   commitment anchoring) under `crypto`.
 
 pub mod cache;
 pub mod chain;
@@ -21,7 +24,7 @@ pub mod state_manager;
 use anyhow::Result;
 use cache::Cache;
 use chain::{BlockStore, TransactionStore};
-use crypto::database_encryption::{DatabaseEncryptionConfig, EncryptedDatabase, EncryptionStats};
+use crypto::at_rest::{AtRestStats, EncryptionAtRestConfig};
 use db::RocksDB;
 use citrate_consensus::types::Hash;
 use pruning::{Pruner, PruningConfig};
@@ -41,9 +44,6 @@ pub struct StorageManager {
     // Caches
     pub block_cache: Cache<Hash, Vec<u8>>,
     pub state_cache: Cache<Vec<u8>, Vec<u8>>,
-
-    // Quantum-safe encryption layer
-    encryption: Option<Arc<EncryptedDatabase>>,
 }
 
 /// Configuration for storage manager
@@ -52,33 +52,23 @@ pub struct StorageManager {
 pub struct StorageConfig {
     /// Pruning configuration
     pub pruning: PruningConfig,
-    /// Database encryption configuration (None = disabled)
-    pub encryption: Option<DatabaseEncryptionConfig>,
+    /// Encryption at rest (None = disabled, the default). When set, every
+    /// value written through the storage layer is AES-256-GCM encrypted —
+    /// see `crypto::at_rest` for the key/meta lifecycle.
+    pub encryption: Option<EncryptionAtRestConfig>,
 }
 
 
 impl StorageConfig {
-    /// Create config with encryption enabled
-    pub fn with_encryption(mut self, config: DatabaseEncryptionConfig) -> Self {
+    /// Create config with encryption at rest enabled
+    pub fn with_encryption(mut self, config: EncryptionAtRestConfig) -> Self {
         self.encryption = Some(config);
         self
-    }
-
-    /// Create config for maximum security (AI models)
-    pub fn maximum_security(node_id: String) -> Self {
-        Self {
-            pruning: PruningConfig::default(),
-            encryption: Some(DatabaseEncryptionConfig {
-                enabled: true,
-                node_id,
-                ..Default::default()
-            }),
-        }
     }
 }
 
 impl StorageManager {
-    /// Create a new storage manager
+    /// Create a new storage manager (encryption at rest disabled)
     pub fn new(path: impl AsRef<Path>, pruning_config: PruningConfig) -> Result<Self> {
         Self::with_config(path, StorageConfig {
             pruning: pruning_config,
@@ -86,9 +76,19 @@ impl StorageManager {
         })
     }
 
-    /// Create storage manager with full configuration
+    /// Create storage manager with full configuration.
+    ///
+    /// With `config.encryption = Some(..)` the underlying RocksDB is opened
+    /// through `RocksDB::open_encrypted`: the key is verified against the
+    /// persisted `encryption.meta` commitment (wrong key → explicit error)
+    /// and every store built on this db (blocks, transactions, state,
+    /// pruner, plus external users of `storage.db`) transparently reads and
+    /// writes encrypted values.
     pub fn with_config(path: impl AsRef<Path>, config: StorageConfig) -> Result<Self> {
-        let db = Arc::new(RocksDB::open(path)?);
+        let db = Arc::new(match &config.encryption {
+            Some(enc_config) => RocksDB::open_encrypted(path, enc_config)?,
+            None => RocksDB::open(path)?,
+        });
 
         let blocks = Arc::new(BlockStore::new(db.clone()));
         let transactions = Arc::new(TransactionStore::new(db.clone()));
@@ -101,13 +101,10 @@ impl StorageManager {
             config.pruning,
         ));
 
-        // Initialize encryption if configured
-        let encryption = config.encryption.map(|enc_config| {
-            Arc::new(EncryptedDatabase::new(enc_config))
-        });
-
-        info!("Storage manager initialized (encryption: {})",
-              encryption.is_some());
+        info!(
+            "Storage manager initialized (encryption at rest: {})",
+            db.is_encrypted()
+        );
 
         Ok(Self {
             db,
@@ -117,35 +114,17 @@ impl StorageManager {
             pruner,
             block_cache: Cache::new(1000),
             state_cache: Cache::new(10000),
-            encryption,
         })
     }
 
-    /// Initialize encryption with password/seed
-    ///
-    /// IMPORTANT: For production, use a high-entropy 256-bit seed
-    /// derived from a secure source (HSM, TPM, or secure key management).
-    pub fn initialize_encryption(&mut self, password: &[u8]) -> Result<()> {
-        if let Some(ref _encryption) = self.encryption {
-            // We need mutable access - use Arc::get_mut or recreate
-            // For now, create a new instance
-            let mut enc = EncryptedDatabase::new(DatabaseEncryptionConfig::default());
-            enc.initialize(password)
-                .map_err(|e| anyhow::anyhow!("Encryption initialization failed: {}", e))?;
-
-            info!("Database encryption initialized with QSSP protocol");
-        }
-        Ok(())
-    }
-
-    /// Check if encryption is enabled and initialized
+    /// Check if encryption at rest is active
     pub fn is_encryption_enabled(&self) -> bool {
-        self.encryption.as_ref().map(|e: &Arc<EncryptedDatabase>| e.is_enabled()).unwrap_or(false)
+        self.db.is_encrypted()
     }
 
-    /// Get encryption statistics
-    pub fn get_encryption_stats(&self) -> Option<EncryptionStats> {
-        self.encryption.as_ref().map(|e: &Arc<EncryptedDatabase>| e.get_stats())
+    /// Get encryption statistics (None when encryption is off)
+    pub fn get_encryption_stats(&self) -> Option<AtRestStats> {
+        self.db.encryption_stats()
     }
 
     /// Start background services (pruning)
