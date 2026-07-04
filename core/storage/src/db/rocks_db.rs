@@ -1,12 +1,15 @@
 // citrate/core/storage/src/db/rocks_db.rs
 
 use super::column_families::all_column_families;
+use crate::crypto::at_rest::{
+    AtRestCipher, AtRestError, AtRestStats, EncryptionAtRestConfig, EncryptionMeta,
+};
 use anyhow::Result;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 // Simpler alias for iterator item type to reduce signature complexity
 type KvItem = (Box<[u8]>, Box<[u8]>);
@@ -23,6 +26,12 @@ type KvItem = (Box<[u8]>, Box<[u8]>);
 /// pattern at lint time.
 pub struct RocksDB {
     db: Arc<DB>,
+    /// Encryption-at-rest cipher (STOR-EAR). `None` = raw plaintext path
+    /// (the default — identical behavior and performance to pre-encryption
+    /// builds). `Some` = every VALUE through get/put/batch/iterator paths
+    /// is sealed/opened with AES-256-GCM; record keys stay plaintext so
+    /// iteration and prefix scans keep working.
+    cipher: Option<Arc<AtRestCipher>>,
     /// Number of `write_batch` (non-fsync) calls — see struct doc.
     write_batch_count: Arc<AtomicU64>,
     /// Number of `write_batch_sync` (fsync) calls — see struct doc.
@@ -30,13 +39,51 @@ pub struct RocksDB {
 }
 
 impl RocksDB {
-    /// Open database with default options
+    /// Open database with default options (no encryption at rest).
+    ///
+    /// Fails with a clear error if the data directory belongs to an
+    /// encrypted database (`encryption.meta` present, or — as a fallback
+    /// when the marker was deleted — a probe read finds sealed values):
+    /// there is no in-place migration in either direction.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if EncryptionMeta::load(path)?.is_some() {
+            return Err(AtRestError::EncryptedDbWithoutEncryption(path.display().to_string()).into());
+        }
+
+        let db = Self::open_inner(path, None)?;
+
+        // Probe read: the meta marker is the primary mismatch guard, but if
+        // it was deleted out-of-band the values would still be sealed. Only
+        // errors when values are found AND all sampled ones look sealed, so
+        // a legitimate plaintext DB cannot trip it.
+        db.probe_for_sealed_values(path)?;
+        Ok(db)
+    }
+
+    /// Open database with encryption at rest enabled.
+    ///
+    /// Key/meta lifecycle (see [`AtRestCipher::open_or_init`]): a fresh
+    /// directory writes `encryption.meta` (KDF salt + key commitment); an
+    /// existing encrypted DB verifies the supplied key against the stored
+    /// commitment and fails with an explicit wrong-key error on mismatch;
+    /// an existing plaintext DB fails with a wipe-and-resync error.
+    pub fn open_encrypted(path: impl AsRef<Path>, config: &EncryptionAtRestConfig) -> Result<Self> {
+        let path = path.as_ref();
+        let cipher = AtRestCipher::open_or_init(path, config)?;
+        let db = Self::open_inner(path, Some(Arc::new(cipher)))?;
+        info!("RocksDB opened with encryption at rest (AES-256-GCM, values only)");
+        Ok(db)
+    }
+
+    fn open_inner(path: &Path, cipher: Option<Arc<AtRestCipher>>) -> Result<Self> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        // Use compression in prod; disable in tests or when feature `no-compression` is set
-        let compression = if cfg!(any(test, feature = "no-compression")) {
+        // Use compression in prod; disable in tests or when feature
+        // `no-compression` is set. Encrypted values are high-entropy and
+        // incompressible, so encryption also disables RocksDB compression.
+        let compression = if cipher.is_some() || cfg!(any(test, feature = "no-compression")) {
             rocksdb::DBCompressionType::None
         } else {
             rocksdb::DBCompressionType::Lz4
@@ -65,9 +112,47 @@ impl RocksDB {
         info!("RocksDB opened successfully");
         Ok(Self {
             db: Arc::new(db),
+            cipher,
             write_batch_count: Arc::new(AtomicU64::new(0)),
             write_batch_sync_count: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Sample the first value of a few high-traffic column families; if
+    /// values exist and every sampled one carries the at-rest envelope
+    /// prefix, this is an encrypted database whose `encryption.meta` went
+    /// missing — refuse the plaintext open.
+    fn probe_for_sealed_values(&self, path: &Path) -> Result<()> {
+        let mut sampled = 0usize;
+        let mut sealed = 0usize;
+        for cf in ["blocks", "accounts", "transactions", "metadata"] {
+            if let Ok(cf_handle) = self.cf_handle(cf) {
+                if let Some(Ok((_, value))) = self
+                    .db
+                    .iterator_cf(&cf_handle, rocksdb::IteratorMode::Start)
+                    .next()
+                {
+                    sampled += 1;
+                    if AtRestCipher::looks_sealed(&value) {
+                        sealed += 1;
+                    }
+                }
+            }
+        }
+        if sampled > 0 && sealed == sampled {
+            return Err(AtRestError::EncryptedValuesWithoutMeta(path.display().to_string()).into());
+        }
+        Ok(())
+    }
+
+    /// Whether encryption at rest is active for this database.
+    pub fn is_encrypted(&self) -> bool {
+        self.cipher.is_some()
+    }
+
+    /// Encryption counters (None when encryption is off).
+    pub fn encryption_stats(&self) -> Option<AtRestStats> {
+        self.cipher.as_ref().map(|c| c.stats())
     }
 
     /// REM-2 / WP-H1.3: number of non-fsync `write_batch` calls observed
@@ -84,16 +169,25 @@ impl RocksDB {
         self.write_batch_sync_count.load(AtomicOrdering::Relaxed)
     }
 
-    /// Get a value from a column family
+    /// Get a value from a column family (decrypted when encryption is on)
     pub fn get_cf(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let cf_handle = self.cf_handle(cf)?;
-        Ok(self.db.get_cf(&cf_handle, key)?)
+        let value = self.db.get_cf(&cf_handle, key)?;
+        match (&self.cipher, value) {
+            (Some(cipher), Some(stored)) => Ok(Some(cipher.open_value(cf, key, &stored)?)),
+            (_, value) => Ok(value),
+        }
     }
 
-    /// Put a value in a column family
+    /// Put a value in a column family (encrypted when encryption is on)
     pub fn put_cf(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()> {
         let cf_handle = self.cf_handle(cf)?;
-        self.db.put_cf(&cf_handle, key, value)?;
+        match &self.cipher {
+            Some(cipher) => self
+                .db
+                .put_cf(&cf_handle, key, cipher.seal(cf, key, value)?)?,
+            None => self.db.put_cf(&cf_handle, key, value)?,
+        }
         Ok(())
     }
 
@@ -104,9 +198,11 @@ impl RocksDB {
         Ok(())
     }
 
-    /// Check if a key exists in a column family
+    /// Check if a key exists in a column family (presence check on the
+    /// stored bytes — never decrypts)
     pub fn exists_cf(&self, cf: &str, key: &[u8]) -> Result<bool> {
-        Ok(self.get_cf(cf, key)?.is_some())
+        let cf_handle = self.cf_handle(cf)?;
+        Ok(self.db.get_pinned_cf(&cf_handle, key)?.is_some())
     }
 
     /// Write a batch of operations atomically with the default
@@ -151,7 +247,7 @@ impl RocksDB {
         WriteBatch::default()
     }
 
-    /// Add put operation to batch
+    /// Add put operation to batch (encrypted when encryption is on)
     pub fn batch_put_cf(
         &self,
         batch: &mut WriteBatch,
@@ -160,7 +256,10 @@ impl RocksDB {
         value: &[u8],
     ) -> Result<()> {
         let cf_handle = self.cf_handle(cf)?;
-        batch.put_cf(&cf_handle, key, value);
+        match &self.cipher {
+            Some(cipher) => batch.put_cf(&cf_handle, key, cipher.seal(cf, key, value)?),
+            None => batch.put_cf(&cf_handle, key, value),
+        }
         Ok(())
     }
 
@@ -171,26 +270,63 @@ impl RocksDB {
         Ok(())
     }
 
-    /// Get iterator for a column family
+    /// Decrypt an iterator item when encryption is on. Mirrors the
+    /// existing `.filter_map(|r| r.ok())` error-swallowing semantics for
+    /// storage-level errors: an undecryptable value is logged and skipped
+    /// (a wrong key can never reach here — it is rejected at open time by
+    /// the encryption.meta key commitment).
+    fn map_iter_item(
+        cipher: &Option<Arc<AtRestCipher>>,
+        cf: &str,
+        item: KvItem,
+    ) -> Option<KvItem> {
+        match cipher {
+            None => Some(item),
+            Some(cipher) => {
+                let (key, stored) = item;
+                match cipher.open_value(cf, &key, &stored) {
+                    Ok(plain) => Some((key, plain.into_boxed_slice())),
+                    Err(e) => {
+                        error!(
+                            "skipping undecryptable value in cf '{}' (key {}): {}",
+                            cf,
+                            hex::encode(&key[..key.len().min(16)]),
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get iterator for a column family (values decrypted when encryption is on)
     pub fn iter_cf(&self, cf: &str) -> Result<impl Iterator<Item = KvItem> + '_> {
         let cf_handle = self.cf_handle(cf)?;
+        let cipher = self.cipher.clone();
+        let cf_name = cf.to_string();
         Ok(self
             .db
             .iterator_cf(&cf_handle, rocksdb::IteratorMode::Start)
-            .filter_map(|r| r.ok()))
+            .filter_map(|r| r.ok())
+            .filter_map(move |item| Self::map_iter_item(&cipher, &cf_name, item)))
     }
 
-    /// Get iterator with prefix for a column family
+    /// Get iterator with prefix for a column family (values decrypted when
+    /// encryption is on)
     pub fn prefix_iter_cf(
         &self,
         cf: &str,
         prefix: &[u8],
     ) -> Result<impl Iterator<Item = KvItem> + '_> {
         let cf_handle = self.cf_handle(cf)?;
+        let cipher = self.cipher.clone();
+        let cf_name = cf.to_string();
         Ok(self
             .db
             .prefix_iterator_cf(&cf_handle, prefix)
-            .filter_map(|r| r.ok()))
+            .filter_map(|r| r.ok())
+            .filter_map(move |item| Self::map_iter_item(&cipher, &cf_name, item)))
     }
 
     /// Compact a column family
@@ -232,6 +368,7 @@ impl Clone for RocksDB {
     fn clone(&self) -> Self {
         Self {
             db: Arc::clone(&self.db),
+            cipher: self.cipher.clone(),
             write_batch_count: Arc::clone(&self.write_batch_count),
             write_batch_sync_count: Arc::clone(&self.write_batch_sync_count),
         }

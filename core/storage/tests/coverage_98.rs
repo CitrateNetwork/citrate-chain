@@ -1057,10 +1057,17 @@ fn storage_manager_with_config() {
 }
 
 #[test]
-fn storage_manager_maximum_security_config() {
-    let config = StorageConfig::maximum_security("test-node".to_string());
+fn storage_manager_encrypted_config_enables_encryption() {
+    use citrate_storage::crypto::at_rest::EncryptionAtRestConfig;
+
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::default()
+        .with_encryption(EncryptionAtRestConfig::with_raw_key([42u8; 32]));
     assert!(config.encryption.is_some());
-    assert!(config.encryption.unwrap().enabled);
+
+    let mgr = StorageManager::with_config(tmp.path(), config).unwrap();
+    assert!(mgr.is_encryption_enabled());
+    assert!(mgr.get_encryption_stats().is_some());
 }
 
 #[test]
@@ -1132,22 +1139,9 @@ fn storage_manager_persistence() {
 
 #[test]
 fn storage_config_with_encryption_builder() {
-    use citrate_storage::crypto::database_encryption::DatabaseEncryptionConfig;
+    use citrate_storage::crypto::at_rest::EncryptionAtRestConfig;
 
     let config = StorageConfig::default()
-        .with_encryption(DatabaseEncryptionConfig {
-            enabled: true,
-            node_id: "my-node".to_string(),
-            ..Default::default()
-        });
+        .with_encryption(EncryptionAtRestConfig::with_password("my-passphrase"));
     assert!(config.encryption.is_some());
-}
-
-#[test]
-fn storage_manager_initialize_encryption_noop_without_config() {
-    let tmp = TempDir::new().unwrap();
-    let mut mgr = StorageManager::new(tmp.path(), PruningConfig::default()).unwrap();
-    // No encryption configured, should be a no-op
-    mgr.initialize_encryption(b"password").unwrap();
-    assert!(!mgr.is_encryption_enabled());
 }
