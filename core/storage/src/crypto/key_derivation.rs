@@ -350,33 +350,29 @@ impl MasterKeyDerivation {
         expected == key.commitment
     }
 
-    /// Argon2id key derivation (simplified - uses SHA3 until argon2 crate is added)
+    /// Argon2id key derivation (memory-hard, RFC 9106) via the `argon2` crate.
+    ///
+    /// Data source: pure KDF — password + `self.params.salt` +
+    /// `self.params.argon2` cost parameters. Replaces the pre-wiring
+    /// SHA3-iteration placeholder (which was NOT memory-hard and was
+    /// mislabeled as Argon2id).
     fn argon2id_derive(&self, password: &[u8]) -> Result<[u8; 32], KeyDerivationError> {
-        // In production, use the argon2 crate:
-        // use argon2::{Argon2, Params, Algorithm, Version};
-        // let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        // argon2.hash_password_into(password, &salt, &mut key)?;
+        use argon2::{Algorithm, Argon2, Params, Version};
 
-        // For now, use a secure but simpler construction
-        // PBKDF2-like iteration with SHA3-512
-        let iterations = self.params.argon2.time_cost * 10000;
-        let mut current = Vec::with_capacity(password.len() + self.params.salt.len() + 8);
-        current.extend_from_slice(password);
-        current.extend_from_slice(&self.params.salt);
-        current.extend_from_slice(b"QSSP-v1");
+        let params = Params::new(
+            self.params.argon2.memory_cost,
+            self.params.argon2.time_cost,
+            self.params.argon2.parallelism,
+            Some(32),
+        )
+        .map_err(|_| KeyDerivationError::InvalidParameters)?;
 
-        for i in 0..iterations {
-            let mut hasher = Sha3_512::new();
-            hasher.update(&current);
-            hasher.update(i.to_be_bytes());
-            current = hasher.finalize().to_vec();
-        }
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
         let mut key = [0u8; 32];
-        key.copy_from_slice(&current[..32]);
-
-        // Zero out the intermediate value
-        current.iter_mut().for_each(|b| *b = 0);
+        argon2
+            .hash_password_into(password, &self.params.salt, &mut key)
+            .map_err(|_| KeyDerivationError::DerivationFailed)?;
 
         Ok(key)
     }
