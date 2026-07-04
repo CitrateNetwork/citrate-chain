@@ -337,6 +337,21 @@ Gas Fees → 10% Market Maker (pre-split)
 - **Testnet RPC**: https://rpc.citrate.ai
 - **Block time**: 2 seconds (testnet), 1 second (devnet)
 
+#### Canonical RPC ports
+
+These are the platform-wide canonical values — treat this section as the
+source of truth for any client default, SDK, wallet, or docs:
+
+- **Local node HTTP JSON-RPC**: `8545` (loopback default; binds `0.0.0.0`
+  only on fleet/devnet)
+- **Local node WebSocket**: `8546`
+- **Public HTTP RPC**: `https://rpc.citrate.ai` (443 → Caddy → node
+  `127.0.0.1:8545`); **Public WS**: `wss://rpc.citrate.ai` (443 → `:8546`)
+- **Co-resident 2nd instance**: apply a **+10000** host-side offset
+  (`18545`/`18546`) — this is ONLY for docker host-port maps and multi-node
+  test harnesses, never a client default or a server bind. `18545` is
+  retired as a client default everywhere.
+
 ---
 
 ## 11. Storage Layer

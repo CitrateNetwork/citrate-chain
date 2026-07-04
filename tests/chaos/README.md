@@ -7,7 +7,8 @@ stress scenarios against a local devnet to verify resilience and recovery.
 
 - Node binary at `target/release/citrate` (build with `cargo build --release -p citrate-node`)
 - `curl` and `python3` for RPC calls and JSON validation
-- Ports 8545 (single-node) and 18545-18546 + 30403-30404 (multi-node) must be free
+- Ports 8545/8546 (single-node RPC/WS) and, for multi-node tests, node 2's
+  8555/8556 (RPC/WS) + 30303-30304 (P2P) must be free
 
 ## Scenarios
 
