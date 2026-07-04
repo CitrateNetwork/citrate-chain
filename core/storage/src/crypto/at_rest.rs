@@ -22,7 +22,8 @@
 //   enabled (or an encrypted DB without) fails with an error telling the
 //   operator to wipe-and-resync. See `RocksDB::open`/`open_encrypted`.
 //
-// Nonce bound: nonces are 96-bit random (OsRng). NIST SP 800-38D limits
+// Nonce bound: nonces are 96-bit random (thread-local CSPRNG, OS-seeded).
+// NIST SP 800-38D limits
 // random-nonce AES-GCM to 2^32 encryptions per key; per-CF subkeys
 // partition writes across 20+ keys, keeping each far below the bound for
 // the desktop-node workload this mode targets. Key rotation (wipe-and-
@@ -521,8 +522,11 @@ impl AtRestCipher {
     pub fn seal(&self, cf: &str, record_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AtRestError> {
         let cipher = self.cipher_for(cf);
 
+        // thread_rng is a CSPRNG (ChaCha12, periodically reseeded from the
+        // OS): cryptographically sound for nonce generation and avoids a
+        // getrandom syscall on every write (hot path).
         let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce);
+        rand::thread_rng().fill_bytes(&mut nonce);
 
         let aad = Self::aad(cf, record_key);
         let ciphertext = cipher
