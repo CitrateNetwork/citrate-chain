@@ -10,7 +10,7 @@ NODE_BIN="${SCRIPT_DIR}/../../target/release/citrate"
 DATA_DIR_1=$(mktemp -d /tmp/citrate-chaos-02-node1.XXXXXX)
 DATA_DIR_2=$(mktemp -d /tmp/citrate-chaos-02-node2.XXXXXX)
 RPC_URL_1="http://127.0.0.1:8545"
-RPC_URL_2="http://127.0.0.1:8546"
+RPC_URL_2="http://127.0.0.1:8555"
 NODE_PID_1=""
 NODE_PID_2=""
 
@@ -64,8 +64,8 @@ echo "[1/6] Starting node 1 (port 8545)..."
 NODE_PID_1=$!
 wait_for_rpc "$RPC_URL_1" 30
 
-echo "[2/6] Starting node 2 (port 8546) with node 1 as peer..."
-"$NODE_BIN" devnet --data-dir "$DATA_DIR_2" --rpc-port 8546 --p2p-port 30304 \
+echo "[2/6] Starting node 2 (port 8555) with node 1 as peer..."
+"$NODE_BIN" devnet --data-dir "$DATA_DIR_2" --rpc-port 8555 --p2p-port 30304 \
   --peers "127.0.0.1:30303" \
   > "${DATA_DIR_2}/node.log" 2>&1 &
 NODE_PID_2=$!
