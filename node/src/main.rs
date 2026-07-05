@@ -1230,6 +1230,31 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             }
         }
     };
+    // PIL-42 (write/init half): genesis is written to the chain store
+    // (genesis.rs:165 put_block) but never the DAG store, so on a fresh chain
+    // the producer seals block 1 with a zero selected-parent and orphans
+    // genesis — the defect that halted testnet-beta at height 231788. Seed
+    // genesis as the DAG height-0 root whenever the DAG has no tips. Idempotent:
+    // a healthy restart already has tips (skipped); the load-time reconcile in
+    // DagStore repairs any pre-existing corrupted tip set. Together they close
+    // the orphan-genesis class at both the write and read seams.
+    if shared_dag_store.get_tips().await.is_empty() {
+        match storage.blocks.get_block_by_height(0) {
+            Ok(Some(genesis_hash)) => match storage.blocks.get_block(&genesis_hash) {
+                Ok(Some(genesis_block)) => match shared_dag_store.store_block(genesis_block).await {
+                    Ok(()) => info!(
+                        "Seeded genesis into DAG store as height-0 root (fresh-chain init; block 1 will link to genesis)"
+                    ),
+                    Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {}
+                    Err(e) => warn!("Failed to seed genesis into DAG store: {}", e),
+                },
+                Ok(None) => warn!("Genesis hash indexed but block missing; DAG not seeded"),
+                Err(e) => warn!("Failed to read genesis block for DAG seed: {}", e),
+            },
+            Ok(None) => {} // pre-genesis boot — nothing to seed yet
+            Err(e) => warn!("Failed to query genesis height for DAG seed: {}", e),
+        }
+    }
     let shared_ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), shared_dag_store.clone()));
 
     // WP-W.1: Create CheckpointManager for BFT finality vote handling
