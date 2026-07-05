@@ -1323,6 +1323,62 @@ mod tests {
         );
     }
 
+    /// PIL-42 (write/init half): counterpart to the orphan test. When genesis
+    /// is seeded into the DAG *first* (as the node now does on a fresh re-roll,
+    /// node/src/main.rs), it is the sole height-0 tip, so block 1 links to
+    /// genesis (not the zero hash). Genesis then has a child and is never a
+    /// phantom second tip — the wedge cannot form. Locks in the write seam.
+    #[tokio::test]
+    async fn test_pil42_seeded_genesis_links_block1_no_orphan() {
+        let kv = Arc::new(MemKvStore::new());
+        let store = DagStore::persistent_with_strict_vrf(kv.clone(), false)
+            .expect("persistent store construction should succeed");
+
+        // A fresh DAG has no tips — the exact condition the node checks before
+        // seeding genesis.
+        assert!(
+            store.get_tips().await.is_empty(),
+            "a fresh DAG must have no tips before genesis is seeded"
+        );
+
+        // Seed genesis (height 0, zero parent) — the write/init half of the fix.
+        let genesis = create_test_block([0xFF; 32], 0, Hash::default());
+        let genesis_hash = genesis.hash();
+        store.store_block(genesis).await.expect("seed genesis");
+        let tips = store.get_tips().await;
+        assert_eq!(tips.len(), 1, "seeded genesis must be the sole tip");
+        assert_eq!(tips[0].hash, genesis_hash, "genesis is the height-0 root tip");
+
+        // Block 1 now links to genesis (parent = genesis_hash, NOT the zero hash).
+        let b1 = create_test_block([1; 32], 1, genesis_hash);
+        let b1_hash = b1.hash();
+        store.store_block(b1).await.expect("store b1 linked to genesis");
+
+        // Genesis has a child ⇒ no longer a tip; block 1 is the sole tip.
+        let tips = store.get_tips().await;
+        assert_eq!(
+            tips.len(),
+            1,
+            "exactly one tip once block 1 links genesis (got {:?})",
+            tips.iter().map(|t| t.hash).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tips[0].hash, b1_hash,
+            "block 1 is the sole tip; genesis is not orphaned"
+        );
+
+        // Survives a reload — parity with the read/repair half.
+        drop(store);
+        let store2 = DagStore::persistent_with_strict_vrf(kv, false)
+            .expect("reload should succeed");
+        let tips = store2.get_tips().await;
+        assert_eq!(tips.len(), 1, "one tip after reload");
+        assert_eq!(
+            tips[0].hash, b1_hash,
+            "head remains the sole tip after reload"
+        );
+    }
+
     /// WP-S.1: Finalization state survives restart.
     #[tokio::test]
     async fn test_s1_finalization_persistence() {
