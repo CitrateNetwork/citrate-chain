@@ -5,7 +5,7 @@
   "rpcUrl": "https://rpc.citrate.ai",
   "explorerUrl": "https://explorer.citrate.ai",
   "deployer": "0x4250675F9015E65fC866F3a373F82bb9DFc000c6",
-  "deployedAt": "2026-06-29T17:48:12Z",
+  "deployedAt": "2026-07-05T06:49:31Z",
   "regenerator": "scripts/ops/emit-address-table.sh",
   "comment": "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
   "contracts": {
@@ -52,13 +52,14 @@
     "IPFSIncentivesV3": "0x629f7cd4aeade49e4b27c9a39237d132f9ff39f4",
     "AggregationChallenge": "0xe7d7ebe1242feec29d514b00c9272fbffc9e69be",
     "ComputePoolPipeline": "0xc2ddf9dd186781697ed9c16af3bb36e42a79f4ad",
-    "EduForwarder": "0xe9fffad1c2442179cfe6264d71c6caf75d0f2f1a"
+    "EduForwarder": "0xe9fffad1c2442179cfe6264d71c6caf75d0f2f1a",
+    "CitrateCooperativeFactory": "0x6fe6fd2aa92e9c8b996258671647b5369b366aa4"
   },
   "aaStack": {
-    "EntryPoint": "0x575d0d85e272eca8784a4D11F4713C698082c807",
-    "CitrateWallet": "0x21af0fd5b3cb383e20d07c4cf6f3269320c70ef1",
-    "CitrateWalletFactory": "0xdd5f4fcbbee7a744e583d64ade54d085092cf649",
-    "CitratePaymaster": "0x7a9adb27578d6837b8b7e4c9ad953bb328f4fd69",
+    "EntryPoint": "0x077Fbc3338A9e6BAD90A3A041E6b7425689754Ef",
+    "CitrateWallet": "0xe641a41b02f1ff114481d357d148be4519830087",
+    "CitrateWalletFactory": "0x9c0c25d4355fae68679711ea99b7642bf3e9a68a",
+    "CitratePaymaster": "0x884c47518a21496d17d4dae62e96239b06177d28",
     "WebAuthnP256Validator": "0x97ff6d1c4d2f4337ec09f2a1c01808016f728def",
     "CitrateECDSAValidator": "0xd2d35421379ae5b461e216bfcdd1b7e6a64bbc40",
     "GuardianRecoveryModule": "0x381b5848f3b5d73ff67b745624780a43682456ce"
