@@ -193,8 +193,8 @@ if ! mv "$TMP" "$ENV_TESTNET"; then
 fi
 
 log ""
-log "post-redeploy state of CITRATE_AA_* pins in $ENV_TESTNET:"
-grep -E '^CITRATE_AA_' "$ENV_TESTNET" | sed 's/^/  /'
+log "post-redeploy state of CITRATE_AA_* pins in $ENV_TESTNET (secrets redacted):"
+grep -E '^CITRATE_AA_' "$ENV_TESTNET" | grep -vE '(_KEY|_MNEMONIC|_PRIVATE|_SECRET)=' | sed 's/^/  /'
 
 log ""
 log "✓ redeploy complete. Next steps:"
