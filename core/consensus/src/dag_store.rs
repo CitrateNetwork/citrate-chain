@@ -317,6 +317,59 @@ impl DagStore {
             _ => Hash::default(),
         };
 
+        // PIL-42: Reconstruct the tip set from authoritative block-header
+        // parentage rather than trusting the persisted `dag_tips` CF, and drop
+        // the orphaned genesis block if present.
+        //
+        // Root cause of the wedge this heals: the i64 re-roll created genesis
+        // in the *chain* store but not the *DAG* store (the DAG-aware
+        // `initialize_genesis_with_dag` is dead code), so when the producer
+        // sealed block 1 the DAG had no tips and block 1's selected parent
+        // defaulted to the zero hash instead of genesis. Genesis is therefore
+        // an orphaned island — no block names it as a parent — so it reads as
+        // a permanent second tip alongside the real head. Two tips force the
+        // producer off its `select_tip` fast path onto the O(N)
+        // `calculate_blue_set` walk (the allocation PIL-13 removed from the
+        // eager-load path), which never seals and OOM-thrashes the box.
+        //
+        // A block is a tip iff no other block names it as a selected- or
+        // merge-parent. The genesis block (height 0) is the DAG root and is
+        // never a valid producer tip once the chain has advanced (in a healthy
+        // DAG it has a child and is excluded anyway); exclude it unless it is
+        // the only block (fresh-chain bootstrap). Zero-hash parents (genesis
+        // and the orphaned block 1) are not real blocks and are ignored. This
+        // is authoritative and self-heals a corrupted `dag_tips` CF on load.
+        let mut non_tip_parents: HashSet<Hash> = HashSet::new();
+        for block in blocks.values() {
+            let sp = block.selected_parent();
+            if sp != Hash::default() {
+                non_tip_parents.insert(sp);
+            }
+            for merge_parent in &block.header.merge_parent_hashes {
+                if *merge_parent != Hash::default() {
+                    non_tip_parents.insert(*merge_parent);
+                }
+            }
+        }
+        let only_block = blocks.len() == 1;
+        let mut derived_tips: HashSet<Hash> = HashSet::new();
+        for (hash, block) in &blocks {
+            let has_children = non_tip_parents.contains(hash);
+            let is_root_genesis = block.header.height == 0 && !only_block;
+            if !has_children && !is_root_genesis {
+                derived_tips.insert(*hash);
+            }
+        }
+        if derived_tips != tips {
+            warn!(
+                "DAG tip set reconciled on load: {} persisted tip(s) -> {} derived \
+                 from block headers (dropped orphaned/phantom tips)",
+                tips.len(),
+                derived_tips.len()
+            );
+            tips = derived_tips;
+        }
+
         // Populate in-memory state
         // These try_write() calls are made during construction (before the DagStore is shared),
         // so the locks should never be contended. We use map_err to surface any poisoning as a
@@ -1223,6 +1276,51 @@ mod tests {
         let tips2 = store2.get_tips().await;
         assert_eq!(tips2.len(), 1);
         assert_eq!(tips2[0].hash, child_hash);
+    }
+
+    /// PIL-42 regression: reproduces the production wedge where genesis is an
+    /// orphaned island. The i64 re-roll put genesis in the chain store but not
+    /// the DAG store, so block 1 was sealed with a ZERO-hash selected parent
+    /// instead of genesis. Genesis then has no children and reads as a
+    /// permanent second tip alongside the head; two tips force the producer
+    /// onto the O(N) `calculate_blue_set` walk and wedge sealing / OOM the box.
+    /// On load, the height-0 orphan genesis must be excluded so only the head
+    /// remains a tip.
+    #[tokio::test]
+    async fn test_pil42_orphan_genesis_excluded_from_tips_on_load() {
+        let kv = Arc::new(MemKvStore::new());
+        let store = DagStore::persistent_with_strict_vrf(kv.clone(), false)
+            .expect("persistent store construction should succeed");
+
+        // Genesis (height 0, zero parent).
+        let genesis = create_test_block([0xFF; 32], 0, Hash::default());
+        store.store_block(genesis).await.expect("store genesis");
+
+        // The real head chain, rooted at a block whose selected parent is the
+        // ZERO hash (not genesis) — exactly the orphan the re-roll produced.
+        let b1 = create_test_block([1; 32], 1, Hash::default());
+        let b1_hash = b1.hash();
+        store.store_block(b1).await.expect("store b1 (orphan root)");
+        let b2 = create_test_block([2; 32], 2, b1_hash);
+        let b2_hash = b2.hash();
+        store.store_block(b2).await.expect("store b2 (head)");
+
+        // On disk this leaves the wedged state: two tips {genesis, head}.
+        // Reload with the fix — the height-0 orphan genesis must be dropped.
+        drop(store);
+        let store2 = DagStore::persistent_with_strict_vrf(kv, false)
+            .expect("reload should succeed");
+        let tips = store2.get_tips().await;
+        assert_eq!(
+            tips.len(),
+            1,
+            "orphan genesis must be excluded; only the head should remain a tip (got {:?})",
+            tips.iter().map(|t| t.hash).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tips[0].hash, b2_hash,
+            "the head must be the sole surviving tip"
+        );
     }
 
     /// WP-S.1: Finalization state survives restart.
