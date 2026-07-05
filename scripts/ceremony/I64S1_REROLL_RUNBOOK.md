@@ -119,7 +119,10 @@ cd /home/saul/Projects/Citrate-Labs/citrate-chain
 forge create lib/account-abstraction/contracts/core/EntryPoint.sol:EntryPoint \
   --rpc-url "$RPC_URL" \
   --private-key "$(grep '^DEPLOYER_PRIVATE_KEY=' /home/saul/Projects/Citrate-Labs/.env.testnet | head -1 | cut -d= -f2-)" \
+  --gas-limit 6000000 \
   --broadcast
+# --gas-limit is REQUIRED: this node's eth_estimateGas returns 21000 (base) for
+# contract creation, so WITHOUT it the create mines with status 0 / no code.
 # Capture the address → update CITRATE_AA_ENTRY_POINT in .env.testnet.
 ```
 
