@@ -67,18 +67,19 @@ contract WireBfrOperators is Script {
     // ── Live addresses (chain 40204, deployed 2026-05-10) ───────────
 
     // Stage 1 — BFR-02 RBAC
-    address constant TENANT_HIERARCHY            = 0x3FF095445b382075971fD5D3e05FD8bB3FF8006C;
-    address constant CLASSIFICATION_REGISTRY     = 0x933E6f4d28E3ebeD462227522d839A77C85B4c06;
-    address constant ROLE_ESCALATION             = 0x3130B9494Dc9c9253078176917cF4CDdcEf48337;
-    address constant MULTISIG_ENVELOPE           = 0x05825775315f3d074db9F948713D05059e12a8Fd;
-    address constant AGENT_DECISION_REGISTRY_V2  = 0x4a86659BDab24dc444C72fbbaD4cd83491820E40;
-    address constant CONTRADICTION_LEDGER        = 0x25051e90A110fbE4569f124274ce387eB033bC9c;
+    // Repointed 2026-07-03 to the fresh BFR-DEMO deploy on 40204 (harvest_bfr_addresses.sh).
+    address constant TENANT_HIERARCHY            = 0x9101f6f1AB0A9FFF84e61B8D9E426E22723bc765;
+    address constant CLASSIFICATION_REGISTRY     = 0xd4b1680684106888b7c55d19fB236b41c192340e;
+    address constant ROLE_ESCALATION             = 0xC9B8c0bd4BDf70502095276dEE2b3f4d5da1488e;
+    address constant MULTISIG_ENVELOPE           = 0x01f6293FEB59C5950A484F35CE4317B40d8F76be;
+    address constant AGENT_DECISION_REGISTRY_V2  = 0xb524C66176f11613c3A43b0B7DB796cce607C013;
+    address constant CONTRADICTION_LEDGER        = 0x8997e9838Fe5BB451d9D518FaEF5e4Bac49e341D;
 
     // Stages 2-4 — Boeing-side
-    address constant PART_PROVENANCE_REGISTRY    = 0xF0dCa50F418acFb8917D71d8bB65393308629381;
-    address constant SUPPLIER_REGISTRY           = 0xdE991179021A208cF7E6caeBF3a07c229aEd3D0F;
-    address constant MOQ_REGISTRY                = 0x575d0d85e272eca8784a4D11F4713C698082c807;
-    address constant BOEING_FL_SCOPE_INDEX       = 0x26BAD758EAC1bac02457F8e4544269b8B52BC5d7;
+    address constant PART_PROVENANCE_REGISTRY    = 0xb0c35160C8d49fB589dd7FED1b8737F885d9e60a;
+    address constant SUPPLIER_REGISTRY           = 0xB2bD1c4084341f04b34e8EAb01D3cAF776816306;
+    address constant MOQ_REGISTRY                = 0xc6955562E15E822F0177618052c1Abe15BE1789C;
+    address constant BOEING_FL_SCOPE_INDEX       = 0x5c24659E68285497E43F18C429151E902abf528A;
 
     function _recorder() internal view returns (address) {
         try vm.envAddress("OPERATOR_RECORDER") returns (address r) {
