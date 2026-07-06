@@ -55,73 +55,74 @@ contract SeedBoeingState is Script {
     // ── Stage-N address constants (from .agentile/CONFIG.md) ───────
 
     // Stage-1: RBAC foundation
+    // Repointed 2026-07-03 to the fresh BFR-DEMO deploy on 40204 (harvest_bfr_addresses.sh).
     ClassificationRegistry constant CLASS = ClassificationRegistry(
-        0x933E6f4d28E3ebeD462227522d839A77C85B4c06
+        0xd4b1680684106888b7c55d19fB236b41c192340e
     );
     RoleEscalation constant ROLE_ESC = RoleEscalation(
-        0x3130B9494Dc9c9253078176917cF4CDdcEf48337
+        0xC9B8c0bd4BDf70502095276dEE2b3f4d5da1488e
     );
     MultiSigEnvelope constant MSE = MultiSigEnvelope(
-        0x05825775315f3d074db9F948713D05059e12a8Fd
+        0x01f6293FEB59C5950A484F35CE4317B40d8F76be
     );
     AgentDecisionRegistryV2 constant ADR = AgentDecisionRegistryV2(
-        0x4a86659BDab24dc444C72fbbaD4cd83491820E40
+        0xb524C66176f11613c3A43b0B7DB796cce607C013
     );
     ContradictionLedger constant CL = ContradictionLedger(
-        0x25051e90A110fbE4569f124274ce387eB033bC9c
+        0x8997e9838Fe5BB451d9D518FaEF5e4Bac49e341D
     );
 
     // BFR-05 / 06 / 07
     PartProvenanceRegistry constant PROV = PartProvenanceRegistry(
-        0xF0dCa50F418acFb8917D71d8bB65393308629381
+        0xb0c35160C8d49fB589dd7FED1b8737F885d9e60a
     );
     SupplierRegistry constant SUP = SupplierRegistry(
-        0xdE991179021A208cF7E6caeBF3a07c229aEd3D0F
+        0xB2bD1c4084341f04b34e8EAb01D3cAF776816306
     );
     MoqRegistry constant MOQ = MoqRegistry(
-        0x575d0d85e272eca8784a4D11F4713C698082c807
+        0xc6955562E15E822F0177618052c1Abe15BE1789C
     );
     BoeingFLScopeIndex constant FL_IDX = BoeingFLScopeIndex(
-        0x26BAD758EAC1bac02457F8e4544269b8B52BC5d7
+        0x5c24659E68285497E43F18C429151E902abf528A
     );
 
     // BFR-09 / 10 / 11
     AppRegistry constant APP = AppRegistry(
-        0xdAff2B9DC254B6CB3040F8f14304d30E136fa136
+        0xE0f9d7Bd15613eD7B27F2C6a77EB47e39A73c545
     );
     CrossOrgIndex constant COI = CrossOrgIndex(
-        0xb87a4F754CA316D2416553d04F4edEd26424B536
+        0x0487f8A9688B4A3f576BF2aEC31321E2d73e0CAE
     );
     AuditBundleRegistry constant ABR = AuditBundleRegistry(
-        0xcEdfd8D76E0d755E9BC93a06FA339c397b70F38D
+        0x8Ec50f940256EEA578C540Fd9887aC241AECecdc
     );
     BoeingComplianceRegistry constant BCR = BoeingComplianceRegistry(
-        0x8dbbbc46D840f40205b48D76aA9FC5063B7D55D8
+        0x13fBc55C285737FefFD8Ab539440DC111d58bA2a
     );
     RoleGrantTenantIndex constant RGTI = RoleGrantTenantIndex(
-        0x1F7a33edF743349d1cb86Ea3A219f6Beb3e647C8
+        0x86F61cBFD487AAe861Fe12bf42a04a726f5320FE
     );
 
     // BFR-12 / 13 / 14
     EntityRegistry constant ENT = EntityRegistry(
-        0x16041DDF6cdb49d3A2D46dA23b5C5820BBD92a66
+        0xef31c8AA595f4015CEAA6fA108c62597b8FDd145
     );
     TinaWorkpaperRegistry constant TWR = TinaWorkpaperRegistry(
-        0xc503fDb502d40c7317aFE1285209e0508A5cC63F
+        0xba74Ca5c325F2150A3fbBE3bFbE86D1970e50904
     );
     ICrossOrgEnvelopeV1 constant COE = ICrossOrgEnvelopeV1(
-        0x9871e73a189885f87C9C9eC41a6B0C98175C99F8
+        0x6a2e7355BC4C2DBf87758eCF9890C2EfAa500d03
     );
 
     // BFR-15 / 16 / 17
     TripwireRegistry constant TW = TripwireRegistry(
-        0xA37091480Df4d380D1D2eEe58ead6B3a014FE70F
+        0xA8b7Bf4c911EA77D3B7e5e3D5FE0b7EDf275C651
     );
     SponsorEvidenceRegistry constant SE = SponsorEvidenceRegistry(
-        0xf9D198E1280B0D1952e4fF63BD87bcae44b4F82e
+        0xE190e4608e9132548E873c977cD16555A746Ab96
     );
     ReleaseManifestRegistry constant REL = ReleaseManifestRegistry(
-        0xb92f631bB7f16763C00E52d95f5627806A1284F6
+        0x54347fF2f43505204d154f36F126EaBfA86a91Fe
     );
 
     // ── Mock entity constants ──────────────────────────────────────
@@ -452,9 +453,11 @@ contract SeedBoeingState is Script {
                 );
                 prev = stepId;
             }
-            // Link first part to a tail number
+            // Link first part to a tail number. Tails must be registered
+            // before a part can be linked (else TailDoesNotExist).
             if (p < 2) {
                 bytes32 tail = keccak256(abi.encodePacked("tail-N", _utoa(7340 + p)));
+                PROV.registerTail(tail);
                 PROV.linkPartToTail(partHash, tail);
             }
         }
@@ -591,6 +594,9 @@ contract SeedBoeingState is Script {
             keccak256("ipfs-fedramp-high-wip"),
             0
         );
+        // CMMC L3: attest (2) first, then move to Exception (3). The state
+        // machine disallows a direct 0→3 transition (NotAttempted→Exception).
+        BCR.attest(FRAMEWORK_CMMC_L3, BCA_SCOPE, 2, keccak256("ipfs-cmmc-attested"), 0);
         BCR.attest(
             FRAMEWORK_CMMC_L3,
             BCA_SCOPE,
@@ -598,6 +604,8 @@ contract SeedBoeingState is Script {
             keccak256("ipfs-cmmc-waiver"),
             block.number + 360_000 // ~30 days at 0.5s blocks
         );
+        // ITAR: attest (2) first, then Failed (4). Direct 0→4 is disallowed.
+        BCR.attest(FRAMEWORK_ITAR, LINE_787, 2, keccak256("ipfs-itar-attested"), 0);
         BCR.attest(
             FRAMEWORK_ITAR,
             LINE_787,
@@ -614,8 +622,9 @@ contract SeedBoeingState is Script {
         ENT.registerType(BCA_SCOPE, "Person", "Identity record (HR)", keccak256("ipfs-schema-person"));
         ENT.registerType(LINE_787, "Contract", "Procurement contract", keccak256("ipfs-schema-contract"));
 
-        // Bump one schema version
-        bytes32 partTypeId = keccak256(abi.encodePacked(BCA_SCOPE, "Part"));
+        // Bump one schema version. type_id must match EntityRegistry's
+        // derivation: keccak256(abi.encode(scope, name)) — NOT encodePacked.
+        bytes32 partTypeId = keccak256(abi.encode(BCA_SCOPE, "Part"));
         ENT.bumpSchema(partTypeId, keccak256("ipfs-schema-part-v2"));
 
         // 2 TINA workpapers
@@ -667,7 +676,8 @@ contract SeedBoeingState is Script {
             ths,
             perOrg,
             0,
-            BCA_SCOPE
+            BCA_SCOPE,
+            0 // artifact_max_class = Public → clearance gate off
         );
 
         // env-2: Signing (1 of 2)
@@ -679,7 +689,8 @@ contract SeedBoeingState is Script {
             ths,
             perOrg,
             0,
-            BCA_SCOPE
+            BCA_SCOPE,
+            0
         );
         COE.sign(keccak256("coe-2"), BOEING_ROOT, USER_BOB_PM);
 
@@ -692,7 +703,8 @@ contract SeedBoeingState is Script {
             ths,
             perOrg,
             0,
-            BCA_SCOPE
+            BCA_SCOPE,
+            0
         );
         COE.sign(keccak256("coe-3"), BOEING_ROOT, USER_BOB_PM);
         COE.sign(keccak256("coe-3"), TIER1_HONEYWELL, keccak256("honeywell-pm"));

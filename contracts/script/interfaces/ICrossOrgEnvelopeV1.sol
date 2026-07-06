@@ -16,6 +16,9 @@ pragma solidity ^0.8.26;
 ///         current source's `CrossOrgEnvelope` import and adds the
 ///         max_class arg per call.
 interface ICrossOrgEnvelopeV1 {
+    // BFR-DEMO 2026-07-03: the fresh deploy (DeployBfr14InterOrg) ships the
+    // CURRENT source with the 9th classification-gate arg. Interface updated
+    // to match; seed passes artifact_max_class = 0 (gate off, Public).
     function draft(
         bytes32 envelope_id,
         bytes32 artifact_root,
@@ -24,7 +27,8 @@ interface ICrossOrgEnvelopeV1 {
         uint8[] calldata thresholds,
         bytes32[][] calldata signers_per_org,
         uint256 expires_at_block,
-        bytes32 scope
+        bytes32 scope,
+        uint8 artifact_max_class
     ) external;
 
     function sign(bytes32 envelope_id, bytes32 org_root, bytes32 signer) external;
