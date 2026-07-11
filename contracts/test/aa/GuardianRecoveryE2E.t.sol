@@ -10,6 +10,7 @@ import {PackedUserOperation} from "@account-abstraction/interfaces/PackedUserOpe
 
 import {CitrateWallet} from "../../src/aa/wallet/CitrateWallet.sol";
 import {CitrateWalletFactory} from "../../src/aa/factory/CitrateWalletFactory.sol";
+import {CitratePaymaster} from "../../src/aa/paymaster/CitratePaymaster.sol";
 import {CitrateECDSAValidator} from "../../src/aa/validators/CitrateECDSAValidator.sol";
 import {WebAuthnP256Validator} from "../../src/aa/validators/WebAuthnP256Validator.sol";
 import {GuardianRecoveryModule} from "../../src/aa/recovery/GuardianRecoveryModule.sol";
@@ -93,6 +94,15 @@ contract GuardianRecoveryE2ETest is Test {
         recoveryModule = new GuardianRecoveryModule();
         oldOwner = vm.addr(OLD_OWNER_PK);
         factory = new CitrateWalletFactory(address(walletImpl), vm.addr(IDENTITY_PK), address(0xA11CE));
+
+        // E-8: deployFor fails closed until the paymaster registry is
+        // wired (registrar = factory, as in script/aa/DeployAA.s.sol).
+        // Wired against the REAL EntryPoint this suite already runs.
+        CitratePaymaster pm = new CitratePaymaster(
+            IEntryPoint(address(entryPoint)), address(0xA11CE), address(factory), 100_000, 200_000, 300_000
+        );
+        vm.prank(address(0xA11CE));
+        factory.setPaymaster(address(pm));
 
         wallet = payable(_deployWalletWithGuardians());
         // Prefund the account's EntryPoint deposit so it pays its own gas
