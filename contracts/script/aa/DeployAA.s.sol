@@ -96,7 +96,25 @@ contract DeployAA is Script, ScriptEnv {
             firstOpCap
         );
 
+        // E-8: wire the registry direction factory → paymaster so every
+        // deploy registers its wallet atomically
+        // (ADR-2026-07-11-e8-atomic-factory-registration). `setPaymaster`
+        // is owner-gated; when the ceremony broadcaster is not the owner
+        // (prod multisig), the owner must perform this call before ANY
+        // wallet deploy — `deployFor` fails closed (PaymasterNotSet)
+        // until then.
+        (, address broadcaster,) = vm.readCallers();
+        if (broadcaster == owner) {
+            d.factory.setPaymaster(address(d.paymaster));
+        }
+
         vm.stopBroadcast();
+
+        if (broadcaster != owner) {
+            console2.log("ACTION REQUIRED: factory owner %s must call", owner);
+            console2.log("  CitrateWalletFactory(%s).setPaymaster(%s)", address(d.factory), address(d.paymaster));
+            console2.log("  before any wallet deploy (deployFor fails closed until wired).");
+        }
     }
 
     /// Human-readable summary the operator reads at the end of a ceremony.

@@ -7,7 +7,10 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 import {CitrateWallet} from "../../src/aa/wallet/CitrateWallet.sol";
 import {CitrateWalletFactory} from "../../src/aa/factory/CitrateWalletFactory.sol";
 import {CitrateECDSAValidator} from "../../src/aa/validators/CitrateECDSAValidator.sol";
+import {CitratePaymaster} from "../../src/aa/paymaster/CitratePaymaster.sol";
+import {StubEntryPoint} from "./CitratePaymaster.t.sol";
 import {IEntryPoint} from "@kernel/interfaces/IEntryPoint.sol";
+import {IEntryPoint as IAaEntryPoint} from "@account-abstraction/interfaces/IEntryPoint.sol";
 import {KERNEL_WRAPPER_TYPE_HASH, ERC1271_MAGICVALUE, ERC1271_INVALID} from "@kernel/types/Constants.sol";
 
 /// Stub EntryPoint — 1271 verification never touches the EntryPoint, so
@@ -76,6 +79,14 @@ contract KernelEip1271Test is Test {
         validator = new CitrateECDSAValidator();
         walletOwner = vm.addr(OWNER_PK);
         factory = new CitrateWalletFactory(address(walletImpl), vm.addr(IDENTITY_PK), address(0xA11CE));
+
+        // E-8: deployFor fails closed until the paymaster registry is
+        // wired (registrar = factory, as in script/aa/DeployAA.s.sol).
+        CitratePaymaster pm = new CitratePaymaster(
+            IAaEntryPoint(address(new StubEntryPoint())), address(0xA11CE), address(factory), 100_000, 200_000, 300_000
+        );
+        vm.prank(address(0xA11CE));
+        factory.setPaymaster(address(pm));
 
         // initialize(bytes21 rootValidator, address hook, bytes validatorData,
         //            bytes hookData, bytes[] initConfig) — ECDSA root validator
