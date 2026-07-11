@@ -4,6 +4,9 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 
 import {CitrateWalletFactory} from "../../src/aa/factory/CitrateWalletFactory.sol";
+import {CitratePaymaster} from "../../src/aa/paymaster/CitratePaymaster.sol";
+import {StubEntryPoint} from "./CitratePaymaster.t.sol";
+import {IEntryPoint} from "@account-abstraction/interfaces/IEntryPoint.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 /// A minimal initializable target so we can test that:
@@ -34,6 +37,7 @@ contract CitrateWalletFactoryTest is Test {
 
     CitrateWalletFactory internal factory;
     MockImplementation internal impl;
+    CitratePaymaster internal pm;
 
     uint256 internal constant SIGNER_PK = 0x59E7;
     address internal signer;
@@ -46,6 +50,15 @@ contract CitrateWalletFactoryTest is Test {
         impl = new MockImplementation();
         signer = vm.addr(SIGNER_PK);
         factory = new CitrateWalletFactory(address(impl), signer, ownerAddr);
+
+        // E-8: `deployFor` fails closed until the paymaster registry is
+        // wired (registrar = factory, mirroring script/aa/DeployAA.s.sol).
+        StubEntryPoint ep = new StubEntryPoint();
+        pm = new CitratePaymaster(
+            IEntryPoint(address(ep)), ownerAddr, address(factory), 100_000, 200_000, 300_000
+        );
+        vm.prank(ownerAddr);
+        factory.setPaymaster(address(pm));
     }
 
     // --- Constructor ---
@@ -251,6 +264,111 @@ contract CitrateWalletFactoryTest is Test {
         bytes memory newSig = _signWith(newSignerPk, factory.permitDigest(USER_A, initData, expiresAt));
         address deployed = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, newSig);
         assertEq(deployed, factory.predictAddress(USER_A));
+    }
+
+    // --- E-8: atomic paymaster registration ---
+
+    function test_E8_deployFor_failsClosedWhenPaymasterUnwired() public {
+        // Fresh factory, registry never wired — a deploy would mint an
+        // unsponsorable wallet, so it must refuse.
+        CitrateWalletFactory unwired = new CitrateWalletFactory(address(impl), signer, ownerAddr);
+        bytes memory initData = abi.encodeCall(MockImplementation.init, ("x"));
+        uint256 expiresAt = block.timestamp + 1 hours;
+        bytes32 digest = unwired.permitDigest(USER_A, initData, expiresAt);
+        bytes memory sig = _signWith(SIGNER_PK, digest);
+
+        vm.expectRevert(CitrateWalletFactory.PaymasterNotSet.selector);
+        unwired.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+    }
+
+    function test_E8_deployFor_registersAtomically_emitsWalletRegistered() public {
+        address predicted = factory.predictAddress(USER_A);
+        assertFalse(pm.isRegistered(predicted));
+
+        bytes memory initData = abi.encodeCall(MockImplementation.init, ("reg"));
+        uint256 expiresAt = block.timestamp + 1 hours;
+        bytes memory sig = _permitSig(USER_A, initData, expiresAt);
+
+        vm.expectEmit(true, false, false, false, address(pm));
+        emit CitratePaymaster.WalletRegistered(predicted);
+        address account = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+
+        assertEq(account, predicted);
+        assertTrue(pm.isRegistered(account), "registered in the deploy call frame");
+    }
+
+    function test_E8_idempotentRepeat_neverReRegisters() public {
+        bytes memory initData = abi.encodeCall(MockImplementation.init, ("once"));
+        uint256 expiresAt = block.timestamp + 1 hours;
+        bytes memory sig = _permitSig(USER_A, initData, expiresAt);
+        address account = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+        assertTrue(pm.isRegistered(account));
+
+        // Incident response: owner unregisters the compromised wallet.
+        vm.prank(ownerAddr);
+        factory.unregisterWallet(account);
+        assertFalse(pm.isRegistered(account));
+
+        // The permit-less idempotent path must NOT re-register it.
+        address again = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+        assertEq(again, account);
+        assertFalse(pm.isRegistered(account), "idempotent path must not undo an unregistration");
+    }
+
+    function test_E8_setPaymaster_onlyOwner_rejectsZero_emits() public {
+        address newPm = address(0xBEEF);
+        vm.expectRevert(CitrateWalletFactory.NotOwner.selector);
+        factory.setPaymaster(newPm);
+
+        vm.prank(ownerAddr);
+        vm.expectRevert(CitrateWalletFactory.ZeroAddress.selector);
+        factory.setPaymaster(address(0));
+
+        vm.prank(ownerAddr);
+        vm.expectEmit(true, true, false, false, address(factory));
+        emit CitrateWalletFactory.PaymasterSet(address(pm), newPm);
+        factory.setPaymaster(newPm);
+        assertEq(factory.paymaster(), newPm);
+    }
+
+    function test_E8_registerDeployedWallet_backfillsOnlyRealWallets() public {
+        bytes memory initData = abi.encodeCall(MockImplementation.init, ("bf"));
+        uint256 expiresAt = block.timestamp + 1 hours;
+        bytes memory sig = _permitSig(USER_A, initData, expiresAt);
+        address account = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+
+        vm.prank(ownerAddr);
+        factory.unregisterWallet(account);
+
+        // Non-owner cannot backfill.
+        vm.expectRevert(CitrateWalletFactory.NotOwner.selector);
+        factory.registerDeployedWallet(account);
+
+        // Codeless addresses cannot be pre-registered.
+        address eoa = address(0xE0A);
+        vm.prank(ownerAddr);
+        vm.expectRevert(abi.encodeWithSelector(CitrateWalletFactory.AccountNotDeployed.selector, eoa));
+        factory.registerDeployedWallet(eoa);
+
+        // Owner backfills a real deployed wallet.
+        vm.prank(ownerAddr);
+        factory.registerDeployedWallet(account);
+        assertTrue(pm.isRegistered(account));
+    }
+
+    function test_E8_unregisterWallet_onlyOwner() public {
+        bytes memory initData = abi.encodeCall(MockImplementation.init, ("ur"));
+        uint256 expiresAt = block.timestamp + 1 hours;
+        bytes memory sig = _permitSig(USER_A, initData, expiresAt);
+        address account = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+
+        vm.expectRevert(CitrateWalletFactory.NotOwner.selector);
+        factory.unregisterWallet(account);
+        assertTrue(pm.isRegistered(account));
+
+        vm.prank(ownerAddr);
+        factory.unregisterWallet(account);
+        assertFalse(pm.isRegistered(account));
     }
 
     // --- Helpers ---
