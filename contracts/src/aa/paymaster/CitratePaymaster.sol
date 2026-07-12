@@ -4,93 +4,139 @@ pragma solidity ^0.8.26;
 import {BasePaymaster} from "@account-abstraction/core/BasePaymaster.sol";
 import {IEntryPoint} from "@account-abstraction/interfaces/IEntryPoint.sol";
 import {PackedUserOperation} from "@account-abstraction/interfaces/PackedUserOperation.sol";
+import {_packValidationData} from "@account-abstraction/core/Helpers.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
-/// WP-1 / EW-S1 — Per-user-per-day budgeted paymaster for the Citrate
-/// embedded-wallet stack.
+/// WP-1 / EW-S1 — Signature-gated, wei-budgeted verifying paymaster for
+/// the Citrate embedded-wallet stack.
 ///
-/// Per `ADR-2026-06-05-ew-paymaster-policy`:
-///   - **Standard budget**: every Citrate wallet account gets a daily
-///     gas-units allowance (default 100,000; settable by owner). Resets
-///     at the start of the next UTC day after the first sponsored op
-///     of any given day.
-///   - **Recovery budget**: when the bundler tags a UserOp as recovery,
-///     it draws from a per-event budget (default 200,000) that does NOT
-///     consume the standard daily counter. Recovery flows must succeed
-///     even when the user has exhausted their daily allowance.
-///   - **First-op budget**: when the bundler tags a UserOp as the
-///     account's first-ever transaction, sponsorship is unconditional
-///     (subject to a per-op cap to bound the spend), and the first-op
-///     flag flips so the same account cannot reuse it.
-///   - **Fail-closed**: an account whose daily/recovery/first-op budget
-///     is insufficient for the EntryPoint-reported `maxCost` reverts at
-///     `validatePaymasterUserOp` so the user sees a clear refusal at
-///     the bundler layer (per bundler's off-chain pre-check).
+/// Per `ADR-2026-07-11-e8-signature-based-paymaster` (supersedes the E-8
+/// atomic-factory-registration ADR for the first-op path):
+///
+///   - **Signature gating (E8-1).** Every sponsored UserOp carries, in
+///     the suffix of `paymasterAndData`, an ECDSA signature from a
+///     trusted `sponsorSigner` over a message that binds the chainId,
+///     THIS paymaster's address, the sender, the sponsorship category,
+///     and a `[validAfter, validUntil]` window. The paymaster verifies
+///     that signature against a signer address stored in its OWN storage.
+///     No entity writes another entity's storage during validation — the
+///     factory no longer calls `registerWallet` from `deployFor`'s
+///     validation path, so a strict ERC-7562 bundler tracer sees the
+///     paymaster touch only its own storage + `ecrecover`. This closes
+///     the E8-1 cross-entity-write violation and makes the counterfactual
+///     first-op mempool-legal.
+///
+///   - **Standard budget**: a Citrate wallet gets a daily WEI allowance
+///     (default `dailyCap`). Resets at the start of the next UTC day
+///     after the first sponsored op of any given day. Standard/recovery
+///     additionally require the account to be `isRegistered` (a read of
+///     the paymaster's OWN storage — always legal under ERC-7562
+///     STO-010). Registration happens OUTSIDE the validation phase (owner
+///     passthrough on the factory).
+///
+///   - **Recovery budget**: a recovery-tagged op draws from a per-event
+///     WEI budget (`recoveryEventCap`) that does NOT consume the standard
+///     daily counter, bounded by a per-account daily recovery-op COUNT
+///     cap. First-op does NOT require registration — the signature is the
+///     authorization — so a counterfactual wallet's very first op is
+///     sponsorable with zero cross-entity writes.
+///
+///   - **Cap units (E8-2).** ALL three caps are denominated in WEI
+///     (requiredPreFund = requiredGas × maxFeePerGas, EntryPoint L412).
+///     A `maxFeePerGasCeiling` bounds the fee an attacker can claim so a
+///     generous wei cap cannot be drained by a single inflated-fee op.
+///     A GLOBAL daily deposit-spend cap (`globalDailyCap`) aggregates
+///     spend across ALL accounts as a drain backstop.
+///
+///   - **Fail-closed**: any op whose signature, budget, fee ceiling, or
+///     global cap check fails reverts at `validatePaymasterUserOp`.
+///
 ///   - **Admin pause** for incident response (operator multisig holds
 ///     `owner`).
 ///
-/// Account-eligibility is enforced via a "Citrate registry" — a
-/// trusted address (typically the wallet factory) calls
-/// `registerWallet(account)` after a successful deploy. Only registered
-/// accounts can be sponsored.
-///
-/// The bundler embeds a 1-byte **category tag** in the suffix of
-/// `paymasterAndData` (after the standard 52-byte ERC-4337 v0.7 prefix
-/// of `address paymaster | uint128 verificationGasLimit |
-/// uint128 postOpGasLimit`):
-///   0x00 = standard
-///   0x01 = recovery
-///   0x02 = first-op
+/// The `paymasterAndData` layout (ERC-4337 v0.7):
+///   [0:20]    address paymaster
+///   [20:36]   uint128 paymasterVerificationGasLimit
+///   [36:52]   uint128 paymasterPostOpGasLimit
+///   [52]      uint8   category  (0 standard / 1 recovery / 2 first-op)
+///   [53:59]   uint48  validUntil
+///   [59:65]   uint48  validAfter
+///   [65:130]  bytes65 sponsorSigner ECDSA signature (r||s||v)
 contract CitratePaymaster is BasePaymaster {
+    using MessageHashUtils for bytes32;
+
     // --- Categories ---
     uint8 internal constant CAT_STANDARD = 0;
     uint8 internal constant CAT_RECOVERY = 1;
     uint8 internal constant CAT_FIRST_OP = 2;
 
-    /// Constant offset of the category byte inside `paymasterAndData`.
-    /// ERC-4337 v0.7 reserves the first 52 bytes for `paymaster + gas
-    /// limits`; our suffix starts at index 52.
-    uint256 internal constant PMD_TAG_OFFSET = 52;
+    /// ERC-4337 v0.7 reserves the first 52 bytes of `paymasterAndData`
+    /// for `paymaster + gas limits`; our signed suffix starts at index 52.
+    uint256 internal constant PMD_TAG_OFFSET = 52; // category byte
+    uint256 internal constant PMD_VALID_UNTIL_OFFSET = 53; // uint48
+    uint256 internal constant PMD_VALID_AFTER_OFFSET = 59; // uint48
+    uint256 internal constant PMD_SIG_OFFSET = 65; // 65-byte ECDSA sig
+    uint256 internal constant PMD_MIN_LEN = 130; // 65 + 65
 
     // --- Errors ---
     error Paused();
     error NotARegisteredCitrateWallet(address account);
     error NotARegistrar();
-    error StandardCapExceeded(address account, uint256 used, uint256 cap, uint256 wouldUse);
-    error RecoveryCapExceeded(address account, uint256 cap, uint256 wouldUse);
+    error StandardCapExceeded(address account, uint256 usedWei, uint256 capWei, uint256 wouldUseWei);
+    error RecoveryCapExceeded(address account, uint256 capWei, uint256 wouldUseWei);
     error FirstOpAlreadyUsed(address account);
-    error FirstOpCapExceeded(uint256 cap, uint256 wouldUse);
+    error FirstOpCapExceeded(uint256 capWei, uint256 wouldUseWei);
     error UnknownCategory(uint8 tag);
     error MissingCategoryTag();
     error ZeroAddress();
-    /// @notice FWA-C3-04: too many recovery-tagged ops for this account today.
+    /// FWA-C3-04: too many recovery-tagged ops for this account today.
     error RecoveryDailyCountExceeded(address account, uint256 usedToday, uint256 maxPerDay);
+    /// E8-1: sponsorship signature invalid / not from `sponsorSigner`.
+    error InvalidSponsorSignature();
+    /// E8-1: signed sponsorship window does not cover `block.timestamp`.
+    error SponsorshipExpired();
+    /// E8-2: per-op fee exceeds the sponsorship fee ceiling (drain guard).
+    error MaxFeePerGasCeilingExceeded(uint256 maxFeePerGas, uint256 ceiling);
+    /// E8-2: aggregate deposit spend today would exceed the global backstop.
+    error GlobalDailyCapExceeded(uint256 spentTodayWei, uint256 capWei, uint256 wouldSpendWei);
 
     // --- Events ---
     event WalletRegistered(address indexed account);
     event WalletUnregistered(address indexed account);
     event RegistrarSet(address indexed oldRegistrar, address indexed newRegistrar);
-    event SponsorshipUsed(address indexed account, uint8 category, uint256 actualGasUsed);
+    event SponsorSignerSet(address indexed oldSigner, address indexed newSigner);
+    event SponsorshipUsed(address indexed account, uint8 category, uint256 actualGasCostWei);
     event PausedSet(bool paused);
-    event DailyCapSet(uint256 oldCap, uint256 newCap);
-    event RecoveryEventCapSet(uint256 oldCap, uint256 newCap);
-    event FirstOpCapSet(uint256 oldCap, uint256 newCap);
+    event DailyCapSet(uint256 oldCapWei, uint256 newCapWei);
+    event RecoveryEventCapSet(uint256 oldCapWei, uint256 newCapWei);
+    event FirstOpCapSet(uint256 oldCapWei, uint256 newCapWei);
     event RecoveryDailyCountCapSet(uint256 oldCap, uint256 newCap);
+    event MaxFeePerGasCeilingSet(uint256 oldCeiling, uint256 newCeiling);
+    event GlobalDailyCapSet(uint256 oldCapWei, uint256 newCapWei);
 
     // --- Storage ---
 
+    /// Per-account daily spend. `usedWei` accumulates the actual WEI gas
+    /// cost charged to the deposit in `_postOp` (NOT gas units).
     struct DailyUsage {
-        uint128 used; // gas units consumed today
-        uint64 dayKey; // unix day (block.timestamp / 86400) when `used` last reset
+        uint128 usedWei; // WEI of deposit spent by this account today
+        uint64 dayKey; // unix day (block.timestamp / 86400) when `usedWei` last reset
     }
 
-    /// FWA-C3-04: per-account daily recovery-op counter. The recovery
-    /// category deliberately bypasses the standard daily gas counter, but
-    /// without a cumulative bound a registered wallet could self-tag an
-    /// unlimited stream of recovery ops to drain the paymaster's deposit.
-    /// This caps the NUMBER of recovery-sponsored ops per account per day.
+    /// FWA-C3-04: per-account daily recovery-op counter (bounds the
+    /// NUMBER of recovery-sponsored ops per account per day).
     struct RecoveryUsage {
-        uint64 count;  // recovery ops sponsored today
+        uint64 count; // recovery ops sponsored today
         uint64 dayKey; // unix day when `count` last reset
+    }
+
+    /// E8-2: global aggregate deposit spend across ALL accounts, per day.
+    /// Drain backstop — even if per-account caps and the fee ceiling are
+    /// individually satisfied, aggregate spend cannot exceed the day cap.
+    struct GlobalUsage {
+        uint128 spentWei; // WEI of deposit spent by ALL accounts today
+        uint64 dayKey; // unix day when `spentWei` last reset
     }
 
     mapping(address account => DailyUsage) public dailyUsage;
@@ -98,43 +144,66 @@ contract CitratePaymaster is BasePaymaster {
     mapping(address account => bool) public isRegistered;
     mapping(address account => bool) public hasUsedFirstOp;
 
+    /// E8-2: aggregate spend backstop.
+    GlobalUsage public globalUsage;
+
     /// The single address authorized to register / unregister Citrate
     /// wallets (typically `CitrateWalletFactory`). Settable by owner.
     address public registrar;
 
+    /// E8-1: the address whose ECDSA signature authorizes sponsorship.
+    /// Managed by the sponsorship service; rotatable by `owner`. Held in
+    /// the paymaster's OWN storage so verification reads no other entity.
+    address public sponsorSigner;
+
     /// Operator pause for incident response.
     bool public paused;
 
-    /// Per-user-per-day gas-unit cap. 0 disables the standard category.
+    /// Per-user-per-day WEI cap. 0 disables the standard category.
     uint256 public dailyCap;
 
-    /// Per-event recovery budget. 0 disables recovery sponsorship.
+    /// Per-event recovery budget (WEI). 0 disables recovery sponsorship.
     uint256 public recoveryEventCap;
 
-    /// Per-call first-op budget. Bounds the deploy + first-action cost.
+    /// Per-call first-op budget (WEI). Bounds deploy + first-action cost.
     uint256 public firstOpCap;
 
     /// FWA-C3-04: max recovery-tagged ops sponsored per account per day.
-    /// 0 == unlimited (preserves prior behavior unless configured); the
-    /// deploy script and ADR-aligned default sets a small positive cap.
     uint256 public recoveryDailyCountCap;
+
+    /// E8-2: max `maxFeePerGas` (wei/gas) a sponsored op may claim. Bounds
+    /// the drain a single generous-wei-cap op can inflict. 0 disables the
+    /// check (NOT recommended in production).
+    uint256 public maxFeePerGasCeiling;
+
+    /// E8-2: aggregate deposit-spend ceiling across all accounts per UTC
+    /// day. 0 disables the global backstop (NOT recommended in prod).
+    uint256 public globalDailyCap;
 
     constructor(
         IEntryPoint _entryPoint,
         address _owner,
         address _registrar,
+        address _sponsorSigner,
         uint256 _dailyCap,
         uint256 _recoveryEventCap,
-        uint256 _firstOpCap
+        uint256 _firstOpCap,
+        uint256 _maxFeePerGasCeiling,
+        uint256 _globalDailyCap
     ) BasePaymaster(_entryPoint) {
-        if (_owner == address(0) || _registrar == address(0)) revert ZeroAddress();
+        if (_owner == address(0) || _registrar == address(0) || _sponsorSigner == address(0)) {
+            revert ZeroAddress();
+        }
         _transferOwnership(_owner);
         registrar = _registrar;
+        sponsorSigner = _sponsorSigner;
         dailyCap = _dailyCap;
         recoveryEventCap = _recoveryEventCap;
         firstOpCap = _firstOpCap;
-        // Default cap: a wallet should never legitimately need many
-        // recovery ops in a single day. Owner can re-tune via setter.
+        maxFeePerGasCeiling = _maxFeePerGasCeiling;
+        globalDailyCap = _globalDailyCap;
+        // A wallet should never legitimately need many recovery ops in a
+        // single day. Owner can re-tune via setter.
         recoveryDailyCountCap = 3;
     }
 
@@ -144,6 +213,12 @@ contract CitratePaymaster is BasePaymaster {
         if (newRegistrar == address(0)) revert ZeroAddress();
         emit RegistrarSet(registrar, newRegistrar);
         registrar = newRegistrar;
+    }
+
+    function setSponsorSigner(address newSigner) external onlyOwner {
+        if (newSigner == address(0)) revert ZeroAddress();
+        emit SponsorSignerSet(sponsorSigner, newSigner);
+        sponsorSigner = newSigner;
     }
 
     function setPaused(bool v) external onlyOwner {
@@ -166,15 +241,27 @@ contract CitratePaymaster is BasePaymaster {
         firstOpCap = v;
     }
 
-    /// FWA-C3-04: tune the per-account daily recovery-op count cap.
     function setRecoveryDailyCountCap(uint256 v) external onlyOwner {
         emit RecoveryDailyCountCapSet(recoveryDailyCountCap, v);
         recoveryDailyCountCap = v;
     }
 
+    function setMaxFeePerGasCeiling(uint256 v) external onlyOwner {
+        emit MaxFeePerGasCeilingSet(maxFeePerGasCeiling, v);
+        maxFeePerGasCeiling = v;
+    }
+
+    function setGlobalDailyCap(uint256 v) external onlyOwner {
+        emit GlobalDailyCapSet(globalDailyCap, v);
+        globalDailyCap = v;
+    }
+
     // --- Registrar ---
 
-    /// Called by the wallet factory after a successful deploy.
+    /// Called OUTSIDE the validation phase (owner passthrough on the
+    /// factory, or a permitted tx) to mark a wallet sponsorship-eligible
+    /// for the standard/recovery categories. Never called during a
+    /// UserOp's initCode/validation (that was the E8-1 violation).
     function registerWallet(address account) external {
         if (msg.sender != registrar) revert NotARegistrar();
         if (account == address(0)) revert ZeroAddress();
@@ -182,8 +269,6 @@ contract CitratePaymaster is BasePaymaster {
         emit WalletRegistered(account);
     }
 
-    /// Optional: factory may unregister a wallet (e.g. on a known
-    /// compromise). Used sparingly; documented in KYC_OPERATOR.md.
     function unregisterWallet(address account) external {
         if (msg.sender != registrar) revert NotARegistrar();
         isRegistered[account] = false;
@@ -196,12 +281,36 @@ contract CitratePaymaster is BasePaymaster {
         return uint64(block.timestamp / 86400);
     }
 
-    /// Remaining standard gas-unit budget for `account` today.
+    /// Remaining standard WEI budget for `account` today.
     function remainingStandard(address account) external view returns (uint256) {
         DailyUsage memory u = dailyUsage[account];
         if (u.dayKey != todayKey()) return dailyCap;
-        if (u.used >= dailyCap) return 0;
-        return dailyCap - u.used;
+        if (u.usedWei >= dailyCap) return 0;
+        return dailyCap - u.usedWei;
+    }
+
+    /// E8-1: the message digest the `sponsorSigner` signs (off-chain).
+    /// Public so the sponsorship service + SDK can reconstruct it. Binds
+    /// chainId (cross-chain replay), THIS paymaster (cross-paymaster
+    /// replay / domain separation), the sender (cross-wallet replay), the
+    /// category (so a standard grant can't be spent as first-op), and the
+    /// [validAfter, validUntil] window.
+    function sponsorDigest(
+        address account,
+        uint8 category,
+        uint48 validUntil,
+        uint48 validAfter
+    ) public view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                block.chainid,
+                address(this),
+                account,
+                category,
+                validUntil,
+                validAfter
+            )
+        );
     }
 
     // --- Paymaster hooks ---
@@ -214,28 +323,59 @@ contract CitratePaymaster is BasePaymaster {
         if (paused) revert Paused();
 
         address account = userOp.sender;
-        if (!isRegistered[account]) revert NotARegisteredCitrateWallet(account);
+        bytes calldata pmd = userOp.paymasterAndData;
+        if (pmd.length < PMD_MIN_LEN) revert MissingCategoryTag();
 
-        if (userOp.paymasterAndData.length <= PMD_TAG_OFFSET) revert MissingCategoryTag();
-        uint8 category = uint8(userOp.paymasterAndData[PMD_TAG_OFFSET]);
+        uint8 category = uint8(pmd[PMD_TAG_OFFSET]);
+        uint48 validUntil = _readUint48(pmd, PMD_VALID_UNTIL_OFFSET);
+        uint48 validAfter = _readUint48(pmd, PMD_VALID_AFTER_OFFSET);
+        bytes calldata signature = pmd[PMD_SIG_OFFSET:PMD_MIN_LEN];
+
+        // E8-1: authorize this op by the sponsor's signature. The digest
+        // binds chainId + this paymaster + sender + category + window, so
+        // a signature cannot be replayed across wallets, chains,
+        // paymasters, or categories. ecrecover touches no external
+        // storage — ERC-7562 clean.
+        _verifySponsorSignature(account, category, validUntil, validAfter, signature);
+
+        // E8-2: bound the fee an op may claim so a generous wei cap can't
+        // be drained by inflating maxFeePerGas.
+        if (maxFeePerGasCeiling != 0) {
+            uint256 opMaxFee = _maxFeePerGas(userOp);
+            if (opMaxFee > maxFeePerGasCeiling) {
+                revert MaxFeePerGasCeilingExceeded(opMaxFee, maxFeePerGasCeiling);
+            }
+        }
+
+        // E8-2: aggregate deposit-spend backstop (own storage only).
+        if (globalDailyCap != 0) {
+            GlobalUsage memory g = globalUsage;
+            uint64 today = todayKey();
+            uint256 spentToday = g.dayKey == today ? g.spentWei : 0;
+            uint256 wouldSpend = spentToday + maxCost;
+            if (wouldSpend > globalDailyCap) {
+                revert GlobalDailyCapExceeded(spentToday, globalDailyCap, wouldSpend);
+            }
+        }
 
         if (category == CAT_STANDARD) {
+            // Standard/recovery require registration (own-storage read,
+            // ERC-7562 STO-010 — always legal).
+            if (!isRegistered[account]) revert NotARegisteredCitrateWallet(account);
             DailyUsage memory u = dailyUsage[account];
             uint64 today = todayKey();
-            uint256 usedToday = u.dayKey == today ? u.used : 0;
+            uint256 usedToday = u.dayKey == today ? u.usedWei : 0;
             uint256 wouldUse = usedToday + maxCost;
             if (dailyCap == 0 || wouldUse > dailyCap) {
                 revert StandardCapExceeded(account, usedToday, dailyCap, wouldUse);
             }
         } else if (category == CAT_RECOVERY) {
+            if (!isRegistered[account]) revert NotARegisteredCitrateWallet(account);
             if (recoveryEventCap == 0 || maxCost > recoveryEventCap) {
                 revert RecoveryCapExceeded(account, recoveryEventCap, maxCost);
             }
-            // FWA-C3-04: enforce a cumulative per-account daily recovery-op
-            // count so the recovery category cannot be abused to drain the
-            // deposit. Read-only here (validation rules limit storage
-            // writes); the counter is advanced in _postOp. Only this
-            // account's own slot is touched (ERC-4337 storage rule OK).
+            // FWA-C3-04: cumulative per-account daily recovery-op count.
+            // Read-only here (counter advanced in _postOp); own slot only.
             if (recoveryDailyCountCap != 0) {
                 RecoveryUsage memory ru = recoveryUsage[account];
                 uint64 today = todayKey();
@@ -245,6 +385,11 @@ contract CitratePaymaster is BasePaymaster {
                 }
             }
         } else if (category == CAT_FIRST_OP) {
+            // E8-1: the first op is authorized by the sponsor signature
+            // ALONE — NO registration read/write. This is what makes the
+            // counterfactual first op mempool-legal: during it, this
+            // paymaster touches only its own storage + ecrecover, and the
+            // factory writes NO paymaster storage.
             if (hasUsedFirstOp[account]) revert FirstOpAlreadyUsed(account);
             if (firstOpCap == 0 || maxCost > firstOpCap) {
                 revert FirstOpCapExceeded(firstOpCap, maxCost);
@@ -253,13 +398,11 @@ contract CitratePaymaster is BasePaymaster {
             revert UnknownCategory(category);
         }
 
-        // The EntryPoint's `postOp` is required for STANDARD ops (we
-        // need to record the actually-used gas against the daily
-        // counter). The other categories don't need accounting, but we
-        // unconditionally pass context so we can emit a SponsorshipUsed
-        // event for observability.
         context = abi.encode(account, category);
-        validationData = 0; // 0 == ok, no time bounds
+        // E8-1: return the signed time window so the EntryPoint enforces
+        // it (packed validationData, ERC-4337 v0.7). sigFailed=false — we
+        // already reverted on a bad signature above.
+        validationData = _packValidationData(false, validUntil, validAfter);
     }
 
     function _postOp(
@@ -270,30 +413,40 @@ contract CitratePaymaster is BasePaymaster {
     ) internal override {
         (address account, uint8 category) = abi.decode(context, (address, uint8));
 
+        // E8-2: advance the global aggregate spend backstop (WEI).
+        {
+            GlobalUsage memory g = globalUsage;
+            uint64 today = todayKey();
+            if (g.dayKey != today) {
+                g.spentWei = 0;
+                g.dayKey = today;
+            }
+            uint256 nextG = uint256(g.spentWei) + actualGasCost;
+            g.spentWei = nextG > type(uint128).max ? type(uint128).max : uint128(nextG);
+            globalUsage = g;
+        }
+
         if (category == CAT_STANDARD) {
             DailyUsage memory u = dailyUsage[account];
             uint64 today = todayKey();
             if (u.dayKey != today) {
-                u.used = 0;
+                u.usedWei = 0;
                 u.dayKey = today;
             }
-            // Saturating add — we never undercharge but a tx that exactly
-            // hits the cap should still settle.
-            uint256 next = uint256(u.used) + actualGasCost;
-            u.used = next > type(uint128).max ? type(uint128).max : uint128(next);
+            // Saturating add (WEI): never undercharge, but a tx that
+            // exactly hits the cap should still settle.
+            uint256 next = uint256(u.usedWei) + actualGasCost;
+            u.usedWei = next > type(uint128).max ? type(uint128).max : uint128(next);
             dailyUsage[account] = u;
         } else if (category == CAT_FIRST_OP) {
             hasUsedFirstOp[account] = true;
         } else if (category == CAT_RECOVERY) {
-            // FWA-C3-04: advance the per-account daily recovery-op counter
-            // so the cumulative cap checked in validation is enforced.
             RecoveryUsage memory ru = recoveryUsage[account];
             uint64 today = todayKey();
             if (ru.dayKey != today) {
                 ru.count = 0;
                 ru.dayKey = today;
             }
-            // Saturating — once at max we stop counting up (cap already hit).
             if (ru.count != type(uint64).max) {
                 ru.count += 1;
             }
@@ -301,5 +454,42 @@ contract CitratePaymaster is BasePaymaster {
         }
 
         emit SponsorshipUsed(account, category, actualGasCost);
+    }
+
+    // --- Internal helpers ---
+
+    /// E8-1: recover the sponsor signature and enforce the signed window.
+    function _verifySponsorSignature(
+        address account,
+        uint8 category,
+        uint48 validUntil,
+        uint48 validAfter,
+        bytes calldata signature
+    ) internal view {
+        // Enforce the window here too (defense in depth); the EntryPoint
+        // also enforces it via the returned packed validationData.
+        if (block.timestamp < validAfter) revert SponsorshipExpired();
+        if (validUntil != 0 && block.timestamp > validUntil) revert SponsorshipExpired();
+
+        bytes32 digest = sponsorDigest(account, category, validUntil, validAfter);
+        bytes32 ethDigest = digest.toEthSignedMessageHash();
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(ethDigest, signature);
+        if (err != ECDSA.RecoverError.NoError || recovered != sponsorSigner) {
+            revert InvalidSponsorSignature();
+        }
+    }
+
+    /// Read a big-endian uint48 out of `paymasterAndData` at `offset`.
+    function _readUint48(bytes calldata pmd, uint256 offset) internal pure returns (uint48 v) {
+        // 6 bytes, big-endian.
+        for (uint256 i = 0; i < 6; i++) {
+            v = uint48((uint256(v) << 8) | uint8(pmd[offset + i]));
+        }
+    }
+
+    /// The op's maxFeePerGas (wei/gas). `gasFees` packs
+    /// [maxPriorityFeePerGas(16) | maxFeePerGas(16)] per UserOperationLib.
+    function _maxFeePerGas(PackedUserOperation calldata userOp) internal pure returns (uint256) {
+        return uint128(uint256(userOp.gasFees));
     }
 }

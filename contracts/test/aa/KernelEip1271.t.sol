@@ -83,7 +83,15 @@ contract KernelEip1271Test is Test {
         // E-8: deployFor fails closed until the paymaster registry is
         // wired (registrar = factory, as in script/aa/DeployAA.s.sol).
         CitratePaymaster pm = new CitratePaymaster(
-            IAaEntryPoint(address(new StubEntryPoint())), address(0xA11CE), address(factory), 100_000, 200_000, 300_000
+            IAaEntryPoint(address(new StubEntryPoint())),
+            address(0xA11CE),
+            address(factory),
+            vm.addr(IDENTITY_PK), // sponsorSigner (unused in this suite)
+            0.01 ether,
+            0.01 ether,
+            0.02 ether,
+            20 gwei,
+            5 ether
         );
         vm.prank(address(0xA11CE));
         factory.setPaymaster(address(pm));

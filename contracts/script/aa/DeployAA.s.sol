@@ -35,9 +35,24 @@ import {IEntryPoint as IAaEntryPoint} from "@account-abstraction/interfaces/IEnt
  *   CITRATE_AA_ENTRY_POINT   — EntryPoint v0.7 address to wire the paymaster against
  *   CITRATE_AA_IDENTITY_SIGNER — operator EOA whose signature authorises factory deploys
  *   CITRATE_AA_OWNER         — owner of the factory + paymaster (operator multisig in prod)
- *   CITRATE_AA_DAILY_CAP     — paymaster daily gas cap (default 100_000)
- *   CITRATE_AA_RECOVERY_CAP  — paymaster recovery event cap (default 200_000)
- *   CITRATE_AA_FIRST_OP_CAP  — paymaster first-op cap (default 300_000)
+ *   CITRATE_AA_SPONSOR_SIGNER — EOA whose signature authorises sponsorship (E8-1)
+ *   CITRATE_AA_DAILY_CAP     — paymaster daily spend cap, WEI (default 0.01 ether)
+ *   CITRATE_AA_RECOVERY_CAP  — paymaster recovery event cap, WEI (default 0.01 ether)
+ *   CITRATE_AA_FIRST_OP_CAP  — paymaster first-op cap, WEI (default 0.02 ether)
+ *   CITRATE_AA_MAX_FEE_CEIL  — paymaster maxFeePerGas ceiling, WEI/gas (default 20 gwei)
+ *   CITRATE_AA_GLOBAL_CAP    — paymaster global daily spend backstop, WEI (default 5 ether)
+ *
+ * E8-2 cap math (40204 min_gas_price = 1 gwei; devnet-config.toml L38):
+ *   ceiling = 20 gwei  → 20x the 1-gwei floor; bounds per-op drain.
+ *   first-op = 0.02 ether = 800k gas x 20 gwei  (counterfactual proxy
+ *     deploy + Kernel init + first action ~500k gas, +headroom to 800k).
+ *   recovery = 0.01 ether = ~300k gas x 20 gwei (guardian recovery flow).
+ *   daily    = 0.01 ether = ~500k gas x 20 gwei (a few standard ops/day).
+ *   global   = 5 ether/day aggregate across ALL accounts — a drain
+ *     backstop; at the realistic 1-gwei price a first-op costs ~0.0005-
+ *     0.0008 ether, so 5 ether/day tolerates thousands of onboardings
+ *     while capping a fee-inflation drain to 5 ether before the day's
+ *     sponsorship fails closed. Owner re-tunes via setters.
  */
 contract DeployAA is Script, ScriptEnv {
     struct Deployment {
@@ -63,13 +78,22 @@ contract DeployAA is Script, ScriptEnv {
         address entryPoint = envAddressOr("CITRATE_AA_ENTRY_POINT", address(0));
         address identitySigner = envAddressOr("CITRATE_AA_IDENTITY_SIGNER", address(0));
         address owner = envAddressOr("CITRATE_AA_OWNER", address(0));
-        uint256 dailyCap = envUintOr("CITRATE_AA_DAILY_CAP", 100_000);
-        uint256 recoveryCap = envUintOr("CITRATE_AA_RECOVERY_CAP", 200_000);
-        uint256 firstOpCap = envUintOr("CITRATE_AA_FIRST_OP_CAP", 300_000);
+        // E8-1: the sponsorship signer defaults to the identity signer if
+        // unset (single-key operators), but SHOULD be a dedicated key in
+        // prod so a leaked deploy-permit signer cannot also drain the
+        // paymaster deposit (separation of duties — see ADR).
+        address sponsorSigner = envAddressOr("CITRATE_AA_SPONSOR_SIGNER", identitySigner);
+        // E8-2: caps in WEI (see header math). 40204 floor = 1 gwei.
+        uint256 dailyCap = envUintOr("CITRATE_AA_DAILY_CAP", 0.01 ether);
+        uint256 recoveryCap = envUintOr("CITRATE_AA_RECOVERY_CAP", 0.01 ether);
+        uint256 firstOpCap = envUintOr("CITRATE_AA_FIRST_OP_CAP", 0.02 ether);
+        uint256 maxFeeCeiling = envUintOr("CITRATE_AA_MAX_FEE_CEIL", 20 gwei);
+        uint256 globalDailyCap = envUintOr("CITRATE_AA_GLOBAL_CAP", 5 ether);
 
         require(entryPoint.code.length > 0, "EntryPoint not deployed on this chain");
         require(identitySigner != address(0), "identity signer not set");
         require(owner != address(0), "owner not set");
+        require(sponsorSigner != address(0), "sponsor signer not set");
 
         vm.startBroadcast();
 
@@ -91,9 +115,12 @@ contract DeployAA is Script, ScriptEnv {
             IAaEntryPoint(entryPoint),
             owner,
             address(d.factory),
+            sponsorSigner,
             dailyCap,
             recoveryCap,
-            firstOpCap
+            firstOpCap,
+            maxFeeCeiling,
+            globalDailyCap
         );
 
         // E-8: wire the registry direction factory → paymaster so every
