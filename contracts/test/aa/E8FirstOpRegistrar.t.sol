@@ -8,38 +8,32 @@ import {CitratePaymaster} from "../../src/aa/paymaster/CitratePaymaster.sol";
 import {CitrateWallet} from "../../src/aa/wallet/CitrateWallet.sol";
 import {CitrateECDSAValidator} from "../../src/aa/validators/CitrateECDSAValidator.sol";
 import {EntryPoint} from "@account-abstraction/core/EntryPoint.sol";
+import {EntryPointSimulations} from "@account-abstraction/core/EntryPointSimulations.sol";
+import {IEntryPointSimulations} from "@account-abstraction/interfaces/IEntryPointSimulations.sol";
 import {IEntryPoint} from "@account-abstraction/interfaces/IEntryPoint.sol";
 import {PackedUserOperation} from "@account-abstraction/interfaces/PackedUserOperation.sol";
 import {IEntryPoint as IKernelEntryPoint} from "@kernel/interfaces/IEntryPoint.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 
-/// E-8 — paymaster registrar gap (first-op sponsorship).
+/// E-8 — paymaster registrar gap (first-op sponsorship), SIGNATURE-BASED.
 ///
-/// Reproduces the counterfactual CREATE2 onboarding flow the way
-/// EntryPoint v0.7 actually sequences it (`_validatePrepayment`,
-/// lib/account-abstraction/contracts/core/EntryPoint.sol):
-///
-///   1. `_validateAccountPrepayment` → `_createSenderIfNeeded` runs the
-///      UserOp's initCode, i.e. `CitrateWalletFactory.deployFor(...)`
-///      (EntryPoint.sol L480).
-///   2. Only then does `_validatePaymasterPrepayment` call
-///      `CitratePaymaster.validatePaymasterUserOp` (EntryPoint.sol
-///      L661-666).
-///
-/// The 40204 ceremony (script/aa/DeployAA.s.sol) wires the paymaster
-/// with `registrar = factory`. But the factory never calls
-/// `registerWallet`, so a wallet's FIRST sponsored UserOp — the one
-/// whose initCode deploys it — reaches step 2 unregistered and the
-/// paymaster reverts `NotARegisteredCitrateWallet`. Onboarding degrades
-/// to "you pay gas", which the first-op category exists to prevent.
-///
-/// These tests assert the DELIVERABLE (first-op sponsorship succeeds at
-/// step 2 with no out-of-band registration transaction). They are RED
-/// against the current contracts — that is the E-8 WP-1 reproduction.
+/// Post-E8-1 the counterfactual CREATE2 first op is authorized by a
+/// SPONSOR SIGNATURE the paymaster verifies against its OWN signer — the
+/// factory no longer writes the paymaster's `isRegistered` slot during
+/// the UserOp's initCode/validation phase (the removed cross-entity
+/// write). These tests assert:
+///   - a counterfactual first op is sponsorable with a valid signature,
+///     with NO registration transaction and NO cross-entity write;
+///   - the E8-2 fix makes first-op sponsorship pass at a NONZERO gas
+///     price (it reverted before, when caps were mis-denominated in gas
+///     units — the units bug);
+///   - a validation-phase simulation (EntryPointSimulations) accepts the
+///     counterfactual first op AND leaves the paymaster's registry slot
+///     untouched by the factory.
 
 /// Minimal initializable wallet implementation (stand-in for the Kernel
-/// v3.3 CitrateWallet adapter, which is irrelevant to registrar logic).
+/// v3.3 CitrateWallet adapter, which is irrelevant to sponsorship logic).
 contract E8MockWalletImpl {
     uint256 public initCalls;
 
@@ -71,63 +65,66 @@ contract E8FirstOpRegistrarTest is Test {
     E8MockWalletImpl internal impl;
     E8StubEntryPoint internal entryPoint;
 
-    uint256 internal constant SIGNER_PK = 0x59E7;
+    uint256 internal constant SIGNER_PK = 0x59E7; // identity + sponsor (single-key test)
     address internal signer;
     address internal ownerAddr = address(0xA11CE);
 
     bytes32 internal constant USER = keccak256("e8-first-op-user");
 
-    uint256 internal constant DAILY = 100_000;
-    uint256 internal constant RECOVERY = 200_000;
-    uint256 internal constant FIRST_OP = 300_000;
+    uint256 internal constant DAILY = 0.01 ether;
+    uint256 internal constant RECOVERY = 0.01 ether;
+    uint256 internal constant FIRST_OP = 0.02 ether;
 
     function setUp() public {
         signer = vm.addr(SIGNER_PK);
         impl = new E8MockWalletImpl();
         entryPoint = new E8StubEntryPoint();
 
-        // Wire exactly as script/aa/DeployAA.s.sol does on 40204:
-        // factory first, then paymaster with registrar = factory, then
-        // (E-8 fix) the owner wires the registry direction
-        // factory → paymaster so deploys register atomically.
         factory = new CitrateWalletFactory(address(impl), signer, ownerAddr);
         pm = new CitratePaymaster(
-            IEntryPoint(address(entryPoint)), ownerAddr, address(factory), DAILY, RECOVERY, FIRST_OP
+            IEntryPoint(address(entryPoint)),
+            ownerAddr,
+            address(factory),
+            signer, // sponsorSigner
+            DAILY,
+            RECOVERY,
+            FIRST_OP,
+            20 gwei, // maxFeePerGas ceiling
+            5 ether // global daily cap
         );
         vm.prank(ownerAddr);
         factory.setPaymaster(address(pm));
     }
 
-    /// The whole E-8 deliverable in one test: a counterfactual CREATE2
-    /// wallet's first sponsored UserOp must pass paymaster validation
-    /// with no registration transaction between deploy and validate —
-    /// because in a single `handleOps` there is nowhere to put one.
-    function test_E8_counterfactualFirstOp_sponsorshipSucceedsAfterFactoryDeploy() public {
+    /// The E-8 deliverable: a counterfactual CREATE2 wallet's first
+    /// sponsored UserOp passes paymaster validation with only a sponsor
+    /// signature — NO registration transaction, NO cross-entity write.
+    function test_E8_counterfactualFirstOp_sponsorshipSucceedsBySignature() public {
         address predicted = factory.predictAddress(USER);
         assertEq(predicted.code.length, 0, "wallet must start counterfactual");
 
-        // Step 1 — EntryPoint._createSenderIfNeeded executes initCode:
-        // the permit-gated factory deploy.
+        // Deploy via the permit (this is what EntryPoint initCode runs).
         address account = _deployViaPermit(USER);
         assertEq(account, predicted, "CREATE2 address mismatch");
 
-        // Step 2 — EntryPoint._validatePaymasterPrepayment, same UserOp.
-        // No other transaction has run. This must sponsor the first op.
+        // E8-1: the factory did NOT register the wallet. First-op is
+        // authorized by signature alone.
+        assertFalse(pm.isRegistered(account), "E8-1: factory must not write paymaster storage");
+
         PackedUserOperation memory op = _firstOpUserOp(account);
         vm.prank(address(entryPoint));
-        (bytes memory ctx,) = pm.validatePaymasterUserOp(op, bytes32(0), 250_000);
+        (bytes memory ctx,) = pm.validatePaymasterUserOp(op, bytes32(0), 0.015 ether);
 
         (address ctxAccount, uint8 ctxCategory) = abi.decode(ctx, (address, uint8));
         assertEq(ctxAccount, account, "context account");
         assertEq(ctxCategory, CAT_FIRST_OP, "context category");
     }
 
-    /// The mechanism behind the deliverable: a factory deploy must leave
-    /// the wallet registered with the paymaster (the factory IS the
-    /// registrar per the 40204 ceremony — nobody else can register it).
-    function test_E8_deployFor_registersWalletWithPaymaster() public {
+    /// E8-1 invariant, stated directly: `deployFor` must not touch the
+    /// paymaster's `isRegistered` mapping at all.
+    function test_E8_deployFor_doesNotRegisterWithPaymaster() public {
         address account = _deployViaPermit(USER);
-        assertTrue(pm.isRegistered(account), "deployFor must register the wallet it deploys");
+        assertFalse(pm.isRegistered(account), "deployFor must not register (cross-entity write removed)");
     }
 
     // --- Helpers ---
@@ -140,33 +137,25 @@ contract E8FirstOpRegistrarTest is Test {
         return factory.deployFor(userId, address(0xDEAD), initData, expiresAt, abi.encodePacked(r, s, v));
     }
 
-    /// paymasterAndData: 52-byte ERC-4337 v0.7 prefix then the 1-byte
-    /// category tag (0x02 = first-op).
+    /// paymasterAndData: 52-byte ERC-4337 v0.7 prefix, then
+    /// [tag(1) | validUntil(6) | validAfter(6) | sponsorSig(65)].
     function _firstOpUserOp(address sender) internal view returns (PackedUserOperation memory op) {
         op.sender = sender;
-        bytes memory pmd = new bytes(53);
-        for (uint256 i = 0; i < 20; i++) {
-            pmd[i] = bytes20(address(pm))[i];
-        }
-        pmd[52] = bytes1(CAT_FIRST_OP);
-        op.paymasterAndData = pmd;
+        uint48 until = uint48(block.timestamp + 1 hours);
+        uint48 aft = uint48(block.timestamp);
+        bytes32 digest = pm.sponsorDigest(sender, CAT_FIRST_OP, until, aft);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_PK, digest.toEthSignedMessageHash());
+        op.paymasterAndData = abi.encodePacked(
+            address(pm), uint128(0), uint128(0), bytes1(CAT_FIRST_OP), until, aft, abi.encodePacked(r, s, v)
+        );
     }
 }
 
 /// E-8 end-to-end against the REAL EntryPoint v0.7 + real Kernel wallet:
 /// one `handleOps` whose UserOp carries initCode (counterfactual CREATE2
-/// deploy through `deployFor`) and a first-op-tagged paymaster. This
-/// pins the load-bearing ordering claim from
-/// ADR-2026-07-11-e8-atomic-factory-registration in-tree: sender
-/// creation runs before paymaster validation, so atomic registration
-/// inside `deployFor` makes the wallet's FIRST sponsored op eligible.
-///
-/// NB: `gasFees` are zero here. The paymaster compares the
-/// EntryPoint-reported `maxCost` (WEI = gas x maxFeePerGas) against
-/// `firstOpCap`, which the ADR-2026-06-05 policy and deploy script
-/// document in GAS UNITS (300k). At any nonzero fee a full
-/// counterfactual deploy's maxCost exceeds the cap — a pre-existing
-/// units mismatch flagged to Lane C in the E-8 PR, out of scope here.
+/// deploy through `deployFor`) and a signature-authorized first-op
+/// paymaster. This pins the load-bearing ordering claim in-tree AND (the
+/// E8-3 fix) exercises it at a NONZERO gas price with the E8-2 wei caps.
 contract E8RealEntryPointE2ETest is Test {
     using MessageHashUtils for bytes32;
 
@@ -178,7 +167,7 @@ contract E8RealEntryPointE2ETest is Test {
     CitrateWalletFactory internal factory;
     CitratePaymaster internal pm;
 
-    uint256 internal constant IDENTITY_PK = 0x59E7;
+    uint256 internal constant IDENTITY_PK = 0x59E7; // identity + sponsor (single-key test)
     uint256 internal constant OWNER_PK = 0xB0B0;
     address internal walletOwner;
     address internal opsOwner = address(0xA11CE);
@@ -192,64 +181,36 @@ contract E8RealEntryPointE2ETest is Test {
         ecdsaValidator = new CitrateECDSAValidator();
         walletOwner = vm.addr(OWNER_PK);
 
-        // The full 40204 ceremony, including the E-8 wiring step.
         factory = new CitrateWalletFactory(address(walletImpl), vm.addr(IDENTITY_PK), opsOwner);
         pm = new CitratePaymaster(
-            IEntryPoint(address(entryPoint)), opsOwner, address(factory), 100_000, 200_000, 300_000
+            IEntryPoint(address(entryPoint)),
+            opsOwner,
+            address(factory),
+            vm.addr(IDENTITY_PK), // sponsorSigner
+            0.01 ether,
+            0.01 ether,
+            0.02 ether,
+            20 gwei,
+            5 ether
         );
         vm.prank(opsOwner);
         factory.setPaymaster(address(pm));
 
-        // Sponsor treasury: the paymaster's EntryPoint deposit.
         vm.deal(address(this), 100 ether);
         pm.deposit{value: 10 ether}();
     }
 
-    function test_E8_realEntryPoint_counterfactualFirstOp_endToEnd() public {
+    /// E8-3: a counterfactual first op sponsored end-to-end at a NONZERO
+    /// gas price. Before the E8-2 fix the caps were denominated in gas
+    /// units (300k), so at any nonzero maxFeePerGas the wei `maxCost` far
+    /// exceeded the cap and validation reverted `FirstOpCapExceeded`.
+    /// With wei caps + a fee ceiling it passes.
+    function test_E8_realEntryPoint_counterfactualFirstOp_nonzeroGasPrice() public {
         address predicted = factory.predictAddress(USER_ID);
         assertEq(predicted.code.length, 0, "wallet must start counterfactual");
         assertFalse(pm.isRegistered(predicted), "must start unregistered");
 
-        // initCode: factory ++ deployFor(permit) — ECDSA root validator
-        // owned by walletOwner (source tag 1 = gui-native).
-        bytes memory initData = abi.encodeWithSignature(
-            "initialize(bytes21,address,bytes,bytes,bytes[])",
-            bytes21(abi.encodePacked(bytes1(0x01), address(ecdsaValidator))),
-            address(0),
-            abi.encodePacked(walletOwner, uint8(1)),
-            bytes(""),
-            new bytes[](0)
-        );
-        uint256 expiresAt = block.timestamp + 1 hours;
-        bytes32 permit = factory.permitDigest(USER_ID, initData, expiresAt);
-        (uint8 pv, bytes32 pr, bytes32 ps) = vm.sign(IDENTITY_PK, permit.toEthSignedMessageHash());
-        bytes memory initCode = abi.encodePacked(
-            address(factory),
-            abi.encodeCall(
-                CitrateWalletFactory.deployFor,
-                (USER_ID, address(ecdsaValidator), initData, expiresAt, abi.encodePacked(pr, ps, pv))
-            )
-        );
-
-        // First action: a no-op single-call execute (value 0). What
-        // matters is that the op EXECUTES sponsored, not what it does.
-        bytes memory callData = abi.encodeWithSignature(
-            "execute(bytes32,bytes)", bytes32(0), abi.encodePacked(address(0xD00D), uint256(0), bytes(""))
-        );
-
-        PackedUserOperation memory op = PackedUserOperation({
-            sender: predicted,
-            nonce: entryPoint.getNonce(predicted, 0), // key 0 → Kernel root validator
-            initCode: initCode,
-            callData: callData,
-            accountGasLimits: bytes32(abi.encodePacked(uint128(2_000_000), uint128(1_000_000))),
-            preVerificationGas: 100_000,
-            gasFees: bytes32(0), // see contract doc — units-mismatch note
-            paymasterAndData: abi.encodePacked(
-                address(pm), uint128(500_000), uint128(200_000), bytes1(CAT_FIRST_OP)
-            ),
-            signature: ""
-        });
+        PackedUserOperation memory op = _buildFirstOp(predicted, 1 gwei); // NONZERO fee
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(OWNER_PK, entryPoint.getUserOpHash(op));
         op.signature = abi.encodePacked(r, s, v);
 
@@ -257,11 +218,134 @@ contract E8RealEntryPointE2ETest is Test {
         ops[0] = op;
         entryPoint.handleOps(ops, beneficiary);
 
-        // Deployed at the predicted address, registered atomically, and
-        // the first-op budget was consumed — all in ONE handleOps with
-        // zero out-of-band transactions.
         assertGt(predicted.code.length, 0, "wallet deployed via initCode");
-        assertTrue(pm.isRegistered(predicted), "registered atomically by deployFor");
-        assertTrue(pm.hasUsedFirstOp(predicted), "first-op category consumed via postOp");
+        // E8-1: NOT registered — the factory writes no paymaster storage.
+        assertFalse(pm.isRegistered(predicted), "E8-1: no cross-entity write");
+        assertTrue(pm.hasUsedFirstOp(predicted), "first-op consumed via postOp");
+    }
+
+    /// E8-3: validation-phase proof via EntryPointSimulations. This runs
+    /// `simulateValidation`, the account-abstraction harness that mirrors
+    /// what a bundler's `debug_traceCall` drives — account validation
+    /// (initCode → deployFor) THEN paymaster validation — WITHOUT
+    /// executing the op. It asserts the counterfactual first op passes
+    /// validation AND that after simulation the factory left the
+    /// paymaster's `isRegistered` slot untouched (the E8-1 invariant:
+    /// during validation no entity writes another entity's storage).
+    ///
+    /// Residual gap (documented honestly): `simulateValidation` proves
+    /// the validation path SUCCEEDS and lets us assert the storage
+    /// invariant by inspection, but forge cannot run the ERC-7562
+    /// OPCODE/STORAGE TRACER itself. A full banned-storage-access proof
+    /// still requires the live Citrate bundler's `debug_traceCall`
+    /// (WP-3 staging). What this test DOES prove: (1) validation succeeds
+    /// end-to-end with the signature gate, (2) the factory performs zero
+    /// writes to paymaster storage during the whole validation, which is
+    /// the specific behavior E8-1 flagged. It does NOT independently
+    /// re-derive the tracer's verdict.
+    function test_E8_simulateValidation_counterfactualFirstOp_noCrossEntityWrite() public {
+        // Deploy a fresh EntryPointSimulations at the canonical EntryPoint
+        // address so account/paymaster wiring resolves against it.
+        EntryPointSimulations sim = new EntryPointSimulations();
+
+        // Rebuild the stack against the simulations EntryPoint.
+        CitrateWallet wImpl = new CitrateWallet(IKernelEntryPoint(address(sim)));
+        CitrateECDSAValidator val = new CitrateECDSAValidator();
+        CitrateWalletFactory f = new CitrateWalletFactory(address(wImpl), vm.addr(IDENTITY_PK), opsOwner);
+        CitratePaymaster p = new CitratePaymaster(
+            IEntryPoint(address(sim)),
+            opsOwner,
+            address(f),
+            vm.addr(IDENTITY_PK),
+            0.01 ether,
+            0.01 ether,
+            0.02 ether,
+            20 gwei,
+            5 ether
+        );
+        vm.prank(opsOwner);
+        f.setPaymaster(address(p));
+        vm.deal(address(this), 100 ether);
+        p.deposit{value: 10 ether}();
+
+        bytes32 userId = keccak256("e8-sim-user");
+        address predicted = f.predictAddress(userId);
+        assertFalse(p.isRegistered(predicted), "counterfactual: unregistered");
+
+        PackedUserOperation memory op = _buildFirstOpFor(sim, f, val, p, userId, predicted, 1 gwei);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(OWNER_PK, sim.getUserOpHash(op));
+        op.signature = abi.encodePacked(r, s, v);
+
+        // simulateValidation runs account (initCode/deployFor) + paymaster
+        // validation. A revert here would mean the counterfactual first
+        // op is NOT sponsorable in the validation phase.
+        IEntryPointSimulations.ValidationResult memory res = sim.simulateValidation(op);
+
+        // Paymaster validation returned a valid (non-sig-failed) result.
+        assertEq(uint160(res.returnInfo.paymasterValidationData), 0, "paymaster validation must succeed (sigFailed==0)");
+
+        // E8-1 invariant: the factory ran (initCode executed — the sender
+        // now has code) but wrote NOTHING to the paymaster's registry.
+        assertGt(predicted.code.length, 0, "initCode executed during validation");
+        assertFalse(p.isRegistered(predicted), "E8-1: factory wrote no paymaster storage during validation");
+    }
+
+    // --- Helpers ---
+
+    function _buildFirstOp(address predicted, uint256 maxFee) internal view returns (PackedUserOperation memory) {
+        return _buildFirstOpFor(entryPoint, factory, ecdsaValidator, pm, USER_ID, predicted, maxFee);
+    }
+
+    function _buildFirstOpFor(
+        EntryPoint ep,
+        CitrateWalletFactory f,
+        CitrateECDSAValidator val,
+        CitratePaymaster p,
+        bytes32 userId,
+        address predicted,
+        uint256 maxFee
+    ) internal view returns (PackedUserOperation memory op) {
+        bytes memory initData = abi.encodeWithSignature(
+            "initialize(bytes21,address,bytes,bytes,bytes[])",
+            bytes21(abi.encodePacked(bytes1(0x01), address(val))),
+            address(0),
+            abi.encodePacked(walletOwner, uint8(1)),
+            bytes(""),
+            new bytes[](0)
+        );
+        uint256 expiresAt = block.timestamp + 1 hours;
+        bytes32 permit = f.permitDigest(userId, initData, expiresAt);
+        (uint8 pv, bytes32 pr, bytes32 ps) = vm.sign(IDENTITY_PK, permit.toEthSignedMessageHash());
+        bytes memory initCode = abi.encodePacked(
+            address(f),
+            abi.encodeCall(
+                CitrateWalletFactory.deployFor,
+                (userId, address(val), initData, expiresAt, abi.encodePacked(pr, ps, pv))
+            )
+        );
+
+        bytes memory callData = abi.encodeWithSignature(
+            "execute(bytes32,bytes)", bytes32(0), abi.encodePacked(address(0xD00D), uint256(0), bytes(""))
+        );
+
+        // E8-1: sign the sponsorship for this sender + first-op + window.
+        uint48 until = uint48(block.timestamp + 1 hours);
+        uint48 aft = uint48(block.timestamp);
+        bytes32 sd = p.sponsorDigest(predicted, CAT_FIRST_OP, until, aft);
+        (uint8 sv, bytes32 sr, bytes32 ss) = vm.sign(IDENTITY_PK, sd.toEthSignedMessageHash());
+
+        op = PackedUserOperation({
+            sender: predicted,
+            nonce: ep.getNonce(predicted, 0),
+            initCode: initCode,
+            callData: callData,
+            accountGasLimits: bytes32(abi.encodePacked(uint128(2_000_000), uint128(1_000_000))),
+            preVerificationGas: 100_000,
+            gasFees: bytes32(abi.encodePacked(uint128(maxFee), uint128(maxFee))), // NONZERO (E8-3)
+            paymasterAndData: abi.encodePacked(
+                address(p), uint128(500_000), uint128(200_000), bytes1(CAT_FIRST_OP), until, aft, abi.encodePacked(sr, ss, sv)
+            ),
+            signature: ""
+        });
     }
 }

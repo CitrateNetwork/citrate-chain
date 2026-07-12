@@ -168,9 +168,13 @@ contract CitrateWalletFactory {
 
         // E-8: refuse to mint a wallet that cannot be sponsored. Checked
         // before the CREATE2 so a mis-wired ceremony fails loudly instead
-        // of silently reintroducing the registrar gap.
-        address paymaster_ = paymaster;
-        if (paymaster_ == address(0)) revert PaymasterNotSet();
+        // of silently reintroducing the registrar gap. This reads the
+        // factory's OWN `paymaster` storage slot only (ERC-7562 STO-010),
+        // so it is validation-legal even when `deployFor` runs as a
+        // UserOp's initCode. The factory no longer WRITES paymaster
+        // storage here (E8-1) — it only requires the wiring to exist so
+        // post-onboarding standard/recovery sponsorship is reachable.
+        if (paymaster == address(0)) revert PaymasterNotSet();
 
         bool alreadyDeployed;
         (alreadyDeployed, account) = LibClone.createDeterministicERC1967(msg.value, implementation, _salt(userId));
@@ -180,20 +184,21 @@ contract CitrateWalletFactory {
             deployNonce[userId] += 1;
             (bool ok,) = account.call(initData);
             if (!ok) revert InitializeFailed();
-            // E-8: register atomically with the deploy. EntryPoint v0.7
-            // runs initCode (this call) BEFORE paymaster validation
-            // (_validatePrepayment: _createSenderIfNeeded at L480, then
-            // _validatePaymasterPrepayment), so the counterfactual
-            // wallet's FIRST sponsored UserOp already sees
-            // isRegistered == true. The registry write stays behind the
-            // identity-signer permit verified above — anti-griefing is
-            // unchanged. A registration revert bubbles up (fail-closed).
-            ICitratePaymasterRegistry(paymaster_).registerWallet(account);
+            // E8-1: the factory NO LONGER calls paymaster.registerWallet
+            // here. That was a write to a SECOND ENTITY's storage
+            // (paymaster.isRegistered) during the UserOp's initCode/
+            // validation phase, which strict ERC-7562 bundlers reject
+            // (the paymaster is an entity named in the same UserOp).
+            // The counterfactual FIRST op is now authorized by the
+            // sponsor SIGNATURE the paymaster verifies against its OWN
+            // signer (see ADR-2026-07-11-e8-signature-based-paymaster),
+            // so no cross-entity write is needed to sponsor onboarding.
+            // Standard/recovery registration (still gated on the
+            // paymaster's own `isRegistered` read) happens OUTSIDE
+            // validation via `registerDeployedWallet` (owner passthrough)
+            // — see below.
             emit AccountDeployed(userId, account, initialValidator);
         }
-        // NB: the idempotent path above returns early and NEVER
-        // registers — a wallet unregistered for compromise cannot be
-        // re-registered through this permit-less short-circuit.
     }
 
     /// The digest the identity signer signs (off-chain, in
