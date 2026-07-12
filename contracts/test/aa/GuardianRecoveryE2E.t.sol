@@ -99,7 +99,15 @@ contract GuardianRecoveryE2ETest is Test {
         // wired (registrar = factory, as in script/aa/DeployAA.s.sol).
         // Wired against the REAL EntryPoint this suite already runs.
         CitratePaymaster pm = new CitratePaymaster(
-            IEntryPoint(address(entryPoint)), address(0xA11CE), address(factory), 100_000, 200_000, 300_000
+            IEntryPoint(address(entryPoint)),
+            address(0xA11CE),
+            address(factory),
+            vm.addr(IDENTITY_PK), // sponsorSigner (unused in this suite)
+            0.01 ether,
+            0.01 ether,
+            0.02 ether,
+            20 gwei,
+            5 ether
         );
         vm.prank(address(0xA11CE));
         factory.setPaymaster(address(pm));

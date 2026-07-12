@@ -11,9 +11,15 @@ repo: citrate-chain
 
 ## Status
 
-Accepted. Implemented on `fix/e8-paymaster-registrar`. Requires Rule-8
-security sign-off before any deployment (paymaster/factory touch money +
-keys).
+SUPERSEDED (first-op path) by
+`ADR-2026-07-11-e8-signature-based-paymaster` after the Rule-8 review
+(citrate-security PR #12). The atomic factory→paymaster
+`registerWallet` write during `deployFor` was an ERC-7562 cross-entity
+storage write (finding E8-1) and has been removed; sponsorship is now
+authorized by a signature the paymaster verifies against its own signer.
+The EntryPoint-ordering analysis below remains accurate; only the
+"register inside deployFor" mechanism is replaced. Retained for
+historical context.
 
 ## Context
 
