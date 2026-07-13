@@ -16,6 +16,14 @@ rand = { workspace = true }
 hex = "0.4"
 rlp = "0.5"
 bip39 = { version = "1.2", features = ["rand", "std"] }
+# BIP32 → BIP44 HD derivation (WAL / feat/wal-bip44-secp256k1-hd).
+# `secp256k1` here is bip32's PURE-RUST k256-backed curve feature
+# (`secp256k1 = ["k256"]`), NOT the C-FFI backend — that is the separate
+# `secp256k1-ffi` feature, which we do NOT enable. Verified via
+# `cargo tree`: no `secp256k1-sys`/native crate enters the build graph,
+# so HD derivation stays WASM-compatible (pure Rust, matching the crate's
+# WASM posture). Pulls k256 0.13.4, matching our `k256 = "0.13"`.
+bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "alloc"] }
 
 # Encryption (WASM-compatible — pure Rust)
 # WP-A3.3: AEAD calls route through the citrate-security wrapper which
