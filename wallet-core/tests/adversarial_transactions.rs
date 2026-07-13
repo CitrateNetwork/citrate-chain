@@ -1,3 +1,5 @@
+// B1.1-F-1: native-only — exercises `chain::TransactionBuilder`.
+#![cfg(feature = "native")]
 //! Adversarial tests for transaction building and signing.
 //!
 //! Attack surfaces: overflow, replay, malleability, cross-chain,

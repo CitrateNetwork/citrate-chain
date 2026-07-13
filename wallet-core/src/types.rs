@@ -3,6 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Wallet configuration
+///
+/// Native-only: `Default::default()` resolves `default_keystore_path()`,
+/// which uses the `dirs` crate (an OS-specific, native-only dependency).
+/// The lean `crypto` build has no on-disk keystore, so this type is not
+/// compiled there.
+#[cfg(feature = "native")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletConfig {
     pub keystore_path: String,
@@ -16,6 +22,7 @@ pub struct WalletConfig {
     pub lockout_duration_secs: u64,
 }
 
+#[cfg(feature = "native")]
 impl Default for WalletConfig {
     fn default() -> Self {
         Self {
@@ -33,6 +40,7 @@ impl Default for WalletConfig {
     }
 }
 
+#[cfg(feature = "native")]
 fn default_keystore_path() -> String {
     dirs::data_local_dir()
         .map(|d| d.join("citrate-wallet").join("keystore").to_string_lossy().to_string())
@@ -137,6 +145,7 @@ impl NetworkConfig {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "native")]
     #[test]
     fn test_default_config() {
         let config = WalletConfig::default();
@@ -146,6 +155,7 @@ mod tests {
         assert_eq!(config.max_failed_attempts, 5);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn test_config_serialization() {
         let config = WalletConfig::default();

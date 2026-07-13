@@ -22,21 +22,31 @@
 //! comment must be updated in lock-step.
 
 use crate::error::WalletError;
-use crate::types::{CreateAccountResult, EncryptedKeyEntry, KeyType};
+use crate::types::KeyType;
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use sha3::{Digest, Keccak256};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use zeroize::Zeroizing;
 
+// Keystore-path imports (native-only): the on-disk `KeyManager` and its
+// encrypt/decrypt helpers. The lean `crypto` build derives + signs keys
+// but never persists them, so none of this is compiled there.
+#[cfg(feature = "native")]
+use crate::types::{CreateAccountResult, EncryptedKeyEntry};
+#[cfg(feature = "native")]
+use std::collections::HashMap;
+#[cfg(feature = "native")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "native")]
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
 // =========================================================================
-// KDF version registry
+// KDF version registry (native-only — used by the keystore encrypt path)
 // =========================================================================
 
 /// Legacy KDF version. Entries written before WAL-01 was closed used
 /// `Argon2::default()` parameters. Accepted on read for backward
 /// compatibility; never written by the current code.
+#[cfg(feature = "native")]
 pub const KDF_VERSION_LEGACY: u32 = 1;
 
 /// Current production KDF version. OWASP 2024 recommended Argon2id
@@ -46,11 +56,13 @@ pub const KDF_VERSION_LEGACY: u32 = 1;
 /// but the dispatcher constructs with `p=1`. OWASP's 2024 cheat-sheet
 /// lists `p=1` as acceptable at this `(m, t)` setting — the security
 /// floor is met. Comment now matches code.
+#[cfg(feature = "native")]
 pub const KDF_VERSION_CURRENT: u32 = 2;
 
 /// Low-memory KDF version (OWASP "alternative"). Reserved for the
 /// browser extension and other constrained environments — not used by
 /// `wallet-core` directly today. m=46336 KiB, t=1, p=1, output_len=32.
+#[cfg(feature = "native")]
 pub const KDF_VERSION_LOW_MEMORY: u32 = 3;
 
 /// Construct the appropriate Argon2 instance for a given KDF version.
@@ -64,6 +76,7 @@ pub const KDF_VERSION_LOW_MEMORY: u32 = 3;
 /// can pin the parameter set directly. Without that test, a regression
 /// to `Ok(Argon2::default())` survives the round-trip suite — see
 /// `tools/mutants/RESULTS_2026_04_24.md`.
+#[cfg(feature = "native")]
 pub(crate) fn argon2_for_version(version: u32) -> Result<argon2::Argon2<'static>, WalletError> {
     use argon2::{Algorithm, Argon2, Params, Version};
 
@@ -157,12 +170,20 @@ impl UnifiedKey {
 }
 
 /// Key manager — handles key lifecycle: generate → encrypt → store → unlock → sign → lock
+///
+/// Native-only: this is the on-disk keystore. It persists Argon2 +
+/// AES-GCM encrypted entries to a `dirs`-derived path and depends on
+/// `citrate_security::Aead`. The lean `crypto` build has no keystore —
+/// consumers hold the seed elsewhere and call the stateless
+/// `secp256k1_from_mnemonic`/`secp256k1_from_seed` primitives.
+#[cfg(feature = "native")]
 pub struct KeyManager {
     keystore_path: PathBuf,
     entries: Arc<RwLock<Vec<EncryptedKeyEntry>>>,
     unlocked_keys: Arc<RwLock<HashMap<String, UnifiedKey>>>, // address → decrypted key
 }
 
+#[cfg(feature = "native")]
 impl KeyManager {
     /// Create a new key manager pointing to a keystore directory.
     pub fn new(keystore_path: &Path) -> Self {
@@ -770,6 +791,7 @@ pub fn secp256k1_from_mnemonic(
 }
 
 /// Encrypt an Ed25519 signing key (convenience wrapper).
+#[cfg(feature = "native")]
 fn encrypt_key(
     signing_key: &Ed25519SigningKey,
     password: &str,
@@ -804,8 +826,10 @@ fn encrypt_key(
 // See `decrypt_key` for the version-dispatch.
 // =========================================================================
 
+#[cfg(feature = "native")]
 const KEYSTORE_AAD_DOMAIN: &[u8] = b"citrate-keystore-v2";
 
+#[cfg(feature = "native")]
 fn keystore_v2_aad(kdf_version: u32, key_type: KeyType, address: &str) -> Vec<u8> {
     let mut aad = Vec::with_capacity(
         KEYSTORE_AAD_DOMAIN.len() + 4 + 1 + address.len(),
@@ -826,6 +850,7 @@ fn keystore_v2_aad(kdf_version: u32, key_type: KeyType, address: &str) -> Vec<u8
 /// `docs/security/KDF_POLICY.md`. WAL-01: KDF strength. WAL-02: AAD bind
 /// (routed through `citrate_security::Aead`, the canonical AEAD
 /// wrapper added in WP-A3.3).
+#[cfg(feature = "native")]
 fn encrypt_key_raw(
     secret_bytes: &[u8; 32],
     password: &str,
@@ -886,6 +911,7 @@ fn encrypt_key_raw(
 /// onto a different entry's metadata — fails the GCM tag check and
 /// surfaces as `WalletError::InvalidPassword` to the caller. The legacy
 /// v1 path decrypts without AAD for backward compatibility.
+#[cfg(feature = "native")]
 fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], WalletError> {
     use base64::Engine;
 
@@ -963,7 +989,11 @@ fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], Wa
     Ok(secret)
 }
 
-#[cfg(test)]
+// The full keystore test suite exercises `KeyManager` (disk persistence,
+// Argon2 + AES-GCM encrypt/decrypt) and `#[tokio::test]`, so it is
+// native-only. The crypto-only BIP44/UnifiedKey vectors live in the
+// separate `crypto_tests` module below, which compiles WITHOUT `native`.
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
     use std::env::temp_dir;
@@ -1646,7 +1676,9 @@ mod tests {
 // surfaced this gap.
 // =========================================================================
 
-#[cfg(test)]
+// KDF dispatcher tests pin the Argon2 parameter set — native-only, since
+// `argon2_for_version` and the KDF version constants are native-gated.
+#[cfg(all(test, feature = "native"))]
 mod kdf_dispatcher_tests {
     use super::*;
 
@@ -1734,5 +1766,72 @@ mod kdf_dispatcher_tests {
             "Error message should reference the unknown version: {}",
             err_msg
         );
+    }
+}
+
+// =========================================================================
+// B1.1-F-1 — crypto-only smoke tests.
+//
+// These compile and run in the LEAN build (WITHOUT the `native` feature),
+// proving the crown-jewel BIP44 derivation + signing path stands alone.
+// They deliberately avoid `KeyManager`, the keystore, `dirs`, tokio, and
+// any native-gated symbol. The `native` suite above already covers these
+// same vectors; this module is what makes the guarantee testable in the
+// crypto-only configuration a downstream (citrate-core) actually links.
+//
+// Run explicitly with:
+//   cargo test -p citrate-wallet-core --no-default-features \
+//       --features crypto crypto_only
+// =========================================================================
+#[cfg(test)]
+mod crypto_only_smoke {
+    use super::*;
+
+    /// The canonical MetaMask / standard-BIP44 test vector.
+    const ABANDON_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon \
+        abandon abandon abandon abandon abandon about";
+    /// `abandon…about` at `m/44'/60'/0'/0/0`, EIP-55 checksummed.
+    const ABANDON_ADDR_INDEX0_EIP55: &str = "0x9858EfFD232B4033E47d90003D41EC34EcaEda94";
+
+    #[test]
+    fn crypto_only_canonical_bip44_vector_index0() {
+        // The whole point of B1.1-F-1: this must derive the published
+        // MetaMask address WITHOUT the native/keystore stack compiled in.
+        let key = secp256k1_from_mnemonic(ABANDON_MNEMONIC, 0)
+            .expect("canonical mnemonic must derive in the lean build");
+        assert_eq!(key.key_type(), KeyType::Secp256k1);
+
+        let derived = crate::address::to_eip55_checksum(&key.derive_address());
+        assert_eq!(
+            derived, ABANDON_ADDR_INDEX0_EIP55,
+            "lean crypto build must reproduce the named BIP44 vector"
+        );
+    }
+
+    #[test]
+    fn crypto_only_seed_helper_and_unified_sign() {
+        // secp256k1_from_seed agrees with the mnemonic wrapper, and the
+        // returned UnifiedKey signs (proves signing works lean).
+        let seed = bip39::Mnemonic::parse(ABANDON_MNEMONIC)
+            .expect("parse")
+            .to_seed("");
+        let key = secp256k1_from_seed(&seed, 0).expect("seed derive");
+        assert_eq!(
+            crate::address::to_eip55_checksum(&key.derive_address()),
+            ABANDON_ADDR_INDEX0_EIP55
+        );
+
+        let sig = key.sign(b"citrate B1.1-F-1 lean signing");
+        assert_eq!(sig.len(), 64, "secp256k1 ECDSA r||s is 64 bytes");
+        assert!(!key.public_key_bytes().is_empty());
+    }
+
+    #[test]
+    fn crypto_only_bip39_generate_and_parse() {
+        // BIP39 gen/parse must be available lean (with zeroize enabled).
+        let m = bip39::Mnemonic::generate(24).expect("generate 24-word mnemonic");
+        assert_eq!(m.to_string().split_whitespace().count(), 24);
+        let reparsed = bip39::Mnemonic::parse(m.to_string()).expect("re-parse");
+        assert_eq!(reparsed.to_string(), m.to_string());
     }
 }

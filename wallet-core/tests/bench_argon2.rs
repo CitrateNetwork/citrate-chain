@@ -1,3 +1,5 @@
+// B1.1-F-1: native-only — exercises `KeyManager` + Argon2 keystore path.
+#![cfg(feature = "native")]
 //! WP-A1.2 — Argon2 v2 latency gate.
 //!
 //! Asserts that `KeyManager::create_account` completes within the
