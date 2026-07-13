@@ -1,3 +1,5 @@
+// B1.1-F-1: native-only — full pipeline through `KeyManager` + `chain`.
+#![cfg(feature = "native")]
 //! Integration tests — full wallet pipeline.
 //!
 //! Tests the complete flow: create account → unlock → build tx → sign → verify.

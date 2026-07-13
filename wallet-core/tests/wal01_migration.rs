@@ -1,3 +1,5 @@
+// B1.1-F-1: native-only — exercises `KeyManager` KDF migration.
+#![cfg(feature = "native")]
 //! WP-A1.3 — KDF migration v1 → v2 regression tests.
 //!
 //! Verifies the lazy-migration path documented in

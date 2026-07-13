@@ -1,3 +1,5 @@
+// B1.1-F-1: native-only — exercises the AES-GCM keystore AAD path.
+#![cfg(feature = "native")]
 //! WAL-02 — wallet-core AES-GCM AAD binding regression tests.
 //!
 //! Audit finding `WAL-02` (HIGH): the keystore's AES-256-GCM seal/open
