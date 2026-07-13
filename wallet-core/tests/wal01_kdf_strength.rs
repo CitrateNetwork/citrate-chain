@@ -1,3 +1,5 @@
+// B1.1-F-1: native-only — exercises the Argon2 keystore KDF path.
+#![cfg(feature = "native")]
 //! WP-A1.1 / WAL-01 — Argon2 KDF strength regression tests.
 //!
 //! Audit finding: WAL-01 (CRITICAL) — `Argon2::default()` is at the OWASP
