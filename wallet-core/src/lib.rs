@@ -18,6 +18,10 @@ pub mod chain;
 
 pub use error::WalletError;
 pub use keys::KeyManager;
+// BIP44 secp256k1 HD derivation (B1.1.0). Stateless primitives — no
+// KeyManager/keystore/disk — for consumers that hold the seed elsewhere
+// (e.g. citrate-core's A2 vault, Option A).
+pub use keys::{secp256k1_from_mnemonic, secp256k1_from_seed, UnifiedKey};
 pub use session::{PersistedFailure, SessionManager, SessionStatus};
 pub use types::{WalletAccount, WalletConfig};
 
