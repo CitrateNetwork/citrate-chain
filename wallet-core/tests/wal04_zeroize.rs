@@ -1,3 +1,5 @@
+// B1.1-F-1: native-only — exercises `KeyManager` secret-zeroize paths.
+#![cfg(feature = "native")]
 //! WAL-04 — Zeroize regression tests.
 //!
 //! Audit finding `WAL-04` (HIGH): every secret-bearing buffer in
