@@ -658,6 +658,112 @@ pub fn derive_address(pubkey_bytes: &[u8; 32]) -> String {
 // lands (so a seed maps to multiple addresses, not just one).
 // Re-add via a proper sprint when EVM mnemonic recovery is on the
 // roadmap.
+//
+// That sprint is `feat/wal-bip44-secp256k1-hd` (CORE-B1 / B1.1.0).
+// The re-add below is the "proper" one the comment prescribed: full
+// BIP32 → BIP44 HD derivation (a seed maps to many indexed keys, not
+// one), delegated to the vetted iqlusion `bip32` crate on its
+// pure-Rust k256 backend (no bespoke HMAC-SHA512 crypto). See
+// `secp256k1_from_mnemonic` / `secp256k1_from_seed`.
+
+// =========================================================================
+// BIP44 secp256k1 HD derivation (B1.1.0 / feat/wal-bip44-secp256k1-hd).
+//
+// Standard flow: BIP39 mnemonic → 64-byte seed (empty passphrase) →
+// BIP32 master → BIP44 path `m/44'/60'/0'/0/{index}` → k256 SigningKey.
+//
+// Coin type 60' is Ethereum/EVM (SLIP-44). Chain 40204 is EVM-compatible
+// (`UnifiedKey::derive_address` = Keccak-256(uncompressed_pubkey[1..])
+// [12..32]), so the standard MetaMask/Ledger BIP44 path applies and a
+// mnemonic recovered elsewhere resolves to the same address here.
+//
+// These are STATELESS pure functions: they never touch `KeyManager`,
+// the keystore, `save`, disk, or a session. citrate-core B1.1 (Option A)
+// seals the seed in the A2 vault and needs only this primitive.
+//
+// Crypto is delegated to the iqlusion `bip32` crate (pure-Rust k256
+// backend, no C-FFI / no native `secp256k1-sys`; WASM-compatible). We do
+// NOT hand-roll the BIP32 HMAC-SHA512 child-key ladder. The named vector
+// `abandon abandon ... about` → `m/44'/60'/0'/0/0` →
+// `0x9858EfFD232B4033E47d90003D41EC34EcaEda94` is pinned in the tests.
+// =========================================================================
+
+/// The BIP44 derivation path prefix for Ethereum/EVM accounts
+/// (`m/44'/60'/0'/0`). The final child index is appended per account.
+/// Coin type 60' = Ethereum (SLIP-44); applies to EVM chain 40204.
+const BIP44_EVM_PATH_PREFIX: &str = "m/44'/60'/0'/0";
+
+/// Derive a BIP44 secp256k1 signing key from a 64-byte BIP39 seed.
+///
+/// Path: `m/44'/60'/0'/0/{account_index}`. Returns a
+/// `UnifiedKey::Secp256k1` whose `derive_address()` is the standard EVM
+/// address for that seed + index.
+///
+/// This is the seed→key helper (the mnemonic-agnostic core).
+/// `secp256k1_from_mnemonic` is the mnemonic→seed→key convenience wrapper.
+///
+/// WAL-04: the caller owns the seed's lifetime; this function does not
+/// copy it into any longer-lived buffer. The intermediate extended-key
+/// material inside `bip32` is zeroized by that crate on drop (it derives
+/// `Zeroize`). The returned `SigningKey` zeroizes on drop via k256.
+pub fn secp256k1_from_seed(
+    seed: &[u8],
+    account_index: u32,
+) -> Result<UnifiedKey, WalletError> {
+    use core::str::FromStr;
+
+    let path_str = format!("{}/{}", BIP44_EVM_PATH_PREFIX, account_index);
+    let path = bip32::DerivationPath::from_str(&path_str).map_err(|e| {
+        WalletError::KeyGeneration(format!("BIP44: invalid derivation path {}: {}", path_str, e))
+    })?;
+
+    // XPrv::derive_from_path runs the BIP32 HMAC-SHA512 child-key ladder
+    // over the seed. Fails closed on a bad seed length or an out-of-range
+    // scalar (the crate re-derives on the astronomically-unlikely invalid
+    // child; we surface any residual error rather than panic).
+    let xprv = bip32::XPrv::derive_from_path(seed, &path).map_err(|e| {
+        WalletError::KeyGeneration(format!(
+            "BIP44: HD derivation failed for {}: {}",
+            path_str, e
+        ))
+    })?;
+
+    // For the k256 backend, `bip32::PrivateKey` IS `k256::ecdsa::SigningKey`.
+    // Clone the leaf out of the extended key; the XPrv (and its chain code)
+    // is dropped here and zeroized by the crate.
+    let signing_key: k256::ecdsa::SigningKey = xprv.private_key().clone();
+    Ok(UnifiedKey::Secp256k1(signing_key))
+}
+
+/// Derive a BIP44 secp256k1 signing key from a BIP39 mnemonic phrase.
+///
+/// Standard, mnemonic-recoverable EVM key: parses and checksum-validates
+/// the mnemonic, converts it to a 64-byte seed with an EMPTY passphrase
+/// (the MetaMask/standard default), then derives
+/// `m/44'/60'/0'/0/{account_index}`.
+///
+/// Returns `UnifiedKey::Secp256k1(SigningKey)`. Use
+/// `UnifiedKey::derive_address()` for the EVM address and
+/// `chain::TransactionBuilder::sign_secp256k1` / `UnifiedKey::sign` to
+/// sign — the derived key is a real EVM signer.
+///
+/// STATELESS: does not persist anything. Errors (never panics) on an
+/// empty, short, or checksum-invalid mnemonic.
+///
+/// WAL-04: the 64-byte seed is held in a `Zeroizing` buffer and erased
+/// when this function returns; the returned `SigningKey` zeroizes on drop.
+pub fn secp256k1_from_mnemonic(
+    mnemonic: &str,
+    account_index: u32,
+) -> Result<UnifiedKey, WalletError> {
+    let mnemonic_obj = bip39::Mnemonic::parse(mnemonic.trim())
+        .map_err(|e| WalletError::InvalidMnemonic(format!("{}", e)))?;
+
+    // Empty-passphrase seed — the standard/MetaMask default that makes the
+    // named vector reproduce. WAL-04: zeroize the seed on scope exit.
+    let seed: Zeroizing<[u8; 64]> = Zeroizing::new(mnemonic_obj.to_seed(""));
+    secp256k1_from_seed(seed.as_ref(), account_index)
+}
 
 /// Encrypt an Ed25519 signing key (convenience wrapper).
 fn encrypt_key(
@@ -1360,6 +1466,165 @@ mod tests {
         let secret = ed_key.to_bytes();
         let unified = UnifiedKey::Ed25519(ed_key);
         assert_eq!(unified.secret_bytes(), secret);
+    }
+
+    // ================================================================
+    // B1.1.0 — BIP44 secp256k1 HD derivation (feat/wal-bip44-secp256k1-hd).
+    //
+    // Red-test-first (Rule 11): these assert the published named vector
+    // and fail before `secp256k1_from_mnemonic` exists.
+    // ================================================================
+
+    /// The canonical MetaMask / standard-BIP44 test vector.
+    const ABANDON_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon \
+        abandon abandon abandon abandon abandon about";
+    /// `abandon…about` at `m/44'/60'/0'/0/0`, EIP-55 checksummed.
+    const ABANDON_ADDR_INDEX0_EIP55: &str = "0x9858EfFD232B4033E47d90003D41EC34EcaEda94";
+
+    #[test]
+    fn test_b110_canonical_bip44_vector_index0() {
+        // Named vector: the published MetaMask/standard address. Assert
+        // exact EIP-55 checksum match (via address::to_eip55_checksum),
+        // not just lowercase equality.
+        let key = secp256k1_from_mnemonic(ABANDON_MNEMONIC, 0)
+            .expect("canonical mnemonic must derive");
+        assert_eq!(key.key_type(), KeyType::Secp256k1, "must be a secp256k1 key");
+
+        let derived_lower = key.derive_address();
+        let derived_eip55 = crate::address::to_eip55_checksum(&derived_lower);
+        assert_eq!(
+            derived_eip55, ABANDON_ADDR_INDEX0_EIP55,
+            "m/44'/60'/0'/0/0 for the abandon…about mnemonic must be the published EVM address"
+        );
+    }
+
+    #[test]
+    fn test_b110_seed_helper_matches_mnemonic_wrapper() {
+        // secp256k1_from_seed (the seed→key core) must agree with the
+        // mnemonic wrapper for the same seed + index.
+        let m = bip39::Mnemonic::parse(ABANDON_MNEMONIC).expect("parse");
+        let seed = m.to_seed("");
+        let via_seed = secp256k1_from_seed(&seed, 0).expect("seed derive");
+        let via_mnemonic = secp256k1_from_mnemonic(ABANDON_MNEMONIC, 0).expect("mnemonic derive");
+        assert_eq!(
+            via_seed.derive_address(),
+            via_mnemonic.derive_address(),
+            "seed helper and mnemonic wrapper must derive the same key"
+        );
+        assert_eq!(
+            crate::address::to_eip55_checksum(&via_seed.derive_address()),
+            ABANDON_ADDR_INDEX0_EIP55
+        );
+    }
+
+    #[test]
+    fn test_b110_hd_distinct_index_and_determinism() {
+        // HD, not single-key: a different index gives a different,
+        // deterministic address; re-deriving index 0 reproduces the vector.
+        let k0 = secp256k1_from_mnemonic(ABANDON_MNEMONIC, 0).expect("index 0");
+        let k1 = secp256k1_from_mnemonic(ABANDON_MNEMONIC, 1).expect("index 1");
+        let a0 = k0.derive_address();
+        let a1 = k1.derive_address();
+        assert_ne!(a0, a1, "index 0 and index 1 must derive distinct addresses (HD)");
+
+        // Determinism: re-derive index 0 and index 1.
+        let a0_again = secp256k1_from_mnemonic(ABANDON_MNEMONIC, 0)
+            .expect("re-derive 0")
+            .derive_address();
+        let a1_again = secp256k1_from_mnemonic(ABANDON_MNEMONIC, 1)
+            .expect("re-derive 1")
+            .derive_address();
+        assert_eq!(a0, a0_again, "index 0 must be deterministic");
+        assert_eq!(a1, a1_again, "index 1 must be deterministic");
+        assert_eq!(
+            crate::address::to_eip55_checksum(&a0),
+            ABANDON_ADDR_INDEX0_EIP55,
+            "re-derived index 0 must reproduce the named vector"
+        );
+    }
+
+    #[test]
+    fn test_b110_ecrecover_roundtrip_proves_evm_signer() {
+        // Round-trip: derive → sign a prehash → ecrecover to the derived
+        // address. Proves the HD key is a real EVM signer, not just a
+        // string that happens to match a vector.
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+
+        let key = secp256k1_from_mnemonic(ABANDON_MNEMONIC, 0).expect("derive");
+        let signing_key = match &key {
+            UnifiedKey::Secp256k1(sk) => sk.clone(),
+            _ => panic!("expected secp256k1"),
+        };
+        let derived_addr = key.derive_address();
+
+        // 32-byte message digest (stand-in for an EIP-155 signing hash).
+        let msg_hash = Keccak256::digest(b"citrate B1.1.0 ecrecover round-trip");
+
+        let (signature, recovery_id): (Signature, RecoveryId) = signing_key
+            .sign_prehash(&msg_hash)
+            .expect("prehash sign");
+
+        // ecrecover the verifying key from (hash, sig, recovery_id).
+        let recovered_vk =
+            VerifyingKey::recover_from_prehash(&msg_hash, &signature, recovery_id)
+                .expect("recover verifying key");
+
+        // Address of the recovered key.
+        let uncompressed = recovered_vk.to_encoded_point(false);
+        let recovered_hash = Keccak256::digest(&uncompressed.as_bytes()[1..]);
+        let recovered_addr = format!("0x{}", hex::encode(&recovered_hash[12..32]));
+
+        assert_eq!(
+            recovered_addr, derived_addr,
+            "ecrecover(sig) must equal the derived EVM address — the key is a real EVM signer"
+        );
+    }
+
+    #[test]
+    fn test_b110_invalid_mnemonic_bad_checksum_errors_not_panic() {
+        // 12 valid BIP39 words but a wrong final checksum word.
+        let bad = "abandon abandon abandon abandon abandon abandon \
+            abandon abandon abandon abandon abandon abandon";
+        // Map Ok → address string so `expect_err` only needs a Debug Ok
+        // type (UnifiedKey deliberately isn't Debug — no key material in
+        // debug output).
+        let err = secp256k1_from_mnemonic(bad, 0)
+            .map(|k| k.derive_address())
+            .expect_err("bad checksum must error, not panic");
+        assert!(
+            matches!(err, WalletError::InvalidMnemonic(_)),
+            "expected InvalidMnemonic, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_b110_invalid_word_errors() {
+        let bad = "zzzz abandon abandon abandon abandon abandon \
+            abandon abandon abandon abandon abandon about";
+        let err = secp256k1_from_mnemonic(bad, 0)
+            .map(|k| k.derive_address())
+            .expect_err("non-wordlist token must error");
+        assert!(matches!(err, WalletError::InvalidMnemonic(_)));
+    }
+
+    #[test]
+    fn test_b110_empty_and_short_mnemonic_rejected() {
+        assert!(
+            matches!(
+                secp256k1_from_mnemonic("", 0),
+                Err(WalletError::InvalidMnemonic(_))
+            ),
+            "empty mnemonic must be rejected"
+        );
+        assert!(
+            matches!(
+                secp256k1_from_mnemonic("abandon abandon about", 0),
+                Err(WalletError::InvalidMnemonic(_))
+            ),
+            "short (non-standard-length) mnemonic must be rejected"
+        );
     }
 }
 
