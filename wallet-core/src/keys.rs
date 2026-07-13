@@ -703,9 +703,12 @@ const BIP44_EVM_PATH_PREFIX: &str = "m/44'/60'/0'/0";
 /// `secp256k1_from_mnemonic` is the mnemonic→seed→key convenience wrapper.
 ///
 /// WAL-04: the caller owns the seed's lifetime; this function does not
-/// copy it into any longer-lived buffer. The intermediate extended-key
-/// material inside `bip32` is zeroized by that crate on drop (it derives
-/// `Zeroize`). The returned `SigningKey` zeroizes on drop via k256.
+/// copy it into any longer-lived buffer. The two SECRETS are erased: the
+/// 64-byte seed is held in `Zeroizing` by the mnemonic wrapper, and the
+/// returned leaf `SigningKey` zeroizes on drop via k256. NOTE: bip32 0.5.3
+/// does NOT implement Zeroize/Drop on `ExtendedKeyAttrs`, so the XPrv's
+/// chain code is left as stack residue (not zeroized) — low impact, since
+/// the chain code is not the private scalar and the leaf key IS zeroized.
 pub fn secp256k1_from_seed(
     seed: &[u8],
     account_index: u32,
@@ -729,8 +732,9 @@ pub fn secp256k1_from_seed(
     })?;
 
     // For the k256 backend, `bip32::PrivateKey` IS `k256::ecdsa::SigningKey`.
-    // Clone the leaf out of the extended key; the XPrv (and its chain code)
-    // is dropped here and zeroized by the crate.
+    // Clone the leaf out of the extended key; the leaf `SigningKey` zeroizes
+    // via k256. The XPrv chain code is dropped here but NOT zeroized (bip32
+    // 0.5.3 lacks Zeroize on ExtendedKeyAttrs) — stack residue, low impact.
     let signing_key: k256::ecdsa::SigningKey = xprv.private_key().clone();
     Ok(UnifiedKey::Secp256k1(signing_key))
 }
