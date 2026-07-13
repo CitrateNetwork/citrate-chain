@@ -15,7 +15,10 @@ hmac = "0.12"
 rand = { workspace = true }
 hex = "0.4"
 rlp = "0.5"
-bip39 = { version = "1.2", features = ["rand", "std"] }
+# B1.1-F-2 (LOW): enable bip39's `zeroize` feature so the `Mnemonic`
+# word buffer is zeroized on drop. Small, always-on hardening — applies
+# to both the lean `crypto` build and the full `native` build.
+bip39 = { version = "1.2", features = ["rand", "std", "zeroize"] }
 # BIP32 → BIP44 HD derivation (WAL / feat/wal-bip44-secp256k1-hd).
 # `secp256k1` here is bip32's PURE-RUST k256-backed curve feature
 # (`secp256k1 = ["k256"]`), NOT the C-FFI backend — that is the separate
@@ -25,14 +28,26 @@ bip39 = { version = "1.2", features = ["rand", "std"] }
 # WASM posture). Pulls k256 0.13.4, matching our `k256 = "0.13"`.
 bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "alloc"] }
 
-# Encryption (WASM-compatible — pure Rust)
+# Encryption — only used by the keystore encrypt/decrypt path
+# (`KeyManager`, `encrypt_key_raw`, `decrypt_key`). The lean crypto-only
+# build (BIP44 derivation + signing) does NOT touch these, so they are
+# `native`-gated (`optional = true`) to keep the lean dependency tree
+# minimal and maximally WASM-friendly.
+#
 # WP-A3.3: AEAD calls route through the citrate-security wrapper which
 # enforces AAD-bind via Payload. Direct aes-gcm use in this crate is
-# allowed only inside the keystore migration path; new code must call
-# `Aead::seal/open`.
-aes-gcm = "0.10"
-citrate-security = { path = "../core/security" }
-argon2 = "0.5"
+# allowed only inside the keystore migration path (v1 legacy read); new
+# code must call `Aead::seal/open`.
+#
+# NOTE: `citrate-security` is a LEAN crate (aes-gcm/subtle/thiserror
+# only) — it does NOT drag citrate-execution/ark. The heavy chain enters
+# solely via the `citrate-consensus`/`citrate-execution` deps below, so
+# gating those alone removes ark-*/tracing-subscriber. `citrate-security`
+# is gated with the rest of the keystore path only because the lean
+# crypto path has no keystore.
+aes-gcm = { version = "0.10", optional = true }
+citrate-security = { path = "../core/security", optional = true }
+argon2 = { version = "0.5", optional = true }
 # Audit finding WAL-04: zeroize secret material on drop.
 # Audit finding CX-02: constant-time byte comparison for MAC/tag values.
 zeroize = { version = "1.7", features = ["zeroize_derive"] }
@@ -62,8 +77,48 @@ citrate-consensus = { path = "../core/consensus", optional = true }
 citrate-execution = { path = "../core/execution", optional = true }
 
 [features]
+# ---------------------------------------------------------------------
+# Feature shape (B1.1-F-1, @rule8):
+#
+#   crypto  (lean, default-OFF) — BIP44 secp256k1/ed25519 HD derivation +
+#           signing, address derivation, BIP39 gen/parse, sessions. Pure
+#           Rust, WASM-friendly. Pulls NONE of citrate-execution / ark-* /
+#           tracing-subscriber. This is the crown-jewel key path a
+#           downstream (e.g. citrate-core) consumes with
+#           `default-features = false, features = ["crypto"]`.
+#
+#   native  (superset, DEFAULT) — everything in `crypto` PLUS the on-disk
+#           `KeyManager` keystore (Argon2 + AES-GCM via citrate-security),
+#           `WalletConfig`/`default_keystore_path` (dirs), and the
+#           `chain` module (RPC via reqwest/tokio, ed25519 tx signing via
+#           citrate-consensus/-execution). This is what desktop/CLI use.
+#
+# `native` is a strict superset of `crypto`, so the existing default
+# build is unchanged. The lean tree drops the heavy chain because
+# citrate-consensus/-execution (which transitively pull ark-* /
+# tracing-subscriber) are `native`-only.
+# ---------------------------------------------------------------------
 default = ["native"]
-native = ["tokio", "reqwest", "bincode", "dirs", "primitive-types", "citrate-consensus", "citrate-execution"]
+
+# Lean, always-buildable crypto core. Kept as an explicit feature (rather
+# than "the crate with no features") so consumers select intent
+# positively and the crypto-only smoke tests can gate on it.
+crypto = []
+
+native = [
+    "crypto",
+    "tokio",
+    "reqwest",
+    "bincode",
+    "dirs",
+    "primitive-types",
+    "citrate-consensus",
+    "citrate-execution",
+    # Keystore encrypt/decrypt (Argon2 + AES-GCM AAD) — native-only.
+    "aes-gcm",
+    "argon2",
+    "citrate-security",
+]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

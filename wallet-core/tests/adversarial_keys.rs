@@ -1,3 +1,5 @@
+// B1.1-F-1: native-only — exercises `KeyManager` (keystore encrypt path).
+#![cfg(feature = "native")]
 //! Adversarial tests for wallet key management.
 //!
 //! These tests simulate attacks against the wallet's most critical component:
