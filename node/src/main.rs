@@ -1550,15 +1550,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // source and could never re-sync. Removing the peer lets it
                     // re-handshake fresh; we reset the failure counter so the
                     // reconnection starts from a clean slate.
-                    if *pf >= 5 {
-                        if pm_for_sync.get_peer(&pid).is_some() {
-                            pm_for_sync.remove_peer(&pid).await;
-                            *pf = 0;
-                            tracing::warn!(
-                                "Dropped peer {} after repeated sync timeouts (will re-handshake)",
-                                pid.0
-                            );
-                        }
+                    if *pf >= 5 && pm_for_sync.get_peer(&pid).is_some() {
+                        pm_for_sync.remove_peer(&pid).await;
+                        *pf = 0;
+                        tracing::warn!(
+                            "Dropped peer {} after repeated sync timeouts (will re-handshake)",
+                            pid.0
+                        );
                     }
                 }
                 // Issue any due retries
