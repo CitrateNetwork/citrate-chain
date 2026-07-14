@@ -69,6 +69,12 @@ impl TransactionBuilder {
 
     /// RLP-encode the unsigned legacy transaction per EIP-155:
     /// [nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0].
+    ///
+    /// B1.4.0: production secp256k1 signing now routes through the lean
+    /// [`crate::tx`] module. This helper is retained only for the pinned
+    /// spec-vector test that validates the native builder's payload
+    /// construction, hence `#[cfg(test)]`.
+    #[cfg(test)]
     fn eip155_signing_payload(&self, nonce: u64) -> Result<Vec<u8>, WalletError> {
         let mut stream = rlp::RlpStream::new_list(9);
         stream.append(&nonce);
@@ -83,7 +89,9 @@ impl TransactionBuilder {
         Ok(stream.out().to_vec())
     }
 
-    /// Build the canonical EIP-155 signing hash.
+    /// Build the canonical EIP-155 signing hash. `#[cfg(test)]`: see
+    /// `eip155_signing_payload`.
+    #[cfg(test)]
     fn eip155_signing_hash(&self, nonce: u64) -> Result<[u8; 32], WalletError> {
         let signing_payload = self.eip155_signing_payload(nonce)?;
         let mut hasher = Keccak256::new();
@@ -94,15 +102,10 @@ impl TransactionBuilder {
         Ok(hash)
     }
 
-    fn signed_tx_hash(raw: &[u8]) -> [u8; 32] {
-        let mut hasher = Keccak256::new();
-        hasher.update(raw);
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
-    }
-
+    /// RLP-append the `to` field. `#[cfg(test)]`: only the retained
+    /// spec-vector test exercises the native builder's own payload path
+    /// now; production goes through [`crate::tx`].
+    #[cfg(test)]
     fn append_to_address(&self, stream: &mut rlp::RlpStream) -> Result<(), WalletError> {
         if let Some(ref to) = self.to {
             let to_clean = to.strip_prefix("0x").unwrap_or(to);
@@ -121,28 +124,54 @@ impl TransactionBuilder {
         Ok(())
     }
 
+    /// Parse `self.to` into a fixed 20-byte EVM address, or `None` for
+    /// contract creation. Rejects a present-but-malformed address (same
+    /// validation as `append_to_address`).
+    fn to_address_bytes(&self) -> Result<Option<[u8; 20]>, WalletError> {
+        match self.to {
+            Some(ref to) => {
+                let to_clean = to.strip_prefix("0x").unwrap_or(to);
+                let to_bytes = hex::decode(to_clean)
+                    .map_err(|e| WalletError::InvalidAddress(format!("invalid hex: {}", e)))?;
+                if to_bytes.len() != 20 {
+                    return Err(WalletError::InvalidAddress(format!(
+                        "expected 20-byte EVM address, got {} bytes",
+                        to_bytes.len()
+                    )));
+                }
+                let mut addr = [0u8; 20];
+                addr.copy_from_slice(&to_bytes);
+                Ok(Some(addr))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Sign the transaction with a secp256k1 key (EVM-compatible ECDSA).
     /// Produces EIP-155 compliant v/r/s signature.
+    ///
+    /// B1.4.0: delegates the pure EIP-155 signing to the lean
+    /// [`crate::tx::sign_eip155_legacy_tx`] primitive so the RLP + v/r/s
+    /// logic has a single source of truth shared with the lean `crypto`
+    /// build. This method only adds the native builder's `from`-address
+    /// derivation and the `SignedTransaction` wrapper.
     pub fn sign_secp256k1(
         self,
         signing_key: &k256::ecdsa::SigningKey,
         nonce: u64,
     ) -> Result<SignedTransaction, WalletError> {
-        let signing_hash = self.eip155_signing_hash(nonce)?;
+        let fields = crate::tx::LegacyTxFields {
+            nonce,
+            gas_price: self.gas_price,
+            gas_limit: self.gas_limit,
+            to: self.to_address_bytes()?,
+            value: self.value,
+            data: self.data.clone(),
+        };
 
-        // Sign with ECDSA
-        let (signature, recovery_id) = signing_key
-            .sign_prehash_recoverable(&signing_hash)
-            .map_err(|e| WalletError::SigningFailed(format!("secp256k1 sign failed: {}", e)))?;
+        let signed = crate::tx::sign_eip155_legacy_tx(signing_key, &fields, self.chain_id)?;
 
-        let sig_bytes = signature.to_bytes();
-        let r = &sig_bytes[..32];
-        let s = &sig_bytes[32..];
-
-        // EIP-155: v = recovery_id + chain_id * 2 + 35
-        let v = recovery_id.to_byte() as u64 + self.chain_id * 2 + 35;
-
-        // Derive the EVM address from the public key
+        // Derive the EVM address from the public key (display only).
         let verifying_key = signing_key.verifying_key();
         let pubkey_bytes = k256::EncodedPoint::from(verifying_key);
         let pubkey_uncompressed = pubkey_bytes.as_bytes();
@@ -152,12 +181,8 @@ impl TransactionBuilder {
         let address_hash = address_hasher.finalize();
         let from_addr = hex::encode(&address_hash[12..]);
 
-        // Build the RLP-encoded signed transaction for EVM submission
-        let raw = self.serialize_rlp_signed(nonce, v, r, s)?;
-        let tx_hash = Self::signed_tx_hash(&raw);
-
         Ok(SignedTransaction {
-            hash: hex::encode(tx_hash),
+            hash: hex::encode(signed.hash),
             from: format!("0x{}", from_addr),
             to: self.to.clone(),
             value: self.value,
@@ -166,31 +191,14 @@ impl TransactionBuilder {
             gas_limit: self.gas_limit,
             chain_id: self.chain_id,
             data: self.data.clone(),
-            signature: format!("v={} r={} s={}", v, hex::encode(r), hex::encode(s)),
-            raw,
+            signature: format!(
+                "v={} r={} s={}",
+                signed.v,
+                hex::encode(signed.r),
+                hex::encode(signed.s)
+            ),
+            raw: signed.raw,
         })
-    }
-
-    /// RLP-encode a signed legacy transaction (EIP-155).
-    fn serialize_rlp_signed(
-        &self,
-        nonce: u64,
-        v: u64,
-        r: &[u8],
-        s: &[u8],
-    ) -> Result<Vec<u8>, WalletError> {
-        let mut stream = rlp::RlpStream::new_list(9);
-        stream.append(&nonce);
-        stream.append(&self.gas_price);
-        stream.append(&self.gas_limit);
-        self.append_to_address(&mut stream)?;
-        stream.append(&self.value);
-        stream.append(&self.data.as_slice());
-        stream.append(&v);
-        stream.append(&r);
-        stream.append(&s);
-
-        Ok(stream.out().to_vec())
     }
 
     /// Sign the transaction with an Ed25519 key. Returns the signed raw bytes.
