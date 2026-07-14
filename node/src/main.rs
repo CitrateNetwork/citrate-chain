@@ -8,7 +8,8 @@ use citrate_network::peer::PeerId;
 use citrate_network::peer::{PeerManager, PeerManagerConfig};
 use citrate_network::{NetworkTransport, GossipProtocol, GossipConfig, Discovery, DiscoveryConfig, SyncManager, SyncConfig};
 use citrate_sequencer::mempool::{Mempool, MempoolConfig};
-use citrate_storage::{pruning::PruningConfig, StorageManager};
+use citrate_storage::{pruning::PruningConfig, StorageConfig, StorageManager};
+use citrate_storage::crypto::at_rest::EncryptionAtRestConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -479,9 +480,18 @@ async fn main() -> Result<()> {
     // Pre-created dirs or partial state no longer bypass genesis init.
     std::fs::create_dir_all(&config.storage.data_dir)?;
 
-    let probe_storage = Arc::new(StorageManager::new(
+    // If a storage-at-rest key is supplied (CITRATE_STORAGE_KEY, from the parent
+    // process's OS keyring), the probe MUST open the DB with the same encryption
+    // config as the live `start_node` storage below — otherwise the genesis
+    // probe would open a plaintext handle over an encrypted DB (or vice-versa)
+    // and the mismatch guard in `open_encrypted` would reject it.
+    let probe_encryption = at_rest_encryption_from_env()?;
+    let probe_storage = Arc::new(StorageManager::with_config(
         &config.storage.data_dir,
-        PruningConfig::default(),
+        StorageConfig {
+            pruning: PruningConfig::default(),
+            encryption: probe_encryption,
+        },
     )?);
 
     let has_genesis = probe_storage.blocks.get_block_by_height(0)
@@ -917,6 +927,42 @@ fn show_genesis_info() -> Result<()> {
     Ok(())
 }
 
+/// Encryption-at-rest key sourcing for a light-node / desktop deployment.
+///
+/// The node itself is key-source-agnostic (`core/storage` was built so "the
+/// desktop GUI supplies the bytes, typically from the OS keyring"): when the
+/// `CITRATE_STORAGE_KEY` env var is present and holds exactly 64 lowercase/
+/// uppercase hex chars (32 bytes), storage-at-rest is enabled with that raw
+/// key via `EncryptionAtRestConfig::with_raw_key`. When the var is absent the
+/// node keeps the default plaintext path (servers / bootnodes / sequencers are
+/// unaffected). A malformed value is a hard error (fail closed) rather than a
+/// silent downgrade to plaintext — an operator who asked for encryption and
+/// typo'd the key must not get an unencrypted DB.
+///
+/// The key never touches disk from the node's side: the parent process
+/// (citrate-core's SidecarSupervisor) holds it in the OS keyring and passes it
+/// only through this env var to the spawned child. The commitment in
+/// `<data_dir>/encryption.meta` lets a wrong key fail fast on the next open.
+fn at_rest_encryption_from_env() -> Result<Option<EncryptionAtRestConfig>> {
+    let raw = match std::env::var("CITRATE_STORAGE_KEY") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Ok(None),
+    };
+    let hex_str = raw.trim();
+    let bytes = hex::decode(hex_str)
+        .map_err(|_| anyhow::anyhow!("CITRATE_STORAGE_KEY must be 64 hex chars (32 bytes)"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "CITRATE_STORAGE_KEY must decode to exactly 32 bytes, got {}",
+            bytes.len()
+        );
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    info!("Storage encryption-at-rest ENABLED (key from CITRATE_STORAGE_KEY env)");
+    Ok(Some(EncryptionAtRestConfig::with_raw_key(key)))
+}
+
 async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Starting Citrate node...");
     info!("Chain ID: {}", config.chain.chain_id);
@@ -945,15 +991,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     });
 
-    // Create storage
-    let storage = Arc::new(StorageManager::new(
+    // Create storage. When CITRATE_STORAGE_KEY is set the data dir is opened
+    // encrypted-at-rest (AES-256-GCM per value) with the raw key from the parent
+    // process's OS keyring; absent, the default plaintext path is used.
+    let storage_encryption = at_rest_encryption_from_env()?;
+    let storage = Arc::new(StorageManager::with_config(
         &config.storage.data_dir,
-        PruningConfig {
-            keep_blocks: config.storage.keep_blocks,
-            keep_states: config.storage.keep_blocks,
-            interval: Duration::from_secs(3600),
-            batch_size: 1000,
-            auto_prune: config.storage.pruning,
+        StorageConfig {
+            pruning: PruningConfig {
+                keep_blocks: config.storage.keep_blocks,
+                keep_states: config.storage.keep_blocks,
+                interval: Duration::from_secs(3600),
+                batch_size: 1000,
+                auto_prune: config.storage.pruning,
+            },
+            encryption: storage_encryption,
         },
     )?);
 
