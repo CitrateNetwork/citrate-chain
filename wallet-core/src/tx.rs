@@ -469,4 +469,67 @@ mod tests {
         assert_eq!(s, signed.s);
         assert_eq!(recid as u64 + 40204 * 2 + 35, signed.v);
     }
+
+    #[test]
+    fn leading_zero_r_or_s_is_canonically_rlp_trimmed() {
+        // B140-1 regression pin: ~1/256 of ECDSA signatures have r (or s)
+        // with a leading 0x00 byte. RLP requires minimal big-endian, so that
+        // zero must be stripped. The pre-fix encoder appended the full 32
+        // bytes including the leading zero, producing a wire-invalid tx that
+        // geth/ethers reject ("Unexpected type flag. Got 0."). This test finds
+        // a real leading-zero case (deterministic RFC-6979) and asserts the
+        // RLP-encoded r/s are trimmed — it FAILS against the un-trimmed encoder.
+        let key = SigningKey::from_bytes((&unhex(EIP155_PRIV)[..]).into())
+            .expect("valid key");
+        let chain_id = 40204u64;
+        let mut found = false;
+        for nonce in 0u64..2000 {
+            let tx = LegacyTxFields {
+                nonce,
+                gas_price: 20_000_000_000,
+                gas_limit: 21_000,
+                to: Some(addr20(EIP155_TO)),
+                value: 1_000_000_000_000_000_000,
+                data: vec![],
+            };
+            let signed = sign_eip155_legacy_tx(&key, &tx, chain_id).expect("sign");
+            let r_lead0 = signed.r[0] == 0;
+            let s_lead0 = signed.s[0] == 0;
+            if !(r_lead0 || s_lead0) {
+                continue;
+            }
+            found = true;
+            // Sanity: the tx still ecrecovers to the signer.
+            assert_eq!(
+                recover_evm_address(&tx, chain_id, &signed),
+                evm_address_of_key(&key)
+            );
+            // The RLP r/s fields (indices 7,8 of the 9-item legacy tx) must be
+            // the trimmed big-endian, i.e. no leading zero survives on the wire.
+            let rlp = rlp::Rlp::new(&signed.raw);
+            let r_item: Vec<u8> = rlp.val_at(7).expect("rlp r");
+            let s_item: Vec<u8> = rlp.val_at(8).expect("rlp s");
+            assert_eq!(
+                r_item.as_slice(),
+                trim_leading_zeros(&signed.r),
+                "r must be canonically trimmed in the RLP wire bytes"
+            );
+            assert_eq!(
+                s_item.as_slice(),
+                trim_leading_zeros(&signed.s),
+                "s must be canonically trimmed in the RLP wire bytes"
+            );
+            if r_lead0 {
+                assert!(r_item.len() < 32, "leading-zero r must encode to <32 bytes");
+            }
+            if s_lead0 {
+                assert!(s_item.len() < 32, "leading-zero s must encode to <32 bytes");
+            }
+            break;
+        }
+        assert!(
+            found,
+            "expected a leading-zero r or s within 2000 nonces (~certain at p=1/256)"
+        );
+    }
 }
