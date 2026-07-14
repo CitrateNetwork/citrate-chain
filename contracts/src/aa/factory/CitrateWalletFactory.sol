@@ -5,6 +5,14 @@ import {LibClone} from "../../../lib/kernel/lib/solady/src/utils/LibClone.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
+/// E-8: the registrar surface of CitratePaymaster this factory drives.
+/// Minimal interface (not the full paymaster) so the factory carries no
+/// compile-time dependency on paymaster internals.
+interface ICitratePaymasterRegistry {
+    function registerWallet(address account) external;
+    function unregisterWallet(address account) external;
+}
+
 /// WP-1 / EW-S1 — Identity-keyed Kernel wallet factory.
 ///
 /// Per `ADR-2026-06-05-ew-surface-interop`, the smart-wallet address
@@ -39,11 +47,20 @@ contract CitrateWalletFactory {
     error InitializeFailed();
     error ZeroAddress();
     error NotOwner();
+    /// E-8: deploys are refused until the paymaster registry is wired —
+    /// a deploy that silently mints a sponsorship-ineligible wallet is
+    /// the registrar gap reappearing as a configuration error.
+    error PaymasterNotSet();
+    /// E-8: `registerDeployedWallet` backfill only accepts addresses
+    /// that actually hold code.
+    error AccountNotDeployed(address account);
 
     // --- Events ---
     event AccountDeployed(bytes32 indexed userId, address indexed account, address initialValidator);
     event IdentitySignerRotated(address indexed oldSigner, address indexed newSigner);
     event OwnerTransferred(address indexed oldOwner, address indexed newOwner);
+    /// E-8: paymaster registry wiring changed.
+    event PaymasterSet(address indexed oldPaymaster, address indexed newPaymaster);
 
     // --- Immutable ---
 
@@ -65,6 +82,16 @@ contract CitrateWalletFactory {
     /// so a captured permit cannot be replayed/front-run to grief the
     /// sender's forwarded `msg.value`.
     mapping(bytes32 userId => uint256) public deployNonce;
+
+    /// E-8: the CitratePaymaster whose registry this factory feeds. The
+    /// paymaster names this factory as its `registrar`; every successful
+    /// deploy registers the new wallet atomically (see
+    /// ADR-2026-07-11-e8-atomic-factory-registration). Set post-deploy by
+    /// `owner` — a constructor argument is impossible because the CREATE2
+    /// ceremony makes the factory and paymaster addresses mutually
+    /// dependent (the paymaster's constructor takes this factory as
+    /// registrar).
+    address public paymaster;
 
     constructor(address _implementation, address _identitySigner, address _owner) {
         if (_implementation == address(0) || _identitySigner == address(0) || _owner == address(0)) {
@@ -139,6 +166,16 @@ contract CitrateWalletFactory {
             revert InvalidSigner();
         }
 
+        // E-8: refuse to mint a wallet that cannot be sponsored. Checked
+        // before the CREATE2 so a mis-wired ceremony fails loudly instead
+        // of silently reintroducing the registrar gap. This reads the
+        // factory's OWN `paymaster` storage slot only (ERC-7562 STO-010),
+        // so it is validation-legal even when `deployFor` runs as a
+        // UserOp's initCode. The factory no longer WRITES paymaster
+        // storage here (E8-1) — it only requires the wiring to exist so
+        // post-onboarding standard/recovery sponsorship is reachable.
+        if (paymaster == address(0)) revert PaymasterNotSet();
+
         bool alreadyDeployed;
         (alreadyDeployed, account) = LibClone.createDeterministicERC1967(msg.value, implementation, _salt(userId));
         if (!alreadyDeployed) {
@@ -147,6 +184,19 @@ contract CitrateWalletFactory {
             deployNonce[userId] += 1;
             (bool ok,) = account.call(initData);
             if (!ok) revert InitializeFailed();
+            // E8-1: the factory NO LONGER calls paymaster.registerWallet
+            // here. That was a write to a SECOND ENTITY's storage
+            // (paymaster.isRegistered) during the UserOp's initCode/
+            // validation phase, which strict ERC-7562 bundlers reject
+            // (the paymaster is an entity named in the same UserOp).
+            // The counterfactual FIRST op is now authorized by the
+            // sponsor SIGNATURE the paymaster verifies against its OWN
+            // signer (see ADR-2026-07-11-e8-signature-based-paymaster),
+            // so no cross-entity write is needed to sponsor onboarding.
+            // Standard/recovery registration (still gated on the
+            // paymaster's own `isRegistered` read) happens OUTSIDE
+            // validation via `registerDeployedWallet` (owner passthrough)
+            // — see below.
             emit AccountDeployed(userId, account, initialValidator);
         }
     }
@@ -176,6 +226,37 @@ contract CitrateWalletFactory {
     }
 
     // --- Admin (owner) ---
+
+    /// E-8: wire (or rotate) the paymaster whose registry deploys feed.
+    /// Zero is rejected — unwiring would re-open the registrar gap; to
+    /// halt sponsorship use the paymaster's own `setPaused`.
+    function setPaymaster(address newPaymaster) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (newPaymaster == address(0)) revert ZeroAddress();
+        emit PaymasterSet(paymaster, newPaymaster);
+        paymaster = newPaymaster;
+    }
+
+    /// E-8: owner passthrough — backfill registration for a wallet this
+    /// factory deployed BEFORE atomic registration existed (the paymaster
+    /// only accepts `registerWallet` from its registrar, i.e. this
+    /// factory, so the call must route through here). Restricted to
+    /// addresses that hold code: counterfactual/arbitrary addresses
+    /// cannot be pre-registered.
+    function registerDeployedWallet(address account) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (account.code.length == 0) revert AccountNotDeployed(account);
+        ICitratePaymasterRegistry(paymaster).registerWallet(account);
+    }
+
+    /// E-8: owner passthrough — incident-response unregistration (e.g.
+    /// known compromise; see the paymaster's KYC_OPERATOR.md flow). The
+    /// permit-less idempotent `deployFor` path never re-registers, so
+    /// this is sticky until an explicit `registerDeployedWallet`.
+    function unregisterWallet(address account) external {
+        if (msg.sender != owner) revert NotOwner();
+        ICitratePaymasterRegistry(paymaster).unregisterWallet(account);
+    }
 
     function setIdentitySigner(address newSigner) external {
         if (msg.sender != owner) revert NotOwner();
