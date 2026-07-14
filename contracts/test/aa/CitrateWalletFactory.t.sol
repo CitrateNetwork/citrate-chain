@@ -4,6 +4,9 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 
 import {CitrateWalletFactory} from "../../src/aa/factory/CitrateWalletFactory.sol";
+import {CitratePaymaster} from "../../src/aa/paymaster/CitratePaymaster.sol";
+import {StubEntryPoint} from "./CitratePaymaster.t.sol";
+import {IEntryPoint} from "@account-abstraction/interfaces/IEntryPoint.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 /// A minimal initializable target so we can test that:
@@ -34,6 +37,7 @@ contract CitrateWalletFactoryTest is Test {
 
     CitrateWalletFactory internal factory;
     MockImplementation internal impl;
+    CitratePaymaster internal pm;
 
     uint256 internal constant SIGNER_PK = 0x59E7;
     address internal signer;
@@ -46,6 +50,26 @@ contract CitrateWalletFactoryTest is Test {
         impl = new MockImplementation();
         signer = vm.addr(SIGNER_PK);
         factory = new CitrateWalletFactory(address(impl), signer, ownerAddr);
+
+        // E-8: `deployFor` fails closed until the paymaster registry is
+        // wired (registrar = factory, mirroring script/aa/DeployAA.s.sol).
+        StubEntryPoint ep = new StubEntryPoint();
+        // E8-1/E8-2: constructor now takes sponsorSigner + wei caps +
+        // maxFeePerGas ceiling + global daily cap. `signer` doubles as
+        // the sponsor signer here (single-key test operator).
+        pm = new CitratePaymaster(
+            IEntryPoint(address(ep)),
+            ownerAddr,
+            address(factory),
+            signer,
+            0.01 ether,
+            0.01 ether,
+            0.02 ether,
+            20 gwei,
+            5 ether
+        );
+        vm.prank(ownerAddr);
+        factory.setPaymaster(address(pm));
     }
 
     // --- Constructor ---
@@ -251,6 +275,128 @@ contract CitrateWalletFactoryTest is Test {
         bytes memory newSig = _signWith(newSignerPk, factory.permitDigest(USER_A, initData, expiresAt));
         address deployed = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, newSig);
         assertEq(deployed, factory.predictAddress(USER_A));
+    }
+
+    // --- E-8: atomic paymaster registration ---
+
+    function test_E8_deployFor_failsClosedWhenPaymasterUnwired() public {
+        // Fresh factory, registry never wired — a deploy would mint an
+        // unsponsorable wallet, so it must refuse.
+        CitrateWalletFactory unwired = new CitrateWalletFactory(address(impl), signer, ownerAddr);
+        bytes memory initData = abi.encodeCall(MockImplementation.init, ("x"));
+        uint256 expiresAt = block.timestamp + 1 hours;
+        bytes32 digest = unwired.permitDigest(USER_A, initData, expiresAt);
+        bytes memory sig = _signWith(SIGNER_PK, digest);
+
+        vm.expectRevert(CitrateWalletFactory.PaymasterNotSet.selector);
+        unwired.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+    }
+
+    /// E8-1: `deployFor` must NOT write the paymaster's `isRegistered`
+    /// slot. That cross-entity write during the UserOp's initCode/
+    /// validation phase was the E8-1 violation; the fix removed it. The
+    /// counterfactual first op is now authorized by the sponsor signature
+    /// the paymaster verifies against its own signer — no registration is
+    /// required to onboard. Registration (for later standard/recovery) is
+    /// a SEPARATE, out-of-validation owner passthrough.
+    function test_E8_deployFor_doesNotWritePaymasterStorage() public {
+        address predicted = factory.predictAddress(USER_A);
+        assertFalse(pm.isRegistered(predicted));
+
+        bytes memory initData = abi.encodeCall(MockImplementation.init, ("reg"));
+        uint256 expiresAt = block.timestamp + 1 hours;
+        bytes memory sig = _permitSig(USER_A, initData, expiresAt);
+
+        address account = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+
+        assertEq(account, predicted);
+        assertFalse(
+            pm.isRegistered(account),
+            "E8-1: deployFor must NOT write paymaster.isRegistered (cross-entity write removed)"
+        );
+    }
+
+    /// Registration is now an explicit, out-of-validation owner action.
+    function test_E8_registerDeployedWallet_registersAfterDeploy() public {
+        bytes memory initData = abi.encodeCall(MockImplementation.init, ("once"));
+        uint256 expiresAt = block.timestamp + 1 hours;
+        bytes memory sig = _permitSig(USER_A, initData, expiresAt);
+        address account = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+        assertFalse(pm.isRegistered(account), "deploy alone does not register");
+
+        vm.prank(ownerAddr);
+        vm.expectEmit(true, false, false, false, address(pm));
+        emit CitratePaymaster.WalletRegistered(account);
+        factory.registerDeployedWallet(account);
+        assertTrue(pm.isRegistered(account));
+
+        // Incident response: owner unregisters the compromised wallet.
+        vm.prank(ownerAddr);
+        factory.unregisterWallet(account);
+        assertFalse(pm.isRegistered(account));
+
+        // The permit-less idempotent deploy path must NOT re-register it
+        // (it never touches paymaster storage at all).
+        address again = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+        assertEq(again, account);
+        assertFalse(pm.isRegistered(account), "idempotent path must not undo an unregistration");
+    }
+
+    function test_E8_setPaymaster_onlyOwner_rejectsZero_emits() public {
+        address newPm = address(0xBEEF);
+        vm.expectRevert(CitrateWalletFactory.NotOwner.selector);
+        factory.setPaymaster(newPm);
+
+        vm.prank(ownerAddr);
+        vm.expectRevert(CitrateWalletFactory.ZeroAddress.selector);
+        factory.setPaymaster(address(0));
+
+        vm.prank(ownerAddr);
+        vm.expectEmit(true, true, false, false, address(factory));
+        emit CitrateWalletFactory.PaymasterSet(address(pm), newPm);
+        factory.setPaymaster(newPm);
+        assertEq(factory.paymaster(), newPm);
+    }
+
+    function test_E8_registerDeployedWallet_backfillsOnlyRealWallets() public {
+        bytes memory initData = abi.encodeCall(MockImplementation.init, ("bf"));
+        uint256 expiresAt = block.timestamp + 1 hours;
+        bytes memory sig = _permitSig(USER_A, initData, expiresAt);
+        address account = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+        assertFalse(pm.isRegistered(account), "deploy does not register (E8-1)");
+
+        // Non-owner cannot backfill.
+        vm.expectRevert(CitrateWalletFactory.NotOwner.selector);
+        factory.registerDeployedWallet(account);
+
+        // Codeless addresses cannot be pre-registered.
+        address eoa = address(0xE0A);
+        vm.prank(ownerAddr);
+        vm.expectRevert(abi.encodeWithSelector(CitrateWalletFactory.AccountNotDeployed.selector, eoa));
+        factory.registerDeployedWallet(eoa);
+
+        // Owner backfills a real deployed wallet.
+        vm.prank(ownerAddr);
+        factory.registerDeployedWallet(account);
+        assertTrue(pm.isRegistered(account));
+    }
+
+    function test_E8_unregisterWallet_onlyOwner() public {
+        bytes memory initData = abi.encodeCall(MockImplementation.init, ("ur"));
+        uint256 expiresAt = block.timestamp + 1 hours;
+        bytes memory sig = _permitSig(USER_A, initData, expiresAt);
+        address account = factory.deployFor(USER_A, address(0xDEAD), initData, expiresAt, sig);
+        // Register out-of-band first (deploy no longer auto-registers).
+        vm.prank(ownerAddr);
+        factory.registerDeployedWallet(account);
+
+        vm.expectRevert(CitrateWalletFactory.NotOwner.selector);
+        factory.unregisterWallet(account);
+        assertTrue(pm.isRegistered(account));
+
+        vm.prank(ownerAddr);
+        factory.unregisterWallet(account);
+        assertFalse(pm.isRegistered(account));
     }
 
     // --- Helpers ---
