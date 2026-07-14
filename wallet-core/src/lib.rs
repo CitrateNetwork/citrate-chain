@@ -13,6 +13,13 @@ pub mod keys;
 pub mod session;
 pub mod types;
 
+// Lean EIP-155 secp256k1 transaction signing (B1.4.0). Pure `sha3` +
+// `k256` + `rlp` — no RPC, no consensus, no U256. Available in BOTH the
+// lean `crypto` build and the full `native` build. citrate-core's lean
+// `crypto` consumer signs real 40204 transactions through this without
+// pulling the native/zk/execution stack into the key path.
+pub mod tx;
+
 #[cfg(feature = "native")]
 pub mod chain;
 
@@ -28,6 +35,10 @@ pub use keys::KeyManager;
 // (e.g. citrate-core's A2 vault, Option A). Available in BOTH the lean
 // `crypto` build and the full `native` build.
 pub use keys::{secp256k1_from_mnemonic, secp256k1_from_seed, UnifiedKey};
+// Lean EIP-155 signing primitives (B1.4.0). Exported in BOTH `crypto`
+// and `native` so citrate-core's lean build and desktop/CLI both consume
+// the same signer.
+pub use tx::{sign_eip155_legacy_tx, sign_recoverable, LegacyTxFields, SignedTx};
 pub use session::{PersistedFailure, SessionManager, SessionStatus};
 pub use types::WalletAccount;
 // `WalletConfig::default()` calls `default_keystore_path()` (needs
