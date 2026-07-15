@@ -58,8 +58,8 @@
   "aaStack": {
     "EntryPoint": "0x077Fbc3338A9e6BAD90A3A041E6b7425689754Ef",
     "CitrateWallet": "0xe641a41b02f1ff114481d357d148be4519830087",
-    "CitrateWalletFactory": "0x9c0c25d4355fae68679711ea99b7642bf3e9a68a",
-    "CitratePaymaster": "0x884c47518a21496d17d4dae62e96239b06177d28",
+    "CitrateWalletFactory": "0x7b0eCE41ff4958cB1e26e0fc8e99DB442bf560c6",
+    "CitratePaymaster": "0x44AE1e0b3f531E9b77284e9Efa819217FF1C7d62",
     "WebAuthnP256Validator": "0x97ff6d1c4d2f4337ec09f2a1c01808016f728def",
     "CitrateECDSAValidator": "0xd2d35421379ae5b461e216bfcdd1b7e6a64bbc40",
     "GuardianRecoveryModule": "0x381b5848f3b5d73ff67b745624780a43682456ce"
