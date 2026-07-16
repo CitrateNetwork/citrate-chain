@@ -469,6 +469,15 @@ impl CanonicalApplicator {
             let block = match self.storage.blocks.get_block(&cursor).ok().flatten() {
                 Some(b) => b,
                 None => {
+                    // The genesis base is a sentinel (`Hash::default` @ height 0)
+                    // seeded into the ring at construction with no stored block. A
+                    // branch that forks at genesis walks down to it — that is the
+                    // fork point, and its snapshot is the base to revert to.
+                    if let Some((h0, _)) = state.snapshots.get(&0) {
+                        if *h0 == cursor {
+                            break AppliedTip { hash: cursor, height: 0 };
+                        }
+                    }
                     return ReorgOutcome::Rejected(format!(
                         "reorg to {new_tip}: missing block {cursor} on branch"
                     ));
@@ -480,7 +489,11 @@ impl CanonicalApplicator {
                     break AppliedTip { hash: cursor, height: h }; // fork point (the base)
                 }
             }
-            if block.is_genesis() || branch.len() as u64 >= MAX_REORG_DEPTH {
+            // NB: do NOT bail on `block.is_genesis()` — that is true for any
+            // first block (its selected_parent is the genesis sentinel), and we
+            // must still step to that sentinel, which the `None` arm above turns
+            // into the genesis fork point. Only the depth cap bounds the walk.
+            if branch.len() as u64 >= MAX_REORG_DEPTH {
                 return ReorgOutcome::Rejected(format!(
                     "reorg to {new_tip}: no common applied ancestor within {MAX_REORG_DEPTH} blocks"
                 ));
@@ -702,7 +715,7 @@ pub fn record_produced(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use citrate_consensus::types::{BlockBuilder, VrfProof};
+    use citrate_consensus::types::{BlockBuilder, PublicKey, Signature, Transaction, VrfProof};
     use citrate_execution::revm_adapter::BlockContext;
     use citrate_execution::types::Address;
     use citrate_execution::StateDB;
@@ -1202,5 +1215,232 @@ mod tests {
         let (exec, storage, _dir) = fresh();
         let app = CanonicalApplicator::new(exec, storage);
         app.maybe_sync_registry(800).await; // must not panic / do anything
+    }
+
+    // ========================================================================
+    // STEP 6 — two-node divergence harness.
+    //
+    // A "producer" executor builds a chain exactly as node/src/producer.rs does
+    // (set block context → execute txs → credit the deterministic basic reward →
+    // state_root → seal a v2 header). A "follower" — a CanonicalApplicator over an
+    // INDEPENDENT executor + store — applies each block via apply_received. The
+    // harness asserts the follower reproduces the producer's state_root at EVERY
+    // height (invariant I2), rejects a corrupted block (I3), and CONVERGES to the
+    // producer after a reorg. Uses real value-transfer transactions (not just
+    // rewards) so the full execute→verify pipeline is exercised across nodes.
+    // ========================================================================
+
+    const ALICE: [u8; 20] = [0xAA; 20];
+    const BOB: [u8; 20] = [0xBB; 20];
+    const FUND: u128 = 1_000_000_000_000_000_000; // 1e18 wei
+
+    /// Address → PublicKey embedding that `Address::from_public_key` round-trips
+    /// back to the same address (the EVM-address shape the node uses for tx.from).
+    fn embedded(addr: [u8; 20]) -> PublicKey {
+        let mut b = [0u8; 32];
+        b[..20].copy_from_slice(&addr);
+        PublicKey::new(b)
+    }
+
+    /// A value-transfer transaction from `from` to `to` (executor trusts tx.from).
+    fn transfer(from: [u8; 20], to: [u8; 20], value: u128, nonce: u64) -> Transaction {
+        Transaction {
+            nonce,
+            from: embedded(from),
+            to: Some(embedded(to)),
+            value,
+            gas_limit: 21_000,
+            gas_price: 1_000_000_000,
+            signature: Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ..Default::default()
+        }
+    }
+
+    /// Build a v2 block carrying `txs` (state_root supplied by the producer).
+    fn mk_block_txs(
+        height: u64,
+        parent: Hash,
+        state_root: Hash,
+        vrf: [u8; 32],
+        txs: Vec<Transaction>,
+    ) -> Block {
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(parent)
+            .coinbase(CB)
+            .timestamp(1000)
+            .vrf_reveal(VrfProof { proof: vec![], output: Hash::new(vrf) })
+            .transactions(txs)
+            .state_root(state_root)
+            .build_unhashed();
+        b.header.block_hash = b.compute_hash();
+        b
+    }
+
+    /// Produce a block on `exec` the way node/src/producer.rs does under v2:
+    /// set block context → execute txs → credit the basic reward → compute the
+    /// final state_root → seal. Advances `exec` to the post-block state.
+    async fn produce(
+        exec: &Executor,
+        parent: Hash,
+        height: u64,
+        vrf: [u8; 32],
+        txs: Vec<Transaction>,
+    ) -> Block {
+        exec.set_block_context(BlockContext {
+            coinbase: CB,
+            prevrandao: vrf,
+            block_hashes: std::collections::HashMap::new(),
+        });
+        // Reward calc reads only header.height + txs — a provisional block suffices.
+        let provisional = mk_block_txs(height, parent, Hash::default(), vrf, txs.clone());
+        for tx in &txs {
+            exec.execute_transaction(&provisional, tx)
+                .await
+                .expect("producer tx must execute");
+        }
+        let reward = RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        for (addr, amt) in [
+            (Address(CB), reward.validator_reward),
+            (Address(TREASURY_ADDR), reward.treasury_reward),
+        ] {
+            if amt > U256::zero() {
+                let bal = exec.get_balance(&addr);
+                exec.set_balance(&addr, bal + amt);
+            }
+        }
+        let root = exec.calculate_state_root();
+        mk_block_txs(height, parent, root, vrf, txs)
+    }
+
+    /// A funded producer executor + a funded follower (applicator over an
+    /// independent exec/store). Both start from the identical genesis state.
+    fn two_nodes() -> (Arc<Executor>, CanonicalApplicator, Arc<Executor>, Arc<StorageManager>, tempfile::TempDir)
+    {
+        let producer = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        producer.set_balance(&Address(ALICE), U256::from(FUND));
+
+        let (follower, storage, dir) = fresh();
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        // Construct the applicator AFTER funding so its genesis base snapshot
+        // reflects the shared funded state.
+        let app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        (producer, app, follower, storage, dir)
+    }
+
+    #[tokio::test]
+    async fn two_node_state_root_parity_with_transactions() {
+        let (producer, app, follower, storage, _dir) = two_nodes();
+
+        let mut parent = Hash::default();
+        for h in 1..=3u64 {
+            // Producer builds block h with a transfer alice → bob.
+            let tx = transfer(ALICE, BOB, 1_000, h - 1);
+            let block = produce(&producer, parent, h, VRF_OUT, vec![tx]).await;
+            let producer_root = block.state_root;
+
+            // Follower ingests it exactly as the receive path does.
+            persist(&storage, &block);
+            assert!(
+                matches!(app.apply_received(&block).await, ApplyOutcome::Applied { .. }),
+                "follower must apply block {h}"
+            );
+
+            // I2: the follower reproduced the producer's state root at this height.
+            assert_eq!(
+                follower.calculate_state_root(),
+                producer_root,
+                "state root parity at height {h}"
+            );
+            parent = block.header.block_hash;
+        }
+
+        // Balances agree across the two independent executors.
+        assert_eq!(
+            producer.get_balance(&Address(BOB)),
+            follower.get_balance(&Address(BOB))
+        );
+        assert_eq!(follower.get_balance(&Address(BOB)), U256::from(3_000u64));
+        assert_eq!(app.applied_tip().await.height, 3);
+    }
+
+    #[tokio::test]
+    async fn follower_rejects_corrupted_state_root() {
+        let (producer, mut app, follower, storage, _dir) = two_nodes();
+
+        // The genuine block, and a malicious variant flipping the committed root.
+        // (Distinct VRF so it is a genuine sibling, not the same block hash.)
+        let good = produce(&producer, Hash::default(), 1, VRF_OUT, vec![transfer(ALICE, BOB, 1_000, 0)]).await;
+        let corrupt = mk_block_txs(
+            1,
+            Hash::default(),
+            Hash::new([0xFF; 32]),
+            [0x5B; 32],
+            vec![transfer(ALICE, BOB, 1_000, 0)],
+        );
+        let root_before = follower.calculate_state_root();
+
+        // The corrupt block is admitted + persisted (structure/sig pass), then
+        // execute-on-receive verifies its state root and REJECTS it.
+        persist(&storage, &corrupt);
+        assert!(matches!(
+            app.apply_received(&corrupt).await,
+            ApplyOutcome::Rejected(_)
+        ));
+
+        // I3: rejected block leaves the follower byte-identical + tip unmoved.
+        assert_eq!(follower.calculate_state_root(), root_before);
+        assert_eq!(app.applied_tip().await.height, 0);
+        assert_eq!(follower.get_balance(&Address(BOB)), U256::zero());
+
+        // Fork choice routes around the rejected block to the valid sibling
+        // (which forks at genesis): the follower reorgs onto it and converges.
+        persist(&storage, &good);
+        app.fork_choice = Some(fork_choice_returning(good.header.block_hash));
+        assert!(matches!(app.apply_received(&good).await, ApplyOutcome::Applied { .. }));
+        assert_eq!(follower.calculate_state_root(), good.state_root);
+        assert_eq!(follower.get_balance(&Address(BOB)), U256::from(1_000u64));
+    }
+
+    #[tokio::test]
+    async fn two_nodes_converge_after_reorg() {
+        let (producer, mut app, follower, storage, _dir) = two_nodes();
+
+        // Shared block a1 (both nodes apply it).
+        let a1 = produce(&producer, Hash::default(), 1, VRF_OUT, vec![transfer(ALICE, BOB, 1_000, 0)]).await;
+        persist(&storage, &a1);
+        app.apply_received(&a1).await;
+
+        // A branch continues on the producer's a1 state: a2.
+        let a2 = produce(&producer, a1.header.block_hash, 2, VRF_OUT, vec![transfer(ALICE, BOB, 1_000, 1)]).await;
+        persist(&storage, &a2);
+        app.apply_received(&a2).await;
+        assert_eq!(follower.calculate_state_root(), a2.state_root, "follower on the A branch");
+
+        // Now a heavier B branch appears, forking at a1. Rebuild the producer's
+        // state to a1 (fresh exec) and produce b2, b3 with a DISTINCT vrf.
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        let b1 = produce(&pb, Hash::default(), 1, VRF_OUT, vec![transfer(ALICE, BOB, 1_000, 0)]).await;
+        assert_eq!(b1.header.block_hash, a1.header.block_hash, "b1 == a1 (shared)");
+        let vrf_b = [0x5B; 32];
+        let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![transfer(ALICE, BOB, 2_000, 1)]).await;
+        let b3 = produce(&pb, b2.header.block_hash, 3, vrf_b, vec![transfer(ALICE, BOB, 2_000, 2)]).await;
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+
+        // Follower's fork choice now selects the B tip → it reorgs and converges.
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.apply_received(&b3).await;
+
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip { hash: b3.header.block_hash, height: 3 }
+        );
+        // I2 after reorg: follower state == producer's B-branch state at the tip.
+        assert_eq!(follower.calculate_state_root(), b3.state_root, "converged to B branch");
+        assert_eq!(follower.get_balance(&Address(BOB)), pb.get_balance(&Address(BOB)));
     }
 }
