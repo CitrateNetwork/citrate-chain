@@ -137,7 +137,21 @@ bad-state_root block is rejected AND leaves state untouched, (c) re-apply is ide
      in the reroll addendum (operators must NOT rely on enhanced rewards under v2).
    - 3 driver tests (`applies_linear_extension_and_advances_tip`,
      `rejects_bad_state_root_and_leaves_state_and_tip_untouched`, `defers_non_linear_blocks`).
-3. **Gap-extend** — walk-forward when the selected chain jumped.
+3. ✅ **Gap-extend** — walk-forward when the selected chain jumped. **DONE** (2026-07-16).
+   `apply_received` now drives `drain_forward`: starting at the applied tip it repeatedly
+   applies the unique persisted child on the selected chain (`next_persisted_extension` —
+   a `get_children(tip)` filtered by `selected_parent == tip ∧ height == tip.height+1`)
+   until it reaches a chain tip, a fork (≥2 selected-parent children → defer to step 4), or a
+   rejection. Because `put_block` persists a block before the driver sees it, out-of-order
+   delivery self-heals: a block ahead of its intermediates is `Deferred`, and the moment the
+   gap is filled by a later arrival the whole contiguous suffix drains in one call. The
+   received block is classified `Applied` iff the drain executed it, `Rejected` iff the drain
+   reached and rejected exactly it, else `Deferred`. This subsumes the step-2 direct extension
+   (the one-iteration case). Two new tests: `gap_extend_cascades_when_missing_intermediate_arrives`,
+   `drains_full_chain_when_top_arrives_with_all_intermediates_present`.
+   - *Known limitation (→ step 4):* a persisted bad-root block, or a fork above the tip, halts
+     linear extension on that path (no wrong state is ever applied — the drain just stops). A
+     valid sibling can't overtake it until fork-choice/reorg lands.
 4. **Reorg (option A)** — revert-to-checkpoint + re-apply; checkpoint floor guard.
 5. **Generalize VALIDATOR-S1 sync** — move `maybe_sync_registry` into the driver so all nodes
    sync at S(E); retire the producer-only hook.
