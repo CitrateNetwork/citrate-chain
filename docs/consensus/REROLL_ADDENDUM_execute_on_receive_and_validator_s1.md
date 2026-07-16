@@ -34,6 +34,22 @@ CITRATE_BLOCK_V2=1
 - Leave unset (or `0`) only if the reroll intentionally stays on v1 (execute-on-receive
   verification then remains unavailable — not recommended for a multi-node fleet).
 
+**⚠️ Reward path changes under v2.** Execute-on-receive requires that a receiver reproduce
+each block's `state_root`, which is only possible if block rewards are a *deterministic,
+consensus-visible* function of the block. The **enhanced economics reward path** (staking
+bonus, f64 reputation bonus, congestion bonus) reads **node-local, non-consensus** state that
+no other node can reproduce — so when `CITRATE_BLOCK_V2=1` the producer is **forced onto the
+deterministic basic reward path** (base block reward + halving + inference/model bonuses +
+fixed treasury split, computed purely from `header.height` + transactions). This is automatic;
+no separate flag. Consequence for the reroll:
+- Do **not** rely on staking/reputation/congestion reward bonuses under v2 — they are inert.
+- All nodes credit identical rewards, so `state_root` matches fleet-wide. The reward params
+  live in one place (`node/src/canonical_apply.rs::canonical_reward_config()`), shared by the
+  producer and the receive-side applier — never fork them.
+- The richer stake-weighted VALIDATOR-S1 reward (spec §C/§R') is a *future* deterministic
+  reward policy that will slot into this same basic-path seam (still a pure function of
+  committed/on-chain data), not the node-local enhanced path.
+
 ## B. VALIDATOR-S1 stake-gated membership
 
 **Why.** Enforces proposer-set membership from `ValidatorRegistry`. OFF unless configured.
