@@ -143,9 +143,12 @@ pub struct BlockProducer {
     /// [`Self::with_equivocation_vote_config`]; `None` until the registry is configured.
     equivocation_vote_cfg: Option<EquivocationVoteConfig>,
 
-    /// VALIDATOR-S1 (v5): optional registry snapshot-sync. When set, after sealing a
-    /// block at a snapshot boundary S(E) the producer rebuilds the shared proposer
-    /// selector from `ValidatorRegistry.activeSet()` as-of that state. `None` disables it.
+    /// VALIDATOR-S1 (v5): optional registry snapshot-sync for LOCALLY-PRODUCED S(E)
+    /// blocks. When set, after sealing a block at a snapshot boundary S(E) the producer
+    /// rebuilds the shared proposer selector from `ValidatorRegistry.activeSet()` as-of
+    /// that state. RECEIVED and REORGED S(E) blocks are synced by the execute-on-receive
+    /// driver (`CanonicalApplicator`, step 5) — the two cover disjoint block sources, so
+    /// there is no double-sync. `None` disables it.
     registry_sync: Option<Arc<crate::registry_sync::RegistrySync>>,
 
     /// EXECUTE-ON-RECEIVE (reroll addendum): when true, seal version-2 headers that COMMIT

@@ -108,6 +108,13 @@ impl AppliedState {
 /// inject a fixed tip — avoiding an async-trait dependency.
 type ForkChoice = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<Hash>> + Send>> + Send + Sync>;
 
+/// Registry snapshot-sync hook: given a snapshot-boundary height, rebuild the
+/// proposer selector and return the validator count (or an error string). A boxed
+/// async closure so production wires `RegistrySync::sync_for_snapshot` while tests
+/// inject a counter.
+type RegistrySyncHook =
+    Arc<dyn Fn(u64) -> Pin<Box<dyn Future<Output = Result<usize, String>> + Send>> + Send + Sync>;
+
 /// Outcome of a reorg attempt.
 #[derive(Debug)]
 pub enum ReorgOutcome {
@@ -161,6 +168,15 @@ pub struct CanonicalApplicator {
     /// Last finalized height — the reorg floor (I4: never revert below finality).
     /// Defaults to 0 (genesis); tightened when wired to the checkpoint manager.
     finalized_height: Arc<AtomicU64>,
+    /// VALIDATOR-S1 registry snapshot-sync. When set, after applying a RECEIVED
+    /// or REORGED block at a snapshot boundary S(E) the driver rebuilds the shared
+    /// proposer selector from `ValidatorRegistry.activeSet()` as-of that state —
+    /// so a non-producing node (or any node that receives / reorgs to S(E) from a
+    /// peer) loads epoch-E membership, not just the producer. Complements the
+    /// producer's own hook, which covers locally-produced S(E) blocks; the two
+    /// cover disjoint block sources (produced blocks are recorded, never drained),
+    /// so there is no double-sync. `None` disables it.
+    registry_sync: Option<RegistrySyncHook>,
 }
 
 impl CanonicalApplicator {
@@ -204,6 +220,7 @@ impl CanonicalApplicator {
             lock: Arc::new(Mutex::new(AppliedState { tip, snapshots })),
             fork_choice: None,
             finalized_height: Arc::new(AtomicU64::new(0)),
+            registry_sync: None,
         }
     }
 
@@ -221,6 +238,42 @@ impl CanonicalApplicator {
     /// BFT checkpoints finalize. Reorgs never revert below this height (I4).
     pub fn finalized_height_handle(&self) -> Arc<AtomicU64> {
         self.finalized_height.clone()
+    }
+
+    /// Attach the VALIDATOR-S1 registry snapshot-sync (see the field docs). The
+    /// driver then re-syncs the proposer selector at each applied/reorged S(E).
+    pub fn with_registry_sync(
+        mut self,
+        registry_sync: Arc<crate::registry_sync::RegistrySync>,
+    ) -> Self {
+        self.registry_sync = Some(Arc::new(move |height| {
+            let rs = registry_sync.clone();
+            Box::pin(async move { rs.sync_for_snapshot(height).await })
+        }));
+        self
+    }
+
+    /// VALIDATOR-S1: if `height` is a snapshot boundary S(E), rebuild the shared
+    /// proposer selector from the registry against the just-applied state (so
+    /// epoch-E membership is loaded before epoch-E blocks are admitted). Called
+    /// after applying a received or reorged block. No-op unless a registry sync is
+    /// attached and `height` is a boundary. Runs under the applied-state lock, so
+    /// the selector update is atomic with advancing past S(E).
+    async fn maybe_sync_registry(&self, height: u64) {
+        if let Some(hook) = &self.registry_sync {
+            if let Some(epoch) = crate::registry_sync::snapshot_epoch_at(height) {
+                match hook(height).await {
+                    Ok(n) => info!(
+                        "VALIDATOR-S1: synced validator set for epoch {} at snapshot height {} ({} validators) [receive/reorg path]",
+                        epoch, height, n
+                    ),
+                    Err(e) => warn!(
+                        "VALIDATOR-S1: registry snapshot sync failed at height {} (epoch {}): {}",
+                        height, epoch, e
+                    ),
+                }
+            }
+        }
     }
 
     fn finalized_height(&self) -> u64 {
@@ -352,6 +405,8 @@ impl CanonicalApplicator {
                         "execute-on-receive: applied block {} @ height {} (root verified)",
                         block_hash, height
                     );
+                    // VALIDATOR-S1: re-sync the selector if this crossed a snapshot boundary.
+                    self.maybe_sync_registry(height).await;
                 }
                 Err(ExecutionError::StateRootMismatch { expected, got }) => {
                     warn!(
@@ -473,6 +528,10 @@ impl CanonicalApplicator {
                     tip = AppliedTip { hash: hh, height: h };
                     new_snaps.push((h, hh, self.executor.state_snapshot()));
                     let _ = self.storage.state.put_state_root(&hh, &block.state_root);
+                    // VALIDATOR-S1: a reorg that re-applies across S(E) must re-sync the
+                    // selector to the NEW branch's registry state (the producer hook never
+                    // did this — it only fired on produce).
+                    self.maybe_sync_registry(h).await;
                 }
                 Err(e) => {
                     // Abort: full byte-exact restore to the pre-reorg state. The
@@ -1104,5 +1163,44 @@ mod tests {
             app.applied_tip().await,
             AppliedTip { hash: b3.header.block_hash, height: 3 }
         );
+    }
+
+    /// STEP 5: the driver re-syncs the validator registry ONLY at snapshot
+    /// boundaries S(E) = E·1000 − 200 (800, 1800, …) — the generalization that
+    /// makes a receiving/reorging node load epoch membership, not just producers.
+    #[tokio::test]
+    async fn registry_sync_fires_only_at_snapshot_boundaries() {
+        use std::sync::atomic::AtomicUsize;
+        let (exec, storage, _dir) = fresh();
+        let hits: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        let calls2 = calls.clone();
+        let mut app = CanonicalApplicator::new(exec, storage);
+        app.registry_sync = Some(Arc::new(move |h| {
+            hits2.lock().expect("lock").push(h);
+            calls2.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(3usize) })
+        }));
+
+        // Non-boundary heights: no sync.
+        for h in [1u64, 500, 799, 801, 1000] {
+            app.maybe_sync_registry(h).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no sync off a boundary");
+
+        // Boundaries S(1)=800, S(2)=1800: sync fires.
+        app.maybe_sync_registry(800).await;
+        app.maybe_sync_registry(1800).await;
+        assert_eq!(*hits.lock().expect("lock"), vec![800, 1800]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// With no registry-sync attached the hook is inert (steps 2–4 unaffected).
+    #[tokio::test]
+    async fn registry_sync_absent_is_noop() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec, storage);
+        app.maybe_sync_registry(800).await; // must not panic / do anything
     }
 }

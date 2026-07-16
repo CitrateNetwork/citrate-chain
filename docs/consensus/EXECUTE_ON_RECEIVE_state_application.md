@@ -183,8 +183,19 @@ bad-state_root block is rejected AND leaves state untouched, (c) re-apply is ide
      (state never corrupts, but that branch can't be adopted). The fix is fork choice excluding
      blocks that fail state verification.
    - 4 reorg tests: revert+reapply, abort-on-bad-block (I3), finalized-floor refusal (I4), no-op.
-5. **Generalize VALIDATOR-S1 sync** — move `maybe_sync_registry` into the driver so all nodes
-   sync at S(E); retire the producer-only hook.
+5. ✅ **Generalize VALIDATOR-S1 sync** — **DONE** (2026-07-16). The driver
+   (`CanonicalApplicator`) now re-syncs the proposer selector from the registry after applying a
+   RECEIVED or REORGED block at a snapshot boundary `S(E) = E·1000 − 200` — so a non-producing
+   node, or any node that receives/reorgs to `S(E)` from a peer, loads epoch-E membership. This
+   closes the memory-noted gap (sync was producer-path only). Refinement vs the original "retire
+   the producer hook": the producer hook is KEPT for locally-PRODUCED `S(E)` blocks (which never
+   flow through the driver's execute path — they are recorded, not re-executed). The two hooks
+   cover disjoint block sources, so there is no double-sync, and VALIDATOR-S1 activation is not
+   coupled to the v2 flag. The driver's hook is also strictly more correct than the producer's on
+   one axis: it re-syncs on a REORG across `S(E)` (to the new branch's registry state), which the
+   producer hook never did. Registry sync is a boxed async hook (RegistrySync in prod, injectable
+   in tests). Wired in `main.rs` when the registry is configured + the driver is enabled. Tests:
+   `registry_sync_fires_only_at_snapshot_boundaries`, `registry_sync_absent_is_noop`.
 6. **Harness** — two-node divergence test: producer + follower must reach identical state_root
    at every height; a corrupted-state_root block must be rejected fleet-wide.
 
