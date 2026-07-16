@@ -68,6 +68,19 @@ fn generate_block_vrf(signing_key: &Ed25519SigningKey, proposer_pubkey: &PublicK
     }
 }
 
+/// VALIDATOR-S1 (v5): configuration for producing the height-binding EquivocationVote
+/// signature on each sealed block. When present and the block height is at/above
+/// `activation_height`, the producer signs `EquivocationVote(chain_id, registry, height,
+/// block_hash)` with its proposer key and attaches it as a gossip sidecar so a double-sign
+/// can be slashed on-chain via `ValidatorRegistry.submitEquivocation`. `None` disables it
+/// (no behavior change) until the node is configured with the registry address.
+#[derive(Debug, Clone)]
+pub struct EquivocationVoteConfig {
+    pub chain_id: u64,
+    pub registry: [u8; 20],
+    pub activation_height: u64,
+}
+
 /// Block producer for mining new blocks
 pub struct BlockProducer {
     storage: Arc<StorageManager>,
@@ -125,6 +138,10 @@ pub struct BlockProducer {
     /// recording ModelHosting contributions. Atomically incremented by the
     /// inference handler and reset after each block production.
     inference_count: Arc<AtomicU64>,
+
+    /// VALIDATOR-S1 (v5): optional EquivocationVote signing config. Set via
+    /// [`Self::with_equivocation_vote_config`]; `None` until the registry is configured.
+    equivocation_vote_cfg: Option<EquivocationVoteConfig>,
 }
 
 impl BlockProducer {
@@ -191,6 +208,7 @@ impl BlockProducer {
             peer_profile_store: Mutex::new(PeerProfileStore::default()),
             contribution_recorder: None,
             inference_count: Arc::new(AtomicU64::new(0)),
+            equivocation_vote_cfg: None,
         }
     }
 
@@ -258,6 +276,7 @@ impl BlockProducer {
             peer_profile_store: Mutex::new(PeerProfileStore::default()),
             contribution_recorder: None,
             inference_count: Arc::new(AtomicU64::new(0)),
+            equivocation_vote_cfg: None,
         }
     }
 
@@ -317,6 +336,7 @@ impl BlockProducer {
             peer_profile_store: Mutex::new(PeerProfileStore::default()),
             contribution_recorder: None,
             inference_count: Arc::new(AtomicU64::new(0)),
+            equivocation_vote_cfg: None,
         }
     }
 
@@ -411,6 +431,7 @@ impl BlockProducer {
             peer_profile_store: Mutex::new(PeerProfileStore::default()),
             contribution_recorder: None,
             inference_count: Arc::new(AtomicU64::new(0)),
+            equivocation_vote_cfg: None,
         }
     }
 
@@ -515,6 +536,7 @@ impl BlockProducer {
             peer_profile_store: Mutex::new(PeerProfileStore::default()),
             contribution_recorder: None,
             inference_count: Arc::new(AtomicU64::new(0)),
+            equivocation_vote_cfg: None,
         }
     }
 
@@ -569,6 +591,14 @@ impl BlockProducer {
     #[allow(dead_code)]
     pub fn inference_counter(&self) -> Arc<AtomicU64> {
         self.inference_count.clone()
+    }
+
+    /// VALIDATOR-S1 (v5): configure EquivocationVote signing (see
+    /// [`EquivocationVoteConfig`]). Idempotent builder-style setter used by node
+    /// startup once the ValidatorRegistry address is known.
+    pub fn with_equivocation_vote_config(mut self, cfg: EquivocationVoteConfig) -> Self {
+        self.equivocation_vote_cfg = Some(cfg);
+        self
     }
 
     /// Pause block production (emergency stop).
@@ -857,6 +887,21 @@ impl BlockProducer {
 
         // WP-G.2: Sign the canonical block hash with the proposer's ed25519 key.
         block.signature = crypto::sign_block(&block.header.block_hash, &self.signing_key);
+
+        // VALIDATOR-S1 (v5): also sign the height-binding EquivocationVote for THIS block
+        // so a double-sign at this height is slashable on-chain. Sidecar (not in the hash);
+        // only produced at/above the activation height when the registry is configured.
+        if let Some(cfg) = &self.equivocation_vote_cfg {
+            if block.header.height >= cfg.activation_height {
+                block.equivocation_vote = Some(crypto::sign_equivocation_vote(
+                    cfg.chain_id,
+                    &cfg.registry,
+                    block.header.height,
+                    block.header.block_hash.as_bytes(),
+                    &self.signing_key,
+                ));
+            }
+        }
 
         // Persist state changes from executed transactions + rewards to storage
         info!("Persisting state changes to storage...");
