@@ -32,6 +32,7 @@ mod model_verifier;
 mod network_inference;
 mod persistent_dag;
 mod producer;
+mod registry_sync;
 mod contribution_recorder;
 mod sync;
 
@@ -1269,10 +1270,45 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // WP-S.1: Use persistent RocksDB-backed DAG store for restart survivability.
     // WP-W.2: Wire VRF strictness from config to DAG store
     let strict_vrf = config.vrf.strict_vrf;
+    // VALIDATOR-S1 (v5): parse the ValidatorRegistry config once. When set, the node
+    // enforces stake-gated proposer membership — a shared selector is attached to the DAG
+    // store (admission gate) and rebuilt each epoch from the registry (registry_sync).
+    // OFF by default (env unset) → no selector, no behavior change.
+    let validator_registry: Option<([u8; 20], u64)> = std::env::var("CITRATE_VALIDATOR_REGISTRY")
+        .ok()
+        .and_then(|reg_hex| match hex::decode(reg_hex.trim().trim_start_matches("0x")) {
+            Ok(bytes) if bytes.len() == 20 => {
+                let mut registry = [0u8; 20];
+                registry.copy_from_slice(&bytes);
+                let activation_height = std::env::var("CITRATE_VALIDATOR_ACTIVATION_HEIGHT")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                Some((registry, activation_height))
+            }
+            _ => {
+                warn!("CITRATE_VALIDATOR_REGISTRY set but not a valid 0x-hex 20-byte address; stake-gating DISABLED");
+                None
+            }
+        });
+    // The shared proposer selector — the SAME Arc the DAG store admits against and the
+    // snapshot-sync rebuilds. production() disables the forgeable legacy VRF path.
+    let validator_selector: Option<Arc<citrate_consensus::vrf::VrfProposerSelector>> = validator_registry
+        .as_ref()
+        .map(|_| Arc::new(citrate_consensus::vrf::VrfProposerSelector::production()));
+
     let shared_dag_store = {
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
         match DagStore::persistent_with_strict_vrf(kv, strict_vrf) {
             Ok(store) => {
+                // VALIDATOR-S1: attach the shared selector + fleet-wide activation height so
+                // admission enforces membership at/above the cutover. Empty until first sync.
+                let store = match (&validator_selector, &validator_registry) {
+                    (Some(sel), Some((_, activation))) => store
+                        .with_proposer_selector(sel.clone())
+                        .with_enforcement_activation_height(*activation),
+                    _ => store,
+                };
                 info!("DAG store created with strict_vrf={}", strict_vrf);
                 Arc::new(store)
             }
@@ -2128,39 +2164,29 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             shared_ghostdag.clone(),
         ).await;
 
-        // VALIDATOR-S1 (v5): enable EquivocationVote signing when the ValidatorRegistry
-        // is configured. OFF by default (the registry is not yet deployed) — the operator
-        // activates it by setting CITRATE_VALIDATOR_REGISTRY (0x-hex 20-byte address) and
-        // CITRATE_VALIDATOR_ACTIVATION_HEIGHT (defaults to 0). Once on, every sealed block
-        // at/above the activation height carries the proposer's height-binding vote so a
-        // double-sign is slashable on-chain via ValidatorRegistry.submitEquivocation.
-        if let Ok(reg_hex) = std::env::var("CITRATE_VALIDATOR_REGISTRY") {
-            match hex::decode(reg_hex.trim().trim_start_matches("0x")) {
-                Ok(bytes) if bytes.len() == 20 => {
-                    let mut registry = [0u8; 20];
-                    registry.copy_from_slice(&bytes);
-                    let activation_height = std::env::var("CITRATE_VALIDATOR_ACTIVATION_HEIGHT")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u64>().ok())
-                        .unwrap_or(0);
-                    producer_instance = producer_instance.with_equivocation_vote_config(
-                        producer::EquivocationVoteConfig {
-                            chain_id: config.chain.chain_id,
-                            registry,
-                            activation_height,
-                        },
-                    );
-                    info!(
-                        "VALIDATOR-S1: EquivocationVote signing ENABLED (registry 0x{}, activation height {})",
-                        hex::encode(registry),
-                        activation_height
-                    );
-                }
-                _ => warn!(
-                    "CITRATE_VALIDATOR_REGISTRY set but not a valid 0x-hex 20-byte address; \
-                     EquivocationVote signing DISABLED"
-                ),
-            }
+        // VALIDATOR-S1 (v5): when the ValidatorRegistry is configured, enable BOTH the
+        // EquivocationVote signing and the epoch snapshot-sync (rebuilds the shared selector
+        // — the same Arc the DAG store admits against — from the registry at each S(E)).
+        // OFF by default; activates on CITRATE_VALIDATOR_REGISTRY + _ACTIVATION_HEIGHT.
+        if let (Some((registry, activation_height)), Some(sel)) =
+            (&validator_registry, &validator_selector)
+        {
+            producer_instance = producer_instance
+                .with_equivocation_vote_config(producer::EquivocationVoteConfig {
+                    chain_id: config.chain.chain_id,
+                    registry: *registry,
+                    activation_height: *activation_height,
+                })
+                .with_registry_sync(Arc::new(registry_sync::RegistrySync::new(
+                    executor.clone(),
+                    sel.clone(),
+                    *registry,
+                )));
+            info!(
+                "VALIDATOR-S1: stake-gated membership ENABLED (registry 0x{}, activation height {})",
+                hex::encode(registry),
+                activation_height
+            );
         }
 
         // WP-I.3: Share the same pause_flag between RPC server and producer
