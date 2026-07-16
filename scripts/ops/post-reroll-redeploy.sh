@@ -78,6 +78,21 @@ CITRATE_AA_IDENTITY_SIGNER_ADDR=$(get_env CITRATE_AA_IDENTITY_SIGNER_ADDR)
 [[ -n "${CITRATE_AA_ENTRY_POINT:-}" ]]          || { err "CITRATE_AA_ENTRY_POINT missing";    exit 1; }
 [[ -n "${CITRATE_AA_IDENTITY_SIGNER_ADDR:-}" ]] || { err "CITRATE_AA_IDENTITY_SIGNER_ADDR missing"; exit 1; }
 
+# --- E-8: ensure the DETERMINISTIC operator keys exist BEFORE the AA deploy ---
+# The E-8 CitratePaymaster constructor requires CITRATE_AA_SPONSOR_SIGNER; the
+# deterministic derivation writes it (+ the grant/registrar keys). Without this,
+# DeployAA reverts "sponsor signer not set". Idempotent — safe to re-run.
+log "deriving deterministic operator keys (grant/sponsor/registrar)…"
+CITRATE_ENV_FILE="$ENV_TESTNET" bash "${REPO_ROOT}/scripts/ops/derive-operator-keys.sh" || {
+  err "derive-operator-keys.sh failed — CITRATE_AA_SPONSOR_SIGNER would be unset"; exit 1; }
+CITRATE_AA_SPONSOR_SIGNER=$(get_env CITRATE_AA_SPONSOR_SIGNER)
+export CITRATE_AA_SPONSOR_SIGNER
+log "sponsor signer:    ${CITRATE_AA_SPONSOR_SIGNER}"
+log ""
+log "NOTE: after this AA redeploy, run scripts/ops/post-reroll-membership.sh to"
+log "      redeploy the membership money path (contracts owned by the grant"
+log "      signer, funding, treasury-signer). See handoffs/REROLL_MASTER_RUNBOOK.md."
+
 log "rpc:               $RPC_URL"
 log "deployer:          $DEPLOYER_ADDRESS"
 log "entrypoint (env):  $CITRATE_AA_ENTRY_POINT"
