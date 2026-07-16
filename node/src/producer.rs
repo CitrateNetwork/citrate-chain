@@ -142,6 +142,11 @@ pub struct BlockProducer {
     /// VALIDATOR-S1 (v5): optional EquivocationVote signing config. Set via
     /// [`Self::with_equivocation_vote_config`]; `None` until the registry is configured.
     equivocation_vote_cfg: Option<EquivocationVoteConfig>,
+
+    /// VALIDATOR-S1 (v5): optional registry snapshot-sync. When set, after sealing a
+    /// block at a snapshot boundary S(E) the producer rebuilds the shared proposer
+    /// selector from `ValidatorRegistry.activeSet()` as-of that state. `None` disables it.
+    registry_sync: Option<Arc<crate::registry_sync::RegistrySync>>,
 }
 
 impl BlockProducer {
@@ -209,6 +214,7 @@ impl BlockProducer {
             contribution_recorder: None,
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
+            registry_sync: None,
         }
     }
 
@@ -277,6 +283,7 @@ impl BlockProducer {
             contribution_recorder: None,
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
+            registry_sync: None,
         }
     }
 
@@ -337,6 +344,7 @@ impl BlockProducer {
             contribution_recorder: None,
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
+            registry_sync: None,
         }
     }
 
@@ -432,6 +440,7 @@ impl BlockProducer {
             contribution_recorder: None,
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
+            registry_sync: None,
         }
     }
 
@@ -537,6 +546,7 @@ impl BlockProducer {
             contribution_recorder: None,
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
+            registry_sync: None,
         }
     }
 
@@ -599,6 +609,32 @@ impl BlockProducer {
     pub fn with_equivocation_vote_config(mut self, cfg: EquivocationVoteConfig) -> Self {
         self.equivocation_vote_cfg = Some(cfg);
         self
+    }
+
+    /// VALIDATOR-S1 (v5): attach the registry snapshot-sync (see [`Self::registry_sync`]).
+    pub fn with_registry_sync(mut self, sync: Arc<crate::registry_sync::RegistrySync>) -> Self {
+        self.registry_sync = Some(sync);
+        self
+    }
+
+    /// VALIDATOR-S1 (v5): if `height` is a snapshot boundary S(E), rebuild the shared
+    /// proposer selector from the registry against the just-applied state. Called after a
+    /// block is persisted so the executor state == state at S(E).
+    async fn maybe_sync_registry(&self, height: u64) {
+        if let Some(rs) = &self.registry_sync {
+            if let Some(epoch) = crate::registry_sync::snapshot_epoch_at(height) {
+                match rs.sync_for_snapshot(height).await {
+                    Ok(n) => info!(
+                        "VALIDATOR-S1: synced validator set for epoch {} at snapshot height {} ({} validators)",
+                        epoch, height, n
+                    ),
+                    Err(e) => warn!(
+                        "VALIDATOR-S1: registry snapshot sync failed at height {} (epoch {}): {}",
+                        height, epoch, e
+                    ),
+                }
+            }
+        }
     }
 
     /// Pause block production (emergency stop).
@@ -907,6 +943,11 @@ impl BlockProducer {
         info!("Persisting state changes to storage...");
         let modified_count = self.executor.persist_state_changes().await?;
         info!("Persisted {} modified accounts to storage", modified_count);
+
+        // VALIDATOR-S1 (v5): the executor state is now post-height H. If H is a snapshot
+        // boundary S(E), rebuild the proposer selector from the registry as-of this state
+        // so epoch-E membership is loaded before epoch-E blocks are validated.
+        self.maybe_sync_registry(block.header.height).await;
 
         // WP-G.4: Verify state root consistency after persistence.
         // The executor's in-memory state root (used in the block) must still match.

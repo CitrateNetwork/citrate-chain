@@ -58,7 +58,9 @@ pub struct VrfProposerSelector {
     /// Populated from `ValidatorRegistry.minStake` at the epoch snapshot S(E).
     /// A validator is eligible iff it is active AND `stake >= min_stake` — an
     /// INTEGER, platform-deterministic gate (no f64), see `is_eligible_proposer`.
-    min_stake: u128,
+    /// Behind a lock so the epoch snapshot-sync can update it live through the
+    /// shared `Arc<VrfProposerSelector>` the DagStore holds.
+    min_stake: Arc<RwLock<u128>>,
     /// Audit H-06: legacy 32-byte SHA3 proofs rejected at or above
     /// this height. See [`DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT`].
     legacy_vrf_cutoff_height: u64,
@@ -69,22 +71,39 @@ impl VrfProposerSelector {
         Self {
             validators: Arc::new(RwLock::new(HashMap::new())),
             total_stake: Arc::new(RwLock::new(0)),
-            min_stake: 0,
+            min_stake: Arc::new(RwLock::new(0)),
             legacy_vrf_cutoff_height: DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT,
         }
     }
 
-    /// VALIDATOR-S1: set the membership stake floor (governance `minStake`,
-    /// read from the registry at the epoch snapshot). Builder form so the node
-    /// can rebuild the selector each epoch with the as-of-S(E) value.
+    /// VALIDATOR-S1: set the initial membership stake floor. Builder form used at
+    /// construction; the live value is updated each epoch via [`Self::sync_active_set`].
     pub fn with_min_stake(mut self, min_stake: u128) -> Self {
-        self.min_stake = min_stake;
+        self.min_stake = Arc::new(RwLock::new(min_stake));
         self
     }
 
-    /// The current membership stake floor.
-    pub fn min_stake(&self) -> u128 {
-        self.min_stake
+    /// The current membership stake floor (as-of the last snapshot sync).
+    pub async fn min_stake(&self) -> u128 {
+        *self.min_stake.read().await
+    }
+
+    /// VALIDATOR-S1: atomically replace the active validator set + minStake from a
+    /// registry snapshot read at S(E). `entries` are (proposer pubkey, effective stake)
+    /// as returned by `ValidatorRegistry.activeSet()` — every entry is active. This is
+    /// how the node rebuilds membership each epoch through the shared selector Arc.
+    pub async fn sync_active_set(&self, entries: Vec<(PublicKey, u128)>, min_stake: u128) {
+        let mut validators = self.validators.write().await;
+        let mut total = self.total_stake.write().await;
+        let mut ms = self.min_stake.write().await;
+        validators.clear();
+        let mut sum: u128 = 0;
+        for (pubkey, stake) in entries {
+            validators.insert(pubkey, Validator { pubkey, stake, is_active: true });
+            sum = sum.saturating_add(stake);
+        }
+        *total = sum;
+        *ms = min_stake;
     }
 
     /// Override the legacy-VRF cutoff height. Used by devnet and
@@ -357,7 +376,8 @@ impl VrfProposerSelector {
     ) -> Result<bool, VrfError> {
         let validators = self.validators.read().await;
         let validator = validators.get(pubkey).ok_or(VrfError::ValidatorNotFound)?;
-        Ok(validator.is_active && validator.stake >= self.min_stake)
+        let min_stake = *self.min_stake.read().await;
+        Ok(validator.is_active && validator.stake >= min_stake)
     }
 
     /// Convert VRF output to a float between 0 and 1.
@@ -580,6 +600,34 @@ mod tests {
             .is_eligible_proposer(&pk, &Hash::new([1; 32]), 1)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_sync_active_set_replaces_membership_and_min_stake() {
+        let selector = VrfProposerSelector::new().with_min_stake(1_000);
+        let stale = PublicKey::new([0xEE; 32]);
+        selector
+            .register_validator(Validator { pubkey: stale, stake: 5_000, is_active: true })
+            .await;
+
+        // Snapshot from S(E): a fresh set + new minStake, replacing everything.
+        let a = PublicKey::new([0xA0; 32]);
+        let b = PublicKey::new([0xB0; 32]);
+        selector
+            .sync_active_set(vec![(a, 40_000), (b, 32_000)], 32_000)
+            .await;
+
+        assert_eq!(selector.min_stake().await, 32_000);
+        assert_eq!(selector.total_stake().await, 72_000);
+        assert_eq!(selector.active_validator_count().await, 2);
+        // stale validator is gone (not in the snapshot)
+        assert!(matches!(
+            selector.is_eligible_proposer(&stale, &Hash::new([0; 32]), 1).await,
+            Err(VrfError::ValidatorNotFound)
+        ));
+        // new members eligible at/above the new minStake
+        assert!(selector.is_eligible_proposer(&a, &Hash::new([0; 32]), 1).await.unwrap());
+        assert!(selector.is_eligible_proposer(&b, &Hash::new([0; 32]), 1).await.unwrap());
     }
 
     #[tokio::test]
