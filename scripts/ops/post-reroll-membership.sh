@@ -60,19 +60,39 @@ echo "  balance: $(cast balance "$GRANT_ADDR" -r "$RPC")"
 cat <<EOF
 
 == step 3: redeploy the droplet treasury-signer (manual, @rule8) ==
-The signing key is deterministic, so on the identity droplet (157.230.55.191):
+The signing key is deterministic; only the CONTRACT addresses change on a
+re-roll (DeployCoreMembership uses plain CREATE, nonce-based), so on the
+identity droplet (157.230.55.191) refresh the env + rebuild + recreate:
   1. Refresh /etc/citrate-treasury-signer.env with:
        TREASURY_SIGNER_KEY=<GRANT_SIGNER_PRIVATE_KEY from .env.testnet>
        MEMBERSHIP_STAKE_VAULT_ADDRESS=${VAULT}
        CITRATE_MEMBER_SBT_ADDRESS=${SBT}
-     (keep TREASURY_SIGNER_TOKEN + TREASURY_DAILY_CAP_WEI)
-  2. cd /opt/citrate-treasury-signer && docker build -t citrate-treasury-signer .
-     docker rm -f citrate-treasury-signer
-     docker run -d --name citrate-treasury-signer --restart unless-stopped \\
-       -p 127.0.0.1:8790:8790 --env-file /etc/citrate-treasury-signer.env \\
-       -v /var/lib/citrate-treasury-signer:/var/lib/citrate-treasury-signer citrate-treasury-signer
-  3. curl -s http://127.0.0.1:8790/health   # signer == ${GRANT_ADDR}
-Then re-pin the new SBT/VAULT into core-membership's Vercel env + redeploy.
+     (keep TREASURY_SIGNER_TOKEN + TREASURY_DAILY_CAP_WEI + CITRATE_RPC_URL + CITRATE_CHAIN_ID)
+  2. Copy the latest service source then rebuild + RECREATE the container.
+     NOTE: 'docker restart' does NOT re-read --env-file; you MUST rm + run so the
+     new SBT/VAULT/cap take effect. The --network flag is REQUIRED so Caddy can
+     reach the container by name for the HTTPS route.
+       scp citrate-identity/services/treasury-signer/{server.mjs,package.json,Dockerfile} \\
+           root@157.230.55.191:/opt/citrate-treasury-signer/
+       cd /opt/citrate-treasury-signer && docker build -t citrate-treasury-signer .
+       docker rm -f citrate-treasury-signer
+       docker run -d --name citrate-treasury-signer --restart unless-stopped \\
+         --network citrate-identity_default \\
+         -p 127.0.0.1:8790:8790 --env-file /etc/citrate-treasury-signer.env \\
+         -v /var/lib/citrate-treasury-signer:/var/lib/citrate-treasury-signer citrate-treasury-signer
+  3. Confirm the Caddy TLS route still exists (it persists across re-rolls; only
+     re-add if the Caddyfile was rebuilt). /opt/citrate-identity/Caddyfile must
+     contain, inside the {\$ISSUER_HOST} block:
+       @treasury path /_ops/treasury/*
+       handle @treasury { uri strip_prefix /_ops/treasury; reverse_proxy citrate-treasury-signer:8790 }
+     After any Caddyfile edit: docker restart citrate-identity-caddy-1
+     (a plain 'caddy reload' does NOT pick up new handle blocks — restart the container).
+  4. Verify local + public:
+       curl -s http://127.0.0.1:8790/health                     # signer == ${GRANT_ADDR}
+       curl -s https://auth.citrate.ai/_ops/treasury/health     # same JSON via TLS
+Then re-pin the new SBT/VAULT into core-membership's Vercel env + redeploy, and
+confirm TREASURY_SIGNER_URL=https://auth.citrate.ai/_ops/treasury/grant is set
+there (the URL + token are STABLE across re-rolls; only SBT/VAULT change).
 Service source: citrate-identity/services/treasury-signer/.
 EOF
 echo "post-reroll membership ceremony complete."
