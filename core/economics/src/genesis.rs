@@ -542,6 +542,7 @@ pub fn create_canonical_genesis_block(timestamp: u64) -> Block {
         base_fee_per_gas: 1_000_000_000,
         gas_used: 0,
         gas_limit: 30_000_000,
+        coinbase: [0u8; 20],
     };
 
     BlockBuilder::new()

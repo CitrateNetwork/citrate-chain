@@ -831,6 +831,78 @@ impl Executor {
         self.state_db.calculate_state_root()
     }
 
+    /// EXECUTE-ON-RECEIVE — the verified, revertible state-application atom.
+    ///
+    /// Applies a canonical block's transactions to world state, credits the block's
+    /// reward(s), then VERIFIES the resulting state root equals the block's claimed
+    /// `state_root`. On any transaction error or a root mismatch it REVERTS — world
+    /// state is left byte-identical (invariant I3) — and returns an error, so the caller
+    /// rejects the block. On success it persists and returns the verified root.
+    ///
+    /// `coinbase` feeds the EVM COINBASE opcode + block context (recovered from
+    /// `block.header.coinbase` for v>=2 blocks — the field that makes state_root
+    /// reproducible by receivers). `reward_credits` are the post-execution mints the
+    /// producer applied, e.g. `[(beneficiary, validator_reward), (treasury, treasury_reward)]`
+    /// — supplied by the caller so this atom stays free of reward/economics policy (and so
+    /// the VALIDATOR-S1 §R' on-chain reward path can slot in as just another credit list).
+    ///
+    /// Revert safety: `execute_transaction` drains its journal into `state_db` on commit
+    /// (nothing persists to the store until `persist_state_changes`), and
+    /// `state_db.snapshot()/restore()` captures/restores the full account+storage+dirty
+    /// state — so a rejected block touches neither in-memory state nor the store. The
+    /// commit-coordinator version counter is monotonic and advancing it under a reverted
+    /// apply is benign for the sequential caller. See
+    /// docs/consensus/EXECUTE_ON_RECEIVE_state_application.md §2.2/§2.5.
+    pub async fn apply_block(
+        &self,
+        block: &Block,
+        coinbase: [u8; 20],
+        reward_credits: &[(Address, U256)],
+    ) -> Result<Hash, ExecutionError> {
+        let snapshot = self.state_db.snapshot();
+        let prev_ctx = self.get_block_context();
+
+        // Same block context the producer used: this block's ECVRF beacon as prevrandao,
+        // and the committed coinbase for the COINBASE opcode.
+        self.set_block_context(crate::revm_adapter::BlockContext {
+            coinbase,
+            prevrandao: *block.header.vrf_reveal.output.as_bytes(),
+            block_hashes: std::collections::HashMap::new(),
+        });
+
+        for tx in &block.transactions {
+            if let Err(e) = self.execute_transaction(block, tx).await {
+                // A hard tx error means the block shouldn't have included it → invalid block.
+                self.state_db.restore(snapshot);
+                self.set_block_context(prev_ctx);
+                return Err(e);
+            }
+        }
+
+        // Post-execution reward mints (must match what the producer applied).
+        for (addr, amount) in reward_credits {
+            if *amount > U256::zero() {
+                let bal = self.get_balance(addr);
+                self.set_balance(addr, bal + *amount);
+            }
+        }
+
+        let got = self.calculate_state_root();
+        if got != block.state_root {
+            self.state_db.restore(snapshot);
+            self.set_block_context(prev_ctx);
+            return Err(ExecutionError::StateRootMismatch {
+                expected: block.state_root,
+                got,
+            });
+        }
+
+        self.persist_state_changes()
+            .await
+            .map_err(|e| ExecutionError::Reverted(format!("persist after apply_block: {e}")))?;
+        Ok(got)
+    }
+
     /// Execute a transaction via the MVCC path.
     ///
     /// Sprint P950-A-5 WP-A.5.3: parallel execution via journal + CAS.
@@ -2928,7 +3000,7 @@ impl Executor {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use citrate_consensus::types::{BlockBuilder, PublicKey, Signature};
+    use citrate_consensus::types::{BlockBuilder, PublicKey, Signature, VrfProof};
     use parking_lot::Mutex;
     use serde_json::json;
     use sha3::{Digest, Keccak256};
@@ -3066,6 +3138,102 @@ mod tests {
 
         assert!(receipt.status);
         assert_eq!(state_db.accounts.get_balance(&bob_addr), U256::from(1000));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // EXECUTE-ON-RECEIVE — apply_block atom (docs/consensus/EXECUTE_ON_RECEIVE_*).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build a block carrying `txs` + a claimed `state_root`, with a VRF output so the
+    /// prevrandao context matches, at height 100.
+    fn block_with(txs: Vec<Transaction>, state_root: Hash) -> Block {
+        BlockBuilder::new()
+            .height(100)
+            .timestamp(1000000)
+            .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+            .transactions(txs)
+            .state_root(state_root)
+            .build_unhashed()
+    }
+
+    const CB: [u8; 20] = [0x33; 20];
+
+    #[tokio::test]
+    async fn test_apply_block_good_advances_and_verifies() {
+        let alice = PublicKey::new([1; 32]);
+        let bob = PublicKey::new([2; 32]);
+        let alice_addr = Address::from_public_key(&alice);
+        let bob_addr = Address::from_public_key(&bob);
+        let cb_addr = Address(CB);
+        let reward = U256::from(500u64);
+        let fund = U256::from(1_000_000_000_000_000u128);
+
+        // 1) Compute the expected post-state root by mirroring apply_block on a throwaway db.
+        let expected = {
+            let sdb = Arc::new(StateDB::new());
+            let exec = Executor::new(sdb.clone());
+            sdb.accounts.set_balance(alice_addr, fund);
+            exec.set_block_context(crate::revm_adapter::BlockContext {
+                coinbase: CB,
+                prevrandao: [0x5A; 32],
+                block_hashes: std::collections::HashMap::new(),
+            });
+            let tx = create_test_tx(alice, Some(bob), 1000, 0);
+            let blk = block_with(vec![tx.clone()], Hash::default());
+            exec.execute_transaction(&blk, &tx).await.unwrap();
+            let bal = exec.get_balance(&cb_addr);
+            exec.set_balance(&cb_addr, bal + reward);
+            exec.calculate_state_root()
+        };
+
+        // 2) apply_block on a fresh, identical executor must reproduce that root + advance state.
+        let sdb = Arc::new(StateDB::new());
+        let exec = Executor::new(sdb.clone());
+        sdb.accounts.set_balance(alice_addr, fund);
+        let tx = create_test_tx(alice, Some(bob), 1000, 0);
+        let blk = block_with(vec![tx], expected);
+
+        let got = exec
+            .apply_block(&blk, CB, &[(cb_addr, reward)])
+            .await
+            .expect("valid block must apply");
+        assert_eq!(got, expected, "apply_block must reproduce the claimed state_root");
+        assert_eq!(exec.get_balance(&bob_addr), U256::from(1000u64), "tx effect applied");
+        assert_eq!(exec.get_balance(&cb_addr), reward, "reward credited");
+    }
+
+    #[tokio::test]
+    async fn test_apply_block_bad_root_rejects_and_leaves_state_untouched() {
+        let alice = PublicKey::new([1; 32]);
+        let bob = PublicKey::new([2; 32]);
+        let alice_addr = Address::from_public_key(&alice);
+        let bob_addr = Address::from_public_key(&bob);
+        let cb_addr = Address(CB);
+        let fund = U256::from(1_000_000_000_000_000u128);
+
+        let sdb = Arc::new(StateDB::new());
+        let exec = Executor::new(sdb.clone());
+        sdb.accounts.set_balance(alice_addr, fund);
+        let root_before = exec.calculate_state_root();
+
+        let tx = create_test_tx(alice, Some(bob), 1000, 0);
+        // Claim a bogus state_root → must be rejected.
+        let blk = block_with(vec![tx], Hash::new([0xFF; 32]));
+
+        let err = exec
+            .apply_block(&blk, CB, &[(cb_addr, U256::from(500u64))])
+            .await
+            .expect_err("bad state_root must be rejected");
+        assert!(
+            matches!(err, ExecutionError::StateRootMismatch { .. }),
+            "expected StateRootMismatch, got {err:?}"
+        );
+
+        // Invariant I3: world state byte-identical to before the rejected attempt.
+        assert_eq!(exec.calculate_state_root(), root_before, "state must be reverted");
+        assert_eq!(exec.get_balance(&bob_addr), U256::zero(), "tx effect reverted");
+        assert_eq!(exec.get_balance(&cb_addr), U256::zero(), "reward reverted");
+        assert_eq!(exec.get_balance(&alice_addr), fund, "sender balance restored");
     }
 
     /// PIN-P1(d): end-to-end proof that the block-execution entrypoint surfaces
