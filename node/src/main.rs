@@ -1365,15 +1365,33 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         .unwrap_or(false);
     let canonical_applicator: Option<Arc<canonical_apply::CanonicalApplicator>> =
         if execute_on_receive_enabled {
-            let app = Arc::new(canonical_apply::CanonicalApplicator::new(
-                executor.clone(),
-                storage.clone(),
-            ));
+            // Attach GhostDAG as the fork-choice authority so the driver reorgs
+            // the applied chain toward the selected tip (step 4). Bounded revert
+            // depth + finalized floor guard reverts inside the applicator.
+            let app = Arc::new(
+                canonical_apply::CanonicalApplicator::new(executor.clone(), storage.clone())
+                    .with_fork_choice(shared_ghostdag.clone()),
+            );
             let start = app.applied_tip().await;
             info!(
-                "EXECUTE-ON-RECEIVE: fast-path applier ENABLED (received blocks executed + state-root-verified); applied head = {} @ {}",
+                "EXECUTE-ON-RECEIVE: fast-path applier + reorg ENABLED (received blocks executed + state-root-verified); applied head = {} @ {}",
                 start.hash, start.height
             );
+            // I4: keep the reorg floor in sync with BFT finality so a reorg can
+            // never revert below a finalized checkpoint. Cheap poll (the applied
+            // height advances ~1/s); the floor is monotonic in the checkpoint mgr.
+            let floor = app.finalized_height_handle();
+            let cp = checkpoint_manager.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    tick.tick().await;
+                    let h = cp.latest_finalized_height().await;
+                    if h > floor.load(std::sync::atomic::Ordering::SeqCst) {
+                        floor.store(h, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            });
             Some(app)
         } else {
             None

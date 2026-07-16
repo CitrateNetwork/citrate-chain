@@ -31,14 +31,26 @@
 
 use std::sync::Arc;
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::types::{Block, Hash};
 use citrate_economics::{RewardCalculator, RewardConfig};
+use citrate_execution::state::StateSnapshot;
 use citrate_execution::types::ExecutionError;
 use citrate_execution::Executor;
 use citrate_storage::StorageManager;
 use primitive_types::U256;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// Reorg window: the number of most-recent applied blocks whose full state
+/// snapshots the ring retains. Bounds both memory (≤ this many full-state
+/// snapshots) and the deepest revertible reorg — a fork older than this is
+/// refused (treated like a finality violation). Matches `ChainSelector`'s
+/// default `max_reorg_depth`. See docs/consensus/EXECUTE_ON_RECEIVE §4 step 4.
+const MAX_REORG_DEPTH: u64 = 100;
 
 /// Treasury address that receives the treasury slice of each block reward.
 /// Mirrors `producer.rs::apply_basic_rewards` and `RewardConfig.treasury_address`.
@@ -66,6 +78,49 @@ pub struct AppliedTip {
     pub height: u64,
 }
 
+/// The applied tip plus a bounded ring of state snapshots — one per applied
+/// block within the reorg window, keyed by height — so a reorg can revert world
+/// state to the fork point. Guarded by the shared state-advance lock, so the
+/// producer and the receive path mutate it atomically.
+pub struct AppliedState {
+    tip: AppliedTip,
+    /// height → (that block's hash, executor state AS-OF that block). Pruned to
+    /// the most recent `MAX_REORG_DEPTH` heights (below the reorg window is
+    /// unrevertible). One entry per applied height on the current applied chain.
+    snapshots: BTreeMap<u64, (Hash, StateSnapshot)>,
+}
+
+impl AppliedState {
+    /// Record the state snapshot for a freshly-applied block and advance the tip,
+    /// pruning snapshots that fall out of the reorg window.
+    fn record(&mut self, hash: Hash, height: u64, snapshot: StateSnapshot) {
+        self.tip = AppliedTip { hash, height };
+        self.snapshots.insert(height, (hash, snapshot));
+        let floor = height.saturating_sub(MAX_REORG_DEPTH);
+        self.snapshots.retain(|h, _| *h >= floor);
+    }
+}
+
+/// Outcome of a reorg attempt.
+#[derive(Debug)]
+pub enum ReorgOutcome {
+    /// Reverted to the fork point and re-applied the winning branch to `new_tip`.
+    Reorged {
+        new_tip: Hash,
+        height: u64,
+        /// Blocks rolled off the abandoned branch (fork_point..old_tip).
+        reverted: u64,
+        /// Blocks applied on the winning branch (fork_point..new_tip).
+        applied: u64,
+    },
+    /// `new_tip` is already the applied tip — nothing to do.
+    NoChange,
+    /// Refused or failed: fork point below the retained window / finalized floor,
+    /// a missing block, or a bad block on the winning branch. World state is left
+    /// byte-identical to before the attempt (invariant I3).
+    Rejected(String),
+}
+
 /// Result of attempting to apply a received block on the fast path.
 #[derive(Debug)]
 pub enum ApplyOutcome {
@@ -82,15 +137,23 @@ pub enum ApplyOutcome {
     AlreadyApplied,
 }
 
-/// Execute-on-receive driver. Owns the shared applied-tip lock and the
-/// deterministic reward calculator; drives `Executor::apply_block`.
+/// Execute-on-receive driver. Owns the shared applied-state lock (tip + reorg
+/// snapshot ring), the deterministic reward calculator, and an optional
+/// fork-choice source; drives `Executor::apply_block`.
 pub struct CanonicalApplicator {
     executor: Arc<Executor>,
     storage: Arc<StorageManager>,
     reward_calculator: RewardCalculator,
-    /// Serializes state advancement (see module docs). The value under the lock
-    /// is the current applied tip.
-    lock: Arc<Mutex<AppliedTip>>,
+    /// Serializes state advancement (see module docs). Holds the applied tip +
+    /// the reorg snapshot ring.
+    lock: Arc<Mutex<AppliedState>>,
+    /// Fork-choice authority (GhostDAG). When set, after the forward drain the
+    /// driver reorgs the applied tip toward the DAG's selected tip. `None`
+    /// disables reorg (steps 2–3 behavior only). Wired under `CITRATE_BLOCK_V2`.
+    fork_choice: Option<Arc<GhostDag>>,
+    /// Last finalized height — the reorg floor (I4: never revert below finality).
+    /// Defaults to 0 (genesis); tightened when wired to the checkpoint manager.
+    finalized_height: Arc<AtomicU64>,
 }
 
 impl CanonicalApplicator {
@@ -122,24 +185,49 @@ impl CanonicalApplicator {
             "execute-on-receive: applied tip seeded at {} @ height {}",
             tip.hash, tip.height
         );
+        // Seed the reorg ring with the current state as-of the seeded tip: the
+        // executor reflects this tip's state at construction, so it is the base a
+        // reorg can revert to before any new block is applied.
+        let mut snapshots = BTreeMap::new();
+        snapshots.insert(tip.height, (tip.hash, executor.state_snapshot()));
         Self {
             executor,
             storage,
             reward_calculator: RewardCalculator::new(canonical_reward_config()),
-            lock: Arc::new(Mutex::new(tip)),
+            lock: Arc::new(Mutex::new(AppliedState { tip, snapshots })),
+            fork_choice: None,
+            finalized_height: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// The shared state-advance lock. The producer acquires this across its own
-    /// execute→persist critical section so production never races the receive
-    /// path, and updates the tip inline via [`record_produced`] before release.
-    pub fn advance_lock(&self) -> Arc<Mutex<AppliedTip>> {
+    /// Attach the fork-choice authority (GhostDAG). Enables reorg: after the
+    /// forward drain, the driver reorgs the applied tip toward `select_tip()`.
+    pub fn with_fork_choice(mut self, ghostdag: Arc<GhostDag>) -> Self {
+        self.fork_choice = Some(ghostdag);
+        self
+    }
+
+    /// Shared handle to the finalized-height floor, for the caller to update as
+    /// BFT checkpoints finalize. Reorgs never revert below this height (I4).
+    pub fn finalized_height_handle(&self) -> Arc<AtomicU64> {
+        self.finalized_height.clone()
+    }
+
+    fn finalized_height(&self) -> u64 {
+        self.finalized_height.load(Ordering::SeqCst)
+    }
+
+    /// The shared state-advance lock (applied tip + reorg snapshot ring). The
+    /// producer acquires this across its execute→persist critical section so
+    /// production never races the receive path, and records the sealed block via
+    /// [`record_produced`] before release.
+    pub fn advance_lock(&self) -> Arc<Mutex<AppliedState>> {
         self.lock.clone()
     }
 
     /// Current applied tip (locks briefly).
     pub async fn applied_tip(&self) -> AppliedTip {
-        *self.lock.lock().await
+        self.lock.lock().await.tip
     }
 
     /// Deterministic reward credits for `block` — the SAME mints the producer
@@ -224,16 +312,16 @@ impl CanonicalApplicator {
     /// `tip`). Blocks applied before a rejection are valid + committed; the chain
     /// simply cannot advance past the offending block until fork-choice (step 4)
     /// routes around it.
-    async fn drain_forward(&self, tip: &mut AppliedTip) -> DrainOutcome {
+    async fn drain_forward(&self, state: &mut AppliedState) -> DrainOutcome {
         let mut applied: Vec<Hash> = Vec::new();
         loop {
-            let block = match self.next_persisted_extension(tip) {
+            let block = match self.next_persisted_extension(&state.tip) {
                 Ok(Some(b)) => b,
                 Ok(None) => break,
                 Err(()) => {
                     debug!(
                         "execute-on-receive: fork above applied tip {} @ {} — deferring to reorg (step 4)",
-                        tip.hash, tip.height
+                        state.tip.hash, state.tip.height
                     );
                     break;
                 }
@@ -247,7 +335,7 @@ impl CanonicalApplicator {
                 .await
             {
                 Ok(_root) => {
-                    *tip = AppliedTip { hash: block_hash, height };
+                    state.record(block_hash, height, self.executor.state_snapshot());
                     self.persist_applied(&block_hash, height, &block.state_root);
                     applied.push(block_hash);
                     info!(
@@ -283,34 +371,199 @@ impl CanonicalApplicator {
         DrainOutcome { applied, rejected: None }
     }
 
+    /// Reorg the applied chain to `new_tip`: revert world state to the fork point
+    /// (the deepest applied block on both the current and the target chain), then
+    /// re-apply + state-root-verify the winning branch forward to `new_tip`.
+    ///
+    /// The fork point is found by walking `new_tip`'s selected-parent ancestry
+    /// until it meets a retained applied block `(height, hash)` in the snapshot
+    /// ring — which both locates the divergence and guarantees a snapshot to
+    /// revert to. Guards (each leaves world state byte-identical — invariant I3):
+    /// - fork point older than the retained window (`MAX_REORG_DEPTH`) → `Rejected`
+    ///   (too deep to revert; treated like a finality violation);
+    /// - fork point below the finalized floor → `Rejected` (I4: never revert past
+    ///   finality);
+    /// - a missing or bad block on the winning branch → `Rejected`, and the ENTIRE
+    ///   attempt is rolled back to the pre-reorg state (an outer full snapshot).
+    ///
+    /// Must be called with the lock held (mutates the live `AppliedState`).
+    pub async fn reorg_to(&self, state: &mut AppliedState, new_tip: Hash) -> ReorgOutcome {
+        if new_tip == state.tip.hash {
+            return ReorgOutcome::NoChange;
+        }
+        // Outer safety net: a byte-exact snapshot of the current state + tip so a
+        // failed reapply is fully undone (I3). This is the pre-reorg applied tip.
+        let pre_state = self.executor.state_snapshot();
+        let pre_tip = state.tip;
+
+        // Walk new_tip's selected-parent ancestry down to the fork point (the
+        // first ancestor that is a retained applied block), collecting the branch.
+        let mut branch: Vec<Block> = Vec::new(); // new_tip .. fork_point+1
+        let mut cursor = new_tip;
+        let fork = loop {
+            let block = match self.storage.blocks.get_block(&cursor).ok().flatten() {
+                Some(b) => b,
+                None => {
+                    return ReorgOutcome::Rejected(format!(
+                        "reorg to {new_tip}: missing block {cursor} on branch"
+                    ));
+                }
+            };
+            let h = block.header.height;
+            if let Some((hash, _)) = state.snapshots.get(&h) {
+                if *hash == cursor {
+                    break AppliedTip { hash: cursor, height: h }; // fork point (the base)
+                }
+            }
+            if block.is_genesis() || branch.len() as u64 >= MAX_REORG_DEPTH {
+                return ReorgOutcome::Rejected(format!(
+                    "reorg to {new_tip}: no common applied ancestor within {MAX_REORG_DEPTH} blocks"
+                ));
+            }
+            cursor = block.selected_parent();
+            branch.push(block);
+        };
+
+        // I4: never revert below the finalized floor.
+        let floor = self.finalized_height();
+        if fork.height < floor {
+            return ReorgOutcome::Rejected(format!(
+                "reorg fork point height {} below finalized height {}",
+                fork.height, floor
+            ));
+        }
+
+        // Revert to the fork point.
+        let base_snapshot = match state.snapshots.get(&fork.height) {
+            Some((_, snap)) => snap.clone(),
+            None => {
+                return ReorgOutcome::Rejected(format!(
+                    "reorg fork point snapshot missing at height {}",
+                    fork.height
+                ));
+            }
+        };
+        self.executor.state_restore(base_snapshot);
+
+        // Re-apply the winning branch forward. Build snapshots locally; commit to
+        // the ring only on full success so an abort leaves the ring untouched.
+        branch.reverse(); // fork_point+1 .. new_tip
+        let mut new_snaps: Vec<(u64, Hash, StateSnapshot)> = Vec::new();
+        let mut tip = fork;
+        for block in &branch {
+            let credits = self.reward_credits(block);
+            match self
+                .executor
+                .apply_block(block, block.header.coinbase, &credits)
+                .await
+            {
+                Ok(_) => {
+                    let h = block.header.height;
+                    let hh = block.header.block_hash;
+                    tip = AppliedTip { hash: hh, height: h };
+                    new_snaps.push((h, hh, self.executor.state_snapshot()));
+                    let _ = self.storage.state.put_state_root(&hh, &block.state_root);
+                }
+                Err(e) => {
+                    // Abort: full byte-exact restore to the pre-reorg state. The
+                    // ring + tip are untouched (still the old branch), and the
+                    // persisted pointer was never moved.
+                    self.executor.state_restore(pre_state);
+                    warn!(
+                        "execute-on-receive: reorg to {} aborted at {} — {} (reverted to {})",
+                        new_tip, block.header.block_hash, e, pre_tip.hash
+                    );
+                    return ReorgOutcome::Rejected(format!(
+                        "reorg reapply failed at {}: {e}",
+                        block.header.block_hash
+                    ));
+                }
+            }
+        }
+
+        // Commit: adopt the new tip, merge new-branch snapshots, drop the stale
+        // abandoned-branch snapshots (heights above the new tip) and prune the
+        // window, then persist the pointer once.
+        state.tip = tip;
+        for (h, hh, snap) in new_snaps {
+            state.snapshots.insert(h, (hh, snap));
+        }
+        let floor = tip.height.saturating_sub(MAX_REORG_DEPTH);
+        state.snapshots.retain(|h, _| *h <= tip.height && *h >= floor);
+        if let Err(e) = self.storage.blocks.put_applied_tip(&tip.hash, tip.height) {
+            warn!(
+                "execute-on-receive: reorged to {} @ {} but failed to persist tip: {}",
+                tip.hash, tip.height, e
+            );
+        }
+        info!(
+            "execute-on-receive: REORG {} @ {} → {} @ {} (reverted {}, applied {})",
+            pre_tip.hash,
+            pre_tip.height,
+            tip.hash,
+            tip.height,
+            pre_tip.height.saturating_sub(fork.height),
+            branch.len()
+        );
+        ReorgOutcome::Reorged {
+            new_tip: tip.hash,
+            height: tip.height,
+            reverted: pre_tip.height.saturating_sub(fork.height),
+            applied: branch.len() as u64,
+        }
+    }
+
     /// Apply a received, DAG-admitted block, extending the applied tip as far as
-    /// the persisted selected chain allows.
+    /// the persisted selected chain allows, then (if a fork-choice source is
+    /// attached) reorging toward the DAG's selected tip.
     ///
     /// Common case (step 2): the block directly extends the tip → applied +
-    /// state-root-verified. Out-of-order case (step 3, gap-extend): the block
-    /// arrived ahead of its intermediates and was deferred; a later arrival fills
-    /// the gap and this drain cascades the whole suffix (including this block). A
-    /// bad `state_root` anywhere on the drained chain is rejected with world state
-    /// left byte-identical (revert inside `apply_block`).
+    /// state-root-verified. Out-of-order (step 3, gap-extend): the block arrived
+    /// ahead of its intermediates and was deferred; a later arrival fills the gap
+    /// and the drain cascades the whole suffix. Fork (step 4): when the drain
+    /// stalls at a fork and the DAG selects a heavier branch, `reorg_to` reverts
+    /// to the fork point and re-applies the winner. A bad `state_root` anywhere is
+    /// rejected with world state left byte-identical.
     ///
-    /// The outcome is classified for the RECEIVED block: `Applied` iff the drain
-    /// executed it; `Rejected` iff the drain reached and rejected exactly it;
-    /// otherwise `Deferred` (still ahead of the applied chain, or stuck behind a
-    /// rejected ancestor).
+    /// The outcome is classified for the RECEIVED block: `Applied` iff it ended up
+    /// on the applied chain (via drain or reorg); `Rejected` iff it was reached and
+    /// rejected; otherwise `Deferred`.
     pub async fn apply_received(&self, block: &Block) -> ApplyOutcome {
-        let mut tip = self.lock.lock().await;
+        let mut state = self.lock.lock().await;
 
         let block_hash = block.header.block_hash;
         let height = block.header.height;
 
         // Echo of our own tip, or an already-applied / stale block.
-        if block_hash == tip.hash || height <= tip.height {
+        if block_hash == state.tip.hash || height <= state.tip.height {
             return ApplyOutcome::AlreadyApplied;
         }
 
-        let out = self.drain_forward(&mut tip).await;
+        let out = self.drain_forward(&mut state).await;
 
-        if out.applied.contains(&block_hash) {
+        // Step 4: after the linear drain, follow fork choice. If the DAG selects a
+        // tip that isn't ours, reorg toward it (a no-op extension when our tip is
+        // an ancestor of it; a revert+reapply when it's on a heavier branch).
+        if let Some(fc) = &self.fork_choice {
+            if let Ok(best) = fc.select_tip().await {
+                if best != state.tip.hash {
+                    match self.reorg_to(&mut state, best).await {
+                        ReorgOutcome::Reorged { new_tip, height, reverted, applied } => {
+                            info!(
+                                "execute-on-receive: fork-choice reorged to {new_tip} @ {height} (reverted {reverted}, applied {applied})"
+                            );
+                        }
+                        ReorgOutcome::NoChange => {}
+                        ReorgOutcome::Rejected(why) => {
+                            debug!("execute-on-receive: fork-choice reorg to {best} declined: {why}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Classify for the received block against the (possibly reorged) tip.
+        if out.applied.contains(&block_hash) || self.on_applied_chain(&state, block_hash, height) {
             ApplyOutcome::Applied {
                 root: block.state_root,
                 height,
@@ -319,22 +572,31 @@ impl CanonicalApplicator {
             if *bad == block_hash {
                 ApplyOutcome::Rejected(format!("{bad}: {why}"))
             } else {
-                // This block sits beyond a rejected ancestor — cannot apply until
-                // fork-choice routes around the bad block (step 4).
                 ApplyOutcome::Deferred
             }
         } else {
             if !out.applied.is_empty() {
                 debug!(
                     "execute-on-receive: extended tip to {} @ {} ({} block(s)); {} still deferred",
-                    tip.hash,
-                    tip.height,
+                    state.tip.hash,
+                    state.tip.height,
                     out.applied.len(),
                     block_hash
                 );
             }
             ApplyOutcome::Deferred
         }
+    }
+
+    /// Whether `(hash, height)` is the applied block at that height on the current
+    /// applied chain (i.e., it was applied — possibly via reorg — and retained).
+    fn on_applied_chain(&self, state: &AppliedState, hash: Hash, height: u64) -> bool {
+        height <= state.tip.height
+            && state
+                .snapshots
+                .get(&height)
+                .map(|(h, _)| *h == hash)
+                .unwrap_or(false)
     }
 }
 
@@ -346,18 +608,20 @@ struct DrainOutcome {
     rejected: Option<(Hash, String)>,
 }
 
-/// Update the applied tip to a block the producer just authored (executed +
-/// persisted itself). Called by the producer WHILE it holds `advance_lock()`,
-/// so it takes the already-held guard rather than re-locking (the tokio Mutex
-/// is not reentrant). Persists the pointer for crash recovery.
+/// Update the applied state to a block the producer just authored (executed +
+/// persisted itself). Called by the producer WHILE it holds `advance_lock()`, so
+/// it takes the already-held guard rather than re-locking (the tokio Mutex is not
+/// reentrant). Captures the executor's post-block state into the reorg ring (so a
+/// later reorg can revert to a locally-produced block) and persists the pointer.
 pub fn record_produced(
-    guard: &mut AppliedTip,
+    state: &mut AppliedState,
     storage: &StorageManager,
+    executor: &Executor,
     block: &Block,
 ) {
     let hash = block.header.block_hash;
     let height = block.header.height;
-    *guard = AppliedTip { hash, height };
+    state.record(hash, height, executor.state_snapshot());
     if let Err(e) = storage.blocks.put_applied_tip(&hash, height) {
         warn!(
             "execute-on-receive: produced block {} @ {} but failed to persist applied tip: {}",
@@ -378,10 +642,11 @@ mod tests {
     const CB: [u8; 20] = [0x33; 20];
     const VRF_OUT: [u8; 32] = [0x5A; 32];
 
-    /// Build an empty (reward-only) v2 block. Transactions are exercised by the
-    /// executor's own `apply_block` tests; here we isolate the DRIVER: fast-path
-    /// decision, deterministic reward reproduction, pointer advance, and revert.
-    fn mk_block(height: u64, parent: Hash, state_root: Hash) -> Block {
+    /// Build an empty (reward-only) v2 block with an explicit VRF output.
+    /// `vrf` only distinguishes block HASHES (it feeds prevrandao, which
+    /// reward-only blocks never read) — so two branches can share a state root
+    /// while forking, exactly as sibling blocks from different producers do.
+    fn mk_block_vrf(height: u64, parent: Hash, state_root: Hash, vrf: [u8; 32]) -> Block {
         let mut b = BlockBuilder::new()
             .version(2)
             .height(height)
@@ -390,13 +655,25 @@ mod tests {
             .timestamp(1000)
             .vrf_reveal(VrfProof {
                 proof: vec![],
-                output: Hash::new(VRF_OUT),
+                output: Hash::new(vrf),
             })
             .transactions(vec![])
             .state_root(state_root)
             .build_unhashed();
         b.header.block_hash = b.compute_hash();
         b
+    }
+
+    /// A-branch block (canonical VRF). Transactions are exercised by the
+    /// executor's own `apply_block` tests; here we isolate the DRIVER.
+    fn mk_block(height: u64, parent: Hash, state_root: Hash) -> Block {
+        mk_block_vrf(height, parent, state_root, VRF_OUT)
+    }
+
+    /// B-branch block — distinct VRF so it forks from the A-branch at the same
+    /// height with an identical (reward-only) state root but a different hash.
+    fn mk_block_b(height: u64, parent: Hash, state_root: Hash) -> Block {
+        mk_block_vrf(height, parent, state_root, [0x5B; 32])
     }
 
     /// Reward credits the driver applies, computed the same way it does internally.
@@ -628,5 +905,134 @@ mod tests {
             ApplyOutcome::Applied { .. }
         ));
         assert_eq!(app.applied_tip().await.height, 3);
+    }
+
+    /// Cumulative reward-only state roots for heights 1..=n (mirrors `chain`).
+    fn roots(n: u64) -> Vec<Hash> {
+        chain(n).iter().map(|b| b.state_root).collect()
+    }
+
+    /// Apply the A-branch [a1, a2] so the applied tip is a2 @ height 2, then
+    /// persist a competing B-branch [b2, b3] that forks at a1. Returns everything
+    /// the reorg tests need. b2/b3 are persisted but NOT applied (a fork above a1).
+    async fn setup_fork(
+        app: &CanonicalApplicator,
+        storage: &StorageManager,
+    ) -> (Block, Block, Block, Block) {
+        let r = roots(3);
+        let a1 = mk_block(1, Hash::default(), r[0]);
+        let a2 = mk_block(2, a1.header.block_hash, r[1]);
+        let b2 = mk_block_b(2, a1.header.block_hash, r[1]); // same state as a2, different hash
+        let b3 = mk_block_b(3, b2.header.block_hash, r[2]);
+
+        // Apply the A branch in order (b2 not yet persisted, so no fork blocks it).
+        persist(storage, &a1);
+        assert!(matches!(app.apply_received(&a1).await, ApplyOutcome::Applied { .. }));
+        persist(storage, &a2);
+        assert!(matches!(app.apply_received(&a2).await, ApplyOutcome::Applied { .. }));
+        assert_eq!(app.applied_tip().await, AppliedTip { hash: a2.header.block_hash, height: 2 });
+
+        // Now the heavier B branch arrives (persisted, but forks above the tip).
+        persist(storage, &b2);
+        persist(storage, &b3);
+        (a1, a2, b2, b3)
+    }
+
+    #[tokio::test]
+    async fn reorg_reverts_to_fork_point_and_reapplies_winning_branch() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (a1, _a2, b2, b3) = setup_fork(&app, &storage).await;
+        let (v, t) = reward_for(&b3);
+
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        match app.reorg_to(&mut state, b3.header.block_hash).await {
+            ReorgOutcome::Reorged { new_tip, height, reverted, applied } => {
+                assert_eq!(new_tip, b3.header.block_hash);
+                assert_eq!(height, 3);
+                assert_eq!(reverted, 1, "a2 rolled off");
+                assert_eq!(applied, 2, "b2 + b3 applied");
+            }
+            other => panic!("expected Reorged, got {other:?}"),
+        }
+
+        // Tip is on the B branch; state = 3 blocks of reward; fork point retained.
+        assert_eq!(state.tip, AppliedTip { hash: b3.header.block_hash, height: 3 });
+        assert_eq!(state.snapshots.get(&2).map(|(h, _)| *h), Some(b2.header.block_hash),
+            "height-2 snapshot now belongs to the B branch");
+        assert_eq!(state.snapshots.get(&1).map(|(h, _)| *h), Some(a1.header.block_hash),
+            "fork point retained");
+        drop(state);
+        assert_eq!(exec.get_balance(&Address(CB)), v * U256::from(3u64));
+        assert_eq!(exec.get_balance(&Address(TREASURY_ADDR)), t * U256::from(3u64));
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("tip"),
+            Some((b3.header.block_hash, 3))
+        );
+    }
+
+    #[tokio::test]
+    async fn reorg_aborts_on_bad_block_and_restores_pre_reorg_state() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (_a1, a2, b2, _b3) = setup_fork(&app, &storage).await;
+        let (v, t) = reward_for(&a2);
+
+        // A B-branch tip claiming a bogus state root (b2 is valid; b3_bad is not).
+        let b3_bad = mk_block_b(3, b2.header.block_hash, Hash::new([0xFF; 32]));
+        persist(&storage, &b3_bad);
+
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        match app.reorg_to(&mut state, b3_bad.header.block_hash).await {
+            ReorgOutcome::Rejected(_) => {}
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // I3: pre-reorg state + tip fully restored (still a2 @ 2, 2 blocks reward).
+        assert_eq!(state.tip, AppliedTip { hash: a2.header.block_hash, height: 2 });
+        assert_eq!(state.snapshots.get(&2).map(|(h, _)| *h), Some(a2.header.block_hash),
+            "height-2 snapshot still the A branch");
+        drop(state);
+        assert_eq!(exec.get_balance(&Address(CB)), v * U256::from(2u64));
+        assert_eq!(exec.get_balance(&Address(TREASURY_ADDR)), t * U256::from(2u64));
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("tip"),
+            Some((a2.header.block_hash, 2)),
+            "persisted pointer never moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorg_refused_below_finalized_floor() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (_a1, a2, _b2, b3) = setup_fork(&app, &storage).await;
+
+        // Finalize height 2: the fork point (a1 @ 1) is now below finality.
+        app.finalized_height_handle().store(2, Ordering::SeqCst);
+
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        match app.reorg_to(&mut state, b3.header.block_hash).await {
+            ReorgOutcome::Rejected(why) => assert!(why.contains("finalized"), "got: {why}"),
+            other => panic!("expected Rejected (finality), got {other:?}"),
+        }
+        // I4: applied tip unchanged (never reverted past finality).
+        assert_eq!(state.tip, AppliedTip { hash: a2.header.block_hash, height: 2 });
+    }
+
+    #[tokio::test]
+    async fn reorg_to_current_tip_is_noop() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (_a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        assert!(matches!(
+            app.reorg_to(&mut state, a2.header.block_hash).await,
+            ReorgOutcome::NoChange
+        ));
     }
 }
