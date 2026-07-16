@@ -149,9 +149,14 @@ bad-state_root block is rejected AND leaves state untouched, (c) re-apply is ide
    reached and rejected exactly it, else `Deferred`. This subsumes the step-2 direct extension
    (the one-iteration case). Two new tests: `gap_extend_cascades_when_missing_intermediate_arrives`,
    `drains_full_chain_when_top_arrives_with_all_intermediates_present`.
-   - *Known limitation (→ step 4):* a persisted bad-root block, or a fork above the tip, halts
-     linear extension on that path (no wrong state is ever applied — the drain just stops). A
-     valid sibling can't overtake it until fork-choice/reorg lands.
+   - *Fork-above-tip limitation — RESOLVED by step 4 + trigger-tested (2026-07-16):* a fork above
+     the tip halts the linear drain (no wrong state applied — it just stops). The step-4 fork-choice
+     trigger now drains it: `apply_received` consults fork choice and `reorg_to`s onto the winning
+     branch (fork point = applied tip ⇒ a no-op restore then forward re-apply). Proven end-to-end
+     through `apply_received` by `fork_choice_reorg_drains_fork_above_tip_wedge` (asserts the wedge
+     exists without fork choice, then is drained with it). The fork choice is a boxed async hook
+     (GhostDAG in prod, injectable in tests). *Residual:* a state-INVALID block with high blue work
+     can still wedge a branch (see step 4 residual) — needs consensus↔execution feedback.
 4. ✅ **Reorg** — revert-to-fork-point + re-apply; finalized floor guard. **DONE** (2026-07-16).
    - **Snapshot ring:** `AppliedState` folds the applied tip together with a bounded ring of
      full `StateSnapshot`s (one per applied block, keyed by height, capped at `MAX_REORG_DEPTH`
