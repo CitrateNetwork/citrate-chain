@@ -831,6 +831,21 @@ impl Executor {
         self.state_db.calculate_state_root()
     }
 
+    /// EXECUTE-ON-RECEIVE (reorg): capture a full, restorable snapshot of world
+    /// state (accounts + storage + models + jobs + the accumulating state trie).
+    /// Used by the reorg snapshot ring to retain the state as-of each applied
+    /// block within the reorg window so a fork can be reverted to its fork point.
+    pub fn state_snapshot(&self) -> crate::state::StateSnapshot {
+        self.state_db.snapshot()
+    }
+
+    /// EXECUTE-ON-RECEIVE (reorg): restore world state to a previously captured
+    /// snapshot (byte-exact, incl. the accumulating state trie). Reverts the
+    /// in-memory state to a fork point before re-applying the winning branch.
+    pub fn state_restore(&self, snapshot: crate::state::StateSnapshot) {
+        self.state_db.restore(snapshot)
+    }
+
     /// EXECUTE-ON-RECEIVE — the verified, revertible state-application atom.
     ///
     /// Applies a canonical block's transactions to world state, credits the block's
