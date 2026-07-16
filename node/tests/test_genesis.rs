@@ -29,6 +29,7 @@ fn create_test_genesis_block() -> Block {
         base_fee_per_gas: 0,
         gas_used: 0,
         gas_limit: 30_000_000,
+        coinbase: [0u8; 20],
     };
 
     BlockBuilder::new()

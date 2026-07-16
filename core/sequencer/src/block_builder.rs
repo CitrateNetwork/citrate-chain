@@ -180,6 +180,7 @@ impl BlockBuilder {
             base_fee_per_gas: 0,
             gas_used: 0,
             gas_limit: self.config.max_gas_per_block,
+            coinbase: [0u8; 20],
         };
 
         // Create preliminary block for execution context
@@ -544,6 +545,7 @@ impl BlockBuilder {
             base_fee_per_gas: 1_000_000_000, // 1 gwei for tests
             gas_used,
             gas_limit: self.config.max_gas_per_block,
+            coinbase: [0u8; 20],
         };
 
         // Use legacy synthetic methods for tests
