@@ -1368,10 +1368,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // Attach GhostDAG as the fork-choice authority so the driver reorgs
             // the applied chain toward the selected tip (step 4). Bounded revert
             // depth + finalized floor guard reverts inside the applicator.
-            let app = Arc::new(
+            let mut app_builder =
                 canonical_apply::CanonicalApplicator::new(executor.clone(), storage.clone())
-                    .with_fork_choice(shared_ghostdag.clone()),
-            );
+                    .with_fork_choice(shared_ghostdag.clone());
+            // VALIDATOR-S1 (step 5): attach the registry snapshot-sync so a node
+            // that RECEIVES or REORGS to a snapshot block S(E) rebuilds its
+            // proposer selector from the registry — not only the producer.
+            if let (Some((registry, _)), Some(sel)) = (&validator_registry, &validator_selector) {
+                app_builder = app_builder.with_registry_sync(Arc::new(
+                    registry_sync::RegistrySync::new(executor.clone(), sel.clone(), *registry),
+                ));
+                info!("VALIDATOR-S1: registry snapshot-sync attached to execute-on-receive driver (received/reorged S(E) blocks)");
+            }
+            let app = Arc::new(app_builder);
             let start = app.applied_tip().await;
             info!(
                 "EXECUTE-ON-RECEIVE: fast-path applier + reorg ENABLED (received blocks executed + state-root-verified); applied head = {} @ {}",
