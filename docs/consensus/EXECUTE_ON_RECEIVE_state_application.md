@@ -106,10 +106,37 @@ bad-state_root block is rejected AND leaves state untouched, (c) re-apply is ide
   boundaries." The producer-only hook generalizes for free.
 
 ## 4. Incremental plan
-1. **Atom** — `Executor::apply_block` (verified + revertible) + tests (§2.2, §2.5 tests). No
-   wiring yet; adds state-root verification as a callable primitive.
-2. **Pointer + fast-path driver** — applied_tip persistence + fast-path apply on the receive
+1. ✅ **Atom** — `Executor::apply_block` (verified + revertible) + tests (§2.2, §2.5 tests). No
+   wiring yet; adds state-root verification as a callable primitive. **DONE** (2026-07-16).
+2. ✅ **Pointer + fast-path driver** — applied_tip persistence + fast-path apply on the receive
    path; state-root rejection live. Covers linear canonical growth (the common case).
+   **DONE** (2026-07-16). Implementation:
+   - `BlockStore::put_applied_tip` / `get_applied_tip` (CF_METADATA key `applied_tip`,
+     40-byte hash‖height; SECREM-01 CONS-6 panic-free decode). Distinct from `latest_height`
+     (a block can be admitted + bytes-persisted before its txs execute).
+   - `node/src/canonical_apply.rs::CanonicalApplicator` — owns the shared applied-tip lock +
+     the deterministic reward calculator; drives `apply_block`. `apply_received` returns
+     `Applied` / `Deferred` (gap/fork, deferred to steps 3–4) / `Rejected` (bad root, state
+     reverted) / `AlreadyApplied`. Seeds the tip from the persisted pointer, else from the
+     latest persisted block ("state is applied through `latest_height`", true for a producer).
+   - Wired at both receive seams in `main.rs` (gossip `NewBlock` + sync `Blocks`) right after
+     DAG admission + `put_block`. Gated on `CITRATE_BLOCK_V2` (execute-on-receive = on).
+   - **Concurrency:** `apply_block`'s snapshot/restore is NOT safe to run concurrently with the
+     producer's own execute→persist. A single `Arc<Mutex<AppliedTip>>` serializes all
+     state advancement: `apply_received` locks it; the producer holds the SAME lock (via
+     `with_applied_tip_lock`) across its whole `produce_block` and calls `record_produced`
+     before releasing. So on a node that both produces and receives (the multi-producer
+     fleet), the two paths are mutually exclusive on executor state.
+   - **Reward determinism (crux finding):** a receiver can only reproduce `state_root` if it
+     credits the exact rewards the producer did. The **enhanced** economics reward path reads
+     node-local, non-consensus state (staking manager, **f64 reputation**, dynamic pricing) and
+     is unreproducible. So under v2 the producer is forced onto the **basic** reward path — a
+     pure function of `header.height` + `transactions` — via `canonical_reward_config()`, the
+     single source of truth shared by producer and `CanonicalApplicator::reward_credits`. If
+     these ever diverge, execute-on-receive rejects every block (state_root mismatch). Recorded
+     in the reroll addendum (operators must NOT rely on enhanced rewards under v2).
+   - 3 driver tests (`applies_linear_extension_and_advances_tip`,
+     `rejects_bad_state_root_and_leaves_state_and_tip_untouched`, `defers_non_linear_blocks`).
 3. **Gap-extend** — walk-forward when the selected chain jumped.
 4. **Reorg (option A)** — revert-to-checkpoint + re-apply; checkpoint floor guard.
 5. **Generalize VALIDATOR-S1 sync** — move `maybe_sync_registry` into the driver so all nodes
