@@ -2127,6 +2127,42 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             shared_dag_store.clone(),
             shared_ghostdag.clone(),
         ).await;
+
+        // VALIDATOR-S1 (v5): enable EquivocationVote signing when the ValidatorRegistry
+        // is configured. OFF by default (the registry is not yet deployed) — the operator
+        // activates it by setting CITRATE_VALIDATOR_REGISTRY (0x-hex 20-byte address) and
+        // CITRATE_VALIDATOR_ACTIVATION_HEIGHT (defaults to 0). Once on, every sealed block
+        // at/above the activation height carries the proposer's height-binding vote so a
+        // double-sign is slashable on-chain via ValidatorRegistry.submitEquivocation.
+        if let Ok(reg_hex) = std::env::var("CITRATE_VALIDATOR_REGISTRY") {
+            match hex::decode(reg_hex.trim().trim_start_matches("0x")) {
+                Ok(bytes) if bytes.len() == 20 => {
+                    let mut registry = [0u8; 20];
+                    registry.copy_from_slice(&bytes);
+                    let activation_height = std::env::var("CITRATE_VALIDATOR_ACTIVATION_HEIGHT")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(0);
+                    producer_instance = producer_instance.with_equivocation_vote_config(
+                        producer::EquivocationVoteConfig {
+                            chain_id: config.chain.chain_id,
+                            registry,
+                            activation_height,
+                        },
+                    );
+                    info!(
+                        "VALIDATOR-S1: EquivocationVote signing ENABLED (registry 0x{}, activation height {})",
+                        hex::encode(registry),
+                        activation_height
+                    );
+                }
+                _ => warn!(
+                    "CITRATE_VALIDATOR_REGISTRY set but not a valid 0x-hex 20-byte address; \
+                     EquivocationVote signing DISABLED"
+                ),
+            }
+        }
+
         // WP-I.3: Share the same pause_flag between RPC server and producer
         // so citrate_emergencyPause actually halts block production.
         producer_instance.set_pause_flag(pause_flag.clone());
