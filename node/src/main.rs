@@ -2189,6 +2189,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             );
         }
 
+        // EXECUTE-ON-RECEIVE (reroll addendum): seal version-2 headers that commit the
+        // coinbase, making state_root reproducible by receivers. Feature-flagged
+        // (CITRATE_BLOCK_V2=1) so it activates at the reroll; default off keeps v1 headers.
+        if std::env::var("CITRATE_BLOCK_V2").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+            producer_instance = producer_instance.with_v2_headers(true);
+            info!("EXECUTE-ON-RECEIVE: sealing version-2 headers (coinbase committed in block hash)");
+        }
+
         // WP-I.3: Share the same pause_flag between RPC server and producer
         // so citrate_emergencyPause actually halts block production.
         producer_instance.set_pause_flag(pause_flag.clone());

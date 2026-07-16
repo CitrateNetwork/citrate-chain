@@ -253,6 +253,7 @@ impl StateDB {
                 .iter()
                 .map(|entry| entry.clone())
                 .collect(),
+            state_trie: self.state_trie.read().clone(),
         }
     }
 
@@ -271,6 +272,9 @@ impl StateDB {
         for entry in snapshot.dirty_storage {
             self.dirty_storage.insert(entry);
         }
+
+        // Restore the accumulating account trie (see StateSnapshot::state_trie).
+        *self.state_trie.write() = snapshot.state_trie;
 
         // Restore models
         self.models.clear();
@@ -309,6 +313,11 @@ pub struct StateSnapshot {
     models: Vec<(ModelId, ModelState)>,
     training_jobs: Vec<(JobId, TrainingJob)>,
     dirty_storage: Vec<(Address, Vec<u8>)>,
+    /// The accumulating account trie. `calculate_state_root` mutates this (it is NOT
+    /// rebuilt from scratch), so a snapshot that omitted it left the trie polluted after
+    /// a restore — a rejected apply_block would then still report the (uncommitted)
+    /// candidate root. Capturing + restoring it makes revert byte-exact.
+    state_trie: Trie,
 }
 
 #[cfg(test)]

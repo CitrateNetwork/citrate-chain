@@ -147,6 +147,12 @@ pub struct BlockProducer {
     /// block at a snapshot boundary S(E) the producer rebuilds the shared proposer
     /// selector from `ValidatorRegistry.activeSet()` as-of that state. `None` disables it.
     registry_sync: Option<Arc<crate::registry_sync::RegistrySync>>,
+
+    /// EXECUTE-ON-RECEIVE (reroll addendum): when true, seal version-2 headers that COMMIT
+    /// the `coinbase` in `compute_hash`, making the block's `state_root` reproducible by
+    /// receivers. Feature-flagged (`CITRATE_BLOCK_V2`) so it activates at the reroll; false
+    /// keeps version-1 headers (coinbase present but not hashed) and existing history intact.
+    emit_v2_headers: bool,
 }
 
 impl BlockProducer {
@@ -215,6 +221,7 @@ impl BlockProducer {
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
             registry_sync: None,
+            emit_v2_headers: false,
         }
     }
 
@@ -284,6 +291,7 @@ impl BlockProducer {
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
             registry_sync: None,
+            emit_v2_headers: false,
         }
     }
 
@@ -345,6 +353,7 @@ impl BlockProducer {
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
             registry_sync: None,
+            emit_v2_headers: false,
         }
     }
 
@@ -441,6 +450,7 @@ impl BlockProducer {
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
             registry_sync: None,
+            emit_v2_headers: false,
         }
     }
 
@@ -547,6 +557,7 @@ impl BlockProducer {
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
             registry_sync: None,
+            emit_v2_headers: false,
         }
     }
 
@@ -614,6 +625,12 @@ impl BlockProducer {
     /// VALIDATOR-S1 (v5): attach the registry snapshot-sync (see [`Self::registry_sync`]).
     pub fn with_registry_sync(mut self, sync: Arc<crate::registry_sync::RegistrySync>) -> Self {
         self.registry_sync = Some(sync);
+        self
+    }
+
+    /// EXECUTE-ON-RECEIVE: seal version-2 headers that commit the coinbase (reroll flag).
+    pub fn with_v2_headers(mut self, enabled: bool) -> Self {
+        self.emit_v2_headers = enabled;
         self
     }
 
@@ -761,9 +778,10 @@ impl BlockProducer {
         // Blue score and work are already calculated above
         let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
 
-        // Create block header with GhostDAG consensus data
+        // Create block header with GhostDAG consensus data.
+        // EXECUTE-ON-RECEIVE: v2 headers commit the coinbase (reroll flag); v1 keep legacy hashing.
         let mut header = BlockHeader {
-            version: 1,
+            version: if self.emit_v2_headers { 2 } else { 1 },
             block_hash: Hash::default(), // Will be computed
             selected_parent_hash: selected_parent,
             merge_parent_hashes: merge_parents,
@@ -794,6 +812,9 @@ impl BlockProducer {
             },
             gas_used: 0, // Will be updated after execution
             gas_limit: 30_000_000, // 30M gas default
+            // EXECUTE-ON-RECEIVE: commit the beneficiary so receivers can reproduce state_root.
+            // Hashed only for v2 (see compute_hash); harmless for v1.
+            coinbase: self.coinbase.0[0..20].try_into().unwrap_or([0u8; 20]),
         };
 
         // WP-Z.3 / PIN-P1(d): Set block context with the consensus ECVRF
