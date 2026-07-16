@@ -78,6 +78,7 @@ argon2 = "0.5"
 hmac = "0.12"
 rand = { workspace = true }
 k256 = { version = "0.13", features = ["ecdsa", "sha256", "ecdh"] }
+ed25519-dalek = { workspace = true }   # 0x0120 Ed25519 verify precompile (is_weak + verify_strict)
 
 # Precompile implementations
 ripemd = "0.1"                # RIPEMD-160 hash
