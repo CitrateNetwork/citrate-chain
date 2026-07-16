@@ -160,7 +160,7 @@ pub struct BlockProducer {
     /// the sealed block as the new applied tip before releasing it. `None` disables the
     /// interlock (pre-reroll / execute-on-receive off), preserving legacy behavior.
     applied_tip_lock:
-        Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedTip>>>,
+        Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>>,
 }
 
 impl BlockProducer {
@@ -624,7 +624,7 @@ impl BlockProducer {
     /// executor's snapshot/restore; the sealed block becomes the new applied tip.
     pub fn with_applied_tip_lock(
         mut self,
-        lock: Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedTip>>,
+        lock: Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>,
     ) -> Self {
         self.applied_tip_lock = Some(lock);
         self
@@ -1013,7 +1013,12 @@ impl BlockProducer {
         // executor reflects" true for locally-produced blocks too, so a peer building on
         // our tip fast-path-applies cleanly.
         if let Some(guard) = applied_guard.as_mut() {
-            crate::canonical_apply::record_produced(guard, &self.storage, &block);
+            crate::canonical_apply::record_produced(
+                guard,
+                &self.storage,
+                &self.executor,
+                &block,
+            );
         }
 
         // Broadcast block to connected peers

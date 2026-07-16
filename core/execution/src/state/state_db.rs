@@ -306,7 +306,13 @@ impl Default for StateDB {
     }
 }
 
-/// State snapshot for rollback
+/// State snapshot for rollback.
+///
+/// `Clone` supports the execute-on-receive reorg snapshot ring
+/// (`node/src/canonical_apply.rs`): the ring retains one snapshot per applied
+/// block within the reorg window and must restore from a stored snapshot
+/// (possibly more than once), so it clones rather than moves.
+#[derive(Clone)]
 pub struct StateSnapshot {
     accounts: crate::state::account::AccountSnapshot,
     storage_tries: Vec<(Address, Trie)>,

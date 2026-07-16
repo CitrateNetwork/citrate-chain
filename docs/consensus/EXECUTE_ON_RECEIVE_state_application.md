@@ -152,7 +152,32 @@ bad-state_root block is rejected AND leaves state untouched, (c) re-apply is ide
    - *Known limitation (→ step 4):* a persisted bad-root block, or a fork above the tip, halts
      linear extension on that path (no wrong state is ever applied — the drain just stops). A
      valid sibling can't overtake it until fork-choice/reorg lands.
-4. **Reorg (option A)** — revert-to-checkpoint + re-apply; checkpoint floor guard.
+4. ✅ **Reorg** — revert-to-fork-point + re-apply; finalized floor guard. **DONE** (2026-07-16).
+   - **Snapshot ring:** `AppliedState` folds the applied tip together with a bounded ring of
+     full `StateSnapshot`s (one per applied block, keyed by height, capped at `MAX_REORG_DEPTH`
+     = 100). Every state advance — drain apply, producer `record_produced`, and reorg re-apply —
+     records a snapshot; the ring prunes below the window. (`StateSnapshot`/`AccountSnapshot`
+     gained `Clone`; `Executor` exposes `state_snapshot`/`state_restore`.) Chosen over
+     rebuild-from-genesis (O(chain) — the live chain is already ~386k blocks) and over an
+     archive trie (memory). Memory = ≤ `MAX_REORG_DEPTH` full-state clones; the reorg depth is
+     bounded by that + the finalized floor. Documented tradeoff: a CoW/reverse-diff ring is the
+     scale optimization.
+   - **`reorg_to(new_tip)`:** walk `new_tip`'s selected-parent ancestry until it meets a retained
+     applied block — that is simultaneously the fork point AND a snapshot to revert to. Guards
+     (each leaves state byte-identical, I3): fork older than the window → `Rejected`; fork below
+     the finalized floor → `Rejected` (I4); a missing/bad block on the winning branch → the whole
+     re-apply is rolled back to an outer pre-reorg snapshot. Re-apply builds new snapshots locally
+     and commits to the ring only on full success (abort leaves ring + persisted pointer untouched).
+   - **Trigger:** `apply_received` now attaches GhostDAG as fork-choice; after the forward drain it
+     calls `select_tip()` and, if the selected tip isn't the applied tip, `reorg_to(best)`. This
+     also resolves step 3's fork-above-tip wedge (fork point = applied tip ⇒ a no-op restore then
+     forward re-apply of the winning branch). Wired under `CITRATE_BLOCK_V2`; the finalized floor is
+     kept in sync with the `CheckpointManager` by a 5 s poll.
+   - *Residual (needs consensus↔execution feedback, beyond execute-on-receive):* a state-INVALID
+     block with high blue work can be repeatedly selected by fork choice and rejected on re-apply
+     (state never corrupts, but that branch can't be adopted). The fix is fork choice excluding
+     blocks that fail state verification.
+   - 4 reorg tests: revert+reapply, abort-on-bad-block (I3), finalized-floor refusal (I4), no-op.
 5. **Generalize VALIDATOR-S1 sync** — move `maybe_sync_registry` into the driver so all nodes
    sync at S(E); retire the producer-only hook.
 6. **Harness** — two-node divergence test: producer + follower must reach identical state_root

@@ -228,6 +228,7 @@ impl Default for AccountManager {
 }
 
 /// Account snapshot for rollback
+#[derive(Clone)]
 pub struct AccountSnapshot {
     accounts: Vec<(Address, AccountState)>,
     dirty: Vec<Address>,
