@@ -32,6 +32,8 @@
 use std::sync::Arc;
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use citrate_consensus::ghostdag::GhostDag;
@@ -101,6 +103,11 @@ impl AppliedState {
     }
 }
 
+/// Fork-choice hook: yields the DAG's currently selected (best) tip, or `None`.
+/// A boxed async closure so production wires `GhostDag::select_tip` while tests
+/// inject a fixed tip — avoiding an async-trait dependency.
+type ForkChoice = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<Hash>> + Send>> + Send + Sync>;
+
 /// Outcome of a reorg attempt.
 #[derive(Debug)]
 pub enum ReorgOutcome {
@@ -147,10 +154,10 @@ pub struct CanonicalApplicator {
     /// Serializes state advancement (see module docs). Holds the applied tip +
     /// the reorg snapshot ring.
     lock: Arc<Mutex<AppliedState>>,
-    /// Fork-choice authority (GhostDAG). When set, after the forward drain the
-    /// driver reorgs the applied tip toward the DAG's selected tip. `None`
+    /// Fork-choice hook (GhostDAG in production). When set, after the forward
+    /// drain the driver reorgs the applied tip toward the selected tip. `None`
     /// disables reorg (steps 2–3 behavior only). Wired under `CITRATE_BLOCK_V2`.
-    fork_choice: Option<Arc<GhostDag>>,
+    fork_choice: Option<ForkChoice>,
     /// Last finalized height — the reorg floor (I4: never revert below finality).
     /// Defaults to 0 (genesis); tightened when wired to the checkpoint manager.
     finalized_height: Arc<AtomicU64>,
@@ -203,7 +210,10 @@ impl CanonicalApplicator {
     /// Attach the fork-choice authority (GhostDAG). Enables reorg: after the
     /// forward drain, the driver reorgs the applied tip toward `select_tip()`.
     pub fn with_fork_choice(mut self, ghostdag: Arc<GhostDag>) -> Self {
-        self.fork_choice = Some(ghostdag);
+        self.fork_choice = Some(Arc::new(move || {
+            let g = ghostdag.clone();
+            Box::pin(async move { g.select_tip().await.ok() })
+        }));
         self
     }
 
@@ -545,7 +555,7 @@ impl CanonicalApplicator {
         // tip that isn't ours, reorg toward it (a no-op extension when our tip is
         // an ancestor of it; a revert+reapply when it's on a heavier branch).
         if let Some(fc) = &self.fork_choice {
-            if let Ok(best) = fc.select_tip().await {
+            if let Some(best) = fc().await {
                 if best != state.tip.hash {
                     match self.reorg_to(&mut state, best).await {
                         ReorgOutcome::Reorged { new_tip, height, reverted, applied } => {
@@ -1034,5 +1044,65 @@ mod tests {
             app.reorg_to(&mut state, a2.header.block_hash).await,
             ReorgOutcome::NoChange
         ));
+    }
+
+    /// A fork-choice hook that always returns a fixed tip (a stand-in for
+    /// GhostDAG's `select_tip` so the trigger path is testable in isolation).
+    fn fork_choice_returning(hash: Hash) -> ForkChoice {
+        Arc::new(move || Box::pin(async move { Some(hash) }))
+    }
+
+    /// STEP 3 UNBLOCK: prove the fork-above-tip wedge (a drain stalled at a fork
+    /// with ≥2 selected-parent children) is drained by the step-4 fork-choice
+    /// trigger inside `apply_received` — the resolution step 3 deferred.
+    #[tokio::test]
+    async fn fork_choice_reorg_drains_fork_above_tip_wedge() {
+        let (exec, storage, _dir) = fresh();
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let r = roots(3);
+        let a1 = mk_block(1, Hash::default(), r[0]);
+        let a2 = mk_block(2, a1.header.block_hash, r[1]);
+        let b2 = mk_block_b(2, a1.header.block_hash, r[1]);
+        let b3 = mk_block_b(3, b2.header.block_hash, r[2]);
+
+        // Apply only a1; the tip is a1 @ 1.
+        persist(&storage, &a1);
+        assert!(matches!(app.apply_received(&a1).await, ApplyOutcome::Applied { .. }));
+
+        // Both branches now present → the drain stalls at a1's fork (2 children).
+        persist(&storage, &a2);
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+
+        // Without fork choice, the wedge is real: a2 can't be drained, tip stuck.
+        assert!(matches!(app.apply_received(&a2).await, ApplyOutcome::Deferred));
+        assert_eq!(app.applied_tip().await.height, 1, "wedged at the fork");
+
+        // Attach fork choice selecting the heavier B tip; the trigger now reverts
+        // the (no-op) fork point and re-applies the winning branch to b3.
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        assert!(matches!(app.apply_received(&b3).await, ApplyOutcome::Applied { .. }));
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip { hash: b3.header.block_hash, height: 3 },
+            "fork choice drained the wedge onto the winning branch"
+        );
+    }
+
+    /// The fork-choice trigger also performs a true branch switch: applied tip on
+    /// the A branch, fork choice selects the heavier B branch → reorg.
+    #[tokio::test]
+    async fn fork_choice_trigger_switches_to_heavier_branch() {
+        let (exec, storage, _dir) = fresh();
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (_a1, _a2, _b2, b3) = setup_fork(&app, &storage).await; // tip = a2 @ 2
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+
+        // Any received block re-drives fork choice; deliver b3.
+        app.apply_received(&b3).await;
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip { hash: b3.header.block_hash, height: 3 }
+        );
     }
 }
