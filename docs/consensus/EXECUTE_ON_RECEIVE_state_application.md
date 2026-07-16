@@ -196,12 +196,38 @@ bad-state_root block is rejected AND leaves state untouched, (c) re-apply is ide
    producer hook never did. Registry sync is a boxed async hook (RegistrySync in prod, injectable
    in tests). Wired in `main.rs` when the registry is configured + the driver is enabled. Tests:
    `registry_sync_fires_only_at_snapshot_boundaries`, `registry_sync_absent_is_noop`.
-6. **Harness** — two-node divergence test: producer + follower must reach identical state_root
-   at every height; a corrupted-state_root block must be rejected fleet-wide.
+6. ✅ **Harness** — two-node divergence test. **DONE** (2026-07-16). A component-level harness (two
+   INDEPENDENT executors — a producer that builds a chain exactly as `node/src/producer.rs` does
+   under v2, and a follower `CanonicalApplicator` over its own exec+store — with REAL value-transfer
+   transactions, not just rewards):
+   - `two_node_state_root_parity_with_transactions` — the follower reproduces the producer's
+     `state_root` at EVERY height + agreeing balances (**I2**).
+   - `follower_rejects_corrupted_state_root` — a flipped-root block is rejected with the follower
+     left byte-identical (**I3**), then fork choice routes around it to the valid sibling.
+   - `two_nodes_converge_after_reorg` — the follower on branch A converges to the producer's heavier
+     branch B after a reorg (state parity restored post-reorg).
+   - **Bug the harness caught + fixed:** `reorg_to` could not revert to the genesis base — `Block::
+     is_genesis()` is true for ANY first block (its `selected_parent` is the genesis sentinel), so the
+     ancestry walk bailed on the block itself instead of stepping to the sentinel. Fixed: drop the
+     `is_genesis()` bail (only the depth cap bounds the walk) + treat a walk that reaches the seeded
+     genesis-base hash (no stored block) as the fork point. A fork at genesis now reverts correctly.
 
 ## 5. Invariants
-- I1: a block is admitted to the canonical chain ⇒ re-executing its txs yields its `state_root`.
-- I2: after applying canonical block H, every honest node's `state_root` at H is identical.
-- I3: a rejected (bad-root) block leaves world state byte-identical to before the attempt.
-- I4: state is never reverted below the last finalized BFT checkpoint.
-- I5: `applied_tip` is always an ancestor-or-equal of the DAG selected tip.
+- I1 ✅: a block is admitted to the canonical chain ⇒ re-executing its txs yields its `state_root`.
+  (`apply_block` verifies this; the harness proves it across nodes with real txs.)
+- I2 ✅: after applying canonical block H, every honest node's `state_root` at H is identical.
+  (`two_node_state_root_parity_with_transactions`, `two_nodes_converge_after_reorg`.)
+- I3 ✅: a rejected (bad-root) block leaves world state byte-identical to before the attempt.
+  (`rejects_bad_state_root…`, `reorg_aborts_on_bad_block…`, `follower_rejects_corrupted_state_root`.)
+- I4 ✅: state is never reverted below the last finalized BFT checkpoint. (`reorg_refused_below_finalized_floor`;
+  the floor is synced from `CheckpointManager` in `main.rs`.)
+- I5 (partial): `applied_tip` is an ancestor-or-equal of the DAG selected tip. The reorg trigger drives
+  `applied_tip` toward `select_tip()` after every received block; a fully live cross-check awaits a real
+  multi-node deployment (the harness uses an injected fork choice). Tracked for the post-reroll fleet.
+
+## 6. Status
+Steps 1–6 COMPLETE (2026-07-16). Execute-on-receive is feature-flagged (`CITRATE_BLOCK_V2`), off by
+default, and activates at the reroll per `REROLL_ADDENDUM_*.md`. Residuals: (a) a state-INVALID block
+with high blue work can wedge a branch (needs consensus↔execution feedback — fork choice excluding
+state-invalid blocks); (b) the snapshot ring is bounded by `MAX_REORG_DEPTH` full-state clones — a
+CoW/reverse-diff ring is the scale optimization; (c) I5 live cross-check awaits a real multi-node run.
