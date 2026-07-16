@@ -912,9 +912,20 @@ impl Executor {
             });
         }
 
-        self.persist_state_changes()
-            .await
-            .map_err(|e| ExecutionError::Reverted(format!("persist after apply_block: {e}")))?;
+        if let Err(e) = self.persist_state_changes().await {
+            // HIGH-1: a durable-write failure must NOT leave in-memory state
+            // advanced while the store (atomic batch — unchanged on failure) and
+            // the applied-tip pointer stay behind. Revert in-memory too, so
+            // memory == store == pre-block and the caller cleanly rejects; else
+            // the next drain re-applies on already-advanced state and the node
+            // wedges. `write_state_batch_sync` is a single atomic batch, so on
+            // failure the store is untouched and this restore fully reconciles.
+            self.state_db.restore(snapshot);
+            self.set_block_context(prev_ctx);
+            return Err(ExecutionError::Reverted(format!(
+                "persist after apply_block: {e}"
+            )));
+        }
         Ok(got)
     }
 

@@ -616,8 +616,13 @@ impl CanonicalApplicator {
         let block_hash = block.header.block_hash;
         let height = block.header.height;
 
-        // Echo of our own tip, or an already-applied / stale block.
-        if block_hash == state.tip.hash || height <= state.tip.height {
+        // Echo of the exact applied tip, or a block already on the applied chain.
+        // NB (F3): we do NOT short-circuit on `height <= tip.height` alone — an
+        // equal-or-lower-height block that is NOT on our applied chain is a
+        // competing fork sibling, and fork choice below may select it (a heavier
+        // equal-height branch). Only a block that is genuinely already applied is
+        // a no-op here.
+        if block_hash == state.tip.hash || self.on_applied_chain(&state, block_hash, height) {
             return ApplyOutcome::AlreadyApplied;
         }
 
@@ -644,8 +649,11 @@ impl CanonicalApplicator {
             }
         }
 
-        // Classify for the received block against the (possibly reorged) tip.
-        if out.applied.contains(&block_hash) || self.on_applied_chain(&state, block_hash, height) {
+        // Classify for the received block against the FINAL (post-reorg) applied
+        // chain — NOT the pre-reorg `out.applied` (F1): a block the drain applied
+        // could have been reverted by the subsequent fork-choice reorg, so only
+        // the ring reflects whether it actually ended up on the applied chain.
+        if self.on_applied_chain(&state, block_hash, height) {
             ApplyOutcome::Applied {
                 root: block.state_root,
                 height,
@@ -1172,6 +1180,63 @@ mod tests {
 
         // Any received block re-drives fork choice; deliver b3.
         app.apply_received(&b3).await;
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip { hash: b3.header.block_hash, height: 3 }
+        );
+    }
+
+    /// F3: an equal-height competing sibling must still consult fork choice
+    /// (pre-fix `height <= tip.height` short-circuited to AlreadyApplied and
+    /// never reorged to a heavier equal-height branch).
+    #[tokio::test]
+    async fn equal_height_sibling_triggers_fork_choice_reorg() {
+        let (exec, storage, _dir) = fresh();
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (_a1, _a2, b2, b3) = setup_fork(&app, &storage).await; // tip = a2 @ 2
+        // b2 is an equal-height (2) sibling of the applied tip a2.
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        // Delivering the equal-height sibling must NOT be dismissed as
+        // AlreadyApplied — it drives fork choice, which reorgs to the heavier B.
+        assert!(!matches!(
+            app.apply_received(&b2).await,
+            ApplyOutcome::AlreadyApplied
+        ));
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip { hash: b3.header.block_hash, height: 3 },
+            "equal-height sibling drove the reorg to the heavier branch"
+        );
+    }
+
+    /// F1: a block the drain applied but the same call's fork-choice reorg then
+    /// reverted must NOT be reported Applied (pre-fix used the stale pre-reorg
+    /// `out.applied`).
+    #[tokio::test]
+    async fn drain_applied_then_reorged_away_is_not_reported_applied() {
+        let (exec, storage, _dir) = fresh();
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let r = roots(3);
+        let a1 = mk_block(1, Hash::default(), r[0]);
+        let a2 = mk_block(2, a1.header.block_hash, r[1]);
+        let b2 = mk_block_b(2, a1.header.block_hash, r[1]);
+        let b3 = mk_block_b(3, b2.header.block_hash, r[2]);
+
+        persist(&storage, &a1);
+        app.apply_received(&a1).await; // tip = a1
+        for b in [&a2, &b2, &b3] {
+            persist(&storage, b);
+        }
+        // Fork choice prefers the heavier B branch.
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+
+        // Receiving a2 drains a1→a2, then fork choice reorgs it away to b3.
+        // a2 is therefore NOT on the final applied chain → not Applied.
+        let outcome = app.apply_received(&a2).await;
+        assert!(
+            !matches!(outcome, ApplyOutcome::Applied { .. }),
+            "a2 was reverted by the reorg; must not report Applied (got {outcome:?})"
+        );
         assert_eq!(
             app.applied_tip().await,
             AppliedTip { hash: b3.header.block_hash, height: 3 }
