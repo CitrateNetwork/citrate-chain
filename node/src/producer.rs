@@ -17,7 +17,6 @@ use citrate_network::{GossipProtocol, NetworkMessage, PeerManager};
 use citrate_network::learning_messages::LearningMessage;
 use citrate_sequencer::mempool::Mempool;
 use citrate_storage::{state_manager::StateManager as AIStateManager, StorageManager};
-use primitive_types::U256;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -785,6 +784,22 @@ impl BlockProducer {
         // Get transactions from mempool with AI priority
         let transactions = self.select_transactions_with_ai_priority().await?;
 
+        // VALIDATOR-S1 §R': under v2 (execute-on-receive), exclude EIP-1559-invalid
+        // txs (`gas_price < canonical base fee`) so a produced block never trips the
+        // receiver's reject rule (`settle_block_rewards`). Real txs pay >= 1 gwei, so
+        // this is a no-op in practice; it just keeps producer and importer agreeing on
+        // block validity. Off for v1/legacy (no execute-on-receive).
+        let transactions: Vec<citrate_consensus::types::Transaction> = if self.emit_v2_headers {
+            transactions
+                .into_iter()
+                .filter(|t| {
+                    t.gas_price >= citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS
+                })
+                .collect()
+        } else {
+            transactions
+        };
+
         // Blue score and work are already calculated above
         let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
 
@@ -826,6 +841,15 @@ impl BlockProducer {
             // Hashed only for v2 (see compute_hash); harmless for v1.
             coinbase: self.coinbase.0[0..20].try_into().unwrap_or([0u8; 20]),
         };
+
+        // VALIDATOR-S1 §R': base fee is a REROLL CONSTANT under v2. The dynamic
+        // EIP-1559 block above already evaluates to exactly this (it never loads
+        // parent_gas_used), but pin it explicitly so the committed value is
+        // unambiguous and the importer's base-fee check (`settle_block_rewards`) is
+        // exact. See core/execution/src/block_rewards.rs::CANONICAL_BASE_FEE_PER_GAS.
+        if self.emit_v2_headers {
+            header.base_fee_per_gas = citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS;
+        }
 
         // WP-Z.3 / PIN-P1(d): Set block context with the consensus ECVRF
         // randomness before executing transactions. `header.vrf_reveal.output`
@@ -921,7 +945,32 @@ impl BlockProducer {
                 .transactions(executed_transactions.clone())
                 .build_unhashed();
             let reward = self.reward_calculator.calculate_reward(&temp_block);
-            self.apply_basic_rewards(&reward, &validator_address);
+            // VALIDATOR-S1 §R': route the basic block reward AND the priority-fee
+            // vesting through the ONE shared settlement fn the receiver (Executor::
+            // apply_block) also calls — so producer and receiver credit byte-identical
+            // state. `basic_credits` mirrors `canonical_apply::reward_credits`
+            // exactly: [(coinbase, validator_reward), (0x11..treasury, treasury_reward)].
+            // Below the VALIDATOR-S1 activation (or before a snapshot is materialized)
+            // this only credits the basic reward, exactly as the old apply_basic_rewards.
+            let basic_credits = [
+                (validator_address, reward.validator_reward),
+                (
+                    citrate_execution::types::Address([0x11; 20]),
+                    reward.treasury_reward,
+                ),
+            ];
+            self.executor
+                .settle_block_rewards(
+                    header.height,
+                    header.coinbase,
+                    *header.proposer_pubkey.as_bytes(),
+                    header.base_fee_per_gas,
+                    &executed_transactions,
+                    &receipts,
+                    &basic_credits,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("VALIDATOR-S1 §R' reward settlement failed: {e}"))?;
         }
 
         // NOW compute final state root — includes both tx effects and reward balances
@@ -1408,32 +1457,11 @@ impl BlockProducer {
         Ok(citrate_consensus::types::blue_work_for_score(blue_score))
     }
 
-    /// Apply basic rewards (fallback when economics system is not available)
-    fn apply_basic_rewards(&self, reward: &citrate_economics::BlockReward, validator_address: &citrate_execution::types::Address) {
-        let treasury_address = citrate_execution::types::Address([0x11; 20]);
-
-        // Apply validator rewards
-        if reward.validator_reward > U256::zero() {
-            let current_balance = self.executor.get_balance(validator_address);
-            self.executor.set_balance(
-                validator_address,
-                current_balance + reward.validator_reward,
-            );
-            info!(
-                "Basic: Minted {} wei to validator {}",
-                reward.validator_reward,
-                hex::encode(validator_address.0)
-            );
-        }
-
-        // Apply treasury rewards
-        if reward.treasury_reward > U256::zero() {
-            let current_balance = self.executor.get_balance(&treasury_address);
-            self.executor
-                .set_balance(&treasury_address, current_balance + reward.treasury_reward);
-            info!("Basic: Minted {} wei to treasury", reward.treasury_reward);
-        }
-    }
+    // NOTE (VALIDATOR-S1 §R'): `apply_basic_rewards` was REMOVED. Basic reward
+    // crediting now flows through the single shared `Executor::settle_block_rewards`
+    // that the receiver (`Executor::apply_block`) also calls, so the two paths cannot
+    // drift. It credits the identical [(coinbase, validator_reward),
+    // (0x11..treasury, treasury_reward)] list plus the §R' priority-fee vesting.
 
     /// WP-F.3 + WP-F.5: Compute the learning_root for a checkpoint block.
     ///
@@ -1657,6 +1685,7 @@ mod tests {
     use super::*;
     use citrate_consensus::crypto::Ed25519SigningKey;
     use citrate_consensus::types::Signature;
+    use primitive_types::U256;
     use citrate_execution::types::Address;
     use citrate_sequencer::mempool::{MempoolConfig, TxClass};
     use citrate_storage::pruning::PruningConfig;

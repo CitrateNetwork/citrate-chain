@@ -146,25 +146,47 @@ pub struct RegistrySync {
     executor: Arc<Executor>,
     selector: Arc<VrfProposerSelector>,
     registry: [u8; 20],
+    /// VALIDATOR-S1 activation height (fleet-wide), embedded into the materialized
+    /// reward policy so `settle_block_rewards` gates §R' vesting on it.
+    activation_height: u64,
+    /// The SAME `SharedRewardPolicy` cell the `Executor` reads in
+    /// `settle_block_rewards`. Rewritten here at each snapshot boundary S(E) so the
+    /// §R' reward beneficiary + share are read from the FINALIZED snapshot, never
+    /// the live tip.
+    reward_policy: citrate_execution::block_rewards::SharedRewardPolicy,
 }
 
 impl RegistrySync {
-    pub fn new(executor: Arc<Executor>, selector: Arc<VrfProposerSelector>, registry: [u8; 20]) -> Self {
-        Self { executor, selector, registry }
+    pub fn new(
+        executor: Arc<Executor>,
+        selector: Arc<VrfProposerSelector>,
+        registry: [u8; 20],
+        activation_height: u64,
+    ) -> Self {
+        let reward_policy = executor.reward_policy_handle();
+        Self { executor, selector, registry, activation_height, reward_policy }
     }
 
     /// Read activeSet() + minStake() against the CURRENT executor state and atomically
     /// replace the selector's membership. Call this right after applying block S(E) so the
     /// current state == state at S(E). Returns the number of validators loaded.
     ///
+    /// Also materializes the VALIDATOR-S1 §R' reward policy for this epoch
+    /// (priorityFeeShareBps + rewardMinter + proposer->staker map) into the shared
+    /// cell the executor reads — so the reward beneficiary + share are fixed at the
+    /// finalized snapshot, not re-read from a governance-mutable live tip.
+    ///
     /// `snapshot_height` is used only for the view's block context; the STATE read is the
     /// executor's current state.
     pub async fn sync_for_snapshot(&self, snapshot_height: u64) -> Result<usize, String> {
-        let active_ret = self.view_call(&active_set_selector(), snapshot_height).await?;
-        let min_ret = self.view_call(&min_stake_selector(), snapshot_height).await?;
+        let active_ret = self.view_call(active_set_selector().to_vec(), snapshot_height).await?;
+        let min_ret = self.view_call(min_stake_selector().to_vec(), snapshot_height).await?;
 
         let entries = decode_active_set(&active_ret)?;
         let min_stake = decode_min_stake(&min_ret)?;
+
+        // Materialize the §R' reward policy from the SAME finalized snapshot.
+        self.materialize_reward_policy(snapshot_height, &entries).await?;
 
         let mapped: Vec<(PublicKey, u128)> = entries
             .into_iter()
@@ -175,9 +197,55 @@ impl RegistrySync {
         Ok(n)
     }
 
+    /// Read priorityFeeShareBps() + rewardMinter() + each active validator's staker
+    /// (validatorInfo(pubkey).staker) at the snapshot state, and publish an
+    /// `EpochRewardPolicy` into the shared cell. Every value comes from the SAME S(E)
+    /// state the membership set was read from, so producer and receiver — which share
+    /// this one cell — settle §R' rewards identically.
+    async fn materialize_reward_policy(
+        &self,
+        snapshot_height: u64,
+        entries: &[([u8; 32], u128)],
+    ) -> Result<(), String> {
+        use citrate_execution::block_rewards as br;
+
+        let epoch = snapshot_epoch_at(snapshot_height).unwrap_or(0);
+
+        let share_ret = self
+            .view_call(br::PRIORITY_FEE_SHARE_BPS_SELECTOR.to_vec(), snapshot_height)
+            .await?;
+        let priority_fee_share_bps = br::decode_u64_word(&share_ret)?;
+
+        let minter_ret = self
+            .view_call(br::REWARD_MINTER_SELECTOR.to_vec(), snapshot_height)
+            .await?;
+        let reward_minter = br::decode_address_word(&minter_ret)?;
+
+        let mut staker_of = std::collections::HashMap::with_capacity(entries.len());
+        for (pubkey, _stake) in entries {
+            let mut calldata = br::VALIDATOR_INFO_SELECTOR.to_vec();
+            calldata.extend_from_slice(pubkey);
+            let info_ret = self.view_call(calldata, snapshot_height).await?;
+            let staker = br::decode_address_word(&info_ret)?;
+            staker_of.insert(*pubkey, staker);
+        }
+
+        let policy = br::EpochRewardPolicy {
+            epoch,
+            snapshot_height,
+            activation_height: self.activation_height,
+            registry: self.registry,
+            reward_minter,
+            priority_fee_share_bps,
+            staker_of,
+        };
+        *self.reward_policy.write() = Some(policy);
+        Ok(())
+    }
+
     /// Read-only contract call against current state, via the executor's simulate path
     /// (same mechanism as eth_call). Returns the ABI-encoded return bytes.
-    async fn view_call(&self, calldata: &[u8; 4], snapshot_height: u64) -> Result<Vec<u8>, String> {
+    async fn view_call(&self, calldata: Vec<u8>, snapshot_height: u64) -> Result<Vec<u8>, String> {
         // Registry address as a 32-byte PublicKey (EVM 20-byte address in the high bytes).
         let mut to_bytes = [0u8; 32];
         to_bytes[..20].copy_from_slice(&self.registry);
@@ -203,7 +271,7 @@ impl RegistrySync {
             value: 0,
             gas_limit: 50_000_000,
             gas_price: 1,
-            data: calldata.to_vec(),
+            data: calldata,
             signature: Signature::new([0u8; 64]),
             tx_type: None,
             ..Default::default()
