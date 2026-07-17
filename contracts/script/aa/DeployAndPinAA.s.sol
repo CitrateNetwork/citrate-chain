@@ -46,10 +46,10 @@ contract DeployAndPinAA is DeployAA {
     /// contract the redeploy ceremony produces. The bash wrapper greps
     /// for `^EW_S1_PIN:` and rewrites `.env.testnet` in place from these.
     function _emitPinTable(Deployment memory d) internal view {
-        address entryPoint = envAddressOr("CITRATE_AA_ENTRY_POINT", address(0));
-        // EntryPoint is vendored (not redeployed by this script); pinning
-        // it back unchanged makes the parser idempotent on a no-op rerun.
-        _pin("CITRATE_AA_ENTRY_POINT", entryPoint);
+        // WS-3: EntryPoint is now deployed deterministically (CREATE2) by
+        // DeployAA._deploy and captured in the struct; pin the address actually
+        // deployed so consumers re-pin the stable EntryPoint.
+        _pin("CITRATE_AA_ENTRY_POINT", d.entryPoint);
         _pin("CITRATE_AA_WEBAUTHN_VALIDATOR", address(d.webauthn));
         _pin("CITRATE_AA_ECDSA_VALIDATOR", address(d.ecdsa));
         _pin("CITRATE_AA_GUARDIAN_RECOVERY", address(d.recovery));
