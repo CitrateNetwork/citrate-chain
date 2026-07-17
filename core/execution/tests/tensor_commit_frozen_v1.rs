@@ -26,8 +26,8 @@ use citrate_execution::precompiles::{
     verify::tensor_commit,
 };
 
-fn q16(shape: &[u32], values: &[i32]) -> Vec<u8> {
-    let mut data = Vec::with_capacity(values.len() * 4);
+fn q16(shape: &[u32], values: &[i64]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(values.len() * 8);
     for &v in values {
         data.extend_from_slice(&v.to_le_bytes());
     }
@@ -44,6 +44,15 @@ fn tensor_commit_frozen_vectors_v1() {
     // BN254 Fr (RM-M1b WP-M1b.3 migration). v1 BLS12-381 hashes
     // are in git history; pre-mainnet, no production commitments
     // depended on the old hashes.
+    //
+    // I64-S1 RE-FREEZE (2026-07-17, owner-approved): I64-S1 Phase A (026b877)
+    // widened Q16.16 elements i32→i64, changing 0x0107's INPUT bytes for
+    // multi-element Q16 tensors and hence its committed output. Per the tripwire
+    // procedure this is a DELIBERATE change; because the chain is pre-mainnet and
+    // no production commitment depends on the old (i32) vectors, the owner chose
+    // to RE-FREEZE these vectors to the i64 encoding rather than version the
+    // address. Vectors 2 & 3 updated below; vector 1 ([0], all-zero data) and
+    // vector 4 (Field32, byte_size unchanged) hash identically under i64.
     let h1 = tensor_commit(&q16(&[1], &[0]), 1_000_000).unwrap();
     assert_eq!(
         hex_be(&h1.output),
@@ -51,19 +60,19 @@ fn tensor_commit_frozen_vectors_v1() {
         "TENSOR_COMMIT(Q16, [1], [0]) drifted"
     );
 
-    // Vector 2: small vector [1, 2, 3].
+    // Vector 2: small vector [1, 2, 3]. Re-frozen for i64 (I64-S1).
     let h2 = tensor_commit(&q16(&[3], &[1, 2, 3]), 1_000_000).unwrap();
     assert_eq!(
         hex_be(&h2.output),
-        "0x2cf29c993ba8432a07811f765fada910b99cc477b56ac57b6e6197706a65a496",
+        "0x25d5b00014b5f13ba2289a506fbe5489628f2e38df14e5fcc4e60aaba3e45960",
         "TENSOR_COMMIT(Q16, [3], [1,2,3]) drifted"
     );
 
-    // Vector 3: 2×2 matrix [[1,2],[3,4]].
+    // Vector 3: 2×2 matrix [[1,2],[3,4]]. Re-frozen for i64 (I64-S1).
     let h3 = tensor_commit(&q16(&[2, 2], &[1, 2, 3, 4]), 1_000_000).unwrap();
     assert_eq!(
         hex_be(&h3.output),
-        "0x18dfcf46ab947af444fa6b1a025f8c4dbd4002659431a7cbe3d5660338ef88db",
+        "0x04ca10d916c00d02c17066d1a2b72950d343abdd4f1bc962592940ca88e1b311",
         "TENSOR_COMMIT(Q16, [2,2], [1,2,3,4]) drifted"
     );
 
