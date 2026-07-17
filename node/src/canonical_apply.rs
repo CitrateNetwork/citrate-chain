@@ -55,7 +55,8 @@ use tracing::{debug, info, warn};
 const MAX_REORG_DEPTH: u64 = 100;
 
 /// Treasury address that receives the treasury slice of each block reward.
-/// Mirrors `producer.rs::apply_basic_rewards` and `RewardConfig.treasury_address`.
+/// Mirrors the producer's `settle_block_rewards` basic-credit list and
+/// `RewardConfig.treasury_address`.
 const TREASURY_ADDR: [u8; 20] = [0x11; 20];
 
 /// Canonical block-reward parameters. **Single source of truth** shared by the
