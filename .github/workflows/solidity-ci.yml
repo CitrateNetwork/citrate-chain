@@ -6,10 +6,12 @@ on:
     paths:
       - 'contracts/**'
       - 'foundry.toml'
+      - '.github/workflows/solidity-ci.yml'
   pull_request:
     paths:
       - 'contracts/**'
       - 'foundry.toml'
+      - '.github/workflows/solidity-ci.yml'
 
 # RM-B1 / WP-F1.1 (audit CI-01): minimum permissions at workflow level.
 permissions:
@@ -34,31 +36,48 @@ jobs:
     # GitHub-hosted runner that multiplied past the memory ceiling.
     #
     # MITIGATION (coverage-neutral — does NOT change bytecode, optimizer
-    # settings, or which tests run; it only bounds scheduling):
-    #   * `FOUNDRY_THREADS: 2` caps concurrent solc jobs to 2 so peak
-    #     memory is ~2× a single via-IR unit instead of Nx. Trades some
-    #     wall-clock for staying under the ceiling.
+    # settings, or which tests run; it only bounds scheduling + adds swap):
+    #   * `FOUNDRY_THREADS: 1` serializes solc jobs so peak memory is a
+    #     SINGLE via-IR unit rather than Nx (the earlier `2` cap still
+    #     OOM'd — two concurrent via-IR units exceeded the ~7 GB hosted-
+    #     runner ceiling).
+    #   * A large swapfile gives the single-unit via-IR compile a disk-
+    #     backed safety net so a transient peak spills to swap instead of
+    #     being killed (exit 143). Trades wall-clock for completing.
     #   * `forge build` runs as its own step first, warming the compile
     #     cache; the subsequent `forge test` reuses artifacts and only
     #     pays the (memory-light) test-runtime cost.
     #
-    # DEVOPS ESCALATION (do this if the job still OOMs / to remove the
-    # serialization slowdown): move this job to a larger runner. The
-    # robust fix is more RAM, e.g.:
+    # DEVOPS ESCALATION (to drop the swap+serialize slowdown): move this
+    # job to a larger runner with more RAM, e.g.:
     #     runs-on: ubuntu-latest-8-cores   # (or a GitHub Larger Runner)
-    # or a self-hosted runner with >=16 GB free. With headroom, drop the
-    # FOUNDRY_THREADS cap below and let forge parallelize again.
+    # or a self-hosted runner with >=16 GB free, then raise FOUNDRY_THREADS
+    # and remove the swap step below.
     runs-on: ubuntu-latest
     env:
-      # Bound concurrent solc via-IR compilations to keep peak memory
-      # under the hosted-runner ceiling. Raise/remove on a bigger runner.
-      FOUNDRY_THREADS: 2
+      # Serialize solc via-IR compilations so peak memory is a single unit.
+      # Raise on a bigger runner (see escalation note above).
+      FOUNDRY_THREADS: 1
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      # Give the memory-heavy via-IR compile a disk-backed safety net so a
+      # transient peak spills to swap instead of being OOM-killed (exit 143).
+      # Placed on /mnt (the large ephemeral disk on hosted runners).
+      - name: Add swap space
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/ci-swapfile
+          sudo fallocate -l 12G /mnt/ci-swapfile || \
+            sudo dd if=/dev/zero of=/mnt/ci-swapfile bs=1M count=12288
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+          echo "--- memory after adding swap ---"
+          free -h
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
@@ -69,17 +88,17 @@ jobs:
             https://github.com/ethereum/solidity/releases/download/v0.8.26/solc-static-linux
           chmod +x /usr/local/bin/solc
           solc --version
-      # Compile first (memory-bounded via FOUNDRY_THREADS) so the cache is
-      # warm; keeps the heavy via-IR work in one observable step.
+      # Compile first (serialized via FOUNDRY_THREADS=1 + swap) so the cache
+      # is warm; keeps the heavy via-IR work in one observable step.
       - name: Build contracts (bounded concurrency)
         working-directory: contracts
         run: |
           forge --version
-          forge build --use 0.8.26 --threads 2
+          forge build --use 0.8.26 --threads 1
       - name: Run Forge tests
         working-directory: contracts
         run: |
-          forge test -vvv --use 0.8.26 --threads 2
+          forge test -vvv --use 0.8.26 --threads 1
 
   slither:
     if: github.event_name == 'workflow_dispatch'

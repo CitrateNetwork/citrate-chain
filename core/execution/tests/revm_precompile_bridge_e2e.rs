@@ -133,10 +133,12 @@ fn word_is_zero(w: &[u8; 32]) -> bool {
 }
 
 /// Valid Q16 tensor in the canonical `tensor_format::encode` wire format —
-/// the documented input of the 0x0107 TENSOR_COMMIT precompile.
+/// the documented input of the 0x0107 TENSOR_COMMIT precompile. I64-S1 Phase A
+/// widened Q16.16 elements i32→i64 (`Dtype::Q16_16.byte_size() == 8`), so each
+/// element is 8 bytes.
 fn valid_q16_tensor() -> Vec<u8> {
-    let values: [i32; 3] = [1, 2, 3];
-    let mut data = Vec::with_capacity(values.len() * 4);
+    let values: [i64; 3] = [1, 2, 3];
+    let mut data = Vec::with_capacity(values.len() * 8);
     for v in values {
         data.extend_from_slice(&v.to_le_bytes());
     }
