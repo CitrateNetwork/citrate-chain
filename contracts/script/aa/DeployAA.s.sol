@@ -4,6 +4,9 @@ pragma solidity ^0.8.26;
 import "forge-std/Script.sol";
 import "../ScriptEnv.sol";
 import "../Salts.sol";
+// WS-3: deterministic CREATE2 EntryPoint (deploy-if-absent). Inheriting
+// EntryPointDeployer gives DeployAA `projectedEntryPoint()` + `_ensureEntryPoint()`.
+import {EntryPointDeployer} from "./DeployEntryPoint.s.sol";
 
 // AA contracts shipped by WP-1
 import {WebAuthnP256Validator} from "../../src/aa/validators/WebAuthnP256Validator.sol";
@@ -54,8 +57,12 @@ import {IEntryPoint as IAaEntryPoint} from "@account-abstraction/interfaces/IEnt
  *     while capping a fee-inflation drain to 5 ether before the day's
  *     sponsorship fails closed. Owner re-tunes via setters.
  */
-contract DeployAA is Script, ScriptEnv {
+contract DeployAA is Script, ScriptEnv, EntryPointDeployer {
     struct Deployment {
+        // WS-3: the deterministic CREATE2 EntryPoint every downstream AA
+        // contract embeds. Captured here so the human + pin tables report the
+        // address actually deployed, not a (possibly stale) env value.
+        address entryPoint;
         WebAuthnP256Validator webauthn;
         CitrateECDSAValidator ecdsa;
         GuardianRecoveryModule recovery;
@@ -75,7 +82,18 @@ contract DeployAA is Script, ScriptEnv {
     // `EW_S1_PIN:` lines the `scripts/ops/post-reroll-redeploy.sh`
     // script greps for, in addition to the human table this script logs.
     function _deploy() internal returns (Deployment memory d) {
-        address entryPoint = envAddressOr("CITRATE_AA_ENTRY_POINT", address(0));
+        // WS-3: the EntryPoint is no longer read from env as a free variable —
+        // it is deployed deterministically via CREATE2 (Salts.salt("EntryPoint"))
+        // and always lands at `projectedEntryPoint()`. We still READ the env pin
+        // as a fail-closed guard: if an operator has a stale
+        // CITRATE_AA_ENTRY_POINT wired, refuse rather than silently embed a
+        // different EntryPoint than the one we deploy.
+        address projectedEp = projectedEntryPoint();
+        address pinnedEp = envAddressOr("CITRATE_AA_ENTRY_POINT", address(0));
+        require(
+            pinnedEp == address(0) || pinnedEp == projectedEp,
+            "CITRATE_AA_ENTRY_POINT != deterministic EntryPoint; unset it or repin to projectedEntryPoint()"
+        );
         address identitySigner = envAddressOr("CITRATE_AA_IDENTITY_SIGNER", address(0));
         address owner = envAddressOr("CITRATE_AA_OWNER", address(0));
         // E8-1: the sponsorship signer defaults to the identity signer if
@@ -90,12 +108,18 @@ contract DeployAA is Script, ScriptEnv {
         uint256 maxFeeCeiling = envUintOr("CITRATE_AA_MAX_FEE_CEIL", 20 gwei);
         uint256 globalDailyCap = envUintOr("CITRATE_AA_GLOBAL_CAP", 5 ether);
 
-        require(entryPoint.code.length > 0, "EntryPoint not deployed on this chain");
         require(identitySigner != address(0), "identity signer not set");
         require(owner != address(0), "owner not set");
         require(sponsorSigner != address(0), "sponsor signer not set");
 
         vm.startBroadcast();
+
+        // WS-3: deploy the deterministic EntryPoint first (idempotent — skipped
+        // if already present at its projected address), then embed THAT address
+        // in walletImpl / factory / paymaster so the whole cascade is stable.
+        d.entryPoint = _ensureEntryPoint();
+        require(d.entryPoint == projectedEp, "EntryPoint not at projected address");
+        address entryPoint = d.entryPoint;
 
         d.webauthn = new WebAuthnP256Validator{salt: Salts.salt("WebAuthnP256Validator")}();
         d.ecdsa = new CitrateECDSAValidator{salt: Salts.salt("CitrateECDSAValidator")}();
@@ -146,7 +170,8 @@ contract DeployAA is Script, ScriptEnv {
 
     /// Human-readable summary the operator reads at the end of a ceremony.
     function _emitHumanTable(Deployment memory d) internal view {
-        address entryPoint = envAddressOr("CITRATE_AA_ENTRY_POINT", address(0));
+        // WS-3: report the EntryPoint actually deployed (deterministic), not env.
+        address entryPoint = d.entryPoint;
         address identitySigner = envAddressOr("CITRATE_AA_IDENTITY_SIGNER", address(0));
         address owner = envAddressOr("CITRATE_AA_OWNER", address(0));
 
@@ -157,7 +182,7 @@ contract DeployAA is Script, ScriptEnv {
         console2.log("CitrateWallet implementation: %s", address(d.walletImpl));
         console2.log("CitrateWalletFactory: %s", address(d.factory));
         console2.log("CitratePaymaster: %s", address(d.paymaster));
-        console2.log("EntryPoint (existing): %s", entryPoint);
+        console2.log("EntryPoint (deterministic CREATE2): %s", entryPoint);
         console2.log("Identity signer: %s", identitySigner);
         console2.log("Owner: %s", owner);
     }
