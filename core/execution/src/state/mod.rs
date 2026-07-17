@@ -9,5 +9,5 @@ pub mod state_db;
 pub mod trie;
 
 pub use account::AccountManager;
-pub use state_db::{StateDB, StateRoot};
+pub use state_db::{StateDB, StateRoot, StateSnapshot};
 pub use trie::{Trie, TrieNode};
