@@ -113,6 +113,17 @@ impl Trie {
         }
     }
 
+    /// Enumerate all (key, value) pairs held by this trie.
+    ///
+    /// Every `insert` also records the pair in `cache` (and `cache` is
+    /// serialized with the trie), so this is a complete key→value view — used by
+    /// the execute-on-receive reorg to diff a contract's storage between two
+    /// state snapshots and reconcile the durable store. Cloning is intentional:
+    /// the caller owns the returned map.
+    pub fn entries_map(&self) -> HashMap<Vec<u8>, Vec<u8>> {
+        self.cache.clone()
+    }
+
     /// Get a value by key
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         // Check cache first

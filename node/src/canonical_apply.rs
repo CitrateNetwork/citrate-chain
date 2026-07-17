@@ -523,8 +523,11 @@ impl CanonicalApplicator {
         };
         self.executor.state_restore(base_snapshot);
 
-        // Re-apply the winning branch forward. Build snapshots locally; commit to
-        // the ring only on full success so an abort leaves the ring untouched.
+        // Re-apply the winning branch forward IN-MEMORY ONLY (`apply_block_no_persist`).
+        // HIGH-2: the durable store has no rollback, so we must NOT write the candidate
+        // branch to it per block — otherwise an abort would leave abandoned writes on
+        // disk. Nothing is persisted here; `reconcile_store_from` writes the store once,
+        // after the whole reorg succeeds. Snapshots commit to the ring on success only.
         branch.reverse(); // fork_point+1 .. new_tip
         let mut new_snaps: Vec<(u64, Hash, StateSnapshot)> = Vec::new();
         let mut tip = fork;
@@ -532,7 +535,7 @@ impl CanonicalApplicator {
             let credits = self.reward_credits(block);
             match self
                 .executor
-                .apply_block(block, block.header.coinbase, &credits)
+                .apply_block_no_persist(block, block.header.coinbase, &credits)
                 .await
             {
                 Ok(_) => {
@@ -540,16 +543,11 @@ impl CanonicalApplicator {
                     let hh = block.header.block_hash;
                     tip = AppliedTip { hash: hh, height: h };
                     new_snaps.push((h, hh, self.executor.state_snapshot()));
-                    let _ = self.storage.state.put_state_root(&hh, &block.state_root);
-                    // VALIDATOR-S1: a reorg that re-applies across S(E) must re-sync the
-                    // selector to the NEW branch's registry state (the producer hook never
-                    // did this — it only fired on produce).
-                    self.maybe_sync_registry(h).await;
                 }
                 Err(e) => {
-                    // Abort: full byte-exact restore to the pre-reorg state. The
-                    // ring + tip are untouched (still the old branch), and the
-                    // persisted pointer was never moved.
+                    // Abort: byte-exact in-memory restore. Because the re-apply did
+                    // NOT persist, the durable store is untouched (still the old
+                    // branch, == pre_state) and the ring/tip/pointer never moved.
                     self.executor.state_restore(pre_state);
                     warn!(
                         "execute-on-receive: reorg to {} aborted at {} — {} (reverted to {})",
@@ -561,6 +559,26 @@ impl CanonicalApplicator {
                     ));
                 }
             }
+        }
+
+        // Success. Reconcile the durable store from the pre-reorg baseline (which
+        // the store still reflects) to the now-current new-branch state — writing
+        // the account+storage diff and deleting abandoned-created accounts — so
+        // RocksDB matches memory and a restart-after-reorg hydrates correctly.
+        if let Err(e) = self.executor.reconcile_store_from(&pre_state) {
+            warn!(
+                "execute-on-receive: reorg to {} applied in-memory but store reconcile failed: {}",
+                new_tip, e
+            );
+        }
+        // Persist the new branch's state roots + re-sync the selector at any S(E)
+        // the reorg crossed (deferred to here so an abort writes nothing durable).
+        for block in &branch {
+            let _ = self
+                .storage
+                .state
+                .put_state_root(&block.header.block_hash, &block.state_root);
+            self.maybe_sync_registry(block.header.height).await;
         }
 
         // Commit: adopt the new tip, merge new-branch snapshots, drop the stale
@@ -1272,6 +1290,114 @@ mod tests {
         app.maybe_sync_registry(1800).await;
         assert_eq!(*hits.lock().expect("lock"), vec![800, 1800]);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    const CAROL: [u8; 20] = [0xCC; 20];
+    const DAVE: [u8; 20] = [0xDD; 20];
+
+    /// A store-backed executor sharing `storage`'s durable state store, so
+    /// `apply_block` actually persists and a "restart" (a fresh executor over the
+    /// same store, cold cache) reads the durable truth.
+    fn store_backed(storage: &Arc<StorageManager>) -> Arc<Executor> {
+        Arc::new(Executor::with_storage(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+        ))
+    }
+
+    /// HIGH-2: after a reorg, the DURABLE store must match the new branch — proven
+    /// by reading a fresh (cold-cache) executor over the same store. Includes an
+    /// account CREATED on the abandoned branch, which must be deleted from the store.
+    #[tokio::test]
+    async fn reorg_reconciles_durable_store_and_survives_restart() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.persist_state_changes().await.expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+
+        // Shared block a1 (ALICE→DAVE), then A branch a2 (ALICE→BOB).
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![transfer(ALICE, DAVE, 1_000, 0)]).await;
+        let a2 = produce(&pa, a1.header.block_hash, 2, VRF_OUT, vec![transfer(ALICE, BOB, 1_000, 1)]).await;
+        persist(&storage, &a1);
+        app.apply_received(&a1).await;
+        persist(&storage, &a2);
+        app.apply_received(&a2).await;
+        assert_eq!(follower.get_balance(&Address(BOB)), U256::from(1_000u64), "A branch funded BOB");
+
+        // Heavier B branch off a1: b2, b3 (ALICE→CAROL). BOB is never touched on B.
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        let _b1 = produce(&pb, Hash::default(), 1, VRF_OUT, vec![transfer(ALICE, DAVE, 1_000, 0)]).await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![transfer(ALICE, CAROL, 1_000, 1)]).await;
+        let b3 = produce(&pb, b2.header.block_hash, 3, vrf_b, vec![transfer(ALICE, CAROL, 1_000, 2)]).await;
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.apply_received(&b3).await;
+        assert_eq!(app.applied_tip().await.height, 3, "reorged to B");
+
+        // Simulated restart: a brand-new executor over the SAME store, cold cache.
+        let restarted = store_backed(&storage);
+        assert_eq!(restarted.get_balance(&Address(CAROL)), U256::from(2_000u64), "B branch CAROL persisted");
+        assert_eq!(restarted.get_balance(&Address(DAVE)), U256::from(1_000u64), "shared DAVE persisted");
+        assert_eq!(
+            restarted.get_balance(&Address(BOB)),
+            U256::zero(),
+            "BOB (created on the abandoned A branch) must be deleted from the store"
+        );
+        assert_eq!(
+            restarted.get_balance(&Address(ALICE)),
+            follower.get_balance(&Address(ALICE)),
+            "ALICE durable balance matches in-memory after reorg"
+        );
+    }
+
+    /// HIGH-2 (abort path): a reorg that aborts on a bad block must leave the
+    /// durable store on the OLD branch — proven across a restart.
+    #[tokio::test]
+    async fn aborted_reorg_leaves_durable_store_on_old_branch() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.persist_state_changes().await.expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![transfer(ALICE, BOB, 1_000, 0)]).await;
+        let a2 = produce(&pa, a1.header.block_hash, 2, VRF_OUT, vec![transfer(ALICE, BOB, 1_000, 1)]).await;
+        persist(&storage, &a1);
+        app.apply_received(&a1).await;
+        persist(&storage, &a2);
+        app.apply_received(&a2).await; // store has A: BOB = 2000
+
+        // A B branch whose valid b2 is followed by a bad-root b3.
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        let _b1 = produce(&pb, Hash::default(), 1, VRF_OUT, vec![transfer(ALICE, BOB, 1_000, 0)]).await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![transfer(ALICE, CAROL, 1_000, 1)]).await;
+        let b3_bad = mk_block_txs(3, b2.header.block_hash, Hash::new([0xFF; 32]), vrf_b, vec![transfer(ALICE, CAROL, 1_000, 2)]);
+        persist(&storage, &b2);
+        persist(&storage, &b3_bad);
+
+        app.fork_choice = Some(fork_choice_returning(b3_bad.header.block_hash));
+        app.apply_received(&b3_bad).await; // reorg reapplies b2 in-memory, b3_bad fails → abort
+
+        // Applied tip stayed on A; the durable store was never written during reapply.
+        assert_eq!(app.applied_tip().await, AppliedTip { hash: a2.header.block_hash, height: 2 });
+        let restarted = store_backed(&storage);
+        assert_eq!(restarted.get_balance(&Address(BOB)), U256::from(2_000u64), "store still on A branch");
+        assert_eq!(restarted.get_balance(&Address(CAROL)), U256::zero(), "aborted B branch never persisted");
     }
 
     /// With no registry-sync attached the hook is inert (steps 2–4 unaffected).

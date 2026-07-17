@@ -234,6 +234,14 @@ pub struct AccountSnapshot {
     dirty: Vec<Address>,
 }
 
+impl AccountSnapshot {
+    /// All captured accounts (every account resident in the cache at snapshot
+    /// time). Used by the reorg store-reconciliation to diff two snapshots.
+    pub fn entries(&self) -> &[(Address, AccountState)] {
+        &self.accounts
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -160,6 +160,14 @@ pub trait StateStoreTrait: Send + Sync {
     /// C6: Delete a contract storage slot
     fn delete_storage(&self, address: &Address, key: &[u8]) -> anyhow::Result<()>;
 
+    /// Delete an account. Used by the execute-on-receive reorg store
+    /// reconciliation to remove accounts that a reverted (abandoned) branch
+    /// created but the post-reorg chain does not have. Default `Ok(())` so test
+    /// stores that don't persist accounts keep compiling.
+    fn delete_account(&self, _address: &Address) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Persist all finalized account and storage mutations in one state batch.
     ///
     /// K1.1: producer-finalized state must be atomic and durable. The real
@@ -846,6 +854,84 @@ impl Executor {
         self.state_db.restore(snapshot)
     }
 
+    /// EXECUTE-ON-RECEIVE (reorg, HIGH-2): make the durable store match CURRENT
+    /// in-memory world state, given the store presently reflects `baseline`.
+    ///
+    /// A reorg reverts in-memory state via the snapshot ring but the durable
+    /// store has no rollback — after switching branches the store still holds the
+    /// abandoned branch's per-block writes. This writes the account + storage
+    /// diff (`baseline` → current) to the store: changed entries are put, entries
+    /// the abandoned branch created but the new chain lacks are deleted. Called
+    /// once after a reorg settles, so RocksDB matches memory and a restart-after-
+    /// reorg hydrates the correct state. No-op without a configured store.
+    ///
+    /// Correctness rests on `baseline` being exactly what the store reflects: the
+    /// reorg captures it before reverting, and the pre-reorg forward path
+    /// (`apply_block`, per block) kept store == in-memory, so it holds.
+    pub fn reconcile_store_from(
+        &self,
+        baseline: &crate::state::StateSnapshot,
+    ) -> anyhow::Result<()> {
+        use std::collections::{HashMap, HashSet};
+        let store = match &self.state_store {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let current = self.state_db.snapshot();
+
+        // --- accounts ---
+        let base_accts: HashMap<Address, crate::types::AccountState> =
+            baseline.account_entries().iter().cloned().collect();
+        let cur_accts: HashMap<Address, crate::types::AccountState> =
+            current.account_entries().iter().cloned().collect();
+        let mut account_puts: Vec<(Address, crate::types::AccountState)> = Vec::new();
+        for (addr, acct) in &cur_accts {
+            if base_accts.get(addr) != Some(acct) {
+                account_puts.push((*addr, acct.clone()));
+            }
+        }
+        let account_dels: Vec<Address> = base_accts
+            .keys()
+            .filter(|a| !cur_accts.contains_key(*a))
+            .copied()
+            .collect();
+
+        // --- contract storage ---
+        let base_storage = baseline.storage_map();
+        let cur_storage = current.storage_map();
+        let empty = HashMap::new();
+        let contracts: HashSet<Address> = base_storage
+            .keys()
+            .chain(cur_storage.keys())
+            .copied()
+            .collect();
+        let mut storage_changes: Vec<StateStorageChange> = Vec::new();
+        for addr in contracts {
+            let b = base_storage.get(&addr).unwrap_or(&empty);
+            let c = cur_storage.get(&addr).unwrap_or(&empty);
+            let keys: HashSet<&Vec<u8>> = b.keys().chain(c.keys()).collect();
+            for key in keys {
+                let cur_val = c.get(key);
+                if cur_val != b.get(key) {
+                    storage_changes.push(StateStorageChange {
+                        address: addr,
+                        key: key.clone(),
+                        // Some(v) writes the slot; None deletes it (see StateStorageChange).
+                        value: cur_val.cloned(),
+                    });
+                }
+            }
+        }
+
+        if !account_puts.is_empty() || !storage_changes.is_empty() {
+            store.write_state_batch_sync(&account_puts, &storage_changes)?;
+        }
+        for addr in &account_dels {
+            store.delete_account(addr)?;
+        }
+        Ok(())
+    }
+
     /// EXECUTE-ON-RECEIVE — the verified, revertible state-application atom.
     ///
     /// Applies a canonical block's transactions to world state, credits the block's
@@ -873,6 +959,33 @@ impl Executor {
         block: &Block,
         coinbase: [u8; 20],
         reward_credits: &[(Address, U256)],
+    ) -> Result<Hash, ExecutionError> {
+        self.apply_block_inner(block, coinbase, reward_credits, true)
+            .await
+    }
+
+    /// EXECUTE-ON-RECEIVE (reorg): like [`Self::apply_block`], but advances only
+    /// IN-MEMORY state — it does NOT persist to the durable store. The reorg
+    /// re-applies a candidate branch this way so that an aborted reorg leaves the
+    /// store untouched (nothing to roll back), and the driver reconciles the store
+    /// once, via [`Self::reconcile_store_from`], only after the reorg fully
+    /// succeeds. Revert-on-failure semantics are identical to `apply_block`.
+    pub async fn apply_block_no_persist(
+        &self,
+        block: &Block,
+        coinbase: [u8; 20],
+        reward_credits: &[(Address, U256)],
+    ) -> Result<Hash, ExecutionError> {
+        self.apply_block_inner(block, coinbase, reward_credits, false)
+            .await
+    }
+
+    async fn apply_block_inner(
+        &self,
+        block: &Block,
+        coinbase: [u8; 20],
+        reward_credits: &[(Address, U256)],
+        persist: bool,
     ) -> Result<Hash, ExecutionError> {
         let snapshot = self.state_db.snapshot();
         let prev_ctx = self.get_block_context();
@@ -910,6 +1023,10 @@ impl Executor {
                 expected: block.state_root,
                 got,
             });
+        }
+
+        if !persist {
+            return Ok(got);
         }
 
         if let Err(e) = self.persist_state_changes().await {
