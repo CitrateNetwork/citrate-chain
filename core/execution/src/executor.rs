@@ -126,6 +126,17 @@ pub struct Executor {
     /// fresh boot). Shared by cloning the handle to `registry_sync`, so producer
     /// and receiver (which share this one `Executor`) read byte-identical policy.
     reward_policy: crate::block_rewards::SharedRewardPolicy,
+    /// VALIDATOR-S1 §R': the fleet-wide activation height, held INDEPENDENTLY of
+    /// `reward_policy` so `settle_block_rewards` can distinguish "pre-activation,
+    /// a `None` policy is normal" from "at/above activation, a `None` policy is a
+    /// FAULT" — and hard-reject the latter instead of silently skipping vesting
+    /// (which would fork a node whose policy failed to rehydrate against the fleet).
+    /// `u64::MAX` (the default) means VALIDATOR-S1 is not configured on this node,
+    /// so a `None` policy always means "skip" — preserving pre-reroll / non-validator
+    /// behavior. Set once at startup via `set_validator_activation_height` when the
+    /// registry is configured; it always equals `reward_policy`'s embedded
+    /// `activation_height` once a snapshot is materialized.
+    validator_activation_height: std::sync::atomic::AtomicU64,
 }
 
 /// RAII guard for `Executor::defer_persist`: sets it on `engage` and restores the
@@ -425,6 +436,7 @@ impl Executor {
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             defer_persist: std::sync::atomic::AtomicBool::new(false),
             reward_policy: crate::block_rewards::new_shared_reward_policy(),
+            validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -576,6 +588,7 @@ impl Executor {
             commit_coordinator,
             defer_persist: std::sync::atomic::AtomicBool::new(false),
             reward_policy: crate::block_rewards::new_shared_reward_policy(),
+            validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -1157,6 +1170,76 @@ impl Executor {
         self.reward_policy.clone()
     }
 
+    /// VALIDATOR-S1 §R': set the fleet-wide activation height (see the field docs).
+    /// Called once at startup when `CITRATE_VALIDATOR_REGISTRY` is configured, so
+    /// `settle_block_rewards` can HARD-REJECT a `None` policy at/above activation
+    /// rather than silently skip vesting (which would fork). Idempotent; safe to
+    /// call before any snapshot is materialized.
+    pub fn set_validator_activation_height(&self, height: u64) {
+        self.validator_activation_height
+            .store(height, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// VALIDATOR-S1 §R': capture the current epoch reward-policy cell (a cheap
+    /// clone of the `Option<EpochRewardPolicy>`). Used by the reorg driver to snapshot
+    /// the policy alongside world state so a failed reapply can restore BOTH — the
+    /// policy is NOT part of `state_snapshot`, so it must be captured explicitly.
+    pub fn capture_reward_policy(&self) -> Option<crate::block_rewards::EpochRewardPolicy> {
+        self.reward_policy.read().clone()
+    }
+
+    /// VALIDATOR-S1 §R': restore a previously [`Self::capture_reward_policy`]d cell.
+    /// The reorg driver calls this on every abort arm so a failed reorg never leaves
+    /// the shared policy mutated (mirrors `state_restore` for world state).
+    pub fn restore_reward_policy(
+        &self,
+        policy: Option<crate::block_rewards::EpochRewardPolicy>,
+    ) {
+        *self.reward_policy.write() = policy;
+    }
+
+    /// VALIDATOR-S1 §R' (producer path): run [`Self::settle_block_rewards`] with the
+    /// SAME revert-on-error safety the receiver's `apply_block_inner` provides — the
+    /// producer calls settle WITHOUT the surrounding snapshot/restore that `apply_block`
+    /// wraps its receiver-side settle in, so a settle error (e.g. the absent-proposer
+    /// reject arm, which fires AFTER the basic credits at step 1 are applied) would
+    /// otherwise leak stray credits into shared state (and, since the producer runs with
+    /// eager persistence, into the durable store). This engages the persistence-defer
+    /// guard for the whole settle and snapshots world state first, so on ANY error both
+    /// in-memory state and the store are left byte-identical (nothing persisted). On
+    /// success the credits stay dirty in state_db and are persisted by the producer's
+    /// subsequent `persist_state_changes`, exactly as before.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn settle_block_rewards_guarded(
+        &self,
+        height: u64,
+        coinbase: [u8; 20],
+        proposer_pubkey: [u8; 32],
+        base_fee_per_gas: u64,
+        txs: &[Transaction],
+        receipts: &[TransactionReceipt],
+        basic_credits: &[(Address, U256)],
+    ) -> Result<(), ExecutionError> {
+        let _defer_guard = DeferGuard::engage(&self.defer_persist);
+        let snapshot = self.state_db.snapshot();
+        if let Err(e) = self
+            .settle_block_rewards(
+                height,
+                coinbase,
+                proposer_pubkey,
+                base_fee_per_gas,
+                txs,
+                receipts,
+                basic_credits,
+            )
+            .await
+        {
+            self.state_db.restore(snapshot);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// VALIDATOR-S1 §R' — the ONE shared reward-settlement function (producer + receiver).
     ///
     /// Called AFTER all of a block's transactions are applied and BEFORE the state
@@ -1203,9 +1286,31 @@ impl Executor {
 
         // (2) gate on a materialized snapshot + activation height. Before either,
         // priority fees burn exactly as before (no behavior change pre-reroll).
+        //
+        // HARD-REJECT (fork remediation): a `None` policy AT/ABOVE the activation
+        // height is a FAULT, not a skip — it means the epoch snapshot failed to
+        // materialize / rehydrate on THIS node while the fleet has it. Silently
+        // returning Ok here would let this node compute a §R'-less state root that
+        // diverges from every node that DID materialize the policy — a silent fork.
+        // Turning it into an immediate `RewardSettlement` error makes the fault a
+        // testable, node-local block rejection instead. Below activation (or when
+        // VALIDATOR-S1 is unconfigured — `validator_activation_height == u64::MAX`),
+        // a `None` policy still means "skip", exactly as before.
         let policy = match self.reward_policy.read().clone() {
             Some(p) => p,
-            None => return Ok(()),
+            None => {
+                let activation = self
+                    .validator_activation_height
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if height >= activation {
+                    return Err(ExecutionError::RewardSettlement(format!(
+                        "VALIDATOR-S1 reward policy unmaterialized at height {height} \
+                         (>= activation {activation}); refusing to settle a divergent \
+                         (policy-less) block — epoch snapshot must be rehydrated"
+                    )));
+                }
+                return Ok(());
+            }
         };
         if height < policy.activation_height {
             return Ok(());

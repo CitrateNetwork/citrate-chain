@@ -226,7 +226,11 @@ pub fn compute_priority_pool(
 /// stays out of supply exactly as the whole pool did before §R'.
 pub fn vested_share(pool: U256, share_bps: u64) -> U256 {
     let bps = share_bps.min(10_000);
-    pool * U256::from(bps) / U256::from(10_000u64)
+    // `saturating_mul` for consistency with `compute_priority_pool`'s
+    // `saturating_add`: a u256 pool * a <=10000 bps cannot realistically
+    // overflow, but we never panic on the arithmetic (a panic mid-settle would
+    // be a fleet-wide liveness fault). Saturation is deterministic on every node.
+    pool.saturating_mul(U256::from(bps)) / U256::from(10_000u64)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
