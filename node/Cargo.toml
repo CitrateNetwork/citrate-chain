@@ -7,9 +7,21 @@ license.workspace = true
 name = "citrate"
 path = "src/main.rs"
 
+# WS-5: VALIDATOR-S1 registration ceremony. Derives each fleet node's ed25519
+# proposer key from its coinbase (byte-for-byte with src/main.rs), builds the
+# on-chain Register digest, ed25519-signs it, and submits registerValidator via
+# RPC from a funded staker EOA. Reroll ops tool — not part of the node runtime.
+[[bin]]
+name = "validator-registration-ceremony"
+path = "src/bin/validator_registration_ceremony.rs"
+
 [dependencies]
 # Local dependencies
 citrate-consensus = { path = "../core/consensus" }
+# WS-5 ceremony: lean EIP-155 secp256k1 tx signer (crypto feature only — no RPC,
+# no consensus/execution pulled through this crate; the staker signs its own
+# registerValidator tx for eth_sendRawTransaction).
+citrate-wallet-core = { path = "../wallet-core", default-features = false, features = ["crypto"] }
 citrate-storage = { path = "../core/storage" }
 citrate-execution = { path = "../core/execution" }
 citrate-network = { path = "../core/network" }
@@ -49,6 +61,8 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart", "json"] }
 rand = { workspace = true }
 k256 = { version = "0.13", features = ["ecdsa"] }
+# WS-5 ceremony: ed25519 proposer-key derivation + signing the Register digest.
+ed25519-dalek = { workspace = true }
 # Prometheus-style metrics
 metrics = "0.21"
 metrics-exporter-prometheus = "0.12"
