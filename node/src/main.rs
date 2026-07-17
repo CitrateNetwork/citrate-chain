@@ -1374,9 +1374,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // VALIDATOR-S1 (step 5): attach the registry snapshot-sync so a node
             // that RECEIVES or REORGS to a snapshot block S(E) rebuilds its
             // proposer selector from the registry — not only the producer.
-            if let (Some((registry, _)), Some(sel)) = (&validator_registry, &validator_selector) {
+            if let (Some((registry, activation)), Some(sel)) = (&validator_registry, &validator_selector) {
                 app_builder = app_builder.with_registry_sync(Arc::new(
-                    registry_sync::RegistrySync::new(executor.clone(), sel.clone(), *registry),
+                    registry_sync::RegistrySync::new(executor.clone(), sel.clone(), *registry, *activation),
                 ));
                 info!("VALIDATOR-S1: registry snapshot-sync attached to execute-on-receive driver (received/reorged S(E) blocks)");
             }
@@ -2285,6 +2285,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     executor.clone(),
                     sel.clone(),
                     *registry,
+                    *activation_height,
                 )));
             info!(
                 "VALIDATOR-S1: stake-gated membership ENABLED (registry 0x{}, activation height {})",
