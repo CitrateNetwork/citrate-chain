@@ -2262,16 +2262,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // WP-G.2: Generate block signing key.
         // Deterministic derivation from coinbase for devnet reproducibility.
         // Production nodes should load a persistent key from disk.
-        let signing_key = {
-            use sha3::{Digest as _, Sha3_256};
-            let mut hasher = Sha3_256::new();
-            hasher.update(b"citrate-block-signing-key-v1");
-            hasher.update(coinbase);
-            let seed = hasher.finalize();
-            let mut seed_bytes = [0u8; 32];
-            seed_bytes.copy_from_slice(&seed);
-            citrate_consensus::crypto::Ed25519SigningKey::from_bytes(&seed_bytes)
-        };
+        //
+        // LOAD-BEARING: this MUST be the SAME derivation the registration
+        // ceremony (node/src/bin/validator_registration_ceremony.rs) uses, or the
+        // pubkey registered on-chain won't match the key that signs blocks here.
+        // Both call the single shared `derive_block_signing_key`; see its
+        // BLOCK_SIGNING_KEY_DOMAIN doc-comment.
+        let signing_key = citrate_consensus::crypto::derive_block_signing_key(&coinbase);
         info!(
             "Block signing key: proposer_pubkey={}",
             hex::encode(signing_key.verifying_key().to_bytes())
