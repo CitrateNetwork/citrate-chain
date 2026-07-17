@@ -540,7 +540,9 @@ impl CanonicalApplicator {
             ));
         }
 
-        // Revert to the fork point.
+        // Revert IN-MEMORY state to the fork point. `base_snapshot` is RETAINED
+        // (cloned into `state_restore`) because it is also the reconcile baseline for
+        // both the success (forward) and abort (restore) store writes below.
         let base_snapshot = match state.snapshots.get(&fork.height) {
             Some((_, snap)) => snap.clone(),
             None => {
@@ -550,13 +552,56 @@ impl CanonicalApplicator {
                 ));
             }
         };
-        self.executor.state_restore(base_snapshot);
+        self.executor.state_restore(base_snapshot.clone());
+
+        // REORG-STORE-FIX (consensus fork remediation). The durable store is a FLAT
+        // latest-state KV: an account/slot ABSENT from the in-memory fork-point working
+        // set falls THROUGH to the store on read (`Executor::get_balance`/`get_nonce`/
+        // `get_code_hash` and the REVM adapter `basic`/`storage`). Immediately after the
+        // in-memory revert above, the store STILL holds the LOSING branch (`pre_state`),
+        // so a reapply read of any account the fork point never resident-cached but the
+        // losing branch persisted would return the losing value — settling the winning
+        // block against stale state → state-root mismatch → the reorg ABORTS and the
+        // node REJECTS a valid heavier branch its peers accepted (a partition/fork). This
+        // is generic (it also bites NORMAL-TX reorgs), and §R' registry credits trigger
+        // it reliably (the registry is credited on both branches but untouched at the
+        // fork point).
+        //
+        // Fix: revert the durable store to the FORK POINT *before* reapply, so every
+        // read-through resolves against fork-point state — uniformly for balance / nonce
+        // / code / storage. `reconcile_store_from(baseline)` writes the diff from
+        // `baseline` to CURRENT in-memory state; with memory just restored to the fork
+        // point and the store == `pre_state`, `reconcile_store_from(&pre_state)` rewrites
+        // the store from the losing branch back to the fork point (put changed accounts
+        // /slots at their fork-point value, delete losing-branch-created ones). On
+        // SUCCESS the store is reconciled forward to the winning branch (baseline = the
+        // fork point); on EVERY abort it is reconciled back to `pre_state` — so an
+        // aborted reorg still leaves the store byte-identical to before the attempt
+        // (HIGH-2 / invariant I2). Only committed branch states (fork point / pre_state /
+        // winning) are ever written — never an un-rollback-able candidate.
+        if let Err(e) = self.executor.reconcile_store_from(&pre_state) {
+            // The account+storage write is a single atomic batch (unchanged on failure).
+            // Restore in-memory state + the §R' policy cell and best-effort re-reconcile
+            // the store back to pre_state, then decline the reorg — world state is left
+            // as before the attempt (invariant I3).
+            self.executor.state_restore(pre_state.clone());
+            self.executor.restore_reward_policy(pre_policy.clone());
+            let _ = self.executor.reconcile_store_from(&base_snapshot);
+            warn!(
+                "execute-on-receive: reorg to {} aborted — could not revert store to fork point {} @ {}: {} (reverted to {})",
+                new_tip, fork.hash, fork.height, e, pre_tip.hash
+            );
+            return ReorgOutcome::Rejected(format!(
+                "reorg store-revert to fork point failed at height {}: {e}",
+                fork.height
+            ));
+        }
 
         // Re-apply the winning branch forward IN-MEMORY ONLY (`apply_block_no_persist`).
-        // HIGH-2: the durable store has no rollback, so we must NOT write the candidate
-        // branch to it per block — otherwise an abort would leave abandoned writes on
-        // disk. Nothing is persisted here; `reconcile_store_from` writes the store once,
-        // after the whole reorg succeeds. Snapshots commit to the ring on success only.
+        // Per-block writes are still NOT persisted (an abort must leave nothing of the
+        // candidate branch on disk); the store — currently AT THE FORK POINT — is
+        // reconciled ONCE, to the winning branch, only after the whole reorg succeeds.
+        // Snapshots commit to the ring on success only.
         branch.reverse(); // fork_point+1 .. new_tip
         let mut new_snaps: Vec<(u64, Hash, StateSnapshot)> = Vec::new();
         let mut tip = fork;
@@ -583,6 +628,16 @@ impl CanonicalApplicator {
                             if let Err(e) = hook(h).await {
                                 self.executor.state_restore(pre_state.clone());
                                 self.executor.restore_reward_policy(pre_policy.clone());
+                                // The store was reverted to the fork point before reapply;
+                                // reconcile it back to pre_state so the abort leaves the
+                                // durable store byte-identical to before the reorg (I2).
+                                // memory == pre_state, store == fork point (== base_snapshot).
+                                if let Err(re) = self.executor.reconcile_store_from(&base_snapshot) {
+                                    warn!(
+                                        "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
+                                        new_tip
+                                    );
+                                }
                                 warn!(
                                     "execute-on-receive: reorg to {} aborted — reward-policy resync at S({}) failed: {} (reverted to {})",
                                     new_tip, h, e, pre_tip.hash
@@ -596,13 +651,21 @@ impl CanonicalApplicator {
                 }
                 Err(e) => {
                     // Abort: byte-exact in-memory restore (incl. dirty-code, captured
-                    // in the snapshot) — the re-apply did NOT persist, so the durable
-                    // store is untouched (still the old branch, == pre_state) and the
-                    // ring/tip/pointer never moved (review finding E). Also restore the
-                    // §R' policy cell (mutated in-loop above) so a failed reorg leaves it
-                    // byte-identical to before the attempt.
+                    // in the snapshot); the re-apply did NOT persist per-block, so the
+                    // ring/tip/pointer never moved (review finding E). Restore the §R'
+                    // policy cell (mutated in-loop above), then reconcile the durable
+                    // store — reverted to the fork point before reapply — back to
+                    // pre_state, so a failed reorg leaves BOTH in-memory state AND the
+                    // store byte-identical to before the attempt (invariants I2/I3).
                     self.executor.state_restore(pre_state);
                     self.executor.restore_reward_policy(pre_policy.clone());
+                    // memory == pre_state, store == fork point (== base_snapshot).
+                    if let Err(re) = self.executor.reconcile_store_from(&base_snapshot) {
+                        warn!(
+                            "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
+                            new_tip
+                        );
+                    }
                     warn!(
                         "execute-on-receive: reorg to {} aborted at {} — {} (reverted to {})",
                         new_tip, block.header.block_hash, e, pre_tip.hash
@@ -615,11 +678,12 @@ impl CanonicalApplicator {
             }
         }
 
-        // Success. Reconcile the durable store from the pre-reorg baseline (which
-        // the store still reflects) to the now-current new-branch state — writing
-        // the account+storage diff and deleting abandoned-created accounts — so
-        // RocksDB matches memory and a restart-after-reorg hydrates correctly.
-        if let Err(e) = self.executor.reconcile_store_from(&pre_state) {
+        // Success. The store currently reflects the FORK POINT (reverted before
+        // reapply); reconcile it FORWARD to the now-current winning-branch state —
+        // writing the account+storage diff and deleting abandoned-created accounts — so
+        // RocksDB matches memory and a restart-after-reorg hydrates correctly. Baseline
+        // is `base_snapshot` (the fork point == what the store now holds), NOT pre_state.
+        if let Err(e) = self.executor.reconcile_store_from(&base_snapshot) {
             warn!(
                 "execute-on-receive: reorg to {} applied in-memory but store reconcile failed: {}",
                 new_tip, e
@@ -1993,5 +2057,432 @@ mod tests {
             Some(2500),
             "aborted reorg must restore the pre-reorg reward policy (not leave it at 5000)"
         );
+    }
+
+    // ========================================================================
+    // REORG-STORE-FIX acceptance — the reorg durable-store read-through fork.
+    //
+    // These are the residual repro tests from `build/campaign-lifecycle-fuzz`,
+    // brought in and FLIPPED from their CONFIRMED-BUG assertions to the correct,
+    // peer-consistent expectation: the heavier winning branch is now ACCEPTED and
+    // the victim CONVERGES (identical tip + root + registry balance) with the golden
+    // node. Root cause + fix: see `reorg_to` REORG-STORE-FIX comment (revert the
+    // durable store to the fork point before reapply, so read-throughs during reapply
+    // resolve against fork-point state, not the losing branch the store still held).
+    // ========================================================================
+
+    /// Fork point s799 on a store-backed follower (registry untouched at 0). Returns
+    /// (app, follower, storage, s799_hash, dir). Constant-2500 §R' policy hooks.
+    async fn seed_s799(
+    ) -> (CanonicalApplicator, Arc<Executor>, Arc<StorageManager>, Hash, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.persist_state_changes().await.expect("persist genesis");
+        let a798 = seal_rprime(798, Hash::default(), Hash::default(), VRF_OUT, vec![]);
+        persist(&storage, &a798);
+        storage.blocks.put_applied_tip(&a798.header.block_hash, 798).expect("seed tip");
+        follower.set_validator_activation_height(800);
+        *follower.reward_policy_handle().write() = Some(rprime_policy(2500));
+
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        // Constant-2500 hooks (isolate the registry read-through from any policy flip).
+        let f1 = follower.clone();
+        app.registry_sync = Some(Arc::new(move |_h| {
+            *f1.reward_policy_handle().write() = Some(rprime_policy(2500));
+            Box::pin(async { Ok(1usize) })
+        }));
+        let f2 = follower.clone();
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            *f2.reward_policy_handle().write() = Some(rprime_policy(2500));
+            Box::pin(async { Ok(()) })
+        }));
+
+        // Produce + apply the shared s799 (empty).
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        pa.set_validator_activation_height(800);
+        *pa.reward_policy_handle().write() = Some(rprime_policy(2500));
+        let s799 = produce_rprime(&pa, a798.header.block_hash, 799, VRF_OUT, vec![]).await;
+        persist(&storage, &s799);
+        assert!(matches!(app.apply_received(&s799).await, ApplyOutcome::Applied { .. }), "s799");
+        assert_eq!(follower.get_balance(&Address(REG)), U256::zero(), "registry untouched at fork point");
+        (app, follower, storage, s799.header.block_hash, dir)
+    }
+
+    /// Branch A off s799: two VESTING blocks (prio ALICE→BOB) at 800, 801. Fresh
+    /// memory-only producer → honest fork-point-relative roots. Returns (a800, a801).
+    async fn produce_branch_a(s799: Hash) -> (Block, Block) {
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        pa.set_validator_activation_height(800);
+        *pa.reward_policy_handle().write() = Some(rprime_policy(2500));
+        let _s = produce_rprime(&pa, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let a800 = produce_rprime(&pa, s799, 800, VRF_OUT, vec![prio_tx(ALICE, BOB, 0, 0xA0)]).await;
+        let a801 = produce_rprime(&pa, a800.header.block_hash, 801, VRF_OUT, vec![prio_tx(ALICE, BOB, 1, 0xA1)]).await;
+        (a800, a801)
+    }
+
+    /// Branch B off s799: three VESTING blocks (prio ALICE→CAROL) at 800/801/802,
+    /// distinct VRF so they fork from branch A. Fresh memory-only producer → honest
+    /// fork-point-relative roots (registry starts at 0 for B).
+    async fn produce_branch_b_vesting(s799: Hash) -> (Block, Block, Block) {
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_validator_activation_height(800);
+        *pb.reward_policy_handle().write() = Some(rprime_policy(2500));
+        let _s = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5B; 32];
+        let b800 = produce_rprime(&pb, s799, 800, vrf_b, vec![prio_tx(ALICE, CAROL, 0, 0xB0)]).await;
+        let b801 = produce_rprime(&pb, b800.header.block_hash, 801, vrf_b, vec![prio_tx(ALICE, CAROL, 1, 0xB1)]).await;
+        let b802 = produce_rprime(&pb, b801.header.block_hash, 802, vrf_b, vec![prio_tx(ALICE, CAROL, 2, 0xB2)]).await;
+        (b800, b801, b802)
+    }
+
+    /// ⭐ THE FLAGGED RESIDUAL — now REMEDIATED. A store-backed victim that briefly
+    /// followed + PERSISTED a losing §R'-vesting branch A must, on reorg, CONVERGE to
+    /// the heavier winning branch B (identical tip + root + registry balance) with a
+    /// golden node that only ever followed B. Pre-fix, the reorg reapply read the
+    /// registry THROUGH to the durable store (still holding branch A's vest) and
+    /// settled the winning block against stale state → root mismatch → abort → fork.
+    #[tokio::test]
+    async fn residual3_stale_registry_read_through_forks_reorg_now_converges() {
+        // --- GOLDEN: only ever follows branch B. ---
+        let (golden_app, golden, gstore, s799_g, _gdir) = seed_s799().await;
+        let s799_ref = s799_g;
+        let (b800, b801, b802) = produce_branch_b_vesting(s799_ref).await;
+        persist(&gstore, &b800);
+        assert!(matches!(golden_app.apply_received(&b800).await, ApplyOutcome::Applied { .. }), "golden b800");
+        persist(&gstore, &b801);
+        assert!(matches!(golden_app.apply_received(&b801).await, ApplyOutcome::Applied { .. }), "golden b801");
+        persist(&gstore, &b802);
+        assert!(matches!(golden_app.apply_received(&b802).await, ApplyOutcome::Applied { .. }), "golden b802");
+        let golden_tip = golden_app.applied_tip().await;
+        let golden_root = golden.calculate_state_root();
+        let golden_reg = golden.get_balance(&Address(REG));
+        assert_eq!(golden_tip.height, 802, "golden converged to branch B tip");
+        assert!(golden_reg > U256::zero(), "golden vested a positive §R' share on branch B");
+
+        // --- VICTIM: follows+persists branch A (which VESTS), then reorgs to B. ---
+        let (mut victim_app, victim, vstore, s799_v, _vdir) = seed_s799().await;
+        assert_eq!(s799_v, s799_ref, "both nodes share the deterministic fork point");
+        let (a800, a801) = produce_branch_a(s799_ref).await;
+        persist(&vstore, &a800);
+        assert!(matches!(victim_app.apply_received(&a800).await, ApplyOutcome::Applied { .. }), "victim a800");
+        persist(&vstore, &a801);
+        assert!(matches!(victim_app.apply_received(&a801).await, ApplyOutcome::Applied { .. }), "victim a801");
+        let stale_reg = victim.get_balance(&Address(REG));
+        assert!(stale_reg > U256::zero(), "branch A vested a NONZERO registry balance (now persisted)");
+
+        // Deliver the heavier branch B; fork choice selects b802.
+        for b in [&b800, &b801, &b802] {
+            persist(&vstore, b);
+        }
+        victim_app.fork_choice = Some(fork_choice_returning(b802.header.block_hash));
+        let outcome = victim_app.apply_received(&b802).await;
+
+        // ---- PEER-CONSISTENT assertions (the winning branch is ACCEPTED) ----
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "victim ACCEPTS the valid winning branch (reorg no longer aborts on a stale-registry read); got {outcome:?}"
+        );
+        assert_eq!(victim_app.applied_tip().await, golden_tip, "victim tip converges to the golden winning-branch tip");
+        assert_eq!(victim.calculate_state_root(), golden_root, "victim state root converges to the golden node's");
+        assert_eq!(
+            victim.get_balance(&Address(REG)),
+            golden_reg,
+            "victim registry reflects branch B's vest (fork-point 0 + B share), NOT branch A's stale persisted vest"
+        );
+        assert_ne!(victim.get_balance(&Address(REG)), stale_reg, "registry is no longer frozen at branch-A's stale value");
+
+        // Cold restart reads the winning branch from the durable store (invariant I3).
+        let restarted = store_backed(&vstore);
+        assert_eq!(restarted.get_balance(&Address(REG)), golden_reg, "durable store holds branch B's registry vest after reorg");
+    }
+
+    /// ROOT-CAUSE ISOLATION control (unchanged expectation): a MEMORY-ONLY victim has
+    /// no durable store to read through, so it ALWAYS converged — and still must. This
+    /// pins that the fix did not regress the memory-only path.
+    #[tokio::test]
+    async fn residual3_memory_only_node_converges_no_store_read_through() {
+        let follower = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.set_validator_activation_height(800);
+        *follower.reward_policy_handle().write() = Some(rprime_policy(2500));
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let a798 = seal_rprime(798, Hash::default(), Hash::default(), VRF_OUT, vec![]);
+        persist(&storage, &a798);
+        storage.blocks.put_applied_tip(&a798.header.block_hash, 798).expect("seed tip");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let f1 = follower.clone();
+        app.registry_sync = Some(Arc::new(move |_h| {
+            *f1.reward_policy_handle().write() = Some(rprime_policy(2500));
+            Box::pin(async { Ok(1usize) })
+        }));
+        let f2 = follower.clone();
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            *f2.reward_policy_handle().write() = Some(rprime_policy(2500));
+            Box::pin(async { Ok(()) })
+        }));
+
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        pa.set_validator_activation_height(800);
+        *pa.reward_policy_handle().write() = Some(rprime_policy(2500));
+        let s799 = produce_rprime(&pa, a798.header.block_hash, 799, VRF_OUT, vec![]).await;
+        persist(&storage, &s799);
+        assert!(matches!(app.apply_received(&s799).await, ApplyOutcome::Applied { .. }));
+        let s799 = s799.header.block_hash;
+
+        let (a800, a801) = produce_branch_a(s799).await;
+        persist(&storage, &a800);
+        assert!(matches!(app.apply_received(&a800).await, ApplyOutcome::Applied { .. }));
+        persist(&storage, &a801);
+        assert!(matches!(app.apply_received(&a801).await, ApplyOutcome::Applied { .. }));
+
+        let (b800, b801, b802) = produce_branch_b_vesting(s799).await;
+        for b in [&b800, &b801, &b802] {
+            persist(&storage, b);
+        }
+        app.fork_choice = Some(fork_choice_returning(b802.header.block_hash));
+        let outcome = app.apply_received(&b802).await;
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip { hash: b802.header.block_hash, height: 802 },
+            "memory-only victim CONVERGES to branch B — outcome {outcome:?}"
+        );
+        assert_eq!(
+            follower.calculate_state_root(),
+            b802.state_root,
+            "memory-only victim reproduces branch B's winning root"
+        );
+    }
+
+    /// RESIDUAL breadth — now REMEDIATED: the SAME stale-registry fork occurred on a
+    /// reorg crossing NO S(E) boundary (constant policy, one epoch window), proving the
+    /// divergence was the generic durable-store read-through, not a §R' boundary
+    /// artifact. Post-fix the victim CONVERGES to the winning branch across no boundary.
+    #[tokio::test]
+    async fn residual3_same_epoch_no_boundary_reorg_now_converges() {
+        async fn seed_809(
+        ) -> (CanonicalApplicator, Arc<Executor>, Arc<StorageManager>, Hash, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("dir");
+            let storage =
+                Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+            let follower = store_backed(&storage);
+            follower.set_balance(&Address(ALICE), U256::from(FUND));
+            follower.persist_state_changes().await.expect("persist genesis");
+            let a808 = seal_rprime(808, Hash::default(), Hash::default(), VRF_OUT, vec![]);
+            persist(&storage, &a808);
+            storage.blocks.put_applied_tip(&a808.header.block_hash, 808).expect("seed tip");
+            follower.set_validator_activation_height(800);
+            *follower.reward_policy_handle().write() = Some(rprime_policy(2500));
+            let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+            let f1 = follower.clone();
+            app.registry_sync = Some(Arc::new(move |_h| {
+                *f1.reward_policy_handle().write() = Some(rprime_policy(2500));
+                Box::pin(async { Ok(1usize) })
+            }));
+            let f2 = follower.clone();
+            app.registry_policy_resync = Some(Arc::new(move |_h| {
+                *f2.reward_policy_handle().write() = Some(rprime_policy(2500));
+                Box::pin(async { Ok(()) })
+            }));
+            let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+            pa.set_balance(&Address(ALICE), U256::from(FUND));
+            pa.set_validator_activation_height(800);
+            *pa.reward_policy_handle().write() = Some(rprime_policy(2500));
+            let s809 = produce_rprime(&pa, a808.header.block_hash, 809, VRF_OUT, vec![]).await;
+            persist(&storage, &s809);
+            assert!(matches!(app.apply_received(&s809).await, ApplyOutcome::Applied { .. }));
+            assert!(crate::registry_sync::snapshot_epoch_at(810).is_none(), "810 is NOT a boundary");
+            (app, follower, storage, s809.header.block_hash, dir)
+        }
+
+        // GOLDEN: only follows branch B (four vesting blocks 810..813).
+        let (golden_app, golden, gstore, s809, _gd) = seed_809().await;
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_validator_activation_height(800);
+        *pb.reward_policy_handle().write() = Some(rprime_policy(2500));
+        let _s = produce_rprime(&pb, Hash::default(), 809, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5B; 32];
+        let mut parent = s809;
+        let mut b_blocks = Vec::new();
+        for i in 0..4u64 {
+            let blk = produce_rprime(&pb, parent, 810 + i, vrf_b, vec![prio_tx(ALICE, CAROL, i, 0xB0 + i as u8)]).await;
+            parent = blk.header.block_hash;
+            b_blocks.push(blk);
+        }
+        for b in &b_blocks {
+            persist(&gstore, b);
+            assert!(matches!(golden_app.apply_received(b).await, ApplyOutcome::Applied { .. }));
+        }
+        let golden_tip = golden_app.applied_tip().await;
+        let golden_root = golden.calculate_state_root();
+        let golden_reg = golden.get_balance(&Address(REG));
+        assert_eq!(golden_tip.height, 813, "golden converged to branch B");
+
+        // VICTIM: follows+persists losing branch A (vests at 810/811), then reorg to B.
+        let (mut victim_app, victim, vstore, s809v, _vd) = seed_809().await;
+        assert_eq!(s809v, s809);
+        let pa2 = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa2.set_balance(&Address(ALICE), U256::from(FUND));
+        pa2.set_validator_activation_height(800);
+        *pa2.reward_policy_handle().write() = Some(rprime_policy(2500));
+        let _s2 = produce_rprime(&pa2, Hash::default(), 809, VRF_OUT, vec![]).await;
+        let a810 = produce_rprime(&pa2, s809, 810, VRF_OUT, vec![prio_tx(ALICE, BOB, 0, 0xA0)]).await;
+        let a811 = produce_rprime(&pa2, a810.header.block_hash, 811, VRF_OUT, vec![prio_tx(ALICE, BOB, 1, 0xA1)]).await;
+        persist(&vstore, &a810);
+        assert!(matches!(victim_app.apply_received(&a810).await, ApplyOutcome::Applied { .. }));
+        persist(&vstore, &a811);
+        assert!(matches!(victim_app.apply_received(&a811).await, ApplyOutcome::Applied { .. }));
+        assert!(victim.get_balance(&Address(REG)) > U256::zero(), "losing branch persisted a §R' vest");
+        for b in &b_blocks {
+            persist(&vstore, b);
+        }
+        let tip_b = b_blocks.last().expect("nonempty");
+        victim_app.fork_choice = Some(fork_choice_returning(tip_b.header.block_hash));
+        let outcome = victim_app.apply_received(tip_b).await;
+
+        // PEER-CONSISTENT: the victim converges even with NO boundary crossed.
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "no-boundary victim ACCEPTS the valid winning branch: {outcome:?}"
+        );
+        assert_eq!(victim_app.applied_tip().await, golden_tip, "no-boundary victim tip converges to golden");
+        assert_eq!(victim.calculate_state_root(), golden_root, "no-boundary victim root converges to golden");
+        assert_eq!(victim.get_balance(&Address(REG)), golden_reg, "no-boundary victim registry converges to golden");
+    }
+
+    /// A reward-only v2 block with an explicit coinbase (the account the basic
+    /// block reward credits). Reward-only, so `vrf` only distinguishes hashes.
+    fn mk_block_cb(height: u64, parent: Hash, state_root: Hash, vrf: [u8; 32], coinbase: [u8; 20]) -> Block {
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(parent)
+            .coinbase(coinbase)
+            .timestamp(1000)
+            .vrf_reveal(VrfProof { proof: vec![], output: Hash::new(vrf) })
+            .transactions(vec![])
+            .state_root(state_root)
+            .build_unhashed();
+        b.header.block_hash = b.compute_hash();
+        b
+    }
+
+    /// Produce a reward-only block crediting `coinbase` (+ treasury), advancing
+    /// `exec` to the post-block state and sealing the honest root. Mirrors the
+    /// producer's basic-reward path (node/src/producer.rs) for a custom coinbase.
+    async fn produce_cb(exec: &Executor, parent: Hash, height: u64, vrf: [u8; 32], coinbase: [u8; 20]) -> Block {
+        exec.set_block_context(BlockContext {
+            coinbase,
+            prevrandao: vrf,
+            block_hashes: std::collections::HashMap::new(),
+        });
+        let provisional = mk_block_cb(height, parent, Hash::default(), vrf, coinbase);
+        let reward = RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        for (addr, amt) in [
+            (Address(coinbase), reward.validator_reward),
+            (Address(TREASURY_ADDR), reward.treasury_reward),
+        ] {
+            if amt > U256::zero() {
+                let bal = exec.get_balance(&addr);
+                exec.set_balance(&addr, bal + amt);
+            }
+        }
+        let root = exec.calculate_state_root();
+        mk_block_cb(height, parent, root, vrf, coinbase)
+    }
+
+    /// GENERIC (NON-§R') variant — proves the fix is NOT registry-specific. A plain
+    /// reward-settlement reorg with NO §R', NO epoch boundary, NO reward policy: both
+    /// branches are produced by a NEW validator whose coinbase `CBN` the fork point
+    /// never credited. The basic block reward credits `CBN` via `Executor::get_balance`
+    /// — the SAME durable-store read-through primitive. The LOSING branch persists a
+    /// `CBN` balance the WINNING branch also credits; the fork point never touched
+    /// `CBN`. Pre-fix, reapplying the winning branch read `CBN` THROUGH to the store
+    /// (still the losing branch's vest) and settled `stale + reward` instead of
+    /// `0 + reward` → root mismatch → abort → the victim rejected a valid heavier
+    /// branch (a fork). Post-fix the victim CONVERGES.
+    ///
+    /// (Native EOA value transfers read the recipient via `state_db.accounts` — memory
+    /// only, no store read-through — so they do NOT trip this bug; the read-through
+    /// vectors are `Executor::get_balance/get_nonce/get_code_hash` and the REVM adapter,
+    /// exercised here by the reward-credit path.)
+    #[tokio::test]
+    async fn normal_reward_reorg_new_validator_coinbase_no_longer_forks() {
+        const CBN: [u8; 20] = [0x44; 20]; // a new validator's coinbase, unseen at the fork point
+        let vrf_b = [0x5B; 32];
+
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+
+        // Shared a1 (coinbase CB): the fork point at height 1 — credits CB + TREASURY,
+        // NEVER CBN. Losing branch A off a1 is a2 (coinbase CBN) → persists a CBN vest.
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        let a1 = produce_cb(&pa, Hash::default(), 1, VRF_OUT, CB).await;
+        let a2 = produce_cb(&pa, a1.header.block_hash, 2, VRF_OUT, CBN).await;
+        persist(&storage, &a1);
+        assert!(matches!(app.apply_received(&a1).await, ApplyOutcome::Applied { .. }), "a1");
+        persist(&storage, &a2);
+        assert!(matches!(app.apply_received(&a2).await, ApplyOutcome::Applied { .. }), "a2");
+        let stale_cbn = follower.get_balance(&Address(CBN));
+        assert!(stale_cbn > U256::zero(), "branch A persisted a NONZERO CBN reward");
+
+        // GOLDEN (only branch B): b2, b3 (coinbase CBN) fork at a1. CBN starts at the
+        // fork-point value 0 → golden CBN = reward(h2) + reward(h3).
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        let _b1 = produce_cb(&pb, Hash::default(), 1, VRF_OUT, CB).await; // identical to a1
+        let b2 = produce_cb(&pb, a1.header.block_hash, 2, vrf_b, CBN).await;
+        let b3 = produce_cb(&pb, b2.header.block_hash, 3, vrf_b, CBN).await;
+        // Independent golden node to pin the honest convergence target.
+        let gdir = tempfile::tempdir().expect("gdir");
+        let gstorage =
+            Arc::new(StorageManager::new(gdir.path(), PruningConfig::default()).expect("gstorage"));
+        let golden = store_backed(&gstorage);
+        let gapp = CanonicalApplicator::new(golden.clone(), gstorage.clone());
+        // Persist-just-before-deliver so the golden node applies a1→b2→b3 as a clean
+        // linear extension (no premature cascade from pre-persisted descendants).
+        persist(&gstorage, &a1);
+        assert!(matches!(gapp.apply_received(&a1).await, ApplyOutcome::Applied { .. }), "golden a1");
+        persist(&gstorage, &b2);
+        assert!(matches!(gapp.apply_received(&b2).await, ApplyOutcome::Applied { .. }), "golden b2");
+        persist(&gstorage, &b3);
+        assert!(matches!(gapp.apply_received(&b3).await, ApplyOutcome::Applied { .. }), "golden b3");
+        let golden_cbn = golden.get_balance(&Address(CBN));
+        let golden_root = golden.calculate_state_root();
+        assert!(golden_cbn > U256::zero() && golden_cbn != stale_cbn, "golden CBN differs from branch A's stale vest");
+
+        // Victim reorgs A → B.
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let outcome = app.apply_received(&b3).await;
+
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "victim ACCEPTS the valid heavier winning branch (no stale-coinbase read-through abort); got {outcome:?}"
+        );
+        assert_eq!(app.applied_tip().await, AppliedTip { hash: b3.header.block_hash, height: 3 }, "reorged to B tip");
+        assert_eq!(follower.calculate_state_root(), golden_root, "victim root converges to golden");
+        assert_eq!(
+            follower.get_balance(&Address(CBN)),
+            golden_cbn,
+            "CBN = 0 (fork point) + reward(h2) + reward(h3) on branch B, NOT the stale A vest + rewards"
+        );
+        assert_ne!(follower.get_balance(&Address(CBN)), stale_cbn, "CBN is no longer frozen at branch-A's stale value");
+
+        // Cold restart proves the durable store holds branch B (I3).
+        let restarted = store_backed(&storage);
+        assert_eq!(restarted.get_balance(&Address(CBN)), golden_cbn, "durable store CBN == branch B after reorg");
     }
 }
