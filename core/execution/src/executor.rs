@@ -119,6 +119,24 @@ pub struct Executor {
     /// Off by default, so direct callers (genesis init, RPC) persist eagerly as
     /// before. See `docs/consensus/EXECUTE_ON_RECEIVE_state_application.md` §7.
     defer_persist: std::sync::atomic::AtomicBool,
+    /// VALIDATOR-S1 §R': the FINALIZED epoch reward policy (share bps + reward
+    /// minter + proposer->staker map), materialized by `registry_sync` at each
+    /// snapshot boundary S(E) and read — never re-derived from the live tip — by
+    /// `settle_block_rewards`. `None` until the first snapshot (pre-activation /
+    /// fresh boot). Shared by cloning the handle to `registry_sync`, so producer
+    /// and receiver (which share this one `Executor`) read byte-identical policy.
+    reward_policy: crate::block_rewards::SharedRewardPolicy,
+    /// VALIDATOR-S1 §R': the fleet-wide activation height, held INDEPENDENTLY of
+    /// `reward_policy` so `settle_block_rewards` can distinguish "pre-activation,
+    /// a `None` policy is normal" from "at/above activation, a `None` policy is a
+    /// FAULT" — and hard-reject the latter instead of silently skipping vesting
+    /// (which would fork a node whose policy failed to rehydrate against the fleet).
+    /// `u64::MAX` (the default) means VALIDATOR-S1 is not configured on this node,
+    /// so a `None` policy always means "skip" — preserving pre-reroll / non-validator
+    /// behavior. Set once at startup via `set_validator_activation_height` when the
+    /// registry is configured; it always equals `reward_policy`'s embedded
+    /// `activation_height` once a snapshot is materialized.
+    validator_activation_height: std::sync::atomic::AtomicU64,
 }
 
 /// RAII guard for `Executor::defer_persist`: sets it on `engage` and restores the
@@ -417,6 +435,8 @@ impl Executor {
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             defer_persist: std::sync::atomic::AtomicBool::new(false),
+            reward_policy: crate::block_rewards::new_shared_reward_policy(),
+            validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -567,6 +587,8 @@ impl Executor {
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
             commit_coordinator,
             defer_persist: std::sync::atomic::AtomicBool::new(false),
+            reward_policy: crate::block_rewards::new_shared_reward_policy(),
+            validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -1070,21 +1092,43 @@ impl Executor {
             block_hashes: std::collections::HashMap::new(),
         });
 
+        // Capture receipts so §R' can levy the priority fee on the EXACT gas each
+        // tx was charged — the same receipts the producer built. Positionally
+        // aligned with `block.transactions` (both iterate the committed list).
+        let mut receipts: Vec<TransactionReceipt> = Vec::with_capacity(block.transactions.len());
         for tx in &block.transactions {
-            if let Err(e) = self.execute_transaction(block, tx).await {
-                // A hard tx error means the block shouldn't have included it → invalid block.
-                self.state_db.restore(snapshot);
-                self.set_block_context(prev_ctx);
-                return Err(e);
+            match self.execute_transaction(block, tx).await {
+                Ok(receipt) => receipts.push(receipt),
+                Err(e) => {
+                    // A hard tx error means the block shouldn't have included it → invalid block.
+                    self.state_db.restore(snapshot);
+                    self.set_block_context(prev_ctx);
+                    return Err(e);
+                }
             }
         }
 
-        // Post-execution reward mints (must match what the producer applied).
-        for (addr, amount) in reward_credits {
-            if *amount > U256::zero() {
-                let bal = self.get_balance(addr);
-                self.set_balance(addr, bal + *amount);
-            }
+        // Post-execution reward settlement — the SINGLE shared entrypoint the
+        // PRODUCER also calls (node/src/producer.rs). It applies the basic block
+        // reward `reward_credits` AND, at/above the VALIDATOR-S1 activation, runs
+        // the §R' priority-fee vesting + its import rules. Byte-identical to the
+        // producer because it is literally the same function on the same inputs.
+        // Any rejection reverts world state (invalid block).
+        if let Err(e) = self
+            .settle_block_rewards(
+                block.header.height,
+                coinbase,
+                *block.header.proposer_pubkey.as_bytes(),
+                block.header.base_fee_per_gas,
+                &block.transactions,
+                &receipts,
+                reward_credits,
+            )
+            .await
+        {
+            self.state_db.restore(snapshot);
+            self.set_block_context(prev_ctx);
+            return Err(e);
         }
 
         let got = self.calculate_state_root();
@@ -1116,6 +1160,286 @@ impl Executor {
             )));
         }
         Ok(got)
+    }
+
+    /// VALIDATOR-S1 §R': the shared handle to the FINALIZED epoch reward policy.
+    /// `registry_sync` clones this and rewrites it at each snapshot boundary S(E);
+    /// `settle_block_rewards` reads it. Since the whole node shares ONE `Executor`,
+    /// producer and receiver read the identical policy.
+    pub fn reward_policy_handle(&self) -> crate::block_rewards::SharedRewardPolicy {
+        self.reward_policy.clone()
+    }
+
+    /// VALIDATOR-S1 §R': set the fleet-wide activation height (see the field docs).
+    /// Called once at startup when `CITRATE_VALIDATOR_REGISTRY` is configured, so
+    /// `settle_block_rewards` can HARD-REJECT a `None` policy at/above activation
+    /// rather than silently skip vesting (which would fork). Idempotent; safe to
+    /// call before any snapshot is materialized.
+    pub fn set_validator_activation_height(&self, height: u64) {
+        self.validator_activation_height
+            .store(height, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// VALIDATOR-S1 §R': capture the current epoch reward-policy cell (a cheap
+    /// clone of the `Option<EpochRewardPolicy>`). Used by the reorg driver to snapshot
+    /// the policy alongside world state so a failed reapply can restore BOTH — the
+    /// policy is NOT part of `state_snapshot`, so it must be captured explicitly.
+    pub fn capture_reward_policy(&self) -> Option<crate::block_rewards::EpochRewardPolicy> {
+        self.reward_policy.read().clone()
+    }
+
+    /// VALIDATOR-S1 §R': restore a previously [`Self::capture_reward_policy`]d cell.
+    /// The reorg driver calls this on every abort arm so a failed reorg never leaves
+    /// the shared policy mutated (mirrors `state_restore` for world state).
+    pub fn restore_reward_policy(
+        &self,
+        policy: Option<crate::block_rewards::EpochRewardPolicy>,
+    ) {
+        *self.reward_policy.write() = policy;
+    }
+
+    /// VALIDATOR-S1 §R' (producer path): run [`Self::settle_block_rewards`] with the
+    /// SAME revert-on-error safety the receiver's `apply_block_inner` provides — the
+    /// producer calls settle WITHOUT the surrounding snapshot/restore that `apply_block`
+    /// wraps its receiver-side settle in, so a settle error (e.g. the absent-proposer
+    /// reject arm, which fires AFTER the basic credits at step 1 are applied) would
+    /// otherwise leak stray credits into shared state (and, since the producer runs with
+    /// eager persistence, into the durable store). This engages the persistence-defer
+    /// guard for the whole settle and snapshots world state first, so on ANY error both
+    /// in-memory state and the store are left byte-identical (nothing persisted). On
+    /// success the credits stay dirty in state_db and are persisted by the producer's
+    /// subsequent `persist_state_changes`, exactly as before.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn settle_block_rewards_guarded(
+        &self,
+        height: u64,
+        coinbase: [u8; 20],
+        proposer_pubkey: [u8; 32],
+        base_fee_per_gas: u64,
+        txs: &[Transaction],
+        receipts: &[TransactionReceipt],
+        basic_credits: &[(Address, U256)],
+    ) -> Result<(), ExecutionError> {
+        let _defer_guard = DeferGuard::engage(&self.defer_persist);
+        let snapshot = self.state_db.snapshot();
+        if let Err(e) = self
+            .settle_block_rewards(
+                height,
+                coinbase,
+                proposer_pubkey,
+                base_fee_per_gas,
+                txs,
+                receipts,
+                basic_credits,
+            )
+            .await
+        {
+            self.state_db.restore(snapshot);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// VALIDATOR-S1 §R' — the ONE shared reward-settlement function (producer + receiver).
+    ///
+    /// Called AFTER all of a block's transactions are applied and BEFORE the state
+    /// root is computed, on the identical post-tx state on both paths. Steps:
+    ///
+    /// 1. credit the deterministic BASIC block reward (`basic_credits`: validator +
+    ///    treasury) — unchanged from the pre-§R' behavior.
+    /// 2. below the VALIDATOR-S1 activation height (or before any epoch snapshot is
+    ///    materialized): STOP — priority fees burn exactly as before.
+    /// 3. at/above activation, enforce the §R' import rules and vest the share:
+    ///    (a) `base_fee_per_gas` MUST equal the reroll constant (else REJECT);
+    ///    (b) resolve the proposer's registered `stakerAddress` from the FINALIZED
+    ///    S(E) snapshot — the proposer MUST be present (else REJECT);
+    ///    (c) `coinbase` MUST equal that stakerAddress (else REJECT) — a producer
+    ///    cannot redirect the reward to itself;
+    ///    (d) compute the priority pool (REJECT if any tx `gas_price < base_fee`);
+    ///    (e) vest `floor(pool * shareBps / 10000)` via the `creditReward`
+    ///    system-call into bonded slashable stake.
+    ///
+    /// A REJECT (`ExecutionError::RewardSettlement`) means an invalid block; the
+    /// receiver reverts world state. On the producer a REJECT aborts production —
+    /// a correctly-configured producer (canonical base fee, coinbase == its staker,
+    /// only txs with `gas_price >= base_fee`) never trips it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn settle_block_rewards(
+        &self,
+        height: u64,
+        coinbase: [u8; 20],
+        proposer_pubkey: [u8; 32],
+        base_fee_per_gas: u64,
+        txs: &[Transaction],
+        receipts: &[TransactionReceipt],
+        basic_credits: &[(Address, U256)],
+    ) -> Result<(), ExecutionError> {
+        use crate::block_rewards as br;
+
+        // (1) basic block reward — identical to the pre-§R' credit loop.
+        for (addr, amount) in basic_credits {
+            if *amount > U256::zero() {
+                let bal = self.get_balance(addr);
+                self.set_balance(addr, bal + *amount);
+            }
+        }
+
+        // (2) gate on a materialized snapshot + activation height. Before either,
+        // priority fees burn exactly as before (no behavior change pre-reroll).
+        //
+        // HARD-REJECT (fork remediation): a `None` policy AT/ABOVE the activation
+        // height is a FAULT, not a skip — it means the epoch snapshot failed to
+        // materialize / rehydrate on THIS node while the fleet has it. Silently
+        // returning Ok here would let this node compute a §R'-less state root that
+        // diverges from every node that DID materialize the policy — a silent fork.
+        // Turning it into an immediate `RewardSettlement` error makes the fault a
+        // testable, node-local block rejection instead. Below activation (or when
+        // VALIDATOR-S1 is unconfigured — `validator_activation_height == u64::MAX`),
+        // a `None` policy still means "skip", exactly as before.
+        let policy = match self.reward_policy.read().clone() {
+            Some(p) => p,
+            None => {
+                let activation = self
+                    .validator_activation_height
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if height >= activation {
+                    return Err(ExecutionError::RewardSettlement(format!(
+                        "VALIDATOR-S1 reward policy unmaterialized at height {height} \
+                         (>= activation {activation}); refusing to settle a divergent \
+                         (policy-less) block — epoch snapshot must be rehydrated"
+                    )));
+                }
+                return Ok(());
+            }
+        };
+        if height < policy.activation_height {
+            return Ok(());
+        }
+
+        // (3a) base-fee validation — the committed header base fee is a reroll
+        // constant; any other value is a producer trying to skew the pool.
+        if base_fee_per_gas != br::CANONICAL_BASE_FEE_PER_GAS {
+            return Err(ExecutionError::RewardSettlement(format!(
+                "base_fee_per_gas {base_fee_per_gas} != canonical {}",
+                br::CANONICAL_BASE_FEE_PER_GAS
+            )));
+        }
+
+        // (3b) resolve beneficiary from the FINALIZED snapshot (never the live tip).
+        let staker = policy
+            .staker_of
+            .get(&proposer_pubkey)
+            .copied()
+            .ok_or_else(|| {
+                ExecutionError::RewardSettlement(format!(
+                    "proposer {} absent from epoch-{} snapshot",
+                    hex::encode(proposer_pubkey),
+                    policy.epoch
+                ))
+            })?;
+
+        // (3c) importer credit-verification: coinbase MUST be the registered staker.
+        if coinbase != staker {
+            return Err(ExecutionError::RewardSettlement(format!(
+                "coinbase {} != registered staker {} for proposer {}",
+                hex::encode(coinbase),
+                hex::encode(staker),
+                hex::encode(proposer_pubkey)
+            )));
+        }
+
+        // (3d) priority pool (rejects any included sub-base-fee tx).
+        let pool = br::compute_priority_pool(txs, receipts, base_fee_per_gas)?;
+        let share = br::vested_share(pool, policy.priority_fee_share_bps);
+        if share.is_zero() {
+            return Ok(());
+        }
+
+        // (3e) vest the share into bonded slashable stake via the registry.
+        self.credit_validator_reward(
+            policy.reward_minter,
+            policy.registry,
+            &proposer_pubkey,
+            share,
+            height,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// §R' vesting system-call: `rewardMinter -> ValidatorRegistry.creditReward(pubkey,
+    /// amount)` with `msg.value == amount`, executed on the current post-tx state.
+    ///
+    /// `creditReward` is PAYABLE and requires `msg.value == amount` (ETH-backed
+    /// vesting), `msg.sender == rewardMinter`, `status == Active`, and honors the
+    /// per-epoch emission cap. REVM performs the value transfer + storage writes,
+    /// but `StateDBAdapter::commit` DISCARDS REVM's balance/nonce writes (the
+    /// executor owns balances — Sprint EL-1 Fix #19), so we reconcile the balances
+    /// to reflect the transfer the contract's storage now assumes:
+    ///   * SUCCESS: registry balance += amount (backs `vestedRewards`), minter
+    ///     restored to its pre-call value (net-zero) — the un-burned share is
+    ///     redistributed from the burn into slashable stake.
+    ///   * REVERT (NotActive / EmissionCapped / ...): storage is already reverted
+    ///     by REVM; we only undo the transient minter funding, leaving the fee
+    ///     burned for this block, exactly as before §R'. Deterministic either way.
+    ///
+    /// Returns `Ok(true)` if vested, `Ok(false)` if the contract reverted (burned).
+    async fn credit_validator_reward(
+        &self,
+        reward_minter: [u8; 20],
+        registry: [u8; 20],
+        pubkey: &[u8; 32],
+        amount: U256,
+        height: u64,
+    ) -> Result<bool, ExecutionError> {
+        let minter = Address(reward_minter);
+        let registry_addr = Address(registry);
+        let calldata = crate::block_rewards::encode_credit_reward(pubkey, amount);
+
+        // Transiently fund the minter so REVM's caller-balance precheck (>= value)
+        // passes; gas price is 0 so nothing is charged. Recorded for restore.
+        let minter_before = self.get_balance(&minter);
+        self.set_balance(&minter, minter_before + amount);
+
+        let block_ctx = self.get_block_context();
+        let result = crate::revm_adapter::execute_contract_call_with_context(
+            self.state_db.clone(),
+            minter,
+            registry_addr,
+            calldata,
+            amount,
+            crate::block_rewards::SYSTEM_CALL_GAS_LIMIT,
+            U256::zero(), // gasless system call.
+            self.chain_id,
+            height, // block.number → creditReward's currentEpoch() = height / EPOCH.
+            0,      // creditReward ignores block.timestamp; fixed for determinism.
+            block_ctx,
+            None, // no MVCC WriteSet capture (end-of-block system op, not a user tx).
+            None, // no journal buffering — writes go straight to state_db (direct call).
+            self.state_store.clone(),
+        );
+
+        match result {
+            Ok(_) => {
+                // Reflect the value transfer REVM discarded.
+                self.set_balance(&minter, minter_before);
+                let reg_bal = self.get_balance(&registry_addr);
+                self.set_balance(&registry_addr, reg_bal + amount);
+                Ok(true)
+            }
+            Err(e) => {
+                // Storage already reverted by REVM; undo the transient funding only.
+                self.set_balance(&minter, minter_before);
+                warn!(
+                    "§R': creditReward reverted at height {} for proposer {} (amount {}): {} — fee burned this block",
+                    height,
+                    hex::encode(pubkey),
+                    amount,
+                    e
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// Execute a transaction via the MVCC path.
