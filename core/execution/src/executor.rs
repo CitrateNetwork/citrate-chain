@@ -109,6 +109,39 @@ pub struct Executor {
     /// as of Sprint P950-A-3 (2026-04-21). Design proven in
     /// `specs/tla/consensus/ExecutorMVCC.tla`.
     commit_coordinator: Arc<CommitCoordinator>,
+    /// EXECUTE-ON-RECEIVE: when true, the eager account/code/nonce setters
+    /// (`set_balance`/`set_code`/`set_nonce`) DEFER durable persistence — they
+    /// mutate in-memory state + dirty-tracking only, leaving the store write to
+    /// `persist_state_changes` / `reconcile_store_from`. Set for the duration of
+    /// `apply_block` execution (incl. reward crediting + contract deploys), so a
+    /// reorg re-applying a branch via `apply_block_no_persist` writes nothing
+    /// durable and an aborted reorg leaves no phantom state on disk (review E).
+    /// Off by default, so direct callers (genesis init, RPC) persist eagerly as
+    /// before. See `docs/consensus/EXECUTE_ON_RECEIVE_state_application.md` §7.
+    defer_persist: std::sync::atomic::AtomicBool,
+}
+
+/// RAII guard for `Executor::defer_persist`: sets it on `engage` and restores the
+/// prior value on drop, so `apply_block`'s deferral is reset on every exit path
+/// (early `return`, `?`, or normal). `apply_block` is not nested, but restoring
+/// the prior value (not blindly `false`) keeps it correct if that ever changes.
+struct DeferGuard<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+    prev: bool,
+}
+
+impl<'a> DeferGuard<'a> {
+    fn engage(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        let prev = flag.swap(true, std::sync::atomic::Ordering::SeqCst);
+        Self { flag, prev }
+    }
+}
+
+impl Drop for DeferGuard<'_> {
+    fn drop(&mut self) {
+        self.flag
+            .store(self.prev, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Dirty contract storage mutation captured for a finalized state commit.
@@ -159,6 +192,14 @@ pub trait StateStoreTrait: Send + Sync {
     }
     /// C6: Delete a contract storage slot
     fn delete_storage(&self, address: &Address, key: &[u8]) -> anyhow::Result<()>;
+
+    /// Delete an account. Used by the execute-on-receive reorg store
+    /// reconciliation to remove accounts that a reverted (abandoned) branch
+    /// created but the post-reorg chain does not have. Default `Ok(())` so test
+    /// stores that don't persist accounts keep compiling.
+    fn delete_account(&self, _address: &Address) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Persist all finalized account and storage mutations in one state batch.
     ///
@@ -375,6 +416,7 @@ impl Executor {
             chain_id,
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
             commit_coordinator: Arc::new(CommitCoordinator::new()),
+            defer_persist: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -524,6 +566,7 @@ impl Executor {
             chain_id,
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
             commit_coordinator,
+            defer_persist: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -661,6 +704,12 @@ impl Executor {
                 store.write_state_batch_sync(&account_changes, &storage_changes)?;
             }
 
+            // Persist contract code deployed since the last commit (deferred from
+            // `set_code`, which is now in-memory only — review finding E).
+            for (code_hash, code) in self.state_db.take_dirty_code() {
+                store.put_code(&code_hash, &code)?;
+            }
+
             // Commit state DB (clears dirty tracking)
             self.state_db.commit();
             Ok(count)
@@ -734,24 +783,36 @@ impl Executor {
     pub fn set_balance(&self, address: &Address, balance: U256) {
         self.state_db.accounts.set_balance(*address, balance);
 
-        // Persist to storage if available
-        if let Some(store) = &self.state_store {
-            let account = self.state_db.accounts.get_account(address);
-            if let Err(e) = store.put_account(address, &account) {
-                error!("Failed to persist account balance: {}", e);
+        // Persist eagerly unless deferring (during apply_block execution the
+        // account is dirty-tracked and persisted by persist_state_changes /
+        // reconcile_store_from instead — review finding E).
+        if !self.defer_persist() {
+            if let Some(store) = &self.state_store {
+                let account = self.state_db.accounts.get_account(address);
+                if let Err(e) = store.put_account(address, &account) {
+                    error!("Failed to persist account balance: {}", e);
+                }
             }
         }
+    }
+
+    #[inline]
+    fn defer_persist(&self) -> bool {
+        self.defer_persist
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Set account nonce
     pub fn set_nonce(&self, address: &Address, nonce: u64) {
         self.state_db.accounts.set_nonce(*address, nonce);
 
-        // Persist to storage if available
-        if let Some(store) = &self.state_store {
-            let account = self.state_db.accounts.get_account(address);
-            if let Err(e) = store.put_account(address, &account) {
-                error!("Failed to persist account nonce: {}", e);
+        // Persist eagerly unless deferring (see set_balance — review finding E).
+        if !self.defer_persist() {
+            if let Some(store) = &self.state_store {
+                let account = self.state_db.accounts.get_account(address);
+                if let Err(e) = store.put_account(address, &account) {
+                    error!("Failed to persist account nonce: {}", e);
+                }
             }
         }
     }
@@ -810,18 +871,23 @@ impl Executor {
     }
 
     pub fn set_code(&self, address: &Address, code: Vec<u8>) {
+        // `state_db.set_code` inserts the code, records its hash in the dirty-code
+        // set, and marks the owning account dirty. Persist eagerly unless deferring
+        // (during apply_block the code + account are dirty-tracked and persisted by
+        // persist_state_changes / reconcile_store_from — review finding E). Without
+        // deferral (genesis init, RPC) the old eager behavior is preserved.
         let code_hash = self.state_db.set_code(*address, code.clone());
         self.state_db.accounts.set_code_hash(*address, code_hash);
 
-        // Persist to storage if available
-        if let Some(store) = &self.state_store {
-            if let Err(e) = store.put_code(&code_hash, &code) {
-                error!("Failed to persist contract code: {}", e);
-            }
-
-            let account = self.state_db.accounts.get_account(address);
-            if let Err(e) = store.put_account(address, &account) {
-                error!("Failed to persist account code hash: {}", e);
+        if !self.defer_persist() {
+            if let Some(store) = &self.state_store {
+                if let Err(e) = store.put_code(&code_hash, &code) {
+                    error!("Failed to persist contract code: {}", e);
+                }
+                let account = self.state_db.accounts.get_account(address);
+                if let Err(e) = store.put_account(address, &account) {
+                    error!("Failed to persist account code hash: {}", e);
+                }
             }
         }
     }
@@ -829,6 +895,227 @@ impl Executor {
     /// Calculate state root
     pub fn calculate_state_root(&self) -> Hash {
         self.state_db.calculate_state_root()
+    }
+
+    /// EXECUTE-ON-RECEIVE (reorg): capture a full, restorable snapshot of world
+    /// state (accounts + storage + models + jobs + the accumulating state trie).
+    /// Used by the reorg snapshot ring to retain the state as-of each applied
+    /// block within the reorg window so a fork can be reverted to its fork point.
+    pub fn state_snapshot(&self) -> crate::state::StateSnapshot {
+        self.state_db.snapshot()
+    }
+
+    /// EXECUTE-ON-RECEIVE (reorg): restore world state to a previously captured
+    /// snapshot (byte-exact, incl. the accumulating state trie). Reverts the
+    /// in-memory state to a fork point before re-applying the winning branch.
+    pub fn state_restore(&self, snapshot: crate::state::StateSnapshot) {
+        self.state_db.restore(snapshot)
+    }
+
+    /// EXECUTE-ON-RECEIVE (reorg, HIGH-2): make the durable store match CURRENT
+    /// in-memory world state, given the store presently reflects `baseline`.
+    ///
+    /// A reorg reverts in-memory state via the snapshot ring but the durable
+    /// store has no rollback — after switching branches the store still holds the
+    /// abandoned branch's per-block writes. This writes the account + storage
+    /// diff (`baseline` → current) to the store: changed entries are put, entries
+    /// the abandoned branch created but the new chain lacks are deleted. Called
+    /// once after a reorg settles, so RocksDB matches memory and a restart-after-
+    /// reorg hydrates the correct state. No-op without a configured store.
+    ///
+    /// Correctness rests on `baseline` being exactly what the store reflects: the
+    /// reorg captures it before reverting, and the pre-reorg forward path
+    /// (`apply_block`, per block) kept store == in-memory, so it holds.
+    pub fn reconcile_store_from(
+        &self,
+        baseline: &crate::state::StateSnapshot,
+    ) -> anyhow::Result<()> {
+        use std::collections::{HashMap, HashSet};
+        let store = match &self.state_store {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let current = self.state_db.snapshot();
+
+        // --- accounts ---
+        let base_accts: HashMap<Address, crate::types::AccountState> =
+            baseline.account_entries().iter().cloned().collect();
+        let cur_accts: HashMap<Address, crate::types::AccountState> =
+            current.account_entries().iter().cloned().collect();
+        let mut account_puts: Vec<(Address, crate::types::AccountState)> = Vec::new();
+        for (addr, acct) in &cur_accts {
+            if base_accts.get(addr) != Some(acct) {
+                account_puts.push((*addr, acct.clone()));
+            }
+        }
+        let account_dels: Vec<Address> = base_accts
+            .keys()
+            .filter(|a| !cur_accts.contains_key(*a))
+            .copied()
+            .collect();
+
+        // --- contract storage ---
+        let base_storage = baseline.storage_map();
+        let cur_storage = current.storage_map();
+        let empty = HashMap::new();
+        let contracts: HashSet<Address> = base_storage
+            .keys()
+            .chain(cur_storage.keys())
+            .copied()
+            .collect();
+        let mut storage_changes: Vec<StateStorageChange> = Vec::new();
+        for addr in contracts {
+            let b = base_storage.get(&addr).unwrap_or(&empty);
+            let c = cur_storage.get(&addr).unwrap_or(&empty);
+            let keys: HashSet<&Vec<u8>> = b.keys().chain(c.keys()).collect();
+            for key in keys {
+                let cur_val = c.get(key);
+                if cur_val != b.get(key) {
+                    storage_changes.push(StateStorageChange {
+                        address: addr,
+                        key: key.clone(),
+                        // Some(v) writes the slot; None deletes it (see StateStorageChange).
+                        value: cur_val.cloned(),
+                    });
+                }
+            }
+        }
+
+        if !account_puts.is_empty() || !storage_changes.is_empty() {
+            store.write_state_batch_sync(&account_puts, &storage_changes)?;
+        }
+        for addr in &account_dels {
+            store.delete_account(addr)?;
+        }
+        // Persist contract code deployed on the winning branch (deferred from
+        // `set_code`). Code is content-addressed, so any leftover code from an
+        // abandoned branch is an unreferenced (harmless) orphan.
+        for (code_hash, code) in self.state_db.take_dirty_code() {
+            store.put_code(&code_hash, &code)?;
+        }
+        Ok(())
+    }
+
+    /// EXECUTE-ON-RECEIVE — the verified, revertible state-application atom.
+    ///
+    /// Applies a canonical block's transactions to world state, credits the block's
+    /// reward(s), then VERIFIES the resulting state root equals the block's claimed
+    /// `state_root`. On any transaction error or a root mismatch it REVERTS — world
+    /// state is left byte-identical (invariant I3) — and returns an error, so the caller
+    /// rejects the block. On success it persists and returns the verified root.
+    ///
+    /// `coinbase` feeds the EVM COINBASE opcode + block context (recovered from
+    /// `block.header.coinbase` for v>=2 blocks — the field that makes state_root
+    /// reproducible by receivers). `reward_credits` are the post-execution mints the
+    /// producer applied, e.g. `[(beneficiary, validator_reward), (treasury, treasury_reward)]`
+    /// — supplied by the caller so this atom stays free of reward/economics policy (and so
+    /// the VALIDATOR-S1 §R' on-chain reward path can slot in as just another credit list).
+    ///
+    /// Revert safety: `execute_transaction` drains its journal into `state_db` on commit
+    /// (nothing persists to the store until `persist_state_changes`), and
+    /// `state_db.snapshot()/restore()` captures/restores the full account+storage+dirty
+    /// state — so a rejected block touches neither in-memory state nor the store. The
+    /// commit-coordinator version counter is monotonic and advancing it under a reverted
+    /// apply is benign for the sequential caller. See
+    /// docs/consensus/EXECUTE_ON_RECEIVE_state_application.md §2.2/§2.5.
+    pub async fn apply_block(
+        &self,
+        block: &Block,
+        coinbase: [u8; 20],
+        reward_credits: &[(Address, U256)],
+    ) -> Result<Hash, ExecutionError> {
+        self.apply_block_inner(block, coinbase, reward_credits, true)
+            .await
+    }
+
+    /// EXECUTE-ON-RECEIVE (reorg): like [`Self::apply_block`], but advances only
+    /// IN-MEMORY state — it does NOT persist to the durable store. The reorg
+    /// re-applies a candidate branch this way so that an aborted reorg leaves the
+    /// store untouched (nothing to roll back), and the driver reconciles the store
+    /// once, via [`Self::reconcile_store_from`], only after the reorg fully
+    /// succeeds. Revert-on-failure semantics are identical to `apply_block`.
+    pub async fn apply_block_no_persist(
+        &self,
+        block: &Block,
+        coinbase: [u8; 20],
+        reward_credits: &[(Address, U256)],
+    ) -> Result<Hash, ExecutionError> {
+        self.apply_block_inner(block, coinbase, reward_credits, false)
+            .await
+    }
+
+    async fn apply_block_inner(
+        &self,
+        block: &Block,
+        coinbase: [u8; 20],
+        reward_credits: &[(Address, U256)],
+        persist: bool,
+    ) -> Result<Hash, ExecutionError> {
+        // Defer eager persistence for the whole apply (execution + reward
+        // crediting + contract deploys): set_balance/set_code/set_nonce mutate
+        // in-memory + dirty-tracking only, so a `no_persist` apply writes nothing
+        // durable. The guard restores the prior value on every exit path (review
+        // finding E). Durable writes happen at the end (persist=true) via
+        // persist_state_changes, or later via reconcile_store_from (reorg success).
+        let _defer_guard = DeferGuard::engage(&self.defer_persist);
+
+        let snapshot = self.state_db.snapshot();
+        let prev_ctx = self.get_block_context();
+
+        // Same block context the producer used: this block's ECVRF beacon as prevrandao,
+        // and the committed coinbase for the COINBASE opcode.
+        self.set_block_context(crate::revm_adapter::BlockContext {
+            coinbase,
+            prevrandao: *block.header.vrf_reveal.output.as_bytes(),
+            block_hashes: std::collections::HashMap::new(),
+        });
+
+        for tx in &block.transactions {
+            if let Err(e) = self.execute_transaction(block, tx).await {
+                // A hard tx error means the block shouldn't have included it → invalid block.
+                self.state_db.restore(snapshot);
+                self.set_block_context(prev_ctx);
+                return Err(e);
+            }
+        }
+
+        // Post-execution reward mints (must match what the producer applied).
+        for (addr, amount) in reward_credits {
+            if *amount > U256::zero() {
+                let bal = self.get_balance(addr);
+                self.set_balance(addr, bal + *amount);
+            }
+        }
+
+        let got = self.calculate_state_root();
+        if got != block.state_root {
+            self.state_db.restore(snapshot);
+            self.set_block_context(prev_ctx);
+            return Err(ExecutionError::StateRootMismatch {
+                expected: block.state_root,
+                got,
+            });
+        }
+
+        if !persist {
+            return Ok(got);
+        }
+
+        if let Err(e) = self.persist_state_changes().await {
+            // HIGH-1: a durable-write failure must NOT leave in-memory state
+            // advanced while the store (atomic batch — unchanged on failure) and
+            // the applied-tip pointer stay behind. Revert in-memory too, so
+            // memory == store == pre-block and the caller cleanly rejects; else
+            // the next drain re-applies on already-advanced state and the node
+            // wedges. `write_state_batch_sync` is a single atomic batch, so on
+            // failure the store is untouched and this restore fully reconciles.
+            self.state_db.restore(snapshot);
+            self.set_block_context(prev_ctx);
+            return Err(ExecutionError::Reverted(format!(
+                "persist after apply_block: {e}"
+            )));
+        }
+        Ok(got)
     }
 
     /// Execute a transaction via the MVCC path.
@@ -2928,7 +3215,7 @@ impl Executor {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use citrate_consensus::types::{BlockBuilder, PublicKey, Signature};
+    use citrate_consensus::types::{BlockBuilder, PublicKey, Signature, VrfProof};
     use parking_lot::Mutex;
     use serde_json::json;
     use sha3::{Digest, Keccak256};
@@ -3066,6 +3353,102 @@ mod tests {
 
         assert!(receipt.status);
         assert_eq!(state_db.accounts.get_balance(&bob_addr), U256::from(1000));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // EXECUTE-ON-RECEIVE — apply_block atom (docs/consensus/EXECUTE_ON_RECEIVE_*).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build a block carrying `txs` + a claimed `state_root`, with a VRF output so the
+    /// prevrandao context matches, at height 100.
+    fn block_with(txs: Vec<Transaction>, state_root: Hash) -> Block {
+        BlockBuilder::new()
+            .height(100)
+            .timestamp(1000000)
+            .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+            .transactions(txs)
+            .state_root(state_root)
+            .build_unhashed()
+    }
+
+    const CB: [u8; 20] = [0x33; 20];
+
+    #[tokio::test]
+    async fn test_apply_block_good_advances_and_verifies() {
+        let alice = PublicKey::new([1; 32]);
+        let bob = PublicKey::new([2; 32]);
+        let alice_addr = Address::from_public_key(&alice);
+        let bob_addr = Address::from_public_key(&bob);
+        let cb_addr = Address(CB);
+        let reward = U256::from(500u64);
+        let fund = U256::from(1_000_000_000_000_000u128);
+
+        // 1) Compute the expected post-state root by mirroring apply_block on a throwaway db.
+        let expected = {
+            let sdb = Arc::new(StateDB::new());
+            let exec = Executor::new(sdb.clone());
+            sdb.accounts.set_balance(alice_addr, fund);
+            exec.set_block_context(crate::revm_adapter::BlockContext {
+                coinbase: CB,
+                prevrandao: [0x5A; 32],
+                block_hashes: std::collections::HashMap::new(),
+            });
+            let tx = create_test_tx(alice, Some(bob), 1000, 0);
+            let blk = block_with(vec![tx.clone()], Hash::default());
+            exec.execute_transaction(&blk, &tx).await.unwrap();
+            let bal = exec.get_balance(&cb_addr);
+            exec.set_balance(&cb_addr, bal + reward);
+            exec.calculate_state_root()
+        };
+
+        // 2) apply_block on a fresh, identical executor must reproduce that root + advance state.
+        let sdb = Arc::new(StateDB::new());
+        let exec = Executor::new(sdb.clone());
+        sdb.accounts.set_balance(alice_addr, fund);
+        let tx = create_test_tx(alice, Some(bob), 1000, 0);
+        let blk = block_with(vec![tx], expected);
+
+        let got = exec
+            .apply_block(&blk, CB, &[(cb_addr, reward)])
+            .await
+            .expect("valid block must apply");
+        assert_eq!(got, expected, "apply_block must reproduce the claimed state_root");
+        assert_eq!(exec.get_balance(&bob_addr), U256::from(1000u64), "tx effect applied");
+        assert_eq!(exec.get_balance(&cb_addr), reward, "reward credited");
+    }
+
+    #[tokio::test]
+    async fn test_apply_block_bad_root_rejects_and_leaves_state_untouched() {
+        let alice = PublicKey::new([1; 32]);
+        let bob = PublicKey::new([2; 32]);
+        let alice_addr = Address::from_public_key(&alice);
+        let bob_addr = Address::from_public_key(&bob);
+        let cb_addr = Address(CB);
+        let fund = U256::from(1_000_000_000_000_000u128);
+
+        let sdb = Arc::new(StateDB::new());
+        let exec = Executor::new(sdb.clone());
+        sdb.accounts.set_balance(alice_addr, fund);
+        let root_before = exec.calculate_state_root();
+
+        let tx = create_test_tx(alice, Some(bob), 1000, 0);
+        // Claim a bogus state_root → must be rejected.
+        let blk = block_with(vec![tx], Hash::new([0xFF; 32]));
+
+        let err = exec
+            .apply_block(&blk, CB, &[(cb_addr, U256::from(500u64))])
+            .await
+            .expect_err("bad state_root must be rejected");
+        assert!(
+            matches!(err, ExecutionError::StateRootMismatch { .. }),
+            "expected StateRootMismatch, got {err:?}"
+        );
+
+        // Invariant I3: world state byte-identical to before the rejected attempt.
+        assert_eq!(exec.calculate_state_root(), root_before, "state must be reverted");
+        assert_eq!(exec.get_balance(&bob_addr), U256::zero(), "tx effect reverted");
+        assert_eq!(exec.get_balance(&cb_addr), U256::zero(), "reward reverted");
+        assert_eq!(exec.get_balance(&alice_addr), fund, "sender balance restored");
     }
 
     /// PIN-P1(d): end-to-end proof that the block-execution entrypoint surfaces

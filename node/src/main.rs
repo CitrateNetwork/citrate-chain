@@ -21,6 +21,7 @@ mod adapters;
 mod artifact;
 mod block_serve;
 pub mod bundled_model;
+mod canonical_apply;
 mod commands;
 mod config;
 mod genesis;
@@ -1353,6 +1354,58 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         Arc::new(CheckpointManager::with_persistence(cp_config, shared_dag_store.clone(), kv))
     };
 
+    // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Only active under v2 headers
+    // (CITRATE_BLOCK_V2) — the flag that makes a block's state_root reproducible by a
+    // receiver (committed coinbase + deterministic basic rewards). When enabled, received
+    // blocks that linearly extend the applied tip are executed + state-root-verified on
+    // the receive path, and the producer holds the same lock so the two never race.
+    // Default off preserves the legacy producer-only state-advance model.
+    let execute_on_receive_enabled = std::env::var("CITRATE_BLOCK_V2")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let canonical_applicator: Option<Arc<canonical_apply::CanonicalApplicator>> =
+        if execute_on_receive_enabled {
+            // Attach GhostDAG as the fork-choice authority so the driver reorgs
+            // the applied chain toward the selected tip (step 4). Bounded revert
+            // depth + finalized floor guard reverts inside the applicator.
+            let mut app_builder =
+                canonical_apply::CanonicalApplicator::new(executor.clone(), storage.clone())
+                    .with_fork_choice(shared_ghostdag.clone());
+            // VALIDATOR-S1 (step 5): attach the registry snapshot-sync so a node
+            // that RECEIVES or REORGS to a snapshot block S(E) rebuilds its
+            // proposer selector from the registry — not only the producer.
+            if let (Some((registry, _)), Some(sel)) = (&validator_registry, &validator_selector) {
+                app_builder = app_builder.with_registry_sync(Arc::new(
+                    registry_sync::RegistrySync::new(executor.clone(), sel.clone(), *registry),
+                ));
+                info!("VALIDATOR-S1: registry snapshot-sync attached to execute-on-receive driver (received/reorged S(E) blocks)");
+            }
+            let app = Arc::new(app_builder);
+            let start = app.applied_tip().await;
+            info!(
+                "EXECUTE-ON-RECEIVE: fast-path applier + reorg ENABLED (received blocks executed + state-root-verified); applied head = {} @ {}",
+                start.hash, start.height
+            );
+            // I4: keep the reorg floor in sync with BFT finality so a reorg can
+            // never revert below a finalized checkpoint. Cheap poll (the applied
+            // height advances ~1/s); the floor is monotonic in the checkpoint mgr.
+            let floor = app.finalized_height_handle();
+            let cp = checkpoint_manager.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    tick.tick().await;
+                    let h = cp.latest_finalized_height().await;
+                    if h > floor.load(std::sync::atomic::Ordering::SeqCst) {
+                        floor.store(h, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            });
+            Some(app)
+        } else {
+            None
+        };
+
     // Start P2P listener and connect to bootstrap nodes
     {
         // Prepare head info
@@ -1382,6 +1435,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let pm_for_rx = peer_manager.clone();
         let storage_for_handler = storage.clone();
         let mempool_for_handler = mempool.clone();
+        // EXECUTE-ON-RECEIVE (step 2): clone the applier into the receive handler.
+        let applicator_for_net = canonical_applicator.clone();
         let gossip = Arc::new(GossipProtocol::new(GossipConfig::default(), peer_manager.clone()));
         let gossip_for_rx = gossip.clone();
         // Sync manager (basic integration)
@@ -1796,6 +1851,33 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                                             "Added network block {} to live DAG",
                                                             hex::encode(&block.header.block_hash.as_bytes()[..8])
                                                         );
+                                                        // EXECUTE-ON-RECEIVE (step 2): fast-path
+                                                        // apply if this block linearly extends the
+                                                        // applied tip. Rejection is logged (a bad
+                                                        // state_root doesn't unwind DAG admission
+                                                        // here — reorg handling is a later step);
+                                                        // the block simply never becomes the
+                                                        // applied tip, so no invalid state is served.
+                                                        if let Some(app) = &applicator_for_net {
+                                                            match app.apply_received(&block).await {
+                                                                canonical_apply::ApplyOutcome::Applied { root, height } => {
+                                                                    tracing::debug!(
+                                                                        "execute-on-receive applied network block @ {} (root {})",
+                                                                        height, root
+                                                                    );
+                                                                }
+                                                                canonical_apply::ApplyOutcome::Rejected(why) => {
+                                                                    tracing::warn!(
+                                                                        "execute-on-receive REJECTED network block {} from {}: {}",
+                                                                        hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                                                        pid,
+                                                                        why
+                                                                    );
+                                                                }
+                                                                // Deferred / AlreadyApplied: no state change (gap/fork/echo).
+                                                                _ => {}
+                                                            }
+                                                        }
                                                     }
                                                     Err(e) => {
                                                         tracing::warn!(
@@ -1870,6 +1952,28 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                                         hex::encode(&hash.as_bytes()[..8]),
                                                         e
                                                     );
+                                                }
+                                                // EXECUTE-ON-RECEIVE (step 2): fast-path apply of a
+                                                // synced block that linearly extends the applied tip.
+                                                // The sync path delivers blocks in order, so this is
+                                                // the common catch-up case; gaps defer to a later step.
+                                                if let Some(app) = &applicator_for_net {
+                                                    match app.apply_received(&block).await {
+                                                        canonical_apply::ApplyOutcome::Applied { root, height } => {
+                                                            tracing::debug!(
+                                                                "execute-on-receive applied synced block @ {} (root {})",
+                                                                height, root
+                                                            );
+                                                        }
+                                                        canonical_apply::ApplyOutcome::Rejected(why) => {
+                                                            tracing::warn!(
+                                                                "execute-on-receive REJECTED synced block {}: {}",
+                                                                hex::encode(&hash.as_bytes()[..8]),
+                                                                why
+                                                            );
+                                                        }
+                                                        _ => {}
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
@@ -2187,6 +2291,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 hex::encode(registry),
                 activation_height
             );
+        }
+
+        // EXECUTE-ON-RECEIVE (reroll addendum): seal version-2 headers that commit the
+        // coinbase, making state_root reproducible by receivers. Feature-flagged
+        // (CITRATE_BLOCK_V2=1) so it activates at the reroll; default off keeps v1 headers.
+        if std::env::var("CITRATE_BLOCK_V2").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+            producer_instance = producer_instance.with_v2_headers(true);
+            info!("EXECUTE-ON-RECEIVE: sealing version-2 headers (coinbase committed in block hash)");
+        }
+
+        // EXECUTE-ON-RECEIVE (step 2): share the applied-tip lock so the producer's
+        // execute→persist never races the receive-path applier, and each sealed block
+        // advances the applied tip. Present iff execute-on-receive (v2) is enabled.
+        if let Some(app) = &canonical_applicator {
+            producer_instance = producer_instance.with_applied_tip_lock(app.advance_lock());
         }
 
         // WP-I.3: Share the same pause_flag between RPC server and producer

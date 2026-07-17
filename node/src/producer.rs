@@ -143,10 +143,27 @@ pub struct BlockProducer {
     /// [`Self::with_equivocation_vote_config`]; `None` until the registry is configured.
     equivocation_vote_cfg: Option<EquivocationVoteConfig>,
 
-    /// VALIDATOR-S1 (v5): optional registry snapshot-sync. When set, after sealing a
-    /// block at a snapshot boundary S(E) the producer rebuilds the shared proposer
-    /// selector from `ValidatorRegistry.activeSet()` as-of that state. `None` disables it.
+    /// VALIDATOR-S1 (v5): optional registry snapshot-sync for LOCALLY-PRODUCED S(E)
+    /// blocks. When set, after sealing a block at a snapshot boundary S(E) the producer
+    /// rebuilds the shared proposer selector from `ValidatorRegistry.activeSet()` as-of
+    /// that state. RECEIVED and REORGED S(E) blocks are synced by the execute-on-receive
+    /// driver (`CanonicalApplicator`, step 5) — the two cover disjoint block sources, so
+    /// there is no double-sync. `None` disables it.
     registry_sync: Option<Arc<crate::registry_sync::RegistrySync>>,
+
+    /// EXECUTE-ON-RECEIVE (reroll addendum): when true, seal version-2 headers that COMMIT
+    /// the `coinbase` in `compute_hash`, making the block's `state_root` reproducible by
+    /// receivers. Feature-flagged (`CITRATE_BLOCK_V2`) so it activates at the reroll; false
+    /// keeps version-1 headers (coinbase present but not hashed) and existing history intact.
+    emit_v2_headers: bool,
+
+    /// EXECUTE-ON-RECEIVE (step 2): shared applied-tip lock. When set, the producer
+    /// holds it across its execute→persist critical section (so production never races
+    /// the receive-path applier — they both mutate the same executor state) and records
+    /// the sealed block as the new applied tip before releasing it. `None` disables the
+    /// interlock (pre-reroll / execute-on-receive off), preserving legacy behavior.
+    applied_tip_lock:
+        Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>>,
 }
 
 impl BlockProducer {
@@ -177,14 +194,7 @@ impl BlockProducer {
         ));
 
         // Create reward calculator with default config
-        let reward_config = RewardConfig {
-            block_reward: 10, // 10 SALT per block
-            halving_interval: 2_100_000,
-            inference_bonus: 1,        // 0.01 SALT per inference
-            model_deployment_bonus: 1, // 1 SALT per model deployment
-            treasury_percentage: 10,
-            treasury_address: citrate_execution::types::Address([0x11; 20]), // Treasury address
-        };
+        let reward_config = crate::canonical_apply::canonical_reward_config();
         let reward_calculator = RewardCalculator::new(reward_config);
 
         // Create AI state manager
@@ -215,6 +225,8 @@ impl BlockProducer {
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
             registry_sync: None,
+            emit_v2_headers: false,
+            applied_tip_lock: None,
         }
     }
 
@@ -246,14 +258,7 @@ impl BlockProducer {
         ));
 
         // Create reward calculator with default config
-        let reward_config = RewardConfig {
-            block_reward: 10, // 10 SALT per block
-            halving_interval: 2_100_000,
-            inference_bonus: 1,        // 0.01 SALT per inference
-            model_deployment_bonus: 1, // 1 SALT per model deployment
-            treasury_percentage: 10,
-            treasury_address: citrate_execution::types::Address([0x11; 20]), // Treasury address
-        };
+        let reward_config = crate::canonical_apply::canonical_reward_config();
         let reward_calculator = RewardCalculator::new(reward_config);
 
         // Create AI state manager
@@ -284,6 +289,8 @@ impl BlockProducer {
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
             registry_sync: None,
+            emit_v2_headers: false,
+            applied_tip_lock: None,
         }
     }
 
@@ -345,6 +352,8 @@ impl BlockProducer {
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
             registry_sync: None,
+            emit_v2_headers: false,
+            applied_tip_lock: None,
         }
     }
 
@@ -405,14 +414,7 @@ impl BlockProducer {
         ));
 
         // For backwards compatibility, keep a basic reward calculator
-        let reward_config = RewardConfig {
-            block_reward: 10, // This will be overridden by economics manager
-            halving_interval: 2_100_000,
-            inference_bonus: 1,
-            model_deployment_bonus: 1,
-            treasury_percentage: 10,
-            treasury_address: citrate_execution::types::Address([0x11; 20]),
-        };
+        let reward_config = crate::canonical_apply::canonical_reward_config();
         let reward_calculator = RewardCalculator::new(reward_config);
         let ai_state_manager = Arc::new(AIStateManager::new(storage.db.clone()));
 
@@ -441,6 +443,8 @@ impl BlockProducer {
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
             registry_sync: None,
+            emit_v2_headers: false,
+            applied_tip_lock: None,
         }
     }
 
@@ -511,14 +515,7 @@ impl BlockProducer {
             100,
         ));
 
-        let reward_config = RewardConfig {
-            block_reward: 10,
-            halving_interval: 2_100_000,
-            inference_bonus: 1,
-            model_deployment_bonus: 1,
-            treasury_percentage: 10,
-            treasury_address: citrate_execution::types::Address([0x11; 20]),
-        };
+        let reward_config = crate::canonical_apply::canonical_reward_config();
         let reward_calculator = RewardCalculator::new(reward_config);
         let ai_state_manager = Arc::new(AIStateManager::new(storage.db.clone()));
 
@@ -547,6 +544,8 @@ impl BlockProducer {
             inference_count: Arc::new(AtomicU64::new(0)),
             equivocation_vote_cfg: None,
             registry_sync: None,
+            emit_v2_headers: false,
+            applied_tip_lock: None,
         }
     }
 
@@ -614,6 +613,23 @@ impl BlockProducer {
     /// VALIDATOR-S1 (v5): attach the registry snapshot-sync (see [`Self::registry_sync`]).
     pub fn with_registry_sync(mut self, sync: Arc<crate::registry_sync::RegistrySync>) -> Self {
         self.registry_sync = Some(sync);
+        self
+    }
+
+    /// EXECUTE-ON-RECEIVE: seal version-2 headers that commit the coinbase (reroll flag).
+    pub fn with_v2_headers(mut self, enabled: bool) -> Self {
+        self.emit_v2_headers = enabled;
+        self
+    }
+
+    /// EXECUTE-ON-RECEIVE (step 2): share the applied-tip lock with the receive-path
+    /// applier. Held across produce→persist so production and reception never race the
+    /// executor's snapshot/restore; the sealed block becomes the new applied tip.
+    pub fn with_applied_tip_lock(
+        mut self,
+        lock: Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>,
+    ) -> Self {
+        self.applied_tip_lock = Some(lock);
         self
     }
 
@@ -687,6 +703,17 @@ impl BlockProducer {
 
     /// Produce a single block
     async fn produce_block(&self) -> anyhow::Result<Hash> {
+        // EXECUTE-ON-RECEIVE (step 2): hold the shared state-advance lock across the
+        // whole build. The receive-path applier (`CanonicalApplicator::apply_received`)
+        // takes the same lock, so production and reception never concurrently mutate the
+        // executor (whose apply_block snapshot/restore is not concurrency-safe). Held
+        // until this method returns; the sealed block is recorded as the new applied tip
+        // just before release. `None` when execute-on-receive is disabled (legacy path).
+        let mut applied_guard = match &self.applied_tip_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
         // Get current tips for parent selection
         let tips = self.dag_store.get_tips().await;
 
@@ -761,9 +788,10 @@ impl BlockProducer {
         // Blue score and work are already calculated above
         let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
 
-        // Create block header with GhostDAG consensus data
+        // Create block header with GhostDAG consensus data.
+        // EXECUTE-ON-RECEIVE: v2 headers commit the coinbase (reroll flag); v1 keep legacy hashing.
         let mut header = BlockHeader {
-            version: 1,
+            version: if self.emit_v2_headers { 2 } else { 1 },
             block_hash: Hash::default(), // Will be computed
             selected_parent_hash: selected_parent,
             merge_parent_hashes: merge_parents,
@@ -794,6 +822,9 @@ impl BlockProducer {
             },
             gas_used: 0, // Will be updated after execution
             gas_limit: 30_000_000, // 30M gas default
+            // EXECUTE-ON-RECEIVE: commit the beneficiary so receivers can reproduce state_root.
+            // Hashed only for v2 (see compute_hash); harmless for v1.
+            coinbase: self.coinbase.0[0..20].try_into().unwrap_or([0u8; 20]),
         };
 
         // WP-Z.3 / PIN-P1(d): Set block context with the consensus ECVRF
@@ -834,7 +865,15 @@ impl BlockProducer {
             self.coinbase.0[0..20].try_into().unwrap_or([0; 20])
         );
 
-        if let Some(economics) = &self.economics_manager {
+        // EXECUTE-ON-RECEIVE: the enhanced reward path reads node-local, non-consensus
+        // state (staking manager, f64 reputation, dynamic pricing) that a receiver cannot
+        // reproduce — so it is incompatible with execute-on-receive. Under v2 headers
+        // (the reroll flag that turns on execute-on-receive) force the DETERMINISTIC basic
+        // path, whose reward is a pure function of header.height + transactions and matches
+        // `CanonicalApplicator::reward_credits` byte-for-byte. See
+        // docs/consensus/EXECUTE_ON_RECEIVE_state_application.md and the reroll addendum.
+        let use_enhanced = self.economics_manager.is_some() && !self.emit_v2_headers;
+        if let Some(economics) = self.economics_manager.as_ref().filter(|_| use_enhanced) {
             info!("Economics: Applying enhanced reward system for block {}", header.height);
 
             let base_reward = economics.get_config().rewards_config.base_block_reward;
@@ -969,6 +1008,20 @@ impl BlockProducer {
         // Persist state root separately for fast startup verification
         if let Err(e) = self.storage.state.put_state_root(&block.header.block_hash, &block.state_root) {
             warn!("Failed to persist state root for block {}: {}", block.header.height, e);
+        }
+
+        // EXECUTE-ON-RECEIVE (step 2): we just executed + persisted this block's state,
+        // so advance the applied tip to it (under the lock we've held since fn entry).
+        // Keeps the fleet-wide invariant "applied_tip == the block whose state the
+        // executor reflects" true for locally-produced blocks too, so a peer building on
+        // our tip fast-path-applies cleanly.
+        if let Some(guard) = applied_guard.as_mut() {
+            crate::canonical_apply::record_produced(
+                guard,
+                &self.storage,
+                &self.executor,
+                &block,
+            );
         }
 
         // Broadcast block to connected peers

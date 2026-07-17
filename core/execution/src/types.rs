@@ -603,4 +603,10 @@ pub enum ExecutionError {
 
     #[error("Invalid jump destination")]
     InvalidJumpDestination,
+
+    /// Execute-on-receive: re-executing a received block's transactions produced a
+    /// state root different from the block's claimed `state_root`. The block is invalid
+    /// and MUST be rejected; world state is left untouched (reverted).
+    #[error("State root mismatch: block claims {expected}, re-execution produced {got}")]
+    StateRootMismatch { expected: Hash, got: Hash },
 }
