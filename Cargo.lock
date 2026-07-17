@@ -1237,6 +1237,7 @@ dependencies = [
  "citrate-consensus",
  "criterion",
  "dashmap",
+ "ed25519-dalek",
  "ethereum-types",
  "futures",
  "halo2_proofs",
