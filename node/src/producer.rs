@@ -959,8 +959,17 @@ impl BlockProducer {
                     reward.treasury_reward,
                 ),
             ];
+            // Use the GUARDED settle: the producer calls settle WITHOUT the
+            // snapshot/restore that the receiver's `apply_block_inner` wraps it in,
+            // so a settle error (e.g. the absent-proposer reject arm, which fires
+            // AFTER step 1's basic credits are applied) would otherwise leak stray
+            // credits into shared state — and, since production runs with eager
+            // persistence, into the durable store. `settle_block_rewards_guarded`
+            // engages the persistence-defer guard + snapshots world state, so ANY
+            // error leaves both memory and store byte-identical; on success the
+            // credits stay dirty and are persisted by `persist_state_changes` below.
             self.executor
-                .settle_block_rewards(
+                .settle_block_rewards_guarded(
                     header.height,
                     header.coinbase,
                     *header.proposer_pubkey.as_bytes(),

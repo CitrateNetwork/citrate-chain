@@ -142,6 +142,25 @@ fn block_txs(alice: PublicKey, alice_to: PublicKey, bob: PublicKey, bob_to: Publ
     ]
 }
 
+/// Build a v2 block committing the proposer + coinbase + base fee, at an explicit
+/// height, with the given transactions and claimed state root.
+fn build_block_h(height: u64, base_fee: u64, txs: Vec<ConsensusTransaction>, state_root: Hash) -> Block {
+    let mut b = BlockBuilder::new()
+        .version(2)
+        .height(height)
+        .parent(Hash::default())
+        .coinbase(COINBASE)
+        .proposer(PublicKey::new(proposer_pubkey()))
+        .timestamp(1_700_000_000)
+        .base_fee_per_gas(base_fee)
+        .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+        .transactions(txs)
+        .state_root(state_root)
+        .build_unhashed();
+    b.header.block_hash = b.compute_hash();
+    b
+}
+
 /// Build a v2 block committing the proposer + coinbase + base fee, with the
 /// given transactions and claimed state root.
 fn build_block(base_fee: u64, txs: Vec<ConsensusTransaction>, state_root: Hash) -> Block {
@@ -323,6 +342,124 @@ async fn sub_base_fee_tx_is_rejected_on_import() {
         matches!(err, ExecutionError::RewardSettlement(_)),
         "expected RewardSettlement, got {err:?}"
     );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// (c) HARD-REJECT — a None policy AT/ABOVE the activation height is a fault, not a
+// silent skip. Without this, a node whose epoch snapshot failed to materialize /
+// rehydrate would settle a §R'-less (policy-less) block and fork the fleet.
+// ═════════════════════════════════════════════════════════════════════════════
+#[tokio::test]
+async fn none_policy_at_or_above_activation_is_rejected() {
+    // Activation configured (as main.rs does when the registry is set), but NO
+    // policy materialized (None) — simulating a snapshot that failed to load.
+    let er = new_executor();
+    er.set_validator_activation_height(800);
+    let (a, at, b, bt) = fund_senders(&er);
+    let txs = block_txs(a, at, b, bt);
+    // A block AT the activation height with a None policy → HARD REJECT.
+    let block = build_block_h(800, CANONICAL_BASE_FEE_PER_GAS, txs.clone(), Hash::new([0xAB; 32]));
+    let err = er
+        .apply_block(&block, block.header.coinbase, &basic_credits())
+        .await
+        .expect_err("None policy at/above activation must be rejected");
+    match err {
+        ExecutionError::RewardSettlement(msg) => {
+            assert!(
+                msg.contains("unmaterialized"),
+                "reject reason should name the unmaterialized policy: {msg}"
+            );
+        }
+        other => panic!("expected RewardSettlement, got {other:?}"),
+    }
+}
+
+// (c) control: a None policy BELOW activation is NOT a fault — priority fees just
+// burn (pre-reroll behavior), and the block is accepted.
+#[tokio::test]
+async fn none_policy_below_activation_is_accepted() {
+    let ep = new_executor();
+    ep.set_validator_activation_height(800);
+    let (a, at, b, bt) = fund_senders(&ep);
+    let txs = block_txs(a, at, b, bt);
+    // height 1 < activation 800, no policy → settle skips §R', computes a root.
+    let template = build_block_h(1, CANONICAL_BASE_FEE_PER_GAS, txs.clone(), Hash::default());
+    ep.set_block_context(citrate_execution::revm_adapter::BlockContext {
+        coinbase: COINBASE,
+        prevrandao: *template.header.vrf_reveal.output.as_bytes(),
+        block_hashes: HashMap::new(),
+    });
+    let mut receipts = Vec::new();
+    for tx in &template.transactions {
+        receipts.push(ep.execute_transaction(&template, tx).await.expect("tx executes"));
+    }
+    ep.settle_block_rewards(
+        1,
+        COINBASE,
+        proposer_pubkey(),
+        CANONICAL_BASE_FEE_PER_GAS,
+        &template.transactions,
+        &receipts,
+        &basic_credits(),
+    )
+    .await
+    .expect("below activation, a None policy is a skip (not a reject)");
+    let root = ep.calculate_state_root();
+    let sealed = build_block_h(1, CANONICAL_BASE_FEE_PER_GAS, txs, root);
+
+    let er = new_executor();
+    er.set_validator_activation_height(800);
+    fund_senders(&er);
+    let got = er
+        .apply_block(&sealed, sealed.header.coinbase, &basic_credits())
+        .await
+        .expect("accepted below activation with a None policy");
+    assert_eq!(got, root, "parity holds below activation with a None policy");
+    assert_eq!(
+        er.get_balance(&Address(REGISTRY)),
+        U256::zero(),
+        "no share vested below the activation height"
+    );
+}
+
+// (fix #4) PRODUCER settle safety: the guarded settle leaves NO balance mutation
+// when settlement errors (the absent-proposer reject arm fires AFTER step-1 basic
+// credits are applied). Proves the producer path matches the receiver's revert.
+#[tokio::test]
+async fn guarded_settle_reverts_all_credits_on_error() {
+    let e = new_executor();
+    // Policy WITHOUT the proposer in the staker map → settle rejects at step (3b),
+    // AFTER the basic credits (step 1) have been applied.
+    let empty_staker = HashMap::new();
+    *e.reward_policy_handle().write() = Some(EpochRewardPolicy {
+        epoch: 0,
+        snapshot_height: 0,
+        activation_height: 0,
+        registry: REGISTRY,
+        reward_minter: REWARD_MINTER_ADDRESS,
+        priority_fee_share_bps: SHARE_BPS,
+        staker_of: empty_staker, // proposer absent → reject
+    });
+    let root_before = e.calculate_state_root();
+
+    let err = e
+        .settle_block_rewards_guarded(
+            1,
+            COINBASE,
+            proposer_pubkey(),
+            CANONICAL_BASE_FEE_PER_GAS,
+            &[],
+            &[],
+            &basic_credits(),
+        )
+        .await
+        .expect_err("absent proposer must reject");
+    assert!(matches!(err, ExecutionError::RewardSettlement(_)));
+
+    // No stray credits leaked: coinbase + treasury balances untouched, root identical.
+    assert_eq!(e.get_balance(&Address(COINBASE)), U256::zero(), "no basic validator credit leaked");
+    assert_eq!(e.get_balance(&Address(TREASURY)), U256::zero(), "no treasury credit leaked");
+    assert_eq!(e.calculate_state_root(), root_before, "state byte-identical after guarded reject");
 }
 
 // Pre-activation (height < activation): §R' is inert — the block is accepted and
