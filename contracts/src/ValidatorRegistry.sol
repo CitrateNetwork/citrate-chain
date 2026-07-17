@@ -119,7 +119,7 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
     // ── Governance params (timelocked, bounded; read by the node at S(E)) ──
     uint256 public minStake;
     uint256 public blockSubsidy;
-    uint256 public priorityFeeShareBps; // < 10000
+    uint256 public priorityFeeShareBps; // <= 10000 (100% admissible; WS-5 reconcile)
     uint256 public maxEpochEmission;    // hard cap per epoch
     address public slasher;             // authorizes non-equivocation slash tiers
     address public immutable rewardMinter; // execution-layer system address that funds+credits reward
@@ -180,7 +180,9 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
     ) Governable(governance_) {
         if (slasher_ == address(0) || rewardMinter_ == address(0)) revert ZeroAddr();
         if (minStake_ < MIN_STAKE_FLOOR || minStake_ > MIN_STAKE_CEIL) revert OutOfBounds();
-        if (priorityFeeShareBps_ >= 10000) revert OutOfBounds();
+        // Admit up to and INCLUDING 100% (10000 bps): the owner routes the entire
+        // priority-fee share to validators (WS-4 §R'). Only > 100% is nonsensical.
+        if (priorityFeeShareBps_ > 10000) revert OutOfBounds();
         if (blockSubsidy_ > BLOCK_SUBSIDY_CEIL) revert OutOfBounds();
         if (maxEpochEmission_ > MAX_EPOCH_EMISSION_CEIL) revert OutOfBounds();
         slasher = slasher_;
@@ -455,7 +457,7 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
         } else if (name == keccak256("blockSubsidy")) {
             if (value > BLOCK_SUBSIDY_CEIL) revert OutOfBounds();
         } else if (name == keccak256("priorityFeeShareBps")) {
-            if (value >= 10000) revert OutOfBounds();
+            if (value > 10000) revert OutOfBounds(); // <= 100% (owner may route the full share)
         } else if (name == keccak256("maxEpochEmission")) {
             if (value > MAX_EPOCH_EMISSION_CEIL) revert OutOfBounds();
         } else {
