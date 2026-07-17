@@ -1292,6 +1292,25 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 None
             }
         });
+    // VALIDATOR-S1 §R': fail fast if the activation height is below the FIRST
+    // materialized snapshot S(1) = EPOCH - SNAPSHOT_LAG (= 800). Below S(1) no epoch
+    // policy is ever materialized, so — with the §R' hard-reject — every block at/above
+    // activation but below 800 would be rejected (a node brick). Refuse to start rather
+    // than silently misconfigure the fleet.
+    if let Some((_, activation)) = &validator_registry {
+        let s1 = registry_sync::EPOCH - registry_sync::SNAPSHOT_LAG;
+        if *activation < s1 {
+            return Err(anyhow::anyhow!(
+                "CITRATE_VALIDATOR_ACTIVATION_HEIGHT {} is below the first snapshot S(1)={}; \
+                 §R' vesting cannot be enforced before an epoch policy exists",
+                activation, s1
+            ));
+        }
+        // §R' hard-reject: teach the executor the activation height INDEPENDENTLY of the
+        // (initially-None) policy cell, so a None policy at/above activation is a rejectable
+        // fault rather than a silent skip (which would fork this node from the fleet).
+        executor.set_validator_activation_height(*activation);
+    }
     // The shared proposer selector — the SAME Arc the DAG store admits against and the
     // snapshot-sync rebuilds. production() disables the forgeable legacy VRF path.
     let validator_selector: Option<Arc<citrate_consensus::vrf::VrfProposerSelector>> = validator_registry
@@ -1375,9 +1394,28 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // that RECEIVES or REORGS to a snapshot block S(E) rebuilds its
             // proposer selector from the registry — not only the producer.
             if let (Some((registry, activation)), Some(sel)) = (&validator_registry, &validator_selector) {
-                app_builder = app_builder.with_registry_sync(Arc::new(
-                    registry_sync::RegistrySync::new(executor.clone(), sel.clone(), *registry, *activation),
+                let rs = Arc::new(registry_sync::RegistrySync::new(
+                    executor.clone(),
+                    sel.clone(),
+                    *registry,
+                    *activation,
+                    storage.clone(),
                 ));
+                // BOOT REHYDRATION (fixes the restart reward-policy fork AND the pre-
+                // existing membership restart-brick): before the driver drains or serves
+                // ANY block, restore BOTH the §R' reward policy cell AND the proposer
+                // selector for the epoch governing the resumed applied tip — from the
+                // durable snapshot when present, else recomputed from persisted state at
+                // the greatest S(E) <= the tip. Without this, `CanonicalApplicator::new`
+                // resumes from the mid-epoch tip with an empty selector (admission would
+                // reject every proposer) and a None policy (the §R' hard-reject would
+                // reject every block at/above activation).
+                let resumed = app_builder.applied_tip().await.height;
+                match rs.hydrate_on_boot(resumed).await {
+                    Ok(desc) => info!("VALIDATOR-S1: boot rehydration — {}", desc),
+                    Err(e) => warn!("VALIDATOR-S1: boot rehydration failed at height {}: {}", resumed, e),
+                }
+                app_builder = app_builder.with_registry_sync(rs);
                 info!("VALIDATOR-S1: registry snapshot-sync attached to execute-on-receive driver (received/reorged S(E) blocks)");
             }
             let app = Arc::new(app_builder);
@@ -2286,6 +2324,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     sel.clone(),
                     *registry,
                     *activation_height,
+                    storage.clone(),
                 )));
             info!(
                 "VALIDATOR-S1: stake-gated membership ENABLED (registry 0x{}, activation height {})",
@@ -2297,7 +2336,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // EXECUTE-ON-RECEIVE (reroll addendum): seal version-2 headers that commit the
         // coinbase, making state_root reproducible by receivers. Feature-flagged
         // (CITRATE_BLOCK_V2=1) so it activates at the reroll; default off keeps v1 headers.
-        if std::env::var("CITRATE_BLOCK_V2").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        // Uses the SINGLE parsed `execute_on_receive_enabled` (parsed once above) so the
+        // producer's v2-header emission can NEVER diverge from the receive-path applier's
+        // enablement — a split parse could seal v2 blocks with no applier, or vice-versa.
+        if execute_on_receive_enabled {
             producer_instance = producer_instance.with_v2_headers(true);
             info!("EXECUTE-ON-RECEIVE: sealing version-2 headers (coinbase committed in block hash)");
         }
