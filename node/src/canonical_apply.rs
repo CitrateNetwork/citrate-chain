@@ -545,9 +545,10 @@ impl CanonicalApplicator {
                     new_snaps.push((h, hh, self.executor.state_snapshot()));
                 }
                 Err(e) => {
-                    // Abort: byte-exact in-memory restore. Because the re-apply did
-                    // NOT persist, the durable store is untouched (still the old
-                    // branch, == pre_state) and the ring/tip/pointer never moved.
+                    // Abort: byte-exact in-memory restore (incl. dirty-code, captured
+                    // in the snapshot) — the re-apply did NOT persist, so the durable
+                    // store is untouched (still the old branch, == pre_state) and the
+                    // ring/tip/pointer never moved (review finding E).
                     self.executor.state_restore(pre_state);
                     warn!(
                         "execute-on-receive: reorg to {} aborted at {} — {} (reverted to {})",
@@ -1357,6 +1358,18 @@ mod tests {
             follower.get_balance(&Address(ALICE)),
             "ALICE durable balance matches in-memory after reorg"
         );
+        // Reward accounts (credited via set_balance, which defers under apply):
+        // the store must reflect the B branch's rewards, not A's.
+        assert_eq!(
+            restarted.get_balance(&Address(CB)),
+            follower.get_balance(&Address(CB)),
+            "coinbase reward durable balance matches in-memory after reorg"
+        );
+        assert_eq!(
+            restarted.get_balance(&Address(TREASURY_ADDR)),
+            follower.get_balance(&Address(TREASURY_ADDR)),
+            "treasury reward durable balance matches after reorg"
+        );
     }
 
     /// HIGH-2 (abort path): a reorg that aborts on a bad block must leave the
@@ -1398,6 +1411,33 @@ mod tests {
         let restarted = store_backed(&storage);
         assert_eq!(restarted.get_balance(&Address(BOB)), U256::from(2_000u64), "store still on A branch");
         assert_eq!(restarted.get_balance(&Address(CAROL)), U256::zero(), "aborted B branch never persisted");
+        // Reward accounts must not carry the aborted B reapply's credits (set_balance
+        // deferred under apply → nothing persisted during the aborted reapply).
+        assert_eq!(
+            restarted.get_balance(&Address(CB)),
+            follower.get_balance(&Address(CB)),
+            "coinbase reward store matches A branch after abort"
+        );
+    }
+
+    /// Review finding E (backward-compat side): a DIRECT `set_code` (genesis
+    /// init, RPC — no apply in progress, so `defer_persist` is off) still
+    /// persists account + code eagerly, exactly as before. The deferral only
+    /// engages inside `apply_block`.
+    #[tokio::test]
+    async fn direct_set_code_persists_eagerly() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        let addr = Address([0xCD; 20]);
+        let code = vec![0x60u8, 0x2a, 0x60, 0x00, 0x52];
+
+        exec.set_code(&addr, code.clone());
+        let code_hash = exec.get_code_hash(&addr);
+        // Eagerly durable (no persist_state_changes call needed).
+        assert!(storage.state.get_account(&addr).expect("get").is_some(), "account persisted eagerly");
+        assert_eq!(storage.state.get_code(&code_hash).expect("get"), Some(code), "code persisted eagerly");
     }
 
     /// With no registry-sync attached the hook is inert (steps 2–4 unaffected).
