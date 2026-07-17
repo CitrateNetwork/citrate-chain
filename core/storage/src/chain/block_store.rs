@@ -20,6 +20,16 @@ const LATEST_HEIGHT_KEY: &[u8] = b"latest_height";
 /// Stored as 32-byte hash ‖ 8-byte big-endian height (40 bytes).
 const APPLIED_TIP_KEY: &[u8] = b"applied_tip";
 
+/// VALIDATOR-S1 §R': the durably-persisted, materialized epoch reward snapshot —
+/// the `EpochRewardPolicy` (share bps + reward minter + proposer->staker map) AND
+/// the active-set + minStake needed to rebuild the proposer selector — written at
+/// each snapshot boundary S(E) by `registry_sync`. On restart the node reloads
+/// this BEFORE serving blocks, so it resumes with the byte-identical finalized
+/// snapshot a continuously-up node holds (reading it live from the mid-epoch tip
+/// would re-derive a possibly governance-mutated policy and fork). Opaque blob —
+/// the node layer owns the encoding.
+const REWARD_SNAPSHOT_KEY: &[u8] = b"reward_snapshot";
+
 /// Block storage manager
 pub struct BlockStore {
     db: Arc<RocksDB>,
@@ -242,6 +252,19 @@ impl BlockStore {
         buf[..32].copy_from_slice(hash.as_bytes());
         buf[32..].copy_from_slice(&height.to_be_bytes());
         self.db.put_cf(CF_METADATA, APPLIED_TIP_KEY, &buf)
+    }
+
+    /// VALIDATOR-S1 §R': durably persist the materialized epoch reward snapshot
+    /// (opaque blob — see [`REWARD_SNAPSHOT_KEY`]). Overwrites the previous epoch's
+    /// snapshot; only the most-recent (greatest S(E) applied) is needed at boot.
+    pub fn put_reward_snapshot(&self, blob: &[u8]) -> Result<()> {
+        self.db.put_cf(CF_METADATA, REWARD_SNAPSHOT_KEY, blob)
+    }
+
+    /// VALIDATOR-S1 §R': read the persisted epoch reward snapshot, or `None` if
+    /// never written (fresh node / pre-upgrade store / pre-first-snapshot boot).
+    pub fn get_reward_snapshot(&self) -> Result<Option<Vec<u8>>> {
+        self.db.get_cf(CF_METADATA, REWARD_SNAPSHOT_KEY)
     }
 
     /// Execute-on-receive: read the persisted applied-tip pointer, or `None`
