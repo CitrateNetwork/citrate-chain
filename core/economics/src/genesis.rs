@@ -65,6 +65,44 @@ pub const DETERMINISTIC_FAUCET_SIGNER_ADDRESS: Address = Address([
     0xbf, 0x53, 0x78, 0xeb, 0x58, 0x0e, 0x3b, 0x39, 0x01, 0x82,
 ]);
 
+// ─────────────────────────────────────────────────────────────────────────────
+// VALIDATOR-S1 (WS-5) genesis staker seed.
+//
+// Four DEDICATED validator-staker EOAs, one per fleet node (rpc-1 + boot1/2/3).
+// They are the `msg.sender` that calls `ValidatorRegistry.registerValidator` and
+// bonds the stake — one-staker-one-pubkey, so 4 DISTINCT funded stakers are
+// mandatory. Each is pre-funded with 40,000 SALT (>= the 32,000 minStake plus gas
+// headroom) so the registration ceremony can run at the reroll before S(1)=800.
+//
+// Keys are DETERMINISTIC and owner-regenerable — NOT stored as new secrets:
+//   key_i = keccak256( DEPLOYER_PRIVATE_KEY_bytes || utf8("citrate/validator-staker/{i}/v1") )
+// (the same derivation as scripts/ops/derive-operator-keys.sh; see
+// scripts/ops/derive-validator-stakers.sh). The deployer key is already the
+// genesis root of trust, so this adds no new secret to back up.
+//
+// The 40,000-SALT total (160,000 across the four) comes out of the mining pool,
+// exactly as the deterministic faucet signer's pre-fund does — see the reduced
+// `mining_pool_max` in testnet_beta().
+pub const VALIDATOR_STAKER_1_ADDRESS: Address = Address([
+    0xe7, 0x50, 0x9e, 0x40, 0xb8, 0xb7, 0xfc, 0xba, 0xd0, 0xb0,
+    0xa2, 0x59, 0xb0, 0x37, 0xf0, 0x02, 0xce, 0xe6, 0xdf, 0x5b,
+]);
+pub const VALIDATOR_STAKER_2_ADDRESS: Address = Address([
+    0x75, 0x09, 0xd6, 0x95, 0x5a, 0xb4, 0x32, 0x75, 0xb9, 0xe1,
+    0x00, 0xc6, 0xb6, 0xe9, 0xc6, 0x26, 0xc4, 0x5d, 0x9e, 0x80,
+]);
+pub const VALIDATOR_STAKER_3_ADDRESS: Address = Address([
+    0xf7, 0x19, 0x8f, 0xc9, 0xa3, 0x89, 0x22, 0x7d, 0x4f, 0x41,
+    0xbc, 0x97, 0x6c, 0x27, 0x3a, 0x1c, 0x22, 0x98, 0x13, 0xe6,
+]);
+pub const VALIDATOR_STAKER_4_ADDRESS: Address = Address([
+    0x11, 0xec, 0x3e, 0x50, 0x54, 0x6c, 0x7c, 0x47, 0xe9, 0x87,
+    0xec, 0x2e, 0xb5, 0x70, 0xeb, 0x32, 0x9c, 0x0f, 0x9e, 0xc3,
+]);
+
+/// Per-staker genesis funding: 40,000 SALT (32k minStake bond + gas/re-stake headroom).
+pub const VALIDATOR_STAKER_GENESIS_SALT: u64 = 40_000;
+
 fn account(address: Address, balance_latt: u64) -> GenesisAccount {
     GenesisAccount {
         address,
@@ -328,6 +366,14 @@ impl GenesisConfig {
                 // so a re-roll no longer needs a manual `cast send` to top it up.
                 // (10M SALT — matches DEPLOYED_ADDRESSES.md + team_testnet_genesis.)
                 account(DETERMINISTIC_FAUCET_SIGNER_ADDRESS, 10_000_000),
+                // VALIDATOR-S1 (WS-5): 4 dedicated validator-staker EOAs, one per
+                // fleet node, each pre-funded with 40,000 SALT (>= 32k minStake +
+                // gas) so the registration ceremony can bond them before S(1)=800.
+                // Deterministic, owner-regenerable keys — see the address consts.
+                account(VALIDATOR_STAKER_1_ADDRESS, VALIDATOR_STAKER_GENESIS_SALT),
+                account(VALIDATOR_STAKER_2_ADDRESS, VALIDATOR_STAKER_GENESIS_SALT),
+                account(VALIDATOR_STAKER_3_ADDRESS, VALIDATOR_STAKER_GENESIS_SALT),
+                account(VALIDATOR_STAKER_4_ADDRESS, VALIDATOR_STAKER_GENESIS_SALT),
                 // Arachnid deterministic CREATE2 deployer — required for
                 // the ERC-4337 bundler to boot (EW-S1 unblocker).
                 arachnid_deterministic_deployer_account(),
@@ -335,9 +381,10 @@ impl GenesisConfig {
             treasury_address: TESTNET_TREASURY_ADDRESS,
             team_allocations: HashMap::new(),
             ecosystem_fund: TESTNET_TREASURY_ADDRESS, // Treasury doubles as ecosystem fund
-            // 585M pre-allocated (now incl. the 10M faucet signer) + 415M mining
-            // = the 1B supply cap. The faucet pre-fund comes out of the mining pool.
-            mining_pool_max: latt_to_wei(415_000_000),
+            // 585.16M pre-allocated (585M + 4×40k validator stakers) + 414.84M mining
+            // = the 1B supply cap. The staker pre-fund (160k) comes out of the mining
+            // pool, exactly as the faucet-signer pre-fund does.
+            mining_pool_max: latt_to_wei(414_840_000),
         }
     }
 
@@ -735,9 +782,41 @@ mod tests {
         let config = GenesisConfig::testnet_beta();
         assert!(config.validate().is_ok());
         assert_eq!(config.chain_id, 40204);
-        // 6 funded accounts (incl. the deterministic faucet signer) + the
-        // Arachnid deterministic CREATE2 deployer.
-        assert_eq!(config.accounts.len(), 7);
+        // 6 funded accounts (incl. the deterministic faucet signer) + 4 VALIDATOR-S1
+        // stakers (WS-5) + the Arachnid deterministic CREATE2 deployer.
+        assert_eq!(config.accounts.len(), 11);
+    }
+
+    /// VALIDATOR-S1 (WS-5) regression: testnet_beta() MUST pre-fund 4 DISTINCT
+    /// validator-staker EOAs, each with >= the 32,000 SALT minStake so the
+    /// registration ceremony can bond them before the epoch-1 snapshot S(1)=800.
+    #[test]
+    fn test_testnet_beta_funds_four_validator_stakers() {
+        let config = GenesisConfig::testnet_beta();
+        let stakers = [
+            VALIDATOR_STAKER_1_ADDRESS,
+            VALIDATOR_STAKER_2_ADDRESS,
+            VALIDATOR_STAKER_3_ADDRESS,
+            VALIDATOR_STAKER_4_ADDRESS,
+        ];
+        // Distinct addresses (one-staker-one-pubkey).
+        let mut seen = std::collections::HashSet::new();
+        for s in stakers {
+            assert!(seen.insert(s), "validator stakers must be distinct");
+        }
+        // Each funded at 40,000 SALT (>= 32,000 minStake).
+        for staker in stakers {
+            let acct = config
+                .accounts
+                .iter()
+                .find(|a| a.address == staker)
+                .expect("testnet beta must fund every validator staker (WS-5)");
+            assert_eq!(acct.balance, latt_to_wei(VALIDATOR_STAKER_GENESIS_SALT));
+            assert!(
+                acct.balance >= latt_to_wei(32_000),
+                "staker must hold >= the 32k minStake"
+            );
+        }
     }
 
     #[test]
@@ -779,8 +858,9 @@ mod tests {
         let total = config.total_preallocation();
 
         // 500M treasury + 50M reserve + 10M deployer + 10M team + 5M validator
-        // + 10M deterministic faucet signer (R1/D-2) = 585M.
-        let expected = latt_to_wei(585_000_000);
+        // + 10M deterministic faucet signer (R1/D-2) + 4×40k VALIDATOR-S1 stakers
+        // (WS-5, 160k) = 585.16M.
+        let expected = latt_to_wei(585_160_000);
         assert_eq!(total, expected);
     }
 
