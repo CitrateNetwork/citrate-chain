@@ -25,16 +25,12 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use citrate_consensus::crypto::{registration_digest, Ed25519SigningKey};
+use citrate_consensus::crypto::{derive_block_signing_key, registration_digest, Ed25519SigningKey};
 use citrate_wallet_core::{sign_eip155_legacy_tx, LegacyTxFields};
 use clap::Parser;
 use k256::ecdsa::SigningKey as Secp256k1SigningKey;
 use serde_json::{json, Value};
-use sha3::{Digest, Keccak256, Sha3_256};
-
-/// The exact domain-separation string `node/src/main.rs` hashes before the
-/// coinbase to derive the block-signing (proposer) key. MUST match byte-for-byte.
-const PROPOSER_KEY_DOMAIN: &[u8] = b"citrate-block-signing-key-v1";
+use sha3::{Digest, Keccak256};
 
 /// Snapshot geometry (mirrors ValidatorRegistry EPOCH=1000, SNAPSHOT_LAG=200):
 /// the epoch-1 snapshot is taken at S(1) = 1*1000 - 200 = 800. A registration must
@@ -122,12 +118,12 @@ async fn main() -> Result<()> {
         let height = eth_block_number(&client, &cli.rpc_url)
             .await
             .context("eth_blockNumber (seed-timing guard)")?;
-        let limit = FIRST_SNAPSHOT_HEIGHT.saturating_sub(DEFAULT_SEED_MARGIN_BLOCKS);
+        let limit = seed_timing_refuse_limit();
         println!(
             "chain height {} (epoch-1 snapshot S(1)={}, refuse-after {})",
             height, FIRST_SNAPSHOT_HEIGHT, limit
         );
-        if height >= limit && !cli.force {
+        if !seed_timing_permitted(height, cli.force) {
             bail!(
                 "chain height {} is within the seed margin of S(1)={} — registrations may miss \
                  the epoch-1 active set. Re-roll and register earlier, or pass --force if you \
@@ -249,20 +245,19 @@ async fn register_one(
 // Crypto: proposer-key derivation + calldata/address encoding.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Derive the ed25519 proposer signing key from a 20-byte coinbase, reproducing
-/// `node/src/main.rs` EXACTLY: the coinbase is zero-padded into a 32-byte buffer,
-/// then `Sha3_256(DOMAIN ‖ coinbase32)` seeds `Ed25519SigningKey::from_bytes`.
+/// Derive the ed25519 proposer signing key from a 20-byte coinbase.
+///
+/// This zero-pads the coinbase into a 32-byte buffer (right-padded, exactly the
+/// shape the block producer builds in `node/src/main.rs`) and delegates to the
+/// SINGLE shared derivation `citrate_consensus::crypto::derive_block_signing_key`.
+/// The node's block producer calls the SAME shared function, so the pubkey this
+/// tool registers is byte-identical to the key the node signs blocks with — the
+/// most critical property of the whole ceremony. There is no second copy of the
+/// hashing/domain-separation logic that could drift.
 fn derive_proposer_key(coinbase20: &[u8; 20]) -> Ed25519SigningKey {
     let mut coinbase32 = [0u8; 32];
     coinbase32[..20].copy_from_slice(coinbase20);
-
-    let mut hasher = Sha3_256::new();
-    hasher.update(PROPOSER_KEY_DOMAIN);
-    hasher.update(coinbase32);
-    let seed = hasher.finalize();
-    let mut seed_bytes = [0u8; 32];
-    seed_bytes.copy_from_slice(&seed);
-    Ed25519SigningKey::from_bytes(&seed_bytes)
+    derive_block_signing_key(&coinbase32)
 }
 
 /// ABI-encode `registerValidator(bytes32 proposerPubkey, bytes ed25519Sig)`.
@@ -303,6 +298,22 @@ fn word_u64(v: u64) -> [u8; 32] {
 
 fn salt_to_wei(salt: u64) -> u128 {
     (salt as u128) * 1_000_000_000_000_000_000u128
+}
+
+/// The block height at/after which the seed-timing guard refuses (without
+/// `--force`): `S(1) - margin`. A registration mined at or after this height
+/// risks missing the epoch-1 active-set snapshot at S(1)=800.
+fn seed_timing_refuse_limit() -> u64 {
+    FIRST_SNAPSHOT_HEIGHT.saturating_sub(DEFAULT_SEED_MARGIN_BLOCKS)
+}
+
+/// Seed-timing guard predicate (factored out of `main` for testing). A
+/// registration at `height` is permitted iff it is safely before the
+/// refuse-after limit, or `force` overrides the guard. Boundary: with the
+/// default margin the limit is 700, so 699 is permitted, 700 is refused, and
+/// 700-with-force is permitted.
+fn seed_timing_permitted(height: u64, force: bool) -> bool {
+    force || height < seed_timing_refuse_limit()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -473,6 +484,9 @@ fn addr_hex(a: &[u8; 20]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, Verifier};
+    use proptest::prelude::*;
+    use sha3::Sha3_256;
 
     // Fixed vector: the testnet-config.toml fleet coinbase.
     const VEC_COINBASE: &str = "47fb23137e0ee4248eb975848416e6632fa36090";
@@ -489,6 +503,72 @@ mod tests {
         a
     }
 
+    /// Byte-for-byte reproduction of the derivation that USED to live inline in
+    /// `node/src/main.rs` (before the WS-5 refactor extracted it to the shared
+    /// `citrate_consensus::crypto::derive_block_signing_key`). It reproduces
+    /// main.rs's EXACT `copy_len = min(len, 32)` right-zero-pad and hardcodes the
+    /// domain string LITERALLY here so this test file never imports the shared
+    /// constant it is trying to police. If the shared derivation (which the node
+    /// now calls to sign blocks) ever drifts from this pinned reference, the
+    /// derivation-equivalence fuzz below fails — that is the drift tripwire.
+    fn main_rs_reference_pubkey(coinbase_bytes: &[u8]) -> [u8; 32] {
+        let mut coinbase = [0u8; 32];
+        let copy_len = coinbase_bytes.len().min(32);
+        coinbase[..copy_len].copy_from_slice(&coinbase_bytes[..copy_len]);
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"citrate-block-signing-key-v1");
+        hasher.update(coinbase);
+        let seed = hasher.finalize();
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes.copy_from_slice(&seed);
+        Ed25519SigningKey::from_bytes(&seed_bytes)
+            .verifying_key()
+            .to_bytes()
+    }
+
+    /// A deterministic, valid secp256k1 staker key for tests (nonzero, well below
+    /// the curve order). `seed` MUST be nonzero.
+    fn test_staker_key(seed: u8) -> Secp256k1SigningKey {
+        let mut b = [0u8; 32];
+        b[31] = seed;
+        Secp256k1SigningKey::from_slice(&b).expect("nonzero 32-byte scalar is a valid secp256k1 key")
+    }
+
+    fn node_spec(coinbase: [u8; 20], staker_seed: u8) -> NodeSpec {
+        NodeSpec {
+            coinbase,
+            staker_key: test_staker_key(staker_seed),
+            staker_key_env: format!("TEST_STAKER_{staker_seed}"),
+        }
+    }
+
+    /// Independent, hand-rolled ABI encoder for the Register EIP-712 digest —
+    /// deliberately NOT calling `registration_digest`, so it is a true oracle.
+    fn hand_register_digest(
+        chain_id: u64,
+        registry: &[u8; 20],
+        staker: &[u8; 20],
+        pubkey: &[u8; 32],
+        nonce: u64,
+    ) -> [u8; 32] {
+        let mut enc = Vec::new();
+        enc.extend_from_slice(&keccak256(
+            b"Register(uint256 chainId,address registry,address staker,bytes32 proposerPubkey,uint256 nonce)",
+        ));
+        enc.extend_from_slice(&word_u64(chain_id));
+        let mut wr = [0u8; 32];
+        wr[12..].copy_from_slice(registry);
+        enc.extend_from_slice(&wr);
+        let mut ws = [0u8; 32];
+        ws[12..].copy_from_slice(staker);
+        enc.extend_from_slice(&ws);
+        enc.extend_from_slice(pubkey);
+        enc.extend_from_slice(&word_u64(nonce));
+        keccak256(&enc)
+    }
+
+    // ── Example-based regression pins ────────────────────────────────────────
+
     #[test]
     fn derivation_is_deterministic() {
         let cb = coinbase20(VEC_COINBASE);
@@ -500,31 +580,25 @@ mod tests {
 
     #[test]
     fn derivation_matches_inline_main_rs_algorithm() {
-        // Independently recompute the main.rs seed and compare — proves this tool
-        // reproduces the node's derivation byte-for-byte.
+        // The pinned reference reproduces the historical main.rs inline algorithm;
+        // the tool's derivation must equal it byte-for-byte for the fleet coinbase.
         let cb = coinbase20(VEC_COINBASE);
-        let mut coinbase32 = [0u8; 32];
-        coinbase32[..20].copy_from_slice(&cb);
-        let mut hasher = Sha3_256::new();
-        hasher.update(b"citrate-block-signing-key-v1");
-        hasher.update(coinbase32);
-        let seed = hasher.finalize();
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes.copy_from_slice(&seed);
-        let expected = Ed25519SigningKey::from_bytes(&seed_bytes);
-        let got = derive_proposer_key(&cb);
-        assert_eq!(expected.to_bytes(), got.to_bytes());
+        let got = derive_proposer_key(&cb).verifying_key().to_bytes();
+        assert_eq!(got, main_rs_reference_pubkey(&cb));
+    }
+
+    #[test]
+    fn shared_domain_constant_is_unchanged() {
+        // Guards the shared domain string against a silent edit. This literal is
+        // the contract the node signs blocks under; changing it moves every key.
         assert_eq!(
-            expected.verifying_key().to_bytes(),
-            got.verifying_key().to_bytes()
+            citrate_consensus::crypto::BLOCK_SIGNING_KEY_DOMAIN,
+            b"citrate-block-signing-key-v1",
         );
     }
 
     #[test]
     fn derivation_pinned_pubkey_vector() {
-        if VEC_PUBKEY == "PINNED_BELOW" {
-            return; // placeholder run — replaced with the real pin below
-        }
         let cb = coinbase20(VEC_COINBASE);
         let pk = derive_proposer_key(&cb).verifying_key().to_bytes();
         assert_eq!(hex::encode(pk), VEC_PUBKEY, "proposer pubkey regression vector drifted");
@@ -534,7 +608,6 @@ mod tests {
     fn sign_verify_roundtrip_over_register_digest() {
         // The full cryptographic chain the contract's 0x0120 precompile checks:
         // ed25519 sign the 32-byte register digest, verify_strict must pass.
-        use ed25519_dalek::Signer;
         let cb = coinbase20(VEC_COINBASE);
         let key = derive_proposer_key(&cb);
         let pubkey = key.verifying_key().to_bytes();
@@ -549,29 +622,18 @@ mod tests {
 
     #[test]
     fn register_digest_matches_pinned_vector() {
-        // Pinned Register-digest vector for fixed inputs (regression teeth against a
-        // silent change to the EIP-712 encoding / typehash).
-        let cb = coinbase20(VEC_COINBASE);
-        let pubkey = derive_proposer_key(&cb).verifying_key().to_bytes();
+        // Fully-pinned Register-digest literal for fixed inputs (regression teeth
+        // against any silent change to the EIP-712 encoding / typehash). Every
+        // input is a literal here (pubkey is NOT derived) so the vector is frozen.
         let registry = coinbase20("00112233445566778899aabbccddeeff00112233");
         let staker = coinbase20("aabbccddeeff00112233445566778899aabbccdd");
-        let digest = registration_digest(40204, &registry, &staker, &pubkey, 0);
-        // Hand-recompute keccak256(abi.encode(REGISTER_TYPEHASH, chainId, registry,
-        // staker, proposerPubkey, nonce)) to cross-check the consensus helper.
-        let mut enc = Vec::new();
-        enc.extend_from_slice(&keccak256(
-            b"Register(uint256 chainId,address registry,address staker,bytes32 proposerPubkey,uint256 nonce)",
-        ));
-        enc.extend_from_slice(&word_u64(40204));
-        let mut w = [0u8; 32];
-        w[12..].copy_from_slice(&registry);
-        enc.extend_from_slice(&w);
-        let mut w2 = [0u8; 32];
-        w2[12..].copy_from_slice(&staker);
-        enc.extend_from_slice(&w2);
-        enc.extend_from_slice(&pubkey);
-        enc.extend_from_slice(&word_u64(0));
-        assert_eq!(keccak256(&enc), digest, "register digest must equal hand-encoded EIP-712 digest");
+        let pubkey = [0xABu8; 32];
+        let digest = registration_digest(40204, &registry, &staker, &pubkey, 7);
+        assert_eq!(
+            hex::encode(digest),
+            "f95e614fe16769bd6e1f207674b238a842f3f257f0b8fed00efbf0f5f2b22068",
+            "register digest vector drifted",
+        );
     }
 
     #[test]
@@ -595,5 +657,190 @@ mod tests {
     fn salt_to_wei_is_1e18() {
         assert_eq!(salt_to_wei(1), 1_000_000_000_000_000_000u128);
         assert_eq!(salt_to_wei(32_000), 32_000u128 * 1_000_000_000_000_000_000u128);
+    }
+
+    // ── Guard edges ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn seed_timing_guard_boundary() {
+        // Default margin 100 → refuse-after limit S(1)-100 = 700.
+        assert_eq!(seed_timing_refuse_limit(), 700);
+        assert!(seed_timing_permitted(0, false), "genesis-era height permitted");
+        assert!(seed_timing_permitted(699, false), "one below limit permitted");
+        assert!(!seed_timing_permitted(700, false), "at the limit is refused");
+        assert!(!seed_timing_permitted(701, false), "past the limit is refused");
+        assert!(!seed_timing_permitted(FIRST_SNAPSHOT_HEIGHT, false), "at S(1) refused");
+        // --force overrides at and beyond the boundary.
+        assert!(seed_timing_permitted(700, true), "force overrides at the limit");
+        assert!(seed_timing_permitted(u64::MAX, true), "force overrides everywhere");
+    }
+
+    #[test]
+    fn reject_duplicates_accepts_all_distinct() {
+        let specs = vec![
+            node_spec([1u8; 20], 1),
+            node_spec([2u8; 20], 2),
+            node_spec([3u8; 20], 3),
+        ];
+        reject_duplicates(&specs).expect("all-distinct coinbases + stakers accepted");
+    }
+
+    #[test]
+    fn reject_duplicates_rejects_duplicate_coinbase() {
+        // Same coinbase → same proposer pubkey → on-chain PubkeyTaken; caught here.
+        let specs = vec![node_spec([7u8; 20], 1), node_spec([7u8; 20], 2)];
+        let err = reject_duplicates(&specs).expect_err("duplicate coinbase must be rejected");
+        assert!(format!("{err}").contains("duplicate coinbase"));
+    }
+
+    #[test]
+    fn reject_duplicates_rejects_duplicate_staker() {
+        // Distinct coinbases but the SAME staker key → StakerHasValidator on-chain.
+        let specs = vec![node_spec([1u8; 20], 9), node_spec([2u8; 20], 9)];
+        let err = reject_duplicates(&specs).expect_err("duplicate staker must be rejected");
+        assert!(format!("{err}").contains("duplicate staker"));
+    }
+
+    #[test]
+    fn parse_addr20_rejects_malformed() {
+        parse_addr20("0x1234").expect_err("too-short address must error, not panic");
+        parse_addr20(&format!("0x{}", "ab".repeat(21))).expect_err("too-long address must error");
+        parse_addr20("0xZZ112233445566778899aabbccddeeff00112233")
+            .expect_err("non-hex address must error");
+        let ok = parse_addr20("0x47fb23137e0ee4248eb975848416e6632fa36090")
+            .expect("valid 20-byte address parses");
+        assert_eq!(ok, coinbase20(VEC_COINBASE));
+    }
+
+    #[test]
+    fn parse_nodes_rejects_missing_delimiter() {
+        // No '=' → deterministic error, no panic. (NodeSpec isn't Debug, so match
+        // rather than expect_err on the Ok payload.)
+        match parse_nodes(&["0x47fb23137e0ee4248eb975848416e6632fa36090".to_string()]) {
+            Ok(_) => panic!("--node without '=' must error"),
+            Err(e) => assert!(format!("{e}").contains("<coinbase_hex>=<STAKER_KEY_ENV_VAR>")),
+        }
+    }
+
+    // ── Fuzz: derivation equivalence (the load-bearing property) ──────────────
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        /// For any 20-byte coinbase, the ceremony's derived proposer pubkey is
+        /// byte-identical to the pinned reproduction of node/src/main.rs's
+        /// derivation. Catches any domain-string / padding / hash / endianness
+        /// drift between what the node signs blocks with and what the ceremony
+        /// registers on-chain.
+        #[test]
+        fn fuzz_derivation_equivalence(coinbase in any::<[u8; 20]>()) {
+            let got = derive_proposer_key(&coinbase).verifying_key().to_bytes();
+            prop_assert_eq!(got, main_rs_reference_pubkey(&coinbase));
+        }
+
+        /// The 20→32 right-zero-pad the ceremony applies must equal main.rs's
+        /// `min(len, 32)` pad for a 20-byte coinbase: derive from the ceremony's
+        /// padded buffer via the shared fn and from the reference over the raw
+        /// 20 bytes; the resulting pubkeys must match.
+        #[test]
+        fn fuzz_derivation_padding_equivalence(coinbase in any::<[u8; 20]>()) {
+            let mut coinbase32 = [0u8; 32];
+            coinbase32[..20].copy_from_slice(&coinbase);
+            let via_shared = derive_block_signing_key(&coinbase32).verifying_key().to_bytes();
+            prop_assert_eq!(via_shared, main_rs_reference_pubkey(&coinbase[..]));
+        }
+    }
+
+    // ── Fuzz: Register digest == independent EIP-712 encoding ─────────────────
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        #[test]
+        fn fuzz_registration_digest_matches_hand_encoded(
+            chain_id in any::<u64>(),
+            registry in any::<[u8; 20]>(),
+            staker in any::<[u8; 20]>(),
+            pubkey in any::<[u8; 32]>(),
+            nonce in any::<u64>(),
+        ) {
+            let got = registration_digest(chain_id, &registry, &staker, &pubkey, nonce);
+            let oracle = hand_register_digest(chain_id, &registry, &staker, &pubkey, nonce);
+            prop_assert_eq!(got, oracle);
+        }
+    }
+
+    // ── Fuzz: sign → verify_strict roundtrip + tamper rejection ───────────────
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        #[test]
+        fn fuzz_sign_verify_strict_roundtrip(
+            coinbase in any::<[u8; 20]>(),
+            msg in prop::collection::vec(any::<u8>(), 1..256),
+        ) {
+            let key = derive_proposer_key(&coinbase);
+            let vk = key.verifying_key();
+            let sig: ed25519_dalek::Signature = key.sign(&msg);
+            // Honest signature verifies under the strict (non-malleable) check.
+            prop_assert!(vk.verify_strict(&msg, &sig).is_ok());
+            prop_assert!(vk.verify(&msg, &sig).is_ok());
+        }
+
+        #[test]
+        fn fuzz_message_bitflip_fails(
+            coinbase in any::<[u8; 20]>(),
+            msg in prop::collection::vec(any::<u8>(), 1..256),
+            flip_idx in any::<prop::sample::Index>(),
+            bit in 0u8..8,
+        ) {
+            let key = derive_proposer_key(&coinbase);
+            let vk = key.verifying_key();
+            let sig: ed25519_dalek::Signature = key.sign(&msg);
+            let mut tampered = msg.clone();
+            let i = flip_idx.index(tampered.len());
+            tampered[i] ^= 1u8 << bit;
+            // A one-bit change to the message must break verification.
+            prop_assert!(vk.verify_strict(&tampered, &sig).is_err());
+        }
+
+        #[test]
+        fn fuzz_signature_bitflip_fails(
+            coinbase in any::<[u8; 20]>(),
+            msg in prop::collection::vec(any::<u8>(), 1..256),
+            flip_idx in any::<prop::sample::Index>(),
+            bit in 0u8..8,
+        ) {
+            let key = derive_proposer_key(&coinbase);
+            let vk = key.verifying_key();
+            let sig: ed25519_dalek::Signature = key.sign(&msg);
+            let mut sig_bytes = sig.to_bytes();
+            let i = flip_idx.index(sig_bytes.len());
+            sig_bytes[i] ^= 1u8 << bit;
+            let tampered = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+            // A one-bit change to the signature must break verification.
+            prop_assert!(vk.verify_strict(&msg, &tampered).is_err());
+        }
+    }
+
+    // ── Fuzz: registerValidator calldata layout ───────────────────────────────
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        #[test]
+        fn fuzz_calldata_layout(
+            pubkey in any::<[u8; 32]>(),
+            sig in any::<[u8; 64]>(),
+        ) {
+            let cd = encode_register_validator(&pubkey, &sig);
+            // Independently reconstruct the ABI encoding and compare byte-for-byte.
+            let selector = keccak256(b"registerValidator(bytes32,bytes)");
+            let mut expected = Vec::with_capacity(164);
+            expected.extend_from_slice(&selector[..4]);
+            expected.extend_from_slice(&pubkey);      // bytes32 head
+            expected.extend_from_slice(&word_u64(0x40)); // offset to tail
+            expected.extend_from_slice(&word_u64(64));   // bytes length
+            expected.extend_from_slice(&sig);            // 64-byte tail (2 words)
+            prop_assert_eq!(cd.len(), 164);
+            prop_assert_eq!(cd, expected);
+        }
     }
 }
