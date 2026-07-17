@@ -404,6 +404,293 @@ mod tests {
         assert!(compute_priority_pool(&txs, &receipts, BASE).is_err());
     }
 
+    // Expose the test constructors to the sibling proptest module. (The private
+    // `gas_charged` is reachable there directly as `super::gas_charged`, since
+    // that module is a descendant of `block_rewards`.)
+    pub(super) fn mk_tx_pub(t: u8, gp: u64, mp: Option<u64>, gl: u64) -> Transaction {
+        mk_tx(t, gp, mp, gl)
+    }
+    pub(super) fn mk_receipt_pub(status: bool, gas_used: u64) -> TransactionReceipt {
+        mk_receipt(status, gas_used)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROPERTY / FUZZ suite (campaign-rprime-math-fuzz).
+//
+// These tests throw thousands of proptest-generated inputs at the §R' pure math
+// to try to BREAK the six load-bearing invariants of the priority-fee reroll.
+// Every assertion is a determinism / conservation guarantee: a single failing
+// case is a consensus fork or a wei created/destroyed. Reference computations
+// are done in U512 so overflow behaviour of the U256 code under test is checked
+// against an oracle that cannot itself overflow.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod proptests {
+    use super::tests::{mk_receipt_pub, mk_tx_pub};
+    use super::*;
+    use primitive_types::U512;
+    use proptest::prelude::*;
+
+    /// EIP-1559 tip oracle, written independently of the implementation.
+    fn expected_tip(eth_tx_type: u8, gas_price: u64, max_prio: Option<u64>, base_fee: u64) -> Option<u64> {
+        if gas_price < base_fee {
+            return None;
+        }
+        let over_base = gas_price - base_fee;
+        if eth_tx_type == 2 {
+            let cap = max_prio.unwrap_or(over_base);
+            Some(over_base.min(cap))
+        } else {
+            Some(over_base)
+        }
+    }
+
+    /// U256 -> U512 widening (lossless) so the oracle never overflows.
+    fn to512(x: U256) -> U512 {
+        let mut be = [0u8; 32];
+        x.to_big_endian(&mut be);
+        U512::from_big_endian(&be)
+    }
+
+    fn u256_from_bytes(b: [u8; 32]) -> U256 {
+        U256::from_big_endian(&b)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 4096, ..ProptestConfig::default() })]
+
+        // ── INVARIANT 2: EIP-1559 tip correctness across ALL tx types + edges ──
+        // eth_tx_type spans 0..=5 (covers legacy/2930, type-2, and unknown-high
+        // which §R' must treat as legacy). Full u64 range on prices + priority.
+        #[test]
+        fn prop_tip_matches_eip1559_oracle(
+            eth_tx_type in 0u8..=5,
+            gas_price in any::<u64>(),
+            base_fee in any::<u64>(),
+            max_prio in proptest::option::of(any::<u64>()),
+        ) {
+            let tx = mk_tx_pub(eth_tx_type, gas_price, max_prio, 21_000);
+            let got = true_priority_per_gas(&tx, base_fee);
+            let want = expected_tip(eth_tx_type, gas_price, max_prio, base_fee);
+            prop_assert_eq!(got, want, "tip mismatch t={} gp={} bf={} mp={:?}", eth_tx_type, gas_price, base_fee, max_prio);
+
+            match got {
+                None => prop_assert!(gas_price < base_fee, "None only when gas_price < base_fee"),
+                Some(tip) => {
+                    let over_base = gas_price - base_fee;
+                    // tip can never exceed the room above base fee.
+                    prop_assert!(tip <= over_base, "tip {} exceeds over_base {}", tip, over_base);
+                    // edge: gas_price == base_fee => tip exactly 0.
+                    if gas_price == base_fee { prop_assert_eq!(tip, 0u64); }
+                    // type-2 explicit-cap edges.
+                    if eth_tx_type == 2 {
+                        if let Some(cap) = max_prio {
+                            if cap == 0 { prop_assert_eq!(tip, 0u64); }
+                            if cap >= over_base { prop_assert_eq!(tip, over_base); }
+                            if cap < over_base { prop_assert_eq!(tip, cap); }
+                        } else {
+                            // absent cap on type-2 => behaves like legacy (full over_base).
+                            prop_assert_eq!(tip, over_base);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── INVARIANT 2 (reject path): gas_price < base_fee => None AND the whole
+        //    block is rejected by compute_priority_pool. ──
+        #[test]
+        fn prop_sub_base_fee_rejected(
+            base_fee in 1u64..=u64::MAX,
+            deficit in 1u64..=u64::MAX,
+        ) {
+            let gas_price = base_fee.saturating_sub(deficit);
+            prop_assume!(gas_price < base_fee);
+            let tx = mk_tx_pub(0, gas_price, None, 21_000);
+            prop_assert_eq!(true_priority_per_gas(&tx, base_fee), None);
+            let res = compute_priority_pool(&[tx], &[mk_receipt_pub(true, 21_000)], base_fee);
+            prop_assert!(res.is_err(), "block with sub-base-fee tx must be rejected");
+        }
+
+        // ── INVARIANT 3: vested_share — floor semantics, bps clamp, NO PANIC even
+        //    near U256::MAX (the saturating_mul fix). Oracle in U512. ──
+        #[test]
+        fn prop_vested_share_floor_and_no_panic(
+            pool_bytes in any::<[u8; 32]>(),
+            share_bps in any::<u64>(),
+        ) {
+            let pool = u256_from_bytes(pool_bytes);
+            // MUST NOT PANIC for any pool/bps (this line is the actual assertion
+            // for the overflow-safety half of the invariant).
+            let share = vested_share(pool, share_bps);
+
+            let bps_c = share_bps.min(10_000);
+            // Never exceeds the pool; complement is exact (no wei created/lost).
+            prop_assert!(share <= pool, "share > pool: pool={} bps={}", pool, share_bps);
+            let burned = pool - share;
+            prop_assert_eq!(burned + share, pool, "wei created/lost: pool={} bps={}", pool, share_bps);
+
+            // Exact floor semantics in the region where pool*bps does NOT overflow
+            // U256 (the only region that occurs on a real chain). Oracle: U512.
+            let prod512 = to512(pool) * U512::from(bps_c);
+            let max256 = to512(U256::MAX);
+            if prod512 <= max256 {
+                let expected512 = prod512 / U512::from(10_000u64);
+                prop_assert_eq!(to512(share), expected512, "floor mismatch pool={} bps={}", pool, share_bps);
+            } else {
+                // Overflow region: code saturates deterministically; still bounded.
+                prop_assert!(share <= pool);
+            }
+        }
+
+        // ── INVARIANT 4: gas_charged — success -> gas_used, revert -> gas_limit. ──
+        #[test]
+        fn prop_gas_charged_matches_executor(
+            status in any::<bool>(),
+            gas_used in any::<u64>(),
+            gas_limit in any::<u64>(),
+        ) {
+            let receipt = mk_receipt_pub(status, gas_used);
+            let charged = super::gas_charged(&receipt, gas_limit);
+            if status {
+                prop_assert_eq!(charged, gas_used);
+            } else {
+                prop_assert_eq!(charged, gas_limit);
+            }
+        }
+
+        // ── INVARIANT 1 (conservation) + INVARIANT 5 (commutativity) ──
+        // A valid tx set (gas_price >= base_fee by construction). The pool equals
+        // Σ tip*gas_charged; vested_share <= pool; share + burned == pool; and the
+        // pool is invariant under any permutation of the (tx,receipt) order.
+        #[test]
+        fn prop_conservation_and_commutativity(
+            base_fee in 0u64..=2_000_000_000u64,
+            share_bps in any::<u64>(),
+            perm_seed in any::<u64>(),
+            specs in proptest::collection::vec(
+                (0u8..=5, any::<u64>(), proptest::option::of(any::<u64>()), 0u64..=30_000_000, any::<bool>(), 0u64..=30_000_000),
+                0..24usize),
+        ) {
+            // Build valid txs: gas_price = base_fee + delta (saturating => always >= base_fee).
+            let mut txs = Vec::with_capacity(specs.len());
+            let mut receipts = Vec::with_capacity(specs.len());
+            for (t, delta, mp, gl, status, gu) in &specs {
+                let gas_price = base_fee.saturating_add(*delta);
+                txs.push(mk_tx_pub(*t, gas_price, *mp, *gl));
+                receipts.push(mk_receipt_pub(*status, *gu));
+            }
+
+            let pool = compute_priority_pool(&txs, &receipts, base_fee)
+                .expect("valid tx set must produce a pool");
+
+            // Independent oracle sum (same saturating semantics).
+            let mut oracle = U256::zero();
+            for (tx, receipt) in txs.iter().zip(receipts.iter()) {
+                let tip = expected_tip(tx.eth_tx_type, tx.gas_price, tx.max_priority_fee_per_gas, base_fee)
+                    .expect("constructed valid");
+                if tip == 0 { continue; }
+                let charged = if receipt.status { receipt.gas_used } else { tx.gas_limit };
+                oracle = oracle.saturating_add(U256::from(tip) * U256::from(charged));
+            }
+            prop_assert_eq!(pool, oracle, "pool != Σ tip*gas_charged oracle");
+
+            // CONSERVATION: share <= pool <= Σ(effective_tip*gas_charged) [== oracle];
+            // share + burned == pool exactly.
+            let share = vested_share(pool, share_bps);
+            prop_assert!(share <= pool, "vested share exceeds pool");
+            prop_assert!(pool <= oracle, "pool exceeds Σ tip*gas_charged");
+            let burned = pool - share;
+            prop_assert_eq!(share + burned, pool, "wei created/lost in split");
+
+            // COMMUTATIVITY: shuffle (tx,receipt) pairs with a seeded Fisher–Yates
+            // (deterministic per case) and re-derive the pool — must be identical.
+            let mut idx: Vec<usize> = (0..txs.len()).collect();
+            let mut state = perm_seed ^ 0x9E37_79B9_7F4A_7C15;
+            let mut i = idx.len();
+            while i > 1 {
+                i -= 1;
+                // xorshift64* step for a deterministic pseudo-random index.
+                state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+                let r = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                let j = (r % (i as u64 + 1)) as usize;
+                idx.swap(i, j);
+            }
+            let sh_txs: Vec<Transaction> = idx.iter().map(|&k| txs[k].clone()).collect();
+            let sh_receipts: Vec<TransactionReceipt> = idx.iter().map(|&k| receipts[k].clone()).collect();
+            let pool_shuffled = compute_priority_pool(&sh_txs, &sh_receipts, base_fee)
+                .expect("shuffled valid tx set must produce a pool");
+            prop_assert_eq!(pool, pool_shuffled, "pool changed under permutation (non-determinism!)");
+        }
+
+        // ── INVARIANT 5 (count mismatch): unequal lengths => Err (reject). ──
+        #[test]
+        fn prop_count_mismatch_rejected(
+            n_tx in 0usize..8,
+            n_rc in 0usize..8,
+        ) {
+            prop_assume!(n_tx != n_rc);
+            let txs: Vec<Transaction> = (0..n_tx).map(|_| mk_tx_pub(0, 2_000_000_000, None, 21_000)).collect();
+            let receipts: Vec<TransactionReceipt> = (0..n_rc).map(|_| mk_receipt_pub(true, 21_000)).collect();
+            prop_assert!(compute_priority_pool(&txs, &receipts, CANONICAL_BASE_FEE_PER_GAS).is_err());
+        }
+
+        // ── INVARIANT 6: encode_credit_reward exact layout (4+32+32) + roundtrip. ──
+        #[test]
+        fn prop_encode_credit_reward_layout(
+            pubkey in any::<[u8; 32]>(),
+            amount_bytes in any::<[u8; 32]>(),
+        ) {
+            let amount = u256_from_bytes(amount_bytes);
+            let data = encode_credit_reward(&pubkey, amount);
+            prop_assert_eq!(data.len(), 68, "calldata must be 4+32+32");
+            prop_assert_eq!(&data[..4], &CREDIT_REWARD_SELECTOR, "selector");
+            prop_assert_eq!(&data[4..36], &pubkey, "pubkey word");
+            let mut want_amt = [0u8; 32];
+            amount.to_big_endian(&mut want_amt);
+            prop_assert_eq!(&data[36..68], &want_amt, "amount big-endian word");
+            // Roundtrip the amount back out of the last word.
+            prop_assert_eq!(U256::from_big_endian(&data[36..68]), amount, "amount roundtrip");
+        }
+
+        // ── INVARIANT 6: decode_u64_word — roundtrip low, saturate on high, error short. ──
+        #[test]
+        fn prop_decode_u64_word(word in any::<[u8; 32]>()) {
+            let got = decode_u64_word(&word).expect("32-byte word decodes");
+            let high_nonzero = word[..24].iter().any(|&b| b != 0);
+            if high_nonzero {
+                prop_assert_eq!(got, u64::MAX, "must saturate, never truncate");
+            } else {
+                let mut b8 = [0u8; 8];
+                b8.copy_from_slice(&word[24..32]);
+                prop_assert_eq!(got, u64::from_be_bytes(b8), "low-8 roundtrip");
+            }
+        }
+
+        // decode_u64_word MUST error deterministically on short input.
+        #[test]
+        fn prop_decode_u64_word_short_errors(len in 0usize..32) {
+            let buf = vec![0xABu8; len];
+            prop_assert!(decode_u64_word(&buf).is_err(), "short input must error");
+        }
+
+        // ── INVARIANT 6: decode_address_word — roundtrip [12..32], error on short. ──
+        #[test]
+        fn prop_decode_address_word(word in any::<[u8; 32]>()) {
+            let got = decode_address_word(&word).expect("32-byte word decodes");
+            let mut want = [0u8; 20];
+            want.copy_from_slice(&word[12..32]);
+            prop_assert_eq!(got, want, "address is the right-aligned 20 bytes");
+        }
+
+        #[test]
+        fn prop_decode_address_word_short_errors(len in 0usize..32) {
+            let buf = vec![0xABu8; len];
+            prop_assert!(decode_address_word(&buf).is_err(), "short input must error");
+        }
+    }
+
     /// Share-rounding PROPERTY: over a spread of pools and bps, `vested_share` is
     /// exactly `floor(pool * bps / 10000)`, is monotonic-bounded by the pool, and
     /// the vested part plus the (implicitly burned) remainder always reconstitute
