@@ -67,6 +67,11 @@ contract DeployValidatorRegistry is ScriptEnv {
     address public constant GOVERNANCE = GENESIS_DEPLOYER;
     address public constant SLASHER = GENESIS_DEPLOYER;
 
+    // NOTE (WS-4 reconcile): governance_ and slasher_ are the genesis DEPLOYER
+    // (0x4250675F…000c6). rewardMinter_ is DIFFERENT — it is the WS-4 execution
+    // sentinel, NOT the deployer (see REWARD_MINTER below), because WS-4's
+    // creditReward system-call uses that sentinel as msg.sender.
+
     // ── rewardMinter_ — RECONCILE WITH WS-4 §R' (built in parallel) ─────────────
     // rewardMinter is IMMUTABLE in ValidatorRegistry and is the ONLY address that
     // may call `creditReward(pubkey, amount)` (the §R' stake-weighted reward
@@ -74,14 +79,16 @@ contract DeployValidatorRegistry is ScriptEnv {
     // dictates the msg.sender that call uses — REWARD_MINTER MUST equal that
     // address or every creditReward reverts `NotMinter()`.
     //
-    // At the reroll §R' is INERT: under CITRATE_BLOCK_V2=1 the producer is forced
-    // onto the deterministic basic-reward path (canonical_reward_config), and §R'
-    // is a *future* deterministic reward policy that slots into that same seam
-    // (docs/consensus/REROLL_ADDENDUM_… §A). So a placeholder is safe for the
-    // reroll, but because it is immutable it MUST be finalized to WS-4's value
-    // BEFORE the address is pinned. Default: genesis DEPLOYER.
-    //   >>> RECONCILE WITH WS-4 §R' — see build/ws4 report <<<
-    address public constant REWARD_MINTER = GENESIS_DEPLOYER;
+    // FINALIZED (WS-4 reconcile 2026-07-16): rewardMinter_ MUST equal WS-4's
+    // execution-layer reward sentinel `block_rewards::REWARD_MINTER_ADDRESS`
+    // (core/execution/src/block_rewards.rs on build/ws4-priority-fee-rprime). WS-4's
+    // §R' vesting system-call sets msg.sender = that sentinel; creditReward's
+    // `if (msg.sender != rewardMinter) revert NotMinter()` reverts every credit
+    // unless rewardMinter equals it exactly. It is NOT the genesis DEPLOYER.
+    // Sentinel = 0x0000000000000000000000000000000050524950 (low 4 bytes = "PRIP",
+    // chosen above the precompile range so it never aliases a precompile and
+    // never has code → EIP-3607 never rejects it as caller).
+    address public constant REWARD_MINTER = 0x0000000000000000000000000000000050524950;
 
     // ═════════════════════════════════════════════════════════════════════════
     // ECONOMIC POLICY (constructor args 4–7) — IMMUTABLE + address-fixing.
@@ -95,22 +102,39 @@ contract DeployValidatorRegistry is ScriptEnv {
     //     (threshold locked 2026-07-16, CITRATE_CORE_DGX_WORKORDER). Governance
     //     may raise it later (prospective; sitting validators grandfathered).
     //
-    //   BLOCK_SUBSIDY        (bounds: <= 1_000 ether)  [PLACEHOLDER]
-    //     Per-selected-block validator subsidy the §R' path will emit. Placeholder
-    //     10 SALT/block. FINAL = owner economic decision.
+    //   BLOCK_SUBSIDY        (bounds: <= 1_000 ether)  [OWNER-DECIDED]
+    //     Per-selected-block validator subsidy. FINAL = 10 SALT/block.
+    //     NOTE (WS-4 verify): the subsidy is NOT credited through this registry —
+    //     WS-4 credits the basic block reward IN THE EXECUTOR (`settle_block_rewards`
+    //     step 1, from `reward_credits`/canonical_reward_config), never via
+    //     creditReward. `blockSubsidy` is an unconsumed policy param today (the §R'
+    //     path only vests the priority-fee SHARE). It is therefore NOT metered by
+    //     maxEpochEmission below. (Verified: `block_subsidy` has zero uses in
+    //     core/execution on build/ws4-priority-fee-rprime.)
     //
-    //   PRIORITY_FEE_SHARE_BPS (bounds: < 10_000)      [PLACEHOLDER]
+    //   PRIORITY_FEE_SHARE_BPS (bounds: <= 10_000 after WS-5 reconcile) [OWNER-DECIDED]
     //     Share (bps) of priority fees routed to the validator reward path.
-    //     Placeholder 5_000 (50%). FINAL = owner economic decision.
+    //     FINAL = 10_000 (100%). The original contract bound was `< 10000`, which
+    //     REVERTED on the owner's 100% choice; WS-5 widened the constructor +
+    //     queueParam bound to `<= 10000` so exactly 100% is admissible (see
+    //     ValidatorRegistry.sol — this re-projects the CREATE2 address). WS-4's
+    //     `vested_share` already handles 10000 (pool*10000/10000 = whole pool).
     //
-    //   MAX_EPOCH_EMISSION   (bounds: <= 1_000_000 ether) [PLACEHOLDER]
+    //   MAX_EPOCH_EMISSION   (bounds: <= 1_000_000 ether) [OWNER-DECIDED]
     //     Hard anti-hyperinflation cap on reward emission per 1_000-block epoch.
-    //     Placeholder 10_000 SALT (= BLOCK_SUBSIDY × 1_000 blocks). FINAL = owner.
+    //     FINAL = 10_000 SALT. SCOPE (WS-4 verify): this cap meters ONLY
+    //     creditReward priority-fee vesting (`emittedInEpoch[currentEpoch()]`); the
+    //     block subsidy is NOT metered here (credited in-executor, see above). So
+    //     the full 10_000 SALT/epoch is headroom for priority-fee vesting alone,
+    //     which at pilot volume is orders of magnitude under the cap — no silent
+    //     burn. (If a FUTURE change ever routes the subsidy THROUGH creditReward,
+    //     the 10 SALT×1000 = 10_000 subsidy would consume the whole cap and this
+    //     value MUST be raised then — flagged for that future owner decision.)
     // ═════════════════════════════════════════════════════════════════════════
     uint256 public constant MIN_STAKE = 32_000 ether;                 // OWNER-DECIDED (locked 32k)
-    uint256 public constant BLOCK_SUBSIDY = 10 ether;                 // OWNER-DECISION placeholder
-    uint256 public constant PRIORITY_FEE_SHARE_BPS = 5_000;           // OWNER-DECISION placeholder
-    uint256 public constant MAX_EPOCH_EMISSION = 10_000 ether;        // OWNER-DECISION placeholder
+    uint256 public constant BLOCK_SUBSIDY = 10 ether;                 // OWNER-DECIDED (10 SALT/block)
+    uint256 public constant PRIORITY_FEE_SHARE_BPS = 10_000;          // OWNER-DECIDED (100%)
+    uint256 public constant MAX_EPOCH_EMISSION = 10_000 ether;        // OWNER-DECIDED (10k SALT/epoch, fee-vesting only)
 
     /// The canonical CREATE2 salt for the registry.
     function registrySalt() public pure returns (bytes32) {
