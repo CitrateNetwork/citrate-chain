@@ -34,6 +34,13 @@ pub struct StateDB {
     /// C6 fix: Track dirty storage slots for persistence.
     /// Stores (address, key) pairs that have been modified since last commit.
     dirty_storage: Arc<DashSet<(Address, Vec<u8>)>>,
+
+    /// Track code hashes deployed since the last commit, so contract code is
+    /// persisted through the SAME deferred path as accounts/storage rather than
+    /// written to the store eagerly. This lets the execute-on-receive reorg
+    /// re-apply a branch in-memory (`apply_block_no_persist`) with NO durable
+    /// writes — an aborted reorg that deployed a contract leaves nothing on disk.
+    dirty_code: Arc<DashSet<Hash>>,
 }
 
 impl StateDB {
@@ -46,7 +53,22 @@ impl StateDB {
             training_jobs: Arc::new(DashMap::new()),
             state_trie: Arc::new(parking_lot::RwLock::new(Trie::new())),
             dirty_storage: Arc::new(DashSet::new()),
+            dirty_code: Arc::new(DashSet::new()),
         }
+    }
+
+    /// Drain the set of code hashes deployed since the last commit (for the
+    /// caller to persist). Clears the dirty-code set.
+    pub fn take_dirty_code(&self) -> Vec<(Hash, Vec<u8>)> {
+        let hashes: Vec<Hash> = self.dirty_code.iter().map(|h| *h).collect();
+        let mut out = Vec::with_capacity(hashes.len());
+        for h in hashes {
+            self.dirty_code.remove(&h);
+            if let Some(code) = self.code_storage.get(&h) {
+                out.push((h, code.clone()));
+            }
+        }
+        out
     }
 
     /// Get storage value
@@ -101,6 +123,7 @@ impl StateDB {
     pub fn set_code(&self, address: Address, code: Vec<u8>) -> Hash {
         let code_hash = Self::hash_code(&code);
         self.code_storage.insert(code_hash, code);
+        self.dirty_code.insert(code_hash);
         self.accounts.set_code_hash(address, code_hash);
         code_hash
     }
@@ -253,6 +276,7 @@ impl StateDB {
                 .iter()
                 .map(|entry| entry.clone())
                 .collect(),
+            dirty_code: self.dirty_code.iter().map(|h| *h).collect(),
             state_trie: self.state_trie.read().clone(),
         }
     }
@@ -271,6 +295,13 @@ impl StateDB {
         self.dirty_storage.clear();
         for entry in snapshot.dirty_storage {
             self.dirty_storage.insert(entry);
+        }
+
+        // Restore the dirty-code set so a reverted deploy is not later persisted
+        // (its code_storage entry may remain — harmless, content-addressed orphan).
+        self.dirty_code.clear();
+        for h in snapshot.dirty_code {
+            self.dirty_code.insert(h);
         }
 
         // Restore the accumulating account trie (see StateSnapshot::state_trie).
@@ -319,6 +350,10 @@ pub struct StateSnapshot {
     models: Vec<(ModelId, ModelState)>,
     training_jobs: Vec<(JobId, TrainingJob)>,
     dirty_storage: Vec<(Address, Vec<u8>)>,
+    /// Code hashes deployed-but-not-yet-persisted at snapshot time. Captured so a
+    /// revert (failed apply, aborted reorg) does not later persist a reverted
+    /// deploy's code. See `StateDB::dirty_code`.
+    dirty_code: Vec<Hash>,
     /// The accumulating account trie. `calculate_state_root` mutates this (it is NOT
     /// rebuilt from scratch), so a snapshot that omitted it left the trie polluted after
     /// a restore — a rejected apply_block would then still report the (uncommitted)
