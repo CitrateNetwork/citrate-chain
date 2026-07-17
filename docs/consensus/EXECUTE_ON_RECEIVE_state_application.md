@@ -256,3 +256,19 @@ All five fixed with tests; 95 node-bin + 538 execution-lib green, clippy clean. 
 reorg store fix: a crash *between* the reconcile batch and the account-deletes could momentarily leave an
 abandoned account on disk — self-heals on restart (the applied-tip pointer is persisted only after
 reconcile, so fork choice re-drives the reorg). LOW; documented.
+
+**Re-review finding E (durable leak during reorg reapply) — FIXED.** `apply_block`'s eager setters
+(`set_balance`/`set_code`/`set_nonce`) wrote world state to RocksDB directly, so a reorg's in-memory
+`apply_block_no_persist` still leaked durable account/code (reward crediting, contract deploys) that an
+abort never rolled back. Fixed with an executor `defer_persist` flag: an RAII guard engages it for the
+whole `apply_block` execution, so those setters mutate in-memory + dirty-tracking only, and durable writes
+happen once — at the end via `persist_state_changes`, or via `reconcile_store_from` (reorg success). Direct
+callers (genesis init, RPC) leave it off and persist eagerly as before. Contract code persists through the
+deferred path via a new `dirty_code` set (captured in `StateSnapshot`, so a reverted deploy is discarded).
+Restart-simulation tests now also cover reward accounts across reorg success + abort.
+
+**Intentionally eager on the `no_persist` path (NOT world state — reviewed + accepted, 3 rounds):** MVCC
+`account_versions` / `global_version` (monotonic, restart-safe) and the external best-effort AI side-effect
+stores (model registry, IPFS artifact pins — content-addressed + idempotent) still persist during a reorg
+reapply and are not rolled back on abort. None contribute to `state_root`; their orphans are unreferenced
+and harmless. Left eager deliberately, so a future reviewer does not mistake them for a deferral gap.
