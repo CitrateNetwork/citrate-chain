@@ -212,6 +212,17 @@ pub struct BlockHeader {
     /// Block gas limit. Default is 30M gas.
     #[serde(default = "default_gas_limit")]
     pub gas_limit: u64,
+
+    /// EXECUTE-ON-RECEIVE (reroll addendum): the block's beneficiary / coinbase — the
+    /// 20-byte address credited with the block reward and returned by the EVM `COINBASE`
+    /// opcode. Committing it in the header is what makes a block's `state_root`
+    /// REPRODUCIBLE by a receiving node (rewards are part of state; without this the
+    /// beneficiary was the producer's uncommitted local config). VERSION-GATED: only
+    /// included in `compute_hash` for version >= 2 blocks, so existing v1 history/genesis
+    /// hashes are unchanged and the field activates at the reroll (see
+    /// docs/consensus/EXECUTE_ON_RECEIVE_state_application.md + the reroll addendum).
+    #[serde(default)]
+    pub coinbase: [u8; 20],
 }
 
 fn default_gas_limit() -> u64 {
@@ -337,6 +348,11 @@ impl Block {
         hasher.update(self.header.base_fee_per_gas.to_le_bytes());
         hasher.update(self.header.gas_used.to_le_bytes());
         hasher.update(self.header.gas_limit.to_le_bytes());
+        // EXECUTE-ON-RECEIVE: commit the beneficiary so state_root is reproducible.
+        // Version-gated (v>=2 only) so v1 history/genesis hashes are untouched.
+        if length_prefixed {
+            hasher.update(self.header.coinbase);
+        }
 
         // Commitment roots (these bind the block body to the hash).
         // All fixed-length, so no prefix needed.
@@ -732,6 +748,7 @@ impl BlockBuilder {
                     base_fee_per_gas: 0,
                     gas_used: 0,
                     gas_limit: 30_000_000,
+                    coinbase: [0u8; 20],
                 },
                 state_root: Hash::default(),
                 tx_root: Hash::default(),
@@ -875,6 +892,12 @@ impl BlockBuilder {
     /// block hash is known.
     pub fn equivocation_vote(mut self, sig: Option<Signature>) -> Self {
         self.block.equivocation_vote = sig;
+        self
+    }
+    /// EXECUTE-ON-RECEIVE: set the block beneficiary/coinbase (committed in compute_hash
+    /// for v>=2). The producer sets this to its reward address at/after the reroll.
+    pub fn coinbase(mut self, coinbase: [u8; 20]) -> Self {
+        self.block.header.coinbase = coinbase;
         self
     }
 
@@ -1184,6 +1207,33 @@ mod tests {
         assert_eq!(create_test_block().equivocation_vote, None);
     }
 
+    // EXECUTE-ON-RECEIVE: coinbase is committed in compute_hash for v>=2 ONLY, so v1
+    // history/genesis hashes are untouched and the field activates at the reroll.
+    #[test]
+    fn test_coinbase_hash_version_gated() {
+        // v1: coinbase must NOT affect the hash (legacy history preserved).
+        let mut v1a = create_test_block();
+        v1a.header.version = 1;
+        let mut v1b = v1a.clone();
+        v1b.header.coinbase = [0xCC; 20];
+        assert_eq!(
+            v1a.compute_hash(),
+            v1b.compute_hash(),
+            "v1 blocks must not commit coinbase (history stability)"
+        );
+
+        // v2: coinbase MUST affect the hash (state_root reproducibility).
+        let mut v2a = create_test_block();
+        v2a.header.version = 2;
+        let mut v2b = v2a.clone();
+        v2b.header.coinbase = [0xCC; 20];
+        assert_ne!(
+            v2a.compute_hash(),
+            v2b.compute_hash(),
+            "v2 blocks must commit coinbase so receivers can reproduce state_root"
+        );
+    }
+
     // WP-F.3: learning_root does NOT affect compute_hash (Theorem 3).
     // Per StrobilationCheckpoint.tla INV-4: StateRootIndependent.
     #[test]
@@ -1333,6 +1383,7 @@ mod tests {
             base_fee_per_gas: 2_000_000_000,
             gas_used: 21000,
             gas_limit: 15_000_000,
+            coinbase: [0u8; 20],
         };
 
         let block = BlockBuilder::new()

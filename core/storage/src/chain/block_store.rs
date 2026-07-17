@@ -12,6 +12,14 @@ use tracing::{debug, info};
 /// RM-B1 / WP-C3.2 (audit L-STORE-01).
 const LATEST_HEIGHT_KEY: &[u8] = b"latest_height";
 
+/// Execute-on-receive: persistent pointer to the block whose post-execution
+/// world state the executor currently reflects (the "applied tip"). Distinct
+/// from `latest_height` — a block can be DAG-admitted + block-bytes persisted
+/// long before its transactions have been executed and its `state_root`
+/// verified. The applied tip only advances when `apply_block` succeeds.
+/// Stored as 32-byte hash ‖ 8-byte big-endian height (40 bytes).
+const APPLIED_TIP_KEY: &[u8] = b"applied_tip";
+
 /// Block storage manager
 pub struct BlockStore {
     db: Arc<RocksDB>,
@@ -223,6 +231,38 @@ impl BlockStore {
             max_height -= 1;
         }
         Ok(max_height)
+    }
+
+    /// Execute-on-receive: persist the applied-tip pointer (the block whose
+    /// post-execution state the executor now reflects). Written after
+    /// `apply_block` succeeds. A single 40-byte value keeps the hash and
+    /// height mutually consistent (no torn read across two keys).
+    pub fn put_applied_tip(&self, hash: &Hash, height: u64) -> Result<()> {
+        let mut buf = [0u8; 40];
+        buf[..32].copy_from_slice(hash.as_bytes());
+        buf[32..].copy_from_slice(&height.to_be_bytes());
+        self.db.put_cf(CF_METADATA, APPLIED_TIP_KEY, &buf)
+    }
+
+    /// Execute-on-receive: read the persisted applied-tip pointer, or `None`
+    /// if never written (fresh node / pre-upgrade store). SECREM-01 CONS-6:
+    /// a short/corrupt value decodes to `None` rather than panicking.
+    pub fn get_applied_tip(&self) -> Result<Option<(Hash, u64)>> {
+        match self.db.get_cf(CF_METADATA, APPLIED_TIP_KEY)? {
+            Some(bytes) if bytes.len() >= 40 => {
+                let hash = match Hash::try_from_bytes(&bytes[..32]) {
+                    Some(h) => h,
+                    None => return Ok(None),
+                };
+                let height = u64::from_be_bytes(
+                    bytes[32..40]
+                        .try_into()
+                        .expect("40-byte buffer sliced to 8 bytes"),
+                );
+                Ok(Some((hash, height)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Get blocks by blue score range

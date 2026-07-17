@@ -835,6 +835,7 @@ mod tests {
         // Genesis block should be valid
         let genesis_header = BlockHeader {
             version: 1,
+            coinbase: [0u8; 20],
             block_hash: Hash::new([0; 32]),
             selected_parent_hash: Hash::default(),
             merge_parent_hashes: vec![],
@@ -857,6 +858,7 @@ mod tests {
         // Non-genesis without parent should be invalid
         let invalid_header = BlockHeader {
             version: 1,
+            coinbase: [0u8; 20],
             block_hash: Hash::new([1; 32]),
             selected_parent_hash: Hash::default(), // Invalid: non-genesis without parent
             merge_parent_hashes: vec![],
@@ -879,6 +881,7 @@ mod tests {
         // Valid non-genesis block
         let valid_header = BlockHeader {
             version: 1,
+            coinbase: [0u8; 20],
             block_hash: Hash::new([1; 32]),
             selected_parent_hash: Hash::new([2; 32]), // Has parent (non-zero)
             merge_parent_hashes: vec![],
