@@ -54,7 +54,13 @@ pub const DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT: u64 = 100_000;
 pub struct VrfProposerSelector {
     validators: Arc<RwLock<HashMap<PublicKey, Validator>>>,
     total_stake: Arc<RwLock<u128>>,
-    difficulty_adjustment: f64,
+    /// VALIDATOR-S1 (v5): minimum bonded stake for proposer-set MEMBERSHIP.
+    /// Populated from `ValidatorRegistry.minStake` at the epoch snapshot S(E).
+    /// A validator is eligible iff it is active AND `stake >= min_stake` — an
+    /// INTEGER, platform-deterministic gate (no f64), see `is_eligible_proposer`.
+    /// Behind a lock so the epoch snapshot-sync can update it live through the
+    /// shared `Arc<VrfProposerSelector>` the DagStore holds.
+    min_stake: Arc<RwLock<u128>>,
     /// Audit H-06: legacy 32-byte SHA3 proofs rejected at or above
     /// this height. See [`DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT`].
     legacy_vrf_cutoff_height: u64,
@@ -65,9 +71,39 @@ impl VrfProposerSelector {
         Self {
             validators: Arc::new(RwLock::new(HashMap::new())),
             total_stake: Arc::new(RwLock::new(0)),
-            difficulty_adjustment: 1.0,
+            min_stake: Arc::new(RwLock::new(0)),
             legacy_vrf_cutoff_height: DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT,
         }
+    }
+
+    /// VALIDATOR-S1: set the initial membership stake floor. Builder form used at
+    /// construction; the live value is updated each epoch via [`Self::sync_active_set`].
+    pub fn with_min_stake(mut self, min_stake: u128) -> Self {
+        self.min_stake = Arc::new(RwLock::new(min_stake));
+        self
+    }
+
+    /// The current membership stake floor (as-of the last snapshot sync).
+    pub async fn min_stake(&self) -> u128 {
+        *self.min_stake.read().await
+    }
+
+    /// VALIDATOR-S1: atomically replace the active validator set + minStake from a
+    /// registry snapshot read at S(E). `entries` are (proposer pubkey, effective stake)
+    /// as returned by `ValidatorRegistry.activeSet()` — every entry is active. This is
+    /// how the node rebuilds membership each epoch through the shared selector Arc.
+    pub async fn sync_active_set(&self, entries: Vec<(PublicKey, u128)>, min_stake: u128) {
+        let mut validators = self.validators.write().await;
+        let mut total = self.total_stake.write().await;
+        let mut ms = self.min_stake.write().await;
+        validators.clear();
+        let mut sum: u128 = 0;
+        for (pubkey, stake) in entries {
+            validators.insert(pubkey, Validator { pubkey, stake, is_active: true });
+            sum = sum.saturating_add(stake);
+        }
+        *total = sum;
+        *ms = min_stake;
     }
 
     /// Override the legacy-VRF cutoff height. Used by devnet and
@@ -312,44 +348,43 @@ impl VrfProposerSelector {
         Ok(proof.output == expected_output)
     }
 
-    /// Check if a validator is eligible to propose for a slot
+    /// VALIDATOR-S1 (v5) — proposer eligibility is **set MEMBERSHIP**, evaluated
+    /// with INTEGER arithmetic so every node reaches the identical verdict on every
+    /// platform (the previous f64 stake-weighted lottery was nondeterministic across
+    /// architectures AND halted a small fleet in ~24% of slots).
+    ///
+    /// A validator is eligible to propose iff:
+    ///   - it is in the active set for the block's epoch (populated from
+    ///     `ValidatorRegistry.activeSet()` at the finalized snapshot S(E)), AND
+    ///   - its bonded stake is at least `min_stake` (governance `minStake` as-of S(E)).
+    ///
+    /// There is NO per-slot threshold: on a BlockDAG any member may propose at any
+    /// height and GHOSTDAG orders the results; equivocation (two blocks, one height,
+    /// one proposer) is caught by `detect_equivocation` + on-chain slashing. Leadership
+    /// smoothing (reducing orphans) is a SOFT, producer-side round-robin — never a
+    /// consensus admission rule — so it can use non-deterministic hints without
+    /// affecting safety.
+    ///
+    /// `_vrf_output` / `_slot` are retained for call-site compatibility and the VRF
+    /// identity binding (checked separately in `verify_vrf_with_block_signature`); they
+    /// do not influence the membership verdict.
     pub async fn is_eligible_proposer(
         &self,
         pubkey: &PublicKey,
-        vrf_output: &Hash,
-        slot: u64,
+        _vrf_output: &Hash,
+        _slot: u64,
     ) -> Result<bool, VrfError> {
         let validators = self.validators.read().await;
-        let total_stake = self.total_stake.read().await;
-
         let validator = validators.get(pubkey).ok_or(VrfError::ValidatorNotFound)?;
-
-        if !validator.is_active {
-            return Ok(false);
-        }
-
-        // Calculate threshold based on stake
-        let stake_ratio = validator.stake as f64 / *total_stake as f64;
-        let threshold = self.calculate_threshold(stake_ratio, slot);
-
-        // Convert VRF output to a number between 0 and 1
-        let vrf_value = self.vrf_output_to_float(vrf_output);
-
-        Ok(vrf_value < threshold)
+        let min_stake = *self.min_stake.read().await;
+        Ok(validator.is_active && validator.stake >= min_stake)
     }
 
-    /// Calculate threshold for proposer eligibility
-    fn calculate_threshold(&self, stake_ratio: f64, slot: u64) -> f64 {
-        // Base threshold proportional to stake
-        let base_threshold = stake_ratio * self.difficulty_adjustment;
-
-        // Add time-based variation to prevent predictability
-        let time_factor = ((slot % 100) as f64 / 100.0) * 0.1;
-
-        (base_threshold + time_factor).min(1.0)
-    }
-
-    /// Convert VRF output to a float between 0 and 1
+    /// Convert VRF output to a float between 0 and 1.
+    ///
+    /// Producer-side ADVISORY only (soft leadership smoothing in `select_proposer`).
+    /// NOT used in consensus admission — `is_eligible_proposer` is integer-only — so
+    /// the f64 here cannot cause cross-node divergence.
     fn vrf_output_to_float(&self, output: &Hash) -> f64 {
         let bytes = output.as_bytes();
         let mut value = 0u64;
@@ -515,6 +550,114 @@ mod tests {
 
         assert_eq!(selector.active_validator_count().await, 1);
         assert_eq!(selector.total_stake().await, 1000);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // VALIDATOR-S1 (v5) — integer MEMBERSHIP eligibility. Replaces the
+    // nondeterministic f64 stake-weighted lottery. Eligible iff active AND
+    // stake >= min_stake, evaluated with integer arithmetic only.
+    // ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_membership_eligible_at_or_above_min_stake() {
+        let selector = VrfProposerSelector::new().with_min_stake(32_000);
+        let pk = PublicKey::new([7; 32]);
+        selector
+            .register_validator(Validator { pubkey: pk, stake: 32_000, is_active: true })
+            .await;
+        // exactly at the floor → eligible; verdict is independent of vrf_output/slot
+        assert!(selector
+            .is_eligible_proposer(&pk, &Hash::new([0xFF; 32]), 1)
+            .await
+            .unwrap());
+        assert!(selector
+            .is_eligible_proposer(&pk, &Hash::new([0x00; 32]), 999_999)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_membership_below_min_stake_not_eligible() {
+        let selector = VrfProposerSelector::new().with_min_stake(32_000);
+        let pk = PublicKey::new([8; 32]);
+        selector
+            .register_validator(Validator { pubkey: pk, stake: 31_999, is_active: true })
+            .await;
+        assert!(!selector
+            .is_eligible_proposer(&pk, &Hash::new([1; 32]), 1)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_membership_inactive_not_eligible() {
+        let selector = VrfProposerSelector::new().with_min_stake(0);
+        let pk = PublicKey::new([9; 32]);
+        selector
+            .register_validator(Validator { pubkey: pk, stake: 1_000_000, is_active: false })
+            .await;
+        assert!(!selector
+            .is_eligible_proposer(&pk, &Hash::new([1; 32]), 1)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_sync_active_set_replaces_membership_and_min_stake() {
+        let selector = VrfProposerSelector::new().with_min_stake(1_000);
+        let stale = PublicKey::new([0xEE; 32]);
+        selector
+            .register_validator(Validator { pubkey: stale, stake: 5_000, is_active: true })
+            .await;
+
+        // Snapshot from S(E): a fresh set + new minStake, replacing everything.
+        let a = PublicKey::new([0xA0; 32]);
+        let b = PublicKey::new([0xB0; 32]);
+        selector
+            .sync_active_set(vec![(a, 40_000), (b, 32_000)], 32_000)
+            .await;
+
+        assert_eq!(selector.min_stake().await, 32_000);
+        assert_eq!(selector.total_stake().await, 72_000);
+        assert_eq!(selector.active_validator_count().await, 2);
+        // stale validator is gone (not in the snapshot)
+        assert!(matches!(
+            selector.is_eligible_proposer(&stale, &Hash::new([0; 32]), 1).await,
+            Err(VrfError::ValidatorNotFound)
+        ));
+        // new members eligible at/above the new minStake
+        assert!(selector.is_eligible_proposer(&a, &Hash::new([0; 32]), 1).await.unwrap());
+        assert!(selector.is_eligible_proposer(&b, &Hash::new([0; 32]), 1).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_membership_unregistered_errors() {
+        let selector = VrfProposerSelector::new();
+        let pk = PublicKey::new([10; 32]);
+        assert!(matches!(
+            selector.is_eligible_proposer(&pk, &Hash::new([1; 32]), 1).await,
+            Err(VrfError::ValidatorNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_membership_single_validator_fleet_never_halts() {
+        // Regression: the old f64 lottery rejected the sole validator's block in
+        // ~24% of slots. Membership admits it at every slot.
+        let selector = VrfProposerSelector::new().with_min_stake(32_000);
+        let pk = PublicKey::new([11; 32]);
+        selector
+            .register_validator(Validator { pubkey: pk, stake: 32_000, is_active: true })
+            .await;
+        for slot in 0..200u64 {
+            assert!(
+                selector
+                    .is_eligible_proposer(&pk, &Hash::new([(slot % 256) as u8; 32]), slot)
+                    .await
+                    .unwrap(),
+                "sole validator must be eligible at slot {slot}"
+            );
+        }
     }
 
     #[tokio::test]

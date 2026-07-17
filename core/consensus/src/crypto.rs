@@ -135,10 +135,131 @@ pub fn sign_block(block_hash: &Hash, signing_key: &SigningKey) -> Signature {
     Signature::new(sig.to_bytes())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// VALIDATOR-S1 (v5) — ValidatorRegistry proof signing (companion §8).
+//
+// The on-chain ValidatorRegistry verifies ed25519 signatures over EIP-712-style
+// digests using the 0x0120 precompile. For those checks to ever pass, the NODE
+// must sign the SAME 32-byte digest the contract reconstructs. These helpers
+// replicate `keccak256(abi.encode(TYPEHASH, ...))` byte-for-byte and sign it.
+//
+//   - Registration proof-of-key-control: registerValidator(pubkey, sig).
+//   - Equivocation vote: submitEquivocation verifies each double-sign signature
+//     over EquivocationVote(chainId, registry, height, blockHash). A raw block-hash
+//     signature (see `sign_block`) CANNOT prove two blocks share a height, so the
+//     block proposer must ALSO sign this height-binding vote for the permissionless
+//     Byzantine-slash path to function.
+//
+// Cross-layer byte-equivalence is asserted against the Solidity contract in
+// `contracts/test/ValidatorRegistryDigest.t.sol` (fixed vectors) and mirrored in the
+// tests below.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The exact EIP-712 type strings the contract hashes for its TYPEHASH constants.
+pub const REGISTER_TYPE: &str =
+    "Register(uint256 chainId,address registry,address staker,bytes32 proposerPubkey,uint256 nonce)";
+pub const EQUIVOCATION_VOTE_TYPE: &str =
+    "EquivocationVote(uint256 chainId,address registry,uint64 height,bytes32 blockHash)";
+
+fn keccak256(data: &[u8]) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    let mut h = Keccak256::new();
+    h.update(data);
+    h.finalize().into()
+}
+
+/// abi.encode word for an unsigned integer (right-aligned, big-endian 32 bytes).
+fn word_u64(v: u64) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&v.to_be_bytes());
+    w
+}
+
+/// abi.encode word for a 20-byte address (left-padded to 32 bytes).
+fn word_addr(a: &[u8; 20]) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[12..].copy_from_slice(a);
+    w
+}
+
+/// Digest for the registration proof: `keccak256(abi.encode(REGISTER_TYPEHASH,
+/// chainId, registry, staker, proposerPubkey, nonce))`. `proposer_pubkey` is the
+/// 32-byte ed25519 key (the contract's `bytes32 proposerPubkey`).
+pub fn registration_digest(
+    chain_id: u64,
+    registry: &[u8; 20],
+    staker: &[u8; 20],
+    proposer_pubkey: &[u8; 32],
+    nonce: u64,
+) -> [u8; 32] {
+    let mut enc = Vec::with_capacity(6 * 32);
+    enc.extend_from_slice(&keccak256(REGISTER_TYPE.as_bytes()));
+    enc.extend_from_slice(&word_u64(chain_id));
+    enc.extend_from_slice(&word_addr(registry));
+    enc.extend_from_slice(&word_addr(staker));
+    enc.extend_from_slice(proposer_pubkey);
+    enc.extend_from_slice(&word_u64(nonce));
+    keccak256(&enc)
+}
+
+/// Sign the registration digest with the ed25519 proposer key. The contract's
+/// `_ed25519Verify` message is `abi.encodePacked(digest)` — i.e. the 32-byte digest
+/// itself — so we sign exactly those 32 bytes. The signature is canonical and passes
+/// the precompile's `verify_strict`.
+pub fn sign_registration(
+    chain_id: u64,
+    registry: &[u8; 20],
+    staker: &[u8; 20],
+    proposer_pubkey: &[u8; 32],
+    nonce: u64,
+    signing_key: &SigningKey,
+) -> Signature {
+    let digest = registration_digest(chain_id, registry, staker, proposer_pubkey, nonce);
+    let sig: DalekSignature = signing_key.sign(&digest);
+    Signature::new(sig.to_bytes())
+}
+
+/// Digest for an equivocation vote: `keccak256(abi.encode(EQUIVOCATION_TYPEHASH,
+/// chainId, registry, height, blockHash))`.
+pub fn equivocation_vote_digest(
+    chain_id: u64,
+    registry: &[u8; 20],
+    height: u64,
+    block_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut enc = Vec::with_capacity(5 * 32);
+    enc.extend_from_slice(&keccak256(EQUIVOCATION_VOTE_TYPE.as_bytes()));
+    enc.extend_from_slice(&word_u64(chain_id));
+    enc.extend_from_slice(&word_addr(registry));
+    enc.extend_from_slice(&word_u64(height));
+    enc.extend_from_slice(block_hash);
+    keccak256(&enc)
+}
+
+/// Sign the height-binding equivocation vote. The block proposer signs this ALONGSIDE
+/// `sign_block` so a double-sign at one height yields two contract-verifiable votes
+/// (submitEquivocation checks both). Signs the 32-byte digest; canonical → verify_strict.
+pub fn sign_equivocation_vote(
+    chain_id: u64,
+    registry: &[u8; 20],
+    height: u64,
+    block_hash: &[u8; 32],
+    signing_key: &SigningKey,
+) -> Signature {
+    let digest = equivocation_vote_digest(chain_id, registry, height, block_hash);
+    let sig: DalekSignature = signing_key.sign(&digest);
+    Signature::new(sig.to_bytes())
+}
+
 /// Verify a block's signature against its `proposer_pubkey`.
 ///
 /// Returns `Ok(true)` if valid, `Ok(false)` if the signature doesn't match.
 /// Returns `Err` only for malformed keys.
+///
+/// VALIDATOR-S1 note: this uses the permissive `verify` (RFC-8032), consistent across
+/// the fleet. The on-chain 0x0120 precompile uses `verify_strict`; a canonical dalek
+/// signature (which the node always produces) satisfies both, so the registry proofs
+/// signed above verify on-chain.
 pub fn verify_block_signature(block: &Block) -> Result<bool, CryptoError> {
     let pubkey = VerifyingKey::from_bytes(block.header.proposer_pubkey.as_bytes())
         .map_err(|_| CryptoError::InvalidPublicKey)?;
@@ -236,6 +357,91 @@ mod tests {
         assert!(is_ecdsa_transaction(&tx));
         // Must FAIL verification — no cryptographic proof
         assert!(!verify_transaction(&tx).unwrap());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // VALIDATOR-S1 (v5) — registry digest cross-layer equivalence + strict-verify.
+    //
+    // The expected digests are produced by the Solidity contract for identical
+    // fixed vectors in contracts/test/ValidatorRegistryDigest.t.sol. If either
+    // side changes the abi.encode layout or a type string, these break — which is
+    // exactly the cross-layer drift we want to catch.
+    // ─────────────────────────────────────────────────────────────────────
+
+    const V_CHAIN_ID: u64 = 40204;
+    const V_REGISTRY: [u8; 20] = [0x11; 20];
+    const V_STAKER: [u8; 20] = [0x22; 20];
+    const V_NONCE: u64 = 7;
+    const V_HEIGHT: u64 = 12345;
+
+    fn vector_pubkey() -> [u8; 32] {
+        // bytes32(uint256(0xABCDEF))
+        let mut pk = [0u8; 32];
+        pk[29] = 0xAB;
+        pk[30] = 0xCD;
+        pk[31] = 0xEF;
+        pk
+    }
+
+    fn vector_block_hash() -> [u8; 32] {
+        // bytes32(uint256(0x99))
+        let mut bh = [0u8; 32];
+        bh[31] = 0x99;
+        bh
+    }
+
+    #[test]
+    fn test_registration_digest_matches_solidity() {
+        let d = registration_digest(V_CHAIN_ID, &V_REGISTRY, &V_STAKER, &vector_pubkey(), V_NONCE);
+        assert_eq!(
+            hex::encode(d),
+            "43e3b0efc79703bd0e9327f6c6e6fcd080b6b69bf6096b2add28ed273afdd953",
+            "registration digest must match the Solidity contract byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn test_equivocation_digest_matches_solidity() {
+        let d = equivocation_vote_digest(V_CHAIN_ID, &V_REGISTRY, V_HEIGHT, &vector_block_hash());
+        assert_eq!(
+            hex::encode(d),
+            "4a9847b204a23b943979a06ced71cc9ba1d86895a0c7b1d81a6bd969b7285727",
+            "equivocation vote digest must match the Solidity contract byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn test_signed_vote_passes_verify_strict() {
+        // The node's signature over the digest must satisfy the on-chain precompile,
+        // which uses ed25519_dalek::verify_strict (canonical S + non-small-order R).
+        let signing_key = generate_keypair();
+        let vk = signing_key.verifying_key();
+        let digest = equivocation_vote_digest(V_CHAIN_ID, &V_REGISTRY, V_HEIGHT, &vector_block_hash());
+        let sig = sign_equivocation_vote(
+            V_CHAIN_ID,
+            &V_REGISTRY,
+            V_HEIGHT,
+            &vector_block_hash(),
+            &signing_key,
+        );
+        let dalek_sig = DalekSignature::from_bytes(sig.as_bytes());
+        // strict verify over the exact 32-byte digest (what the precompile receives as message)
+        assert!(vk.verify_strict(&digest, &dalek_sig).is_ok());
+        // wrong message must fail
+        let mut other = digest;
+        other[0] ^= 0x01;
+        assert!(vk.verify_strict(&other, &dalek_sig).is_err());
+    }
+
+    #[test]
+    fn test_registration_signature_roundtrip_strict() {
+        let signing_key = generate_keypair();
+        let vk = signing_key.verifying_key();
+        let pk = vk.to_bytes();
+        let digest = registration_digest(V_CHAIN_ID, &V_REGISTRY, &V_STAKER, &pk, V_NONCE);
+        let sig = sign_registration(V_CHAIN_ID, &V_REGISTRY, &V_STAKER, &pk, V_NONCE, &signing_key);
+        let dalek_sig = DalekSignature::from_bytes(sig.as_bytes());
+        assert!(vk.verify_strict(&digest, &dalek_sig).is_ok());
     }
 
     /// Verify that ecdsa_verified=true allows ECDSA-shaped tx through
