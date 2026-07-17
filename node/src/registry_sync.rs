@@ -412,7 +412,11 @@ const REWARD_SNAPSHOT_VERSION: u8 = 1;
 ///   [73..89] min_stake u128
 ///   [89..93] validator count u32
 ///   then count * (pubkey[32] ‖ stake u128 ‖ staker[20]) = 68 bytes each
-fn encode_reward_snapshot(
+///
+/// `pub(crate)` so the node's multi-node integration harness (canonical_apply
+/// tests) can persist a byte-identical durable snapshot at a modeled snapshot
+/// boundary, exercising the real `hydrate_on_boot` durable-reload path.
+pub(crate) fn encode_reward_snapshot(
     policy: &citrate_execution::block_rewards::EpochRewardPolicy,
     entries: &[([u8; 32], u128)],
     min_stake: u128,
