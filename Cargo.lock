@@ -1500,6 +1500,7 @@ dependencies = [
  "openssl",
  "parking_lot 0.12.5",
  "primitive-types",
+ "proptest",
  "rand 0.8.6",
  "reqwest",
  "serde",

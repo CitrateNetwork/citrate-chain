@@ -79,6 +79,9 @@ colored = "2.0"
 
 [dev-dependencies]
 tempfile = "3.15"
+# WS-5 ceremony fuzz: property-based coverage of proposer-key derivation,
+# Register-digest encoding, sign→verify_strict roundtrip, and calldata layout.
+proptest = { workspace = true }
 
 [features]
 default = []
