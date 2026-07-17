@@ -65,6 +65,11 @@ impl StateStoreTrait for StateStore {
         Ok(())
     }
 
+    fn delete_account(&self, address: &Address) -> Result<()> {
+        self.db.delete_cf(CF_ACCOUNTS, &address.0)?;
+        Ok(())
+    }
+
     fn write_state_batch_sync(
         &self,
         accounts: &[(Address, AccountState)],
