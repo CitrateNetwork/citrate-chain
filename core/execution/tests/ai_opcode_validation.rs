@@ -33,7 +33,8 @@ fn test_all_precompile_addresses_are_distinct() {
 
 #[test]
 fn test_precompile_address_namespace() {
-    // All AI precompiles in 0x0001xx namespace (bytes 16-17 = 0x0001)
+    // All AI precompiles live in the 0x01xx page: bytes 0..18 are zero, byte 18
+    // is the namespace high byte (0x01), byte 19 is the operation id.
     let addrs = [
         addresses::MODEL_DEPLOY,
         addresses::MODEL_INFERENCE,
@@ -44,8 +45,8 @@ fn test_precompile_address_namespace() {
         addresses::MODEL_ENCRYPTION,
     ];
     for (i, addr) in addrs.iter().enumerate() {
-        assert_eq!(addr[17], 1, "Precompile {} should be in 0x0001xx namespace", i);
-        assert_eq!(addr[18], 0, "Precompile {} byte 18 should be 0", i);
+        assert!(addr[..18].iter().all(|&b| b == 0), "Precompile {} high bytes must be zero", i);
+        assert_eq!(addr[18], 1, "Precompile {} should be in the 0x01xx namespace", i);
     }
 }
 

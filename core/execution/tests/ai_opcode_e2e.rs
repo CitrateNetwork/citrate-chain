@@ -333,11 +333,12 @@ fn test_ai_precompile_addresses_in_correct_namespace() {
         (addresses::MODEL_BENCHMARK, 5),
         (addresses::MODEL_ENCRYPTION, 6),
     ];
+    // AI precompiles live in the 0x0100–0x0106 page: bytes 0..18 are zero, byte 18
+    // is the namespace high byte (0x01), byte 19 is the operation id.
     for (addr, expected_id) in &addrs {
-        assert!(addr[..17].iter().all(|&b| b == 0));
-        assert_eq!(addr[17], 1);
-        assert_eq!(addr[18], 0);
-        assert_eq!(addr[19], *expected_id);
+        assert!(addr[..18].iter().all(|&b| b == 0), "AI precompile high bytes must be zero");
+        assert_eq!(addr[18], 1, "AI precompile namespace byte (0x01__) must be 1");
+        assert_eq!(addr[19], *expected_id, "AI precompile op id (byte 19) must match");
     }
 }
 
@@ -350,8 +351,11 @@ fn test_x402_precompile_addresses_separate_namespace() {
         x402_addrs::TRANSFER_AUTH_VERIFY,
         x402_addrs::BATCH_PAYMENT_VERIFY,
     ];
+    // x402 precompiles live in the 0x0200–0x0202 page: namespace high byte (0x02)
+    // is byte 18, distinct from the AI page (0x01__).
     for addr in &x402_list {
-        assert_eq!(addr[17], 2);
+        assert!(addr[..18].iter().all(|&b| b == 0), "x402 precompile high bytes must be zero");
+        assert_eq!(addr[18], 2, "x402 precompile namespace byte (0x02__) must be 2");
     }
 
     let ai_list = [
