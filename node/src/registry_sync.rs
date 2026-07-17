@@ -904,4 +904,204 @@ mod tests {
         assert!(desc.contains("below first snapshot"), "got: {desc}");
         assert!(r.reward_policy_handle().read().is_none(), "no policy below S(1)");
     }
+
+    // ========================================================================
+    // CAMPAIGN TRACK 2 — perturbation #1 (RESTART, durable-blob path) +
+    // perturbation #4 (FLEET-WIDE simultaneous restart), FUZZED over seeds.
+    //
+    // The durable-blob restart path is the reroll fleet-restart path: every node
+    // persists the materialized S(E) snapshot and reloads it verbatim on boot. We
+    // fuzz the geometry (which epoch window / forward height) and the policy
+    // (share bps, proposer stake, min-stake) over many deterministic seeds, and
+    // assert a "restarted" node reproduces a "continuously-up" node's forward-block
+    // state root AND admission verdict BYTE/BOOL-identically — for perturbation #1
+    // one restarted node; for perturbation #4 a whole fleet of K independently
+    // restarted nodes all converging (no fork).
+    // ========================================================================
+
+    /// Deterministic splitmix64 — a self-contained PRNG (no dev-dep) so every seed
+    /// reproduces an exact scenario.
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// One fuzzed restart scenario, fully derived from `seed`.
+    struct RestartCase {
+        activation: u64,
+        fwd_height: u64,
+        snapshot_height: u64,
+        epoch: u64,
+        share_bps: u64,
+        proposer_stake: u128,
+        min_stake: u128,
+    }
+
+    fn gen_restart_case(seed: u64) -> RestartCase {
+        let mut s = seed ^ 0xD1B5_4A32_D192_ED03;
+        // Epoch window 1..=6 → snapshot S(E) = E*1000 - 200, forward height in
+        // (S(E), S(E)+199] and non-boundary, always >= activation (=800=S(1)).
+        let epoch = 1 + (splitmix64(&mut s) % 6); // 1..=6
+        let snapshot_height = epoch * EPOCH - SNAPSHOT_LAG; // S(E)
+        // offset 1..=199 keeps it inside the epoch window and OFF the next boundary.
+        let offset = 1 + (splitmix64(&mut s) % 199); // 1..=199
+        let fwd_height = snapshot_height + offset;
+        let share_bps = [0u64, 1, 2500, 5000, 9999, 10000][(splitmix64(&mut s) % 6) as usize];
+        let proposer_stake = 1 + (splitmix64(&mut s) % 200_000) as u128;
+        let min_stake = (splitmix64(&mut s) % 100_000) as u128;
+        RestartCase {
+            activation: 800,
+            fwd_height,
+            snapshot_height,
+            epoch,
+            share_bps,
+            proposer_stake,
+            min_stake,
+        }
+    }
+
+    fn policy_for(case: &RestartCase) -> EpochRewardPolicy {
+        let mut staker_of = std::collections::HashMap::new();
+        staker_of.insert(PROPOSER, CB); // coinbase == registered staker (§R' 3c)
+        EpochRewardPolicy {
+            epoch: case.epoch,
+            snapshot_height: case.snapshot_height,
+            activation_height: case.activation,
+            registry: REG,
+            reward_minter: REWARD_MINTER_ADDRESS,
+            priority_fee_share_bps: case.share_bps,
+            staker_of,
+        }
+    }
+
+    fn seal_block_at(height: u64, txs: Vec<Transaction>, root: Hash) -> Block {
+        let mut blk = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(Hash::default())
+            .coinbase(CB)
+            .proposer(PublicKey::new(PROPOSER))
+            .timestamp(1_700_000_000)
+            .base_fee_per_gas(CANONICAL_BASE_FEE_PER_GAS)
+            .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+            .transactions(txs)
+            .state_root(root)
+            .build_unhashed();
+        blk.header.block_hash = blk.compute_hash();
+        blk
+    }
+
+    /// Settle a forward block at `height` exactly as `apply_block_inner` does.
+    async fn produce_fwd_at(exec: &Executor, height: u64, txs: &[Transaction]) -> Hash {
+        exec.set_block_context(citrate_execution::revm_adapter::BlockContext {
+            coinbase: CB,
+            prevrandao: [0x5A; 32],
+            block_hashes: std::collections::HashMap::new(),
+        });
+        let tmpl = seal_block_at(height, txs.to_vec(), Hash::default());
+        let mut receipts = Vec::new();
+        for tx in txs {
+            receipts.push(exec.execute_transaction(&tmpl, tx).await.expect("tx executes"));
+        }
+        let basic = [
+            (Address(CB), U256::from(10_000_000_000u64)),
+            (Address([0x11; 20]), U256::from(1_000_000_000u64)),
+        ];
+        exec.settle_block_rewards(
+            height, CB, PROPOSER, CANONICAL_BASE_FEE_PER_GAS, txs, &receipts, &basic,
+        )
+        .await
+        .expect("settle");
+        exec.calculate_state_root()
+    }
+
+    #[tokio::test]
+    async fn fuzz_restart_durable_blob_matches_continuously_up_node() {
+        let basic = [
+            (Address(CB), U256::from(10_000_000_000u64)),
+            (Address([0x11; 20]), U256::from(1_000_000_000u64)),
+        ];
+        // Fleet size for perturbation #4 (all restart simultaneously from the blob).
+        const FLEET: usize = 4;
+        let mut forks = 0u32;
+
+        for seed in 0u64..60 {
+            let case = gen_restart_case(seed);
+            let policy = policy_for(&case);
+            let entries = vec![(PROPOSER, case.proposer_stake)];
+
+            // --- Continuously-up node U. ---
+            let u = Arc::new(Executor::new(Arc::new(StateDB::new())));
+            u.set_validator_activation_height(case.activation);
+            *u.reward_policy_handle().write() = Some(policy.clone());
+            let sel_u = Arc::new(VrfProposerSelector::production());
+            sel_u
+                .sync_active_set(vec![(PublicKey::new(PROPOSER), case.proposer_stake)], case.min_stake)
+                .await;
+            let a = snd(1);
+            let b = snd(2);
+            u.set_balance(&address_utils::normalize_address(&a), U256::from(u128::MAX));
+            let txs = vec![priority_tx(a, b, 0, CANONICAL_BASE_FEE_PER_GAS + 900, 250, 0xA1)];
+            let root_u = produce_fwd_at(&u, case.fwd_height, &txs).await;
+            let reg_u = u.get_balance(&Address(REG));
+            let admit_u = sel_u
+                .is_eligible_proposer(&PublicKey::new(PROPOSER), &Hash::default(), case.fwd_height)
+                .await;
+            let sealed = seal_block_at(case.fwd_height, txs.clone(), root_u);
+
+            // --- A fleet of FLEET restarted nodes, each rehydrating from the SAME
+            //     durable blob (perturbation #4: simultaneous fleet restart). ---
+            let mut fleet_roots = Vec::with_capacity(FLEET);
+            for _ in 0..FLEET {
+                let dir = tempfile::tempdir().expect("dir");
+                let storage = Arc::new(
+                    citrate_storage::StorageManager::new(dir.path(), PruningConfig::default())
+                        .expect("storage"),
+                );
+                storage
+                    .blocks
+                    .put_reward_snapshot(&encode_reward_snapshot(&policy, &entries, case.min_stake))
+                    .expect("persist snapshot");
+                let r = Arc::new(Executor::new(Arc::new(StateDB::new())));
+                r.set_validator_activation_height(case.activation);
+                let sel_r = Arc::new(VrfProposerSelector::production());
+                let rs = RegistrySync::new(r.clone(), sel_r.clone(), REG, case.activation, storage.clone());
+                let desc = rs
+                    .hydrate_on_boot(case.fwd_height - 1)
+                    .await
+                    .expect("hydrate");
+                assert!(desc.contains("durable"), "seed {seed}: durable path expected: {desc}");
+                r.set_balance(&address_utils::normalize_address(&a), U256::from(u128::MAX));
+                let got = r
+                    .apply_block(&sealed, sealed.header.coinbase, &basic)
+                    .await
+                    .unwrap_or_else(|e| panic!("seed {seed}: restarted node rejected valid block: {e}"));
+                // Root parity vs the continuously-up node.
+                assert_eq!(got, root_u, "seed {seed}: restart state root != continuously-up");
+                assert_eq!(
+                    r.get_balance(&Address(REG)),
+                    reg_u,
+                    "seed {seed}: restart vested-share != continuously-up"
+                );
+                // Admission verdict parity (both Ok(bool) equal, or both Err).
+                let admit_r = sel_r
+                    .is_eligible_proposer(&PublicKey::new(PROPOSER), &Hash::default(), case.fwd_height)
+                    .await;
+                match (&admit_u, &admit_r) {
+                    (Ok(x), Ok(y)) => assert_eq!(x, y, "seed {seed}: admission verdict differs"),
+                    (Err(_), Err(_)) => {}
+                    _ => panic!("seed {seed}: admission verdict shape differs (one Ok, one Err)"),
+                }
+                fleet_roots.push(got);
+            }
+            // Perturbation #4: the whole fleet converged to one root (no fork).
+            if fleet_roots.iter().any(|r| *r != fleet_roots[0]) {
+                forks += 1;
+            }
+        }
+        assert_eq!(forks, 0, "fleet-wide restart produced a fork on {forks} seed(s)");
+    }
 }
