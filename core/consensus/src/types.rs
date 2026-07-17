@@ -264,6 +264,18 @@ pub struct Block {
     /// Verified by TLA+ spec StrobilationCheckpoint.tla (INV-4: StateRootIndependent).
     #[serde(default)]
     pub learning_root: Hash,
+
+    /// VALIDATOR-S1 (v5): the proposer's ed25519 signature over the height-binding
+    /// EquivocationVote digest for THIS block (chainId, registry, height, block_hash),
+    /// produced by `crypto::sign_equivocation_vote`. It is a GOSSIP SIDECAR — NOT part
+    /// of `compute_hash()` and NOT consensus-critical — carried so that if a proposer
+    /// double-signs (two distinct blocks at one height), a reporter can extract both
+    /// signatures and submit them to `ValidatorRegistry.submitEquivocation`. A raw
+    /// block-hash signature cannot prove same-height equivocation, so this height-bound
+    /// vote is the on-chain-verifiable evidence. `None` for genesis / pre-activation
+    /// blocks and for nodes that have not yet been configured with the registry address.
+    #[serde(default)]
+    pub equivocation_vote: Option<Signature>,
 }
 
 impl Block {
@@ -734,6 +746,7 @@ impl BlockBuilder {
                 learning_confidence: None,
                 gradient_commitment: None,
                 learning_root: Hash::default(),
+                equivocation_vote: None,
             },
         }
     }
@@ -855,6 +868,13 @@ impl BlockBuilder {
     }
     pub fn learning_root(mut self, root: Hash) -> Self {
         self.block.learning_root = root;
+        self
+    }
+    /// VALIDATOR-S1: attach the proposer's height-binding EquivocationVote signature
+    /// (gossip sidecar; not part of `compute_hash`). Set by the producer after the
+    /// block hash is known.
+    pub fn equivocation_vote(mut self, sig: Option<Signature>) -> Self {
+        self.block.equivocation_vote = sig;
         self
     }
 
@@ -1140,6 +1160,28 @@ mod tests {
 
         // Hash must be identical — learning fields are NOT consensus-critical
         assert_eq!(block_a.compute_hash(), block_b.compute_hash());
+    }
+
+    // VALIDATOR-S1 (v5): equivocation_vote is a gossip sidecar — NOT in compute_hash
+    // (so it can't cause consensus divergence or block-hash malleability) but survives
+    // serde so reporters can extract it from gossiped blocks.
+    #[test]
+    fn test_equivocation_vote_excluded_from_hash_and_roundtrips() {
+        let block_a = create_test_block();
+        let mut block_b = create_test_block();
+        block_b.equivocation_vote = Some(Signature::new([0x7C; 64]));
+        assert_eq!(
+            block_a.compute_hash(),
+            block_b.compute_hash(),
+            "equivocation_vote must not affect the block hash"
+        );
+
+        let json = serde_json::to_string(&block_b).unwrap();
+        let de: Block = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.equivocation_vote, Some(Signature::new([0x7C; 64])));
+
+        // backward-compat: a block serialized WITHOUT the field deserializes to None
+        assert_eq!(create_test_block().equivocation_vote, None);
     }
 
     // WP-F.3: learning_root does NOT affect compute_hash (Theorem 3).

@@ -5,6 +5,7 @@
 
 pub mod attestation;
 pub mod compute;
+pub mod ed25519;
 pub mod inference;
 pub mod q16;
 pub mod tensor_format;
@@ -120,6 +121,9 @@ pub fn execute_pure(address: &Address, input: &[u8], gas_limit: u64) -> Result<P
         if selector == 0x11 {
             return q16::routing::execute(input, gas_limit);
         }
+        if selector == 0x20 {
+            return ed25519::execute(input, gas_limit);
+        }
     }
     Err(anyhow::anyhow!(
         "Not a Citrate pure precompile address: 0x{:02x}{:02x}",
@@ -132,7 +136,7 @@ pub fn execute_pure(address: &Address, input: &[u8], gas_limit: u64) -> Result<P
 /// contract code (WP-B0). Kept next to `execute_pure` so the two cannot
 /// drift: every address listed here MUST route in `execute_pure`, and the
 /// `pure_precompile_table_routes` unit test enforces it.
-pub const PURE_PRECOMPILE_ADDRESSES: [[u8; 20]; 14] = [
+pub const PURE_PRECOMPILE_ADDRESSES: [[u8; 20]; 15] = [
     verify::addresses::TENSOR_COMMIT,          // 0x0107
     verify::addresses::INFERENCE_PROOF_VERIFY, // 0x0108
     verify::addresses::MERKLE_VERIFY_TENSOR,   // 0x0109
@@ -144,6 +148,7 @@ pub const PURE_PRECOMPILE_ADDRESSES: [[u8; 20]; 14] = [
     compute::addresses::TENSOR_TRANSPOSE_Q16,  // 0x010F
     q16::belnap::BELNAP_AGGREGATE,             // 0x0110
     q16::routing::ROUTING_INFERENCE,           // 0x0111
+    ed25519::ED25519_VERIFY,                   // 0x0120
     x402::addresses::EIP712_VERIFY,            // 0x0200
     x402::addresses::TRANSFER_AUTH_VERIFY,     // 0x0201
     x402::addresses::BATCH_PAYMENT_VERIFY,     // 0x0202
@@ -200,10 +205,15 @@ impl PrecompileExecutor {
         let is_learning =
             prefix_check && addr_bytes[18] == 1 && (0x10..=0x1F).contains(&addr_bytes[19]);
 
+        // Citrate crypto precompiles (0x0120 - 0x012F)
+        // 0x0120: Ed25519 signature verification (SUF-CMA, is_weak-hardened)
+        let is_crypto =
+            prefix_check && addr_bytes[18] == 1 && (0x20..=0x2F).contains(&addr_bytes[19]);
+
         // Citrate x402 payment precompiles (0x0200 - 0x0209)
         let is_x402 = prefix_check && addr_bytes[18] == 2 && addr_bytes[19] <= 9;
 
-        is_standard || is_ai || is_learning || is_x402
+        is_standard || is_ai || is_learning || is_crypto || is_x402
     }
 
     /// Execute a precompile
@@ -218,6 +228,23 @@ impl PrecompileExecutor {
         // x402 payment precompiles (0x0200–0x0209; canonical byte 18 = 2)
         if addr_bytes[..18].iter().all(|&b| b == 0) && addr_bytes[18] == 2 && addr_bytes[19] <= 9 {
             return x402::execute(address, input, gas_limit);
+        }
+
+        // Crypto precompiles (0x0120–0x012F; canonical byte 18 = 1,
+        // selector 0x20–0x2F).
+        // 0x0120 — Ed25519 signature verification (SUF-CMA, is_weak-hardened)
+        if addr_bytes[..18].iter().all(|&b| b == 0)
+            && addr_bytes[18] == 1
+            && (0x20..=0x2F).contains(&addr_bytes[19])
+        {
+            let selector = addr_bytes[19];
+            if selector == 0x20 {
+                return ed25519::execute(input, gas_limit);
+            }
+            return Err(anyhow::anyhow!(
+                "Unknown crypto precompile selector 0x{:02x}",
+                selector
+            ));
         }
 
         // Learning precompiles (0x0110–0x011F; canonical byte 18 = 1,
@@ -1660,10 +1687,16 @@ mod tests {
         let future_routing = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 1, 0x11]);
         assert!(executor.is_precompile(&future_routing));
 
-        // Just past the page (0x0120) MUST NOT be recognized — that
-        // would silently route to nothing and break the dispatcher
+        // 0x0120 is now the crypto sub-page (Ed25519 verify), so it IS a
+        // precompile — it opens a new page (0x0120-0x012F) rather than
+        // extending the learning page.
+        let ed25519_addr = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 1, 0x20]);
+        assert!(executor.is_precompile(&ed25519_addr));
+
+        // Just past the crypto page (0x0130) MUST NOT be recognized —
+        // that would silently route to nothing and break the dispatcher
         // contract.
-        let out_of_page = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 1, 0x20]);
+        let out_of_page = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 1, 0x30]);
         assert!(!executor.is_precompile(&out_of_page));
     }
 

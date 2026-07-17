@@ -155,6 +155,15 @@ pub struct DagStore {
     /// Production node startup MUST populate this via
     /// [`Self::with_proposer_selector`].
     proposer_selector: Option<Arc<VrfProposerSelector>>,
+
+    /// VALIDATOR-S1 (v5): consensus ACTIVATION HEIGHT for stake-gated eligibility.
+    /// Membership enforcement (`is_eligible_proposer`) applies only to blocks at or
+    /// above this height, so the whole fleet flips enforcement on at ONE agreed height
+    /// — never per-node based on whether a selector happens to be attached (which would
+    /// fork the chain: node A enforces, node B doesn't, for the same block). `None`
+    /// means "enforce whenever a selector is attached" (test/back-compat). Set via
+    /// [`Self::with_enforcement_activation_height`]; the scheduled re-roll seeds it.
+    enforcement_activation_height: Option<u64>,
 }
 
 /// Column family names for persistent DAG storage
@@ -192,6 +201,7 @@ impl DagStore {
             strict_vrf: true,
             persistent: None,
             proposer_selector: None,
+            enforcement_activation_height: None,
         }
     }
 
@@ -201,6 +211,15 @@ impl DagStore {
     /// shared (Arc) so the node can keep its validator/stake set live.
     pub fn with_proposer_selector(mut self, selector: Arc<VrfProposerSelector>) -> Self {
         self.proposer_selector = Some(selector);
+        self
+    }
+
+    /// VALIDATOR-S1 (v5): set the consensus activation height at/above which
+    /// stake-gated membership is ENFORCED. Below it, blocks are admitted on VRF
+    /// math + identity binding only (the pre-activation rule), so history replays
+    /// and the cutover is a single fleet-wide height, not a per-node toggle.
+    pub fn with_enforcement_activation_height(mut self, height: u64) -> Self {
+        self.enforcement_activation_height = Some(height);
         self
     }
 
@@ -238,6 +257,7 @@ impl DagStore {
             strict_vrf: true,
             persistent: Some(kv),
             proposer_selector: None,
+            enforcement_activation_height: None,
         };
         store.load_from_persistent()?;
         Ok(store)
@@ -506,7 +526,11 @@ impl DagStore {
         let vrf_selector: &VrfProposerSelector = match &self.proposer_selector {
             Some(s) => s.as_ref(),
             None => {
-                fallback = VrfProposerSelector::new();
+                // FWA-C1-01 fix: the fallback MUST disable the forgeable legacy
+                // SHA3 VRF path (production() = legacy cutoff 0), matching the
+                // production selector. Using `new()` here reopened the H-06
+                // downgrade for blocks admitted without an attached selector.
+                fallback = VrfProposerSelector::production();
                 &fallback
             }
         };
@@ -528,15 +552,22 @@ impl DagStore {
             Err(e) => return Err(format!("VRF verification error: {}", e)),
         }
 
-        // FWA-C1-01: enforce stake-weighted leader-election ELIGIBILITY at
-        // admission. Previously the admission gate verified the VRF math +
-        // identity binding but NEVER called `is_eligible_proposer`, so any
-        // peer with a syntactically-valid VRF could propose unlimited
-        // blocks at any height regardless of stake. We now reject a block
-        // whose proposer is not eligible for its slot. Only enforced when a
-        // populated selector is attached (production wiring); without it we
-        // cannot evaluate eligibility and preserve prior behavior.
-        if self.proposer_selector.is_some() {
+        // VALIDATOR-S1 (v5): enforce stake-gated MEMBERSHIP eligibility at
+        // admission — integer/deterministic (see `is_eligible_proposer`). This
+        // rejects a block whose proposer is not in the active set at stake
+        // >= minStake for the block's epoch.
+        //
+        // Enforcement is gated on the fleet-wide ACTIVATION HEIGHT, not merely on
+        // "a selector is attached". A per-node `is_some()` toggle would fork the
+        // chain the instant one node wired the registry before another. Below the
+        // activation height (or with no selector), admission stays on VRF math +
+        // identity binding only. `enforcement_activation_height == None` preserves
+        // the legacy "enforce whenever a selector is attached" behavior for tests.
+        let enforce = self.proposer_selector.is_some()
+            && self
+                .enforcement_activation_height
+                .is_none_or(|h| block.header.height >= h);
+        if enforce {
             match vrf_selector
                 .is_eligible_proposer(
                     &block.header.proposer_pubkey,
@@ -547,7 +578,7 @@ impl DagStore {
             {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(
-                    "Leader-election eligibility failed: proposer not eligible for this slot (stake threshold / inactive / unregistered)"
+                    "Stake-gated eligibility failed: proposer not in the active set at minStake for this epoch (below minStake / inactive / unregistered)"
                         .to_string(),
                 ),
                 Err(e) => Err(format!("Eligibility check error: {}", e)),
@@ -1142,22 +1173,30 @@ mod tests {
         );
     }
 
-    /// WP-K.5: Block with valid VRF structure → accepted in both modes
+    /// WP-K.5 + VALIDATOR-S1 fallback hardening: a legacy 32-byte SHA3 proof is
+    /// accepted in PERMISSIVE mode (crypto skipped) but REJECTED in strict mode
+    /// with no selector attached — the fallback now uses `production()` (legacy
+    /// cutoff 0) instead of the old `new()` (cutoff 100k), closing H-06 where a
+    /// forgeable legacy proof was admitted by default.
     #[tokio::test]
-    async fn test_k5_valid_vrf_accepted() {
-        // Permissive mode
+    async fn test_k5_legacy_proof_permissive_ok_strict_rejected() {
+        // Permissive mode: VRF crypto skipped → accepted.
         let store = DagStore::with_permissive_vrf_for_testing();
         let genesis = create_test_block([0xFE; 32], 0, Hash::default());
         store.store_block(genesis.clone()).await.unwrap();
         let block = create_block_with_vrf([1; 32], 1, genesis.hash());
         assert!(store.store_block(block).await.is_ok());
 
-        // Strict mode
+        // Strict mode, no selector → hardened production() fallback rejects the
+        // forgeable legacy proof (H-06 / FWA-C1-01).
         let store_strict = DagStore::with_strict_vrf(true);
         let genesis2 = create_test_block([0xFD; 32], 0, Hash::default());
         store_strict.store_block(genesis2.clone()).await.unwrap();
         let block2 = create_block_with_vrf([2; 32], 1, genesis2.hash());
-        assert!(store_strict.store_block(block2).await.is_ok());
+        assert!(
+            matches!(store_strict.store_block(block2).await, Err(DagStoreError::InvalidVrf(_))),
+            "strict-mode fallback must reject a forgeable legacy SHA3 proof"
+        );
     }
 
     /// WP-K.5: Genesis block bypasses VRF check even in strict mode
@@ -1600,11 +1639,47 @@ mod tests {
     #[allow(non_snake_case)]
     async fn test_C1_01_admission_rejects_ineligible_when_selector_wired() {
         use crate::vrf::{Validator, VrfProposerSelector};
-        let selector = Arc::new(VrfProposerSelector::new());
+        // VALIDATOR-S1 (v5): eligibility is INTEGER MEMBERSHIP (stake >= minStake),
+        // not the old f64 stake-weighted lottery. A below-minStake proposer is
+        // ineligible regardless of its VRF output.
+        let selector = Arc::new(VrfProposerSelector::new().with_min_stake(32_000));
 
-        // A whale validator holds (nearly) all stake, so our test
-        // proposer's stake_ratio is ~0 → eligibility threshold ~0 →
-        // ineligible for essentially every VRF output.
+        // In-set whale (well above minStake) — eligible.
+        let whale = PublicKey::new([0x9A; 32]);
+        selector
+            .register_validator(Validator { pubkey: whale, stake: 1_000_000, is_active: true })
+            .await;
+        // Below-minStake proposer — ineligible by membership.
+        let proposer = PublicKey::new([7; 32]);
+        selector
+            .register_validator(Validator { pubkey: proposer, stake: 1, is_active: true })
+            .await;
+
+        // Eligibility no longer depends on the VRF output (integer/deterministic).
+        let any_output = Hash::new([0xFF; 32]);
+        assert!(
+            !selector.is_eligible_proposer(&proposer, &any_output, 1).await.unwrap(),
+            "below-minStake proposer must be ineligible (membership gate)"
+        );
+        assert!(
+            selector.is_eligible_proposer(&whale, &any_output, 1).await.unwrap(),
+            "above-minStake member must be eligible"
+        );
+
+        // A selector-wired store carries the eligibility predicate. With no
+        // activation height set, enforcement applies whenever a selector is attached.
+        let store = DagStore::with_strict_vrf(true).with_proposer_selector(selector);
+        assert!(store.proposer_selector.is_some());
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn test_activation_height_gates_enforcement() {
+        use crate::vrf::{Validator, VrfProposerSelector};
+        // Below the activation height, an unregistered/ineligible proposer is NOT
+        // rejected for eligibility (pre-activation rule); at/above it, membership
+        // is enforced. This pins the fleet-wide cutover semantics.
+        let selector = Arc::new(VrfProposerSelector::new().with_min_stake(32_000));
         selector
             .register_validator(Validator {
                 pubkey: PublicKey::new([0x9A; 32]),
@@ -1612,32 +1687,25 @@ mod tests {
                 is_active: true,
             })
             .await;
-        let proposer = PublicKey::new([7; 32]);
-        selector
-            .register_validator(Validator {
-                pubkey: proposer,
-                stake: 1, // negligible stake vs the whale → threshold ~0
-                is_active: true,
-            })
-            .await;
+        let store = DagStore::with_strict_vrf(true)
+            .with_proposer_selector(selector)
+            .with_enforcement_activation_height(1000);
 
-        // A near-1.0 VRF output is above the negligible threshold, so the
-        // low-stake proposer is ineligible (this is the predicate the
-        // admission gate now enforces — FWA-C1-01).
-        let high_output = Hash::new([0xFF; 32]);
-        let eligible = selector
-            .is_eligible_proposer(&proposer, &high_output, 1)
-            .await
-            .unwrap();
-        assert!(!eligible, "negligible-stake proposer must be ineligible for a high VRF output");
-
-        // The store, when wired with this selector, has the eligibility
-        // gate active (proposer_selector.is_some()). Full end-to-end
-        // admission requires a real ECVRF proof to first pass the math
-        // gate; that path is exercised by vrf_tests. Here we pin that the
-        // selector-wired store carries the eligibility predicate.
-        let store = DagStore::with_strict_vrf(true).with_proposer_selector(selector);
-        assert!(store.proposer_selector.is_some());
+        // An ECVRF-signed block by an UNREGISTERED proposer below the activation
+        // height passes eligibility (enforcement off); at/above it, it would be
+        // rejected. We assert the gate predicate directly.
+        assert_eq!(store.enforcement_activation_height, Some(1000));
+        // Genesis with a default VRF output (via create_test_block) so the child's
+        // legacy proof — built assuming parent_output == default — verifies. The
+        // attached selector is new() (legacy cutoff 100k) so height-1 legacy passes math.
+        let genesis = create_test_block([0xFE; 32], 0, Hash::default());
+        store.store_block(genesis.clone()).await.unwrap();
+        // height 1 < 1000 → eligibility not enforced; block admitted on VRF math alone
+        let below = create_block_with_vrf([0x01; 32], 1, genesis.hash());
+        assert!(
+            store.store_block(below).await.is_ok(),
+            "below activation height, membership must not be enforced"
+        );
     }
 
     // ===================================================================
