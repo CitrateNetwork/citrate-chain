@@ -326,6 +326,24 @@ pub struct StateSnapshot {
     state_trie: Trie,
 }
 
+impl StateSnapshot {
+    /// All captured accounts (address → state). For reorg store reconciliation.
+    pub fn account_entries(&self) -> &[(Address, crate::types::AccountState)] {
+        self.accounts.entries()
+    }
+
+    /// All captured contract storage as address → (slot key → value). Enumerated
+    /// from each contract's storage trie. For reorg store reconciliation.
+    pub fn storage_map(
+        &self,
+    ) -> std::collections::HashMap<Address, std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+        self.storage_tries
+            .iter()
+            .map(|(addr, trie)| (*addr, trie.entries_map()))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

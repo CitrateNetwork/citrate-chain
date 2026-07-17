@@ -231,3 +231,28 @@ default, and activates at the reroll per `REROLL_ADDENDUM_*.md`. Residuals: (a) 
 with high blue work can wedge a branch (needs consensus↔execution feedback — fork choice excluding
 state-invalid blocks); (b) the snapshot ring is bounded by `MAX_REORG_DEPTH` full-state clones — a
 CoW/reverse-diff ring is the scale optimization; (c) I5 live cross-check awaits a real multi-node run.
+
+## 7. Pre-merge adversarial review (2026-07-16) — findings + fixes
+Two independent adversarial reviews before merge. The happy path was confirmed solid (reward parity
+byte-for-byte, `StateSnapshot` `Clone` deeply independent, lock discipline correct). Findings fixed:
+- **HIGH-1** — `apply_block` left in-memory state advanced when the durable persist failed (store
+  unchanged, tip behind → next drain re-applied and wedged). Now reverts in-memory on persist failure.
+- **HIGH-2 (durable reorg rollback)** — a reorg reverted in-memory via the ring but the durable store
+  had no rollback, so an aborted reorg (or the reverted-account set of a successful one) left RocksDB
+  diverged from memory, surfacing after a restart-following-a-reorg. **Fixed:** the reorg re-applies the
+  candidate branch IN-MEMORY only (`apply_block_no_persist`), so an abort writes nothing durable; on
+  success `Executor::reconcile_store_from(baseline)` writes the account+storage diff to the store and
+  DELETES accounts the abandoned branch created (new `Trie::entries_map` enumeration + `delete_account`
+  on the store trait). Proven by restart-simulation tests: a fresh cold-cache executor over the same
+  store reads the new branch (incl. an abandoned-created account correctly deleted); an aborted reorg
+  leaves the store on the old branch.
+- **F1** — a drain-applied block reverted by the same call's reorg was misreported `Applied`; now
+  classified against the post-reorg ring.
+- **F2** — proposer-selector desync on a reorg-abort across `S(E)`; the registry re-sync now fires only
+  after the reorg succeeds, so an abort never touches the selector.
+- **F3** — an equal-height heavier sibling couldn't trigger a reorg (short-circuited to `AlreadyApplied`);
+  now it consults fork choice.
+All five fixed with tests; 95 node-bin + 538 execution-lib green, clippy clean. Remaining residual on the
+reorg store fix: a crash *between* the reconcile batch and the account-deletes could momentarily leave an
+abandoned account on disk — self-heals on restart (the applied-tip pointer is persisted only after
+reconcile, so fork choice re-drives the reorg). LOW; documented.
