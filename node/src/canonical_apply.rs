@@ -2485,4 +2485,636 @@ mod tests {
         let restarted = store_backed(&storage);
         assert_eq!(restarted.get_balance(&Address(CBN)), golden_cbn, "durable store CBN == branch B after reorg");
     }
+
+    // ========================================================================
+    // INDEPENDENT ADVERSARIAL RE-FUZZ of the REORG-STORE-FIX (build/campaign-
+    // lifecycle-refuzz). This harness is written to BREAK the fix, not to trust
+    // its own tests: it randomizes fork depth / vest amounts / branch shapes over
+    // many seeds and asserts the store-backed victim CONVERGES with an independent
+    // golden node (byte-identical root + balances), that aborts leave the durable
+    // store byte-identical (read COLD), and it CONSTRUCTS + CHARACTERIZES the
+    // author-flagged residual (cold pre-existing account in the reorg base).
+    //
+    // Deterministic PRNG (splitmix64) so any failure repro is a fixed seed.
+    // ========================================================================
+
+    fn splitmix64_rf(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// The FULL durable account set, sorted — a true byte-identity fingerprint of
+    /// the persisted store (independent of any in-memory executor cache).
+    fn dump_store(storage: &StorageManager) -> Vec<(Address, citrate_execution::types::AccountState)> {
+        let mut v = storage.state.get_all_accounts().expect("get_all_accounts");
+        v.sort_by_key(|a| a.0 .0);
+        v
+    }
+
+    /// A linear §R'-vesting branch of `n` blocks off `fork` (heights 800..800+n-1),
+    /// `per_block` priority transfers ALICE→`to` each. Fresh memory-only producer
+    /// advanced through the empty fork point (799) → honest fork-point-relative
+    /// roots. Constant 2500 bps (0-boundary). `seed_base` disambiguates tx hashes.
+    async fn produce_vesting_branch(
+        fork: Hash,
+        n: u64,
+        per_block: u64,
+        to: [u8; 20],
+        vrf: [u8; 32],
+        seed_base: u8,
+    ) -> Vec<Block> {
+        let p = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        p.set_balance(&Address(ALICE), U256::from(FUND));
+        p.set_validator_activation_height(800);
+        *p.reward_policy_handle().write() = Some(rprime_policy(2500));
+        let _s = produce_rprime(&p, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let mut parent = fork;
+        let mut nonce = 0u64;
+        let mut sctr = seed_base;
+        let mut out = Vec::new();
+        for i in 0..n {
+            let h = 800 + i;
+            let mut txs = Vec::new();
+            for _ in 0..per_block {
+                txs.push(prio_tx(ALICE, to, nonce, sctr));
+                nonce += 1;
+                sctr = sctr.wrapping_add(1);
+            }
+            let blk = produce_rprime(&p, parent, h, vrf, txs).await;
+            parent = blk.header.block_hash;
+            out.push(blk);
+        }
+        out
+    }
+
+    /// One randomized §R'-vesting reorg: a store-backed VICTIM follows + persists a
+    /// losing branch A (`da` vesting blocks, `pa` vests each), then reorgs to a
+    /// winning branch B (`db` vesting blocks, `pb` vests each). It must converge —
+    /// identical tip + root + registry balance, in memory AND durably — with a
+    /// GOLDEN node that only ever followed B. This is the fix's core claim under
+    /// randomized fork depth and vest amounts (RESIDUAL CLOSED AT SCALE).
+    async fn run_vesting_convergence(da: u64, db: u64, pa: u64, pb: u64) {
+        // GOLDEN: only ever follows branch B.
+        let (golden_app, golden, gstore, s799_g, _gd) = seed_s799().await;
+        let branch_b = produce_vesting_branch(s799_g, db, pb, CAROL, [0x5B; 32], 0xB0).await;
+        for b in &branch_b {
+            persist(&gstore, b);
+        }
+        let tip_b = branch_b.last().expect("branch B nonempty");
+        assert!(
+            matches!(golden_app.apply_received(tip_b).await, ApplyOutcome::Applied { .. }),
+            "da={da} db={db} pa={pa} pb={pb}: golden failed to drain branch B"
+        );
+        let golden_tip = golden_app.applied_tip().await;
+        let golden_root = golden.calculate_state_root();
+        let golden_reg = golden.get_balance(&Address(REG));
+
+        // VICTIM: follow + persist losing branch A, then reorg to B.
+        let (mut victim_app, victim, vstore, s799_v, _vd) = seed_s799().await;
+        assert_eq!(s799_v, s799_g, "deterministic fork point across nodes");
+        let branch_a = produce_vesting_branch(s799_v, da, pa, BOB, VRF_OUT, 0xA0).await;
+        for a in &branch_a {
+            persist(&vstore, a);
+            assert!(
+                matches!(victim_app.apply_received(a).await, ApplyOutcome::Applied { .. }),
+                "da={da} db={db}: victim failed to follow losing branch A"
+            );
+        }
+        for b in &branch_b {
+            persist(&vstore, b);
+        }
+        victim_app.fork_choice = Some(fork_choice_returning(tip_b.header.block_hash));
+        let outcome = victim_app.apply_received(tip_b).await;
+
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "da={da} db={db} pa={pa} pb={pb}: winning branch not accepted: {outcome:?}"
+        );
+        assert_eq!(
+            victim_app.applied_tip().await,
+            golden_tip,
+            "da={da} db={db} pa={pa} pb={pb}: victim tip diverged from golden"
+        );
+        assert_eq!(
+            victim.calculate_state_root(),
+            golden_root,
+            "da={da} db={db} pa={pa} pb={pb}: victim root diverged from golden"
+        );
+        assert_eq!(
+            victim.get_balance(&Address(REG)),
+            golden_reg,
+            "da={da} db={db} pa={pa} pb={pb}: victim registry diverged from golden"
+        );
+        // Durable parity across a cold restart (I3).
+        let restarted = store_backed(&vstore);
+        assert_eq!(
+            restarted.get_balance(&Address(REG)),
+            golden_reg,
+            "da={da} db={db} pa={pa} pb={pb}: durable registry != golden after reorg"
+        );
+    }
+
+    /// TRACK 1 — RESIDUAL CLOSED AT SCALE (§R' vesting). Randomize fork depth and
+    /// vest amounts over many seeds; the victim must converge with the golden node
+    /// every time. Includes explicit near-`MAX_REORG_DEPTH` fork depths.
+    #[tokio::test]
+    async fn refuzz_vesting_reorg_converges_at_scale() {
+        let mut seed = 0xCAFE_F00D_1234_5678u64;
+        let mut cases = 0u32;
+        for _ in 0..40 {
+            let da = 1 + splitmix64_rf(&mut seed) % 5; // losing depth 1..=5
+            let db = 1 + splitmix64_rf(&mut seed) % 5; // winning depth 1..=5 (indep.)
+            let pa = 1 + splitmix64_rf(&mut seed) % 3; // vests/block losing 1..=3
+            let pb = 1 + splitmix64_rf(&mut seed) % 3; // vests/block winning 1..=3
+            run_vesting_convergence(da, db, pa, pb).await;
+            cases += 1;
+        }
+        assert_eq!(cases, 40);
+        // Explicit deep fork depths near MAX_REORG_DEPTH=100 (must still converge).
+        for &(da, db) in &[(1u64, 20u64), (3, 50), (2, 90), (1, 99)] {
+            run_vesting_convergence(da, db, 1, 1).await;
+        }
+    }
+
+    /// One randomized NORMAL-TX (non-§R') reorg: both branches are produced by a
+    /// NEW validator whose coinbase `CBN` the fork point never credited, exercising
+    /// the SAME `Executor::get_balance` durable read-through via the basic reward
+    /// path — no registry, no policy. Losing `da` blocks, winning `db` blocks; the
+    /// victim must converge with a golden node that only followed B.
+    async fn run_normal_convergence(da: u64, db: u64) {
+        const CBN: [u8; 20] = [0x44; 20];
+        let vrf_b = [0x5B; 32];
+
+        // Producers. a1 (coinbase CB) is the shared fork point; branches credit CBN.
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        let a1 = produce_cb(&pa, Hash::default(), 1, VRF_OUT, CB).await;
+        let mut branch_a = Vec::new();
+        let mut parent = a1.header.block_hash;
+        for i in 0..da {
+            let blk = produce_cb(&pa, parent, 2 + i, VRF_OUT, CBN).await;
+            parent = blk.header.block_hash;
+            branch_a.push(blk);
+        }
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        let _b1 = produce_cb(&pb, Hash::default(), 1, VRF_OUT, CB).await; // identical to a1
+        let mut branch_b = Vec::new();
+        let mut parent = a1.header.block_hash;
+        for i in 0..db {
+            let blk = produce_cb(&pb, parent, 2 + i, vrf_b, CBN).await;
+            parent = blk.header.block_hash;
+            branch_b.push(blk);
+        }
+        let tip_b = branch_b.last().expect("branch B nonempty");
+
+        // GOLDEN: only ever follows branch B.
+        let gdir = tempfile::tempdir().expect("gdir");
+        let gstorage =
+            Arc::new(StorageManager::new(gdir.path(), PruningConfig::default()).expect("gstorage"));
+        let golden = store_backed(&gstorage);
+        let gapp = CanonicalApplicator::new(golden.clone(), gstorage.clone());
+        persist(&gstorage, &a1);
+        assert!(matches!(gapp.apply_received(&a1).await, ApplyOutcome::Applied { .. }), "golden a1");
+        for b in &branch_b {
+            persist(&gstorage, b);
+        }
+        assert!(
+            matches!(gapp.apply_received(tip_b).await, ApplyOutcome::Applied { .. }),
+            "da={da} db={db}: golden failed to drain branch B"
+        );
+        let golden_tip = gapp.applied_tip().await;
+        let golden_root = golden.calculate_state_root();
+        let golden_cbn = golden.get_balance(&Address(CBN));
+
+        // VICTIM: follow + persist losing branch A, then reorg to B.
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let victim = store_backed(&storage);
+        let mut app = CanonicalApplicator::new(victim.clone(), storage.clone());
+        persist(&storage, &a1);
+        assert!(matches!(app.apply_received(&a1).await, ApplyOutcome::Applied { .. }), "victim a1");
+        for a in &branch_a {
+            persist(&storage, a);
+            assert!(
+                matches!(app.apply_received(a).await, ApplyOutcome::Applied { .. }),
+                "da={da} db={db}: victim failed to follow losing branch A"
+            );
+        }
+        for b in &branch_b {
+            persist(&storage, b);
+        }
+        app.fork_choice = Some(fork_choice_returning(tip_b.header.block_hash));
+        let outcome = app.apply_received(tip_b).await;
+
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "da={da} db={db}: winning branch not accepted: {outcome:?}"
+        );
+        assert_eq!(app.applied_tip().await, golden_tip, "da={da} db={db}: victim tip != golden");
+        assert_eq!(victim.calculate_state_root(), golden_root, "da={da} db={db}: victim root != golden");
+        assert_eq!(victim.get_balance(&Address(CBN)), golden_cbn, "da={da} db={db}: victim CBN != golden");
+        let restarted = store_backed(&storage);
+        assert_eq!(restarted.get_balance(&Address(CBN)), golden_cbn, "da={da} db={db}: durable CBN != golden");
+    }
+
+    /// TRACK 1 — RESIDUAL CLOSED AT SCALE (NORMAL-TX variant). The losing branch
+    /// mutates a plain coinbase account the fork point never touched; the winning
+    /// branch reads it. Randomized depths over many seeds → converge.
+    #[tokio::test]
+    async fn refuzz_normal_coinbase_reorg_converges_at_scale() {
+        let mut seed = 0x0BAD_C0DE_D00D_FEEDu64;
+        let mut cases = 0u32;
+        for _ in 0..30 {
+            let da = 1 + splitmix64_rf(&mut seed) % 4; // 1..=4
+            let db = 1 + splitmix64_rf(&mut seed) % 4; // 1..=4
+            run_normal_convergence(da, db).await;
+            cases += 1;
+        }
+        assert_eq!(cases, 30);
+        for &(da, db) in &[(1u64, 30u64), (4, 60), (2, 95)] {
+            run_normal_convergence(da, db).await;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // TRACK 2 — NO NEW REGRESSION. The original cross-boundary cross-policy
+    // convergence + abort-restore matrix (perturbation #2/#4), ported verbatim
+    // from build/campaign-lifecycle-fuzz. The store-revert must not have broken
+    // the previously-passing (empty-losing-branch) cases.
+    // ------------------------------------------------------------------------
+
+    fn cross_policy_hook_p(exec: Arc<Executor>, pre: u64, post: u64) -> impl Fn() {
+        move || {
+            let bps = if exec.get_balance(&Address(CAROL)) > U256::zero() { post } else { pre };
+            *exec.reward_policy_handle().write() = Some(rprime_policy(bps));
+        }
+    }
+
+    async fn setup_cross_policy_p(
+        pre: u64,
+        post: u64,
+    ) -> (CanonicalApplicator, Arc<Executor>, Arc<StorageManager>, Hash, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.persist_state_changes().await.expect("persist genesis");
+        let a798 = seal_rprime(798, Hash::default(), Hash::default(), VRF_OUT, vec![]);
+        persist(&storage, &a798);
+        storage.blocks.put_applied_tip(&a798.header.block_hash, 798).expect("seed tip");
+        follower.set_validator_activation_height(800);
+        *follower.reward_policy_handle().write() = Some(rprime_policy(pre));
+
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let h_full = cross_policy_hook_p(follower.clone(), pre, post);
+        app.registry_sync = Some(Arc::new(move |_h| {
+            h_full();
+            Box::pin(async { Ok(1usize) })
+        }));
+        let h_pol = cross_policy_hook_p(follower.clone(), pre, post);
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            h_pol();
+            Box::pin(async { Ok(()) })
+        }));
+
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        pa.set_validator_activation_height(800);
+        *pa.reward_policy_handle().write() = Some(rprime_policy(pre));
+        let s799 = produce_rprime(&pa, a798.header.block_hash, 799, VRF_OUT, vec![]).await;
+        let a800 = produce_rprime(&pa, s799.header.block_hash, 800, VRF_OUT, vec![]).await;
+        let a801 = produce_rprime(&pa, a800.header.block_hash, 801, VRF_OUT, vec![]).await;
+        persist(&storage, &s799);
+        assert!(matches!(app.apply_received(&s799).await, ApplyOutcome::Applied { .. }), "s799");
+        persist(&storage, &a800);
+        assert!(matches!(app.apply_received(&a800).await, ApplyOutcome::Applied { .. }), "a800");
+        persist(&storage, &a801);
+        assert!(matches!(app.apply_received(&a801).await, ApplyOutcome::Applied { .. }), "a801");
+        assert_eq!(follower.get_balance(&Address(REG)), U256::zero(), "branch A vested nothing");
+        (app, follower, storage, s799.header.block_hash, dir)
+    }
+
+    async fn produce_branch_b_p(s799: Hash, pre: u64, post: u64, depth: u64) -> Vec<Block> {
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_validator_activation_height(800);
+        *pb.reward_policy_handle().write() = Some(rprime_policy(pre));
+        let _s = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5B; 32];
+        let mut out = Vec::new();
+        let b800 = produce_rprime(&pb, s799, 800, vrf_b, vec![prio_tx(ALICE, CAROL, 0, 0xB0)]).await;
+        let mut parent = b800.header.block_hash;
+        out.push(b800);
+        *pb.reward_policy_handle().write() = Some(rprime_policy(post));
+        for i in 0..depth {
+            let h = 801 + i;
+            let nonce = 1 + i;
+            let blk = produce_rprime(&pb, parent, h, vrf_b, vec![prio_tx(ALICE, CAROL, nonce, 0xB1 + i as u8)]).await;
+            parent = blk.header.block_hash;
+            out.push(blk);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn refuzz_cross_policy_reorg_converges_over_boundary() {
+        let bps_choices = [0u64, 2500, 5000, 10000];
+        let mut seed = 0xABCD_1234u64;
+        let mut cases = 0u32;
+        for _ in 0..24 {
+            let pre = bps_choices[(splitmix64_rf(&mut seed) % 4) as usize];
+            let post = bps_choices[(splitmix64_rf(&mut seed) % 4) as usize];
+            let depth = 1 + splitmix64_rf(&mut seed) % 3;
+
+            let (mut app, follower, storage, s799, _dir) = setup_cross_policy_p(pre, post).await;
+            let branch_b = produce_branch_b_p(s799, pre, post, depth).await;
+            for b in &branch_b {
+                persist(&storage, b);
+            }
+            let tip_b = branch_b.last().expect("branch B nonempty");
+            app.fork_choice = Some(fork_choice_returning(tip_b.header.block_hash));
+            let outcome = app.apply_received(tip_b).await;
+            assert!(
+                matches!(outcome, ApplyOutcome::Applied { .. }),
+                "pre={pre} post={post} depth={depth}: winning branch not accepted: {outcome:?}"
+            );
+            assert_eq!(
+                app.applied_tip().await.hash,
+                tip_b.header.block_hash,
+                "pre={pre} post={post} depth={depth}: did not converge to branch B tip"
+            );
+            assert_eq!(
+                follower.calculate_state_root(),
+                tip_b.state_root,
+                "pre={pre} post={post} depth={depth}: state root != winning branch"
+            );
+            assert_eq!(
+                follower.reward_policy_handle().read().as_ref().map(|p| p.priority_fee_share_bps),
+                Some(post),
+                "pre={pre} post={post} depth={depth}: final policy != post-boundary bps"
+            );
+            let restarted = store_backed(&storage);
+            assert_eq!(
+                restarted.get_balance(&Address(REG)),
+                follower.get_balance(&Address(REG)),
+                "pre={pre} post={post} depth={depth}: durable registry vest != in-memory"
+            );
+            cases += 1;
+        }
+        assert_eq!(cases, 24);
+    }
+
+    #[tokio::test]
+    async fn refuzz_cross_policy_reorg_abort_restores_policy_and_tip() {
+        let bps_choices = [0u64, 2500, 5000, 10000];
+        let mut seed = 0x5150_9977u64;
+        for _ in 0..18 {
+            let pre = bps_choices[(splitmix64_rf(&mut seed) % 4) as usize];
+            let post = bps_choices[(splitmix64_rf(&mut seed) % 4) as usize];
+            let depth = 1 + splitmix64_rf(&mut seed) % 3;
+
+            let (mut app, follower, storage, s799, _dir) = setup_cross_policy_p(pre, post).await;
+            let a_tip = app.applied_tip().await;
+            let pre_root = follower.calculate_state_root();
+            let pre_dump = dump_store(&storage);
+            let pre_policy = follower
+                .reward_policy_handle()
+                .read()
+                .as_ref()
+                .map(|p| p.priority_fee_share_bps);
+            assert_eq!(pre_policy, Some(pre), "sanity: pre-reorg policy is the pre bps");
+
+            let mut branch_b = produce_branch_b_p(s799, pre, post, depth).await;
+            let last = branch_b.last().expect("nonempty");
+            let bad_height = last.header.height + 1;
+            let bad = seal_rprime(
+                bad_height,
+                last.header.block_hash,
+                Hash::new([0xFF; 32]),
+                [0x5B; 32],
+                vec![prio_tx(ALICE, CAROL, 1 + depth, 0xEE)],
+            );
+            for b in &branch_b {
+                persist(&storage, b);
+            }
+            persist(&storage, &bad);
+            branch_b.push(bad.clone());
+
+            app.fork_choice = Some(fork_choice_returning(bad.header.block_hash));
+            app.apply_received(&bad).await;
+
+            assert_eq!(
+                app.applied_tip().await, a_tip,
+                "pre={pre} post={post} depth={depth}: aborted reorg moved the applied tip"
+            );
+            assert_eq!(
+                follower.calculate_state_root(), pre_root,
+                "pre={pre} post={post} depth={depth}: aborted reorg left world state mutated"
+            );
+            assert_eq!(
+                follower.reward_policy_handle().read().as_ref().map(|p| p.priority_fee_share_bps),
+                Some(pre),
+                "pre={pre} post={post} depth={depth}: aborted reorg did not restore reward policy"
+            );
+            // I2: the durable store, read COLD, is byte-identical to before the attempt.
+            assert_eq!(
+                dump_store(&storage), pre_dump,
+                "pre={pre} post={post} depth={depth}: aborted reorg left the durable store mutated"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // TRACK 3 — ABORT BYTE-IDENTITY (I2), FUZZED, on a NON-EMPTY (vesting) losing
+    // branch so the store actually holds §R' registry state to (mis)restore. Every
+    // aborted reorg must leave the durable store — read COLD via get_all_accounts —
+    // byte-identical to `pre_state`, and the applied tip + ring unmoved.
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn refuzz_abort_byte_identity_cold_store_vesting() {
+        let mut seed = 0x7777_1111_2222_3333u64;
+        for _ in 0..20 {
+            let da = 1 + splitmix64_rf(&mut seed) % 3; // losing vesting depth
+            let pre_depth = 1 + splitmix64_rf(&mut seed) % 3; // valid B prefix before the bad block
+
+            // Victim follows + persists a VESTING losing branch A (nonzero REG in store).
+            let (mut app, follower, storage, s799, _dir) = seed_s799().await;
+            let branch_a = produce_vesting_branch(s799, da, 2, BOB, VRF_OUT, 0xA0).await;
+            for a in &branch_a {
+                persist(&storage, a);
+                assert!(matches!(app.apply_received(a).await, ApplyOutcome::Applied { .. }), "victim A");
+            }
+            assert!(follower.get_balance(&Address(REG)) > U256::zero(), "losing branch vested REG");
+
+            let a_tip = app.applied_tip().await;
+            let ring_len_before = app.advance_lock().lock().await.snapshots.len();
+            let pre_dump = dump_store(&storage);
+
+            // Valid B prefix that vests, then a BAD-root block → the reorg reapplies
+            // the prefix in-memory, then ABORTS on the bad block.
+            let mut branch_b = produce_vesting_branch(s799, pre_depth, 2, CAROL, [0x5B; 32], 0xB0).await;
+            let last = branch_b.last().expect("nonempty");
+            let bad = seal_rprime(
+                last.header.height + 1,
+                last.header.block_hash,
+                Hash::new([0xFF; 32]),
+                [0x5B; 32],
+                vec![prio_tx(ALICE, CAROL, 100, 0xEE)],
+            );
+            for b in &branch_b {
+                persist(&storage, b);
+            }
+            persist(&storage, &bad);
+            branch_b.push(bad.clone());
+
+            app.fork_choice = Some(fork_choice_returning(bad.header.block_hash));
+            let outcome = app.apply_received(&bad).await;
+
+            assert!(
+                matches!(outcome, ApplyOutcome::Deferred | ApplyOutcome::Rejected(_)),
+                "da={da} pre_depth={pre_depth}: aborted reorg unexpectedly {outcome:?}"
+            );
+            assert_eq!(app.applied_tip().await, a_tip, "da={da} pre_depth={pre_depth}: tip moved on abort");
+            assert_eq!(
+                app.advance_lock().lock().await.snapshots.len(),
+                ring_len_before,
+                "da={da} pre_depth={pre_depth}: ring size changed on abort"
+            );
+            // I2: COLD durable store byte-identical to before the attempt.
+            assert_eq!(
+                dump_store(&storage), pre_dump,
+                "da={da} pre_depth={pre_depth}: aborted reorg left the durable store mutated"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // TRACK 4 — ⭐ THE FLAGGED RESIDUAL: post-restart COLD-mutated pre-existing
+    // account (the reorg base snapshot lacks a pre-existing account the losing
+    // branch mutated). Two proofs: (4a) the store-revert MECHANIC in isolation
+    // (delete→0 then byte-restore), and (4b) the FULL reorg with a deliberately
+    // cold/incomplete base snapshot injected into the ring — asserting the reorg
+    // is FAIL-SAFE (aborts, store byte-restored, wrong state never adopted).
+    // ------------------------------------------------------------------------
+
+    /// 4a — MECHANIC PROOF. `reconcile_store_from(pre_state)` after a revert to a
+    /// base that LACKS a pre-existing nonzero account DELETES that account from the
+    /// store (→0) — so a reapply read-through returns 0, not its fork-point value.
+    /// On abort, `reconcile_store_from(base)` PUTS it back → the store is restored
+    /// byte-identically. Fund/state never corrupts; the account merely can't be
+    /// read correctly until warmed. Driven at the executor level, no applicator.
+    #[tokio::test]
+    async fn flagged_residual_store_revert_deletes_then_restores_preexisting_account() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+
+        // Pre-existing nonzero account DAVE=V, fully persisted (the fork-point truth).
+        let v = U256::from(7_000_000u64);
+        exec.set_balance(&Address(DAVE), v);
+        exec.persist_state_changes().await.expect("persist DAVE");
+        // `pre_state` = the losing branch's persisted world (here just DAVE=V).
+        let pre_snapshot = exec.state_snapshot();
+        let pre_dump = dump_store(&storage);
+        assert_eq!(pre_dump.len(), 1, "only DAVE persisted");
+
+        // BASE (the reorg fork point) captured while DAVE is NON-resident: a cold
+        // executor over the same store that never loaded DAVE. This is the exact
+        // author-flagged condition — a base snapshot missing a pre-existing account.
+        let cold = store_backed(&storage);
+        let base_snapshot = cold.state_snapshot();
+        assert!(base_snapshot.account_entries().is_empty(), "base snapshot is cold (no DAVE)");
+
+        // Reorg step 1: revert in-memory to the cold base, then reconcile the store
+        // to the fork point relative to `pre_state`. DAVE is in `pre_state` but not
+        // in current (cold) memory → the store-revert DELETES it.
+        exec.state_restore(base_snapshot.clone());
+        exec.reconcile_store_from(&pre_snapshot).expect("store-revert to fork point");
+        let cold_read = store_backed(&storage);
+        assert_eq!(
+            cold_read.get_balance(&Address(DAVE)),
+            U256::zero(),
+            "store-revert DELETED the cold pre-existing account (a reapply now reads 0)"
+        );
+
+        // Reorg step 2 (abort arm): reconcile the store back to `pre_state` from the
+        // cold base. Memory is restored to pre_state; DAVE is put back.
+        exec.state_restore(pre_snapshot.clone());
+        exec.reconcile_store_from(&base_snapshot).expect("store restore to pre_state");
+        assert_eq!(
+            dump_store(&storage), pre_dump,
+            "abort restored the durable store byte-identically to pre_state (no fund loss)"
+        );
+    }
+
+    /// 4b — FAIL-SAFE PROOF via the full applicator. A store-backed victim applies
+    /// a1 (fork) + a losing branch (coinbase CBN), then the reorg base snapshot at
+    /// the fork height is REPLACED with a cold/incomplete one (modelling the flagged
+    /// residual: base missing accounts the winning branch reads). Delivering the
+    /// heavier winning branch must ABORT: the winning blocks settle against the
+    /// (deleted → 0) read-through, mismatch the honest roots, and the reorg declines
+    /// — leaving the applied tip on the losing branch and the durable store
+    /// byte-identical. The wrong state is NEVER adopted (abort-only, fail-safe).
+    #[tokio::test]
+    async fn flagged_residual_cold_base_snapshot_reorg_is_fail_safe() {
+        const CBN: [u8; 20] = [0x44; 20];
+        let vrf_b = [0x5B; 32];
+
+        // Producers: a1 (coinbase CB) is the fork point; branches credit CBN.
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        let a1 = produce_cb(&pa, Hash::default(), 1, VRF_OUT, CB).await;
+        let a2 = produce_cb(&pa, a1.header.block_hash, 2, VRF_OUT, CBN).await;
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        let _b1 = produce_cb(&pb, Hash::default(), 1, VRF_OUT, CB).await;
+        let b2 = produce_cb(&pb, a1.header.block_hash, 2, vrf_b, CBN).await;
+        let b3 = produce_cb(&pb, b2.header.block_hash, 3, vrf_b, CBN).await;
+
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let victim = store_backed(&storage);
+        let mut app = CanonicalApplicator::new(victim.clone(), storage.clone());
+        persist(&storage, &a1);
+        assert!(matches!(app.apply_received(&a1).await, ApplyOutcome::Applied { .. }), "a1");
+        persist(&storage, &a2);
+        assert!(matches!(app.apply_received(&a2).await, ApplyOutcome::Applied { .. }), "a2");
+
+        let a_tip = app.applied_tip().await;
+        assert_eq!(a_tip.height, 2, "victim on losing branch A");
+        let pre_dump = dump_store(&storage);
+
+        // Inject the flagged condition: replace the fork-point (a1, height 1) ring
+        // snapshot with a COLD/incomplete one that lacks the accounts the winning
+        // branch will read. A production node CANNOT reach this state (boot eagerly
+        // loads every persisted account via get_all_accounts, so every ring snapshot
+        // is complete) — we force it to exercise the fail-safe path directly.
+        let cold = Executor::new(Arc::new(StateDB::new()));
+        {
+            let lock = app.advance_lock();
+            let mut st = lock.lock().await;
+            st.snapshots.insert(1, (a1.header.block_hash, cold.state_snapshot()));
+        }
+
+        // Deliver the heavier winning branch B.
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let outcome = app.apply_received(&b3).await;
+
+        // FAIL-SAFE: the reorg ABORTS (never adopts the wrong state).
+        assert!(
+            matches!(outcome, ApplyOutcome::Deferred | ApplyOutcome::Rejected(_)),
+            "cold-base reorg must NOT be accepted; got {outcome:?}"
+        );
+        assert_eq!(app.applied_tip().await, a_tip, "wrong state NOT adopted — tip stays on branch A");
+        assert_ne!(app.applied_tip().await.hash, b3.header.block_hash, "winning tip was NOT adopted");
+        // The durable store, read COLD, is byte-identical to before the attempt.
+        assert_eq!(dump_store(&storage), pre_dump, "aborted cold-base reorg left the durable store byte-identical");
+    }
 }
