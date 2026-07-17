@@ -1994,4 +1994,741 @@ mod tests {
             "aborted reorg must restore the pre-reorg reward policy (not leave it at 5000)"
         );
     }
+
+    // ========================================================================
+    // VALIDATOR-S1 §R' — MULTI-NODE INTEGRATION FLEET HARNESS.
+    //
+    // The tests above isolate the driver / a single follower. This section wires
+    // an N-node FLEET (each an INDEPENDENT store-backed executor + selector +
+    // applicator + registry hook) and drives them through the FULL §R' lifecycle:
+    // production past the activation height, ≥2 real snapshot boundaries S(E) =
+    // E·1000 − 200, priority-fee vesting to the registry, a validator-set change
+    // across an epoch, and — the crux the reviewers flagged — a MID-EPOCH single-
+    // node restart and a FLEET-WIDE restart that both `hydrate_on_boot` and
+    // re-converge with no permanent partition. Everything is deterministic
+    // (fixed VRF beacons, fixed epoch→policy schedule, fixed tx seeds); no
+    // wall-clock or RNG is read, so runs are byte-reproducible.
+    //
+    // Modeling note (consistent with the cross-policy tests above): the
+    // ValidatorRegistry is codeless, so its BALANCE is the on-chain vested-share
+    // proxy, and the epoch policy/active-set is materialized by a deterministic
+    // schedule hook that mirrors `RegistrySync::sync_for_snapshot` EXACTLY — it
+    // writes the same shared policy cell, persists the same durable snapshot blob
+    // (real `encode_reward_snapshot` codec), and syncs the same `VrfProposerSelector`.
+    // The restart tests then drive the REAL `RegistrySync::hydrate_on_boot`
+    // durable-reload path over that persisted blob, so the lifecycle fix is proven
+    // with production code, not a stub.
+    // ========================================================================
+
+    use crate::registry_sync::{encode_reward_snapshot, RegistrySync};
+    use citrate_consensus::vrf::VrfProposerSelector;
+
+    const PROPOSER_B: [u8; 32] = [0x6B; 32]; // a validator that JOINS at an epoch boundary
+    const STAKER_B: [u8; 20] = [0x6B; 20]; // its registered staker (== coinbase for its blocks)
+    const MIN_STAKE: u128 = 32_000;
+    const EFF_STAKE: u128 = 40_000;
+    const ACT: u64 = 1000; // VALIDATOR-S1 activation height (task scenario 1)
+
+    /// The deterministic epoch reward policy + active set materialized at snapshot
+    /// boundary height `h`. `set_change_epoch = Some(E)` models validator B joining
+    /// the active set at S(E) (and every later epoch). Pure function of `h` + config,
+    /// so every node in the fleet — and the producer — derive the byte-identical
+    /// policy for the same boundary.
+    fn boundary_policy(
+        h: u64,
+        set_change_epoch: Option<u64>,
+    ) -> (
+        citrate_execution::block_rewards::EpochRewardPolicy,
+        Vec<([u8; 32], u128)>,
+    ) {
+        let epoch = crate::registry_sync::snapshot_epoch_at(h).expect("boundary height");
+        let with_b = set_change_epoch.is_some_and(|ce| epoch >= ce);
+        let mut staker_of = std::collections::HashMap::new();
+        staker_of.insert(PROPOSER, CB);
+        let mut entries = vec![(PROPOSER, EFF_STAKE)];
+        if with_b {
+            staker_of.insert(PROPOSER_B, STAKER_B);
+            entries.push((PROPOSER_B, EFF_STAKE));
+        }
+        let policy = citrate_execution::block_rewards::EpochRewardPolicy {
+            epoch,
+            snapshot_height: h,
+            activation_height: ACT,
+            registry: REG,
+            reward_minter: citrate_execution::block_rewards::REWARD_MINTER_ADDRESS,
+            priority_fee_share_bps: 2500,
+            staker_of,
+        };
+        (policy, entries)
+    }
+
+    /// A §R' block committing an arbitrary proposer + coinbase (generalizes
+    /// `seal_rprime`, which fixes them to PROPOSER/CB), so the fleet can exercise a
+    /// validator-set change where a new proposer's blocks settle to a new staker.
+    fn seal_fleet(
+        height: u64,
+        parent: Hash,
+        root: Hash,
+        vrf: [u8; 32],
+        proposer: [u8; 32],
+        coinbase: [u8; 20],
+        txs: Vec<Transaction>,
+    ) -> Block {
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(parent)
+            .coinbase(coinbase)
+            .proposer(PublicKey::new(proposer))
+            .timestamp(1000)
+            .base_fee_per_gas(citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS)
+            .vrf_reveal(VrfProof { proof: vec![], output: Hash::new(vrf) })
+            .transactions(txs)
+            .state_root(root)
+            .build_unhashed();
+        b.header.block_hash = b.compute_hash();
+        b
+    }
+
+    /// Produce a §R' block on `exec` exactly as `apply_block_inner` settles it
+    /// (set ctx → execute txs → settle basic + §R' rewards → root), with an explicit
+    /// proposer + coinbase. Advances `exec` to the post-block state.
+    async fn produce_fleet(
+        exec: &Executor,
+        parent: Hash,
+        height: u64,
+        vrf: [u8; 32],
+        proposer: [u8; 32],
+        coinbase: [u8; 20],
+        txs: Vec<Transaction>,
+    ) -> Block {
+        exec.set_block_context(BlockContext {
+            coinbase,
+            prevrandao: vrf,
+            block_hashes: std::collections::HashMap::new(),
+        });
+        let provisional = seal_fleet(height, parent, Hash::default(), vrf, proposer, coinbase, txs.clone());
+        let mut receipts = Vec::new();
+        for tx in &txs {
+            receipts.push(
+                exec.execute_transaction(&provisional, tx)
+                    .await
+                    .expect("producer tx executes"),
+            );
+        }
+        let reward = RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let basic = [
+            (Address(coinbase), reward.validator_reward),
+            (Address(TREASURY_ADDR), reward.treasury_reward),
+        ];
+        exec.settle_block_rewards(
+            height,
+            coinbase,
+            proposer,
+            citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS,
+            &txs,
+            &receipts,
+            &basic,
+        )
+        .await
+        .expect("producer §R' settle");
+        let root = exec.calculate_state_root();
+        seal_fleet(height, parent, root, vrf, proposer, coinbase, txs)
+    }
+
+    /// After the producer seals block `h`, mirror the follower's post-apply registry
+    /// re-sync: at a snapshot boundary S(E), install the epoch-E policy cell. Same
+    /// order as the receive path (`apply_block` settles with the OLD cell, THEN the
+    /// boundary sync updates it) — so producer and followers stay policy-symmetric.
+    fn producer_boundary_sync(exec: &Executor, h: u64, set_change_epoch: Option<u64>) {
+        if crate::registry_sync::snapshot_epoch_at(h).is_some() {
+            let (policy, _entries) = boundary_policy(h, set_change_epoch);
+            *exec.reward_policy_handle().write() = Some(policy);
+        }
+    }
+
+    /// One fleet node: an independent store-backed executor, its proposer selector,
+    /// the applicator, and its durable store. The registry hooks are wired to the
+    /// deterministic schedule (see `wire_fleet_hooks`).
+    struct FleetNode {
+        exec: Arc<Executor>,
+        storage: Arc<StorageManager>,
+        app: CanonicalApplicator,
+        selector: Arc<VrfProposerSelector>,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A node after `restart_node`: the rehydrated executor + selector + applicator,
+    /// plus the shared store and the tempdir guard kept alive for the test's life.
+    type RestartedNode = (
+        Arc<Executor>,
+        Arc<VrfProposerSelector>,
+        CanonicalApplicator,
+        Arc<StorageManager>,
+        tempfile::TempDir,
+    );
+
+    /// Wire a node's §R' registry hooks to the deterministic epoch schedule,
+    /// mirroring `RegistrySync::with_registry_sync` wiring: the full sync (used on
+    /// the forward/received path) writes the policy cell, persists the durable
+    /// snapshot blob, and syncs the selector; the policy-only resync (used INSIDE
+    /// the reorg reapply loop) writes ONLY the policy cell — exactly as the real
+    /// `sync_for_snapshot` / `resync_policy_only` split does.
+    fn wire_fleet_hooks(
+        app: &mut CanonicalApplicator,
+        exec: &Arc<Executor>,
+        selector: &Arc<VrfProposerSelector>,
+        storage: &Arc<StorageManager>,
+        set_change_epoch: Option<u64>,
+    ) {
+        let e_full = exec.clone();
+        let s_full = selector.clone();
+        let st_full = storage.clone();
+        app.registry_sync = Some(Arc::new(move |h| {
+            let (policy, entries) = boundary_policy(h, set_change_epoch);
+            *e_full.reward_policy_handle().write() = Some(policy.clone());
+            if let Err(err) = st_full
+                .blocks
+                .put_reward_snapshot(&encode_reward_snapshot(&policy, &entries, MIN_STAKE))
+            {
+                warn!("fleet test: durable reward-snapshot persist failed at {h}: {err}");
+            }
+            let n = entries.len();
+            let mapped: Vec<(PublicKey, u128)> = entries
+                .into_iter()
+                .map(|(pk, stake)| (PublicKey::new(pk), stake))
+                .collect();
+            let sel = s_full.clone();
+            Box::pin(async move {
+                sel.sync_active_set(mapped, MIN_STAKE).await;
+                Ok(n)
+            })
+        }));
+        let e_pol = exec.clone();
+        app.registry_policy_resync = Some(Arc::new(move |h| {
+            let (policy, _entries) = boundary_policy(h, set_change_epoch);
+            *e_pol.reward_policy_handle().write() = Some(policy);
+            Box::pin(async { Ok(()) })
+        }));
+    }
+
+    /// A funded, activation-configured fleet node with its registry hooks wired.
+    ///
+    /// World state is in-memory (the reboot tests reconstruct it via a captured
+    /// `state_snapshot`, so the durable STATE store is not the mechanism under
+    /// test); the node keeps a real `StorageManager` for the block/DAG index, the
+    /// applied-tip pointer, and — critically — the durable reward-snapshot blob the
+    /// registry hook persists and `hydrate_on_boot` reloads.
+    async fn fleet_node(set_change_epoch: Option<u64>) -> FleetNode {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.set_validator_activation_height(ACT);
+        let selector = Arc::new(VrfProposerSelector::production());
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        wire_fleet_hooks(&mut app, &exec, &selector, &storage, set_change_epoch);
+        FleetNode { exec, storage, app, selector, _dir: dir }
+    }
+
+    /// A funded in-memory producer executor (never restarts) with activation set.
+    fn fleet_producer() -> Arc<Executor> {
+        let p = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        p.set_balance(&Address(ALICE), U256::from(FUND));
+        p.set_validator_activation_height(ACT);
+        p
+    }
+
+    // ------------------------------------------------------------------------
+    // SCENARIO 1 — fleet state-root parity across ≥2 snapshot boundaries with
+    // priority-fee vesting. 3 nodes, one producer; run past activation (1000) and
+    // across S(1)=800 and S(2)=1800. Assert every node reproduces the producer's
+    // state root at EVERY height, and the registry (vested share) balance is
+    // identical fleet-wide and matches the producer.
+    // ------------------------------------------------------------------------
+    #[tokio::test]
+    async fn fleet_parity_across_two_snapshot_boundaries() {
+        let sce = None;
+        let producer = fleet_producer();
+        let mut nodes = [
+            fleet_node(sce).await,
+            fleet_node(sce).await,
+            fleet_node(sce).await,
+        ];
+        // Priority-fee blocks straddle activation and both boundaries (all >= ACT so
+        // they actually vest): epoch-1 (1001, 1500) and epoch-2 (1801, 1805).
+        let prio: [(u64, u8); 4] = [(1001, 0xA0), (1500, 0xA1), (1801, 0xA2), (1805, 0xA3)];
+        let top = 1810u64;
+        let mut parent = Hash::default();
+        let mut nonce = 0u64;
+
+        for h in 1..=top {
+            let txs = match prio.iter().find(|(ph, _)| *ph == h) {
+                Some((_, seed)) => {
+                    let t = vec![prio_tx(ALICE, BOB, nonce, *seed)];
+                    nonce += 1;
+                    t
+                }
+                None => vec![],
+            };
+            let block = produce_fleet(&producer, parent, h, VRF_OUT, PROPOSER, CB, txs).await;
+            producer_boundary_sync(&producer, h, sce);
+
+            // `Applied` IS the per-height state-root parity assertion: the driver
+            // recomputes the world-state root inside `apply_block` and returns
+            // `Rejected` on any mismatch with the producer's committed `state_root`,
+            // so an `Applied` on every node at height `h` proves all nodes hold the
+            // producer's identical root at `h`. Belt-and-suspenders explicit root
+            // equality is checked at the key heights (boundaries, activation,
+            // priority-fee blocks, tip) to keep the cheaper invariant visible.
+            let key_height = matches!(h, 800 | 1000 | 1800)
+                || h == top
+                || prio.iter().any(|(ph, _)| *ph == h);
+            for (i, node) in nodes.iter_mut().enumerate() {
+                persist(&node.storage, &block);
+                let outcome = node.app.apply_received(&block).await;
+                assert!(
+                    matches!(outcome, ApplyOutcome::Applied { .. }),
+                    "node {i} must apply block {h} (state-root parity): {outcome:?}"
+                );
+                if key_height {
+                    assert_eq!(
+                        node.exec.calculate_state_root(),
+                        block.state_root,
+                        "explicit state-root parity: node {i} at height {h}"
+                    );
+                }
+            }
+            parent = block.header.block_hash;
+        }
+
+        let reg0 = nodes[0].exec.get_balance(&Address(REG));
+        assert!(reg0 > U256::zero(), "priority fees must have vested to the registry");
+        let prod_reg = producer.get_balance(&Address(REG));
+        for (i, node) in nodes.iter().enumerate() {
+            assert_eq!(node.app.applied_tip().await.height, top, "node {i} tip height");
+            assert_eq!(
+                node.exec.get_balance(&Address(REG)),
+                reg0,
+                "fleet-wide registry (vested-share) parity: node {i}"
+            );
+            assert_eq!(
+                node.exec.get_balance(&Address(REG)),
+                prod_reg,
+                "node {i} registry matches producer"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // SCENARIO 2 — validator-set change across an epoch. Validator B joins the
+    // active set at S(2)=1800. Assert (a) every node reproduces every root (no
+    // fork), (b) all nodes admit/reject B IDENTICALLY across the boundary, and
+    // (c) a B-proposed priority block post-boundary settles §R' to B's staker on
+    // every node (its acceptance == identical staker resolution fleet-wide).
+    // ------------------------------------------------------------------------
+    #[tokio::test]
+    async fn fleet_validator_set_change_across_epoch() {
+        let sce = Some(2u64); // B joins at S(2)=1800
+        let producer = fleet_producer();
+        let mut nodes = [fleet_node(sce).await, fleet_node(sce).await];
+        let top = 1810u64;
+        let mut parent = Hash::default();
+        let mut nonce = 0u64;
+        let mut checked_pre = false;
+        let mut checked_post = false;
+
+        for h in 1..=top {
+            // Post-boundary B-proposed priority block (settles to STAKER_B); one
+            // epoch-1 priority block for baseline vesting.
+            let (proposer, coinbase, txs) = if h == 1805 {
+                let t = vec![prio_tx(ALICE, BOB, nonce, 0xB5)];
+                nonce += 1;
+                (PROPOSER_B, STAKER_B, t)
+            } else if h == 1001 {
+                let t = vec![prio_tx(ALICE, BOB, nonce, 0xA1)];
+                nonce += 1;
+                (PROPOSER, CB, t)
+            } else {
+                (PROPOSER, CB, vec![])
+            };
+            let block = produce_fleet(&producer, parent, h, VRF_OUT, proposer, coinbase, txs).await;
+            producer_boundary_sync(&producer, h, sce);
+
+            // `Applied` per node == per-height root parity (see scenario 1). Explicit
+            // root equality is spot-checked at boundaries / activation / the set-change
+            // and B-proposed blocks / the tip.
+            let key_height = matches!(h, 800 | 1000 | 1001 | 1800 | 1805) || h == top;
+            for (i, node) in nodes.iter_mut().enumerate() {
+                persist(&node.storage, &block);
+                let outcome = node.app.apply_received(&block).await;
+                assert!(
+                    matches!(outcome, ApplyOutcome::Applied { .. }),
+                    "node {i} must apply block {h} (state-root parity): {outcome:?}"
+                );
+                if key_height {
+                    assert_eq!(
+                        node.exec.calculate_state_root(),
+                        block.state_root,
+                        "explicit state-root parity: node {i} at height {h}"
+                    );
+                }
+            }
+
+            // Pre-boundary (epoch-1 loaded at S(1)=800): B is NOT yet a validator on
+            // any node — identical rejection verdict.
+            if h == 1000 && !checked_pre {
+                for (i, node) in nodes.iter().enumerate() {
+                    let v = node
+                        .selector
+                        .is_eligible_proposer(&PublicKey::new(PROPOSER_B), &Hash::default(), h)
+                        .await;
+                    assert!(
+                        matches!(v, Err(_) | Ok(false)),
+                        "node {i}: B must be rejected pre-S(2) (got {v:?})"
+                    );
+                }
+                checked_pre = true;
+            }
+            // Post-boundary (epoch-2 loaded at S(2)=1800): B admitted on every node,
+            // identical verdict + identical set size.
+            if h == 1801 && !checked_post {
+                for (i, node) in nodes.iter().enumerate() {
+                    let v = node
+                        .selector
+                        .is_eligible_proposer(&PublicKey::new(PROPOSER_B), &Hash::default(), h)
+                        .await
+                        .expect("post-S(2) admission verdict");
+                    assert!(v, "node {i}: B must be admitted post-S(2)");
+                    assert_eq!(
+                        node.selector.active_validator_count().await,
+                        2,
+                        "node {i}: active set grew to {{A, B}} at S(2)"
+                    );
+                }
+                checked_post = true;
+            }
+            parent = block.header.block_hash;
+        }
+        assert!(checked_pre && checked_post, "admission verdicts were exercised");
+
+        // The B-proposed block 1805 credited its basic reward to STAKER_B, and §R'
+        // resolved to B's staker — identically on every node (identical roots above
+        // already imply this; assert the beneficiary balance to make it explicit).
+        let stb0 = nodes[0].exec.get_balance(&Address(STAKER_B));
+        assert!(stb0 > U256::zero(), "B's staker was credited for B's block");
+        let reg0 = nodes[0].exec.get_balance(&Address(REG));
+        for (i, node) in nodes.iter().enumerate() {
+            assert_eq!(node.exec.get_balance(&Address(STAKER_B)), stb0, "node {i} staker-B parity");
+            assert_eq!(node.exec.get_balance(&Address(REG)), reg0, "node {i} registry parity");
+        }
+    }
+
+    /// Restart a downed node: rebuild a FRESH executor over the SAME durable store,
+    /// a FRESH EMPTY selector, and a FRESH (empty) §R' reward-policy cell — then run
+    /// the REAL `RegistrySync::hydrate_on_boot` and rebuild the applicator with hooks
+    /// rewired. Returns the restarted executor + selector + applicator (sharing
+    /// `storage`).
+    ///
+    /// Scope separation (deliberate): world state is reconstructed from the captured
+    /// `down_state` snapshot — standing in for the node's normal world-state boot
+    /// hydration (main.rs loads every persisted account into the trie), a mechanism
+    /// ORTHOGONAL to VALIDATOR-S1. The §R' lifecycle state under test — the reward-
+    /// policy cell and the proposer selector — is genuinely DROPPED (the fresh
+    /// executor's policy is `None`, the fresh selector is empty) and must be restored
+    /// solely by `hydrate_on_boot`. That is exactly the reviewer bug: pre-fix a
+    /// mid-epoch restart left policy `None` (→ HARD-REJECT at ≥ activation) and the
+    /// selector empty (→ admission brick).
+    async fn restart_node(
+        storage: &Arc<StorageManager>,
+        set_change_epoch: Option<u64>,
+        pre_down_root: Hash,
+        down_state: StateSnapshot,
+    ) -> (Arc<Executor>, Arc<VrfProposerSelector>, CanonicalApplicator) {
+        let r_exec = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        r_exec.set_validator_activation_height(ACT);
+        // World-state boot hydration (orthogonal to §R'): reconstruct the trie.
+        r_exec.state_restore(down_state);
+        let r_sel = Arc::new(VrfProposerSelector::production());
+
+        // The exact reviewer bug pre-fix: a fresh boot has NO policy cell and an
+        // EMPTY selector, so a ≥ activation block HARD-REJECTs and admission bricks.
+        assert!(
+            r_exec.reward_policy_handle().read().is_none(),
+            "restarted node starts with no reward policy (would HARD-REJECT ≥ activation)"
+        );
+        assert!(
+            r_sel
+                .is_eligible_proposer(&PublicKey::new(PROPOSER), &Hash::default(), ACT)
+                .await
+                .is_err(),
+            "restarted selector starts empty (admission would brick)"
+        );
+
+        let applied_height = storage
+            .blocks
+            .get_applied_tip()
+            .expect("read applied tip")
+            .expect("applied tip present")
+            .1;
+        let rs = RegistrySync::new(r_exec.clone(), r_sel.clone(), REG, ACT, storage.clone());
+        let desc = rs.hydrate_on_boot(applied_height).await.expect("hydrate_on_boot");
+        assert!(desc.contains("durable"), "durable snapshot reload path used: {desc}");
+
+        // Policy + selector are now repopulated, and world state matches pre-down.
+        assert!(
+            r_exec.reward_policy_handle().read().is_some(),
+            "hydrate_on_boot restored the §R' reward policy"
+        );
+        assert_eq!(
+            r_exec.calculate_state_root(),
+            pre_down_root,
+            "rehydrated node holds the pre-restart world-state root"
+        );
+
+        let mut rapp = CanonicalApplicator::new(r_exec.clone(), storage.clone());
+        wire_fleet_hooks(&mut rapp, &r_exec, &r_sel, storage, set_change_epoch);
+        (r_exec, r_sel, rapp)
+    }
+
+    // ------------------------------------------------------------------------
+    // SCENARIO 3 — MID-EPOCH single-node restart (the exact reviewer bug). One node
+    // stays up while another goes down mid-epoch (after activation, past S(1)),
+    // loses its in-memory policy + selector, restarts via `hydrate_on_boot`, is fed
+    // the blocks it missed, and must re-derive IDENTICAL roots + admission verdicts
+    // as the node that stayed up — proving no permanent partition at the
+    // integration level, not just the unit level.
+    // ------------------------------------------------------------------------
+    #[tokio::test]
+    async fn mid_epoch_restart_rejoins_and_reproduces_roots() {
+        let sce = None;
+        let producer = fleet_producer();
+        let mut stay = fleet_node(sce).await;
+        let mut down = fleet_node(sce).await;
+        let down_at = 1050u64; // mid epoch-1 window (800,1800), past activation 1000
+        let mut parent = Hash::default();
+        let mut nonce = 0u64;
+
+        for h in 1..=down_at {
+            let txs = if h == 1001 {
+                let t = vec![prio_tx(ALICE, BOB, nonce, 0xA1)];
+                nonce += 1;
+                t
+            } else {
+                vec![]
+            };
+            let block = produce_fleet(&producer, parent, h, VRF_OUT, PROPOSER, CB, txs).await;
+            producer_boundary_sync(&producer, h, sce);
+            for node in [&mut stay, &mut down] {
+                persist(&node.storage, &block);
+                assert!(
+                    matches!(node.app.apply_received(&block).await, ApplyOutcome::Applied { .. }),
+                    "pre-down apply at {h}"
+                );
+            }
+            parent = block.header.block_hash;
+        }
+
+        let pre_down_root = down.exec.calculate_state_root();
+        assert_eq!(pre_down_root, stay.exec.calculate_state_root(), "fleet aligned before down");
+        let stay_verdict = stay
+            .selector
+            .is_eligible_proposer(&PublicKey::new(PROPOSER), &Hash::default(), down_at)
+            .await
+            .expect("stayer admission verdict");
+
+        // NODE GOES DOWN: capture the world state (stands in for boot state-load),
+        // then drop the executor/selector/applicator so ALL in-memory §R' lifecycle
+        // state (policy cell + selector) is lost. Keep the durable store + tempdir.
+        let FleetNode { exec, storage, _dir, .. } = down;
+        let down_state = exec.state_snapshot();
+        drop(exec);
+        let (r_exec, r_sel, rapp) = restart_node(&storage, sce, pre_down_root, down_state).await;
+
+        // Admission verdict matches the node that stayed up.
+        let r_verdict = r_sel
+            .is_eligible_proposer(&PublicKey::new(PROPOSER), &Hash::default(), down_at)
+            .await
+            .expect("restarted admission verdict");
+        assert_eq!(r_verdict, stay_verdict, "admission verdict matches the stayer after restart");
+
+        // Feed the restarted node the blocks it missed (still epoch-1); assert it
+        // reproduces the stayer's root at every one — no divergence, no wedge.
+        for h in (down_at + 1)..=(down_at + 40) {
+            let txs = if h == 1080 {
+                let t = vec![prio_tx(ALICE, BOB, nonce, 0xA2)];
+                nonce += 1;
+                t
+            } else {
+                vec![]
+            };
+            let block = produce_fleet(&producer, parent, h, VRF_OUT, PROPOSER, CB, txs).await;
+            producer_boundary_sync(&producer, h, sce);
+
+            persist(&stay.storage, &block);
+            assert!(matches!(stay.app.apply_received(&block).await, ApplyOutcome::Applied { .. }));
+
+            persist(&storage, &block);
+            let outcome = rapp.apply_received(&block).await;
+            assert!(
+                matches!(outcome, ApplyOutcome::Applied { .. }),
+                "restarted node applies missed block {h}: {outcome:?}"
+            );
+            assert_eq!(
+                r_exec.calculate_state_root(),
+                block.state_root,
+                "restarted node reproduces producer root at {h}"
+            );
+            assert_eq!(
+                r_exec.calculate_state_root(),
+                stay.exec.calculate_state_root(),
+                "restarted node == stayer at {h}"
+            );
+            parent = block.header.block_hash;
+        }
+
+        assert_eq!(
+            r_exec.get_balance(&Address(REG)),
+            stay.exec.get_balance(&Address(REG)),
+            "registry (vested-share) converged fleet-wide after restart"
+        );
+        assert_eq!(rapp.applied_tip().await.height, down_at + 40, "restarted node caught up");
+        drop(_dir);
+    }
+
+    // ------------------------------------------------------------------------
+    // SCENARIO 4 — FLEET-WIDE restart (the reroll / upgrade case). ALL nodes go
+    // down mid-epoch after activation, ALL `hydrate_on_boot`, ALL resume; the chain
+    // does not halt and every node re-converges on identical roots.
+    // ------------------------------------------------------------------------
+    #[tokio::test]
+    async fn fleet_wide_restart_resumes_without_halt() {
+        let sce = None;
+        let producer = fleet_producer();
+        let n0 = fleet_node(sce).await;
+        let n1 = fleet_node(sce).await;
+        let down_at = 1100u64;
+        let mut parent = Hash::default();
+        let mut nonce = 0u64;
+
+        // Two nodes, kept in owned Vecs so we can consume them at the restart point.
+        let mut nodes = vec![n0, n1];
+        for h in 1..=down_at {
+            let txs = if h == 1001 {
+                let t = vec![prio_tx(ALICE, BOB, nonce, 0xA1)];
+                nonce += 1;
+                t
+            } else {
+                vec![]
+            };
+            let block = produce_fleet(&producer, parent, h, VRF_OUT, PROPOSER, CB, txs).await;
+            producer_boundary_sync(&producer, h, sce);
+            for node in nodes.iter_mut() {
+                persist(&node.storage, &block);
+                assert!(
+                    matches!(node.app.apply_received(&block).await, ApplyOutcome::Applied { .. }),
+                    "pre-restart apply at {h}"
+                );
+            }
+            parent = block.header.block_hash;
+        }
+
+        let pre_root = nodes[0].exec.calculate_state_root();
+        for node in &nodes {
+            assert_eq!(node.exec.calculate_state_root(), pre_root, "fleet aligned pre-restart");
+        }
+
+        // ENTIRE FLEET RESTARTS: drop every in-memory executor/selector/applicator,
+        // rebuild each from its cold store via `hydrate_on_boot`.
+        let mut restarted: Vec<RestartedNode> = Vec::new();
+        for node in nodes {
+            let FleetNode { exec, storage, _dir, .. } = node;
+            let down_state = exec.state_snapshot();
+            drop(exec);
+            let (r_exec, r_sel, rapp) = restart_node(&storage, sce, pre_root, down_state).await;
+            restarted.push((r_exec, r_sel, rapp, storage, _dir));
+        }
+
+        // The fleet resumes: produce past the restart point and drive every node.
+        for h in (down_at + 1)..=(down_at + 30) {
+            let txs = if h == 1120 {
+                let t = vec![prio_tx(ALICE, BOB, nonce, 0xA3)];
+                nonce += 1;
+                t
+            } else {
+                vec![]
+            };
+            let block = produce_fleet(&producer, parent, h, VRF_OUT, PROPOSER, CB, txs).await;
+            producer_boundary_sync(&producer, h, sce);
+            for (i, (r_exec, _sel, rapp, storage, _d)) in restarted.iter_mut().enumerate() {
+                persist(storage, &block);
+                let outcome = rapp.apply_received(&block).await;
+                assert!(
+                    matches!(outcome, ApplyOutcome::Applied { .. }),
+                    "restarted node {i} resumes at {h}: {outcome:?}"
+                );
+                assert_eq!(
+                    r_exec.calculate_state_root(),
+                    block.state_root,
+                    "restarted node {i} reproduces root at {h}"
+                );
+            }
+            parent = block.header.block_hash;
+        }
+
+        // No halt, no fork: every restarted node holds the identical tip root +
+        // registry balance.
+        let root0 = restarted[0].0.calculate_state_root();
+        let reg0 = restarted[0].0.get_balance(&Address(REG));
+        for (i, (r_exec, _sel, _rapp, _st, _d)) in restarted.iter().enumerate() {
+            assert_eq!(r_exec.calculate_state_root(), root0, "fleet converged after full restart: node {i}");
+            assert_eq!(r_exec.get_balance(&Address(REG)), reg0, "registry parity after full restart: node {i}");
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // SCENARIO 5 — cross-boundary, cross-POLICY network reorg at the FLEET level. A
+    // heavier branch B (whose post-S(1) blocks were produced under a DIFFERENT
+    // reward policy: 5000 bps vs branch A's 2500) replaces the current tip on
+    // multiple nodes at once. Every node must reorg across S(1)=800 — with the §R'
+    // in-loop policy re-sync re-materializing the epoch policy DURING the reapply —
+    // and converge to byte-identical roots + registry balances. Built on the proven
+    // single-node cross-policy helpers (`setup_cross_policy` / `produce_branch_b`),
+    // run across two independent nodes.
+    // ------------------------------------------------------------------------
+    #[tokio::test]
+    async fn fleet_cross_boundary_reorg_converges() {
+        let (mut app0, f0, s0, s799_0, _d0) = setup_cross_policy().await;
+        let (mut app1, f1, s1, s799_1, _d1) = setup_cross_policy().await;
+        assert_eq!(s799_0, s799_1, "deterministic fork point identical across nodes");
+
+        let (b800, b801, b802) = produce_branch_b(s799_0).await;
+
+        for (app, storage) in [(&mut app0, &s0), (&mut app1, &s1)] {
+            persist(storage, &b800);
+            persist(storage, &b801);
+            persist(storage, &b802);
+            app.fork_choice = Some(fork_choice_returning(b802.header.block_hash));
+            let outcome = app.apply_received(&b802).await;
+            assert!(matches!(outcome, ApplyOutcome::Applied { .. }), "fleet reorg apply: {outcome:?}");
+        }
+
+        let want_tip = AppliedTip { hash: b802.header.block_hash, height: 802 };
+        assert_eq!(app0.applied_tip().await, want_tip, "node 0 reorged to B");
+        assert_eq!(app1.applied_tip().await, want_tip, "node 1 reorged to B");
+        assert_eq!(f0.calculate_state_root(), b802.state_root, "node 0 converged to B");
+        assert_eq!(f1.calculate_state_root(), b802.state_root, "node 1 converged to B");
+        assert_eq!(
+            f0.calculate_state_root(),
+            f1.calculate_state_root(),
+            "fleet converged to identical root after cross-policy reorg"
+        );
+        assert!(f0.get_balance(&Address(REG)) > U256::zero(), "branch B vested a §R' share");
+        assert_eq!(
+            f0.get_balance(&Address(REG)),
+            f1.get_balance(&Address(REG)),
+            "fleet-wide registry (vested-share) parity after cross-policy reorg"
+        );
+    }
 }
