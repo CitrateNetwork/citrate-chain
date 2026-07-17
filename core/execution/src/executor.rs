@@ -109,6 +109,39 @@ pub struct Executor {
     /// as of Sprint P950-A-3 (2026-04-21). Design proven in
     /// `specs/tla/consensus/ExecutorMVCC.tla`.
     commit_coordinator: Arc<CommitCoordinator>,
+    /// EXECUTE-ON-RECEIVE: when true, the eager account/code/nonce setters
+    /// (`set_balance`/`set_code`/`set_nonce`) DEFER durable persistence — they
+    /// mutate in-memory state + dirty-tracking only, leaving the store write to
+    /// `persist_state_changes` / `reconcile_store_from`. Set for the duration of
+    /// `apply_block` execution (incl. reward crediting + contract deploys), so a
+    /// reorg re-applying a branch via `apply_block_no_persist` writes nothing
+    /// durable and an aborted reorg leaves no phantom state on disk (review E).
+    /// Off by default, so direct callers (genesis init, RPC) persist eagerly as
+    /// before. See `docs/consensus/EXECUTE_ON_RECEIVE_state_application.md` §7.
+    defer_persist: std::sync::atomic::AtomicBool,
+}
+
+/// RAII guard for `Executor::defer_persist`: sets it on `engage` and restores the
+/// prior value on drop, so `apply_block`'s deferral is reset on every exit path
+/// (early `return`, `?`, or normal). `apply_block` is not nested, but restoring
+/// the prior value (not blindly `false`) keeps it correct if that ever changes.
+struct DeferGuard<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+    prev: bool,
+}
+
+impl<'a> DeferGuard<'a> {
+    fn engage(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        let prev = flag.swap(true, std::sync::atomic::Ordering::SeqCst);
+        Self { flag, prev }
+    }
+}
+
+impl Drop for DeferGuard<'_> {
+    fn drop(&mut self) {
+        self.flag
+            .store(self.prev, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Dirty contract storage mutation captured for a finalized state commit.
@@ -383,6 +416,7 @@ impl Executor {
             chain_id,
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
             commit_coordinator: Arc::new(CommitCoordinator::new()),
+            defer_persist: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -532,6 +566,7 @@ impl Executor {
             chain_id,
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
             commit_coordinator,
+            defer_persist: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -669,6 +704,12 @@ impl Executor {
                 store.write_state_batch_sync(&account_changes, &storage_changes)?;
             }
 
+            // Persist contract code deployed since the last commit (deferred from
+            // `set_code`, which is now in-memory only — review finding E).
+            for (code_hash, code) in self.state_db.take_dirty_code() {
+                store.put_code(&code_hash, &code)?;
+            }
+
             // Commit state DB (clears dirty tracking)
             self.state_db.commit();
             Ok(count)
@@ -742,24 +783,36 @@ impl Executor {
     pub fn set_balance(&self, address: &Address, balance: U256) {
         self.state_db.accounts.set_balance(*address, balance);
 
-        // Persist to storage if available
-        if let Some(store) = &self.state_store {
-            let account = self.state_db.accounts.get_account(address);
-            if let Err(e) = store.put_account(address, &account) {
-                error!("Failed to persist account balance: {}", e);
+        // Persist eagerly unless deferring (during apply_block execution the
+        // account is dirty-tracked and persisted by persist_state_changes /
+        // reconcile_store_from instead — review finding E).
+        if !self.defer_persist() {
+            if let Some(store) = &self.state_store {
+                let account = self.state_db.accounts.get_account(address);
+                if let Err(e) = store.put_account(address, &account) {
+                    error!("Failed to persist account balance: {}", e);
+                }
             }
         }
+    }
+
+    #[inline]
+    fn defer_persist(&self) -> bool {
+        self.defer_persist
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Set account nonce
     pub fn set_nonce(&self, address: &Address, nonce: u64) {
         self.state_db.accounts.set_nonce(*address, nonce);
 
-        // Persist to storage if available
-        if let Some(store) = &self.state_store {
-            let account = self.state_db.accounts.get_account(address);
-            if let Err(e) = store.put_account(address, &account) {
-                error!("Failed to persist account nonce: {}", e);
+        // Persist eagerly unless deferring (see set_balance — review finding E).
+        if !self.defer_persist() {
+            if let Some(store) = &self.state_store {
+                let account = self.state_db.accounts.get_account(address);
+                if let Err(e) = store.put_account(address, &account) {
+                    error!("Failed to persist account nonce: {}", e);
+                }
             }
         }
     }
@@ -818,18 +871,23 @@ impl Executor {
     }
 
     pub fn set_code(&self, address: &Address, code: Vec<u8>) {
+        // `state_db.set_code` inserts the code, records its hash in the dirty-code
+        // set, and marks the owning account dirty. Persist eagerly unless deferring
+        // (during apply_block the code + account are dirty-tracked and persisted by
+        // persist_state_changes / reconcile_store_from — review finding E). Without
+        // deferral (genesis init, RPC) the old eager behavior is preserved.
         let code_hash = self.state_db.set_code(*address, code.clone());
         self.state_db.accounts.set_code_hash(*address, code_hash);
 
-        // Persist to storage if available
-        if let Some(store) = &self.state_store {
-            if let Err(e) = store.put_code(&code_hash, &code) {
-                error!("Failed to persist contract code: {}", e);
-            }
-
-            let account = self.state_db.accounts.get_account(address);
-            if let Err(e) = store.put_account(address, &account) {
-                error!("Failed to persist account code hash: {}", e);
+        if !self.defer_persist() {
+            if let Some(store) = &self.state_store {
+                if let Err(e) = store.put_code(&code_hash, &code) {
+                    error!("Failed to persist contract code: {}", e);
+                }
+                let account = self.state_db.accounts.get_account(address);
+                if let Err(e) = store.put_account(address, &account) {
+                    error!("Failed to persist account code hash: {}", e);
+                }
             }
         }
     }
@@ -929,6 +987,12 @@ impl Executor {
         for addr in &account_dels {
             store.delete_account(addr)?;
         }
+        // Persist contract code deployed on the winning branch (deferred from
+        // `set_code`). Code is content-addressed, so any leftover code from an
+        // abandoned branch is an unreferenced (harmless) orphan.
+        for (code_hash, code) in self.state_db.take_dirty_code() {
+            store.put_code(&code_hash, &code)?;
+        }
         Ok(())
     }
 
@@ -987,6 +1051,14 @@ impl Executor {
         reward_credits: &[(Address, U256)],
         persist: bool,
     ) -> Result<Hash, ExecutionError> {
+        // Defer eager persistence for the whole apply (execution + reward
+        // crediting + contract deploys): set_balance/set_code/set_nonce mutate
+        // in-memory + dirty-tracking only, so a `no_persist` apply writes nothing
+        // durable. The guard restores the prior value on every exit path (review
+        // finding E). Durable writes happen at the end (persist=true) via
+        // persist_state_changes, or later via reconcile_store_from (reorg success).
+        let _defer_guard = DeferGuard::engage(&self.defer_persist);
+
         let snapshot = self.state_db.snapshot();
         let prev_ctx = self.get_block_context();
 
