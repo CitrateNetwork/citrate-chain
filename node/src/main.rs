@@ -1495,18 +1495,43 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             &noise_keypair.public_key_hex()[..16],
             local_peer_id
         );
+        // Shared LIVE head advertised in every handshake. Seeded with our current
+        // applied tip and refreshed below as we apply/produce blocks — so a node
+        // advertises its CURRENT head, not the genesis snapshot it booted with.
+        let advertised_head =
+            std::sync::Arc::new(tokio::sync::RwLock::new((head_height, head_hash)));
         let transport = NetworkTransport::new(
             peer_manager.clone(),
             local_peer_id,
             citrate_network::transport::HandshakeParams {
                 network_id,
                 genesis_hash,
-                head_height,
-                head_hash,
+                head: advertised_head.clone(),
             },
         )
         .with_noise(noise_keypair)
         .with_allowed_peers(config.network.allowed_peers.clone());
+        // Keep the advertised head current (every 1s) from the persisted applied
+        // tip, so peers see us advance and their sync triggers fire.
+        {
+            let advertised_head = advertised_head.clone();
+            let storage_head = storage.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    if let Ok(Some((hash, height))) =
+                        storage_head.blocks.get_applied_tip()
+                    {
+                        let mut g = advertised_head.write().await;
+                        if g.0 != height {
+                            *g = (height, hash);
+                        }
+                    }
+                }
+            });
+        }
         let listen_addr = config.network.listen_addr;
         transport
             .start_listener(listen_addr)
