@@ -105,8 +105,15 @@ impl Default for SyncConfig {
             max_concurrent_downloads: 16,
             request_timeout: Duration::from_secs(30),
             max_retries: 3,
-            header_batch_size: 2000,
-            block_batch_size: 128,
+            // Small batches so a sync RESPONSE stays close to gossip frame size.
+            // Cross-region (nyc1↔fra1) the large 128-block / 2000-header responses
+            // were lost on the wire (rpc-1 served in 4ms but the follower never
+            // received them and timed out), while single-block gossip frames
+            // delivered fine. Keeping responses tiny lets a lagging node catch a
+            // gap over the same path that already carries gossip. Concurrency
+            // (16 in-flight) preserves throughput despite the small per-batch size.
+            header_batch_size: 64,
+            block_batch_size: 8,
             sync_interval: Duration::from_secs(1),
         }
     }
