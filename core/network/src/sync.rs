@@ -256,6 +256,20 @@ impl SyncManager {
     ///
     /// WP-H.4: Headers are validated for height monotonicity before storage.
     pub async fn handle_headers(&self, headers: Vec<BlockHeader>) -> Result<(), NetworkError> {
+        // A response from our sync peer answers our in-flight header request
+        // REGARDLESS of its contents. Retire ALL pending header requests up
+        // front — this covers (a) an EMPTY "you're already at my tip" batch,
+        // previously early-returned *before* retirement, and (b) a batch whose
+        // first header's selected-parent does not exactly equal the requested
+        // `from` (a multi-producer GhostDAG sibling, since both the anchor and
+        // the server resolve `from` through the last-writer-wins height index).
+        // Either case used to leave a phantom `pending_headers` entry that
+        // `check_timeouts` then flagged as a FALSE timeout, monotonically
+        // penalizing and finally dropping the responding peer — the mechanism
+        // that isolated a bootnode from its only block source and split-brained
+        // the fleet. Any still-needed request is re-issued on the next 2s sync
+        // tick from the node's current tip, so clearing here loses nothing.
+        self.pending_headers.write().await.clear();
         if headers.is_empty() {
             return Ok(());
         }
@@ -283,16 +297,8 @@ impl SyncManager {
         let last_height = last.height;
         let first_hash = first.block_hash;
         let last_hash = last.block_hash;
-        // Retire the in-flight request this batch answers. The request anchor
-        // (`from`) is the selected-parent of the first served header — the
-        // server resolves `from` to the block at anchor.height+1, whose
-        // selected-parent IS `from` (genesis's is the all-zero sentinel, which
-        // is also the genesis-request anchor). Without this, pending_headers
-        // never drains, so `check_timeouts` eventually (falsely) flags the
-        // responding peer — the bug that let a bootnode ban its only block
-        // source and split-brain the fleet.
-        let answered_anchor = first.selected_parent_hash;
-        self.pending_headers.write().await.remove(&answered_anchor);
+        // (Pending retirement already done unconditionally at the top of this
+        // function — see the comment there.)
 
         // Store validated headers
         self.downloaded_headers.write().await.extend(headers);
@@ -349,6 +355,13 @@ impl SyncManager {
     ///
     /// Only validated blocks are stored and count toward progress.
     pub async fn handle_blocks(&self, blocks: Vec<Block>) -> Result<(), NetworkError> {
+        // Retire ALL pending block requests up front — a response answers our
+        // in-flight request regardless of contents (empty batch, or a batch
+        // whose first block's selected-parent differs from the requested `from`
+        // on a multi-producer DAG). See the matching note in `handle_headers`;
+        // leaving a phantom pending entry is what false-timed-out the sole block
+        // source and isolated the node. Re-issued next tick from the current tip.
+        self.pending_blocks.write().await.clear();
         if blocks.is_empty() {
             return Ok(());
         }
@@ -359,15 +372,8 @@ impl SyncManager {
             Some(b) => b.header.height,
             None => return Ok(()),
         };
-        // Retire the in-flight block request this batch answers, keyed by the
-        // first block's selected-parent (== the `from` anchor we requested).
-        // The peer responded, so the request is no longer pending regardless of
-        // per-block validation below; leaving it pending would falsely time the
-        // peer out. See the matching note in `handle_headers`.
-        if let Some(first) = blocks.first() {
-            let answered_anchor = first.header.selected_parent_hash;
-            self.pending_blocks.write().await.remove(&answered_anchor);
-        }
+        // (Pending retirement already done unconditionally at the top of this
+        // function — see the comment there.)
         let mut validated = Vec::with_capacity(total);
         let mut rejected = 0usize;
 
@@ -719,6 +725,69 @@ mod tests {
         assert!(
             !sync.pending_blocks.read().await.contains_key(&anchor),
             "pending blocks request must be retired once the peer responds"
+        );
+    }
+
+    /// P1 regression: an EMPTY batch ("you are already at my tip") MUST still
+    /// retire the pending request. Pre-fix the `is_empty()` early-return skipped
+    /// retirement, so the entry lingered until `check_timeouts` FALSELY flagged
+    /// the responding peer — a core driver of the sync-stall / peer-isolation
+    /// storm (the node kept requesting from a peer that had nothing new, timed
+    /// it out, and dropped its only block source).
+    #[tokio::test]
+    async fn empty_response_retires_pending() {
+        use crate::PeerId;
+        let sync = SyncManager::new(SyncConfig::default());
+        let ha = Hash::new([7u8; 32]);
+        let ba = Hash::new([8u8; 32]);
+        sync.pending_headers.write().await.insert(
+            ha,
+            BlockRequest { hash: ha, peer_id: PeerId("p".into()), requested_at: Instant::now(), retries: 0 },
+        );
+        sync.pending_blocks.write().await.insert(
+            ba,
+            BlockRequest { hash: ba, peer_id: PeerId("p".into()), requested_at: Instant::now(), retries: 0 },
+        );
+        sync.handle_headers(vec![]).await.expect("handle empty headers");
+        let _ = sync.handle_blocks(vec![]).await;
+        assert!(
+            sync.pending_headers.read().await.is_empty(),
+            "an empty header response must retire the pending request"
+        );
+        assert!(
+            sync.pending_blocks.read().await.is_empty(),
+            "an empty block response must retire the pending request"
+        );
+    }
+
+    /// P1 regression: a batch whose first block's selected-parent does NOT equal
+    /// the requested anchor (a multi-producer DAG sibling served via the
+    /// height index) MUST still retire the pending request. The pre-fix keyed
+    /// remove (`remove(first.selected_parent_hash)`) missed, so the entry
+    /// lingered forever and false-timed-out the peer.
+    #[tokio::test]
+    async fn mismatched_first_block_retires_pending() {
+        use crate::PeerId;
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+        let sync = SyncManager::new(SyncConfig::default());
+        *sync.current_height.write().await = 0;
+        *sync.target_height.write().await = 100;
+        let anchor = Hash::new([3u8; 32]);
+        sync.pending_blocks.write().await.insert(
+            anchor,
+            BlockRequest { hash: anchor, peer_id: PeerId("p".into()), requested_at: Instant::now(), retries: 0 },
+        );
+        // First served block's parent is a DIFFERENT hash than the requested
+        // anchor — i.e. the height-index successor is a non-selected sibling.
+        let served = BlockBuilder::new()
+            .parent(Hash::new([99u8; 32]))
+            .height(1)
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed();
+        let _ = sync.handle_blocks(vec![served]).await;
+        assert!(
+            sync.pending_blocks.read().await.is_empty(),
+            "a sibling-first-block response must still retire the pending request"
         );
     }
 }
