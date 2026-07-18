@@ -1639,17 +1639,28 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // even once pending-clearing let requests complete. The tip
                     // advances as synced blocks persist (Blocks handler →
                     // put_block), so this drives forward progress to the head.
-                    let local_h = storage_for_sync.blocks.get_latest_height().unwrap_or(0);
-                    let start_from = if local_h > 0 {
-                        storage_for_sync
-                            .blocks
-                            .get_block_by_height(local_h)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| citrate_consensus::types::Hash::new([0u8; 32]))
-                    } else {
-                        citrate_consensus::types::Hash::new([0u8; 32])
-                    };
+                    // Anchor sync on the APPLIED (execute-on-receive selected)
+                    // tip — NOT the height index. `get_latest_height` /
+                    // `get_block_by_height` return the highest STORED block,
+                    // which on a follower that is behind is a gossiped tip
+                    // stored far ahead of the applied chain (with the whole
+                    // range below it missing), or a non-selected sibling
+                    // (`put_block` is last-writer-wins per height). Anchoring
+                    // there made the node request blocks AFTER a gap it had
+                    // never filled: the server resolves that unknown/ahead
+                    // anchor to nothing servable and replies "Sending 0 blocks",
+                    // so the applied tip never advanced — the exact boot stall at
+                    // 5580 while the stored height silently tracked the
+                    // producer's tip. The applied tip is the last block we truly
+                    // extended state with, so requesting ITS children is the gap
+                    // we actually need. Genesis sentinel when nothing is applied.
+                    let start_from = storage_for_sync
+                        .blocks
+                        .get_applied_tip()
+                        .ok()
+                        .flatten()
+                        .map(|(hash, _height)| hash)
+                        .unwrap_or_else(|| citrate_consensus::types::Hash::new([0u8; 32]));
                     // Request next headers and blocks from our last known point only if not saturated
                     let (ph, pb) = sync_for_loop.pending_counts().await;
                     if ph < 8 {
