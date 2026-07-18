@@ -1446,18 +1446,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
 
     // Start P2P listener and connect to bootstrap nodes
     {
-        // Prepare head info
-        let head_height = storage.blocks.get_latest_height().unwrap_or(0);
-        let head_hash = if head_height > 0 {
-            storage
-                .blocks
-                .get_block_by_height(head_height)
-                .ok()
-                .flatten()
-                .unwrap_or_default()
-        } else {
-            citrate_consensus::types::Hash::default()
-        };
+        // Prepare head info — advertise our APPLIED tip (height + hash), NOT the
+        // stored height index. A follower stores gossiped tips far ahead of its
+        // applied chain; advertising the stored max makes it look caught up to
+        // peers (which then pick it as a sync source and it serves them nothing)
+        // and mis-drives fork choice. The applied tip is our true synced head.
+        let (head_hash, head_height) = storage
+            .blocks
+            .get_applied_tip()
+            .ok()
+            .flatten()
+            .unwrap_or((citrate_consensus::types::Hash::default(), 0));
         let genesis_hash = storage
             .blocks
             .get_block_by_height(0)
@@ -1748,9 +1747,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 match msg {
                     NetworkMessage::Hello { head_height, head_hash, .. } => {
                         // Kick off naive sync: request blocks from genesis if behind
+                        // APPLIED tip, not the stored height index: a follower
+                        // stores gossiped tips far ahead of its applied chain, so
+                        // get_latest_height() would report it as already caught up
+                        // (7000) when it has only APPLIED to 5580 — the trigger
+                        // then never fires and the node never starts syncing the
+                        // gap from a genuinely-ahead peer.
                         let local_h = storage_for_handler
                             .blocks
-                            .get_latest_height()
+                            .get_applied_tip()
+                            .ok()
+                            .flatten()
+                            .map(|(_, h)| h)
                             .unwrap_or(0);
                         if head_height > local_h {
                             let _ = sync_for_rx.start_sync(head_height, head_hash).await;
@@ -1759,9 +1767,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // Sync manager will request in periodic loop
                     }
                     NetworkMessage::HelloAck { head_height, head_hash, .. } => {
+                        // APPLIED tip, not the stored height index: a follower
+                        // stores gossiped tips far ahead of its applied chain, so
+                        // get_latest_height() would report it as already caught up
+                        // (7000) when it has only APPLIED to 5580 — the trigger
+                        // then never fires and the node never starts syncing the
+                        // gap from a genuinely-ahead peer.
                         let local_h = storage_for_handler
                             .blocks
-                            .get_latest_height()
+                            .get_applied_tip()
+                            .ok()
+                            .flatten()
+                            .map(|(_, h)| h)
                             .unwrap_or(0);
                         if head_height > local_h {
                             let _ = sync_for_rx.start_sync(head_height, head_hash).await;
