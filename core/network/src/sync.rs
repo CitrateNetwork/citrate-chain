@@ -300,7 +300,19 @@ impl SyncManager {
         // Update progress
         let current = *self.current_height.read().await;
         let target = *self.target_height.read().await;
-        let progress = ((last_height - current) as f32 / (target - current) as f32) * 100.0;
+        // Guard against u64 underflow: a peer on a shorter/sibling branch can
+        // answer with `target`/`last_height` at or below `current` (e.g. during
+        // a fork or reorg). With release `overflow-checks = true` a bare
+        // subtraction panics the sync worker thread (previously observed here as
+        // "attempt to subtract with overflow"). Saturate, and guard the
+        // denominator so an at-tip peer reports 100% rather than dividing by 0.
+        let span = target.saturating_sub(current);
+        let done = last_height.saturating_sub(current);
+        let progress = if span == 0 {
+            100.0
+        } else {
+            (done as f32 / span as f32) * 100.0
+        };
 
         *self.state.write().await = SyncState::DownloadingHeaders {
             from: first_hash,
