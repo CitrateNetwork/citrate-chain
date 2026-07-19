@@ -609,4 +609,13 @@ pub enum ExecutionError {
     /// and MUST be rejected; world state is left untouched (reverted).
     #[error("State root mismatch: block claims {expected}, re-execution produced {got}")]
     StateRootMismatch { expected: Hash, got: Hash },
+
+    /// VALIDATOR-S1 §R': a block violated a priority-fee reward-settlement import
+    /// rule and MUST be rejected — a committed `base_fee_per_gas` != the reroll
+    /// constant, a `header.coinbase` that is not the proposer's registered
+    /// `stakerAddress` at the epoch snapshot, a proposer absent from the snapshot,
+    /// or an included transaction whose `gas_price < base_fee` (EIP-1559 invalid).
+    /// Deterministic: every correctly-synced node reaches the identical verdict.
+    #[error("Reward settlement rejected: {0}")]
+    RewardSettlement(String),
 }

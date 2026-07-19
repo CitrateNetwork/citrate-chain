@@ -3,6 +3,9 @@ pragma solidity ^0.8.26;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Base64.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
+import "./MemberEmblem.sol";
 
 /// @title CitrateMemberSBT — CORE-S5.4 (citrate-core planset 02 §5.2b)
 ///
@@ -158,6 +161,72 @@ contract CitrateMemberSBT is ERC721, Ownable {
 
     function getMember(uint256 tokenId) external view returns (Member memory) {
         return _members[_requireMinted(tokenId)];
+    }
+
+    /// On-chain, deterministic ERC-721 metadata (WS-2). Returns a
+    /// `data:application/json;base64,…` document embedding a
+    /// `data:image/svg+xml;base64,…` emblem generated wholly on-chain from the
+    /// token owner's wallet address via `MemberEmblem` — an EXACT port of
+    /// citrate-core's `sbtArt.ts`, so the explorer emblem is byte-identical to
+    /// the in-app one. No IPFS, no baseURI, no placeholder (Rule 1): the seed
+    /// is the owner address itself, so parity is structural, not configured.
+    ///
+    /// Reverts (ERC721NonexistentToken via `_requireOwned`) for unminted or
+    /// burned/revoked tokens — there is no empty/placeholder URI path.
+    function tokenURI(uint256 tokenId) public view override returns (string memory) {
+        address owner = _requireOwned(tokenId);
+        Member storage m = _members[tokenId];
+
+        (string memory svg, uint256 palIdx) = MemberEmblem.render(owner);
+
+        string memory image = string(
+            abi.encodePacked(
+                "data:image/svg+xml;base64,",
+                Base64.encode(bytes(svg))
+            )
+        );
+
+        string memory json = string(
+            abi.encodePacked(
+                '{"name":"Citrate MemberSBT #',
+                Strings.toString(tokenId),
+                '","description":"Soulbound Citrate membership token. The emblem is generated deterministically on-chain from the member wallet address (no IPFS, no external image) and matches the in-app identity mark.","image":"',
+                image,
+                '","attributes":[',
+                _attributes(owner, m, palIdx),
+                "]}"
+            )
+        );
+
+        return string(
+            abi.encodePacked(
+                "data:application/json;base64,",
+                Base64.encode(bytes(json))
+            )
+        );
+    }
+
+    /// The metadata attribute array (member fields + emblem seed params).
+    function _attributes(address owner, Member storage m, uint256 palIdx)
+        private
+        view
+        returns (string memory)
+    {
+        return string(
+            abi.encodePacked(
+                '{"trait_type":"Wallet","value":"',
+                Strings.toHexString(owner),
+                '"},{"trait_type":"Sub Hash","value":"',
+                Strings.toHexString(uint256(m.subHash), 32),
+                '"},{"trait_type":"Term Start","display_type":"date","value":',
+                Strings.toString(uint256(m.termStart)),
+                '},{"trait_type":"Term End","display_type":"date","value":',
+                Strings.toString(uint256(m.termEnd)),
+                '},{"trait_type":"Palette","value":"',
+                Strings.toString(palIdx),
+                '"}'
+            )
+        );
     }
 
     /// Look up the tokenId bound to a subHash. Reverts for unbound subs.
