@@ -56,10 +56,10 @@
     "CitrateCooperativeFactory": "0x6fe6fd2aa92e9c8b996258671647b5369b366aa4"
   },
   "aaStack": {
-    "EntryPoint": "0x077Fbc3338A9e6BAD90A3A041E6b7425689754Ef",
-    "CitrateWallet": "0xe641a41b02f1ff114481d357d148be4519830087",
-    "CitrateWalletFactory": "0x7b0eCE41ff4958cB1e26e0fc8e99DB442bf560c6",
-    "CitratePaymaster": "0x44AE1e0b3f531E9b77284e9Efa819217FF1C7d62",
+    "EntryPoint": "0xc698feaf0ff7fdb0d60e2f620c97cb729a694975",
+    "CitrateWallet": "0x79c4a8367d2d65b162de841ff678db4875490b2e",
+    "CitrateWalletFactory": "0x5a45b6f83050a76a81d0f2e6c857f16b37b2693b",
+    "CitratePaymaster": "0xf14f56e812ce93544e75e841ac6316f2d7e561b0",
     "WebAuthnP256Validator": "0x97ff6d1c4d2f4337ec09f2a1c01808016f728def",
     "CitrateECDSAValidator": "0xd2d35421379ae5b461e216bfcdd1b7e6a64bbc40",
     "GuardianRecoveryModule": "0x381b5848f3b5d73ff67b745624780a43682456ce"
@@ -90,6 +90,6 @@
     "X402TransferAuthVerify": "0x0000000000000000000000000000000000000201",
     "X402BatchPaymentVerify": "0x0000000000000000000000000000000000000202"
   },
-  "CitrateMemberSBT": "0x16041DDF6cdb49d3A2D46dA23b5C5820BBD92a66",
-  "MembershipStakeVault": "0x94c0A52350ed198641aA720B6666931AF593Eec2"
+  "CitrateMemberSBT": "0x7be005aa8c45c1695b4c75468c6ca8b40238a7c4",
+  "MembershipStakeVault": "0x0aceb7b474ecc4abe12696ce48628f0cabe0267e"
 }
