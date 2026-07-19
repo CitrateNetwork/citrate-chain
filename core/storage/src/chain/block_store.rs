@@ -189,6 +189,40 @@ impl BlockStore {
         }
     }
 
+    /// Enumerate `(height, hash)` for every stored block whose height is in
+    /// `[start, end]` inclusive, scanning headers (cheaper than full blocks).
+    ///
+    /// #85 (fresh-node forward-sync wedge): the single-hash `get_block_by_height`
+    /// index is last-writer-wins, so on a multi-producer GhostDAG it drops the
+    /// SIBLING blocks at each height. A joining node then never receives the
+    /// merge-parents that canonical blocks reference, and every admission fails
+    /// with "Missing parent at admission". DAG-aware serving needs ALL blocks at
+    /// each height; this returns them so the serve path can deliver complete
+    /// height-groups in topological (height-ascending) order.
+    ///
+    /// Cost: O(total stored headers) per call (no per-height multi-hash index
+    /// exists yet). Acceptable because only a late-joining peer triggers it and
+    /// the result is bounded downstream; a height→[hashes] index is the future
+    /// optimization if sync-serve load ever warrants it.
+    pub fn hashes_in_height_range(&self, start: u64, end: u64) -> Result<Vec<(u64, Hash)>> {
+        let mut out: Vec<(u64, Hash)> = Vec::new();
+        if start > end {
+            return Ok(out);
+        }
+        for (key, value) in self.db.iter_cf(CF_HEADERS)? {
+            // Key is the 32-byte block hash; value is a serialized BlockHeader.
+            let Some(hash) = Hash::try_from_bytes(key.as_ref()) else {
+                continue;
+            };
+            if let Ok(header) = bincode::deserialize::<BlockHeader>(&value) {
+                if header.height >= start && header.height <= end {
+                    out.push((header.height, hash));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Get children of a block
     pub fn get_children(&self, parent: &Hash) -> Result<Vec<Hash>> {
         let key = parent_children_key(parent);

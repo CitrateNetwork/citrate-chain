@@ -96,9 +96,82 @@ pub fn serve_headers(storage: &StorageManager, from: &Hash, count: u32) -> Vec<B
     })
 }
 
-/// Serve a `GetBlocks { from, count }` request, fully bounded.
+/// Serve a `GetBlocks { from, count }` request, fully bounded and DAG-aware.
+///
+/// #85 (fresh-node forward-sync wedge): the linear `collect_bounded` walk
+/// serves exactly ONE block per height (the last-writer-wins height index),
+/// which silently drops the SIBLING blocks a multi-producer GhostDAG creates
+/// at each height. A joining node then admits height 1, but height 2's
+/// canonical block references a height-1 *sibling* it was never sent, so
+/// `validate_block_consistency` fails with "Missing parent at admission" and
+/// the node wedges at height 1 — on every architecture.
+///
+/// The fix serves the DAG in topological (height-ascending) order including
+/// ALL siblings at each height, delivered as COMPLETE height-groups: because
+/// every parent (selected *and* merge) has a strictly lower height than its
+/// child, height-ascending complete-group delivery guarantees the requester
+/// already holds all of a block's parents before that block. Never split a
+/// height across responses (a later batch's child could reference a sibling
+/// this batch left behind) and stop at the first height gap.
 pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Block> {
-    collect_bounded(storage, from, count.min(MAX_BLOCKS_PER_REQUEST), |b| b)
+    let max_items = count.min(MAX_BLOCKS_PER_REQUEST);
+    let Some(start) = resolve_start(storage, from) else {
+        return Vec::new();
+    };
+    let Ok(tip) = storage.blocks.get_latest_height() else {
+        return Vec::new();
+    };
+    if start > tip {
+        return Vec::new();
+    }
+    // A height-group holds >= 1 block, so more than `max_items` heights can
+    // never fit in one response — bound the enumerated window accordingly.
+    let end = start.saturating_add(max_items as u64).min(tip);
+    let mut rows = match storage.blocks.hashes_in_height_range(start, end) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    // Deterministic, peer-independent order: height asc, then hash asc.
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_bytes().cmp(b.1.as_bytes())));
+
+    let mut out: Vec<Block> = Vec::new();
+    let mut budget = MAX_RESPONSE_BYTES;
+    let mut expected = start;
+    let mut i = 0usize;
+    while i < rows.len() {
+        let h = rows[i].0;
+        // Heights must be contiguous from `start`: a gap means nothing further
+        // is admissible in order, so stop rather than serve a disconnected tail.
+        if h != expected {
+            break;
+        }
+        // Gather the WHOLE sibling group at height `h`.
+        let mut group: Vec<Block> = Vec::new();
+        let mut group_bytes = 0u64;
+        while i < rows.len() && rows[i].0 == h {
+            if let Ok(Some(block)) = storage.blocks.get_block(&rows[i].1) {
+                let sz = bincode::serialized_size(&block).unwrap_or(u64::MAX);
+                group_bytes = group_bytes.saturating_add(sz);
+                group.push(block);
+            }
+            i += 1;
+        }
+        if group.is_empty() {
+            break; // unreadable height behaves as a gap
+        }
+        // Always emit the first group (forward-progress guarantee even if a
+        // single height's siblings exceed the soft budget); otherwise stop
+        // before a group that would blow the item cap or the byte budget.
+        if !out.is_empty()
+            && ((out.len() + group.len()) as u32 > max_items || group_bytes > budget)
+        {
+            break;
+        }
+        budget = budget.saturating_sub(group_bytes);
+        out.extend(group);
+        expected = h.saturating_add(1);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -254,6 +327,84 @@ mod tests {
         assert_eq!(headers.len(), 3, "heights 2, 3, 4");
         assert_eq!(headers[0].height, 2);
         assert_eq!(headers[2].height, 4);
+    }
+
+    /// Build a block with an explicit id-derived hash, a selected parent,
+    /// and optional merge parents (for constructing multi-producer DAGs).
+    fn dag_block(id: u8, height: u64, selected: Hash, merges: Vec<Hash>) -> Block {
+        let mut bytes = [id; 32];
+        bytes[0] = id; // ensure never all-zero (genesis sentinel)
+        BlockBuilder::new()
+            .hash(Hash::new(bytes))
+            .parent(selected)
+            .merge_parents(merges)
+            .height(height)
+            .timestamp(1_000_000 + height)
+            .blue_score(height * 10)
+            .blue_work(height as u128 * 100)
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed()
+    }
+
+    /// #85 regression: on a multi-producer GhostDAG the serve must deliver
+    /// EVERY sibling at each height (a complete height-group) in topological
+    /// order — not the single last-writer-wins block. Here height 1 has two
+    /// siblings A and B; the height-2 block C selects A and MERGES B. A
+    /// requester can only admit C if it already holds BOTH A and B, so the
+    /// serve must return A and B (both height 1) before C (height 2).
+    #[test]
+    fn serves_all_siblings_before_merging_child() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let genesis = dag_block(1, 0, Hash::default(), vec![]);
+        let g = genesis.hash();
+        let a1 = dag_block(0xA1, 1, g, vec![]);
+        let b1 = dag_block(0xB1, 1, g, vec![]);
+        // C selects A1, merges B1 — B1 is a merge-parent the old serve dropped.
+        let c2 = dag_block(0xC2, 2, a1.hash(), vec![b1.hash()]);
+        for b in [&genesis, &a1, &b1, &c2] {
+            storage.blocks.put_block(b).expect("put_block");
+        }
+
+        let served = serve_blocks(&storage, &Hash::new(ZERO_ANCHOR), u32::MAX);
+        let heights: Vec<u64> = served.iter().map(|b| b.header.height).collect();
+        // Both height-1 siblings must be present...
+        let hashes: Vec<Hash> = served.iter().map(|b| b.hash()).collect();
+        assert!(hashes.contains(&a1.hash()), "sibling A1 must be served");
+        assert!(hashes.contains(&b1.hash()), "sibling B1 (a merge-parent) must be served");
+        assert!(hashes.contains(&c2.hash()), "child C2 must be served");
+        // ...and every height-1 block must precede the height-2 child.
+        let c_idx = served.iter().position(|b| b.hash() == c2.hash()).expect("C2 present");
+        for (idx, h) in heights.iter().enumerate() {
+            if *h == 1 {
+                assert!(idx < c_idx, "all height-1 siblings must precede the height-2 child");
+            }
+        }
+    }
+
+    /// A height-group is never split across a response: if the item cap lands
+    /// mid-height, the whole group is deferred so a later batch's child never
+    /// references an unserved sibling.
+    #[test]
+    fn does_not_split_a_height_group() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let genesis = dag_block(1, 0, Hash::default(), vec![]);
+        let g = genesis.hash();
+        // Three siblings at height 1.
+        let s = [dag_block(0x11, 1, g, vec![]), dag_block(0x12, 1, g, vec![]), dag_block(0x13, 1, g, vec![])];
+        storage.blocks.put_block(&genesis).expect("put");
+        for b in &s {
+            storage.blocks.put_block(b).expect("put");
+        }
+        // genesis(0) is one group, height-1 is a 3-sibling group. Ask for a
+        // count that could only fit genesis + part of height 1 — the height-1
+        // group must be served whole or not at all.
+        let served = serve_blocks(&storage, &Hash::new(ZERO_ANCHOR), 2);
+        let h1 = served.iter().filter(|b| b.header.height == 1).count();
+        assert!(h1 == 0 || h1 == 3, "height-1 group served whole or not at all, got {h1}");
     }
 
     /// The serialized response always fits the byte budget (which sits
