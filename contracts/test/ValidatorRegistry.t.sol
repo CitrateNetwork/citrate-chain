@@ -477,6 +477,38 @@ contract ValidatorRegistryTest is Test {
         r2.queueParam(keccak256("maxEpochEmission"), 2_000_000 ether); // > CEIL
     }
 
+    // ── WS-5 reconcile: 100% priority-fee share is admissible (bound is <= 10000) ──
+    function test_ctor_priorityFeeShare_100pct_admissible() public {
+        // Exactly 10000 bps (100%) must construct — the owner routes the whole share.
+        ValidatorRegistry r2 = new ValidatorRegistry(gov, slasher, minter, MIN, 1 ether, 10000, 10_000 ether);
+        assertEq(r2.priorityFeeShareBps(), 10000, "100% share must be stored");
+    }
+
+    function test_ctor_priorityFeeShare_over100pct_reverts() public {
+        // Above 100% is still nonsensical → OutOfBounds.
+        vm.expectRevert(ValidatorRegistry.OutOfBounds.selector);
+        new ValidatorRegistry(gov, slasher, minter, MIN, 1 ether, 10001, 10_000 ether);
+    }
+
+    function test_governance_priorityFeeShare_to100pct_admissible() public {
+        // Governance may raise the share up to (and including) 100% within the 50% delta bound.
+        // start at 8000 so a single change to 10000 is within +50% (max +4000).
+        ValidatorRegistry r2 = new ValidatorRegistry(gov, slasher, minter, MIN, 1 ether, 8000, 10_000 ether);
+        vm.prank(gov);
+        r2.queueParam(keccak256("priorityFeeShareBps"), 10000); // exactly 100% — must NOT revert
+        vm.warp(block.timestamp + r2.GOV_TIMELOCK());
+        vm.prank(gov);
+        r2.executeParam(keccak256("priorityFeeShareBps"));
+        assertEq(r2.priorityFeeShareBps(), 10000, "governance set to 100%");
+    }
+
+    function test_governance_priorityFeeShare_over100pct_reverts() public {
+        ValidatorRegistry r2 = new ValidatorRegistry(gov, slasher, minter, MIN, 1 ether, 8000, 10_000 ether);
+        vm.prank(gov);
+        vm.expectRevert(ValidatorRegistry.OutOfBounds.selector);
+        r2.queueParam(keccak256("priorityFeeShareBps"), 10001); // > 100% → OutOfBounds
+    }
+
     function test_governance_bootstrapFromZero_stillBounded() public {
         // maxEpochEmission == 0 → bootstrap path skips the % delta, but the absolute CEIL still bites
         ValidatorRegistry r2 = new ValidatorRegistry(gov, slasher, minter, MIN, 0, 0, 0);

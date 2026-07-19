@@ -20,13 +20,25 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
-/// Parameters sent during handshake
+/// Parameters sent during handshake.
 #[derive(Debug, Clone)]
 pub struct HandshakeParams {
     pub network_id: u32,
     pub genesis_hash: Hash,
-    pub head_height: u64,
-    pub head_hash: Hash,
+    /// LIVE head (height, hash), shared with the node and read FRESH at every
+    /// handshake. Previously this was a static (height, hash) snapshot captured
+    /// at transport construction — i.e. genesis (height 0) for a node that boots
+    /// fresh. A producer therefore advertised head 0 forever, so no follower's
+    /// Hello/HelloAck sync-trigger ever fired and no one ever synced. The node
+    /// updates this via `HandshakeParams::head` as its applied tip advances.
+    pub head: Arc<tokio::sync::RwLock<(u64, Hash)>>,
+}
+
+impl HandshakeParams {
+    /// Read the current advertised head (height, hash).
+    pub async fn current_head(&self) -> (u64, Hash) {
+        *self.head.read().await
+    }
 }
 
 /// TCP-based transport with optional Noise encryption and length-delimited frames.
@@ -265,11 +277,12 @@ async fn handle_inbound(
         _ => return Err(NetworkError::ProtocolError("expected Hello".into())),
     };
 
-    // Send HelloAck (encrypt if noise enabled)
+    // Send HelloAck (encrypt if noise enabled) — advertise our LIVE head.
+    let (adv_height, adv_hash) = params.current_head().await;
     let ack = NetworkMessage::HelloAck {
         version: ProtocolVersion::CURRENT,
-        head_height: params.head_height,
-        head_hash: params.head_hash,
+        head_height: adv_height,
+        head_hash: adv_hash,
         peer_id: local_id.0.clone(),
     };
     let ser = bincode::serialize(&ack)
@@ -457,13 +470,14 @@ async fn handle_outbound(
     let framed = Framed::new(stream, codec);
     let (mut sink, mut stream_rx) = framed.split();
 
-    // Send Hello (encrypt if noise enabled)
+    // Send Hello (encrypt if noise enabled) — advertise our LIVE head.
+    let (adv_height, adv_hash) = params.current_head().await;
     let hello = NetworkMessage::Hello {
         version: ProtocolVersion::CURRENT,
         network_id: params.network_id,
         genesis_hash: params.genesis_hash,
-        head_height: params.head_height,
-        head_hash: params.head_hash,
+        head_height: adv_height,
+        head_hash: adv_hash,
         peer_id: local_id.0.clone(),
     };
     let ser = bincode::serialize(&hello)

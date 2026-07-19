@@ -126,6 +126,39 @@ pub fn generate_keypair() -> SigningKey {
     SigningKey::from_bytes(&rand::random())
 }
 
+/// Domain-separation prefix hashed before the coinbase to derive a node's
+/// deterministic ed25519 block-signing (proposer) key.
+///
+/// LOAD-BEARING: the node (`node/src/main.rs` block producer) and the
+/// registration ceremony (`node/src/bin/validator_registration_ceremony.rs`)
+/// BOTH derive the proposer key via [`derive_block_signing_key`], which hashes
+/// this exact byte string. If these two derivations ever disagreed by a single
+/// bit, the pubkey the ceremony registers on-chain would not match the key the
+/// node signs blocks with, and that node would be rejected as a proposer. This
+/// constant + [`derive_block_signing_key`] are the single source of truth that
+/// makes such drift impossible.
+pub const BLOCK_SIGNING_KEY_DOMAIN: &[u8] = b"citrate-block-signing-key-v1";
+
+/// Derive a node's deterministic ed25519 block-signing (proposer) key from its
+/// 32-byte coinbase buffer: `Sha3_256(BLOCK_SIGNING_KEY_DOMAIN ‖ coinbase32)`
+/// seeds `Ed25519SigningKey::from_bytes`.
+///
+/// The 32-byte buffer is the node's 20-byte coinbase address zero-padded on the
+/// right to 32 bytes (the shape the block producer already builds). Callers that
+/// hold only a 20-byte address MUST zero-extend it to 32 bytes the same way.
+///
+/// This is the ONE place the derivation lives; see [`BLOCK_SIGNING_KEY_DOMAIN`].
+pub fn derive_block_signing_key(coinbase32: &[u8; 32]) -> Ed25519SigningKey {
+    use sha3::{Digest as _, Sha3_256};
+    let mut hasher = Sha3_256::new();
+    hasher.update(BLOCK_SIGNING_KEY_DOMAIN);
+    hasher.update(coinbase32);
+    let seed = hasher.finalize();
+    let mut seed_bytes = [0u8; 32];
+    seed_bytes.copy_from_slice(&seed);
+    Ed25519SigningKey::from_bytes(&seed_bytes)
+}
+
 /// Sign a block's canonical hash with an ed25519 signing key.
 ///
 /// The block hash MUST already be computed via `Block::compute_hash()` before calling this.

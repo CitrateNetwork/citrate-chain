@@ -1292,6 +1292,25 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 None
             }
         });
+    // VALIDATOR-S1 §R': fail fast if the activation height is below the FIRST
+    // materialized snapshot S(1) = EPOCH - SNAPSHOT_LAG (= 800). Below S(1) no epoch
+    // policy is ever materialized, so — with the §R' hard-reject — every block at/above
+    // activation but below 800 would be rejected (a node brick). Refuse to start rather
+    // than silently misconfigure the fleet.
+    if let Some((_, activation)) = &validator_registry {
+        let s1 = registry_sync::EPOCH - registry_sync::SNAPSHOT_LAG;
+        if *activation < s1 {
+            return Err(anyhow::anyhow!(
+                "CITRATE_VALIDATOR_ACTIVATION_HEIGHT {} is below the first snapshot S(1)={}; \
+                 §R' vesting cannot be enforced before an epoch policy exists",
+                activation, s1
+            ));
+        }
+        // §R' hard-reject: teach the executor the activation height INDEPENDENTLY of the
+        // (initially-None) policy cell, so a None policy at/above activation is a rejectable
+        // fault rather than a silent skip (which would fork this node from the fleet).
+        executor.set_validator_activation_height(*activation);
+    }
     // The shared proposer selector — the SAME Arc the DAG store admits against and the
     // snapshot-sync rebuilds. production() disables the forgeable legacy VRF path.
     let validator_selector: Option<Arc<citrate_consensus::vrf::VrfProposerSelector>> = validator_registry
@@ -1374,10 +1393,29 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // VALIDATOR-S1 (step 5): attach the registry snapshot-sync so a node
             // that RECEIVES or REORGS to a snapshot block S(E) rebuilds its
             // proposer selector from the registry — not only the producer.
-            if let (Some((registry, _)), Some(sel)) = (&validator_registry, &validator_selector) {
-                app_builder = app_builder.with_registry_sync(Arc::new(
-                    registry_sync::RegistrySync::new(executor.clone(), sel.clone(), *registry),
+            if let (Some((registry, activation)), Some(sel)) = (&validator_registry, &validator_selector) {
+                let rs = Arc::new(registry_sync::RegistrySync::new(
+                    executor.clone(),
+                    sel.clone(),
+                    *registry,
+                    *activation,
+                    storage.clone(),
                 ));
+                // BOOT REHYDRATION (fixes the restart reward-policy fork AND the pre-
+                // existing membership restart-brick): before the driver drains or serves
+                // ANY block, restore BOTH the §R' reward policy cell AND the proposer
+                // selector for the epoch governing the resumed applied tip — from the
+                // durable snapshot when present, else recomputed from persisted state at
+                // the greatest S(E) <= the tip. Without this, `CanonicalApplicator::new`
+                // resumes from the mid-epoch tip with an empty selector (admission would
+                // reject every proposer) and a None policy (the §R' hard-reject would
+                // reject every block at/above activation).
+                let resumed = app_builder.applied_tip().await.height;
+                match rs.hydrate_on_boot(resumed).await {
+                    Ok(desc) => info!("VALIDATOR-S1: boot rehydration — {}", desc),
+                    Err(e) => warn!("VALIDATOR-S1: boot rehydration failed at height {}: {}", resumed, e),
+                }
+                app_builder = app_builder.with_registry_sync(rs);
                 info!("VALIDATOR-S1: registry snapshot-sync attached to execute-on-receive driver (received/reorged S(E) blocks)");
             }
             let app = Arc::new(app_builder);
@@ -1408,18 +1446,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
 
     // Start P2P listener and connect to bootstrap nodes
     {
-        // Prepare head info
-        let head_height = storage.blocks.get_latest_height().unwrap_or(0);
-        let head_hash = if head_height > 0 {
-            storage
-                .blocks
-                .get_block_by_height(head_height)
-                .ok()
-                .flatten()
-                .unwrap_or_default()
-        } else {
-            citrate_consensus::types::Hash::default()
-        };
+        // Prepare head info — advertise our APPLIED tip (height + hash), NOT the
+        // stored height index. A follower stores gossiped tips far ahead of its
+        // applied chain; advertising the stored max makes it look caught up to
+        // peers (which then pick it as a sync source and it serves them nothing)
+        // and mis-drives fork choice. The applied tip is our true synced head.
+        let (head_hash, head_height) = storage
+            .blocks
+            .get_applied_tip()
+            .ok()
+            .flatten()
+            .unwrap_or((citrate_consensus::types::Hash::default(), 0));
         let genesis_hash = storage
             .blocks
             .get_block_by_height(0)
@@ -1458,18 +1495,43 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             &noise_keypair.public_key_hex()[..16],
             local_peer_id
         );
+        // Shared LIVE head advertised in every handshake. Seeded with our current
+        // applied tip and refreshed below as we apply/produce blocks — so a node
+        // advertises its CURRENT head, not the genesis snapshot it booted with.
+        let advertised_head =
+            std::sync::Arc::new(tokio::sync::RwLock::new((head_height, head_hash)));
         let transport = NetworkTransport::new(
             peer_manager.clone(),
             local_peer_id,
             citrate_network::transport::HandshakeParams {
                 network_id,
                 genesis_hash,
-                head_height,
-                head_hash,
+                head: advertised_head.clone(),
             },
         )
         .with_noise(noise_keypair)
         .with_allowed_peers(config.network.allowed_peers.clone());
+        // Keep the advertised head current (every 1s) from the persisted applied
+        // tip, so peers see us advance and their sync triggers fire.
+        {
+            let advertised_head = advertised_head.clone();
+            let storage_head = storage.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    if let Ok(Some((hash, height))) =
+                        storage_head.blocks.get_applied_tip()
+                    {
+                        let mut g = advertised_head.write().await;
+                        if g.0 != height {
+                            *g = (height, hash);
+                        }
+                    }
+                }
+            });
+        }
         let listen_addr = config.network.listen_addr;
         transport
             .start_listener(listen_addr)
@@ -1601,17 +1663,28 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // even once pending-clearing let requests complete. The tip
                     // advances as synced blocks persist (Blocks handler →
                     // put_block), so this drives forward progress to the head.
-                    let local_h = storage_for_sync.blocks.get_latest_height().unwrap_or(0);
-                    let start_from = if local_h > 0 {
-                        storage_for_sync
-                            .blocks
-                            .get_block_by_height(local_h)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| citrate_consensus::types::Hash::new([0u8; 32]))
-                    } else {
-                        citrate_consensus::types::Hash::new([0u8; 32])
-                    };
+                    // Anchor sync on the APPLIED (execute-on-receive selected)
+                    // tip — NOT the height index. `get_latest_height` /
+                    // `get_block_by_height` return the highest STORED block,
+                    // which on a follower that is behind is a gossiped tip
+                    // stored far ahead of the applied chain (with the whole
+                    // range below it missing), or a non-selected sibling
+                    // (`put_block` is last-writer-wins per height). Anchoring
+                    // there made the node request blocks AFTER a gap it had
+                    // never filled: the server resolves that unknown/ahead
+                    // anchor to nothing servable and replies "Sending 0 blocks",
+                    // so the applied tip never advanced — the exact boot stall at
+                    // 5580 while the stored height silently tracked the
+                    // producer's tip. The applied tip is the last block we truly
+                    // extended state with, so requesting ITS children is the gap
+                    // we actually need. Genesis sentinel when nothing is applied.
+                    let start_from = storage_for_sync
+                        .blocks
+                        .get_applied_tip()
+                        .ok()
+                        .flatten()
+                        .map(|(hash, _height)| hash)
+                        .unwrap_or_else(|| citrate_consensus::types::Hash::new([0u8; 32]));
                     // Request next headers and blocks from our last known point only if not saturated
                     let (ph, pb) = sync_for_loop.pending_counts().await;
                     if ph < 8 {
@@ -1699,9 +1772,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 match msg {
                     NetworkMessage::Hello { head_height, head_hash, .. } => {
                         // Kick off naive sync: request blocks from genesis if behind
+                        // APPLIED tip, not the stored height index: a follower
+                        // stores gossiped tips far ahead of its applied chain, so
+                        // get_latest_height() would report it as already caught up
+                        // (7000) when it has only APPLIED to 5580 — the trigger
+                        // then never fires and the node never starts syncing the
+                        // gap from a genuinely-ahead peer.
                         let local_h = storage_for_handler
                             .blocks
-                            .get_latest_height()
+                            .get_applied_tip()
+                            .ok()
+                            .flatten()
+                            .map(|(_, h)| h)
                             .unwrap_or(0);
                         if head_height > local_h {
                             let _ = sync_for_rx.start_sync(head_height, head_hash).await;
@@ -1710,9 +1792,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // Sync manager will request in periodic loop
                     }
                     NetworkMessage::HelloAck { head_height, head_hash, .. } => {
+                        // APPLIED tip, not the stored height index: a follower
+                        // stores gossiped tips far ahead of its applied chain, so
+                        // get_latest_height() would report it as already caught up
+                        // (7000) when it has only APPLIED to 5580 — the trigger
+                        // then never fires and the node never starts syncing the
+                        // gap from a genuinely-ahead peer.
                         let local_h = storage_for_handler
                             .blocks
-                            .get_latest_height()
+                            .get_applied_tip()
+                            .ok()
+                            .flatten()
+                            .map(|(_, h)| h)
                             .unwrap_or(0);
                         if head_height > local_h {
                             let _ = sync_for_rx.start_sync(head_height, head_hash).await;
@@ -2224,16 +2315,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // WP-G.2: Generate block signing key.
         // Deterministic derivation from coinbase for devnet reproducibility.
         // Production nodes should load a persistent key from disk.
-        let signing_key = {
-            use sha3::{Digest as _, Sha3_256};
-            let mut hasher = Sha3_256::new();
-            hasher.update(b"citrate-block-signing-key-v1");
-            hasher.update(coinbase);
-            let seed = hasher.finalize();
-            let mut seed_bytes = [0u8; 32];
-            seed_bytes.copy_from_slice(&seed);
-            citrate_consensus::crypto::Ed25519SigningKey::from_bytes(&seed_bytes)
-        };
+        //
+        // LOAD-BEARING: this MUST be the SAME derivation the registration
+        // ceremony (node/src/bin/validator_registration_ceremony.rs) uses, or the
+        // pubkey registered on-chain won't match the key that signs blocks here.
+        // Both call the single shared `derive_block_signing_key`; see its
+        // BLOCK_SIGNING_KEY_DOMAIN doc-comment.
+        let signing_key = citrate_consensus::crypto::derive_block_signing_key(&coinbase);
         info!(
             "Block signing key: proposer_pubkey={}",
             hex::encode(signing_key.verifying_key().to_bytes())
@@ -2285,6 +2373,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     executor.clone(),
                     sel.clone(),
                     *registry,
+                    *activation_height,
+                    storage.clone(),
                 )));
             info!(
                 "VALIDATOR-S1: stake-gated membership ENABLED (registry 0x{}, activation height {})",
@@ -2296,7 +2386,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // EXECUTE-ON-RECEIVE (reroll addendum): seal version-2 headers that commit the
         // coinbase, making state_root reproducible by receivers. Feature-flagged
         // (CITRATE_BLOCK_V2=1) so it activates at the reroll; default off keeps v1 headers.
-        if std::env::var("CITRATE_BLOCK_V2").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        // Uses the SINGLE parsed `execute_on_receive_enabled` (parsed once above) so the
+        // producer's v2-header emission can NEVER diverge from the receive-path applier's
+        // enablement — a split parse could seal v2 blocks with no applier, or vice-versa.
+        if execute_on_receive_enabled {
             producer_instance = producer_instance.with_v2_headers(true);
             info!("EXECUTE-ON-RECEIVE: sealing version-2 headers (coinbase committed in block hash)");
         }
