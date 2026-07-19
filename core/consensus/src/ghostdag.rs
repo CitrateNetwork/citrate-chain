@@ -785,13 +785,28 @@ impl GhostDag {
         let tips = self.tips.read().await;
         let relations = self.relations.read().await;
 
-        let mut best_tip = None;
-        let mut best_score = 0;
+        let mut best_tip: Option<Hash> = None;
+        let mut best_score: u64 = 0;
 
         for tip in tips.iter() {
             if let Some(relation) = relations.get(tip) {
-                if relation.blue_set.score > best_score {
-                    best_score = relation.blue_set.score;
+                let score = relation.blue_set.score;
+                // Deterministic total order matching the producer's
+                // `cmp_tip_for_parent_selection` (higher blue_score first, ties
+                // broken by SMALLEST hash). This is the receive-side analogue of
+                // audit finding H-08: `tips` is a `HashSet`, so a bare `>` keeps
+                // whichever equal-score sibling the process-random iteration order
+                // surfaces first. Two producers at the same height publish
+                // equal-`blue_score` sibling tips (and `blue_work` is purely
+                // score-derived, so it cannot discriminate either), which made
+                // different nodes latch different branches and never reorg —
+                // a permanent fork. The hash tie-break MUST NOT be removed.
+                let better = match best_tip {
+                    None => true,
+                    Some(cur) => score > best_score || (score == best_score && *tip < cur),
+                };
+                if better {
+                    best_score = score;
                     best_tip = Some(*tip);
                 }
             }
@@ -966,6 +981,79 @@ mod tests {
 
         let best_tip = ghostdag.select_tip().await.unwrap();
         assert_eq!(best_tip, genesis.hash());
+    }
+
+    #[tokio::test]
+    async fn test_select_tip_deterministic_tie_break_by_hash() {
+        // Receive-side analogue of audit finding H-08: equal-`blue_score` sibling
+        // tips (what two concurrent producers create at the same height) MUST
+        // resolve to the same tip — the smallest hash — on every node regardless
+        // of `HashSet` iteration order, or the fleet forks permanently. Before the
+        // fix `select_tip` used a bare `>` with no tie-break and returned whichever
+        // equal-score tip iteration happened to surface first.
+        let params = GhostDagParams::default();
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = GhostDag::new(params, dag_store.clone());
+
+        // Five sibling tips, all at blue_score = 7, distinct hashes.
+        let tie_hashes = [
+            Hash::new([0x11; 32]),
+            Hash::new([0x33; 32]),
+            Hash::new([0x22; 32]),
+            Hash::new([0xAA; 32]),
+            Hash::new([0x05; 32]),
+        ];
+        for h in tie_hashes.iter() {
+            let mut bs = BlueSet::new();
+            bs.insert(*h);
+            bs.score = 7;
+            let rel = DagRelation {
+                block: *h,
+                selected_parent: Hash::default(),
+                merge_parents: vec![],
+                children: vec![],
+                blue_set: bs.clone(),
+                is_chain_block: true,
+                height: 7,
+            };
+            ghostdag.relations.write().await.insert(*h, rel);
+            ghostdag.tips.write().await.insert(*h);
+        }
+
+        let expected = *tie_hashes.iter().min().expect("non-empty"); // 0x05..
+        // HashSet iteration order varies run-to-run; the result must not.
+        for _ in 0..50 {
+            let got = ghostdag.select_tip().await.expect("a tip is available");
+            assert_eq!(
+                got, expected,
+                "select_tip must deterministically pick the smallest-hash tip on a blue_score tie"
+            );
+        }
+
+        // A strictly higher blue_score must win over the whole tie group even
+        // though its hash is the largest — score dominates the tie-break.
+        let winner = Hash::new([0xFF; 32]);
+        let mut wbs = BlueSet::new();
+        wbs.insert(winner);
+        wbs.score = 8;
+        let wrel = DagRelation {
+            block: winner,
+            selected_parent: Hash::default(),
+            merge_parents: vec![],
+            children: vec![],
+            blue_set: wbs.clone(),
+            is_chain_block: true,
+            height: 8,
+        };
+        ghostdag.relations.write().await.insert(winner, wrel);
+        ghostdag.tips.write().await.insert(winner);
+        for _ in 0..20 {
+            assert_eq!(
+                ghostdag.select_tip().await.expect("a tip is available"),
+                winner,
+                "higher blue_score must win regardless of hash ordering"
+            );
+        }
     }
 
     #[tokio::test]
