@@ -69,7 +69,7 @@
     },
     "precompiles": {
       "type": "object",
-      "description": "Built-in executor addresses (state precompiles, runtime inference). NOT contracts — listed for consumer convenience.",
+      "description": "Native executor precompiles — implemented in core/execution/src/precompiles, NO on-chain bytecode by design (eth_getCode returns 0x). Standard EVM precompiles 0x01-0x09 also present but omitted here. NOT contracts — listed for consumer convenience.",
       "additionalProperties": {
         "type": "string",
         "pattern": "^0x[0-9a-fA-F]{40}$"
