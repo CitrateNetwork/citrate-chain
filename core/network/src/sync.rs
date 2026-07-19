@@ -151,24 +151,39 @@ impl SyncManager {
     pub async fn start_sync(&self, peer_height: u64, peer_hash: Hash) -> Result<(), NetworkError> {
         let current = *self.current_height.read().await;
 
-        if peer_height <= current {
+        // Raise the target to the HIGHEST head any peer has advertised — never
+        // lower it. Each connected peer's Hello/HelloAck drives one start_sync
+        // with THAT peer's advertised applied tip. A peer wedged (or genuinely
+        // lagging) at a low applied tip advertises a low head; if we let its
+        // Hello overwrite `target_height`, the target collapses from the real
+        // producer head (~73k) to that low value, `handle_blocks` then sees
+        // `last_height >= target` and declares "Synchronization complete" at the
+        // low height, and the drain stops — the fresh-node wedge-at-7 bug
+        // (handoffs/NODE_FRESH_SYNC_WEDGE_2026-07-19.md). On a peer-to-peer
+        // fleet this is self-reinforcing: nodes wedged at N advertise N to each
+        // other and cap each other's targets. Taking the max keeps the target at
+        // the best-known head so the drain continues to the real tip, and lets a
+        // wedged node recover the moment any peer advertises a higher head.
+        let target = (*self.target_height.read().await).max(peer_height);
+
+        if target <= current {
             *self.state.write().await = SyncState::Synced;
             return Ok(());
         }
 
-        *self.target_height.write().await = peer_height;
+        *self.target_height.write().await = target;
 
         // Start with header download
         *self.state.write().await = SyncState::DownloadingHeaders {
             from: peer_hash,
-            target_height: peer_height,
+            target_height: target,
             progress: 0.0,
         };
 
-        info!("Starting sync from height {} to {}", current, peer_height);
+        info!("Starting sync from height {} to {}", current, target);
 
         // Queue initial header requests
-        self.queue_header_downloads(peer_hash, peer_height - current)
+        self.queue_header_downloads(peer_hash, target - current)
             .await;
 
         Ok(())
@@ -636,6 +651,35 @@ mod tests {
             }
             _ => panic!("Expected DownloadingHeaders state"),
         }
+    }
+
+    /// Wedge regression: a later `start_sync` from a peer advertising a LOWER
+    /// head must NOT lower the sync target below a higher peer's head. Pre-fix,
+    /// `start_sync` overwrote `target_height` with the last caller's height, so a
+    /// boot wedged at applied-tip 7 collapsed the target from the producer's ~73k
+    /// to 7 and the drain declared "complete" at 7
+    /// (handoffs/NODE_FRESH_SYNC_WEDGE_2026-07-19.md).
+    #[tokio::test]
+    async fn start_sync_target_only_rises_never_lowers() {
+        let sync = SyncManager::new(SyncConfig::default());
+
+        // Producer peer advertises the real head.
+        sync.start_sync(73_400, Hash::new([1u8; 32])).await.unwrap();
+        assert_eq!(*sync.target_height.read().await, 73_400);
+
+        // A boot wedged at applied-tip 7 advertises 7 — must NOT lower the target.
+        sync.start_sync(7, Hash::new([2u8; 32])).await.unwrap();
+        assert_eq!(
+            *sync.target_height.read().await,
+            73_400,
+            "a low-advertising peer must not lower the sync target"
+        );
+        // And we must still be draining (not prematurely Synced).
+        assert!(!sync.is_synced().await, "must keep draining toward the real head");
+
+        // A peer advertising an even higher head DOES raise it.
+        sync.start_sync(80_000, Hash::new([3u8; 32])).await.unwrap();
+        assert_eq!(*sync.target_height.read().await, 80_000);
     }
 
     #[tokio::test]
