@@ -814,6 +814,60 @@ impl CanonicalApplicator {
         }
     }
 
+    /// Periodic self-heal: walk the applied tip forward through blocks that are
+    /// ALREADY persisted but not yet applied, then follow fork choice. Returns the
+    /// number of blocks applied this tick.
+    ///
+    /// Why this is needed: the receive/sync ingest persists a block (`put_block`)
+    /// BEFORE applying it, and only invokes `apply_received` for blocks it has not
+    /// already stored (`if !have_block`). So a block that is stored but unapplied —
+    /// because it was stored on a prior sync round, arrived via gossip, or was left
+    /// stored-ahead across a restart — is never handed to the drain again, and the
+    /// applied tip freezes while the stored height climbs. That is the fresh-node /
+    /// boot catch-up wedge: blocks 8..head download and store, but the applied tip
+    /// stays at the join point forever (handoffs/NODE_SYNC_INVESTIGATION_2026-07-19b).
+    ///
+    /// This tick, driven on a timer independent of new arrivals, drains every
+    /// persisted child of the applied tip so the node advances to head. Idempotent
+    /// and cheap: a no-op when there is no persisted extension (a producer already
+    /// at its tip, or a fully-synced follower). Shares the same advance lock as the
+    /// producer and receive-path, so it never races the executor.
+    pub async fn drive_drain(&self) -> usize {
+        let mut state = self.lock.lock().await;
+        let out = self.drain_forward(&mut state).await;
+        if let Some(fc) = &self.fork_choice {
+            if let Some(best) = fc().await {
+                if best != state.tip.hash {
+                    match self.reorg_to(&mut state, best).await {
+                        ReorgOutcome::Reorged {
+                            new_tip,
+                            height,
+                            reverted,
+                            applied,
+                        } => {
+                            info!(
+                                "periodic drain: fork-choice reorged to {new_tip} @ {height} (reverted {reverted}, applied {applied})"
+                            );
+                        }
+                        ReorgOutcome::NoChange => {}
+                        ReorgOutcome::Rejected(why) => {
+                            debug!("periodic drain: fork-choice reorg to {best} declined: {why}");
+                        }
+                    }
+                }
+            }
+        }
+        if !out.applied.is_empty() {
+            info!(
+                "periodic drain: applied {} persisted block(s), tip now {} @ {}",
+                out.applied.len(),
+                state.tip.hash,
+                state.tip.height
+            );
+        }
+        out.applied.len()
+    }
+
     /// Whether `(hash, height)` is the applied block at that height on the current
     /// applied chain (i.e., it was applied — possibly via reorg — and retained).
     fn on_applied_chain(&self, state: &AppliedState, hash: Hash, height: u64) -> bool {

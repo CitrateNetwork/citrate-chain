@@ -1474,6 +1474,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let mempool_for_handler = mempool.clone();
         // EXECUTE-ON-RECEIVE (step 2): clone the applier into the receive handler.
         let applicator_for_net = canonical_applicator.clone();
+        // EXECUTE-ON-RECEIVE (step 3): periodic forward-drain self-heal. The receive
+        // path persists blocks before applying and only drives the drain for blocks it
+        // hasn't already stored, so a node holding stored-but-unapplied blocks ahead of
+        // its applied tip (fresh-join / boot catch-up, or a restart with blocks stored
+        // ahead) would freeze its applied tip forever while the stored height climbs.
+        // This timer walks the applied tip forward through already-persisted blocks so
+        // the node advances to head unattended. No-op when there is nothing to drain.
+        if let Some(app) = canonical_applicator.clone() {
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    app.drive_drain().await;
+                }
+            });
+        }
         let gossip = Arc::new(GossipProtocol::new(GossipConfig::default(), peer_manager.clone()));
         let gossip_for_rx = gossip.clone();
         // Sync manager (basic integration)
