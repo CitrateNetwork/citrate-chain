@@ -37,7 +37,13 @@ contract DeployCoreMembership is Script {
 
     /// The grant/treasury signer (current membership owner). PINNED — it is a
     /// constructor arg for BOTH contracts and thus part of each init_code hash.
-    address constant FROZEN_OWNER = 0x9aFFF274d888F2545c91dA223578c260E6508A50;
+    /// ROTATED 2026-07-20: prior 0x9aFFF274…8A50 was keccak256(OLD_DEPLOYER ‖
+    /// "citrate/treasury-grant-signer/v1"); the old deployer leak makes that key
+    /// derivable, so it rotates to the NEW-deployer-derived grant signer (matched
+    /// by scripts/ops/derive-operator-keys.sh --print-only). Because it is a
+    /// constructor arg, the SBT + vault CREATE2 addresses MOVE — the droplet
+    /// treasury-signer must be rekeyed to this address and core-membership re-pinned.
+    address constant FROZEN_OWNER = 0xF42a19194fee89E71dC4b8631a71a9CeCf42B483;
 
     function run() external {
         require(block.chainid == 40204, "refusing to deploy off chain 40204 (testnet-beta)");
