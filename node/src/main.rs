@@ -2026,7 +2026,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // WP-H.5: Drain validated blocks and persist to chain store.
                         // Without this, synced blocks live only in SyncManager memory
                         // and are never integrated into the DAG.
-                        let validated = sync_for_rx.drain_validated_blocks().await;
+                        let mut validated = sync_for_rx.drain_validated_blocks().await;
+                        // #85 (fresh-node forward-sync wedge): admit in
+                        // topological (height-ascending) order. The DAG-aware
+                        // serve delivers complete height-groups, but multiple
+                        // in-flight GetBlocks responses can interleave in the
+                        // drain buffer. Every parent (selected OR merge) has a
+                        // strictly lower height than its child, so a stable
+                        // height sort guarantees a block's parents are admitted
+                        // before it — eliminating the spurious "Missing parent
+                        // at admission" drops that wedged fresh nodes at height 1.
+                        validated.sort_by_key(|b| b.header.height);
                         for block in validated {
                             let hash = block.header.block_hash;
                             let have = storage_for_handler
