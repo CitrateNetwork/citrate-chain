@@ -208,13 +208,60 @@ impl StateDB {
         Ok(())
     }
 
-    /// Calculate state root
+    /// Calculate state root.
+    ///
+    /// CONSENSUS-CRITICAL — must be IDEMPOTENT and a PURE function of the
+    /// current account/storage state. The previous implementation inserted each
+    /// dirty account into the trie with its CURRENT `storage_root`, then
+    /// recomputed and wrote back a fresh `storage_root` as a side effect
+    /// *after* the insert. Because a dirty account stays dirty until `commit`,
+    /// a second call inserted the now-updated `storage_root` and produced a
+    /// DIFFERENT root. The producer calls this 2-3x per block while a validator
+    /// calls it once, so for any block touching contract storage the producer's
+    /// claimed root and the validator's computed root diverged — splitting the
+    /// fleet (observed at block 235: claimed d9238df1 vs computed 5fb263db).
+    ///
+    /// The fix has two parts:
+    ///
+    /// 1. Fold the freshly-computed `storage_root` into the account BEFORE
+    ///    encoding and inserting it, so the trie value written for an address is
+    ///    the final account state on the very first call. Repeated calls
+    ///    recompute the identical `storage_root` and insert identical bytes, so
+    ///    the root is stable (see `idempotency_probe`).
+    ///
+    /// 2. Insert accounts in ADDRESS-SORTED order. `get_dirty_accounts()`
+    ///    iterates a `DashMap` whose order is randomized per-instance, and the
+    ///    hand-rolled `Trie` is NOT canonically insertion-order-independent for
+    ///    all key distributions (it is a bespoke structure, not a normalized
+    ///    MPT). Inserting in random order therefore produced a different root on
+    ///    each node for the identical state — the deeper half of the fleet split.
+    ///    A fixed sort makes every node build the trie via the same insertion
+    ///    sequence (and since execution is deterministic + serial, every node
+    ///    marks the same accounts dirty per block), so the accumulated trie —
+    ///    and its root — is identical across the fleet (see
+    ///    `state_root_is_operation_order_independent`).
     pub fn calculate_state_root(&self) -> StateRoot {
         let mut state_trie = self.state_trie.write();
 
+        // Deterministic insertion order (see doc item 2).
+        let mut dirty = self.accounts.get_dirty_accounts();
+        dirty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
         // Update state trie with account data
-        for address in self.accounts.get_dirty_accounts() {
-            let account = self.accounts.get_account(&address);
+        for address in dirty {
+            let mut account = self.accounts.get_account(&address);
+
+            // Fold the CURRENT storage root into the account first, so the
+            // encoded trie value is a pure function of state (idempotent). An
+            // account with no storage trie keeps its existing `storage_root`.
+            if let Some(storage_trie) = self.storage_tries.get(&address) {
+                account.storage_root = storage_trie.root_hash();
+                // Keep the account store consistent with what we hash. This
+                // re-marks the account dirty, but every future call recomputes
+                // the identical storage_root, so the result stays stable.
+                self.accounts.set_account(address, account.clone());
+            }
+
             let encoded = match bincode::serialize(&account) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -223,14 +270,6 @@ impl StateDB {
                 }
             };
             state_trie.insert(address.0.to_vec(), encoded);
-
-            // Update storage root for account
-            if let Some(storage_trie) = self.storage_tries.get(&address) {
-                let storage_root = storage_trie.root_hash();
-                let mut account = self.accounts.get_account(&address);
-                account.storage_root = storage_root;
-                self.accounts.set_account(address, account);
-            }
         }
 
         state_trie.root_hash()
@@ -466,3 +505,104 @@ mod tests {
         assert_eq!(db.get_storage(&addr, b"key"), Some(b"value".to_vec()));
     }
 }
+
+#[cfg(test)]
+mod idempotency_probe {
+    use super::*;
+
+    /// DECISIVE PROBE (fleet-split non-determinism): `calculate_state_root`
+    /// inserts a dirty account into the persistent trie with its CURRENT
+    /// `storage_root`, then recomputes+writes back a fresh `storage_root` as a
+    /// side effect. The account stays dirty (only `commit` clears dirty), so a
+    /// SECOND call inserts the now-updated `storage_root` → a DIFFERENT trie
+    /// value → a DIFFERENT root. The producer calls this 2-3x/block; the
+    /// validator calls it once → they compute different roots for any block
+    /// touching contract storage. That is the "claimed vs computed" split.
+    #[test]
+    fn calculate_state_root_is_idempotent() {
+        let db = StateDB::new();
+        let addr = Address([0x11u8; 20]);
+        db.set_code(addr, vec![1, 2, 3, 4]);              // marks account dirty
+        db.set_storage(addr, vec![7u8; 32], vec![9u8; 32]); // gives it a storage trie
+        let r1 = db.calculate_state_root();
+        let r2 = db.calculate_state_root();
+        let r3 = db.calculate_state_root();
+        assert_eq!(r1, r2, "NON-IDEMPOTENT state root: r1 != r2 (storage_root side-effect)");
+        assert_eq!(r2, r3, "NON-IDEMPOTENT state root: r2 != r3");
+    }
+
+    /// DIRECT MODEL of the fleet split: the producer computes the root by calling
+    /// `calculate_state_root` more than once per block (producer.rs:986 then
+    /// again at :1051), while a validator computes it once (canonical_apply.rs:985)
+    /// on a freshly-executed copy of the same state. For a block that touches
+    /// contract storage, the buggy side-effect made the producer's later call and
+    /// the validator's single call insert different `storage_root`s → different
+    /// roots → the exact "claimed vs computed" mismatch that split the fleet.
+    /// Both paths reach the SAME logical state, so their roots must be equal.
+    #[test]
+    fn producer_multicall_and_validator_singlecall_agree_with_storage() {
+        let addr = Address([0x22u8; 20]);
+
+        // Producer: build state, then compute the root MORE THAN ONCE.
+        let producer = StateDB::new();
+        producer.set_code(addr, vec![9, 9, 9]);
+        producer.set_storage(addr, vec![1u8; 32], vec![2u8; 32]);
+        let _first = producer.calculate_state_root(); // producer.rs:986
+        let producer_root = producer.calculate_state_root(); // producer.rs:1051
+
+        // Validator: fresh executor reaches the identical logical state, ONE call.
+        let validator = StateDB::new();
+        validator.set_code(addr, vec![9, 9, 9]);
+        validator.set_storage(addr, vec![1u8; 32], vec![2u8; 32]);
+        let validator_root = validator.calculate_state_root(); // canonical_apply.rs:985
+
+        assert_eq!(
+            producer_root, validator_root,
+            "producer (multi-call) and validator (single-call) roots diverged on a storage block \
+             — this is the fleet-split bug"
+        );
+    }
+
+    /// The root must be a PURE function of the final state — independent of the
+    /// ORDER operations were applied in (two nodes execute the same block but may
+    /// touch accounts/storage in different internal orders).
+    #[test]
+    fn state_root_is_operation_order_independent() {
+        // Enough distinct accounts that any order-dependent hashing (e.g. folding
+        // a HashMap in iteration order) reliably diverges between the two runs —
+        // a 2-account version was too small to catch it.
+        let mk = |i: u8| {
+            let mut a = [0u8; 20];
+            a[0] = i;
+            a[19] = i.wrapping_mul(3).wrapping_add(1);
+            Address(a)
+        };
+        let apply = |db: &StateDB, order: &[u8]| {
+            for &i in order {
+                let addr = mk(i);
+                db.set_code(addr, vec![i, i.wrapping_add(1)]);
+                db.set_storage(addr, vec![i; 32], vec![i.wrapping_mul(7); 32]);
+            }
+        };
+        let fwd: Vec<u8> = (0u8..48).collect();
+        let rev: Vec<u8> = (0u8..48).rev().collect();
+        let shuf: Vec<u8> = (0u8..48).map(|i| ((i as usize * 37 + 5) % 48) as u8).collect();
+
+        let db1 = StateDB::new();
+        apply(&db1, &fwd);
+        let root1 = db1.calculate_state_root();
+
+        let db2 = StateDB::new();
+        apply(&db2, &rev);
+        let root2 = db2.calculate_state_root();
+
+        let db3 = StateDB::new();
+        apply(&db3, &shuf);
+        let root3 = db3.calculate_state_root();
+
+        assert_eq!(root1, root2, "state root must not depend on operation order (reversed)");
+        assert_eq!(root1, root3, "state root must not depend on operation order (shuffled)");
+    }
+}
+
+
