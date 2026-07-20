@@ -113,7 +113,13 @@ impl Default for SyncConfig {
             // gap over the same path that already carries gossip. Concurrency
             // (16 in-flight) preserves throughput despite the small per-batch size.
             header_batch_size: 64,
-            block_batch_size: 8,
+            // Blocks per GetBlocks request. Kept modest: large responses over a
+            // cross-region link break the connection (observed: a batch of 128 to
+            // a producer over the WAN → "Broken pipe", zero blocks synced). 32 is
+            // a safe step up from the old 8 for throughput without over-large
+            // responses; deep catch-up throughput comes from the resilient
+            // multi-peer + correct-target driver, not from oversized batches.
+            block_batch_size: 32,
             sync_interval: Duration::from_secs(1),
         }
     }
@@ -187,6 +193,26 @@ impl SyncManager {
             .await;
 
         Ok(())
+    }
+
+    /// Raise the sync target to at least `height` (never lowers it), WITHOUT the
+    /// side effects of `start_sync`.
+    ///
+    /// The 2s driver loop calls this every tick from the best peer's advertised
+    /// head. `start_sync` cannot be used there: it resets the state to
+    /// `DownloadingHeaders` and re-queues header downloads on every call, so
+    /// driving it each tick leaves the node perpetually "starting" and it never
+    /// settles into block download (observed: 0 blocks imported while `start_sync`
+    /// fired 60+ times). The 2s loop already issues `request_headers` /
+    /// `request_blocks` anchored on the applied tip, so all this needs to do is
+    /// keep `target_height` at the real head — otherwise `handle_blocks` sees
+    /// `last_height >= target` (target 0) and declares "Synchronization complete"
+    /// after every batch, wedging a fresh node a few blocks in.
+    pub async fn set_target(&self, height: u64) {
+        let mut t = self.target_height.write().await;
+        if height > *t {
+            *t = height;
+        }
     }
 
     /// Queue header downloads
