@@ -532,3 +532,74 @@ mod tests {
         assert_ne!(trie1.root_hash(), trie2.root_hash());
     }
 }
+
+#[cfg(test)]
+mod nondeterminism_probe {
+    use super::*;
+
+    /// DECISIVE PROBE (#85-followup non-determinism): the executor inserts
+    /// dirty accounts into the state trie in `DashMap` iteration order, which
+    /// differs per node/run. If `root_hash()` depends on insertion order, two
+    /// nodes with identical state compute different roots — the exact fleet
+    /// split (block 235: d9238df1 vs 5fb263db). Insert the SAME key/value set
+    /// in two different orders and compare roots.
+    #[test]
+    fn root_hash_is_insertion_order_independent() {
+        // 32-byte keys (like account addresses), varied to exercise branching.
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for i in 0u16..64 {
+            let mut k = vec![0u8; 32];
+            k[0] = (i & 0xff) as u8;
+            k[1] = ((i * 7 + 3) & 0xff) as u8;
+            k[31] = (i * 3) as u8;
+            pairs.push((k, vec![(i % 251) as u8; 8]));
+        }
+        let mut t1 = Trie::new();
+        for (k, v) in pairs.iter() {
+            t1.insert(k.clone(), v.clone());
+        }
+        // reversed order
+        let mut t2 = Trie::new();
+        for (k, v) in pairs.iter().rev() {
+            t2.insert(k.clone(), v.clone());
+        }
+        // a rotated/shuffled order
+        let mut t3 = Trie::new();
+        let n = pairs.len();
+        for idx in 0..n {
+            let (k, v) = &pairs[(idx * 37 + 11) % n];
+            t3.insert(k.clone(), v.clone());
+        }
+        assert_eq!(t1.root_hash(), t2.root_hash(), "reversed insertion order changed the root");
+        assert_eq!(t1.root_hash(), t3.root_hash(), "shuffled insertion order changed the root");
+    }
+}
+
+
+#[cfg(test)]
+mod trie_shuffle_probe {
+    use super::*;
+    #[test]
+    fn address_keys_all_orders() {
+        let mk = |i: u8| { let mut k = vec![0u8; 20]; k[0]=i; k[19]=i.wrapping_mul(3).wrapping_add(1); k };
+        let val = |i: u8| vec![i.wrapping_mul(7); 32];
+        let orders: Vec<Vec<u8>> = vec![
+            (0u8..48).collect(),
+            (0u8..48).rev().collect(),
+            (0u8..48).map(|i| ((i as usize *37+5)%48) as u8).collect(),
+            (0u8..48).map(|i| ((i as usize *13+7)%48) as u8).collect(),
+        ];
+        let mut roots = Vec::new();
+        for ord in &orders {
+            let mut t = Trie::new();
+            for &i in ord { t.insert(mk(i), val(i)); }
+            roots.push(t.root_hash());
+        }
+        for (idx, r) in roots.iter().enumerate() {
+            eprintln!("order {idx}: root {}", hex::encode(&r.as_bytes()[..8]));
+        }
+        for idx in 1..roots.len() {
+            assert_eq!(roots[0], roots[idx], "trie root differs for order {idx} vs 0");
+        }
+    }
+}
