@@ -40,11 +40,15 @@ import "../src/ValidatorRegistry.sol";
 ///     --rpc-url $CITRATE_TESTNET_RPC --sender $DEPLOYER_ADDRESS
 contract DeployValidatorRegistry is ScriptEnv {
     // ─────────────────────────────────────────────────────────────────────────
-    // Canonical genesis DEPLOYER (0x4250675F…000c6) — the genesis root of trust
-    // (10M SALT, deploys everything). See core/economics/src/genesis.rs
-    // TESTNET_DEPLOYER_ADDRESS. Used as the default admin trio below.
+    // Canonical genesis DEPLOYER — the genesis root of trust (10M SALT, deploys
+    // everything). See core/economics/src/genesis.rs TESTNET_DEPLOYER_ADDRESS.
+    // Used as the default admin trio below.
+    // ROTATED 2026-07-20: prior 0x4250675F…000c6 was exposed by a `bash -x` trace;
+    // rotated to the fresh DGX-generated deployer. This VALUE is a constructor arg
+    // (governance_ + slasher_), so changing it MOVES the CREATE2 address — the new
+    // projection is re-pinned as CITRATE_VALIDATOR_REGISTRY on every fleet node.
     // ─────────────────────────────────────────────────────────────────────────
-    address public constant GENESIS_DEPLOYER = 0x4250675F9015E65fC866F3a373F82bb9DFc000c6;
+    address public constant GENESIS_DEPLOYER = 0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732;
 
     // Canonical Arachnid deterministic CREATE2 factory (EIP-2470), pre-stamped in
     // every Citrate genesis profile. Forge routes `new X{salt:}` through it, so
