@@ -34,17 +34,19 @@ contract CoreMembershipCreate2Test is Test {
     // Determinism inputs — PINNED, identical to DeployCoreMembership.s.sol.
     address internal constant ARACHNID = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     address internal constant DEFAULT_POOL = 0xFD272195B55Cb4F5A240a5bE75AABaB0D1C5685E;
-    address internal constant FROZEN_OWNER = 0x9aFFF274d888F2545c91dA223578c260E6508A50;
+    // ROTATED 2026-07-20 with the deployer — see DeployCoreMembership.s.sol.
+    address internal constant FROZEN_OWNER = 0xF42a19194fee89E71dC4b8631a71a9CeCf42B483;
 
-    // NEW frozen projections (Arachnid deployer), post-WS-2. See report.
-    address internal constant SBT_FROZEN = 0x7bE005aA8c45C1695b4C75468c6cA8B40238A7C4;
-    address internal constant VAULT_FROZEN = 0x0aceb7B474eCC4abe12696CE48628f0CABE0267e;
+    // Frozen projections (Arachnid deployer). Re-pinned 2026-07-20 for the
+    // deployer/owner rotation (FROZEN_OWNER → new grant signer).
+    address internal constant SBT_FROZEN = 0x3e0c2B1cD29a615E4eA2E263C8e7df3Aef243E42;
+    address internal constant VAULT_FROZEN = 0x61E324cFd6B7Cb106AC0AD1dF163bdFef2b74268;
 
     // init_code hashes = keccak256(creationCode ++ abi.encode(ctorArgs)).
     bytes32 internal constant SBT_INIT_HASH =
-        0xd705f67d55572b023712d632bd188a49a9c5bf98855502addcd79cf75daf0f7c;
+        0x15db7207cbfa5e97d671a3f53aaacf60c4fb04fe70129b782f152a6ea54aa08c;
     bytes32 internal constant VAULT_INIT_HASH =
-        0x90c1c91478b6780e58a63fb5e0a38cd12c00c6b3c3ce244c58d6d6485b861f75;
+        0x234d1004c881a86019bfbc32729a1eb54b40f65c56129049a1afb06e6e660d15;
 
     function _sbtInit() internal pure returns (bytes memory) {
         return abi.encodePacked(type(CitrateMemberSBT).creationCode, abi.encode(FROZEN_OWNER));
