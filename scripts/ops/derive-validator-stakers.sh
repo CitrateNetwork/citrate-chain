@@ -44,7 +44,7 @@ done
 if [ "$PRINT_ONLY" = "--print-only" ]; then exit 0; fi
 
 cp "$ENV_FILE" "${ENV_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
-PY=python3; command -v python3 >/dev/null || PY="uv run python3"
+if command -v uv >/dev/null 2>&1; then PY="uv run python3"; else PY=python3; fi
 $PY - "$ENV_FILE" "${ADDRS[1]}" "${PKS[1]}" "${ADDRS[2]}" "${PKS[2]}" "${ADDRS[3]}" "${PKS[3]}" "${ADDRS[4]}" "${PKS[4]}" <<'PY'
 import sys,re
 p=sys.argv[1]; rest=sys.argv[2:]

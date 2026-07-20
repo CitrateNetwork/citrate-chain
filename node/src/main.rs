@@ -1661,6 +1661,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // Pick best peer by head height
                 let mut best: Option<Arc<citrate_network::peer::Peer>> = None;
                 let mut best_h: u64 = 0;
+                let mut best_hash = citrate_consensus::types::Hash::new([0u8; 32]);
                 for p in peers {
                     let info = p.info.read().await;
                     if info.state == citrate_network::peer::PeerState::Connected
@@ -1668,10 +1669,27 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         && peer_failures.get(&info.id.0).cloned().unwrap_or(0) < 3
                     {
                         best_h = info.head_height;
+                        best_hash = info.head_hash;
                         best = Some(p.clone());
                     }
                 }
                 if let Some(peer) = best {
+                    // CRITICAL: raise the sync target to the best peer's advertised
+                    // head. The Hello/HelloAck that carries a peer's head is consumed
+                    // INSIDE the transport handshake (transport.rs) to seed
+                    // PeerInfo.head_height and is NEVER forwarded to the message loop,
+                    // so the `NetworkMessage::Hello` handler that would call
+                    // start_sync never fires. target_height therefore stayed 0, and
+                    // handle_blocks declared "Synchronization complete" after every
+                    // batch (last_height >= 0) — the node synced a few blocks then
+                    // looped forever without pushing to the real tip. Driving
+                    // start_sync here from the best peer's head (start_sync only ever
+                    // RAISES the target, never lowers it) makes the target track the
+                    // true head so sync walks all the way forward.
+                    if best_h > 0 {
+                        sync_for_loop.set_target(best_h).await;
+                    }
+                    let _ = best_hash; // anchor uses the applied tip, not best_hash
                     // Anchor every request on our current PERSISTED tip so sync
                     // walks forward batch by batch. The pre-fix logic preferred
                     // `last_requested_header`, which latched onto the first anchor
@@ -1731,13 +1749,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // source and could never re-sync. Removing the peer lets it
                     // re-handshake fresh; we reset the failure counter so the
                     // reconnection starts from a clean slate.
-                    if *pf >= 5 && pm_for_sync.get_peer(&pid).is_some() {
+                    // Never drop a peer if it is our ONLY one — doing so strands a
+                    // fresh node with zero peers and it wedges permanently (observed:
+                    // a follower syncing a deep chain hit a few timeouts, dropped its
+                    // sole source, and never recovered). Only prune when another peer
+                    // can take over; otherwise keep retrying against the one we have.
+                    let (total_peers, _, _) = pm_for_sync.get_peer_counts().await;
+                    if *pf >= 5 && total_peers > 1 && pm_for_sync.get_peer(&pid).is_some() {
                         pm_for_sync.remove_peer(&pid).await;
                         *pf = 0;
                         tracing::warn!(
                             "Dropped peer {} after repeated sync timeouts (will re-handshake)",
                             pid.0
                         );
+                    } else if *pf >= 5 {
+                        // Sole peer: reset the counter so we keep trying it rather
+                        // than freezing after 5 timeouts.
+                        *pf = 0;
                     }
                 }
                 // Issue any due retries
@@ -1919,6 +1947,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::NewBlock { block } => {
+                        // Keep this peer's advertised head FRESH from its gossip.
+                        // PeerInfo.head_height is seeded once at the transport
+                        // handshake and never refreshed afterward, so the sync target
+                        // (driven from the best peer's head in the 2s tick) froze at
+                        // the handshake value — a follower then stopped one
+                        // growth-window short of a still-producing tip and never
+                        // closed the gap. A gossiped block proves the peer is at least
+                        // at that height, so bump it.
+                        if let Some(p) = pm_for_rx.get_peer(&pid) {
+                            let mut info = p.info.write().await;
+                            if block.header.height > info.head_height {
+                                info.head_height = block.header.height;
+                                info.head_hash = block.header.block_hash;
+                            }
+                        }
                         // C3 fix: validate BEFORE persisting to prevent
                         // invalid blocks from polluting local storage.
                         let have = storage_for_handler
