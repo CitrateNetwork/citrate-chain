@@ -123,12 +123,30 @@ consistent for deployer, identity signer, sponsor, grant signer).
 6. **Register 4 validators** (staker == coinbase) BEFORE snapshot S(2)=1800; `--force` ok pre-1800.
 7. **Verify** determinism (0 state-root mismatch) across activation 2000 + a fresh node full-replays to head (PR #91).
 
+# PHASE 3.5 — treasury-signer rekey (immediately after post-reroll-membership)
+
+The grant signer rotates with the deployer (`keccak256(DEPLOYER ‖ label)`); the new
+signer `0xF42a19194fee89E71dC4b8631a71a9CeCf42B483` owns the new SBT/vault. **Off-chain
++ address-neutral** — changes no CREATE2 address, genesis, or sync (verified: signer ==
+`FROZEN_OWNER` == new SBT/vault owner; the service is 100% env-driven, no repo-hardcoded
+addresses). Run AFTER the new SBT `0x3e0c2B1c…` + vault `0x61E324cF…` have code AND the
+new signer is funded, via the staged `citrate-identity/services/treasury-signer/rekey.sh`
+(private key on STDIN only — never argv/log):
+
+    grep -m1 '^GRANT_SIGNER_PRIVATE_KEY=' /home/saul/Projects/Citrate-Labs/.env.testnet \
+      | cut -d= -f2 | ssh root@<droplet> \
+        'NEW_VAULT=0x61E324cFd6B7Cb106AC0AD1dF163bdFef2b74268 \
+         NEW_SBT=0x3e0c2B1cD29a615E4eA2E263C8e7df3Aef243E42 \
+         bash /opt/citrate-treasury-signer/rekey.sh'
+
+It patches the env-file, RECREATES the docker container (a plain restart won't re-read
+`--env-file`), and asserts `/health` shows the new signer + both contracts. Also fund the
+new grant signer for gas.
+
 # Downstream re-pins (GATED — do NOT run until the reroll is live)
 
 - **Consumers** (emit-address-table list): explorer, inference-gateway, node-agent,
   sdk-marketplace, gui-native, boeing-shell, buyer-webapp → each repo's `sync-addresses`.
-- **treasury-signer droplet** — rekey the grant signer to the new key for
-  `0xF42a19194fee89E71dC4b8631a71a9CeCf42B483` (owns new SBT+vault); update its env; restart.
 - **identity / bundler** — re-pin AA factory `0xc9c7b3d3fe28012ab5f2583a4f58531e9f26d3f5`
   + paymaster `0x0cd122ace90084afb26d5101074af15aaccc1c0e`; `setIdentitySigner`
   to `0x8A906262…`; fund + re-pin per AA_STACK_RESTORE runbook.
