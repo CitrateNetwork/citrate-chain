@@ -1811,6 +1811,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             use citrate_consensus::checkpoint::CheckpointVote;
             use citrate_network::NetworkMessage;
             use citrate_sequencer::mempool::TxClass;
+            // #85 (deep bulk-sync wedge): blocks that fail admission ONLY because
+            // their parent hasn't been applied yet are buffered here instead of
+            // dropped, then re-tried when a later batch delivers the parent. The
+            // pre-fix code dropped them, so a re-requested child was re-dropped
+            // forever whenever its parent rode a separate, not-yet-arrived batch —
+            // wedging a cold node at the first out-of-order block (observed live in
+            // the contract-deploy region). Bounded to cap memory if a parent never
+            // arrives; the sync loop independently re-requests missing parents.
+            let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
             while let Some((pid, msg)) = in_rx.recv().await {
                 tracing::debug!("[P2P] from={} msg={:?}", pid.0, msg);
                 // Handle protocol messages
@@ -2069,94 +2078,118 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // WP-H.5: Drain validated blocks and persist to chain store.
                         // Without this, synced blocks live only in SyncManager memory
                         // and are never integrated into the DAG.
-                        let mut validated = sync_for_rx.drain_validated_blocks().await;
-                        // #85 (fresh-node forward-sync wedge): admit in
-                        // topological (height-ascending) order. The DAG-aware
-                        // serve delivers complete height-groups, but multiple
-                        // in-flight GetBlocks responses can interleave in the
-                        // drain buffer. Every parent (selected OR merge) has a
-                        // strictly lower height than its child, so a stable
-                        // height sort guarantees a block's parents are admitted
-                        // before it — eliminating the spurious "Missing parent
-                        // at admission" drops that wedged fresh nodes at height 1.
-                        validated.sort_by_key(|b| b.header.height);
-                        for block in validated {
-                            let hash = block.header.block_hash;
-                            let have = storage_for_handler
-                                .blocks
-                                .has_block(&hash)
-                                .unwrap_or(false);
-                            if !have {
-                                // SECREM-01 CONS-1/2/3: consistency gate before
-                                // any persistence (same as the gossip path —
-                                // sync is an equally untrusted ingest).
-                                if let Err(e) = ghostdag_for_net
-                                    .validate_block_consistency(&block)
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "Rejected inconsistent synced block {}: {}",
-                                        hex::encode(&hash.as_bytes()[..8]),
-                                        e
-                                    );
-                                } else {
-                                    // WP-K.2: Feed synced block into live DAG for fork-choice
-                                    match dag_store_for_net.store_block(block.clone()).await {
-                                        Ok(_) => match ghostdag_for_net.add_block(&block).await {
-                                            Ok(_) => {
-                                                // Admission complete — only now persist.
-                                                if let Err(e) =
-                                                    storage_for_handler.blocks.put_block(&block)
-                                                {
+                        let mut pending = sync_for_rx.drain_validated_blocks().await;
+                        // #85 (deep bulk-sync wedge): admit in topological
+                        // (height-ascending) order — every parent (selected OR
+                        // merge) has strictly lower height than its child, and the
+                        // header-height check enforces child = parent + 1, so a
+                        // height sort is a valid topological order. Retry any
+                        // orphans buffered from earlier batches alongside the fresh
+                        // drain: a parent delivered now can unblock a child that
+                        // arrived (and was buffered) in a prior, out-of-order batch.
+                        pending.append(&mut orphan_blocks);
+                        pending.sort_by_key(|b| b.header.height);
+                        pending.dedup_by_key(|b| b.header.block_hash);
+
+                        // Fixpoint: a block that fails admission ONLY because its
+                        // parent isn't applied yet is DEFERRED (buffered), never
+                        // dropped. The pre-fix code dropped it, so a re-requested
+                        // child was re-dropped forever whenever its parent rode a
+                        // separate not-yet-arrived batch — the live cold-sync wedge.
+                        loop {
+                            let mut progressed = false;
+                            let mut deferred: Vec<citrate_consensus::types::Block> = Vec::new();
+                            for block in std::mem::take(&mut pending) {
+                                let hash = block.header.block_hash;
+                                if storage_for_handler.blocks.has_block(&hash).unwrap_or(false) {
+                                    continue;
+                                }
+                                // SECREM-01 CONS-1/2/3: consistency gate before any
+                                // persistence (sync is an equally untrusted ingest).
+                                match ghostdag_for_net.validate_block_consistency(&block).await {
+                                    Err(citrate_consensus::ghostdag::GhostDagError::MissingParent(_)) => {
+                                        // Parent not applied yet — keep for a later
+                                        // batch rather than dropping (the #85 fix).
+                                        deferred.push(block);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Rejected inconsistent synced block {}: {}",
+                                            hex::encode(&hash.as_bytes()[..8]),
+                                            e
+                                        );
+                                    }
+                                    Ok(()) => {
+                                        // WP-K.2: feed synced block into live DAG for fork-choice
+                                        match dag_store_for_net.store_block(block.clone()).await {
+                                            Ok(_) => match ghostdag_for_net.add_block(&block).await {
+                                                Ok(_) => {
+                                                    progressed = true;
+                                                    // Admission complete — only now persist.
+                                                    if let Err(e) =
+                                                        storage_for_handler.blocks.put_block(&block)
+                                                    {
+                                                        tracing::warn!(
+                                                            "Failed to persist synced block {}: {}",
+                                                            hex::encode(&hash.as_bytes()[..8]),
+                                                            e
+                                                        );
+                                                    }
+                                                    // EXECUTE-ON-RECEIVE (step 2): fast-path apply of a
+                                                    // synced block that linearly extends the applied tip.
+                                                    if let Some(app) = &applicator_for_net {
+                                                        match app.apply_received(&block).await {
+                                                            canonical_apply::ApplyOutcome::Applied { root, height } => {
+                                                                tracing::debug!(
+                                                                    "execute-on-receive applied synced block @ {} (root {})",
+                                                                    height, root
+                                                                );
+                                                            }
+                                                            canonical_apply::ApplyOutcome::Rejected(why) => {
+                                                                tracing::warn!(
+                                                                    "execute-on-receive REJECTED synced block {}: {}",
+                                                                    hex::encode(&hash.as_bytes()[..8]),
+                                                                    why
+                                                                );
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
                                                     tracing::warn!(
-                                                        "Failed to persist synced block {}: {}",
+                                                        "Synced block {} failed DAG admission: {}",
                                                         hex::encode(&hash.as_bytes()[..8]),
                                                         e
                                                     );
                                                 }
-                                                // EXECUTE-ON-RECEIVE (step 2): fast-path apply of a
-                                                // synced block that linearly extends the applied tip.
-                                                // The sync path delivers blocks in order, so this is
-                                                // the common catch-up case; gaps defer to a later step.
-                                                if let Some(app) = &applicator_for_net {
-                                                    match app.apply_received(&block).await {
-                                                        canonical_apply::ApplyOutcome::Applied { root, height } => {
-                                                            tracing::debug!(
-                                                                "execute-on-receive applied synced block @ {} (root {})",
-                                                                height, root
-                                                            );
-                                                        }
-                                                        canonical_apply::ApplyOutcome::Rejected(why) => {
-                                                            tracing::warn!(
-                                                                "execute-on-receive REJECTED synced block {}: {}",
-                                                                hex::encode(&hash.as_bytes()[..8]),
-                                                                why
-                                                            );
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                }
-                                            }
+                                            },
+                                            Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {}
                                             Err(e) => {
                                                 tracing::warn!(
-                                                    "Synced block {} failed DAG admission: {}",
+                                                    "Failed to add synced block {} to live DAG: {}",
                                                     hex::encode(&hash.as_bytes()[..8]),
                                                     e
                                                 );
                                             }
-                                        },
-                                        Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {}
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Failed to add synced block {} to live DAG: {}",
-                                                hex::encode(&hash.as_bytes()[..8]),
-                                                e
-                                            );
                                         }
                                     }
                                 }
                             }
+                            pending = deferred;
+                            if !progressed {
+                                break;
+                            }
                         }
+                        // Buffer unresolved orphans for the next Blocks batch (their
+                        // parents are still en route); bound the buffer so a parent
+                        // that never arrives can't grow it without limit.
+                        const MAX_ORPHAN_BLOCKS: usize = 20_000;
+                        if pending.len() > MAX_ORPHAN_BLOCKS {
+                            pending.sort_by_key(|b| b.header.height);
+                            pending.truncate(MAX_ORPHAN_BLOCKS);
+                        }
+                        orphan_blocks = pending;
                     }
                     NetworkMessage::Transactions { transactions } => {
                         for tx in transactions {
