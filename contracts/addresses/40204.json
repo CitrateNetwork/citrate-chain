@@ -5,7 +5,7 @@
   "rpcUrl": "https://rpc.citrate.ai",
   "explorerUrl": "https://explorer.citrate.ai",
   "deployer": "0x4250675F9015E65fC866F3a373F82bb9DFc000c6",
-  "deployedAt": "2026-07-18T04:00:00Z",
+  "deployedAt": "2026-07-20T03:05:00Z",
   "regenerator": "scripts/ops/emit-address-table.sh",
   "comment": "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
   "contracts": {
@@ -52,14 +52,13 @@
     "IPFSIncentivesV3": "0x629f7cd4aeade49e4b27c9a39237d132f9ff39f4",
     "AggregationChallenge": "0xe7d7ebe1242feec29d514b00c9272fbffc9e69be",
     "ComputePoolPipeline": "0xc2ddf9dd186781697ed9c16af3bb36e42a79f4ad",
-    "EduForwarder": "0xe9fffad1c2442179cfe6264d71c6caf75d0f2f1a",
-    "CitrateCooperativeFactory": "0x6fe6fd2aa92e9c8b996258671647b5369b366aa4"
+    "EduForwarder": "0xe9fffad1c2442179cfe6264d71c6caf75d0f2f1a"
   },
   "aaStack": {
-    "EntryPoint": "0xC698feAf0FF7FdB0D60E2F620C97cB729A694975",
-    "CitrateWallet": "0x79c4A8367d2d65B162DE841fF678DB4875490b2e",
-    "CitrateWalletFactory": "0x5a45B6F83050a76A81D0F2E6c857F16B37B2693b",
-    "CitratePaymaster": "0xF14F56e812cE93544e75E841Ac6316F2d7E561b0",
+    "EntryPoint": "0xc698feaf0ff7fdb0d60e2f620c97cb729a694975",
+    "CitrateWallet": "0x79c4a8367d2d65b162de841ff678db4875490b2e",
+    "CitrateWalletFactory": "0x5a45b6f83050a76a81d0f2e6c857f16b37b2693b",
+    "CitratePaymaster": "0xf14f56e812ce93544e75e841ac6316f2d7e561b0",
     "WebAuthnP256Validator": "0x97ff6d1c4d2f4337ec09f2a1c01808016f728def",
     "CitrateECDSAValidator": "0xd2d35421379ae5b461e216bfcdd1b7e6a64bbc40",
     "GuardianRecoveryModule": "0x381b5848f3b5d73ff67b745624780a43682456ce"
@@ -89,8 +88,5 @@
     "X402Eip712Verify": "0x0000000000000000000000000000000000000200",
     "X402TransferAuthVerify": "0x0000000000000000000000000000000000000201",
     "X402BatchPaymentVerify": "0x0000000000000000000000000000000000000202"
-  },
-  "CitrateMemberSBT": "0x7bE005aA8c45C1695b4C75468c6cA8B40238A7C4",
-  "MembershipStakeVault": "0x0aceb7B474eCC4abe12696CE48628f0CABE0267e",
-  "ValidatorRegistry": "0x3Bf6C5bb365717Bec9348b953758b196652caEdf"
+  }
 }

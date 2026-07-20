@@ -48,7 +48,9 @@ echo "  AA_REGISTRAR_ADDRESS       = $RADDR"
 if [ "$PRINT_ONLY" = "--print-only" ]; then exit 0; fi
 
 cp "$ENV_FILE" "${ENV_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
-PY=python3; command -v python3 >/dev/null || PY="uv run python3"
+# On the DGX box, bare `python3` is a shim that rejects direct use and demands
+# `uv run python3`; prefer uv when available so this works there and elsewhere.
+if command -v uv >/dev/null 2>&1; then PY="uv run python3"; else PY=python3; fi
 $PY - "$ENV_FILE" "$GPK" "$GADDR" "$SPK" "$SADDR" "$RPK" "$RADDR" <<'PY'
 import sys,re
 p,gpk,gaddr,spk,saddr,rpk,raddr=sys.argv[1:8]

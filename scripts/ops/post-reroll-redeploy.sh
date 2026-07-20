@@ -75,7 +75,9 @@ CITRATE_AA_IDENTITY_SIGNER_ADDR=$(get_env CITRATE_AA_IDENTITY_SIGNER_ADDR)
 [[ -n "${RPC_URL:-}" ]]                         || { err "RPC_URL missing from $ENV_TESTNET"; exit 1; }
 [[ -n "${DEPLOYER_ADDRESS:-}" ]]                || { err "DEPLOYER_ADDRESS missing";          exit 1; }
 [[ -n "${DEPLOYER_PRIVATE_KEY:-}" ]]            || { err "DEPLOYER_PRIVATE_KEY missing";      exit 1; }
-[[ -n "${CITRATE_AA_ENTRY_POINT:-}" ]]          || { err "CITRATE_AA_ENTRY_POINT missing";    exit 1; }
+# WS-3: CITRATE_AA_ENTRY_POINT may be empty/unset — DeployAndPinAA deploys the
+# EntryPoint deterministically (CREATE2) and re-pins it. Only a non-empty value
+# is validated (below); an empty pin means "deploy the canonical EntryPoint".
 [[ -n "${CITRATE_AA_IDENTITY_SIGNER_ADDR:-}" ]] || { err "CITRATE_AA_IDENTITY_SIGNER_ADDR missing"; exit 1; }
 
 # --- E-8: ensure the DETERMINISTIC operator keys exist BEFORE the AA deploy ---
@@ -119,14 +121,22 @@ if [[ -z "$ARACHNID_CODE" || "$ARACHNID_CODE" == "0x" ]]; then
 fi
 log "arachnid deployer: present (${#ARACHNID_CODE} hex chars) ✓"
 
-ENTRY_POINT_CODE=$(cast code "$CITRATE_AA_ENTRY_POINT" --rpc-url "$RPC_URL" 2>/dev/null || true)
-if [[ -z "$ENTRY_POINT_CODE" || "$ENTRY_POINT_CODE" == "0x" ]]; then
-  err "EntryPoint at $CITRATE_AA_ENTRY_POINT has NO code — vendor it first"
-  err "  EntryPoint v0.7 is an eth-infinitism contract that must be deployed"
-  err "  via its own ceremony before the AA stack can wire to it."
-  exit 1
+# WS-3: DeployAndPinAA now deploys the EntryPoint deterministically (CREATE2)
+# and pins it. If CITRATE_AA_ENTRY_POINT is unset, skip the pre-deploy check —
+# the script will deploy the canonical EntryPoint itself. Only require a
+# pre-deployed EntryPoint when the operator has explicitly pinned one.
+if [[ -n "$CITRATE_AA_ENTRY_POINT" ]]; then
+  ENTRY_POINT_CODE=$(cast code "$CITRATE_AA_ENTRY_POINT" --rpc-url "$RPC_URL" 2>/dev/null || true)
+  if [[ -z "$ENTRY_POINT_CODE" || "$ENTRY_POINT_CODE" == "0x" ]]; then
+    err "EntryPoint at $CITRATE_AA_ENTRY_POINT has NO code — vendor it first"
+    err "  EntryPoint v0.7 is an eth-infinitism contract that must be deployed"
+    err "  via its own ceremony before the AA stack can wire to it."
+    exit 1
+  fi
+  log "entrypoint code:   present (${#ENTRY_POINT_CODE} hex chars) ✓"
+else
+  log "entrypoint:        unset — DeployAndPinAA deploys it deterministically (WS-3) ✓"
 fi
-log "entrypoint code:   present (${#ENTRY_POINT_CODE} hex chars) ✓"
 
 DEPLOYER_BALANCE_WEI=$(cast balance "$DEPLOYER_ADDRESS" --rpc-url "$RPC_URL" 2>/dev/null || echo 0)
 ONE_ETHER_WEI="1000000000000000000"
