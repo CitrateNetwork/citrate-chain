@@ -1011,43 +1011,53 @@ impl BlockProducer {
             }
         }
 
-        // Persist state changes from executed transactions + rewards to storage
+        // SRP-S3b (restart/crash consistency): persist the BLOCK first, then the state +
+        // applied-tip pointer ATOMICALLY. Durable order = BLOCK → (STATE + TIP atomic). A
+        // crash after the block but before the atomic commit leaves the block stored AHEAD
+        // of the applied tip (state+tip still consistent at N-1); on restart the forward
+        // drain re-applies the stored block deterministically (SRP-S2). The OLD order
+        // (state before block, tip written separately) left the durable state one reward
+        // AHEAD of the committed block on a mid-window stop → restart root mismatch
+        // (block-2345). See ADR-2026-07-21-restart-produce-purity §SRP-S3b.
+
+        // WP-G.4: verify the executor's in-memory root still matches the sealed block root
+        // BEFORE any durable write (nothing has mutated committed state since sealing).
+        let post_persist_root = self.executor.calculate_state_root();
+        if post_persist_root != block.state_root {
+            error!(
+                "STATE ROOT MISMATCH before persist: block={} computed={}",
+                block.state_root, post_persist_root
+            );
+            return Err(anyhow::anyhow!(
+                "State root mismatch before persistence: block {} vs computed {}",
+                block.state_root, post_persist_root
+            ));
+        }
+
+        // 1) Persist the block + its state-root pointer (block may lead the applied tip).
+        self.storage.blocks.put_block(&block)?;
+        if let Err(e) = self.storage.state.put_state_root(&block.header.block_hash, &block.state_root) {
+            warn!("Failed to persist state root for block {}: {}", block.header.height, e);
+        }
+
+        // 2) Persist state changes + advance the durable applied tip ATOMICALLY to THIS
+        //    block, so durable state and the committed tip can never diverge on a crash.
         info!("Persisting state changes to storage...");
-        let modified_count = self.executor.persist_state_changes().await?;
-        info!("Persisted {} modified accounts to storage", modified_count);
+        let modified_count = self
+            .executor
+            .persist_state_changes_with_tip(Some((block.header.block_hash, block.header.height)))
+            .await?;
+        info!("Persisted {} modified accounts to storage (tip @ {})", modified_count, block.header.height);
 
         // VALIDATOR-S1 (v5): the executor state is now post-height H. If H is a snapshot
         // boundary S(E), rebuild the proposer selector from the registry as-of this state
         // so epoch-E membership is loaded before epoch-E blocks are validated.
         self.maybe_sync_registry(block.header.height).await;
 
-        // WP-G.4: Verify state root consistency after persistence.
-        // The executor's in-memory state root (used in the block) must still match.
-        let post_persist_root = self.executor.calculate_state_root();
-        if post_persist_root != block.state_root {
-            error!(
-                "STATE ROOT MISMATCH after persist: block={} post_persist={}",
-                block.state_root, post_persist_root
-            );
-            return Err(anyhow::anyhow!(
-                "State root mismatch after persistence: block {} vs post-persist {}",
-                block.state_root, post_persist_root
-            ));
-        }
-
-        // Persist block and related data
-        self.storage.blocks.put_block(&block)?;
-
-        // Persist state root separately for fast startup verification
-        if let Err(e) = self.storage.state.put_state_root(&block.header.block_hash, &block.state_root) {
-            warn!("Failed to persist state root for block {}: {}", block.header.height, e);
-        }
-
-        // EXECUTE-ON-RECEIVE (step 2): we just executed + persisted this block's state,
-        // so advance the applied tip to it (under the lock we've held since fn entry).
-        // Keeps the fleet-wide invariant "applied_tip == the block whose state the
-        // executor reflects" true for locally-produced blocks too, so a peer building on
-        // our tip fast-path-applies cleanly.
+        // EXECUTE-ON-RECEIVE (step 2): update the IN-MEMORY applied-tip ring to this block
+        // (the DURABLE tip was just advanced atomically with the state above). Keeps the
+        // invariant "applied_tip == the block whose state the executor reflects" for
+        // locally-produced blocks too, so a peer building on our tip fast-path-applies.
         if let Some(guard) = applied_guard.as_mut() {
             crate::canonical_apply::record_produced(
                 guard,

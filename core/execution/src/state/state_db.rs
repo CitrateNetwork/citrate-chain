@@ -78,6 +78,12 @@ impl StateDB {
             .and_then(|trie| trie.get(key))
     }
 
+    /// SRP-S3b diagnostic: recompute an account's storage_root FRESH from its resident
+    /// storage trie (what `calculate_state_root` folds), or `None` if no trie is resident.
+    pub fn get_storage_root_recomputed(&self, address: &Address) -> Option<Hash> {
+        self.storage_tries.get(address).map(|t| t.root_hash())
+    }
+
     /// Set storage value
     pub fn set_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
         self.dirty_storage.insert((address, key.clone()));
@@ -273,6 +279,18 @@ impl StateDB {
                 account.storage_root = storage_trie.root_hash();
                 // Keep the resident account consistent with what we hash.
                 self.accounts.set_account(address, account.clone());
+            }
+
+            // SRP-S3 (EIP-158): an EMPTY account (no balance/nonce/code/storage/perms)
+            // carries NO committed state and is indistinguishable from an absent one, so
+            // it MUST NOT be folded. The fold iterates the volatile RESIDENT map, so a
+            // read-through / restart reconstruction can leave an empty account resident
+            // on one node but not another with identical committed state; folding it
+            // forks the chain on an empty post-restart block (block 2042). Checked AFTER
+            // the fresh storage_root recompute above so an account with live storage is
+            // never mistaken for empty. See ADR-2026-07-21-restart-produce-purity.
+            if account.is_empty() {
+                continue;
             }
 
             let encoded = match bincode::serialize(&account) {
@@ -694,6 +712,45 @@ mod srp_purity_red {
             root_after, root_before,
             "STORAGE STALENESS (SRP): the root ignored a committed slot change — storage \
              sub-trie is a stale accumulator (state_db.rs:20,257-258)"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SRP-S3 (restart-produced purity): the fold in `calculate_state_root` iterates
+    // the RESIDENT account map (`all_accounts()`), so the root depends on WHICH
+    // accounts are materialized — a node-local, restart/history-dependent property.
+    // A read-through or a restart's bulk hydration can leave an EMPTY (all-default)
+    // account resident on one node but not another WITH IDENTICAL COMMITTED STATE.
+    // Folding that empty account changes the root → the block-2042 split-brain on an
+    // EMPTY post-restart block (reward accounts identical; a spurious empty account
+    // differs). Fix: EIP-158 — an empty account is indistinguishable from an absent
+    // one and MUST NOT be folded. This test FAILS on `main`, PASSES after the fix.
+    #[test]
+    fn srp_s3_resident_empty_account_must_not_change_root() {
+        use crate::types::{Address, AccountState};
+        use primitive_types::U256;
+
+        // Two DBs reach byte-identical COMMITTED state (one non-empty account).
+        let committed = Address([0x11u8; 20]);
+        let a = StateDB::new();
+        let b = StateDB::new();
+        a.accounts.set_balance(committed, U256::from(1000u64));
+        b.accounts.set_balance(committed, U256::from(1000u64));
+        let root_a = a.calculate_state_root();
+
+        // `b` additionally has a spurious RESIDENT empty account — exactly what a
+        // non-dirtying read-through (`load_account` with default) or a restart's
+        // reconstruction materializes. Committed state is UNCHANGED (an empty account
+        // is not committed state).
+        b.accounts
+            .load_account(Address([0x99u8; 20]), AccountState::default());
+        let root_b = b.calculate_state_root();
+
+        assert_eq!(
+            root_a, root_b,
+            "SRP-S3: a resident EMPTY account must not change the consensus root \
+             (EIP-158: empty ≡ absent). The root is being folded from the volatile \
+             resident set, so restart-reconstructed residency forks the chain (block 2042)."
         );
     }
 }

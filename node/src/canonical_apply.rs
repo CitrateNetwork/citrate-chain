@@ -341,6 +341,13 @@ impl CanonicalApplicator {
     /// Persist the applied-tip pointer + this block's verified state root (crash
     /// recovery / fast startup). Non-fatal on failure — logged, not returned.
     fn persist_applied(&self, block_hash: &Hash, height: u64, state_root: &Hash) {
+        // SRP-S3b: the applied-tip pointer is advanced ATOMICALLY with the state batch
+        // inside `Executor::apply_block` (persist_state_changes_with_tip) — that is the
+        // crash-consistency guarantee. This re-writes the SAME tip via the block store: an
+        // idempotent no-op in production (same value, right after the atomic commit, so it
+        // can never create a state-ahead-of-tip window), and the durable tip write for
+        // tests whose executor has no persistent state store. Also persists the block's
+        // state root (a separate fast-start/diagnostic pointer).
         if let Err(e) = self.storage.blocks.put_applied_tip(block_hash, height) {
             warn!(
                 "execute-on-receive: applied block {} @ {} but failed to persist tip: {}",
@@ -479,6 +486,24 @@ impl CanonicalApplicator {
     pub async fn reorg_to(&self, state: &mut AppliedState, new_tip: Hash) -> ReorgOutcome {
         if new_tip == state.tip.hash {
             return ReorgOutcome::NoChange;
+        }
+        // SRP-S3c: NEVER reorg to a block already on the applied chain. Such a block is an
+        // ANCESTOR of (or equal to) the current applied tip, so reorging to it would REVERT
+        // committed blocks — a backwards reorg, which fork-choice must never do (it only ever
+        // ADVANCES to a strictly heavier tip). After a miner restart, `select_tip` transiently
+        // returned an already-applied ancestor as "best"; without this guard, `reorg_to`
+        // `state_restore`d the executor back to that fork-point snapshot, FREEZING the
+        // producer's sealed state root (every subsequent block re-sealed the fork-point root
+        // while balances advanced) and wedging the fleet (block-174). If the block's height
+        // is unknown (not persisted), fall through to the normal fork-point walk.
+        if let Ok(Some(nb)) = self.storage.blocks.get_block(&new_tip) {
+            if self.on_applied_chain(state, new_tip, nb.header.height) {
+                debug!(
+                    "execute-on-receive: fork-choice tip {} @ {} is already on the applied chain (ancestor of tip {} @ {}) — declining backwards reorg",
+                    new_tip, nb.header.height, state.tip.hash, state.tip.height
+                );
+                return ReorgOutcome::NoChange;
+            }
         }
         // Outer safety net: a byte-exact snapshot of the current state + tip so a
         // failed reapply is fully undone (I3). This is the pre-reorg applied tip.
@@ -902,6 +927,11 @@ pub fn record_produced(
     let hash = block.header.block_hash;
     let height = block.header.height;
     state.record(hash, height, executor.state_snapshot());
+    // SRP-S3b: the durable applied-tip is advanced ATOMICALLY with the state batch by the
+    // producer's `persist_state_changes_with_tip` (see produce_block) — the crash-consistency
+    // guarantee. This re-writes the SAME tip value: idempotent in production (right after the
+    // atomic commit, so no state-ahead-of-tip window is possible), and the durable tip write
+    // for tests whose executor has no persistent state store.
     if let Err(e) = storage.blocks.put_applied_tip(&hash, height) {
         warn!(
             "execute-on-receive: produced block {} @ {} but failed to persist applied tip: {}",
@@ -1314,6 +1344,42 @@ mod tests {
             app.reorg_to(&mut state, a2.header.block_hash).await,
             ReorgOutcome::NoChange
         ));
+    }
+
+    /// SRP-S3c regression: `reorg_to` an ANCESTOR of the current tip (an already-applied
+    /// earlier block) is a BACKWARDS reorg — it must be declined (NoChange) and MUST NOT
+    /// revert committed state. Without the guard, `select_tip` transiently returning an
+    /// applied ancestor after a miner restart made `reorg_to` `state_restore` the executor
+    /// back to that block, freezing the producer's sealed state root and wedging the fleet.
+    #[tokio::test]
+    async fn reorg_to_applied_ancestor_is_declined_and_state_preserved() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        // tip advances to a2 (height 2); a1 (height 1) is an already-applied ancestor.
+        let (a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
+        let (v, t) = reward_for(&a1);
+
+        // Balances + tip reflect TWO applied blocks before the (backwards) reorg attempt.
+        let bal_cb_before = exec.get_balance(&Address(CB));
+        let bal_tr_before = exec.get_balance(&Address(TREASURY_ADDR));
+        assert_eq!(bal_cb_before, v * U256::from(2u64), "two blocks of validator reward");
+        assert_eq!(bal_tr_before, t * U256::from(2u64), "two blocks of treasury reward");
+
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        // Reorg to a1 — an ancestor of the current tip a2. Must be declined.
+        assert!(
+            matches!(
+                app.reorg_to(&mut state, a1.header.block_hash).await,
+                ReorgOutcome::NoChange
+            ),
+            "reorg to an applied ancestor must be a NoChange (never a backwards revert)"
+        );
+        // Tip and committed state are UNCHANGED — no state_restore to a1 happened.
+        assert_eq!(state.tip, AppliedTip { hash: a2.header.block_hash, height: 2 });
+        drop(state);
+        assert_eq!(exec.get_balance(&Address(CB)), bal_cb_before, "state must NOT revert to a1");
+        assert_eq!(exec.get_balance(&Address(TREASURY_ADDR)), bal_tr_before, "state must NOT revert to a1");
     }
 
     /// A fork-choice hook that always returns a fixed tip (a stand-in for
