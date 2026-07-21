@@ -243,22 +243,35 @@ impl StateDB {
     pub fn calculate_state_root(&self) -> StateRoot {
         let mut state_trie = self.state_trie.write();
 
-        // Deterministic insertion order (see doc item 2).
-        let mut dirty = self.accounts.get_dirty_accounts();
-        dirty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        // SRP (ADR-2026-07-21-state-root-purity, Decision §1+§2): the consensus root MUST
+        // be a PURE FUNCTION of committed state — identical whether a node produced,
+        // gossip-received, or cold-synced the block — never a function of dirty/insertion
+        // history. The pre-fix code folded ONLY the dirty accounts into a persistent,
+        // never-rebuilt accumulator, so an account/slot changed via a path that left it
+        // clean at fold time (zero-reward guard, non-dirtying read-through, cache_storage)
+        // kept a STALE trie value. Warm fleet nodes shared that stale accumulation and
+        // agreed on a root while their committed balances diverged; a cold node rebuilt a
+        // different history and computed a different root — the sync wedge.
+        //
+        // Fix: rebuild the trie FRESH from the full committed RESIDENT account set every
+        // call (never the store — the store is stale at root time: written after the root
+        // and holding the abandoned branch mid-reorg), folding EVERY account's CURRENT
+        // storage_root (§2: the per-contract storage sub-tries are the same accumulator
+        // class). The resident map is never evicted; a restarted node fully hydrates it
+        // first (WP-2.2). Deterministic address-sorted insertion preserves the PR-#88
+        // order-independence invariant.
+        *state_trie = Trie::new();
 
-        // Update state trie with account data
-        for address in dirty {
-            let mut account = self.accounts.get_account(&address);
+        let mut all = self.accounts.all_accounts();
+        all.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
 
-            // Fold the CURRENT storage root into the account first, so the
-            // encoded trie value is a pure function of state (idempotent). An
-            // account with no storage trie keeps its existing `storage_root`.
+        for (address, mut account) in all {
+            // Fold this account's storage_root computed FRESH from its committed slot
+            // trie — for EVERY account, not just dirty ones — so a slot change via any
+            // path is reflected. (Recomputes identically each call → idempotent.)
             if let Some(storage_trie) = self.storage_tries.get(&address) {
                 account.storage_root = storage_trie.root_hash();
-                // Keep the account store consistent with what we hash. This
-                // re-marks the account dirty, but every future call recomputes
-                // the identical storage_root, so the result stays stable.
+                // Keep the resident account consistent with what we hash.
                 self.accounts.set_account(address, account.clone());
             }
 
@@ -602,6 +615,86 @@ mod idempotency_probe {
 
         assert_eq!(root1, root2, "state root must not depend on operation order (reversed)");
         assert_eq!(root1, root3, "state root must not depend on operation order (shuffled)");
+    }
+}
+
+/// SRP-S1 WP-1.2 — RED probes for the state-root PURITY bug.
+///
+/// These encode ADR-2026-07-21-state-root-purity Decision §1 (root = pure function of the
+/// committed set) and §2 (the per-contract storage sub-tries are the SAME accumulator bug),
+/// and are the pass/fail oracle for SRP-S1 Phase 2. They MUST FAIL on the current
+/// accumulator implementation and pass once `calculate_state_root` derives BOTH the account
+/// trie and every `storage_root` from the committed resident set each call.
+///
+/// The mechanism they exploit: `calculate_state_root` re-folds `storage_root` only for
+/// accounts DIRTY at the instant it runs (`:247`), off a persistent, never-rebuilt
+/// `storage_trie` (`:20`). `cache_storage` (`:95-100`) changes a slot WITHOUT marking the
+/// account dirty (it models the lazy read-through hydration `revm_adapter.rs:261-296`). So a
+/// slot can change in committed state while the root keeps a stale value — the exact class of
+/// bug that put the live fleet on the same root with different committed state.
+#[cfg(test)]
+mod srp_purity_red {
+    use super::*;
+
+    /// The direct model of the live fleet split, at the storage layer: two StateDBs reach
+    /// the SAME committed state (contract `c`, slot `k` = `v2`) via different histories, and
+    /// MUST commit the same root. On `main` they diverge because `db_hist` folded `v1` and
+    /// never re-folded after the non-dirtying change to `v2`.
+    #[test]
+    fn state_root_is_pure_function_of_committed_state() {
+        let c = Address([0x44u8; 20]);
+        let k = vec![2u8; 32];
+        let v1 = vec![0x11u8; 32];
+        let v2 = vec![0x22u8; 32];
+
+        // db_hist: fold v1, commit (clears dirty), then change the slot to v2 via the
+        // non-dirtying hydration path — committed state is now v2 but the account is clean.
+        let db_hist = StateDB::new();
+        db_hist.set_code(c, vec![9, 9, 9]);
+        db_hist.set_storage(c, k.clone(), v1);
+        let _ = db_hist.commit();
+        db_hist.cache_storage(c, k.clone(), v2.clone());
+        assert_eq!(
+            db_hist.get_storage(&c, &k),
+            Some(v2.clone()),
+            "precondition: committed slot must be v2 after cache_storage"
+        );
+        let root_hist = db_hist.calculate_state_root();
+
+        // db_fresh: reach the SAME committed state directly (v2 dirty-folded).
+        let db_fresh = StateDB::new();
+        db_fresh.set_code(c, vec![9, 9, 9]);
+        db_fresh.set_storage(c, k.clone(), v2);
+        let root_fresh = db_fresh.calculate_state_root();
+
+        assert_eq!(
+            root_hist, root_fresh,
+            "IMPURE ROOT (SRP): identical committed state, different root — the root is a \
+             function of dirty/insertion history, not of committed state (state_db.rs:247,257)"
+        );
+    }
+
+    /// A committed storage change that did not re-dirty the account MUST move the root.
+    /// On `main` the root is unchanged (the storage_root is stale) — RED.
+    #[test]
+    fn storage_root_reflects_committed_slot_not_dirty_history() {
+        let c = Address([0x55u8; 20]);
+        let k = vec![3u8; 32];
+        let db = StateDB::new();
+        db.set_code(c, vec![7, 7]);
+        db.set_storage(c, k.clone(), vec![0xAAu8; 32]);
+        let root_before = db.commit(); // folds storage_root over 0xAA, clears dirty
+
+        // Committed state changes to 0xBB via the non-dirtying path.
+        db.cache_storage(c, k.clone(), vec![0xBBu8; 32]);
+        assert_eq!(db.get_storage(&c, &k), Some(vec![0xBBu8; 32]));
+
+        let root_after = db.calculate_state_root();
+        assert_ne!(
+            root_after, root_before,
+            "STORAGE STALENESS (SRP): the root ignored a committed slot change — storage \
+             sub-trie is a stale accumulator (state_db.rs:20,257-258)"
+        );
     }
 }
 
