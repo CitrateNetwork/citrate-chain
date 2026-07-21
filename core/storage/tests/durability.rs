@@ -197,7 +197,8 @@ fn test_k1_1_executor_persist_state_changes_has_no_direct_point_writes() {
     let body = &source[start..end];
 
     assert!(
-        body.contains("write_state_batch_sync"),
+        body.contains("write_state_batch_sync")
+            || body.contains("write_state_batch_with_applied_tip"),
         "K1.1: Executor must route finalized state through the batch API"
     );
     assert!(
