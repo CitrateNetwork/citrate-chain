@@ -161,7 +161,20 @@ live INSIDE /home/citrate/.citrate (PRESERVE on wipe).
     cross-activation(G8) + **G9 DURABLE RESTART PROOF (restart miner+follower WITHOUT wipe)**.
     Only after G9: merge srp/s3 → main + update citrate-core handoff.
 
-# ⚠️ 4TH RESTART FACET (SRP-S3c, OPEN): producer sealed state root FREEZES after a miner restart
+# ✅ SRP-S3c FIXED + G9 PROVEN (binary be0f55c3, branch d00e29d): miner restart no longer wedges
+- Root cause: after a miner restart, the drain's fork-choice select_tip transiently returned an
+  already-applied ANCESTOR as "best"; reorg_to state_restore'd the executor back to that fork-point
+  snapshot every tick → producer's sealed root FROZE (173/174/175 all 966a9fa9) → boots rejected →
+  wedge. Fix: reorg_to declines any reorg to a block already on the applied chain (backwards reorg;
+  fork-choice only ever advances to a strictly heavier tip). Test reorg_to_applied_ancestor_is_declined.
+- **G9 PASS (live)**: restarted the MINER (rpc-1, S3c, no wipe) → boots' APPLIED tips advanced in
+  lockstep (88/89/90), 0 mismatches, 0 reorg-thrash, sr@70 identical on all 4 (0xb2fa526e).
+- **G9b PASS**: SECOND miner restart + simultaneous FOLLOWER (boot2) restart → all 4 advancing
+  (126-129), 0 mismatches, sr@110 identical (0xf2594ddc). Restart durability proven REPEATEDLY.
+- ALL FOUR facets fixed: S2 (enhanced path) + S3 (EIP-158) + S3b (atomic state+tip) + S3c (no
+  backwards reorg). Miner AND follower restart mid-operation without divergence.
+
+# (historical) SRP-S3c investigation notes below
 - Setup complete (G1/G2/G3/G5/G6/G7 all PASS, front-loaded registration). Then the G9 MINER restart
   (rpc-1, no wipe, S3b binary): boot-check PASSED (S3b atomic commit works — no halt), miner resumed
   producing. But: blocks 173,174,175,... ALL sealed the SAME state_root 0x966a9fa9 (block 172 was
