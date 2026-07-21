@@ -186,6 +186,19 @@ impl AccountManager {
             .collect()
     }
 
+    /// SRP (ADR-2026-07-21): every resident account — the authoritative committed set
+    /// the state root is computed over. `calculate_state_root` folds THIS set (not the
+    /// dirty diff), so the root is a pure function of committed state, independent of
+    /// dirty/insertion history. The resident map is never evicted, so for a from-genesis
+    /// node this is the complete account set; a restarted node must fully hydrate the
+    /// resident map from the store BEFORE computing any root (WP-2.2).
+    pub fn all_accounts(&self) -> Vec<(Address, AccountState)> {
+        self.accounts
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect()
+    }
+
     /// Clear dirty flags
     pub fn clear_dirty(&self) {
         self.dirty.clear();
