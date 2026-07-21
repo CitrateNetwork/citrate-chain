@@ -219,3 +219,25 @@ live INSIDE /home/citrate/.citrate (PRESERVE on wipe).
 
 # Key handling: DEPLOYER/TREASURY/GRANT_SIGNER/VALIDATOR_STAKER_* keys read from .env.testnet by
 # scripts/forge/ceremony ONLY; never argv/echo/log. C-1 in force. Never pgrep -af the deploy proc.
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# ✅ CEREMONY COMPLETE + VERIFIED (2026-07-21, S3c binary be0f55c3, main a4f1a7a)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# - All 54 book contracts have on-chain code; regenerated 40204.json byte-identical to the frozen
+#   book (address- AND genesis-neutral: genesis 0xd1a1941e / sroot 0xd703e8c6 unchanged).
+# - ValidatorRegistry activeCount()=4 (pubkeys 0x1af7f9d5/0x25b78e08/0x39bd37a4/0xd7da4213, each
+#   staker bonded 32k); SBT 0x4CE39F89 + vault 0x61E324cF owned by grant signer 0xF42a1919 (funded
+#   200k); AA stack deployed + .env AA pins repopulated; WrappedSALT live (wSALT/18); deployer nonce 57.
+# - G8 activation 2000 CROSSED CLEAN — sr@2001 0xfc9c6992 + sr@2050 0x3dab5b20 identical on all 4;
+#   chain healthy past head 4200, 0 live mismatches, 0 errors/halts on any node.
+# - OPERATIONAL-ROLE FUNDING DONE (scripts/ops/fund-operational-roles.sh --broadcast, from deployer;
+#   idempotent top-up; the python3 hook was worked around via a `uv run python3` PATH shim):
+#     Bundler operator   0x560B2a15f1b949126AA548AcA35De5B3F33DEAC9  = 100 SALT
+#     Gateway operator   0xafde00628f1e949c2314b6bfc43dcd176fc0995d  = 100 SALT
+#     DGX provider       0x06583d0918f09A89f2Dad5fE4C5c524C2e5494AB  =  50 SALT
+#     DGX provider v2    0x71D321A396FAD49C58a346fec5C6cA712e345e1f  =  50 SALT
+#     Identity signer    0x8A9062625E98666Fc0072Ee2E7CB8AB08Bd1b651  =  10 SALT
+#   (EIP-2771 relayer unset → skipped.) Total 310 SALT; re-run = no-op (funded=0 noop=5).
+# - Downstream consumer re-pins: NO-OP (address-neutral). Treasury-signer droplet: NO-OP.
+# - ALL GATES PASS: G1/G2/G3/G5/G6/G7/G8/G9/G9b. Chain is DISTRIBUTABLE (build node/dmg from main,
+#   bare --network testnet, fresh data dir).
