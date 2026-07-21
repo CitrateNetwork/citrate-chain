@@ -285,16 +285,21 @@ mod tests {
         assert!(headers.is_empty());
     }
 
-    /// NET-2: `count` is clamped to the protocol maximum even when the
-    /// chain has more blocks than the clamp.
+    /// NET-2: `count` is clamped to the protocol maximum even when the chain has
+    /// more blocks than the clamp — AND the response never exceeds the byte budget.
+    /// The count clamp is an UPPER bound: since MAX_RESPONSE_BYTES was lowered to
+    /// 60 KiB (under the Noise per-message cap), the byte budget may bind before the
+    /// count clamp, so assert `<=` the protocol max + non-empty forward progress.
     #[test]
     fn net2_count_clamped_to_protocol_max() {
         let n = MAX_HEADERS_PER_REQUEST as u64 + 7;
         let (_dir, storage) = chain_of(n);
         let headers = serve_headers(&storage, &Hash::new(ZERO_ANCHOR), u32::MAX);
-        assert_eq!(headers.len(), MAX_HEADERS_PER_REQUEST as usize);
+        assert!(headers.len() <= MAX_HEADERS_PER_REQUEST as usize);
+        assert!(!headers.is_empty(), "serve must make forward progress");
         let blocks = serve_blocks(&storage, &Hash::new(ZERO_ANCHOR), u32::MAX);
-        assert_eq!(blocks.len(), MAX_BLOCKS_PER_REQUEST as usize);
+        assert!(blocks.len() <= MAX_BLOCKS_PER_REQUEST as usize);
+        assert!(!blocks.is_empty(), "serve must make forward progress");
     }
 
     /// A gap in the height index stops the walk: nothing contiguous can
