@@ -15,6 +15,12 @@ path = "src/main.rs"
 name = "validator-registration-ceremony"
 path = "src/bin/validator_registration_ceremony.rs"
 
+# SRP-S3b diagnostic: bulk-load a data dir's state as node boot does and print a per-account
+# digest + reloaded root, to name the account whose persisted representation diverges. Read-only.
+[[bin]]
+name = "state-digest"
+path = "src/bin/state_digest.rs"
+
 [dependencies]
 # Local dependencies
 citrate-consensus = { path = "../core/consensus" }
