@@ -243,22 +243,35 @@ impl StateDB {
     pub fn calculate_state_root(&self) -> StateRoot {
         let mut state_trie = self.state_trie.write();
 
-        // Deterministic insertion order (see doc item 2).
-        let mut dirty = self.accounts.get_dirty_accounts();
-        dirty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        // SRP (ADR-2026-07-21-state-root-purity, Decision §1+§2): the consensus root MUST
+        // be a PURE FUNCTION of committed state — identical whether a node produced,
+        // gossip-received, or cold-synced the block — never a function of dirty/insertion
+        // history. The pre-fix code folded ONLY the dirty accounts into a persistent,
+        // never-rebuilt accumulator, so an account/slot changed via a path that left it
+        // clean at fold time (zero-reward guard, non-dirtying read-through, cache_storage)
+        // kept a STALE trie value. Warm fleet nodes shared that stale accumulation and
+        // agreed on a root while their committed balances diverged; a cold node rebuilt a
+        // different history and computed a different root — the sync wedge.
+        //
+        // Fix: rebuild the trie FRESH from the full committed RESIDENT account set every
+        // call (never the store — the store is stale at root time: written after the root
+        // and holding the abandoned branch mid-reorg), folding EVERY account's CURRENT
+        // storage_root (§2: the per-contract storage sub-tries are the same accumulator
+        // class). The resident map is never evicted; a restarted node fully hydrates it
+        // first (WP-2.2). Deterministic address-sorted insertion preserves the PR-#88
+        // order-independence invariant.
+        *state_trie = Trie::new();
 
-        // Update state trie with account data
-        for address in dirty {
-            let mut account = self.accounts.get_account(&address);
+        let mut all = self.accounts.all_accounts();
+        all.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
 
-            // Fold the CURRENT storage root into the account first, so the
-            // encoded trie value is a pure function of state (idempotent). An
-            // account with no storage trie keeps its existing `storage_root`.
+        for (address, mut account) in all {
+            // Fold this account's storage_root computed FRESH from its committed slot
+            // trie — for EVERY account, not just dirty ones — so a slot change via any
+            // path is reflected. (Recomputes identically each call → idempotent.)
             if let Some(storage_trie) = self.storage_tries.get(&address) {
                 account.storage_root = storage_trie.root_hash();
-                // Keep the account store consistent with what we hash. This
-                // re-marks the account dirty, but every future call recomputes
-                // the identical storage_root, so the result stays stable.
+                // Keep the resident account consistent with what we hash.
                 self.accounts.set_account(address, account.clone());
             }
 
