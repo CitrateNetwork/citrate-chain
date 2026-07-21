@@ -242,6 +242,36 @@ pub trait StateStoreTrait: Send + Sync {
         Ok(())
     }
 
+    /// SRP-S3b (restart/crash consistency): atomically persist the finalized state
+    /// batch AND the applied-tip pointer (block hash + height) in ONE write batch, so
+    /// the durable flat state can NEVER be out of step with the committed block across a
+    /// crash/restart. Before this, the producer/receiver wrote state and the applied-tip
+    /// in SEPARATE writes: an interrupt between them left the state one block-reward ahead
+    /// of the committed block (block-2345), and on restart the reloaded state root != the
+    /// committed root → the node forked (now: SRP-S3 boot hard-fail). The real RocksDB
+    /// `StateStore` overrides this with a single cross-CF `WriteBatch`; the default here
+    /// writes state then tip (non-atomic — only used by in-memory test stores, where a
+    /// crash mid-write is not modeled). `applied_tip = None` means "state only".
+    fn write_state_batch_with_applied_tip(
+        &self,
+        accounts: &[(Address, crate::types::AccountState)],
+        storage: &[StateStorageChange],
+        applied_tip: Option<(Hash, u64)>,
+    ) -> anyhow::Result<()> {
+        self.write_state_batch_sync(accounts, storage)?;
+        if let Some((hash, height)) = applied_tip {
+            self.put_applied_tip_meta(&hash, height)?;
+        }
+        Ok(())
+    }
+
+    /// Persist the applied-tip pointer (block hash + height). Default no-op for test
+    /// stores; the real `StateStore` writes it to `CF_METADATA`. Used by the atomic
+    /// [`Self::write_state_batch_with_applied_tip`] default fallback.
+    fn put_applied_tip_meta(&self, _hash: &Hash, _height: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     // ------------------------------------------------------------------------
     // Sprint P950-A-4 WP-A.4.3: MVCC account-version persistence.
     //
@@ -696,8 +726,22 @@ impl Executor {
         }
     }
 
-    /// Persist all dirty accounts and storage slots from state_db to state_store
+    /// Persist all dirty accounts and storage slots from state_db to state_store.
     pub async fn persist_state_changes(&self) -> anyhow::Result<usize> {
+        self.persist_state_changes_with_tip(None).await
+    }
+
+    /// SRP-S3b: persist dirty state AND (atomically) advance the durable applied-tip
+    /// pointer to `applied_tip` in ONE write batch, so the durable flat state can never
+    /// be out of step with the committed block across a crash/restart. The producer and
+    /// the receiver pass the block they just executed as the tip; a `None` tip persists
+    /// state only (legacy callers). Contract code (content-addressed) is written BEFORE
+    /// the atomic batch, so a crash after code but before state leaves only harmless
+    /// orphan code and never a committed tip whose code is missing.
+    pub async fn persist_state_changes_with_tip(
+        &self,
+        applied_tip: Option<(Hash, u64)>,
+    ) -> anyhow::Result<usize> {
         let _guard = self.commit_coordinator.acquire_exec_lock().await;
         if let Some(store) = &self.state_store {
             let dirty_accounts = self.state_db.accounts.get_dirty_accounts();
@@ -721,15 +765,22 @@ impl Executor {
                 });
             }
 
-            let count = account_changes.len() + storage_changes.len();
-            if count > 0 {
-                store.write_state_batch_sync(&account_changes, &storage_changes)?;
-            }
-
             // Persist contract code deployed since the last commit (deferred from
-            // `set_code`, which is now in-memory only — review finding E).
+            // `set_code`) FIRST — content-addressed, so orphan code on a crash is
+            // harmless, whereas a committed tip whose code is missing would not be.
             for (code_hash, code) in self.state_db.take_dirty_code() {
                 store.put_code(&code_hash, &code)?;
+            }
+
+            let count = account_changes.len() + storage_changes.len();
+            // Write state + the applied-tip pointer ATOMICALLY. Always write when a tip
+            // is supplied (even with 0 dirty changes — the tip must still advance).
+            if count > 0 || applied_tip.is_some() {
+                store.write_state_batch_with_applied_tip(
+                    &account_changes,
+                    &storage_changes,
+                    applied_tip,
+                )?;
             }
 
             // Commit state DB (clears dirty tracking)
@@ -1145,7 +1196,12 @@ impl Executor {
             return Ok(got);
         }
 
-        if let Err(e) = self.persist_state_changes().await {
+        // SRP-S3b: persist state AND advance the applied-tip to THIS block atomically, so
+        // the durable state and the committed applied tip can never diverge on a crash.
+        if let Err(e) = self
+            .persist_state_changes_with_tip(Some((block.header.block_hash, block.header.height)))
+            .await
+        {
             // HIGH-1: a durable-write failure must NOT leave in-memory state
             // advanced while the store (atomic batch — unchanged on failure) and
             // the applied-tip pointer stay behind. Revert in-memory too, so

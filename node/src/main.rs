@@ -1047,38 +1047,75 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     }
 
-    // Verify state root: compare in-memory trie root against last persisted state root
+    // SRP-S3b: verify the hydrated in-memory root reproduces the committed root of the
+    // APPLIED TIP — the block whose post-execution state the durable store reflects — NOT
+    // the latest stored block. A node legitimately stores blocks AHEAD of what it has
+    // applied (execute-on-receive downloads then drains; the producer persists the block
+    // before atomically advancing state+tip). Comparing against the latest BLOCK would
+    // false-positive whenever blocks lead the applied tip; the applied-tip pointer and the
+    // durable state are advanced ATOMICALLY (persist_state_changes_with_tip), so they must
+    // always agree — a mismatch means a genuinely corrupt/divergent reconstruction.
     {
         let memory_root = state_db.calculate_state_root();
-        let latest_height = storage.blocks.get_latest_height().unwrap_or(0);
-        if latest_height > 0 {
-            if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(latest_height) {
-                // Try dedicated state root store first, fall back to reading from block
-                let persisted_root = storage.state.get_state_root(&block_hash)
+        // The applied tip = the block whose committed state the store holds. Fall back to
+        // the latest block only when no applied-tip pointer exists (pre-S3b stores / fresh
+        // genesis), preserving the prior behavior for those.
+        let (tip_hash, tip_height) = storage
+            .blocks
+            .get_applied_tip()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                let h = storage.blocks.get_latest_height().unwrap_or(0);
+                let hash = storage
+                    .blocks
+                    .get_block_by_height(h)
                     .ok()
                     .flatten()
-                    .or_else(|| {
-                        storage.blocks.get_block(&block_hash)
-                            .ok()
-                            .flatten()
-                            .map(|b| b.state_root)
-                    });
-
-                match persisted_root {
-                    Some(root) if root != citrate_consensus::types::Hash::default() => {
-                        if memory_root == root {
-                            info!("State root verification PASSED (height {}, root={})",
-                                latest_height, hex::encode(&memory_root.as_bytes()[..8]));
-                        } else {
-                            warn!("State root MISMATCH at height {}: memory={} persisted={}",
-                                latest_height,
-                                hex::encode(memory_root.as_bytes()),
-                                hex::encode(root.as_bytes()));
-                        }
+                    .unwrap_or_default();
+                (hash, h)
+            });
+        if tip_height > 0 && tip_hash != citrate_consensus::types::Hash::default() {
+            let committed_root = storage
+                .state
+                .get_state_root(&tip_hash)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    storage
+                        .blocks
+                        .get_block(&tip_hash)
+                        .ok()
+                        .flatten()
+                        .map(|b| b.state_root)
+                });
+            match committed_root {
+                Some(root) if root != citrate_consensus::types::Hash::default() => {
+                    if memory_root == root {
+                        info!(
+                            "State root verification PASSED (applied tip height {}, root={})",
+                            tip_height,
+                            hex::encode(&memory_root.as_bytes()[..8])
+                        );
+                    } else {
+                        // SRP-S3: a node whose hydrated root does NOT reproduce the applied
+                        // tip's committed root MUST NOT start — it would seal/verify against
+                        // a divergent root and fork the fleet. HARD-FAIL (safe local stop),
+                        // never warn-and-continue. See ADR-2026-07-21-restart-produce-purity.
+                        error!("SRP-S3 BOOT HALT: state root MISMATCH at applied tip height {}: memory={} committed={} — refusing to start (a node that cannot reconstruct the committed root would fork the fleet)",
+                            tip_height,
+                            hex::encode(memory_root.as_bytes()),
+                            hex::encode(root.as_bytes()));
+                        return Err(anyhow::anyhow!(
+                            "SRP-S3 boot halt: hydrated state root {} != committed root {} at applied tip height {}",
+                            hex::encode(memory_root.as_bytes()),
+                            hex::encode(root.as_bytes()),
+                            tip_height
+                        ));
                     }
-                    _ => {
-                        debug!("No persisted state root for height {} — skipping verification", latest_height);
-                    }
+                }
+                _ => {
+                    debug!("No committed state root for applied tip height {} — skipping verification", tip_height);
                 }
             }
         }
