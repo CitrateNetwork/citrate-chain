@@ -1070,10 +1070,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             info!("State root verification PASSED (height {}, root={})",
                                 latest_height, hex::encode(&memory_root.as_bytes()[..8]));
                         } else {
-                            warn!("State root MISMATCH at height {}: memory={} persisted={}",
+                            // SRP-S3 (restart-produce purity): a node whose hydrated
+                            // in-memory root does NOT reproduce the committed persisted
+                            // root MUST NOT start producing or applying blocks — it would
+                            // silently seal/verify against a divergent root and fork the
+                            // fleet (the block-2042 restart poison). HARD-FAIL instead of
+                            // the old warn-and-continue, converting a silent fork into a
+                            // safe local stop. See ADR-2026-07-21-restart-produce-purity.
+                            error!("SRP-S3 BOOT HALT: state root MISMATCH at height {}: memory={} persisted={} — refusing to start (a node that cannot reconstruct the committed root would fork the fleet)",
                                 latest_height,
                                 hex::encode(memory_root.as_bytes()),
                                 hex::encode(root.as_bytes()));
+                            return Err(anyhow::anyhow!(
+                                "SRP-S3 boot halt: hydrated state root {} != committed root {} at height {}",
+                                hex::encode(memory_root.as_bytes()),
+                                hex::encode(root.as_bytes()),
+                                latest_height
+                            ));
                         }
                     }
                     _ => {
