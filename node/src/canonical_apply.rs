@@ -341,6 +341,13 @@ impl CanonicalApplicator {
     /// Persist the applied-tip pointer + this block's verified state root (crash
     /// recovery / fast startup). Non-fatal on failure — logged, not returned.
     fn persist_applied(&self, block_hash: &Hash, height: u64, state_root: &Hash) {
+        // SRP-S3b: the applied-tip pointer is advanced ATOMICALLY with the state batch
+        // inside `Executor::apply_block` (persist_state_changes_with_tip) — that is the
+        // crash-consistency guarantee. This re-writes the SAME tip via the block store: an
+        // idempotent no-op in production (same value, right after the atomic commit, so it
+        // can never create a state-ahead-of-tip window), and the durable tip write for
+        // tests whose executor has no persistent state store. Also persists the block's
+        // state root (a separate fast-start/diagnostic pointer).
         if let Err(e) = self.storage.blocks.put_applied_tip(block_hash, height) {
             warn!(
                 "execute-on-receive: applied block {} @ {} but failed to persist tip: {}",
@@ -902,6 +909,11 @@ pub fn record_produced(
     let hash = block.header.block_hash;
     let height = block.header.height;
     state.record(hash, height, executor.state_snapshot());
+    // SRP-S3b: the durable applied-tip is advanced ATOMICALLY with the state batch by the
+    // producer's `persist_state_changes_with_tip` (see produce_block) — the crash-consistency
+    // guarantee. This re-writes the SAME tip value: idempotent in production (right after the
+    // atomic commit, so no state-ahead-of-tip window is possible), and the durable tip write
+    // for tests whose executor has no persistent state store.
     if let Err(e) = storage.blocks.put_applied_tip(&hash, height) {
         warn!(
             "execute-on-receive: produced block {} @ {} but failed to persist applied tip: {}",
