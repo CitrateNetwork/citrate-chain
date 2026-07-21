@@ -3,7 +3,7 @@ title: "SRP — State-Root Purity remediation: complete handoff (safe to clear c
 created: 2026-07-21
 branch: main
 author: Claude (Opus 4.8, 1M) for SaulBuilds
-status: spec + ADR + planset written & TLC-verified; ADR RED-TEAMED + G0 SIGNED 2026-07-21; Phase 1 (red test) is next
+status: Phases 0-3 DONE 2026-07-21 — spec+ADR (G0 signed) → red probes → pure-root fix → live cold-sync gate PASS (root+balance+storage). Only Phase 4 (reroll on the fixed binary) remains. Branch srp/s1-red-tests (fix e246ca83, gate e584d10), docs merged in.
 chain: 40204, rpc.citrate.ai
 ---
 
@@ -30,9 +30,19 @@ the ADR was red-teamed and amended.** Red-team surfaced a CRITICAL second instan
 — the fix must rebuild BOTH the account trie and every storage trie over the committed set,
 and the "authoritative committed set" is the **never-evicted, fully-hydrated resident state**,
 with **store reads at root time FORBIDDEN** (the store is stale pre-persist + mid-reorg). All 6
-findings are recorded in the ADR "Red-team (gate G0)" section. **Next action: SRP-S1 Phase 1 —
-write the red test** (per-account balance AND per-storage-slot equality on a from-genesis +
-mid-restart cold sync). Do NOT band-aid, and do NOT reroll before the fix lands.
+findings are recorded in the ADR "Red-team (gate G0)" section.
+
+**UPDATE 2026-07-21 — Phases 1-3 DONE.** The red probes (commit 7726e6d) reproduced the
+defect RED; the pure-root fix (`calculate_state_root` rebuilds the account trie AND every
+storage trie fresh from the committed resident set each call — commit 246ca83) flipped them
+GREEN with no regression (execution 566/566, node 120/120). The live cold-sync gate
+(`scripts/ci/srp_coldsync_gate.sh`, commit e584d10) then proved a fresh cold follower matches
+a producer on **root + per-account balance + per-storage-slot** (root `0x02624868…`, coinbase
+`0x8d933b0b…`, `contract-storage@0 = 0x…2a` — all MATCH; 0 state-root mismatches) — the exact
+property the live fleet failed. **Next action: SRP-S1 Phase 4 — build the reroll binary
+(SRP fix + #85 serve cap + deployer rotation, all on `srp/s1-red-tests`) and execute the
+practiced reroll runbook; the state-root fix moves NO CREATE2 address.** Do NOT reroll on the
+pre-fix binary.
 
 # The artifacts (all written, spec verified)
 

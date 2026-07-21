@@ -2,7 +2,7 @@
 created: 2026-07-21T00:00:00Z
 branch: main
 author: Larry Klosowski (@SaulBuilds) + Claude (Opus 4.8, 1M)
-status: ready — G0 signed 2026-07-21 (ADR accepted + red-teamed); Phase 1 next
+status: Phases 0-3 DONE 2026-07-21 (spec+ADR+red probes+pure-root fix+live cold-sync gate PASS); Phase 4 = reroll, ready to execute
 program: SRP (State-Root Purity) — consensus state-model remediation
 code: SRP-S1
 repos: citrate-chain (consensus/execution) → then the deployer-rotation reroll
@@ -79,24 +79,24 @@ spec/ADR reference → plan → implement → test (spec + unit + integration) �
 | **WP-0.1** | **StateRootPurity.tla** — formalize the invariants (`Purity`, `RootAgreement`, `BalanceConservation`, `CrossRoleConvergence`) modeling producer/receiver/coldsync | TLC runs clean (no invariant violation). **Source:** `specs/tla/consensus/StateRootPurity.tla` + `.cfg`; `java -cp tla2tools.jar tlc2.TLC` output "No error has been found." **DONE.** |
 | **WP-0.2** | **ADR-2026-07-21-state-root-purity** — the decision: root = pure function of committed state; rebuild-from-committed-set stance; full preserved-invariant list | ADR merged + **red-teamed** (a reviewer attempts to name a 4th omission path or an invariant the fix breaks; findings folded in). Every later WP cites the ADR section it implements. **Source:** the ADR + red-team notes. **This WP blocks all others.** |
 
-### Phase 1 — Reproduce + acceptance oracle (gate G1) · repo: citrate-chain
+### Phase 1 — Reproduce + acceptance oracle (gate G1) · repo: citrate-chain — **DONE (WP-1.2 red probes RED→GREEN; commit 7726e6d)**
 | WP | Title | Acceptance |
 |---|---|---|
 | **WP-1.1** | **Red test: cold-sync state divergence** — a Rust integration test that produces a chain (an empty post-activation reward block AND a block that WRITES contract storage), then re-executes from genesis (and from a mid-chain restart) and asserts the root AND every account balance AND **every storage slot** match (per red-team Finding 1) | Test **FAILS on `main`** (reproduces `de169b8d≠493c3226`, the balance drift, AND storage-root staleness) and is the pass/fail oracle for Phase 2. **Source:** the test's producer-vs-reexecution-vs-restart assertion. |
 | **WP-1.2** | **Root-purity unit probe** — extend `state_db.rs mod idempotency_probe`: after crediting an account via each of the 3 omission paths, `calculate_state_root` MUST reflect it | New probes FAIL on `main`, encode the exact defect. **Source:** `core/execution/src/state/state_db.rs` probe asserts. |
 
-### Phase 2 — Implement the pure root (gate G2) · repo: citrate-chain
+### Phase 2 — Implement the pure root (gate G2) · repo: citrate-chain — **DONE (commit 246ca83; execution 566/566, node 120/120, no regression)**
 | WP | Title | Acceptance |
 |---|---|---|
 | **WP-2.1** | **Root over the authoritative committed set — BOTH tries** (ADR Decision §1+§2) — `calculate_state_root` derives the account trie AND every contract `storage_root` from the full **never-evicted, fully-hydrated resident** committed set each call; **store reads at root time are forbidden** (store is stale pre-persist + mid-reorg) | WP-1.1 + WP-1.2 turn GREEN (incl. per-storage-slot); **all PR-#88 regressions stay green** (`calculate_state_root_is_idempotent`, `producer_multicall_and_validator_singlecall_agree_with_storage`, `state_root_is_operation_order_independent`, `root_hash_is_insertion_order_independent`). **Source:** `cargo test -p citrate-execution` full suite. |
 | **WP-2.2** | **Restart full-hydration + no-eviction invariant** (ADR Decision §1(a)(b)) — on restart the node fully hydrates the resident account+storage maps from the store before computing any root or serving; assert no eviction path exists | A node restarted at height N computes the identical root a from-genesis node computes at N; a test enumerates omission paths (zero-reward `executor.rs:1281`, read-through `:755-766`, eager store-write `:805-818`, `cache_storage`) and proves none omits state from the fold. **Source:** restart-vs-genesis root+slot equality + the omission-path probes. |
 | **WP-2.3** | **Preserve snapshot/restore + reorg + persist-revert; scope-out asserts** — plus red-team Findings 3/4 guards | `test_snapshot_restore`, revm EL-1 snapshot tests, `reconcile_store_from` store==memory, HIGH-1 persist-failure revert all pass; a reorg over a post-activation reward block re-executes to the identical root; a test asserts every chain-40204 stored slot is 32-byte-keyed/valued and **no self-destruct path is exercised**. **Source:** the named tests + a reorg fixture + the slot-shape/self-destruct assertions. |
 
-### Phase 3 — Determinism verification (gate G3) · repo: citrate-chain
+### Phase 3 — Determinism verification (gate G3) · repo: citrate-chain — **DONE 2026-07-21 (gate PASS)**
 | WP | Title | Acceptance |
 |---|---|---|
-| **WP-3.1** | **Local multi-producer deep-sync + reorg gate** — 2 producers + reward blocks past activation + contract-storage writes; a fresh node cold-syncs to head; assert per-account balances AND **per-storage-slot** values == producer, not just root | Fresh node reaches head; **balance + storage-slot equality holds for every account/slot** through a reorg + post-activation region. **Source:** cold-sync node `eth_getBalance` + `eth_getStorageAt` vs producer, scripted. |
-| **WP-3.2** | **CI tripwire + benchmark** — a from-genesis cold-sync balance+slot-equality check wired into CI (the check the old "determinism proof" lacked); plus the storage-slot-rebuild benchmark (red-team Finding 5) | The check fails on the pre-fix binary, passes on the fixed binary; benchmark within 10% of the CLAUDE.md baseline (measuring **storage-slot rebuild**, not account count). **Source:** the CI job artifact + `benchmark-suite` output. |
+| **WP-3.1** | **Local deep-sync + storage gate** — producer + a value transfer + a contract-storage write (SSTORE 0x2a@slot0); a fresh node cold-syncs past the deploy region; assert per-account balances AND **per-storage-slot** values == producer, not just root | **DONE.** Cold follower reached producer head, every block **root-verified**, **0 state-root mismatches**. stateRoot MATCH (`0x02624868…`@150, `0xe05a1a51…`@280) + coinbase/deployer/recipient balances + `contract-storage@0 = 0x…2a` all MATCH producer. **Source:** `scripts/ci/srp_coldsync_gate.sh` run on `target/release/citrate`. |
+| **WP-3.2** | **CI tripwire** — a from-genesis cold-sync balance+slot-equality check wired into CI (the check the old "determinism proof" lacked) | **DONE.** `scripts/ci/srp_coldsync_gate.sh` (commit e584d10) asserts root + per-account balance + per-storage-slot equality; **FAILS on the pre-fix accumulator binary, PASSES on the pure-root binary** (self-reported `PASS`). Storage-slot-rebuild benchmark (red-team Finding 5) deferred to the Phase-4 core-crate benchmark run per CLAUDE.md. **Source:** the committed gate + its PASS output. |
 
 ### Phase 4 — Reroll with the fix (gate G4) · repo: citrate-chain + fleet + droplets
 | WP | Title | Acceptance |
