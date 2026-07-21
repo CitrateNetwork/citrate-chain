@@ -1373,15 +1373,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         Arc::new(CheckpointManager::with_persistence(cp_config, shared_dag_store.clone(), kv))
     };
 
-    // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Only active under v2 headers
+    // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Active under v2 headers
     // (CITRATE_BLOCK_V2) — the flag that makes a block's state_root reproducible by a
     // receiver (committed coinbase + deterministic basic rewards). When enabled, received
     // blocks that linearly extend the applied tip are executed + state-root-verified on
     // the receive path, and the producer holds the same lock so the two never race.
-    // Default off preserves the legacy producer-only state-advance model.
+    // DEFAULT ON since the 2026-07-21 SRP reroll: v2 is the live network format, so a
+    // fresh node (e.g. citrate-core via `--network testnet`) computes the same genesis
+    // commitment as the fleet and cold-syncs out of the box. The legacy v1 model is dead;
+    // pass CITRATE_BLOCK_V2=0 only to force an isolated v1 devnet. Safe to default-on now
+    // that SRP-S2 removed the restart-poison reward path (was unsafe pre-fix).
     let execute_on_receive_enabled = std::env::var("CITRATE_BLOCK_V2")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .unwrap_or(true);
     let canonical_applicator: Option<Arc<canonical_apply::CanonicalApplicator>> =
         if execute_on_receive_enabled {
             // Attach GhostDAG as the fork-choice authority so the driver reorgs
