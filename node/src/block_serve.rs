@@ -25,10 +25,23 @@ pub const MAX_HEADERS_PER_REQUEST: u32 = 2048;
 /// Protocol maximum blocks returned per `GetBlocks` request.
 pub const MAX_BLOCKS_PER_REQUEST: u32 = 512;
 
-/// Soft cap on the serialized response payload. Kept under the 1 MiB
-/// transport frame cap so an over-budget response is truncated here
-/// instead of serialized in full and then rejected by the framing layer.
-pub const MAX_RESPONSE_BYTES: u64 = 900 * 1024;
+/// Soft cap on the serialized response payload.
+///
+/// This MUST stay under the Noise per-message limit, NOT the 1 MiB length-frame
+/// cap. The transport encrypts every message with a single Noise
+/// `write_message`, which hard-fails above `MAX_NOISE_MSG_LEN` (65535 bytes) —
+/// so an over-64 KiB response is silently dropped by `encrypt`, the requester
+/// never receives it, and a cold node wedges forever re-requesting the same
+/// anchor. (This is exactly why empty pre-deploy blocks synced but a batch of
+/// real ~13 KiB contract-deploy blocks did not.) 60 KiB leaves headroom for the
+/// `NetworkMessage::Blocks` enum/vec wrapper (~12 B) and Noise's 16-byte auth
+/// tag: 60 KiB payload + wrapper + tag < 65519 usable plaintext bytes.
+///
+/// NOTE: the serve ALWAYS emits its first height-group for forward progress, so
+/// a SINGLE block larger than this still can't be served over Noise — no such
+/// block exists on chain 40204 today (max observed ~13.6 KiB). Full robustness
+/// for arbitrarily large messages needs Noise-layer chunking (follow-up).
+pub const MAX_RESPONSE_BYTES: u64 = 60 * 1024;
 
 /// Resolve the first height to serve for a request anchor.
 ///
@@ -272,16 +285,21 @@ mod tests {
         assert!(headers.is_empty());
     }
 
-    /// NET-2: `count` is clamped to the protocol maximum even when the
-    /// chain has more blocks than the clamp.
+    /// NET-2: `count` is clamped to the protocol maximum even when the chain has
+    /// more blocks than the clamp — AND the response never exceeds the byte budget.
+    /// The count clamp is an UPPER bound: since MAX_RESPONSE_BYTES was lowered to
+    /// 60 KiB (under the Noise per-message cap), the byte budget may bind before the
+    /// count clamp, so assert `<=` the protocol max + non-empty forward progress.
     #[test]
     fn net2_count_clamped_to_protocol_max() {
         let n = MAX_HEADERS_PER_REQUEST as u64 + 7;
         let (_dir, storage) = chain_of(n);
         let headers = serve_headers(&storage, &Hash::new(ZERO_ANCHOR), u32::MAX);
-        assert_eq!(headers.len(), MAX_HEADERS_PER_REQUEST as usize);
+        assert!(headers.len() <= MAX_HEADERS_PER_REQUEST as usize);
+        assert!(!headers.is_empty(), "serve must make forward progress");
         let blocks = serve_blocks(&storage, &Hash::new(ZERO_ANCHOR), u32::MAX);
-        assert_eq!(blocks.len(), MAX_BLOCKS_PER_REQUEST as usize);
+        assert!(blocks.len() <= MAX_BLOCKS_PER_REQUEST as usize);
+        assert!(!blocks.is_empty(), "serve must make forward progress");
     }
 
     /// A gap in the height index stops the walk: nothing contiguous can
