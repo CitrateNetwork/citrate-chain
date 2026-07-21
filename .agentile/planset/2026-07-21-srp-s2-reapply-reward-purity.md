@@ -2,7 +2,13 @@
 created: 2026-07-21T05:00:00Z
 branch: main
 author: Larry Klosowski (@SaulBuilds) + Claude (Opus 4.8, 1M)
-status: DRAFT — root-cause CLASS established + evidence; spec/ADR/red-test next (G0 pending)
+status: PHASES 0–2 CODE-COMPLETE (spec+ADR+red-test+fix landed, all green) — awaiting owner gates G0/G1/G2; Phase 3 (durable reroll) pending owner go
+progress:
+  - "WP-0.1 RewardApplyPurity.tla + .cfg + _buggy.cfg — TLC-clean (committed-only: no error; buggy: RewardRootAgreement violated). DONE, G0 pending."
+  - "WP-0.2 ADR-2026-07-21-reapply-reward-purity.md — decision + red-team, mechanism PINNED. DONE, G0 pending."
+  - "WP-1.1 red test srp_s2_producer_receiver_reward_parity_on_restart_empty_block (node/src/producer.rs) drives the REAL produce_block — FAILED on main (StateRootMismatch 0x6f1d8584 vs 0xdf1c59d0), pins the enhanced-path mechanism. DONE, G1 pending."
+  - "WP-2.1 fix: removed the node-local enhanced reward path; producer settles ONLY via settle_block_rewards_guarded (committed state). Red test GREEN; 121 node-bin + 8 rprime-parity + 46 rollback/reorg/batch tests all green; tripwire scripts/ci/srp_s2_reward_purity_tripwire.sh added. DONE, G2 pending."
+  - "WP-3.1 durable reroll — NOT executed (live production ceremony; owner go required)."
 program: SRP (State-Root Purity) — Sprint S2: the re-apply / reward-settlement path
 code: SRP-S2
 depends-on: SRP-S1 (forward root purity — DONE + rerolled); this covers the path S1 did NOT
