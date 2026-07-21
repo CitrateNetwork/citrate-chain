@@ -10,11 +10,16 @@ chain: 40204, genesis 0xd1a1941e, rpc https://rpc.citrate.ai
 
 # TL;DR
 
-Chain 40204 was **cleanly rerolled** onto the SRP-S2-fixed node binary (2026-07-21). It is a
-**fresh chain from genesis** but **ADDRESS-NEUTRAL** — every contract address is unchanged
-(the fix is Rust-only). You can now **build the app/node from `main`** and it will **cold-sync
-`--network testnet` out of the box** (v2 now defaults ON). The one thing that will bite you:
-**a data dir left over from the OLD chain will NOT sync — start with a fresh data dir.**
+Chain 40204 was **cleanly rerolled** onto the fully restart-durable node binary (2026-07-21, SRP
+S2+S3+S3b+S3c, all merged to `main` @ `ecc2a51`). It is a **fresh chain from genesis** but
+**GENESIS- AND ADDRESS-NEUTRAL** — genesis hash is unchanged (`0xd1a1941e…`) and every contract
+address is unchanged (the fixes are Rust-only). You can now **build the app/node from `main`** and it
+will **cold-sync `--network testnet` out of the box** (v2 defaults ON). The one thing that will bite
+you: **a data dir left over from an OLD chain will NOT sync — start with a fresh data dir.**
+
+**Restart durability is now proven:** a node can be **restarted / closed & reopened mid-operation**
+without diverging — verified live for both a follower and the miner, repeatedly (this was the hard
+problem across SRP-S2..S3c). So the desktop app's close/reopen is safe.
 
 # What changed and why
 
