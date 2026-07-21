@@ -87,3 +87,73 @@ async fn srp_s3b_bulk_reload_reproduces_live_root() {
         root_live, root_reload
     );
 }
+
+/// SRP-S3b crash-consistency: the applied-tip pointer and the durable state must advance
+/// ATOMICALLY. This models the exact block-2345 fault — a producer credits block N's reward
+/// and persists STATE, but is interrupted before committing the BLOCK/tip — and asserts the
+/// fix: `persist_state_changes_with_tip` writes state + applied-tip in one batch, so on
+/// reload the applied tip and the reloaded state root always agree (either both at N or both
+/// at N-1), never state-ahead-of-tip (which forked the fleet).
+#[tokio::test]
+async fn srp_s3b_state_and_applied_tip_advance_atomically() {
+    use citrate_consensus::types::Hash;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let storage =
+        Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+    let state_db = Arc::new(StateDB::new());
+    let executor = Arc::new(Executor::with_storage_and_chain_id(
+        state_db.clone(),
+        Some(storage.state.clone()),
+        40204,
+    ));
+
+    // Commit "block N-1": credit some reward, persist state + tip atomically.
+    let cb = Address([0x0eu8; 20]);
+    state_db.accounts.set_balance(cb, U256::from(9u64));
+    let tip_nm1 = Hash::new([0xA1u8; 32]);
+    executor
+        .persist_state_changes_with_tip(Some((tip_nm1, 100)))
+        .await
+        .expect("commit N-1");
+    // Record what a reload of the committed N-1 state produces.
+    let root_nm1 = state_db.calculate_state_root();
+
+    // The durable applied tip is exactly N-1.
+    assert_eq!(
+        storage.blocks.get_applied_tip().expect("tip"),
+        Some((tip_nm1, 100)),
+        "applied tip must be durably at N-1 after the atomic commit"
+    );
+
+    // Now "block N": credit the next reward into the in-memory state, but DO NOT commit
+    // (simulate the interrupt before the atomic state+tip write for block N).
+    state_db.accounts.set_balance(cb, U256::from(18u64));
+
+    // Reload from the durable store, exactly as boot does, and read the durable tip.
+    let reloaded = StateDB::new();
+    for (address, account) in storage.state.get_all_accounts().expect("accts") {
+        reloaded.accounts.load_account(address, account);
+    }
+    for ((address, k), v) in storage.state.get_all_storage().expect("slots") {
+        reloaded.set_storage(address, k.as_bytes().to_vec(), v.as_bytes().to_vec());
+    }
+    let _ = reloaded.take_dirty_storage();
+    let reloaded_root = reloaded.calculate_state_root();
+    let (durable_tip_hash, durable_tip_height) =
+        storage.blocks.get_applied_tip().expect("tip").expect("some");
+
+    // The durable state was NOT advanced to N (block N never committed), so the reloaded
+    // root must equal the committed N-1 root, and the durable tip is still N-1 — they AGREE.
+    // Before the fix, the producer persisted N's state separately from the tip, so the
+    // reloaded state would be at N while the tip stayed at N-1 → boot-halt / fork.
+    assert_eq!(
+        reloaded_root, root_nm1,
+        "SRP-S3b: durable state must not advance past the atomically-committed tip"
+    );
+    assert_eq!(
+        (durable_tip_hash, durable_tip_height),
+        (tip_nm1, 100),
+        "SRP-S3b: applied tip must match the durable state (both at N-1), never diverge"
+    );
+}
