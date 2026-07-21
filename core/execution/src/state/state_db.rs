@@ -78,6 +78,12 @@ impl StateDB {
             .and_then(|trie| trie.get(key))
     }
 
+    /// SRP-S3b diagnostic: recompute an account's storage_root FRESH from its resident
+    /// storage trie (what `calculate_state_root` folds), or `None` if no trie is resident.
+    pub fn get_storage_root_recomputed(&self, address: &Address) -> Option<Hash> {
+        self.storage_tries.get(address).map(|t| t.root_hash())
+    }
+
     /// Set storage value
     pub fn set_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
         self.dirty_storage.insert((address, key.clone()));
