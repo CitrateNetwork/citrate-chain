@@ -94,6 +94,57 @@ accumulator) and SRP-S2 (reward path) did not cover: **resident-set membership a
   future non-empty residency/representation drift at the source; omitted now for per-block cost
   since EIP-158 closes the confirmed class and the boot hard-fail covers restart reconstruction.
 
+## Addendum — SRP-S3b: state/applied-tip write atomicity (a second restart facet)
+
+The EIP-158 fix + boot hard-fail (above) exposed a distinct crash-consistency bug when the live
+restart-resilience gate restarted the MINER at block 2345: the miner's boot hard-fail fired (safe
+stop, no fork). A `state-digest` diff of the halted miner's store vs a follower's (69 accounts, 238
+slots) showed **only two accounts differ — the coinbase (+9 SALT) and treasury (+1 SALT) = exactly
+one block's basic reward.** A follower reloads faithfully; only the producer's store diverged.
+
+**Root cause:** `produce_block` wrote durable **state** (`persist_state_changes`) *before* the
+**block** and advanced the **applied-tip** in a *separate* write. The flat state store has no height,
+so a stop between the state write and the block/tip commit left the durable state **one block-reward
+ahead of the committed block**. On restart the reloaded root ≠ the committed root → (with the hard-
+fail) a safe halt; without it, a fork. It is purely a restart/crash-consistency defect — live roots
+always agreed.
+
+**Decision (SRP-S3b):** the durable **state and the applied-tip pointer must advance atomically.**
+`StateStore::write_state_batch_with_applied_tip` writes the account+storage batch AND the applied-tip
+pointer (CF_METADATA) in ONE cross-CF RocksDB `WriteBatch` (all stores share one `db`).
+`Executor::persist_state_changes_with_tip` uses it on BOTH the producer and receiver paths. The
+producer persists the BLOCK first, then the atomic state+tip; a crash after the block but before the
+commit leaves the block AHEAD of a consistent state+tip, and the existing forward-drain re-applies it
+deterministically (SRP-S2). The boot check compares the hydrated root against the **applied-tip's**
+committed root, not the latest stored block (a node legitimately stores blocks ahead of applied).
+Confirmed by `srp_s3b_state_and_applied_tip_advance_atomically`.
+
+**Recovery note:** SRP-S3b changes only *when/how* state+tip are persisted, NOT root computation, so
+an S3b node computes identical roots to the S3 chain. The existing chain was therefore recovered
+WITHOUT a reroll: swap the boots (correct committed state) to the S3b binary, then wipe + cold-sync
+only the corrupt miner. Genesis (0xd1a1941e), contracts, and validators are preserved.
+
+## Addendum 2 — SRP-S3c: fork-choice must never reorg backwards (miner-restart reorg-thrash)
+
+After S3b let the restarted miner START (instead of halting), a deeper facet surfaced: the miner
+produced blocks whose sealed state root FROZE (blocks 173,174,175… all sealed `0x966a9fa9`) while
+its balances advanced, and followers rejected them → wedge. The rpc-1 log showed the disease: the
+execute-on-receive **periodic drain's fork-choice repeatedly REORGed to an already-applied ANCESTOR**
+(`REORG 8069f8fd`), and `reorg_to` obligingly `state_restore`d the executor back to that fork-point
+snapshot every tick — reverting the producer's just-credited reward, so the next block re-sealed the
+fork-point root. A `select_tip` that transiently returned an applied ancestor as "best" after the
+restart drove it.
+
+**Decision (SRP-S3c):** fork-choice must **never** reorg to a block already on the applied chain — a
+block that is an ancestor of (or equal to) the current applied tip. Reorging to it would REVERT
+committed blocks, which fork-choice must never do (it only ever ADVANCES to a strictly heavier tip).
+`reorg_to` now declines (`NoChange`) when `new_tip` is on the applied chain, so a misbehaving
+`select_tip` can no longer corrupt committed state. This is a defensive consensus invariant: the fix
+holds regardless of why `select_tip` returned an ancestor. Confirmed by
+`reorg_to_applied_ancestor_is_declined_and_state_preserved` (canonical_apply). The residual
+`select_tip`-returns-ancestor-after-restart is now harmless (declined reorg attempts) and tracked
+separately as a non-safety cleanup.
+
 ## Red-team notes
 
 - *"Just make hydration provably complete instead of changing the root."* — Rejected as primary:
