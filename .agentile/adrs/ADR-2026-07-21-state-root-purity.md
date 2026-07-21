@@ -2,7 +2,7 @@
 created: 2026-07-21T00:00:00Z
 branch: main
 author: Claude (Opus 4.8, 1M) directed by Larry Klosowski (@SaulBuilds)
-status: proposed
+status: accepted (G0 signed 2026-07-21 — red-team findings folded in below)
 work_order: SRP (State-Root Purity) — planset .agentile/planset/2026-07-21-srp-state-root-purity.md
 repo: citrate-chain
 spec: specs/tla/consensus/StateRootPurity.tla (TLC: no error)
@@ -71,21 +71,50 @@ or cold-synced the block.** Formalized as `specs/tla/consensus/StateRootPurity.t
 (invariants `Purity`, `RootAgreement`, `BalanceConservation`, `CrossRoleConvergence`;
 TLC: *no error*). Concretely:
 
-1. **Root over the authoritative committed set, not a dirty-diff accumulator.**
-   `calculate_state_root` derives the trie from the authoritative committed account state
-   (the executor's account map as the single source of truth, reconciled with the durable
-   store), so every account that exists is represented at its current value **every**
-   computation — no reliance on "was it dirtied this block." Whether implemented as a
-   full deterministic rebuild each call or as a correctly-maintained persistent MPT keyed
-   by the committed set, the acceptance oracle is identical: `Purity` + `RootAgreement`.
-2. **One balance representation folded into the root.** Collapse the resident-map /
-   durable-store / accumulator-trie triad so a balance has a single source of truth that
-   the root reflects. Close the three omission paths: route `set_balance` through the
-   dirty-tracked path (no eager store bypass during apply), and ensure read-through
-   hydration cannot leave a value out of the folded set.
-3. **Reward is committed state, not off-book.** The validator/treasury credit is part of
+1. **Root over the authoritative committed set — precisely defined (amended per red-team
+   Finding 2).** The authoritative source at root-computation time is the
+   **never-evicted, fully-hydrated resident state** (`AccountManager.accounts` +
+   `storage_tries`), NOT the durable store. Rationale: the store is deliberately STALE at
+   root time — it is written *after* the root is computed (`apply_block_inner`:1134 root,
+   :1148 persist) and it intentionally holds the ABANDONED branch during a reorg reapply
+   (`reconcile_store_from` runs only after the reorg settles). **Reading the store during
+   root computation is therefore FORBIDDEN** — it would fold pre-persist-lagged or
+   abandoned-branch rows. The resident set is a complete authority *iff* two properties
+   hold, which the fix must guarantee: (a) accounts/slots are NEVER evicted from the
+   resident maps (true today — no eviction path), and (b) on **restart** the node FULLY
+   hydrates the resident maps from the store before computing any root or serving. Given
+   (a)+(b), `calculate_state_root` derives the trie from the full resident committed set
+   each call — every account/slot represented at its current value, no reliance on "was it
+   dirtied this block."
+2. **Storage sub-tries are the SAME bug — in scope for S1 (red-team Finding 1, CRITICAL).**
+   `calculate_state_root` folds `account.storage_root = storage_trie.root_hash()`
+   (`state_db.rs:257-258`) off the persistent, never-rebuilt per-contract `storage_tries`
+   accumulator (`state_db.rs:20`), which hydrates lazily/per-slot (`revm_adapter.rs:261-296`
+   `cache_storage`) — so a warm/restarted node computes `storage_root` over a DIFFERENT
+   subset of the same committed slots than a from-genesis node. The account-trie rebuild
+   does nothing here (it *reads* the stale storage root). **The fix MUST make `storage_root`
+   a pure function of a contract's committed slot set too** — rebuild each storage trie
+   from its resident slot set, on the same never-evicted/fully-hydrated basis as (1). The
+   empty-block symptom didn't expose this (no storage writes), so it is a *latent* second
+   instance, not deferrable to S2.
+3. **One representation, no store reads at root time.** Collapse the resident-map /
+   durable-store / accumulator-trie triad so balance AND storage have a single source of
+   truth the root reflects. Close the three omission paths: route `set_balance` through the
+   dirty-tracked path (no eager store bypass during apply, `executor.rs:805-818`), and
+   ensure read-through hydration (`executor.rs:755-766`; `cache_storage` `state_db.rs:95-100`)
+   and zero-reward blocks (`executor.rs:1281`) cannot leave a value out of the folded set —
+   because the root is now over the FULL resident set, not the dirty diff, hydration
+   correctness is what matters, not dirty-tracking.
+4. **Reward is committed state, not off-book.** The validator/treasury credit is part of
    the account state the root commits (`BalanceConservation`), so all roles mint the same
    supply and agree.
+5. **Root scope is account+storage ONLY — stated explicitly (red-team Finding 4).** The
+   root does NOT authenticate `models` / `training_jobs` (`state_db.rs:26,29`) — those are
+   deterministic state a root comparison will not catch; flagged for audit posture, tracked
+   separately. **Self-destruct / account deletion is UNSUPPORTED** — there is no
+   `remove_account` and REVM commit ignores destruction (`revm_adapter.rs:324-407`); the
+   rebuild cannot express deletion. S1 asserts (test) that no chain-40204 path self-destructs;
+   deletion support is an explicit non-goal (SRP-S2 if ever needed).
 
 **Chosen implementation stance (correctness-first):** rebuild the account trie from the
 authoritative committed set on each root computation. Rationale: history-independence *by
@@ -114,6 +143,27 @@ regression, never on correctness.
 - **TransactionExecution.tla**: `BalanceConservation`, `NoNegativeBalance`,
   `NonceMonotonicity` (`specs/tla/consensus/TransactionExecution.tla:150-191`).
 
+## Red-team (gate G0) — findings folded in
+
+Adversarial review (2026-07-21) attacked the fix. Six findings; three were load-bearing and
+changed the Decision above. Verdict was "do not sign as originally written" — resolved by the
+amendments now in Decision §1–§5 and Performance.
+
+| # | Sev | Finding | Resolution |
+|---|---|---|---|
+| 1 | **CRITICAL** | Storage sub-tries are the identical accumulator bug (`state_db.rs:20,257-258`); account-only rebuild leaves it live one level down. Latent (empty-block symptom didn't touch storage). | **In S1** — Decision §2. Root must rebuild storage tries over each contract's committed slot set. Acceptance test asserts **per-storage-slot** equality, not just per-account balance. |
+| 2 | **HIGH** | "Account map reconciled with the durable store" is self-contradictory: resident map is incomplete (lazy hydration `executor.rs:760-761`); store is stale at root time (pre-persist `:1134`→`:1148`; abandoned-branch mid-reorg). | **Fixed** — Decision §1 pins the authority to a never-evicted, fully-hydrated resident set and **forbids store reads at root time**; restart must fully hydrate. |
+| 3 | **HIGH** | Enumeration exists (`state_store.rs:206-248`) but `get_all_storage` silently drops slots with key-len ≠ 52B and truncates values to 32B (`:230,238`); `set_storage` accepts arbitrary sizes. | **Mooted + guarded** — Decision §1 forbids using the store as the root-time authority (so the lossy scan is off the consensus path). S1 adds a test asserting every chain-40204 stored slot is 32-byte-keyed/valued (EVM guarantees it, `revm_adapter.rs:357`). |
+| 4 | MEDIUM | Self-destruct/deletion has no representation (no `remove_account`; REVM commit ignores destruction). `models`/`training_jobs` are deterministic state the root never commits. | **Scoped out explicitly** — Decision §5. S1 asserts no self-destruct path is exercised; models/jobs-not-root-committed is an audit-posture note. |
+| 5 | MEDIUM | Perf claim "O(N accounts)" undercounts: it's O(total storage slots) × 2–3 calls/block. | **Fixed** — Performance amended to O(resident storage slots); S1 benchmark measures storage-slot rebuild, store scans forbidden. |
+| 6 | REFUTED | Deep-reorg reconstruction as a corruption vector. | `reorg_to` reverts to a **retained full StateSnapshot** and rejects forks past `MAX_REORG_DEPTH`; it never reconstructs a parent from the store → a too-deep reorg **stalls (rejected)**, not corrupts. Deep-reorg reconstruction NOT pulled into S1. |
+
+**G0 sign-off:** ACCEPTED 2026-07-21, on owner delegation (@SaulBuilds: "red-team the ADR and
+sign off G0"). The core direction — history-independent root by construction, mandatory
+reroll, and the per-account **+ per-slot** cold-sync acceptance test — stands; the three
+load-bearing gaps are closed in the amendments above. SRP-S1 WPs must cite the amended
+Decision §§ they implement.
+
 ## Consequences
 
 - **A reroll is required after the fix.** The current live chain already carries divergent
@@ -123,8 +173,15 @@ regression, never on correctness.
   deterministic chain, on which cold sync (citrate-core / Mac + Linux) just works.
 - **New acceptance test that matters:** cold-sync a node from genesis and assert
   **per-account balances** equal the fleet, not merely the root (the old proof's blind spot).
-- **Performance:** full-rebuild adds O(N accounts) per block; benchmarked in SRP-S1, with
-  the persistent-MPT follow-on (SRP-S2) gated on a >10% regression vs the CLAUDE.md baseline.
+- **Performance (amended per red-team Finding 5):** the cost is NOT O(N accounts) — it is
+  **O(total resident storage slots)** because rebuilding `storage_root` (Decision §2) walks
+  every committed slot of every touched contract, and `calculate_state_root` runs **2–3×
+  per block on the producer + once per receiver/drain apply** (`state_db.rs:218-222`,
+  `apply_block_inner:1134`). The SRP-S1 benchmark MUST measure storage-slot rebuild cost
+  (ValidatorRegistry / EntryPoint / SBT / vault can hold thousands of slots), not account
+  count. The persistent-MPT follow-on (SRP-S2) is gated on a >10% regression vs the
+  CLAUDE.md baseline. Store CF scans at root time are FORBIDDEN (Decision §1), so the
+  worst case is bounded by resident-slot count, not RocksDB table scans.
 - **TOB / audit posture:** this is a genuine consensus-safety finding caught pre-handoff;
   filing the ADR + spec + regression makes it an auditable, closed class rather than a
   latent divergence.

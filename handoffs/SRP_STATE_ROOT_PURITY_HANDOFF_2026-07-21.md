@@ -3,7 +3,7 @@ title: "SRP — State-Root Purity remediation: complete handoff (safe to clear c
 created: 2026-07-21
 branch: main
 author: Claude (Opus 4.8, 1M) for SaulBuilds
-status: spec + ADR + planset written & TLC-verified; implementation gated on G0 sign-off
+status: spec + ADR + planset written & TLC-verified; ADR RED-TEAMED + G0 SIGNED 2026-07-21; Phase 1 (red test) is next
 chain: 40204, rpc.citrate.ai
 ---
 
@@ -24,10 +24,15 @@ the honest root, which the fleet never committed → hard `StateRootMismatch` �
 (rpc-1 `0xc5e5bb45…` vs boots `0x691b4bac…`). Same root, different state. It is NOT
 cross-arch (x86_64 and aarch64 both compute the honest `de169b8d`).
 
-This handoff + the ADR + planset + TLA spec are complete. **Next action: get gate G0 signed
-(red-team the ADR), then start SRP-S1 Phase 1 (write the red test).** Do NOT band-aid, and do
-NOT reroll before the fix lands — the chain must be rerolled *after* the fix to be genuinely
-deterministic.
+This handoff + the ADR + planset + TLA spec are complete. **Gate G0 is SIGNED (2026-07-21) —
+the ADR was red-teamed and amended.** Red-team surfaced a CRITICAL second instance: the
+**per-contract storage sub-tries have the identical accumulator bug** (`state_db.rs:20,257-258`)
+— the fix must rebuild BOTH the account trie and every storage trie over the committed set,
+and the "authoritative committed set" is the **never-evicted, fully-hydrated resident state**,
+with **store reads at root time FORBIDDEN** (the store is stale pre-persist + mid-reorg). All 6
+findings are recorded in the ADR "Red-team (gate G0)" section. **Next action: SRP-S1 Phase 1 —
+write the red test** (per-account balance AND per-storage-slot equality on a from-genesis +
+mid-restart cold sync). Do NOT band-aid, and do NOT reroll before the fix lands.
 
 # The artifacts (all written, spec verified)
 
@@ -53,13 +58,17 @@ deterministic.
 - **Why PR #88 didn't fix it:** #88 fixed insertion-order + storage-root side-effects
   (`state_db.rs:248,254-263`) but not the accumulator staleness — the symptom moved.
 
-# The fix (decided in the ADR)
+# The fix (decided in the ADR, amended by the G0 red-team)
 
 Make `calculate_state_root` a **pure, history-independent function of the full committed
-account+storage set** (rebuild the trie from the authoritative committed state each call),
-collapse the balance to one dirty-tracked representation, and close the 3 omission paths.
-Correctness-first; O(N-accounts) rebuild is negligible at pilot scale; a persistent-MPT for
-scale is the SRP-S2 follow-on (gated only on a benchmark regression).
+account+storage set** — rebuild BOTH the account trie AND every per-contract storage trie
+from the **never-evicted, fully-hydrated resident committed set** each call. **Store reads at
+root time are FORBIDDEN** (the store is written *after* the root and holds the abandoned
+branch mid-reorg — reading it folds stale rows). Restart must fully hydrate the resident maps
+before computing any root or serving. Close the omission paths. Correctness-first; the cost is
+O(resident storage slots) × 2–3 calls/block (NOT O(accounts)) — benchmark storage-slot rebuild;
+a persistent-MPT for scale is the SRP-S2 follow-on. **Out of scope:** self-destruct/deletion
+(unsupported — asserted absent on 40204), and `models`/`training_jobs` (not root-committed).
 
 **Invariants the fix must preserve** (full list in the ADR): `StateRootPurity.tla`;
 `GenesisSafetyAcrossNodes` (`StateRootFor` pure+injective); the PR-#88 `idempotency_probe`
@@ -99,20 +108,23 @@ failure revert (`executor.rs:1148-1161`); `TransactionExecution.tla` conservatio
 
 # Exact next steps (SRP-S1, in order — the Agentile loop each WP)
 
-1. **Gate G0 (WP-0.2):** red-team the ADR — a reviewer tries to name a 4th omission path or
-   an invariant the rebuild breaks; fold findings in; owner signs. NOTHING else starts first.
-2. **Phase 1 (WP-1.1):** write the RED integration test — produce a chain incl. an empty
-   post-activation reward block, re-execute from genesis, assert BOTH root AND every account
-   balance match. It must FAIL on current code (that is the oracle). Add the `idempotency_probe`
-   omission-path probes (WP-1.2).
-3. **Phase 2 (WP-2.1/2.2/2.3):** implement root-over-committed-set + one balance representation
-   + close the 3 paths; turn the red tests green; keep ALL PR-#88 + snapshot/reorg/persist
-   tests green; benchmark.
-4. **Phase 3:** local 2-producer deep-sync + reorg; cold node reaches head with per-account
-   balances == producer; wire the CI cold-sync balance-equality tripwire.
-5. **Phase 4:** build the reroll binary (fix + serve cap + rotation), execute the practiced
+**G0 is DONE (ADR red-teamed + signed 2026-07-21).** Start at Phase 1.
+
+1. **Phase 1 (WP-1.1):** write the RED integration test — produce a chain incl. an empty
+   post-activation reward block AND a block that WRITES contract storage; re-execute from
+   genesis AND from a mid-chain restart; assert root AND every account balance AND **every
+   storage slot** match. It must FAIL on current code (that is the oracle). Add the
+   `idempotency_probe` omission-path probes (WP-1.2), incl. a storage-slot staleness probe.
+2. **Phase 2 (WP-2.1/2.2/2.3):** root over the committed resident set for BOTH tries; forbid
+   store reads at root time; full-hydrate on restart + no-eviction invariant; close the paths;
+   turn the red tests green; keep ALL PR-#88 + snapshot/reorg/persist tests green; benchmark
+   storage-slot rebuild.
+3. **Phase 3:** local 2-producer deep-sync + reorg with storage writes; cold node reaches head
+   with per-account balances AND per-slot values == producer; wire the CI cold-sync
+   balance+slot-equality tripwire.
+4. **Phase 4:** build the reroll binary (fix + serve cap + rotation), execute the practiced
    reroll runbook, prove a fresh Linux + Mac citrate-core node cold-syncs to head with
-   matching balances.
+   matching balances AND storage.
 
 # Do NOT
 
