@@ -306,6 +306,75 @@ impl StateDB {
         state_trie.root_hash()
     }
 
+    /// SRP-S4 diagnostic — an INJECTIVE full-state fingerprint that DISTINGUISHES two
+    /// states which `calculate_state_root` maps to the SAME root. Unlike the consensus
+    /// root it (a) folds EVERY resident account INCLUDING the EIP-158-empty ones the root
+    /// SKIPS (with an explicit `empty` flag), and (b) folds each account's RAW storage
+    /// slots — so an empty account resident on one node but absent on another, a torn
+    /// mid-reorg read, or any residency artifact changes the fingerprint even when the
+    /// consensus root agrees. Deploy under `CITRATE_SRP_FINGERPRINT`, log per block, then
+    /// diff two nodes at a wedge height. DIAGNOSTIC ONLY — never a consensus value.
+    pub fn full_state_fingerprint(&self) -> Hash {
+        use sha3::{Digest, Keccak256};
+        let mut all = self.accounts.all_accounts();
+        all.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        let mut h = Keccak256::new();
+        for (address, mut account) in all {
+            let slots: Vec<(Vec<u8>, Vec<u8>)> = match self.storage_tries.get(&address) {
+                Some(t) => {
+                    account.storage_root = t.root_hash();
+                    let mut s: Vec<(Vec<u8>, Vec<u8>)> = t.entries_map().into_iter().collect();
+                    s.sort();
+                    s
+                }
+                None => Vec::new(),
+            };
+            h.update(address.0);
+            let mut bal = [0u8; 32];
+            account.balance.to_big_endian(&mut bal);
+            h.update(bal);
+            h.update(account.nonce.to_be_bytes());
+            h.update(account.code_hash.as_bytes());
+            h.update(account.storage_root.as_bytes());
+            h.update([u8::from(account.is_empty())]);
+            for (k, v) in slots {
+                h.update((k.len() as u32).to_be_bytes());
+                h.update(&k);
+                h.update((v.len() as u32).to_be_bytes());
+                h.update(&v);
+            }
+        }
+        Hash::new(h.finalize().into())
+    }
+
+    /// SRP-S4 diagnostic — per-account lines for the injective fingerprint above, so a
+    /// diff of two nodes' dumps at a wedge height NAMES the diverging account/slot-count.
+    pub fn full_state_digest_lines(&self) -> Vec<String> {
+        let mut all = self.accounts.all_accounts();
+        all.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        all.into_iter()
+            .map(|(address, mut account)| {
+                let nslots = match self.storage_tries.get(&address) {
+                    Some(t) => {
+                        account.storage_root = t.root_hash();
+                        t.entries_map().len()
+                    }
+                    None => 0,
+                };
+                format!(
+                    "0x{} bal={} nonce={} code={} sroot={} empty={} slots={}",
+                    hex::encode(address.0),
+                    account.balance,
+                    account.nonce,
+                    hex::encode(&account.code_hash.as_bytes()[..4]),
+                    hex::encode(&account.storage_root.as_bytes()[..4]),
+                    u8::from(account.is_empty()),
+                    nslots,
+                )
+            })
+            .collect()
+    }
+
     /// Commit state changes
     pub fn commit(&self) -> StateRoot {
         let root = self.calculate_state_root();
