@@ -42,7 +42,7 @@ impl TransactionApi {
         // Get nonce if not provided
         let nonce = match request.nonce {
             Some(n) => n,
-            None => self.executor.get_nonce(&request.from),
+            None => self.executor.get_canonical_account(&request.from).nonce, // SRP-S4 WP-2.2: non-warming committed read
         };
 
         // Create transaction hash from nonce + from + to + timestamp
@@ -127,6 +127,6 @@ impl TransactionApi {
         &self,
         address: citrate_execution::types::Address,
     ) -> Result<u64, ApiError> {
-        Ok(self.executor.get_nonce(&address))
+        Ok(self.executor.get_canonical_account(&address).nonce) // SRP-S4 WP-2.2: non-warming committed read
     }
 }

@@ -80,7 +80,9 @@ impl StateApi {
 
     /// Get state root
     pub async fn get_state_root(&self) -> Result<Hash, ApiError> {
-        let root = self.executor.calculate_state_root();
+        // SRP-S4: use the READ-ONLY fold — the mutating `calculate_state_root` would
+        // race the block producer's lock-free fold on the shared consensus state_db.
+        let root = self.executor.state_root_readonly();
         Ok(root)
     }
 }
