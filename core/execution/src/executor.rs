@@ -970,6 +970,17 @@ impl Executor {
         self.state_db.calculate_state_root()
     }
 
+    /// SRP-S4: a READ-ONLY state root for RPC / diagnostics. `calculate_state_root`
+    /// does a `set_account` write-back on the shared resident map (state_db.rs), so
+    /// calling it from a lock-free RPC handler (e.g. `get_state_root`) races the block
+    /// producer's fold. This folds an ISOLATED copy of committed state instead, so it
+    /// NEVER mutates the shared consensus `state_db`.
+    pub fn state_root_readonly(&self) -> Hash {
+        let iso = Arc::new(StateDB::new());
+        iso.restore(self.state_db.snapshot());
+        iso.calculate_state_root()
+    }
+
     /// EXECUTE-ON-RECEIVE (reorg): capture a full, restorable snapshot of world
     /// state (accounts + storage + models + jobs + the accumulating state trie).
     /// Used by the reorg snapshot ring to retain the state as-of each applied
@@ -1796,50 +1807,82 @@ impl Executor {
     /// restores the snapshot afterward. This avoids a race condition where the
     /// block producer's persist_state_changes() could persist the inflated
     /// balance to RocksDB between set_balance and restore.
+    /// Build a throwaway executor over an ISOLATED copy of the current committed state,
+    /// sharing only the read-only machinery (state store for read-through, precompiles,
+    /// service adapters, chain id, block context, reward policy). It has its OWN
+    /// `state_db` and a FRESH `CommitCoordinator`, so anything it mutates — balance/nonce
+    /// overrides, read-through hydration, journal writes — is invisible to the shared
+    /// consensus `state_db` and to the block producer's lock-free root fold.
+    ///
+    /// SRP-S4 ROOT CAUSE: the previous `simulate_transaction` mutated the SHARED
+    /// `state_db` under `exec_lock`, but the producer's `settle_block_rewards` +
+    /// `calculate_state_root` take only `advance_lock` (a DISJOINT lock; the fold takes
+    /// none), so a concurrent `eth_call`/`eth_estimateGas` was observed by the fold and
+    /// its transient `u128::MAX` sender balance was sealed into the committed state root —
+    /// a root no cold-sync reproduces (the block-5,406 non-injective wedge). Isolating
+    /// simulation removes the shared mutation entirely, so no lock coupling is needed.
+    fn isolated_for_simulation(&self) -> Executor {
+        // Copy the current committed state into an isolated db that SHARES the immutable
+        // code map (so contract execution finds bytecode). A concurrent producer write
+        // can make this copy slightly torn, but it only affects THIS throwaway simulation
+        // result — the shared consensus state_db is never mutated, so the committed root
+        // is safe.
+        let iso_db = Arc::new(self.state_db.isolated_clone());
+        Executor {
+            state_db: iso_db,
+            state_store: self.state_store.clone(),
+            gas_schedule: self.gas_schedule.clone(),
+            inference_service: self.inference_service.clone(),
+            artifact_service: self.artifact_service.clone(),
+            ai_storage: self.ai_storage.clone(),
+            model_registry: self.model_registry.clone(),
+            precompile_executor: self.precompile_executor.clone(),
+            chain_id: self.chain_id,
+            block_context: std::sync::RwLock::new(self.get_block_context()),
+            // Share the coordinator so MVCC versions match the copied state exactly (the
+            // isolated `state_db` is a snapshot of `self.state_db`, so its per-account
+            // versions align with `self.commit_coordinator`). The simulation discards its
+            // journal + WriteSet, so no version bumps escape — identical to the prior
+            // in-place simulate, minus the shared-state mutation.
+            commit_coordinator: self.commit_coordinator.clone(),
+            defer_persist: std::sync::atomic::AtomicBool::new(false),
+            reward_policy: self.reward_policy.clone(),
+            validator_activation_height: std::sync::atomic::AtomicU64::new(
+                self.validator_activation_height
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+        }
+    }
+
     pub async fn simulate_transaction(
         &self,
         block: &Block,
         tx: &Transaction,
     ) -> Result<TransactionReceipt, ExecutionError> {
-        // Simulation acquires the exec_lock to serialize against real tx
-        // execution — the simulation's temporary balance/nonce overrides
-        // must not be observable to concurrent workers. Short critical
-        // section; eth_call / eth_estimateGas are not throughput-critical.
-        let _guard = self.commit_coordinator.acquire_exec_lock().await;
+        // SRP-S4: run the WHOLE simulation on an ISOLATED state (never the shared
+        // consensus state_db), so the block producer's lock-free root fold can never
+        // observe the simulation's temporary balance/nonce overrides. No `exec_lock`
+        // needed — there is no shared mutation to serialize.
+        let sim = self.isolated_for_simulation();
 
-        // Snapshot BEFORE any mutations (to undo the simulation overrides).
-        let snapshot = self.state_db.snapshot();
-
-        // Override sender balance for simulation
+        // Override the sender balance/nonce ON THE ISOLATED state only.
         let from = crate::address_utils::normalize_address(&tx.from);
-        self.state_db
-            .accounts
-            .set_balance(from, U256::from(u128::MAX));
-
-        // Align nonce so validation inside execute_tx_into_journal passes
-        let current_nonce = self.state_db.accounts.get_nonce(&from);
+        sim.state_db.accounts.set_balance(from, U256::from(u128::MAX));
+        let current_nonce = sim.state_db.accounts.get_nonce(&from);
         if tx.nonce != current_nonce {
-            self.state_db.accounts.set_nonce(from, tx.nonce);
+            sim.state_db.accounts.set_nonce(from, tx.nonce);
         }
 
-        // Execute the tx into a pinned (but never committed) journal.
-        // Simulation doesn't drain the journal — all pending mutations
-        // stay in the journal and get thrown away on return.
+        // Execute into a pinned (never-committed) journal on the isolated executor.
         let mut context = ExecutionContext::new(block, tx);
         context
             .journal
             .lock()
-            .pin_at(self.commit_coordinator.current_version());
-        let result = self
-            .execute_tx_into_journal(block, tx, &mut context)
-            .await;
+            .pin_at(sim.commit_coordinator.current_version());
+        let result = sim.execute_tx_into_journal(block, tx, &mut context).await;
 
-        // ALWAYS restore — unconditional, no matter success or failure.
-        // Undoes the inflated balance + nonce override.
-        self.state_db.restore(snapshot);
-
-        // Simulation discards the journal + WriteSet capture: no MVCC
-        // version bumps escape the simulation, no state changes land.
+        // The isolated executor + its journal are dropped on return: nothing lands on
+        // the shared state, no MVCC version bumps escape.
         result.map(|(receipt, _writes)| receipt)
     }
 

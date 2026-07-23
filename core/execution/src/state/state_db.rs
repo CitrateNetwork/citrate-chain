@@ -57,6 +57,28 @@ impl StateDB {
         }
     }
 
+    /// SRP-S4: an ISOLATED copy for RPC simulation. Copies the MUTABLE committed state
+    /// (accounts, storage tries, state trie, models, training jobs) so mutations never
+    /// touch `self`'s consensus state, but SHARES the immutable, content-addressed
+    /// `code_storage` (a code hash always maps to the same bytes) so contract execution
+    /// still finds bytecode. `snapshot()`/`restore()` alone do NOT copy code bytes (only
+    /// dirty-code hashes), because the reorg use-case restores onto the SAME db where
+    /// code persists; a fresh isolated db needs the shared code map.
+    pub fn isolated_clone(&self) -> Self {
+        let iso = Self {
+            accounts: Arc::new(AccountManager::new()),
+            storage_tries: Arc::new(DashMap::new()),
+            code_storage: self.code_storage.clone(),
+            models: Arc::new(DashMap::new()),
+            training_jobs: Arc::new(DashMap::new()),
+            state_trie: Arc::new(parking_lot::RwLock::new(Trie::new())),
+            dirty_storage: Arc::new(DashSet::new()),
+            dirty_code: Arc::new(DashSet::new()),
+        };
+        iso.restore(self.snapshot());
+        iso
+    }
+
     /// Drain the set of code hashes deployed since the last commit (for the
     /// caller to persist). Clears the dirty-code set.
     pub fn take_dirty_code(&self) -> Vec<(Hash, Vec<u8>)> {
