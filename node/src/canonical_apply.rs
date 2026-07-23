@@ -436,6 +436,15 @@ impl CanonicalApplicator {
                         "execute-on-receive: applied block {} @ height {} (root verified)",
                         block_hash, height
                     );
+                    // SRP-S4 injective fingerprint (env-gated): log per-block so a
+                    // continuously-running node and a cold-sync can be diffed at a wedge
+                    // height even though their consensus roots agree. Diagnostic only.
+                    if std::env::var("CITRATE_SRP_FINGERPRINT").is_ok() {
+                        warn!(
+                            "SRP-FP applied @ {} root={} fp={}",
+                            height, block.state_root, self.executor.state_db().full_state_fingerprint()
+                        );
+                    }
                     // VALIDATOR-S1: re-sync the selector if this crossed a snapshot boundary.
                     self.maybe_sync_registry(height).await;
                 }
@@ -444,6 +453,15 @@ impl CanonicalApplicator {
                         "execute-on-receive: REJECT block {} @ {} — state root mismatch (claimed {}, computed {})",
                         block_hash, height, expected, got
                     );
+                    // SRP-S4: dump the injective per-account digest of the state that
+                    // produced the DIVERGENT computed root, so a diff vs a healthy node's
+                    // digest at this height NAMES the account (env-gated, diagnostic only).
+                    if std::env::var("CITRATE_SRP_FINGERPRINT").is_ok() {
+                        warn!("SRP-FP REJECT @ {} fp={}", height, self.executor.state_db().full_state_fingerprint());
+                        for line in self.executor.state_db().full_state_digest_lines() {
+                            warn!("SRP-FP-DIGEST @ {} {}", height, line);
+                        }
+                    }
                     return DrainOutcome {
                         applied,
                         rejected: Some((
@@ -2219,6 +2237,72 @@ mod tests {
              root that a clean forward execution does not reproduce — the reorged in-memory \
              state diverged from committed state despite a matching tip root. This is the \
              block-5,406 signature (produce-after-reorg impurity)."
+        );
+    }
+
+    /// SRP-S4 ROOT CAUSE (RED) — the RPC `simulate_transaction` path races the block
+    /// producer's state-root fold on the SHARED `state_db`.
+    ///
+    /// `Executor::simulate_transaction` (executor.rs:1808) takes ONLY `exec_lock`, then
+    /// `snapshot()` → `set_balance(from, u128::MAX)` → execute → `restore()` on the
+    /// shared committed state. Its own comment says these overrides "must not be
+    /// observable to concurrent workers." But the producer's `settle_block_rewards` +
+    /// `calculate_state_root` (producer.rs) take ONLY `advance_lock` — a DISJOINT lock —
+    /// and `Executor::calculate_state_root` takes no lock at all. So an `eth_call` /
+    /// `eth_estimateGas` landing during a block build DOES let the producer's fold
+    /// observe the simulation's transient `u128::MAX` sender balance and seal it into the
+    /// committed root — a root no cold-sync re-executing the block can reproduce. Empty
+    /// blocks are maximally exposed (the build holds no `exec_lock` section at all), the
+    /// reward math stays pure, and the wedge height is set by WHEN an RPC call coincides
+    /// with production — exactly the block-5,406 non-injective wedge, and why every
+    /// SERIAL reproduction (and every prior SRP fix) missed it.
+    ///
+    /// This test hammers `simulate_transaction` concurrently while the producer folds the
+    /// root, and asserts the fold NEVER observes a value other than the honest committed
+    /// root. RED on `main` (the fold sees the phantom); GREEN once simulation runs on an
+    /// ISOLATED state that never touches the shared consensus `state_db`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn srp_s4_rpc_simulate_races_producer_state_root_fold() {
+        let exec = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        exec.set_balance(&Address(CB), U256::from(1_000_000u64));
+        exec.set_balance(&Address([0x11u8; 20]), U256::from(500u64));
+        let honest = exec.calculate_state_root();
+
+        // A block + a tx that an RPC eth_call / eth_estimateGas would simulate. The
+        // simulate path overrides the SENDER's balance to u128::MAX on the shared state.
+        let block = seal_rprime(1, Hash::default(), Hash::default(), VRF_OUT, vec![]);
+        let sim_tx = prio_tx([0x77u8; 20], CAROL, 0, 0xEE);
+
+        // RPC hammer: many concurrent eth_call-equivalent simulations.
+        let e2 = exec.clone();
+        let blk = block.clone();
+        let stx = sim_tx.clone();
+        let hammer = tokio::spawn(async move {
+            for _ in 0..8000 {
+                let _ = e2.simulate_transaction(&blk, &stx).await;
+            }
+        });
+
+        // Producer's fold: the committed state is FIXED, so every fold MUST equal `honest`.
+        let mut torn: Option<Hash> = None;
+        for _ in 0..8000 {
+            let r = exec.calculate_state_root();
+            if r != honest {
+                torn = Some(r);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let _ = hammer.await;
+
+        assert!(
+            torn.is_none(),
+            "SRP-S4 ROOT CAUSE: the producer's state-root fold observed a TORN root {torn:?} != \
+             the honest committed root {honest} while a concurrent RPC simulate_transaction ran. \
+             simulate takes exec_lock (executor.rs:1808); the producer's fold takes only \
+             advance_lock — DISJOINT — so simulate's transient u128::MAX sender balance is folded \
+             into the committed root, which no cold-sync reproduces. This is the block-5,406 \
+             non-injective wedge; height is set by WHEN an eth_call coincides with production."
         );
     }
 
