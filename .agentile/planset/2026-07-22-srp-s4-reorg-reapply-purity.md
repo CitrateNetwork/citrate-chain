@@ -4,7 +4,7 @@ created: 2026-07-22
 updated: 2026-07-23
 branch: srp/s4-reward-rmw-store-purity
 author: Claude (DGX / chain-ops session)
-status: OPEN — mechanism localized to the fork/reorg path; exact account + fix gated on a local multi-producer reorg reproduction (WP-1.2)
+status: OPEN — mechanism = fork/reorg (empirically solid); registry-storage account hypothesis REFUTED by WP-1.1 (simple reorg is pure); exact account open (WP-1.2′ subtler fork variants)
 supersedes: none
 related: .agentile/planset/2026-07-21-srp-s3-restart-produce-purity.md, ../../citrate-core/docs/DGX_NODE_SYNC_WEDGE_RESPONSE_2026-07-22.md
 history: originally scoped as "reward RMW / store read-through purity"; DGX instrumentation on 2026-07-23 REFUTED that mechanism (reward reads are pure) and re-localized it to the fork/reorg reapply path — see "What the live instrumentation proved".
@@ -61,33 +61,33 @@ The impurity lives in the **fork/reorg reapply path**, `node/src/canonical_apply
   registry here is codeless so its BALANCE is the on-chain vested-share"), so they
   **never exercise the §R' `creditReward` REVM storage-write path across a reorg**.
 
-### PINNED ACCOUNT (code-grounded, 2026-07-23): the `ValidatorRegistry` STORAGE
+### Registry-storage hypothesis — TESTED and REFUTED by WP-1.1 (2026-07-23)
 
-The divergence is in the **`ValidatorRegistry` contract (`0x915DdE02`) storage** — the
-`_validators` bonded-stake / `vestedRewards` mapping slots REVM writes during §R'
-`creditReward`. The load-bearing facts:
-- `StateDB::snapshot` DOES capture `storage_tries` + `dirty_storage` (state_db.rs:326),
-  so a reorg `state_restore` rolls storage back — the divergence is NOT lost-on-restore;
-  it is introduced when the **reapply re-executes `creditReward`**.
-- `credit_validator_reward` (executor.rs:1426-1439) has a **storage/balance SPLIT**: REVM
-  writes the registry's storage (vestedRewards/bonded), but `StateDBAdapter::commit`
-  DISCARDS REVM's balance/nonce writes and the executor reconciles only the BALANCE. On a
-  reorg reapply this split can leave the registry's REVM-written STORAGE diverged from a
-  clean forward execution while the balance matches.
-- The reward BALANCES (treasury/coinbase) are pure (proven by live instrumentation) —
-  the divergence is one layer down in **contract storage**, invisible to the codeless
-  test registry. Its divergent storage-root folds into EVERY subsequent state root and
-  surfaces at the forked empty block 5,406.
+The leading hypothesis was that the divergence is the **`ValidatorRegistry` STORAGE**
+(the `_validators` / `vestedRewards` slots REVM writes during §R' `creditReward`), left
+unreconciled by the reorg because `credit_validator_reward` (executor.rs:1426-1439) has a
+storage/balance split (REVM owns storage, the executor reconciles only balance), and the
+existing reorg tests use a CODELESS registry so never exercise it.
 
-> One-line statement: **a state root committed for a FORKED block (5,406) is not a pure
-> function of committed state — the fork/reorg reapply re-executes §R' `creditReward` and
-> leaves the `ValidatorRegistry`'s REVM-written STORAGE diverged (balance matches,
-> storage-root does not), which no clean forward execution reproduces.**
+**WP-1.1 built exactly that test with a CODE-FUL registry (`srp_s4_reorg_reconciles_
+registry_storage_not_just_balance`, canonical_apply.rs) and it PASSES on `main`** — the
+reorg reconciles the registry's creditReward STORAGE correctly: branch A vests
+REG.slot0=2,625,000, heavier branch B vests 5,250,000, and after the reorg A→B **both the
+in-memory follower AND a cold fold of the durable store show B's 5,250,000**, with
+`cold_root == b3.state_root`. So a **simple fork/reorg is PURE** — the registry-storage
+account is NOT the cause. Kept as a regression guard.
 
-(Empirical confirmation of the exact slot = WP-1.1 below: an in-process reorg test with a
-**code-ful** registry + a §R'-vesting forked block, asserting per-storage-slot equality —
-which the codeless tests structurally cannot do. This is the strong hypothesis the fix
-targets; WP-1.1/1.2 turn it into a RED test.)
+> Corrected status: the **mechanism** (block 5,406 is a FORKED height whose committed
+> root a clean forward execution cannot reproduce) is empirically solid from the live
+> cold-sync, but the **exact diverging account is still OPEN** — the simple A→B reorg the
+> guard exercises is pure, so the 5,406 case is a subtler fork scenario.
+
+**Remaining hypotheses to reproduce (WP-1.2):** (a) a **deeper / nested** reorg
+(multi-block winning branch, or a reorg that itself gets reorged); (b) a **restart
+inside the reorg window** (S3b/S3c class but in the reorg-reapply path); (c) **produce-
+after-competitor** — a producer that received the competing tip, reorged, THEN sealed the
+canonical block from the post-reorg state; (d) an **EIP-158 empty-account** created/killed
+on one fork branch. Each is a variant of the passing guard with one added ingredient.
 
 ## The acceptance oracle (unchanged from S1–S3, extended)
 
@@ -107,7 +107,8 @@ execution of that block computes — even when the block is on a reorged/forked 
 ### Phase 1 — Reproduce + PIN the exact account (G1)
 | WP | Title | Acceptance |
 |----|-------|-----------|
-| **WP-1.1** | Extend the `canonical_apply` reorg harness to a **CODE-FUL `ValidatorRegistry`** (not the codeless test stub) that actually vests via `creditReward`, then reorg across the S(E) fork and assert **per-storage-slot** equality of the registry AND `reapplied_root == clean_forward_root`. This is the empirical confirmation of the PINNED ACCOUNT above. RED on `main` (registry storage-root diverges), GREEN after the fix. | A deterministic in-process reorg red test with a code-ful registry that FAILS on `main` on a registry storage slot. |
+| ~~WP-1.1~~ **DONE** | Code-ful-registry reorg test `srp_s4_reorg_reconciles_registry_storage_not_just_balance` (canonical_apply.rs). Result: **PASSES on `main`** → REFUTES the registry-storage hypothesis (simple reorg reconciles registry storage, balance + slots). Kept as a regression guard. | ✅ Built; the reorg-registry-storage-purity invariant holds. Redirects the pin to WP-1.2's subtler fork variants. |
+| **WP-1.2′** | Reproduce the ACTUAL 5,406 case by adding ONE ingredient to the passing guard at a time (deeper/nested reorg; restart-in-reorg; produce-after-competitor; EIP-158 empty-account on a fork branch) until a variant goes RED — that variant NAMES the account/scenario. | A red in-process test reproducing the 5,406-class divergence; the exact account named. |
 | **WP-1.2** | **Local multi-producer reorg reproduction** (the DGX harness `scripts/ci/srp_s4_coldsync_harness.sh`, extended to a SECOND competing producer that forks across an S(E)), + instrument `calculate_state_root` to dump the fold on both branches → `state-digest`/log-diff to NAME the exact account/slot the fork leaves diverged. | The exact account/slot is named; WP-1.1 reproduces that case. |
 
 ### Phase 2 — Fix (G2)

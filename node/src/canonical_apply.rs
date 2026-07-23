@@ -2026,6 +2026,125 @@ mod tests {
         }
     }
 
+    /// SRP-S4 — reorg registry-storage purity GUARD (result: PASSES; REFUTES a hypothesis).
+    ///
+    /// Built to confirm the hypothesis that block-5,406 was the fork/reorg reapply
+    /// failing to reconstruct the `ValidatorRegistry`'s REVM-written creditReward STORAGE
+    /// (the existing cross-policy reorg tests use a CODELESS registry and never exercise
+    /// it). Here REG has code that accumulates each vested `msg.value` into slot 0
+    /// (`SSTORE(0, SLOAD(0)+CALLVALUE)`), so every §R' `creditReward` writes registry
+    /// storage. Branch A vests once (REG.slot0 = vestA); heavier branch B vests twice
+    /// (2·vestA) then an empty tip (the 5,406 analog); reorg A→B; a COLD fold of the
+    /// durable store (what a from-genesis cold-sync does) must reproduce B's tip root.
+    ///
+    /// RESULT (main, 2026-07-23): **PASSES** — the reorg reconciles registry STORAGE
+    /// correctly (in-memory AND durable store both show branch B's slot; cold_root ==
+    /// b3.root). This REFUTES the registry-storage-non-reconciliation hypothesis: a
+    /// simple fork/reorg is pure. Kept as a regression guard. The real 5,406 divergence
+    /// is a subtler fork case (deeper/nested reorg, restart-in-reorg, or produce-after-
+    /// competitor) — still open (planset WP-1.2).
+    #[tokio::test]
+    async fn srp_s4_reorg_reconciles_registry_storage_not_just_balance() {
+        // REG runtime: slot0 += CALLVALUE on every (payable) call — a minimal stand-in
+        // for creditReward's bonded-stake/vestedRewards SSTOREs.
+        //   CALLVALUE PUSH1 0 SLOAD ADD PUSH1 0 SSTORE STOP
+        let reg_code = vec![0x34, 0x60, 0x00, 0x54, 0x01, 0x60, 0x00, 0x55, 0x00];
+
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.set_code(&Address(REG), reg_code.clone());
+        follower.set_validator_activation_height(800);
+        *follower.reward_policy_handle().write() = Some(rprime_policy(5000));
+        follower.persist_state_changes().await.expect("persist genesis");
+
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        // Fixed policy through the reapply (no cross-policy flip — isolate REG storage).
+        let f = follower.clone();
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            *f.reward_policy_handle().write() = Some(rprime_policy(5000));
+            Box::pin(async { Ok(()) })
+        }));
+
+        // Shared a1 (empty), branch A a2 (one priority tx → one §R' vest → REG.slot0 = vestA).
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        pa.set_code(&Address(REG), reg_code.clone());
+        pa.set_validator_activation_height(800);
+        *pa.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let a1 = produce_rprime(&pa, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let a2 = produce_rprime(&pa, a1.header.block_hash, 800, VRF_OUT, vec![prio_tx(ALICE, CAROL, 0, 0xA0)]).await;
+        persist(&storage, &a1);
+        app.apply_received(&a1).await;
+        persist(&storage, &a2);
+        app.apply_received(&a2).await;
+
+        // Heavier branch B off a1: b2 (TWO priority txs → vestB = 2·vestA), then an empty
+        // b3 (the 5,406 analog — no vest, root just re-folds REG's storage).
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_code(&Address(REG), reg_code.clone());
+        pb.set_validator_activation_height(800);
+        *pb.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let _b1 = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce_rprime(
+            &pb,
+            a1.header.block_hash,
+            800,
+            vrf_b,
+            vec![prio_tx(ALICE, CAROL, 0, 0xB0), prio_tx(ALICE, DAVE, 1, 0xB1)],
+        )
+        .await;
+        let b3 = produce_rprime(&pb, b2.header.block_hash, 801, vrf_b, vec![]).await;
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.apply_received(&b3).await;
+        assert_eq!(app.applied_tip().await.height, 801, "reorged to branch B");
+        assert_eq!(
+            follower.calculate_state_root(),
+            b3.state_root,
+            "in-memory follower converged to branch B's tip root after the reorg"
+        );
+
+        // THE ORACLE: a from-genesis cold-sync folds the DURABLE STORE. Hydrate a cold
+        // StateDB from the store exactly as node boot / state-digest does, then fold.
+        let cold = StateDB::new();
+        for (addr, acct) in storage.state.get_all_accounts().expect("get_all_accounts") {
+            cold.accounts.load_account(addr, acct);
+        }
+        for ((addr, key), val) in storage.state.get_all_storage().expect("get_all_storage") {
+            cold.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
+        }
+        let cold_root = cold.calculate_state_root();
+
+        // Sanity: the vest actually fired and the branches differ (else the guard is vacuous).
+        let k0 = vec![0u8; 32];
+        assert!(pb.get_balance(&Address(REG)) > pa.get_balance(&Address(REG)), "branch B vested more than A");
+        assert_ne!(
+            pa.state_db().get_storage(&Address(REG), &k0),
+            pb.state_db().get_storage(&Address(REG), &k0),
+            "precondition: branches A and B wrote DIFFERENT registry storage via creditReward"
+        );
+
+        // RESULT (main, 2026-07-23): PASSES. The reorg reconciles the registry's
+        // creditReward STORAGE (not just its balance): both the in-memory follower and a
+        // cold fold of the durable store show branch B's slot value, and cold_root ==
+        // b3.state_root. This REFUTES the hypothesis that block-5,406 was registry-storage
+        // non-reconciliation. Retained as a regression GUARD for reorg registry-storage
+        // purity. The real 5,406 divergence is a subtler fork/reorg case (this simple
+        // A→B reorg is pure) — still open (planset WP-1.2).
+        assert_eq!(
+            cold_root, b3.state_root,
+            "reorg registry-storage purity guard: a cold fold of the reorged store must \
+             reproduce branch B's committed tip root (registry creditReward storage reconciled)"
+        );
+    }
+
     /// Store-backed follower seeded at height 798, then advanced through a SHARED
     /// applied block s799 (height 799) + a losing branch A (empty blocks 800, 801).
     /// The fork point is s799 — an APPLIED block whose ring snapshot captures the
