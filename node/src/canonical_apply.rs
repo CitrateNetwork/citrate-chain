@@ -2145,6 +2145,83 @@ mod tests {
         );
     }
 
+    /// SRP-S4 WP-1.2′ variant #1 — PRODUCE-AFTER-COMPETITOR.
+    ///
+    /// The live 5,406 producer committed a root a clean forward execution can't reproduce.
+    /// The one path the receive-reorg guard above does NOT cover: a node that RECEIVES a
+    /// competing branch, reorgs to it, THEN *produces* the next canonical block from its
+    /// post-reorg in-memory state. If that in-memory state diverges from a clean forward
+    /// execution (even though its committed root matched), the produced block seals an
+    /// impure root — exactly the 5,406 signature. Here the produced block VESTS (a §R'
+    /// creditReward on top of the reorged registry storage), and we compare the
+    /// reorg-then-produce root to a clean forward producer's root for the same block.
+    #[tokio::test]
+    async fn srp_s4_produce_after_competitor_reorg_is_pure() {
+        let reg_code = vec![0x34, 0x60, 0x00, 0x54, 0x01, 0x60, 0x00, 0x55, 0x00];
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.set_code(&Address(REG), reg_code.clone());
+        follower.set_validator_activation_height(800);
+        *follower.reward_policy_handle().write() = Some(rprime_policy(5000));
+        follower.persist_state_changes().await.expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let f = follower.clone();
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            *f.reward_policy_handle().write() = Some(rprime_policy(5000));
+            Box::pin(async { Ok(()) })
+        }));
+
+        // Branch A (applied): a799 + a800 (one vest).
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        pa.set_code(&Address(REG), reg_code.clone());
+        pa.set_validator_activation_height(800);
+        *pa.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let a799 = produce_rprime(&pa, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let a800 = produce_rprime(&pa, a799.header.block_hash, 800, VRF_OUT, vec![prio_tx(ALICE, CAROL, 0, 0xA0)]).await;
+        persist(&storage, &a799);
+        app.apply_received(&a799).await;
+        persist(&storage, &a800);
+        app.apply_received(&a800).await;
+
+        // Heavier branch B: b800 (two vests) + b801 (empty). Clean producer pb builds it.
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_code(&Address(REG), reg_code.clone());
+        pb.set_validator_activation_height(800);
+        *pb.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let _b1 = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5B; 32];
+        let b800 = produce_rprime(&pb, a799.header.block_hash, 800, vrf_b, vec![prio_tx(ALICE, CAROL, 0, 0xB0), prio_tx(ALICE, DAVE, 1, 0xB1)]).await;
+        let b801 = produce_rprime(&pb, b800.header.block_hash, 801, vrf_b, vec![]).await;
+        persist(&storage, &b800);
+        persist(&storage, &b801);
+
+        // Reorg the follower A → B.
+        app.fork_choice = Some(fork_choice_returning(b801.header.block_hash));
+        app.apply_received(&b801).await;
+        assert_eq!(app.applied_tip().await.height, 801, "reorged to B");
+
+        // PRODUCE-AFTER-REORG: the follower seals b802 (a VESTING block) from its post-reorg
+        // in-memory state. ALICE nonce is 2 after B's two txs.
+        let vest_tx = prio_tx(ALICE, CAROL, 2, 0xC0);
+        let b802_reorg = produce_rprime(&follower, b801.header.block_hash, 802, vrf_b, vec![vest_tx.clone()]).await;
+
+        // Clean forward producer pb seals the SAME b802 from clean state.
+        let b802_clean = produce_rprime(&pb, b801.header.block_hash, 802, vrf_b, vec![vest_tx]).await;
+
+        assert_eq!(
+            b802_reorg.state_root, b802_clean.state_root,
+            "SRP-S4 PRODUCE-AFTER-COMPETITOR: a block PRODUCED from post-reorg state sealed a \
+             root that a clean forward execution does not reproduce — the reorged in-memory \
+             state diverged from committed state despite a matching tip root. This is the \
+             block-5,406 signature (produce-after-reorg impurity)."
+        );
+    }
+
     /// Store-backed follower seeded at height 798, then advanced through a SHARED
     /// applied block s799 (height 799) + a losing branch A (empty blocks 800, 801).
     /// The fork point is s799 — an APPLIED block whose ring snapshot captures the
