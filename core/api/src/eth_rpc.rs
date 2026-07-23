@@ -750,7 +750,7 @@ pub fn register_eth_methods(
         // Check sender has sufficient balance for value + gas cost
         {
             let sender_addr = citrate_execution::address_utils::normalize_address(&tx.from);
-            let sender_balance = exec.get_balance(&sender_addr);
+            let sender_balance = exec.get_canonical_account(&sender_addr).balance; // SRP-S4 WP-2.2: non-warming (committed) read — never mutate the shared resident map from RPC
             let tx_cost = U256::from(tx.value)
                 .saturating_add(U256::from(tx.gas_limit).saturating_mul(U256::from(tx.gas_price)));
             if sender_balance < tx_cost {
@@ -904,7 +904,7 @@ pub fn register_eth_methods(
         // For eth_call, use the sender's current nonce so execution doesn't fail
         // on nonce validation (both in executor and REVM).
         let sender_addr = citrate_execution::address_utils::normalize_address(&from_pk);
-        let sender_nonce = exec.get_nonce(&sender_addr);
+        let sender_nonce = exec.get_canonical_account(&sender_addr).nonce; // SRP-S4 WP-2.2: non-warming committed read
 
         // Create a pseudo-transaction
         let mut tx = citrate_consensus::types::Transaction {
@@ -1100,7 +1100,7 @@ pub fn register_eth_methods(
 
         // For gas estimation, use sender's current nonce to pass nonce validation
         let sender_addr = citrate_execution::address_utils::normalize_address(&from_pk);
-        let sender_nonce = exec.get_nonce(&sender_addr);
+        let sender_nonce = exec.get_canonical_account(&sender_addr).nonce; // SRP-S4 WP-2.2: non-warming committed read
 
         // PIL-47b: capture whether this is a contract call before `data`
         // gets moved into the pseudo-transaction. Needed below for the

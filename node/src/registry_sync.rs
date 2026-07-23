@@ -357,7 +357,7 @@ impl RegistrySync {
         from_bytes[19] = 1;
         let from_pk = PublicKey::new(from_bytes);
         let sender_addr = citrate_execution::address_utils::normalize_address(&from_pk);
-        let sender_nonce = self.executor.get_nonce(&sender_addr);
+        let sender_nonce = self.executor.get_canonical_account(&sender_addr).nonce; // SRP-S4 WP-2.2: non-warming committed read
 
         let blk = BlockBuilder::new()
             .base_fee_per_gas(1_000_000_000)

@@ -1013,7 +1013,7 @@ impl RpcServer {
 
             // Check sender balance covers value + gas
             let sender_addr = citrate_execution::address_utils::normalize_address(&tx.from);
-            let balance = exec.get_balance(&sender_addr);
+            let balance = exec.get_canonical_account(&sender_addr).balance; // SRP-S4 WP-2.2: non-warming committed read
             let gas_cost = primitive_types::U256::from(tx.gas_limit) * primitive_types::U256::from(tx.gas_price);
             let total_cost = gas_cost + primitive_types::U256::from(tx.value);
             if balance < total_cost {
