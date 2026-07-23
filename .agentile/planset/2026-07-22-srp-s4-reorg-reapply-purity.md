@@ -4,7 +4,7 @@ created: 2026-07-22
 updated: 2026-07-23
 branch: srp/s4-reward-rmw-store-purity
 author: Claude (DGX / chain-ops session)
-status: ROOT CAUSE FOUND + REPRODUCED (RPC simulate_transaction races the producer state-root fold on shared state_db); fix = isolate simulation state + pure fold; then clean reroll
+status: FIX IMPLEMENTED + RED test GREEN (simulate isolation + read-only RPC root fold); WP-2.2 RPC-read isolation + clean reroll remain
 supersedes: none
 related: .agentile/planset/2026-07-21-srp-s3-restart-produce-purity.md, ../../citrate-core/docs/DGX_NODE_SYNC_WEDGE_RESPONSE_2026-07-22.md
 history: originally scoped as "reward RMW / store read-through purity"; DGX instrumentation on 2026-07-23 REFUTED that mechanism (reward reads are pure) and re-localized it to the fork/reorg reapply path — see "What the live instrumentation proved".
@@ -40,9 +40,27 @@ torn roots. Compounding surfaces (Agent findings): `calculate_state_root` also *
 concurrent RPC; and the fold reads the read-through-warmed resident/partial-storage maps,
 so a stray `eth_call` warming a slot alone can diverge the fold even absent the balance race.
 
-**THE FIX (WP-2.1):** `simulate_transaction` (and every RPC/read path) MUST run on an
-ISOLATED state overlay and NEVER mutate the shared consensus `state_db`; make
-`calculate_state_root` a pure read (no `set_account` write-back). Then a clean reroll.
+**THE FIX (WP-2.1) — IMPLEMENTED 2026-07-23:**
+1. `Executor::simulate_transaction` now runs the WHOLE simulation on an ISOLATED executor
+   (`isolated_for_simulation` → `StateDB::isolated_clone`): the mutable committed state is
+   copied, the immutable content-addressed `code_storage` is SHARED (so contract exec
+   still finds bytecode), and the balance/nonce overrides + read-through + journal all land
+   on the isolated `state_db`. The shared consensus `state_db` is never mutated, so no
+   `exec_lock` is needed and the producer's fold can never observe a simulation override.
+2. The RPC `get_state_root` now calls `Executor::state_root_readonly()` (folds an isolated
+   copy) instead of the mutating `calculate_state_root`, closing the second race
+   (Mechanism #3: the fold's `set_account` write-back vs a concurrent producer fold).
+3. **RED test `srp_s4_rpc_simulate_races_producer_state_root_fold` is now GREEN** (3/3);
+   citrate-execution/api/node suites all green (incl. the restored AI eth_call test).
+
+Still open (WP-2.2 hardening, NOT the primary cause): the RPC READ paths
+(`get_balance`/`get_storage`/`get_nonce`/`get_code`) still read-through-warm the shared
+resident/partial-storage maps (Mechanism #2); the biggest warmer (`eth_call`/`estimateGas`)
+is now isolated, but these remaining reads should also fold on / read from an isolated
+view. Then a **clean reroll** on the fixed binary (the live chain's torn roots can't be
+un-poisoned), plus the package-alignment hardening (pin+stamp+boot manifest) so the app and
+fleet can't drift.
+
 The earlier "fork/reorg" framing below is SUPERSEDED — a fork is not required; the reorg
 attempts in the cold-sync log are downstream of an already-torn committed root.
 
