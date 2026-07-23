@@ -4,7 +4,7 @@ created: 2026-07-22
 updated: 2026-07-23
 branch: srp/s4-reward-rmw-store-purity
 author: Claude (DGX / chain-ops session)
-status: FIX IMPLEMENTED + RED test GREEN (simulate isolation + read-only RPC root fold); WP-2.2 RPC-read isolation + clean reroll remain
+status: FIX + WP-2.2 HARDENING COMPLETE (all concurrent state_db paths isolated/non-warming; tripwire added); clean reroll + package-alignment remain
 supersedes: none
 related: .agentile/planset/2026-07-21-srp-s3-restart-produce-purity.md, ../../citrate-core/docs/DGX_NODE_SYNC_WEDGE_RESPONSE_2026-07-22.md
 history: originally scoped as "reward RMW / store read-through purity"; DGX instrumentation on 2026-07-23 REFUTED that mechanism (reward reads are pure) and re-localized it to the fork/reorg reapply path — see "What the live instrumentation proved".
@@ -53,13 +53,31 @@ so a stray `eth_call` warming a slot alone can diverge the fold even absent the 
 3. **RED test `srp_s4_rpc_simulate_races_producer_state_root_fold` is now GREEN** (3/3);
    citrate-execution/api/node suites all green (incl. the restored AI eth_call test).
 
-Still open (WP-2.2 hardening, NOT the primary cause): the RPC READ paths
-(`get_balance`/`get_storage`/`get_nonce`/`get_code`) still read-through-warm the shared
-resident/partial-storage maps (Mechanism #2); the biggest warmer (`eth_call`/`estimateGas`)
-is now isolated, but these remaining reads should also fold on / read from an isolated
-view. Then a **clean reroll** on the fixed binary (the live chain's torn roots can't be
-un-poisoned), plus the package-alignment hardening (pin+stamp+boot manifest) so the app and
-fleet can't drift.
+**WP-2.2 hardening — DONE 2026-07-23 (across ALL paths).** A full audit classified every
+concurrent (non-`advance_lock`) reader/writer of the shared consensus `state_db`:
+- The MEMPOOL does NOT read sender balance/nonce off shared state (state-aware admission is
+  deferred) — not a hazard.
+- All block-application mutation (produce / apply / reorg / drain, incl. `revm_adapter`
+  warming, `settle_block_rewards`, `calculate_state_root` write-back, `state_restore`) runs
+  under `advance_lock` — serialized, safe.
+- The sequencer `block_builder` root computer is dead relative to the node consensus path.
+- Exactly **10 concurrent RPC/background sites** called the WARMING `Executor::get_balance`
+  /`get_nonce` (which `load_account`-hydrate the shared resident map): eth_rpc.rs
+  {753 sendRawTx-balance, 907 eth_call-nonce, 1103 estimateGas-nonce}, server.rs 1016,
+  transaction.rs {45, 130}, ai.rs {225, 280, 401}, registry_sync.rs 360. All need
+  COMMITTED state only → switched to the non-warming `get_canonical_account(...).balance/
+  .nonce`. (The warming primitives are KEPT for the execution path: `set_balance` reads the
+  resident map with `unwrap_or_default()`, so `settle_block_rewards` needs the account
+  hydrated first — load-bearing under `advance_lock`, unsafe to drop globally.)
+- Regression fence: `scripts/ci/srp_s4_no_warming_reads_from_rpc.sh` fails if a warming
+  `exec.get_balance/get_nonce/get_code_hash` reappears in `core/api/src`.
+- `eth_call`/`estimateGas` execution itself is already isolated (WP-2.1 `simulate_transaction`).
+Result: NO concurrent path mutates the shared consensus `state_db` any more. `citrate-api`
++ `citrate-node` (125) suites green.
+
+Remaining before reroll: a **clean reroll** on the fixed binary (the live chain's torn
+roots can't be un-poisoned), plus the package-alignment hardening (pin+stamp+boot manifest)
+so the app and fleet can't drift.
 
 The earlier "fork/reorg" framing below is SUPERSEDED — a fork is not required; the reorg
 attempts in the cold-sync log are downstream of an already-torn committed root.
