@@ -44,13 +44,32 @@ SBT="$(echo "$OUT" | grep -iE 'CitrateMemberSBT ' | grep -oE '0x[0-9a-fA-F]{40}'
 VAULT="$(echo "$OUT" | grep -iE 'MembershipStakeVault' | grep -oE '0x[0-9a-fA-F]{40}' | tail -1)"
 [ -n "$SBT" ] && [ -n "$VAULT" ] || { echo "failed to parse new addresses" >&2; exit 2; }
 
-echo "== re-pin book: SBT=$SBT VAULT=$VAULT =="
-PY=python3; command -v python3 >/dev/null || PY="uv run python3"
+echo "== re-pin book + .env.testnet: SBT=$SBT VAULT=$VAULT =="
+# GAP-2 fix: on the DGX box bare `python3` is a shim that rejects direct use and
+# demands `uv run python3`. The old guard (`command -v python3 || ...`) was
+# BACKWARDS — the shim is on PATH so it stayed `python3` and `set -e` killed the
+# script here before the funding step (the S2/S3/S3c mid-ceremony halt). Prefer uv.
+if command -v uv >/dev/null 2>&1; then PY="uv run python3"; else PY=python3; fi
 $PY - "$BOOK" "$SBT" "$VAULT" <<'PY'
 import sys,json
 p,sbt,vault=sys.argv[1:4]
 d=json.load(open(p)); d["CitrateMemberSBT"]=sbt; d["MembershipStakeVault"]=vault
 json.dump(d,open(p,"w"),indent=2); open(p,"a").write("\n"); print("book re-pinned")
+PY
+# GAP-3 fix: the book is not the only pin — .env.testnet holds
+# CITRATE_MEMBER_SBT_ADDRESS / MEMBERSHIP_STAKE_VAULT_ADDRESS too, and used to go
+# stale (May-era addrs with no code) because this script never touched it.
+$PY - "$ENV_FILE" "$SBT" "$VAULT" <<'PY'
+import sys,re
+p,sbt,vault=sys.argv[1:4]
+s=open(p).read()
+def setk(s,k,v):
+    line=f"{k}={v}"
+    if re.search(rf"(?m)^{re.escape(k)}=",s): return re.sub(rf"(?m)^{re.escape(k)}=.*$",line,s)
+    return s+("" if s.endswith("\n") else "\n")+line+"\n"
+s=setk(s,"CITRATE_MEMBER_SBT_ADDRESS",sbt)
+s=setk(s,"MEMBERSHIP_STAKE_VAULT_ADDRESS",vault)
+open(p,"w").write(s); print(".env.testnet re-pinned")
 PY
 
 echo "== step 2: fund grant signer $GRANT_ADDR with ${FUND_SALT} SALT =="

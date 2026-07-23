@@ -62,6 +62,11 @@ ENV_FILE="${ENV_FILE:-/home/saul/Projects/Citrate-Labs/.env.testnet}"
 BROADCAST=0
 [[ "${1:-}" == "--broadcast" ]] && BROADCAST=1
 
+# GAP-2 fix: on the DGX box bare `python3` is a shim that rejects direct use and
+# demands `uv run python3`; under `set -e` a bare `python3 -c` here kills the whole
+# funding pass. Prefer uv when present so the big-int math works there and elsewhere.
+if command -v uv >/dev/null 2>&1; then PY="uv run python3"; else PY=python3; fi
+
 log()  { printf '%s\n' "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
 
@@ -143,14 +148,14 @@ fund_one() {
   # Top-up = max(0, target - balance). Done in python because wei exceeds the
   # 64-bit range bash arithmetic can hold.
   local need_wei
-  need_wei="$(python3 -c "b=int('$bal_wei'); t=int('$target_wei'); print(max(0, t-b))")"
+  need_wei="$($PY -c "b=int('$bal_wei'); t=int('$target_wei'); print(max(0, t-b))")"
   if [[ "$need_wei" == "0" ]]; then
     log "  NOOP  ${name} ($addr) already >= ${target} SALT"
     NOOP=$((NOOP+1))
     return 0
   fi
   local need_salt; need_salt="$(cast to-unit "$need_wei" ether 2>/dev/null || echo '?')"
-  PLANNED_WEI_TOTAL="$(python3 -c "print($PLANNED_WEI_TOTAL + $need_wei)")"
+  PLANNED_WEI_TOTAL="$($PY -c "print($PLANNED_WEI_TOTAL + $need_wei)")"
   if [[ "$BROADCAST" == "0" ]]; then
     log "  PLAN  ${name} ($addr)  +${need_salt} SALT  → target ${target}  [${why}]"
     return 0
