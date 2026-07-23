@@ -436,6 +436,15 @@ impl CanonicalApplicator {
                         "execute-on-receive: applied block {} @ height {} (root verified)",
                         block_hash, height
                     );
+                    // SRP-S4 injective fingerprint (env-gated): log per-block so a
+                    // continuously-running node and a cold-sync can be diffed at a wedge
+                    // height even though their consensus roots agree. Diagnostic only.
+                    if std::env::var("CITRATE_SRP_FINGERPRINT").is_ok() {
+                        warn!(
+                            "SRP-FP applied @ {} root={} fp={}",
+                            height, block.state_root, self.executor.state_db().full_state_fingerprint()
+                        );
+                    }
                     // VALIDATOR-S1: re-sync the selector if this crossed a snapshot boundary.
                     self.maybe_sync_registry(height).await;
                 }
@@ -444,6 +453,15 @@ impl CanonicalApplicator {
                         "execute-on-receive: REJECT block {} @ {} — state root mismatch (claimed {}, computed {})",
                         block_hash, height, expected, got
                     );
+                    // SRP-S4: dump the injective per-account digest of the state that
+                    // produced the DIVERGENT computed root, so a diff vs a healthy node's
+                    // digest at this height NAMES the account (env-gated, diagnostic only).
+                    if std::env::var("CITRATE_SRP_FINGERPRINT").is_ok() {
+                        warn!("SRP-FP REJECT @ {} fp={}", height, self.executor.state_db().full_state_fingerprint());
+                        for line in self.executor.state_db().full_state_digest_lines() {
+                            warn!("SRP-FP-DIGEST @ {} {}", height, line);
+                        }
+                    }
                     return DrainOutcome {
                         applied,
                         rejected: Some((
@@ -2024,6 +2042,268 @@ mod tests {
             let bps = if exec.get_balance(&Address(CAROL)) > U256::zero() { 5000 } else { 2500 };
             *exec.reward_policy_handle().write() = Some(rprime_policy(bps));
         }
+    }
+
+    /// SRP-S4 — reorg registry-storage purity GUARD (result: PASSES; REFUTES a hypothesis).
+    ///
+    /// Built to confirm the hypothesis that block-5,406 was the fork/reorg reapply
+    /// failing to reconstruct the `ValidatorRegistry`'s REVM-written creditReward STORAGE
+    /// (the existing cross-policy reorg tests use a CODELESS registry and never exercise
+    /// it). Here REG has code that accumulates each vested `msg.value` into slot 0
+    /// (`SSTORE(0, SLOAD(0)+CALLVALUE)`), so every §R' `creditReward` writes registry
+    /// storage. Branch A vests once (REG.slot0 = vestA); heavier branch B vests twice
+    /// (2·vestA) then an empty tip (the 5,406 analog); reorg A→B; a COLD fold of the
+    /// durable store (what a from-genesis cold-sync does) must reproduce B's tip root.
+    ///
+    /// RESULT (main, 2026-07-23): **PASSES** — the reorg reconciles registry STORAGE
+    /// correctly (in-memory AND durable store both show branch B's slot; cold_root ==
+    /// b3.root). This REFUTES the registry-storage-non-reconciliation hypothesis: a
+    /// simple fork/reorg is pure. Kept as a regression guard. The real 5,406 divergence
+    /// is a subtler fork case (deeper/nested reorg, restart-in-reorg, or produce-after-
+    /// competitor) — still open (planset WP-1.2).
+    #[tokio::test]
+    async fn srp_s4_reorg_reconciles_registry_storage_not_just_balance() {
+        // REG runtime: slot0 += CALLVALUE on every (payable) call — a minimal stand-in
+        // for creditReward's bonded-stake/vestedRewards SSTOREs.
+        //   CALLVALUE PUSH1 0 SLOAD ADD PUSH1 0 SSTORE STOP
+        let reg_code = vec![0x34, 0x60, 0x00, 0x54, 0x01, 0x60, 0x00, 0x55, 0x00];
+
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.set_code(&Address(REG), reg_code.clone());
+        follower.set_validator_activation_height(800);
+        *follower.reward_policy_handle().write() = Some(rprime_policy(5000));
+        follower.persist_state_changes().await.expect("persist genesis");
+
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        // Fixed policy through the reapply (no cross-policy flip — isolate REG storage).
+        let f = follower.clone();
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            *f.reward_policy_handle().write() = Some(rprime_policy(5000));
+            Box::pin(async { Ok(()) })
+        }));
+
+        // Shared a1 (empty), branch A a2 (one priority tx → one §R' vest → REG.slot0 = vestA).
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        pa.set_code(&Address(REG), reg_code.clone());
+        pa.set_validator_activation_height(800);
+        *pa.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let a1 = produce_rprime(&pa, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let a2 = produce_rprime(&pa, a1.header.block_hash, 800, VRF_OUT, vec![prio_tx(ALICE, CAROL, 0, 0xA0)]).await;
+        persist(&storage, &a1);
+        app.apply_received(&a1).await;
+        persist(&storage, &a2);
+        app.apply_received(&a2).await;
+
+        // Heavier branch B off a1: b2 (TWO priority txs → vestB = 2·vestA), then an empty
+        // b3 (the 5,406 analog — no vest, root just re-folds REG's storage).
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_code(&Address(REG), reg_code.clone());
+        pb.set_validator_activation_height(800);
+        *pb.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let _b1 = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce_rprime(
+            &pb,
+            a1.header.block_hash,
+            800,
+            vrf_b,
+            vec![prio_tx(ALICE, CAROL, 0, 0xB0), prio_tx(ALICE, DAVE, 1, 0xB1)],
+        )
+        .await;
+        let b3 = produce_rprime(&pb, b2.header.block_hash, 801, vrf_b, vec![]).await;
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.apply_received(&b3).await;
+        assert_eq!(app.applied_tip().await.height, 801, "reorged to branch B");
+        assert_eq!(
+            follower.calculate_state_root(),
+            b3.state_root,
+            "in-memory follower converged to branch B's tip root after the reorg"
+        );
+
+        // THE ORACLE: a from-genesis cold-sync folds the DURABLE STORE. Hydrate a cold
+        // StateDB from the store exactly as node boot / state-digest does, then fold.
+        let cold = StateDB::new();
+        for (addr, acct) in storage.state.get_all_accounts().expect("get_all_accounts") {
+            cold.accounts.load_account(addr, acct);
+        }
+        for ((addr, key), val) in storage.state.get_all_storage().expect("get_all_storage") {
+            cold.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
+        }
+        let cold_root = cold.calculate_state_root();
+
+        // Sanity: the vest actually fired and the branches differ (else the guard is vacuous).
+        let k0 = vec![0u8; 32];
+        assert!(pb.get_balance(&Address(REG)) > pa.get_balance(&Address(REG)), "branch B vested more than A");
+        assert_ne!(
+            pa.state_db().get_storage(&Address(REG), &k0),
+            pb.state_db().get_storage(&Address(REG), &k0),
+            "precondition: branches A and B wrote DIFFERENT registry storage via creditReward"
+        );
+
+        // RESULT (main, 2026-07-23): PASSES. The reorg reconciles the registry's
+        // creditReward STORAGE (not just its balance): both the in-memory follower and a
+        // cold fold of the durable store show branch B's slot value, and cold_root ==
+        // b3.state_root. This REFUTES the hypothesis that block-5,406 was registry-storage
+        // non-reconciliation. Retained as a regression GUARD for reorg registry-storage
+        // purity. The real 5,406 divergence is a subtler fork/reorg case (this simple
+        // A→B reorg is pure) — still open (planset WP-1.2).
+        assert_eq!(
+            cold_root, b3.state_root,
+            "reorg registry-storage purity guard: a cold fold of the reorged store must \
+             reproduce branch B's committed tip root (registry creditReward storage reconciled)"
+        );
+    }
+
+    /// SRP-S4 WP-1.2′ variant #1 — PRODUCE-AFTER-COMPETITOR.
+    ///
+    /// The live 5,406 producer committed a root a clean forward execution can't reproduce.
+    /// The one path the receive-reorg guard above does NOT cover: a node that RECEIVES a
+    /// competing branch, reorgs to it, THEN *produces* the next canonical block from its
+    /// post-reorg in-memory state. If that in-memory state diverges from a clean forward
+    /// execution (even though its committed root matched), the produced block seals an
+    /// impure root — exactly the 5,406 signature. Here the produced block VESTS (a §R'
+    /// creditReward on top of the reorged registry storage), and we compare the
+    /// reorg-then-produce root to a clean forward producer's root for the same block.
+    #[tokio::test]
+    async fn srp_s4_produce_after_competitor_reorg_is_pure() {
+        let reg_code = vec![0x34, 0x60, 0x00, 0x54, 0x01, 0x60, 0x00, 0x55, 0x00];
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.set_code(&Address(REG), reg_code.clone());
+        follower.set_validator_activation_height(800);
+        *follower.reward_policy_handle().write() = Some(rprime_policy(5000));
+        follower.persist_state_changes().await.expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let f = follower.clone();
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            *f.reward_policy_handle().write() = Some(rprime_policy(5000));
+            Box::pin(async { Ok(()) })
+        }));
+
+        // Branch A (applied): a799 + a800 (one vest).
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        pa.set_code(&Address(REG), reg_code.clone());
+        pa.set_validator_activation_height(800);
+        *pa.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let a799 = produce_rprime(&pa, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let a800 = produce_rprime(&pa, a799.header.block_hash, 800, VRF_OUT, vec![prio_tx(ALICE, CAROL, 0, 0xA0)]).await;
+        persist(&storage, &a799);
+        app.apply_received(&a799).await;
+        persist(&storage, &a800);
+        app.apply_received(&a800).await;
+
+        // Heavier branch B: b800 (two vests) + b801 (empty). Clean producer pb builds it.
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_code(&Address(REG), reg_code.clone());
+        pb.set_validator_activation_height(800);
+        *pb.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let _b1 = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5B; 32];
+        let b800 = produce_rprime(&pb, a799.header.block_hash, 800, vrf_b, vec![prio_tx(ALICE, CAROL, 0, 0xB0), prio_tx(ALICE, DAVE, 1, 0xB1)]).await;
+        let b801 = produce_rprime(&pb, b800.header.block_hash, 801, vrf_b, vec![]).await;
+        persist(&storage, &b800);
+        persist(&storage, &b801);
+
+        // Reorg the follower A → B.
+        app.fork_choice = Some(fork_choice_returning(b801.header.block_hash));
+        app.apply_received(&b801).await;
+        assert_eq!(app.applied_tip().await.height, 801, "reorged to B");
+
+        // PRODUCE-AFTER-REORG: the follower seals b802 (a VESTING block) from its post-reorg
+        // in-memory state. ALICE nonce is 2 after B's two txs.
+        let vest_tx = prio_tx(ALICE, CAROL, 2, 0xC0);
+        let b802_reorg = produce_rprime(&follower, b801.header.block_hash, 802, vrf_b, vec![vest_tx.clone()]).await;
+
+        // Clean forward producer pb seals the SAME b802 from clean state.
+        let b802_clean = produce_rprime(&pb, b801.header.block_hash, 802, vrf_b, vec![vest_tx]).await;
+
+        assert_eq!(
+            b802_reorg.state_root, b802_clean.state_root,
+            "SRP-S4 PRODUCE-AFTER-COMPETITOR: a block PRODUCED from post-reorg state sealed a \
+             root that a clean forward execution does not reproduce — the reorged in-memory \
+             state diverged from committed state despite a matching tip root. This is the \
+             block-5,406 signature (produce-after-reorg impurity)."
+        );
+    }
+
+    /// SRP-S4 ROOT CAUSE (RED) — the RPC `simulate_transaction` path races the block
+    /// producer's state-root fold on the SHARED `state_db`.
+    ///
+    /// `Executor::simulate_transaction` (executor.rs:1808) takes ONLY `exec_lock`, then
+    /// `snapshot()` → `set_balance(from, u128::MAX)` → execute → `restore()` on the
+    /// shared committed state. Its own comment says these overrides "must not be
+    /// observable to concurrent workers." But the producer's `settle_block_rewards` +
+    /// `calculate_state_root` (producer.rs) take ONLY `advance_lock` — a DISJOINT lock —
+    /// and `Executor::calculate_state_root` takes no lock at all. So an `eth_call` /
+    /// `eth_estimateGas` landing during a block build DOES let the producer's fold
+    /// observe the simulation's transient `u128::MAX` sender balance and seal it into the
+    /// committed root — a root no cold-sync re-executing the block can reproduce. Empty
+    /// blocks are maximally exposed (the build holds no `exec_lock` section at all), the
+    /// reward math stays pure, and the wedge height is set by WHEN an RPC call coincides
+    /// with production — exactly the block-5,406 non-injective wedge, and why every
+    /// SERIAL reproduction (and every prior SRP fix) missed it.
+    ///
+    /// This test hammers `simulate_transaction` concurrently while the producer folds the
+    /// root, and asserts the fold NEVER observes a value other than the honest committed
+    /// root. RED on `main` (the fold sees the phantom); GREEN once simulation runs on an
+    /// ISOLATED state that never touches the shared consensus `state_db`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn srp_s4_rpc_simulate_races_producer_state_root_fold() {
+        let exec = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        exec.set_balance(&Address(CB), U256::from(1_000_000u64));
+        exec.set_balance(&Address([0x11u8; 20]), U256::from(500u64));
+        let honest = exec.calculate_state_root();
+
+        // A block + a tx that an RPC eth_call / eth_estimateGas would simulate. The
+        // simulate path overrides the SENDER's balance to u128::MAX on the shared state.
+        let block = seal_rprime(1, Hash::default(), Hash::default(), VRF_OUT, vec![]);
+        let sim_tx = prio_tx([0x77u8; 20], CAROL, 0, 0xEE);
+
+        // RPC hammer: many concurrent eth_call-equivalent simulations.
+        let e2 = exec.clone();
+        let blk = block.clone();
+        let stx = sim_tx.clone();
+        let hammer = tokio::spawn(async move {
+            for _ in 0..8000 {
+                let _ = e2.simulate_transaction(&blk, &stx).await;
+            }
+        });
+
+        // Producer's fold: the committed state is FIXED, so every fold MUST equal `honest`.
+        let mut torn: Option<Hash> = None;
+        for _ in 0..8000 {
+            let r = exec.calculate_state_root();
+            if r != honest {
+                torn = Some(r);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let _ = hammer.await;
+
+        assert!(
+            torn.is_none(),
+            "SRP-S4 ROOT CAUSE: the producer's state-root fold observed a TORN root {torn:?} != \
+             the honest committed root {honest} while a concurrent RPC simulate_transaction ran. \
+             simulate takes exec_lock (executor.rs:1808); the producer's fold takes only \
+             advance_lock — DISJOINT — so simulate's transient u128::MAX sender balance is folded \
+             into the committed root, which no cold-sync reproduces. This is the block-5,406 \
+             non-injective wedge; height is set by WHEN an eth_call coincides with production."
+        );
     }
 
     /// Store-backed follower seeded at height 798, then advanced through a SHARED

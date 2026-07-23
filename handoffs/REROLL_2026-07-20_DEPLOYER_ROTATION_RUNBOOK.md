@@ -3,9 +3,24 @@ title: "Reroll runbook — deployer rotation + resilient sync + frozen address b
 created: 2026-07-20
 branch: reroll-prep/deployer-rotation
 author: Claude (Opus 4.8, 1M) for SaulBuilds
-status: PREP COMPLETE — book frozen + validated by local dry-run; reroll not yet executed
+status: SUPERSEDED — the deployer rotation ALREADY WENT LIVE (SRP-S2/S3c); this doc's dry-run genesis/membership projections do NOT match the live chain. Deployer 0x4fAB35c8 is correct; genesis/SBT/vault below are WRONG for live.
 chain: 40204, genesis 0x481a59bc, rpc.citrate.ai
 ---
+
+> ⚠️ **SUPERSEDED (2026-07-23).** The deployer rotation described here is DONE — the
+> live chain runs on deployer `0x4fAB35c8…` as intended. But the **dry-run** address
+> projections in this doc (genesis `0x481a59bc`, SBT `0x3e0c2B1c…`) do **NOT** match the
+> chain that actually went live, because `DeployCoreMembership` is CREATE (nonce-based)
+> and the live deploy order differed from the dry-run. **Do NOT deploy the genesis/
+> membership values in this runbook.** Canonical live values:
+> - genesis hash `0xd1a1941e…` / stateRoot `0xd703e8c6…`
+> - CitrateMemberSBT `0x4CE39F891c0A519Fa0E0De97A1DD3e3f856e0cF1`
+> - MembershipStakeVault `0x61E324cFd6B7Cb106AC0AD1dF163bdFef2b74268`
+>
+> Authoritative sources: `handoffs/CITRATE_CORE_APP_START_AFTER_SRP_S2_REROLL_2026-07-21.md`,
+> `contracts/addresses/40204.json`, and the end-to-end runbook
+> `../../handoffs/REROLL_END_TO_END_CEREMONY_AUDIT_2026-07-23.md`. The deployer key
+> (`0x4fAB35c8`) and resilient-sync content in this doc remain valid.
 
 # TL;DR
 

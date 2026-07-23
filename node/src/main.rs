@@ -24,6 +24,7 @@ pub mod bundled_model;
 mod canonical_apply;
 mod commands;
 mod config;
+mod consensus_manifest;
 mod genesis;
 mod inference;
 pub mod logging;
@@ -212,6 +213,15 @@ enum Commands {
     /// Show genesis block information
     GenesisInfo,
 
+    /// Print this binary's consensus-alignment manifest (git SHA + features +
+    /// consensus constants + a stable fingerprint). Diff the fingerprint against
+    /// the fleet binary before a reroll to prove app↔fleet package alignment.
+    Consensus {
+        /// Emit the manifest as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Wallet management (accounts, balances, transfers)
     Wallet {
         /// Wallet keystore path
@@ -323,6 +333,15 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Keygen { ed25519 }) => {
             generate_keypair(ed25519);
+            return Ok(());
+        }
+        Some(Commands::Consensus { json }) => {
+            let manifest = consensus_manifest::ConsensusManifest::current();
+            if json {
+                println!("{}", manifest.to_json());
+            } else {
+                manifest.print_human();
+            }
             return Ok(());
         }
         Some(Commands::Model { command }) => {
@@ -967,6 +986,21 @@ fn at_rest_encryption_from_env() -> Result<Option<EncryptionAtRestConfig>> {
 
 async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Starting Citrate node...");
+    {
+        // Consensus-alignment stamp — logged at boot so field drift is diagnosable
+        // from the journal (the app node and fleet MUST share this fingerprint).
+        let m = consensus_manifest::ConsensusManifest::current();
+        info!(
+            "Consensus manifest: git={}{} halo2={} fingerprint={}",
+            m.git_sha,
+            if m.git_dirty { "(DIRTY)" } else { "" },
+            m.feat_halo2_verifier,
+            m.fingerprint
+        );
+        if m.git_dirty {
+            warn!("Node built from a DIRTY tree — not reproducibly aligned with the fleet");
+        }
+    }
     info!("Chain ID: {}", config.chain.chain_id);
     info!("Data directory: {:?}", config.storage.data_dir);
 
