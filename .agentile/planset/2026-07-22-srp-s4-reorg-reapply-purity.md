@@ -4,13 +4,49 @@ created: 2026-07-22
 updated: 2026-07-23
 branch: srp/s4-reward-rmw-store-purity
 author: Claude (DGX / chain-ops session)
-status: OPEN — mechanism = fork/reorg (empirically solid); registry-storage account hypothesis REFUTED by WP-1.1 (simple reorg is pure); exact account open (WP-1.2′ subtler fork variants)
+status: ROOT CAUSE FOUND + REPRODUCED (RPC simulate_transaction races the producer state-root fold on shared state_db); fix = isolate simulation state + pure fold; then clean reroll
 supersedes: none
 related: .agentile/planset/2026-07-21-srp-s3-restart-produce-purity.md, ../../citrate-core/docs/DGX_NODE_SYNC_WEDGE_RESPONSE_2026-07-22.md
 history: originally scoped as "reward RMW / store read-through purity"; DGX instrumentation on 2026-07-23 REFUTED that mechanism (reward reads are pure) and re-localized it to the fork/reorg reapply path — see "What the live instrumentation proved".
 ---
 
 # SRP-S4 — reorg/fork reapply state-root purity
+
+## ★★★ ROOT CAUSE FOUND + REPRODUCED (2026-07-23) ★★★
+
+**The RPC `simulate_transaction` path races the block producer's state-root fold on the
+SHARED `state_db`.** `Executor::simulate_transaction` (executor.rs:1808) takes only
+`exec_lock`, then on the SHARED committed state does `snapshot()` →
+`set_balance(from, u128::MAX)` → execute → `restore()`. Its own comment says these
+overrides "must not be observable to concurrent workers." But the producer's
+`settle_block_rewards` + `calculate_state_root` (producer.rs) take only `advance_lock` —
+a DISJOINT lock — and `Executor::calculate_state_root` takes NO lock. So an `eth_call` /
+`eth_estimateGas` landing during a block build lets the producer's fold **observe the
+simulation's transient `u128::MAX` sender balance and seal it into the committed root** —
+a root no cold-sync re-executing the block can reproduce.
+
+**Reproduced deterministically** (RED test `srp_s4_rpc_simulate_races_producer_state_root_fold`,
+canonical_apply.rs): hammering `simulate_transaction` concurrently with the fold makes the
+fold return a torn root ≠ the honest committed root, in ~2s.
+
+**This explains the ENTIRE saga.** The wedge relocated every fix (235→2558→2209→2042→5406)
+because its height is set by WHEN an RPC call coincides with production — timing, not a
+block event. Reward math stays pure (the state is torn, not miscomputed). Empty blocks are
+maximally exposed (the build holds no `exec_lock` section at all). Every SERIAL reproduction
+and every prior SRP fix missed it. rpc-1 both MINES and serves RPC on :8545 → it is exactly
+the node where the race fires; boot1 wedges identically because it replays rpc-1's committed
+torn roots. Compounding surfaces (Agent findings): `calculate_state_root` also *writes back*
+`set_account` during the fold (state_db.rs:281) and `get_root_hash` exposes that to
+concurrent RPC; and the fold reads the read-through-warmed resident/partial-storage maps,
+so a stray `eth_call` warming a slot alone can diverge the fold even absent the balance race.
+
+**THE FIX (WP-2.1):** `simulate_transaction` (and every RPC/read path) MUST run on an
+ISOLATED state overlay and NEVER mutate the shared consensus `state_db`; make
+`calculate_state_root` a pure read (no `set_account` write-back). Then a clean reroll.
+The earlier "fork/reorg" framing below is SUPERSEDED — a fork is not required; the reorg
+attempts in the cold-sync log are downstream of an already-torn committed root.
+
+---
 
 ## TL;DR
 
