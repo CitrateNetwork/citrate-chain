@@ -1335,7 +1335,23 @@ impl Executor {
         // (1) basic block reward — identical to the pre-§R' credit loop.
         for (addr, amount) in basic_credits {
             if *amount > U256::zero() {
+                // SRP-S4 WP-1.2 diagnostic (env-gated): log what the reward RMW reads
+                // and whether the account was RESIDENT or a store read-through, so the
+                // producer's and a cold-sync's logs can be diffed at the wedge height.
+                let was_resident = std::env::var("CITRATE_SRP_DEBUG").is_ok()
+                    && self.state_db.accounts.exists(addr);
                 let bal = self.get_balance(addr);
+                if std::env::var("CITRATE_SRP_DEBUG").is_ok() {
+                    tracing::warn!(
+                        target: "srp_s4",
+                        "REWARD-READ h={} addr=0x{} resident={} read={} credit=+{}",
+                        height,
+                        hex::encode(addr.0),
+                        was_resident,
+                        bal,
+                        amount
+                    );
+                }
                 self.set_balance(addr, bal + *amount);
             }
         }

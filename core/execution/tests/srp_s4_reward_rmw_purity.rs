@@ -1,6 +1,18 @@
-//! SRP-S4 red test — the block-reward read-modify-write must be a pure function of
-//! the value the state root COMMITS, not of a divergent durable store surfaced by
-//! `Executor::get_balance`'s read-through.
+//! SRP-S4 defensive invariant test — the block-reward read-modify-write must be a
+//! pure function of the value the state root COMMITS, not of a divergent durable store
+//! surfaced by `Executor::get_balance`'s read-through.
+//!
+//! ⚠️ UPDATE 2026-07-23 — this is NOT the block-5,406 mechanism. DGX instrumentation
+//! against the LIVE chain (env-gated `CITRATE_SRP_DEBUG`) proved the reward reads at
+//! 5,406 are PURE and RESIDENT (treasury/coinbase `resident=true`, correct values) —
+//! REFUTING the read-through hypothesis this test models. The real 5,406 wedge is a
+//! FORK/REORG reapply impurity (canonical_apply.rs `reorg_to` + the separately-restored
+//! §R' policy cell): `reorg to 968feeaf aborted at 117449ba @ 5406 — claims 2d9381d2,
+//! re-execution produced 55286580`. See planset
+//! `.agentile/planset/2026-07-22-srp-s4-reorg-reapply-purity.md`. This test is RETAINED
+//! as a defensive property guard (the read-through invariant is still worth enforcing),
+//! but the AUTHORITATIVE SRP-S4 reproduction is the reorg red test (WP-1.1) + the
+//! multi-producer pin (WP-1.2).
 //!
 //! ## What this reproduces (the live block-5,406 cold-sync wedge)
 //!
