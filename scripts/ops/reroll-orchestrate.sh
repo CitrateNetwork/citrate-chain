@@ -38,7 +38,10 @@ CONTRACTS_DIR="${REPO_ROOT}/contracts"
 OPS="${REPO_ROOT}/scripts/ops"
 ENV_TESTNET="${ENV_TESTNET:-$(cd "${REPO_ROOT}/.." && pwd)/.env.testnet}"
 
-TAG=""; CONFIRM=0; FROM="P1"
+# FROM defaults to P0 so the .env prep (blank CITRATE_AA_ENTRY_POINT — GAP-7) and
+# the GAP-2 regression guards ALWAYS run before the deploys. Resuming with an
+# explicit --from P3 etc. deliberately skips prep, so re-blank the pin by hand first.
+TAG=""; CONFIRM=0; FROM="P0"
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) TAG="$2"; shift 2 ;;
@@ -130,7 +133,10 @@ fi
 if should P2; then
   log "── P2 ValidatorRegistry + register 4 validators → G7 + G5 ────────────────"
   log "  deploy ValidatorRegistry (CREATE2)…"
-  run bash -c "cd '$CONTRACTS_DIR' && forge script script/DeployValidatorRegistry.s.sol \
+  # DeployValidatorRegistry.s.sol (like the regenesis scripts) reads the deployer
+  # from the ENV (CEREMONY_DEPLOYER_ADDRESS/DEPLOYER_ADDRESS), not just --sender.
+  run bash -c "cd '$CONTRACTS_DIR' && DEPLOYER_ADDRESS='$DEPLOYER' CEREMONY_DEPLOYER_ADDRESS='$DEPLOYER' \
+      forge script script/DeployValidatorRegistry.s.sol \
       --rpc-url '$RPC' --private-key '$DK' --sender '$DEPLOYER' \
       --broadcast --slow --gas-estimate-multiplier 130 >/dev/null" \
     || gate_fail P2 "DeployValidatorRegistry failed"
