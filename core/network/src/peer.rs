@@ -259,10 +259,10 @@ impl PeerManager {
     /// Add a new peer
     // LOCK ORDERING: acquires Peer.info (read) + stats (read), drops both, then stats (write) — Level 1
     pub async fn add_peer(&self, peer: Arc<Peer>) -> Result<(), NetworkError> {
-        let info = peer.info.read().await;
-        let peer_id = info.id.clone();
-        let direction = info.direction.clone();
-        let addr = info.addr;
+        let (peer_id, direction, addr) = {
+            let info = peer.info.read().await;
+            (info.id.clone(), info.direction.clone(), info.addr)
+        };
 
         // SECREM-01 NET-4(b): enforce identity- and IP-level bans at
         // the single choke point both inbound (transport handshake)
@@ -278,29 +278,52 @@ impl PeerManager {
             ));
         }
 
-        // Check limits
-        let stats = self.stats.read().await;
-        if stats.total_connected >= self.config.max_peers {
-            return Err(NetworkError::ConnectionFailed(
-                "Max peers reached".to_string(),
-            ));
+        // Reconnect / duplicate-id guard (inbound_count leak fix). The same peer
+        // reconnecting re-enters here with the SAME peer_id. `self.peers.insert`
+        // below silently OVERWRITES the old map entry, but the counter increment
+        // still fired — so every reconnect (and broken-pipe churn causes many)
+        // leaked one inbound/outbound slot until the node wrongly reported
+        // "Max inbound peers reached" with only a handful of real connections and
+        // rejected ALL new followers (observed fleet-wide). Evict the stale entry's
+        // accounting FIRST so re-adding the same id is net-zero, and so a prior
+        // connection whose teardown never ran (e.g. a break without remove_peer) is
+        // reconciled on the next connect rather than leaking forever.
+        if let Some((_, old)) = self.peers.remove(&peer_id) {
+            let old_dir = { old.info.read().await.direction.clone() };
+            let mut stats = self.stats.write().await;
+            stats.total_connected = stats.total_connected.saturating_sub(1);
+            match old_dir {
+                Direction::Inbound => {
+                    stats.inbound_count = stats.inbound_count.saturating_sub(1)
+                }
+                Direction::Outbound => {
+                    stats.outbound_count = stats.outbound_count.saturating_sub(1)
+                }
+            }
         }
 
-        match direction {
-            Direction::Inbound if stats.inbound_count >= self.config.max_inbound => {
+        // Check limits (the reconnecting peer is now NOT double-counted against them).
+        {
+            let stats = self.stats.read().await;
+            if stats.total_connected >= self.config.max_peers {
                 return Err(NetworkError::ConnectionFailed(
-                    "Max inbound peers reached".to_string(),
+                    "Max peers reached".to_string(),
                 ));
             }
-            Direction::Outbound if stats.outbound_count >= self.config.max_outbound => {
-                return Err(NetworkError::ConnectionFailed(
-                    "Max outbound peers reached".to_string(),
-                ));
+            match direction {
+                Direction::Inbound if stats.inbound_count >= self.config.max_inbound => {
+                    return Err(NetworkError::ConnectionFailed(
+                        "Max inbound peers reached".to_string(),
+                    ));
+                }
+                Direction::Outbound if stats.outbound_count >= self.config.max_outbound => {
+                    return Err(NetworkError::ConnectionFailed(
+                        "Max outbound peers reached".to_string(),
+                    ));
+                }
+                _ => {}
             }
-            _ => {}
         }
-        drop(stats);
-        drop(info);
 
         // Add peer
         self.peers.insert(peer_id.clone(), peer);
@@ -969,6 +992,61 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(inbound, 1);
         assert_eq!(outbound, 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_same_id_does_not_leak_inbound_count() {
+        // Regression (fleet follower lockout): the same peer reconnecting re-enters
+        // add_peer with the SAME peer_id. self.peers.insert silently overwrote the
+        // map entry, but the counter still incremented — so every reconnect leaked
+        // an inbound slot until the node reported "Max inbound peers reached" with
+        // only a handful of real connections and rejected ALL new followers.
+        let config = PeerManagerConfig {
+            max_peers: 10,
+            max_inbound: 2,
+            max_outbound: 5,
+            ..Default::default()
+        };
+        let manager = PeerManager::new(config);
+        let pid = PeerId::random();
+
+        // One connect + four reconnects of the SAME id (broken-pipe churn).
+        for i in 0..5u16 {
+            let (tx, rx) = mpsc::channel(10);
+            let addr = format!("127.0.0.1:90{:02}", i).parse().expect("addr");
+            let peer = Arc::new(Peer::new(
+                PeerInfo::new(pid.clone(), addr, Direction::Inbound),
+                tx,
+                rx,
+            ));
+            assert!(
+                manager.add_peer(peer).await.is_ok(),
+                "reconnect {i} must be accepted (replaces, not adds) — pre-fix the 3rd leaked past max_inbound and was rejected"
+            );
+        }
+        let (total, inbound, outbound) = manager.get_peer_counts().await;
+        assert_eq!(inbound, 1, "five connects of one peer_id must count as one inbound, not leak");
+        assert_eq!(total, 1);
+        assert_eq!(outbound, 0);
+
+        // The inbound budget (2) is NOT consumed by the reconnect churn: a DISTINCT
+        // inbound peer still fits (pre-fix this wrongly hit "max inbound").
+        let (tx, rx) = mpsc::channel(10);
+        let other = Arc::new(Peer::new(
+            PeerInfo::new(
+                PeerId::random(),
+                "127.0.0.1:9100".parse().expect("addr"),
+                Direction::Inbound,
+            ),
+            tx,
+            rx,
+        ));
+        assert!(
+            manager.add_peer(other).await.is_ok(),
+            "a distinct inbound peer must still fit after reconnect churn"
+        );
+        let (_, inbound2, _) = manager.get_peer_counts().await;
+        assert_eq!(inbound2, 2);
     }
 
     #[tokio::test]
