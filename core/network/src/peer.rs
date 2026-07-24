@@ -362,6 +362,29 @@ impl PeerManager {
         peer
     }
 
+    /// Remove a peer ONLY if the currently-mapped instance is `current` (same Arc).
+    ///
+    /// A reconnect replaces the map entry with a fresh `Peer` (see `add_peer`). The
+    /// OLD connection's reader/writer tasks live on briefly and, when they finally
+    /// error, call into the disconnect path — which, using the plain `remove_peer`,
+    /// would evict the FRESH reconnected peer by id, churning a node down toward 0
+    /// peers (observed: a follower that dropped to 0 peers and never recovered). This
+    /// identity check makes a stale teardown a no-op so only the connection that owns
+    /// the current mapping can remove it. Returns true if it removed.
+    pub async fn remove_peer_if_current(&self, peer_id: &PeerId, current: &Arc<Peer>) -> bool {
+        let is_current = self
+            .peers
+            .get(peer_id)
+            .map(|p| Arc::ptr_eq(p.value(), current))
+            .unwrap_or(false);
+        if is_current {
+            self.remove_peer(peer_id).await;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Get a peer by ID
     pub fn get_peer(&self, peer_id: &PeerId) -> Option<Arc<Peer>> {
         self.peers.get(peer_id).map(|p| p.clone())
@@ -1047,6 +1070,45 @@ mod tests {
         );
         let (_, inbound2, _) = manager.get_peer_counts().await;
         assert_eq!(inbound2, 2);
+    }
+
+    #[tokio::test]
+    async fn test_remove_peer_if_current_is_identity_aware() {
+        // Regression (teardown race → peer starvation): after a reconnect the map
+        // holds the FRESH peer, but the OLD connection's teardown fires later and,
+        // with a plain remove_peer, would evict the fresh one — churning a node down
+        // to 0 peers. remove_peer_if_current makes a stale teardown a no-op.
+        let manager = PeerManager::new(PeerManagerConfig::default());
+        let pid = PeerId::random();
+
+        let (tx, rx) = mpsc::channel(10);
+        let live = Arc::new(Peer::new(
+            PeerInfo::new(pid.clone(), "127.0.0.1:9001".parse().expect("addr"), Direction::Inbound),
+            tx,
+            rx,
+        ));
+        manager.add_peer(live.clone()).await.expect("add");
+
+        // A DIFFERENT instance with the same id (a stale connection's handle) must
+        // NOT evict the mapped peer.
+        let (tx2, rx2) = mpsc::channel(10);
+        let stale = Arc::new(Peer::new(
+            PeerInfo::new(pid.clone(), "127.0.0.1:9002".parse().expect("addr"), Direction::Inbound),
+            tx2,
+            rx2,
+        ));
+        assert!(
+            !manager.remove_peer_if_current(&pid, &stale).await,
+            "a stale (different) instance must not evict the live peer"
+        );
+        assert!(manager.get_peer(&pid).is_some(), "live peer must remain");
+
+        // The owning instance removes it.
+        assert!(
+            manager.remove_peer_if_current(&pid, &live).await,
+            "the current instance removes"
+        );
+        assert!(manager.get_peer(&pid).is_none());
     }
 
     #[tokio::test]
