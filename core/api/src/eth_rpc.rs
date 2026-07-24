@@ -482,9 +482,12 @@ pub fn register_eth_methods(
         Ok(Value::String(format!("0x{:x}", chain_id)))
     });
 
-    // eth_syncing - Returns sync status
+    // eth_syncing - default stub (fully-synced `false`). A truthful implementation
+    // that knows the node's highest-seen network height is registered by
+    // `RpcServer::with_economics_and_pause` and OVERRIDES this (last registration
+    // wins) when the node wires its sync driver in; standalone/test callers of
+    // register_eth_methods keep this simple default.
     io_handler.add_sync_method("eth_syncing", move |_params: Params| {
-        // Return false when fully synced
         Ok(Value::Bool(false))
     });
 
