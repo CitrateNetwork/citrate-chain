@@ -1519,6 +1519,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             None
         };
 
+    // Forward-sync liveness (handoff 2026-07-23): the highest block height we have
+    // EVIDENCE the network is at, from ANY signal — gossiped NewBlock, a rejected
+    // far-ahead block (MissingParentAtAdmission proves the sender is ahead of us),
+    // or a Hello. The 2s sync tick drives the target off this (not only the best
+    // connected peer's head, which goes stale and parks a follower one growth-window
+    // short of a still-producing tip), and eth_syncing reports it as highestBlock.
+    // Monotonic via fetch_max. Function-scoped so both the P2P tasks and the RPC
+    // server can read it.
+    let max_seen_height = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // Start P2P listener and connect to bootstrap nodes
     {
         // Prepare head info — advertise our APPLIED tip (height + hash), NOT the
@@ -1532,6 +1542,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .ok()
             .flatten()
             .unwrap_or((citrate_consensus::types::Hash::default(), 0));
+        max_seen_height.fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
         let genesis_hash = storage
             .blocks
             .get_block_by_height(0)
@@ -1723,12 +1734,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let pm_for_sync = pm_for_rx.clone();
         let sync_for_loop = sync.clone();
         let storage_for_sync = storage.clone();
+        let max_seen_for_sync = max_seen_height.clone();
         tokio::spawn(async move {
             use std::collections::HashMap;
             use std::time::{Duration, Instant};
             let mut attempt_counts: HashMap<citrate_consensus::types::Hash, u32> = HashMap::new();
             let mut pending_retries: Vec<(Instant, citrate_consensus::types::Hash)> = Vec::new();
             let mut peer_failures: HashMap<String, u32> = HashMap::new();
+            // Round-robin index for rotating request peers when we are behind but no
+            // peer qualified as "best" (forward-sync liveness fix).
+            let mut rotate_idx: u64 = 0;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
@@ -1748,22 +1763,59 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         best = Some(p.clone());
                     }
                 }
-                if let Some(peer) = best {
-                    // CRITICAL: raise the sync target to the best peer's advertised
-                    // head. The Hello/HelloAck that carries a peer's head is consumed
-                    // INSIDE the transport handshake (transport.rs) to seed
-                    // PeerInfo.head_height and is NEVER forwarded to the message loop,
-                    // so the `NetworkMessage::Hello` handler that would call
-                    // start_sync never fires. target_height therefore stayed 0, and
-                    // handle_blocks declared "Synchronization complete" after every
-                    // batch (last_height >= 0) — the node synced a few blocks then
-                    // looped forever without pushing to the real tip. Driving
-                    // start_sync here from the best peer's head (start_sync only ever
-                    // RAISES the target, never lowers it) makes the target track the
-                    // true head so sync walks all the way forward.
-                    if best_h > 0 {
-                        sync_for_loop.set_target(best_h).await;
+                // Drive the sync target off the MAX of the best connected-peer head
+                // and the max height we have evidence for ANYWHERE (gossip / a
+                // rejected far-ahead block / Hello). best_h alone goes stale: a
+                // follower's connected peers can stop advertising a higher head while
+                // the tip keeps climbing (or the far-ahead blocks arrive via a relay
+                // peer not in the peer manager), freezing the target and parking the
+                // node one growth-window short of the tip — the forward-sync stall.
+                // set_target only RAISES, never lowers.
+                let seen = max_seen_for_sync.load(std::sync::atomic::Ordering::Relaxed);
+                let target = best_h.max(seen);
+                if target > 0 {
+                    sync_for_loop.set_target(target).await;
+                }
+                // Our true synced head (applied tip height). When this is below the
+                // target we KNOW we are behind and must keep pulling.
+                let applied_height = storage_for_sync
+                    .blocks
+                    .get_applied_tip()
+                    .ok()
+                    .flatten()
+                    .map(|(_, h)| h)
+                    .unwrap_or(0);
+                // Choose a peer to pull from. Prefer the best-by-head peer; but when
+                // we are demonstrably behind (applied < target) and NO peer qualified
+                // as "best" (all hit the 3-failure cap, or every connected peer's
+                // advertised head went stale ≤ ours), fall back to ANY connected peer,
+                // rotating each tick so we don't spin on one that only serves a
+                // side-branch. Without this a behind node with no "best" peer issues
+                // no GetBlocks and parks idle — the observed stall.
+                let request_peer: Option<Arc<citrate_network::peer::Peer>> = if best.is_some()
+                {
+                    best
+                } else if applied_height < target {
+                    let all = pm_for_sync.get_all_peers();
+                    let mut connected: Vec<Arc<citrate_network::peer::Peer>> = Vec::new();
+                    for p in all {
+                        if p.info.read().await.state
+                            == citrate_network::peer::PeerState::Connected
+                        {
+                            connected.push(p);
+                        }
                     }
+                    if connected.is_empty() {
+                        None
+                    } else {
+                        let i = (rotate_idx as usize) % connected.len();
+                        rotate_idx = rotate_idx.wrapping_add(1);
+                        Some(connected[i].clone())
+                    }
+                } else {
+                    None
+                };
+                if let Some(peer) = request_peer {
                     let _ = best_hash; // anchor uses the applied tip, not best_hash
                     // Anchor every request on our current PERSISTED tip so sync
                     // walks forward batch by batch. The pre-fix logic preferred
@@ -1877,6 +1929,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // WP-K.2: Clone DAG components for the network handler
         let dag_store_for_net = shared_dag_store.clone();
         let ghostdag_for_net = shared_ghostdag.clone();
+        let max_seen_for_rx = max_seen_height.clone();
         let checkpoint_mgr_for_net = checkpoint_manager.clone();
 
         tokio::spawn(async move {
@@ -1900,6 +1953,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // Handle protocol messages
                 match msg {
                     NetworkMessage::Hello { head_height, head_hash, .. } => {
+                        max_seen_for_rx
+                            .fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
                         // Kick off naive sync: request blocks from genesis if behind
                         // APPLIED tip, not the stored height index: a follower
                         // stores gossiped tips far ahead of its applied chain, so
@@ -1921,6 +1976,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // Sync manager will request in periodic loop
                     }
                     NetworkMessage::HelloAck { head_height, head_hash, .. } => {
+                        max_seen_for_rx
+                            .fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
                         // APPLIED tip, not the stored height index: a follower
                         // stores gossiped tips far ahead of its applied chain, so
                         // get_latest_height() would report it as already caught up
@@ -2031,6 +2088,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::NewBlock { block } => {
+                        // Record network-height evidence from ANY gossip — even a relay
+                        // peer not in our peer manager. This is the signal that raises
+                        // the sync target for a far-behind follower (fed to the 2s tick
+                        // + eth_syncing).
+                        max_seen_for_rx
+                            .fetch_max(block.header.height, std::sync::atomic::Ordering::Relaxed);
                         // Keep this peer's advertised head FRESH from its gossip.
                         // PeerInfo.head_height is seeded once at the transport
                         // handshake and never refreshed afterward, so the sync target
@@ -2066,6 +2129,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         .validate_block_consistency(&block)
                                         .await
                                     {
+                                        // A block we can't admit because its parent is
+                                        // missing (MissingParentAtAdmission) is still
+                                        // PROOF the network is at least at block.height.
+                                        // Rejecting the block is correct, but dropping
+                                        // its height signal is what stalled a far-behind
+                                        // follower — record it so the sync tick pulls
+                                        // the gap forward instead of parking.
+                                        max_seen_for_rx.fetch_max(
+                                            block.header.height,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
                                         tracing::warn!(
                                             "Rejected inconsistent block {} from {}: {}",
                                             hex::encode(&block.header.block_hash.as_bytes()[..8]),
@@ -2407,6 +2481,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             config.chain.chain_id,
             Some(economics_manager.clone()),
             Some(pause_flag.clone()),
+            // forward-sync liveness: let eth_syncing report highestBlock from the
+            // sync driver's max-seen height (truthful "stalled" vs "synced").
+            Some(max_seen_height.clone()),
         );
 
         // PIL-12: spawn the Ethereum-compatible subscription server next
