@@ -26,6 +26,7 @@ mod canonical_apply;
 mod commands;
 mod config;
 mod consensus_manifest;
+mod dag_prune;
 mod genesis;
 mod inference;
 pub mod logging;
@@ -1520,6 +1521,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // PIL-42: genesis must be the DAG's height-0 root or the producer seals
     // block 1 against a zero selected-parent and orphans it.
     block_admission.seed_genesis().await;
+
+    // SYNC-S1 D3: bound DagStore memory. D1 made per-block retention O(1)
+    // instead of Theta(N²), but the DAG store still keeps every block it has
+    // admitted — measured at ~16 KB/block on the G3 fleet run, i.e. a 3.9 GB
+    // follower runs out near 150k blocks. Opt-in via CITRATE_DAG_PRUNE_RETAIN
+    // (no-op when unset) because the merge-block score path is not yet bounded.
+    dag_prune::spawn(storage.clone(), shared_dag_store.clone());
 
     // D2.4: repair partial admissions already on disk. Any node that ran a
     // pre-D2 binary can be carrying a chain-store hole with the block sitting
