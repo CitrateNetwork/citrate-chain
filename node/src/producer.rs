@@ -1,5 +1,5 @@
 use citrate_consensus::chain_selection::ChainSelector;
-use citrate_consensus::dag_store::DagStore;
+use citrate_consensus::dag_store::{DagStore, DagStoreError};
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::tip_selection::TipSelector;
 use citrate_consensus::crypto::{self, Ed25519SigningKey};
@@ -388,7 +388,33 @@ impl BlockProducer {
             for height in 0..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
                     if let Ok(Some(block)) = storage.blocks.get_block(&block_hash) {
-                        let _ = dag_store.store_block(block.clone()).await;
+                        // SYNC-S1 D2.3 (R3): a discarded DAG write here left the
+                        // block chain-present / DAG-absent with no log line,
+                        // which makes every descendant fail the consistency
+                        // gate. `BlockExists` IS a genuine no-op in this loop
+                        // (the block was just read OUT of the chain store, so
+                        // the chain half is present by construction, and
+                        // BlockExists proves the DAG half is too) — but a real
+                        // error must never be silent.
+                        match dag_store.store_block(block.clone()).await {
+                            Ok(()) => {}
+                            // Already in the DAG. A genuine no-op HERE, and only
+                            // here: the block was just read OUT of the chain
+                            // store, so the chain half is present by
+                            // construction and BlockExists proves the DAG half
+                            // is too. Logged rather than swallowed — an empty
+                            // arm on this variant is what made the boot-3 wedge
+                            // permanent, so the shape stays grep-able.
+                            Err(DagStoreError::BlockExists(_)) => debug!(
+                                "DAG rehydration: block {} @ {} already present in the DAG store",
+                                block_hash, height
+                            ),
+                            Err(e) => warn!(
+                                "DAG rehydration: block {} @ {} failed to load into the DAG store: {} \
+                                 — descendants will be inadmissible until the startup reconcile repairs it",
+                                block_hash, height, e
+                            ),
+                        }
                         // PIL-13: use register_existing_block, not add_block.
                         // The eager-load loop walks every persisted block on
                         // startup. add_block recomputes the full BlueSet
@@ -399,7 +425,12 @@ impl BlockProducer {
                         // header (already on disk, durable) and stores a
                         // lightweight BlueSet — O(1) per block, no
                         // cumulative materialisation.
-                        let _ = ghostdag.register_existing_block(&block).await;
+                        if let Err(e) = ghostdag.register_existing_block(&block).await {
+                            warn!(
+                                "DAG rehydration: block {} @ {} failed GhostDAG registration: {}",
+                                block_hash, height, e
+                            );
+                        }
                     }
                 }
             }
@@ -490,7 +521,33 @@ impl BlockProducer {
             for height in 0..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
                     if let Ok(Some(block)) = storage.blocks.get_block(&block_hash) {
-                        let _ = dag_store.store_block(block.clone()).await;
+                        // SYNC-S1 D2.3 (R3): a discarded DAG write here left the
+                        // block chain-present / DAG-absent with no log line,
+                        // which makes every descendant fail the consistency
+                        // gate. `BlockExists` IS a genuine no-op in this loop
+                        // (the block was just read OUT of the chain store, so
+                        // the chain half is present by construction, and
+                        // BlockExists proves the DAG half is too) — but a real
+                        // error must never be silent.
+                        match dag_store.store_block(block.clone()).await {
+                            Ok(()) => {}
+                            // Already in the DAG. A genuine no-op HERE, and only
+                            // here: the block was just read OUT of the chain
+                            // store, so the chain half is present by
+                            // construction and BlockExists proves the DAG half
+                            // is too. Logged rather than swallowed — an empty
+                            // arm on this variant is what made the boot-3 wedge
+                            // permanent, so the shape stays grep-able.
+                            Err(DagStoreError::BlockExists(_)) => debug!(
+                                "DAG rehydration: block {} @ {} already present in the DAG store",
+                                block_hash, height
+                            ),
+                            Err(e) => warn!(
+                                "DAG rehydration: block {} @ {} failed to load into the DAG store: {} \
+                                 — descendants will be inadmissible until the startup reconcile repairs it",
+                                block_hash, height, e
+                            ),
+                        }
                         // PIL-13: use register_existing_block, not add_block.
                         // The eager-load loop walks every persisted block on
                         // startup. add_block recomputes the full BlueSet
@@ -501,7 +558,12 @@ impl BlockProducer {
                         // header (already on disk, durable) and stores a
                         // lightweight BlueSet — O(1) per block, no
                         // cumulative materialisation.
-                        let _ = ghostdag.register_existing_block(&block).await;
+                        if let Err(e) = ghostdag.register_existing_block(&block).await {
+                            warn!(
+                                "DAG rehydration: block {} @ {} failed GhostDAG registration: {}",
+                                block_hash, height, e
+                            );
+                        }
                     }
                 }
             }
