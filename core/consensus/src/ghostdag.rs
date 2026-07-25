@@ -767,8 +767,59 @@ impl GhostDag {
             if let Some(sp_score) = sp_score {
                 return Ok(lightweight(sp_score + 1));
             }
-            // Selected parent not registered yet — fall through to the full
-            // computation, which walks the DAG store rather than `relations`.
+
+            // COLD PATH — the selected parent is not in `relations`.
+            //
+            // This is not an edge case: `relations` is in-memory only, so after
+            // EVERY restart a follower's first received block lands here. It
+            // must not reach `calculate_blue_set`: that walks the
+            // selected-parent chain to genesis and caches a full cumulative
+            // ancestor set for EVERY block on the way (see
+            // `get_or_calculate_blue_set` phase 2), which rebuilds the entire
+            // Theta(N²) footprint in a single call. At the live chain's height
+            // that is the ~4 GB that OOM-killed boot-3 — so routing the cold
+            // path through it would have reintroduced the exact bug D1 removes,
+            // once per restart.
+            //
+            // Instead walk back to the nearest ancestor whose score is known,
+            // counting edges. `score(b) = score(cursor) + hops` because each
+            // linear step adds exactly one. O(depth) time, O(1) memory, and
+            // only the first block after a restart pays it — its child then
+            // finds it in `relations`.
+            let mut hops: u64 = 1;
+            let mut cursor = block.selected_parent();
+            // An honest chain cannot have more ancestors than its height; a
+            // longer walk means corrupt linkage (or a cycle), so bail out to
+            // the authoritative computation rather than spin.
+            let max_hops = block.header.height.saturating_add(1);
+            while hops <= max_hops {
+                if let Some(score) = self
+                    .relations
+                    .read()
+                    .await
+                    .get(&cursor)
+                    .map(|r| r.blue_set.score)
+                {
+                    return Ok(lightweight(score + hops));
+                }
+                let ancestor = self
+                    .dag_store
+                    .get_block(&cursor)
+                    .await
+                    .map_err(|_| GhostDagError::BlockNotFound(cursor))?;
+                if ancestor.is_genesis() {
+                    return Ok(lightweight(1 + hops));
+                }
+                if !ancestor.header.merge_parent_hashes.is_empty() {
+                    // A merge block on the path: its own score needs a real
+                    // union, so compute that ONE block authoritatively and add
+                    // the remaining edges.
+                    let full = self.calculate_blue_set(&ancestor).await?;
+                    return Ok(lightweight(full.score + hops));
+                }
+                cursor = ancestor.selected_parent();
+                hops += 1;
+            }
         }
 
         let full = self.calculate_blue_set(block).await?;
@@ -1312,6 +1363,82 @@ mod tests {
             entries_after(2_000, true).await,
             0,
             "a deep linear sync must retain no cumulative ancestry"
+        );
+    }
+
+    /// SYNC-S1 D1 COLD PATH — a follower's FIRST block after a restart must not
+    /// rebuild the O(N²) footprint.
+    ///
+    /// `relations` is in-memory only, so after every restart it is empty and the
+    /// first received block has no registered selected parent. If that case
+    /// falls through to `calculate_blue_set`, it walks to genesis caching a full
+    /// cumulative ancestor set per block on the path — the entire Theta(N²)
+    /// footprint, rebuilt in one call, which is the ~4 GB that OOM-killed
+    /// boot-3 twenty-one times. So the restart case has to be O(1) memory too,
+    /// not just the steady-state case.
+    ///
+    /// This is deliberately a DEEP chain: at N=1_000 the quadratic path would
+    /// retain ~500k ancestry entries, so a regression is unmistakable.
+    #[tokio::test]
+    async fn cold_start_first_block_derives_score_without_materialising_ancestry() {
+        const N: u64 = 1_000;
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+
+        // Populate the DAG STORE only — exactly what `DagStore::load` gives a
+        // node on restart. `relations` stays empty.
+        let genesis = create_test_block_with_parents([0xA1; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        let mut parent = genesis.hash();
+        let mut tip = genesis.clone();
+        for i in 1..=N {
+            let mut h = [0u8; 32];
+            h[0..8].copy_from_slice(&i.to_le_bytes());
+            h[31] = 0xC3; // keep hashes clear of Hash::default()
+            let b = create_test_block_with_parents(h, parent, vec![], i);
+            dag_store.store_block(b.clone()).await.unwrap();
+            parent = b.hash();
+            tip = b;
+        }
+
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+        assert_eq!(
+            ghostdag.materialised_blue_ancestry_entries().await,
+            0,
+            "a freshly constructed GhostDag has an empty relations map (post-restart state)"
+        );
+
+        // The first block admitted after the restart — deepest possible cold path.
+        ghostdag.add_block(&tip).await.expect("cold admit");
+
+        assert_eq!(
+            ghostdag.get_blue_score(&tip.hash()).await.unwrap(),
+            N + 1,
+            "cold-path derivation must agree with the warm path: genesis 1 + one per step"
+        );
+        assert_eq!(
+            ghostdag.materialised_blue_ancestry_entries().await,
+            0,
+            "SYNC-S1 D1: the cold path must not materialise cumulative ancestry — \
+             routing it through calculate_blue_set would retain ~N²/2 entries and \
+             reintroduce the follower OOM once per restart"
+        );
+
+        // The next block up is now warm: its parent is registered, so O(1).
+        let mut h = [0u8; 32];
+        h[0..8].copy_from_slice(&(N + 1).to_le_bytes());
+        h[31] = 0xC3;
+        let next = create_test_block_with_parents(h, tip.hash(), vec![], N + 1);
+        dag_store.store_block(next.clone()).await.unwrap();
+        ghostdag.add_block(&next).await.expect("warm admit");
+        assert_eq!(
+            ghostdag.get_blue_score(&next.hash()).await.unwrap(),
+            N + 2,
+            "warm path continues the same sequence"
+        );
+        assert_eq!(
+            ghostdag.materialised_blue_ancestry_entries().await,
+            0,
+            "still flat"
         );
     }
 
