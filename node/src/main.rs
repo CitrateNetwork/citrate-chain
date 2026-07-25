@@ -18,6 +18,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod adapters;
+mod admission;
 mod artifact;
 mod block_serve;
 pub mod bundled_model;
@@ -25,6 +26,7 @@ mod canonical_apply;
 mod commands;
 mod config;
 mod consensus_manifest;
+mod dag_prune;
 mod genesis;
 mod inference;
 pub mod logging;
@@ -1409,31 +1411,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             }
         }
     };
-    // PIL-42 (write/init half): genesis is written to the chain store
-    // (genesis.rs:165 put_block) but never the DAG store, so on a fresh chain
-    // the producer seals block 1 with a zero selected-parent and orphans
-    // genesis — the defect that halted testnet-beta at height 231788. Seed
-    // genesis as the DAG height-0 root whenever the DAG has no tips. Idempotent:
-    // a healthy restart already has tips (skipped); the load-time reconcile in
-    // DagStore repairs any pre-existing corrupted tip set. Together they close
-    // the orphan-genesis class at both the write and read seams.
-    if shared_dag_store.get_tips().await.is_empty() {
-        match storage.blocks.get_block_by_height(0) {
-            Ok(Some(genesis_hash)) => match storage.blocks.get_block(&genesis_hash) {
-                Ok(Some(genesis_block)) => match shared_dag_store.store_block(genesis_block).await {
-                    Ok(()) => info!(
-                        "Seeded genesis into DAG store as height-0 root (fresh-chain init; block 1 will link to genesis)"
-                    ),
-                    Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {}
-                    Err(e) => warn!("Failed to seed genesis into DAG store: {}", e),
-                },
-                Ok(None) => warn!("Genesis hash indexed but block missing; DAG not seeded"),
-                Err(e) => warn!("Failed to read genesis block for DAG seed: {}", e),
-            },
-            Ok(None) => {} // pre-genesis boot — nothing to seed yet
-            Err(e) => warn!("Failed to query genesis height for DAG seed: {}", e),
-        }
-    }
+    // PIL-42's genesis DAG seed moved into `BlockAdmission::seed_genesis` (see
+    // SYNC-S1 D2 below) so that every chain-store/DAG-store consistency concern
+    // lives in one module under one set of rules.
     let shared_ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), shared_dag_store.clone()));
 
     // WP-W.1: Create CheckpointManager for BFT finality vote handling
@@ -1519,6 +1499,58 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             None
         };
 
+    // SYNC-S1 / D2: the SINGLE path by which a block enters this node. Every
+    // ingest source (gossip `NewBlock`, sync `Blocks`, the startup reconciler,
+    // the genesis seed) routes through it, and it is the only code that
+    // sequences the DAG-store write, the GhostDAG registration and the
+    // chain-store write. See node/src/admission.rs for the failure it closes:
+    // an OOM kill landing between the DAG write and the chain write used to
+    // freeze a follower's applied tip permanently, because re-delivery hit
+    // `store_block` -> `Err(BlockExists)` and dropped the block without ever
+    // reaching `put_block`.
+    //
+    // Constructed at function scope (not inside the P2P block) so the genesis
+    // seed and the reconcile pass run even with networking disabled.
+    let block_admission = Arc::new(admission::BlockAdmission::new(
+        storage.clone(),
+        shared_dag_store.clone(),
+        shared_ghostdag.clone(),
+        canonical_applicator.clone(),
+    ));
+
+    // PIL-42: genesis must be the DAG's height-0 root or the producer seals
+    // block 1 against a zero selected-parent and orphans it.
+    block_admission.seed_genesis().await;
+
+    // SYNC-S1 D3: bound DagStore memory. D1 made per-block retention O(1)
+    // instead of Theta(N²), but the DAG store still keeps every block it has
+    // admitted — measured at ~16 KB/block on the G3 fleet run, i.e. a 3.9 GB
+    // follower runs out near 150k blocks. Opt-in via CITRATE_DAG_PRUNE_RETAIN
+    // (no-op when unset) because the merge-block score path is not yet bounded.
+    dag_prune::spawn(storage.clone(), shared_dag_store.clone());
+
+    // D2.4: repair partial admissions already on disk. Any node that ran a
+    // pre-D2 binary can be carrying a chain-store hole with the block sitting
+    // in the DAG store, and nothing guarantees a peer offers that block again —
+    // so boot repairs it rather than waiting for a re-delivery that may never
+    // come. Bounded to (applied_tip, latest_height]; a no-op when healthy.
+    {
+        let report = block_admission.reconcile().await;
+        if report.repaired_anything() {
+            warn!(
+                "SYNC-S1: startup reconcile REPAIRED a partial admission — chain writes \
+                 completed at {:?}, DAG admissions at {:?}. This node was wedged (applied \
+                 tip frozen below a store hole); the drain will now advance.",
+                report.chain_writes_completed, report.dag_writes_completed
+            );
+        } else {
+            info!(
+                "SYNC-S1: startup reconcile found no partial admissions ({} ordinary sync gap(s))",
+                report.gaps.len()
+            );
+        }
+    }
+
     // Forward-sync liveness (handoff 2026-07-23): the highest block height we have
     // EVIDENCE the network is at, from ANY signal — gossiped NewBlock, a rejected
     // far-ahead block (MissingParentAtAdmission proves the sender is ahead of us),
@@ -1558,8 +1590,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let pm_for_rx = peer_manager.clone();
         let storage_for_handler = storage.clone();
         let mempool_for_handler = mempool.clone();
-        // EXECUTE-ON-RECEIVE (step 2): clone the applier into the receive handler.
-        let applicator_for_net = canonical_applicator.clone();
+        // EXECUTE-ON-RECEIVE (step 2): the applier is reached through
+        // `BlockAdmission` now (SYNC-S1 D2), not cloned into the handler
+        // separately, so execute-on-receive cannot be skipped on an ingest
+        // path that forgot to call it.
         // EXECUTE-ON-RECEIVE (step 3): periodic forward-drain self-heal. The receive
         // path persists blocks before applying and only drives the drain for blocks it
         // hasn't already stored, so a node holding stored-but-unapplied blocks ahead of
@@ -1926,10 +1960,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         );
         let ai_handler_for_rx = ai_handler.clone();
 
-        // WP-K.2: Clone DAG components for the network handler
-        let dag_store_for_net = shared_dag_store.clone();
-        let ghostdag_for_net = shared_ghostdag.clone();
+        // WP-K.2 / SYNC-S1 D2: the network handler no longer touches the DAG
+        // store or GhostDAG directly — `BlockAdmission` (below) owns both, so
+        // there is exactly one place that writes them. The former
+        // `dag_store_for_net` / `ghostdag_for_net` / `applicator_for_net`
+        // clones existed only to feed the two open-coded admission ladders and
+        // are gone with them.
         let max_seen_for_rx = max_seen_height.clone();
+
+        // SYNC-S1 / D2: the network handler's handle on the single admission
+        // path (constructed at function scope above, alongside the genesis seed
+        // and the startup reconcile).
+        let admission_for_net = block_admission.clone();
         let checkpoint_mgr_for_net = checkpoint_manager.clone();
 
         tokio::spawn(async move {
@@ -2109,107 +2151,60 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 info.head_hash = block.header.block_hash;
                             }
                         }
-                        // C3 fix: validate BEFORE persisting to prevent
-                        // invalid blocks from polluting local storage.
-                        let have = storage_for_handler
-                            .blocks
-                            .has_block(&block.header.block_hash)
-                            .unwrap_or(false);
-                        if !have {
-                            // Let gossip validate (structure/signature) and propagate first
+                        // SYNC-S1 / D2: gossip runs its own validation (structure,
+                        // signature, peer scoring, relay) and then hands the block to the
+                        // SINGLE idempotent admission path. It no longer open-codes the
+                        // store_block -> add_block -> put_block ladder.
+                        //
+                        // The old `has_block(chain) -> skip` gate is GONE on purpose: it
+                        // consulted only the chain store, so a block half-admitted by an
+                        // interrupted earlier attempt looked complete and its missing DAG
+                        // write was never made. Duplicate-suppression now requires
+                        // presence in BOTH stores (see admission.rs, rule R1).
+                        if !admission_for_net
+                            .is_fully_admitted(&block.header.block_hash)
+                            .await
+                        {
                             match gossip_for_rx.handle_new_block(block.clone(), &pid).await {
-                                Ok(_) => {
-                                    // SECREM-01 CONS-1/2/3: consensus-consistency
-                                    // gate (parents exist, height linkage, blue
-                                    // score/work recomputation) runs BEFORE any
-                                    // persistence. Pre-fix, put_block ran first and
-                                    // wrote the RocksDB blue-score/height indexes
-                                    // from unvalidated header claims.
-                                    if let Err(e) = ghostdag_for_net
-                                        .validate_block_consistency(&block)
-                                        .await
-                                    {
+                                Ok(_) => match admission_for_net.admit(&block).await {
+                                    admission::AdmitOutcome::Admitted { completed_partial } => {
+                                        if completed_partial {
+                                            tracing::warn!(
+                                                "Completed a partial admission of gossiped block {} @ {}",
+                                                hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                                block.header.height
+                                            );
+                                        }
+                                    }
+                                    admission::AdmitOutcome::AlreadyAdmitted => {}
+                                    admission::AdmitOutcome::Deferred { missing_parent } => {
                                         // A block we can't admit because its parent is
-                                        // missing (MissingParentAtAdmission) is still
-                                        // PROOF the network is at least at block.height.
-                                        // Rejecting the block is correct, but dropping
-                                        // its height signal is what stalled a far-behind
-                                        // follower — record it so the sync tick pulls
-                                        // the gap forward instead of parking.
+                                        // missing is still PROOF the network is at least
+                                        // at block.height. Rejecting it is correct, but
+                                        // dropping that height signal is what stalled a
+                                        // far-behind follower — record it so the sync tick
+                                        // pulls the gap forward instead of parking.
                                         max_seen_for_rx.fetch_max(
                                             block.header.height,
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
+                                        tracing::debug!(
+                                            "Deferred gossiped block {} @ {} from {}: missing parent {}",
+                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                            block.header.height,
+                                            pid,
+                                            hex::encode(&missing_parent.as_bytes()[..8])
+                                        );
+                                    }
+                                    admission::AdmitOutcome::Rejected(why) => {
                                         tracing::warn!(
                                             "Rejected inconsistent block {} from {}: {}",
                                             hex::encode(&block.header.block_hash.as_bytes()[..8]),
                                             pid,
-                                            e
+                                            why
                                         );
-                                    } else {
-                                        // WP-K.2: Feed validated block into live DAG for fork-choice
-                                        match dag_store_for_net.store_block(block.clone()).await {
-                                            Ok(_) => {
-                                                match ghostdag_for_net.add_block(&block).await {
-                                                    Ok(_) => {
-                                                        // Admission complete — only now persist.
-                                                        let _ = storage_for_handler
-                                                            .blocks
-                                                            .put_block(&block);
-                                                        tracing::debug!(
-                                                            "Added network block {} to live DAG",
-                                                            hex::encode(&block.header.block_hash.as_bytes()[..8])
-                                                        );
-                                                        // EXECUTE-ON-RECEIVE (step 2): fast-path
-                                                        // apply if this block linearly extends the
-                                                        // applied tip. Rejection is logged (a bad
-                                                        // state_root doesn't unwind DAG admission
-                                                        // here — reorg handling is a later step);
-                                                        // the block simply never becomes the
-                                                        // applied tip, so no invalid state is served.
-                                                        if let Some(app) = &applicator_for_net {
-                                                            match app.apply_received(&block).await {
-                                                                canonical_apply::ApplyOutcome::Applied { root, height } => {
-                                                                    tracing::debug!(
-                                                                        "execute-on-receive applied network block @ {} (root {})",
-                                                                        height, root
-                                                                    );
-                                                                }
-                                                                canonical_apply::ApplyOutcome::Rejected(why) => {
-                                                                    tracing::warn!(
-                                                                        "execute-on-receive REJECTED network block {} from {}: {}",
-                                                                        hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                                                        pid,
-                                                                        why
-                                                                    );
-                                                                }
-                                                                // Deferred / AlreadyApplied: no state change (gap/fork/echo).
-                                                                _ => {}
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            "Block {} failed DAG admission: {}",
-                                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {
-                                                // Already in DAG (e.g., from local production) — safe to ignore
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "Failed to add block {} to live DAG: {}",
-                                                    hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                                    e
-                                                );
-                                            }
-                                        }
                                     }
-                                }
+                                },
                                 Err(e) => {
                                     tracing::warn!(
                                         "Rejected invalid block {} from {}: {}",
@@ -2249,79 +2244,54 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             let mut progressed = false;
                             let mut deferred: Vec<citrate_consensus::types::Block> = Vec::new();
                             for block in std::mem::take(&mut pending) {
-                                let hash = block.header.block_hash;
-                                if storage_for_handler.blocks.has_block(&hash).unwrap_or(false) {
-                                    continue;
-                                }
-                                // SECREM-01 CONS-1/2/3: consistency gate before any
-                                // persistence (sync is an equally untrusted ingest).
-                                match ghostdag_for_net.validate_block_consistency(&block).await {
-                                    Err(citrate_consensus::ghostdag::GhostDagError::MissingParent(_)) => {
-                                        // Parent not applied yet — keep for a later
-                                        // batch rather than dropping (the #85 fix).
+                                // SYNC-S1 / D2: one call, idempotent and
+                                // crash-safe. The pre-D2 body open-coded
+                                // store_block -> add_block -> put_block and
+                                // began with `if has_block(chain) { continue }`
+                                // — a chain-store-only check that skipped a
+                                // block whose DAG half was already written,
+                                // and whose `Err(BlockExists) => {}` arm then
+                                // dropped the block without ever reaching
+                                // put_block. An OOM kill between those two
+                                // writes therefore froze the applied tip
+                                // permanently (boot-3 @ 10944). Presence is
+                                // now established per-store inside `admit`.
+                                match admission_for_net.admit(&block).await {
+                                    admission::AdmitOutcome::Admitted {
+                                        completed_partial,
+                                    } => {
+                                        progressed = true;
+                                        if completed_partial {
+                                            tracing::warn!(
+                                                "Completed a partial admission of synced block {} @ {}",
+                                                hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                                block.header.height
+                                            );
+                                        }
+                                    }
+                                    // Fully present already: no progress, but
+                                    // not an orphan either — drop it from the
+                                    // fixpoint set.
+                                    admission::AdmitOutcome::AlreadyAdmitted => {}
+                                    // Parent not admitted yet — DEFER, never
+                                    // drop. A parent riding a later batch can
+                                    // still unblock this child.
+                                    admission::AdmitOutcome::Deferred { missing_parent } => {
+                                        tracing::debug!(
+                                            "Deferred synced block {} @ {}: missing parent {}",
+                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                            block.header.height,
+                                            hex::encode(&missing_parent.as_bytes()[..8])
+                                        );
                                         deferred.push(block);
                                     }
-                                    Err(e) => {
+                                    admission::AdmitOutcome::Rejected(why) => {
                                         tracing::warn!(
-                                            "Rejected inconsistent synced block {}: {}",
-                                            hex::encode(&hash.as_bytes()[..8]),
-                                            e
+                                            "Rejected inconsistent synced block {} @ {}: {}",
+                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                            block.header.height,
+                                            why
                                         );
-                                    }
-                                    Ok(()) => {
-                                        // WP-K.2: feed synced block into live DAG for fork-choice
-                                        match dag_store_for_net.store_block(block.clone()).await {
-                                            Ok(_) => match ghostdag_for_net.add_block(&block).await {
-                                                Ok(_) => {
-                                                    progressed = true;
-                                                    // Admission complete — only now persist.
-                                                    if let Err(e) =
-                                                        storage_for_handler.blocks.put_block(&block)
-                                                    {
-                                                        tracing::warn!(
-                                                            "Failed to persist synced block {}: {}",
-                                                            hex::encode(&hash.as_bytes()[..8]),
-                                                            e
-                                                        );
-                                                    }
-                                                    // EXECUTE-ON-RECEIVE (step 2): fast-path apply of a
-                                                    // synced block that linearly extends the applied tip.
-                                                    if let Some(app) = &applicator_for_net {
-                                                        match app.apply_received(&block).await {
-                                                            canonical_apply::ApplyOutcome::Applied { root, height } => {
-                                                                tracing::debug!(
-                                                                    "execute-on-receive applied synced block @ {} (root {})",
-                                                                    height, root
-                                                                );
-                                                            }
-                                                            canonical_apply::ApplyOutcome::Rejected(why) => {
-                                                                tracing::warn!(
-                                                                    "execute-on-receive REJECTED synced block {}: {}",
-                                                                    hex::encode(&hash.as_bytes()[..8]),
-                                                                    why
-                                                                );
-                                                            }
-                                                            _ => {}
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "Synced block {} failed DAG admission: {}",
-                                                        hex::encode(&hash.as_bytes()[..8]),
-                                                        e
-                                                    );
-                                                }
-                                            },
-                                            Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {}
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "Failed to add synced block {} to live DAG: {}",
-                                                    hex::encode(&hash.as_bytes()[..8]),
-                                                    e
-                                                );
-                                            }
-                                        }
                                     }
                                 }
                             }

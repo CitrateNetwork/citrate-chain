@@ -1,0 +1,34 @@
+# SYNC-S1 D2.3 (rule R3) — a persistence Result is never discarded.
+#
+# Planset: citrate-federation/.agentile/planset/
+#          2026-07-24-sync-s1-crash-atomic-admission-and-blueset-memory.md
+#
+# node/src/main.rs, gossip admission, pre-D2:
+#
+#       let _ = storage_for_handler.blocks.put_block(&block);
+#
+# The DAG write had already committed at that point, so a transient failure of
+# this write produced the identical permanent wedge as an OOM kill in the same
+# window — a chain-store hole the applied tip can never cross — with NO crash
+# and NO log line to attribute it to. The failure mode was invisible.
+#
+# A durable block write is a consensus-relevant state transition. Its Result is
+# either propagated or handled explicitly; `let _ =` on one is always a bug.
+
+rules:
+  - id: syncs1-d2-discarded-persistence
+    message: >-
+      Durable block-write Result discarded with `let _ =` (SYNC-S1 D2.3 R3).
+      A silently-failed `put_block` / `store_block` leaves the chain store and
+      the DAG store divergent, which permanently freezes the applied tip and
+      leaves no diagnostic trace. Propagate the error or handle it explicitly.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - "**/tests/**"
+    patterns:
+      - pattern-either:
+          - pattern: let _ = $S.blocks.put_block($B);
+          - pattern: let _ = $S.put_block($B);
+          - pattern: let _ = $DAG.store_block($B).await;

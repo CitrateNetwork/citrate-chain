@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// WP-S.1: Key-value store trait for DAG persistence.
 /// Implemented by RocksDB in the node crate; DagStore uses this for write-through persistence.
@@ -447,6 +447,64 @@ impl DagStore {
     }
 
     /// WP-S.1: Persist pruning point.
+    /// SYNC-S1 D3 — durable anchor for a block's locally-derived blue score.
+    ///
+    /// `GhostDag::relations` is in-memory only, so after a restart the score of
+    /// every already-admitted block is gone and the first block admitted has to
+    /// re-derive its parent's score by walking the selected-parent chain back to
+    /// the nearest known ancestor. That walk is what makes DAG-store pruning
+    /// impossible: prune the ancestors and the walk hits a missing block.
+    ///
+    /// Persisting the score removes the walk (O(1) cold start) and with it the
+    /// last reason the DAG store has to retain deep ancestry — which is the
+    /// prerequisite for wiring `prune()`.
+    ///
+    /// Stored under `score:<hash>` in `DAG_METADATA` rather than a new column
+    /// family, so an existing data directory needs no migration. This is a
+    /// cache, not consensus state: a missing or unreadable entry falls back to
+    /// the derivation walk, so a torn write costs performance, never
+    /// correctness. It records the LOCALLY DERIVED score, never a header value
+    /// (SECREM-01 CONS-2).
+    fn score_key(hash: &Hash) -> Vec<u8> {
+        let mut k = Vec::with_capacity(6 + 32);
+        k.extend_from_slice(b"score:");
+        k.extend_from_slice(hash.as_bytes());
+        k
+    }
+
+    /// Persist the derived blue score for `hash`. Best-effort (see
+    /// [`Self::score_key`]): a failure is logged and the read path degrades to
+    /// the walk.
+    pub fn put_derived_blue_score(&self, hash: &Hash, score: u64) {
+        if let Some(ref kv) = self.persistent {
+            if let Err(e) = kv.kv_put(
+                cf::DAG_METADATA,
+                &Self::score_key(hash),
+                &score.to_be_bytes(),
+            ) {
+                debug!("Failed to persist derived blue score for {}: {}", hash, e);
+            }
+        }
+    }
+
+    /// The persisted derived blue score for `hash`, if one was recorded by a
+    /// previous process. `None` on an in-memory store, a pre-D3 data directory,
+    /// or a torn write — all of which are handled by the caller's fallback.
+    pub fn get_derived_blue_score(&self, hash: &Hash) -> Option<u64> {
+        let kv = self.persistent.as_ref()?;
+        let raw = kv.kv_get(cf::DAG_METADATA, &Self::score_key(hash)).ok()??;
+        let bytes: [u8; 8] = raw.as_slice().try_into().ok()?;
+        Some(u64::from_be_bytes(bytes))
+    }
+
+    /// Drop the persisted score for `hash` — used by `prune` so a pruned
+    /// block's anchor does not outlive the block itself.
+    fn persist_delete_derived_blue_score(&self, hash: &Hash) {
+        if let Some(ref kv) = self.persistent {
+            let _ = kv.kv_delete(cf::DAG_METADATA, &Self::score_key(hash));
+        }
+    }
+
     fn persist_pruning_point(&self, hash: &Hash) {
         if let Some(ref kv) = self.persistent {
             if let Err(e) = kv.kv_put(cf::DAG_METADATA, b"pruning_point", hash.as_bytes()) {
@@ -925,6 +983,11 @@ impl DagStore {
                 for hash in hashes {
                     if blocks.remove(&hash).is_some() {
                         self.persist_delete_block(&hash);
+                        // SYNC-S1 D3: the score anchor must not outlive its
+                        // block, or a pruned range leaves stale entries behind
+                        // forever (the anchor keyspace would then grow without
+                        // bound, which is the leak pruning exists to stop).
+                        self.persist_delete_derived_blue_score(&hash);
                         pruned_count += 1;
                     }
                 }
