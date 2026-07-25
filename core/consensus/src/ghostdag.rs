@@ -1147,6 +1147,133 @@ mod tests {
         assert_eq!(count, 5, "expected early-exit at max_count=5, got {}", count);
     }
 
+    /// SYNC-S1 D1 — the receive path materialises QUADRATIC blue ancestry.
+    ///
+    /// PIL-13 built `materialised_blue_ancestry_entries` and asserted it stays
+    /// zero for the PRODUCER path (`register_existing_block`, see
+    /// core/sequencer `producer_steady_state`). The RECEIVE path
+    /// (`add_block`, called once per synced/gossiped block) was never held to
+    /// the same invariant, and it violates it: `calculate_blue_set` clones the
+    /// selected parent's full ancestor set per block, retaining it in BOTH
+    /// `relations[].blue_set` and `blue_cache`.
+    ///
+    /// That is the follower OOM: at N≈10.9k the two copies bracket 4 GB, and
+    /// `citrate-boot-3` was kernel-killed 21 times on a 3.9 GB box while the
+    /// sole producer sat healthy at height 59k on 2.6 GiB. This test pins the
+    /// growth ORDER, which is the property D1 has to change.
+    #[tokio::test]
+    async fn receive_path_materialises_quadratic_blue_ancestry() {
+        async fn entries_after(n: u64, use_receive_path: bool) -> usize {
+            let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+            let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+            let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+            dag_store.store_block(genesis.clone()).await.unwrap();
+            let mut prev = genesis.hash();
+            let mut blocks = vec![genesis];
+            for i in 1..=n {
+                let mut h = [0u8; 32];
+                h[0..8].copy_from_slice(&i.to_le_bytes());
+                let b = create_test_block_with_parents(h, prev, vec![], i);
+                dag_store.store_block(b.clone()).await.unwrap();
+                prev = b.hash();
+                blocks.push(b);
+            }
+            for b in &blocks {
+                if use_receive_path {
+                    ghostdag.add_block(b).await.unwrap();
+                } else {
+                    ghostdag.register_existing_block(b).await.unwrap();
+                }
+            }
+            ghostdag.materialised_blue_ancestry_entries().await
+        }
+
+        // The producer path is the reference: O(1) per block, nothing retained.
+        assert_eq!(
+            entries_after(100, false).await,
+            0,
+            "register_existing_block must materialise no cumulative ancestry (PIL-13)"
+        );
+
+        // The receive path retains a full ancestor set per block. Doubling the
+        // chain must therefore roughly QUADRUPLE the retained entries — the
+        // signature of O(N²).
+        let at_50 = entries_after(50, true).await;
+        let at_100 = entries_after(100, true).await;
+        let ratio = at_100 as f64 / at_50 as f64;
+        assert!(
+            ratio > 3.0,
+            "receive path retained {at_50} entries at N=50 and {at_100} at N=100 \
+             (ratio {ratio:.2}); a ratio near 4 is the O(N²) signature this test pins"
+        );
+        // And it is quadratic in absolute terms, not merely superlinear.
+        assert!(
+            at_100 > 100 * 100 / 2,
+            "expected ~N²-scale retention at N=100, got {at_100}"
+        );
+    }
+
+    /// SYNC-S1 D1 PRE-CONDITION — the two DAG-registration paths DISAGREE on
+    /// what a block's blue score is, and D1 must pick one before it can derive
+    /// scores in O(1).
+    ///
+    /// * `add_block` (receive path) sets `score = |blue_set.blocks|`, i.e. the
+    ///   cardinality of the cumulative ancestry INCLUDING genesis and self —
+    ///   `height + 1` on a linear chain.
+    /// * `register_existing_block` (producer rehydration) sets
+    ///   `score = block.header.blue_score`, which the fixtures and the live
+    ///   chain set to `height`.
+    ///
+    /// So the SAME block gets a different fork-choice score depending on
+    /// whether this node received it live or rehydrated it from disk at
+    /// startup. `select_tip` compares those scores across tips, so a live
+    /// tip and a rehydrated tip at equal height do not compare equal. This is
+    /// a latent fork-choice inconsistency independent of the OOM, and it is
+    /// why D1 is a decision and not just a refactor.
+    ///
+    /// This test asserts the CURRENT (mismatched) behaviour deliberately, so
+    /// the mismatch cannot drift further while D1 is pending. When D1 unifies
+    /// the convention this test flips to `assert_eq!`.
+    #[tokio::test]
+    async fn blue_score_convention_differs_between_registration_paths() {
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        // Genesis must NOT be hashed [0u8; 32]: that equals `Hash::default()`,
+        // so any direct child would satisfy `is_genesis()` (selected parent ==
+        // default) and take `calculate_blue_set`'s genesis short-circuit,
+        // silently making the chain degenerate.
+        let genesis = create_test_block_with_parents([0xA1; 32], Hash::default(), vec![], 0);
+        let b1 = create_test_block_with_parents([0xB2; 32], genesis.hash(), vec![], 1);
+        assert!(genesis.is_genesis() && !b1.is_genesis(), "fixture must be a real 2-block chain");
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        dag_store.store_block(b1.clone()).await.unwrap();
+
+        // Receive path.
+        let live = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+        live.add_block(&genesis).await.unwrap();
+        live.add_block(&b1).await.unwrap();
+        let score_live = live.get_blue_score(&b1.hash()).await.unwrap();
+
+        // Startup rehydration path.
+        let rehydrated = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+        rehydrated.register_existing_block(&genesis).await.unwrap();
+        rehydrated.register_existing_block(&b1).await.unwrap();
+        let score_rehydrated = rehydrated.get_blue_score(&b1.hash()).await.unwrap();
+
+        assert_eq!(b1.header.blue_score, 1, "the header convention is score == height");
+        assert_eq!(
+            score_rehydrated, 1,
+            "rehydration trusts the header: score == height"
+        );
+        assert_eq!(
+            score_live, 2,
+            "the receive path recomputes set cardinality: score == height + 1"
+        );
+        assert_ne!(
+            score_live, score_rehydrated,
+            "D1 PRE-CONDITION: unify these two conventions before deriving scores in O(1)"
+        );
+    }
+
     #[tokio::test]
     async fn test_deep_chain_cold_blue_set_is_stack_safe() {
         // Regression for the stack-overflow fix (Apr 2026): on a fresh
