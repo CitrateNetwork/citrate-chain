@@ -518,11 +518,22 @@ impl GhostDag {
             return Err(GhostDagError::InvalidParents);
         }
 
-        // Lightweight blue_set — score + work from the header, no
-        // cumulative ancestry materialised.
-        let mut blue_set = BlueSet::new();
-        blue_set.score = block.header.blue_score;
-        blue_set.work = block.header.blue_work;
+        // SYNC-S1 D1: derive the score the SAME way the receive path does
+        // (`derive_score_and_work`) instead of copying it out of the header.
+        //
+        // Pre-D1 this read `header.blue_score` while `add_block` recomputed set
+        // cardinality, so the two paths disagreed by exactly one on the same
+        // block: a tip received live scored `height + 1` and the same tip
+        // rehydrated from disk after a restart scored `height`. `select_tip`
+        // compares those numbers across tips, so a live tip and a rehydrated
+        // tip at equal height did not compare equal — a latent fork-choice
+        // inconsistency, now removed. It also keeps SECREM-01 CONS-2 intact
+        // here: no header-reported score reaches the fork-choice baseline.
+        //
+        // Still O(1) per block: the eager rehydration loop walks blocks in
+        // height order, so the selected parent is already in `relations` and
+        // the linear derivation applies.
+        let blue_set = self.derive_score_and_work(block).await?;
 
         let relation = DagRelation {
             block: block.hash(),
@@ -708,6 +719,62 @@ impl GhostDag {
         Ok(())
     }
 
+    /// SYNC-S1 D1 — the canonical blue score/work for `block`, recomputed
+    /// locally, in O(1) for the linear case and WITHOUT retaining cumulative
+    /// ancestry in either case.
+    ///
+    /// Returns a LIGHTWEIGHT [`BlueSet`]: `score` + `work` populated, `blocks`
+    /// deliberately empty. Callers that genuinely need the ancestor set (only
+    /// k-cluster anticone counting does) go through [`Self::calculate_blue_set`].
+    ///
+    /// **Why the linear derivation is exact, not an approximation.** A block
+    /// with no merge parents has blue set `sp.blue_set ∪ {self}`, and `self` is
+    /// by definition not in its own ancestry, so the cardinality is exactly
+    /// `|sp.blue_set| + 1` — i.e. `sp.score + 1`. No union, no set, no clone.
+    /// This reproduces the pre-D1 value bit-for-bit on a linear chain, which is
+    /// what the live chain is (`mergeParentHashes: []` throughout).
+    ///
+    /// **Why it recomputes rather than trusting the header.** SECREM-01 CONS-2:
+    /// a self-reported score must never reach the fork-choice baseline. The
+    /// recursion base is genesis (score 1) and every step adds 1 locally, so no
+    /// header value is ever consumed. `register_existing_block` uses this too,
+    /// which also repairs the pre-D1 split where the receive path and the
+    /// restart-rehydration path disagreed by one on the same block.
+    ///
+    /// A merge block still needs a real union, so it falls back to
+    /// [`Self::calculate_blue_set`]. Merge blocks are rare, and the fallback is
+    /// also taken when the selected parent is not yet in `relations` (a cold
+    /// process that has not rehydrated the parent yet).
+    async fn derive_score_and_work(&self, block: &Block) -> Result<BlueSet, GhostDagError> {
+        let lightweight = |score: u64| BlueSet {
+            blocks: std::collections::HashSet::new(),
+            score,
+            work: crate::types::blue_work_for_score(score),
+        };
+
+        // Base case: genesis is the single blue block in its own ancestry.
+        if block.is_genesis() {
+            return Ok(lightweight(1));
+        }
+
+        if block.header.merge_parent_hashes.is_empty() {
+            let sp_score = self
+                .relations
+                .read()
+                .await
+                .get(&block.selected_parent())
+                .map(|r| r.blue_set.score);
+            if let Some(sp_score) = sp_score {
+                return Ok(lightweight(sp_score + 1));
+            }
+            // Selected parent not registered yet — fall through to the full
+            // computation, which walks the DAG store rather than `relations`.
+        }
+
+        let full = self.calculate_blue_set(block).await?;
+        Ok(lightweight(full.score))
+    }
+
     pub async fn add_block(&self, block: &Block) -> Result<(), GhostDagError> {
         // Validate parent structure
         if !block.is_genesis() && block.selected_parent() == Hash::default() {
@@ -718,23 +785,43 @@ impl GhostDag {
         // consistency gate. Reject before any state mutation.
         self.validate_block_consistency(block).await?;
 
-        // Calculate blue set
-        let blue_set = self.calculate_blue_set(block).await?;
+        // SYNC-S1 D1: score + work are RECOMPUTED locally (never read from the
+        // header — SECREM-01 CONS-2) but WITHOUT materialising the cumulative
+        // blue ancestry. See `derive_score_and_work`: for a linear block the
+        // derivation is exact and O(1); only a merge block falls back to a set
+        // computation. Pre-D1 this called `calculate_blue_set` unconditionally,
+        // which cloned the selected parent's full ancestor set per block and
+        // retained it here AND in `blue_cache` — Theta(N²) memory, the follower
+        // OOM that froze every non-producing node in the 9k-15k range.
+        let blue_set = self.derive_score_and_work(block).await?;
 
-        // Telemetry for the strict-equality flip (see
-        // validate_block_consistency doc): in-band drift between the
-        // recomputed score and the header claim is logged, not fatal,
-        // until the PIL-13 BlueSet persistence rework lands.
-        if !block.is_genesis() && blue_set.score != block.header.blue_score {
+        // Invariant check replacing the old "blue_score drift" telemetry. That
+        // warning compared a set-cardinality score (counts genesis and self, so
+        // height + 1) against a header convention of `height`, so it fired on
+        // EVERY block of a linear chain and reported a definitional off-by-one
+        // as if it were consensus drift. The real invariant is that the locally
+        // recomputed score sits exactly one above the header's, which is what
+        // `validate_block_consistency`'s score band already pins for a linear
+        // block. Anything else is a genuine inconsistency worth a warning.
+        if !block.is_genesis()
+            && block.header.merge_parent_hashes.is_empty()
+            && blue_set.score != block.header.blue_score + 1
+        {
             warn!(
-                "blue_score drift on {}: header {} vs recomputed {} (in feasible band)",
+                "blue_score inconsistency on {}: recomputed {} but header claims {} \
+                 (expected recomputed == header + 1 for a linear block)",
                 block.hash(),
-                block.header.blue_score,
-                blue_set.score
+                blue_set.score,
+                block.header.blue_score
             );
         }
 
-        // Create DAG relation
+        // Create DAG relation.
+        //
+        // `blue_set.blocks` is intentionally EMPTY here. The only reader of
+        // `relations[*].blue_set` is `select_tip`, which touches `.score` only
+        // (verified by grep at PIL-13 and re-verified for D1), so retaining the
+        // cumulative hash set per relation bought nothing and cost O(N²).
         let relation = DagRelation {
             block: block.hash(),
             selected_parent: block.selected_parent(),
@@ -1162,7 +1249,7 @@ mod tests {
     /// sole producer sat healthy at height 59k on 2.6 GiB. This test pins the
     /// growth ORDER, which is the property D1 has to change.
     #[tokio::test]
-    async fn receive_path_materialises_quadratic_blue_ancestry() {
+    async fn receive_path_retains_no_cumulative_blue_ancestry() {
         async fn entries_after(n: u64, use_receive_path: bool) -> usize {
             let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
             let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
@@ -1195,27 +1282,42 @@ mod tests {
             "register_existing_block must materialise no cumulative ancestry (PIL-13)"
         );
 
-        // The receive path retains a full ancestor set per block. Doubling the
-        // chain must therefore roughly QUADRUPLE the retained entries — the
-        // signature of O(N²).
+        // POST-D1: the receive path is held to the SAME invariant. A linear
+        // chain retains no cumulative ancestry at all, because
+        // `derive_score_and_work` computes score = parent.score + 1 without
+        // ever building a set. Pre-D1 this retained >N²/2 entries and
+        // quadrupled from N=50 to N=100.
+        assert_eq!(
+            entries_after(100, true).await,
+            0,
+            "SYNC-S1 D1: the receive path must retain no cumulative blue ancestry \
+             on a linear chain — this is the follower OOM (Theta(N²) -> O(1) per block)"
+        );
+
+        // Growth is flat, not merely smaller: doubling the chain must not
+        // increase retention at all.
         let at_50 = entries_after(50, true).await;
         let at_100 = entries_after(100, true).await;
-        let ratio = at_100 as f64 / at_50 as f64;
-        assert!(
-            ratio > 3.0,
-            "receive path retained {at_50} entries at N=50 and {at_100} at N=100 \
-             (ratio {ratio:.2}); a ratio near 4 is the O(N²) signature this test pins"
+        assert_eq!(
+            at_50, at_100,
+            "retention must not grow with chain length (N=50 -> {at_50}, N=100 -> {at_100})"
         );
-        // And it is quadratic in absolute terms, not merely superlinear.
-        assert!(
-            at_100 > 100 * 100 / 2,
-            "expected ~N²-scale retention at N=100, got {at_100}"
+
+        // Depth check. Pre-D1 a 2_000-block receive-path sync retained ~2M
+        // ancestry entries (and ~4 GB at the live chain's 11k). It must now be
+        // flat at zero, and this completing quickly also demonstrates the
+        // derivation is O(1) per block in TIME, not merely in retained bytes —
+        // a set-materialising implementation would be O(N²) work here.
+        assert_eq!(
+            entries_after(2_000, true).await,
+            0,
+            "a deep linear sync must retain no cumulative ancestry"
         );
     }
 
-    /// SYNC-S1 D1 PRE-CONDITION — the two DAG-registration paths DISAGREE on
-    /// what a block's blue score is, and D1 must pick one before it can derive
-    /// scores in O(1).
+    /// SYNC-S1 D1 — the two DAG-registration paths agree on a block's blue
+    /// score. Before D1 they did not, which is why D1 was a decision and not
+    /// just a refactor.
     ///
     /// * `add_block` (receive path) sets `score = |blue_set.blocks|`, i.e. the
     ///   cardinality of the cumulative ancestry INCLUDING genesis and self —
@@ -1235,7 +1337,7 @@ mod tests {
     /// the mismatch cannot drift further while D1 is pending. When D1 unifies
     /// the convention this test flips to `assert_eq!`.
     #[tokio::test]
-    async fn blue_score_convention_differs_between_registration_paths() {
+    async fn blue_score_convention_agrees_between_registration_paths() {
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         // Genesis must NOT be hashed [0u8; 32]: that equals `Hash::default()`,
         // so any direct child would satisfy `is_genesis()` (selected parent ==
@@ -1259,18 +1361,24 @@ mod tests {
         rehydrated.register_existing_block(&b1).await.unwrap();
         let score_rehydrated = rehydrated.get_blue_score(&b1.hash()).await.unwrap();
 
-        assert_eq!(b1.header.blue_score, 1, "the header convention is score == height");
+        // POST-D1: both paths derive the score locally and inductively, so the
+        // same block gets the same fork-choice score however it arrived. Pre-D1
+        // this was 2 (live, set cardinality) vs 1 (rehydrated, header value),
+        // so a live tip and a restart-rehydrated tip at equal height did not
+        // compare equal in `select_tip`.
         assert_eq!(
-            score_rehydrated, 1,
-            "rehydration trusts the header: score == height"
+            score_live, score_rehydrated,
+            "SYNC-S1 D1: the receive path and the rehydration path must agree on \
+             a block's blue score, or fork choice depends on how the block arrived"
         );
         assert_eq!(
             score_live, 2,
-            "the receive path recomputes set cardinality: score == height + 1"
+            "canonical convention: genesis == 1, each linear step adds 1 (height + 1)"
         );
-        assert_ne!(
-            score_live, score_rehydrated,
-            "D1 PRE-CONDITION: unify these two conventions before deriving scores in O(1)"
+        assert_eq!(
+            b1.header.blue_score, 1,
+            "the HEADER convention stays score == height; the recomputed score sits \
+             exactly one above it, which is the invariant add_block now checks"
         );
     }
 
