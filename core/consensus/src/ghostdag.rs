@@ -535,6 +535,12 @@ impl GhostDag {
         // the linear derivation applies.
         let blue_set = self.derive_score_and_work(block).await?;
 
+        // SYNC-S1 D3: same durable anchor as `add_block` — the rehydration path
+        // must record it too, or a node whose relations were built only by
+        // eager-load starts the next process with no anchors at all.
+        self.dag_store
+            .put_derived_blue_score(&block.hash(), blue_set.score);
+
         let relation = DagRelation {
             block: block.hash(),
             selected_parent: block.selected_parent(),
@@ -768,6 +774,18 @@ impl GhostDag {
                 return Ok(lightweight(sp_score + 1));
             }
 
+            // SYNC-S1 D3 — durable anchor. `relations` is in-memory, so after a
+            // restart the parent's score is not there, but a previous process
+            // persisted it. One O(1) read replaces the walk below entirely, and
+            // removes the last reason the DAG store must retain deep ancestry
+            // (which is what blocks wiring `prune()`).
+            if let Some(sp_score) = self
+                .dag_store
+                .get_derived_blue_score(&block.selected_parent())
+            {
+                return Ok(lightweight(sp_score + 1));
+            }
+
             // COLD PATH — the selected parent is not in `relations`.
             //
             // This is not an edge case: `relations` is in-memory only, so after
@@ -882,6 +900,12 @@ impl GhostDag {
             is_chain_block: true, // Will be determined by chain selection
             height: block.header.height,
         };
+
+        // SYNC-S1 D3: record the derived score durably so the next process does
+        // not have to walk the selected-parent chain to re-derive it. Best
+        // effort — a failure only costs a walk on the next cold start.
+        self.dag_store
+            .put_derived_blue_score(&block.hash(), blue_set.score);
 
         // Update relations
         let mut relations = self.relations.write().await;
@@ -1363,6 +1387,151 @@ mod tests {
             entries_after(2_000, true).await,
             0,
             "a deep linear sync must retain no cumulative ancestry"
+        );
+    }
+
+    /// SYNC-S1 D3 — the durable score anchor removes the cold-start walk, which
+    /// is what makes DAG-store pruning possible.
+    ///
+    /// D1's cold path walks the selected-parent chain back to the nearest known
+    /// score. That is O(1) memory but it REQUIRES the ancestry to still be in
+    /// the DAG store — so it is precisely what blocks wiring `prune()`. With a
+    /// persisted anchor the restart reads one key instead, so a pruned ancestry
+    /// is no longer fatal.
+    ///
+    /// Asserts both halves: the anchor survives a simulated restart (a fresh
+    /// GhostDag over the same persistent store), AND admission still works when
+    /// every ancestor except the parent has been removed from the DAG store —
+    /// which the pre-D3 walk could not do.
+    #[tokio::test]
+    async fn persisted_score_anchor_survives_restart_and_a_pruned_ancestry() {
+        // Minimal in-memory KvStore so the store is genuinely "persistent"
+        // across the simulated restart below.
+        #[derive(Default)]
+        struct MemKv {
+            #[allow(clippy::type_complexity)]
+            data: std::sync::Mutex<HashMap<String, HashMap<Vec<u8>, Vec<u8>>>>,
+        }
+        impl crate::dag_store::KvStore for MemKv {
+            fn kv_get(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+                Ok(self
+                    .data
+                    .lock()
+                    .unwrap()
+                    .get(cf)
+                    .and_then(|m| m.get(key).cloned()))
+            }
+            fn kv_put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .entry(cf.to_string())
+                    .or_default()
+                    .insert(key.to_vec(), value.to_vec());
+                Ok(())
+            }
+            fn kv_delete(&self, cf: &str, key: &[u8]) -> Result<(), String> {
+                if let Some(m) = self.data.lock().unwrap().get_mut(cf) {
+                    m.remove(key);
+                }
+                Ok(())
+            }
+            fn kv_exists(&self, cf: &str, key: &[u8]) -> Result<bool, String> {
+                Ok(self
+                    .data
+                    .lock()
+                    .unwrap()
+                    .get(cf)
+                    .is_some_and(|m| m.contains_key(key)))
+            }
+            fn kv_iter_cf(&self, cf: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+                Ok(self
+                    .data
+                    .lock()
+                    .unwrap()
+                    .get(cf)
+                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default())
+            }
+        }
+
+        let kv = Arc::new(MemKv::default());
+        let dag_store = Arc::new(
+            DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("persistent store"),
+        );
+
+        // Build and admit a chain in "process 1".
+        let genesis = create_test_block_with_parents([0xA1; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        let mut blocks = vec![genesis.clone()];
+        let mut parent = genesis.hash();
+        for i in 1..=40u64 {
+            let mut h = [0u8; 32];
+            h[0..8].copy_from_slice(&i.to_le_bytes());
+            h[31] = 0xD4;
+            let b = create_test_block_with_parents(h, parent, vec![], i);
+            dag_store.store_block(b.clone()).await.unwrap();
+            parent = b.hash();
+            blocks.push(b);
+        }
+        {
+            let gd1 = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+            for b in &blocks {
+                gd1.add_block(b).await.expect("admit");
+            }
+            assert_eq!(gd1.get_blue_score(&parent).await.unwrap(), 41);
+        }
+
+        // The anchor is durable, not just in-memory.
+        assert_eq!(
+            dag_store.get_derived_blue_score(&parent),
+            Some(41),
+            "the derived score must be persisted, not only held in `relations`"
+        );
+
+        // "Process 2": a fresh GhostDag over the same store — relations empty,
+        // exactly the post-restart state.
+        let gd2 = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+        assert_eq!(
+            gd2.materialised_blue_ancestry_entries().await,
+            0,
+            "fresh process starts with no relations"
+        );
+
+        // Now PRUNE the ancestry through the REAL production mechanism: set the
+        // pruning point at height 39 and call `prune()`, which drops every block
+        // below it from memory and disk. The D1 walk would hit a missing block
+        // and fail; the anchor makes it a single key read.
+        dag_store
+            .update_pruning_point(blocks[39].hash())
+            .await
+            .expect("set pruning point");
+        let pruned = dag_store.prune().await.expect("prune");
+        assert_eq!(pruned, 39, "heights 0..=38 pruned, tip + parent retained");
+        assert!(
+            dag_store.get_block(&blocks[0].hash()).await.is_err(),
+            "a pruned ancestor is genuinely gone from the DAG store"
+        );
+
+        // Admit the next block on top of the pruned chain.
+        let mut h = [0u8; 32];
+        h[0..8].copy_from_slice(&41u64.to_le_bytes());
+        h[31] = 0xD4;
+        let next = create_test_block_with_parents(h, parent, vec![], 41);
+        dag_store.store_block(next.clone()).await.unwrap();
+        gd2.add_block(&next)
+            .await
+            .expect("admission must succeed over a PRUNED ancestry via the durable anchor");
+
+        assert_eq!(
+            gd2.get_blue_score(&next.hash()).await.unwrap(),
+            42,
+            "score continues the sequence across a restart AND a pruned ancestry"
+        );
+        assert_eq!(
+            gd2.materialised_blue_ancestry_entries().await,
+            0,
+            "still no cumulative ancestry materialised"
         );
     }
 
