@@ -1483,6 +1483,261 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // DEEP-SYNC WEDGE (handoffs/NODE_SYNC_INVESTIGATION) — phase-0 repro.
+    //
+    // Symptom: a follower cold-syncing the deep chain freezes its APPLIED tip
+    // at a node-specific height (9275 / 10139 / 10974 / 14468 observed) while
+    // its STORED height keeps climbing, and re-imports the same ~32-block
+    // range every 2s forever.
+    //
+    // Every fork test above drives fork choice through `fork_choice_returning`
+    // — a hardcoded stub that always names the right winner. Production wires
+    // the REAL `GhostDag::select_tip`, whose answer is only as good as the
+    // in-memory DAG store behind it. These two tests use the real GhostDAG and
+    // pin the mechanism the stub hides.
+    // ---------------------------------------------------------------------
+
+    /// Like [`mk_block_vrf`] but with an explicit blue score (and the canonical
+    /// derived work), so the block passes `validate_block_consistency`'s
+    /// score/work band — which the DAG-admission path enforces and the
+    /// applicator-only tests above never exercise.
+    fn mk_block_scored(
+        height: u64,
+        parent: Hash,
+        state_root: Hash,
+        blue_score: u64,
+        vrf: [u8; 32],
+    ) -> Block {
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(parent)
+            .coinbase(CB)
+            .timestamp(1000)
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new(vrf),
+            })
+            .transactions(vec![])
+            .state_root(state_root)
+            .blue_score(blue_score)
+            .blue_work(citrate_consensus::types::blue_work_for_score(blue_score))
+            .build_unhashed();
+        b.header.block_hash = b.compute_hash();
+        b
+    }
+
+    /// A block that reached the CHAIN store without a matching
+    /// `DagStore::store_block` is invisible to `validate_block_consistency`, so
+    /// EVERY descendant is rejected `MissingParent` — permanently.
+    ///
+    /// The hole is unrepairable because both admission paths in `main.rs` skip
+    /// a block that is already in the chain store *without consulting the DAG
+    /// store*: the sync fixpoint `continue`s (`main.rs:2253`) and gossip gates
+    /// on `if !have` (`main.rs:2114`). Re-delivery therefore never reaches
+    /// `store_block`, and no reconciliation path exists anywhere in the tree.
+    #[tokio::test]
+    async fn dag_hole_makes_every_descendant_permanently_inadmissible() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::ghostdag::GhostDagError;
+        use citrate_consensus::types::GhostDagParams;
+
+        let (_exec, storage, _dir) = fresh();
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
+
+        let r = roots(3);
+        // Height 1 has no selected parent, so `is_genesis()` holds and it is
+        // admitted unconditionally — the chain root for this test.
+        let g = mk_block(1, Hash::default(), r[0]);
+        let b2 = mk_block_scored(2, g.header.block_hash, r[1], 1, VRF_OUT);
+        let b3 = mk_block_scored(3, b2.header.block_hash, r[2], 2, VRF_OUT);
+
+        // Healthy state: the root is in BOTH stores.
+        dag.store_block(g.clone()).await.expect("root into DAG");
+        ghostdag.add_block(&g).await.expect("root admitted");
+        persist(&storage, &g);
+
+        // THE HOLE: b2 reaches the chain store but never the DAG store. This is
+        // the state `producer.rs` can leave behind — it writes the chain store
+        // at :1038 (`put_block`) and the DAG store only at :1118
+        // (`store_block`), with several `?`-propagating fallible steps between
+        // them, so any error in that window persists the block and returns.
+        persist(&storage, &b2);
+        assert!(
+            storage
+                .blocks
+                .has_block(&b2.header.block_hash)
+                .expect("chain has_block"),
+            "b2 is in the chain store"
+        );
+        assert!(
+            !dag.has_block(&b2.header.block_hash).await,
+            "b2 is absent from the DAG store — the hole"
+        );
+
+        // Consequence 1: the child is inadmissible, naming b2 as the missing
+        // parent — the exact error the live wedge defers on.
+        match ghostdag.validate_block_consistency(&b3).await {
+            Err(GhostDagError::MissingParent(h)) => {
+                assert_eq!(h, b2.header.block_hash, "missing parent is the hole");
+            }
+            other => panic!("expected MissingParent(b2), got {other:?}"),
+        }
+
+        // Consequence 2: re-delivering b2 cannot repair it. Both admission
+        // paths evaluate exactly this predicate and skip on true, so
+        // `store_block` is never reached no matter how many times b2 arrives.
+        assert!(
+            storage
+                .blocks
+                .has_block(&b2.header.block_hash)
+                .expect("chain has_block"),
+            "the chain-store guard is TRUE, so re-delivery is skipped forever"
+        );
+
+        // Consequence 3: the hole IS repairable — the missing step is precisely
+        // the one the guard skips. Performing it admits the child immediately.
+        dag.store_block(b2.clone()).await.expect("repair: into DAG");
+        ghostdag.add_block(&b2).await.expect("repair: admit");
+        ghostdag
+            .validate_block_consistency(&b3)
+            .await
+            .expect("child is admissible once the hole is filled");
+    }
+
+    /// Applied tip FROZEN while the stored height climbs — the live symptom,
+    /// reproduced deterministically with the real GhostDAG as fork choice.
+    ///
+    /// Two siblings above the applied tip make `next_persisted_extension`
+    /// return `Err(())`, so `drain_forward` breaks and defers to fork choice.
+    /// But if those siblings are chain-present / DAG-absent, `select_tip` only
+    /// ever sees the current tip, returns it, and `drive_drain` is a no-op —
+    /// so the tip never advances again, on any tick, forever.
+    #[tokio::test]
+    async fn fork_above_tip_wedges_forever_when_siblings_are_absent_from_the_dag() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+
+        let (exec, storage, _dir) = fresh();
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let app = CanonicalApplicator::new(exec, storage.clone())
+            .with_fork_choice(ghostdag.clone());
+
+        let r = roots(2);
+        let a1 = mk_block(1, Hash::default(), r[0]);
+        // Two competing children of a1 at height 2: same (reward-only) state
+        // root, different VRF → different hashes. Exactly the sibling pair a
+        // follower downloads when a serve response carries an anchor-height
+        // group, or when two producers published at the same height.
+        let a2 = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
+        let b2 = mk_block_scored(2, a1.header.block_hash, r[1], 1, [0x5B; 32]);
+        assert_ne!(a2.header.block_hash, b2.header.block_hash);
+
+        // Apply a1 through both stores — a healthy tip at height 1.
+        dag.store_block(a1.clone()).await.expect("a1 into DAG");
+        ghostdag.add_block(&a1).await.expect("a1 admitted");
+        persist(&storage, &a1);
+        assert!(matches!(
+            app.apply_received(&a1).await,
+            ApplyOutcome::Applied { .. }
+        ));
+        assert_eq!(app.applied_tip().await.height, 1);
+
+        // Both siblings reach the CHAIN store; neither reaches the DAG store.
+        persist(&storage, &a2);
+        persist(&storage, &b2);
+        assert_eq!(
+            storage.blocks.get_latest_height().expect("latest"),
+            2,
+            "stored height climbed"
+        );
+
+        // The drain hits the fork and breaks; fork choice can only see a1, so
+        // it names the current tip and the reorg is a no-op. Ticking the timer
+        // repeatedly — which is all the live node does — never heals it.
+        for tick in 0..5 {
+            assert_eq!(
+                app.drive_drain().await,
+                0,
+                "tick {tick}: nothing drains across the fork"
+            );
+            assert_eq!(
+                app.applied_tip().await.height,
+                1,
+                "tick {tick}: APPLIED TIP FROZEN while the stored height is 2"
+            );
+        }
+        assert_eq!(
+            ghostdag.select_tip().await.expect("select_tip"),
+            a1.header.block_hash,
+            "fork choice cannot see either sibling, so it re-names the frozen tip"
+        );
+
+        // Contrast — the same fork resolves the instant the DAG can see the
+        // siblings. Nothing else about the scenario changes, which localizes
+        // the wedge to the missing DAG admission, not to the fork itself.
+        for sib in [&a2, &b2] {
+            dag.store_block(sib.clone()).await.expect("sibling into DAG");
+            ghostdag.add_block(sib).await.expect("sibling admitted");
+        }
+        app.drive_drain().await;
+        let tip = app.applied_tip().await;
+        assert_eq!(tip.height, 2, "fork choice drained the wedge");
+        assert!(
+            tip.hash == a2.header.block_hash || tip.hash == b2.header.block_hash,
+            "tip settled on one of the two siblings"
+        );
+    }
+
+    /// CONTROL for the two tests above: a DAG hole ALONE does not freeze the
+    /// applied tip. `drain_forward` walks the CHAIN store's parent→children
+    /// index, which knows nothing about the DAG store — so a single
+    /// chain-present / DAG-absent child still applies normally.
+    ///
+    /// This is what separates the two failure modes: the DAG hole makes
+    /// *descendants inadmissible* (they never get stored, so the stored height
+    /// would stall too), whereas the live symptom is a frozen applied tip with
+    /// a CLIMBING stored height. Only the fork-plus-hole combination produces
+    /// that, so a fix that merely re-admits DAG holes would not clear the
+    /// wedge on its own.
+    #[tokio::test]
+    async fn single_dag_hole_alone_does_not_freeze_the_applied_tip() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+
+        let (exec, storage, _dir) = fresh();
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let app = CanonicalApplicator::new(exec, storage.clone())
+            .with_fork_choice(ghostdag.clone());
+
+        let r = roots(2);
+        let a1 = mk_block(1, Hash::default(), r[0]);
+        let a2 = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
+
+        dag.store_block(a1.clone()).await.expect("a1 into DAG");
+        ghostdag.add_block(&a1).await.expect("a1 admitted");
+        persist(&storage, &a1);
+        assert!(matches!(
+            app.apply_received(&a1).await,
+            ApplyOutcome::Applied { .. }
+        ));
+
+        // ONE child, chain-present but DAG-absent — the same hole as above.
+        persist(&storage, &a2);
+        assert!(!dag.has_block(&a2.header.block_hash).await);
+
+        assert_eq!(app.drive_drain().await, 1, "the lone child still drains");
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip { hash: a2.header.block_hash, height: 2 },
+            "a DAG hole by itself does NOT freeze the applied tip"
+        );
+    }
+
     /// F1: a block the drain applied but the same call's fork-choice reorg then
     /// reverted must NOT be reported Applied (pre-fix used the stale pre-reorg
     /// `out.applied`).

@@ -127,5 +127,20 @@ async fn eager_load_of_200_blocks_keeps_memory_flat() {
     let tip = ghostdag.select_tip().await.expect("a tip exists");
     assert_eq!(tip, parent, "the chain head is the selected tip");
     let score = ghostdag.get_blue_score(&tip).await.expect("tip has a score");
-    assert_eq!(score, CHAIN_LEN - 1, "header-derived blue score survives");
+    // SYNC-S1 D1: `register_existing_block` no longer copies the score out of
+    // the header. It derives it locally and inductively — genesis is 1 and each
+    // linear step adds 1 — so the tip of a CHAIN_LEN-block chain (heights
+    // 0..CHAIN_LEN-1) scores CHAIN_LEN, one above the header's `height`.
+    //
+    // The shift is the POINT of D1, not a side effect: pre-D1 this path stored
+    // `height` while the receive path (`add_block`) stored `height + 1`, so the
+    // same block scored differently depending on whether it arrived live or was
+    // rehydrated from disk after a restart, and `select_tip` compares those
+    // numbers across tips. Deriving in both paths removes that inconsistency
+    // and still keeps SECREM-01 CONS-2 (no header-reported score reaches the
+    // fork-choice baseline).
+    assert_eq!(
+        score, CHAIN_LEN,
+        "locally derived blue score: genesis 1 + one per linear step"
+    );
 }
