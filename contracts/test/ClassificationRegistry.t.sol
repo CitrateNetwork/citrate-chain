@@ -319,4 +319,104 @@ contract ClassificationRegistryTest is Test {
         );
         cr.setClearance(USER, ClassificationRegistry.ClassLevel.CUI, false, "sig");
     }
+
+    // ── Governance transfer (two-step) ──────────────────────────────
+    //
+    // Added 2026-07-26. `governance` was assigned only in the constructor and
+    // had no setter, so the address chosen at deploy time governed the
+    // contract permanently — a staging deploy could never be handed to a
+    // customer's multi-sig without redeploying and re-booking the address
+    // across the federation.
+
+    function test_transferGovernance_isTwoStep() public {
+        address newGov = address(0xC1);
+
+        vm.prank(governance);
+        cr.transferGovernance(newGov);
+
+        // Nominated, but NOT yet in force — this is the whole point.
+        assertEq(cr.pendingGovernance(), newGov);
+        assertEq(cr.governance(), governance);
+
+        vm.prank(newGov);
+        cr.acceptGovernance();
+
+        assertEq(cr.governance(), newGov);
+        assertEq(cr.pendingGovernance(), address(0));
+    }
+
+    function test_transferGovernance_onlyGovernanceMayNominate() public {
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(ClassificationRegistry.NotGovernance.selector, stranger)
+        );
+        cr.transferGovernance(stranger);
+    }
+
+    function test_acceptGovernance_onlyNomineeMayAccept() public {
+        vm.prank(governance);
+        cr.transferGovernance(address(0xC1));
+
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ClassificationRegistry.NotPendingGovernance.selector, stranger
+            )
+        );
+        cr.acceptGovernance();
+    }
+
+    function test_newGovernanceCanAdminister_andOldCannot() public {
+        address newGov = address(0xC1);
+        vm.prank(governance);
+        cr.transferGovernance(newGov);
+        vm.prank(newGov);
+        cr.acceptGovernance();
+
+        // The new holder really governs.
+        vm.prank(newGov);
+        cr.addOracleSigner(oracle2);
+
+        // And the old one is out.
+        vm.prank(governance);
+        vm.expectRevert(
+            abi.encodeWithSelector(ClassificationRegistry.NotGovernance.selector, governance)
+        );
+        cr.addOracleSigner(stranger);
+    }
+
+    function test_pendingNominationCanBeCleared() public {
+        vm.startPrank(governance);
+        cr.transferGovernance(address(0xC1));
+        cr.transferGovernance(address(0));
+        vm.stopPrank();
+
+        assertEq(cr.pendingGovernance(), address(0));
+
+        // The dropped nominee cannot sneak in afterwards.
+        vm.prank(address(0xC1));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ClassificationRegistry.NotPendingGovernance.selector, address(0xC1)
+            )
+        );
+        cr.acceptGovernance();
+    }
+
+    function test_nominationDoesNotWeakenTheCurrentHolder() public {
+        // Between nomination and acceptance the incumbent still governs.
+        vm.prank(governance);
+        cr.transferGovernance(address(0xC1));
+
+        vm.prank(governance);
+        cr.addOracleSigner(oracle2);
+
+        vm.prank(address(0xC1));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ClassificationRegistry.NotGovernance.selector, address(0xC1)
+            )
+        );
+        cr.addOracleSigner(stranger);
+    }
 }
