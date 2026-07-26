@@ -53,11 +53,16 @@ contract MultisigTimelock2of3 is IERC1155Receiver {
     error TimelockNotElapsed();
     error InvalidState();
     error ExecutionFailed(bytes returnData);
+    error NotTimelock(address caller);
+    error BadOwnerIndex(uint8 index);
+    error ZeroOwner();
+    error DuplicateOwner(address owner);
 
     event Proposed(bytes32 indexed opId, address indexed proposer, address target);
     event Approved(bytes32 indexed opId, address indexed approver, uint8 approvalCount);
     event ExecutableAt(bytes32 indexed opId, uint256 timestamp);
     event Executed(bytes32 indexed opId, address indexed executor);
+    event OwnerReplaced(uint8 indexed index, address indexed previous, address indexed replacement);
     event Cancelled(bytes32 indexed opId, address indexed canceller);
 
     modifier onlyOwner() {
@@ -162,6 +167,33 @@ contract MultisigTimelock2of3 is IERC1155Receiver {
 
     function isOwner(address candidate) external view returns (bool) {
         return _isOwner(candidate);
+    }
+
+    /// Rotate one of the three owners.
+    ///
+    /// @dev Callable ONLY by this contract — i.e. through the normal
+    ///      `propose` → 2-of-3 `approve` → `execute` flow with
+    ///      `target == address(this)`. A single owner must NOT be able to
+    ///      replace another: that would let one key swap the other two out
+    ///      and seize the multisig, making 2-of-3 decorative.
+    ///
+    ///      This exists so a deployment can be stood up with staging keys and
+    ///      handed to a customer's signers later. Before it, `owners` was set
+    ///      in the constructor with no way to change it, so the keys present
+    ///      at deploy time controlled the timelock — and everything it owns —
+    ///      permanently.
+    ///
+    ///      The duplicate check is load-bearing: allowing an address into two
+    ///      slots would let one key satisfy two of the three approvals and
+    ///      collapse 2-of-3 into 1-of-1.
+    function replaceOwner(uint8 index, address replacement) external {
+        if (msg.sender != address(this)) revert NotTimelock(msg.sender);
+        if (index > 2) revert BadOwnerIndex(index);
+        if (replacement == address(0)) revert ZeroOwner();
+        if (_isOwner(replacement)) revert DuplicateOwner(replacement);
+        address previous = owners[index];
+        owners[index] = replacement;
+        emit OwnerReplaced(index, previous, replacement);
     }
 
     function _isOwner(address candidate) internal view returns (bool) {
