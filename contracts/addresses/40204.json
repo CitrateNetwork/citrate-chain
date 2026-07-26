@@ -7,7 +7,7 @@
   "deployer": "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732",
   "deployedAt": "2026-07-23T14:49:58Z",
   "regenerator": "scripts/ops/emit-address-table.sh",
-  "comment": "Canonical contract-address table for chain 40204 \u2014 the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
+  "comment": "Canonical contract-address table for chain 40204 \u2014 the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md. AnchorRegistry was deployed separately on 2026-07-26 (tx 0x9969fd326503bbe1d901e3d867d0ed7bfb91ae84a3ea09f4caac1e79eb41c179), AFTER the 2026-07-23 reroll set that `deployedAt` refers to \u2014 it is ownerless and append-anyone, so it carries no governance parameter. The rest of the cit_agent set (OrganizationSBT, AgentSBT, CapsuleRegistry, BenchmarkRegistry, MultisigTimelock2of3) is still UNDEPLOYED: DeployCitAgent.s.sol transfers their ownership to a 2-of-3 timelock whose owners are an undecided governance parameter.",
   "contracts": {
     "ModelRegistry": "0xf64636d56ec9e0c406149b34ea9c5c5d80b342c0",
     "WrappedSALT": "0xaa918302b94a4b0e75e01e019cc6b819b4f7c906",
@@ -52,7 +52,8 @@
     "IPFSIncentivesV3": "0xb024ad0b5aefa87fa1e10234afc85b6128932df4",
     "AggregationChallenge": "0xe7d7ebe1242feec29d514b00c9272fbffc9e69be",
     "ComputePoolPipeline": "0x5a0437ac03ca92113962f1e4f3d15e062b942bde",
-    "EduForwarder": "0x50a798eaab184eeb11a27fbc1333b85646c1582a"
+    "EduForwarder": "0x50a798eaab184eeb11a27fbc1333b85646c1582a",
+    "AnchorRegistry": "0xd903b7d47f8ba592c1e9ed9dc79ffb2ad97241f5"
   },
   "aaStack": {
     "EntryPoint": "0xc698feaf0ff7fdb0d60e2f620c97cb729a694975",
