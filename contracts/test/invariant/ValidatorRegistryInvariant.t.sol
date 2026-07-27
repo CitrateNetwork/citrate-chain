@@ -255,7 +255,7 @@ contract ValidatorRegistryInvariant is StdInvariant, Test {
         bytes32[] memory pks = handler.allPubkeys();
         uint256 liabilities;
         for (uint256 i = 0; i < pks.length; i++) {
-            (, uint256 bonded, uint256 rewards, uint256 escrow,,,,,) = reg.validatorInfo(pks[i]);
+            (, uint256 bonded, uint256 rewards, uint256 escrow,,,,,,) = reg.validatorInfo(pks[i]);
             liabilities += bonded + rewards + escrow;
         }
         uint256 n = handler.actorCount();
@@ -280,7 +280,7 @@ contract ValidatorRegistryInvariant is StdInvariant, Test {
     function invariant_StakingIntegrity() public view {
         bytes32[] memory pks = handler.allPubkeys();
         for (uint256 i = 0; i < pks.length; i++) {
-            (address staker, uint256 bonded,,, uint256 admissionMin,,,, ValidatorRegistry.Status status) =
+            (address staker, uint256 bonded,,, uint256 admissionMin,,,, ValidatorRegistry.Status status,) =
                 reg.validatorInfo(pks[i]);
             if (status == ValidatorRegistry.Status.Active) {
                 assertTrue(reg.isActive(pks[i]), "Active status but not in active set");
