@@ -222,7 +222,7 @@ impl AiApi {
         // We'll encode the model registration data in the transaction data field
 
         // Get current nonce (get_nonce returns u64 directly, not Result)
-        let nonce = self.executor.get_nonce(&from);
+        let nonce = self.executor.get_canonical_account(&from).nonce; // SRP-S4 WP-2.2: non-warming committed read
 
         // Create transaction (Transaction doesn't have a new() constructor, build directly)
         // Convert Address to PublicKey for the from field
@@ -277,7 +277,7 @@ impl AiApi {
     ) -> Result<Hash, ApiError> {
         // We'll encode the model update data in the transaction data field
 
-        let nonce = self.executor.get_nonce(&from);
+        let nonce = self.executor.get_canonical_account(&from).nonce; // SRP-S4 WP-2.2: non-warming committed read
 
         // Convert Address to PublicKey
         let mut from_pk_bytes = [0u8; 32];
@@ -398,7 +398,7 @@ impl AiApi {
 
         // We'll encode the inference request data in the transaction data field
 
-        let nonce = self.executor.get_nonce(&from);
+        let nonce = self.executor.get_canonical_account(&from).nonce; // SRP-S4 WP-2.2: non-warming committed read
 
         // Convert Address to PublicKey
         let mut from_pk_bytes = [0u8; 32];

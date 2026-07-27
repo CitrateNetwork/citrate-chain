@@ -1,0 +1,41 @@
+# SYNC-S1 D2.1 — block admission has exactly ONE entry point.
+#
+# Planset: citrate-federation/.agentile/planset/
+#          2026-07-24-sync-s1-crash-atomic-admission-and-blueset-memory.md
+#
+# A block entering the node is several writes, not one: the DAG store
+# (`DagStore::store_block`, durable) and the chain store
+# (`BlockStore::put_block`, durable) plus the in-memory GhostDAG relations.
+# When the network handlers open-coded that ladder, a crash between two of
+# the writes left the two stores permanently divergent, and `main.rs` had no
+# way to notice: an OOM kill at height 10944 froze `citrate-boot-3`'s applied
+# tip forever while its stored height kept climbing.
+#
+# `node/src/admission.rs` is now the only place allowed to sequence those
+# writes, because it is the only place that establishes presence per-store
+# and completes whichever half is missing. This rule keeps a future ingest
+# path (a new NetworkMessage arm, a new fast-sync mode) from quietly growing
+# a second, non-idempotent copy of the ladder in the message handler.
+#
+# Known remaining callers, deliberately out of scope for D2 and tracked for a
+# follow-on: `producer.rs` (authors its own block under the applied-tip lock)
+# and `genesis.rs` (writes the genesis block before any handler exists).
+
+rules:
+  - id: syncs1-d2-admission-barrier
+    message: >-
+      Block admission open-coded outside `admission.rs` (SYNC-S1 D2.1).
+      `store_block` / `put_block` must not be sequenced by a network message
+      handler — a crash between the two writes leaves the DAG store and the
+      chain store permanently divergent and freezes the applied tip. Route
+      the block through `BlockAdmission::admit`, which is idempotent and
+      completes a partially-written admission.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "node/src/main.rs"
+    patterns:
+      - pattern-either:
+          - pattern: $DAG.store_block($BLK).await
+          - pattern: $STORE.blocks.put_block($BLK)

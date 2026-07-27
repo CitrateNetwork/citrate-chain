@@ -18,12 +18,15 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod adapters;
+mod admission;
 mod artifact;
 mod block_serve;
 pub mod bundled_model;
 mod canonical_apply;
 mod commands;
 mod config;
+mod consensus_manifest;
+mod dag_prune;
 mod genesis;
 mod inference;
 pub mod logging;
@@ -212,6 +215,15 @@ enum Commands {
     /// Show genesis block information
     GenesisInfo,
 
+    /// Print this binary's consensus-alignment manifest (git SHA + features +
+    /// consensus constants + a stable fingerprint). Diff the fingerprint against
+    /// the fleet binary before a reroll to prove app↔fleet package alignment.
+    Consensus {
+        /// Emit the manifest as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Wallet management (accounts, balances, transfers)
     Wallet {
         /// Wallet keystore path
@@ -323,6 +335,15 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Keygen { ed25519 }) => {
             generate_keypair(ed25519);
+            return Ok(());
+        }
+        Some(Commands::Consensus { json }) => {
+            let manifest = consensus_manifest::ConsensusManifest::current();
+            if json {
+                println!("{}", manifest.to_json());
+            } else {
+                manifest.print_human();
+            }
             return Ok(());
         }
         Some(Commands::Model { command }) => {
@@ -967,6 +988,21 @@ fn at_rest_encryption_from_env() -> Result<Option<EncryptionAtRestConfig>> {
 
 async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Starting Citrate node...");
+    {
+        // Consensus-alignment stamp — logged at boot so field drift is diagnosable
+        // from the journal (the app node and fleet MUST share this fingerprint).
+        let m = consensus_manifest::ConsensusManifest::current();
+        info!(
+            "Consensus manifest: git={}{} halo2={} fingerprint={}",
+            m.git_sha,
+            if m.git_dirty { "(DIRTY)" } else { "" },
+            m.feat_halo2_verifier,
+            m.fingerprint
+        );
+        if m.git_dirty {
+            warn!("Node built from a DIRTY tree — not reproducibly aligned with the fleet");
+        }
+    }
     info!("Chain ID: {}", config.chain.chain_id);
     info!("Data directory: {:?}", config.storage.data_dir);
 
@@ -1047,38 +1083,75 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     }
 
-    // Verify state root: compare in-memory trie root against last persisted state root
+    // SRP-S3b: verify the hydrated in-memory root reproduces the committed root of the
+    // APPLIED TIP — the block whose post-execution state the durable store reflects — NOT
+    // the latest stored block. A node legitimately stores blocks AHEAD of what it has
+    // applied (execute-on-receive downloads then drains; the producer persists the block
+    // before atomically advancing state+tip). Comparing against the latest BLOCK would
+    // false-positive whenever blocks lead the applied tip; the applied-tip pointer and the
+    // durable state are advanced ATOMICALLY (persist_state_changes_with_tip), so they must
+    // always agree — a mismatch means a genuinely corrupt/divergent reconstruction.
     {
         let memory_root = state_db.calculate_state_root();
-        let latest_height = storage.blocks.get_latest_height().unwrap_or(0);
-        if latest_height > 0 {
-            if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(latest_height) {
-                // Try dedicated state root store first, fall back to reading from block
-                let persisted_root = storage.state.get_state_root(&block_hash)
+        // The applied tip = the block whose committed state the store holds. Fall back to
+        // the latest block only when no applied-tip pointer exists (pre-S3b stores / fresh
+        // genesis), preserving the prior behavior for those.
+        let (tip_hash, tip_height) = storage
+            .blocks
+            .get_applied_tip()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                let h = storage.blocks.get_latest_height().unwrap_or(0);
+                let hash = storage
+                    .blocks
+                    .get_block_by_height(h)
                     .ok()
                     .flatten()
-                    .or_else(|| {
-                        storage.blocks.get_block(&block_hash)
-                            .ok()
-                            .flatten()
-                            .map(|b| b.state_root)
-                    });
-
-                match persisted_root {
-                    Some(root) if root != citrate_consensus::types::Hash::default() => {
-                        if memory_root == root {
-                            info!("State root verification PASSED (height {}, root={})",
-                                latest_height, hex::encode(&memory_root.as_bytes()[..8]));
-                        } else {
-                            warn!("State root MISMATCH at height {}: memory={} persisted={}",
-                                latest_height,
-                                hex::encode(memory_root.as_bytes()),
-                                hex::encode(root.as_bytes()));
-                        }
+                    .unwrap_or_default();
+                (hash, h)
+            });
+        if tip_height > 0 && tip_hash != citrate_consensus::types::Hash::default() {
+            let committed_root = storage
+                .state
+                .get_state_root(&tip_hash)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    storage
+                        .blocks
+                        .get_block(&tip_hash)
+                        .ok()
+                        .flatten()
+                        .map(|b| b.state_root)
+                });
+            match committed_root {
+                Some(root) if root != citrate_consensus::types::Hash::default() => {
+                    if memory_root == root {
+                        info!(
+                            "State root verification PASSED (applied tip height {}, root={})",
+                            tip_height,
+                            hex::encode(&memory_root.as_bytes()[..8])
+                        );
+                    } else {
+                        // SRP-S3: a node whose hydrated root does NOT reproduce the applied
+                        // tip's committed root MUST NOT start — it would seal/verify against
+                        // a divergent root and fork the fleet. HARD-FAIL (safe local stop),
+                        // never warn-and-continue. See ADR-2026-07-21-restart-produce-purity.
+                        error!("SRP-S3 BOOT HALT: state root MISMATCH at applied tip height {}: memory={} committed={} — refusing to start (a node that cannot reconstruct the committed root would fork the fleet)",
+                            tip_height,
+                            hex::encode(memory_root.as_bytes()),
+                            hex::encode(root.as_bytes()));
+                        return Err(anyhow::anyhow!(
+                            "SRP-S3 boot halt: hydrated state root {} != committed root {} at applied tip height {}",
+                            hex::encode(memory_root.as_bytes()),
+                            hex::encode(root.as_bytes()),
+                            tip_height
+                        ));
                     }
-                    _ => {
-                        debug!("No persisted state root for height {} — skipping verification", latest_height);
-                    }
+                }
+                _ => {
+                    debug!("No committed state root for applied tip height {} — skipping verification", tip_height);
                 }
             }
         }
@@ -1338,31 +1411,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             }
         }
     };
-    // PIL-42 (write/init half): genesis is written to the chain store
-    // (genesis.rs:165 put_block) but never the DAG store, so on a fresh chain
-    // the producer seals block 1 with a zero selected-parent and orphans
-    // genesis — the defect that halted testnet-beta at height 231788. Seed
-    // genesis as the DAG height-0 root whenever the DAG has no tips. Idempotent:
-    // a healthy restart already has tips (skipped); the load-time reconcile in
-    // DagStore repairs any pre-existing corrupted tip set. Together they close
-    // the orphan-genesis class at both the write and read seams.
-    if shared_dag_store.get_tips().await.is_empty() {
-        match storage.blocks.get_block_by_height(0) {
-            Ok(Some(genesis_hash)) => match storage.blocks.get_block(&genesis_hash) {
-                Ok(Some(genesis_block)) => match shared_dag_store.store_block(genesis_block).await {
-                    Ok(()) => info!(
-                        "Seeded genesis into DAG store as height-0 root (fresh-chain init; block 1 will link to genesis)"
-                    ),
-                    Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {}
-                    Err(e) => warn!("Failed to seed genesis into DAG store: {}", e),
-                },
-                Ok(None) => warn!("Genesis hash indexed but block missing; DAG not seeded"),
-                Err(e) => warn!("Failed to read genesis block for DAG seed: {}", e),
-            },
-            Ok(None) => {} // pre-genesis boot — nothing to seed yet
-            Err(e) => warn!("Failed to query genesis height for DAG seed: {}", e),
-        }
-    }
+    // PIL-42's genesis DAG seed moved into `BlockAdmission::seed_genesis` (see
+    // SYNC-S1 D2 below) so that every chain-store/DAG-store consistency concern
+    // lives in one module under one set of rules.
     let shared_ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), shared_dag_store.clone()));
 
     // WP-W.1: Create CheckpointManager for BFT finality vote handling
@@ -1381,7 +1432,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // DEFAULT ON since the 2026-07-21 SRP reroll: v2 is the live network format, so a
     // fresh node (e.g. citrate-core via `--network testnet`) computes the same genesis
     // commitment as the fleet and cold-syncs out of the box. The legacy v1 model is dead;
-    // pass CITRATE_BLOCK_V2=0 only to force an isolated v1 devnet.
+    // pass CITRATE_BLOCK_V2=0 only to force an isolated v1 devnet. Safe to default-on now
+    // that SRP-S2 removed the restart-poison reward path (was unsafe pre-fix).
     let execute_on_receive_enabled = std::env::var("CITRATE_BLOCK_V2")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(true);
@@ -1447,6 +1499,68 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             None
         };
 
+    // SYNC-S1 / D2: the SINGLE path by which a block enters this node. Every
+    // ingest source (gossip `NewBlock`, sync `Blocks`, the startup reconciler,
+    // the genesis seed) routes through it, and it is the only code that
+    // sequences the DAG-store write, the GhostDAG registration and the
+    // chain-store write. See node/src/admission.rs for the failure it closes:
+    // an OOM kill landing between the DAG write and the chain write used to
+    // freeze a follower's applied tip permanently, because re-delivery hit
+    // `store_block` -> `Err(BlockExists)` and dropped the block without ever
+    // reaching `put_block`.
+    //
+    // Constructed at function scope (not inside the P2P block) so the genesis
+    // seed and the reconcile pass run even with networking disabled.
+    let block_admission = Arc::new(admission::BlockAdmission::new(
+        storage.clone(),
+        shared_dag_store.clone(),
+        shared_ghostdag.clone(),
+        canonical_applicator.clone(),
+    ));
+
+    // PIL-42: genesis must be the DAG's height-0 root or the producer seals
+    // block 1 against a zero selected-parent and orphans it.
+    block_admission.seed_genesis().await;
+
+    // SYNC-S1 D3: bound DagStore memory. D1 made per-block retention O(1)
+    // instead of Theta(N²), but the DAG store still keeps every block it has
+    // admitted — measured at ~16 KB/block on the G3 fleet run, i.e. a 3.9 GB
+    // follower runs out near 150k blocks. Opt-in via CITRATE_DAG_PRUNE_RETAIN
+    // (no-op when unset) because the merge-block score path is not yet bounded.
+    dag_prune::spawn(storage.clone(), shared_dag_store.clone());
+
+    // D2.4: repair partial admissions already on disk. Any node that ran a
+    // pre-D2 binary can be carrying a chain-store hole with the block sitting
+    // in the DAG store, and nothing guarantees a peer offers that block again —
+    // so boot repairs it rather than waiting for a re-delivery that may never
+    // come. Bounded to (applied_tip, latest_height]; a no-op when healthy.
+    {
+        let report = block_admission.reconcile().await;
+        if report.repaired_anything() {
+            warn!(
+                "SYNC-S1: startup reconcile REPAIRED a partial admission — chain writes \
+                 completed at {:?}, DAG admissions at {:?}. This node was wedged (applied \
+                 tip frozen below a store hole); the drain will now advance.",
+                report.chain_writes_completed, report.dag_writes_completed
+            );
+        } else {
+            info!(
+                "SYNC-S1: startup reconcile found no partial admissions ({} ordinary sync gap(s))",
+                report.gaps.len()
+            );
+        }
+    }
+
+    // Forward-sync liveness (handoff 2026-07-23): the highest block height we have
+    // EVIDENCE the network is at, from ANY signal — gossiped NewBlock, a rejected
+    // far-ahead block (MissingParentAtAdmission proves the sender is ahead of us),
+    // or a Hello. The 2s sync tick drives the target off this (not only the best
+    // connected peer's head, which goes stale and parks a follower one growth-window
+    // short of a still-producing tip), and eth_syncing reports it as highestBlock.
+    // Monotonic via fetch_max. Function-scoped so both the P2P tasks and the RPC
+    // server can read it.
+    let max_seen_height = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // Start P2P listener and connect to bootstrap nodes
     {
         // Prepare head info — advertise our APPLIED tip (height + hash), NOT the
@@ -1460,6 +1574,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .ok()
             .flatten()
             .unwrap_or((citrate_consensus::types::Hash::default(), 0));
+        max_seen_height.fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
         let genesis_hash = storage
             .blocks
             .get_block_by_height(0)
@@ -1475,8 +1590,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let pm_for_rx = peer_manager.clone();
         let storage_for_handler = storage.clone();
         let mempool_for_handler = mempool.clone();
-        // EXECUTE-ON-RECEIVE (step 2): clone the applier into the receive handler.
-        let applicator_for_net = canonical_applicator.clone();
+        // EXECUTE-ON-RECEIVE (step 2): the applier is reached through
+        // `BlockAdmission` now (SYNC-S1 D2), not cloned into the handler
+        // separately, so execute-on-receive cannot be skipped on an ingest
+        // path that forgot to call it.
         // EXECUTE-ON-RECEIVE (step 3): periodic forward-drain self-heal. The receive
         // path persists blocks before applying and only drives the drain for blocks it
         // hasn't already stored, so a node holding stored-but-unapplied blocks ahead of
@@ -1651,12 +1768,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let pm_for_sync = pm_for_rx.clone();
         let sync_for_loop = sync.clone();
         let storage_for_sync = storage.clone();
+        let max_seen_for_sync = max_seen_height.clone();
         tokio::spawn(async move {
             use std::collections::HashMap;
             use std::time::{Duration, Instant};
             let mut attempt_counts: HashMap<citrate_consensus::types::Hash, u32> = HashMap::new();
             let mut pending_retries: Vec<(Instant, citrate_consensus::types::Hash)> = Vec::new();
             let mut peer_failures: HashMap<String, u32> = HashMap::new();
+            // Round-robin index for rotating request peers when we are behind but no
+            // peer qualified as "best" (forward-sync liveness fix).
+            let mut rotate_idx: u64 = 0;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
@@ -1676,22 +1797,59 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         best = Some(p.clone());
                     }
                 }
-                if let Some(peer) = best {
-                    // CRITICAL: raise the sync target to the best peer's advertised
-                    // head. The Hello/HelloAck that carries a peer's head is consumed
-                    // INSIDE the transport handshake (transport.rs) to seed
-                    // PeerInfo.head_height and is NEVER forwarded to the message loop,
-                    // so the `NetworkMessage::Hello` handler that would call
-                    // start_sync never fires. target_height therefore stayed 0, and
-                    // handle_blocks declared "Synchronization complete" after every
-                    // batch (last_height >= 0) — the node synced a few blocks then
-                    // looped forever without pushing to the real tip. Driving
-                    // start_sync here from the best peer's head (start_sync only ever
-                    // RAISES the target, never lowers it) makes the target track the
-                    // true head so sync walks all the way forward.
-                    if best_h > 0 {
-                        sync_for_loop.set_target(best_h).await;
+                // Drive the sync target off the MAX of the best connected-peer head
+                // and the max height we have evidence for ANYWHERE (gossip / a
+                // rejected far-ahead block / Hello). best_h alone goes stale: a
+                // follower's connected peers can stop advertising a higher head while
+                // the tip keeps climbing (or the far-ahead blocks arrive via a relay
+                // peer not in the peer manager), freezing the target and parking the
+                // node one growth-window short of the tip — the forward-sync stall.
+                // set_target only RAISES, never lowers.
+                let seen = max_seen_for_sync.load(std::sync::atomic::Ordering::Relaxed);
+                let target = best_h.max(seen);
+                if target > 0 {
+                    sync_for_loop.set_target(target).await;
+                }
+                // Our true synced head (applied tip height). When this is below the
+                // target we KNOW we are behind and must keep pulling.
+                let applied_height = storage_for_sync
+                    .blocks
+                    .get_applied_tip()
+                    .ok()
+                    .flatten()
+                    .map(|(_, h)| h)
+                    .unwrap_or(0);
+                // Choose a peer to pull from. Prefer the best-by-head peer; but when
+                // we are demonstrably behind (applied < target) and NO peer qualified
+                // as "best" (all hit the 3-failure cap, or every connected peer's
+                // advertised head went stale ≤ ours), fall back to ANY connected peer,
+                // rotating each tick so we don't spin on one that only serves a
+                // side-branch. Without this a behind node with no "best" peer issues
+                // no GetBlocks and parks idle — the observed stall.
+                let request_peer: Option<Arc<citrate_network::peer::Peer>> = if best.is_some()
+                {
+                    best
+                } else if applied_height < target {
+                    let all = pm_for_sync.get_all_peers();
+                    let mut connected: Vec<Arc<citrate_network::peer::Peer>> = Vec::new();
+                    for p in all {
+                        if p.info.read().await.state
+                            == citrate_network::peer::PeerState::Connected
+                        {
+                            connected.push(p);
+                        }
                     }
+                    if connected.is_empty() {
+                        None
+                    } else {
+                        let i = (rotate_idx as usize) % connected.len();
+                        rotate_idx = rotate_idx.wrapping_add(1);
+                        Some(connected[i].clone())
+                    }
+                } else {
+                    None
+                };
+                if let Some(peer) = request_peer {
                     let _ = best_hash; // anchor uses the applied tip, not best_hash
                     // Anchor every request on our current PERSISTED tip so sync
                     // walks forward batch by batch. The pre-fix logic preferred
@@ -1802,9 +1960,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         );
         let ai_handler_for_rx = ai_handler.clone();
 
-        // WP-K.2: Clone DAG components for the network handler
-        let dag_store_for_net = shared_dag_store.clone();
-        let ghostdag_for_net = shared_ghostdag.clone();
+        // WP-K.2 / SYNC-S1 D2: the network handler no longer touches the DAG
+        // store or GhostDAG directly — `BlockAdmission` (below) owns both, so
+        // there is exactly one place that writes them. The former
+        // `dag_store_for_net` / `ghostdag_for_net` / `applicator_for_net`
+        // clones existed only to feed the two open-coded admission ladders and
+        // are gone with them.
+        let max_seen_for_rx = max_seen_height.clone();
+
+        // SYNC-S1 / D2: the network handler's handle on the single admission
+        // path (constructed at function scope above, alongside the genesis seed
+        // and the startup reconcile).
+        let admission_for_net = block_admission.clone();
         let checkpoint_mgr_for_net = checkpoint_manager.clone();
 
         tokio::spawn(async move {
@@ -1828,6 +1995,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // Handle protocol messages
                 match msg {
                     NetworkMessage::Hello { head_height, head_hash, .. } => {
+                        max_seen_for_rx
+                            .fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
                         // Kick off naive sync: request blocks from genesis if behind
                         // APPLIED tip, not the stored height index: a follower
                         // stores gossiped tips far ahead of its applied chain, so
@@ -1849,6 +2018,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // Sync manager will request in periodic loop
                     }
                     NetworkMessage::HelloAck { head_height, head_hash, .. } => {
+                        max_seen_for_rx
+                            .fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
                         // APPLIED tip, not the stored height index: a follower
                         // stores gossiped tips far ahead of its applied chain, so
                         // get_latest_height() would report it as already caught up
@@ -1959,6 +2130,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::NewBlock { block } => {
+                        // Record network-height evidence from ANY gossip — even a relay
+                        // peer not in our peer manager. This is the signal that raises
+                        // the sync target for a far-behind follower (fed to the 2s tick
+                        // + eth_syncing).
+                        max_seen_for_rx
+                            .fetch_max(block.header.height, std::sync::atomic::Ordering::Relaxed);
                         // Keep this peer's advertised head FRESH from its gossip.
                         // PeerInfo.head_height is seeded once at the transport
                         // handshake and never refreshed afterward, so the sync target
@@ -1974,96 +2151,60 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 info.head_hash = block.header.block_hash;
                             }
                         }
-                        // C3 fix: validate BEFORE persisting to prevent
-                        // invalid blocks from polluting local storage.
-                        let have = storage_for_handler
-                            .blocks
-                            .has_block(&block.header.block_hash)
-                            .unwrap_or(false);
-                        if !have {
-                            // Let gossip validate (structure/signature) and propagate first
+                        // SYNC-S1 / D2: gossip runs its own validation (structure,
+                        // signature, peer scoring, relay) and then hands the block to the
+                        // SINGLE idempotent admission path. It no longer open-codes the
+                        // store_block -> add_block -> put_block ladder.
+                        //
+                        // The old `has_block(chain) -> skip` gate is GONE on purpose: it
+                        // consulted only the chain store, so a block half-admitted by an
+                        // interrupted earlier attempt looked complete and its missing DAG
+                        // write was never made. Duplicate-suppression now requires
+                        // presence in BOTH stores (see admission.rs, rule R1).
+                        if !admission_for_net
+                            .is_fully_admitted(&block.header.block_hash)
+                            .await
+                        {
                             match gossip_for_rx.handle_new_block(block.clone(), &pid).await {
-                                Ok(_) => {
-                                    // SECREM-01 CONS-1/2/3: consensus-consistency
-                                    // gate (parents exist, height linkage, blue
-                                    // score/work recomputation) runs BEFORE any
-                                    // persistence. Pre-fix, put_block ran first and
-                                    // wrote the RocksDB blue-score/height indexes
-                                    // from unvalidated header claims.
-                                    if let Err(e) = ghostdag_for_net
-                                        .validate_block_consistency(&block)
-                                        .await
-                                    {
+                                Ok(_) => match admission_for_net.admit(&block).await {
+                                    admission::AdmitOutcome::Admitted { completed_partial } => {
+                                        if completed_partial {
+                                            tracing::warn!(
+                                                "Completed a partial admission of gossiped block {} @ {}",
+                                                hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                                block.header.height
+                                            );
+                                        }
+                                    }
+                                    admission::AdmitOutcome::AlreadyAdmitted => {}
+                                    admission::AdmitOutcome::Deferred { missing_parent } => {
+                                        // A block we can't admit because its parent is
+                                        // missing is still PROOF the network is at least
+                                        // at block.height. Rejecting it is correct, but
+                                        // dropping that height signal is what stalled a
+                                        // far-behind follower — record it so the sync tick
+                                        // pulls the gap forward instead of parking.
+                                        max_seen_for_rx.fetch_max(
+                                            block.header.height,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        tracing::debug!(
+                                            "Deferred gossiped block {} @ {} from {}: missing parent {}",
+                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                            block.header.height,
+                                            pid,
+                                            hex::encode(&missing_parent.as_bytes()[..8])
+                                        );
+                                    }
+                                    admission::AdmitOutcome::Rejected(why) => {
                                         tracing::warn!(
                                             "Rejected inconsistent block {} from {}: {}",
                                             hex::encode(&block.header.block_hash.as_bytes()[..8]),
                                             pid,
-                                            e
+                                            why
                                         );
-                                    } else {
-                                        // WP-K.2: Feed validated block into live DAG for fork-choice
-                                        match dag_store_for_net.store_block(block.clone()).await {
-                                            Ok(_) => {
-                                                match ghostdag_for_net.add_block(&block).await {
-                                                    Ok(_) => {
-                                                        // Admission complete — only now persist.
-                                                        let _ = storage_for_handler
-                                                            .blocks
-                                                            .put_block(&block);
-                                                        tracing::debug!(
-                                                            "Added network block {} to live DAG",
-                                                            hex::encode(&block.header.block_hash.as_bytes()[..8])
-                                                        );
-                                                        // EXECUTE-ON-RECEIVE (step 2): fast-path
-                                                        // apply if this block linearly extends the
-                                                        // applied tip. Rejection is logged (a bad
-                                                        // state_root doesn't unwind DAG admission
-                                                        // here — reorg handling is a later step);
-                                                        // the block simply never becomes the
-                                                        // applied tip, so no invalid state is served.
-                                                        if let Some(app) = &applicator_for_net {
-                                                            match app.apply_received(&block).await {
-                                                                canonical_apply::ApplyOutcome::Applied { root, height } => {
-                                                                    tracing::debug!(
-                                                                        "execute-on-receive applied network block @ {} (root {})",
-                                                                        height, root
-                                                                    );
-                                                                }
-                                                                canonical_apply::ApplyOutcome::Rejected(why) => {
-                                                                    tracing::warn!(
-                                                                        "execute-on-receive REJECTED network block {} from {}: {}",
-                                                                        hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                                                        pid,
-                                                                        why
-                                                                    );
-                                                                }
-                                                                // Deferred / AlreadyApplied: no state change (gap/fork/echo).
-                                                                _ => {}
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            "Block {} failed DAG admission: {}",
-                                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {
-                                                // Already in DAG (e.g., from local production) — safe to ignore
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "Failed to add block {} to live DAG: {}",
-                                                    hex::encode(&block.header.block_hash.as_bytes()[..8]),
-                                                    e
-                                                );
-                                            }
-                                        }
                                     }
-                                }
+                                },
                                 Err(e) => {
                                     tracing::warn!(
                                         "Rejected invalid block {} from {}: {}",
@@ -2103,79 +2244,54 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             let mut progressed = false;
                             let mut deferred: Vec<citrate_consensus::types::Block> = Vec::new();
                             for block in std::mem::take(&mut pending) {
-                                let hash = block.header.block_hash;
-                                if storage_for_handler.blocks.has_block(&hash).unwrap_or(false) {
-                                    continue;
-                                }
-                                // SECREM-01 CONS-1/2/3: consistency gate before any
-                                // persistence (sync is an equally untrusted ingest).
-                                match ghostdag_for_net.validate_block_consistency(&block).await {
-                                    Err(citrate_consensus::ghostdag::GhostDagError::MissingParent(_)) => {
-                                        // Parent not applied yet — keep for a later
-                                        // batch rather than dropping (the #85 fix).
+                                // SYNC-S1 / D2: one call, idempotent and
+                                // crash-safe. The pre-D2 body open-coded
+                                // store_block -> add_block -> put_block and
+                                // began with `if has_block(chain) { continue }`
+                                // — a chain-store-only check that skipped a
+                                // block whose DAG half was already written,
+                                // and whose `Err(BlockExists) => {}` arm then
+                                // dropped the block without ever reaching
+                                // put_block. An OOM kill between those two
+                                // writes therefore froze the applied tip
+                                // permanently (boot-3 @ 10944). Presence is
+                                // now established per-store inside `admit`.
+                                match admission_for_net.admit(&block).await {
+                                    admission::AdmitOutcome::Admitted {
+                                        completed_partial,
+                                    } => {
+                                        progressed = true;
+                                        if completed_partial {
+                                            tracing::warn!(
+                                                "Completed a partial admission of synced block {} @ {}",
+                                                hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                                block.header.height
+                                            );
+                                        }
+                                    }
+                                    // Fully present already: no progress, but
+                                    // not an orphan either — drop it from the
+                                    // fixpoint set.
+                                    admission::AdmitOutcome::AlreadyAdmitted => {}
+                                    // Parent not admitted yet — DEFER, never
+                                    // drop. A parent riding a later batch can
+                                    // still unblock this child.
+                                    admission::AdmitOutcome::Deferred { missing_parent } => {
+                                        tracing::debug!(
+                                            "Deferred synced block {} @ {}: missing parent {}",
+                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                            block.header.height,
+                                            hex::encode(&missing_parent.as_bytes()[..8])
+                                        );
                                         deferred.push(block);
                                     }
-                                    Err(e) => {
+                                    admission::AdmitOutcome::Rejected(why) => {
                                         tracing::warn!(
-                                            "Rejected inconsistent synced block {}: {}",
-                                            hex::encode(&hash.as_bytes()[..8]),
-                                            e
+                                            "Rejected inconsistent synced block {} @ {}: {}",
+                                            hex::encode(&block.header.block_hash.as_bytes()[..8]),
+                                            block.header.height,
+                                            why
                                         );
-                                    }
-                                    Ok(()) => {
-                                        // WP-K.2: feed synced block into live DAG for fork-choice
-                                        match dag_store_for_net.store_block(block.clone()).await {
-                                            Ok(_) => match ghostdag_for_net.add_block(&block).await {
-                                                Ok(_) => {
-                                                    progressed = true;
-                                                    // Admission complete — only now persist.
-                                                    if let Err(e) =
-                                                        storage_for_handler.blocks.put_block(&block)
-                                                    {
-                                                        tracing::warn!(
-                                                            "Failed to persist synced block {}: {}",
-                                                            hex::encode(&hash.as_bytes()[..8]),
-                                                            e
-                                                        );
-                                                    }
-                                                    // EXECUTE-ON-RECEIVE (step 2): fast-path apply of a
-                                                    // synced block that linearly extends the applied tip.
-                                                    if let Some(app) = &applicator_for_net {
-                                                        match app.apply_received(&block).await {
-                                                            canonical_apply::ApplyOutcome::Applied { root, height } => {
-                                                                tracing::debug!(
-                                                                    "execute-on-receive applied synced block @ {} (root {})",
-                                                                    height, root
-                                                                );
-                                                            }
-                                                            canonical_apply::ApplyOutcome::Rejected(why) => {
-                                                                tracing::warn!(
-                                                                    "execute-on-receive REJECTED synced block {}: {}",
-                                                                    hex::encode(&hash.as_bytes()[..8]),
-                                                                    why
-                                                                );
-                                                            }
-                                                            _ => {}
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "Synced block {} failed DAG admission: {}",
-                                                        hex::encode(&hash.as_bytes()[..8]),
-                                                        e
-                                                    );
-                                                }
-                                            },
-                                            Err(citrate_consensus::dag_store::DagStoreError::BlockExists(_)) => {}
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "Failed to add synced block {} to live DAG: {}",
-                                                    hex::encode(&hash.as_bytes()[..8]),
-                                                    e
-                                                );
-                                            }
-                                        }
                                     }
                                 }
                             }
@@ -2335,6 +2451,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             config.chain.chain_id,
             Some(economics_manager.clone()),
             Some(pause_flag.clone()),
+            // forward-sync liveness: let eth_syncing report highestBlock from the
+            // sync driver's max-seen height (truthful "stalled" vs "synced").
+            Some(max_seen_height.clone()),
         );
 
         // PIL-12: spawn the Ethereum-compatible subscription server next

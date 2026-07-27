@@ -242,6 +242,36 @@ pub trait StateStoreTrait: Send + Sync {
         Ok(())
     }
 
+    /// SRP-S3b (restart/crash consistency): atomically persist the finalized state
+    /// batch AND the applied-tip pointer (block hash + height) in ONE write batch, so
+    /// the durable flat state can NEVER be out of step with the committed block across a
+    /// crash/restart. Before this, the producer/receiver wrote state and the applied-tip
+    /// in SEPARATE writes: an interrupt between them left the state one block-reward ahead
+    /// of the committed block (block-2345), and on restart the reloaded state root != the
+    /// committed root → the node forked (now: SRP-S3 boot hard-fail). The real RocksDB
+    /// `StateStore` overrides this with a single cross-CF `WriteBatch`; the default here
+    /// writes state then tip (non-atomic — only used by in-memory test stores, where a
+    /// crash mid-write is not modeled). `applied_tip = None` means "state only".
+    fn write_state_batch_with_applied_tip(
+        &self,
+        accounts: &[(Address, crate::types::AccountState)],
+        storage: &[StateStorageChange],
+        applied_tip: Option<(Hash, u64)>,
+    ) -> anyhow::Result<()> {
+        self.write_state_batch_sync(accounts, storage)?;
+        if let Some((hash, height)) = applied_tip {
+            self.put_applied_tip_meta(&hash, height)?;
+        }
+        Ok(())
+    }
+
+    /// Persist the applied-tip pointer (block hash + height). Default no-op for test
+    /// stores; the real `StateStore` writes it to `CF_METADATA`. Used by the atomic
+    /// [`Self::write_state_batch_with_applied_tip`] default fallback.
+    fn put_applied_tip_meta(&self, _hash: &Hash, _height: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     // ------------------------------------------------------------------------
     // Sprint P950-A-4 WP-A.4.3: MVCC account-version persistence.
     //
@@ -696,8 +726,22 @@ impl Executor {
         }
     }
 
-    /// Persist all dirty accounts and storage slots from state_db to state_store
+    /// Persist all dirty accounts and storage slots from state_db to state_store.
     pub async fn persist_state_changes(&self) -> anyhow::Result<usize> {
+        self.persist_state_changes_with_tip(None).await
+    }
+
+    /// SRP-S3b: persist dirty state AND (atomically) advance the durable applied-tip
+    /// pointer to `applied_tip` in ONE write batch, so the durable flat state can never
+    /// be out of step with the committed block across a crash/restart. The producer and
+    /// the receiver pass the block they just executed as the tip; a `None` tip persists
+    /// state only (legacy callers). Contract code (content-addressed) is written BEFORE
+    /// the atomic batch, so a crash after code but before state leaves only harmless
+    /// orphan code and never a committed tip whose code is missing.
+    pub async fn persist_state_changes_with_tip(
+        &self,
+        applied_tip: Option<(Hash, u64)>,
+    ) -> anyhow::Result<usize> {
         let _guard = self.commit_coordinator.acquire_exec_lock().await;
         if let Some(store) = &self.state_store {
             let dirty_accounts = self.state_db.accounts.get_dirty_accounts();
@@ -721,15 +765,22 @@ impl Executor {
                 });
             }
 
-            let count = account_changes.len() + storage_changes.len();
-            if count > 0 {
-                store.write_state_batch_sync(&account_changes, &storage_changes)?;
-            }
-
             // Persist contract code deployed since the last commit (deferred from
-            // `set_code`, which is now in-memory only — review finding E).
+            // `set_code`) FIRST — content-addressed, so orphan code on a crash is
+            // harmless, whereas a committed tip whose code is missing would not be.
             for (code_hash, code) in self.state_db.take_dirty_code() {
                 store.put_code(&code_hash, &code)?;
+            }
+
+            let count = account_changes.len() + storage_changes.len();
+            // Write state + the applied-tip pointer ATOMICALLY. Always write when a tip
+            // is supplied (even with 0 dirty changes — the tip must still advance).
+            if count > 0 || applied_tip.is_some() {
+                store.write_state_batch_with_applied_tip(
+                    &account_changes,
+                    &storage_changes,
+                    applied_tip,
+                )?;
             }
 
             // Commit state DB (clears dirty tracking)
@@ -917,6 +968,17 @@ impl Executor {
     /// Calculate state root
     pub fn calculate_state_root(&self) -> Hash {
         self.state_db.calculate_state_root()
+    }
+
+    /// SRP-S4: a READ-ONLY state root for RPC / diagnostics. `calculate_state_root`
+    /// does a `set_account` write-back on the shared resident map (state_db.rs), so
+    /// calling it from a lock-free RPC handler (e.g. `get_state_root`) races the block
+    /// producer's fold. This folds an ISOLATED copy of committed state instead, so it
+    /// NEVER mutates the shared consensus `state_db`.
+    pub fn state_root_readonly(&self) -> Hash {
+        let iso = Arc::new(StateDB::new());
+        iso.restore(self.state_db.snapshot());
+        iso.calculate_state_root()
     }
 
     /// EXECUTE-ON-RECEIVE (reorg): capture a full, restorable snapshot of world
@@ -1145,7 +1207,12 @@ impl Executor {
             return Ok(got);
         }
 
-        if let Err(e) = self.persist_state_changes().await {
+        // SRP-S3b: persist state AND advance the applied-tip to THIS block atomically, so
+        // the durable state and the committed applied tip can never diverge on a crash.
+        if let Err(e) = self
+            .persist_state_changes_with_tip(Some((block.header.block_hash, block.header.height)))
+            .await
+        {
             // HIGH-1: a durable-write failure must NOT leave in-memory state
             // advanced while the store (atomic batch — unchanged on failure) and
             // the applied-tip pointer stay behind. Revert in-memory too, so
@@ -1279,7 +1346,23 @@ impl Executor {
         // (1) basic block reward — identical to the pre-§R' credit loop.
         for (addr, amount) in basic_credits {
             if *amount > U256::zero() {
+                // SRP-S4 WP-1.2 diagnostic (env-gated): log what the reward RMW reads
+                // and whether the account was RESIDENT or a store read-through, so the
+                // producer's and a cold-sync's logs can be diffed at the wedge height.
+                let was_resident = std::env::var("CITRATE_SRP_DEBUG").is_ok()
+                    && self.state_db.accounts.exists(addr);
                 let bal = self.get_balance(addr);
+                if std::env::var("CITRATE_SRP_DEBUG").is_ok() {
+                    tracing::warn!(
+                        target: "srp_s4",
+                        "REWARD-READ h={} addr=0x{} resident={} read={} credit=+{}",
+                        height,
+                        hex::encode(addr.0),
+                        was_resident,
+                        bal,
+                        amount
+                    );
+                }
                 self.set_balance(addr, bal + *amount);
             }
         }
@@ -1349,8 +1432,18 @@ impl Executor {
         }
 
         // (3d) priority pool (rejects any included sub-base-fee tx).
+        // (3d) priority pool (rejects any included sub-base-fee tx) + the flat
+        // block subsidy. CBF-S1 / ADR-4: the subsidy is the term that makes a
+        // producing validator earn on a chain with no fee volume. Previously only
+        // the fee share was vested, so an idle chain took the zero short-circuit
+        // below on EVERY block and `creditReward` was never called — four staked
+        // validators on 40204 had earned 0.00207 SALT in total.
+        //
+        // Still short-circuits when the TOTAL is zero, which is the correct
+        // behavior for a chain that has governed `blockSubsidy` down to 0 and has
+        // no fees: nothing to vest, no system-call, no state change.
         let pool = br::compute_priority_pool(txs, receipts, base_fee_per_gas)?;
-        let share = br::vested_share(pool, policy.priority_fee_share_bps);
+        let share = br::total_vested(pool, policy.priority_fee_share_bps, policy.block_subsidy);
         if share.is_zero() {
             return Ok(());
         }
@@ -1724,50 +1817,82 @@ impl Executor {
     /// restores the snapshot afterward. This avoids a race condition where the
     /// block producer's persist_state_changes() could persist the inflated
     /// balance to RocksDB between set_balance and restore.
+    /// Build a throwaway executor over an ISOLATED copy of the current committed state,
+    /// sharing only the read-only machinery (state store for read-through, precompiles,
+    /// service adapters, chain id, block context, reward policy). It has its OWN
+    /// `state_db` and a FRESH `CommitCoordinator`, so anything it mutates — balance/nonce
+    /// overrides, read-through hydration, journal writes — is invisible to the shared
+    /// consensus `state_db` and to the block producer's lock-free root fold.
+    ///
+    /// SRP-S4 ROOT CAUSE: the previous `simulate_transaction` mutated the SHARED
+    /// `state_db` under `exec_lock`, but the producer's `settle_block_rewards` +
+    /// `calculate_state_root` take only `advance_lock` (a DISJOINT lock; the fold takes
+    /// none), so a concurrent `eth_call`/`eth_estimateGas` was observed by the fold and
+    /// its transient `u128::MAX` sender balance was sealed into the committed state root —
+    /// a root no cold-sync reproduces (the block-5,406 non-injective wedge). Isolating
+    /// simulation removes the shared mutation entirely, so no lock coupling is needed.
+    fn isolated_for_simulation(&self) -> Executor {
+        // Copy the current committed state into an isolated db that SHARES the immutable
+        // code map (so contract execution finds bytecode). A concurrent producer write
+        // can make this copy slightly torn, but it only affects THIS throwaway simulation
+        // result — the shared consensus state_db is never mutated, so the committed root
+        // is safe.
+        let iso_db = Arc::new(self.state_db.isolated_clone());
+        Executor {
+            state_db: iso_db,
+            state_store: self.state_store.clone(),
+            gas_schedule: self.gas_schedule.clone(),
+            inference_service: self.inference_service.clone(),
+            artifact_service: self.artifact_service.clone(),
+            ai_storage: self.ai_storage.clone(),
+            model_registry: self.model_registry.clone(),
+            precompile_executor: self.precompile_executor.clone(),
+            chain_id: self.chain_id,
+            block_context: std::sync::RwLock::new(self.get_block_context()),
+            // Share the coordinator so MVCC versions match the copied state exactly (the
+            // isolated `state_db` is a snapshot of `self.state_db`, so its per-account
+            // versions align with `self.commit_coordinator`). The simulation discards its
+            // journal + WriteSet, so no version bumps escape — identical to the prior
+            // in-place simulate, minus the shared-state mutation.
+            commit_coordinator: self.commit_coordinator.clone(),
+            defer_persist: std::sync::atomic::AtomicBool::new(false),
+            reward_policy: self.reward_policy.clone(),
+            validator_activation_height: std::sync::atomic::AtomicU64::new(
+                self.validator_activation_height
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+        }
+    }
+
     pub async fn simulate_transaction(
         &self,
         block: &Block,
         tx: &Transaction,
     ) -> Result<TransactionReceipt, ExecutionError> {
-        // Simulation acquires the exec_lock to serialize against real tx
-        // execution — the simulation's temporary balance/nonce overrides
-        // must not be observable to concurrent workers. Short critical
-        // section; eth_call / eth_estimateGas are not throughput-critical.
-        let _guard = self.commit_coordinator.acquire_exec_lock().await;
+        // SRP-S4: run the WHOLE simulation on an ISOLATED state (never the shared
+        // consensus state_db), so the block producer's lock-free root fold can never
+        // observe the simulation's temporary balance/nonce overrides. No `exec_lock`
+        // needed — there is no shared mutation to serialize.
+        let sim = self.isolated_for_simulation();
 
-        // Snapshot BEFORE any mutations (to undo the simulation overrides).
-        let snapshot = self.state_db.snapshot();
-
-        // Override sender balance for simulation
+        // Override the sender balance/nonce ON THE ISOLATED state only.
         let from = crate::address_utils::normalize_address(&tx.from);
-        self.state_db
-            .accounts
-            .set_balance(from, U256::from(u128::MAX));
-
-        // Align nonce so validation inside execute_tx_into_journal passes
-        let current_nonce = self.state_db.accounts.get_nonce(&from);
+        sim.state_db.accounts.set_balance(from, U256::from(u128::MAX));
+        let current_nonce = sim.state_db.accounts.get_nonce(&from);
         if tx.nonce != current_nonce {
-            self.state_db.accounts.set_nonce(from, tx.nonce);
+            sim.state_db.accounts.set_nonce(from, tx.nonce);
         }
 
-        // Execute the tx into a pinned (but never committed) journal.
-        // Simulation doesn't drain the journal — all pending mutations
-        // stay in the journal and get thrown away on return.
+        // Execute into a pinned (never-committed) journal on the isolated executor.
         let mut context = ExecutionContext::new(block, tx);
         context
             .journal
             .lock()
-            .pin_at(self.commit_coordinator.current_version());
-        let result = self
-            .execute_tx_into_journal(block, tx, &mut context)
-            .await;
+            .pin_at(sim.commit_coordinator.current_version());
+        let result = sim.execute_tx_into_journal(block, tx, &mut context).await;
 
-        // ALWAYS restore — unconditional, no matter success or failure.
-        // Undoes the inflated balance + nonce override.
-        self.state_db.restore(snapshot);
-
-        // Simulation discards the journal + WriteSet capture: no MVCC
-        // version bumps escape the simulation, no state changes land.
+        // The isolated executor + its journal are dropped on return: nothing lands on
+        // the shared state, no MVCC version bumps escape.
         result.map(|(receipt, _writes)| receipt)
     }
 

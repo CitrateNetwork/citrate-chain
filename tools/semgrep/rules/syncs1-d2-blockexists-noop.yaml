@@ -1,0 +1,50 @@
+# SYNC-S1 D2.3 — `BlockExists` means CONTINUE, never STOP.
+#
+# Planset: citrate-federation/.agentile/planset/
+#          2026-07-24-sync-s1-crash-atomic-admission-and-blueset-memory.md
+#
+# THE BUG THIS RULE EXISTS FOR (verified on citrate-boot-3, 2026-07-24):
+#
+#   node/src/main.rs, sync admission:
+#       Err(DagStoreError::BlockExists(_)) => {}
+#
+# `DagStore::store_block` returning `BlockExists` does NOT mean "this block is
+# fully admitted, nothing to do". It means step 1 of admission already landed
+# — which is exactly the state an interrupted earlier attempt leaves behind,
+# and exactly when the REMAINING steps (GhostDAG registration, the chain-store
+# write) still need to run.
+#
+# Discarding it as a no-op is what made the wedge permanent. Every 2s the node
+# re-received block 10944, saw it absent from the chain store, passed the
+# consistency gate, hit `BlockExists`, and dropped it — never reaching
+# `put_block`. The applied tip never moved again.
+#
+# An empty arm on this variant is therefore always a bug. Handle it by falling
+# through to the rest of admission (see `BlockAdmission::admit`, rule R2), or
+# at minimum log and continue — never silently swallow it.
+
+rules:
+  - id: syncs1-d2-blockexists-noop
+    message: >-
+      `BlockExists` swallowed as a no-op (SYNC-S1 D2.3). This variant reports
+      that the DAG write already landed, which is precisely when the chain
+      write is still outstanding — a crash between the two writes leaves a
+      permanent chain-store hole and freezes the applied tip. Fall through to
+      the remaining admission steps instead of returning early.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - "**/tests/**"
+    # A regex, not a `pattern:` — semgrep's Rust frontend does not reliably
+    # match a bare match-arm as a top-level pattern, and the original defect
+    # had TWO shapes that must both be caught: a truly empty body (`=> {}`)
+    # and a body containing only a "safe to ignore" comment. Verified against
+    # the pre-D2 source: this fires on both, the AST patterns fired on neither.
+    #
+    # The trailing `\)?` is load-bearing: the arm is
+    # `Err(DagStoreError::BlockExists(_))`, so a second paren closes the `Err(`
+    # before the `=>`. Without it the regex matched nothing at all — verified
+    # against the pre-D2 source, where the correct form finds all three sites.
+    patterns:
+      - pattern-regex: 'BlockExists\([^)]*\)\)?\s*=>\s*\{\s*(?://[^\n]*\n\s*)*\}'

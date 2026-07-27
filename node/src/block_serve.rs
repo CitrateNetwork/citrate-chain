@@ -59,6 +59,29 @@ fn resolve_start(storage: &StorageManager, from: &Hash) -> Option<u64> {
     }
 }
 
+/// Like `resolve_start` but INCLUSIVE of the anchor's own height — used only by
+/// `serve_blocks` (not headers).
+///
+/// Deep-sync merge-parent wedge: a follower's applied tip is the CANONICAL block
+/// at height H. The block that extends it, H+1, may MERGE a SIBLING at height H
+/// (a parallel tip — routinely created when a producer restart spawns concurrent
+/// tips). Serving strictly after the anchor (H+1) never delivered that sibling, so
+/// the follower could never admit H+1 (`validate_block_consistency` →
+/// `MissingParent`) and wedged FOREVER — the applied tip frozen while it
+/// re-imported the same range. Serving from H (inclusive) delivers the anchor's
+/// whole height-group, so the merge-parent sibling is available; the follower
+/// already holds the canonical anchor and skips it (`has_block`), so the only
+/// added delivery is the sibling(s) it actually needs.
+fn resolve_start_inclusive(storage: &StorageManager, from: &Hash) -> Option<u64> {
+    if *from == Hash::new([0u8; 32]) {
+        return Some(0);
+    }
+    match storage.blocks.get_block(from) {
+        Ok(Some(anchor)) => Some(anchor.header.height),
+        _ => None,
+    }
+}
+
 /// Walk heights `[start, tip]`, mapping each stored block through `map`,
 /// stopping at the item clamp, the first index gap, or the byte budget.
 fn collect_bounded<T: serde::Serialize>(
@@ -128,7 +151,9 @@ pub fn serve_headers(storage: &StorageManager, from: &Hash, count: u32) -> Vec<B
 /// this batch left behind) and stop at the first height gap.
 pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Block> {
     let max_items = count.min(MAX_BLOCKS_PER_REQUEST);
-    let Some(start) = resolve_start(storage, from) else {
+    // INCLUSIVE of the anchor's height so a merge parent that is a sibling of the
+    // anchor is delivered (see resolve_start_inclusive — the deep-sync wedge fix).
+    let Some(start) = resolve_start_inclusive(storage, from) else {
         return Vec::new();
     };
     let Ok(tip) = storage.blocks.get_latest_height() else {
@@ -399,6 +424,45 @@ mod tests {
                 assert!(idx < c_idx, "all height-1 siblings must precede the height-2 child");
             }
         }
+    }
+
+    /// Deep-sync merge-parent wedge regression. The follower's APPLIED TIP is the
+    /// canonical block A1 at height 1. The block that extends it, C2 (height 2),
+    /// selects A1 and MERGES B1 — a SIBLING of A1 at height 1 (a parallel tip, as a
+    /// producer restart routinely creates). Anchored on A1, the pre-fix serve
+    /// started at height 2 and delivered C2 but NOT B1, so the follower could never
+    /// admit C2 (`validate_block_consistency` → `MissingParent(B1)`) and wedged
+    /// forever — the applied tip frozen while it re-imported the same range (the
+    /// live boot3 wedge at height 10108). The serve must deliver B1, the
+    /// anchor-height sibling merge-parent.
+    #[test]
+    fn serve_delivers_anchor_height_sibling_merge_parent() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let genesis = dag_block(1, 0, Hash::default(), vec![]);
+        let g = genesis.hash();
+        let a1 = dag_block(0xA1, 1, g, vec![]); // canonical height-1 = follower's applied tip
+        let b1 = dag_block(0xB1, 1, g, vec![]); // SIBLING at height 1 (the merge parent)
+        let c2 = dag_block(0xC2, 2, a1.hash(), vec![b1.hash()]); // selects A1, MERGES B1
+        for b in [&genesis, &a1, &b1, &c2] {
+            storage.blocks.put_block(b).expect("put_block");
+        }
+
+        // Follower requests from its applied tip A1.
+        let served = serve_blocks(&storage, &a1.hash(), u32::MAX);
+        let hashes: Vec<Hash> = served.iter().map(|b| b.hash()).collect();
+
+        assert!(hashes.contains(&c2.hash()), "the extending block C2 must be served");
+        assert!(
+            hashes.contains(&b1.hash()),
+            "the anchor-height sibling B1 (C2's merge parent) MUST be served — pre-fix it was \
+             omitted (serve started at anchor+1) and the follower wedged forever"
+        );
+        // And B1 (height 1) must precede C2 (height 2) so the requester holds it first.
+        let b_idx = served.iter().position(|b| b.hash() == b1.hash()).expect("B1 present");
+        let c_idx = served.iter().position(|b| b.hash() == c2.hash()).expect("C2 present");
+        assert!(b_idx < c_idx, "merge-parent sibling B1 must be served before its child C2");
     }
 
     /// A height-group is never split across a response: if the item cap lands

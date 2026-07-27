@@ -341,6 +341,13 @@ impl CanonicalApplicator {
     /// Persist the applied-tip pointer + this block's verified state root (crash
     /// recovery / fast startup). Non-fatal on failure — logged, not returned.
     fn persist_applied(&self, block_hash: &Hash, height: u64, state_root: &Hash) {
+        // SRP-S3b: the applied-tip pointer is advanced ATOMICALLY with the state batch
+        // inside `Executor::apply_block` (persist_state_changes_with_tip) — that is the
+        // crash-consistency guarantee. This re-writes the SAME tip via the block store: an
+        // idempotent no-op in production (same value, right after the atomic commit, so it
+        // can never create a state-ahead-of-tip window), and the durable tip write for
+        // tests whose executor has no persistent state store. Also persists the block's
+        // state root (a separate fast-start/diagnostic pointer).
         if let Err(e) = self.storage.blocks.put_applied_tip(block_hash, height) {
             warn!(
                 "execute-on-receive: applied block {} @ {} but failed to persist tip: {}",
@@ -429,6 +436,15 @@ impl CanonicalApplicator {
                         "execute-on-receive: applied block {} @ height {} (root verified)",
                         block_hash, height
                     );
+                    // SRP-S4 injective fingerprint (env-gated): log per-block so a
+                    // continuously-running node and a cold-sync can be diffed at a wedge
+                    // height even though their consensus roots agree. Diagnostic only.
+                    if std::env::var("CITRATE_SRP_FINGERPRINT").is_ok() {
+                        warn!(
+                            "SRP-FP applied @ {} root={} fp={}",
+                            height, block.state_root, self.executor.state_db().full_state_fingerprint()
+                        );
+                    }
                     // VALIDATOR-S1: re-sync the selector if this crossed a snapshot boundary.
                     self.maybe_sync_registry(height).await;
                 }
@@ -437,6 +453,15 @@ impl CanonicalApplicator {
                         "execute-on-receive: REJECT block {} @ {} — state root mismatch (claimed {}, computed {})",
                         block_hash, height, expected, got
                     );
+                    // SRP-S4: dump the injective per-account digest of the state that
+                    // produced the DIVERGENT computed root, so a diff vs a healthy node's
+                    // digest at this height NAMES the account (env-gated, diagnostic only).
+                    if std::env::var("CITRATE_SRP_FINGERPRINT").is_ok() {
+                        warn!("SRP-FP REJECT @ {} fp={}", height, self.executor.state_db().full_state_fingerprint());
+                        for line in self.executor.state_db().full_state_digest_lines() {
+                            warn!("SRP-FP-DIGEST @ {} {}", height, line);
+                        }
+                    }
                     return DrainOutcome {
                         applied,
                         rejected: Some((
@@ -479,6 +504,24 @@ impl CanonicalApplicator {
     pub async fn reorg_to(&self, state: &mut AppliedState, new_tip: Hash) -> ReorgOutcome {
         if new_tip == state.tip.hash {
             return ReorgOutcome::NoChange;
+        }
+        // SRP-S3c: NEVER reorg to a block already on the applied chain. Such a block is an
+        // ANCESTOR of (or equal to) the current applied tip, so reorging to it would REVERT
+        // committed blocks — a backwards reorg, which fork-choice must never do (it only ever
+        // ADVANCES to a strictly heavier tip). After a miner restart, `select_tip` transiently
+        // returned an already-applied ancestor as "best"; without this guard, `reorg_to`
+        // `state_restore`d the executor back to that fork-point snapshot, FREEZING the
+        // producer's sealed state root (every subsequent block re-sealed the fork-point root
+        // while balances advanced) and wedging the fleet (block-174). If the block's height
+        // is unknown (not persisted), fall through to the normal fork-point walk.
+        if let Ok(Some(nb)) = self.storage.blocks.get_block(&new_tip) {
+            if self.on_applied_chain(state, new_tip, nb.header.height) {
+                debug!(
+                    "execute-on-receive: fork-choice tip {} @ {} is already on the applied chain (ancestor of tip {} @ {}) — declining backwards reorg",
+                    new_tip, nb.header.height, state.tip.hash, state.tip.height
+                );
+                return ReorgOutcome::NoChange;
+            }
         }
         // Outer safety net: a byte-exact snapshot of the current state + tip so a
         // failed reapply is fully undone (I3). This is the pre-reorg applied tip.
@@ -902,6 +945,11 @@ pub fn record_produced(
     let hash = block.header.block_hash;
     let height = block.header.height;
     state.record(hash, height, executor.state_snapshot());
+    // SRP-S3b: the durable applied-tip is advanced ATOMICALLY with the state batch by the
+    // producer's `persist_state_changes_with_tip` (see produce_block) — the crash-consistency
+    // guarantee. This re-writes the SAME tip value: idempotent in production (right after the
+    // atomic commit, so no state-ahead-of-tip window is possible), and the durable tip write
+    // for tests whose executor has no persistent state store.
     if let Err(e) = storage.blocks.put_applied_tip(&hash, height) {
         warn!(
             "execute-on-receive: produced block {} @ {} but failed to persist applied tip: {}",
@@ -1316,6 +1364,42 @@ mod tests {
         ));
     }
 
+    /// SRP-S3c regression: `reorg_to` an ANCESTOR of the current tip (an already-applied
+    /// earlier block) is a BACKWARDS reorg — it must be declined (NoChange) and MUST NOT
+    /// revert committed state. Without the guard, `select_tip` transiently returning an
+    /// applied ancestor after a miner restart made `reorg_to` `state_restore` the executor
+    /// back to that block, freezing the producer's sealed state root and wedging the fleet.
+    #[tokio::test]
+    async fn reorg_to_applied_ancestor_is_declined_and_state_preserved() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        // tip advances to a2 (height 2); a1 (height 1) is an already-applied ancestor.
+        let (a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
+        let (v, t) = reward_for(&a1);
+
+        // Balances + tip reflect TWO applied blocks before the (backwards) reorg attempt.
+        let bal_cb_before = exec.get_balance(&Address(CB));
+        let bal_tr_before = exec.get_balance(&Address(TREASURY_ADDR));
+        assert_eq!(bal_cb_before, v * U256::from(2u64), "two blocks of validator reward");
+        assert_eq!(bal_tr_before, t * U256::from(2u64), "two blocks of treasury reward");
+
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        // Reorg to a1 — an ancestor of the current tip a2. Must be declined.
+        assert!(
+            matches!(
+                app.reorg_to(&mut state, a1.header.block_hash).await,
+                ReorgOutcome::NoChange
+            ),
+            "reorg to an applied ancestor must be a NoChange (never a backwards revert)"
+        );
+        // Tip and committed state are UNCHANGED — no state_restore to a1 happened.
+        assert_eq!(state.tip, AppliedTip { hash: a2.header.block_hash, height: 2 });
+        drop(state);
+        assert_eq!(exec.get_balance(&Address(CB)), bal_cb_before, "state must NOT revert to a1");
+        assert_eq!(exec.get_balance(&Address(TREASURY_ADDR)), bal_tr_before, "state must NOT revert to a1");
+    }
+
     /// A fork-choice hook that always returns a fixed tip (a stand-in for
     /// GhostDAG's `select_tip` so the trigger path is testable in isolation).
     fn fork_choice_returning(hash: Hash) -> ForkChoice {
@@ -1396,6 +1480,261 @@ mod tests {
             app.applied_tip().await,
             AppliedTip { hash: b3.header.block_hash, height: 3 },
             "equal-height sibling drove the reorg to the heavier branch"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // DEEP-SYNC WEDGE (handoffs/NODE_SYNC_INVESTIGATION) — phase-0 repro.
+    //
+    // Symptom: a follower cold-syncing the deep chain freezes its APPLIED tip
+    // at a node-specific height (9275 / 10139 / 10974 / 14468 observed) while
+    // its STORED height keeps climbing, and re-imports the same ~32-block
+    // range every 2s forever.
+    //
+    // Every fork test above drives fork choice through `fork_choice_returning`
+    // — a hardcoded stub that always names the right winner. Production wires
+    // the REAL `GhostDag::select_tip`, whose answer is only as good as the
+    // in-memory DAG store behind it. These two tests use the real GhostDAG and
+    // pin the mechanism the stub hides.
+    // ---------------------------------------------------------------------
+
+    /// Like [`mk_block_vrf`] but with an explicit blue score (and the canonical
+    /// derived work), so the block passes `validate_block_consistency`'s
+    /// score/work band — which the DAG-admission path enforces and the
+    /// applicator-only tests above never exercise.
+    fn mk_block_scored(
+        height: u64,
+        parent: Hash,
+        state_root: Hash,
+        blue_score: u64,
+        vrf: [u8; 32],
+    ) -> Block {
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(parent)
+            .coinbase(CB)
+            .timestamp(1000)
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new(vrf),
+            })
+            .transactions(vec![])
+            .state_root(state_root)
+            .blue_score(blue_score)
+            .blue_work(citrate_consensus::types::blue_work_for_score(blue_score))
+            .build_unhashed();
+        b.header.block_hash = b.compute_hash();
+        b
+    }
+
+    /// A block that reached the CHAIN store without a matching
+    /// `DagStore::store_block` is invisible to `validate_block_consistency`, so
+    /// EVERY descendant is rejected `MissingParent` — permanently.
+    ///
+    /// The hole is unrepairable because both admission paths in `main.rs` skip
+    /// a block that is already in the chain store *without consulting the DAG
+    /// store*: the sync fixpoint `continue`s (`main.rs:2253`) and gossip gates
+    /// on `if !have` (`main.rs:2114`). Re-delivery therefore never reaches
+    /// `store_block`, and no reconciliation path exists anywhere in the tree.
+    #[tokio::test]
+    async fn dag_hole_makes_every_descendant_permanently_inadmissible() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::ghostdag::GhostDagError;
+        use citrate_consensus::types::GhostDagParams;
+
+        let (_exec, storage, _dir) = fresh();
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
+
+        let r = roots(3);
+        // Height 1 has no selected parent, so `is_genesis()` holds and it is
+        // admitted unconditionally — the chain root for this test.
+        let g = mk_block(1, Hash::default(), r[0]);
+        let b2 = mk_block_scored(2, g.header.block_hash, r[1], 1, VRF_OUT);
+        let b3 = mk_block_scored(3, b2.header.block_hash, r[2], 2, VRF_OUT);
+
+        // Healthy state: the root is in BOTH stores.
+        dag.store_block(g.clone()).await.expect("root into DAG");
+        ghostdag.add_block(&g).await.expect("root admitted");
+        persist(&storage, &g);
+
+        // THE HOLE: b2 reaches the chain store but never the DAG store. This is
+        // the state `producer.rs` can leave behind — it writes the chain store
+        // at :1038 (`put_block`) and the DAG store only at :1118
+        // (`store_block`), with several `?`-propagating fallible steps between
+        // them, so any error in that window persists the block and returns.
+        persist(&storage, &b2);
+        assert!(
+            storage
+                .blocks
+                .has_block(&b2.header.block_hash)
+                .expect("chain has_block"),
+            "b2 is in the chain store"
+        );
+        assert!(
+            !dag.has_block(&b2.header.block_hash).await,
+            "b2 is absent from the DAG store — the hole"
+        );
+
+        // Consequence 1: the child is inadmissible, naming b2 as the missing
+        // parent — the exact error the live wedge defers on.
+        match ghostdag.validate_block_consistency(&b3).await {
+            Err(GhostDagError::MissingParent(h)) => {
+                assert_eq!(h, b2.header.block_hash, "missing parent is the hole");
+            }
+            other => panic!("expected MissingParent(b2), got {other:?}"),
+        }
+
+        // Consequence 2: re-delivering b2 cannot repair it. Both admission
+        // paths evaluate exactly this predicate and skip on true, so
+        // `store_block` is never reached no matter how many times b2 arrives.
+        assert!(
+            storage
+                .blocks
+                .has_block(&b2.header.block_hash)
+                .expect("chain has_block"),
+            "the chain-store guard is TRUE, so re-delivery is skipped forever"
+        );
+
+        // Consequence 3: the hole IS repairable — the missing step is precisely
+        // the one the guard skips. Performing it admits the child immediately.
+        dag.store_block(b2.clone()).await.expect("repair: into DAG");
+        ghostdag.add_block(&b2).await.expect("repair: admit");
+        ghostdag
+            .validate_block_consistency(&b3)
+            .await
+            .expect("child is admissible once the hole is filled");
+    }
+
+    /// Applied tip FROZEN while the stored height climbs — the live symptom,
+    /// reproduced deterministically with the real GhostDAG as fork choice.
+    ///
+    /// Two siblings above the applied tip make `next_persisted_extension`
+    /// return `Err(())`, so `drain_forward` breaks and defers to fork choice.
+    /// But if those siblings are chain-present / DAG-absent, `select_tip` only
+    /// ever sees the current tip, returns it, and `drive_drain` is a no-op —
+    /// so the tip never advances again, on any tick, forever.
+    #[tokio::test]
+    async fn fork_above_tip_wedges_forever_when_siblings_are_absent_from_the_dag() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+
+        let (exec, storage, _dir) = fresh();
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let app = CanonicalApplicator::new(exec, storage.clone())
+            .with_fork_choice(ghostdag.clone());
+
+        let r = roots(2);
+        let a1 = mk_block(1, Hash::default(), r[0]);
+        // Two competing children of a1 at height 2: same (reward-only) state
+        // root, different VRF → different hashes. Exactly the sibling pair a
+        // follower downloads when a serve response carries an anchor-height
+        // group, or when two producers published at the same height.
+        let a2 = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
+        let b2 = mk_block_scored(2, a1.header.block_hash, r[1], 1, [0x5B; 32]);
+        assert_ne!(a2.header.block_hash, b2.header.block_hash);
+
+        // Apply a1 through both stores — a healthy tip at height 1.
+        dag.store_block(a1.clone()).await.expect("a1 into DAG");
+        ghostdag.add_block(&a1).await.expect("a1 admitted");
+        persist(&storage, &a1);
+        assert!(matches!(
+            app.apply_received(&a1).await,
+            ApplyOutcome::Applied { .. }
+        ));
+        assert_eq!(app.applied_tip().await.height, 1);
+
+        // Both siblings reach the CHAIN store; neither reaches the DAG store.
+        persist(&storage, &a2);
+        persist(&storage, &b2);
+        assert_eq!(
+            storage.blocks.get_latest_height().expect("latest"),
+            2,
+            "stored height climbed"
+        );
+
+        // The drain hits the fork and breaks; fork choice can only see a1, so
+        // it names the current tip and the reorg is a no-op. Ticking the timer
+        // repeatedly — which is all the live node does — never heals it.
+        for tick in 0..5 {
+            assert_eq!(
+                app.drive_drain().await,
+                0,
+                "tick {tick}: nothing drains across the fork"
+            );
+            assert_eq!(
+                app.applied_tip().await.height,
+                1,
+                "tick {tick}: APPLIED TIP FROZEN while the stored height is 2"
+            );
+        }
+        assert_eq!(
+            ghostdag.select_tip().await.expect("select_tip"),
+            a1.header.block_hash,
+            "fork choice cannot see either sibling, so it re-names the frozen tip"
+        );
+
+        // Contrast — the same fork resolves the instant the DAG can see the
+        // siblings. Nothing else about the scenario changes, which localizes
+        // the wedge to the missing DAG admission, not to the fork itself.
+        for sib in [&a2, &b2] {
+            dag.store_block(sib.clone()).await.expect("sibling into DAG");
+            ghostdag.add_block(sib).await.expect("sibling admitted");
+        }
+        app.drive_drain().await;
+        let tip = app.applied_tip().await;
+        assert_eq!(tip.height, 2, "fork choice drained the wedge");
+        assert!(
+            tip.hash == a2.header.block_hash || tip.hash == b2.header.block_hash,
+            "tip settled on one of the two siblings"
+        );
+    }
+
+    /// CONTROL for the two tests above: a DAG hole ALONE does not freeze the
+    /// applied tip. `drain_forward` walks the CHAIN store's parent→children
+    /// index, which knows nothing about the DAG store — so a single
+    /// chain-present / DAG-absent child still applies normally.
+    ///
+    /// This is what separates the two failure modes: the DAG hole makes
+    /// *descendants inadmissible* (they never get stored, so the stored height
+    /// would stall too), whereas the live symptom is a frozen applied tip with
+    /// a CLIMBING stored height. Only the fork-plus-hole combination produces
+    /// that, so a fix that merely re-admits DAG holes would not clear the
+    /// wedge on its own.
+    #[tokio::test]
+    async fn single_dag_hole_alone_does_not_freeze_the_applied_tip() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+
+        let (exec, storage, _dir) = fresh();
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let app = CanonicalApplicator::new(exec, storage.clone())
+            .with_fork_choice(ghostdag.clone());
+
+        let r = roots(2);
+        let a1 = mk_block(1, Hash::default(), r[0]);
+        let a2 = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
+
+        dag.store_block(a1.clone()).await.expect("a1 into DAG");
+        ghostdag.add_block(&a1).await.expect("a1 admitted");
+        persist(&storage, &a1);
+        assert!(matches!(
+            app.apply_received(&a1).await,
+            ApplyOutcome::Applied { .. }
+        ));
+
+        // ONE child, chain-present but DAG-absent — the same hole as above.
+        persist(&storage, &a2);
+        assert!(!dag.has_block(&a2.header.block_hash).await);
+
+        assert_eq!(app.drive_drain().await, 1, "the lone child still drains");
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip { hash: a2.header.block_hash, height: 2 },
+            "a DAG hole by itself does NOT freeze the applied tip"
         );
     }
 
@@ -1871,6 +2210,7 @@ mod tests {
             registry: REG,
             reward_minter: citrate_execution::block_rewards::REWARD_MINTER_ADDRESS,
             priority_fee_share_bps: bps,
+            block_subsidy: U256::zero(),
             staker_of,
         }
     }
@@ -1958,6 +2298,268 @@ mod tests {
             let bps = if exec.get_balance(&Address(CAROL)) > U256::zero() { 5000 } else { 2500 };
             *exec.reward_policy_handle().write() = Some(rprime_policy(bps));
         }
+    }
+
+    /// SRP-S4 — reorg registry-storage purity GUARD (result: PASSES; REFUTES a hypothesis).
+    ///
+    /// Built to confirm the hypothesis that block-5,406 was the fork/reorg reapply
+    /// failing to reconstruct the `ValidatorRegistry`'s REVM-written creditReward STORAGE
+    /// (the existing cross-policy reorg tests use a CODELESS registry and never exercise
+    /// it). Here REG has code that accumulates each vested `msg.value` into slot 0
+    /// (`SSTORE(0, SLOAD(0)+CALLVALUE)`), so every §R' `creditReward` writes registry
+    /// storage. Branch A vests once (REG.slot0 = vestA); heavier branch B vests twice
+    /// (2·vestA) then an empty tip (the 5,406 analog); reorg A→B; a COLD fold of the
+    /// durable store (what a from-genesis cold-sync does) must reproduce B's tip root.
+    ///
+    /// RESULT (main, 2026-07-23): **PASSES** — the reorg reconciles registry STORAGE
+    /// correctly (in-memory AND durable store both show branch B's slot; cold_root ==
+    /// b3.root). This REFUTES the registry-storage-non-reconciliation hypothesis: a
+    /// simple fork/reorg is pure. Kept as a regression guard. The real 5,406 divergence
+    /// is a subtler fork case (deeper/nested reorg, restart-in-reorg, or produce-after-
+    /// competitor) — still open (planset WP-1.2).
+    #[tokio::test]
+    async fn srp_s4_reorg_reconciles_registry_storage_not_just_balance() {
+        // REG runtime: slot0 += CALLVALUE on every (payable) call — a minimal stand-in
+        // for creditReward's bonded-stake/vestedRewards SSTOREs.
+        //   CALLVALUE PUSH1 0 SLOAD ADD PUSH1 0 SSTORE STOP
+        let reg_code = vec![0x34, 0x60, 0x00, 0x54, 0x01, 0x60, 0x00, 0x55, 0x00];
+
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.set_code(&Address(REG), reg_code.clone());
+        follower.set_validator_activation_height(800);
+        *follower.reward_policy_handle().write() = Some(rprime_policy(5000));
+        follower.persist_state_changes().await.expect("persist genesis");
+
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        // Fixed policy through the reapply (no cross-policy flip — isolate REG storage).
+        let f = follower.clone();
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            *f.reward_policy_handle().write() = Some(rprime_policy(5000));
+            Box::pin(async { Ok(()) })
+        }));
+
+        // Shared a1 (empty), branch A a2 (one priority tx → one §R' vest → REG.slot0 = vestA).
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        pa.set_code(&Address(REG), reg_code.clone());
+        pa.set_validator_activation_height(800);
+        *pa.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let a1 = produce_rprime(&pa, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let a2 = produce_rprime(&pa, a1.header.block_hash, 800, VRF_OUT, vec![prio_tx(ALICE, CAROL, 0, 0xA0)]).await;
+        persist(&storage, &a1);
+        app.apply_received(&a1).await;
+        persist(&storage, &a2);
+        app.apply_received(&a2).await;
+
+        // Heavier branch B off a1: b2 (TWO priority txs → vestB = 2·vestA), then an empty
+        // b3 (the 5,406 analog — no vest, root just re-folds REG's storage).
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_code(&Address(REG), reg_code.clone());
+        pb.set_validator_activation_height(800);
+        *pb.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let _b1 = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce_rprime(
+            &pb,
+            a1.header.block_hash,
+            800,
+            vrf_b,
+            vec![prio_tx(ALICE, CAROL, 0, 0xB0), prio_tx(ALICE, DAVE, 1, 0xB1)],
+        )
+        .await;
+        let b3 = produce_rprime(&pb, b2.header.block_hash, 801, vrf_b, vec![]).await;
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.apply_received(&b3).await;
+        assert_eq!(app.applied_tip().await.height, 801, "reorged to branch B");
+        assert_eq!(
+            follower.calculate_state_root(),
+            b3.state_root,
+            "in-memory follower converged to branch B's tip root after the reorg"
+        );
+
+        // THE ORACLE: a from-genesis cold-sync folds the DURABLE STORE. Hydrate a cold
+        // StateDB from the store exactly as node boot / state-digest does, then fold.
+        let cold = StateDB::new();
+        for (addr, acct) in storage.state.get_all_accounts().expect("get_all_accounts") {
+            cold.accounts.load_account(addr, acct);
+        }
+        for ((addr, key), val) in storage.state.get_all_storage().expect("get_all_storage") {
+            cold.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
+        }
+        let cold_root = cold.calculate_state_root();
+
+        // Sanity: the vest actually fired and the branches differ (else the guard is vacuous).
+        let k0 = vec![0u8; 32];
+        assert!(pb.get_balance(&Address(REG)) > pa.get_balance(&Address(REG)), "branch B vested more than A");
+        assert_ne!(
+            pa.state_db().get_storage(&Address(REG), &k0),
+            pb.state_db().get_storage(&Address(REG), &k0),
+            "precondition: branches A and B wrote DIFFERENT registry storage via creditReward"
+        );
+
+        // RESULT (main, 2026-07-23): PASSES. The reorg reconciles the registry's
+        // creditReward STORAGE (not just its balance): both the in-memory follower and a
+        // cold fold of the durable store show branch B's slot value, and cold_root ==
+        // b3.state_root. This REFUTES the hypothesis that block-5,406 was registry-storage
+        // non-reconciliation. Retained as a regression GUARD for reorg registry-storage
+        // purity. The real 5,406 divergence is a subtler fork/reorg case (this simple
+        // A→B reorg is pure) — still open (planset WP-1.2).
+        assert_eq!(
+            cold_root, b3.state_root,
+            "reorg registry-storage purity guard: a cold fold of the reorged store must \
+             reproduce branch B's committed tip root (registry creditReward storage reconciled)"
+        );
+    }
+
+    /// SRP-S4 WP-1.2′ variant #1 — PRODUCE-AFTER-COMPETITOR.
+    ///
+    /// The live 5,406 producer committed a root a clean forward execution can't reproduce.
+    /// The one path the receive-reorg guard above does NOT cover: a node that RECEIVES a
+    /// competing branch, reorgs to it, THEN *produces* the next canonical block from its
+    /// post-reorg in-memory state. If that in-memory state diverges from a clean forward
+    /// execution (even though its committed root matched), the produced block seals an
+    /// impure root — exactly the 5,406 signature. Here the produced block VESTS (a §R'
+    /// creditReward on top of the reorged registry storage), and we compare the
+    /// reorg-then-produce root to a clean forward producer's root for the same block.
+    #[tokio::test]
+    async fn srp_s4_produce_after_competitor_reorg_is_pure() {
+        let reg_code = vec![0x34, 0x60, 0x00, 0x54, 0x01, 0x60, 0x00, 0x55, 0x00];
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.set_code(&Address(REG), reg_code.clone());
+        follower.set_validator_activation_height(800);
+        *follower.reward_policy_handle().write() = Some(rprime_policy(5000));
+        follower.persist_state_changes().await.expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let f = follower.clone();
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            *f.reward_policy_handle().write() = Some(rprime_policy(5000));
+            Box::pin(async { Ok(()) })
+        }));
+
+        // Branch A (applied): a799 + a800 (one vest).
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        pa.set_code(&Address(REG), reg_code.clone());
+        pa.set_validator_activation_height(800);
+        *pa.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let a799 = produce_rprime(&pa, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let a800 = produce_rprime(&pa, a799.header.block_hash, 800, VRF_OUT, vec![prio_tx(ALICE, CAROL, 0, 0xA0)]).await;
+        persist(&storage, &a799);
+        app.apply_received(&a799).await;
+        persist(&storage, &a800);
+        app.apply_received(&a800).await;
+
+        // Heavier branch B: b800 (two vests) + b801 (empty). Clean producer pb builds it.
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_code(&Address(REG), reg_code.clone());
+        pb.set_validator_activation_height(800);
+        *pb.reward_policy_handle().write() = Some(rprime_policy(5000));
+        let _b1 = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5B; 32];
+        let b800 = produce_rprime(&pb, a799.header.block_hash, 800, vrf_b, vec![prio_tx(ALICE, CAROL, 0, 0xB0), prio_tx(ALICE, DAVE, 1, 0xB1)]).await;
+        let b801 = produce_rprime(&pb, b800.header.block_hash, 801, vrf_b, vec![]).await;
+        persist(&storage, &b800);
+        persist(&storage, &b801);
+
+        // Reorg the follower A → B.
+        app.fork_choice = Some(fork_choice_returning(b801.header.block_hash));
+        app.apply_received(&b801).await;
+        assert_eq!(app.applied_tip().await.height, 801, "reorged to B");
+
+        // PRODUCE-AFTER-REORG: the follower seals b802 (a VESTING block) from its post-reorg
+        // in-memory state. ALICE nonce is 2 after B's two txs.
+        let vest_tx = prio_tx(ALICE, CAROL, 2, 0xC0);
+        let b802_reorg = produce_rprime(&follower, b801.header.block_hash, 802, vrf_b, vec![vest_tx.clone()]).await;
+
+        // Clean forward producer pb seals the SAME b802 from clean state.
+        let b802_clean = produce_rprime(&pb, b801.header.block_hash, 802, vrf_b, vec![vest_tx]).await;
+
+        assert_eq!(
+            b802_reorg.state_root, b802_clean.state_root,
+            "SRP-S4 PRODUCE-AFTER-COMPETITOR: a block PRODUCED from post-reorg state sealed a \
+             root that a clean forward execution does not reproduce — the reorged in-memory \
+             state diverged from committed state despite a matching tip root. This is the \
+             block-5,406 signature (produce-after-reorg impurity)."
+        );
+    }
+
+    /// SRP-S4 ROOT CAUSE (RED) — the RPC `simulate_transaction` path races the block
+    /// producer's state-root fold on the SHARED `state_db`.
+    ///
+    /// `Executor::simulate_transaction` (executor.rs:1808) takes ONLY `exec_lock`, then
+    /// `snapshot()` → `set_balance(from, u128::MAX)` → execute → `restore()` on the
+    /// shared committed state. Its own comment says these overrides "must not be
+    /// observable to concurrent workers." But the producer's `settle_block_rewards` +
+    /// `calculate_state_root` (producer.rs) take ONLY `advance_lock` — a DISJOINT lock —
+    /// and `Executor::calculate_state_root` takes no lock at all. So an `eth_call` /
+    /// `eth_estimateGas` landing during a block build DOES let the producer's fold
+    /// observe the simulation's transient `u128::MAX` sender balance and seal it into the
+    /// committed root — a root no cold-sync re-executing the block can reproduce. Empty
+    /// blocks are maximally exposed (the build holds no `exec_lock` section at all), the
+    /// reward math stays pure, and the wedge height is set by WHEN an RPC call coincides
+    /// with production — exactly the block-5,406 non-injective wedge, and why every
+    /// SERIAL reproduction (and every prior SRP fix) missed it.
+    ///
+    /// This test hammers `simulate_transaction` concurrently while the producer folds the
+    /// root, and asserts the fold NEVER observes a value other than the honest committed
+    /// root. RED on `main` (the fold sees the phantom); GREEN once simulation runs on an
+    /// ISOLATED state that never touches the shared consensus `state_db`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn srp_s4_rpc_simulate_races_producer_state_root_fold() {
+        let exec = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        exec.set_balance(&Address(CB), U256::from(1_000_000u64));
+        exec.set_balance(&Address([0x11u8; 20]), U256::from(500u64));
+        let honest = exec.calculate_state_root();
+
+        // A block + a tx that an RPC eth_call / eth_estimateGas would simulate. The
+        // simulate path overrides the SENDER's balance to u128::MAX on the shared state.
+        let block = seal_rprime(1, Hash::default(), Hash::default(), VRF_OUT, vec![]);
+        let sim_tx = prio_tx([0x77u8; 20], CAROL, 0, 0xEE);
+
+        // RPC hammer: many concurrent eth_call-equivalent simulations.
+        let e2 = exec.clone();
+        let blk = block.clone();
+        let stx = sim_tx.clone();
+        let hammer = tokio::spawn(async move {
+            for _ in 0..8000 {
+                let _ = e2.simulate_transaction(&blk, &stx).await;
+            }
+        });
+
+        // Producer's fold: the committed state is FIXED, so every fold MUST equal `honest`.
+        let mut torn: Option<Hash> = None;
+        for _ in 0..8000 {
+            let r = exec.calculate_state_root();
+            if r != honest {
+                torn = Some(r);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let _ = hammer.await;
+
+        assert!(
+            torn.is_none(),
+            "SRP-S4 ROOT CAUSE: the producer's state-root fold observed a TORN root {torn:?} != \
+             the honest committed root {honest} while a concurrent RPC simulate_transaction ran. \
+             simulate takes exec_lock (executor.rs:1808); the producer's fold takes only \
+             advance_lock — DISJOINT — so simulate's transient u128::MAX sender balance is folded \
+             into the committed root, which no cold-sync reproduces. This is the block-5,406 \
+             non-injective wedge; height is set by WHEN an eth_call coincides with production."
+        );
     }
 
     /// Store-backed follower seeded at height 798, then advanced through a SHARED
@@ -3234,6 +3836,7 @@ mod tests {
             registry: REG,
             reward_minter: citrate_execution::block_rewards::REWARD_MINTER_ADDRESS,
             priority_fee_share_bps: 2500,
+            block_subsidy: U256::zero(),
             staker_of,
         };
         (policy, entries)
