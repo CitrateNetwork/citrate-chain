@@ -2537,16 +2537,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let copy_len = coinbase_bytes.len().min(32);
         coinbase[..copy_len].copy_from_slice(&coinbase_bytes[..copy_len]);
 
-        // WP-G.2: Generate block signing key.
-        // Deterministic derivation from coinbase for devnet reproducibility.
-        // Production nodes should load a persistent key from disk.
+        // WP-11: the block-signing key is a PERSISTED SECRET, not a derivation.
         //
-        // LOAD-BEARING: this MUST be the SAME derivation the registration
-        // ceremony (node/src/bin/validator_registration_ceremony.rs) uses, or the
-        // pubkey registered on-chain won't match the key that signs blocks here.
-        // Both call the single shared `derive_block_signing_key`; see its
-        // BLOCK_SIGNING_KEY_DOMAIN doc-comment.
-        let signing_key = citrate_consensus::crypto::derive_block_signing_key(&coinbase);
+        // It used to be `Sha3_256(domain ‖ coinbase)`. The coinbase is public
+        // (recoverable on-chain via `validatorInfo(pubkey).staker`, which
+        // consensus forces to equal it), so that made every validator's signing
+        // PRIVATE key computable by anyone — and `submitEquivocation` is
+        // permissionless, so anyone could forge a double-sign and Byzantine-slash
+        // any validator for 100% of its stake. See
+        // `citrate_consensus::crypto::generate_block_signing_key`.
+        //
+        // The registered pubkey now comes FROM this file rather than from the
+        // coinbase, so the ceremony reads the same file (`--node
+        // <coinbase>=<STAKER_ENV>=<proposer_key_file>`) instead of re-deriving.
+        let proposer_key_path = config.storage.data_dir.join("proposer.key");
+        let signing_key = load_or_generate_proposer_key(&proposer_key_path)?;
         info!(
             "Block signing key: proposer_pubkey={}",
             hex::encode(signing_key.verifying_key().to_bytes())
@@ -2734,6 +2739,80 @@ fn load_or_generate_noise_keypair(
         write_secret_file_0600(noise_key_path, &key_bytes)?;
         info!("Generated new persistent Noise identity at {:?}", noise_key_path);
         Ok(kp)
+    }
+}
+
+/// WP-11: load this node's persistent ed25519 block-signing (proposer) key from
+/// `proposer_key_path`, or mint and persist a new one.
+///
+/// Deliberately mirrors [`load_or_generate_noise_keypair`] — 0600 on create,
+/// loose permissions tightened with a warning on load, seed bytes held in
+/// `Zeroizing` — because this key is now a REAL secret. It used to be derived
+/// from the public coinbase, which meant anyone could reconstruct it and
+/// Byzantine-slash the validator via the permissionless `submitEquivocation`.
+/// The entire point of this function is that the key can no longer be recomputed
+/// from public data, so it must be generated once and kept.
+///
+/// PRESERVE ACROSS WIPES: like `noise.key`, this file IS the node's registered
+/// consensus identity. Deleting it mints a new pubkey that is not in the active
+/// set, and the node silently stops being able to propose until it re-registers.
+fn load_or_generate_proposer_key(
+    proposer_key_path: &std::path::Path,
+) -> anyhow::Result<citrate_consensus::crypto::Ed25519SigningKey> {
+    use zeroize::{Zeroize as _, Zeroizing};
+
+    if proposer_key_path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(proposer_key_path)
+                .map_err(|e| anyhow::anyhow!("Failed to stat proposer key: {}", e))?;
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                warn!(
+                    "Proposer key file {:?} had permissions {:o}; tightening to 0600 (WP-11)",
+                    proposer_key_path, mode
+                );
+                std::fs::set_permissions(proposer_key_path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| anyhow::anyhow!("Failed to chmod proposer key to 0600: {}", e))?;
+            }
+        }
+        let seed_bytes = Zeroizing::new(
+            std::fs::read(proposer_key_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read proposer key: {}", e))?,
+        );
+        if seed_bytes.len() != 32 {
+            // Fail closed: a wrong-length file means we do not know what identity
+            // this node has. Signing blocks with a key of unknown provenance is
+            // worse than refusing to start.
+            return Err(anyhow::anyhow!(
+                "Proposer key {:?} is {} bytes, expected a 32-byte ed25519 seed",
+                proposer_key_path,
+                seed_bytes.len()
+            ));
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_bytes);
+        let key = citrate_consensus::crypto::block_signing_key_from_seed(&seed);
+        seed.zeroize();
+        info!(
+            "Loaded persistent proposer identity from {:?} (pubkey {})",
+            proposer_key_path,
+            hex::encode(key.verifying_key().to_bytes())
+        );
+        Ok(key)
+    } else {
+        let key = citrate_consensus::crypto::generate_block_signing_key();
+        let seed_bytes = Zeroizing::new(key.to_bytes().to_vec());
+        write_secret_file_0600(proposer_key_path, &seed_bytes)?;
+        info!(
+            "Minted a new persistent proposer identity at {:?} (pubkey {}). This key is NOT \
+             recoverable from public data — back it up alongside noise.key and preserve it \
+             across data-dir wipes, or the node must re-register before it can propose again.",
+            proposer_key_path,
+            hex::encode(key.verifying_key().to_bytes())
+        );
+        Ok(key)
     }
 }
 
