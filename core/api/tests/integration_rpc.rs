@@ -1377,3 +1377,196 @@ async fn test_eth_estimate_gas_contract_deploy_not_simple_transfer() {
         gas
     );
 }
+
+/// CBF-S1 WP-2 REGRESSION — `eth_call` must execute at the canonical chain tip.
+///
+/// Before the fix, both `eth_call` and `eth_estimateGas` built their simulation
+/// block with a bare `BlockBuilder::new()`, giving `block.number == 0` and
+/// `block.timestamp == 0` inside the EVM at every block tag. Live proof on
+/// chain 40204: `ValidatorRegistry.currentEpoch()` (which is `block.number /
+/// 1000`) returned 0 at `latest`, `138000`, `100000`, `50000` and `2000`, while
+/// the pure `epochOf(138235)` correctly returned 138.
+///
+/// The contract here is the minimal NUMBER-returning runtime:
+///   43  NUMBER            ; push block.number
+///   6000 PUSH1 0x00
+///   52  MSTORE            ; mem[0..32] = block.number
+///   6020 PUSH1 0x20
+///   6000 PUSH1 0x00
+///   f3  RETURN            ; return mem[0..32]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_eth_call_executes_at_canonical_tip_not_height_zero() {
+    ensure_test_rate_limit_bypass();
+    use primitive_types::U256;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let storage = Arc::new(
+        StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"),
+    );
+
+    // Seed a chain whose tip is height 7 (make_block sets timestamp = 1_000_000 + h).
+    let mut parent = Hash::default();
+    for h in 0..=7u64 {
+        let b = make_block(h, parent);
+        parent = b.hash();
+        storage.blocks.put_block(&b).expect("put_block");
+    }
+    let expected_height = 7u64;
+    let expected_timestamp = 1_000_000u64 + expected_height;
+
+    let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
+    let state_db = Arc::new(citrate_execution::StateDB::new());
+    let executor = Arc::new(Executor::new(state_db));
+
+    let from_addr = Address([0xAA; 20]);
+    executor.set_balance(&from_addr, U256::from(10_000_000u64));
+
+    // NUMBER-returning contract.
+    let number_addr = Address([0xCE; 20]);
+    executor.set_code(&number_addr, vec![0x43, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    // TIMESTAMP-returning contract (0x42 instead of 0x43).
+    let time_addr = Address([0xCF; 20]);
+    executor.set_code(&time_addr, vec![0x42, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+
+    let mut io = jsonrpc_core::IoHandler::new();
+    citrate_api::eth_rpc::register_eth_methods(
+        &mut io,
+        storage.clone(),
+        mempool,
+        executor.clone(),
+        1,
+        Arc::new(FilterRegistry::new()),
+        None,
+    );
+
+    let call_word = |to: Address| {
+        let req = serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"eth_call",
+            "params":[{
+                "from": format!("0x{}", hex::encode(from_addr.0)),
+                "to": format!("0x{}", hex::encode(to.0)),
+                "gas": "0x186a0",
+                "gasPrice": "0x1",
+                "data": "0xdeadbeef"
+            }, "latest"]
+        })
+        .to_string();
+        req
+    };
+
+    // block.number must be the tip, NOT 0.
+    let resp = io.handle_request(&call_word(number_addr)).await.expect("response");
+    let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+    let out = v["result"].as_str().unwrap_or_default();
+    let raw = hex::decode(out.strip_prefix("0x").unwrap_or(out)).expect("hex output");
+    assert_eq!(raw.len(), 32, "NUMBER must return one 32-byte word, got {out}");
+    let got_height = U256::from_big_endian(&raw);
+    assert_eq!(
+        got_height,
+        U256::from(expected_height),
+        "eth_call executed at block.number {got_height} instead of the canonical tip \
+         {expected_height} — the height-0 simulation-context bug has regressed"
+    );
+    assert!(!got_height.is_zero(), "block.number must never be 0 at a non-genesis tip");
+
+    // block.timestamp must be the tip's, NOT 0.
+    let resp = io.handle_request(&call_word(time_addr)).await.expect("response");
+    let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+    let out = v["result"].as_str().unwrap_or_default();
+    let raw = hex::decode(out.strip_prefix("0x").unwrap_or(out)).expect("hex output");
+    let got_ts = U256::from_big_endian(&raw);
+    assert_eq!(
+        got_ts,
+        U256::from(expected_timestamp),
+        "eth_call executed at block.timestamp {got_ts} instead of the tip's {expected_timestamp}"
+    );
+}
+
+/// CBF-S1 WP-3 REGRESSION — `miner` must be the coinbase EOA, never a truncated
+/// proposer pubkey.
+///
+/// Before the fix, `miner` ran the 32-byte ed25519 `proposer_pubkey` through
+/// `pubkey_hex_to_evm_address`, which truncates to the first 20 bytes for any
+/// value that isn't an embedded EVM address. On live 40204 every block reported
+/// miner `0x25b78e08309e0d4e0a4472512786ca7e1dac6e6a` — the first 20 bytes of
+/// proposer pubkey `0x25b78e08…8ad9` — while the account that actually earned
+/// the block was the registered staker `0x0ecbcd85…363b`. Explorers attributed
+/// every block to a phantom account that nobody controls.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_block_miner_is_coinbase_not_truncated_proposer_pubkey() {
+    ensure_test_rate_limit_bypass();
+
+    let tmp = TempDir::new().expect("tempdir");
+    let storage = Arc::new(
+        StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"),
+    );
+
+    // Mirror the live 40204 shape: a proposer pubkey whose first 20 bytes are
+    // NOT the coinbase, so truncation is detectable.
+    let mut pubkey_bytes = [0u8; 32];
+    pubkey_bytes[..20].copy_from_slice(&[0x25u8; 20]);
+    pubkey_bytes[20..].copy_from_slice(&[0x8au8; 12]);
+    let coinbase = [0x0eu8; 20];
+    assert_ne!(
+        &pubkey_bytes[..20],
+        &coinbase[..],
+        "test is only meaningful when the truncated pubkey differs from the coinbase"
+    );
+
+    let genesis = make_block(0, Hash::default());
+    storage.blocks.put_block(&genesis).expect("put genesis");
+    let b1 = BlockBuilder::new()
+        .hash(Hash::new([1u8; 32]))
+        .parent(genesis.hash())
+        .height(1)
+        .timestamp(1_000_001)
+        .blue_score(1)
+        .blue_work(1)
+        .proposer(PublicKey::new(pubkey_bytes))
+        .coinbase(coinbase)
+        .build_unhashed();
+    storage.blocks.put_block(&b1).expect("put b1");
+
+    let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
+    let state_db = Arc::new(citrate_execution::StateDB::new());
+    let executor = Arc::new(Executor::new(state_db));
+
+    let mut io = jsonrpc_core::IoHandler::new();
+    citrate_api::eth_rpc::register_eth_methods(
+        &mut io,
+        storage.clone(),
+        mempool,
+        executor,
+        1,
+        Arc::new(FilterRegistry::new()),
+        None,
+    );
+
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x1", false]
+    })
+    .to_string();
+    let resp = io.handle_request(&req).await.expect("response");
+    let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+
+    let miner = v["result"]["miner"].as_str().expect("miner field");
+    assert_eq!(
+        miner,
+        format!("0x{}", hex::encode(coinbase)),
+        "miner must be the coinbase EOA"
+    );
+    assert_ne!(
+        miner,
+        format!("0x{}", hex::encode(&pubkey_bytes[..20])),
+        "miner must NOT be the truncated proposer pubkey — that address is a phantom"
+    );
+
+    // The consensus key stays available, separately, for validator attribution.
+    let proposer = v["result"]["proposerPubkey"].as_str().expect("proposerPubkey field");
+    assert_eq!(proposer, format!("0x{}", hex::encode(pubkey_bytes)));
+    assert_eq!(
+        proposer.len(),
+        66,
+        "proposerPubkey must be the full 32-byte key, not truncated"
+    );
+}

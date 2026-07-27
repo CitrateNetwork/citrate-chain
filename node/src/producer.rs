@@ -2037,6 +2037,7 @@ mod tests {
                 registry: REGISTRY,
                 reward_minter: REWARD_MINTER_ADDRESS,
                 priority_fee_share_bps: 2500,
+                block_subsidy: U256::zero(),
                 staker_of,
             }
         };
