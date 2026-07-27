@@ -94,6 +94,14 @@ pub struct AppliedState {
 }
 
 impl AppliedState {
+    /// The block whose post-execution world state the executor currently
+    /// reflects. MP-S1: the producer reads this under the same lock it holds
+    /// across its build, so it can refuse to seal a block whose declared parent
+    /// is NOT the state it actually holds. See `producer.rs::produce_block`.
+    pub fn tip(&self) -> AppliedTip {
+        self.tip
+    }
+
     /// Record the state snapshot for a freshly-applied block and advance the tip,
     /// pruning snapshots that fall out of the reorg window.
     fn record(&mut self, hash: Hash, height: u64, snapshot: StateSnapshot) {
