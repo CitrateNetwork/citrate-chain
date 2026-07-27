@@ -821,33 +821,106 @@ impl BlockProducer {
         // follow-up below.
         //
         // Read parent's height + VRF + blue_score in one storage hit.
+        //
+        // MULTI-PRODUCER FIX (2026-07-27 incident): this used to end in
+        // `.unwrap_or((0, Hash::default(), 0, 0))`. When GHOSTDAG selected a
+        // parent this node could not fetch — which is exactly what happens the
+        // first time ANOTHER producer's block wins tip selection before it has
+        // been stored locally — the miss was swallowed and production silently
+        // continued from height 0 with a DEFAULT VRF output. The node then built
+        // `height: 0 + 1 = 1` forever, and every such block failed
+        // `verify_vrf_with_block_signature` because its proof was bound to
+        // `Hash::default()` instead of the real parent's `vrf_reveal.output`.
+        //
+        // Observed live on rpc-1: a healthy producer at `tip @ 152754` dropped to
+        // `tip @ 1` in the same instant a second validator started proposing, and
+        // emitted `Invalid VRF: ... invalid proof or identity binding` every 2s
+        // thereafter. It never recovered, including across a restart, because the
+        // degraded tip was persisted.
+        //
+        // Failing loudly is strictly better: a missing selected parent means this
+        // node's view is behind, so the correct behaviour is to skip this round
+        // and let the sync path fetch the block, not to mint an invalid one.
         let (last_height, parent_vrf_output, parent_blue_score, parent_blue_work) =
             if selected_parent != Hash::default() {
-                self.storage
+                let parent = self
+                    .storage
                     .blocks
                     .get_block(&selected_parent)
-                    .ok()
-                    .flatten()
-                    .map(|b| {
-                        (
-                            b.header.height,
-                            b.header.vrf_reveal.output,
-                            b.header.blue_score,
-                            b.header.blue_work,
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "selected parent {} could not be read from storage: {e}. Refusing to \
+                             produce — building from a default parent mints blocks with an \
+                             unverifiable VRF binding.",
+                            selected_parent
                         )
-                    })
-                    .unwrap_or((0, Hash::default(), 0, 0))
+                    })?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "selected parent {} is not in local storage yet (this node is behind \
+                             a peer's tip). Skipping this production round; the sync path will \
+                             fetch it.",
+                            selected_parent
+                        )
+                    })?;
+                (
+                    parent.header.height,
+                    parent.header.vrf_reveal.output,
+                    parent.header.blue_score,
+                    parent.header.blue_work,
+                )
             } else {
                 (0, Hash::default(), 0, 0)
             };
 
-        // Single-producer increment. Each new block adds itself to the blue
-        // set; with no other producers there are no additional blue merges.
-        let blue_score = parent_blue_score + 1;
-        // Lightweight placeholder (no cumulative ancestry materialised).
+        // MULTI-PRODUCER FIX: `parent_blue_score + 1` is EXACT when there is
+        // nothing to merge — the block adds only itself to the blue set — and that
+        // is the whole story for a single-producer chain, where `merge_parents` is
+        // always empty. It is WRONG the moment a second producer exists, because
+        // GHOSTDAG blue score is defined as the parent's score plus the blue blocks
+        // in the mergeset, and the old code counted the mergeset as zero
+        // unconditionally (the comment read "with no other producers there are no
+        // additional blue merges").
+        //
+        // So: keep the cheap exact path when we are not merging, and pay for the
+        // real GHOSTDAG calculation only when we actually have merge parents. That
+        // preserves the PIL-13 fix (no O(N) ancestry walk on every block — which
+        // OOM'd the box) while making the merging case correct rather than
+        // approximate.
         let mut blue_set = citrate_consensus::types::BlueSet::new();
+        let blue_score = if merge_parents.is_empty() {
+            parent_blue_score + 1
+        } else {
+            // Build the candidate block so GHOSTDAG can see its parents, then let
+            // the real algorithm compute the mergeset. `calculate_blue_set` is
+            // iterative and cached (see its docstring), and merge parents form a
+            // wide-but-shallow DAG, so this does not reintroduce the deep walk.
+            let candidate = citrate_consensus::types::BlockBuilder::new()
+                .parent(selected_parent)
+                .merge_parents(merge_parents.clone())
+                .height(last_height + 1)
+                .build_unhashed();
+            match self.ghostdag.calculate_blue_set(&candidate).await {
+                Ok(bs) => {
+                    blue_set = bs;
+                    blue_set.score
+                }
+                Err(e) => {
+                    // Do not silently fall back to the single-producer
+                    // approximation — that is how the original bug shipped.
+                    return Err(anyhow::anyhow!(
+                        "GHOSTDAG blue-set calculation failed for a block merging {} \
+                         parent(s): {e}. Refusing to produce with an approximated blue \
+                         score.",
+                        merge_parents.len()
+                    ));
+                }
+            }
+        };
         blue_set.score = blue_score;
-        blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
+        if blue_set.work == 0 {
+            blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
+        }
 
         // Get transactions from mempool with AI priority
         let transactions = self.select_transactions_with_ai_priority().await?;
