@@ -25,7 +25,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use citrate_consensus::crypto::{derive_block_signing_key, registration_digest, Ed25519SigningKey};
+use citrate_consensus::crypto::registration_digest;
 use citrate_wallet_core::{sign_eip155_legacy_tx, LegacyTxFields};
 use clap::Parser;
 use k256::ecdsa::SigningKey as Secp256k1SigningKey;
@@ -70,13 +70,19 @@ struct Cli {
     #[arg(long, default_value_t = 600_000)]
     gas_limit: u64,
 
-    /// One per fleet node, repeatable. Format: `<coinbase_hex>=<STAKER_KEY_ENV_VAR>`,
-    /// where the coinbase is the node's PUBLIC 20-byte address and the env var holds
-    /// that validator's staker private key (0x-hex, 32 bytes). Example:
-    ///   --node 0x47fb..36090=VALIDATOR_STAKER_1_PRIVATE_KEY
-    /// The 4 fleet coinbases (rpc-1 + boot1/2/3) are NOT stored in the repo — the
-    /// operator MUST supply them (one distinct coinbase per node, or all nodes derive
-    /// the same proposer key and only one validator exists).
+    /// One per fleet node, repeatable. Format:
+    ///   `<coinbase_hex>=<STAKER_KEY_ENV_VAR>=<proposer_key_file>`
+    /// where the coinbase is the node's PUBLIC 20-byte address, the env var holds that
+    /// validator's staker private key (0x-hex, 32 bytes), and the file is that node's
+    /// `proposer.key` — the 32-byte ed25519 seed the node minted in its data dir.
+    ///   --node 0x47fb..36090=VALIDATOR_STAKER_1_PRIVATE_KEY=/secure/boot1-proposer.key
+    ///
+    /// WP-11: the third field is REQUIRED and the old two-field form is REJECTED. The
+    /// proposer key used to be derived from the public coinbase, which let anyone
+    /// reconstruct any validator's signing key and Byzantine-slash it through the
+    /// permissionless `submitEquivocation`. It is now a real secret only the node
+    /// holds, so the ceremony must be given it rather than recomputing it. Copy the
+    /// file off the node over SSH (0600 both ends) or run this tool on the node.
     #[arg(long = "node", required = true)]
     nodes: Vec<String>,
 
@@ -95,6 +101,8 @@ struct NodeSpec {
     coinbase: [u8; 20],
     staker_key: Secp256k1SigningKey,
     staker_key_env: String,
+    /// WP-11: the node's real ed25519 proposer seed, read from its `proposer.key`.
+    proposer_seed: [u8; 32],
 }
 
 #[tokio::main]
@@ -153,8 +161,8 @@ async fn register_one(
     stake_wei: u128,
     spec: &NodeSpec,
 ) -> Result<()> {
-    // 1. Proposer key from coinbase (byte-for-byte with node/src/main.rs).
-    let proposer = derive_proposer_key(&spec.coinbase);
+    // 1. Proposer key = the node's REAL persisted secret (WP-11), not a derivation.
+    let proposer = citrate_consensus::crypto::block_signing_key_from_seed(&spec.proposer_seed);
     let proposer_pubkey: [u8; 32] = proposer.verifying_key().to_bytes();
 
     // Staker EVM address from its secp256k1 key.
@@ -245,19 +253,13 @@ async fn register_one(
 // Crypto: proposer-key derivation + calldata/address encoding.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Derive the ed25519 proposer signing key from a 20-byte coinbase.
-///
-/// This zero-pads the coinbase into a 32-byte buffer (right-padded, exactly the
-/// shape the block producer builds in `node/src/main.rs`) and delegates to the
-/// SINGLE shared derivation `citrate_consensus::crypto::derive_block_signing_key`.
-/// The node's block producer calls the SAME shared function, so the pubkey this
-/// tool registers is byte-identical to the key the node signs blocks with — the
-/// most critical property of the whole ceremony. There is no second copy of the
-/// hashing/domain-separation logic that could drift.
-fn derive_proposer_key(coinbase20: &[u8; 20]) -> Ed25519SigningKey {
-    let mut coinbase32 = [0u8; 32];
-    coinbase32[..20].copy_from_slice(coinbase20);
-    derive_block_signing_key(&coinbase32)
+/// WP-11: a node's proposer key is a persisted SECRET, so tests build one from an
+/// explicit seed. There is deliberately no `derive_proposer_key(coinbase)` any more —
+/// its existence WAS the vulnerability: the coinbase is public, so anyone could
+/// reconstruct any validator's signing key and Byzantine-slash it.
+#[cfg(test)]
+fn proposer_key_from_seed(seed: &[u8; 32]) -> citrate_consensus::crypto::Ed25519SigningKey {
+    citrate_consensus::crypto::block_signing_key_from_seed(seed)
 }
 
 /// ABI-encode `registerValidator(bytes32 proposerPubkey, bytes ed25519Sig)`.
@@ -334,9 +336,35 @@ fn parse_addr20(s: &str) -> Result<[u8; 20]> {
 fn parse_nodes(nodes: &[String]) -> Result<Vec<NodeSpec>> {
     let mut out = Vec::with_capacity(nodes.len());
     for spec in nodes {
-        let (coinbase_str, env_name) = spec
-            .split_once('=')
-            .ok_or_else(|| anyhow!("--node must be <coinbase_hex>=<STAKER_KEY_ENV_VAR>, got: {spec}"))?;
+        let mut parts = spec.split('=');
+        let coinbase_str = parts.next().unwrap_or_default();
+        let env_name = parts.next().ok_or_else(|| {
+            anyhow!("--node must be <coinbase_hex>=<STAKER_KEY_ENV_VAR>=<proposer_key_file>, got: {spec}")
+        })?;
+        // WP-11: the proposer key is no longer derivable from the coinbase, so it MUST
+        // be supplied. Rejecting the old two-field form loudly is deliberate — silently
+        // falling back to a derivation would re-introduce a forgeable consensus key.
+        let proposer_key_file = parts.next().ok_or_else(|| {
+            anyhow!(
+                "--node is missing the proposer key file: expected \
+                 <coinbase_hex>=<STAKER_KEY_ENV_VAR>=<proposer_key_file>, got: {spec}. \
+                 WP-11 replaced the coinbase-derived proposer key with a real secret; \
+                 pass the node's data-dir `proposer.key`."
+            )
+        })?;
+        if parts.next().is_some() {
+            bail!("--node has too many '=' separated fields: {spec}");
+        }
+        let proposer_seed_raw = std::fs::read(proposer_key_file)
+            .with_context(|| format!("reading proposer key file {proposer_key_file}"))?;
+        if proposer_seed_raw.len() != 32 {
+            bail!(
+                "proposer key file {proposer_key_file} is {} bytes, expected a 32-byte ed25519 seed",
+                proposer_seed_raw.len()
+            );
+        }
+        let mut proposer_seed = [0u8; 32];
+        proposer_seed.copy_from_slice(&proposer_seed_raw);
         let coinbase = parse_addr20(coinbase_str).with_context(|| format!("--node coinbase in {spec}"))?;
         let key_hex = std::env::var(env_name)
             .map_err(|_| anyhow!("staker key env var `{env_name}` is not set (referenced by --node {spec})"))?;
@@ -347,7 +375,7 @@ fn parse_nodes(nodes: &[String]) -> Result<Vec<NodeSpec>> {
         }
         let staker_key = Secp256k1SigningKey::from_slice(&key_bytes)
             .map_err(|e| anyhow!("staker key in `{env_name}` is not a valid secp256k1 key: {e}"))?;
-        out.push(NodeSpec { coinbase, staker_key, staker_key_env: env_name.to_string() });
+        out.push(NodeSpec { coinbase, staker_key, staker_key_env: env_name.to_string(), proposer_seed });
     }
     Ok(out)
 }
@@ -521,7 +549,7 @@ mod tests {
         let seed = hasher.finalize();
         let mut seed_bytes = [0u8; 32];
         seed_bytes.copy_from_slice(&seed);
-        Ed25519SigningKey::from_bytes(&seed_bytes)
+        citrate_consensus::crypto::Ed25519SigningKey::from_bytes(&seed_bytes)
             .verifying_key()
             .to_bytes()
     }
@@ -535,10 +563,14 @@ mod tests {
     }
 
     fn node_spec(coinbase: [u8; 20], staker_seed: u8) -> NodeSpec {
+        let mut proposer_seed = [0u8; 32];
+        proposer_seed[0] = staker_seed;
+        proposer_seed[31] = 0xA5;
         NodeSpec {
             coinbase,
             staker_key: test_staker_key(staker_seed),
             staker_key_env: format!("TEST_STAKER_{staker_seed}"),
+            proposer_seed,
         }
     }
 
@@ -569,47 +601,80 @@ mod tests {
 
     // ── Example-based regression pins ────────────────────────────────────────
 
+    /// WP-11 SECURITY REGRESSION — the proposer key must NOT be a function of the
+    /// coinbase.
+    ///
+    /// It used to be `Sha3_256(b"citrate-block-signing-key-v1" ‖ coinbase32)`. Every
+    /// input was public (the coinbase is recoverable on-chain from
+    /// `validatorInfo(pubkey).staker`, which consensus forces to equal it), so anyone
+    /// could reconstruct any validator's signing PRIVATE key. `submitEquivocation` is
+    /// permissionless, so that meant anyone could forge a double-sign and trigger a
+    /// Byzantine slash: 100% of bond + escrow + rewards, a 10% bounty to the attacker,
+    /// and a permanent ban of the pubkey and the staker.
+    ///
+    /// The tests this replaced asserted the OPPOSITE — that the key was a pure
+    /// function of the coinbase — which is exactly what pinned the vulnerability in
+    /// place.
     #[test]
-    fn derivation_is_deterministic() {
+    fn proposer_key_is_not_derivable_from_the_public_coinbase() {
+        use sha3::{Digest as _, Sha3_256};
         let cb = coinbase20(VEC_COINBASE);
-        let k1 = derive_proposer_key(&cb);
-        let k2 = derive_proposer_key(&cb);
-        assert_eq!(k1.to_bytes(), k2.to_bytes(), "derivation must be deterministic");
-        assert_eq!(k1.verifying_key().to_bytes(), k2.verifying_key().to_bytes());
-    }
 
-    #[test]
-    fn derivation_matches_inline_main_rs_algorithm() {
-        // The pinned reference reproduces the historical main.rs inline algorithm;
-        // the tool's derivation must equal it byte-for-byte for the fleet coinbase.
-        let cb = coinbase20(VEC_COINBASE);
-        let got = derive_proposer_key(&cb).verifying_key().to_bytes();
-        assert_eq!(got, main_rs_reference_pubkey(&cb));
-    }
+        // Recompute exactly what the removed derivation did.
+        let mut coinbase32 = [0u8; 32];
+        coinbase32[..20].copy_from_slice(&cb);
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"citrate-block-signing-key-v1");
+        hasher.update(coinbase32);
+        let mut legacy_seed = [0u8; 32];
+        legacy_seed.copy_from_slice(&hasher.finalize());
+        let forged = citrate_consensus::crypto::Ed25519SigningKey::from_bytes(&legacy_seed)
+            .verifying_key()
+            .to_bytes();
 
-    #[test]
-    fn shared_domain_constant_is_unchanged() {
-        // Guards the shared domain string against a silent edit. This literal is
-        // the contract the node signs blocks under; changing it moves every key.
-        assert_eq!(
-            citrate_consensus::crypto::BLOCK_SIGNING_KEY_DOMAIN,
-            b"citrate-block-signing-key-v1",
+        let real = citrate_consensus::crypto::generate_block_signing_key()
+            .verifying_key()
+            .to_bytes();
+
+        assert_ne!(
+            real, forged,
+            "proposer key is reconstructible from the public coinbase — anyone can forge \
+             this validator's block signatures and slash it via submitEquivocation"
         );
     }
 
+    /// Two nodes must get distinct consensus identities. Under the old scheme two
+    /// nodes sharing a coinbase collided into ONE key, so only one validator could
+    /// ever exist per address.
     #[test]
-    fn derivation_pinned_pubkey_vector() {
-        let cb = coinbase20(VEC_COINBASE);
-        let pk = derive_proposer_key(&cb).verifying_key().to_bytes();
-        assert_eq!(hex::encode(pk), VEC_PUBKEY, "proposer pubkey regression vector drifted");
+    fn distinct_nodes_get_distinct_proposer_keys() {
+        let a = citrate_consensus::crypto::generate_block_signing_key()
+            .verifying_key()
+            .to_bytes();
+        let b = citrate_consensus::crypto::generate_block_signing_key()
+            .verifying_key()
+            .to_bytes();
+        assert_ne!(a, b, "each node must mint its own independent proposer identity");
+    }
+
+    /// A persisted seed must round-trip to the same key, or a node would come back
+    /// from a restart with a different identity than the one it registered.
+    #[test]
+    fn persisted_seed_round_trips_to_the_same_identity() {
+        let key = citrate_consensus::crypto::generate_block_signing_key();
+        let seed = key.to_bytes();
+        let reloaded = proposer_key_from_seed(&seed);
+        assert_eq!(
+            key.verifying_key().to_bytes(),
+            reloaded.verifying_key().to_bytes()
+        );
     }
 
     #[test]
     fn sign_verify_roundtrip_over_register_digest() {
         // The full cryptographic chain the contract's 0x0120 precompile checks:
         // ed25519 sign the 32-byte register digest, verify_strict must pass.
-        let cb = coinbase20(VEC_COINBASE);
-        let key = derive_proposer_key(&cb);
+        let key = citrate_consensus::crypto::generate_block_signing_key();
         let pubkey = key.verifying_key().to_bytes();
         let registry = coinbase20("00112233445566778899aabbccddeeff00112233");
         let staker = coinbase20("aabbccddeeff00112233445566778899aabbccdd");
@@ -726,27 +791,18 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(4096))]
 
-        /// For any 20-byte coinbase, the ceremony's derived proposer pubkey is
-        /// byte-identical to the pinned reproduction of node/src/main.rs's
-        /// derivation. Catches any domain-string / padding / hash / endianness
-        /// drift between what the node signs blocks with and what the ceremony
-        /// registers on-chain.
+        /// WP-11 SECURITY REGRESSION, generalized: for ANY coinbase, a real proposer
+        /// key must not equal the key the removed derivation would have produced from
+        /// that same public address. The two proptests this replaced asserted exactly
+        /// the opposite — that the key WAS a pure function of the coinbase — which is
+        /// precisely what let anyone reconstruct a validator's signing key and
+        /// Byzantine-slash it through the permissionless `submitEquivocation`.
         #[test]
-        fn fuzz_derivation_equivalence(coinbase in any::<[u8; 20]>()) {
-            let got = derive_proposer_key(&coinbase).verifying_key().to_bytes();
-            prop_assert_eq!(got, main_rs_reference_pubkey(&coinbase));
-        }
-
-        /// The 20→32 right-zero-pad the ceremony applies must equal main.rs's
-        /// `min(len, 32)` pad for a 20-byte coinbase: derive from the ceremony's
-        /// padded buffer via the shared fn and from the reference over the raw
-        /// 20 bytes; the resulting pubkeys must match.
-        #[test]
-        fn fuzz_derivation_padding_equivalence(coinbase in any::<[u8; 20]>()) {
-            let mut coinbase32 = [0u8; 32];
-            coinbase32[..20].copy_from_slice(&coinbase);
-            let via_shared = derive_block_signing_key(&coinbase32).verifying_key().to_bytes();
-            prop_assert_eq!(via_shared, main_rs_reference_pubkey(&coinbase[..]));
+        fn fuzz_key_is_independent_of_coinbase(coinbase in any::<[u8; 20]>()) {
+            let real = citrate_consensus::crypto::generate_block_signing_key()
+                .verifying_key()
+                .to_bytes();
+            prop_assert_ne!(real, main_rs_reference_pubkey(&coinbase));
         }
     }
 
@@ -774,10 +830,9 @@ mod tests {
 
         #[test]
         fn fuzz_sign_verify_strict_roundtrip(
-            coinbase in any::<[u8; 20]>(),
             msg in prop::collection::vec(any::<u8>(), 1..256),
         ) {
-            let key = derive_proposer_key(&coinbase);
+            let key = citrate_consensus::crypto::generate_block_signing_key();
             let vk = key.verifying_key();
             let sig: ed25519_dalek::Signature = key.sign(&msg);
             // Honest signature verifies under the strict (non-malleable) check.
@@ -787,12 +842,11 @@ mod tests {
 
         #[test]
         fn fuzz_message_bitflip_fails(
-            coinbase in any::<[u8; 20]>(),
             msg in prop::collection::vec(any::<u8>(), 1..256),
             flip_idx in any::<prop::sample::Index>(),
             bit in 0u8..8,
         ) {
-            let key = derive_proposer_key(&coinbase);
+            let key = citrate_consensus::crypto::generate_block_signing_key();
             let vk = key.verifying_key();
             let sig: ed25519_dalek::Signature = key.sign(&msg);
             let mut tampered = msg.clone();
@@ -804,12 +858,11 @@ mod tests {
 
         #[test]
         fn fuzz_signature_bitflip_fails(
-            coinbase in any::<[u8; 20]>(),
             msg in prop::collection::vec(any::<u8>(), 1..256),
             flip_idx in any::<prop::sample::Index>(),
             bit in 0u8..8,
         ) {
-            let key = derive_proposer_key(&coinbase);
+            let key = citrate_consensus::crypto::generate_block_signing_key();
             let vk = key.verifying_key();
             let sig: ed25519_dalek::Signature = key.sign(&msg);
             let mut sig_bytes = sig.to_bytes();
