@@ -53,7 +53,7 @@ done
 [ -n "$TAG" ] || { echo "ERROR: --tag <binary-tag> required (e.g. srp-s4)" >&2; exit 1; }
 
 CHAIN_ID=40204
-REGISTRY_EXPECT="0x915DdE02831ebacFc57f329f60944492ebb0A095"
+REGISTRY_EXPECT="0x61d44d8a14443646b756905410be951e6ece95a6"
 EPOINT_EXPECT="0xc698feaf0ff7fdb0d60e2f620c97cb729a694975"
 SBT_EXPECT="0x4CE39F891c0A519Fa0E0De97A1DD3e3f856e0cF1"
 VAULT_EXPECT="0x61E324cFd6B7Cb106AC0AD1dF163bdFef2b74268"
@@ -132,14 +132,23 @@ fi
 # ─────────────────────────── P2: VALIDATOR SET (front-loaded) ─────────────────
 if should P2; then
   log "── P2 ValidatorRegistry + register 4 validators → G7 + G5 ────────────────"
-  log "  deploy ValidatorRegistry (CREATE2)…"
-  # DeployValidatorRegistry.s.sol (like the regenesis scripts) reads the deployer
-  # from the ENV (CEREMONY_DEPLOYER_ADDRESS/DEPLOYER_ADDRESS), not just --sender.
-  run bash -c "cd '$CONTRACTS_DIR' && DEPLOYER_ADDRESS='$DEPLOYER' CEREMONY_DEPLOYER_ADDRESS='$DEPLOYER' \
-      forge script script/DeployValidatorRegistry.s.sol \
-      --rpc-url '$RPC' --private-key '$DK' --sender '$DEPLOYER' \
-      --broadcast --slow --gas-estimate-multiplier 130 >/dev/null" \
-    || gate_fail P2 "DeployValidatorRegistry failed"
+  # IDEMPOTENT: a CREATE2 deploy to an address that already has code reverts with
+  # empty revert data, so a `--from P2` resume after a later gate failure would
+  # fail here forever — defeating the whole point of resume-without-re-wiping.
+  # The registry is uniquely determined by (salt, init code), so existing code at
+  # REGISTRY_EXPECT IS our deployment; skip and let G7 verify it.
+  if [ "$CONFIRM" -eq 1 ] && has_code "$REGISTRY_EXPECT"; then
+    log "  ValidatorRegistry already deployed at $REGISTRY_EXPECT — skipping (idempotent resume)."
+  else
+    log "  deploy ValidatorRegistry (CREATE2)…"
+    # DeployValidatorRegistry.s.sol (like the regenesis scripts) reads the deployer
+    # from the ENV (CEREMONY_DEPLOYER_ADDRESS/DEPLOYER_ADDRESS), not just --sender.
+    run bash -c "cd '$CONTRACTS_DIR' && DEPLOYER_ADDRESS='$DEPLOYER' CEREMONY_DEPLOYER_ADDRESS='$DEPLOYER' \
+        forge script script/DeployValidatorRegistry.s.sol \
+        --rpc-url '$RPC' --private-key '$DK' --sender '$DEPLOYER' \
+        --broadcast --slow --gas-estimate-multiplier 130 >/dev/null" \
+      || gate_fail P2 "DeployValidatorRegistry failed"
+  fi
   if [ "$CONFIRM" -eq 1 ]; then
     has_code "$REGISTRY_EXPECT" || gate_fail P2 "G7: ValidatorRegistry has no code at $REGISTRY_EXPECT"
   fi
