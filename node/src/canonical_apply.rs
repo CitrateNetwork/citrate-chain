@@ -2210,6 +2210,7 @@ mod tests {
             registry: REG,
             reward_minter: citrate_execution::block_rewards::REWARD_MINTER_ADDRESS,
             priority_fee_share_bps: bps,
+            block_subsidy: U256::zero(),
             staker_of,
         }
     }
@@ -3835,6 +3836,7 @@ mod tests {
             registry: REG,
             reward_minter: citrate_execution::block_rewards::REWARD_MINTER_ADDRESS,
             priority_fee_share_bps: 2500,
+            block_subsidy: U256::zero(),
             staker_of,
         };
         (policy, entries)

@@ -71,6 +71,40 @@ fn append_eip_fields(
 /// Convert a 32-byte pubkey hex (64 chars) to a 20-byte EVM address (40 chars).
 /// If the last 12 bytes are zeros (EVM-style embedded address), returns first 20 bytes.
 /// Otherwise returns first 20 bytes as well (truncated pubkey-derived address).
+/// The block context a read-only simulation (`eth_call`, `eth_estimateGas`) must
+/// execute against: the canonical chain tip's height and timestamp.
+///
+/// CBF-S1 WP-2 — before this, both handlers built their simulation block with a
+/// bare `BlockBuilder::new()`, so every `eth_call` on the network executed with
+/// `block.number == 0` and `block.timestamp == 0`. Any contract view reading
+/// either opcode returned nonsense at every block tag. Live proof on 40204:
+/// `ValidatorRegistry.currentEpoch()` (`block.number / 1000`) returned 0 at
+/// `latest`, `138000`, `100000`, `50000` and `2000`, while the pure
+/// `epochOf(138235)` correctly returned 138 — so the app could not compute a
+/// validator's activation epoch or any countdown at all.
+///
+/// It survived so long because it is read-path only: `ExecutionContext::new`
+/// uses the real `block.header.height` on the write path, so a wrong simulation
+/// height never diverged state.
+///
+/// Falls back to `(0, 0)` — the old behavior — only if the tip is unreadable,
+/// which is also the state of a node that has not yet applied a block.
+fn simulation_block_context(storage: &Arc<StorageManager>) -> (u64, u64) {
+    let height = match storage.blocks.get_latest_height() {
+        Ok(h) => h,
+        Err(_) => return (0, 0),
+    };
+    let timestamp = storage
+        .blocks
+        .get_block_by_height(height)
+        .ok()
+        .flatten()
+        .and_then(|hash| storage.blocks.get_block(&hash).ok().flatten())
+        .map(|b| b.header.timestamp)
+        .unwrap_or(0);
+    (height, timestamp)
+}
+
 fn pubkey_hex_to_evm_address(hex_str: &str) -> String {
     if hex_str.len() == 64 && hex_str[40..].chars().all(|c| c == '0') {
         // EVM address embedded in first 20 bytes
@@ -112,7 +146,23 @@ fn eth_block_json(block: &crate::types::response::BlockResponse, transactions: V
         "difficulty": "0x0",
         "totalDifficulty": "0x0",
         "transactions": transactions,
-        "miner": pubkey_hex_to_evm_address(&block.proposer_pubkey),
+        // CBF-S1 WP-3 — `miner` is the block's COINBASE (the registered staker
+        // EOA that receives the reward), not the proposer key.
+        //
+        // It previously ran the 32-byte ed25519 `proposer_pubkey` through
+        // `pubkey_hex_to_evm_address`, which simply TRUNCATES to the first 20
+        // bytes when the value isn't an embedded EVM address. On 40204 that
+        // published `0x25b78e08309e0d4e0a4472512786ca7e1dac6e6a` — the first 20
+        // bytes of pubkey `0x25b78e08…8ad9` — as the miner of every block. That
+        // is not an address: nobody controls it, it holds no balance, and it is
+        // not the account that earned the block. Explorers attributed every
+        // block to a phantom account, and the app could not count "blocks I
+        // proposed" by wallet address.
+        "miner": format!("0x{}", block.coinbase),
+        // The consensus identity that signed the block, exposed separately
+        // because it is a key, not an account. This is the value that registers
+        // in the ValidatorRegistry and the one `validatorInfo(pubkey)` is keyed by.
+        "proposerPubkey": format!("0x{}", block.proposer_pubkey),
         "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
         "nonce": "0x0000000000000000",
         "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
@@ -797,6 +847,7 @@ pub fn register_eth_methods(
 
     // eth_call - Execute call without creating transaction
     let executor_call = executor.clone();
+    let storage_call = storage.clone();
     io_handler.add_sync_method("eth_call", move |params: Params| {
         // WP-I.4: eth_call costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
@@ -899,9 +950,13 @@ pub fn register_eth_methods(
             1
         };
 
-        // Build a lightweight block context
+        // Build the simulation block context AT THE CANONICAL TIP (CBF-S1 WP-2),
+        // so `block.number` / `block.timestamp` are real inside the EVM.
+        let (sim_height, sim_timestamp) = simulation_block_context(&storage_call);
         let blk = citrate_consensus::types::BlockBuilder::new()
             .base_fee_per_gas(1_000_000_000)
+            .height(sim_height)
+            .timestamp(sim_timestamp)
             .build_unhashed();
 
         // For eth_call, use the sender's current nonce so execution doesn't fail
@@ -968,6 +1023,7 @@ pub fn register_eth_methods(
 
     // eth_estimateGas - Estimate gas for transaction by dry-running execution
     let executor_estimate = executor.clone();
+    let storage_estimate = storage.clone();
     io_handler.add_sync_method("eth_estimateGas", move |params: Params| {
         // WP-I.4: eth_estimateGas costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
@@ -1092,12 +1148,15 @@ pub fn register_eth_methods(
             None
         };
 
-        // Build a lightweight block context for execution
+        // Build the simulation block context AT THE CANONICAL TIP (CBF-S1 WP-2).
+        // The previous wall-clock timestamp + implicit height 0 meant a gas
+        // estimate could take a different branch than the real transaction will
+        // (any `block.number`-dependent path), under-estimating and stranding the
+        // user's tx out-of-gas.
+        let (sim_height, sim_timestamp) = simulation_block_context(&storage_estimate);
         let blk = citrate_consensus::types::BlockBuilder::new()
-            .timestamp(std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0))
+            .height(sim_height)
+            .timestamp(sim_timestamp)
             .base_fee_per_gas(1_000_000_000)
             .build_unhashed();
 

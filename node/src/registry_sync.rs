@@ -275,6 +275,14 @@ impl RegistrySync {
             .await?;
         let reward_minter = br::decode_address_word(&minter_ret)?;
 
+        // CBF-S1 / ADR-4: the flat per-block issuance, read from the SAME
+        // finalized snapshot as every other policy field so producer and
+        // receiver settle byte-identically for the whole epoch.
+        let subsidy_ret = self
+            .view_call(br::BLOCK_SUBSIDY_SELECTOR.to_vec(), snapshot_height)
+            .await?;
+        let block_subsidy = br::decode_u256_word(&subsidy_ret)?;
+
         let mut staker_of = std::collections::HashMap::with_capacity(entries.len());
         for (pubkey, _stake) in entries {
             let mut calldata = br::VALIDATOR_INFO_SELECTOR.to_vec();
@@ -291,6 +299,7 @@ impl RegistrySync {
             registry: self.registry,
             reward_minter,
             priority_fee_share_bps,
+            block_subsidy,
             staker_of,
         })
     }
@@ -396,21 +405,32 @@ impl RegistrySync {
 
 /// Durable snapshot codec version. Bump on any layout change; `decode_reward_snapshot`
 /// rejects an unknown version so a format change can never be silently misread.
-const REWARD_SNAPSHOT_VERSION: u8 = 1;
+/// v2 (CBF-S1 / ADR-4) added the 32-byte `block_subsidy` word. A v1 blob written
+/// by an older binary is REJECTED, not reinterpreted — the boot path then falls
+/// back to a live recompute, which reads the subsidy from the registry anyway.
+/// Silently accepting v1 would leave `block_subsidy` at zero on a rehydrating
+/// node while the rest of the fleet vested the subsidy: a state-root fork.
+const REWARD_SNAPSHOT_VERSION: u8 = 2;
+
+/// Fixed-size prefix of a v2 snapshot blob, before the variable validator array.
+/// Named so the encoder, the length checks, and the array offset can never drift
+/// apart again (v1 hard-coded `93` in four places).
+const REWARD_SNAPSHOT_HEADER_LEN: usize = 125;
 
 /// Serialize the materialized epoch snapshot — the `EpochRewardPolicy` plus the
 /// active-set (pubkey, effective stake, registered staker) and minStake needed to
 /// rebuild the proposer selector — into a self-describing, length-checked blob.
 /// Layout (all integers big-endian):
-///   [0]      version (=1)
-///   [1..9]   epoch u64
-///   [9..17]  snapshot_height u64
-///   [17..25] activation_height u64
-///   [25..45] registry [20]
-///   [45..65] reward_minter [20]
-///   [65..73] priority_fee_share_bps u64
-///   [73..89] min_stake u128
-///   [89..93] validator count u32
+///   [0]       version (=2)
+///   [1..9]    epoch u64
+///   [9..17]   snapshot_height u64
+///   [17..25]  activation_height u64
+///   [25..45]  registry [20]
+///   [45..65]  reward_minter [20]
+///   [65..73]  priority_fee_share_bps u64
+///   [73..105] block_subsidy u256          (v2, CBF-S1)
+///   [105..121] min_stake u128
+///   [121..125] validator count u32
 ///   then count * (pubkey[32] ‖ stake u128 ‖ staker[20]) = 68 bytes each
 ///
 /// `pub(crate)` so the node's multi-node integration harness (canonical_apply
@@ -421,7 +441,7 @@ pub(crate) fn encode_reward_snapshot(
     entries: &[([u8; 32], u128)],
     min_stake: u128,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(93 + entries.len() * 68);
+    let mut buf = Vec::with_capacity(REWARD_SNAPSHOT_HEADER_LEN + entries.len() * 68);
     buf.push(REWARD_SNAPSHOT_VERSION);
     buf.extend_from_slice(&policy.epoch.to_be_bytes());
     buf.extend_from_slice(&policy.snapshot_height.to_be_bytes());
@@ -429,6 +449,9 @@ pub(crate) fn encode_reward_snapshot(
     buf.extend_from_slice(&policy.registry);
     buf.extend_from_slice(&policy.reward_minter);
     buf.extend_from_slice(&policy.priority_fee_share_bps.to_be_bytes());
+    let mut subsidy_be = [0u8; 32];
+    policy.block_subsidy.to_big_endian(&mut subsidy_be);
+    buf.extend_from_slice(&subsidy_be);
     buf.extend_from_slice(&min_stake.to_be_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_be_bytes());
     for (pubkey, stake) in entries {
@@ -456,7 +479,7 @@ fn decode_reward_snapshot(
     ),
     String,
 > {
-    if buf.len() < 93 {
+    if buf.len() < REWARD_SNAPSHOT_HEADER_LEN {
         return Err(format!("reward snapshot too short ({} bytes)", buf.len()));
     }
     if buf[0] != REWARD_SNAPSHOT_VERSION {
@@ -480,13 +503,16 @@ fn decode_reward_snapshot(
     let mut reward_minter = [0u8; 20];
     reward_minter.copy_from_slice(&buf[45..65]);
     let priority_fee_share_bps = u64_at(65);
-    let min_stake = u128_at(73);
+    // v2 (CBF-S1): full-width subsidy word — the contract ceiling is 1e21, far
+    // above u64, so this must not be narrowed.
+    let block_subsidy = primitive_types::U256::from_big_endian(&buf[73..105]);
+    let min_stake = u128_at(105);
     let count = {
         let mut b = [0u8; 4];
-        b.copy_from_slice(&buf[89..93]);
+        b.copy_from_slice(&buf[121..REWARD_SNAPSHOT_HEADER_LEN]);
         u32::from_be_bytes(b) as usize
     };
-    let need = 93usize
+    let need = REWARD_SNAPSHOT_HEADER_LEN
         .checked_add(count.checked_mul(68).ok_or("validator count overflow")?)
         .ok_or("snapshot size overflow")?;
     if buf.len() < need {
@@ -497,7 +523,7 @@ fn decode_reward_snapshot(
     }
     let mut entries = Vec::with_capacity(count);
     let mut staker_of = std::collections::HashMap::with_capacity(count);
-    let mut off = 93;
+    let mut off = REWARD_SNAPSHOT_HEADER_LEN;
     for _ in 0..count {
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(&buf[off..off + 32]);
@@ -517,6 +543,7 @@ fn decode_reward_snapshot(
         registry,
         reward_minter,
         priority_fee_share_bps,
+        block_subsidy,
         staker_of,
     };
     Ok((policy, entries, min_stake))
@@ -569,6 +596,7 @@ mod tests {
             registry: [0x99u8; 20],
             reward_minter: [0x50u8; 20],
             priority_fee_share_bps: 2500,
+            block_subsidy: U256::zero(),
             staker_of,
         };
         let entries = vec![(pk_a, 40_000u128), (pk_b, 32_000u128)];
@@ -593,6 +621,61 @@ mod tests {
         let mut bad = blob.clone();
         bad[0] = 0xFF;
         assert!(decode_reward_snapshot(&bad).is_err());
+    }
+
+    /// CBF-S1 / ADR-4: the subsidy must survive the durable snapshot round-trip
+    /// at FULL width. If it were narrowed or dropped, a node that rehydrated from
+    /// disk would vest a different amount than the fleet computing it live — a
+    /// state-root fork, which is exactly the class of bug SRP-S4 chased.
+    #[test]
+    fn test_reward_snapshot_roundtrip_preserves_block_subsidy() {
+        use citrate_execution::block_rewards::EpochRewardPolicy;
+        let pk = [0xC3u8; 32];
+        let mut staker_of = std::collections::HashMap::new();
+        staker_of.insert(pk, [0x33u8; 20]);
+        // The contract ceiling, well above u64::MAX — proves no narrowing.
+        let subsidy = U256::from(1_000u64) * U256::exp10(18);
+        assert!(subsidy > U256::from(u64::MAX));
+
+        let policy = EpochRewardPolicy {
+            epoch: 7,
+            snapshot_height: 6800,
+            activation_height: 800,
+            registry: [0x99u8; 20],
+            reward_minter: [0x50u8; 20],
+            priority_fee_share_bps: 10_000,
+            block_subsidy: subsidy,
+            staker_of,
+        };
+        let entries = vec![(pk, 32_000u128)];
+        let blob = encode_reward_snapshot(&policy, &entries, 32_000u128);
+        let (p2, e2, ms2) = decode_reward_snapshot(&blob).expect("decode");
+
+        assert_eq!(p2.block_subsidy, subsidy, "subsidy must round-trip exactly");
+        // Every neighbouring field must still land at the right offset after the
+        // v2 header grew by 32 bytes.
+        assert_eq!(p2.epoch, 7);
+        assert_eq!(p2.snapshot_height, 6800);
+        assert_eq!(p2.priority_fee_share_bps, 10_000);
+        assert_eq!(ms2, 32_000u128);
+        assert_eq!(e2, vec![(pk, 32_000u128)]);
+        assert_eq!(p2.staker_of.get(&pk).copied(), Some([0x33u8; 20]));
+    }
+
+    /// A v1 blob (written before the subsidy existed) must be REJECTED, not
+    /// reinterpreted. Accepting it would silently leave `block_subsidy` at zero on
+    /// the rehydrating node while the rest of the fleet vests the subsidy.
+    /// Rejection sends the boot path to a live recompute, which reads the real
+    /// value from the registry.
+    #[test]
+    fn test_v1_reward_snapshot_is_rejected_not_reinterpreted() {
+        // A structurally valid v1 blob: 93-byte header, zero validators.
+        let mut v1 = vec![0u8; 93];
+        v1[0] = 1; // version 1
+        assert!(
+            decode_reward_snapshot(&v1).is_err(),
+            "a v1 snapshot must not decode under v2 — silent acceptance is a fork"
+        );
     }
 
     #[test]
@@ -761,6 +844,7 @@ mod tests {
             registry: REG,
             reward_minter: REWARD_MINTER_ADDRESS,
             priority_fee_share_bps: SHARE_BPS,
+            block_subsidy: U256::zero(),
             staker_of,
         }
     }

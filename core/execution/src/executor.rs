@@ -1432,8 +1432,18 @@ impl Executor {
         }
 
         // (3d) priority pool (rejects any included sub-base-fee tx).
+        // (3d) priority pool (rejects any included sub-base-fee tx) + the flat
+        // block subsidy. CBF-S1 / ADR-4: the subsidy is the term that makes a
+        // producing validator earn on a chain with no fee volume. Previously only
+        // the fee share was vested, so an idle chain took the zero short-circuit
+        // below on EVERY block and `creditReward` was never called — four staked
+        // validators on 40204 had earned 0.00207 SALT in total.
+        //
+        // Still short-circuits when the TOTAL is zero, which is the correct
+        // behavior for a chain that has governed `blockSubsidy` down to 0 and has
+        // no fees: nothing to vest, no system-call, no state change.
         let pool = br::compute_priority_pool(txs, receipts, base_fee_per_gas)?;
-        let share = br::vested_share(pool, policy.priority_fee_share_bps);
+        let share = br::total_vested(pool, policy.priority_fee_share_bps, policy.block_subsidy);
         if share.is_zero() {
             return Ok(());
         }

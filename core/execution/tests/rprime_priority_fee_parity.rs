@@ -109,6 +109,7 @@ fn inject_policy(executor: &Executor, activation_height: u64) {
         registry: REGISTRY,
         reward_minter: REWARD_MINTER_ADDRESS,
         priority_fee_share_bps: SHARE_BPS,
+        block_subsidy: U256::zero(),
         staker_of,
     };
     *executor.reward_policy_handle().write() = Some(policy);
@@ -438,6 +439,7 @@ async fn guarded_settle_reverts_all_credits_on_error() {
         registry: REGISTRY,
         reward_minter: REWARD_MINTER_ADDRESS,
         priority_fee_share_bps: SHARE_BPS,
+        block_subsidy: U256::zero(),
         staker_of: empty_staker, // proposer absent → reject
     });
     let root_before = e.calculate_state_root();
