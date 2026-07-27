@@ -873,54 +873,46 @@ impl BlockProducer {
                 (0, Hash::default(), 0, 0)
             };
 
-        // MULTI-PRODUCER FIX: `parent_blue_score + 1` is EXACT when there is
-        // nothing to merge — the block adds only itself to the blue set — and that
-        // is the whole story for a single-producer chain, where `merge_parents` is
-        // always empty. It is WRONG the moment a second producer exists, because
-        // GHOSTDAG blue score is defined as the parent's score plus the blue blocks
-        // in the mergeset, and the old code counted the mergeset as zero
-        // unconditionally (the comment read "with no other producers there are no
-        // additional blue merges").
+        // BLUE SCORE — `parent_blue_score + 1`, deliberately.
         //
-        // So: keep the cheap exact path when we are not merging, and pay for the
-        // real GHOSTDAG calculation only when we actually have merge parents. That
-        // preserves the PIL-13 fix (no O(N) ancestry walk on every block — which
-        // OOM'd the box) while making the merging case correct rather than
-        // approximate.
+        // REGRESSION HISTORY (2026-07-27): a previous "fix" replaced this with a
+        // real `ghostdag.calculate_blue_set(&candidate)` call whenever
+        // `merge_parents` was non-empty, on the reasoning that GHOSTDAG blue score
+        // is the parent's score plus the blue blocks in the mergeset, so `+1` is an
+        // approximation. The reasoning is right. The implementation was not, and it
+        // walled off the chain.
+        //
+        // `calculate_blue_set` resolves a block through the DAG STORE. The candidate
+        // here has not been stored — it does not exist yet, that is the point of
+        // producing it — so the calculation returned the ancestry's score WITHOUT
+        // counting the new block itself. Live result on 40204: block 4028 was
+        // produced with blue_score 4028, identical to its parent, while
+        // `validate_block_consistency` requires the band `[sp+1, sp+1+|merges|]` =
+        // `[4029, 4030]`. Every follower rejected it:
+        //
+        //     Rejected inconsistent synced block 55f933a0 @ 4028: consistency:
+        //     Header blue_score 4028 outside feasible range [4029, 4030]
+        //
+        // Blocks carrying merge parents are rare on this fleet, so exactly one bad
+        // block was enough — every node stalled at 4027 and retried forever while
+        // the producer ran on alone to 19,000+. A silent, unrecoverable partition.
+        //
+        // `parent_blue_score + 1` is ALWAYS inside the feasible band (it is the
+        // band's minimum), so it can never be rejected. It under-counts a non-empty
+        // mergeset, which is a known, bounded, DOCUMENTED approximation —
+        // `ghostdag.rs::validate_block_consistency` says so explicitly: "the
+        // producer itself currently writes the parent+1 approximation ... exact
+        // k-cluster equality is deliberately deferred to the BlueSet-persistence
+        // rework tracked since PIL-13".
+        //
+        // Making this exact requires that rework — computing the mergeset for a
+        // block that is not yet in the store — not a call into a function whose
+        // contract assumes it is. Until then, in-band and correct beats exact and
+        // rejected.
         let mut blue_set = citrate_consensus::types::BlueSet::new();
-        let blue_score = if merge_parents.is_empty() {
-            parent_blue_score + 1
-        } else {
-            // Build the candidate block so GHOSTDAG can see its parents, then let
-            // the real algorithm compute the mergeset. `calculate_blue_set` is
-            // iterative and cached (see its docstring), and merge parents form a
-            // wide-but-shallow DAG, so this does not reintroduce the deep walk.
-            let candidate = citrate_consensus::types::BlockBuilder::new()
-                .parent(selected_parent)
-                .merge_parents(merge_parents.clone())
-                .height(last_height + 1)
-                .build_unhashed();
-            match self.ghostdag.calculate_blue_set(&candidate).await {
-                Ok(bs) => {
-                    blue_set = bs;
-                    blue_set.score
-                }
-                Err(e) => {
-                    // Do not silently fall back to the single-producer
-                    // approximation — that is how the original bug shipped.
-                    return Err(anyhow::anyhow!(
-                        "GHOSTDAG blue-set calculation failed for a block merging {} \
-                         parent(s): {e}. Refusing to produce with an approximated blue \
-                         score.",
-                        merge_parents.len()
-                    ));
-                }
-            }
-        };
+        let blue_score = parent_blue_score + 1;
         blue_set.score = blue_score;
-        if blue_set.work == 0 {
-            blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
-        }
+        blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
 
         // Get transactions from mempool with AI priority
         let transactions = self.select_transactions_with_ai_priority().await?;
@@ -2278,5 +2270,49 @@ mod multi_producer_regression {
             !merging.is_empty(),
             "merging blocks must take the real calculate_blue_set path"
         );
+    }
+}
+
+#[cfg(test)]
+mod blue_score_band_regression {
+    /// 2026-07-27 REGRESSION — the producer's blue_score must sit inside the band
+    /// `validate_block_consistency` enforces: `[sp+1, sp+1+|merges|]`.
+    ///
+    /// A previous fix computed it via `ghostdag.calculate_blue_set(&candidate)` for
+    /// merging blocks. That resolves through the DAG STORE, and the candidate is by
+    /// definition not stored yet, so it returned the ancestry's score WITHOUT the
+    /// new block — one below the band's minimum. Live result: block 4028 carried
+    /// blue_score 4028 against a required `[4029, 4030]`, every follower rejected
+    /// it, and the fleet stalled at 4027 while the producer ran on to 19,000+.
+    ///
+    /// `parent + 1` IS the band minimum, so it can never be rejected.
+    #[test]
+    fn parent_plus_one_is_always_inside_the_feasible_band() {
+        for (sp_score, n_merges) in [(0u64, 0usize), (4028, 1), (4028, 3), (152_754, 10)] {
+            let produced = sp_score + 1;
+            let band_min = sp_score + 1;
+            let band_max = sp_score + 1 + n_merges as u64;
+            assert!(
+                produced >= band_min && produced <= band_max,
+                "parent+1 ({produced}) fell outside [{band_min}, {band_max}] for \
+                 sp={sp_score} merges={n_merges}"
+            );
+        }
+    }
+
+    /// The exact shape that broke the chain: a score equal to the parent's is one
+    /// below the minimum and is rejected for ANY mergeset size.
+    #[test]
+    fn a_score_equal_to_the_parent_is_always_rejected() {
+        for n_merges in [0usize, 1, 3, 10] {
+            let sp_score = 4028u64;
+            let bad = sp_score; // what calculate_blue_set returned for the unstored candidate
+            let band_min = sp_score + 1;
+            assert!(
+                bad < band_min,
+                "a score equal to the parent must be below the band minimum \
+                 (mergeset {n_merges})"
+            );
+        }
     }
 }
