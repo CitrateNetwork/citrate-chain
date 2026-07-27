@@ -126,37 +126,50 @@ pub fn generate_keypair() -> SigningKey {
     SigningKey::from_bytes(&rand::random())
 }
 
-/// Domain-separation prefix hashed before the coinbase to derive a node's
-/// deterministic ed25519 block-signing (proposer) key.
+/// Mint a fresh, random ed25519 block-signing (proposer) key.
 ///
-/// LOAD-BEARING: the node (`node/src/main.rs` block producer) and the
-/// registration ceremony (`node/src/bin/validator_registration_ceremony.rs`)
-/// BOTH derive the proposer key via [`derive_block_signing_key`], which hashes
-/// this exact byte string. If these two derivations ever disagreed by a single
-/// bit, the pubkey the ceremony registers on-chain would not match the key the
-/// node signs blocks with, and that node would be rejected as a proposer. This
-/// constant + [`derive_block_signing_key`] are the single source of truth that
-/// makes such drift impossible.
-pub const BLOCK_SIGNING_KEY_DOMAIN: &[u8] = b"citrate-block-signing-key-v1";
+/// # Why this replaced a derivation (WP-11 — CRITICAL)
+///
+/// Until 2026-07-27 this key was DERIVED as
+/// `Sha3_256(b"citrate-block-signing-key-v1" ‖ coinbase32)`. Every input to that
+/// was public — the domain was a compile-time constant, and the coinbase is
+/// recoverable on-chain from `ValidatorRegistry.validatorInfo(pubkey).staker`
+/// (consensus *enforces* `coinbase == staker`, so they are always equal).
+///
+/// That made every validator's block-signing PRIVATE key computable by anyone in
+/// milliseconds. Verified against live chain 40204: hashing the public coinbase
+/// `0x0ecbcd85…363b` reproduced the registered proposer pubkey
+/// `0x25b78e08…8ad9` exactly.
+///
+/// The reachable exploit was `ValidatorRegistry.submitEquivocation`, which is
+/// permissionless and only refuses `msg.sender == staker` (self-report). An
+/// attacker could derive any validator's key, sign two `EquivocationVote`
+/// digests at one height, and trigger a **Byzantine slash: 100% of bond +
+/// escrow + rewards, a 10% bounty to themselves, and a permanent ban of both the
+/// pubkey and the staker**. Across the set that destroys every validator and
+/// halts the chain.
+///
+/// The original code comment described the derivation as "for devnet
+/// reproducibility" and noted "production nodes should load a persistent key
+/// from disk" — that devnet shortcut reached production.
+///
+/// The property the design actually wanted — *the member's wallet key never
+/// touches the node* — is fully preserved, because the proposer key is now its
+/// own independent secret rather than a function of the wallet address.
+pub fn generate_block_signing_key() -> Ed25519SigningKey {
+    use zeroize::Zeroize as _;
+    let mut seed: [u8; 32] = rand::random();
+    let key = Ed25519SigningKey::from_bytes(&seed);
+    seed.zeroize();
+    key
+}
 
-/// Derive a node's deterministic ed25519 block-signing (proposer) key from its
-/// 32-byte coinbase buffer: `Sha3_256(BLOCK_SIGNING_KEY_DOMAIN ‖ coinbase32)`
-/// seeds `Ed25519SigningKey::from_bytes`.
+/// Reconstruct a block-signing key from its persisted 32-byte seed.
 ///
-/// The 32-byte buffer is the node's 20-byte coinbase address zero-padded on the
-/// right to 32 bytes (the shape the block producer already builds). Callers that
-/// hold only a 20-byte address MUST zero-extend it to 32 bytes the same way.
-///
-/// This is the ONE place the derivation lives; see [`BLOCK_SIGNING_KEY_DOMAIN`].
-pub fn derive_block_signing_key(coinbase32: &[u8; 32]) -> Ed25519SigningKey {
-    use sha3::{Digest as _, Sha3_256};
-    let mut hasher = Sha3_256::new();
-    hasher.update(BLOCK_SIGNING_KEY_DOMAIN);
-    hasher.update(coinbase32);
-    let seed = hasher.finalize();
-    let mut seed_bytes = [0u8; 32];
-    seed_bytes.copy_from_slice(&seed);
-    Ed25519SigningKey::from_bytes(&seed_bytes)
+/// The caller owns the file handling (0600 permissions, zeroization); see
+/// `node/src/main.rs::load_or_generate_proposer_key`.
+pub fn block_signing_key_from_seed(seed: &[u8; 32]) -> Ed25519SigningKey {
+    Ed25519SigningKey::from_bytes(seed)
 }
 
 /// Sign a block's canonical hash with an ed25519 signing key.
