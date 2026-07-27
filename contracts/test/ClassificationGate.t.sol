@@ -54,9 +54,14 @@ contract ClassificationGateTest is Test {
         gate = _deploy(ROOT, ITAR, NO_FN_RULE);
     }
 
+    uint256 private _clearTick;
+
     function _clear(address who, ClassificationRegistry.ClassLevel level, bool foreignNational) internal {
         // Timestamps must strictly increase per subject (HistoryMonotonic).
-        vm.warp(block.timestamp + 1);
+        // Warped to an absolute value, not `block.timestamp + 1`: solc caches
+        // `block.timestamp` within a call frame, so two relative warps in one
+        // test would silently land on the same instant.
+        vm.warp(1_700_000_000 + ++_clearTick);
         registry.setClearance(_subject(who), level, foreignNational, hex"5163");
     }
 
