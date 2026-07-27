@@ -163,9 +163,11 @@ if should P2; then
   trap 'rm -rf -- "$PROPOSER_KEY_DIR"' EXIT INT TERM
 
   NODE_ARGS=()
+  COINBASES=()
   for i in 1 2 3 4; do
     CB="$(get_env "VALIDATOR_STAKER_${i}_ADDRESS")"
     [ -n "$CB" ] || gate_fail P2 "VALIDATOR_STAKER_${i}_ADDRESS missing in $ENV_TESTNET"
+    COINBASES+=( "$CB" )
     NODE_IP="${FLEET_IPS[$((i-1))]}"
     PK_FILE="$PROPOSER_KEY_DIR/node${i}-proposer.key"
     if [ "$CONFIRM" -eq 1 ]; then
@@ -191,6 +193,51 @@ if should P2; then
   if [ "$CONFIRM" -eq 1 ]; then
     AC="$(cast_read call "$REGISTRY_EXPECT" 'activeCount()(uint256)')"
     [ "$AC" = "4" ] || gate_fail P2 "G5: activeCount()=$AC != 4"
+
+    # ── G5b: KEY↔REGISTRATION BINDING ────────────────────────────────────────
+    #
+    # activeCount()==4 proves four validators exist. It does NOT prove that
+    # validator i's REGISTERED pubkey is the key node i actually holds. If those
+    # desync — wrong FLEET_IPS order, a key scp'd from the wrong host, a node
+    # restarted and re-minted after its key was copied — every gate above still
+    # passes, the validator is admitted to the active set, and it can NEVER sign
+    # a block. It looks healthy and simply never produces. That is precisely the
+    # class of silent failure that cost us the 2026-07-27 halt, so assert it.
+    #
+    # The authority here is the pubkey THE NODE ITSELF reports at startup (from
+    # its own proposer.key), not the one the ceremony used — otherwise we would
+    # only be checking the ceremony against itself.
+    log "  G5b: verifying key↔registration binding per node…"
+    for i in 1 2 3 4; do
+      NODE_IP="${FLEET_IPS[$((i-1))]}"
+      CB="${COINBASES[$((i-1))]}"
+
+      # The node logs `... proposer identity ... (pubkey <64 hex>)` on every boot.
+      NODE_PK="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "root@${NODE_IP}" \
+        "journalctl -u citrate-node --no-pager 2>/dev/null | grep -oE 'proposer identity.*\(pubkey [0-9a-f]{64}\)' | tail -1 | grep -oE '[0-9a-f]{64}'" 2>/dev/null)"
+      [ -n "$NODE_PK" ] || gate_fail P2 \
+        "G5b: node ${NODE_IP} never logged a proposer identity — cannot prove what key it signs with"
+
+      # 1. The key the node holds must be the one that got registered.
+      REG_STAKER="$(cast_read call "$REGISTRY_EXPECT" 'validatorInfo(bytes32)(address,uint256,uint256,uint256,uint256,uint64,uint64,uint64,uint8,uint256)' "0x${NODE_PK}" | head -1)"
+      [ -n "$REG_STAKER" ] || gate_fail P2 \
+        "G5b: node ${NODE_IP} pubkey 0x${NODE_PK} is NOT registered — this node can never propose"
+
+      # 2. …and it must be bound to THIS node's coinbase, not another node's.
+      #    settle_block_rewards rejects any block whose coinbase != registered
+      #    staker, so a crossed binding also breaks reward settlement.
+      if [ "$(printf '%s' "$REG_STAKER" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$CB" | tr 'A-Z' 'a-z')" ]; then
+        gate_fail P2 "G5b: node ${NODE_IP} (coinbase ${CB}) registered against staker ${REG_STAKER} — keys are CROSSED between nodes; check FLEET_IPS ordering"
+      fi
+
+      # 3. …and it must actually be in the active set for this epoch.
+      IS_ACTIVE="$(cast_read call "$REGISTRY_EXPECT" 'isActive(bytes32)(bool)' "0x${NODE_PK}")"
+      [ "$IS_ACTIVE" = "true" ] || gate_fail P2 \
+        "G5b: node ${NODE_IP} pubkey 0x${NODE_PK} is registered but not active"
+
+      log "    node${i} ${NODE_IP}: pubkey 0x${NODE_PK:0:16}… ↔ coinbase ${CB} ✓"
+    done
+    log "  G5b PASS: all 4 nodes sign with the key registered to their own coinbase."
   fi
   log "  G5 PASS: 4 validators registered, activeCount()==4."
 fi
