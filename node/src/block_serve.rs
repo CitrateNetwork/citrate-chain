@@ -18,6 +18,7 @@
 
 use citrate_consensus::types::{Block, BlockHeader, Hash};
 use citrate_storage::StorageManager;
+use tracing::warn;
 
 /// Protocol maximum headers returned per `GetHeaders` request.
 pub const MAX_HEADERS_PER_REQUEST: u32 = 2048;
@@ -37,10 +38,15 @@ pub const MAX_BLOCKS_PER_REQUEST: u32 = 512;
 /// `NetworkMessage::Blocks` enum/vec wrapper (~12 B) and Noise's 16-byte auth
 /// tag: 60 KiB payload + wrapper + tag < 65519 usable plaintext bytes.
 ///
-/// NOTE: the serve ALWAYS emits its first height-group for forward progress, so
-/// a SINGLE block larger than this still can't be served over Noise — no such
-/// block exists on chain 40204 today (max observed ~13.6 KiB). Full robustness
-/// for arbitrarily large messages needs Noise-layer chunking (follow-up).
+/// NOTE: this is a SOFT budget. `serve_blocks` deliberately exceeds it for the
+/// first height-group above the anchor (the SYNC-S2 forward-progress guarantee)
+/// and logs a warning when it does — a response that carries nothing new wedges
+/// the requester permanently, which is strictly worse than an oversized one.
+///
+/// The "no block on 40204 exceeds this" assumption that used to live here was
+/// WRONG and is what wedged every cold sync: block `79e46ed2` at height 245
+/// carries 8 contract-deploy transactions and serializes to **60,515 bytes**.
+/// Genuinely oversized single groups still need Noise-layer chunking (follow-up).
 pub const MAX_RESPONSE_BYTES: u64 = 60 * 1024;
 
 /// Resolve the first height to serve for a request anchor.
@@ -149,6 +155,32 @@ pub fn serve_headers(storage: &StorageManager, from: &Hash, count: u32) -> Vec<B
 /// already holds all of a block's parents before that block. Never split a
 /// height across responses (a later batch's child could reference a sibling
 /// this batch left behind) and stop at the first height gap.
+///
+/// SYNC-S2 (cold-sync wedge, 2026-07-27 — why gate G4 never passed). Two
+/// interacting defects made a response carry NOTHING the requester could use,
+/// forever. Reproduced against a real fleet store at the exact wedge height:
+///
+///   height 244 group: 1 block  (7c05130a,   674 B) — the requester's OWN anchor
+///   height 245 group: 2 blocks (29883fab,   706 B  +  79e46ed2, 60,515 B, 8 txs)
+///
+/// 1. `resolve_start_inclusive` makes the walk begin at the ANCHOR's height, so
+///    the first group emitted is the anchor itself — a block the requester
+///    provably already has. That consumed the "always emit the first group"
+///    forward-progress escape hatch, which was keyed on `out.is_empty()`.
+/// 2. With `out` non-empty, the height-245 group (61,221 B) was then measured
+///    against the remaining budget (61,440 − 674 = 60,766 B) and REJECTED.
+///
+/// Result: `serve_blocks` returned exactly one block — the anchor — so the
+/// requester's applied tip never moved, it re-requested the same anchor, and the
+/// server returned the same single block. Observed live on rpc-1 as
+/// "Sending 1 blocks" every 2 s while the same peer's `GetHeaders` was answered
+/// with a full 64 headers, and on the cold node as "Validated and imported 1/1
+/// blocks (height 244-244)" indefinitely.
+///
+/// Fixes, both here: never echo the requester's own anchor back, and key the
+/// forward-progress guarantee on "no group ABOVE the anchor emitted yet" rather
+/// than on `out.is_empty()`. Pinned by
+/// `cold_sync_serve_always_delivers_a_block_above_the_anchor`.
 pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Block> {
     let max_items = count.min(MAX_BLOCKS_PER_REQUEST);
     // INCLUSIVE of the anchor's height so a merge parent that is a sibling of the
@@ -176,6 +208,9 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
     let mut budget = MAX_RESPONSE_BYTES;
     let mut expected = start;
     let mut i = 0usize;
+    // Has any height-group ABOVE the anchor been emitted yet? The forward-
+    // progress guarantee keys on this (see SYNC-S2 in the fn docs).
+    let mut progressed = false;
     while i < rows.len() {
         let h = rows[i].0;
         // Heights must be contiguous from `start`: a gap means nothing further
@@ -186,27 +221,63 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
         // Gather the WHOLE sibling group at height `h`.
         let mut group: Vec<Block> = Vec::new();
         let mut group_bytes = 0u64;
+        let mut unreadable = false;
         while i < rows.len() && rows[i].0 == h {
-            if let Ok(Some(block)) = storage.blocks.get_block(&rows[i].1) {
+            let hash = rows[i].1;
+            i += 1;
+            // SYNC-S2: never echo the requester's OWN anchor back. They provably
+            // hold it — they anchored on it. Re-sending it is pure waste, and on
+            // chain 40204 it also consumed the byte budget the next height-group
+            // needed (see the wedge described in the fn docs).
+            if hash == *from {
+                continue;
+            }
+            if let Ok(Some(block)) = storage.blocks.get_block(&hash) {
                 let sz = bincode::serialized_size(&block).unwrap_or(u64::MAX);
                 group_bytes = group_bytes.saturating_add(sz);
                 group.push(block);
+            } else {
+                // A row we cannot read is a genuine gap: nothing contiguous can
+                // follow it in order, so stop rather than serve a broken tail.
+                unreadable = true;
             }
-            i += 1;
         }
-        if group.is_empty() {
-            break; // unreadable height behaves as a gap
-        }
-        // Always emit the first group (forward-progress guarantee even if a
-        // single height's siblings exceed the soft budget); otherwise stop
-        // before a group that would blow the item cap or the byte budget.
-        if !out.is_empty()
-            && ((out.len() + group.len()) as u32 > max_items || group_bytes > budget)
-        {
+        if unreadable {
             break;
         }
-        budget = budget.saturating_sub(group_bytes);
-        out.extend(group);
+        // A height whose only member was the anchor leaves an empty group. That
+        // is NOT a gap — the requester needs nothing at that height — so fall
+        // through and advance rather than breaking.
+        if !group.is_empty() {
+            // SYNC-S2 forward-progress guarantee: the first height-group ABOVE
+            // the anchor is emitted regardless of the soft byte budget, so every
+            // response carries something the requester can actually advance on.
+            // Keying this on `out.is_empty()` was the defect — with an inclusive
+            // anchor the anchor's own group had already filled `out`.
+            let first_progress = h > start && !progressed;
+            if !first_progress
+                && !out.is_empty()
+                && ((out.len() + group.len()) as u32 > max_items || group_bytes > budget)
+            {
+                break;
+            }
+            if group_bytes > MAX_RESPONSE_BYTES {
+                // Emitted anyway — forward progress beats a permanent wedge — but
+                // this is the one shape the Noise transport may still drop whole.
+                // Make it LOUD: a silent drop is indistinguishable from a stall.
+                warn!(
+                    "block-serve: height-{} group is {} bytes, over the {}-byte soft budget — \
+                     serving it anyway to guarantee sync progress, but it may exceed the Noise \
+                     per-message cap. Noise-layer chunking is the durable fix.",
+                    h, group_bytes, MAX_RESPONSE_BYTES
+                );
+            }
+            budget = budget.saturating_sub(group_bytes);
+            out.extend(group);
+            if h > start {
+                progressed = true;
+            }
+        }
         expected = h.saturating_add(1);
     }
     out
@@ -357,6 +428,92 @@ mod tests {
         assert!(headers.is_empty());
     }
 
+    /// SYNC-S2 — COLD-SYNC WEDGE (gate G4). Reproduces, to the byte, the shape
+    /// harvested from a live fleet store at the height where every fresh node
+    /// on chain 40204 stalls:
+    ///
+    ///   height H   : the requester's own anchor,  674 B
+    ///   height H+1 : 706 B canonical  +  60,515 B contract-deploy sibling
+    ///
+    /// Pre-fix, `serve_blocks` emitted the anchor first (inclusive start), which
+    /// consumed the `out.is_empty()` forward-progress escape hatch; the H+1 group
+    /// (61,221 B) was then measured against the budget MINUS the anchor
+    /// (61,440 − 674 = 60,766 B) and rejected. The response carried exactly one
+    /// block — the anchor the requester already had — so its applied tip never
+    /// moved and it re-requested the same anchor forever. Observed live as
+    /// "Sending 1 blocks" on the server and "Validated and imported 1/1 blocks
+    /// (height 244-244)" on the cold node, every 2 seconds, indefinitely.
+    ///
+    /// INVARIANT: a response anchored at H MUST contain at least one block above
+    /// H whenever the server has one. Anything less cannot advance the requester.
+    #[test]
+    fn cold_sync_serve_always_delivers_a_block_above_the_anchor() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let genesis = dag_block(1, 0, Hash::default(), vec![]);
+        let g = genesis.hash();
+        // The anchor: the cold node's applied tip, small and alone at its height.
+        let anchor = fat_dag_block(0xA1, 1, g, vec![], 674);
+        // The next height: a small canonical block plus a large deploy sibling,
+        // together just over the budget that remains once the anchor is counted.
+        let next = fat_dag_block(0xC2, 2, anchor.hash(), vec![], 706);
+        let deploy = fat_dag_block(0xD2, 2, anchor.hash(), vec![], 60_515);
+        for b in [&genesis, &anchor, &next, &deploy] {
+            storage.blocks.put_block(b).expect("put_block");
+        }
+
+        let served = serve_blocks(&storage, &anchor.hash(), 32);
+        let heights: Vec<u64> = served.iter().map(|b| b.header.height).collect();
+        assert!(
+            heights.iter().any(|h| *h > 1),
+            "SYNC-S2 INVARIANT: the response must carry at least one block ABOVE the \
+             anchor, else the requester can never advance and re-requests the same \
+             anchor forever (the live cold-sync wedge). Got heights {heights:?}"
+        );
+        // And the anchor itself must not be echoed back — the requester has it,
+        // and on 40204 that wasted 674 B of the budget the next group needed.
+        assert!(
+            !served.iter().any(|b| b.hash() == anchor.hash()),
+            "the requester's own anchor must not be re-sent"
+        );
+    }
+
+    /// SYNC-S2, second half: the forward-progress guarantee must key on "no group
+    /// ABOVE the anchor emitted yet", NOT on `out.is_empty()`. Here the anchor
+    /// height carries a genuine SIBLING, so `out` is non-empty by the time the
+    /// H+1 group is weighed even after the anchor itself is excluded — and that
+    /// group alone exceeds the remaining budget. Keyed on `out.is_empty()` the
+    /// serve stalls again; keyed on progress it delivers.
+    #[test]
+    fn forward_progress_survives_a_nonempty_anchor_height_group() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let genesis = dag_block(1, 0, Hash::default(), vec![]);
+        let g = genesis.hash();
+        let anchor = fat_dag_block(0xA1, 1, g, vec![], 700);
+        let sibling = fat_dag_block(0xB1, 1, g, vec![], 700); // merge-parent sibling
+        // Selects the anchor, merges the sibling — and is itself oversized.
+        let big = fat_dag_block(0xC2, 2, anchor.hash(), vec![sibling.hash()], 61_000);
+        for b in [&genesis, &anchor, &sibling, &big] {
+            storage.blocks.put_block(b).expect("put_block");
+        }
+
+        let served = serve_blocks(&storage, &anchor.hash(), 32);
+        let hashes: Vec<Hash> = served.iter().map(|b| b.hash()).collect();
+        assert!(
+            hashes.contains(&sibling.hash()),
+            "the anchor-height merge-parent sibling must still be delivered"
+        );
+        assert!(
+            hashes.contains(&big.hash()),
+            "SYNC-S2 INVARIANT: the first height-group above the anchor must be served \
+             even when it exceeds the remaining soft byte budget — a response the \
+             requester cannot advance on wedges it permanently"
+        );
+    }
+
     /// Anchored request serves strictly after the anchor.
     #[test]
     fn anchored_request_starts_after_anchor() {
@@ -370,6 +527,53 @@ mod tests {
         assert_eq!(headers.len(), 3, "heights 2, 3, 4");
         assert_eq!(headers[0].height, 2);
         assert_eq!(headers[2].height, 4);
+    }
+
+    /// Like [`dag_block`] but padded with one transaction so the block
+    /// serializes to (very close to) `target_bytes` — for exercising the
+    /// response byte budget with realistically large contract-deploy blocks.
+    fn fat_dag_block(
+        id: u8,
+        height: u64,
+        selected: Hash,
+        merges: Vec<Hash>,
+        target_bytes: u64,
+    ) -> Block {
+        use citrate_consensus::types::{Signature, Transaction};
+        let mk = |data: Vec<u8>| {
+            let tx = Transaction {
+                hash: Hash::new([id; 32]),
+                nonce: 0,
+                from: PublicKey::new([2; 32]),
+                to: Some(PublicKey::new([3; 32])),
+                value: 0,
+                gas_limit: 21_000,
+                gas_price: 1_000_000_000,
+                data,
+                signature: Signature::new([1; 64]),
+                tx_type: None,
+                chain_id: Some(40204),
+                ..Default::default()
+            };
+            let mut bytes = [id; 32];
+            bytes[0] = id;
+            BlockBuilder::new()
+                .hash(Hash::new(bytes))
+                .parent(selected)
+                .merge_parents(merges.clone())
+                .height(height)
+                .timestamp(1_000_000 + height)
+                .blue_score(height * 10)
+                .blue_work(height as u128 * 100)
+                .proposer(PublicKey::new([1; 32]))
+                .transactions(vec![tx])
+                .build_unhashed()
+        };
+        // `data` is a Vec<u8> — one serialized byte per element — so a single
+        // measurement of the empty-payload block gives the exact padding.
+        let base = bincode::serialized_size(&mk(Vec::new())).expect("size");
+        let pad = target_bytes.saturating_sub(base) as usize;
+        mk(vec![0xABu8; pad])
     }
 
     /// Build a block with an explicit id-derived hash, a selected parent,
