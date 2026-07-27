@@ -5,9 +5,9 @@
   "rpcUrl": "https://rpc.citrate.ai",
   "explorerUrl": "https://explorer.citrate.ai",
   "deployer": "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732",
-  "deployedAt": "2026-07-27T04:41:00Z",
+  "deployedAt": "2026-07-27T05:52:00Z",
   "regenerator": "scripts/ops/emit-address-table.sh",
-  "comment": "Canonical contract-address table for chain 40204 \u2014 the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
+  "comment": "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
   "contracts": {
     "ModelRegistry": "0xf64636d56ec9e0c406149b34ea9c5c5d80b342c0",
     "WrappedSALT": "0xaa918302b94a4b0e75e01e019cc6b819b4f7c906",
@@ -53,7 +53,14 @@
     "AggregationChallenge": "0xe7d7ebe1242feec29d514b00c9272fbffc9e69be",
     "ComputePoolPipeline": "0x5a0437ac03ca92113962f1e4f3d15e062b942bde",
     "ValidatorRegistry": "0x61d44d8a14443646b756905410be951e6ece95a6",
-    "EduForwarder": "0x50a798eaab184eeb11a27fbc1333b85646c1582a"
+    "EduForwarder": "0x50a798eaab184eeb11a27fbc1333b85646c1582a",
+    "MeetingRegistry": "0x260ffedd17cd05a2e4daa41e1339c19a083f9e57",
+    "GovernanceTemplateRegistry": "0x1dc147b73863b1fc662bc9172b19193b4865af5f",
+    "GovernanceProtocolFactory": "0xadc2e3849d10cfdc3b83e5c3fe650b29f0478e54",
+    "PolicyBinding": "0x78d71ad3aa68e50fd16c0514e4ff1eb63c4008b5",
+    "CapabilityGrant": "0x80d98a7687dd806c1e602c991dc0e3c29be03a0e",
+    "VoteAllowance": "0xea70c701cb2db87f44b99966442187523ce7772e",
+    "Sortition": "0x6f1a2315405d4d91191bb538ad905f083165480b"
   },
   "aaStack": {
     "EntryPoint": "0xc698feaf0ff7fdb0d60e2f620c97cb729a694975",
