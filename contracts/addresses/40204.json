@@ -7,7 +7,7 @@
   "deployer": "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732",
   "deployedAt": "2026-07-27T04:41:00Z",
   "regenerator": "scripts/ops/emit-address-table.sh",
-  "comment": "Canonical contract-address table for chain 40204 \u2014 the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
+  "comment": "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md. 2026-07-27 REROLL: the chain was rebuilt from genesis. ValidatorRegistry moved to 0x61d44d8a… because ADR-5 changed the contract (CREATE2 addresses are a function of init code, so improving the reward rules relocated it) — a reroll is only address-neutral if no contract changed. CitrateMemberSBT moved to 0x3e0c2B1c… (nonce-based CREATE). The reroll's re-pin step DROPPED the whole cit_agent set from this book, which was correct — none of them existed on the new chain. AnchorRegistry (0xa9C1379B…) and MeetingRegistry (0x00b5E07d…) have since been REDEPLOYED and are booked again; both are ownerless/permissionless so they carry no governance parameter. The remaining five (OrganizationSBT, AgentSBT, CapsuleRegistry, BenchmarkRegistry, MultisigTimelock2of3) are UNDEPLOYED — DeployCitAgent.s.sol hands them to a 2-of-3 timelock whose owners are an open governance decision. NOTE: forge create fails on this chain with 'contract was not deployed'; it sends EIP-1559 typed txs. Use `cast send --legacy --create <bytecode>`.",
   "contracts": {
     "ModelRegistry": "0xf64636d56ec9e0c406149b34ea9c5c5d80b342c0",
     "WrappedSALT": "0xaa918302b94a4b0e75e01e019cc6b819b4f7c906",
@@ -53,7 +53,9 @@
     "AggregationChallenge": "0xe7d7ebe1242feec29d514b00c9272fbffc9e69be",
     "ComputePoolPipeline": "0x5a0437ac03ca92113962f1e4f3d15e062b942bde",
     "ValidatorRegistry": "0x61d44d8a14443646b756905410be951e6ece95a6",
-    "EduForwarder": "0x50a798eaab184eeb11a27fbc1333b85646c1582a"
+    "EduForwarder": "0x50a798eaab184eeb11a27fbc1333b85646c1582a",
+    "AnchorRegistry": "0xa9C1379B8239253Fd9C8EDDd1A1be5C53EcF41C3",
+    "MeetingRegistry": "0x00b5E07dF3e601DfdD3237937D14f4fBEfA5bb0F"
   },
   "aaStack": {
     "EntryPoint": "0xc698feaf0ff7fdb0d60e2f620c97cb729a694975",
