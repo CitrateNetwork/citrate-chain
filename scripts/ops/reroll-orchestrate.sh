@@ -249,6 +249,37 @@ if should P2; then
     log "  G5b PASS: all 4 nodes sign with the key registered to their own coinbase."
   fi
   log "  G5 PASS: 4 validators registered, activeCount()==4."
+
+  # ── G5c: FLEET ENV MATCHES THE DEPLOYED REGISTRY ──────────────────────────
+  #
+  # THE FAILURE THIS EXISTS FOR. On 2026-07-27 the registry moved (ADR-5 changed
+  # its bytecode, so CREATE2 relocated it), the book and every app repo were
+  # re-pinned — and the FLEET'S OWN systemd env was missed. All four nodes kept
+  # reading activeSet() from the old, empty address, so the epoch snapshot never
+  # materialized, and the chain ran happily to 1999 and then HARD-STOPPED at the
+  # activation boundary:
+  #
+  #   VALIDATOR-S1 reward policy unmaterialized at height 2000 (>= activation
+  #   2000); refusing to settle a divergent (policy-less) block
+  #
+  # Nothing before 2000 showed a symptom. Catching it here — right after
+  # registration, ~1200 blocks of headroom before activation — turns a chain halt
+  # into a one-line fix. The env lives in a systemd DROP-IN, not the main unit,
+  # which is why a `sed` on the unit file silently does nothing.
+  if [ "$CONFIRM" -eq 1 ]; then
+    log "  G5c: verifying fleet systemd env points at the deployed registry…"
+    for ip in "${FLEET_IPS[@]}"; do
+      FLEET_REG="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "root@${ip}" \
+        "systemctl cat citrate-node 2>/dev/null | grep -oE 'CITRATE_VALIDATOR_REGISTRY=0x[0-9a-fA-F]{40}' | tail -1 | cut -d= -f2" 2>/dev/null)"
+      [ -n "$FLEET_REG" ] || gate_fail P2 \
+        "G5c: ${ip} has no CITRATE_VALIDATOR_REGISTRY in its systemd env — it can never materialize the reward policy and WILL halt the chain at activation height ${ACTIVATION_HEIGHT}"
+      if [ "${FLEET_REG,,}" != "${REGISTRY_EXPECT,,}" ]; then
+        gate_fail P2 "G5c: ${ip} points at registry ${FLEET_REG} but the deployed registry is ${REGISTRY_EXPECT}. Fix /etc/systemd/system/citrate-node.service.d/reroll.conf (a DROP-IN, not the main unit), then: systemctl daemon-reload && systemctl restart citrate-node"
+      fi
+      log "    ${ip}: ${FLEET_REG} ✓"
+    done
+    log "  G5c PASS: all 4 nodes read the deployed registry — reward policy will materialize."
+  fi
 fi
 
 # ─────────────────────────── P3: CORE + FEATURE + AA ──────────────────────────
@@ -268,12 +299,30 @@ if should P4; then
   run bash -c "CITRATE_ENV_FILE='$ENV_TESTNET' bash '$OPS/post-reroll-membership.sh'" \
     || gate_fail P4 "membership deploy/fund failed (GAP-2 fixed; if it still halts, check uv)"
   if [ "$CONFIRM" -eq 1 ]; then
-    has_code "$SBT_EXPECT"   || gate_fail P4 "G6: SBT has no code at $SBT_EXPECT"
-    has_code "$VAULT_EXPECT" || gate_fail P4 "G6: vault has no code at $VAULT_EXPECT"
-    OWN="$(cast_read call "$SBT_EXPECT" 'owner()(address)' || true)"
+    # G6 reads the ADDRESSES THE CEREMONY ACTUALLY DEPLOYED, not hardcoded ones.
+    #
+    # DeployCoreMembership uses plain nonce-based CREATE, so the SBT and vault
+    # addresses follow the deployer nonce and MOVE on every reroll. The 2026-07-27
+    # run failed this gate for exactly that reason — the constants were a snapshot
+    # of the previous ceremony, and the run had already succeeded. A gate that
+    # fails when the work succeeded trains people to skip gates.
+    #
+    # post-reroll-membership.sh re-pins the book as its last step, so the book IS
+    # the source of truth here. Verify what is there; do not assert what we guessed.
+    BOOK="${CONTRACTS_DIR}/addresses/40204.json"
+    SBT_ACTUAL="$(jq -r '.CitrateMemberSBT // .contracts.CitrateMemberSBT // empty' "$BOOK" 2>/dev/null)"
+    VAULT_ACTUAL="$(jq -r '.MembershipStakeVault // .contracts.MembershipStakeVault // empty' "$BOOK" 2>/dev/null)"
+    [ -n "$SBT_ACTUAL" ]   || gate_fail P4 "G6: CitrateMemberSBT missing from $BOOK after the membership ceremony"
+    [ -n "$VAULT_ACTUAL" ] || gate_fail P4 "G6: MembershipStakeVault missing from $BOOK after the membership ceremony"
+    has_code "$SBT_ACTUAL"   || gate_fail P4 "G6: SBT has no code at $SBT_ACTUAL (booked but not deployed)"
+    has_code "$VAULT_ACTUAL" || gate_fail P4 "G6: vault has no code at $VAULT_ACTUAL (booked but not deployed)"
+    OWN="$(cast_read call "$SBT_ACTUAL" 'owner()(address)' || true)"
     [ -z "$OWN" ] || [ "${OWN,,}" = "${GRANT_SIGNER,,}" ] || gate_fail P4 "G6: SBT owner $OWN != grant signer $GRANT_SIGNER"
     GB="$(cast_read balance "$GRANT_SIGNER")"
     [ -n "$GB" ] && [ "$GB" != "0" ] || gate_fail P4 "G6: grant signer $GRANT_SIGNER not funded"
+    [ "${SBT_ACTUAL,,}" = "${SBT_EXPECT,,}" ] || log "  NOTE: SBT moved ${SBT_EXPECT} -> ${SBT_ACTUAL} (nonce-based CREATE; expected on a reroll)"
+    [ "${VAULT_ACTUAL,,}" = "${VAULT_EXPECT,,}" ] || log "  NOTE: vault moved ${VAULT_EXPECT} -> ${VAULT_ACTUAL} (nonce-based CREATE)"
+    SBT_EXPECT="$SBT_ACTUAL"; VAULT_EXPECT="$VAULT_ACTUAL"
   fi
   log "  G6 PASS: SBT $SBT_EXPECT + vault $VAULT_EXPECT owned by grant signer, funded."
 fi
