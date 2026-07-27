@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {IGovernanceProtocol} from "./IGovernanceProtocol.sol";
 import {ITenantHierarchy} from "./GovernanceProtocolFactory.sol";
+import {QuorumIdentity} from "./QuorumIdentity.sol";
 
 /// Minimal view of the deployed `ClassificationRegistry` (DPF-02, `rbac/`).
 ///
@@ -158,22 +159,13 @@ contract ClassificationGate is IGovernanceProtocol {
 
     /// The `ClassificationRegistry` key for an address.
     ///
-    /// Reproduces citrate-quorum's `chain.rs::clearance_subject`:
-    /// `keccak256` over the **lowercase "0x"-prefixed hex string**, not over the
-    /// 20 raw bytes. Exposed publicly so the app and any verifier can confirm
-    /// the two sides agree instead of assuming it.
+    /// Delegates to [`QuorumIdentity.subjectKey`], which is the single
+    /// implementation of this derivation across the quorum contracts — four of
+    /// them need it, and four copies is four chances to drift into a silent
+    /// fail-open. Exposed publicly so the app and any verifier can confirm the
+    /// two sides agree instead of assuming it.
     function subjectKey(address who) public pure returns (bytes32) {
-        bytes16 hexDigits = "0123456789abcdef";
-        bytes memory s = new bytes(42);
-        s[0] = "0";
-        s[1] = "x";
-        uint160 v = uint160(who);
-        for (uint256 i = 0; i < 20; ++i) {
-            uint8 b = uint8(v >> (8 * (19 - i)));
-            s[2 + i * 2] = hexDigits[b >> 4];
-            s[3 + i * 2] = hexDigits[b & 0x0f];
-        }
-        return keccak256(s);
+        return QuorumIdentity.subjectKey(who);
     }
 
     /// @inheritdoc IGovernanceProtocol
