@@ -60,7 +60,8 @@
     "PolicyBinding": "0x78d71ad3aa68e50fd16c0514e4ff1eb63c4008b5",
     "CapabilityGrant": "0x80d98a7687dd806c1e602c991dc0e3c29be03a0e",
     "VoteAllowance": "0xea70c701cb2db87f44b99966442187523ce7772e",
-    "Sortition": "0x6f1a2315405d4d91191bb538ad905f083165480b"
+    "Sortition": "0x6f1a2315405d4d91191bb538ad905f083165480b",
+    "AnchorRegistry": "0x040002e0edc5f5f8fe1c25829e251587df087c03"
   },
   "aaStack": {
     "EntryPoint": "0xc698feaf0ff7fdb0d60e2f620c97cb729a694975",
