@@ -57,6 +57,11 @@ CEREMONIES=(
   # this broadcast; pre-ceremony their deterministic projection lives in
   # contracts/addresses/I64S1_PROJECTION.md.
   "DeployFederatedLearning.s.sol"
+  # CBF-S1 WP-0: VALIDATOR-S1's registry. It was deployed to 40204 in the
+  # 2026-07-23 reroll but never listed here, so it never reached the address
+  # table — the contract was live and unreachable for every consumer, and the
+  # WO-1 handoff recorded it as "not delivered" as a result.
+  "DeployValidatorRegistry.s.sol"
 )
 
 # Collect every CREATE transaction's (contractName, contractAddress) pair
