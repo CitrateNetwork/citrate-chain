@@ -78,7 +78,7 @@ contract ValidatorRegistryFuzzTest is Test {
         vm.prank(minter);
         try reg.creditReward{value: amt}(PK_A, amt) {
             assertLe(reg.emittedInEpoch(ep), reg.maxEpochEmission(), "emitted past cap");
-            (,, uint256 rewards,,,,,,) = reg.validatorInfo(PK_A);
+            (,, uint256 rewards,,,,,,,) = reg.validatorInfo(PK_A);
             assertEq(rewards, amt, "vested != credited");
             assertLe(rewards, address(reg).balance, "vested not ETH-backed");
         } catch {
@@ -152,7 +152,7 @@ contract ValidatorRegistryFuzzTest is Test {
             reg.initiateUnbond(PK_A, unbondAmt);
         } else {
             reg.initiateUnbond(PK_A, unbondAmt);
-            (, uint256 bonded,, uint256 escrow,,,,,) = reg.validatorInfo(PK_A);
+            (, uint256 bonded,, uint256 escrow,,,,,,) = reg.validatorInfo(PK_A);
             assertEq(escrow, unbondAmt, "escrow != unbonded amount");
             assertEq(bonded, stake - unbondAmt, "bond not reduced exactly");
             assertLe(escrow, address(reg).balance, "escrow not backed");

@@ -123,7 +123,7 @@ contract ValidatorRegistryTest is Test {
         assertTrue(reg.isActive(PK_A));
         assertEq(reg.stakeOf(PK_A), MIN);
         assertEq(alice.balance, balBefore); // NOT refunded yet
-        (, , , uint256 escrow, , , , , ) = reg.validatorInfo(PK_A);
+        (, , , uint256 escrow, , , , , ,) = reg.validatorInfo(PK_A);
         assertEq(escrow, 5000 ether);
 
         // cannot withdraw before the lock
@@ -155,7 +155,7 @@ contract ValidatorRegistryTest is Test {
         vm.prank(bob);
         reg.submitEquivocation(PK_A, 7, bytes32(uint256(1)), SIG, bytes32(uint256(2)), SIG);
         // 100% of bond + escrow seized; escrow no longer withdrawable (Slashed)
-        (, uint256 bonded, , uint256 escrow, , , , , ) = reg.validatorInfo(PK_A);
+        (, uint256 bonded, , uint256 escrow, , , , , ,) = reg.validatorInfo(PK_A);
         assertEq(bonded, 0);
         assertEq(escrow, 0);
         assertTrue(reg.slashedPubkey(PK_A));
@@ -273,7 +273,7 @@ contract ValidatorRegistryTest is Test {
         vm.prank(slasher);
         reg.slash(PK_A, ValidatorRegistry.SlashTier.Inconsistency, "x");
         assertFalse(reg.isActive(PK_A)); // demoted out of the set
-        (, uint256 bonded, , uint256 escrow, , , , , ValidatorRegistry.Status status) = reg.validatorInfo(PK_A);
+        (, uint256 bonded, , uint256 escrow, , , , , ValidatorRegistry.Status status,) = reg.validatorInfo(PK_A);
         assertEq(bonded, 0);
         assertEq(escrow, MIN - (MIN * 2000) / 10000); // remaining bond escrowed, still slashable
         assertEq(uint8(status), uint8(ValidatorRegistry.Status.Exiting));
@@ -311,7 +311,7 @@ contract ValidatorRegistryTest is Test {
         uint256 balBefore = address(reg).balance;
         vm.prank(minter);
         reg.creditReward{value: 100 ether}(PK_A, 100 ether);
-        (, , uint256 rewards, , , , , , ) = reg.validatorInfo(PK_A);
+        (, , uint256 rewards, , , , , , ,) = reg.validatorInfo(PK_A);
         assertEq(rewards, 100 ether);
         assertEq(reg.emittedInEpoch(reg.currentEpoch()), 100 ether);
         assertEq(address(reg).balance, balBefore + 100 ether); // ETH-backed
@@ -532,6 +532,200 @@ contract ValidatorRegistryTest is Test {
         reg.initiateUnbond(PK_A, 1000 ether); // leaves 32k == admissionMinStake → allowed
         assertEq(reg.stakeOf(PK_A), MIN);
         assertTrue(reg.isActive(PK_A));
+    }
+
+    // ── ADR-5: matured-reward incremental claim ─────────────────────────────
+    //
+    // Before ADR-5, `withdraw` released rewards ONLY on a full exit after
+    // EXIT_LOCK_EPOCHS, so a member could realise earnings only by ceasing to
+    // validate. These pin the new behaviour AND the slashing invariant it must
+    // not weaken.
+
+    uint256 constant EPOCH_BLOCKS = 1000;
+
+    function _rollEpochs(uint256 n) internal {
+        vm.roll(block.number + n * EPOCH_BLOCKS);
+    }
+
+    function _credit(bytes32 pk, uint256 amount) internal {
+        vm.deal(minter, amount);
+        vm.prank(minter);
+        reg.creditReward{value: amount}(pk, amount);
+    }
+
+    function test_adr5_rewards_not_claimable_inside_evidence_window() public {
+        _register(alice, PK_A, MIN);
+        _credit(PK_A, 10 ether);
+
+        (uint256 total, uint256 claimableNow) = reg.rewardsOf(PK_A);
+        assertEq(total, 10 ether, "earned rewards must be visible immediately");
+        assertEq(claimableNow, 0, "nothing matures inside the window");
+
+        _rollEpochs(reg.REWARD_RING() - 1); // one epoch short
+        (, claimableNow) = reg.rewardsOf(PK_A);
+        assertEq(claimableNow, 0, "still inside the window");
+
+        vm.prank(alice);
+        vm.expectRevert(ValidatorRegistry.NothingToWithdraw.selector);
+        reg.claimRewards(PK_A);
+    }
+
+    function test_adr5_claim_after_maturity_without_unbonding() public {
+        _register(alice, PK_A, MIN);
+        _credit(PK_A, 10 ether);
+        _rollEpochs(reg.REWARD_RING());
+
+        (uint256 total, uint256 claimableNow) = reg.rewardsOf(PK_A);
+        assertEq(total, 10 ether);
+        assertEq(claimableNow, 10 ether, "must mature after REWARD_RING epochs");
+
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        reg.claimRewards(PK_A);
+        assertEq(alice.balance - before, 10 ether, "staker receives the matured amount");
+
+        // THE POINT OF ADR-5: still Active, still staked, never unbonded.
+        assertTrue(reg.isActive(PK_A), "claiming must not remove the validator");
+        assertEq(reg.stakeOf(PK_A), MIN, "claiming must not touch bonded stake");
+
+        (total, claimableNow) = reg.rewardsOf(PK_A);
+        assertEq(total, 0);
+        assertEq(claimableNow, 0, "no double claim");
+    }
+
+    function test_adr5_only_staker_can_claim() public {
+        _register(alice, PK_A, MIN);
+        _credit(PK_A, 5 ether);
+        _rollEpochs(reg.REWARD_RING());
+
+        vm.prank(bob);
+        vm.expectRevert(ValidatorRegistry.NotStaker.selector);
+        reg.claimRewards(PK_A);
+    }
+
+    /// The invariant ADR-5 must not break: rewards inside the evidence window
+    /// stay in the slashable base.
+    function test_adr5_unmatured_rewards_remain_slashable() public {
+        // Stake ABOVE minStake so a Latency slash does not push the bond under
+        // `admissionMinStake` and trigger the demotion path — this test is about
+        // the penalty BASE, not about demotion.
+        uint256 stake = 40_000 ether;
+        _register(alice, PK_A, stake);
+        _credit(PK_A, 100 ether);
+
+        (, uint256 claimableNow) = reg.rewardsOf(PK_A);
+        assertEq(claimableNow, 0, "precondition: rewards are unmatured");
+
+        vm.prank(slasher);
+        reg.slash(PK_A, ValidatorRegistry.SlashTier.Latency, bytes(""));
+
+        // Latency = 5% of (bond + escrow + UNMATURED rewards). If rewards had
+        // been excluded the penalty would be 2000 ether; because they are in the
+        // base it is 2005. That 5-ether delta IS the invariant.
+        uint256 penaltyWithRewards = ((stake + 100 ether) * 500) / 10000;
+        uint256 penaltyWithout = (stake * 500) / 10000;
+        assertEq(penaltyWithRewards, 2005 ether);
+        assertEq(penaltyWithout, 2000 ether);
+        assertEq(
+            reg.stakeOf(PK_A),
+            stake - penaltyWithRewards,
+            "penalty must be computed over a base that includes unmatured rewards"
+        );
+        assertTrue(reg.isActive(PK_A), "still active: bond stayed above admission minStake");
+    }
+
+    /// The deliberate ADR-5 tradeoff, pinned so it is a decision and not a
+    /// surprise: once rewards mature they LEAVE the slashable base, so a
+    /// subsequent slasher-authorized tier draws against a smaller amount.
+    /// Equivocation is unaffected because its evidence window is shorter than
+    /// REWARD_RING.
+    function test_adr5_matured_rewards_leave_the_slashable_base() public {
+        uint256 stake = 40_000 ether;
+        _register(alice, PK_A, stake);
+        _credit(PK_A, 100 ether);
+        _rollEpochs(reg.REWARD_RING()); // the 100 matures
+
+        (, uint256 claimableNow) = reg.rewardsOf(PK_A);
+        assertEq(claimableNow, 100 ether, "precondition: rewards matured");
+
+        vm.prank(slasher);
+        reg.slash(PK_A, ValidatorRegistry.SlashTier.Latency, bytes(""));
+
+        // Base is now bond only — 5% of 40,000 = 2,000, NOT 2,005.
+        assertEq(
+            reg.stakeOf(PK_A),
+            stake - (stake * 500) / 10000,
+            "matured rewards are outside the base"
+        );
+    }
+
+    /// Regression: a slash draws down `vestedRewards` without touching the ring,
+    /// so the ring can transiently exceed it. Without the clamp in
+    /// `_sweepMatured` that underflows and bricks the validator.
+    function test_adr5_slash_then_mature_does_not_underflow() public {
+        _register(alice, PK_A, MIN);
+        _credit(PK_A, 100 ether);
+
+        vm.prank(slasher);
+        reg.slash(PK_A, ValidatorRegistry.SlashTier.Byzantine, bytes(""));
+
+        // Maturity arrives with the ring still holding 100 ether but
+        // vestedRewards at 0. Must not revert.
+        _rollEpochs(reg.REWARD_RING() + 1);
+        (uint256 total, uint256 claimableNow) = reg.rewardsOf(PK_A);
+        assertEq(total, 0, "slashed rewards cannot resurrect via maturity");
+        assertEq(claimableNow, 0);
+    }
+
+    /// Two epochs mapping to the same ring slot are always REWARD_RING apart,
+    /// so a slot holding a different epoch is necessarily matured.
+    function test_adr5_ring_slot_reuse_matures_previous_occupant() public {
+        _register(alice, PK_A, MIN);
+        _credit(PK_A, 7 ether);
+
+        _rollEpochs(reg.REWARD_RING()); // same slot, previous occupant matured
+        _credit(PK_A, 3 ether);
+
+        (uint256 total, uint256 claimableNow) = reg.rewardsOf(PK_A);
+        assertEq(total, 10 ether, "both credits accounted");
+        assertEq(claimableNow, 7 ether, "only the older credit matured");
+
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        reg.claimRewards(PK_A);
+        assertEq(alice.balance - before, 7 ether);
+    }
+
+    /// The terminal full-exit path must still release EVERYTHING.
+    function test_adr5_terminal_withdraw_releases_both_buckets() public {
+        _register(alice, PK_A, MIN);
+        _credit(PK_A, 10 ether);
+        _rollEpochs(reg.REWARD_RING()); // 10 matures
+        _credit(PK_A, 4 ether);         // 4 still inside the window
+
+        (uint256 total, uint256 claimableNow) = reg.rewardsOf(PK_A);
+        assertEq(total, 14 ether);
+        assertEq(claimableNow, 10 ether);
+
+        vm.prank(alice);
+        reg.initiateUnbond(PK_A, MIN);
+        _rollEpochs(reg.EXIT_LOCK_EPOCHS() + 1);
+
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        reg.withdraw(PK_A);
+        assertEq(alice.balance - before, MIN + 14 ether, "terminal payout includes both buckets");
+    }
+
+    function test_adr5_validatorInfo_exposes_total_and_claimable() public {
+        _register(alice, PK_A, MIN);
+        _credit(PK_A, 10 ether);
+        _rollEpochs(reg.REWARD_RING());
+        _credit(PK_A, 4 ether);
+
+        (, , uint256 rewards, , , , , , , uint256 claimableNow) = reg.validatorInfo(PK_A);
+        assertEq(rewards, 14 ether, "validatorInfo.rewards is TOTAL unclaimed");
+        assertEq(claimableNow, 10 ether, "matured portion exposed separately");
     }
 }
 
