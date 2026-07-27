@@ -12,6 +12,32 @@
 #        - noise.key   (stable libp2p identity / peer id)
 #        - node.toml   (per-node coinbase == that node's staker)
 #        - models/     (pinned model blobs)
+#
+#      WP-11 — `proposer.key` is DELIBERATELY NOT PRESERVED HERE.
+#
+#      Since WP-11 the ed25519 block-signing key is a real secret persisted at
+#      `<data-dir>/proposer.key`, not a value derived from the public coinbase.
+#      A reroll re-registers every validator from genesis, so each node SHOULD
+#      mint a fresh consensus identity — carrying the old one over would re-use
+#      a key across two chains for no benefit.
+#
+#      THIS CHANGES THE REROLL SEQUENCE. The old flow could register validators
+#      before the nodes had even started, because the pubkey was computable from
+#      the coinbase. It no longer is. The order is now:
+#
+#        wipe → start nodes (each mints proposer.key) → COPY each node's
+#        proposer.key to the operator box (0600 both ends) → run
+#        validator-registration-ceremony with
+#        `--node <coinbase>=<STAKER_KEY_ENV>=<proposer_key_file>`
+#
+#      Registering before the nodes have started is now impossible, and the
+#      ceremony rejects the old two-field `--node` form rather than silently
+#      falling back to a derivation.
+#
+#      For a NON-reroll resync (a single node rebuilding its chaindata while the
+#      network keeps running) the opposite is true: `proposer.key` MUST be
+#      preserved, or that node comes back with an unregistered identity and
+#      silently stops proposing. Use a targeted copy, not this script.
 #      i.e. mv /home/citrate/.citrate → .citrate.preroll-<tag>-<ts>, recreate
 #      /home/citrate/.citrate, copy the 3 artifacts back.
 #   3. Swap the binary: back up the live one, install the pre-staged

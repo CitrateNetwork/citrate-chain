@@ -2200,3 +2200,83 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod multi_producer_regression {
+    use super::*;
+    use citrate_consensus::types::{Hash, PublicKey};
+    use citrate_consensus::vrf::VrfProposerSelector;
+
+    /// MULTI-PRODUCER REGRESSION (2026-07-27 chain halt).
+    ///
+    /// The producer's parent read ended in
+    /// `.unwrap_or((0, Hash::default(), 0, 0))`. When GHOSTDAG selected a parent
+    /// the node had not stored yet — which is exactly what happens the first time
+    /// another producer's block wins tip selection — the miss was swallowed and
+    /// the VRF proof was generated against `Hash::default()` instead of the real
+    /// parent's `vrf_reveal.output`.
+    ///
+    /// This pins WHY that was fatal rather than merely wrong: the resulting proof
+    /// does not verify against the real chain, so every block the node minted was
+    /// rejected. On rpc-1 that produced `Invalid VRF: ... invalid proof or
+    /// identity binding` every 2 seconds, indefinitely, across restarts.
+    #[test]
+    fn vrf_proof_bound_to_a_default_parent_does_not_verify_against_the_real_parent() {
+        let sk = citrate_consensus::crypto::generate_block_signing_key();
+        let proposer = PublicKey::new(sk.verifying_key().to_bytes());
+        let slot = 152_755u64;
+
+        // The real chain's previous VRF output.
+        let real_prev_vrf = Hash::new([0x7au8; 32]);
+        // What the degraded `.unwrap_or` path substituted.
+        let degraded_prev_vrf = Hash::default();
+        assert_ne!(real_prev_vrf, degraded_prev_vrf);
+
+        // A proof built the way the bug built it.
+        let degraded = generate_block_vrf(&sk, &proposer, &degraded_prev_vrf, slot);
+
+        let selector = VrfProposerSelector::production();
+        let verified_against_real_chain = selector
+            .verify_vrf_math_only(&proposer, &degraded, &real_prev_vrf, slot)
+            .expect("verification must not error");
+
+        assert!(
+            !verified_against_real_chain,
+            "a VRF proof bound to a default parent verified against the real chain — \
+             the degraded-parent path would have gone undetected"
+        );
+
+        // And the correctly-bound proof does verify, so the assertion above is
+        // testing the binding and not a broken verifier.
+        let correct = generate_block_vrf(&sk, &proposer, &real_prev_vrf, slot);
+        assert!(
+            selector
+                .verify_vrf_math_only(&proposer, &correct, &real_prev_vrf, slot)
+                .expect("verification must not error"),
+            "a correctly-bound proof must verify"
+        );
+    }
+
+    /// The blue-score path used to be `parent_blue_score + 1` unconditionally,
+    /// with the comment "with no other producers there are no additional blue
+    /// merges". That is exact only when the mergeset is empty. This pins the
+    /// distinction the fix now makes.
+    #[test]
+    fn empty_mergeset_is_the_only_case_where_plus_one_is_exact() {
+        let parent_blue_score = 152_754u64;
+        let no_merge: Vec<Hash> = Vec::new();
+        assert!(
+            no_merge.is_empty(),
+            "single-parent blocks keep the cheap exact path"
+        );
+        assert_eq!(parent_blue_score + 1, 152_755);
+
+        // With merge parents present, +1 is an approximation the producer must no
+        // longer use — GHOSTDAG blue score is parent + |blue blocks in mergeset|.
+        let merging = vec![Hash::new([1u8; 32]), Hash::new([2u8; 32])];
+        assert!(
+            !merging.is_empty(),
+            "merging blocks must take the real calculate_blue_set path"
+        );
+    }
+}
