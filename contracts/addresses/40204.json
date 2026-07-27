@@ -5,9 +5,9 @@
   "rpcUrl": "https://rpc.citrate.ai",
   "explorerUrl": "https://explorer.citrate.ai",
   "deployer": "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732",
-  "deployedAt": "2026-07-23T14:49:58Z",
+  "deployedAt": "2026-07-27T04:41:00Z",
   "regenerator": "scripts/ops/emit-address-table.sh",
-  "comment": "Canonical contract-address table for chain 40204 \u2014 the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md. AnchorRegistry was deployed separately on 2026-07-26 (tx 0x9969fd326503bbe1d901e3d867d0ed7bfb91ae84a3ea09f4caac1e79eb41c179), AFTER the 2026-07-23 reroll set that `deployedAt` refers to \u2014 it is ownerless and append-anyone, so it carries no governance parameter. The rest of the cit_agent set (OrganizationSBT, AgentSBT, CapsuleRegistry, BenchmarkRegistry, MultisigTimelock2of3) is still UNDEPLOYED: DeployCitAgent.s.sol transfers their ownership to a 2-of-3 timelock whose owners are an undecided governance parameter. MeetingRegistry was deployed 2026-07-26 (tx 0x8f6ee48357acb6d21c273861986239487a156436939828926dca25c306050a1f) \u2014 like AnchorRegistry it is permissionless and ownerless, so it carries no governance parameter. The cit_agent set was deployed 2026-07-26 with the owner's three MetaMask addresses as the 2-of-3 MultisigTimelock owners (2-day delay); ownership of OrganizationSBT/AgentSBT/CapsuleRegistry transferred to that timelock and the deployer is NOT an owner. That run also minted a SECOND AnchorRegistry (0x8fFfDe6F66901B30adCD1544763c279Ca1E1b30A) which is deliberately NOT booked: the canonical one above already holds a committed root, and re-pointing the book would orphan it. CBF-S1 (2026-07-26) added ValidatorRegistry (VALIDATOR-S1), deployed in the 2026-07-23 reroll (CREATE2, broadcast DeployValidatorRegistry.s.sol/40204) but never booked because its ceremony was missing from emit-address-table.sh's CEREMONIES list — verified live on 40204: 11.8KB code, minStake 32000 SALT, activeCount 4. WARNING: emit-address-table.sh is LOSSY — it rebuilds `contracts` from the listed ceremonies only, so running it DELETES every separately-deployed pin (AnchorRegistry, MeetingRegistry, the cit_agent set, CitrateMemberSBT, MembershipStakeVault) and this comment. Do not run it without diffing the result.",
+  "comment": "Canonical contract-address table for chain 40204 \u2014 the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
   "contracts": {
     "ModelRegistry": "0xf64636d56ec9e0c406149b34ea9c5c5d80b342c0",
     "WrappedSALT": "0xaa918302b94a4b0e75e01e019cc6b819b4f7c906",
@@ -52,15 +52,8 @@
     "IPFSIncentivesV3": "0xb024ad0b5aefa87fa1e10234afc85b6128932df4",
     "AggregationChallenge": "0xe7d7ebe1242feec29d514b00c9272fbffc9e69be",
     "ComputePoolPipeline": "0x5a0437ac03ca92113962f1e4f3d15e062b942bde",
-    "EduForwarder": "0x50a798eaab184eeb11a27fbc1333b85646c1582a",
     "ValidatorRegistry": "0x61d44d8a14443646b756905410be951e6ece95a6",
-    "AnchorRegistry": "0xd903b7d47f8ba592c1e9ed9dc79ffb2ad97241f5",
-    "MeetingRegistry": "0x7cef67f421693a8df6163c69417b41e5d224a011",
-    "MultisigTimelock2of3": "0x3d4abcbef0ae52422b4fede361d92a13f02468fc",
-    "OrganizationSBT": "0x6c73e53d5f6db992f5f70aff4a298732f00f4e66",
-    "AgentSBT": "0xc2f388aaf91d0d19b4cf965364aa6ac59ca6f2e6",
-    "CapsuleRegistry": "0xfeaacf58d9a38c60cbc473c3abea55dd629cf660",
-    "BenchmarkRegistry": "0x90a3d1ccc159501833d1160190a58470db1a0a88"
+    "EduForwarder": "0x50a798eaab184eeb11a27fbc1333b85646c1582a"
   },
   "aaStack": {
     "EntryPoint": "0xc698feaf0ff7fdb0d60e2f620c97cb729a694975",
@@ -97,6 +90,6 @@
     "X402TransferAuthVerify": "0x0000000000000000000000000000000000000201",
     "X402BatchPaymentVerify": "0x0000000000000000000000000000000000000202"
   },
-  "CitrateMemberSBT": "0x4CE39F891c0A519Fa0E0De97A1DD3e3f856e0cF1",
+  "CitrateMemberSBT": "0x3e0c2B1cD29a615E4eA2E263C8e7df3Aef243E42",
   "MembershipStakeVault": "0x61E324cFd6B7Cb106AC0AD1dF163bdFef2b74268"
 }
