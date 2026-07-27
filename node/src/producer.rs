@@ -2453,6 +2453,198 @@ mod tests {
             "receiver's root MUST equal the producer's sealed root"
         );
     }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // MP-S1 END-TO-END — two concurrent producers, verified ON THE FOLLOWER.
+    //
+    // The 2026-07-27 incident was called "working" twice by checking the two
+    // PRODUCERS (both healthy, zero errors) while the followers were the ones
+    // forked. This test inverts that: two real `BlockProducer`s run concurrently
+    // on a shared DAG and a third node — a pure FOLLOWER that produces nothing —
+    // executes every block they emit. The follower is the oracle.
+    //
+    // Asserts BOTH halves of "multi-producer works":
+    //   SAFETY   — no node ever returns `ApplyOutcome::Rejected`. A state-root
+    //              mismatch on any receiver fails the test. On the pre-fix
+    //              producer this is what wedged boot-2 and boot-3 forever.
+    //   LIVENESS — both producers keep producing. The MP-S1 fix makes a producer
+    //              SKIP a round when fork-choice and its applied tip disagree, so
+    //              this pins that the skip is transient and never a deadlock.
+    #[tokio::test]
+    async fn mp_s1_two_concurrent_producers_a_follower_reproduces_every_root() {
+        use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator};
+        use citrate_consensus::types::Block;
+        use citrate_execution::StateDB;
+
+        struct Node {
+            storage: Arc<StorageManager>,
+            dag: Arc<DagStore>,
+            ghostdag: Arc<GhostDag>,
+            app: CanonicalApplicator,
+            producer: Option<BlockProducer>,
+            _dir: TempDir,
+        }
+
+        // A node wired the way main.rs wires one: shared DAG + GhostDag, an
+        // applicator with fork-choice enabled, and (for producers) the applied-tip
+        // lock the producer holds across its build.
+        async fn node(coinbase_byte: u8, key_byte: u8, producing: bool) -> Node {
+            let dir = TempDir::new().expect("tempdir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let executor = Arc::new(Executor::with_storage_and_chain_id(
+                Arc::new(StateDB::new()),
+                Some(storage.state.clone()),
+                40204,
+            ));
+            let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+            let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+            let app = CanonicalApplicator::new(executor.clone(), storage.clone())
+                .with_fork_choice(ghostdag.clone());
+            let producer = if producing {
+                let mempool = Arc::new(Mempool::new(MempoolConfig {
+                    require_valid_signature: false,
+                    ..Default::default()
+                }));
+                Some(
+                    BlockProducer::with_shared_dag(
+                        storage.clone(),
+                        executor.clone(),
+                        mempool,
+                        None,
+                        embedded_pubkey(Address([coinbase_byte; 20])),
+                        Ed25519SigningKey::from_bytes(&[key_byte; 32]),
+                        2,
+                        Arc::new(citrate_economics::UnifiedEconomicsManager::new(
+                            citrate_economics::UnifiedEconomicsConfig::default(),
+                        )),
+                        dag.clone(),
+                        ghostdag.clone(),
+                    )
+                    .await
+                    .with_v2_headers(true)
+                    .with_applied_tip_lock(app.advance_lock()),
+                )
+            } else {
+                None
+            };
+            Node { storage, dag, ghostdag, app, producer, _dir: dir }
+        }
+
+        // Deliver a gossiped block to a node: persist, admit to the DAG, then run
+        // the execute-on-receive driver — the real receive path.
+        async fn deliver(n: &Node, block: &Block) -> ApplyOutcome {
+            n.storage.blocks.put_block(block).expect("persist gossiped block");
+            let _ = n.dag.store_block(block.clone()).await;
+            let _ = n.ghostdag.add_block(block).await;
+            n.app.apply_received(block).await
+        }
+
+        let p = node(0x44, 42, true).await;
+        let q = node(0x55, 77, true).await;
+        let follower = node(0x66, 99, false).await;
+
+        const ROUNDS: usize = 14;
+        let mut produced_total = 0usize;
+        let mut produced_by_p = 0usize;
+        let mut produced_by_q = 0usize;
+
+        for round in 0..ROUNDS {
+            // Both producers attempt the round, as two miners on a 2s slot do.
+            let mut minted: Vec<(usize, Block)> = Vec::new();
+            for (idx, n) in [&p, &q].iter().enumerate() {
+                let Some(prod) = n.producer.as_ref() else { continue };
+                // An Err here is a DELIBERATE skip (MP-S1: fork-choice and the
+                // applied tip disagree). Liveness is asserted after the loop.
+                if let Ok(hash) = prod.produce_block().await {
+                    let block = n
+                        .storage
+                        .blocks
+                        .get_block(&hash)
+                        .expect("read sealed block")
+                        .expect("sealed block present");
+                    minted.push((idx, block));
+                }
+            }
+            produced_total += minted.len();
+            for (idx, _) in &minted {
+                if *idx == 0 {
+                    produced_by_p += 1;
+                } else {
+                    produced_by_q += 1;
+                }
+            }
+
+            // Gossip every minted block to every OTHER node and execute it there.
+            for (origin, block) in &minted {
+                for (idx, n) in [&p, &q, &follower].iter().enumerate() {
+                    if idx == *origin {
+                        continue; // the producer already recorded its own block
+                    }
+                    let who = ["producer-P", "producer-Q", "FOLLOWER"][idx];
+                    match deliver(n, block).await {
+                        ApplyOutcome::Rejected(why) => panic!(
+                            "MP-S1 END-TO-END: {who} REJECTED block {} @ {} in round {round}: \
+                             {why}. Two concurrent producers must never emit a block a \
+                             receiver cannot reproduce — this is the 2026-07-27 fork, where \
+                             boot-2 and boot-3 re-executed one such block 5,166 times and \
+                             never advanced again.",
+                            block.header.block_hash, block.header.height
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // ── LIVENESS: the MP-S1 skip must be transient, never a deadlock. ──
+        assert!(
+            produced_by_p > 0 && produced_by_q > 0,
+            "both producers must keep producing (P={produced_by_p}, Q={produced_by_q}) — \
+             a permanent skip would be a liveness regression, not a fix"
+        );
+        assert!(
+            produced_total >= ROUNDS,
+            "expected at least one block per round across the two producers, got \
+             {produced_total} in {ROUNDS} rounds"
+        );
+
+        // ── SAFETY: the follower's world state must match a producer's at the tip.
+        let f_tip = follower.app.applied_tip().await;
+        let p_tip = p.app.applied_tip().await;
+        let q_tip = q.app.applied_tip().await;
+        assert!(f_tip.height > 1, "the follower must have advanced past genesis");
+        // The DIAGNOSTIC assertion. A poisoned block does NOT surface as
+        // `ApplyOutcome::Rejected` on the receive path — `reorg_to` only LOGS its
+        // rejection and `apply_received` classifies the block as `Deferred`. That
+        // is exactly why "zero errors on both producers" was a false all-clear on
+        // 2026-07-27. The observable symptom is a FROZEN FOLLOWER: with the MP-S1
+        // guard removed this fails as "follower @ 6, producers @ 14".
+        let ahead = p_tip.height.max(q_tip.height);
+        assert!(
+            f_tip.height + 2 >= ahead,
+            "FOLLOWER WEDGED: follower is at height {} while the producers are at {} \
+             (P={}, Q={}). A follower that cannot keep up with concurrent producers is \
+             the 2026-07-27 fork — the producers stay healthy and silent while the rest \
+             of the fleet stops advancing.",
+            f_tip.height, ahead, p_tip.height, q_tip.height
+        );
+        assert!(
+            f_tip.hash == p_tip.hash || f_tip.hash == q_tip.hash,
+            "the follower's applied tip ({} @ {}) must be a tip a producer also holds \
+             (P={} @ {}, Q={} @ {})",
+            f_tip.hash, f_tip.height, p_tip.hash, p_tip.height, q_tip.hash, q_tip.height
+        );
+        // Every block the follower applied was state-root verified by
+        // `Executor::apply_block`, so agreeing on the tip means agreeing on state.
+        let matching = if f_tip.hash == p_tip.hash { &p } else { &q };
+        assert_eq!(
+            follower.app.applied_tip().await.hash,
+            matching.app.applied_tip().await.hash,
+            "follower and the producer it agrees with must be on the same applied block"
+        );
+    }
 }
 
 #[cfg(test)]
