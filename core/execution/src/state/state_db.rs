@@ -57,6 +57,28 @@ impl StateDB {
         }
     }
 
+    /// SRP-S4: an ISOLATED copy for RPC simulation. Copies the MUTABLE committed state
+    /// (accounts, storage tries, state trie, models, training jobs) so mutations never
+    /// touch `self`'s consensus state, but SHARES the immutable, content-addressed
+    /// `code_storage` (a code hash always maps to the same bytes) so contract execution
+    /// still finds bytecode. `snapshot()`/`restore()` alone do NOT copy code bytes (only
+    /// dirty-code hashes), because the reorg use-case restores onto the SAME db where
+    /// code persists; a fresh isolated db needs the shared code map.
+    pub fn isolated_clone(&self) -> Self {
+        let iso = Self {
+            accounts: Arc::new(AccountManager::new()),
+            storage_tries: Arc::new(DashMap::new()),
+            code_storage: self.code_storage.clone(),
+            models: Arc::new(DashMap::new()),
+            training_jobs: Arc::new(DashMap::new()),
+            state_trie: Arc::new(parking_lot::RwLock::new(Trie::new())),
+            dirty_storage: Arc::new(DashSet::new()),
+            dirty_code: Arc::new(DashSet::new()),
+        };
+        iso.restore(self.snapshot());
+        iso
+    }
+
     /// Drain the set of code hashes deployed since the last commit (for the
     /// caller to persist). Clears the dirty-code set.
     pub fn take_dirty_code(&self) -> Vec<(Hash, Vec<u8>)> {
@@ -76,6 +98,12 @@ impl StateDB {
         self.storage_tries
             .get(address)
             .and_then(|trie| trie.get(key))
+    }
+
+    /// SRP-S3b diagnostic: recompute an account's storage_root FRESH from its resident
+    /// storage trie (what `calculate_state_root` folds), or `None` if no trie is resident.
+    pub fn get_storage_root_recomputed(&self, address: &Address) -> Option<Hash> {
+        self.storage_tries.get(address).map(|t| t.root_hash())
     }
 
     /// Set storage value
@@ -275,6 +303,18 @@ impl StateDB {
                 self.accounts.set_account(address, account.clone());
             }
 
+            // SRP-S3 (EIP-158): an EMPTY account (no balance/nonce/code/storage/perms)
+            // carries NO committed state and is indistinguishable from an absent one, so
+            // it MUST NOT be folded. The fold iterates the volatile RESIDENT map, so a
+            // read-through / restart reconstruction can leave an empty account resident
+            // on one node but not another with identical committed state; folding it
+            // forks the chain on an empty post-restart block (block 2042). Checked AFTER
+            // the fresh storage_root recompute above so an account with live storage is
+            // never mistaken for empty. See ADR-2026-07-21-restart-produce-purity.
+            if account.is_empty() {
+                continue;
+            }
+
             let encoded = match bincode::serialize(&account) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -286,6 +326,75 @@ impl StateDB {
         }
 
         state_trie.root_hash()
+    }
+
+    /// SRP-S4 diagnostic — an INJECTIVE full-state fingerprint that DISTINGUISHES two
+    /// states which `calculate_state_root` maps to the SAME root. Unlike the consensus
+    /// root it (a) folds EVERY resident account INCLUDING the EIP-158-empty ones the root
+    /// SKIPS (with an explicit `empty` flag), and (b) folds each account's RAW storage
+    /// slots — so an empty account resident on one node but absent on another, a torn
+    /// mid-reorg read, or any residency artifact changes the fingerprint even when the
+    /// consensus root agrees. Deploy under `CITRATE_SRP_FINGERPRINT`, log per block, then
+    /// diff two nodes at a wedge height. DIAGNOSTIC ONLY — never a consensus value.
+    pub fn full_state_fingerprint(&self) -> Hash {
+        use sha3::{Digest, Keccak256};
+        let mut all = self.accounts.all_accounts();
+        all.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        let mut h = Keccak256::new();
+        for (address, mut account) in all {
+            let slots: Vec<(Vec<u8>, Vec<u8>)> = match self.storage_tries.get(&address) {
+                Some(t) => {
+                    account.storage_root = t.root_hash();
+                    let mut s: Vec<(Vec<u8>, Vec<u8>)> = t.entries_map().into_iter().collect();
+                    s.sort();
+                    s
+                }
+                None => Vec::new(),
+            };
+            h.update(address.0);
+            let mut bal = [0u8; 32];
+            account.balance.to_big_endian(&mut bal);
+            h.update(bal);
+            h.update(account.nonce.to_be_bytes());
+            h.update(account.code_hash.as_bytes());
+            h.update(account.storage_root.as_bytes());
+            h.update([u8::from(account.is_empty())]);
+            for (k, v) in slots {
+                h.update((k.len() as u32).to_be_bytes());
+                h.update(&k);
+                h.update((v.len() as u32).to_be_bytes());
+                h.update(&v);
+            }
+        }
+        Hash::new(h.finalize().into())
+    }
+
+    /// SRP-S4 diagnostic — per-account lines for the injective fingerprint above, so a
+    /// diff of two nodes' dumps at a wedge height NAMES the diverging account/slot-count.
+    pub fn full_state_digest_lines(&self) -> Vec<String> {
+        let mut all = self.accounts.all_accounts();
+        all.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        all.into_iter()
+            .map(|(address, mut account)| {
+                let nslots = match self.storage_tries.get(&address) {
+                    Some(t) => {
+                        account.storage_root = t.root_hash();
+                        t.entries_map().len()
+                    }
+                    None => 0,
+                };
+                format!(
+                    "0x{} bal={} nonce={} code={} sroot={} empty={} slots={}",
+                    hex::encode(address.0),
+                    account.balance,
+                    account.nonce,
+                    hex::encode(&account.code_hash.as_bytes()[..4]),
+                    hex::encode(&account.storage_root.as_bytes()[..4]),
+                    u8::from(account.is_empty()),
+                    nslots,
+                )
+            })
+            .collect()
     }
 
     /// Commit state changes
@@ -694,6 +803,45 @@ mod srp_purity_red {
             root_after, root_before,
             "STORAGE STALENESS (SRP): the root ignored a committed slot change — storage \
              sub-trie is a stale accumulator (state_db.rs:20,257-258)"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SRP-S3 (restart-produced purity): the fold in `calculate_state_root` iterates
+    // the RESIDENT account map (`all_accounts()`), so the root depends on WHICH
+    // accounts are materialized — a node-local, restart/history-dependent property.
+    // A read-through or a restart's bulk hydration can leave an EMPTY (all-default)
+    // account resident on one node but not another WITH IDENTICAL COMMITTED STATE.
+    // Folding that empty account changes the root → the block-2042 split-brain on an
+    // EMPTY post-restart block (reward accounts identical; a spurious empty account
+    // differs). Fix: EIP-158 — an empty account is indistinguishable from an absent
+    // one and MUST NOT be folded. This test FAILS on `main`, PASSES after the fix.
+    #[test]
+    fn srp_s3_resident_empty_account_must_not_change_root() {
+        use crate::types::{Address, AccountState};
+        use primitive_types::U256;
+
+        // Two DBs reach byte-identical COMMITTED state (one non-empty account).
+        let committed = Address([0x11u8; 20]);
+        let a = StateDB::new();
+        let b = StateDB::new();
+        a.accounts.set_balance(committed, U256::from(1000u64));
+        b.accounts.set_balance(committed, U256::from(1000u64));
+        let root_a = a.calculate_state_root();
+
+        // `b` additionally has a spurious RESIDENT empty account — exactly what a
+        // non-dirtying read-through (`load_account` with default) or a restart's
+        // reconstruction materializes. Committed state is UNCHANGED (an empty account
+        // is not committed state).
+        b.accounts
+            .load_account(Address([0x99u8; 20]), AccountState::default());
+        let root_b = b.calculate_state_root();
+
+        assert_eq!(
+            root_a, root_b,
+            "SRP-S3: a resident EMPTY account must not change the consensus root \
+             (EIP-158: empty ≡ absent). The root is being folded from the volatile \
+             resident set, so restart-reconstructed residency forks the chain (block 2042)."
         );
     }
 }

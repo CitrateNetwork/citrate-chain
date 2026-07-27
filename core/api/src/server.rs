@@ -506,6 +506,7 @@ impl RpcServer {
             chain_id,
             economics_manager,
             None,
+            None,
         )
     }
 
@@ -522,6 +523,10 @@ impl RpcServer {
         chain_id: u64,
         economics_manager: Option<Arc<citrate_economics::UnifiedEconomicsManager>>,
         pause_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+        // Highest network height the node's sync driver has evidence for. When Some,
+        // eth_syncing reports {currentBlock, highestBlock} instead of a bare `false`
+        // whenever the applied tip is behind it (forward-sync observability).
+        sync_highest: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Self {
         let mut io_handler = IoHandler::new();
 
@@ -539,6 +544,37 @@ impl RpcServer {
             filter_registry,
             pause_flag,
         );
+
+        // Truthful eth_syncing OVERRIDE (last registration wins): report progress
+        // {currentBlock, highestBlock} whenever the applied tip is below the highest
+        // network height the sync driver has seen, so a stalled follower reads as
+        // "syncing", not a bare "false". Falls back to the register_eth_methods stub
+        // behaviour (false) when no sync signal is wired or we are at the tip.
+        {
+            let storage_syncing = storage.clone();
+            io_handler.add_sync_method("eth_syncing", move |_params: jsonrpc_core::Params| {
+                let highest = sync_highest
+                    .as_ref()
+                    .map(|h| h.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0);
+                let current = storage_syncing
+                    .blocks
+                    .get_applied_tip()
+                    .ok()
+                    .flatten()
+                    .map(|(_, h)| h)
+                    .unwrap_or(0);
+                if highest > current {
+                    Ok(serde_json::json!({
+                        "startingBlock": format!("0x{:x}", current),
+                        "currentBlock": format!("0x{:x}", current),
+                        "highestBlock": format!("0x{:x}", highest),
+                    }))
+                } else {
+                    Ok(serde_json::Value::Bool(false))
+                }
+            });
+        }
 
         // Register economics-related RPC methods
         economics_rpc::register_economics_methods(&mut io_handler, economics_manager, Some(mempool.clone()));
@@ -1013,7 +1049,7 @@ impl RpcServer {
 
             // Check sender balance covers value + gas
             let sender_addr = citrate_execution::address_utils::normalize_address(&tx.from);
-            let balance = exec.get_balance(&sender_addr);
+            let balance = exec.get_canonical_account(&sender_addr).balance; // SRP-S4 WP-2.2: non-warming committed read
             let gas_cost = primitive_types::U256::from(tx.gas_limit) * primitive_types::U256::from(tx.gas_price);
             let total_cost = gas_cost + primitive_types::U256::from(tx.value);
             if balance < total_cost {

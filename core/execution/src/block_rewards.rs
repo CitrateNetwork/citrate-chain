@@ -89,6 +89,11 @@ pub const REWARD_MINTER_SELECTOR: [u8; 4] = [0x9b, 0x8e, 0x55, 0x63];
 /// `validatorInfo(bytes32)` — verified `cast sig` == 0x00408838. Returns
 /// `(address staker, uint256 bonded, ... )`; the first word is the staker.
 pub const VALIDATOR_INFO_SELECTOR: [u8; 4] = [0x00, 0x40, 0x88, 0x38];
+/// `blockSubsidy()` — verified `cast sig` == 0xce0400b7. CBF-S1 / ADR-4: the
+/// per-block issuance the registry has always been parameterised for but which
+/// no execution path ever paid, leaving validators on an idle chain earning
+/// exactly zero (live proof at 40204: `emittedInEpoch` == 0 for every epoch).
+pub const BLOCK_SUBSIDY_SELECTOR: [u8; 4] = [0xce, 0x04, 0x00, 0xb7];
 
 /// Gas ceiling for the `creditReward` system-call. Generous vs. its real cost
 /// (a couple of SSTOREs + an SLOAD ~ 60k). Gas price is 0 so this never charges
@@ -122,6 +127,13 @@ pub struct EpochRewardPolicy {
     pub reward_minter: [u8; 20],
     /// `priorityFeeShareBps` as-of S(E). `< 10000` (contract-enforced).
     pub priority_fee_share_bps: u64,
+    /// `blockSubsidy` as-of S(E) — the flat per-block issuance vested to the
+    /// proposer ON TOP of its priority-fee share (CBF-S1 / ADR-4). Contract-
+    /// bounded by `BLOCK_SUBSIDY_CEIL` (1k SALT) and, together with the fee
+    /// share, by the per-epoch `maxEpochEmission` cap enforced inside
+    /// `creditReward`. Read from the SAME finalized snapshot as every other
+    /// policy field, so producer and receiver settle byte-identically.
+    pub block_subsidy: U256,
     /// proposer ed25519 pubkey (canonical 32-byte) -> registered `stakerAddress`,
     /// for every ACTIVE validator at S(E). The reward beneficiary is resolved
     /// through THIS map (§R' #1), never `header.coinbase` directly.
@@ -233,6 +245,23 @@ pub fn vested_share(pool: U256, share_bps: u64) -> U256 {
     pool.saturating_mul(U256::from(bps)) / U256::from(10_000u64)
 }
 
+/// The TOTAL amount vested to the proposer for one block (CBF-S1 / ADR-4):
+/// its priority-fee share PLUS the flat `block_subsidy`.
+///
+/// The subsidy is what makes "run a node, earn SALT" true on a chain with no
+/// fee volume. Before it, `settle_block_rewards` short-circuited on a zero
+/// share and `creditReward` was never called — verified on live 40204, where
+/// four fully-staked validators had accrued 0.00207 SALT in total.
+///
+/// `saturating_add` for the same reason `vested_share` saturates: a panic
+/// mid-settle would be a fleet-wide liveness fault, and saturation is
+/// deterministic on every node. The per-epoch `maxEpochEmission` cap inside
+/// `creditReward` remains the binding supply limit — if this total would breach
+/// it the contract reverts and the block's reward is burned, exactly as before.
+pub fn total_vested(pool: U256, share_bps: u64, block_subsidy: U256) -> U256 {
+    vested_share(pool, share_bps).saturating_add(block_subsidy)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ABI helpers for the vesting system-call + snapshot materialization reads.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -263,6 +292,19 @@ pub fn decode_u64_word(ret: &[u8]) -> Result<u64, String> {
     let mut b8 = [0u8; 8];
     b8.copy_from_slice(&ret[24..32]);
     Ok(u64::from_be_bytes(b8))
+}
+
+/// Decode a full-width `uint256` from a 32-byte ABI word.
+///
+/// Unlike [`decode_u64_word`] this never saturates, which is REQUIRED for
+/// `blockSubsidy`: its contract ceiling (`BLOCK_SUBSIDY_CEIL` = 1k SALT = 1e21
+/// wei) is two orders of magnitude above `u64::MAX`, so a u64 decode would clamp
+/// every realistic subsidy to a wrong value and vest the wrong amount.
+pub fn decode_u256_word(ret: &[u8]) -> Result<U256, String> {
+    if ret.len() < 32 {
+        return Err(format!("uint256 return too short ({} bytes)", ret.len()));
+    }
+    Ok(U256::from_big_endian(&ret[..32]))
 }
 
 /// Decode a right-aligned 20-byte address from a 32-byte ABI word (`address` or
@@ -373,6 +415,73 @@ mod tests {
         assert_eq!(vested_share(U256::from(7u64), 3333), U256::from(2u64));
         // out-of-range bps clamps to 10000 (defense; contract forbids >=10000).
         assert_eq!(vested_share(U256::from(9u64), 20000), U256::from(9u64));
+    }
+
+    /// CBF-S1 / ADR-4 REGRESSION — the bug this sprint exists to fix.
+    ///
+    /// On an idle chain the priority pool is zero, so the pre-subsidy reward was
+    /// `vested_share(0, bps) == 0`, `settle_block_rewards` short-circuited, and
+    /// `creditReward` was never called. Live proof at 40204 before this change:
+    /// `emittedInEpoch(e) == 0` for every epoch, and four fully-staked validators
+    /// had accrued 0.00207 SALT between them across ~138k blocks.
+    ///
+    /// With the subsidy, a proposer earns on a chain with no transactions at all.
+    #[test]
+    fn subsidy_vests_on_an_idle_chain() {
+        let ten_salt = U256::from(10_000_000_000_000_000_000u128); // 10 SALT
+        // No fees whatsoever — the exact condition that paid zero before.
+        assert_eq!(vested_share(U256::zero(), 10_000), U256::zero());
+        assert_eq!(total_vested(U256::zero(), 10_000, ten_salt), ten_salt);
+        // And the zero short-circuit in `settle_block_rewards` is no longer taken.
+        assert!(!total_vested(U256::zero(), 10_000, ten_salt).is_zero());
+    }
+
+    #[test]
+    fn total_vested_is_fee_share_plus_subsidy() {
+        // 100 wei pool @ 2500 bps = 25, plus a 7-wei subsidy = 32.
+        assert_eq!(
+            total_vested(U256::from(100u64), 2500, U256::from(7u64)),
+            U256::from(32u64)
+        );
+        // A zero subsidy is exactly the pre-CBF-S1 behavior (governance may set it
+        // to 0 to return to a fee-only regime without a binary change).
+        assert_eq!(
+            total_vested(U256::from(100u64), 2500, U256::zero()),
+            vested_share(U256::from(100u64), 2500)
+        );
+        // Both zero => still zero, so the short-circuit still applies on a chain
+        // with no fees AND no subsidy.
+        assert!(total_vested(U256::zero(), 2500, U256::zero()).is_zero());
+    }
+
+    /// A panic mid-settle is a fleet-wide liveness fault, so the addition must
+    /// saturate rather than overflow — deterministically on every node.
+    #[test]
+    fn total_vested_saturates_without_panic() {
+        assert_eq!(total_vested(U256::MAX, 10_000, U256::MAX), U256::MAX);
+        assert_eq!(total_vested(U256::zero(), 0, U256::MAX), U256::MAX);
+    }
+
+    /// `blockSubsidy`'s contract ceiling is 1e21 wei — above `u64::MAX` (~1.8e19).
+    /// Decoding it through the u64 path would silently clamp and vest a wrong
+    /// amount, so the full-width decoder is mandatory.
+    #[test]
+    fn decode_u256_word_does_not_narrow_the_subsidy_ceiling() {
+        let ceil = U256::from(1_000u64) * U256::exp10(18); // BLOCK_SUBSIDY_CEIL = 1k SALT
+        assert!(ceil > U256::from(u64::MAX));
+        let mut word = [0u8; 32];
+        ceil.to_big_endian(&mut word);
+
+        assert_eq!(decode_u256_word(&word).expect("decode"), ceil);
+        // The narrow decoder saturates — proving why it must not be used here.
+        assert_eq!(decode_u64_word(&word).expect("decode"), u64::MAX);
+        assert!(decode_u256_word(&word[..31]).is_err(), "short word must error");
+    }
+
+    #[test]
+    fn block_subsidy_selector_matches_the_contract() {
+        // `cast sig 'blockSubsidy()'` == 0xce0400b7
+        assert_eq!(BLOCK_SUBSIDY_SELECTOR, [0xce, 0x04, 0x00, 0xb7]);
     }
 
     #[test]

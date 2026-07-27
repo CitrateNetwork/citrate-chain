@@ -18,7 +18,7 @@ const LATEST_HEIGHT_KEY: &[u8] = b"latest_height";
 /// long before its transactions have been executed and its `state_root`
 /// verified. The applied tip only advances when `apply_block` succeeds.
 /// Stored as 32-byte hash ‖ 8-byte big-endian height (40 bytes).
-const APPLIED_TIP_KEY: &[u8] = b"applied_tip";
+pub const APPLIED_TIP_KEY: &[u8] = b"applied_tip";
 
 /// VALIDATOR-S1 §R': the durably-persisted, materialized epoch reward snapshot —
 /// the `EpochRewardPolicy` (share bps + reward minter + proposer->staker map) AND

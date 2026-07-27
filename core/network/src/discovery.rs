@@ -303,6 +303,12 @@ impl Discovery {
 
         let connected = self.connected_peers.read().await;
         let (current_peers, _, _) = self.peer_manager.get_peer_counts().await;
+        // When peer-starved, re-dial bootstraps regardless of the `connected_peers`
+        // set — which is NEVER cleaned on disconnect in production (mark_disconnected
+        // is only called from tests). A dropped bootstrap therefore stayed "connected"
+        // forever and was never re-dialed, so a node that lost all its peers stayed
+        // permanently isolated (observed: a follower stuck at 0 peers, never recovering).
+        let peer_starved = current_peers < 3;
 
         if current_peers >= self.config.max_peers {
             return Vec::new();
@@ -321,11 +327,14 @@ impl Discovery {
             .iter()
             .filter(|p| {
                 let peer = p.value();
+                if peer.is_bootstrap {
+                    // Retry bootstraps aggressively when peer-starved (bypassing the
+                    // stale connected set so a 0-peer node re-dials and recovers);
+                    // when well-peered, honor the set to avoid redundant dials.
+                    return peer_starved || !connected.contains(&peer.id);
+                }
                 if connected.contains(&peer.id) {
                     return false;
-                }
-                if peer.is_bootstrap {
-                    return true; // Always retry bootstraps
                 }
                 peer.attempts < 3
                     && (now - peer.last_seen) < self.config.peer_expiry.as_secs()
@@ -579,6 +588,35 @@ mod tests {
         let candidates = discovery.find_peers().await;
         assert!(!candidates.is_empty(), "Bootstrap peer must remain in candidates after 10 failed attempts");
         assert_eq!(candidates[0].0, "bootstrap_127.0.0.1:30303");
+    }
+
+    #[tokio::test]
+    async fn test_starved_node_redials_bootstrap_despite_stale_connected_set() {
+        // Regression: mark_disconnected is never called in production, so a dropped
+        // bootstrap stayed in `connected_peers` forever and find_peers skipped it — a
+        // node that lost all peers never re-dialed and stayed isolated (observed:
+        // boot3 stuck at 0 peers). When peer-starved (real peer count < 3), bootstraps
+        // are re-offered regardless of the stale set.
+        let config = DiscoveryConfig {
+            bootstrap_nodes: vec!["127.0.0.1:30303".to_string()],
+            max_peers: 10,
+            ..Default::default()
+        };
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let discovery = Discovery::new(config, peer_manager);
+        discovery.init().await.unwrap();
+
+        // The connection dropped, but the set was never cleaned: it is still "connected"
+        // while the REAL peer manager holds 0 peers.
+        discovery.mark_connected("bootstrap_127.0.0.1:30303").await;
+
+        let candidates = discovery.find_peers().await;
+        assert!(
+            candidates
+                .iter()
+                .any(|(id, _)| id.as_str() == "bootstrap_127.0.0.1:30303"),
+            "a peer-starved node must re-dial its bootstrap even when it is stale-marked connected"
+        );
     }
 
     // A-10/B-6: Bootstrap nodes are never expired by cleanup_expired
