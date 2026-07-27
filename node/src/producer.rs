@@ -1,5 +1,5 @@
 use citrate_consensus::chain_selection::ChainSelector;
-use citrate_consensus::dag_store::DagStore;
+use citrate_consensus::dag_store::{DagStore, DagStoreError};
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::tip_selection::TipSelector;
 use citrate_consensus::crypto::{self, Ed25519SigningKey};
@@ -99,6 +99,12 @@ pub struct BlockProducer {
     signing_key: Ed25519SigningKey,
     target_block_time: u64,
     reward_calculator: RewardCalculator,
+    /// SRP-S2: retained for RPC/telemetry wiring ONLY. It MUST NEVER influence a block's
+    /// committed reward — block rewards are settled purely from committed state through
+    /// `Executor::settle_block_rewards` (the enhanced, node-local reward path that read
+    /// this was removed; it caused the block-2209 split-brain). See
+    /// .agentile/adrs/ADR-2026-07-21-reapply-reward-purity.md.
+    #[allow(dead_code)]
     economics_manager: Option<Arc<UnifiedEconomicsManager>>,
     /// Emergency pause flag — when true, block production stops.
     /// WP-I.3: Shared with the RPC server so citrate_emergencyPause
@@ -382,7 +388,33 @@ impl BlockProducer {
             for height in 0..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
                     if let Ok(Some(block)) = storage.blocks.get_block(&block_hash) {
-                        let _ = dag_store.store_block(block.clone()).await;
+                        // SYNC-S1 D2.3 (R3): a discarded DAG write here left the
+                        // block chain-present / DAG-absent with no log line,
+                        // which makes every descendant fail the consistency
+                        // gate. `BlockExists` IS a genuine no-op in this loop
+                        // (the block was just read OUT of the chain store, so
+                        // the chain half is present by construction, and
+                        // BlockExists proves the DAG half is too) — but a real
+                        // error must never be silent.
+                        match dag_store.store_block(block.clone()).await {
+                            Ok(()) => {}
+                            // Already in the DAG. A genuine no-op HERE, and only
+                            // here: the block was just read OUT of the chain
+                            // store, so the chain half is present by
+                            // construction and BlockExists proves the DAG half
+                            // is too. Logged rather than swallowed — an empty
+                            // arm on this variant is what made the boot-3 wedge
+                            // permanent, so the shape stays grep-able.
+                            Err(DagStoreError::BlockExists(_)) => debug!(
+                                "DAG rehydration: block {} @ {} already present in the DAG store",
+                                block_hash, height
+                            ),
+                            Err(e) => warn!(
+                                "DAG rehydration: block {} @ {} failed to load into the DAG store: {} \
+                                 — descendants will be inadmissible until the startup reconcile repairs it",
+                                block_hash, height, e
+                            ),
+                        }
                         // PIL-13: use register_existing_block, not add_block.
                         // The eager-load loop walks every persisted block on
                         // startup. add_block recomputes the full BlueSet
@@ -393,7 +425,12 @@ impl BlockProducer {
                         // header (already on disk, durable) and stores a
                         // lightweight BlueSet — O(1) per block, no
                         // cumulative materialisation.
-                        let _ = ghostdag.register_existing_block(&block).await;
+                        if let Err(e) = ghostdag.register_existing_block(&block).await {
+                            warn!(
+                                "DAG rehydration: block {} @ {} failed GhostDAG registration: {}",
+                                block_hash, height, e
+                            );
+                        }
                     }
                 }
             }
@@ -484,7 +521,33 @@ impl BlockProducer {
             for height in 0..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
                     if let Ok(Some(block)) = storage.blocks.get_block(&block_hash) {
-                        let _ = dag_store.store_block(block.clone()).await;
+                        // SYNC-S1 D2.3 (R3): a discarded DAG write here left the
+                        // block chain-present / DAG-absent with no log line,
+                        // which makes every descendant fail the consistency
+                        // gate. `BlockExists` IS a genuine no-op in this loop
+                        // (the block was just read OUT of the chain store, so
+                        // the chain half is present by construction, and
+                        // BlockExists proves the DAG half is too) — but a real
+                        // error must never be silent.
+                        match dag_store.store_block(block.clone()).await {
+                            Ok(()) => {}
+                            // Already in the DAG. A genuine no-op HERE, and only
+                            // here: the block was just read OUT of the chain
+                            // store, so the chain half is present by
+                            // construction and BlockExists proves the DAG half
+                            // is too. Logged rather than swallowed — an empty
+                            // arm on this variant is what made the boot-3 wedge
+                            // permanent, so the shape stays grep-able.
+                            Err(DagStoreError::BlockExists(_)) => debug!(
+                                "DAG rehydration: block {} @ {} already present in the DAG store",
+                                block_hash, height
+                            ),
+                            Err(e) => warn!(
+                                "DAG rehydration: block {} @ {} failed to load into the DAG store: {} \
+                                 — descendants will be inadmissible until the startup reconcile repairs it",
+                                block_hash, height, e
+                            ),
+                        }
                         // PIL-13: use register_existing_block, not add_block.
                         // The eager-load loop walks every persisted block on
                         // startup. add_block recomputes the full BlueSet
@@ -495,7 +558,12 @@ impl BlockProducer {
                         // header (already on disk, durable) and stores a
                         // lightweight BlueSet — O(1) per block, no
                         // cumulative materialisation.
-                        let _ = ghostdag.register_existing_block(&block).await;
+                        if let Err(e) = ghostdag.register_existing_block(&block).await {
+                            warn!(
+                                "DAG rehydration: block {} @ {} failed GhostDAG registration: {}",
+                                block_hash, height, e
+                            );
+                        }
                     }
                 }
             }
@@ -889,98 +957,67 @@ impl BlockProducer {
             self.coinbase.0[0..20].try_into().unwrap_or([0; 20])
         );
 
-        // EXECUTE-ON-RECEIVE: the enhanced reward path reads node-local, non-consensus
-        // state (staking manager, f64 reputation, dynamic pricing) that a receiver cannot
-        // reproduce — so it is incompatible with execute-on-receive. Under v2 headers
-        // (the reroll flag that turns on execute-on-receive) force the DETERMINISTIC basic
-        // path, whose reward is a pure function of header.height + transactions and matches
-        // `CanonicalApplicator::reward_credits` byte-for-byte. See
-        // docs/consensus/EXECUTE_ON_RECEIVE_state_application.md and the reroll addendum.
-        let use_enhanced = self.economics_manager.is_some() && !self.emit_v2_headers;
-        if let Some(economics) = self.economics_manager.as_ref().filter(|_| use_enhanced) {
-            info!("Economics: Applying enhanced reward system for block {}", header.height);
-
-            let base_reward = economics.get_config().rewards_config.base_block_reward;
-            let mut total_reward = base_reward;
-
-            let staked_amount = economics.get_staked_balance(&validator_address);
-            if staked_amount > primitive_types::U256::zero() {
-                let staking_bonus = base_reward / primitive_types::U256::from(10);
-                total_reward += staking_bonus;
-                info!("Economics: Applied staking bonus of {} wei for staked amount {}", staking_bonus, staked_amount);
-            }
-
-            let reputation_score = economics.get_reputation_score(&validator_address);
-            if reputation_score > 0.5 {
-                let reputation_bonus = base_reward * primitive_types::U256::from((reputation_score * 20.0) as u64) / primitive_types::U256::from(100);
-                total_reward += reputation_bonus;
-                info!("Economics: Applied reputation bonus of {} wei for score {}", reputation_bonus, reputation_score);
-            }
-
-            let current_gas_price = economics.get_operation_cost(citrate_economics::OperationType::AIInference { compute_units: 1000 });
-            if current_gas_price > economics.get_config().pricing_config.base_gas_price {
-                let congestion_bonus = base_reward / primitive_types::U256::from(20);
-                total_reward += congestion_bonus;
-                info!("Economics: Applied congestion bonus of {} wei due to high gas prices", congestion_bonus);
-            }
-
-            let current_balance = self.executor.get_balance(&validator_address);
-            self.executor.set_balance(&validator_address, current_balance + total_reward);
-            info!("Economics: Applied total enhanced reward of {} wei to validator {} (base: {}, bonuses: {})",
-                total_reward, hex::encode(validator_address.0), base_reward, total_reward - base_reward);
-
-            if let Some(economic_state) = economics.get_economic_state() {
-                info!("Economics: Network state - Gas price: {}, Staked: {}, Treasury: {}",
-                    economic_state.gas_price, economic_state.staked_amount, economic_state.treasury_balance);
-            }
-        } else {
-            // Basic reward system — create a temporary block for reward calculation
-            // (calculate_reward only reads header.height and transactions, not state_root)
-            let temp_block = BlockBuilder::new()
-                .header(header.clone())
-                .tx_root(tx_root)
-                .receipt_root(receipt_root)
-                .artifact_root(artifact_root)
-                .ghostdag_params(self.ghostdag.params().clone())
-                .transactions(executed_transactions.clone())
-                .build_unhashed();
-            let reward = self.reward_calculator.calculate_reward(&temp_block);
-            // VALIDATOR-S1 §R': route the basic block reward AND the priority-fee
-            // vesting through the ONE shared settlement fn the receiver (Executor::
-            // apply_block) also calls — so producer and receiver credit byte-identical
-            // state. `basic_credits` mirrors `canonical_apply::reward_credits`
-            // exactly: [(coinbase, validator_reward), (0x11..treasury, treasury_reward)].
-            // Below the VALIDATOR-S1 activation (or before a snapshot is materialized)
-            // this only credits the basic reward, exactly as the old apply_basic_rewards.
-            let basic_credits = [
-                (validator_address, reward.validator_reward),
-                (
-                    citrate_execution::types::Address([0x11; 20]),
-                    reward.treasury_reward,
-                ),
-            ];
-            // Use the GUARDED settle: the producer calls settle WITHOUT the
-            // snapshot/restore that the receiver's `apply_block_inner` wraps it in,
-            // so a settle error (e.g. the absent-proposer reject arm, which fires
-            // AFTER step 1's basic credits are applied) would otherwise leak stray
-            // credits into shared state — and, since production runs with eager
-            // persistence, into the durable store. `settle_block_rewards_guarded`
-            // engages the persistence-defer guard + snapshots world state, so ANY
-            // error leaves both memory and store byte-identical; on success the
-            // credits stay dirty and are persisted by `persist_state_changes` below.
-            self.executor
-                .settle_block_rewards_guarded(
-                    header.height,
-                    header.coinbase,
-                    *header.proposer_pubkey.as_bytes(),
-                    header.base_fee_per_gas,
-                    &executed_transactions,
-                    &receipts,
-                    &basic_credits,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("VALIDATOR-S1 §R' reward settlement failed: {e}"))?;
-        }
+        // SRP-S2 (reward/re-apply state-root purity — ADR-2026-07-21-reapply-reward-purity):
+        // the block reward MUST be a pure function of COMMITTED state, settled through the
+        // ONE shared `Executor::settle_block_rewards` path that the receiver / cold-sync /
+        // restart / reorg roles also use — so producer and receiver credit byte-identical
+        // state and the reward-settled root is reproducible on every node.
+        //
+        // The former node-local "enhanced" reward path (economics staking bonus, f64
+        // reputation, dynamic pricing credited straight to the validator, no treasury, no
+        // §R') was REMOVED here: it read non-consensus state a receiver can never reproduce
+        // and, whenever it was selected (it was gated on the transient `emit_v2_headers`
+        // flag), it poisoned the produced block — the block-2209 split-brain. `use_enhanced`
+        // and the enhanced branch are gone; block rewards NEVER read `economics_manager`.
+        // (economics_manager remains for RPC/telemetry only.)
+        //
+        // `calculate_reward` reads only header.height + transactions (never state_root), so
+        // this temp block is a safe reward-input carrier.
+        let temp_block = BlockBuilder::new()
+            .header(header.clone())
+            .tx_root(tx_root)
+            .receipt_root(receipt_root)
+            .artifact_root(artifact_root)
+            .ghostdag_params(self.ghostdag.params().clone())
+            .transactions(executed_transactions.clone())
+            .build_unhashed();
+        let reward = self.reward_calculator.calculate_reward(&temp_block);
+        // `basic_credits` mirrors `canonical_apply::reward_credits` exactly:
+        // [(coinbase, validator_reward), (0x11..treasury, treasury_reward)]. Below the
+        // VALIDATOR-S1 activation (or before a snapshot is materialized) this credits only
+        // the basic reward; at/above it, §R' vests the priority-fee share on top.
+        let basic_credits = [
+            (validator_address, reward.validator_reward),
+            (
+                citrate_execution::types::Address([0x11; 20]),
+                reward.treasury_reward,
+            ),
+        ];
+        // Use the GUARDED settle: the producer calls settle WITHOUT the
+        // snapshot/restore that the receiver's `apply_block_inner` wraps it in,
+        // so a settle error (e.g. the absent-proposer reject arm, which fires
+        // AFTER step 1's basic credits are applied) would otherwise leak stray
+        // credits into shared state — and, since production runs with eager
+        // persistence, into the durable store. `settle_block_rewards_guarded`
+        // engages the persistence-defer guard + snapshots world state, so ANY
+        // error leaves both memory and store byte-identical; on success the
+        // credits stay dirty and are persisted by `persist_state_changes` below.
+        //
+        // SRP-S2 hard-fail: a producer that cannot settle from committed state produces
+        // NO block (the `?` aborts production) rather than a poisoned one — it can never
+        // silently diverge onto a node-local reward.
+        self.executor
+            .settle_block_rewards_guarded(
+                header.height,
+                header.coinbase,
+                *header.proposer_pubkey.as_bytes(),
+                header.base_fee_per_gas,
+                &executed_transactions,
+                &receipts,
+                &basic_credits,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("VALIDATOR-S1 §R' reward settlement failed: {e}"))?;
 
         // NOW compute final state root — includes both tx effects and reward balances
         let state_root = self.executor.calculate_state_root();
@@ -1036,43 +1073,53 @@ impl BlockProducer {
             }
         }
 
-        // Persist state changes from executed transactions + rewards to storage
+        // SRP-S3b (restart/crash consistency): persist the BLOCK first, then the state +
+        // applied-tip pointer ATOMICALLY. Durable order = BLOCK → (STATE + TIP atomic). A
+        // crash after the block but before the atomic commit leaves the block stored AHEAD
+        // of the applied tip (state+tip still consistent at N-1); on restart the forward
+        // drain re-applies the stored block deterministically (SRP-S2). The OLD order
+        // (state before block, tip written separately) left the durable state one reward
+        // AHEAD of the committed block on a mid-window stop → restart root mismatch
+        // (block-2345). See ADR-2026-07-21-restart-produce-purity §SRP-S3b.
+
+        // WP-G.4: verify the executor's in-memory root still matches the sealed block root
+        // BEFORE any durable write (nothing has mutated committed state since sealing).
+        let post_persist_root = self.executor.calculate_state_root();
+        if post_persist_root != block.state_root {
+            error!(
+                "STATE ROOT MISMATCH before persist: block={} computed={}",
+                block.state_root, post_persist_root
+            );
+            return Err(anyhow::anyhow!(
+                "State root mismatch before persistence: block {} vs computed {}",
+                block.state_root, post_persist_root
+            ));
+        }
+
+        // 1) Persist the block + its state-root pointer (block may lead the applied tip).
+        self.storage.blocks.put_block(&block)?;
+        if let Err(e) = self.storage.state.put_state_root(&block.header.block_hash, &block.state_root) {
+            warn!("Failed to persist state root for block {}: {}", block.header.height, e);
+        }
+
+        // 2) Persist state changes + advance the durable applied tip ATOMICALLY to THIS
+        //    block, so durable state and the committed tip can never diverge on a crash.
         info!("Persisting state changes to storage...");
-        let modified_count = self.executor.persist_state_changes().await?;
-        info!("Persisted {} modified accounts to storage", modified_count);
+        let modified_count = self
+            .executor
+            .persist_state_changes_with_tip(Some((block.header.block_hash, block.header.height)))
+            .await?;
+        info!("Persisted {} modified accounts to storage (tip @ {})", modified_count, block.header.height);
 
         // VALIDATOR-S1 (v5): the executor state is now post-height H. If H is a snapshot
         // boundary S(E), rebuild the proposer selector from the registry as-of this state
         // so epoch-E membership is loaded before epoch-E blocks are validated.
         self.maybe_sync_registry(block.header.height).await;
 
-        // WP-G.4: Verify state root consistency after persistence.
-        // The executor's in-memory state root (used in the block) must still match.
-        let post_persist_root = self.executor.calculate_state_root();
-        if post_persist_root != block.state_root {
-            error!(
-                "STATE ROOT MISMATCH after persist: block={} post_persist={}",
-                block.state_root, post_persist_root
-            );
-            return Err(anyhow::anyhow!(
-                "State root mismatch after persistence: block {} vs post-persist {}",
-                block.state_root, post_persist_root
-            ));
-        }
-
-        // Persist block and related data
-        self.storage.blocks.put_block(&block)?;
-
-        // Persist state root separately for fast startup verification
-        if let Err(e) = self.storage.state.put_state_root(&block.header.block_hash, &block.state_root) {
-            warn!("Failed to persist state root for block {}: {}", block.header.height, e);
-        }
-
-        // EXECUTE-ON-RECEIVE (step 2): we just executed + persisted this block's state,
-        // so advance the applied tip to it (under the lock we've held since fn entry).
-        // Keeps the fleet-wide invariant "applied_tip == the block whose state the
-        // executor reflects" true for locally-produced blocks too, so a peer building on
-        // our tip fast-path-applies cleanly.
+        // EXECUTE-ON-RECEIVE (step 2): update the IN-MEMORY applied-tip ring to this block
+        // (the DURABLE tip was just advanced atomically with the state above). Keeps the
+        // invariant "applied_tip == the block whose state the executor reflects" for
+        // locally-produced blocks too, so a peer building on our tip fast-path-applies.
         if let Some(guard) = applied_guard.as_mut() {
             crate::canonical_apply::record_produced(
                 guard,
@@ -1932,6 +1979,151 @@ mod tests {
         assert!(
             storage.transactions.get_transaction(&bad_tx.hash).unwrap().is_none(),
             "Execution errors must not be persisted as block transactions"
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // SRP-S2 — reward/re-apply state-root purity (CONSENSUS-CRITICAL red test).
+    //
+    // Pins the block-2209 split-brain (handoffs/SRP_S2_REAPPLY_REWARD_PURITY_
+    // HANDOFF_2026-07-21.md). Unlike `rprime_priority_fee_parity.rs`, which drives
+    // `Executor::settle_block_rewards` DIRECTLY (and so never exercised the buggy
+    // branch), this test drives the REAL producer entrypoint `produce_block`, which
+    // owns the `use_enhanced` selection at producer.rs:899.
+    //
+    // Reproduction: a production-shaped producer (`with_economics` → economics_manager
+    // = Some, `emit_v2_headers` = false — the exact state of a miner the instant it
+    // restarts, before `with_v2_headers(true)` is (re)applied) seals ONE empty,
+    // post-activation, single-parent block — the shape of block 2209. It takes the
+    // node-local ENHANCED reward path (a `base_block_reward` credited straight to the
+    // validator from non-committed economics state, no treasury, no §R', no basic
+    // canonical credit). An independent fleet node re-applying that block through the
+    // canonical committed-state path (`Executor::apply_block`, as `CanonicalApplicator`
+    // does) credits the basic 9/1 SALT reward instead → a DIFFERENT root → the
+    // block-2209 `StateRootMismatch`.
+    //
+    // INVARIANT (must hold; VIOLATED on `main`): the reward-settled state root is a
+    // pure function of committed state, identical on producer and receiver. This test
+    // asserts that invariant — it FAILS on `main` (RED) and PASSES once the enhanced
+    // path is removed so the producer settles through the same committed-state path.
+    #[tokio::test]
+    async fn srp_s2_producer_receiver_reward_parity_on_restart_empty_block() {
+        use citrate_economics::{UnifiedEconomicsConfig, UnifiedEconomicsManager};
+        use citrate_execution::block_rewards::{
+            EpochRewardPolicy, CANONICAL_BASE_FEE_PER_GAS, REWARD_MINTER_ADDRESS,
+        };
+        use std::collections::HashMap;
+
+        const VALIDATOR: [u8; 20] = [0x44; 20]; // coinbase == registered staker
+        const REGISTRY: [u8; 20] = [0x99; 20];
+        const TREASURY: [u8; 20] = [0x11; 20];
+
+        let signing_key = test_signing_key();
+        let proposer_pk = signing_key.verifying_key().to_bytes(); // header.proposer_pubkey
+        let coinbase = embedded_pubkey(Address(VALIDATOR));
+
+        // A fully-materialized §R' policy (as `registry_sync` installs at S(E)): the
+        // proposer maps to the coinbase staker, activation 0 so height-1 is
+        // post-activation. Empty blocks vest nothing (share == 0), so §R' is inert
+        // here — the ONLY committed change is the basic block reward, which is exactly
+        // what the producer's enhanced path fails to apply.
+        let mk_policy = || {
+            let mut staker_of = HashMap::new();
+            staker_of.insert(proposer_pk, VALIDATOR);
+            EpochRewardPolicy {
+                epoch: 1,
+                snapshot_height: 0,
+                activation_height: 0,
+                registry: REGISTRY,
+                reward_minter: REWARD_MINTER_ADDRESS,
+                priority_fee_share_bps: 2500,
+                block_subsidy: U256::zero(),
+                staker_of,
+            }
+        };
+
+        // ── Producer: production-shaped (economics = Some) but v2 headers NOT applied. ──
+        let tmp = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+        let state_db = Arc::new(citrate_execution::StateDB::new());
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            state_db.clone(),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        *executor.reward_policy_handle().write() = Some(mk_policy());
+        executor.set_validator_activation_height(0);
+
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+        let economics = Arc::new(UnifiedEconomicsManager::new(UnifiedEconomicsConfig::default()));
+        let producer = BlockProducer::with_economics(
+            storage.clone(),
+            executor.clone(),
+            mempool.clone(),
+            None,
+            coinbase.clone(),
+            signing_key.clone(),
+            2,
+            economics,
+        )
+        .await;
+
+        // One empty block at height 1 — post-activation, single-parent: block 2209's shape.
+        let block_hash = producer.produce_block().await.expect("produce empty block");
+        let sealed = storage
+            .blocks
+            .get_block(&block_hash)
+            .expect("read block")
+            .expect("block present");
+        assert!(sealed.transactions.is_empty(), "the reproduction block must be empty");
+        assert_eq!(sealed.header.height, 1, "post-activation single-parent block");
+        assert_eq!(
+            sealed.header.base_fee_per_gas, CANONICAL_BASE_FEE_PER_GAS,
+            "canonical base fee (importer base-fee check must pass)"
+        );
+
+        // ── Receiver: independent executor, byte-identical genesis + policy, applying
+        //    the sealed block through the canonical committed-state reward path. ──
+        let receiver = Arc::new(Executor::new(Arc::new(citrate_execution::StateDB::new())));
+        *receiver.reward_policy_handle().write() = Some(mk_policy());
+        receiver.set_validator_activation_height(0);
+        let reward = RewardCalculator::new(crate::canonical_apply::canonical_reward_config())
+            .calculate_reward(&sealed);
+        let basic_credits = [
+            (Address(sealed.header.coinbase), reward.validator_reward),
+            (Address(TREASURY), reward.treasury_reward),
+        ];
+
+        let got = receiver
+            .apply_block(&sealed, sealed.header.coinbase, &basic_credits)
+            .await
+            .expect(
+                "SRP-S2 INVARIANT: a fleet node re-applying the producer's block through the \
+                 canonical committed-state reward path MUST reproduce its state root. On `main` \
+                 the producer takes the node-local ENHANCED path (producer.rs `use_enhanced`), \
+                 crediting a reward no receiver can reproduce → StateRootMismatch → the block-2209 \
+                 split-brain.",
+            );
+        assert_eq!(
+            got, sealed.state_root,
+            "receiver's committed-state root MUST equal the producer's sealed root"
+        );
+
+        // And the committed reward MUST be the canonical basic block reward (9 SALT to the
+        // validator, 1 SALT to treasury) — not the enhanced 0.01-SALT node-local credit.
+        assert_eq!(
+            receiver.get_balance(&Address(VALIDATOR)),
+            reward.validator_reward,
+            "validator must hold exactly the canonical basic reward"
+        );
+        assert_eq!(
+            receiver.get_balance(&Address(TREASURY)),
+            reward.treasury_reward,
+            "treasury must hold exactly the canonical treasury slice"
         );
     }
 }

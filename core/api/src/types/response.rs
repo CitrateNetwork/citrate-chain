@@ -23,6 +23,12 @@ pub struct BlockResponse {
     pub gas_limit: u64,
     pub base_fee_per_gas: u64,
     pub proposer_pubkey: String,
+    /// CBF-S1 WP-3: the block's reward beneficiary — the 20-byte EOA the
+    /// proposer registered as its `staker` in the `ValidatorRegistry`. This is
+    /// the ONLY correct value for the Ethereum `miner` field. Distinct from
+    /// `proposer_pubkey`, which is a 32-byte ed25519 consensus key and is not an
+    /// address at all.
+    pub coinbase: String,
     pub transactions: Vec<TransactionResponse>,
     pub state_root: Hash,
     pub tx_root: Hash,
@@ -44,6 +50,7 @@ impl From<Block> for BlockResponse {
             gas_limit: block.header.gas_limit,
             base_fee_per_gas: block.header.base_fee_per_gas,
             proposer_pubkey: hex::encode(block.header.proposer_pubkey.as_bytes()),
+            coinbase: hex::encode(block.header.coinbase),
             transactions: block.transactions.into_iter().map(Into::into).collect(),
             state_root: block.state_root,
             tx_root: block.tx_root,

@@ -90,3 +90,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run SECREM-01 class rules
         run: semgrep --error --config tools/semgrep/rules/secrem01-net1-unbounded-serve-loop.yaml --config tools/semgrep/rules/secrem01-brg1-bare-threshold-count.yaml --config tools/semgrep/rules/secrem01-cons2-header-score-in-chainstate.yaml --config tools/semgrep/rules/secrem01-cons6-hash-from-bytes-unguarded.yaml .
+      # SYNC-S1 D2 class rules — the chain-store/DAG-store divergence class.
+      # Four instances shipped before it was understood (PIL-42's orphaned
+      # genesis, PIL-13's O(N^2) sibling, the boot-3 applied-tip freeze at
+      # height 10944, and its mirror direction). Each rule was validated
+      # BIDIRECTIONALLY: it fires on the pre-D2 source and is clean on the fix.
+      - name: Run SYNC-S1 D2 class rules
+        run: semgrep --error --config tools/semgrep/rules/syncs1-d2-admission-barrier.yaml --config tools/semgrep/rules/syncs1-d2-blockexists-noop.yaml --config tools/semgrep/rules/syncs1-d2-discarded-persistence.yaml .

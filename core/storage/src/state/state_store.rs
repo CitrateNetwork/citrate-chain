@@ -75,7 +75,21 @@ impl StateStoreTrait for StateStore {
         accounts: &[(Address, AccountState)],
         storage: &[StateStorageChange],
     ) -> Result<()> {
-        if accounts.is_empty() && storage.is_empty() {
+        self.write_state_batch_with_applied_tip(accounts, storage, None)
+    }
+
+    /// SRP-S3b: atomically persist the state batch AND the applied-tip pointer in ONE
+    /// cross-CF RocksDB `WriteBatch`, so the durable state and the committed applied tip
+    /// can never diverge across a crash/restart (see the trait doc). The applied-tip key
+    /// (`CF_METADATA`/`APPLIED_TIP_KEY`) is written in the SAME batch as the account +
+    /// storage mutations — the whole thing commits or nothing does.
+    fn write_state_batch_with_applied_tip(
+        &self,
+        accounts: &[(Address, AccountState)],
+        storage: &[StateStorageChange],
+        applied_tip: Option<(Hash, u64)>,
+    ) -> Result<()> {
+        if accounts.is_empty() && storage.is_empty() && applied_tip.is_none() {
             return Ok(());
         }
 
@@ -98,14 +112,37 @@ impl StateStoreTrait for StateStore {
                 }
             }
         }
+        if let Some((hash, height)) = applied_tip {
+            // Same key + layout as BlockStore::put_applied_tip (hash[32] || height_be[8]).
+            let mut buf = [0u8; 40];
+            buf[..32].copy_from_slice(hash.as_bytes());
+            buf[32..].copy_from_slice(&height.to_be_bytes());
+            self.db.batch_put_cf(
+                &mut batch,
+                CF_METADATA,
+                crate::chain::block_store::APPLIED_TIP_KEY,
+                &buf,
+            )?;
+        }
 
         self.db.write_batch_sync(batch)?;
         debug!(
-            "Stored finalized state batch: {} account(s), {} storage mutation(s)",
+            "Stored finalized state batch: {} account(s), {} storage mutation(s), tip={}",
             accounts.len(),
-            storage.len()
+            storage.len(),
+            applied_tip.is_some()
         );
         Ok(())
+    }
+
+    /// SRP-S3b: persist the applied-tip pointer alone (non-atomic fallback path). The
+    /// atomic [`Self::write_state_batch_with_applied_tip`] is preferred for the commit path.
+    fn put_applied_tip_meta(&self, hash: &Hash, height: u64) -> Result<()> {
+        let mut buf = [0u8; 40];
+        buf[..32].copy_from_slice(hash.as_bytes());
+        buf[32..].copy_from_slice(&height.to_be_bytes());
+        self.db
+            .put_cf(CF_METADATA, crate::chain::block_store::APPLIED_TIP_KEY, &buf)
     }
 
     // Sprint P950-A-4 WP-A.4.3: persist MVCC per-account versions.

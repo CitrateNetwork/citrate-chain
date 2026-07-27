@@ -307,6 +307,25 @@ impl Default for AccountState {
     }
 }
 
+impl AccountState {
+    /// SRP-S3 (EIP-158): an account is EMPTY when it has no balance, no nonce, no
+    /// code, no storage, and no model permissions — i.e. it carries no committed
+    /// state and is indistinguishable from an absent account. Such an account MUST
+    /// NOT be folded into the consensus state root: otherwise the root depends on
+    /// whether a read-through / restart reconstruction happened to materialize it
+    /// into the volatile resident map, which forks the chain on an empty post-restart
+    /// block. See ADR-2026-07-21-restart-produce-purity + specs/tla/consensus/
+    /// RestartProducePurity.tla. `storage_root` is compared against `Hash::default()`;
+    /// callers that recompute it from the live storage trie must do so BEFORE this call.
+    pub fn is_empty(&self) -> bool {
+        self.nonce == 0
+            && self.balance.is_zero()
+            && self.code_hash == Hash::default()
+            && self.storage_root == Hash::default()
+            && self.model_permissions.is_empty()
+    }
+}
+
 /// Model metadata
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]

@@ -112,6 +112,48 @@ contract ContradictionLedger {
         governance = initialGovernance;
     }
 
+    // ── Governance transfer (two-step) ──────────────────────────────
+
+    /// @notice Governance nominated to take over, pending its own
+    ///         acceptance. Zero when no transfer is in flight.
+    address public pendingGovernance;
+
+    /// @notice Emitted when a transfer is proposed.
+    event GovernanceTransferStarted(address indexed from, address indexed to);
+    /// @notice Emitted when the nominee accepts and governance moves.
+    event GovernanceTransferred(address indexed from, address indexed to);
+
+    error NotPendingGovernance(address caller);
+
+    /// @notice Nominate `newGovernance`. It does not take effect until the
+    ///         nominee calls {acceptGovernance}.
+    ///
+    /// @dev Two-step on purpose. `governance` gates every admin operation on
+    ///      this contract and there is no recovery path: a one-step setter
+    ///      pointed at a typo, an address on the wrong chain, or a contract
+    ///      that cannot call back would brick administration permanently and
+    ///      the only remedy would be redeploying and re-booking the address
+    ///      across the federation. Requiring the nominee to prove it can
+    ///      transact makes that unreachable.
+    ///
+    ///      Passing `address(0)` clears a pending nomination.
+    function transferGovernance(address newGovernance) external {
+        if (msg.sender != governance) revert NotGovernance(msg.sender);
+        pendingGovernance = newGovernance;
+        emit GovernanceTransferStarted(governance, newGovernance);
+    }
+
+    /// @notice Accept a pending nomination. Only the nominee may call this.
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) {
+            revert NotPendingGovernance(msg.sender);
+        }
+        address previous = governance;
+        governance = msg.sender;
+        pendingGovernance = address(0);
+        emit GovernanceTransferred(previous, msg.sender);
+    }
+
     // ── Governance ──────────────────────────────────────────────────
 
     function setResolver(address resolver, bool authorized) external {

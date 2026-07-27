@@ -356,7 +356,7 @@ async fn handle_inbound(
         msg_count += 1;
         if msg_count > MAX_MSGS_PER_SEC {
             warn!("rate limit exceeded from {} — closing", addr);
-            peer_manager.remove_peer(&remote_id).await;
+            peer_manager.remove_peer_if_current(&remote_id, &peer).await;
             break;
         }
         match frame {
@@ -366,7 +366,7 @@ async fn handle_inbound(
                         Ok(pt) => pt,
                         Err(e) => {
                             warn!("decrypt failed from {}: {}", addr, e);
-                            peer_manager.remove_peer(&remote_id).await;
+                            peer_manager.remove_peer_if_current(&remote_id, &peer).await;
                             break;
                         }
                     }
@@ -384,14 +384,18 @@ async fn handle_inbound(
                             .await;
                     }
                     Err(e) => {
+                        // Was: break WITHOUT remove_peer — the peer stayed registered
+                        // and counted after a decode failure, leaking an inbound slot
+                        // (every other exit from this loop de-registers). De-register.
                         warn!("decode failed from {}: {}", addr, e);
+                        peer_manager.remove_peer_if_current(&remote_id, &peer).await;
                         break;
                     }
                 }
             }
             Err(e) => {
                 debug!("peer {} closed: {}", remote_id, e);
-                peer_manager.remove_peer(&remote_id).await;
+                peer_manager.remove_peer_if_current(&remote_id, &peer).await;
                 break;
             }
         }
@@ -599,7 +603,7 @@ async fn handle_outbound(
             msg_count += 1;
             if msg_count > MAX_MSGS_PER_SEC {
                 warn!("rate limit exceeded from {} — closing", addr);
-                peer_manager.remove_peer(&remote_id).await;
+                peer_manager.remove_peer_if_current(&remote_id, &peer).await;
                 break;
             }
             match frame {
@@ -609,7 +613,7 @@ async fn handle_outbound(
                             Ok(pt) => pt,
                             Err(e) => {
                                 warn!("decrypt failed from {}: {}", addr, e);
-                                peer_manager.remove_peer(&remote_id).await;
+                                peer_manager.remove_peer_if_current(&remote_id, &peer).await;
                                 break;
                             }
                         }
@@ -624,14 +628,17 @@ async fn handle_outbound(
                                 .await;
                         }
                         Err(e) => {
+                            // de-register on decode failure (was a bare break →
+                            // leaked an outbound slot; see the inbound path).
                             warn!("decode failed from {}: {}", addr, e);
+                            peer_manager.remove_peer_if_current(&remote_id, &peer).await;
                             break;
                         }
                     }
                 }
                 Err(e) => {
                     debug!("peer {} closed: {}", remote_id, e);
-                    peer_manager.remove_peer(&remote_id).await;
+                    peer_manager.remove_peer_if_current(&remote_id, &peer).await;
                     break;
                 }
             }
