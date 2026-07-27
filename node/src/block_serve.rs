@@ -177,10 +177,14 @@ pub fn serve_headers(storage: &StorageManager, from: &Hash, count: u32) -> Vec<B
 /// with a full 64 headers, and on the cold node as "Validated and imported 1/1
 /// blocks (height 244-244)" indefinitely.
 ///
-/// Fixes, both here: never echo the requester's own anchor back, and key the
-/// forward-progress guarantee on "no group ABOVE the anchor emitted yet" rather
-/// than on `out.is_empty()`. Pinned by
-/// `cold_sync_serve_always_delivers_a_block_above_the_anchor`.
+/// Fix: key the forward-progress guarantee on "no group ABOVE the anchor emitted
+/// yet" rather than on `out.is_empty()`, so the first group the requester can
+/// actually advance on is always sent, budget or no budget. Pinned by
+/// `cold_sync_serve_always_delivers_a_block_above_the_anchor` and
+/// `forward_progress_survives_a_nonempty_anchor_height_group`.
+///
+/// The anchor's own block is deliberately INCLUDED in the response — see the
+/// comment at the group-gathering loop. SYNC-S3's recovery request depends on it.
 pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Block> {
     let max_items = count.min(MAX_BLOCKS_PER_REQUEST);
     // INCLUSIVE of the anchor's height so a merge parent that is a sibling of the
@@ -225,13 +229,14 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
         while i < rows.len() && rows[i].0 == h {
             let hash = rows[i].1;
             i += 1;
-            // SYNC-S2: never echo the requester's OWN anchor back. They provably
-            // hold it — they anchored on it. Re-sending it is pure waste, and on
-            // chain 40204 it also consumed the byte budget the next height-group
-            // needed (see the wedge described in the fn docs).
-            if hash == *from {
-                continue;
-            }
+            // The anchor's own block IS included. It is tempting to strip it —
+            // "they anchored on it, so they have it" — but that assumption is
+            // false for the SYNC-S3 recovery request, which anchors at a MISSING
+            // PARENT precisely because the requester does NOT have it. Stripping
+            // the anchor there would withhold the one block the requester needs
+            // and leave two producers permanently partitioned. The forward-
+            // progress guarantee below is what fixes the SYNC-S2 byte-budget
+            // wedge; excluding the anchor was only ever an optimization.
             if let Ok(Some(block)) = storage.blocks.get_block(&hash) {
                 let sz = bincode::serialized_size(&block).unwrap_or(u64::MAX);
                 group_bytes = group_bytes.saturating_add(sz);
@@ -471,11 +476,48 @@ mod tests {
              anchor, else the requester can never advance and re-requests the same \
              anchor forever (the live cold-sync wedge). Got heights {heights:?}"
         );
-        // And the anchor itself must not be echoed back — the requester has it,
-        // and on 40204 that wasted 674 B of the budget the next group needed.
+    }
+
+    /// SYNC-S3 — the recovery request must be answerable.
+    ///
+    /// When a gossiped block cannot be placed (its parent is missing), the node
+    /// asks the sending peer for blocks anchored at that MISSING PARENT — a block
+    /// the peer provably holds, since it just sent that block's child. The whole
+    /// recovery hinges on the serve returning the anchor ITSELF: the requester
+    /// does not have it, which is the entire point of asking.
+    ///
+    /// This pins that property. It is also why `serve_blocks` must NOT strip the
+    /// anchor from the response as a bandwidth optimization — doing so withholds
+    /// exactly the block the requester is missing and leaves two producers
+    /// permanently partitioned (the 2026-07-27 live split, where one dropped
+    /// gossip message desynced two producers for good).
+    #[test]
+    fn recovery_anchor_at_a_missing_parent_returns_that_block() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let genesis = dag_block(1, 0, Hash::default(), vec![]);
+        let g = genesis.hash();
+        let shared = dag_block(0xA1, 1, g, vec![]);
+        // The peer's branch: `missing` is the block our node never received; `child`
+        // is the one it DID receive and had to defer.
+        let missing = dag_block(0xB2, 2, shared.hash(), vec![]);
+        let child = dag_block(0xC3, 3, missing.hash(), vec![]);
+        for b in [&genesis, &shared, &missing, &child] {
+            storage.blocks.put_block(b).expect("put_block");
+        }
+
+        let served = serve_blocks(&storage, &missing.hash(), 32);
+        let hashes: Vec<Hash> = served.iter().map(|b| b.hash()).collect();
         assert!(
-            !served.iter().any(|b| b.hash() == anchor.hash()),
-            "the requester's own anchor must not be re-sent"
+            hashes.contains(&missing.hash()),
+            "SYNC-S3 INVARIANT: a request anchored at a missing parent MUST return that \
+             block — the requester does not have it, which is why it is asking. Stripping \
+             the anchor makes the recovery request unanswerable and partitions the fleet."
+        );
+        assert!(
+            hashes.contains(&child.hash()),
+            "and the deferred child's ancestry forward must come with it"
         );
     }
 
