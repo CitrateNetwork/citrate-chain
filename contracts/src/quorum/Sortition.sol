@@ -111,6 +111,7 @@ contract Sortition {
     error BadReveal(bytes32 drawId, address who);
     error TooEarlyToFinalize(uint64 earliest);
     error BeyondBlockhashHorizon(uint64 targetBlock, uint64 deadline);
+    error UnreadableAnchor(uint64 targetBlock);
     error UnrevealedCommitments(uint32 committed, uint32 revealed);
     error NotFinal(bytes32 drawId, State state);
     error StillFinalizable(bytes32 drawId);
@@ -204,7 +205,15 @@ contract Sortition {
         // outcome can kill the draw but cannot steer it.
         if (d.revealCount != d.commitCount) revert UnrevealedCommitments(d.commitCount, d.revealCount);
 
-        d.seed = keccak256(abi.encode(blockhash(d.targetBlock), d.revealedXor, drawId, d.poolRoot));
+        // The horizon check above should make this unreachable on a live chain,
+        // but `blockhash` returning zero is how the EVM says "I cannot tell
+        // you", and a seed built on a zero is a draw the chain contributed
+        // nothing to. Refusing is the same rule this contract applies
+        // everywhere else: an unreadable input is a refusal, not a default.
+        bytes32 anchor = blockhash(d.targetBlock);
+        if (anchor == bytes32(0)) revert UnreadableAnchor(d.targetBlock);
+
+        d.seed = keccak256(abi.encode(anchor, d.revealedXor, drawId, d.poolRoot));
         d.state = State.Final;
 
         emit DrawFinalized(drawId, d.seed, d.commitCount);
