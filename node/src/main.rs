@@ -2528,6 +2528,29 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         && coinbase_str != "0000000000000000000000000000000000000000"
         && hex::decode(coinbase_str).map(|b| b.iter().any(|&x| x != 0)).unwrap_or(false);
 
+    // WP-11 (corrected): mint/load the proposer key whenever this node has a
+    // coinbase, REGARDLESS of whether mining is currently enabled.
+    //
+    // The first cut of WP-11 did this inside the `mining.enabled` branch below,
+    // which is wrong: `proposer.key` is the node's CONSENSUS IDENTITY, not a
+    // mining artifact. A node cannot be REGISTERED as a validator without one,
+    // and the reroll ceremony reads this file off every node before registering.
+    // With it gated on mining, the three non-mining boot nodes never minted a key
+    // and P2 could not register them — caught by the ceremony's own gate:
+    //   `scp: /home/citrate/.citrate/proposer.key: No such file or directory`
+    //
+    // Minting it unconditionally also means a node can be registered now and
+    // start producing later (flip `mining.enabled`, restart) WITHOUT
+    // re-registering — its identity is stable across that change. Since pubkeys
+    // are permanently single-use on-chain (`pubkeyEverRegistered`), an identity
+    // that changed when mining was toggled would burn a registration every time.
+    let proposer_signing_key = if coinbase_is_valid {
+        let proposer_key_path = config.storage.data_dir.join("proposer.key");
+        Some(load_or_generate_proposer_key(&proposer_key_path)?)
+    } else {
+        None
+    };
+
     if config.mining.enabled && coinbase_is_valid {
         info!("Starting block producer...");
 
@@ -2550,8 +2573,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // The registered pubkey now comes FROM this file rather than from the
         // coinbase, so the ceremony reads the same file (`--node
         // <coinbase>=<STAKER_ENV>=<proposer_key_file>`) instead of re-deriving.
-        let proposer_key_path = config.storage.data_dir.join("proposer.key");
-        let signing_key = load_or_generate_proposer_key(&proposer_key_path)?;
+        // Minted above, unconditionally on a valid coinbase. Safe to expect:
+        // this branch requires `coinbase_is_valid`, which is the same condition.
+        let signing_key = proposer_signing_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("proposer key missing despite a valid coinbase"))?;
         info!(
             "Block signing key: proposer_pubkey={}",
             hex::encode(signing_key.verifying_key().to_bytes())
