@@ -28,7 +28,14 @@
 #   DGX compute provider     DGX_PROVIDER_ADDRESS               50   provider register + heartbeat txs
 #   DGX compute provider v2  DGX_PROVIDER_V2_ADDRESS            50   second provider identity
 #   Identity signer          CITRATE_AA_IDENTITY_SIGNER_ADDR    10   admin float (setIdentitySigner; permits are off-chain)
+#   AA registrar             AA_REGISTRAR_ADDRESS              100   identity registrar txs
+#   AA sponsor signer        AA_SPONSOR_SIGNER_ADDRESS         100   AA sponsor signing float
 #   EIP-2771 relayer(s)      CITRATE_EDU_RELAYER_ADDRESS*       50   meta-tx relay gas (EduForwarder)  [optional]
+#
+#   Plus a one-time ENTRYPOINT DEPOSIT for the paymaster (25 SALT) — without it
+#   NO UserOp can be sponsored, so the whole gasless path is dead even when every
+#   role above has gas. It is a deposit INTO the EntryPoint, not a balance on an
+#   EOA, so a balance check on the paymaster address will not reveal it missing.
 #
 #   * optional / forward-looking: there is no canonical relayer key in
 #     .env.testnet today. If/when one exists, set CITRATE_EDU_RELAYER_ADDRESS
@@ -109,6 +116,8 @@ ROLE_NAMES=(
   "DGX compute provider"
   "DGX compute provider v2"
   "Identity signer"
+  "AA registrar"
+  "AA sponsor signer"
 )
 ROLE_VARS=(
   "CITRATE_AA_BUNDLER_OPERATOR_ADDR"
@@ -116,14 +125,18 @@ ROLE_VARS=(
   "DGX_PROVIDER_ADDRESS"
   "DGX_PROVIDER_V2_ADDRESS"
   "CITRATE_AA_IDENTITY_SIGNER_ADDR"
+  "AA_REGISTRAR_ADDRESS"
+  "AA_SPONSOR_SIGNER_ADDRESS"
 )
-ROLE_TARGETS=( 100 100 50 50 10 )
+ROLE_TARGETS=( 100 100 50 50 10 100 100 )
 ROLE_WHY=(
   "submits batched ERC-4337 UserOps"
   "inference settlement / pool dispatch txs"
   "provider register + heartbeat txs"
   "second provider identity"
   "admin float (permits are off-chain)"
+  "identity registrar txs (derived deterministically at reroll P4)"
+  "AA sponsor signing float (derived deterministically at reroll P4)"
 )
 
 # Optional EIP-2771 relayer address vars — add more as they become canonical.
@@ -161,7 +174,11 @@ fund_one() {
     return 0
   fi
   log "  SEND  ${name} ($addr)  +${need_salt} SALT ..."
+  # --legacy is REQUIRED: chain 40204 rejects EIP-1559 typed transactions. Without
+  # it `cast send` fails and the nonce never moves, which looks like a silent
+  # no-op rather than an error (this cost real time during the 2026-07-27 reroll).
   if cast send "$addr" \
+        --legacy \
         --value "${need_wei}wei" \
         --rpc-url "$RPC_URL" \
         --private-key "$(env_get DEPLOYER_PRIVATE_KEY)" \
@@ -185,6 +202,58 @@ done
 for var in "${RELAYER_VARS[@]}"; do
   fund_one "EIP-2771 relayer ($var)" "$var" "$RELAYER_TARGET" "meta-tx relay gas (optional)"
 done
+
+# ── One-time: the paymaster's EntryPoint DEPOSIT ─────────────────────────────
+#
+# This is NOT an EOA balance. `CitratePaymaster` sponsors UserOps out of a
+# deposit held INSIDE the EntryPoint, so `cast balance <paymaster>` reads 0 even
+# when it is fully funded — and reads 0 when it is broken, too. The only way to
+# see it is `EntryPoint.balanceOf(paymaster)`.
+#
+# A reroll zeroes it along with every other balance. Until it is topped up NO
+# UserOp can be sponsored, so the entire gasless path is dead even though every
+# role above has gas and every address in the book has code. The 2026-07-27
+# reroll left it at 0 and nothing in this script noticed, because the role list
+# predated the AA operator keys.
+PAYMASTER_TARGET=25
+fund_paymaster_deposit() {
+  local ep pm bal_wei need_wei need_salt
+  ep="$(env_get CITRATE_AA_ENTRY_POINT)"
+  pm="$(env_get CITRATE_AA_PAYMASTER_ADDR)"
+  [[ -z "$pm" ]] && pm="$(env_get CITRATE_AA_PAYMASTER)"
+  if [[ -z "$ep" || -z "$pm" ]]; then
+    log "  SKIP  Paymaster deposit — EntryPoint/Paymaster address unset in $ENV_FILE"
+    SKIPPED=$((SKIPPED+1)); return 0
+  fi
+  bal_wei="$(cast call "$ep" 'balanceOf(address)(uint256)' "$pm" --rpc-url "$RPC_URL" 2>/dev/null | awk '{print $1}')"
+  [[ -z "$bal_wei" ]] && bal_wei=0
+  local target_wei; target_wei="$($PY -c "print($PAYMASTER_TARGET * 10**18)")"
+  if [[ "$($PY -c "print(1 if $bal_wei >= $target_wei else 0)")" == "1" ]]; then
+    log "  NOOP  Paymaster deposit already >= ${PAYMASTER_TARGET} SALT"
+    NOOP=$((NOOP+1)); return 0
+  fi
+  need_wei="$($PY -c "print($target_wei - $bal_wei)")"
+  need_salt="$(cast to-unit "$need_wei" ether 2>/dev/null || echo '?')"
+  PLANNED_WEI_TOTAL="$($PY -c "print($PLANNED_WEI_TOTAL + $need_wei)")"
+  if [[ "$BROADCAST" == "0" ]]; then
+    log "  PLAN  Paymaster deposit ($pm via EntryPoint $ep)  +${need_salt} SALT  → target ${PAYMASTER_TARGET}"
+    return 0
+  fi
+  log "  SEND  Paymaster deposit  +${need_salt} SALT ..."
+  if cast send "$ep" 'depositTo(address)' "$pm" \
+        --legacy \
+        --value "${need_wei}wei" \
+        --rpc-url "$RPC_URL" \
+        --private-key "$(env_get DEPLOYER_PRIVATE_KEY)" \
+        >/dev/null 2>&1; then
+    log "  OK    Paymaster deposit funded to ${PAYMASTER_TARGET} SALT"
+    FUNDED=$((FUNDED+1))
+  else
+    log "  FAIL  Paymaster deposit — cast send failed"
+    FAILED=$((FAILED+1))
+  fi
+}
+fund_paymaster_deposit
 
 PLANNED_SALT="$(cast to-unit "$PLANNED_WEI_TOTAL" ether 2>/dev/null || echo '?')"
 log ""

@@ -1,26 +1,30 @@
 {
-  "mainnet": [
-    "# Mainnet bootstrap nodes will be added here when network launches",
-    "# Format: /ip4/1.2.3.4/tcp/30303/p2p/12D3KooWAbcdef..."
+  "_WARNING": "THIS FILE IS NOT CANONICAL AND IS READ BY NOTHING. Do not pin from it.",
+  "_WHY_IT_STILL_EXISTS": [
+    "Every address this file used to carry was a FABRICATED EXAMPLE from an early",
+    "scaffold — the IPs (54.123.45.67, 35.123.45.67, ...) and the 12D3KooW... peer",
+    "ids were never real, and the file said so in a comment that was easy to miss.",
+    "Nothing loads it: `grep -rn bootstrap-nodes.json` over the repo returns no",
+    "code hits.",
+    "",
+    "It was left behind and LOOKS authoritative, which makes it a trap — someone",
+    "asking 'where are the boot peers' finds this first, pins fake peers, and gets",
+    "a node that never syncs and never says why.",
+    "",
+    "WP-6 (2026-07-27) emptied it rather than deleting it, so the filename stays",
+    "claimed and a future scaffold cannot quietly recreate it with the same",
+    "misleading content."
   ],
-  "testnet": [
-    "# Testnet bootstrap nodes",
-    "# Note: These are example addresses - replace with actual bootstrap node addresses",
-    "# US East",
-    "/ip4/54.123.45.67/tcp/30303/p2p/12D3KooWDEFHPNm3Nb2FBJNs9tFaHSLApUK5xkzDCp9oJvgLUCVQ",
-    "# US West",
-    "/ip4/54.234.56.78/tcp/30303/p2p/12D3KooWKPRQFBgFShwjdrpNTQRnUqPBibw5RPvGEitcvGzMPRkv",
-    "# Europe",
-    "/ip4/35.123.45.67/tcp/30303/p2p/12D3KooWLQPbB5DYfNBhSjKDrpNDEkpRUGVGk8rUjgLUbcVxGzMN",
-    "# Asia",
-    "/ip4/13.234.56.78/tcp/30303/p2p/12D3KooWQYV9dGFShwjrpNTRnUqPBibw5RPvgLEitcvGzMNPRkx"
-  ],
-  "devnet": [
-    "# Local devnet bootstrap nodes",
-    "/ip4/127.0.0.1/tcp/30303/p2p/12D3KooWLocalDevNode1",
-    "/ip4/127.0.0.1/tcp/30304/p2p/12D3KooWLocalDevNode2"
-  ],
-  "local": [
-    "# Local testing - no bootstrap nodes needed"
-  ]
+  "_CANONICAL_SOURCE": "node/config/testnet-beta.toml -> bootstrap_nodes",
+  "_CANONICAL_PEERS_VERIFIED_2026_07_27": {
+    "_note": "Peer identities derive from each node's noise.key, which the reroll's surgical wipe PRESERVES. They therefore survive a reroll unchanged — unlike contract addresses, which do not. DNS re-verified against the live fleet on 2026-07-27.",
+    "boot1.citrate.ai:30303": "142.93.50.217 — noise_f356d3eb...8141",
+    "boot2.citrate.ai:30303": "143.198.134.151 — noise_4ed28138...2c07",
+    "boot3.citrate.ai:30303": "142.93.99.212 — noise_2b492467...a420e",
+    "rpc.citrate.ai:30303": "142.93.58.145 — noise_6ee54971...8b4a — THE SEQUENCER. boot{1,2,3} are discovery-only and advertise height 0, so a fresh node will NOT sync from them alone. Any pinned peer set that omits the sequencer produces a node that connects, reports peers, and never syncs."
+  },
+  "mainnet": [],
+  "testnet": [],
+  "devnet": [],
+  "local": []
 }
