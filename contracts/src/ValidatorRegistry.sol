@@ -88,7 +88,8 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
     struct Validator {
         address staker;
         uint256 bondedStake;      // active slashable principal (backs membership + reward weight)
-        uint256 vestedRewards;    // slashable; withdrawable only on full exit, after the lock
+        uint256 vestedRewards;    // UNMATURED rewards — still inside the evidence window, still slashable
+        uint256 ripeRewards;      // ADR-5: survived the window — claimable while ACTIVE, NOT slashable
         uint256 escrow;           // unbonded principal, STILL SLASHABLE until escrowUnlockEpoch
         uint256 admissionMinStake;// minStake in effect at registration (grandfathering anchor)
         uint64 activationEpoch;
@@ -97,6 +98,20 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
         Status status;
         bool withdrawn;           // final rewards released (full-exit terminal flag)
     }
+
+    // ── ADR-5: matured-reward ring ──────────────────────────────────────────
+    // Rewards leave the slashable base only after surviving REWARD_RING epochs,
+    // which is strictly longer than EVIDENCE_WINDOW_EPOCHS — so equivocation
+    // slashing is never weakened by a claim.
+    //
+    // A fixed ring indexed by `epoch % REWARD_RING` bounds this to O(1) writes
+    // and an O(REWARD_RING) sweep. Because two epochs mapping to the same slot
+    // are always a multiple of REWARD_RING apart, a slot holding a DIFFERENT
+    // epoch than the current one is necessarily already matured — the property
+    // that makes the ring correct without storing an unbounded history.
+    uint256 public constant REWARD_RING = EVIDENCE_WINDOW_EPOCHS + 1; // 4
+    mapping(bytes32 => uint256[4]) private _rewardRing;
+    mapping(bytes32 => uint64[4]) private _rewardRingEpoch;
 
     // proposerPubkey (canonical 32-byte ed25519 encoding) => record
     mapping(bytes32 => Validator) private _validators;
@@ -139,6 +154,8 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
     event Demoted(bytes32 indexed pubkey, uint256 bondedStake, uint256 admissionMinStake);
     event BountyClaimed(address indexed reporter, uint256 amount);
     event RewardCredited(bytes32 indexed pubkey, uint256 amount, uint256 epoch);
+    /// ADR-5: matured rewards paid out to an ACTIVE validator (no unbond required).
+    event RewardsClaimed(bytes32 indexed pubkey, address indexed staker, uint256 amount);
     event ParamQueued(bytes32 indexed name, uint256 value, uint256 eta);
     event ParamExecuted(bytes32 indexed name, uint256 value);
     event SlasherQueued(address slasher, uint256 eta);
@@ -250,6 +267,7 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
             staker: msg.sender,
             bondedStake: msg.value,
             vestedRewards: 0,
+            ripeRewards: 0,
             escrow: 0,
             admissionMinStake: minStake,
             activationEpoch: actEpoch,
@@ -318,8 +336,13 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
         // Terminal reward release for a fully-exited validator (bond and escrow both cleared).
         if (v.status == Status.Exiting && v.bondedStake == 0 && v.escrow == 0 && !v.withdrawn) {
             if (currentEpoch() < uint256(v.exitEpoch) + EXIT_LOCK_EPOCHS) revert Locked();
-            payout += v.vestedRewards;
+            // ADR-5: the terminal release covers BOTH buckets — anything still
+            // inside its window and anything already matured but never claimed.
+            payout += v.vestedRewards + v.ripeRewards;
             v.vestedRewards = 0;
+            v.ripeRewards = 0;
+            delete _rewardRing[pubkey];
+            delete _rewardRingEpoch[pubkey];
             v.withdrawn = true;
         }
         if (payout == 0) revert NothingToWithdraw();
@@ -384,6 +407,14 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
         if (v.status == Status.Slashed) revert AlreadySlashed();
         if (v.status == Status.None) revert BadEvidence();
 
+        // ADR-5: realize maturity BEFORE computing the penalty base. Without
+        // this the sweep is lazy (it happens only on credit/claim), so whether a
+        // matured reward is slashable would depend on whether anyone happened to
+        // call `claimRewards` first — and a validator expecting a slash could
+        // shrink its own base by claiming at the right moment. Sweeping here
+        // makes the base a pure function of the epoch.
+        _sweepMatured(pubkey, v);
+
         uint256 penaltyBps = tier == SlashTier.Byzantine ? 10000 : (tier == SlashTier.Inconsistency ? 2000 : 500);
         // Slashable base includes escrowed (unbonded-but-still-locked) principal + vested rewards.
         uint256 slashable = v.bondedStake + v.escrow + v.vestedRewards;
@@ -436,8 +467,85 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
         uint256 newTotal = emittedInEpoch[ep] + amount;
         if (newTotal > maxEpochEmission) revert EmissionCapped();
         emittedInEpoch[ep] = newTotal;
+
+        // ADR-5: age out anything that has cleared the window, THEN book this
+        // epoch's credit. After the sweep the target slot is either empty or
+        // already holds `ep`, so the accumulate below can never merge two
+        // different epochs into one bucket.
+        _sweepMatured(pubkey, v);
+        uint256 slot = ep % REWARD_RING;
+        _rewardRing[pubkey][slot] += amount;
+        _rewardRingEpoch[pubkey][slot] = uint64(ep);
+
         v.vestedRewards += amount;
         emit RewardCredited(pubkey, amount, ep);
+    }
+
+    /// ADR-5: move every ring bucket that has survived `REWARD_RING` epochs out
+    /// of the slashable base (`vestedRewards`) and into claimable `ripeRewards`.
+    ///
+    /// Bounded at REWARD_RING iterations. Idempotent — safe to call on any path.
+    ///
+    /// The decrement is CLAMPED to `vestedRewards`: a non-Byzantine slash draws
+    /// down `vestedRewards` without touching the ring, so the ring can transiently
+    /// exceed it. Without the clamp that underflows and bricks every subsequent
+    /// credit and claim for that validator.
+    function _sweepMatured(bytes32 pubkey, Validator storage v) internal {
+        uint256 ep = currentEpoch();
+        uint256[4] storage ring = _rewardRing[pubkey];
+        uint64[4] storage ringEpoch = _rewardRingEpoch[pubkey];
+        for (uint256 i = 0; i < REWARD_RING; ++i) {
+            uint256 amt = ring[i];
+            if (amt == 0) continue;
+            if (ep < uint256(ringEpoch[i]) + REWARD_RING) continue; // still slashable
+            ring[i] = 0;
+            uint256 dec = amt > v.vestedRewards ? v.vestedRewards : amt;
+            v.vestedRewards -= dec;
+            v.ripeRewards += dec;
+        }
+    }
+
+    /// ADR-5: claim matured rewards WITHOUT unbonding.
+    ///
+    /// Before this existed, `withdraw` released rewards only on a full exit after
+    /// `EXIT_LOCK_EPOCHS` — so a member could realise earnings only by ceasing to
+    /// validate, which makes "run a node, earn SALT" untrue in practice.
+    ///
+    /// Only rewards that have cleared `REWARD_RING` epochs (> the equivocation
+    /// evidence window) are payable, so this never shrinks the penalty available
+    /// for provable equivocation.
+    function claimRewards(bytes32 pubkey) external nonReentrant {
+        Validator storage v = _validators[pubkey];
+        if (v.staker != msg.sender) revert NotStaker();
+        if (v.status == Status.Slashed) revert AlreadySlashed();
+
+        _sweepMatured(pubkey, v);
+        uint256 amt = v.ripeRewards;
+        if (amt == 0) revert NothingToWithdraw();
+        v.ripeRewards = 0; // CEI: zeroed before the transfer, and nonReentrant.
+
+        (bool ok, ) = payable(msg.sender).call{value: amt}("");
+        require(ok, "xfer");
+        emit RewardsClaimed(pubkey, msg.sender, amt);
+    }
+
+    /// Total unclaimed rewards (slashable + matured) and the portion claimable now.
+    function rewardsOf(bytes32 pubkey) external view returns (uint256 total, uint256 claimableNow) {
+        Validator storage v = _validators[pubkey];
+        uint256 ep = currentEpoch();
+        uint256 ripe = v.ripeRewards;
+        uint256 unmatured = v.vestedRewards;
+        uint256[4] storage ring = _rewardRing[pubkey];
+        uint64[4] storage ringEpoch = _rewardRingEpoch[pubkey];
+        for (uint256 i = 0; i < REWARD_RING; ++i) {
+            uint256 amt = ring[i];
+            if (amt == 0) continue;
+            if (ep < uint256(ringEpoch[i]) + REWARD_RING) continue;
+            uint256 dec = amt > unmatured ? unmatured : amt;
+            unmatured -= dec;
+            ripe += dec;
+        }
+        return (unmatured + ripe, ripe);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -563,13 +671,19 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
             uint64 actEpoch,
             uint64 exitEpoch,
             uint64 escrowUnlock,
-            Status status
+            Status status,
+            uint256 claimableNow
         )
     {
         Validator storage v = _validators[pubkey];
+        // ADR-5: `rewards` is TOTAL unclaimed (slashable + matured) — what a
+        // member has earned and not yet taken. `claimableNow` is the matured
+        // portion `claimRewards` would pay right now. The trailing position keeps
+        // every existing index stable for consumers already decoding this tuple.
+        (uint256 total, uint256 ripe) = this.rewardsOf(pubkey);
         return (
-            v.staker, v.bondedStake, v.vestedRewards, v.escrow, v.admissionMinStake,
-            v.activationEpoch, v.exitEpoch, v.escrowUnlockEpoch, v.status
+            v.staker, v.bondedStake, total, v.escrow, v.admissionMinStake,
+            v.activationEpoch, v.exitEpoch, v.escrowUnlockEpoch, v.status, ripe
         );
     }
 
