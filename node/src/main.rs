@@ -2195,6 +2195,42 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                             pid,
                                             hex::encode(&missing_parent.as_bytes()[..8])
                                         );
+                                        // SYNC-S3 — ANCESTRY RECOVERY (the 2026-07-27 silent
+                                        // partition). Recording the height signal is NOT enough.
+                                        // The 2s sync tick only pulls when `applied_height <
+                                        // target`, and it anchors every request at OUR OWN
+                                        // applied tip — which a peer on a different branch does
+                                        // not have, so it resolves the anchor to nothing and
+                                        // replies "Sending 0 blocks". Live reproduction: two
+                                        // producers, one dropped gossip message (B's first block,
+                                        // broadcast before its peer link was up), and from then on
+                                        // EVERY later block deferred on the previous undelivered
+                                        // one. A issued 236 GetBlocks; B answered "Sending 0
+                                        // blocks" 76/76 times, and vice versa. Both nodes stayed
+                                        // "healthy" — no errors, no root mismatches — while
+                                        // building permanently divergent chains.
+                                        //
+                                        // Fix: ask THIS peer for the missing parent directly. That
+                                        // anchor is one the peer provably holds (it just sent us
+                                        // its child), so the request is answerable, and
+                                        // `serve_blocks` returns the anchor's whole height-group
+                                        // plus everything above it — the ancestry we lack. Self-
+                                        // heals at depth 1, before a deep fork can form.
+                                        // `request_blocks` de-duplicates on the anchor while a
+                                        // request is in flight and honours the concurrency cap, so
+                                        // a run of deferrals cannot storm a peer.
+                                        if let Some(peer) = pm_for_rx.get_peer(&pid) {
+                                            if let Err(e) =
+                                                sync_for_rx.request_blocks(&peer, missing_parent).await
+                                            {
+                                                tracing::debug!(
+                                                    "SYNC-S3: ancestry request to {} for {} failed: {}",
+                                                    pid,
+                                                    hex::encode(&missing_parent.as_bytes()[..8]),
+                                                    e
+                                                );
+                                            }
+                                        }
                                     }
                                     admission::AdmitOutcome::Rejected(why) => {
                                         tracing::warn!(
