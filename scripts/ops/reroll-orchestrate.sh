@@ -145,11 +145,40 @@ if should P2; then
   fi
   log "  G7 PASS: registry at $REGISTRY_EXPECT has code."
   # register the 4 validators (coinbase == staker addr; --force per GAP-6).
+  #
+  # WP-11: the proposer key is no longer derivable from the coinbase — it is a
+  # real secret each node mints into <data-dir>/proposer.key on first start (P1
+  # brought the fleet up, so the files exist by now). Fetch each node's key over
+  # SSH into a 0700 staging dir and pass it as the ceremony's third --node field.
+  # The ceremony REJECTS the old two-field form rather than silently re-deriving.
+  # Fleet order MUST match fleet-surgical-wipe.sh's ALL_IPS and the staker index:
+  #   STAKER_1 = rpc-1, STAKER_2 = boot1, STAKER_3 = boot2, STAKER_4 = boot3.
+  # A mismatch would register node N's coinbase against node M's proposer key —
+  # every such validator would be admitted and then never able to sign a block.
+  FLEET_IPS=( "142.93.58.145" "142.93.50.217" "143.198.134.151" "142.93.99.212" )
+
+  PROPOSER_KEY_DIR="$(mktemp -d -t citrate-proposer-keys-XXXXXX)"
+  chmod 700 "$PROPOSER_KEY_DIR"
+  # Wipe the private keys from disk on ANY exit path, including a gate failure.
+  trap 'rm -rf -- "$PROPOSER_KEY_DIR"' EXIT INT TERM
+
   NODE_ARGS=()
   for i in 1 2 3 4; do
     CB="$(get_env "VALIDATOR_STAKER_${i}_ADDRESS")"
     [ -n "$CB" ] || gate_fail P2 "VALIDATOR_STAKER_${i}_ADDRESS missing in $ENV_TESTNET"
-    NODE_ARGS+=( --node "${CB}=VALIDATOR_STAKER_${i}_PRIVATE_KEY" )
+    NODE_IP="${FLEET_IPS[$((i-1))]}"
+    PK_FILE="$PROPOSER_KEY_DIR/node${i}-proposer.key"
+    if [ "$CONFIRM" -eq 1 ]; then
+      # Nodes mint proposer.key at 0600 on first start; if it is absent the node
+      # never came up in P1 and registering would bind a key nothing signs with.
+      scp -q -o BatchMode=yes -o StrictHostKeyChecking=no \
+        "root@${NODE_IP}:/home/citrate/.citrate/proposer.key" "$PK_FILE" \
+        || gate_fail P2 "could not fetch proposer.key from ${NODE_IP} — did P1 start the node?"
+      chmod 600 "$PK_FILE"
+      SZ="$(wc -c < "$PK_FILE" | tr -d ' ')"
+      [ "$SZ" = "32" ] || gate_fail P2 "proposer.key from ${NODE_IP} is ${SZ} bytes, expected 32"
+    fi
+    NODE_ARGS+=( --node "${CB}=VALIDATOR_STAKER_${i}_PRIVATE_KEY=${PK_FILE}" )
   done
   # export the staker keys so the ceremony bin can resolve the env-var names.
   if [ "$CONFIRM" -eq 1 ]; then
