@@ -61,3 +61,30 @@ test('checkDrift is checksum/case-insensitive', () => {
   const upper = Object.fromEntries(Object.entries(flat).map(([k, v]) => [k, v.toUpperCase().replace('0X', '0x')]))
   assert.equal(checkDrift(upper).ok, true)
 })
+
+// --- CLI --subset mode (for repos that pin an intentional slice, e.g. radar) ---
+import { execFileSync } from 'node:child_process'
+import { writeFileSync, mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+
+const CLI = resolve(here, '../bin/check.mjs')
+const tmp = mkdtempSync(resolve(tmpdir(), 'cc-subset-'))
+const runCli = (args) => {
+  try { execFileSync('node', [CLI, ...args], { stdio: 'pipe' }); return 0 }
+  catch (e) { return e.status ?? 1 }
+}
+
+test('CLI --subset passes a partial book whose pinned addresses all match', () => {
+  const flat = flatten()
+  const partial = { X402Facilitator: flat.X402Facilitator, EntryPoint: flat.EntryPoint }
+  const p = resolve(tmp, 'partial-ok.json'); writeFileSync(p, JSON.stringify(partial))
+  assert.equal(runCli(['check', p, '--subset']), 0)
+  // without --subset the same partial file fails (missing the rest of the book)
+  assert.equal(runCli(['check', p]), 1)
+})
+
+test('CLI --subset still fails on a mismatched pinned address', () => {
+  const bad = { X402Facilitator: '0xdeadbeef00000000000000000000000000000000' }
+  const p = resolve(tmp, 'partial-bad.json'); writeFileSync(p, JSON.stringify(bad))
+  assert.equal(runCli(['check', p, '--subset']), 1)
+})
