@@ -3,24 +3,30 @@
 // canonical @citratelabs/chain-config. Exit 1 on drift so CI fails loudly
 // after a re-roll instead of shipping dead addresses.
 //
-//   citrate-chain-config check <path-to-vendored-json> [--canonical <path>]
+//   citrate-chain-config check <path-to-vendored-json> [--canonical <path>] [--subset]
 //
 // <path> may be a 40204.json-shaped file, an { "contracts": {...} } file, or a
 // flat { "Name": "0x..." } map. With --canonical, compare against that file
 // (e.g. the sibling citrate-chain/contracts/addresses/40204.json in an on-disk
 // federation checkout) instead of the package's embedded snapshot.
+//
+// --subset: for repos that intentionally pin only a slice of the book (e.g.
+// citrate-radar), treat addresses that are absent from the vendored file as OK
+// and fail only on MISMATCH of an address the repo does pin. Without --subset,
+// a missing canonical address is also a failure.
 import { readFileSync } from 'node:fs'
 import { checkDrift, flatten } from '../src/index.mjs'
 
 const argv = process.argv.slice(2)
 const cmd = argv[0]
 if (cmd !== 'check') {
-  console.error('usage: citrate-chain-config check <path-to-vendored-json> [--canonical <path>]')
+  console.error('usage: citrate-chain-config check <path-to-vendored-json> [--canonical <path>] [--subset]')
   process.exit(2)
 }
 const target = argv[1]
 if (!target) { console.error('error: missing <path-to-vendored-json>'); process.exit(2) }
 
+const subset = argv.includes('--subset')
 const ci = argv.indexOf('--canonical')
 const canonicalPath = ci !== -1 ? argv[ci + 1] : null
 
@@ -44,12 +50,17 @@ if (canonicalPath) {
   result = checkDrift(candidate)
 }
 
+// --subset: a repo that pins only a slice of the book passes as long as every
+// address it DOES pin matches canonical; absent addresses are not drift.
+if (subset) result.ok = result.mismatched.length === 0
+
 if (result.ok) {
-  console.log(`[chain-config] ${target} matches canonical ✓`)
+  const scope = subset ? `${Object.keys(candidate).length ? '' : ''}matches canonical (subset ✓)` : 'matches canonical ✓'
+  console.log(`[chain-config] ${target} ${scope}`)
   process.exit(0)
 }
 console.error(`[chain-config] DRIFT in ${target}:`)
-if (result.missing.length) console.error(`  missing (${result.missing.length}): ${result.missing.join(', ')}`)
+if (!subset && result.missing.length) console.error(`  missing (${result.missing.length}): ${result.missing.join(', ')}`)
 for (const m of result.mismatched) console.error(`  mismatch ${m.name}: vendored ${m.actual} != canonical ${m.expected}`)
 console.error('\n[chain-config] re-sync this repo from canonical 40204.json before merging.')
 process.exit(1)
