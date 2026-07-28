@@ -1,4 +1,7 @@
 [profile.default]
+# Read-only access to the param schemas, so RegisterSeedTemplates hashes the
+# file on disk rather than a constant transcribed beside it.
+fs_permissions = [{ access = "read", path = "./schemas" }]
 src = "src"
 out = "out"
 libs = ["lib"]
