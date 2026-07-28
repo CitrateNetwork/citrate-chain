@@ -1,0 +1,61 @@
+THIS IS NOT AN AUDIT
+====================
+
+If you followed an `auditCID` from GovernanceTemplateRegistry on chain 40204 and
+arrived here, read this before you rely on anything.
+
+The templates registered against this CID have NOT been audited. There is no
+third-party audit of any contract in the Citrate federation. This document
+exists because the registry requires a non-empty `auditCID` on every row — by
+design, so that "only audited bytecode governs" is checkable rather than
+procedural — and registering a placeholder that merely looked like a CID would
+have defeated the one invariant the registry exists to hold.
+
+So this is what is actually true, in place of an audit:
+
+WHAT WAS DONE
+-------------
+  * Every invariant named in each contract's NatSpec has a Foundry test that
+    FAILS when the invariant is deliberately broken. Those negative controls are
+    recorded per work package in the sprint's SCOPE.
+  * Two contracts carry TLA+ specifications with complete state-space
+    exploration: VoteAllowance (2,079,364 distinct states) and Sortition
+    (1,485), each with negative controls against the model.
+  * An internal static-analysis pass: Slither (101 detectors) and semgrep
+    (p/smart-contracts, 50 rules) over the whole set, with every finding triaged
+    in writing. One substantive finding — an abi.encodePacked collision in
+    GovernanceProtocolFactory — was closed with a test rather than an argument.
+
+WHAT WAS NOT DONE
+-----------------
+  * No external audit, by anyone.
+  * No economic or governance-capture analysis. Static analysers do not model
+    "what if the tenant admin is hostile".
+  * No formal verification of the other ten contracts.
+
+THE LARGEST KNOWN GAP
+---------------------
+ThresholdApproval reads MultiSigEnvelope, whose `sign` does not authenticate
+signers cryptographically — its own documentation delegates that to the caller.
+So an `Allow` from ThresholdApproval means "N signatures are RECORDED", not "the
+chain verified them". Binding those records to real humans is the
+SignatureCeremony, off chain. No static analyser would have found that; it is
+written here because a reader of an `auditCID` deserves to know the sharpest
+limitation without having to go looking.
+
+SCOPE OF THIS REGISTRATION
+--------------------------
+Devnet only. Chain 40204 is a development network. Nothing registered against
+this CID may be described to a customer as audited, in the product, in
+documentation, or in a presentation.
+
+This CID is intended to be REPLACED. An audit pass using Trail of Bits tooling
+was commissioned by the owner on 2026-07-27; when it produces real evidence,
+these rows should be re-registered under a new version pointing at it. Note that
+the registry is deliberately append-only except for `active`: the rows carrying
+this CID cannot be edited, only deprecated, which is exactly the property that
+makes this notice permanent rather than quietly overwritten.
+
+Registered: 2026-07-27
+Chain: 40204 (development)
+Source: citrate-chain/contracts/audit/UNAUDITED-DEVNET-2026-07-27.txt

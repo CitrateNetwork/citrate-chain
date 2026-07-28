@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Typed parameters the authoring pipeline (QRM-S7.4) must produce for this template. The registry pins keccak256 of this file as paramSchemaHash; the factory records which schema a deployment was supposed to satisfy but deliberately does NOT evaluate it on chain \u2014 see GovernanceProtocolFactory's NatSpec.",
+  "properties": {
+    "ceiling": {
+      "solidityType": "uint8"
+    },
+    "classifications": {
+      "solidityType": "address"
+    },
+    "foreignNationalFloor": {
+      "solidityType": "uint8"
+    },
+    "tenants": {
+      "solidityType": "address"
+    }
+  },
+  "required": [
+    "ceiling",
+    "classifications",
+    "foreignNationalFloor",
+    "tenants"
+  ],
+  "title": "ClassificationGate constructor parameters",
+  "type": "object"
+}
