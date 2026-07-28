@@ -1,0 +1,23 @@
+{
+  "name": "@citratelabs/chain-config",
+  "version": "0.1.0",
+  "description": "Canonical Citrate 40204 chain config — contract addresses, AA stack, precompiles — generated from citrate-chain/contracts/addresses/40204.json. The single source of truth the federation imports instead of vendoring raw copies.",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": { "types": "./src/index.d.ts", "import": "./src/index.mjs" },
+    "./40204.json": "./src/addresses.40204.json"
+  },
+  "bin": {
+    "citrate-chain-config": "./bin/check.mjs"
+  },
+  "files": ["src", "bin"],
+  "scripts": {
+    "generate": "node scripts/generate.mjs",
+    "generate:check": "node scripts/generate.mjs --check",
+    "test": "node --test"
+  },
+  "license": "BUSL-1.1",
+  "repository": { "type": "git", "url": "https://github.com/CitrateNetwork/citrate-chain", "directory": "packages/chain-config" }
+}
