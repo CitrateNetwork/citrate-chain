@@ -145,6 +145,70 @@ contract GovernanceProtocolFactoryTest is Test {
     /// Creation code that does not hash to the registered template is refused.
     /// **This is the whole audit story**: without it, "deployed from audited
     /// bytecode" is a claim about paperwork, not about the bytes that run.
+    /// **The `abi.encodePacked` collision, answered with a test rather than an
+    /// argument.**
+    ///
+    /// Slither and semgrep both flag `abi.encodePacked(creationCode, params)` as
+    /// a hash-collision risk, and they are right about the general shape: two
+    /// dynamic `bytes` concatenated can be re-split without changing the result,
+    /// so `("ab","c")` and `("a","bc")` produce identical bytes.
+    ///
+    /// Here that is harmless, and this is why. The concatenation is not a
+    /// hashing choice — `creationCode ‖ params` is the EVM's own init-code
+    /// layout, and `abi.encode` would produce bytes that are not deployable at
+    /// all. What protects the audit boundary is that GF-2 hashes
+    /// `creationCode` **independently**: an attacker who shifts bytes across the
+    /// boundary changes `keccak256(creationCode)` and fails the registry check,
+    /// even though the deployed init code — and therefore the CREATE2 address —
+    /// is byte-identical.
+    ///
+    /// So the collision exists and buys nothing: you can produce the same
+    /// address only by supplying a `creationCode` that is no longer the audited
+    /// one, and that is exactly what the registry refuses.
+    function test_GF2_reSplittingCreationCodeAndParamsCannotEvadeTheRegistry() public {
+        // Move one byte across the creationCode/params boundary. The
+        // concatenation — and thus the init code and the address — is unchanged.
+        bytes memory shiftedCode = abi.encodePacked(creationCode, _firstByte(params));
+        bytes memory shiftedParams = _tail(params);
+
+        assertEq(
+            keccak256(abi.encodePacked(shiftedCode, shiftedParams)),
+            keccak256(abi.encodePacked(creationCode, params)),
+            "precondition: the re-split really does collide"
+        );
+        assertEq(
+            factory.predict(shiftedCode, shiftedParams, keccak256("resplit")),
+            factory.predict(creationCode, params, keccak256("resplit")),
+            "precondition: it therefore predicts the same address"
+        );
+
+        // And it is still refused, because the registry pins creationCode alone.
+        vm.prank(ADMIN);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GovernanceProtocolFactory.CreationCodeMismatch.selector,
+                templateId,
+                keccak256(shiftedCode),
+                keccak256(creationCode)
+            )
+        );
+        factory.deployProtocol(
+            TENANT, templateId, shiftedCode, shiftedParams, SPEC_HASH, SPEC_CID, 2, keccak256("resplit"), CORRELATION
+        );
+    }
+
+    function _firstByte(bytes memory b) internal pure returns (bytes memory out) {
+        out = new bytes(1);
+        out[0] = b[0];
+    }
+
+    function _tail(bytes memory b) internal pure returns (bytes memory out) {
+        out = new bytes(b.length - 1);
+        for (uint256 i = 1; i < b.length; ++i) {
+            out[i - 1] = b[i];
+        }
+    }
+
     function test_GF2_creationCodeMustHashToTheRegisteredTemplate() public {
         bytes memory tampered = abi.encodePacked(creationCode, hex"00");
         vm.prank(ADMIN);
