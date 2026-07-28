@@ -1,0 +1,42 @@
+name: chain-config
+
+# Guards the canonical address distribution: the embedded snapshot in
+# @citratelabs/chain-config must match contracts/addresses/40204.json, and
+# the package's own drift-check + tests must pass. This is the citrate-chain
+# side of backlog item CL-C2 — after every re-roll, regenerate or this fails.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'contracts/addresses/40204.json'
+      - 'packages/chain-config/**'
+      - '.github/workflows/chain-config.yml'
+  pull_request:
+    paths:
+      - 'contracts/addresses/40204.json'
+      - 'packages/chain-config/**'
+      - '.github/workflows/chain-config.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chain-config-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  selfcheck:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/chain-config
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Embedded snapshot matches canonical 40204.json
+        run: node scripts/generate.mjs --check
+      - name: Package tests
+        run: node --test
