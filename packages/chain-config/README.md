@@ -1,4 +1,4 @@
-# @citratenetwork/chain-config
+# @citratelabs/chain-config
 
 The single source of truth for Citrate chain-40204 addresses, published as a typed
 package so the federation **imports** it instead of vendoring raw JSON copies that
@@ -18,7 +18,7 @@ item `CL-C2`).
 ## Use
 
 ```js
-import { contracts, aaStack, memberSBT, getAddress, checkDrift } from '@citratenetwork/chain-config'
+import { contracts, aaStack, memberSBT, getAddress, checkDrift } from '@citratelabs/chain-config'
 
 contracts.X402Facilitator      // "0xbd46…"
 aaStack.EntryPoint             // ERC-4337 entrypoint
@@ -31,7 +31,7 @@ memberSBT                       // nonce-based — getCode-verify at boot (it MO
 Replace hand-rolled `sync-addresses` checks with a blocking step:
 
 ```yaml
-- run: npx @citratenetwork/chain-config check ./path/to/vendored/addresses.json
+- run: npx @citratelabs/chain-config check ./path/to/vendored/addresses.json
 ```
 
 Exit 1 on any missing/mismatched address, so a re-roll fails CI loudly instead of

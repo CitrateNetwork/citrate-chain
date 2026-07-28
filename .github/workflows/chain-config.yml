@@ -1,7 +1,7 @@
 name: chain-config
 
 # Guards the canonical address distribution: the embedded snapshot in
-# @citratenetwork/chain-config must match contracts/addresses/40204.json, and
+# @citratelabs/chain-config must match contracts/addresses/40204.json, and
 # the package's own drift-check + tests must pass. This is the citrate-chain
 # side of backlog item CL-C2 — after every re-roll, regenerate or this fails.
 

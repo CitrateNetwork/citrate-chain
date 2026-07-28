@@ -8,7 +8,7 @@
 //                                       # drifted from canonical (CI gate)
 //
 // Run (or --check) this in citrate-chain CI after every re-roll so the
-// published @citratenetwork/chain-config can never lag the on-chain book.
+// published @citratelabs/chain-config can never lag the on-chain book.
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'

@@ -1,4 +1,4 @@
-// @citratenetwork/chain-config — canonical Citrate 40204 config.
+// @citratelabs/chain-config — canonical Citrate 40204 config.
 // Import these instead of vendoring raw addresses. Regenerated from
 // citrate-chain/contracts/addresses/40204.json (see scripts/generate.mjs).
 import book from './addresses.40204.json' with { type: 'json' }

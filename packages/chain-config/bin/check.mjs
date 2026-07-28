@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Drift gate for consumer repos. Compares a repo's vendored address file against
-// canonical @citratenetwork/chain-config. Exit 1 on drift so CI fails loudly
+// canonical @citratelabs/chain-config. Exit 1 on drift so CI fails loudly
 // after a re-roll instead of shipping dead addresses.
 //
 //   citrate-chain-config check <path-to-vendored-json> [--canonical <path>]
