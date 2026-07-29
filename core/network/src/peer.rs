@@ -7,10 +7,11 @@ use futures::{SinkExt, StreamExt};
 use citrate_consensus::types::Hash;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
@@ -105,6 +106,14 @@ pub struct Peer {
     pub info: Arc<RwLock<PeerInfo>>,
     pub send_tx: mpsc::Sender<NetworkMessage>,
     pub recv_tx: mpsc::Receiver<NetworkMessage>,
+    /// Connection-close signal for the reader/writer tasks that own this
+    /// connection's socket halves (see [`Peer::close`]).
+    shutdown: Arc<Notify>,
+    /// Latched close flag. `Notify` only wakes tasks that are already parked,
+    /// so a task that is between awaits when `close()` fires would miss the
+    /// notification — it re-checks this instead. Latched, never cleared: a
+    /// closed connection is never reopened, a new one is built.
+    closed: Arc<AtomicBool>,
 }
 
 impl Peer {
@@ -117,7 +126,48 @@ impl Peer {
             info: Arc::new(RwLock::new(info)),
             send_tx,
             recv_tx,
+            shutdown: Arc::new(Notify::new()),
+            closed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Tell this connection's reader and writer tasks to stop, which drops the
+    /// socket halves they own and actually closes the TCP connection.
+    ///
+    /// WHY THIS EXISTS (fleet incident 2026-07-29). `PeerManager::add_peer`
+    /// dedups by `peer_id`: a reconnecting peer replaces the map entry. But
+    /// replacing the entry only dropped the OLD `Arc<Peer>` — it never touched
+    /// the old connection's tasks, which kept running and kept owning their
+    /// socket. Every reconnect therefore leaked one live TCP connection.
+    ///
+    /// boot1 accumulated **25 established connections on :30303** that way. The
+    /// damage is not the socket count, it is that `send_to_peers` resolves a
+    /// peer id to exactly ONE `Peer`, so responses were queued onto a connection
+    /// whose TCP was half-open and silently discarded. rpc-1 logged
+    /// `Sending 32 blocks` while boot1 received nothing and sat frozen at height
+    /// 72,057 for twenty minutes — a follower that looked healthy from both ends
+    /// while exchanging nothing. `send_to_peers` also discards the send result
+    /// at the call site, so nothing surfaced the failure.
+    ///
+    /// Idempotent: calling it twice is harmless.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        // `notify_waiters` (not `notify_one`) — both the reader and the writer
+        // of this connection are parked on it and BOTH must stop. `notify_one`
+        // would wake exactly one and leave the other holding its half open.
+        self.shutdown.notify_waiters();
+    }
+
+    /// True once [`Peer::close`] has been called on this connection.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Handles for this connection's owning tasks to park on. Returns the
+    /// latched flag alongside the notify so a task can close the miss-window:
+    /// check the flag, then park.
+    pub fn shutdown_handles(&self) -> (Arc<Notify>, Arc<AtomicBool>) {
+        (self.shutdown.clone(), self.closed.clone())
     }
 
     pub async fn send(&self, message: NetworkMessage) -> Result<(), NetworkError> {
@@ -289,6 +339,19 @@ impl PeerManager {
         // connection whose teardown never ran (e.g. a break without remove_peer) is
         // reconciled on the next connect rather than leaking forever.
         if let Some((_, old)) = self.peers.remove(&peer_id) {
+            // CONNECTION DEDUP. Evicting the map entry is not enough: the old
+            // connection's reader and writer tasks own the socket halves and
+            // keep running, so the TCP connection stays ESTABLISHED with nothing
+            // routing to it. Those orphans accumulated to 25 sockets on boot1,
+            // and — because `send_to_peers` resolves an id to exactly ONE peer —
+            // block responses were queued onto a half-open one and silently
+            // dropped. Close it explicitly; see `Peer::close`.
+            // Guard: only close if this really is a DIFFERENT connection. If a
+            // caller ever re-adds the same `Arc<Peer>` (idempotent re-register),
+            // closing here would tear down the very connection being added.
+            if !Arc::ptr_eq(&old, &peer) {
+                old.close();
+            }
             let old_dir = { old.info.read().await.direction.clone() };
             let mut stats = self.stats.write().await;
             stats.total_connected = stats.total_connected.saturating_sub(1);
@@ -300,6 +363,7 @@ impl PeerManager {
                     stats.outbound_count = stats.outbound_count.saturating_sub(1)
                 }
             }
+            debug!("Closed superseded connection for reconnecting peer {}", peer_id);
         }
 
         // Check limits (the reconnecting peer is now NOT double-counted against them).
@@ -346,6 +410,12 @@ impl PeerManager {
         let peer = self.peers.remove(peer_id).map(|(_, p)| p);
 
         if let Some(ref p) = peer {
+            // Drop the SOCKET, not just the map entry. Without this a dropped
+            // peer keeps its TCP connection ESTABLISHED, and the sync tick's
+            // drop-and-re-handshake escalation then adds a fresh connection on
+            // every cycle while the dead one lingers — a connection leak driven
+            // by the very mechanism meant to recover the peer.
+            p.close();
             let info = p.info.read().await;
             let mut stats = self.stats.write().await;
             stats.total_connected = stats.total_connected.saturating_sub(1);
@@ -867,6 +937,129 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer_with_id(id: &str, addr: &str, direction: Direction) -> Arc<Peer> {
+        let (send_tx, recv_rx) = mpsc::channel(10);
+        let info = PeerInfo::new(
+            PeerId::new(id.to_string()),
+            addr.parse().expect("valid addr"),
+            direction,
+        );
+        Arc::new(Peer::new(info, send_tx, recv_rx))
+    }
+
+    /// CONNECTION DEDUP (fleet incident 2026-07-29).
+    ///
+    /// `add_peer` already deduped the MAP by peer id — a reconnect replaced the
+    /// entry. What it never did was close the connection it replaced, so the old
+    /// reader/writer tasks kept their socket halves and the TCP connection stayed
+    /// ESTABLISHED with nothing routing to it. boot1 accumulated 25 such sockets,
+    /// and since `send_to_peers` resolves an id to exactly ONE peer, block
+    /// responses were queued onto a half-open one and silently discarded: rpc-1
+    /// logged "Sending 32 blocks" while boot1 sat frozen at 72,057 for 20 minutes.
+    #[tokio::test]
+    async fn reconnect_closes_the_superseded_connection() {
+        let manager = PeerManager::new(PeerManagerConfig::default());
+
+        let first = peer_with_id("noise_abc", "10.0.0.1:30303", Direction::Inbound);
+        manager.add_peer(first.clone()).await.expect("first add");
+        assert!(!first.is_closed(), "a live connection starts open");
+
+        // Same identity reconnects — a fresh socket, same peer id.
+        let second = peer_with_id("noise_abc", "10.0.0.1:44444", Direction::Inbound);
+        manager.add_peer(second.clone()).await.expect("reconnect");
+
+        assert!(
+            first.is_closed(),
+            "the superseded connection MUST be closed — leaving it open is the \
+             orphaned-socket leak, and it is the one `send_to_peers` may still \
+             resolve to while the peer receives nothing"
+        );
+        assert!(!second.is_closed(), "the live connection stays open");
+        assert_eq!(manager.get_peer_counts().await.0, 1, "still exactly one peer");
+    }
+
+    /// Re-registering the SAME connection must not tear it down. Without the
+    /// `Arc::ptr_eq` guard, an idempotent re-add would close the very socket it
+    /// is registering — turning a no-op into a disconnect.
+    #[tokio::test]
+    async fn re_adding_the_same_connection_does_not_close_it() {
+        let manager = PeerManager::new(PeerManagerConfig::default());
+        let peer = peer_with_id("noise_same", "10.0.0.9:30303", Direction::Inbound);
+
+        manager.add_peer(peer.clone()).await.expect("first add");
+        manager.add_peer(peer.clone()).await.expect("re-add");
+
+        assert!(
+            !peer.is_closed(),
+            "re-adding the same Arc must be a no-op, not a self-inflicted close"
+        );
+        assert_eq!(manager.get_peer_counts().await.0, 1);
+    }
+
+    /// Dropping a peer must drop its SOCKET, not just the map entry. The sync
+    /// tick drops a peer after repeated timeouts so it re-handshakes; if the old
+    /// connection survives that, the recovery mechanism itself leaks a socket per
+    /// cycle.
+    #[tokio::test]
+    async fn dropping_a_peer_closes_its_connection() {
+        let manager = PeerManager::new(PeerManagerConfig::default());
+        let peer = peer_with_id("noise_xyz", "10.0.0.2:30303", Direction::Outbound);
+        manager.add_peer(peer.clone()).await.expect("add");
+
+        let removed = manager.remove_peer(&PeerId::new("noise_xyz".to_string())).await;
+        assert!(removed.is_some());
+        assert!(peer.is_closed(), "remove_peer must close the connection");
+    }
+
+    /// The close signal must actually wake a task parked on it — the reader and
+    /// writer both park, so `notify_waiters` (not `notify_one`) is required or
+    /// one of the two halves is left holding the socket open forever.
+    #[tokio::test]
+    async fn close_wakes_every_parked_owner() {
+        let peer = peer_with_id("noise_park", "10.0.0.3:30303", Direction::Inbound);
+        let (shutdown_a, _) = peer.shutdown_handles();
+        let (shutdown_b, _) = peer.shutdown_handles();
+
+        let a = tokio::spawn(async move { shutdown_a.notified().await });
+        let b = tokio::spawn(async move { shutdown_b.notified().await });
+        // Let both register before signalling.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        peer.close();
+
+        let both = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let _ = a.await;
+            let _ = b.await;
+        })
+        .await;
+        assert!(
+            both.is_ok(),
+            "both socket-owning tasks must wake — notify_one would strand one half"
+        );
+    }
+
+    /// A task that is mid-iteration when `close()` fires misses the notify
+    /// entirely, so the latched flag is what guarantees it still stops. Without
+    /// it the fix works only when the timing happens to be favourable.
+    #[tokio::test]
+    async fn close_is_observable_after_the_fact_via_the_latched_flag() {
+        let peer = peer_with_id("noise_latch", "10.0.0.4:30303", Direction::Inbound);
+        let (_, closed) = peer.shutdown_handles();
+
+        // Nobody is parked: this notification wakes no one.
+        peer.close();
+
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "a task that parks AFTER the close must still see it — otherwise the \
+             writer blocks on recv() forever and the socket never closes"
+        );
+        assert!(peer.is_closed());
+        peer.close(); // idempotent
+        assert!(peer.is_closed());
+    }
 
     /// SECREM-01 NET-4(b): banning a SocketAddr must ban the whole
     /// IP — reconnecting from a different source port stays banned.
