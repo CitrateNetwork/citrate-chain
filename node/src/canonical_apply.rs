@@ -187,6 +187,11 @@ pub struct CanonicalApplicator {
     /// Last finalized height — the reorg floor (I4: never revert below finality).
     /// Defaults to 0 (genesis); tightened when wired to the checkpoint manager.
     finalized_height: Arc<AtomicU64>,
+    /// The height this node has actually APPLIED, published for readers outside
+    /// the advance lock. The sync manager judges completion against this: the
+    /// height of the last block RECEIVED is not evidence of holding its ancestry
+    /// (wedge #85 — see `SyncManager::sync_is_complete`).
+    applied_height: Arc<AtomicU64>,
     /// VALIDATOR-S1 registry snapshot-sync. When set, after applying a RECEIVED
     /// or REORGED block at a snapshot boundary S(E) the driver rebuilds the shared
     /// proposer selector from `ValidatorRegistry.activeSet()` as-of that state —
@@ -237,6 +242,7 @@ impl CanonicalApplicator {
         // reorg can revert to before any new block is applied.
         let mut snapshots = BTreeMap::new();
         snapshots.insert(tip.height, (tip.hash, executor.state_snapshot()));
+        let seeded_height = tip.height;
         Self {
             executor,
             storage,
@@ -244,6 +250,7 @@ impl CanonicalApplicator {
             lock: Arc::new(Mutex::new(AppliedState { tip, snapshots })),
             fork_choice: None,
             finalized_height: Arc::new(AtomicU64::new(0)),
+            applied_height: Arc::new(AtomicU64::new(seeded_height)),
             registry_sync: None,
             registry_policy_resync: None,
         }
@@ -263,6 +270,18 @@ impl CanonicalApplicator {
     /// BFT checkpoints finalize. Reorgs never revert below this height (I4).
     pub fn finalized_height_handle(&self) -> Arc<AtomicU64> {
         self.finalized_height.clone()
+    }
+
+    /// Shared handle to the APPLIED height (see the field docs). Wired into the
+    /// sync manager so "am I synced?" is answered from this node's own chain.
+    pub fn applied_height_handle(&self) -> Arc<AtomicU64> {
+        self.applied_height.clone()
+    }
+
+    /// Publish the applied tip height for out-of-lock readers. Call while
+    /// holding the advance lock, after the tip may have moved.
+    fn publish_applied_height(&self, state: &AppliedState) {
+        self.applied_height.store(state.tip.height, Ordering::SeqCst);
     }
 
     /// Attach the VALIDATOR-S1 registry snapshot-sync (see the field docs). The
@@ -836,6 +855,8 @@ impl CanonicalApplicator {
             }
         }
 
+        self.publish_applied_height(&state);
+
         // Classify for the received block against the FINAL (post-reorg) applied
         // chain — NOT the pre-reorg `out.applied` (F1): a block the drain applied
         // could have been reverted by the subsequent fork-choice reorg, so only
@@ -908,6 +929,7 @@ impl CanonicalApplicator {
                 }
             }
         }
+        self.publish_applied_height(&state);
         if !out.applied.is_empty() {
             info!(
                 "periodic drain: applied {} persisted block(s), tip now {} @ {}",
