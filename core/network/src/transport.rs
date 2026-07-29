@@ -14,6 +14,7 @@ use futures::{SinkExt, StreamExt};
 use citrate_consensus::types::Hash;
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -313,10 +314,29 @@ async fn handle_inbound(
         remote_id, addr, encrypted
     );
 
-    // Writer: forward messages from send queue to wire
+    // Writer: forward messages from send queue to wire.
+    //
+    // CONNECTION DEDUP: this task owns `sink`, one half of the socket. It must
+    // stop when the peer manager supersedes or drops this connection, or the
+    // socket stays ESTABLISHED with nothing routing to it — the orphan leak that
+    // left boot1 with 25 live connections and its block responses queued onto a
+    // half-open one. Returning from here drops `sink`.
     let noise_w = noise_session.clone();
+    let (shutdown_w, closed_w) = peer.shutdown_handles();
     tokio::spawn(async move {
-        while let Some(msg) = to_wire_rx.recv().await {
+        loop {
+            // Latched flag first: `notify_waiters` only wakes tasks already
+            // parked, so a close that fires while we are mid-iteration would be
+            // missed by the select alone.
+            if closed_w.load(Ordering::SeqCst) {
+                break;
+            }
+            let msg = tokio::select! {
+                biased;
+                _ = shutdown_w.notified() => break,
+                m = to_wire_rx.recv() => m,
+            };
+            let Some(msg) = msg else { break };
             match bincode::serialize(&msg) {
                 Ok(ser) => {
                     let payload = if let Some(ref ns) = noise_w {
@@ -343,12 +363,26 @@ async fn handle_inbound(
         }
     });
 
-    // Reader loop with rate limiting
+    // Reader loop with rate limiting. Owns the other socket half, so it honours
+    // the same close signal as the writer — otherwise the read side keeps the
+    // connection alive even after the writer has gone.
     let noise_r = noise_session;
+    let (shutdown_r, closed_r) = peer.shutdown_handles();
     let mut msg_count = 0u32;
     let mut window_start = std::time::Instant::now();
     const MAX_MSGS_PER_SEC: u32 = 200;
-    while let Some(frame) = stream_rx.next().await {
+    loop {
+        if closed_r.load(Ordering::SeqCst) {
+            break;
+        }
+        let frame = tokio::select! {
+            biased;
+            _ = shutdown_r.notified() => break,
+            f = stream_rx.next() => match f {
+                Some(f) => f,
+                None => break,
+            },
+        };
         if window_start.elapsed() > std::time::Duration::from_secs(1) {
             window_start = std::time::Instant::now();
             msg_count = 0;
@@ -560,10 +594,20 @@ async fn handle_outbound(
             remote_id, addr, encrypted
         );
 
-        // Writer task
+        // Writer task — see the inbound writer for why this honours `close()`.
         let noise_w = noise_session.clone();
+        let (shutdown_w, closed_w) = peer.shutdown_handles();
         tokio::spawn(async move {
-            while let Some(msg) = to_wire_rx.recv().await {
+            loop {
+                if closed_w.load(Ordering::SeqCst) {
+                    break;
+                }
+                let msg = tokio::select! {
+                    biased;
+                    _ = shutdown_w.notified() => break,
+                    m = to_wire_rx.recv() => m,
+                };
+                let Some(msg) = msg else { break };
                 match bincode::serialize(&msg) {
                     Ok(ser) => {
                         let payload = if let Some(ref ns) = noise_w {
@@ -590,12 +634,24 @@ async fn handle_outbound(
             }
         });
 
-        // Reader loop with rate limiting
+        // Reader loop with rate limiting — same close contract as inbound.
         let noise_r = noise_session;
+        let (shutdown_r, closed_r) = peer.shutdown_handles();
         let mut msg_count = 0u32;
         let mut window_start = std::time::Instant::now();
         const MAX_MSGS_PER_SEC: u32 = 200;
-        while let Some(frame) = stream_rx.next().await {
+        loop {
+            if closed_r.load(Ordering::SeqCst) {
+                break;
+            }
+            let frame = tokio::select! {
+                biased;
+                _ = shutdown_r.notified() => break,
+                f = stream_rx.next() => match f {
+                    Some(f) => f,
+                    None => break,
+                },
+            };
             if window_start.elapsed() > std::time::Duration::from_secs(1) {
                 window_start = std::time::Instant::now();
                 msg_count = 0;
