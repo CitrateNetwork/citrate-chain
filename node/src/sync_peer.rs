@@ -89,8 +89,12 @@ pub struct SyncCandidate {
 
 /// Per-peer sync-timeout accounting plus the selection policy built on it.
 ///
-/// Owned by the sync tick task; not `Sync`, not shared. The counters are
-/// process-local by design — a restart is a legitimate clean slate.
+/// Shared (behind a mutex) between the sync tick task, which records timeouts
+/// and selects, and the network message handler, which records successes — the
+/// tick task alone can only ever observe failures, so I3 has to be credited
+/// from the receive side. The counters are process-local by design: a restart is
+/// a legitimate clean slate, which is also why restarting a wedged node was a
+/// (partial, short-lived) workaround for the bug this closes.
 #[derive(Debug, Default)]
 pub struct SyncPeerSelector {
     failures: HashMap<String, u32>,
@@ -142,8 +146,13 @@ impl SyncPeerSelector {
     ///
     /// Ties on height break on peer id so the choice is deterministic and does
     /// not oscillate between two equal peers across ticks.
+    ///
+    /// Takes `&self`: selection is a pure read of the counters. Every mutation
+    /// is an explicit `record_*` / `reset` call, so "does choosing a peer change
+    /// its standing?" is answerable from the signature alone — the question that
+    /// the clear-on-escape draft got wrong.
     pub fn select<'a>(
-        &mut self,
+        &self,
         candidates: &'a [SyncCandidate],
         applied_height: u64,
     ) -> Option<&'a SyncCandidate> {

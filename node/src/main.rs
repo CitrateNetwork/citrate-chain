@@ -1861,7 +1861,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let candidates: Vec<sync_peer::SyncCandidate> =
                     connected_peers.iter().map(|(c, _)| c.clone()).collect();
                 let chosen_id = {
-                    let mut sel = sync_peers_for_loop.lock().await;
+                    let sel = sync_peers_for_loop.lock().await;
                     sel.select(&candidates, applied_height).map(|c| c.id.clone())
                 };
                 let request_peer: Option<Arc<citrate_network::peer::Peer>> =
