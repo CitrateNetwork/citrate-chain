@@ -1614,7 +1614,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let gossip = Arc::new(GossipProtocol::new(GossipConfig::default(), peer_manager.clone()));
         let gossip_for_rx = gossip.clone();
         // Sync manager (basic integration)
-        let sync = Arc::new(SyncManager::new(SyncConfig::default()));
+        // WEDGE #85: judge sync completion against THIS node's applied chain, not
+        // the height of the last block handed to us. Without this a node with a
+        // gap beneath the live tip declares itself synced on the first gossiped
+        // tip block and stops requesting the backlog — it then drops those tip
+        // blocks (parents absent), persists nothing, serves nothing, and its
+        // applied tip never moves again.
+        let sync = Arc::new(match canonical_applicator.as_ref() {
+            Some(app) => SyncManager::new(SyncConfig::default())
+                .with_local_height(app.applied_height_handle()),
+            None => SyncManager::new(SyncConfig::default()),
+        });
         let sync_for_rx = sync.clone();
 
         // Start transport listener and connect to bootstrap nodes
