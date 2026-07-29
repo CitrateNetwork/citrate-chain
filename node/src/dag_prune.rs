@@ -333,6 +333,107 @@ mod tests {
     /// parent DEPTH. A block at height 72,000 may legally merge a parent at
     /// height 5.
     ///
+    /// Settles the open question in PRUNE_MERGE_PARENT_BOUND_SPEC.md: does
+    /// `prune()` deleting each pruned block's durable score anchor
+    /// (`persist_delete_derived_blue_score`) break the LINEAR path across a
+    /// restart?
+    ///
+    /// The worry was concrete. `GhostDag::relations` is in-memory only and a
+    /// non-producing node never runs the producer's eager-load loop, so after a
+    /// restart it is EMPTY. `derive_score_and_work` then depends on the durable
+    /// anchor — and prune deletes anchors along with their blocks.
+    ///
+    /// ANSWER: not a defect. Scoring a new block only ever consults its SELECTED
+    /// PARENT's score, and the selected parent is at the tip, inside the retained
+    /// window, so its anchor is retained too. Nothing scores against a pruned
+    /// block on the linear path. The anchor keyspace is bounded (the reason it is
+    /// deleted) at no cost to correctness.
+    ///
+    /// Pinned as a test rather than left as reasoning in a doc, because the
+    /// conclusion depends on "the selected parent is always inside the window",
+    /// which a future change to the retain floor could quietly break.
+    #[tokio::test]
+    async fn linear_admission_survives_prune_then_restart_with_empty_relations() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::ghostdag::GhostDag;
+        use citrate_consensus::types::{BlockBuilder, GhostDagParams, Hash, VrfProof};
+        use citrate_storage::pruning::PruningConfig;
+
+        fn mk(height: u64, parent: Hash) -> citrate_consensus::types::Block {
+            let mut b = BlockBuilder::new()
+                .version(2)
+                .height(height)
+                .parent(parent)
+                .coinbase([0x33; 20])
+                .timestamp(1000)
+                .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(height)
+                .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                .build_unhashed();
+            b.header.block_hash = b.compute_hash();
+            b
+        }
+
+        const N: u64 = 1_500;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(
+            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+        );
+        // PERSISTENT DagStore — the fixture detail that decides what this test
+        // actually exercises. With the non-persistent test store,
+        // `put_derived_blue_score` is a silent no-op, so the durable anchor never
+        // exists and every lookup falls through to the deep walk. That measures
+        // the no-anchor path, not the anchor path, and answers the wrong
+        // question. A real node always has persistence here.
+        let kv = Arc::new(crate::persistent_dag::RocksDbKvStore::new(storage.db.clone()));
+        let dag = Arc::new(
+            DagStore::persistent_with_strict_vrf(kv, false).expect("persistent dag store"),
+        );
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
+
+        let mut parent = Hash::default();
+        for h in 1..=N {
+            let b = mk(h, parent);
+            parent = b.header.block_hash;
+            dag.store_block(b.clone()).await.expect("dag");
+            ghostdag.add_block(&b).await.expect("admit");
+            storage.blocks.put_block(&b).expect("chain");
+        }
+        storage.blocks.put_applied_tip(&parent, N).expect("tip");
+        assert!(
+            dag.get_derived_blue_score(&parent).is_some(),
+            "the tip's durable anchor must exist, or this test is exercising the \
+             no-anchor path again rather than the question being asked"
+        );
+        assert_eq!(prune_once(&storage, &dag, N, MIN_RETAIN_BLOCKS).await, 499);
+        assert!(
+            dag.get_derived_blue_score(&parent).is_some(),
+            "pruning must not delete the RETAINED tip's anchor"
+        );
+
+        // RESTART, follower-style: a brand-new GhostDag over the SAME (pruned)
+        // DAG store. `relations` is empty, exactly as it is on a bootnode that
+        // has just come up and never runs the producer's eager-load loop.
+        let after_restart = GhostDag::new(GhostDagParams::default(), dag.clone());
+
+        let next = mk(N + 1, parent);
+        dag.store_block(next.clone()).await.expect("dag");
+        after_restart
+            .add_block(&next)
+            .await
+            .expect("linear admission must survive prune + restart with empty relations");
+        assert_eq!(
+            after_restart
+                .get_blue_score(&next.header.block_hash)
+                .await
+                .expect("score"),
+            N + 1,
+            "the score sequence continues unbroken across prune AND restart"
+        );
+    }
+
     /// VERIFIED FAILING 2026-07-29: `Err(MissingParent(2f76503a…))`.
     ///
     /// `#[ignore]`d rather than deleted or inverted. It is the ACCEPTANCE TEST

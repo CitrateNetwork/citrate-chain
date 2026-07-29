@@ -117,7 +117,30 @@ not honour, and the number that actually governs retention is an env var on each
 box. These must become one authoritative value before pruning is enabled, or
 operators will tune the wrong knob.
 
-**Suspected, NOT yet proven — anchor deletion at the pruning boundary.**
+**RESOLVED — the producer undoes pruning on every restart.** `Producer::with_economics`
+eager-loads `for height in 0..=latest_height` from the **CHAIN** store
+(`node/src/producer.rs:388`), which `dag_prune` never touches, and re-inserts every
+block into the DAG store. So on a producing node, DAG pruning is erased by the next
+restart and memory returns to full. Followers are unaffected (they never run that
+loop, and `DagStore::load_from_persistent` reads the pruned DAG keyspace). **This
+loop must be bounded to the retained window before pruning is enabled on rpc-1**,
+or pruning helps every node except the one with the largest DAG.
+
+**RESOLVED — anchor deletion is NOT a defect.** Pinned by
+`dag_prune::linear_admission_survives_prune_then_restart_with_empty_relations`.
+Scoring a new block only consults its SELECTED PARENT's score, and the selected
+parent is at the tip — inside the retained window — so its anchor is retained too.
+Nothing on the linear path ever scores against a pruned block. The anchor keyspace
+stays bounded at no cost to correctness.
+
+A caveat worth carrying: the first version of that test used
+`DagStore::with_permissive_vrf_for_testing()`, which has **no persistence**, so
+`put_derived_blue_score` is a silent no-op and every lookup falls through to the
+deep walk. It "failed", appearing to confirm the defect. It was measuring the
+no-anchor path. Any future test of anchor behaviour must use a PERSISTENT store or
+it answers a different question than the one asked.
+
+**Original text of the anchor concern, retained for provenance:**
 `prune()` deletes each pruned block's durable score anchor
 (`persist_delete_derived_blue_score`, `dag_store.rs:990`) with the reasoning that
 an anchor must not outlive its block. But after prune + RESTART, `relations` is
@@ -130,14 +153,32 @@ anyone enables pruning.** I have not written it; flagging rather than asserting.
 
 ## Definition of done
 
-1. A prune-then-rehydrate test, settling the anchor question above.
-2. MP-DEPTH implemented in `validate_block_consistency`, gated on the activation
-   height, with the producer refusing to build violating blocks.
-3. The blue-set walk bounded at the retained window, justified by MP-DEPTH.
+1. ~~A prune-then-rehydrate test, settling the anchor question above.~~ **DONE** —
+   not a defect; pinned by
+   `linear_admission_survives_prune_then_restart_with_empty_relations`.
+2. **PARTIALLY DONE** — MP-DEPTH is implemented in `validate_block_consistency`
+   (`ghostdag.rs`), gated on `with_merge_depth_activation_height`, `None` by
+   default so it is inert until scheduled. 3 tests, including one asserting it
+   changes nothing before activation. **The producer does not yet refuse to build
+   violating blocks** — still open.
+3. The blue-set walk bounded at the retained window, justified by MP-DEPTH. **Open,
+   and it cannot land before MP-DEPTH is ACTIVE on the fleet**: bounding the walk
+   while blocks may still legally cite below the window computes a wrong score
+   instead of an error, which is the silent fork this whole spec exists to avoid.
 4. `pruning_window` unified with the pruner's retain value — one source of truth.
-5. `merge_block_referencing_a_pruned_parent_is_rejected_not_scored` green, ignore
-   removed.
-6. Only then: `CITRATE_DAG_PRUNE_RETAIN` set on the fleet.
+   **Open.**
+5. Bound the producer's genesis-deep eager-load (new; see above). **Open.**
+6. `merge_block_referencing_a_pruned_parent_is_rejected_not_scored` green, ignore
+   removed. **Open** — it goes green with item 3.
+7. Only then: `CITRATE_DAG_PRUNE_RETAIN` set on the fleet.
+
+### Ordering constraint
+
+Items 2 and 3 cannot ship together. MP-DEPTH must be enforced by every node, at an
+agreed activation height, BEFORE any node bounds its walk. Shipping them in one
+release means the first node to upgrade bounds its walk while its peers still
+produce blocks it will now score differently. Two releases, with the fleet fully
+upgraded and past the activation height in between.
 
 ## What is NOT blocked on any of this
 
