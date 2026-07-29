@@ -39,6 +39,7 @@ mod producer;
 mod registry_sync;
 mod contribution_recorder;
 mod sync;
+mod sync_peer;
 
 use config::NodeConfig;
 use citrate_consensus::dag_store::DagStore;
@@ -1774,38 +1775,60 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             }
         });
 
+        // #85: which peer the sync tick pulls from, plus the per-peer timeout
+        // accounting behind that choice. Shared with the message handler so a
+        // peer that ANSWERS clears its penalty (sync_peer.rs invariant I3) —
+        // the tick task alone only ever observes failures, which is how a peer
+        // could accumulate penalties it had no way to shed.
+        let sync_peers = Arc::new(
+            tokio::sync::Mutex::new(sync_peer::SyncPeerSelector::new()),
+        );
+
         // Periodic sync tick: request headers/blocks and check timeouts
         let pm_for_sync = pm_for_rx.clone();
         let sync_for_loop = sync.clone();
         let storage_for_sync = storage.clone();
         let max_seen_for_sync = max_seen_height.clone();
+        let sync_peers_for_loop = sync_peers.clone();
         tokio::spawn(async move {
             use std::collections::HashMap;
             use std::time::{Duration, Instant};
             let mut attempt_counts: HashMap<citrate_consensus::types::Hash, u32> = HashMap::new();
             let mut pending_retries: Vec<(Instant, citrate_consensus::types::Hash)> = Vec::new();
-            let mut peer_failures: HashMap<String, u32> = HashMap::new();
             // Round-robin index for rotating request peers when we are behind but no
             // peer qualified as "best" (forward-sync liveness fix).
             let mut rotate_idx: u64 = 0;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                let peers = pm_for_sync.get_all_peers();
-                // Pick best peer by head height
-                let mut best: Option<Arc<citrate_network::peer::Peer>> = None;
+                // Snapshot every CONNECTED peer with the head it advertises. The
+                // scan is split from the choice deliberately: `best_h` (the sync
+                // TARGET) is the highest head anyone advertises, whereas the peer
+                // we PULL from must additionally be ahead of us and not in the
+                // penalty box. Conflating the two is what let a same-height
+                // sibling win selection (sync_peer.rs, defect D1).
+                let mut connected_peers: Vec<(
+                    sync_peer::SyncCandidate,
+                    Arc<citrate_network::peer::Peer>,
+                )> = Vec::new();
                 let mut best_h: u64 = 0;
                 let mut best_hash = citrate_consensus::types::Hash::new([0u8; 32]);
-                for p in peers {
+                for p in pm_for_sync.get_all_peers() {
                     let info = p.info.read().await;
-                    if info.state == citrate_network::peer::PeerState::Connected
-                        && info.head_height > best_h
-                        && peer_failures.get(&info.id.0).cloned().unwrap_or(0) < 3
-                    {
+                    if info.state != citrate_network::peer::PeerState::Connected {
+                        continue;
+                    }
+                    if info.head_height > best_h {
                         best_h = info.head_height;
                         best_hash = info.head_hash;
-                        best = Some(p.clone());
                     }
+                    connected_peers.push((
+                        sync_peer::SyncCandidate {
+                            id: info.id.0.clone(),
+                            head_height: info.head_height,
+                        },
+                        p.clone(),
+                    ));
                 }
                 // Drive the sync target off the MAX of the best connected-peer head
                 // and the max height we have evidence for ANYWHERE (gossip / a
@@ -1829,36 +1852,42 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     .flatten()
                     .map(|(_, h)| h)
                     .unwrap_or(0);
-                // Choose a peer to pull from. Prefer the best-by-head peer; but when
-                // we are demonstrably behind (applied < target) and NO peer qualified
-                // as "best" (all hit the 3-failure cap, or every connected peer's
-                // advertised head went stale ≤ ours), fall back to ANY connected peer,
-                // rotating each tick so we don't spin on one that only serves a
-                // side-branch. Without this a behind node with no "best" peer issues
-                // no GetBlocks and parks idle — the observed stall.
-                let request_peer: Option<Arc<citrate_network::peer::Peer>> = if best.is_some()
-                {
-                    best
-                } else if applied_height < target {
-                    let all = pm_for_sync.get_all_peers();
-                    let mut connected: Vec<Arc<citrate_network::peer::Peer>> = Vec::new();
-                    for p in all {
-                        if p.info.read().await.state
-                            == citrate_network::peer::PeerState::Connected
-                        {
-                            connected.push(p);
-                        }
-                    }
-                    if connected.is_empty() {
-                        None
-                    } else {
-                        let i = (rotate_idx as usize) % connected.len();
-                        rotate_idx = rotate_idx.wrapping_add(1);
-                        Some(connected[i].clone())
-                    }
-                } else {
-                    None
+                // Choose a peer to pull from — see node/src/sync_peer.rs for the
+                // policy and the two live wedges it closes. In short: only peers
+                // whose advertised head is ABOVE our applied tip are candidates
+                // (a same-height peer serves back our own anchor and we re-import
+                // it forever), and the timeout penalty de-prefers a peer without
+                // ever vetoing the last one that could actually serve us.
+                let candidates: Vec<sync_peer::SyncCandidate> =
+                    connected_peers.iter().map(|(c, _)| c.clone()).collect();
+                let chosen_id = {
+                    let mut sel = sync_peers_for_loop.lock().await;
+                    sel.select(&candidates, applied_height).map(|c| c.id.clone())
                 };
+                let request_peer: Option<Arc<citrate_network::peer::Peer>> =
+                    if let Some(id) = chosen_id {
+                        connected_peers
+                            .iter()
+                            .find(|(c, _)| c.id == id)
+                            .map(|(_, p)| p.clone())
+                    } else if applied_height < target {
+                        // We have EVIDENCE we are behind (a gossiped block, a Hello,
+                        // a rejected far-ahead block) but no connected peer admits to
+                        // a head above ours — their advertisements are stale or were
+                        // never updated. Rotate across all connected peers so we keep
+                        // asking rather than parking idle; rotation (not a fixed pick)
+                        // so we don't spin forever on one that only serves a side
+                        // branch.
+                        if connected_peers.is_empty() {
+                            None
+                        } else {
+                            let i = (rotate_idx as usize) % connected_peers.len();
+                            rotate_idx = rotate_idx.wrapping_add(1);
+                            Some(connected_peers[i].1.clone())
+                        }
+                    } else {
+                        None
+                    };
                 if let Some(peer) = request_peer {
                     let _ = best_hash; // anchor uses the applied tip, not best_hash
                     // Anchor every request on our current PERSISTED tip so sync
@@ -1907,10 +1936,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     let backoff = (*entry).min(5); // cap exponent at 5
                     let delay_secs = 1u64 << backoff; // 2,4,8,16,32
                     pending_retries.push((Instant::now() + Duration::from_secs(delay_secs), h));
-                    // Penalize the peer that timed out
-                    let key = pid.0.clone();
-                    let pf = peer_failures.entry(key.clone()).or_insert(0);
-                    *pf = pf.saturating_add(1);
+                    // Penalize the peer that timed out. This DE-PREFERS it as a
+                    // sync source; it can never veto the last peer able to serve
+                    // us (sync_peer.rs invariant I2).
+                    let pf = {
+                        let mut sel = sync_peers_for_loop.lock().await;
+                        sel.record_timeout(&pid.0)
+                    };
                     // Lower peer score
                     pm_for_sync.update_peer_score(&pid, -5).await;
                     // Drop (do NOT ban) a peer after repeated sync timeouts.
@@ -1926,17 +1958,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // sole source, and never recovered). Only prune when another peer
                     // can take over; otherwise keep retrying against the one we have.
                     let (total_peers, _, _) = pm_for_sync.get_peer_counts().await;
-                    if *pf >= 5 && total_peers > 1 && pm_for_sync.get_peer(&pid).is_some() {
+                    if pf >= 5 && total_peers > 1 && pm_for_sync.get_peer(&pid).is_some() {
                         pm_for_sync.remove_peer(&pid).await;
-                        *pf = 0;
+                        sync_peers_for_loop.lock().await.reset(&pid.0);
                         tracing::warn!(
                             "Dropped peer {} after repeated sync timeouts (will re-handshake)",
                             pid.0
                         );
-                    } else if *pf >= 5 {
+                    } else if pf >= 5 {
                         // Sole peer: reset the counter so we keep trying it rather
                         // than freezing after 5 timeouts.
-                        *pf = 0;
+                        sync_peers_for_loop.lock().await.reset(&pid.0);
                     }
                 }
                 // Issue any due retries
@@ -1983,6 +2015,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // and the startup reconcile).
         let admission_for_net = block_admission.clone();
         let checkpoint_mgr_for_net = checkpoint_manager.clone();
+        // #85: the success half of the sync-peer accounting (invariant I3) —
+        // the tick task can only ever observe timeouts, so the peer that
+        // actually answers has to be credited from the receive side.
+        let sync_peers_for_rx = sync_peers.clone();
 
         tokio::spawn(async move {
             // SECREM-01 NET-1/2: the GetHeaders/GetBlocks handlers that used
@@ -2263,6 +2299,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::Blocks { blocks } => {
+                        // #85 (sync_peer.rs invariant I3): this peer ANSWERED, so
+                        // clear any timeout penalty it is carrying. Without a
+                        // success signal the accounting is failure-only and a peer
+                        // can accumulate penalties it has no way to shed — which is
+                        // half of what blacklisted the producer on the live fleet.
+                        sync_peers_for_rx.lock().await.record_success(&pid.0);
                         // WP-H.4: handle_blocks now validates each block
                         let _ = sync_for_rx.handle_blocks(blocks).await;
                         // WP-H.5: Drain validated blocks and persist to chain store.
