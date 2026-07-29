@@ -1446,12 +1446,54 @@ impl BlockProducer {
         // Use tip selector to find the best tip (highest blue score)
         let selected_parent = self.tip_selector.select_tip(&tip_hashes).await?;
 
-        // Select merge parents from remaining tips
-        let merge_parents: Vec<Hash> = tip_hashes
-            .into_iter()
-            .filter(|h| *h != selected_parent)
-            .take(self.ghostdag.params().max_parents - 1) // Leave room for selected parent
-            .collect();
+        // MP-DEPTH: never BUILD a block our own validity rule would reject.
+        //
+        // The block we are about to seal sits at selected_parent.height + 1. Once
+        // the rule is active, merging a tip more than MERGE_PARENT_MAX_DEPTH below
+        // that makes the block invalid — and since the producer validates its own
+        // block on the way in, it would refuse its own output and stop producing.
+        // A stale tip lingering in the tip set is enough to trigger it, so this is
+        // a filter rather than an error: drop the too-deep tips, keep sealing.
+        //
+        // Applied unconditionally, not gated on the activation height. Before
+        // activation these merges are legal but pointless (a tip 100+ blocks back
+        // is abandoned, not a live branch), and filtering early means the producer
+        // is already emitting rule-compliant blocks well before enforcement
+        // begins — so activation is a no-op for block production rather than a
+        // cliff.
+        let child_height = self
+            .ghostdag
+            .get_block_height(&selected_parent)
+            .await
+            .map(|h| h.saturating_add(1));
+
+        let max_parents = self.ghostdag.params().max_parents;
+        let mut dropped_deep = 0usize;
+        let mut merge_parents: Vec<Hash> = Vec::new();
+        for h in tip_hashes.into_iter().filter(|h| *h != selected_parent) {
+            if merge_parents.len() >= max_parents.saturating_sub(1) {
+                break; // Leave room for the selected parent.
+            }
+            if let (Some(child_h), Some(tip_h)) =
+                (child_height, self.ghostdag.get_block_height(&h).await)
+            {
+                if child_h.saturating_sub(tip_h) > citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
+                {
+                    dropped_deep += 1;
+                    continue;
+                }
+            }
+            merge_parents.push(h);
+        }
+        if dropped_deep > 0 {
+            debug!(
+                "MP-DEPTH: dropped {} stale tip(s) more than {} blocks below the block being \
+                 sealed at height {:?} — merging them would make our own block invalid",
+                dropped_deep,
+                citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH,
+                child_height
+            );
+        }
 
         Ok((selected_parent, merge_parents))
     }

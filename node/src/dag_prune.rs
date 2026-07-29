@@ -312,6 +312,216 @@ mod tests {
         );
     }
 
+    /// RED — the hazard `prune_once_bounds_the_dag_store_and_admission_still_works`
+    /// does NOT cover, and the reason pruning is still opt-in.
+    ///
+    /// That test admits a LINEAR block over a pruned ancestry and passes, because
+    /// D3's durable score anchor makes the linear case O(1). A MERGE block is a
+    /// different path entirely: `derive_score_and_work` falls back to
+    /// `calculate_blue_set`, whose phase-1 walk (`get_or_calculate_blue_set`)
+    /// resolves ancestors through `DagStore::get_block` — which is MEMORY-ONLY
+    /// and has no disk fallback. Once the merge parent is below the pruning
+    /// point, that lookup returns `BlockNotFound` and admission REJECTS a block
+    /// the rest of the fleet accepts.
+    ///
+    /// That is not a crash, it is a FORK: an unpruned node admits the block, a
+    /// pruned node refuses it, and the two disagree about the canonical chain.
+    ///
+    /// Nothing in `validate_block_consistency` prevents such a block. It checks
+    /// merge-parent existence, `max_parents`, and that no merge parent outranks
+    /// the selected parent by blue score — but imposes NO lower bound on merge
+    /// parent DEPTH. A block at height 72,000 may legally merge a parent at
+    /// height 5.
+    ///
+    /// Settles the open question in PRUNE_MERGE_PARENT_BOUND_SPEC.md: does
+    /// `prune()` deleting each pruned block's durable score anchor
+    /// (`persist_delete_derived_blue_score`) break the LINEAR path across a
+    /// restart?
+    ///
+    /// The worry was concrete. `GhostDag::relations` is in-memory only and a
+    /// non-producing node never runs the producer's eager-load loop, so after a
+    /// restart it is EMPTY. `derive_score_and_work` then depends on the durable
+    /// anchor — and prune deletes anchors along with their blocks.
+    ///
+    /// ANSWER: not a defect. Scoring a new block only ever consults its SELECTED
+    /// PARENT's score, and the selected parent is at the tip, inside the retained
+    /// window, so its anchor is retained too. Nothing scores against a pruned
+    /// block on the linear path. The anchor keyspace is bounded (the reason it is
+    /// deleted) at no cost to correctness.
+    ///
+    /// Pinned as a test rather than left as reasoning in a doc, because the
+    /// conclusion depends on "the selected parent is always inside the window",
+    /// which a future change to the retain floor could quietly break.
+    #[tokio::test]
+    async fn linear_admission_survives_prune_then_restart_with_empty_relations() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::ghostdag::GhostDag;
+        use citrate_consensus::types::{BlockBuilder, GhostDagParams, Hash, VrfProof};
+        use citrate_storage::pruning::PruningConfig;
+
+        fn mk(height: u64, parent: Hash) -> citrate_consensus::types::Block {
+            let mut b = BlockBuilder::new()
+                .version(2)
+                .height(height)
+                .parent(parent)
+                .coinbase([0x33; 20])
+                .timestamp(1000)
+                .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(height)
+                .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                .build_unhashed();
+            b.header.block_hash = b.compute_hash();
+            b
+        }
+
+        const N: u64 = 1_500;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(
+            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+        );
+        // PERSISTENT DagStore — the fixture detail that decides what this test
+        // actually exercises. With the non-persistent test store,
+        // `put_derived_blue_score` is a silent no-op, so the durable anchor never
+        // exists and every lookup falls through to the deep walk. That measures
+        // the no-anchor path, not the anchor path, and answers the wrong
+        // question. A real node always has persistence here.
+        let kv = Arc::new(crate::persistent_dag::RocksDbKvStore::new(storage.db.clone()));
+        let dag = Arc::new(
+            DagStore::persistent_with_strict_vrf(kv, false).expect("persistent dag store"),
+        );
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
+
+        let mut parent = Hash::default();
+        for h in 1..=N {
+            let b = mk(h, parent);
+            parent = b.header.block_hash;
+            dag.store_block(b.clone()).await.expect("dag");
+            ghostdag.add_block(&b).await.expect("admit");
+            storage.blocks.put_block(&b).expect("chain");
+        }
+        storage.blocks.put_applied_tip(&parent, N).expect("tip");
+        assert!(
+            dag.get_derived_blue_score(&parent).is_some(),
+            "the tip's durable anchor must exist, or this test is exercising the \
+             no-anchor path again rather than the question being asked"
+        );
+        assert_eq!(prune_once(&storage, &dag, N, MIN_RETAIN_BLOCKS).await, 499);
+        assert!(
+            dag.get_derived_blue_score(&parent).is_some(),
+            "pruning must not delete the RETAINED tip's anchor"
+        );
+
+        // RESTART, follower-style: a brand-new GhostDag over the SAME (pruned)
+        // DAG store. `relations` is empty, exactly as it is on a bootnode that
+        // has just come up and never runs the producer's eager-load loop.
+        let after_restart = GhostDag::new(GhostDagParams::default(), dag.clone());
+
+        let next = mk(N + 1, parent);
+        dag.store_block(next.clone()).await.expect("dag");
+        after_restart
+            .add_block(&next)
+            .await
+            .expect("linear admission must survive prune + restart with empty relations");
+        assert_eq!(
+            after_restart
+                .get_blue_score(&next.header.block_hash)
+                .await
+                .expect("score"),
+            N + 1,
+            "the score sequence continues unbroken across prune AND restart"
+        );
+    }
+
+    /// VERIFIED FAILING 2026-07-29: `Err(MissingParent(2f76503a…))`.
+    ///
+    /// `#[ignore]`d rather than deleted or inverted. It is the ACCEPTANCE TEST
+    /// for the fix — when a consensus rule bounds merge-parent depth, this goes
+    /// green and the ignore comes off. Inverting it to assert the rejection
+    /// would pin the bug in place as if it were intended behaviour, which is how
+    /// a hazard becomes a feature. See
+    /// `handoffs/PRUNE_MERGE_PARENT_BOUND_SPEC.md`.
+    ///
+    /// Run it with: `cargo test -p citrate-node --bin citrate -- --ignored`
+    #[tokio::test]
+    #[ignore = "PRUNE HAZARD, not yet fixed: needs a consensus bound on merge-parent depth. \
+                This is the acceptance test for that rule — see PRUNE_MERGE_PARENT_BOUND_SPEC.md"]
+    async fn merge_block_referencing_a_pruned_parent_is_rejected_not_scored() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::ghostdag::GhostDag;
+        use citrate_consensus::types::{BlockBuilder, GhostDagParams, Hash, VrfProof};
+        use citrate_storage::pruning::PruningConfig;
+
+        fn mk(height: u64, parent: Hash, merges: Vec<Hash>) -> citrate_consensus::types::Block {
+            let mut b = BlockBuilder::new()
+                .version(2)
+                .height(height)
+                .parent(parent)
+                .merge_parents(merges)
+                .coinbase([0x33; 20])
+                .timestamp(1000)
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([0x5A; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(height)
+                .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                .build_unhashed();
+            b.header.block_hash = b.compute_hash();
+            b
+        }
+
+        const N: u64 = 1_500;
+        const RETAIN: u64 = MIN_RETAIN_BLOCKS;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(
+            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+        );
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
+
+        let mut parent = Hash::default();
+        let mut deep_hash = Hash::default();
+        for h in 1..=N {
+            let b = mk(h, parent, vec![]);
+            parent = b.header.block_hash;
+            // Remember a block that WILL be pruned (point is N - RETAIN = 500).
+            if h == 200 {
+                deep_hash = b.header.block_hash;
+            }
+            dag.store_block(b.clone()).await.expect("dag");
+            ghostdag.add_block(&b).await.expect("admit");
+            storage.blocks.put_block(&b).expect("chain");
+        }
+        storage.blocks.put_applied_tip(&parent, N).expect("tip");
+
+        let dropped = prune_once(&storage, &dag, N, RETAIN).await;
+        assert_eq!(dropped, 499);
+        assert!(
+            !dag.has_block(&deep_hash).await,
+            "height-200 block must be gone for this test to mean anything"
+        );
+
+        // A merge block whose merge parent is now BELOW the pruning point.
+        // Legal by every rule `validate_block_consistency` enforces.
+        let merge = mk(N + 1, parent, vec![deep_hash]);
+        dag.store_block(merge.clone()).await.expect("dag");
+        let outcome = ghostdag.add_block(&merge).await;
+
+        assert!(
+            outcome.is_ok(),
+            "PRUNE HAZARD: a merge block referencing a pruned parent was rejected \
+             ({outcome:?}). An unpruned peer accepts this block, so the two nodes \
+             now disagree about the canonical chain — a fork, caused by a purely \
+             local storage policy. Bound merge-parent depth in consensus before \
+             enabling pruning."
+        );
+    }
+
     #[test]
     fn disabled_unless_the_env_var_is_set() {
         // The test process may run in any order, so assert the parse rules
