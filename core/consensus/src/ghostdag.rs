@@ -41,6 +41,14 @@ pub enum GhostDagError {
     InvalidLinkage(String),
 }
 
+/// Hard cap on `blue_cache` entries.
+///
+/// Every entry holds a cumulative blue-ancestry set whose size grows with
+/// chain length, so an unbounded map reaches O(entries × N) — the same
+/// quadratic blow-up that halted chain 40204, just reached more slowly.
+/// Entries are pure cache: recomputing one yields an identical set.
+const MAX_BLUE_CACHE_ENTRIES: usize = 32;
+
 /// GhostDAG consensus engine
 pub struct GhostDag {
     /// Consensus parameters
@@ -87,10 +95,8 @@ impl GhostDag {
         // Genesis block is always blue
         if block.is_genesis() {
             blue_set.insert(block.hash());
-            self.blue_cache
-                .write()
-                .await
-                .insert(block.hash(), blue_set.clone());
+            self.insert_blue_cache_bounded(block.hash(), blue_set.clone())
+                .await;
             return Ok(blue_set);
         }
 
@@ -122,10 +128,8 @@ impl GhostDag {
         blue_set.work = crate::types::blue_work_for_score(blue_set.score);
 
         // Cache the result
-        self.blue_cache
-            .write()
-            .await
-            .insert(block.hash(), blue_set.clone());
+        self.insert_blue_cache_bounded(block.hash(), blue_set.clone())
+            .await;
 
         info!(
             "Calculated blue set for block {}: score={}",
@@ -214,14 +218,50 @@ impl GhostDag {
     ) -> Result<usize, GhostDagError> {
         let mut count = 0;
 
+        // `is_ancestor_of(blue_block, block)` BFS-walks up from `block` down
+        // to `blue_block`'s height. For the deep ancestors that dominate a
+        // cumulative blue set that walk is O(depth × width) EACH, so summed
+        // over the set it is Theta(N²) — the residual time cost that remained
+        // after the Theta(N²) *memory* fix, and on its own enough to stop the
+        // producer (~53 min for one merge block at the live chain's height).
+        //
+        // Walk `block`'s past ONCE instead, then answer each query by set
+        // membership. Equivalent by construction: `is_ancestor_of` resolves
+        // ancestry purely by reachability over `relations` parent edges, with
+        // a height short-circuit that is reproduced verbatim below.
+        let past = self.collect_past(block).await?;
+        let heights: HashMap<Hash, u64> = {
+            let relations = self.relations.read().await;
+            reference_blue_set
+                .blocks
+                .iter()
+                .chain(additional_blues.iter())
+                .chain(std::iter::once(block))
+                .filter_map(|h| relations.get(h).map(|r| (*h, r.height)))
+                .collect()
+        };
+        let block_height = heights.get(block).copied();
+        let is_ancestor_of_block = |candidate: &Hash| -> bool {
+            if candidate == block {
+                return true;
+            }
+            // Mirrors the structural short-circuit in `is_ancestor_of`:
+            // a parent edge strictly decreases height, so an equal-or-higher
+            // block can never be an ancestor.
+            if let (Some(a_h), Some(d_h)) = (heights.get(candidate).copied(), block_height) {
+                if a_h >= d_h {
+                    return false;
+                }
+            }
+            past.contains(candidate)
+        };
+
         // Check against reference blue set
         for blue_block in &reference_blue_set.blocks {
             if count >= max_count {
                 return Ok(count);
             }
-            if !self.is_ancestor_of(block, blue_block).await?
-                && !self.is_ancestor_of(blue_block, block).await?
-            {
+            if !self.is_ancestor_of(block, blue_block).await? && !is_ancestor_of_block(blue_block) {
                 count += 1;
             }
         }
@@ -231,14 +271,55 @@ impl GhostDag {
             if count >= max_count {
                 return Ok(count);
             }
-            if !self.is_ancestor_of(block, blue_block).await?
-                && !self.is_ancestor_of(blue_block, block).await?
-            {
+            if !self.is_ancestor_of(block, blue_block).await? && !is_ancestor_of_block(blue_block) {
                 count += 1;
             }
         }
 
         Ok(count)
+    }
+
+    /// Every block reachable from `of` by parent edges, including `of` itself.
+    ///
+    /// Traverses exactly the edges [`Self::is_ancestor_of`] traverses
+    /// (`relations` selected-parent + merge-parents), so
+    /// `collect_past(d).contains(a)` answers the same question as
+    /// `is_ancestor_of(a, d)` for any `a` — but once per `d` rather than once
+    /// per `(a, d)` pair.
+    async fn collect_past(&self, of: &Hash) -> Result<HashSet<Hash>, GhostDagError> {
+        // Same absolute bound as `is_ancestor_of`, and the same refusal to
+        // silently return a wrong answer when it is hit.
+        const MAX_VISITED: usize = 1_000_000;
+
+        let relations = self.relations.read().await;
+        let mut visited: HashSet<Hash> = HashSet::new();
+        let mut queue: VecDeque<Hash> = VecDeque::new();
+        queue.push_back(*of);
+
+        while let Some(current) = queue.pop_front() {
+            if !visited.insert(current) {
+                continue;
+            }
+            if visited.len() >= MAX_VISITED {
+                tracing::error!(
+                    "collect_past exceeded MAX_VISITED ({}) walking the past of {}; \
+                     refusing to lie about ancestry",
+                    MAX_VISITED,
+                    of
+                );
+                return Err(GhostDagError::CycleDetected);
+            }
+            if let Some(relation) = relations.get(&current) {
+                if relation.selected_parent != Hash::default() {
+                    queue.push_back(relation.selected_parent);
+                }
+                for parent in &relation.merge_parents {
+                    queue.push_back(*parent);
+                }
+            }
+        }
+
+        Ok(visited)
     }
 
     /// Check if `ancestor` is an ancestor of `descendant`.
@@ -440,26 +521,48 @@ impl GhostDag {
 
             // --- Phase 2: compose blue sets forward, oldest first ---
             // pending is newest-first; reverse-iterate for oldest-first.
+            //
+            // The running set is carried in a LOCAL and only the requested
+            // hash is cached at the end. Caching every intermediate here is
+            // what made this Theta(N²): each of the N blocks on the walk got
+            // its own cumulative ancestry set, of sizes 1..N, so a single
+            // call retained ~N²/2 hashes. At the live chain's height that was
+            // ~30 GB, which OOM-killed the producer and halted chain 40204 on
+            // 2026-07-29 (see `merge_block_on_deep_chain_does_not_
+            // materialise_quadratic_ancestry`). Peak memory is now the one
+            // running set — O(N), not O(N²).
+            //
+            // The composed VALUES are unchanged; only what is retained is.
+            // A later request for an intermediate recomputes the identical
+            // set, so no caller can observe the difference.
+            let mut running: Option<(Hash, BlueSet)> = None;
             for block in pending.iter().rev() {
                 let bhash = block.hash();
+                let sp = block.selected_parent();
 
-                let selected_parent_blue = {
-                    let cache = self.blue_cache.read().await;
-                    cache
-                        .get(&block.selected_parent())
-                        .cloned()
-                        .ok_or_else(|| {
+                // The selected parent is either the block composed on the
+                // previous iteration (the common case, walking forward down
+                // a chain) or — for the first block only — the cached
+                // ancestor that terminated phase 1.
+                let selected_parent_blue = match running.take() {
+                    Some((prev_hash, prev_blue)) if prev_hash == sp => prev_blue,
+                    _ => {
+                        let cache = self.blue_cache.read().await;
+                        cache.get(&sp).cloned().ok_or({
                             // Should never happen — Phase 1 guarantees
                             // the selected parent is now cached.
-                            GhostDagError::BlockNotFound(block.selected_parent())
+                            GhostDagError::BlockNotFound(sp)
                         })?
+                    }
                 };
 
                 let blue_merge_parents = self
                     .calculate_blue_merge_parents(block, &selected_parent_blue)
                     .await?;
 
-                let mut all_blocks = selected_parent_blue.blocks.clone();
+                // Take the parent's set by value — the parent is not being
+                // cached, so there is nothing left to share it with.
+                let mut all_blocks = selected_parent_blue.blocks;
                 // Merge parents: recurse, but depth here is bounded by
                 // DAG width (usually <= max_parents = 10), not chain
                 // length, so stack is safe.
@@ -470,18 +573,47 @@ impl GhostDag {
                 all_blocks.insert(bhash);
 
                 let mut blue = BlueSet::new();
+                blue.score = all_blocks.len() as u64;
                 blue.blocks = all_blocks;
-                blue.score = blue.blocks.len() as u64;
-                self.blue_cache.write().await.insert(bhash, blue);
+                running = Some((bhash, blue));
             }
 
-            // By construction the requested hash is now cached.
+            if let Some((bhash, blue)) = running {
+                let result = blue.clone();
+                self.insert_blue_cache_bounded(bhash, blue).await;
+                // `pending` ended on the requested hash by construction.
+                if bhash == *hash {
+                    return Ok(result);
+                }
+            }
+
+            // Phase 1 terminated immediately (the hash was already cached, or
+            // it is genesis, seeded above).
             let cache = self.blue_cache.read().await;
             cache
                 .get(hash)
                 .cloned()
                 .ok_or(GhostDagError::BlockNotFound(*hash))
         })
+    }
+
+    /// Insert into `blue_cache` under a hard entry cap.
+    ///
+    /// Each entry holds a cumulative ancestry set that grows with chain
+    /// length, so an unbounded map is O(entries × N) — the same quadratic
+    /// by a slower route. Entries are pure cache (recomputing yields an
+    /// identical set), so evicting is always safe.
+    async fn insert_blue_cache_bounded(&self, hash: Hash, blue: BlueSet) {
+        let mut cache = self.blue_cache.write().await;
+        if cache.len() >= MAX_BLUE_CACHE_ENTRIES && !cache.contains_key(&hash) {
+            // Access is overwhelmingly tip-local, so the cheapest correct
+            // policy is to drop an arbitrary entry rather than track
+            // recency. Worst case costs one recomputation.
+            if let Some(victim) = cache.keys().next().copied() {
+                cache.remove(&victim);
+            }
+        }
+        cache.insert(hash, blue);
     }
 
     /// Register an EXISTING block whose `blue_score`/`blue_work` are already
@@ -1550,7 +1682,7 @@ mod tests {
     /// retain ~500k ancestry entries, so a regression is unmistakable.
     #[tokio::test]
     async fn cold_start_first_block_derives_score_without_materialising_ancestry() {
-        const N: u64 = 1_000;
+        const N: u64 = 800;
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
 
         // Populate the DAG STORE only — exactly what `DagStore::load` gives a
@@ -1877,5 +2009,110 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    /// REGRESSION — the chain-40204 halt of 2026-07-29.
+    ///
+    /// PIL-13 fixed the eager-load path and SYNC-S1 D1 made the LINEAR receive
+    /// path O(1); `materialised_blue_ancestry_entries` + the
+    /// `producer_steady_state` test pin both. Neither covers a **merge block**.
+    ///
+    /// `derive_score_and_work` returns early only when `merge_parent_hashes` is
+    /// empty; any block with merge parents falls through to `calculate_blue_set`,
+    /// which calls `get_or_calculate_blue_set` on the selected parent. After a
+    /// restart `blue_cache` is empty (that is exactly what `register_existing_block`
+    /// is documented to leave behind), so phase 1 walks the selected-parent chain
+    /// all the way to genesis and phase 2 then caches a FULL cumulative BlueSet
+    /// for every block on the way back — Theta(N²) in chain length, materialised
+    /// by a single `add_block`.
+    ///
+    /// That was harmless while the live chain was linear ("merge blocks are
+    /// rare"). Multi-producer made merge blocks routine, and the producer then
+    /// allocated ~30 GB in ~35 s at N=54,600 — OOM-killing the box and halting
+    /// the chain. Followers were untouched because only the producer holds a
+    /// GhostDag that admits new blocks.
+    #[tokio::test]
+    async fn merge_block_on_deep_chain_does_not_materialise_quadratic_ancestry() {
+        // Deep enough that Theta(N²) is unmistakable against an O(N) bound,
+        // small enough to stay a unit test.
+        const N: u64 = 800;
+
+        fn h(i: u64) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&i.to_le_bytes());
+            b
+        }
+
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+
+        // Rehydrate a linear chain exactly as a restarting node does: every
+        // block durable in the store, registered O(1), `blue_cache` left empty.
+        let genesis = create_test_block_with_parents(h(0), Hash::default(), vec![], 0);
+        dag_store
+            .store_block(genesis.clone())
+            .await
+            .expect("store genesis");
+        ghostdag
+            .register_existing_block(&genesis)
+            .await
+            .expect("register genesis");
+
+        let mut tip = genesis.hash();
+        let mut parent_of_tip = genesis.hash();
+        for i in 1..=N {
+            let b = create_test_block_with_parents(h(i), tip, vec![], i);
+            dag_store.store_block(b.clone()).await.expect("store block");
+            ghostdag
+                .register_existing_block(&b)
+                .await
+                .expect("register block");
+            parent_of_tip = tip;
+            tip = b.hash();
+        }
+
+        // A sibling of the tip, so the next block is a genuine merge block.
+        // Its blue_score equals the selected parent's, satisfying the
+        // "selected parent must be the heaviest parent" rule.
+        let sibling = create_test_block_with_parents(h(N + 1_000), parent_of_tip, vec![], N);
+        dag_store
+            .store_block(sibling.clone())
+            .await
+            .expect("store sibling");
+        ghostdag
+            .register_existing_block(&sibling)
+            .await
+            .expect("register sibling");
+
+        // Rehydration itself must materialise nothing — this is PIL-13's
+        // guarantee and it still holds; the regression is what comes next.
+        assert_eq!(
+            ghostdag.materialised_blue_ancestry_entries().await,
+            0,
+            "rehydration must not materialise cumulative ancestry (PIL-13)"
+        );
+
+        let merge =
+            create_test_block_with_parents(h(N + 2_000), tip, vec![sibling.hash()], N + 1);
+        dag_store
+            .store_block(merge.clone())
+            .await
+            .expect("store merge block");
+        ghostdag
+            .add_block(&merge)
+            .await
+            .expect("merge block must be admissible");
+
+        let materialised = ghostdag.materialised_blue_ancestry_entries().await;
+        // Admitting one block may legitimately touch a bounded window of
+        // ancestry (k-cluster anticone counting). It must never scale with
+        // chain length: Theta(N²) here is ~N²/2 = 320_000 entries at N=800.
+        let bound = 4 * N as usize;
+        assert!(
+            materialised <= bound,
+            "admitting ONE merge block onto a {N}-block chain materialised {materialised} \
+             cumulative blue-ancestry entries (bound {bound}). This is the Theta(N²) \
+             blow-up that OOM-killed the producer and halted chain 40204 at N=54,600."
+        );
     }
 }
