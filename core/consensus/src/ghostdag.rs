@@ -65,17 +65,98 @@ pub struct GhostDag {
 
     /// Current tips of the DAG
     tips: Arc<RwLock<HashSet<Hash>>>,
+
+    /// MP-DEPTH activation height. `None` = rule not enforced (the default), so
+    /// this field is inert until an operator schedules it. See
+    /// [`MERGE_PARENT_MAX_DEPTH`] and `handoffs/PRUNE_MERGE_PARENT_BOUND_SPEC.md`.
+    merge_depth_activation_height: Option<u64>,
 }
+
+/// MP-DEPTH: the deepest a merge parent may sit below the block that merges it.
+///
+/// **This is a consensus rule, not a local policy.** It exists so that DAG
+/// pruning can be enabled: a bounded merge depth is what makes it PROVABLE that
+/// nothing a valid block can reference lies below the retained window, which in
+/// turn is what lets the blue-set walk terminate at the window instead of
+/// walking to genesis (`get_or_calculate_blue_set` phase 1) and failing against
+/// a pruned store.
+///
+/// Without it, a block at height 72,000 may legally merge a parent at height 5,
+/// and a node that bounded its walk would compute a WRONG SCORE rather than an
+/// error — a silent fork. Verified live 2026-07-29: a merge block referencing a
+/// pruned parent is rejected with `MissingParent` while unpruned peers accept it
+/// (`dag_prune::merge_block_referencing_a_pruned_parent_is_rejected_not_scored`).
+///
+/// Value: 100, matching `finality_depth` and `canonical_apply::MAX_REORG_DEPTH`.
+/// It bounds how long a partitioned producer can be away and still have its work
+/// merged rather than orphaned. It must stay well under `MIN_RETAIN_BLOCKS`
+/// (1,000) so the pruner can never remove a block a valid block may still cite:
+///
+///   MERGE_PARENT_MAX_DEPTH (100) < MIN_RETAIN_BLOCKS (1,000) <= retain window
+pub const MERGE_PARENT_MAX_DEPTH: u64 = 100;
+
+/// Height from which MP-DEPTH is enforced on chain 40204. Owner decision,
+/// 2026-07-29 (chain was at ~78,000, adding ~43,200/day — roughly a 12-hour
+/// upgrade window).
+///
+/// **Baked into `GhostDag::new` rather than passed by each call site.** There are
+/// six `GhostDag::new` call sites across the node and producer; a validity rule
+/// that depends on every one of them remembering a builder method is a rule that
+/// will eventually be enforced by some nodes and not others, which is a fork. The
+/// default IS the consensus value, and disabling it takes an explicit call.
+pub const MERGE_DEPTH_ACTIVATION_HEIGHT: u64 = 100_000;
+
+/// Devnet-only override for [`MERGE_DEPTH_ACTIVATION_HEIGHT`].
+///
+/// DANGER: this is a consensus parameter. Two nodes on the same chain with
+/// different values disagree about block validity. It exists so an isolated
+/// devnet can activate at a low height; never set it on 40204.
+pub const MERGE_DEPTH_ACTIVATION_ENV: &str = "CITRATE_MERGE_DEPTH_ACTIVATION_HEIGHT";
 
 impl GhostDag {
     pub fn new(params: GhostDagParams, dag_store: Arc<DagStore>) -> Self {
+        let activation = std::env::var(MERGE_DEPTH_ACTIVATION_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(MERGE_DEPTH_ACTIVATION_HEIGHT);
         Self {
             params,
             dag_store,
+            merge_depth_activation_height: Some(activation),
             relations: Arc::new(RwLock::new(HashMap::new())),
             blue_cache: Arc::new(RwLock::new(HashMap::new())),
             tips: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    /// Schedule MP-DEPTH enforcement from `height` onward.
+    ///
+    /// A validity rule, so it MUST be activated by height rather than switched
+    /// on at upgrade time: a node enforcing it while a peer does not disagree
+    /// about which blocks are valid, which is a fork. Blocks below `height` are
+    /// judged by the old rule forever — re-validating history under a new rule
+    /// forks the chain just as surely.
+    ///
+    /// Rollout order: upgrade every node, THEN pick a height comfortably beyond
+    /// the slowest upgrade, and confirm the producer refuses to build violating
+    /// blocks before it arrives.
+    pub fn with_merge_depth_activation_height(mut self, height: u64) -> Self {
+        self.merge_depth_activation_height = Some(height);
+        self
+    }
+
+    /// Disable MP-DEPTH entirely. For tests and isolated devnets that build
+    /// deliberately deep merges; never for a node on a shared chain.
+    pub fn without_merge_depth_enforcement(mut self) -> Self {
+        self.merge_depth_activation_height = None;
+        self
+    }
+
+    /// Whether MP-DEPTH is enforced for a block at `height`. `None` activation
+    /// means never — the default, so an upgraded binary changes nothing until
+    /// an activation height is set deliberately.
+    pub fn merge_depth_enforced_at(&self, height: u64) -> bool {
+        matches!(self.merge_depth_activation_height, Some(a) if height >= a)
     }
 
     /// Get consensus parameters
@@ -826,6 +907,32 @@ impl GhostDag {
                     mp, mp_block.header.blue_score, sp.header.blue_score
                 )));
             }
+
+            // MP-DEPTH. Before this rule there was NO lower bound on merge
+            // parent depth — height, count, duplicates and blue-score ordering
+            // were all checked, but a block at height 72,000 could legally merge
+            // a parent at height 5. That is what makes a bounded blue-set walk
+            // unsound, and therefore what blocks DAG pruning.
+            //
+            // Gated on an activation height: enforcing a new validity rule
+            // without one splits the fleet into nodes that accept a block and
+            // nodes that reject it.
+            if self.merge_depth_enforced_at(header.height) {
+                let depth = header.height.saturating_sub(mp_block.header.height);
+                if depth > MERGE_PARENT_MAX_DEPTH {
+                    return Err(GhostDagError::InvalidLinkage(format!(
+                        "merge parent {} is {} blocks below this block (height {} vs {}), \
+                         over the MP-DEPTH bound of {}. A merge parent deeper than the \
+                         retained window cannot be scored by a pruned node, so accepting \
+                         it would fork pruned nodes away from unpruned ones",
+                        mp,
+                        depth,
+                        mp_block.header.height,
+                        header.height,
+                        MERGE_PARENT_MAX_DEPTH
+                    )));
+                }
+            }
         }
 
         // Blue-score feasibility band, computed from the validated parent.
@@ -1122,6 +1229,25 @@ impl GhostDag {
             .get(hash)
             .map(|r| r.blue_set.score)
             .ok_or(GhostDagError::BlockNotFound(*hash))
+    }
+
+    /// Height of a known block, or `None` if we do not hold it.
+    ///
+    /// Checks `relations` first (in-memory, O(1)) and falls back to the DAG
+    /// store, because `relations` is empty after a restart on a non-producing
+    /// node. Returns `Option` rather than `Result`: the caller (MP-DEPTH parent
+    /// filtering in the producer) treats "height unknown" as "cannot judge the
+    /// depth", and must not turn that into a hard failure that stops block
+    /// production.
+    pub async fn get_block_height(&self, hash: &Hash) -> Option<u64> {
+        if let Some(h) = self.relations.read().await.get(hash).map(|r| r.height) {
+            return Some(h);
+        }
+        self.dag_store
+            .get_block(hash)
+            .await
+            .ok()
+            .map(|b| b.header.height)
     }
 
     /// PIL-13 tripwire metric: the total number of cumulative blue-ancestry
@@ -2031,6 +2157,152 @@ mod tests {
     /// allocated ~30 GB in ~35 s at N=54,600 — OOM-killing the box and halting
     /// the chain. Followers were untouched because only the producer holds a
     /// GhostDag that admits new blocks.
+    ///
+    /// (Attribute lives on the fn below; the MP-DEPTH tests were inserted here.)
+
+    /// The activation height is a consensus constant: every node must use the
+    /// same one or they disagree about validity. Pinned so a future edit is a
+    /// deliberate act with a failing test attached, not a silent one-character
+    /// change.
+    #[test]
+    fn mp_depth_activation_height_is_the_agreed_consensus_value() {
+        assert_eq!(
+            MERGE_DEPTH_ACTIVATION_HEIGHT, 100_000,
+            "owner decision 2026-07-29. Changing this changes which blocks are \
+             valid — it requires a coordinated fleet upgrade, not an edit"
+        );
+        assert!(
+            MERGE_DEPTH_ACTIVATION_HEIGHT > 78_000,
+            "activation must be comfortably ahead of the chain height at the time \
+             it was chosen, or nodes activate before they can all be upgraded"
+        );
+    }
+
+    /// MP-DEPTH must not apply BELOW the activation height. Blocks already on
+    /// the chain were produced under the old rule and must stay valid forever —
+    /// re-judging history under a new rule forks just as surely as enforcing it
+    /// early does.
+    #[tokio::test]
+    async fn mp_depth_is_not_enforced_below_the_activation_height() {
+        fn h(i: u64) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&i.to_le_bytes());
+            b
+        }
+        const N: u64 = 300; // deeper than MERGE_PARENT_MAX_DEPTH
+
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+        assert!(
+            !ghostdag.merge_depth_enforced_at(N + 1),
+            "height {} is below the activation height {} — the rule must not apply",
+            N + 1,
+            MERGE_DEPTH_ACTIVATION_HEIGHT
+        );
+        assert!(
+            ghostdag.merge_depth_enforced_at(MERGE_DEPTH_ACTIVATION_HEIGHT),
+            "and it must apply from the activation height onward"
+        );
+
+        let genesis = create_test_block_with_parents(h(0), Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.expect("store");
+        ghostdag.register_existing_block(&genesis).await.expect("reg");
+        let mut tip = genesis.hash();
+        let mut deep = genesis.hash();
+        for i in 1..=N {
+            let b = create_test_block_with_parents(h(i), tip, vec![], i);
+            dag_store.store_block(b.clone()).await.expect("store");
+            ghostdag.register_existing_block(&b).await.expect("reg");
+            if i == 10 {
+                deep = b.hash(); // 290 below the merger — way over the bound
+            }
+            tip = b.hash();
+        }
+
+        let merger = create_test_block_with_parents(h(N + 1), tip, vec![deep], N + 1);
+        dag_store.store_block(merger.clone()).await.expect("store");
+        assert!(
+            ghostdag.add_block(&merger).await.is_ok(),
+            "with no activation height the old rule stands and this block is valid — \
+             rejecting it on upgrade would fork against un-upgraded peers"
+        );
+    }
+
+    /// Once activated, a merge parent deeper than the bound is invalid. This is
+    /// what makes bounding the blue-set walk sound, and therefore what unblocks
+    /// DAG pruning: no valid block can cite anything below the retained window.
+    #[tokio::test]
+    async fn mp_depth_rejects_a_too_deep_merge_parent_once_activated() {
+        fn h(i: u64) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&i.to_le_bytes());
+            b
+        }
+        const N: u64 = 300;
+
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        // Activate from genesis so every block in the fixture is judged by it.
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone())
+            .with_merge_depth_activation_height(0);
+
+        let genesis = create_test_block_with_parents(h(0), Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.expect("store");
+        ghostdag.register_existing_block(&genesis).await.expect("reg");
+        let mut tip = genesis.hash();
+        let mut deep = genesis.hash();
+        let mut shallow_parent = genesis.hash();
+        for i in 1..=N {
+            let b = create_test_block_with_parents(h(i), tip, vec![], i);
+            dag_store.store_block(b.clone()).await.expect("store");
+            ghostdag.register_existing_block(&b).await.expect("reg");
+            if i == 10 {
+                deep = b.hash();
+            }
+            if i == N - 1 {
+                shallow_parent = b.hash();
+            }
+            tip = b.hash();
+        }
+
+        // Too deep: height N+1 merging height 10 is 291 below the bound of 100.
+        let bad = create_test_block_with_parents(h(N + 1), tip, vec![deep], N + 1);
+        dag_store.store_block(bad.clone()).await.expect("store");
+        let err = ghostdag.add_block(&bad).await;
+        assert!(
+            err.is_err(),
+            "a merge parent {} blocks deep must be rejected once MP-DEPTH is active",
+            N + 1 - 10
+        );
+
+        // A sibling one height back is well inside the bound and stays valid —
+        // the rule must not break ordinary DAG merging, which is the whole point
+        // of multi-producer.
+        let sibling = create_test_block_with_parents(h(N + 500), shallow_parent, vec![], N);
+        dag_store.store_block(sibling.clone()).await.expect("store");
+        ghostdag.register_existing_block(&sibling).await.expect("reg");
+        let good = create_test_block_with_parents(h(N + 2), tip, vec![sibling.hash()], N + 1);
+        dag_store.store_block(good.clone()).await.expect("store");
+        assert!(
+            ghostdag.add_block(&good).await.is_ok(),
+            "a merge parent inside the bound must still be accepted — MP-DEPTH \
+             bounds how DEEP a merge reaches, it does not forbid merging"
+        );
+    }
+
+    /// The bound must sit strictly below the pruner's retain floor, or the
+    /// pruner can delete a block a valid block is still allowed to cite — which
+    /// reintroduces exactly the fork this rule exists to prevent.
+    #[test]
+    fn mp_depth_bound_is_inside_the_prune_retain_floor() {
+        const MIN_RETAIN_BLOCKS: u64 = 1_000; // node::dag_prune::MIN_RETAIN_BLOCKS
+        assert!(
+            MERGE_PARENT_MAX_DEPTH < MIN_RETAIN_BLOCKS,
+            "MERGE_PARENT_MAX_DEPTH ({MERGE_PARENT_MAX_DEPTH}) must stay under the \
+             retain floor ({MIN_RETAIN_BLOCKS}); otherwise pruning can remove a \
+             legally-citable merge parent"
+        );
+    }
+
     #[tokio::test]
     async fn merge_block_on_deep_chain_does_not_materialise_quadratic_ancestry() {
         // Deep enough that Theta(N²) is unmistakable against an O(N) bound,
