@@ -2115,4 +2115,79 @@ mod tests {
              blow-up that OOM-killed the producer and halted chain 40204 at N=54,600."
         );
     }
+
+    /// REGRESSION — the LIVE trigger of the chain-40204 halt.
+    ///
+    /// The companion merge-block test covers the path through
+    /// `derive_score_and_work`'s fallback, but the live chain is **linear**
+    /// (`mergeParentHashes: []` at every sampled height), so that is not the
+    /// path production actually took.
+    ///
+    /// The real entry point is tip selection: `TipSelector::select_parents`
+    /// and `select_highest_blue_score` call `calculate_blue_score` on each tip
+    /// for EVERY block the producer builds, and that resolves through
+    /// `get_or_calculate_blue_set`. After a restart `blue_cache` is empty, so
+    /// the first such call walks the selected-parent chain to genesis and
+    /// materialises cumulative ancestry for every block on the way back.
+    ///
+    /// This is producer-only — `TipSelector` is constructed in
+    /// `node/src/producer.rs` — which is exactly why the three non-producing
+    /// bootnodes sat at 2.0 GB while the producer took 30 GB in 35 s.
+    #[tokio::test]
+    async fn tip_selection_on_deep_linear_chain_does_not_materialise_quadratic_ancestry() {
+        const N: u64 = 800;
+
+        fn h(i: u64) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&i.to_le_bytes());
+            b
+        }
+
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+
+        // A purely linear chain — no merge parents anywhere, matching the
+        // live chain — rehydrated the way a restarting node does.
+        let genesis = create_test_block_with_parents(h(0), Hash::default(), vec![], 0);
+        dag_store
+            .store_block(genesis.clone())
+            .await
+            .expect("store genesis");
+        ghostdag
+            .register_existing_block(&genesis)
+            .await
+            .expect("register genesis");
+
+        let mut tip_block = genesis;
+        for i in 1..=N {
+            let b = create_test_block_with_parents(h(i), tip_block.hash(), vec![], i);
+            dag_store.store_block(b.clone()).await.expect("store block");
+            ghostdag
+                .register_existing_block(&b)
+                .await
+                .expect("register block");
+            tip_block = b;
+        }
+
+        assert_eq!(
+            ghostdag.materialised_blue_ancestry_entries().await,
+            0,
+            "rehydration must not materialise cumulative ancestry (PIL-13)"
+        );
+
+        // Exactly what the producer does once per block, via TipSelector.
+        ghostdag
+            .calculate_blue_score(&tip_block)
+            .await
+            .expect("tip blue score");
+
+        let materialised = ghostdag.materialised_blue_ancestry_entries().await;
+        let bound = 4 * N as usize;
+        assert!(
+            materialised <= bound,
+            "one tip-selection blue-score call on a {N}-block LINEAR chain materialised \
+             {materialised} cumulative blue-ancestry entries (bound {bound}). This is the \
+             live path that halted chain 40204."
+        );
+    }
 }
