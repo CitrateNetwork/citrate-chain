@@ -312,6 +312,115 @@ mod tests {
         );
     }
 
+    /// RED — the hazard `prune_once_bounds_the_dag_store_and_admission_still_works`
+    /// does NOT cover, and the reason pruning is still opt-in.
+    ///
+    /// That test admits a LINEAR block over a pruned ancestry and passes, because
+    /// D3's durable score anchor makes the linear case O(1). A MERGE block is a
+    /// different path entirely: `derive_score_and_work` falls back to
+    /// `calculate_blue_set`, whose phase-1 walk (`get_or_calculate_blue_set`)
+    /// resolves ancestors through `DagStore::get_block` — which is MEMORY-ONLY
+    /// and has no disk fallback. Once the merge parent is below the pruning
+    /// point, that lookup returns `BlockNotFound` and admission REJECTS a block
+    /// the rest of the fleet accepts.
+    ///
+    /// That is not a crash, it is a FORK: an unpruned node admits the block, a
+    /// pruned node refuses it, and the two disagree about the canonical chain.
+    ///
+    /// Nothing in `validate_block_consistency` prevents such a block. It checks
+    /// merge-parent existence, `max_parents`, and that no merge parent outranks
+    /// the selected parent by blue score — but imposes NO lower bound on merge
+    /// parent DEPTH. A block at height 72,000 may legally merge a parent at
+    /// height 5.
+    ///
+    /// VERIFIED FAILING 2026-07-29: `Err(MissingParent(2f76503a…))`.
+    ///
+    /// `#[ignore]`d rather than deleted or inverted. It is the ACCEPTANCE TEST
+    /// for the fix — when a consensus rule bounds merge-parent depth, this goes
+    /// green and the ignore comes off. Inverting it to assert the rejection
+    /// would pin the bug in place as if it were intended behaviour, which is how
+    /// a hazard becomes a feature. See
+    /// `handoffs/PRUNE_MERGE_PARENT_BOUND_SPEC.md`.
+    ///
+    /// Run it with: `cargo test -p citrate-node --bin citrate -- --ignored`
+    #[tokio::test]
+    #[ignore = "PRUNE HAZARD, not yet fixed: needs a consensus bound on merge-parent depth. \
+                This is the acceptance test for that rule — see PRUNE_MERGE_PARENT_BOUND_SPEC.md"]
+    async fn merge_block_referencing_a_pruned_parent_is_rejected_not_scored() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::ghostdag::GhostDag;
+        use citrate_consensus::types::{BlockBuilder, GhostDagParams, Hash, VrfProof};
+        use citrate_storage::pruning::PruningConfig;
+
+        fn mk(height: u64, parent: Hash, merges: Vec<Hash>) -> citrate_consensus::types::Block {
+            let mut b = BlockBuilder::new()
+                .version(2)
+                .height(height)
+                .parent(parent)
+                .merge_parents(merges)
+                .coinbase([0x33; 20])
+                .timestamp(1000)
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([0x5A; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(height)
+                .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                .build_unhashed();
+            b.header.block_hash = b.compute_hash();
+            b
+        }
+
+        const N: u64 = 1_500;
+        const RETAIN: u64 = MIN_RETAIN_BLOCKS;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(
+            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+        );
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
+
+        let mut parent = Hash::default();
+        let mut deep_hash = Hash::default();
+        for h in 1..=N {
+            let b = mk(h, parent, vec![]);
+            parent = b.header.block_hash;
+            // Remember a block that WILL be pruned (point is N - RETAIN = 500).
+            if h == 200 {
+                deep_hash = b.header.block_hash;
+            }
+            dag.store_block(b.clone()).await.expect("dag");
+            ghostdag.add_block(&b).await.expect("admit");
+            storage.blocks.put_block(&b).expect("chain");
+        }
+        storage.blocks.put_applied_tip(&parent, N).expect("tip");
+
+        let dropped = prune_once(&storage, &dag, N, RETAIN).await;
+        assert_eq!(dropped, 499);
+        assert!(
+            !dag.has_block(&deep_hash).await,
+            "height-200 block must be gone for this test to mean anything"
+        );
+
+        // A merge block whose merge parent is now BELOW the pruning point.
+        // Legal by every rule `validate_block_consistency` enforces.
+        let merge = mk(N + 1, parent, vec![deep_hash]);
+        dag.store_block(merge.clone()).await.expect("dag");
+        let outcome = ghostdag.add_block(&merge).await;
+
+        assert!(
+            outcome.is_ok(),
+            "PRUNE HAZARD: a merge block referencing a pruned parent was rejected \
+             ({outcome:?}). An unpruned peer accepts this block, so the two nodes \
+             now disagree about the canonical chain — a fork, caused by a purely \
+             local storage policy. Bound merge-parent depth in consensus before \
+             enabling pruning."
+        );
+    }
+
     #[test]
     fn disabled_unless_the_env_var_is_set() {
         // The test process may run in any order, so assert the parse rules
