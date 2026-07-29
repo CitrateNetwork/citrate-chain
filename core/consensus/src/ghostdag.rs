@@ -95,12 +95,34 @@ pub struct GhostDag {
 ///   MERGE_PARENT_MAX_DEPTH (100) < MIN_RETAIN_BLOCKS (1,000) <= retain window
 pub const MERGE_PARENT_MAX_DEPTH: u64 = 100;
 
+/// Height from which MP-DEPTH is enforced on chain 40204. Owner decision,
+/// 2026-07-29 (chain was at ~78,000, adding ~43,200/day — roughly a 12-hour
+/// upgrade window).
+///
+/// **Baked into `GhostDag::new` rather than passed by each call site.** There are
+/// six `GhostDag::new` call sites across the node and producer; a validity rule
+/// that depends on every one of them remembering a builder method is a rule that
+/// will eventually be enforced by some nodes and not others, which is a fork. The
+/// default IS the consensus value, and disabling it takes an explicit call.
+pub const MERGE_DEPTH_ACTIVATION_HEIGHT: u64 = 100_000;
+
+/// Devnet-only override for [`MERGE_DEPTH_ACTIVATION_HEIGHT`].
+///
+/// DANGER: this is a consensus parameter. Two nodes on the same chain with
+/// different values disagree about block validity. It exists so an isolated
+/// devnet can activate at a low height; never set it on 40204.
+pub const MERGE_DEPTH_ACTIVATION_ENV: &str = "CITRATE_MERGE_DEPTH_ACTIVATION_HEIGHT";
+
 impl GhostDag {
     pub fn new(params: GhostDagParams, dag_store: Arc<DagStore>) -> Self {
+        let activation = std::env::var(MERGE_DEPTH_ACTIVATION_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(MERGE_DEPTH_ACTIVATION_HEIGHT);
         Self {
             params,
             dag_store,
-            merge_depth_activation_height: None,
+            merge_depth_activation_height: Some(activation),
             relations: Arc::new(RwLock::new(HashMap::new())),
             blue_cache: Arc::new(RwLock::new(HashMap::new())),
             tips: Arc::new(RwLock::new(HashSet::new())),
@@ -120,6 +142,13 @@ impl GhostDag {
     /// blocks before it arrives.
     pub fn with_merge_depth_activation_height(mut self, height: u64) -> Self {
         self.merge_depth_activation_height = Some(height);
+        self
+    }
+
+    /// Disable MP-DEPTH entirely. For tests and isolated devnets that build
+    /// deliberately deep merges; never for a node on a shared chain.
+    pub fn without_merge_depth_enforcement(mut self) -> Self {
+        self.merge_depth_activation_height = None;
         self
     }
 
@@ -1202,6 +1231,25 @@ impl GhostDag {
             .ok_or(GhostDagError::BlockNotFound(*hash))
     }
 
+    /// Height of a known block, or `None` if we do not hold it.
+    ///
+    /// Checks `relations` first (in-memory, O(1)) and falls back to the DAG
+    /// store, because `relations` is empty after a restart on a non-producing
+    /// node. Returns `Option` rather than `Result`: the caller (MP-DEPTH parent
+    /// filtering in the producer) treats "height unknown" as "cannot judge the
+    /// depth", and must not turn that into a hard failure that stops block
+    /// production.
+    pub async fn get_block_height(&self, hash: &Hash) -> Option<u64> {
+        if let Some(h) = self.relations.read().await.get(hash).map(|r| r.height) {
+            return Some(h);
+        }
+        self.dag_store
+            .get_block(hash)
+            .await
+            .ok()
+            .map(|b| b.header.height)
+    }
+
     /// PIL-13 tripwire metric: the total number of cumulative blue-ancestry
     /// entries materialised in memory, across every DAG relation's stored
     /// `blue_set.blocks` plus the `blue_cache`.
@@ -2112,11 +2160,30 @@ mod tests {
     ///
     /// (Attribute lives on the fn below; the MP-DEPTH tests were inserted here.)
 
-    /// MP-DEPTH must be INERT until an activation height is set. An upgraded
-    /// binary that started rejecting blocks its peers accept would fork the
-    /// fleet at deploy time — the failure the activation gate exists to prevent.
+    /// The activation height is a consensus constant: every node must use the
+    /// same one or they disagree about validity. Pinned so a future edit is a
+    /// deliberate act with a failing test attached, not a silent one-character
+    /// change.
+    #[test]
+    fn mp_depth_activation_height_is_the_agreed_consensus_value() {
+        assert_eq!(
+            MERGE_DEPTH_ACTIVATION_HEIGHT, 100_000,
+            "owner decision 2026-07-29. Changing this changes which blocks are \
+             valid — it requires a coordinated fleet upgrade, not an edit"
+        );
+        assert!(
+            MERGE_DEPTH_ACTIVATION_HEIGHT > 78_000,
+            "activation must be comfortably ahead of the chain height at the time \
+             it was chosen, or nodes activate before they can all be upgraded"
+        );
+    }
+
+    /// MP-DEPTH must not apply BELOW the activation height. Blocks already on
+    /// the chain were produced under the old rule and must stay valid forever —
+    /// re-judging history under a new rule forks just as surely as enforcing it
+    /// early does.
     #[tokio::test]
-    async fn mp_depth_is_not_enforced_without_an_activation_height() {
+    async fn mp_depth_is_not_enforced_below_the_activation_height() {
         fn h(i: u64) -> [u8; 32] {
             let mut b = [0u8; 32];
             b[0..8].copy_from_slice(&i.to_le_bytes());
@@ -2126,7 +2193,16 @@ mod tests {
 
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
-        assert!(!ghostdag.merge_depth_enforced_at(N + 1), "default is off");
+        assert!(
+            !ghostdag.merge_depth_enforced_at(N + 1),
+            "height {} is below the activation height {} — the rule must not apply",
+            N + 1,
+            MERGE_DEPTH_ACTIVATION_HEIGHT
+        );
+        assert!(
+            ghostdag.merge_depth_enforced_at(MERGE_DEPTH_ACTIVATION_HEIGHT),
+            "and it must apply from the activation height onward"
+        );
 
         let genesis = create_test_block_with_parents(h(0), Hash::default(), vec![], 0);
         dag_store.store_block(genesis.clone()).await.expect("store");
