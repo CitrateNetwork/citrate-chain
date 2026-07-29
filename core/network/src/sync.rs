@@ -9,6 +9,7 @@ use citrate_consensus::crypto;
 use citrate_consensus::types::{Block, BlockHeader, Hash};
 use sha3::{Digest, Sha3_256};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -76,6 +77,14 @@ pub struct SyncManager {
     downloaded_blocks: Arc<RwLock<Vec<Block>>>,
     last_header_hash: Arc<RwLock<Option<Hash>>>,
     last_requested_header: Arc<RwLock<Option<Hash>>>,
+
+    /// This node's OWN applied chain height, when wired via
+    /// [`SyncManager::with_local_height`].
+    ///
+    /// Without it the manager can only see the height of the last block it was
+    /// HANDED, which is not evidence that the node holds that block's ancestry.
+    /// See [`SyncManager::sync_is_complete`].
+    local_height: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +149,41 @@ impl SyncManager {
             downloaded_blocks: Arc::new(RwLock::new(Vec::new())),
             last_header_hash: Arc::new(RwLock::new(None)),
             last_requested_header: Arc::new(RwLock::new(None)),
+            local_height: None,
+        }
+    }
+
+    /// Wire this node's own applied-chain height so sync completion is judged
+    /// against what the node actually HOLDS, not what it was last handed.
+    pub fn with_local_height(mut self, handle: Arc<AtomicU64>) -> Self {
+        self.local_height = Some(handle);
+        self
+    }
+
+    /// This node's applied height, when the handle is wired.
+    fn applied_height(&self) -> Option<u64> {
+        self.local_height.as_ref().map(|h| h.load(Ordering::Relaxed))
+    }
+
+    /// Is the node genuinely synced to `target`?
+    ///
+    /// **Wedge #85.** The height of the last block RECEIVED is not evidence of
+    /// having synced to it. A node sitting at applied height 54,600 receives the
+    /// live tip at 56,128 by gossip; pre-fix this set `current_height = 56_128`
+    /// and, since `56_128 >= target`, declared "Synchronization complete" — so
+    /// the node stopped requesting the 54,601..56,127 backlog it was missing.
+    /// Those tip blocks were then dropped by admission (their parents were
+    /// absent) and never persisted, so `drive_drain` had nothing to walk either.
+    /// The node reported itself synced, served "Sending 0 blocks" to peers, and
+    /// its applied tip never moved again.
+    ///
+    /// Completion is therefore judged against the node's OWN applied height when
+    /// that is known. Falls back to the old behaviour when unwired, so a
+    /// `SyncManager` without the handle is unchanged.
+    pub(crate) fn sync_is_complete(local: Option<u64>, last_seen: u64, target: u64) -> bool {
+        match local {
+            Some(applied) => applied >= target,
+            None => last_seen >= target,
         }
     }
 
@@ -515,18 +559,24 @@ impl SyncManager {
             progress,
         };
 
-        // Only advance height based on validated blocks
-        *self.current_height.write().await = last_height;
+        // Advance progress against the node's OWN applied height when known —
+        // `last_height` is only the height of the last block handed to us, and
+        // recording it here is what let a node with a gap believe it was caught
+        // up (wedge #85, see `sync_is_complete`).
+        *self.current_height.write().await = self.applied_height().unwrap_or(last_height);
 
         info!(
             "Validated and imported {}/{} blocks (height {}-{}), progress: {:.1}%",
             accepted, total, first_height, last_height, progress
         );
 
-        // Check if sync complete
-        if last_height >= target {
+        // Check if sync complete — against our OWN chain, not the last block seen.
+        if Self::sync_is_complete(self.applied_height(), last_height, target) {
             *self.state.write().await = SyncState::Synced;
-            info!("Synchronization complete at height {}", last_height);
+            info!(
+                "Synchronization complete at height {}",
+                self.applied_height().unwrap_or(last_height)
+            );
         }
 
         Ok(())
@@ -866,5 +916,52 @@ mod tests {
             sync.pending_blocks.read().await.is_empty(),
             "a sibling-first-block response must still retire the pending request"
         );
+    }
+
+    /// REGRESSION — wedge #85, observed on chain 40204 on 2026-07-29.
+    ///
+    /// Three bootnodes sat at applied height 54,600 while the producer ran on to
+    /// 56,128. They received the LIVE TIP by gossip, logged "Validated and
+    /// imported 2/2 blocks (height 56127-56128) / Synchronization complete at
+    /// height 56128", and stopped asking for the 54,601..56,127 they were
+    /// missing. Verified on the live node: `eth_getBlockByNumber(0xdb40)`
+    /// returned null — the very block they had just called imported was not in
+    /// their chain store — while head stayed at 0xd548 (54,600), and they served
+    /// "Sending 0 blocks" to their own peers.
+    ///
+    /// The height of the last block HANDED to us is not evidence of holding its
+    /// ancestry. Completion must be judged against our own applied chain.
+    #[test]
+    fn sync_is_not_complete_while_our_own_chain_lags_the_target() {
+        // Applied 54,600; a live tip block at 56,128 arrives; target 56,128.
+        assert!(
+            !SyncManager::sync_is_complete(Some(54_600), 56_128, 56_128),
+            "a node holding only up to 54,600 must NOT call itself synced just \
+             because it was handed the tip block at 56,128 — that is wedge #85"
+        );
+    }
+
+    #[test]
+    fn sync_is_complete_once_our_own_chain_reaches_the_target() {
+        assert!(SyncManager::sync_is_complete(Some(56_128), 56_128, 56_128));
+        assert!(SyncManager::sync_is_complete(Some(56_200), 56_128, 56_128));
+    }
+
+    #[test]
+    fn sync_falls_back_to_last_seen_when_local_height_is_unwired() {
+        // Back-compat: a SyncManager with no handle behaves exactly as before.
+        assert!(SyncManager::sync_is_complete(None, 56_128, 56_128));
+        assert!(!SyncManager::sync_is_complete(None, 54_600, 56_128));
+    }
+
+    #[tokio::test]
+    async fn with_local_height_is_read_live_from_the_handle() {
+        let handle = Arc::new(AtomicU64::new(54_600));
+        let sync = SyncManager::new(SyncConfig::default()).with_local_height(handle.clone());
+        assert_eq!(sync.applied_height(), Some(54_600));
+
+        // The node applies forward; sync must observe it without rewiring.
+        handle.store(56_128, Ordering::Relaxed);
+        assert_eq!(sync.applied_height(), Some(56_128));
     }
 }
