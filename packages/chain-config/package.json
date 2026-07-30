@@ -13,6 +13,7 @@
     "citrate-chain-config": "./bin/check.mjs"
   },
   "files": ["src", "bin"],
+  "publishConfig": { "access": "public" },
   "scripts": {
     "generate": "node scripts/generate.mjs",
     "generate:check": "node scripts/generate.mjs --check",
