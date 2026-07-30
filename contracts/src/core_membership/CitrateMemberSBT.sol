@@ -56,6 +56,19 @@ contract CitrateMemberSBT is ERC721, Ownable {
         /// Permanent revocation flag; set when the token is revoked
         /// (burned). Kept in storage so history is queryable after burn.
         bool revoked;
+        /// M-2.3 — KYC attestation, set by the membership orchestrator once
+        /// identity verification clears.
+        ///
+        /// This gates MONEY OUT only. Owner decision A.7: a paid-but-unverified
+        /// member keeps membership, access and their validator slot; what they
+        /// cannot do is withdraw the bond or download from the commissary.
+        /// `MemberBond` reads this FIRST on every value-out path, ahead of the
+        /// time lock (decision A.6 — KYC supersedes every withdrawal check,
+        /// even after the lock elapses).
+        ///
+        /// Deliberately NOT part of `isActive`: folding it in there would turn
+        /// the KYC gate into a participation paywall, which A.7 forbids.
+        bool kycVerified;
     }
 
     /// Token id → member record.
@@ -85,6 +98,7 @@ contract CitrateMemberSBT is ERC721, Ownable {
     event MemberTermRenewed(uint256 indexed tokenId, uint64 newTermEnd);
     event MemberQuarantined(uint256 indexed tokenId);
     event MemberUnquarantined(uint256 indexed tokenId);
+    event KycVerifiedSet(uint256 indexed tokenId, bool verified);
     event MemberRevoked(uint256 indexed tokenId, bytes32 indexed subHash);
 
     constructor(address initialOwner)
@@ -114,7 +128,10 @@ contract CitrateMemberSBT is ERC721, Ownable {
             termStart: termStart,
             termEnd: termEnd,
             quarantined: false,
-            revoked: false
+            revoked: false,
+            // Fail-closed: a freshly minted membership is unverified until the
+            // orchestrator attests otherwise. Payment does not imply KYC.
+            kycVerified: false
         });
         _tokenIdPlusOneBySub[subHash] = tokenId + 1;
         _safeMint(to, tokenId);
@@ -234,6 +251,29 @@ contract CitrateMemberSBT is ERC721, Ownable {
         uint256 plusOne = _tokenIdPlusOneBySub[subHash];
         if (plusOne == 0) revert UnknownSub();
         return plusOne - 1;
+    }
+
+    /// M-2.3 — record (or withdraw) the KYC attestation for a membership.
+    ///
+    /// Orchestrator-driven: the membership service holds the verification
+    /// result. Revocable in both directions on purpose — if a verification is
+    /// later invalidated, the money-out gate must close again, and
+    /// `MemberBond` re-reads this on every value-out path rather than caching
+    /// it at release time.
+    function setKycVerified(uint256 tokenId, bool verified) external onlyOwner {
+        Member storage m = _requireMember(tokenId);
+        if (m.revoked) revert AlreadyRevoked();
+        m.kycVerified = verified;
+        emit KycVerifiedSet(tokenId, verified);
+    }
+
+    /// True iff this membership carries a live KYC attestation.
+    ///
+    /// Fail-closed on a revoked or quarantined membership: money must not
+    /// leave for a member whose standing has lapsed, whatever the flag says.
+    function isKycVerified(uint256 tokenId) external view returns (bool) {
+        Member storage m = _members[tokenId];
+        return m.kycVerified && !m.revoked && !m.quarantined;
     }
 
     /// True if a subHash has ever been bound (including revoked ones).
