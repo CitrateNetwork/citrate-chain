@@ -89,6 +89,37 @@ pub struct StateDBAdapter {
     /// When `None`, legacy behavior: REVM writes go directly to
     /// `state_db`. This preserves every existing test path.
     journal: Option<JournalHandle>,
+    /// Which value-transfer rule this execution runs under. See
+    /// [`ValueSemantics`]. Defaults to [`ValueSemantics::RevmAuthoritative`]
+    /// — the correct rule — so that new code and tests get it without
+    /// opting in; the executor explicitly selects the legacy rule below
+    /// the activation height.
+    value_semantics: ValueSemantics,
+}
+
+/// Which party owns native value movement during a REVM execution.
+///
+/// This is a **consensus rule**: the two variants produce different state
+/// roots for the same transaction, so which one applies is decided by block
+/// height, not by preference. See
+/// [`VALUE_TRANSFER_ACTIVATION_HEIGHT`](crate::executor::VALUE_TRANSFER_ACTIVATION_HEIGHT).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueSemantics {
+    /// Pre-activation. `DatabaseCommit::commit` DROPS every balance change
+    /// REVM computed, and the executor re-applies only the top-level
+    /// `from → to` leg by hand. Consequence: every transfer a contract
+    /// performs itself is silently discarded while the callee's storage
+    /// commits as though the money arrived.
+    ///
+    /// This is a bug. It is retained solely so blocks already on the chain
+    /// replay to the roots they were produced with — re-judging history
+    /// under the corrected rule forks just as surely as activating early.
+    LegacyDropInternal,
+    /// Post-activation. REVM owns value movement end to end: it is handed a
+    /// zero gas price (so it does no gas accounting, which is the executor's
+    /// job), and `commit` applies its balance changes wholesale — top-level
+    /// leg, internal `call{value:}`, and selfdestruct alike.
+    RevmAuthoritative,
 }
 
 impl StateDBAdapter {
@@ -99,7 +130,15 @@ impl StateDBAdapter {
             block_hashes: HashMap::new(),
             writes: None,
             journal: None,
+            value_semantics: ValueSemantics::RevmAuthoritative,
         }
+    }
+
+    /// Select the value-transfer rule for this execution (consensus-gated by
+    /// block height — see [`ValueSemantics`]).
+    pub fn with_value_semantics(mut self, value_semantics: ValueSemantics) -> Self {
+        self.value_semantics = value_semantics;
+        self
     }
 
     /// PIL-13b: attach a persistent state store for cold-cache fallback.
@@ -334,14 +373,44 @@ impl DatabaseCommit for StateDBAdapter {
                 ws.lock().record_write(addr);
             }
 
-            // ---- Sprint EL-1 Fix (Issue #19) ----
-            // Do NOT update balance or nonce from REVM. The executor is the
-            // sole owner of gas/balance/nonce accounting:
-            //   - executor.execute_transaction() deducts gas upfront and refunds on success
-            //   - executor.check_and_increment_nonce() manages nonces
-            // REVM also internally tracks gas/value/nonce, causing double-deduction
-            // if we write REVM's values back to StateDB. Instead, REVM only commits
-            // storage and code changes.
+            // ---- Nonce: still the executor's ----
+            // `executor.check_and_increment_nonce()` owns nonces; REVM also
+            // bumps the caller's nonce internally, so committing REVM's would
+            // double-increment. Nonce writes stay dropped here.
+            //
+            // ---- Balance: REVM's, as of the internal-value-transfer fix ----
+            // Sprint EL-1 Fix (Issue #19) originally dropped balances too,
+            // because REVM charged gas and the executor charged it again.
+            // The cure was worse than the disease: the executor only ever
+            // re-applied the TOP-LEVEL `from → to` transfer, so every value
+            // transfer a contract performed itself — `call{value:}`, a
+            // payable forward, a payout — was silently discarded while the
+            // callee's storage committed as though the money had arrived.
+            // On live 40204 that left `LiquidStakingPool` reporting
+            // `totalPooled = 32,000 SALT` against an actual balance of 0.
+            //
+            // The double-deduction it was avoiding is now prevented at the
+            // source instead: REVM is handed a ZERO gas price (see
+            // `execute_contract_call_with_context`), so it performs no gas
+            // accounting at all and its balance deltas are exactly the value
+            // movement. Committing them is therefore correct and complete —
+            // top-level and internal transfers alike, plus selfdestruct.
+            //
+            // `info.balance` is absolute, not a delta, and REVM read the
+            // pre-state through `basic()` below (journal-first), so writing
+            // it back is consistent with in-flight pending writes.
+            //
+            // Gated on block height: below the activation the buggy rule is
+            // reproduced exactly, so historical blocks replay to the roots
+            // they were produced with.
+            if self.value_semantics == ValueSemantics::RevmAuthoritative {
+                let new_balance = U256(account.info.balance.into_limbs());
+                if let Some(journal) = &self.journal {
+                    journal.lock().record_balance(addr, new_balance);
+                } else {
+                    self.state_db.accounts.set_balance(addr, new_balance);
+                }
+            }
 
             // Update storage — present_value is the post-transaction value.
             //
@@ -521,6 +590,10 @@ pub fn execute_contract_create(
     execute_contract_create_with_context(
         state_db, deployer, init_code, value, gas_limit, gas_price,
         chain_id, block_number, block_timestamp, BlockContext::default(), None, None,
+        // Correct semantics by default: this wrapper serves tests and bench
+        // paths, which should exercise the rule the chain runs under after
+        // activation, not the bug it is leaving behind.
+        ValueSemantics::RevmAuthoritative,
     )
     .map(|(addr, code, gas, _logs)| (addr, code, gas))
 }
@@ -542,6 +615,7 @@ pub fn execute_contract_create_with_context(
     block_ctx: BlockContext,
     writes_handle: Option<WriteSetHandle>,
     journal_handle: Option<JournalHandle>,
+    value_semantics: ValueSemantics,
 ) -> Result<(Address, Vec<u8>, u64, Vec<CitrateLog>), ExecutionError> {
     debug!("Executing contract creation with revm");
     debug!("  Deployer: {}", deployer);
@@ -550,7 +624,8 @@ pub fn execute_contract_create_with_context(
 
     // Create database adapter with block hashes + optional write/journal capture
     let mut db = StateDBAdapter::new(state_db.clone())
-        .with_block_hashes(block_ctx.block_hashes);
+        .with_block_hashes(block_ctx.block_hashes)
+        .with_value_semantics(value_semantics);
     if let Some(h) = writes_handle {
         db = db.with_writes(h);
     }
@@ -585,7 +660,36 @@ pub fn execute_contract_create_with_context(
             tx.data = Bytes::from(init_code);
             tx.value = RevmU256::from_limbs(value.0);
             tx.gas_limit = gas_limit;
-            tx.gas_price = RevmU256::from_limbs(gas_price.0);
+            // ZERO, deliberately — see `DatabaseCommit::commit`.
+            //
+            // The executor is the sole owner of gas accounting: it deducts
+            // gas upfront and refunds on success. If REVM also charged gas,
+            // committing its balance changes would double-deduct — which is
+            // precisely why Sprint EL-1 dropped balances wholesale, and why
+            // contract-initiated value transfers went missing for so long.
+            //
+            // Zeroing the gas price here is how we say "REVM does no gas
+            // accounting on this chain". Its resulting balance deltas are
+            // then exactly the value movement, which `commit` can apply
+            // wholesale. REVM's affordability precheck degrades to
+            // `balance >= value`, the correct residual test given the
+            // executor already took gas out. `block.basefee` is 0 (never
+            // set), so a zero gas price still validates.
+            //
+            // Known, contained deviation: the GASPRICE opcode returns 0
+            // inside REVM-executed code. No contract deployed on 40204 reads
+            // `tx.gasprice` — verified by grep over `contracts/src`.
+            //
+            // Below the activation height the real gas price is passed
+            // through unchanged. That matters even though pre-activation
+            // balances are discarded: REVM's affordability precheck is
+            // `balance >= gas_limit * gas_price + value`, so zeroing the
+            // price early would let transactions succeed that historically
+            // failed, changing replayed history.
+            tx.gas_price = match value_semantics {
+                ValueSemantics::RevmAuthoritative => RevmU256::ZERO,
+                ValueSemantics::LegacyDropInternal => RevmU256::from_limbs(gas_price.0),
+            };
             tx.chain_id = Some(chain_id);
         })
         .modify_block_env(|block| {
@@ -678,6 +782,10 @@ pub fn execute_contract_call(
         // that don't wire a state store. Cold-cache loads are skipped;
         // the call falls back to the in-memory state_db only.
         None,
+        // Correct semantics by default: this wrapper serves tests and bench
+        // paths, which should exercise the rule the chain runs under after
+        // activation, not the bug it is leaving behind.
+        ValueSemantics::RevmAuthoritative,
     )
     .map(|(output, gas, _logs)| (output, gas))
 }
@@ -706,6 +814,7 @@ pub fn execute_contract_call_with_context(
     // from RocksDB so eth_call against deployed contracts works on a
     // freshly-restarted node.
     state_store: Option<Arc<dyn crate::executor::StateStoreTrait>>,
+    value_semantics: ValueSemantics,
 ) -> Result<(Vec<u8>, u64, Vec<CitrateLog>), ExecutionError> {
     debug!("Executing contract call with revm");
     debug!("  Caller: {}", caller);
@@ -714,7 +823,8 @@ pub fn execute_contract_call_with_context(
 
     // Create database adapter with block hashes + optional write/journal capture
     let mut db = StateDBAdapter::new(state_db)
-        .with_block_hashes(block_ctx.block_hashes);
+        .with_block_hashes(block_ctx.block_hashes)
+        .with_value_semantics(value_semantics);
     if let Some(h) = writes_handle {
         db = db.with_writes(h);
     }
@@ -752,7 +862,36 @@ pub fn execute_contract_call_with_context(
             tx.data = Bytes::from(calldata);
             tx.value = RevmU256::from_limbs(value.0);
             tx.gas_limit = gas_limit;
-            tx.gas_price = RevmU256::from_limbs(gas_price.0);
+            // ZERO, deliberately — see `DatabaseCommit::commit`.
+            //
+            // The executor is the sole owner of gas accounting: it deducts
+            // gas upfront and refunds on success. If REVM also charged gas,
+            // committing its balance changes would double-deduct — which is
+            // precisely why Sprint EL-1 dropped balances wholesale, and why
+            // contract-initiated value transfers went missing for so long.
+            //
+            // Zeroing the gas price here is how we say "REVM does no gas
+            // accounting on this chain". Its resulting balance deltas are
+            // then exactly the value movement, which `commit` can apply
+            // wholesale. REVM's affordability precheck degrades to
+            // `balance >= value`, the correct residual test given the
+            // executor already took gas out. `block.basefee` is 0 (never
+            // set), so a zero gas price still validates.
+            //
+            // Known, contained deviation: the GASPRICE opcode returns 0
+            // inside REVM-executed code. No contract deployed on 40204 reads
+            // `tx.gasprice` — verified by grep over `contracts/src`.
+            //
+            // Below the activation height the real gas price is passed
+            // through unchanged. That matters even though pre-activation
+            // balances are discarded: REVM's affordability precheck is
+            // `balance >= gas_limit * gas_price + value`, so zeroing the
+            // price early would let transactions succeed that historically
+            // failed, changing replayed history.
+            tx.gas_price = match value_semantics {
+                ValueSemantics::RevmAuthoritative => RevmU256::ZERO,
+                ValueSemantics::LegacyDropInternal => RevmU256::from_limbs(gas_price.0),
+            };
             tx.chain_id = Some(chain_id);
         })
         .modify_block_env(|block| {
@@ -874,6 +1013,7 @@ mod tests {
             ctx,
             None, // No WriteSet capture in this test
             None, // No journal buffering in this test
+            ValueSemantics::RevmAuthoritative,
         );
 
         // Should succeed (not panic) with custom coinbase/prevrandao
@@ -915,6 +1055,7 @@ mod tests {
             None, // No WriteSet capture in this test
             None, // No journal buffering in this test
             None, // PIL-13b: no state store — test uses in-memory state_db only
+            ValueSemantics::RevmAuthoritative,
         );
 
         assert!(result.is_ok(), "Contract call with block context should succeed: {:?}", result.err());
@@ -975,6 +1116,7 @@ mod tests {
             None,
             None,
             None,
+            ValueSemantics::RevmAuthoritative,
         )
         .expect("call returning block.prevrandao should succeed");
 
@@ -1019,6 +1161,7 @@ mod tests {
             None,
             None,
             None,
+            ValueSemantics::RevmAuthoritative,
         )
         .expect("call with default block context should not panic");
 
@@ -1083,6 +1226,7 @@ mod tests {
             None,
             None,
             None,
+            ValueSemantics::RevmAuthoritative,
         )
         .expect("LOG1 contract call should succeed");
 
@@ -1238,6 +1382,356 @@ mod tests {
             state_db.get_storage(&addr, b"slot_b"),
             None,
             "Stale storage from failed tx should not exist"
+        );
+    }
+
+    /// A contract that CALLs another address with value must actually move
+    /// the native SALT.
+    ///
+    /// `DatabaseCommit::commit` deliberately discards REVM's balance writes
+    /// (Sprint EL-1 Fix #19) because the executor owns gas/nonce/balance.
+    /// But the executor only re-applies the **top-level** `from → to`
+    /// transfer (`executor.rs` `execute_call`). Every value transfer a
+    /// contract performs *itself* — CALL with value, a payable forward, a
+    /// payout to a user — is therefore dropped, while the callee's storage
+    /// is committed as if the money had arrived.
+    ///
+    /// Observed live on chain 40204: `MembershipStakeVault` grant 0 called
+    /// `LiquidStakingPool.deposit{value: 32_000 ether}()`. The pool's
+    /// storage recorded `totalPooled = 32_000e18` and minted 32,000 shares,
+    /// but the pool's actual balance is 0 and the 32,000 SALT is still
+    /// sitting in the vault.
+    #[test]
+    fn test_contract_initiated_value_transfer_moves_balance() {
+        let state_db = Arc::new(StateDB::new());
+        let caller = Address([1u8; 20]);
+        let contract = Address([2u8; 20]);
+        let recipient = Address([3u8; 20]);
+
+        let one_eth = U256::from(10u64).pow(U256::from(18u64));
+        state_db.accounts.set_balance(caller, one_eth);
+        // Fund the contract so it has the SALT it is about to forward.
+        state_db.accounts.set_balance(contract, one_eth);
+
+        // CALL(gas, recipient, 1000, 0, 0, 0, 0) then STOP.
+        // CALL pops gas, addr, value, argsOff, argsLen, retOff, retLen —
+        // so they are pushed in reverse.
+        let mut code: Vec<u8> = vec![
+            0x60, 0x00, // retLen
+            0x60, 0x00, // retOff
+            0x60, 0x00, // argsLen
+            0x60, 0x00, // argsOff
+            0x61, 0x03, 0xe8, // value = 1000
+            0x73, // PUSH20 recipient
+        ];
+        code.extend_from_slice(&recipient.0);
+        code.extend_from_slice(&[
+            0x5a, // GAS
+            0xf1, // CALL
+            0x00, // STOP
+        ]);
+        state_db.set_code(contract, code);
+
+        let result = execute_contract_call(
+            state_db.clone(),
+            caller,
+            contract,
+            vec![],
+            U256::zero(),
+            1_000_000,
+            U256::from(1_000_000_000u64),
+            40204,
+            1,
+            1_000_000,
+        );
+        assert!(result.is_ok(), "CALL-with-value should succeed: {:?}", result.err());
+
+        assert_eq!(
+            state_db.accounts.get_balance(&recipient),
+            U256::from(1000u64),
+            "recipient must receive the 1000 wei the contract CALLed with — \
+             a contract-initiated value transfer must not be silently dropped"
+        );
+        assert_eq!(
+            state_db.accounts.get_balance(&contract),
+            one_eth - U256::from(1000u64),
+            "the forwarding contract must actually be debited"
+        );
+    }
+
+    /// The top-level `caller → contract` value must be credited EXACTLY once.
+    ///
+    /// This is the guard on the other side of the fix. `commit` now applies
+    /// REVM's balance changes, which already include the top-level leg, so
+    /// the executor's old post-REVM `journal_transfer(from, to, value)` had
+    /// to go. If anyone re-adds it, `contract` ends up +2000 here and this
+    /// test fails.
+    ///
+    /// It also pins that REVM charges NO gas: this path calls REVM directly,
+    /// without the executor's gas deduction, so the caller must be down
+    /// exactly `value` and not a wei more.
+    #[test]
+    fn test_top_level_value_credited_exactly_once() {
+        let state_db = Arc::new(StateDB::new());
+        let caller = Address([1u8; 20]);
+        let contract = Address([2u8; 20]);
+
+        let one_eth = U256::from(10u64).pow(U256::from(18u64));
+        state_db.accounts.set_balance(caller, one_eth);
+        state_db.set_code(contract, vec![0x00]); // STOP
+
+        let result = execute_contract_call(
+            state_db.clone(),
+            caller,
+            contract,
+            vec![],
+            U256::from(1000u64),
+            1_000_000,
+            U256::from(1_000_000_000u64),
+            40204,
+            1,
+            1_000_000,
+        );
+        assert!(result.is_ok(), "call should succeed: {:?}", result.err());
+
+        assert_eq!(
+            state_db.accounts.get_balance(&contract),
+            U256::from(1000u64),
+            "top-level value must be credited exactly once — 2000 here means \
+             the executor's post-REVM journal_transfer was re-added on top of \
+             REVM's own transfer"
+        );
+        assert_eq!(
+            state_db.accounts.get_balance(&caller),
+            one_eth - U256::from(1000u64),
+            "caller must be down exactly the value — REVM is handed a zero gas \
+             price and must charge no gas of its own"
+        );
+    }
+
+    /// A reverted call must move no money, even though REVM performed the
+    /// transfer internally before the revert unwound it.
+    #[test]
+    fn test_reverted_call_moves_no_value() {
+        let state_db = Arc::new(StateDB::new());
+        let caller = Address([1u8; 20]);
+        let contract = Address([2u8; 20]);
+        let recipient = Address([3u8; 20]);
+
+        let one_eth = U256::from(10u64).pow(U256::from(18u64));
+        state_db.accounts.set_balance(caller, one_eth);
+        state_db.accounts.set_balance(contract, one_eth);
+
+        // CALL(gas, recipient, 1000, 0,0,0,0) then REVERT(0, 0).
+        let mut code: Vec<u8> = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, // ret/args
+            0x61, 0x03, 0xe8, // value = 1000
+            0x73, // PUSH20 recipient
+        ];
+        code.extend_from_slice(&recipient.0);
+        code.extend_from_slice(&[
+            0x5a, // GAS
+            0xf1, // CALL
+            0x50, // POP the CALL success flag
+            0x60, 0x00, 0x60, 0x00, // revert offset/len
+            0xfd, // REVERT
+        ]);
+        state_db.set_code(contract, code);
+
+        let result = execute_contract_call(
+            state_db.clone(),
+            caller,
+            contract,
+            vec![],
+            U256::zero(),
+            1_000_000,
+            U256::from(1_000_000_000u64),
+            40204,
+            1,
+            1_000_000,
+        );
+        assert!(result.is_err(), "the call reverts, so it must report an error");
+
+        assert_eq!(
+            state_db.accounts.get_balance(&recipient),
+            U256::zero(),
+            "a reverted call must not move value"
+        );
+        assert_eq!(
+            state_db.accounts.get_balance(&contract),
+            one_eth,
+            "the forwarding contract must be untouched after a revert"
+        );
+    }
+
+    /// Below the activation height the ORIGINAL BUG must be reproduced exactly.
+    ///
+    /// This looks perverse and is not: blocks 0..activation were produced under
+    /// the buggy rule and committed state roots that embed it. A node that
+    /// "helpfully" moved the money while replaying them would compute different
+    /// roots and fork itself off the chain. History has to stay wrong.
+    #[test]
+    fn test_legacy_semantics_still_drop_internal_transfers() {
+        let state_db = Arc::new(StateDB::new());
+        let caller = Address([1u8; 20]);
+        let contract = Address([2u8; 20]);
+        let recipient = Address([3u8; 20]);
+
+        let one_eth = U256::from(10u64).pow(U256::from(18u64));
+        state_db.accounts.set_balance(caller, one_eth);
+        state_db.accounts.set_balance(contract, one_eth);
+
+        let mut code: Vec<u8> = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00,
+            0x61, 0x03, 0xe8, // value = 1000
+            0x73,
+        ];
+        code.extend_from_slice(&recipient.0);
+        code.extend_from_slice(&[0x5a, 0xf1, 0x00]);
+        state_db.set_code(contract, code);
+
+        let result = execute_contract_call_with_context(
+            state_db.clone(),
+            caller,
+            contract,
+            vec![],
+            U256::zero(),
+            1_000_000,
+            U256::from(1_000_000_000u64),
+            40204,
+            1,
+            1_000_000,
+            BlockContext::default(),
+            None,
+            None,
+            None,
+            ValueSemantics::LegacyDropInternal,
+        );
+        assert!(result.is_ok(), "call should succeed: {:?}", result.err());
+
+        assert_eq!(
+            state_db.accounts.get_balance(&recipient),
+            U256::zero(),
+            "pre-activation, the internal transfer must still be dropped — \
+             replaying history under the corrected rule forks the node"
+        );
+        assert_eq!(
+            state_db.accounts.get_balance(&contract),
+            one_eth,
+            "and the forwarding contract must keep its balance, as it did"
+        );
+    }
+
+    /// The gate must flip on block height, at exactly the documented boundary.
+    #[test]
+    fn test_value_semantics_activation_boundary() {
+        use crate::executor::{value_semantics_at, VALUE_TRANSFER_ACTIVATION_HEIGHT};
+
+        assert_eq!(
+            value_semantics_at(VALUE_TRANSFER_ACTIVATION_HEIGHT - 1),
+            ValueSemantics::LegacyDropInternal,
+            "the block below activation still runs the old rule"
+        );
+        assert_eq!(
+            value_semantics_at(VALUE_TRANSFER_ACTIVATION_HEIGHT),
+            ValueSemantics::RevmAuthoritative,
+            "activation is inclusive — the rule applies AT the height, not after"
+        );
+        assert_eq!(
+            value_semantics_at(0),
+            ValueSemantics::LegacyDropInternal,
+            "genesis replays under the old rule"
+        );
+    }
+
+    /// The activation height is a consensus constant: every node must use the
+    /// same one or they disagree about state roots. Pinned so a future edit is
+    /// a deliberate act with a failing test attached.
+    #[test]
+    // The comparison is constant BY DESIGN — that is the point of a pin. It
+    // fails to compile-time-true only while the constant stays sane; lowering
+    // it below the chain height turns this into a failing test, which is the
+    // tripwire we want.
+    #[allow(clippy::assertions_on_constants)]
+    fn test_value_transfer_activation_height_is_the_agreed_consensus_value() {
+        use crate::executor::VALUE_TRANSFER_ACTIVATION_HEIGHT;
+
+        assert_eq!(
+            VALUE_TRANSFER_ACTIVATION_HEIGHT, 300_000,
+            "owner decision 2026-07-29, confirmed. Changing this changes which \
+             state roots are valid — it requires a coordinated fleet upgrade, \
+             not an edit"
+        );
+        assert!(
+            VALUE_TRANSFER_ACTIVATION_HEIGHT > 84_240,
+            "activation must be comfortably ahead of the chain height at the \
+             time it was chosen (~84,240 on 2026-07-29, 2.000 s blocks), or \
+             nodes activate before they can all be upgraded"
+        );
+    }
+
+    /// Two hops: caller → A (top-level), A → B (internal), B → C (internal).
+    /// Every leg must land. This is the shape the membership money path takes
+    /// (orchestrator → vault → pool) and the shape M-2.0 will take
+    /// (orchestrator → vault → MemberBond → ValidatorRegistry).
+    #[test]
+    fn test_nested_internal_transfers_all_apply() {
+        let state_db = Arc::new(StateDB::new());
+        let caller = Address([1u8; 20]);
+        let a = Address([2u8; 20]);
+        let b = Address([3u8; 20]);
+        let c = Address([4u8; 20]);
+
+        let one_eth = U256::from(10u64).pow(U256::from(18u64));
+        state_db.accounts.set_balance(caller, one_eth);
+
+        // Helper: code that CALLs `target` forwarding `amount` wei, then STOPs.
+        let forward_to = |target: &Address, amount: u16| -> Vec<u8> {
+            let mut code: Vec<u8> = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00];
+            code.extend_from_slice(&[0x61, (amount >> 8) as u8, (amount & 0xff) as u8]);
+            code.push(0x73);
+            code.extend_from_slice(&target.0);
+            code.extend_from_slice(&[0x5a, 0xf1, 0x00]);
+            code
+        };
+
+        // A forwards 1000 of the 2000 it receives to B; B forwards 400 to C.
+        state_db.set_code(a, forward_to(&b, 1000));
+        state_db.set_code(b, forward_to(&c, 400));
+
+        let result = execute_contract_call(
+            state_db.clone(),
+            caller,
+            a,
+            vec![],
+            U256::from(2000u64),
+            2_000_000,
+            U256::from(1_000_000_000u64),
+            40204,
+            1,
+            1_000_000,
+        );
+        assert!(result.is_ok(), "nested calls should succeed: {:?}", result.err());
+
+        assert_eq!(
+            state_db.accounts.get_balance(&a),
+            U256::from(1000u64),
+            "A keeps 2000 received minus 1000 forwarded"
+        );
+        assert_eq!(
+            state_db.accounts.get_balance(&b),
+            U256::from(600u64),
+            "B keeps 1000 received minus 400 forwarded"
+        );
+        assert_eq!(
+            state_db.accounts.get_balance(&c),
+            U256::from(400u64),
+            "C receives the innermost hop — two levels below the top-level call"
+        );
+        assert_eq!(
+            state_db.accounts.get_balance(&caller),
+            one_eth - U256::from(2000u64),
+            "caller is down exactly the top-level value"
         );
     }
 }
