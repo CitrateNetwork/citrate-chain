@@ -2,67 +2,112 @@
 pragma solidity ^0.8.26;
 
 import {Script, console2} from "forge-std/Script.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import "./Salts.sol";
 import {CitrateMemberSBT} from "../src/core_membership/CitrateMemberSBT.sol";
+import {MemberBond} from "../src/core_membership/MemberBond.sol";
 import {MembershipStakeVault} from "../src/core_membership/MembershipStakeVault.sol";
-import {LiquidStakingPool} from "../src/LiquidStakingPool.sol";
+import {ValidatorRegistry} from "../src/ValidatorRegistry.sol";
 
-/// @title DeployCoreMembership — CORE-S5.4 / Phase-D D1
-/// @notice Deploys the two money-path membership contracts on 40204:
+/// @title DeployCoreMembership — CORE-S5.4 / Phase-D D1, rebuilt for M-2
+/// @notice Deploys the membership money path on 40204:
 ///   1. CitrateMemberSBT(initialOwner)
-///   2. MembershipStakeVault(initialOwner, LiquidStakingPool)
-/// The SBT and vault are independent at deploy (no cross-linkage); the vault
-/// stakes grants into the existing LiquidStakingPool (no pool authorization
-/// needed — the pool only gates withdrawals to the staker). initialOwner is
-/// the deployer by default and is TRANSFERABLE to the grant-orchestrator /
-/// droplet-signer address once `core-membership` exists (Ownable).
+///   2. MemberBond()                       — the clone master copy
+///   3. MembershipStakeVault()             — the UUPS implementation
+///   4. ERC1967Proxy(impl, initialize(…))  — THE vault address the federation pins
 ///
-/// Salted CREATE2 (WS-1): both contracts deploy through the genesis Arachnid
-/// factory (0x4e59…4956C) via `new X{salt: Salts.salt("X")}(…)`, so their
-/// addresses are a pure function of (salt, init_code) — reroll-stable and
-/// nonce-independent. To keep those addresses FROZEN, every init_code input is
-/// pinned as a literal (NOT read from env): the constructor args (FROZEN_OWNER,
-/// DEFAULT_POOL) feed the init_code hash, so a single env drift would move the
-/// address. The Create2Determinism tripwire (test/CoreMembershipCreate2.t.sol)
-/// pins the resulting projections so a revert to plain CREATE or a bytecode
-/// drift fails CI.
+/// ## What changed in M-2, and what it costs
+///
+/// The vault no longer stakes grants into `LiquidStakingPool`. It places each
+/// grant in a per-member `MemberBond` escrow that bonds into
+/// `ValidatorRegistry` (citrate-chain #139 design (c)). The pool is no longer a
+/// constructor input and no longer appears here at all.
+///
+/// The vault is now UUPS behind an ERC-1967 proxy (owner decision A.3). That
+/// means this deployment moves the vault address ONE more time — and never
+/// again: every later change is an in-place upgrade behind the proxy. That is
+/// the payoff for doing M-2.0 before M-2.1, so the storage layout is frozen
+/// once.
+///
+/// ## Determinism
+///
+/// Salted CREATE2 (WS-1) through the genesis Arachnid factory, so every address
+/// is a pure function of (salt, init_code) — reroll-stable, nonce-independent.
+/// The chain is deliberate and fully determined:
+///
+///   SBT        <- (salt, creationCode, FROZEN_OWNER)
+///   MemberBond <- (salt, creationCode)                 [no ctor args]
+///   vaultImpl  <- (salt, creationCode)                 [no ctor args]
+///   proxy      <- (salt, ERC1967Proxy creationCode, vaultImpl, initialize calldata)
+///
+/// The proxy's init_code embeds the initialize calldata, which embeds the SBT,
+/// MemberBond and REGISTRY addresses. So a bytecode change to ANY of them moves
+/// the vault proxy address. `test/CoreMembershipCreate2.t.sol` pins the whole
+/// chain and fails closed before a deploy can land somewhere unexpected.
 ///
 /// Broadcast (deployer holds SALT for gas):
 ///   forge script script/DeployCoreMembership.s.sol \
-///     --rpc-url https://rpc.citrate.ai --private-key 0x.. --broadcast --slow
+///     --rpc-url https://rpc.citrate.ai --private-key 0x.. --broadcast --slow \
+///     --legacy --gas-limit 8000000
+///
+/// NOTE: chain 40204 REJECTS EIP-1559 transactions — `--legacy` with an
+/// explicit gas limit is mandatory, not optional.
+///
+/// PRE-FLIGHT: this deployment is only safe once citrate-chain PR #140 is live
+/// and past VALUE_TRANSFER_ACTIVATION_HEIGHT (300,000). Below that height the
+/// EVM silently discards contract-initiated value transfers, so
+/// `MemberBond.activate`'s `registerValidator{value: principal}` would register
+/// a validator whose bond does not exist — phantom stake in the consensus
+/// proposer set. `run()` refuses to broadcast before the activation height.
 contract DeployCoreMembership is Script {
-    /// The deployed LiquidStakingPool on 40204 (CREATE2-stable). PINNED — it
-    /// feeds the vault init_code hash, so it must NOT come from env.
-    address constant DEFAULT_POOL = 0xFD272195B55Cb4F5A240a5bE75AABaB0D1C5685E;
-
     /// The grant/treasury signer (current membership owner). PINNED — it is a
-    /// constructor arg for BOTH contracts and thus part of each init_code hash.
-    /// ROTATED 2026-07-20: prior 0x9aFFF274…8A50 was keccak256(OLD_DEPLOYER ‖
-    /// "citrate/treasury-grant-signer/v1"); the old deployer leak makes that key
-    /// derivable, so it rotates to the NEW-deployer-derived grant signer (matched
-    /// by scripts/ops/derive-operator-keys.sh --print-only). Because it is a
-    /// constructor arg, the SBT + vault CREATE2 addresses MOVE — the droplet
-    /// treasury-signer must be rekeyed to this address and core-membership re-pinned.
+    /// constructor arg for the SBT and an initialize arg for the vault, so it
+    /// feeds both init_code hashes and must NOT come from env.
     address constant FROZEN_OWNER = 0xF42a19194fee89E71dC4b8631a71a9CeCf42B483;
+
+    /// The deployed ValidatorRegistry on 40204. PINNED — it feeds the vault
+    /// proxy's init_code hash through the initialize calldata.
+    address constant REGISTRY = 0x61D44D8A14443646B756905410BE951e6eCE95A6;
+
+    /// Height at which citrate-chain #140 makes contract-initiated value
+    /// transfers real. Deploying below this would produce phantom bonds.
+    uint256 constant VALUE_TRANSFER_ACTIVATION_HEIGHT = 300_000;
 
     function run() external {
         require(block.chainid == 40204, "refusing to deploy off chain 40204 (testnet-beta)");
-        require(DEFAULT_POOL.code.length > 0, "LiquidStakingPool has no code on this chain");
+        require(REGISTRY.code.length > 0, "ValidatorRegistry has no code on this chain");
+        require(
+            block.number >= VALUE_TRANSFER_ACTIVATION_HEIGHT,
+            "refusing to deploy below the value-transfer activation height: bonds would be phantom"
+        );
 
         vm.startBroadcast();
 
         CitrateMemberSBT sbt =
             new CitrateMemberSBT{salt: Salts.salt("CitrateMemberSBT")}(FROZEN_OWNER);
-        MembershipStakeVault vault = new MembershipStakeVault{
-            salt: Salts.salt("MembershipStakeVault")
-        }(FROZEN_OWNER, LiquidStakingPool(payable(DEFAULT_POOL)));
+
+        MemberBond bondImpl = new MemberBond{salt: Salts.salt("MemberBond")}();
+
+        MembershipStakeVault vaultImpl =
+            new MembershipStakeVault{salt: Salts.salt("MembershipStakeVault.impl")}();
+
+        ERC1967Proxy proxy = new ERC1967Proxy{salt: Salts.salt("MembershipStakeVault")}(
+            address(vaultImpl),
+            abi.encodeCall(
+                MembershipStakeVault.initialize,
+                (FROZEN_OWNER, ValidatorRegistry(payable(REGISTRY)), sbt, address(bondImpl))
+            )
+        );
 
         vm.stopBroadcast();
 
-        console2.log("chainid           :", block.chainid);
-        console2.log("initialOwner      :", FROZEN_OWNER);
-        console2.log("LiquidStakingPool :", DEFAULT_POOL);
-        console2.log("CitrateMemberSBT  :", address(sbt));
-        console2.log("MembershipStakeVault:", address(vault));
+        console2.log("chainid             :", block.chainid);
+        console2.log("initialOwner        :", FROZEN_OWNER);
+        console2.log("ValidatorRegistry   :", REGISTRY);
+        console2.log("CitrateMemberSBT    :", address(sbt));
+        console2.log("MemberBond (impl)   :", address(bondImpl));
+        console2.log("MembershipStakeVault impl :", address(vaultImpl));
+        console2.log("MembershipStakeVault      :", address(proxy));
+        console2.log("^ the proxy is THE vault address to pin federation-wide");
     }
 }
