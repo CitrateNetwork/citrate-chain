@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use citrate_execution::precompiles::tensor_format::{encode, Dtype};
 use citrate_execution::precompiles::verify::{addresses, execute as verify_execute};
-use citrate_execution::revm_adapter::{execute_contract_call_with_context, BlockContext};
+use citrate_execution::revm_adapter::{execute_contract_call_with_context, BlockContext, ValueSemantics};
 use citrate_execution::state::StateDB;
 use citrate_execution::types::Address;
 use primitive_types::U256;
@@ -109,6 +109,7 @@ fn call_via_forwarder(target: [u8; 20], calldata: Vec<u8>) -> ([u8; 32], [u8; 32
         None,
         None,
         None,
+        ValueSemantics::RevmAuthoritative,
     )
     .expect("the forwarder contract itself must execute successfully");
 
@@ -397,6 +398,7 @@ mod porep_v2_through_revm {
             None,
             None,
             None,
+            ValueSemantics::RevmAuthoritative,
         )
         .expect("direct call to the verifier precompile must execute");
 
