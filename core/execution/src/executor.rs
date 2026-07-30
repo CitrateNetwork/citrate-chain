@@ -139,6 +139,49 @@ pub struct Executor {
     validator_activation_height: std::sync::atomic::AtomicU64,
 }
 
+/// Height at which contract-initiated native value transfers start working.
+///
+/// Below this height the chain reproduces the original bug exactly
+/// ([`ValueSemantics::LegacyDropInternal`]): `DatabaseCommit::commit` drops
+/// REVM's balance changes and only the top-level `from → to` leg is re-applied
+/// by hand, so any SALT a contract moves itself vanishes while the callee's
+/// storage records it as received. At and above this height REVM owns value
+/// movement end to end ([`ValueSemantics::RevmAuthoritative`]).
+///
+/// This is a **consensus constant**: two nodes running different values disagree
+/// about state roots and fork. Changing it requires a coordinated fleet upgrade,
+/// not an edit — there is a pinning test attached.
+///
+/// Chosen against a measured 2.000 s block time (43,200 blocks/day) with the
+/// chain at ~84,240 on 2026-07-29: ~5 days of headroom for the @rule8 audit of
+/// a money-path change, the amd64 build, and the four-node rollout.
+///
+/// NOTE: this does NOT repair state already corrupted below the activation —
+/// `LiquidStakingPool` keeps its phantom `totalPooled` and `ValidatorRegistry`
+/// its 300-SALT shortfall. That repair is a separate, deferred decision.
+pub const VALUE_TRANSFER_ACTIVATION_HEIGHT: u64 = 300_000;
+
+/// Devnet-only override for [`VALUE_TRANSFER_ACTIVATION_HEIGHT`], mirroring the
+/// MP-DEPTH pattern. Never set this on a node that talks to 40204.
+pub const VALUE_TRANSFER_ACTIVATION_ENV: &str = "CITRATE_VALUE_TRANSFER_ACTIVATION_HEIGHT";
+
+/// Resolve the activation height, honouring the devnet override.
+pub fn value_transfer_activation_height() -> u64 {
+    std::env::var(VALUE_TRANSFER_ACTIVATION_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(VALUE_TRANSFER_ACTIVATION_HEIGHT)
+}
+
+/// Which value-transfer rule applies to a block at `height`.
+pub fn value_semantics_at(height: u64) -> crate::revm_adapter::ValueSemantics {
+    if height >= value_transfer_activation_height() {
+        crate::revm_adapter::ValueSemantics::RevmAuthoritative
+    } else {
+        crate::revm_adapter::ValueSemantics::LegacyDropInternal
+    }
+}
+
 /// RAII guard for `Executor::defer_persist`: sets it on `engage` and restores the
 /// prior value on drop, so `apply_block`'s deferral is reset on every exit path
 /// (early `return`, `?`, or normal). `apply_block` is not nested, but restoring
@@ -1466,15 +1509,21 @@ impl Executor {
     /// `creditReward` is PAYABLE and requires `msg.value == amount` (ETH-backed
     /// vesting), `msg.sender == rewardMinter`, `status == Active`, and honors the
     /// per-epoch emission cap. REVM performs the value transfer + storage writes,
-    /// but `StateDBAdapter::commit` DISCARDS REVM's balance/nonce writes (the
-    /// executor owns balances — Sprint EL-1 Fix #19), so we reconcile the balances
-    /// to reflect the transfer the contract's storage now assumes:
-    ///   * SUCCESS: registry balance += amount (backs `vestedRewards`), minter
-    ///     restored to its pre-call value (net-zero) — the un-burned share is
-    ///     redistributed from the burn into slashable stake.
-    ///   * REVERT (NotActive / EmissionCapped / ...): storage is already reverted
-    ///     by REVM; we only undo the transient minter funding, leaving the fee
-    ///     burned for this block, exactly as before §R'. Deterministic either way.
+    /// and `StateDBAdapter::commit` now applies REVM's balance changes, so the
+    /// transfer lands on its own:
+    ///   * SUCCESS: REVM moved `amount` minter → registry. The minter was
+    ///     transiently funded +amount below purely to clear REVM's affordability
+    ///     precheck, so it nets back to its pre-call value; the registry ends up
+    ///     +amount, backing `vestedRewards`. No manual reconciliation.
+    ///   * REVERT (NotActive / EmissionCapped / ...): REVM reverted storage and
+    ///     balances alike, so we only undo the transient minter funding, leaving
+    ///     the fee burned for this block, exactly as before §R'. Deterministic
+    ///     either way.
+    ///
+    /// Until the internal-value-transfer fix this method hand-reconciled the
+    /// balances itself, because `commit` discarded REVM's — it was one of only
+    /// two sites that did, which is how contract-initiated transfers came to be
+    /// dropped chain-wide.
     ///
     /// Returns `Ok(true)` if vested, `Ok(false)` if the contract reverted (burned).
     async fn credit_validator_reward(
@@ -1494,6 +1543,9 @@ impl Executor {
         let minter_before = self.get_balance(&minter);
         self.set_balance(&minter, minter_before + amount);
 
+        // §R' runs at end-of-block for the block at `height`, so it is gated on
+        // the same height as user transactions in that block.
+        let value_semantics = crate::executor::value_semantics_at(height);
         let block_ctx = self.get_block_context();
         let result = crate::revm_adapter::execute_contract_call_with_context(
             self.state_db.clone(),
@@ -1510,14 +1562,27 @@ impl Executor {
             None, // no MVCC WriteSet capture (end-of-block system op, not a user tx).
             None, // no journal buffering — writes go straight to state_db (direct call).
             self.state_store.clone(),
+            value_semantics,
         );
 
         match result {
             Ok(_) => {
-                // Reflect the value transfer REVM discarded.
-                self.set_balance(&minter, minter_before);
-                let reg_bal = self.get_balance(&registry_addr);
-                self.set_balance(&registry_addr, reg_bal + amount);
+                // At/above activation no manual reconciliation is needed:
+                // `commit` applied REVM's balance changes, so the minter is
+                // already back at `minter_before` (transiently funded +amount
+                // above, then -amount by the transfer) and the registry is
+                // +amount. Re-applying here would double-credit the registry.
+                //
+                // Below activation REVM's balances were dropped, so this
+                // hand-reconciliation is what makes the transfer real. It was
+                // one of only two such sites chain-wide — the other being the
+                // top-level leg in `execute_call` — which is how every other
+                // contract-initiated transfer came to be silently discarded.
+                if value_semantics == crate::revm_adapter::ValueSemantics::LegacyDropInternal {
+                    self.set_balance(&minter, minter_before);
+                    let reg_bal = self.get_balance(&registry_addr);
+                    self.set_balance(&registry_addr, reg_bal + amount);
+                }
                 Ok(true)
             }
             Err(e) => {
@@ -2355,6 +2420,10 @@ impl Executor {
             self.get_block_context(),
             Some(context.writes_handle.clone()),
             Some(context.journal.clone()),
+            // Deployments carry no value on this path (see the U256::zero()
+            // above), but constructor code can still CALL out with value, so
+            // the same height gate applies.
+            crate::executor::value_semantics_at(context.block_number),
         );
 
         match result {
@@ -2467,11 +2536,12 @@ impl Executor {
         if let Some(code) = code_opt {
             // Route standard EVM calls through REVM for correct CALL/CREATE/DELEGATECALL.
             //
-            // Sprint EL-1 Fix (Issue #19): REVM handles gas/value/nonce internally
-            // during transact_commit(), but DatabaseCommit::commit() only writes
-            // storage and code — NOT balance or nonce. The executor is the sole
-            // owner of gas/balance/nonce accounting. Value transfer is done
-            // explicitly by the executor after REVM succeeds.
+            // Gas and nonce are the executor's on both sides of the activation.
+            // Balance ownership is height-dependent: at/above
+            // VALUE_TRANSFER_ACTIVATION_HEIGHT REVM owns it (and is handed a zero
+            // gas price so it charges none); below, REVM's balance changes are
+            // dropped and only the top-level leg is re-applied by hand below.
+            let value_semantics = crate::executor::value_semantics_at(context.block_number);
             debug!(
                 "Executing contract at {} with {} bytes of code via REVM",
                 to,
@@ -2496,6 +2566,7 @@ impl Executor {
                 // PIL-13b: pass the executor's state store so REVM can
                 // hydrate account / code / storage on cold cache miss.
                 self.state_store.clone(),
+                value_semantics,
             ) {
                 Ok((output, gas_used, revm_logs)) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["ok"]).inc();
@@ -2505,11 +2576,18 @@ impl Executor {
                     VM_GAS_USED.observe(gas_used as f64);
                     context.output = output;
 
-                    // Transfer value after REVM succeeds. REVM's commit no longer
-                    // writes balance changes, so the executor must handle this.
-                    // Sprint P950-A-5 WP-A.5.2: route through the journal for
-                    // concurrent isolation.
-                    if value > U256::zero() {
+                    // At/above the activation height, value transfer is REVM's:
+                    // `StateDBAdapter::commit` applies its balance changes, which
+                    // cover the top-level `from → to` leg AND every transfer the
+                    // contract performs itself. Re-applying the top-level leg here
+                    // would double-credit `to`.
+                    //
+                    // Below it, this hand-patch IS the only value movement that
+                    // lands — which is exactly why contract-initiated transfers
+                    // went missing chain-wide. Retained so history replays.
+                    if value_semantics == crate::revm_adapter::ValueSemantics::LegacyDropInternal
+                        && value > U256::zero()
+                    {
                         self.journal_transfer(from, to, value, context)?;
                     }
 
