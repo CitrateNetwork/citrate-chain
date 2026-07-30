@@ -1240,4 +1240,78 @@ mod tests {
             "Stale storage from failed tx should not exist"
         );
     }
+
+    /// A contract that CALLs another address with value must actually move
+    /// the native SALT.
+    ///
+    /// `DatabaseCommit::commit` deliberately discards REVM's balance writes
+    /// (Sprint EL-1 Fix #19) because the executor owns gas/nonce/balance.
+    /// But the executor only re-applies the **top-level** `from → to`
+    /// transfer (`executor.rs` `execute_call`). Every value transfer a
+    /// contract performs *itself* — CALL with value, a payable forward, a
+    /// payout to a user — is therefore dropped, while the callee's storage
+    /// is committed as if the money had arrived.
+    ///
+    /// Observed live on chain 40204: `MembershipStakeVault` grant 0 called
+    /// `LiquidStakingPool.deposit{value: 32_000 ether}()`. The pool's
+    /// storage recorded `totalPooled = 32_000e18` and minted 32,000 shares,
+    /// but the pool's actual balance is 0 and the 32,000 SALT is still
+    /// sitting in the vault.
+    #[test]
+    fn test_contract_initiated_value_transfer_moves_balance() {
+        let state_db = Arc::new(StateDB::new());
+        let caller = Address([1u8; 20]);
+        let contract = Address([2u8; 20]);
+        let recipient = Address([3u8; 20]);
+
+        let one_eth = U256::from(10u64).pow(U256::from(18u64));
+        state_db.accounts.set_balance(caller, one_eth);
+        // Fund the contract so it has the SALT it is about to forward.
+        state_db.accounts.set_balance(contract, one_eth);
+
+        // CALL(gas, recipient, 1000, 0, 0, 0, 0) then STOP.
+        // CALL pops gas, addr, value, argsOff, argsLen, retOff, retLen —
+        // so they are pushed in reverse.
+        let mut code: Vec<u8> = vec![
+            0x60, 0x00, // retLen
+            0x60, 0x00, // retOff
+            0x60, 0x00, // argsLen
+            0x60, 0x00, // argsOff
+            0x61, 0x03, 0xe8, // value = 1000
+            0x73, // PUSH20 recipient
+        ];
+        code.extend_from_slice(&recipient.0);
+        code.extend_from_slice(&[
+            0x5a, // GAS
+            0xf1, // CALL
+            0x00, // STOP
+        ]);
+        state_db.set_code(contract, code);
+
+        let result = execute_contract_call(
+            state_db.clone(),
+            caller,
+            contract,
+            vec![],
+            U256::zero(),
+            1_000_000,
+            U256::from(1_000_000_000u64),
+            40204,
+            1,
+            1_000_000,
+        );
+        assert!(result.is_ok(), "CALL-with-value should succeed: {:?}", result.err());
+
+        assert_eq!(
+            state_db.accounts.get_balance(&recipient),
+            U256::from(1000u64),
+            "recipient must receive the 1000 wei the contract CALLed with — \
+             a contract-initiated value transfer must not be silently dropped"
+        );
+        assert_eq!(
+            state_db.accounts.get_balance(&contract),
+            one_eth - U256::from(1000u64),
+            "the forwarding contract must actually be debited"
+        );
+    }
 }
