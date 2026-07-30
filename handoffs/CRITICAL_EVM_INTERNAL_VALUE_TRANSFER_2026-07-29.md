@@ -2,7 +2,7 @@
 created: 2026-07-29
 branch: fix/evm-internal-value-transfer
 author: Claude (Opus 5), directed by @SaulBuilds
-status: CRITICAL — verified on live 40204 + reproduced in a unit test; blocks M-2.0
+status: CRITICAL — fix written and PR'd (#140), NOT deployed; still blocks M-2.0 until it is
 relates:
   - handoffs/DGX_RESPONSE_CONSENSUS_AND_ALF_2026-07-29.md   (#139 — M-2 build order this blocks)
   - core/execution/src/revm_adapter.rs                      (root cause)
@@ -113,25 +113,41 @@ alone. M-2.0 is blocked, not delayed.
 
 ---
 
-## What a fix involves (not yet built — owner decision pending)
+## The fix — written, PR #140, NOT deployed
 
-The principled fix is to stop splitting ownership of balances: let REVM own value
-transfer (it already computes it correctly), give REVM a zero gas price so it performs
-no gas accounting, keep the executor as owner of gas and nonce, then commit REVM's
-balance changes and delete the two hand-patches plus the top-level `journal_transfer`.
+Owner decision 2026-07-29: fix the EVM; defer the state-repair choice until it lands.
 
-Two consequences the owner needs to weigh, and neither is small:
+Ownership of balances stops being split. REVM owns value transfer end to end; the
+executor keeps gas and nonce. The double-deduction that made Sprint EL-1 discard
+balances in the first place is prevented at the source rather than by throwing the
+result away: REVM is handed a **zero gas price**, so it performs no gas accounting and
+its balance deltas are exactly the value movement. `commit` then applies them wholesale
+— top-level leg, internal `call{value:}`, selfdestruct alike — and both hand-patches go.
 
-1. **It is a consensus-rule change.** Execution semantics change, so state roots change.
-   It needs an activation-height gate (the MP-DEPTH pattern from #138) or a reroll, plus
-   a fleet-wide rebuild. This directly contradicts #139's "no reroll, no coordinated
-   fleet activation height, contract-only work" premise — that premise was sound given
-   what was known then, and is not sound now.
+Gated on `VALUE_TRANSFER_ACTIVATION_HEIGHT = 300_000` (`core/execution/src/executor.rs`),
+because this changes state roots. Below the activation the original bug is reproduced
+exactly, including passing the real gas price through — REVM's precheck is
+`balance >= gas_limit * gas_price + value`, so zeroing it early would let transactions
+succeed that historically failed. History has to stay wrong or the node forks.
 
-2. **A fix does not heal existing state.** The pool's phantom 32,000 and the registry's
-   300-SALT shortfall are already committed to chain state. Repair is a separate
-   decision: reroll (clean, and the membership path has exactly one grant to redo), or
-   a targeted state migration at the activation height.
+300,000 is ~5 days out at the measured **2.000 s** block time (43,200 blocks/day, chain
+at ~84,240). Consensus constant, env override, pinning test — the MP-DEPTH (#138)
+pattern. **Owner must confirm the height before deploy.**
+
+Tests 572 → 579, red-first. Full workspace green except one pre-existing unrelated
+`citrate-api` failure. Nothing deployed: T1 money-path change, so @rule8 sign-off and an
+owner merge come first.
+
+### Still open
+
+1. **State repair — deferred, still owed.** The pool's phantom 32,000 and the registry's
+   300-SALT shortfall are committed to chain state and the fix does not heal them.
+   Reroll (clean; exactly one grant to redo, four validators to re-register) or a
+   targeted migration at the activation height.
+
+2. **#139's premise is void.** "No reroll, no coordinated fleet activation height,
+   contract-only work" was sound given what was known then. It is not sound now: this
+   needs a coordinated fleet upgrade whatever the repair choice.
 
 ---
 
