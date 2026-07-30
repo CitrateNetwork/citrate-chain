@@ -1658,8 +1658,9 @@ mod tests {
 
         assert_eq!(
             VALUE_TRANSFER_ACTIVATION_HEIGHT, 300_000,
-            "changing this changes which state roots are valid — it requires a \
-             coordinated fleet upgrade, not an edit"
+            "owner decision 2026-07-29, confirmed. Changing this changes which \
+             state roots are valid — it requires a coordinated fleet upgrade, \
+             not an edit"
         );
         assert!(
             VALUE_TRANSFER_ACTIVATION_HEIGHT > 84_240,
