@@ -7,7 +7,7 @@ use futures::{SinkExt, StreamExt};
 use citrate_consensus::types::Hash;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
@@ -69,6 +69,12 @@ pub struct PeerInfo {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub score: i32,
+    /// Consecutive messages dropped because this peer's send queue was full.
+    ///
+    /// Reset to 0 on every successful queue. A sustained non-zero value is the
+    /// signal that the peer has stopped reading its socket — see
+    /// [`Peer::send`] and [`Peer::SEND_DROPS_BEFORE_CLOSE`].
+    pub send_drops: u32,
 }
 
 impl PeerInfo {
@@ -89,6 +95,7 @@ impl PeerInfo {
             bytes_sent: 0,
             bytes_received: 0,
             score: 0,
+            send_drops: 0,
         }
     }
 
@@ -170,17 +177,83 @@ impl Peer {
         (self.shutdown.clone(), self.closed.clone())
     }
 
+    /// Consecutive full-queue drops before the connection is closed as a
+    /// non-consumer. One full queue is congestion; [`SEND_DROPS_BEFORE_CLOSE`]
+    /// in a row is a peer that has stopped reading and will never catch up.
+    pub const SEND_DROPS_BEFORE_CLOSE: u32 = 64;
+
+    /// Queue `message` for this peer. **Never blocks.**
+    ///
+    /// #149 — THE FLEET DEADLOCK. THIS FUNCTION USED TO `.await` A BOUNDED
+    /// `mpsc::Sender` (capacity 256), AND THAT SINGLE `.await` DEADLOCKED THE
+    /// WHOLE NETWORK. Do not reintroduce it.
+    ///
+    /// The chain, observed end to end on chain 40204 on 2026-07-31:
+    ///
+    ///   1. A peer stops reading its socket. The writer task parks forever in
+    ///      `sink.send(...).await` — TCP window closed, no RST, no timeout.
+    ///      (rpc-1 -> boot1 sat at Send-Q 535,288 bytes.)
+    ///   2. That peer's `send_tx` (256) fills, because nothing drains it.
+    ///   3. Any shared task that sends to that ONE peer blocks forever here.
+    ///      The node has exactly ONE inbound message loop, and it sends
+    ///      responses inline, so it blocks — and it is also the only thing
+    ///      draining the global inbound channel.
+    ///   4. The inbound channel (512) fills. Every peer's reader task then
+    ///      blocks in `PeerManager::forward_incoming`, so the node stops
+    ///      reading EVERY socket. (rpc-1 <- boot1 sat at Recv-Q 681,922 bytes.)
+    ///
+    /// The node then serves nobody, forever, while looking healthy from every
+    /// angle: no panic, no task exit, systemd `active`, `NRestarts=0`, peers
+    /// connected, JSON-RPC answering, producer still minting blocks. Because no
+    /// task ever ENDS, the #147 watchdog cannot see it either — that watchdog
+    /// catches a dead loop, and this one is merely hung.
+    ///
+    /// It is also mutual and self-sustaining: the peer that stopped reading did
+    /// so because it was in the same state. Two wedged nodes hold each other
+    /// there, which is why restarting one never fixed it and why the fleet froze
+    /// at three DIFFERENT heights rather than one.
+    ///
+    /// So: a peer's send queue is a bounded buffer, and a full buffer means that
+    /// peer is not keeping up. The only safe response is to SHED the message and
+    /// eventually drop the peer. Blocking a shared task on one slow peer trades a
+    /// dropped gossip frame — which is re-requested on the next 2s sync tick —
+    /// for a network-wide halt. Every caller here is a shared task (the message
+    /// loop, gossip broadcast, block/tx propagation, the AI handler, the producer),
+    /// so there is no call site where blocking is the right answer.
     pub async fn send(&self, message: NetworkMessage) -> Result<(), NetworkError> {
-        self.send_tx
-            .send(message)
-            .await
-            .map_err(|_| NetworkError::ConnectionFailed("Channel closed".to_string()))?;
-
-        let mut info = self.info.write().await;
-        info.messages_sent += 1;
-        info.update_last_seen();
-
-        Ok(())
+        match self.send_tx.try_send(message) {
+            Ok(()) => {
+                let mut info = self.info.write().await;
+                info.messages_sent += 1;
+                info.update_last_seen();
+                info.send_drops = 0;
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let drops = {
+                    let mut info = self.info.write().await;
+                    info.send_drops = info.send_drops.saturating_add(1);
+                    info.send_drops
+                };
+                if drops >= Self::SEND_DROPS_BEFORE_CLOSE {
+                    // Not congestion — this peer has stopped consuming. Close the
+                    // connection so its socket halves are released and it can
+                    // re-handshake clean, rather than holding a queue nobody drains.
+                    warn!(
+                        "Peer send queue full {} times consecutively — closing connection (peer is not reading)",
+                        drops
+                    );
+                    self.close();
+                }
+                Err(NetworkError::ConnectionFailed(format!(
+                    "peer send queue full ({} consecutive drops)",
+                    drops
+                )))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(NetworkError::ConnectionFailed(
+                "Channel closed".to_string(),
+            )),
+        }
     }
 
     pub async fn disconnect(&self, reason: String) -> Result<(), NetworkError> {
@@ -212,6 +285,8 @@ pub struct PeerManager {
     banned_peer_ids: Arc<DashMap<PeerId, Instant>>,
     stats: Arc<RwLock<PeerStats>>,
     pub(crate) incoming: Arc<RwLock<Option<IncomingTx>>>,
+    /// Inbound messages shed because the message loop was behind (#149).
+    pub(crate) inbound_drops: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +330,7 @@ impl PeerManager {
             banned_peer_ids: Arc::new(DashMap::new()),
             stats: Arc::new(RwLock::new(PeerStats::default())),
             incoming: Arc::new(RwLock::new(None)),
+            inbound_drops: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -264,10 +340,34 @@ impl PeerManager {
     }
 
     /// Forward a received message to the configured incoming sink, if any.
+    ///
+    /// #149 — link 4 of the fleet deadlock. This used to `.await` the bounded
+    /// (512) inbound channel. Every peer has its own reader task, and each one
+    /// calls this, so once the single message loop stalled and stopped draining
+    /// that channel, EVERY reader parked here — and the node stopped reading
+    /// every socket it had. That is why rpc-1 sat with 681,922 bytes unread from
+    /// boot1: not a slow link, a node that had stopped calling `read`.
+    ///
+    /// Shedding is the correct behaviour: a full inbound queue means the node is
+    /// already behind on the messages it has, and blocking the reader converts
+    /// local overload into a network-wide halt. Sync requests are re-issued on
+    /// the 2s tick and gossip is redundant by construction, so a dropped message
+    /// costs a round trip. Blocking cost the entire fleet thirty hours.
     pub async fn forward_incoming(&self, peer_id: PeerId, message: NetworkMessage) {
         if let Some(tx) = self.incoming.read().await.clone() {
-            let _ = tx.send((peer_id, message)).await;
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send((peer_id, message)) {
+                self.inbound_drops.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// Total inbound messages shed because the message loop was behind (#149).
+    ///
+    /// A rising count is genuine backpressure and is survivable. A count that
+    /// rises without bound means the loop is not draining at all — which is the
+    /// deadlock this counter exists to make visible instead of silent.
+    pub fn inbound_drops(&self) -> u64 {
+        self.inbound_drops.load(Ordering::Relaxed)
     }
 
     /// Get max peers configuration
@@ -946,6 +1046,152 @@ mod tests {
             direction,
         );
         Arc::new(Peer::new(info, send_tx, recv_rx))
+    }
+
+    /// A peer whose writer never drains — i.e. one that has stopped reading its
+    /// socket. `cap` is the send-queue depth; the receiver is held so the channel
+    /// stays OPEN (a closed channel is a different, already-handled case).
+    fn peer_with_stuck_writer(id: &str, cap: usize) -> (Arc<Peer>, mpsc::Receiver<NetworkMessage>) {
+        let (send_tx, _never_drained) = mpsc::channel(cap);
+        let (_unused_tx, recv_rx) = mpsc::channel(1);
+        let info = PeerInfo::new(
+            PeerId::new(id.to_string()),
+            "10.0.0.1:30303".parse().expect("valid addr"),
+            Direction::Outbound,
+        );
+        (Arc::new(Peer::new(info, send_tx, recv_rx)), _never_drained)
+    }
+
+    fn ping() -> NetworkMessage {
+        NetworkMessage::GetPeers
+    }
+
+    /// RED TEST — #149, the fleet deadlock, at its root.
+    ///
+    /// `Peer::send` used to `.await` a bounded (256) `mpsc::Sender`. When a peer
+    /// stops reading its socket, its writer task parks forever in `sink.send`, so
+    /// nothing drains that queue, so this `.await` never returns. Every caller is
+    /// a SHARED task — the single inbound message loop, gossip broadcast, block
+    /// and tx propagation, the AI handler, the producer — so one wedged peer
+    /// froze the entire node, and then the entire fleet.
+    ///
+    /// The bound is the whole point of the test: it must return, and it must
+    /// return an ERROR, so callers learn the peer is not keeping up instead of
+    /// silently waiting on it. Timed, because the failure mode is "hangs forever"
+    /// and an unbounded test would hang the suite rather than fail it.
+    #[tokio::test]
+    async fn send_to_a_peer_that_stopped_reading_returns_instead_of_blocking() {
+        let (peer, _held_open) = peer_with_stuck_writer("wedged", 4);
+
+        // Fill the queue. Nothing drains it, exactly like a parked writer.
+        for _ in 0..4 {
+            peer.send(ping()).await.expect("queue has room");
+        }
+
+        // The send that would have blocked forever.
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), peer.send(ping())).await;
+        let res = res.expect(
+            "send MUST NOT block on a full queue — that single await deadlocked chain 40204",
+        );
+        assert!(
+            res.is_err(),
+            "a shed message must be reported to the caller, not silently swallowed"
+        );
+        assert_eq!(
+            peer.info.read().await.send_drops,
+            1,
+            "the drop is counted so a peer that never drains can be closed"
+        );
+    }
+
+    /// A peer that is merely congested must recover: one successful queue clears
+    /// the counter, so transient fullness never accumulates toward a close.
+    #[tokio::test]
+    async fn a_successful_send_clears_the_drop_counter() {
+        let (send_tx, mut rx) = mpsc::channel(1);
+        let (_unused_tx, recv_rx) = mpsc::channel(1);
+        let info = PeerInfo::new(
+            PeerId::new("congested".to_string()),
+            "10.0.0.2:30303".parse().expect("valid addr"),
+            Direction::Outbound,
+        );
+        let peer = Peer::new(info, send_tx, recv_rx);
+
+        // Every send is time-bounded: if the non-blocking contract regresses,
+        // these HANG rather than fail, and a hung test wedges CI instead of
+        // reporting a bug. Verified: against the pre-fix `.await` this test ran
+        // past 60s with no verdict.
+        let send = |m| tokio::time::timeout(std::time::Duration::from_secs(2), peer.send(m));
+        send(ping()).await.expect("must not block").expect("first fits");
+        assert!(
+            send(ping()).await.expect("must not block").is_err(),
+            "second is shed"
+        );
+        assert_eq!(peer.info.read().await.send_drops, 1);
+
+        // The writer drains one frame — the peer is reading again.
+        rx.recv().await.expect("drained");
+        send(ping()).await.expect("must not block").expect("room again");
+        assert_eq!(
+            peer.info.read().await.send_drops,
+            0,
+            "congestion must not accumulate toward a close once the peer recovers"
+        );
+    }
+
+    /// A peer that never drains is not congested, it is gone. After
+    /// `SEND_DROPS_BEFORE_CLOSE` consecutive drops the connection is closed so
+    /// its socket halves are released and it can re-handshake clean, rather than
+    /// being kept forever as a peer that consumes nothing.
+    #[tokio::test]
+    async fn a_peer_that_never_drains_is_eventually_closed() {
+        let (peer, _held_open) = peer_with_stuck_writer("dead", 1);
+        // Time-bounded for the same reason as above: a regression must FAIL the
+        // suite, not hang it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            peer.send(ping()).await.expect("first fits");
+            for _ in 0..Peer::SEND_DROPS_BEFORE_CLOSE {
+                let _ = peer.send(ping()).await;
+            }
+        })
+        .await
+        .expect("send must never block — see send_to_a_peer_that_stopped_reading");
+        assert!(
+            peer.is_closed(),
+            "a peer that has shed {} consecutive messages has stopped reading and must be dropped",
+            Peer::SEND_DROPS_BEFORE_CLOSE
+        );
+    }
+
+    /// RED TEST — #149 link 4. `forward_incoming` used to `.await` the bounded
+    /// inbound channel. Every peer has its own reader task calling this, so once
+    /// the message loop stopped draining, EVERY reader parked here and the node
+    /// stopped reading every socket it had (rpc-1 held 681,922 unread bytes from
+    /// boot1). It must shed and count instead, so readers keep servicing sockets.
+    #[tokio::test]
+    async fn forward_incoming_sheds_instead_of_blocking_the_reader() {
+        let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let (tx, _rx_held_open) = mpsc::channel(1);
+        pm.set_incoming(tx).await;
+
+        pm.forward_incoming(PeerId::new("p".into()), ping()).await;
+        assert_eq!(pm.inbound_drops(), 0, "the first message fits");
+
+        // The loop is not draining. This is the call that used to park forever.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            pm.forward_incoming(PeerId::new("p".into()), ping()),
+        )
+        .await;
+        res.expect(
+            "forward_incoming MUST NOT block a peer's reader task — that is how a stalled loop \
+             became a node that stopped reading every socket",
+        );
+        assert_eq!(
+            pm.inbound_drops(),
+            1,
+            "shed messages are counted so the stall detector can see a loop that is not draining"
+        );
     }
 
     /// CONNECTION DEDUP (fleet incident 2026-07-29).
