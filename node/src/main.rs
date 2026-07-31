@@ -2020,7 +2020,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // actually answers has to be credited from the receive side.
         let sync_peers_for_rx = sync_peers.clone();
 
-        tokio::spawn(async move {
+        let net_rx_task = tokio::spawn(async move {
             // SECREM-01 NET-1/2: the GetHeaders/GetBlocks handlers that used
             // `Hash::new(...)` inline moved to block_serve.rs, so the bare
             // Hash import is no longer needed here.
@@ -2469,6 +2469,52 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     }
                 }
             }
+        });
+
+        // WATCHDOG — the P2P message loop is not allowed to die quietly (#146).
+        //
+        // The task above is the node's ENTIRE inbound network surface: it serves
+        // GetBlocks/GetHeaders, admits synced blocks, ingests gossip, and drives
+        // the applied tip. Nothing else does any of that. When it stopped, the
+        // process kept running and looked healthy from every angle an operator
+        // checks — systemd `active (running)`, `NRestarts=0`, peers connected,
+        // JSON-RPC answering, the producer still minting blocks, `eth_syncing`
+        // reporting a correct gap — while the node had in fact become a black
+        // hole that answered no peer and could never sync again.
+        //
+        // That is exactly what happened to chain 40204: an unguarded subtraction
+        // in a sync PROGRESS PERCENTAGE (core/network/src/sync.rs, fixed in this
+        // change) panicked this task on the sequencer at 04:31:20 on 2026-07-30,
+        // immediately after it produced height 90,467. It was never noticed. The
+        // sequencer went on producing ~39,000 more blocks that no node on the
+        // network could fetch, three of the four fleet nodes ended up in the same
+        // state, and every fresh node — desktop, fleet, explorer — stalled a few
+        // hundred blocks past 90,467 with an inbound-only log. Thirty hours of
+        // silent, total sync failure from one panic in a log-line calculation.
+        //
+        // A tokio task panic is caught by the runtime and surfaces only through
+        // its JoinHandle, which nobody was holding. Hold it: if this task ever
+        // ends — panic or clean return — say so at ERROR and exit non-zero so the
+        // supervisor restarts a node that can actually serve. A loud restart loop
+        // is a diagnosable failure; a silent zombie is not.
+        tokio::spawn(async move {
+            let reason = match net_rx_task.await {
+                Err(e) if e.is_panic() => format!("PANICKED ({})", e),
+                Err(e) => format!("was cancelled ({})", e),
+                // The loop only returns when `in_rx` closes, i.e. every network
+                // sender is gone — the node has no P2P left either way.
+                Ok(()) => "exited (inbound channel closed)".to_string(),
+            };
+            tracing::error!(
+                "FATAL: the P2P message handler {} — this node can no longer serve \
+                 peers, admit synced blocks, or advance its applied tip. Exiting so \
+                 the supervisor restarts it rather than running on as a node that \
+                 looks healthy and syncs nothing.",
+                reason
+            );
+            // Flush before the exit: this line is the only evidence an operator
+            // will have, and the wedge it reports is invisible from outside.
+            std::process::exit(1);
         });
 
         // (legacy direct socket bootstrap removed; handled by NetworkTransport)

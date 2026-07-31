@@ -211,7 +211,10 @@ impl Discovery {
         info!("Added protected bootstrap peer to discovery: {}", addr);
     }
 
-    /// Mark peer as connected
+    /// Mark peer as connected.
+    ///
+    /// BOOKKEEPING ONLY — nothing routes off this set any more, and no dial
+    /// decision may be made from it. See [`Discovery::mark_disconnected`].
     pub async fn mark_connected(&self, peer_id: &str) {
         self.connected_peers
             .write()
@@ -219,7 +222,30 @@ impl Discovery {
             .insert(peer_id.to_string());
     }
 
-    /// Mark peer as disconnected
+    /// Mark peer as disconnected.
+    ///
+    /// #146 — READ THIS BEFORE MAKING ANY DECISION FROM `connected_peers`.
+    ///
+    /// This is called from tests and nowhere else: production adds to the set
+    /// (`main.rs` discovery loop) and never removes from it, because peers are
+    /// dropped by the PEER MANAGER, which has no handle on `Discovery`. The set
+    /// is therefore a monotonically growing record of "was dialed once", not of
+    /// "is connected now".
+    ///
+    /// `find_peers` used to gate re-dials on it, with a `peer_count < 3` escape
+    /// bolted on for the 0-peer case. On the 40204 fleet a cold-syncing node
+    /// dropped the SEQUENCER after five sync timeouts (main.rs
+    /// drop-and-re-handshake), leaving exactly the three discovery-only
+    /// bootnodes — so `3 < 3` was false, the stale set still claimed the
+    /// sequencer was connected, and the one peer holding blocks above ~91k was
+    /// never dialed again. The node then synced to the bootnodes' frozen tips
+    /// and idled ~36k short of the head, serving inbound requests and asking
+    /// nobody for anything. Restarting cleared the process-local state and
+    /// bought exactly one more batch.
+    ///
+    /// `find_peers` now asks the peer manager instead. Keep it that way: any
+    /// threshold on a set that cannot shrink is a latch, and the escape hatch
+    /// only moves where it bites.
     pub async fn mark_disconnected(&self, peer_id: &str) {
         self.connected_peers.write().await.remove(peer_id);
     }
@@ -285,14 +311,19 @@ impl Discovery {
     }
 
     /// Find new peers to connect to
-    // LOCK ORDERING: holds connected_peers (read) while calling get_peer_counts() -> stats (read).
-    // Safe: both are read locks; no write contention in this path.
-    // SECREM-01 NET-4(a): Peer.info read locks are taken BEFORE
-    // connected_peers to keep lock acquisition one-directional.
+    // LOCK ORDERING: takes Peer.info read locks, then get_peer_counts() -> stats
+    // (read). Safe: both are read locks; no write contention in this path.
+    // SECREM-01 NET-4(a): Peer.info read locks are taken first so lock
+    // acquisition stays one-directional.
     pub async fn find_peers(&self) -> Vec<(String, SocketAddr)> {
-        // SECREM-01 NET-4(a): snapshot the addresses of currently
-        // connected peers so existing connections count against each
-        // subnet group's cap during selection.
+        // SECREM-01 NET-4(a): snapshot the addresses of currently connected
+        // peers so existing connections count against each subnet group's cap
+        // during selection.
+        //
+        // #146: this snapshot is ALSO the "is it connected?" test below. The
+        // peer manager is the only source of truth for that question; the
+        // `connected_peers` set is a write-only shadow copy (see
+        // `mark_disconnected`) and using it here is what stranded live nodes.
         let existing_addrs: Vec<SocketAddr> = {
             let mut addrs = Vec::new();
             for peer in self.peer_manager.get_all_peers() {
@@ -300,15 +331,9 @@ impl Discovery {
             }
             addrs
         };
+        let is_connected = |addr: &SocketAddr| existing_addrs.contains(addr);
 
-        let connected = self.connected_peers.read().await;
         let (current_peers, _, _) = self.peer_manager.get_peer_counts().await;
-        // When peer-starved, re-dial bootstraps regardless of the `connected_peers`
-        // set — which is NEVER cleaned on disconnect in production (mark_disconnected
-        // is only called from tests). A dropped bootstrap therefore stayed "connected"
-        // forever and was never re-dialed, so a node that lost all its peers stayed
-        // permanently isolated (observed: a follower stuck at 0 peers, never recovering).
-        let peer_starved = current_peers < 3;
 
         if current_peers >= self.config.max_peers {
             return Vec::new();
@@ -328,12 +353,13 @@ impl Discovery {
             .filter(|p| {
                 let peer = p.value();
                 if peer.is_bootstrap {
-                    // Retry bootstraps aggressively when peer-starved (bypassing the
-                    // stale connected set so a 0-peer node re-dials and recovers);
-                    // when well-peered, honor the set to avoid redundant dials.
-                    return peer_starved || !connected.contains(&peer.id);
+                    // A bootstrap we do not currently hold a connection to is
+                    // ALWAYS re-offered. Nothing else may veto that: a bootstrap
+                    // is the node's trust root and, on this fleet, the sequencer
+                    // is one — see the module note on the 91k stall.
+                    return !is_connected(&peer.addr);
                 }
-                if connected.contains(&peer.id) {
+                if is_connected(&peer.addr) {
                     return false;
                 }
                 peer.attempts < 3
@@ -407,11 +433,18 @@ impl Discovery {
     }
 
     /// A-10: Diagnostics — return count of currently connected bootstrap peers.
+    ///
+    /// Counted from the PEER MANAGER, not `connected_peers`: the latter is a
+    /// write-only shadow set (see [`Discovery::mark_disconnected`]) and reading
+    /// it here reported bootstraps as connected long after they were dropped.
     pub async fn connected_bootstrap_count(&self) -> usize {
-        let connected = self.connected_peers.read().await;
+        let mut connected_addrs: Vec<SocketAddr> = Vec::new();
+        for peer in self.peer_manager.get_all_peers() {
+            connected_addrs.push(peer.info.read().await.addr);
+        }
         self.known_peers
             .iter()
-            .filter(|p| p.value().is_bootstrap && connected.contains(&p.value().id))
+            .filter(|p| p.value().is_bootstrap && connected_addrs.contains(&p.value().addr))
             .count()
     }
 
@@ -459,7 +492,7 @@ impl Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::PeerManagerConfig;
+    use crate::peer::{Direction, Peer, PeerInfo, PeerManagerConfig, PeerState};
 
     // SECREM-01 NET-4(a): /24 grouping for IPv4, /48 for IPv6,
     // disjoint key spaces between families.
@@ -590,13 +623,27 @@ mod tests {
         assert_eq!(candidates[0].0, "bootstrap_127.0.0.1:30303");
     }
 
+    /// Register `addr` in the peer manager as a live, connected peer, the way
+    /// the transport does after a handshake. Used by the re-dial tests to make
+    /// "how many peers do we actually hold" the real thing rather than a mock.
+    async fn connect_fake_peer(peer_manager: &Arc<PeerManager>, id: &str, addr: &str) {
+        let addr: SocketAddr = addr.parse().expect("valid addr");
+        let mut info = PeerInfo::new(PeerId::new(id.to_string()), addr, Direction::Outbound);
+        info.state = PeerState::Connected;
+        let (to_wire_tx, _to_wire_rx) = tokio::sync::mpsc::channel(8);
+        let (_from_wire_tx, from_wire_rx) = tokio::sync::mpsc::channel(8);
+        peer_manager
+            .add_peer(Arc::new(Peer::new(info, to_wire_tx, from_wire_rx)))
+            .await
+            .expect("add_peer succeeds for an unbanned peer");
+    }
+
     #[tokio::test]
     async fn test_starved_node_redials_bootstrap_despite_stale_connected_set() {
         // Regression: mark_disconnected is never called in production, so a dropped
         // bootstrap stayed in `connected_peers` forever and find_peers skipped it — a
         // node that lost all peers never re-dialed and stayed isolated (observed:
-        // boot3 stuck at 0 peers). When peer-starved (real peer count < 3), bootstraps
-        // are re-offered regardless of the stale set.
+        // boot3 stuck at 0 peers).
         let config = DiscoveryConfig {
             bootstrap_nodes: vec!["127.0.0.1:30303".to_string()],
             max_peers: 10,
@@ -616,6 +663,141 @@ mod tests {
                 .iter()
                 .any(|(id, _)| id.as_str() == "bootstrap_127.0.0.1:30303"),
             "a peer-starved node must re-dial its bootstrap even when it is stale-marked connected"
+        );
+    }
+
+    /// RED TEST — the live 40204 stall (#146), reproduced at its exact shape.
+    ///
+    /// A cold-syncing node holds all four fleet bootstraps. Sync requests to the
+    /// SEQUENCER time out five times (its early responses are the largest), so
+    /// `main.rs` drops it — logging "will re-handshake" — leaving exactly the
+    /// three discovery-only bootnodes, which cannot advance anyone past their own
+    /// frozen tips.
+    ///
+    /// Pre-fix, two conditions had to BOTH hold for the promised re-handshake:
+    /// `peer_count < 3` (false: it is exactly 3) or absence from the stale
+    /// `connected_peers` set (false: it is never cleaned). Neither held, so the
+    /// only peer on the network holding blocks above ~91k was never dialed again
+    /// and the node idled ~36k short of the tip until it was restarted — which
+    /// bought exactly one more batch before the same five timeouts recurred.
+    ///
+    /// The count is deliberately pinned at THREE because that is where the old
+    /// `< 3` escape hatch stops firing. A fix that merely widens the threshold
+    /// (`< 4`) relocates the latch to a four-bootnode fleet instead of removing
+    /// it — the same mistake the sync-peer penalty box made with its [3,5) dead
+    /// band (see node/src/sync_peer.rs, defect D2).
+    #[tokio::test]
+    async fn a_dropped_bootstrap_is_redialed_even_with_three_useless_peers_left() {
+        let config = DiscoveryConfig {
+            bootstrap_nodes: vec![
+                "127.0.0.1:30301".to_string(), // boot1
+                "127.0.0.1:30302".to_string(), // boot2
+                "127.0.0.1:30303".to_string(), // boot3
+                "127.0.0.1:30304".to_string(), // the sequencer
+            ],
+            max_peers: 50,
+            ..Default::default()
+        };
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let discovery = Discovery::new(config, peer_manager.clone());
+        discovery.init().await.expect("bootstraps resolve");
+
+        // All four were dialed at boot, so all four are in the shadow set forever.
+        for port in [30301, 30302, 30303, 30304] {
+            discovery
+                .mark_connected(&format!("bootstrap_127.0.0.1:{}", port))
+                .await;
+        }
+        // Three are still connected; the sequencer was dropped by the sync tick.
+        for (i, port) in [30301u16, 30302, 30303].iter().enumerate() {
+            connect_fake_peer(
+                &peer_manager,
+                &format!("boot{}", i + 1),
+                &format!("127.0.0.1:{}", port),
+            )
+            .await;
+        }
+        let (held, _, _) = peer_manager.get_peer_counts().await;
+        assert_eq!(held, 3, "exactly the count the old `< 3` escape does not cover");
+
+        let candidates = discovery.find_peers().await;
+        assert!(
+            candidates
+                .iter()
+                .any(|(id, _)| id.as_str() == "bootstrap_127.0.0.1:30304"),
+            "the dropped sequencer must be re-offered for dial — it is the only peer \
+             that can advance us, and 'will re-handshake' has to be true"
+        );
+        // And the three we already hold are not re-dialed: the fix must not turn
+        // every discovery tick into a redundant reconnect storm.
+        for port in [30301, 30302, 30303] {
+            let id = format!("bootstrap_127.0.0.1:{}", port);
+            assert!(
+                !candidates.iter().any(|(c, _)| *c == id),
+                "{} is connected and must not be re-dialed",
+                id
+            );
+        }
+    }
+
+    /// The same guarantee at full strength: connectivity is judged from the peer
+    /// manager, so a bootstrap we hold NO connection to is offered no matter how
+    /// many other peers are up. Pinned at a well-peered count so no future
+    /// starvation threshold can be reintroduced without failing here.
+    #[tokio::test]
+    async fn a_bootstrap_we_do_not_hold_is_redialed_even_when_well_peered() {
+        let config = DiscoveryConfig {
+            bootstrap_nodes: vec!["127.0.0.1:30304".to_string()],
+            max_peers: 50,
+            ..Default::default()
+        };
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let discovery = Discovery::new(config, peer_manager.clone());
+        discovery.init().await.expect("bootstraps resolve");
+        discovery.mark_connected("bootstrap_127.0.0.1:30304").await;
+
+        // Ten healthy non-bootstrap peers, spread across subnets so the /24 cap
+        // does not do the work the assertion is meant to test.
+        for i in 0..10u16 {
+            connect_fake_peer(
+                &peer_manager,
+                &format!("gossip{}", i),
+                &format!("10.0.{}.5:30303", i),
+            )
+            .await;
+        }
+
+        let candidates = discovery.find_peers().await;
+        assert!(
+            candidates
+                .iter()
+                .any(|(id, _)| id.as_str() == "bootstrap_127.0.0.1:30304"),
+            "a bootstrap with no live connection is always re-offered — being \
+             well-peered is not evidence that the peer we need is among them"
+        );
+    }
+
+    /// Diagnostics must not inherit the lie either: a bootstrap that was dialed
+    /// once and later dropped is NOT a connected bootstrap.
+    #[tokio::test]
+    async fn connected_bootstrap_count_reflects_the_peer_manager_not_the_shadow_set() {
+        let config = DiscoveryConfig {
+            bootstrap_nodes: vec!["127.0.0.1:30301".to_string(), "127.0.0.1:30302".to_string()],
+            max_peers: 50,
+            ..Default::default()
+        };
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let discovery = Discovery::new(config, peer_manager.clone());
+        discovery.init().await.expect("bootstraps resolve");
+
+        discovery.mark_connected("bootstrap_127.0.0.1:30301").await;
+        discovery.mark_connected("bootstrap_127.0.0.1:30302").await;
+        connect_fake_peer(&peer_manager, "boot1", "127.0.0.1:30301").await;
+
+        assert_eq!(
+            discovery.connected_bootstrap_count().await,
+            1,
+            "only the bootstrap the peer manager actually holds counts as connected"
         );
     }
 
@@ -669,23 +851,31 @@ mod tests {
         };
 
         let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
-        let discovery = Discovery::new(config, peer_manager);
+        let discovery = Discovery::new(config, peer_manager.clone());
         discovery.init().await.unwrap();
 
         assert_eq!(discovery.bootstrap_peer_count().await, 3);
         assert_eq!(discovery.connected_bootstrap_count().await, 0);
 
-        // Simulate one bootstrap becoming connected
-        discovery.mark_connected("bootstrap_127.0.0.1:30301").await;
+        // #146: "connected" now means the PEER MANAGER holds the connection.
+        // This test used to drive the count with `mark_connected` alone, which
+        // is exactly the shadow-set reading that let a dropped sequencer keep
+        // reporting itself connected — so it is driven through real peers now.
+        connect_fake_peer(&peer_manager, "boot1", "127.0.0.1:30301").await;
         assert_eq!(discovery.connected_bootstrap_count().await, 1);
 
-        // Simulate a second one too
-        discovery.mark_connected("bootstrap_127.0.0.1:30302").await;
+        connect_fake_peer(&peer_manager, "boot2", "127.0.0.1:30302").await;
         assert_eq!(discovery.connected_bootstrap_count().await, 2);
 
-        // Simulate the first going down
-        discovery.mark_disconnected("bootstrap_127.0.0.1:30301").await;
-        assert_eq!(discovery.connected_bootstrap_count().await, 1);
+        // The first goes down. `mark_disconnected` is NOT called (production
+        // never calls it) — the count must fall anyway.
+        peer_manager.remove_peer(&PeerId::new("boot1".to_string())).await;
+        assert_eq!(
+            discovery.connected_bootstrap_count().await,
+            1,
+            "a dropped bootstrap stops counting as connected without any \
+             bookkeeping call, because the peer manager is the source of truth"
+        );
         assert_eq!(discovery.bootstrap_peer_count().await, 3, "Total bootstrap count stays at 3");
     }
 
