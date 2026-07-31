@@ -73,6 +73,39 @@
 
 use std::collections::HashMap;
 
+/// How far above our applied tip a gossiped block may be and still trigger
+/// SYNC-S3 depth-1 ancestry recovery.
+///
+/// Derived, not picked: `SyncConfig::block_batch_size` (32) x
+/// `max_concurrent_downloads` (16) is the most a node with a completely full
+/// in-flight window can legitimately be behind. Anything further away is not a
+/// fork we narrowly missed — it is the gap, and the 2s forward driver owns the
+/// gap.
+pub const ANCESTRY_RECOVERY_WINDOW: u64 = 32 * 16;
+
+/// Should a gossiped block that deferred on a missing parent trigger a direct
+/// ancestry request to the peer that sent it?
+///
+/// #150. SYNC-S3 recovery exists for the 2026-07-27 silent partition: a peer
+/// gossips a block whose parent we narrowly missed, so we ask THAT peer for the
+/// parent directly and self-heal at depth 1. That is correct and stays.
+///
+/// What was missing is a distance bound. When a node is far behind, EVERY
+/// gossiped tip block is "missing its parent" — so every one queued a request
+/// for a parent tens of thousands of blocks deep, none of which could ever be
+/// applied. Measured on boot1 at a 33,000-block gap: **125 of 159 batches (79%)
+/// landed at the network tip**, unappliable, while those same requests consumed
+/// the in-flight budget (`pending_counts() < 8`) that the one useful forward
+/// request needs. The recovery mechanism was starving the catch-up it was
+/// supposed to assist.
+///
+/// Note this is keyed on the BLOCK's height, not the missing parent's: we do not
+/// have the parent (that is why it is missing), so its height is unknown. The
+/// child's height bounds it from above, which is the direction that matters.
+pub fn should_attempt_ancestry_recovery(block_height: u64, applied_height: u64) -> bool {
+    block_height <= applied_height.saturating_add(ANCESTRY_RECOVERY_WINDOW)
+}
+
 /// Sync timeouts against one peer before it is DE-PREFERRED as a sync source.
 ///
 /// This is a preference, not a ban — see I2 and [`SyncPeerSelector::select`].
@@ -363,5 +396,63 @@ mod tests {
         let peers = [cand("rpc1", 68091)];
         assert_eq!(sel.select(&peers, 68091), None);
         assert_eq!(sel.select(&[], 0), None);
+    }
+
+    /// RED TEST — #150, at boot1's measured shape. A node 33,000 blocks behind
+    /// receives the live tip by gossip. Pre-fix this queued an ancestry request
+    /// for a parent 33,000 blocks deep, and did so for EVERY gossiped block:
+    /// 79% of its downloads landed at the network tip, unappliable, while
+    /// starving the one forward request that could actually advance it.
+    #[test]
+    fn a_far_behind_node_does_not_chase_tip_ancestry() {
+        let applied = 126_254; // boot1's applied tip
+        let tip_block = 159_001; // the sequencer's head, gossiped to it
+        assert!(
+            !should_attempt_ancestry_recovery(tip_block, applied),
+            "a block {} above our tip is the GAP, not a fork — the forward driver owns it",
+            tip_block - applied
+        );
+    }
+
+    /// And the case SYNC-S3 exists for still fires: the 2026-07-27 partition was
+    /// a block whose parent we missed by one. Recovery must remain unconditional
+    /// in that neighbourhood or two producers re-partition permanently.
+    #[test]
+    fn a_narrowly_missed_parent_still_triggers_recovery() {
+        let applied = 126_254;
+        assert!(
+            should_attempt_ancestry_recovery(applied + 1, applied),
+            "depth-1 is the whole point of SYNC-S3"
+        );
+        assert!(
+            should_attempt_ancestry_recovery(applied, applied),
+            "a sibling at our own height must still be recoverable"
+        );
+    }
+
+    /// The boundary is a real edge, so pin both sides of it. A node legitimately
+    /// lagging by a full in-flight window is still syncing normally and must keep
+    /// self-healing; one block further is the regime that starved catch-up.
+    #[test]
+    fn the_window_boundary_is_exact() {
+        let applied = 1_000;
+        assert!(
+            should_attempt_ancestry_recovery(applied + ANCESTRY_RECOVERY_WINDOW, applied),
+            "a full in-flight window behind is normal syncing, not a gap"
+        );
+        assert!(
+            !should_attempt_ancestry_recovery(applied + ANCESTRY_RECOVERY_WINDOW + 1, applied),
+            "one past the window is where chasing tip ancestry starts costing forward progress"
+        );
+    }
+
+    /// A node at genesis must not chase the tip either — this is the cold-start
+    /// case, where the gap is the entire chain and every gossiped block defers.
+    #[test]
+    fn a_cold_starting_node_does_not_chase_the_tip() {
+        assert!(
+            !should_attempt_ancestry_recovery(159_001, 0),
+            "a fresh node has the whole chain to fetch; chasing tip ancestry is pure waste"
+        );
     }
 }
