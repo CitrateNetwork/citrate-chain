@@ -56,6 +56,21 @@ pub struct NetworkTransport {
 
 const MAX_FRAME_LEN: usize = 1024 * 1024; // 1MB
 
+/// Longest a writer task may spend pushing ONE frame to a peer (#149).
+///
+/// There is no natural bound otherwise: when a peer stops reading, its TCP
+/// receive window closes and `sink.send` parks with no error and no timeout —
+/// indefinitely, because a peer that is merely wedged (not dead) never sends a
+/// RST. A parked writer stops draining its peer's send queue, and a full send
+/// queue is what deadlocked every node on chain 40204 (see `Peer::send`).
+///
+/// 30s is deliberately generous relative to the 2s sync tick and the 60 KiB
+/// serve budget: any peer that is alive at all clears a frame in far less, so
+/// hitting this is evidence the peer is gone rather than slow. It matches
+/// `SyncConfig::request_timeout`, so a write that times out and a sync request
+/// that times out describe the same dead peer instead of disagreeing.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl NetworkTransport {
     pub fn new(peer_manager: Arc<PeerManager>, local_id: PeerId, params: HandshakeParams) -> Self {
         Self {
@@ -350,9 +365,34 @@ async fn handle_inbound(
                     } else {
                         ser
                     };
-                    if let Err(e) = sink.send(bytes::Bytes::from(payload)).await {
-                        warn!("send to {} failed: {}", addr, e);
-                        break;
+                    // #149 — link 1 of the fleet deadlock. A bare
+                    // `sink.send(..).await` parks FOREVER when the peer stops
+                    // reading: the TCP window closes, no RST is ever sent, and
+                    // there is no timeout. rpc-1 sat at Send-Q 535,288 bytes to
+                    // boot1 in exactly this state. A parked writer stops draining
+                    // this peer's send queue, which is what lets the queue fill
+                    // and the whole node wedge (see `Peer::send`). Bound it: a
+                    // peer that cannot absorb one frame in WRITE_TIMEOUT is gone,
+                    // and dropping the connection releases the socket instead of
+                    // holding a queue nobody drains.
+                    match tokio::time::timeout(
+                        WRITE_TIMEOUT,
+                        sink.send(bytes::Bytes::from(payload)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!("send to {} failed: {}", addr, e);
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(
+                                "send to {} timed out after {:?} — peer is not reading; closing",
+                                addr, WRITE_TIMEOUT
+                            );
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
@@ -621,9 +661,27 @@ async fn handle_outbound(
                         } else {
                             ser
                         };
-                        if let Err(e) = sink.send(bytes::Bytes::from(payload)).await {
-                            warn!("send to {} failed: {}", addr, e);
-                            break;
+                        // #149 — same bound as the inbound writer above; see the
+                        // note there for why an unbounded write is a fleet-wide
+                        // deadlock and not merely a slow peer.
+                        match tokio::time::timeout(
+                            WRITE_TIMEOUT,
+                            sink.send(bytes::Bytes::from(payload)),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                warn!("send to {} failed: {}", addr, e);
+                                break;
+                            }
+                            Err(_) => {
+                                warn!(
+                                    "send to {} timed out after {:?} — peer is not reading; closing",
+                                    addr, WRITE_TIMEOUT
+                                );
+                                break;
+                            }
                         }
                     }
                     Err(e) => {

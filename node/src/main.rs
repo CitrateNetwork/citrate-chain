@@ -2020,6 +2020,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // actually answers has to be credited from the receive side.
         let sync_peers_for_rx = sync_peers.clone();
 
+        // #149: how many inbound messages the loop has taken off the channel.
+        // Read by the stall detector; see it for why this exists.
+        let msgs_processed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let msgs_processed_for_loop = msgs_processed.clone();
+        let pm_for_stall = pm_for_rx.clone();
+
         let net_rx_task = tokio::spawn(async move {
             // SECREM-01 NET-1/2: the GetHeaders/GetBlocks handlers that used
             // `Hash::new(...)` inline moved to block_serve.rs, so the bare
@@ -2037,6 +2043,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // arrives; the sync loop independently re-requests missing parents.
             let mut orphan_blocks: Vec<citrate_consensus::types::Block> = Vec::new();
             while let Some((pid, msg)) = in_rx.recv().await {
+                // #149 liveness heartbeat. Bumped BEFORE the message is handled,
+                // so a loop that is stuck inside a handler stops advancing this
+                // while inbound traffic keeps arriving — the signature the stall
+                // detector below keys on. See that task for why a dead-task
+                // watchdog (#147) cannot see this failure.
+                msgs_processed_for_loop.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!("[P2P] from={} msg={:?}", pid.0, msg);
                 // Handle protocol messages
                 match msg {
@@ -2518,6 +2530,61 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // Flush before the exit: this line is the only evidence an operator
             // will have, and the wedge it reports is invisible from outside.
             std::process::exit(1);
+        });
+
+        // STALL DETECTOR — the watchdog above catches a message loop that ENDS.
+        // #149 was a loop that never ended and never ran again, which that
+        // watchdog is structurally blind to: no panic, no task exit, nothing to
+        // await. The fleet sat in that state for hours looking perfectly healthy.
+        //
+        // The discriminator is "traffic is arriving but nothing is being taken off
+        // the channel". An idle node advances neither counter and must not be
+        // killed, so idleness alone proves nothing — the signal has to be inbound
+        // pressure with zero progress. `inbound_drops` only rises when the channel
+        // is FULL, which means the loop is provably behind, so the pair
+        // (drops rising, processed frozen) is unambiguous.
+        tokio::spawn(async move {
+            const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+            // Two consecutive stalled samples before acting: one sample can
+            // straddle a legitimately long handler (a big batch admit), and
+            // killing a node mid-catch-up would be its own outage.
+            const STALLED_SAMPLES_BEFORE_FATAL: u32 = 2;
+            let mut last_processed = 0u64;
+            let mut last_drops = 0u64;
+            let mut stalled_samples = 0u32;
+            let mut interval = tokio::time::interval(CHECK_EVERY);
+            loop {
+                interval.tick().await;
+                let processed = msgs_processed.load(std::sync::atomic::Ordering::Relaxed);
+                let drops = pm_for_stall.inbound_drops();
+                let shed_this_window = drops.saturating_sub(last_drops);
+                let starved = shed_this_window > 0 && processed == last_processed;
+                last_processed = processed;
+                last_drops = drops;
+                if !starved {
+                    stalled_samples = 0;
+                    continue;
+                }
+                stalled_samples += 1;
+                tracing::warn!(
+                    "P2P message loop appears stalled: {} inbound messages shed since the last \
+                     check while the loop processed none (sample {}/{})",
+                    shed_this_window,
+                    stalled_samples,
+                    STALLED_SAMPLES_BEFORE_FATAL
+                );
+                if stalled_samples >= STALLED_SAMPLES_BEFORE_FATAL {
+                    tracing::error!(
+                        "FATAL: the P2P message handler is STALLED — inbound messages are arriving \
+                         and being dropped while the loop has processed none for {:?}. This node \
+                         cannot serve peers or advance its applied tip. Exiting so the supervisor \
+                         restarts it rather than running on as a node that looks healthy and \
+                         syncs nothing.",
+                        CHECK_EVERY * STALLED_SAMPLES_BEFORE_FATAL
+                    );
+                    std::process::exit(1);
+                }
+            }
         });
 
         // (legacy direct socket bootstrap removed; handled by NetworkTransport)
