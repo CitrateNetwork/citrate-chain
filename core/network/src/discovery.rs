@@ -234,14 +234,22 @@ impl Discovery {
     ///
     /// `find_peers` used to gate re-dials on it, with a `peer_count < 3` escape
     /// bolted on for the 0-peer case. On the 40204 fleet a cold-syncing node
-    /// dropped the SEQUENCER after five sync timeouts (main.rs
+    /// dropped the SEQUENCER after repeated sync timeouts (main.rs
     /// drop-and-re-handshake), leaving exactly the three discovery-only
     /// bootnodes — so `3 < 3` was false, the stale set still claimed the
-    /// sequencer was connected, and the one peer holding blocks above ~91k was
-    /// never dialed again. The node then synced to the bootnodes' frozen tips
-    /// and idled ~36k short of the head, serving inbound requests and asking
-    /// nobody for anything. Restarting cleared the process-local state and
-    /// bought exactly one more batch.
+    /// sequencer was connected, and the one peer holding the blocks above ~91k
+    /// was not dialed again.
+    ///
+    /// PRECISELY: the latch holds for as long as the peer count sits at exactly
+    /// 3. Dropping a SECOND peer takes it to 2, `peer_starved` flips true, and
+    /// every bootstrap — sequencer included — is re-offered. That was observed
+    /// too: on a DGX reproduction the sequencer was stranded for ~10 minutes at
+    /// 3 peers and came back only when boot1 was dropped as well. So this is a
+    /// latch that releases on further damage, not a permanent one. It matters
+    /// because 3-of-4-bootstraps IS the steady state on this fleet — it is what
+    /// the stalled desktop node reported — and "keeps its peers" is exactly when
+    /// nobody goes looking. Being un-stranded by a second failure is not a
+    /// recovery path anyone should rely on.
     ///
     /// `find_peers` now asks the peer manager instead. Keep it that way: any
     /// threshold on a set that cannot shrink is a latch, and the escape hatch
