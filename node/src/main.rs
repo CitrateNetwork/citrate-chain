@@ -2501,8 +2501,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let reason = match net_rx_task.await {
                 Err(e) if e.is_panic() => format!("PANICKED ({})", e),
                 Err(e) => format!("was cancelled ({})", e),
-                // The loop only returns when `in_rx` closes, i.e. every network
-                // sender is gone — the node has no P2P left either way.
+                // The loop only returns when `in_rx` closes. The single sender
+                // lives in `PeerManager.incoming` (set once above, held for the
+                // process lifetime), so this cannot fire on peer churn — losing
+                // every peer leaves the channel open and the loop parked. It
+                // means the peer manager itself is gone: no P2P either way.
                 Ok(()) => "exited (inbound channel closed)".to_string(),
             };
             tracing::error!(
