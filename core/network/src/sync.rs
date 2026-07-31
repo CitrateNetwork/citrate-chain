@@ -544,13 +544,35 @@ impl SyncManager {
         // Store only validated blocks
         self.downloaded_blocks.write().await.extend(validated);
 
-        // Update progress
+        // Update progress.
+        //
+        // #146 — EVERY term here saturates, and the reason is not cosmetic. This
+        // is a percentage for a log line, and an unguarded `last_height - current`
+        // PANICKED the tokio task that owns the node's entire inbound message
+        // loop (release builds set `overflow-checks = true`). That task is the one
+        // serving GetBlocks/GetHeaders, admitting synced blocks, and driving the
+        // applied tip, so one underflow here silently and permanently stopped the
+        // node from processing any network message at all — while the process
+        // stayed up, kept its peers, kept answering eth_syncing with a correct
+        // "36k behind", and burned 0% CPU. No crash record, no restart loop:
+        // exactly the "genuinely idle" cold-sync stall reported from the fleet.
+        // A restart bought one more batch, until the next underflow.
+        //
+        // `current` is our APPLIED height (set below, and by #135), while
+        // `last_height` is only the height of the last block a peer HANDED us, so
+        // `last_height < current` is ordinary traffic, not an anomaly: a response
+        // to a stale anchor, a sibling group on a shorter branch, or simply
+        // `drive_drain` walking the applied tip past the batch in flight. The
+        // identical guard already exists in `handle_headers` (added when this
+        // very panic was seen there); it was never mirrored here.
         let current = *self.current_height.read().await;
         let target = *self.target_height.read().await;
-        let progress = if target > current {
-            ((last_height - current) as f32 / (target - current) as f32) * 100.0
-        } else {
+        let span = target.saturating_sub(current);
+        let done = last_height.saturating_sub(current);
+        let progress = if span == 0 {
             100.0
+        } else {
+            (done as f32 / span as f32) * 100.0
         };
 
         *self.state.write().await = SyncState::DownloadingBlocks {
@@ -852,6 +874,90 @@ mod tests {
         assert!(
             !sync.pending_blocks.read().await.contains_key(&anchor),
             "pending blocks request must be retired once the peer responds"
+        );
+    }
+
+    /// Build a block that survives every check in `handle_blocks` — canonical
+    /// hash, real ed25519 signature over that hash, and a tx_root consistent
+    /// with an empty transaction list. A block that fails validation is dropped
+    /// before the progress arithmetic, so the underflow tests below cannot use
+    /// the unsigned builders the retirement tests use.
+    fn signed_block_at(height: u64) -> Block {
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+        let key = crypto::generate_keypair();
+        let pubkey = PublicKey::new(key.verifying_key().to_bytes());
+        let mut block = BlockBuilder::new()
+            .parent(Hash::new([7u8; 32]))
+            .height(height)
+            .proposer(pubkey)
+            .build_unhashed();
+        // tx_root over zero transactions, matching handle_blocks' recomputation.
+        let bytes = Sha3_256::new().finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes[..32]);
+        block.tx_root = Hash::new(arr);
+        block.header.block_hash = block.compute_hash();
+        block.signature = crypto::sign_block(&block.header.block_hash, &key);
+        block
+    }
+
+    /// RED TEST — #146. The live cold-sync stall reproduced on this box: a
+    /// follower at applied height 8,137 with the network tip at ~128,000
+    /// received a batch of blocks BELOW its applied tip, and
+    ///
+    ///     ((last_height - current) as f32 / ...)
+    ///
+    /// underflowed. Release profile sets `overflow-checks = true`, so it did not
+    /// wrap — it PANICKED, on the tokio task that owns the node's whole inbound
+    /// message loop. From that instant the node processed no network message
+    /// ever again: it stopped serving GetBlocks/GetHeaders, stopped admitting
+    /// synced blocks, and its applied tip froze — while the process stayed up
+    /// with its peers connected, 0% CPU, and a correct `eth_syncing` (the 2s
+    /// tick task lives in a different spawn, and kept issuing requests nobody
+    /// was left to answer).
+    ///
+    /// `last_height < current` is ORDINARY traffic, not corruption: a response
+    /// to an anchor we have since walked past, a sibling group on a shorter
+    /// branch, or `drive_drain` advancing the applied tip while the batch was in
+    /// flight. Any of them was fatal.
+    #[tokio::test]
+    async fn a_batch_below_our_applied_height_must_not_panic_the_message_loop() {
+        let sync = SyncManager::new(SyncConfig::default())
+            .with_local_height(Arc::new(AtomicU64::new(8_137)));
+        *sync.current_height.write().await = 8_137;
+        sync.set_target(128_000).await;
+
+        // The peer answers with a range entirely BELOW our applied tip.
+        let batch = vec![signed_block_at(8_000), signed_block_at(8_001)];
+        sync.handle_blocks(batch)
+            .await
+            .expect("a behind-us batch is normal traffic, not an error");
+
+        // And the node is still usable afterwards: not wedged into Synced, and
+        // still able to take the next batch.
+        let ahead = vec![signed_block_at(8_200)];
+        sync.handle_blocks(ahead)
+            .await
+            .expect("the manager keeps working after a behind-us batch");
+    }
+
+    /// The denominator half of the same guard: a peer at (or below) our own
+    /// height makes `target == current`, which must report 100% rather than
+    /// divide by zero. Pinned separately so a future edit cannot restore the
+    /// numerator guard while dropping this one.
+    #[tokio::test]
+    async fn a_batch_at_our_target_reports_complete_without_dividing_by_zero() {
+        let sync = SyncManager::new(SyncConfig::default())
+            .with_local_height(Arc::new(AtomicU64::new(500)));
+        *sync.current_height.write().await = 500;
+        sync.set_target(500).await;
+
+        sync.handle_blocks(vec![signed_block_at(500)])
+            .await
+            .expect("an at-tip batch is handled");
+        assert!(
+            sync.is_synced().await,
+            "applied == target is genuinely synced"
         );
     }
 
