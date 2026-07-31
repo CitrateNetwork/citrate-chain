@@ -1791,10 +1791,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let max_seen_for_sync = max_seen_height.clone();
         let sync_peers_for_loop = sync_peers.clone();
         tokio::spawn(async move {
-            use std::collections::HashMap;
-            use std::time::{Duration, Instant};
-            let mut attempt_counts: HashMap<citrate_consensus::types::Hash, u32> = HashMap::new();
-            let mut pending_retries: Vec<(Instant, citrate_consensus::types::Hash)> = Vec::new();
+            // #150: `attempt_counts` (an unpruned HashMap keyed by every anchor
+            // ever timed out — also a slow leak) and `pending_retries` are gone
+            // with the stale-anchor retry queue. See the note at `check_timeouts`.
             // Round-robin index for rotating request peers when we are behind but no
             // peer qualified as "best" (forward-sync liveness fix).
             let mut rotate_idx: u64 = 0;
@@ -1979,13 +1978,30 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                 }
-                // Requeue timed-out requests with exponential backoff
-                for (h, pid) in sync_for_loop.check_timeouts().await {
-                    let entry = attempt_counts.entry(h).or_insert(0);
-                    *entry = entry.saturating_add(1);
-                    let backoff = (*entry).min(5); // cap exponent at 5
-                    let delay_secs = 1u64 << backoff; // 2,4,8,16,32
-                    pending_retries.push((Instant::now() + Duration::from_secs(delay_secs), h));
+                // Retire timed-out requests and penalize the peer that owed them.
+                //
+                // #150 — THERE IS NO SEPARATE RETRY QUEUE ANY MORE, ON PURPOSE.
+                //
+                // A timed-out request was anchored at the applied tip AT THE TIME
+                // IT WAS SENT. By the time any retry fires (2-32s later under the
+                // old backoff) the tip has moved, so re-requesting that anchor asks
+                // for a range the node has already applied. Measured live on a
+                // cold-syncing node: the same four ranges re-imported 30, 25, 24 and
+                // 22 times each, all at or below the applied tip, while forward
+                // progress collapsed from ~700 blocks/min to ~15/min. The retries
+                // also consumed the in-flight budget (`pending_counts() < 8`) that
+                // the ONE useful request needs, and were issued to
+                // `get_all_peers().first()` — an arbitrary peer, not the selected
+                // sync source — so they frequently timed out again and re-queued.
+                //
+                // The 2s tick at the top of this loop already re-issues a request
+                // anchored at the CURRENT applied tip to the CURRENTLY SELECTED
+                // peer. That is the retry, and unlike a queued one it can never be
+                // stale. The old machinery was a second, worse retry path racing
+                // the good one, plus an `attempt_counts` map that was never pruned.
+                //
+                // Timeouts still do their real job below: they penalize the peer.
+                for (_h, pid) in sync_for_loop.check_timeouts().await {
                     // Penalize the peer that timed out. This DE-PREFERS it as a
                     // sync source; it can never veto the last peer able to serve
                     // us (sync_peer.rs invariant I2).
@@ -2021,20 +2037,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         sync_peers_for_loop.lock().await.reset(&pid.0);
                     }
                 }
-                // Issue any due retries
-                let now = Instant::now();
-                let mut remaining: Vec<(Instant, citrate_consensus::types::Hash)> = Vec::new();
-                for (when, h) in pending_retries.drain(..) {
-                    if when <= now {
-                        if let Some(peer) = pm_for_sync.get_all_peers().first() {
-                            let _ = sync_for_loop.request_headers(peer, h).await;
-                            let _ = sync_for_loop.request_blocks(peer, h).await;
-                        }
-                    } else {
-                        remaining.push((when, h));
-                    }
-                }
-                pending_retries = remaining;
             }
         });
         let network_inf_executor = Arc::new(
@@ -2327,7 +2329,44 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         // `request_blocks` de-duplicates on the anchor while a
                                         // request is in flight and honours the concurrency cap, so
                                         // a run of deferrals cannot storm a peer.
-                                        if let Some(peer) = pm_for_rx.get_peer(&pid) {
+                                        //
+                                        // #150 — BOUNDED BY DISTANCE. This recovers a fork we
+                                        // NARROWLY missed. It is not a catch-up mechanism, and
+                                        // firing it while far behind actively prevents catch-up:
+                                        // when the gap is large, EVERY gossiped tip block is
+                                        // "missing its parent", so every one queued a request for a
+                                        // parent that is itself tens of thousands of blocks deep.
+                                        // Measured on boot1 at a 33k gap: 125 of 159 batches (79%)
+                                        // landed at the network tip and could never be applied,
+                                        // while those requests consumed the in-flight budget the
+                                        // ONE useful forward request needs.
+                                        //
+                                        // The window is derived, not picked: `block_batch_size` (32)
+                                        // x `max_concurrent_downloads` (16) is the most a node with
+                                        // a full in-flight window can legitimately be behind. Past
+                                        // that, the "missing parent" is not a fork, it is the gap —
+                                        // and the 2s forward driver already owns the gap.
+                                        let applied_now = storage_for_handler
+                                            .blocks
+                                            .get_applied_tip()
+                                            .ok()
+                                            .flatten()
+                                            .map(|(_, h)| h)
+                                            .unwrap_or(0);
+                                        let within_reach = sync_peer::should_attempt_ancestry_recovery(
+                                            block.header.height,
+                                            applied_now,
+                                        );
+                                        if !within_reach {
+                                            tracing::debug!(
+                                                "SYNC-S3: skipping ancestry recovery for block @ {} \
+                                                 — {} blocks above our applied tip {}; the forward \
+                                                 sync driver owns this gap",
+                                                block.header.height,
+                                                block.header.height.saturating_sub(applied_now),
+                                                applied_now
+                                            );
+                                        } else if let Some(peer) = pm_for_rx.get_peer(&pid) {
                                             if let Err(e) =
                                                 sync_for_rx.request_blocks(&peer, missing_parent).await
                                             {
