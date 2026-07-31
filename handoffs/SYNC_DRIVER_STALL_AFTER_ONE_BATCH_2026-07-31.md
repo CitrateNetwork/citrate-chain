@@ -77,12 +77,23 @@ relates:
 >    and exits non-zero if it ever ends, so this failure class can never again run
 >    for 30 hours looking healthy.
 > 3. **`discovery.rs` — the second, independent defect** found while reproducing:
->    a node that dropped the sequencer after repeated sync timeouts never dialed it
+>    a node that dropped the sequencer after repeated sync timeouts did not dial it
 >    again, despite logging "will re-handshake". `find_peers` gated re-dials on a
 >    `connected_peers` set that production never cleans, with a `peer_count < 3`
 >    escape — and three discovery-only bootnodes hold the count at exactly 3.
 >    Connectivity is now judged from the peer manager. Verified live: the dropped
 >    sequencer is now re-dialed within ~5s.
+>
+>    **Scope, stated precisely:** the latch holds only while the peer count sits at
+>    exactly 3. Dropping a *second* peer takes it to 2, `peer_starved` flips true,
+>    and every bootstrap is re-offered. That was observed in the same reproduction:
+>    the sequencer was stranded for ~10 minutes at 3 peers and returned only once
+>    boot1 was dropped too. So this is a latch that releases on further damage, not
+>    a permanent one — weaker than a first reading of the log suggested. It still
+>    matters, because 3-of-4-bootstraps is the fleet's steady state and is exactly
+>    what the stalled desktop node reported, and because "the node kept its peers"
+>    is precisely when nobody investigates. **This defect is not what stalled the
+>    fleet — defect 1 is.** It is a real bug found on the way to the real one.
 >
 > **The fleet must be redeployed on the fixed binary.** No client-side fix can
 > sync from a sequencer whose serve loop is dead.
