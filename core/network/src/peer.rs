@@ -250,9 +250,32 @@ impl Peer {
                     drops
                 )))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(NetworkError::ConnectionFailed(
-                "Channel closed".to_string(),
-            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // #151 — A CLOSED CHANNEL MEANS THIS PEER IS A CORPSE. SAY SO.
+                //
+                // The writer task owns the receiving half, so a closed channel means
+                // that task is gone: the connection died. The `Peer` object, however,
+                // is still sitting in the `PeerManager` with its advertised head
+                // intact — and the sync selector picks on advertised head. So it kept
+                // choosing this peer, every send failed, the caller discarded the
+                // error, and because a failed send never records a pending request,
+                // NO TIMEOUT WAS EVER OBSERVED. The penalty box (#136) is driven
+                // entirely by timeouts, so it never fired: never de-preferred, never
+                // dropped, never re-handshaked. The node retried a corpse forever.
+                //
+                // Reproduced on chain 40204 by interrupting a syncing node's network
+                // for 150s: it came back with 4 peers, a correct target, an anchor
+                // every peer held — and sat at `ph=0 pb=0 req_headers=false
+                // req_blocks=false` every 2s indefinitely.
+                //
+                // Latching `close()` here makes the corpse self-identifying, so
+                // `is_closed()` is a reliable liveness test for callers that must
+                // stop selecting it. Idempotent.
+                self.close();
+                Err(NetworkError::ConnectionFailed(
+                    "peer connection is closed".to_string(),
+                ))
+            }
         }
     }
 
@@ -1160,6 +1183,106 @@ mod tests {
             peer.is_closed(),
             "a peer that has shed {} consecutive messages has stopped reading and must be dropped",
             Peer::SEND_DROPS_BEFORE_CLOSE
+        );
+    }
+
+    /// RED TEST — #152, the corpse race made deterministic.
+    ///
+    /// The live failure was ~1 in 3 network interruptions, because whichever side
+    /// noticed the dead connection FIRST decided the outcome: the reader evicted
+    /// at all four of its exits, the writer at none of its four. Reader first →
+    /// clean recovery. Writer first → a peer left REGISTERED in the manager with a
+    /// closed send channel and `closed == false`, which sync selection then picks
+    /// forever on its stale advertised head.
+    ///
+    /// This reproduces the writer-first case with no network and no timing: drop
+    /// the receiving half (exactly what a returning writer task does) and assert
+    /// the manager no longer hands that peer out as a usable source.
+    ///
+    /// It is written against the OBSERVABLE contract — "a peer whose channel is
+    /// dead must not remain selectable" — rather than against the transport's
+    /// internals, so it stays honest if the cleanup moves.
+    #[tokio::test]
+    async fn a_peer_whose_writer_died_must_not_stay_selectable() {
+        let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let addr: SocketAddr = "10.0.0.7:30303".parse().expect("valid addr");
+        let id = PeerId::new("writer_died".to_string());
+
+        let (send_tx, to_wire_rx) = mpsc::channel(8);
+        let (_unused_tx, recv_rx) = mpsc::channel(1);
+        let mut info = PeerInfo::new(id.clone(), addr, Direction::Outbound);
+        info.state = PeerState::Connected;
+        // A high advertised head is what made the corpse keep winning selection.
+        info.head_height = 500_000;
+        let peer = Arc::new(Peer::new(info, send_tx, recv_rx));
+        pm.add_peer(peer.clone()).await.expect("registers");
+        assert_eq!(pm.get_all_peers().len(), 1, "peer is registered and selectable");
+
+        // The writer task returns — this is precisely what every one of its four
+        // exit paths does (encrypt fail, send error, WRITE_TIMEOUT, encode fail).
+        drop(to_wire_rx);
+
+        // Discovering the dead channel must mark the peer closed...
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), peer.send(ping()))
+            .await
+            .expect("must not block");
+        assert!(res.is_err(), "sending to a dead connection fails");
+        assert!(
+            peer.is_closed(),
+            "a peer whose send channel is closed must report itself closed — \
+             otherwise it reads as healthy and keeps winning sync selection"
+        );
+
+        // ...and it must be evictable, so the driver can replace it rather than
+        // retrying it every 2s forever.
+        pm.remove_peer_if_current(&id, &peer).await;
+        assert!(
+            pm.get_all_peers().is_empty(),
+            "the corpse must leave the peer set so discovery can re-dial a live \
+             connection in its place"
+        );
+    }
+
+    /// RED TEST — #151, the post-blip corpse loop, reproduced live on chain 40204
+    /// by interrupting a syncing node's network for 150 seconds.
+    ///
+    /// The connection dies, so the writer task (which owns the receiving half) is
+    /// gone and the channel is CLOSED. But the `Peer` object stays in the
+    /// `PeerManager` carrying its last advertised head, and the sync selector
+    /// picks on advertised head — so it kept choosing this peer. Every send
+    /// failed; the caller discarded the error; a failed send records no pending
+    /// request, so no timeout was ever observed; and the penalty box (#136) is
+    /// driven entirely by timeouts, so it never de-preferred or dropped it.
+    ///
+    /// Observed: `ph=0 pb=0 req_headers=false req_blocks=false` every 2s
+    /// indefinitely, with four peers connected and a correct sync target.
+    ///
+    /// The peer must therefore mark ITSELF closed, so callers have a reliable
+    /// liveness test and can evict it instead of retrying a corpse forever.
+    #[tokio::test]
+    async fn a_send_to_a_closed_channel_marks_the_peer_closed() {
+        let (send_tx, rx) = mpsc::channel(8);
+        let (_unused_tx, recv_rx) = mpsc::channel(1);
+        let info = PeerInfo::new(
+            PeerId::new("corpse".to_string()),
+            "10.0.0.9:30303".parse().expect("valid addr"),
+            Direction::Outbound,
+        );
+        let peer = Peer::new(info, send_tx, recv_rx);
+
+        // The writer task owns the receiver. Its death closes the channel.
+        drop(rx);
+        assert!(!peer.is_closed(), "not closed until we discover the dead channel");
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), peer.send(ping()))
+            .await
+            .expect("send must not block on a closed channel");
+        assert!(res.is_err(), "a send to a dead connection must fail");
+        assert!(
+            peer.is_closed(),
+            "the peer must mark itself closed so the sync driver can evict it — \
+             without this it keeps winning selection on a stale advertised head and \
+             every request evaporates with no timeout to trigger the penalty box"
         );
     }
 
