@@ -338,6 +338,11 @@ async fn handle_inbound(
     // half-open one. Returning from here drops `sink`.
     let noise_w = noise_session.clone();
     let (shutdown_w, closed_w) = peer.shutdown_handles();
+    // #152: the writer must be able to EVICT, not just stop. See the cleanup at
+    // the end of this task for why a writer that exits quietly is a corpse.
+    let pm_w = peer_manager.clone();
+    let peer_w = peer.clone();
+    let id_w = remote_id.clone();
     tokio::spawn(async move {
         loop {
             // Latched flag first: `notify_waiters` only wakes tasks already
@@ -401,6 +406,32 @@ async fn handle_inbound(
                 }
             }
         }
+        // #152 — A WRITER THAT EXITS QUIETLY LEAVES A CORPSE.
+        //
+        // This task owns the receiving half of the peer's send queue, so when it
+        // returns, that channel is CLOSED and no message can ever be sent to this
+        // peer again. Until now it just returned: the `Peer` stayed registered in
+        // the manager with `closed == false` and its last advertised head intact.
+        //
+        // Sync selection picks on advertised head, so the dead peer kept winning.
+        // Every send failed; a failed send records no pending request, so it never
+        // timed out; and the penalty box (#136) is driven entirely by timeouts, so
+        // it never de-preferred or dropped it. The node retried a corpse forever
+        // (`ph=0 pb=0 req_headers=false req_blocks=false` every 2s, four peers
+        // "connected", correct target, zero timeouts — chain 40204, #151).
+        //
+        // The READER already did this correctly at all four of its exits; the
+        // comment at its EOF path even records the same bug being fixed there
+        // ("Was: break WITHOUT remove_peer — the peer stayed registered"). It was
+        // never mirrored here, which is why the failure was intermittent: whichever
+        // side noticed the dead connection FIRST decided the outcome. Reader first
+        // → evicted and re-dialed. Writer first → corpse.
+        //
+        // `close()` before eviction so the reader stops too, and
+        // `remove_peer_if_current` so a reconnection that already replaced this
+        // entry is not torn down by its predecessor's cleanup.
+        peer_w.close();
+        pm_w.remove_peer_if_current(&id_w, &peer_w).await;
     });
 
     // Reader loop with rate limiting. Owns the other socket half, so it honours
@@ -634,9 +665,13 @@ async fn handle_outbound(
             remote_id, addr, encrypted
         );
 
-        // Writer task — see the inbound writer for why this honours `close()`.
+        // Writer task — see the inbound writer for why this honours `close()`,
+        // and for why it must EVICT on exit (#152) rather than return quietly.
         let noise_w = noise_session.clone();
         let (shutdown_w, closed_w) = peer.shutdown_handles();
+        let pm_w = peer_manager.clone();
+        let peer_w = peer.clone();
+        let id_w = remote_id.clone();
         tokio::spawn(async move {
             loop {
                 if closed_w.load(Ordering::SeqCst) {
@@ -690,6 +725,12 @@ async fn handle_outbound(
                     }
                 }
             }
+            // #152 — same eviction contract as the inbound writer; see the note
+            // there. A writer that returns without evicting leaves a registered
+            // peer whose send channel is closed, which the sync driver then
+            // selects forever on its stale advertised head.
+            peer_w.close();
+            pm_w.remove_peer_if_current(&id_w, &peer_w).await;
         });
 
         // Reader loop with rate limiting — same close contract as inbound.

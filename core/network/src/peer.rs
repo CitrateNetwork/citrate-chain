@@ -1186,6 +1186,63 @@ mod tests {
         );
     }
 
+    /// RED TEST — #152, the corpse race made deterministic.
+    ///
+    /// The live failure was ~1 in 3 network interruptions, because whichever side
+    /// noticed the dead connection FIRST decided the outcome: the reader evicted
+    /// at all four of its exits, the writer at none of its four. Reader first →
+    /// clean recovery. Writer first → a peer left REGISTERED in the manager with a
+    /// closed send channel and `closed == false`, which sync selection then picks
+    /// forever on its stale advertised head.
+    ///
+    /// This reproduces the writer-first case with no network and no timing: drop
+    /// the receiving half (exactly what a returning writer task does) and assert
+    /// the manager no longer hands that peer out as a usable source.
+    ///
+    /// It is written against the OBSERVABLE contract — "a peer whose channel is
+    /// dead must not remain selectable" — rather than against the transport's
+    /// internals, so it stays honest if the cleanup moves.
+    #[tokio::test]
+    async fn a_peer_whose_writer_died_must_not_stay_selectable() {
+        let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let addr: SocketAddr = "10.0.0.7:30303".parse().expect("valid addr");
+        let id = PeerId::new("writer_died".to_string());
+
+        let (send_tx, to_wire_rx) = mpsc::channel(8);
+        let (_unused_tx, recv_rx) = mpsc::channel(1);
+        let mut info = PeerInfo::new(id.clone(), addr, Direction::Outbound);
+        info.state = PeerState::Connected;
+        // A high advertised head is what made the corpse keep winning selection.
+        info.head_height = 500_000;
+        let peer = Arc::new(Peer::new(info, send_tx, recv_rx));
+        pm.add_peer(peer.clone()).await.expect("registers");
+        assert_eq!(pm.get_all_peers().len(), 1, "peer is registered and selectable");
+
+        // The writer task returns — this is precisely what every one of its four
+        // exit paths does (encrypt fail, send error, WRITE_TIMEOUT, encode fail).
+        drop(to_wire_rx);
+
+        // Discovering the dead channel must mark the peer closed...
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), peer.send(ping()))
+            .await
+            .expect("must not block");
+        assert!(res.is_err(), "sending to a dead connection fails");
+        assert!(
+            peer.is_closed(),
+            "a peer whose send channel is closed must report itself closed — \
+             otherwise it reads as healthy and keeps winning sync selection"
+        );
+
+        // ...and it must be evictable, so the driver can replace it rather than
+        // retrying it every 2s forever.
+        pm.remove_peer_if_current(&id, &peer).await;
+        assert!(
+            pm.get_all_peers().is_empty(),
+            "the corpse must leave the peer set so discovery can re-dial a live \
+             connection in its place"
+        );
+    }
+
     /// RED TEST — #151, the post-blip corpse loop, reproduced live on chain 40204
     /// by interrupting a syncing node's network for 150 seconds.
     ///
