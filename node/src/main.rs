@@ -1922,11 +1922,61 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         .unwrap_or_else(|| citrate_consensus::types::Hash::new([0u8; 32]));
                     // Request next headers and blocks from our last known point only if not saturated
                     let (ph, pb) = sync_for_loop.pending_counts().await;
-                    if ph < 8 {
-                        let _ = sync_for_loop.request_headers(&peer, start_from).await;
+                    // #151: a request that FAILS TO SEND must count against this peer.
+                    //
+                    // Both calls below were `let _ = ...`. A failed send records no
+                    // pending request, so it can never time out — and the penalty box
+                    // (#136) is driven ENTIRELY by timeouts. So a peer whose channel had
+                    // closed was never de-preferred and never dropped, while the selector
+                    // kept choosing it on the stale advertised head a dead peer still
+                    // carries. Every request evaporated, silently, forever.
+                    //
+                    // Instrumented on chain 40204 after a 150s network interruption:
+                    //
+                    //   TICKTRACE 481 F1 ph=0 pb=0 anchor=f15e3524 peer=noise_2b492467
+                    //   TICKTRACE 481 F2 req_headers=false
+                    //   TICKTRACE 481 F3 req_blocks=false
+                    //
+                    // every 2s indefinitely — pending maps EMPTY (so neither saturation
+                    // nor dedup), four peers connected, correct target, zero timeouts
+                    // logged. The node was retrying a corpse.
+                    //
+                    // Crediting a send failure as a timeout is the right equivalence:
+                    // both mean "this peer did not give us blocks", which is exactly what
+                    // the penalty box acts on. That feeds the EXISTING escalation rather
+                    // than adding a second policy that could disagree with it.
+                    let mut send_failed = false;
+                    if ph < 8 && sync_for_loop.request_headers(&peer, start_from).await.is_err() {
+                        send_failed = true;
                     }
-                    if pb < 8 {
-                        let _ = sync_for_loop.request_blocks(&peer, start_from).await;
+                    if pb < 8 && sync_for_loop.request_blocks(&peer, start_from).await.is_err() {
+                        send_failed = true;
+                    }
+                    if send_failed {
+                        let pid = peer.info.read().await.id.clone();
+                        let fails = {
+                            let mut sel = sync_peers_for_loop.lock().await;
+                            sel.record_timeout(&pid.0)
+                        };
+                        // A closed channel is terminal, not slow: the writer task is gone
+                        // and no future send can succeed. Evict now so the discovery
+                        // re-dial (#149) replaces it, rather than waiting out a penalty
+                        // count that a corpse can never earn.
+                        if peer.is_closed() {
+                            pm_for_sync.remove_peer(&pid).await;
+                            sync_peers_for_loop.lock().await.reset(&pid.0);
+                            tracing::warn!(
+                                "Sync peer {} has a closed connection — evicted so it can \
+                                 re-handshake (it was being selected and silently failing)",
+                                pid.0
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Sync request to {} failed to send ({} consecutive) — \
+                                 de-preferring it as a source",
+                                pid.0, fails
+                            );
+                        }
                     }
                 }
                 // Requeue timed-out requests with exponential backoff
