@@ -2400,12 +2400,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::Blocks { blocks } => {
-                        // #85 (sync_peer.rs invariant I3): this peer ANSWERED, so
-                        // clear any timeout penalty it is carrying. Without a
-                        // success signal the accounting is failure-only and a peer
-                        // can accumulate penalties it has no way to shed — which is
-                        // half of what blacklisted the producer on the live fleet.
-                        sync_peers_for_rx.lock().await.record_success(&pid.0);
+                        // #153: the peer's standing is credited AFTER admission, on
+                        // what it actually delivered — see the record_useful /
+                        // record_useless call below. This used to be an
+                        // unconditional `record_success(&pid.0)` right here, before
+                        // a single block had been examined, so answering at all was
+                        // enough to clear the penalty and stay the preferred source.
                         // WP-H.4: handle_blocks now validates each block
                         let _ = sync_for_rx.handle_blocks(blocks).await;
                         // WP-H.5: Drain validated blocks and persist to chain store.
@@ -2429,6 +2429,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // dropped. The pre-fix code dropped it, so a re-requested
                         // child was re-dropped forever whenever its parent rode a
                         // separate not-yet-arrived batch — the live cold-sync wedge.
+                        // #153: how much of this response was genuinely NEW. A
+                        // response that admits nothing is not service, however
+                        // well-formed it was — see the credit call after the loop.
+                        let mut newly_admitted: usize = 0;
+                        let mut highest_admitted: u64 = 0;
                         loop {
                             let mut progressed = false;
                             let mut deferred: Vec<citrate_consensus::types::Block> = Vec::new();
@@ -2450,6 +2455,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         completed_partial,
                                     } => {
                                         progressed = true;
+                                        // #153: this block was NEW. Only this arm
+                                        // counts — `AlreadyAdmitted` is a block we
+                                        // already had, which is exactly what a peer
+                                        // at our own height serves back forever.
+                                        newly_admitted += 1;
+                                        if block.header.height > highest_admitted {
+                                            highest_admitted = block.header.height;
+                                        }
                                         if completed_partial {
                                             tracing::warn!(
                                                 "Completed a partial admission of synced block {} @ {}",
@@ -2498,6 +2511,43 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             pending.truncate(MAX_ORPHAN_BLOCKS);
                         }
                         orphan_blocks = pending;
+
+                        // #153 — CREDIT THE PEER ON WHAT IT ACTUALLY DELIVERED.
+                        //
+                        // Live on chain 40204: our node and boot3 both sat at height
+                        // 177,771. Gossip had inflated boot3's advertised head to the
+                        // network tip (~213k), so it passed invariant I1 and — every
+                        // peer being tied at the inflated head — won the peer-id
+                        // tie-break, being the lowest of the four. It answered
+                        // "Sending 1 blocks" thirty times in three minutes: our own
+                        // anchor group, nothing new. Each of those replies called
+                        // `record_success`, clearing its penalty and confirming it as
+                        // our preferred source. We sent it 63 of 66 requests while
+                        // rpc-1 (at the tip) and boot1/boot2 (17k ahead) went unasked,
+                        // and throughput fell from 445 to 18 blocks/min — losing
+                        // ground to a chain growing at 30.
+                        //
+                        // The distinction the loop above already computes, and used to
+                        // throw away, is the whole fix: `Admitted` is service,
+                        // `AlreadyAdmitted` is not.
+                        {
+                            let mut sel = sync_peers_for_rx.lock().await;
+                            if newly_admitted > 0 {
+                                sel.record_useful(&pid.0, highest_admitted);
+                            } else {
+                                sel.record_useless(&pid.0);
+                                let streak = sel.useless_streak(&pid.0);
+                                if streak == sync_peer::USELESS_SERVES_BEFORE_DEMOTION {
+                                    tracing::warn!(
+                                        "Sync peer {} has answered {} times with nothing we \
+                                         could admit — de-preferring it (it is at or behind \
+                                         our own tip despite advertising higher)",
+                                        pid.0,
+                                        streak
+                                    );
+                                }
+                            }
+                        }
                     }
                     NetworkMessage::Transactions { transactions } => {
                         for tx in transactions {

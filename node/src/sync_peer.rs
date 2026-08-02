@@ -55,8 +55,28 @@
 //       all of them. If penalties would empty a non-empty useful set, the set is
 //       used anyway. Being behind is present-tense evidence; a stale timeout is
 //       not.
-//   I3. Success clears. A peer that answers is not a failing peer (see
-//       `record_success`, credited from the receive path).
+//   I3. Service clears. A peer that actually delivers is not a failing peer (see
+//       `record_useful`, credited from the receive path).
+//   I4. ADVERTISED IS NOT HELD. A peer's advertised head is bumped by any relayed
+//       gossip block, so it proves the peer SAW that height, never that it holds
+//       it. Only blocks we could admit are evidence of a real source; a peer that
+//       answers with nothing new is de-preferred however high it advertises.
+//
+// I4 EXISTS BECAUSE I1 ALONE WAS DEFEATED (chain 40204, 2026-08-01).
+//
+// Our node and boot3 both sat at height 177,771. Gossip had inflated every peer's
+// advertised head to the network tip (~213k), so I1 passed for all four and they
+// all TIED — and the old tie-break (`b.id.cmp(&a.id)`) hands ties to the SMALLEST
+// peer id, which was boot3. It answered "Sending 1 blocks" thirty times in three
+// minutes: our own anchor group, nothing new. Every one of those replies called
+// the old `record_success`, clearing its penalty and reconfirming it as our
+// preferred source. We sent boot3 63 of 66 requests while rpc-1 (at the tip) and
+// boot1/boot2 (17k ahead) went unasked. A genesis→tip cold sync fell from 445 to
+// 18 blocks/min and began LOSING ground to a chain growing at 30.
+//
+// I1 was not wrong; it was reading a number that gossip had made meaningless.
+// That is the general lesson: a selection invariant is only as good as the
+// evidence behind the field it tests.
 //
 // I2 is the one that breaks the latch, and it is deliberately stated as "use it
 // anyway" rather than "raise the threshold": any fixed pair of exclude/reset
@@ -120,17 +140,43 @@ pub struct SyncCandidate {
     pub head_height: u64,
 }
 
-/// Per-peer sync-timeout accounting plus the selection policy built on it.
+/// Consecutive responses that admitted NOTHING NEW before a peer is treated as
+/// proven-useless rather than merely unlucky.
 ///
-/// Shared (behind a mutex) between the sync tick task, which records timeouts
-/// and selects, and the network message handler, which records successes — the
-/// tick task alone can only ever observe failures, so I3 has to be credited
-/// from the receive side. The counters are process-local by design: a restart is
-/// a legitimate clean slate, which is also why restarting a wedged node was a
-/// (partial, short-lived) workaround for the bug this closes.
+/// Two is deliberate and low. A peer that hands us only blocks we already hold
+/// is not congested or slow — it is at or behind our own tip, and no number of
+/// further requests changes that. One response can legitimately be a duplicate
+/// (a race with the drain, an overlapping batch); two in a row is a position,
+/// not an accident.
+pub const USELESS_SERVES_BEFORE_DEMOTION: u32 = 2;
+
+/// Per-peer sync accounting plus the selection policy built on it.
+///
+/// Shared (behind a mutex) between the sync tick task, which records timeouts and
+/// selects, and the network message handler, which records what a response
+/// actually delivered — the tick task alone can only ever observe failures, so I3
+/// and I4 have to be credited from the receive side. The counters are
+/// process-local by design: a restart is a legitimate clean slate, which is also
+/// why restarting a wedged node was a (partial, short-lived) workaround for
+/// several of the bugs this module now pins.
 #[derive(Debug, Default)]
 pub struct SyncPeerSelector {
     failures: HashMap<String, u32>,
+    /// Highest height this peer has actually DELIVERED to us and we could admit.
+    ///
+    /// #153 — THE DIFFERENCE BETWEEN *SEEN* AND *HELD*.
+    ///
+    /// `SyncCandidate::head_height` comes from `PeerInfo.head_height`, which the
+    /// gossip handler bumps on ANY relayed `NewBlock`. Relaying a block proves the
+    /// peer SAW it; it does not prove the peer HOLDS it, and it certainly does not
+    /// prove the peer holds its ancestry. On chain 40204 every peer therefore
+    /// advertised ~the network tip regardless of what it actually stored.
+    ///
+    /// This watermark is the honest number: it only moves when a peer hands us a
+    /// block we did not have and could apply.
+    served: HashMap<String, u64>,
+    /// Consecutive responses from this peer that admitted nothing new.
+    useless: HashMap<String, u32>,
 }
 
 impl SyncPeerSelector {
@@ -145,9 +191,41 @@ impl SyncPeerSelector {
         *e
     }
 
-    /// Clear `id`'s failure count because it ANSWERED us (I3).
-    pub fn record_success(&mut self, id: &str) {
+    /// `id` delivered blocks we did not have and could admit, the highest at
+    /// `height`. This is the ONLY evidence that a peer is a real source (I4).
+    ///
+    /// Clears the timeout penalty (the old I3 meaning — it answered) and the
+    /// useless streak, and raises its served watermark.
+    pub fn record_useful(&mut self, id: &str, height: u64) {
         self.failures.remove(id);
+        self.useless.remove(id);
+        let e = self.served.entry(id.to_string()).or_insert(0);
+        if height > *e {
+            *e = height;
+        }
+    }
+
+    /// `id` answered, but the response admitted NOTHING NEW.
+    ///
+    /// #153 — this used to be indistinguishable from success. The Blocks handler
+    /// called `record_success` on ANY response, so a peer sitting at our exact
+    /// height, serving back our own anchor group one block at a time, had its
+    /// penalty cleared on every reply and stayed the preferred source forever.
+    /// Delivering a block we already hold is not service; counting it as service
+    /// is what made the node reinforce the one peer that could not help it.
+    pub fn record_useless(&mut self, id: &str) {
+        let e = self.useless.entry(id.to_string()).or_insert(0);
+        *e = e.saturating_add(1);
+    }
+
+    /// Highest height `id` has actually delivered (0 if it never has).
+    pub fn served(&self, id: &str) -> u64 {
+        self.served.get(id).copied().unwrap_or(0)
+    }
+
+    /// Consecutive no-progress responses from `id`.
+    pub fn useless_streak(&self, id: &str) -> u32 {
+        self.useless.get(id).copied().unwrap_or(0)
     }
 
     /// Clear `id`'s failure count because it is being dropped and will
@@ -198,23 +276,65 @@ impl SyncPeerSelector {
             return None;
         }
 
+        // #153 — TIE-BREAK ON DEMONSTRATED SERVICE, NOT ON PEER ID.
+        //
+        // Gossip bumps every peer's advertised head to ~the network tip (see
+        // `served`), so on this fleet all four candidates TIE on `head_height`
+        // permanently. The old tie-break was `b.id.cmp(&a.id)` — inside `max_by`
+        // that makes the SMALLEST peer id win. It is deterministic, which the
+        // oscillation test wanted, but deterministic toward an arbitrary peer
+        // chosen by key material.
+        //
+        // Live consequence on chain 40204: boot3 (`noise_2b49…`, lowest id of the
+        // four) won every tie while holding EXACTLY our own height. We sent it 63
+        // of 66 requests in three minutes; it answered "Sending 1 blocks" thirty
+        // times. Throughput fell 445 -> 18 blocks/min and the node began losing
+        // ground to the tip, while boot1/boot2 (17k ahead) and rpc-1 (at the tip)
+        // sat unasked.
+        //
+        // Ordering by served watermark first makes the tie-break mean something:
+        // among peers that look equally good on paper, prefer the one that has
+        // actually handed us blocks. Peer id remains the final key so the choice
+        // stays deterministic and cannot oscillate between two equal peers.
         let pick = |set: &[&'a SyncCandidate]| -> Option<&'a SyncCandidate> {
-            set.iter()
-                .copied()
-                .max_by(|a, b| {
-                    a.head_height
-                        .cmp(&b.head_height)
-                        .then_with(|| b.id.cmp(&a.id))
-                })
+            set.iter().copied().max_by(|a, b| {
+                a.head_height
+                    .cmp(&b.head_height)
+                    .then_with(|| self.served(&a.id).cmp(&self.served(&b.id)))
+                    .then_with(|| b.id.cmp(&a.id))
+            })
+        };
+
+        // I4 — a peer PROVEN unable to advance us is not a candidate while any
+        // unproven or productive peer exists. "Proven" is deliberately narrow: it
+        // has answered `USELESS_SERVES_BEFORE_DEMOTION` times in a row with
+        // nothing we could admit, AND its served watermark is at or below our own
+        // tip, so there is positive evidence it is not ahead of us in substance —
+        // not merely that it was unlucky. A peer we have never pulled from is
+        // never demoted by this rule; it has to earn the demotion.
+        let productive = |c: &SyncCandidate| -> bool {
+            self.useless_streak(&c.id) < USELESS_SERVES_BEFORE_DEMOTION
+                || self.served(&c.id) > applied_height
         };
 
         let clean: Vec<&SyncCandidate> = useful
             .iter()
             .copied()
-            .filter(|c| self.failures(&c.id) < DEPREFER_AT_FAILURES)
+            .filter(|c| self.failures(&c.id) < DEPREFER_AT_FAILURES && productive(c))
             .collect();
         if !clean.is_empty() {
             return pick(&clean);
+        }
+
+        // Everything clean is also proven-useless: fall back to peers that are
+        // merely un-penalised, so a transient no-progress streak cannot strand us.
+        let unpenalised: Vec<&SyncCandidate> = useful
+            .iter()
+            .copied()
+            .filter(|c| self.failures(&c.id) < DEPREFER_AT_FAILURES)
+            .collect();
+        if !unpenalised.is_empty() {
+            return pick(&unpenalised);
         }
 
         // I2 — every peer that could advance us is in the penalty box. That is
@@ -246,7 +366,7 @@ mod tests {
     /// its own anchor.
     #[test]
     fn a_peer_at_our_own_height_is_never_a_sync_source() {
-        let mut sel = SyncPeerSelector::new();
+        let sel = SyncPeerSelector::new();
         let peers = [cand("boot2", 54600), cand("boot3", 54600)];
         assert_eq!(
             sel.select(&peers, 54600),
@@ -259,7 +379,7 @@ mod tests {
     /// And with the producer present it must be the pick, not the siblings.
     #[test]
     fn the_peer_that_is_actually_ahead_wins() {
-        let mut sel = SyncPeerSelector::new();
+        let sel = SyncPeerSelector::new();
         let peers = [cand("boot2", 54600), cand("rpc1", 68091), cand("boot3", 54600)];
         assert_eq!(
             sel.select(&peers, 54600).map(|c| c.id.as_str()),
@@ -367,7 +487,11 @@ mod tests {
         for _ in 0..DEPREFER_AT_FAILURES {
             sel.record_timeout("rpc1");
         }
-        sel.record_success("rpc1");
+        // #153: `record_success` (credited on ANY reply) is now `record_useful`,
+        // credited only when the reply admitted something new. I3's meaning is
+        // unchanged — a peer that genuinely serves us sheds its penalty — but the
+        // evidence required is now service rather than mere responsiveness.
+        sel.record_useful("rpc1", 68_000);
         assert_eq!(sel.failures("rpc1"), 0);
         let peers = [cand("rpc1", 68091), cand("other", 68000)];
         assert_eq!(
@@ -381,7 +505,7 @@ mod tests {
     /// across ticks (an oscillating anchor re-requests the same range forever).
     #[test]
     fn equal_heights_break_deterministically() {
-        let mut sel = SyncPeerSelector::new();
+        let sel = SyncPeerSelector::new();
         let peers = [cand("bbb", 68091), cand("aaa", 68091)];
         let first = sel.select(&peers, 54600).map(|c| c.id.clone());
         let second = sel.select(&peers, 54600).map(|c| c.id.clone());
@@ -392,10 +516,123 @@ mod tests {
     /// A node already at the head has nothing to pull — no candidate, no request.
     #[test]
     fn a_synced_node_selects_nothing() {
-        let mut sel = SyncPeerSelector::new();
+        let sel = SyncPeerSelector::new();
         let peers = [cand("rpc1", 68091)];
         assert_eq!(sel.select(&peers, 68091), None);
         assert_eq!(sel.select(&[], 0), None);
+    }
+
+    /// RED TEST — #153, the live 40204 shape that collapsed a cold sync from 445
+    /// to 18 blocks/min while every diagnostic read healthy.
+    ///
+    /// Our applied tip is 177,771. boot3 holds EXACTLY 177,771 — it cannot advance
+    /// us by a single block. But gossip bumps `PeerInfo.head_height` on any relayed
+    /// `NewBlock`, so boot3 advertises the network tip (213,222) like everyone else.
+    /// I1 therefore passes for all four peers, they all TIE on advertised head, and
+    /// the old tie-break (`b.id.cmp(&a.id)`, smallest id wins inside `max_by`)
+    /// picked `noise_2b49…` — boot3 — deterministically, forever.
+    ///
+    /// Measured: 63 of 66 requests went to boot3, which answered "Sending 1 blocks"
+    /// thirty times, while rpc-1 (at the tip) and boot1/boot2 (17k ahead) sat
+    /// unasked. Every one of those replies called `record_success` and reconfirmed
+    /// boot3 as the preferred source.
+    #[test]
+    fn a_peer_that_serves_nothing_new_stops_being_chosen() {
+        let applied = 177_771;
+        let tip = 213_222;
+        // Every peer advertises the gossip-inflated tip. This is the real defect
+        // condition: advertised head carries no information here.
+        let peers = [
+            cand("noise_2b49_boot3", tip),
+            cand("noise_4ed2_boot2", tip),
+            cand("noise_6ee5_rpc1", tip),
+            cand("noise_f356_boot1", tip),
+        ];
+        let mut sel = SyncPeerSelector::new();
+
+        // Pre-fix, boot3 wins on the id tie-break. That part is unchanged and fine
+        // — with no service history there is nothing better to go on.
+        let first = sel.select(&peers, applied).map(|c| c.id.clone());
+        assert_eq!(first.as_deref(), Some("noise_2b49_boot3"));
+
+        // boot3 answers twice with our own anchor group: nothing admitted.
+        sel.record_useless("noise_2b49_boot3");
+        sel.record_useless("noise_2b49_boot3");
+
+        let next = sel.select(&peers, applied).map(|c| c.id.clone());
+        assert_ne!(
+            next.as_deref(),
+            Some("noise_2b49_boot3"),
+            "a peer that has served nothing admissible twice must stop winning \
+             selection — it is at or behind our tip however high it advertises"
+        );
+        assert!(next.is_some(), "and we must still have a source");
+    }
+
+    /// The positive half: a peer that has actually delivered outranks one that
+    /// merely advertises well. This is what makes the tie-break mean something on
+    /// a fleet where gossip pins every advertised head to the tip.
+    #[test]
+    fn demonstrated_service_outranks_an_equal_advertised_head() {
+        let applied = 177_771;
+        let tip = 213_222;
+        let peers = [cand("aaa_lowest_id", tip), cand("zzz_highest_id", tip)];
+        let mut sel = SyncPeerSelector::new();
+
+        // With no history the id tie-break applies and the lowest id wins.
+        assert_eq!(
+            sel.select(&peers, applied).map(|c| c.id.as_str()),
+            Some("aaa_lowest_id")
+        );
+
+        // The other peer proves it can actually advance us.
+        sel.record_useful("zzz_highest_id", applied + 5_000);
+        assert_eq!(
+            sel.select(&peers, applied).map(|c| c.id.as_str()),
+            Some("zzz_highest_id"),
+            "proven service must beat an arbitrary id tie-break — that tie-break \
+             is what sent 63 of 66 requests to the one peer that could not help"
+        );
+    }
+
+    /// I2 must survive: the new demotion is a PREFERENCE, never a veto. If every
+    /// peer looks useless we still pick one, because a node with no source is
+    /// strictly worse than a node pulling from a poor one.
+    #[test]
+    fn demotion_never_leaves_us_with_no_source() {
+        let applied = 100;
+        let peers = [cand("a", 5_000), cand("b", 5_000)];
+        let mut sel = SyncPeerSelector::new();
+        for _ in 0..USELESS_SERVES_BEFORE_DEMOTION + 3 {
+            sel.record_useless("a");
+            sel.record_useless("b");
+        }
+        assert!(
+            sel.select(&peers, applied).is_some(),
+            "I2: an empty useful set is never the answer, even when every peer is \
+             demoted — being sourceless is the worse failure"
+        );
+    }
+
+    /// A peer proven useful ABOVE our tip is not demoted by a later dry response.
+    /// Its watermark is positive evidence it is genuinely ahead, so a single
+    /// duplicate batch (a race with the drain, an overlapping range) must not
+    /// unseat a peer that is demonstrably serving us.
+    #[test]
+    fn a_proven_peer_survives_a_duplicate_response() {
+        let applied = 1_000;
+        let peers = [cand("good", 9_000), cand("other", 9_000)];
+        let mut sel = SyncPeerSelector::new();
+        sel.record_useful("good", 5_000); // served well above our tip
+        for _ in 0..USELESS_SERVES_BEFORE_DEMOTION + 2 {
+            sel.record_useless("good");
+        }
+        assert_eq!(
+            sel.select(&peers, applied).map(|c| c.id.as_str()),
+            Some("good"),
+            "served watermark above our tip is positive evidence; a dry streak \
+             alone must not discard a peer that has demonstrably advanced us"
+        );
     }
 
     /// RED TEST — #150, at boot1's measured shape. A node 33,000 blocks behind
