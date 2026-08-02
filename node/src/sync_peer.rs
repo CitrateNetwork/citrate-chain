@@ -150,6 +150,35 @@ pub struct SyncCandidate {
 /// not an accident.
 pub const USELESS_SERVES_BEFORE_DEMOTION: u32 = 2;
 
+/// Newly-admitted blocks a response must carry to count as REAL service — the
+/// evidence required to decay a demotion.
+///
+/// #154. Not every non-zero response is service. The measured pathology was a
+/// peer answering with ONE new block at a time (438 x `imported 1/1` in twenty
+/// minutes) while we needed twenty-two thousand: enough to look productive, far
+/// too little to carry us, and — with a naive decay — enough to keep undoing its
+/// own demotion. A peer that can actually advance us returns full batches
+/// (`209 x 32/32` in the healthy window immediately before).
+///
+/// A quarter of `SyncConfig::block_batch_size` (32): generous enough that a
+/// genuinely-serving peer near the tip, or one whose batch was clipped by a
+/// height-group boundary, still counts; strict enough that trickling one block
+/// per response never buys forgiveness.
+pub const MEANINGFUL_SERVE_BLOCKS: usize = 8;
+
+/// Ceiling on the useless streak, and therefore on how long recovery takes.
+///
+/// #154. The streak DECAYS by one per useful serve rather than clearing (see
+/// `record_useful`), which is what makes a demotion durable. Uncapped, that would
+/// also make it unbounded: a peer demoted 300 times would need 300 good serves to
+/// return, which is a permanent exclusion in all but name — the same "latch"
+/// failure mode this module keeps having to unlearn.
+///
+/// Four times the demotion threshold: comfortably outlasts the occasional lucky
+/// block from a peer that is still behind, while letting one that genuinely
+/// caught up rejoin within a handful of good responses.
+pub const USELESS_STREAK_CAP: u32 = USELESS_SERVES_BEFORE_DEMOTION * 4;
+
 /// Per-peer sync accounting plus the selection policy built on it.
 ///
 /// Shared (behind a mutex) between the sync tick task, which records timeouts and
@@ -196,9 +225,37 @@ impl SyncPeerSelector {
     ///
     /// Clears the timeout penalty (the old I3 meaning — it answered) and the
     /// useless streak, and raises its served watermark.
-    pub fn record_useful(&mut self, id: &str, height: u64) {
+    pub fn record_useful(&mut self, id: &str, height: u64, blocks: usize) {
+        // Answering at all is still evidence of liveness, so the timeout penalty
+        // clears regardless of size (I3 unchanged).
         self.failures.remove(id);
-        self.useless.remove(id);
+
+        // #154: a demotion DECAYS, and only against REAL service.
+        //
+        // Two defects, both measured on the same live cold-sync:
+        //
+        //   1. Clearing the streak outright meant one new block bought complete
+        //      forgiveness, so a peer needed two fresh useless serves before
+        //      demotion could fire again -> demote / forgive / re-select / demote,
+        //      THIRTY-EIGHT times against `noise_2b49…` at ~15 blocks/min.
+        //   2. Counting ANY non-zero response as service is what made that lucky
+        //      block qualify. The pathology WAS one-block responses: 438 x
+        //      `imported 1/1` in twenty minutes, against `209 x 32/32` in the
+        //      healthy window immediately before.
+        //
+        // So: decay by one, and only when the response carried a real batch. A
+        // peer that can actually advance us clears its streak in a handful of
+        // proper serves; one trickling single blocks never does, however many it
+        // sends. The judgement should cost about as much to reverse as to earn.
+        if blocks >= MEANINGFUL_SERVE_BLOCKS {
+            if let Some(e) = self.useless.get_mut(id) {
+                *e = e.saturating_sub(1);
+                if *e == 0 {
+                    self.useless.remove(id);
+                }
+            }
+        }
+
         let e = self.served.entry(id.to_string()).or_insert(0);
         if height > *e {
             *e = height;
@@ -215,7 +272,15 @@ impl SyncPeerSelector {
     /// is what made the node reinforce the one peer that could not help it.
     pub fn record_useless(&mut self, id: &str) {
         let e = self.useless.entry(id.to_string()).or_insert(0);
-        *e = e.saturating_add(1);
+        // #154: capped so the streak is STICKY but never a life sentence. With
+        // decay-on-success (see `record_useful`), an uncapped streak would take as
+        // many good serves to clear as it took bad ones — a peer that spent an
+        // hour behind us and then genuinely caught up would be excluded for
+        // hundreds of responses. The cap bounds recovery at
+        // USELESS_STREAK_CAP successful serves, which is long enough to outlast
+        // the occasional lucky block and short enough that a recovered peer
+        // rejoins promptly.
+        *e = e.saturating_add(1).min(USELESS_STREAK_CAP);
     }
 
     /// Highest height `id` has actually delivered (0 if it never has).
@@ -491,7 +556,7 @@ mod tests {
         // credited only when the reply admitted something new. I3's meaning is
         // unchanged — a peer that genuinely serves us sheds its penalty — but the
         // evidence required is now service rather than mere responsiveness.
-        sel.record_useful("rpc1", 68_000);
+        sel.record_useful("rpc1", 68_000, 32);
         assert_eq!(sel.failures("rpc1"), 0);
         let peers = [cand("rpc1", 68091), cand("other", 68000)];
         assert_eq!(
@@ -586,12 +651,69 @@ mod tests {
         );
 
         // The other peer proves it can actually advance us.
-        sel.record_useful("zzz_highest_id", applied + 5_000);
+        sel.record_useful("zzz_highest_id", applied + 5_000, 32);
         assert_eq!(
             sel.select(&peers, applied).map(|c| c.id.as_str()),
             Some("zzz_highest_id"),
             "proven service must beat an arbitrary id tie-break — that tie-break \
              is what sent 63 of 66 requests to the one peer that could not help"
+        );
+    }
+
+    /// RED TEST — #154, the oscillation measured on the live cold-sync.
+    ///
+    /// `record_useful` used to CLEAR the useless streak. A peer far behind us
+    /// still lands the occasional genuinely-new block during churn, and a full
+    /// reset made that one block buy complete forgiveness — so it needed two
+    /// fresh useless serves before demotion could fire again. Result: demote ->
+    /// one lucky block -> forgiven -> re-selected -> demote, THIRTY-EIGHT times
+    /// against `noise_2b49…`, while throughput sat at ~15 blocks/min.
+    ///
+    /// Decay, not reset: one good block must not undo two bad ones.
+    #[test]
+    fn one_lucky_block_does_not_undo_a_demotion() {
+        let applied = 207_878;
+        let mut sel = SyncPeerSelector::new();
+
+        // Two useless serves earn the demotion.
+        sel.record_useless("laggard");
+        sel.record_useless("laggard");
+        assert!(sel.useless_streak("laggard") >= USELESS_SERVES_BEFORE_DEMOTION);
+
+        // One lucky block from a peer still far behind us — its watermark stays
+        // below our tip, so this is not evidence it can carry us.
+        sel.record_useful("laggard", applied - 20_000, 1);
+        assert!(
+            sel.useless_streak("laggard") >= USELESS_SERVES_BEFORE_DEMOTION,
+            "a single new block must not clear a demotion — that reset is exactly \
+             what produced 38 demote/forgive cycles at ~15 blocks/min"
+        );
+    }
+
+    /// But stickiness must not become a life sentence: a peer that genuinely
+    /// catches up has to be able to return, in a BOUNDED number of good serves.
+    /// An unbounded streak would be the same latch failure this module keeps
+    /// having to unlearn (see D2 and the [3,5) dead band).
+    #[test]
+    fn a_recovered_peer_climbs_out_in_bounded_time() {
+        let mut sel = SyncPeerSelector::new();
+        for _ in 0..200 {
+            sel.record_useless("was_behind");
+        }
+        assert_eq!(
+            sel.useless_streak("was_behind"),
+            USELESS_STREAK_CAP,
+            "the streak is capped, so recovery cost is bounded regardless of how \
+             long the peer was useless"
+        );
+        for _ in 0..USELESS_STREAK_CAP {
+            sel.record_useful("was_behind", 500_000, 32);
+        }
+        assert_eq!(
+            sel.useless_streak("was_behind"),
+            0,
+            "a peer that genuinely caught up rejoins after at most \
+             USELESS_STREAK_CAP good serves"
         );
     }
 
@@ -623,7 +745,7 @@ mod tests {
         let applied = 1_000;
         let peers = [cand("good", 9_000), cand("other", 9_000)];
         let mut sel = SyncPeerSelector::new();
-        sel.record_useful("good", 5_000); // served well above our tip
+        sel.record_useful("good", 5_000, 32); // served well above our tip
         for _ in 0..USELESS_SERVES_BEFORE_DEMOTION + 2 {
             sel.record_useless("good");
         }
