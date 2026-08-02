@@ -2530,22 +2530,41 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // The distinction the loop above already computes, and used to
                         // throw away, is the whole fix: `Admitted` is service,
                         // `AlreadyAdmitted` is not.
+                        // #155: ONE call, and it needs the GAP. The same block count
+                        // means opposite things at different distances from the tip:
+                        // one block when we are one behind is a complete answer, one
+                        // block when we are 36,000 behind is a peer that cannot carry
+                        // us. Judging it absolutely is what produced two successive
+                        // dead bands; the gap is the yardstick.
                         {
+                            let applied_now = storage_for_handler
+                                .blocks
+                                .get_applied_tip()
+                                .ok()
+                                .flatten()
+                                .map(|(_, h)| h)
+                                .unwrap_or(0);
+                            let target = max_seen_for_rx
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            let gap = target.saturating_sub(applied_now);
                             let mut sel = sync_peers_for_rx.lock().await;
-                            if newly_admitted > 0 {
-                                sel.record_useful(&pid.0, highest_admitted, newly_admitted);
-                            } else {
-                                sel.record_useless(&pid.0);
-                                let streak = sel.useless_streak(&pid.0);
-                                if streak == sync_peer::USELESS_SERVES_BEFORE_DEMOTION {
-                                    tracing::warn!(
-                                        "Sync peer {} has answered {} times with nothing we \
-                                         could admit — de-preferring it (it is at or behind \
-                                         our own tip despite advertising higher)",
-                                        pid.0,
-                                        streak
-                                    );
-                                }
+                            let quality = sel.record_serve(
+                                &pid.0,
+                                newly_admitted,
+                                highest_admitted,
+                                gap,
+                                32, // SyncConfig::block_batch_size
+                            );
+                            if quality != sync_peer::ServeQuality::Material {
+                                tracing::debug!(
+                                    "Sync peer {} served {:?}: {} new blocks against a gap of \
+                                     {} — score now {}",
+                                    pid.0,
+                                    quality,
+                                    newly_admitted,
+                                    gap,
+                                    sel.score(&pid.0)
+                                );
                             }
                         }
                     }
