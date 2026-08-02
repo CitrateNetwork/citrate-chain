@@ -2533,7 +2533,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         {
                             let mut sel = sync_peers_for_rx.lock().await;
                             if newly_admitted > 0 {
-                                sel.record_useful(&pid.0, highest_admitted);
+                                sel.record_useful(&pid.0, highest_admitted, newly_admitted);
                             } else {
                                 sel.record_useless(&pid.0);
                                 let streak = sel.useless_streak(&pid.0);
