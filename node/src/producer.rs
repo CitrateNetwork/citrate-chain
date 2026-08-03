@@ -2577,9 +2577,21 @@ mod tests {
         // Deliver a gossiped block to a node: persist, admit to the DAG, then run
         // the execute-on-receive driver — the real receive path.
         async fn deliver(n: &Node, block: &Block) -> ApplyOutcome {
+            // SYNC-S1 D2.3 R3: these three writes are the receive path this test
+            // claims to reproduce, and a silently-failed DAG write is the exact
+            // chain-store/DAG-store divergence the test exists to catch. Two of
+            // them were `let _ =` while put_block used `.expect` — so the helper
+            // could swallow the failure it is hunting and report a confusing
+            // downstream symptom instead.
             n.storage.blocks.put_block(block).expect("persist gossiped block");
-            let _ = n.dag.store_block(block.clone()).await;
-            let _ = n.ghostdag.add_block(block).await;
+            n.dag
+                .store_block(block.clone())
+                .await
+                .expect("store gossiped block in the DAG — a dropped write here is the divergence");
+            n.ghostdag
+                .add_block(block)
+                .await
+                .expect("admit gossiped block to ghostdag");
             n.app.apply_received(block).await
         }
 
