@@ -85,6 +85,15 @@ pub struct SyncManager {
     /// HANDED, which is not evidence that the node holds that block's ancestry.
     /// See [`SyncManager::sync_is_complete`].
     local_height: Option<Arc<AtomicU64>>,
+
+    /// Height of the anchor carried by the most recent `GetBlocks` we sent.
+    ///
+    /// #156: needed to tell "the peer had nothing for us" (its fault, Barren)
+    /// from "our applied tip passed the anchor before the answer came back"
+    /// (our fault, Redundant). Those are identical in response content and
+    /// opposite in what they should do to the peer's standing — see
+    /// `sync_peer::classify_serve`.
+    last_block_anchor_height: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +154,7 @@ impl SyncManager {
             block_queue: Arc::new(RwLock::new(VecDeque::new())),
             pending_headers: Arc::new(RwLock::new(HashMap::new())),
             pending_blocks: Arc::new(RwLock::new(HashMap::new())),
+            last_block_anchor_height: Arc::new(AtomicU64::new(0)),
             downloaded_headers: Arc::new(RwLock::new(Vec::new())),
             downloaded_blocks: Arc::new(RwLock::new(Vec::new())),
             last_header_hash: Arc::new(RwLock::new(None)),
@@ -309,8 +319,21 @@ impl SyncManager {
         Ok(())
     }
 
-    /// Process block download request
-    pub async fn request_blocks(&self, peer: &Peer, from: Hash) -> Result<(), NetworkError> {
+    /// Height of the anchor on the most recent `GetBlocks` we sent (#156).
+    pub fn last_block_anchor_height(&self) -> u64 {
+        self.last_block_anchor_height.load(Ordering::Relaxed)
+    }
+
+    /// Process block download request.
+    ///
+    /// `from_height` is the height of `from`, recorded so a response can be
+    /// judged against the anchor that produced it (#156).
+    pub async fn request_blocks(
+        &self,
+        peer: &Peer,
+        from: Hash,
+        from_height: u64,
+    ) -> Result<(), NetworkError> {
         let peer_id = peer.info.read().await.id.clone();
 
         // Check if already pending
@@ -340,6 +363,8 @@ impl SyncManager {
                 retries: 0,
             },
         );
+        self.last_block_anchor_height
+            .store(from_height, Ordering::Relaxed);
 
         Ok(())
     }
