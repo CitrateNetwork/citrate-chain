@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
     // Per-account digest, sorted by address. storage_root is recomputed FRESH from the
     // reloaded trie (what calculate_state_root folds), so a divergence in slot contents shows up.
     let mut all = state_db.accounts.all_accounts();
-    all.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+    all.sort_by_key(|a| a.0 .0);
     println!("# accounts={n_accts} slots={n_slots}");
     for (address, mut account) in all {
         let sroot = state_db

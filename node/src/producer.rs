@@ -2219,7 +2219,7 @@ mod tests {
             executor.clone(),
             mempool.clone(),
             None,
-            coinbase.clone(),
+            coinbase,
             signing_key.clone(),
             2,
             economics,
@@ -2625,16 +2625,15 @@ mod tests {
                         continue; // the producer already recorded its own block
                     }
                     let who = ["producer-P", "producer-Q", "FOLLOWER"][idx];
-                    match deliver(n, block).await {
-                        ApplyOutcome::Rejected(why) => panic!(
+                    if let ApplyOutcome::Rejected(why) = deliver(n, block).await {
+                        panic!(
                             "MP-S1 END-TO-END: {who} REJECTED block {} @ {} in round {round}: \
                              {why}. Two concurrent producers must never emit a block a \
                              receiver cannot reproduce — this is the 2026-07-27 fork, where \
                              boot-2 and boot-3 re-executed one such block 5,166 times and \
                              never advanced again.",
                             block.header.block_hash, block.header.height
-                        ),
-                        _ => {}
+                        );
                     }
                 }
             }
@@ -2761,7 +2760,7 @@ mod multi_producer_regression {
 
         // With merge parents present, +1 is an approximation the producer must no
         // longer use — GHOSTDAG blue score is parent + |blue blocks in mergeset|.
-        let merging = vec![Hash::new([1u8; 32]), Hash::new([2u8; 32])];
+        let merging = [Hash::new([1u8; 32]), Hash::new([2u8; 32])];
         assert!(
             !merging.is_empty(),
             "merging blocks must take the real calculate_blue_set path"
