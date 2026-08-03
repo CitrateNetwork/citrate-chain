@@ -283,7 +283,7 @@ mod tests {
             dag.has_block(&parent).await,
             "the applied tip must never be pruned"
         );
-        assert!(N - 500 >= 10 * 100, "retained range clears MAX_REORG_DEPTH 10x");
+        const { assert!(N - 500 >= 10 * 100, "retained range clears MAX_REORG_DEPTH 10x") };
 
         // And the chain still grows: admitting on top of a pruned ancestry works
         // because D3 step 1 replaced the ancestry walk with a durable anchor.
@@ -646,6 +646,6 @@ mod tests {
         // rather than mutating global env: absent => None is the contract, and
         // a set value is clamped to the floor.
         assert_eq!(DEFAULT_RETAIN_BLOCKS.max(MIN_RETAIN_BLOCKS), DEFAULT_RETAIN_BLOCKS);
-        assert!(MIN_RETAIN_BLOCKS >= 10 * 100, "floor must clear the reorg window");
+        const { assert!(MIN_RETAIN_BLOCKS >= 10 * 100, "floor must clear the reorg window") };
     }
 }

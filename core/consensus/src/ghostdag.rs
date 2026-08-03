@@ -2137,29 +2137,6 @@ mod tests {
         }
     }
 
-    /// REGRESSION — the chain-40204 halt of 2026-07-29.
-    ///
-    /// PIL-13 fixed the eager-load path and SYNC-S1 D1 made the LINEAR receive
-    /// path O(1); `materialised_blue_ancestry_entries` + the
-    /// `producer_steady_state` test pin both. Neither covers a **merge block**.
-    ///
-    /// `derive_score_and_work` returns early only when `merge_parent_hashes` is
-    /// empty; any block with merge parents falls through to `calculate_blue_set`,
-    /// which calls `get_or_calculate_blue_set` on the selected parent. After a
-    /// restart `blue_cache` is empty (that is exactly what `register_existing_block`
-    /// is documented to leave behind), so phase 1 walks the selected-parent chain
-    /// all the way to genesis and phase 2 then caches a FULL cumulative BlueSet
-    /// for every block on the way back — Theta(N²) in chain length, materialised
-    /// by a single `add_block`.
-    ///
-    /// That was harmless while the live chain was linear ("merge blocks are
-    /// rare"). Multi-producer made merge blocks routine, and the producer then
-    /// allocated ~30 GB in ~35 s at N=54,600 — OOM-killing the box and halting
-    /// the chain. Followers were untouched because only the producer holds a
-    /// GhostDag that admits new blocks.
-    ///
-    /// (Attribute lives on the fn below; the MP-DEPTH tests were inserted here.)
-
     /// The activation height is a consensus constant: every node must use the
     /// same one or they disagree about validity. Pinned so a future edit is a
     /// deliberate act with a failing test attached, not a silent one-character
@@ -2171,11 +2148,17 @@ mod tests {
             "owner decision 2026-07-29. Changing this changes which blocks are \
              valid — it requires a coordinated fleet upgrade, not an edit"
         );
-        assert!(
-            MERGE_DEPTH_ACTIVATION_HEIGHT > 78_000,
-            "activation must be comfortably ahead of the chain height at the time \
-             it was chosen, or nodes activate before they can all be upgraded"
-        );
+        // A const block, so a violating edit fails to COMPILE rather than
+        // failing a test somebody might not run. For a consensus constant that
+        // is the right strength: a node that would activate too early cannot be
+        // built at all.
+        const {
+            assert!(
+                MERGE_DEPTH_ACTIVATION_HEIGHT > 78_000,
+                "activation must be comfortably ahead of the chain height at the \
+                 time it was chosen, or nodes activate before they can all be upgraded"
+            )
+        };
     }
 
     /// MP-DEPTH must not apply BELOW the activation height. Blocks already on
@@ -2295,14 +2278,43 @@ mod tests {
     #[test]
     fn mp_depth_bound_is_inside_the_prune_retain_floor() {
         const MIN_RETAIN_BLOCKS: u64 = 1_000; // node::dag_prune::MIN_RETAIN_BLOCKS
-        assert!(
-            MERGE_PARENT_MAX_DEPTH < MIN_RETAIN_BLOCKS,
-            "MERGE_PARENT_MAX_DEPTH ({MERGE_PARENT_MAX_DEPTH}) must stay under the \
-             retain floor ({MIN_RETAIN_BLOCKS}); otherwise pruning can remove a \
-             legally-citable merge parent"
-        );
+        // Const block for the same reason as the activation-height floor: this
+        // invariant is not something to discover at test time.
+        //
+        // The message lost its `{MERGE_PARENT_MAX_DEPTH}` / `{MIN_RETAIN_BLOCKS}`
+        // interpolation because a const context cannot format panic arguments.
+        // Both are compile-time constants a reader can look up two lines away,
+        // so naming the invariant precisely is worth more than echoing them.
+        const {
+            assert!(
+                MERGE_PARENT_MAX_DEPTH < MIN_RETAIN_BLOCKS,
+                "MERGE_PARENT_MAX_DEPTH must stay strictly under the pruner's \
+                 retain floor (MIN_RETAIN_BLOCKS); otherwise pruning can remove a \
+                 block that a valid block is still allowed to cite as a merge parent"
+            )
+        };
     }
 
+    /// REGRESSION — the chain-40204 halt of 2026-07-29.
+    ///
+    /// PIL-13 fixed the eager-load path and SYNC-S1 D1 made the LINEAR receive
+    /// path O(1); `materialised_blue_ancestry_entries` + the
+    /// `producer_steady_state` test pin both. Neither covers a **merge block**.
+    ///
+    /// `derive_score_and_work` returns early only when `merge_parent_hashes` is
+    /// empty; any block with merge parents falls through to `calculate_blue_set`,
+    /// which calls `get_or_calculate_blue_set` on the selected parent. After a
+    /// restart `blue_cache` is empty (that is exactly what `register_existing_block`
+    /// is documented to leave behind), so phase 1 walks the selected-parent chain
+    /// all the way to genesis and phase 2 then caches a FULL cumulative BlueSet
+    /// for every block on the way back — Theta(N²) in chain length, materialised
+    /// by a single `add_block`.
+    ///
+    /// That was harmless while the live chain was linear ("merge blocks are
+    /// rare"). Multi-producer made merge blocks routine, and the producer then
+    /// allocated ~30 GB in ~35 s at N=54,600 — OOM-killing the box and halting
+    /// the chain. Followers were untouched because only the producer holds a
+    /// GhostDag that admits new blocks.
     #[tokio::test]
     async fn merge_block_on_deep_chain_does_not_materialise_quadratic_ancestry() {
         // Deep enough that Theta(N²) is unmistakable against an O(N) bound,

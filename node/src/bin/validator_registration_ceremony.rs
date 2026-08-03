@@ -518,11 +518,18 @@ mod tests {
 
     // Fixed vector: the testnet-config.toml fleet coinbase.
     const VEC_COINBASE: &str = "47fb23137e0ee4248eb975848416e6632fa36090";
-    // Pinned expected proposer pubkey for VEC_COINBASE (regression teeth: this is
-    // the ed25519 verifying key the node registers; a change here means the
-    // derivation drifted from node/src/main.rs and every fleet key would move).
-    // Reproduce: `validator-registration-ceremony --dry-run --node <coinbase>=<env>`.
-    const VEC_PUBKEY: &str = "b898d7550f8bb45b2b6122f56984a5f50c007a46cb219015d13f94539516ee0f";
+    // VEC_PUBKEY was removed 2026-08-03. It pinned
+    // b898d755…16ee0f as "the ed25519 verifying key the node registers", which is
+    // EXACTLY what sha3_256("citrate-block-signing-key-v1" || coinbase32) produces
+    // for VEC_COINBASE — verified by recomputation. That is the PRE-FIX derivation:
+    // a signing key that anyone could compute from a public coinbase address.
+    //
+    // `proposer_key_is_not_derivable_from_the_public_coinbase` below exists because
+    // that was a vulnerability, and its own comment says the tests it replaced
+    // "asserted the OPPOSITE … which is exactly what pinned the vulnerability in
+    // place". This constant was the last surviving piece of that pinning: dead, but
+    // sitting there labelled "regression teeth", inviting the next person to wire it
+    // back up and re-assert the vulnerable property. Deleted rather than hooked up.
 
     fn coinbase20(s: &str) -> [u8; 20] {
         let v = hex::decode(s).expect("valid hex coinbase");
