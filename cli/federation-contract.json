@@ -51,7 +51,16 @@
     "IPFSIncentivesV3": "0xb024ad0b5aefa87fa1e10234afc85b6128932df4",
     "AggregationChallenge": "0xe7d7ebe1242feec29d514b00c9272fbffc9e69be",
     "ComputePoolPipeline": "0x5a0437ac03ca92113962f1e4f3d15e062b942bde",
-    "EduForwarder": "0x50a798eaab184eeb11a27fbc1333b85646c1582a"
+    "ValidatorRegistry": "0x61d44d8a14443646b756905410be951e6ece95a6",
+    "EduForwarder": "0x50a798eaab184eeb11a27fbc1333b85646c1582a",
+    "AnchorRegistry": "0xecedd7a64f88f577a9c5d6b501291454f2bba3a6",
+    "MeetingRegistry": "0xb0e474647bd2f74da0d90c010234b9e9a7d2b048",
+    "GovernanceTemplateRegistry": "0xe9dd5756d2c01a262caed433f67f36ae2a73d3be",
+    "GovernanceProtocolFactory": "0x260ffedd17cd05a2e4daa41e1339c19a083f9e57",
+    "PolicyBinding": "0x1dc147b73863b1fc662bc9172b19193b4865af5f",
+    "CapabilityGrant": "0xadc2e3849d10cfdc3b83e5c3fe650b29f0478e54",
+    "VoteAllowance": "0x78d71ad3aa68e50fd16c0514e4ff1eb63c4008b5",
+    "Sortition": "0x80d98a7687dd806c1e602c991dc0e3c29be03a0e"
   },
   "aaStack": {
     "EntryPoint": "0xc698feaf0ff7fdb0d60e2f620c97cb729a694975",
@@ -118,10 +127,10 @@
   },
   "provenance": {
     "deployer": "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732",
-    "deployedAt": "2026-07-23T14:49:58Z",
+    "deployedAt": "2026-07-27T21:58:00Z",
     "sourceHashes": {
-      "chainAddresses": "a2f43e0195b56bb976df79a1633c07424ebabd099a0423eda220c0a96466ad18",
-      "entitlements": "edb6597ea8dae39e62ec1bd1ade035d55c2b20a6acc622edfa0ca7863cdcb01d"
+      "chainAddresses": "3a41048f881719c97daa7d078b3d23aaa0489f5c82573db454ab06f9f36a291d",
+      "entitlements": "8b5256857093e9b058c5028d0034572f87c0e9f995805f304ef0aae213977789"
     }
   }
 }
