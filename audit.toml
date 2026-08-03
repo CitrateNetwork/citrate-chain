@@ -13,6 +13,38 @@
 [advisories]
 ignore = [
     # ─────────────────────────────────────────────────────────────────
+    # ruint Uint shift flags (fp-check verified NOT EXPLOITABLE) 2026-08-03
+    # ─────────────────────────────────────────────────────────────────
+    # RUSTSEC-2026-0220 — ruint 1.12.4 `overflowing_shl`/`overflowing_shr`
+    # return false-negative overflow flags; `checked_*` return Some instead
+    # of None, `strict_*` fail to panic, `saturating_*` wrap. Separately
+    # `wrapping_sh*` truncate the shift amount mod 2^32, and `to_base_be`
+    # can loop forever on NO-ALLOC builds.
+    # fp-check verdict: NOT EXPLOITABLE for citrate-chain.
+    # Evidence:
+    #   1. The advisory states the SHIFTED VALUES were correct — only the
+    #      flag was wrong. Consensus arithmetic reads values, not flags.
+    #   2. revm's EVM shift opcodes clamp `shift < 256` and then use plain
+    #      `<<` / `>>` / `arithmetic_shr` — never the checked/saturating
+    #      family (revm-interpreter-6.0.0/src/instructions/bitwise.rs
+    #      :83-118, verified by reading the vendored source). The >= 2^32
+    #      truncation is unreachable for the same reason.
+    #   3. citrate-chain calls NO affected API in first-party source
+    #      (core/, node/, cli/) — enforced going forward by
+    #      scripts/ci/ruint_shift_advisory_premise_tripwire.sh, which fails
+    #      the build if one appears, so this justification cannot be
+    #      silently inherited by future code.
+    #   4. The to_base_be infinite loop is documented as no-alloc only; we
+    #      build std binaries and never call it.
+    # Not closable yet: the fix is ruint >= 1.20.0, which requires proptest
+    # with the `no_std` feature -> proptest 1.11+ -> rand 0.9. proptest is
+    # pinned `=1.5.0` workspace-wide (Cargo.toml:134-137) pending the rand
+    # 0.8 -> 0.9 migration, BACKLOG #124. The newest ruint satisfying that
+    # pin is 1.11.0, which is still vulnerable, so no partial bump helps.
+    # Closes mechanically when BACKLOG #124 lands.
+    "RUSTSEC-2026-0220",
+
+    # ─────────────────────────────────────────────────────────────────
     # REM-14 — ruint reciprocal_mg10 (fp-check verified FALSE POSITIVE)
     # ─────────────────────────────────────────────────────────────────
     # RUSTSEC-2025-0137 — ruint 1.12.4 release-mode OOB read on TABLE
