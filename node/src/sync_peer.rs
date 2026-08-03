@@ -246,7 +246,7 @@ mod tests {
     /// its own anchor.
     #[test]
     fn a_peer_at_our_own_height_is_never_a_sync_source() {
-        let mut sel = SyncPeerSelector::new();
+        let sel = SyncPeerSelector::new();
         let peers = [cand("boot2", 54600), cand("boot3", 54600)];
         assert_eq!(
             sel.select(&peers, 54600),
@@ -259,7 +259,7 @@ mod tests {
     /// And with the producer present it must be the pick, not the siblings.
     #[test]
     fn the_peer_that_is_actually_ahead_wins() {
-        let mut sel = SyncPeerSelector::new();
+        let sel = SyncPeerSelector::new();
         let peers = [cand("boot2", 54600), cand("rpc1", 68091), cand("boot3", 54600)];
         assert_eq!(
             sel.select(&peers, 54600).map(|c| c.id.as_str()),
@@ -381,7 +381,7 @@ mod tests {
     /// across ticks (an oscillating anchor re-requests the same range forever).
     #[test]
     fn equal_heights_break_deterministically() {
-        let mut sel = SyncPeerSelector::new();
+        let sel = SyncPeerSelector::new();
         let peers = [cand("bbb", 68091), cand("aaa", 68091)];
         let first = sel.select(&peers, 54600).map(|c| c.id.clone());
         let second = sel.select(&peers, 54600).map(|c| c.id.clone());
@@ -392,7 +392,7 @@ mod tests {
     /// A node already at the head has nothing to pull — no candidate, no request.
     #[test]
     fn a_synced_node_selects_nothing() {
-        let mut sel = SyncPeerSelector::new();
+        let sel = SyncPeerSelector::new();
         let peers = [cand("rpc1", 68091)];
         assert_eq!(sel.select(&peers, 68091), None);
         assert_eq!(sel.select(&[], 0), None);
