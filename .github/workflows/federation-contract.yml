@@ -1,0 +1,80 @@
+name: federation-contract
+
+# Guards the CLI's vendored copy of the federation contract artifact.
+#
+# WHY THIS EXISTS
+#   cli/federation-contract.json is compiled into the binary by include_str! in
+#   cli/src/commands/devx.rs. There is no runtime fetch, so whatever is vendored
+#   at build time ships, and nothing surfaces that it is old.
+#
+#   It went stale exactly that way: committed 2026-07-26, the day before the
+#   2026-07-27 redeployment, and left nine contracts behind with provenance
+#   reading 2026-07-23. The impact was LATENT rather than realised — `devx
+#   contract` exposes only chain/aaStack/membership/identity/entitlements/
+#   gateway, all byte-identical across the drift; the delta was confined to
+#   `contracts` and `provenance`, which the command cannot print. Nobody was
+#   served a wrong address.
+#
+#   The gap is that it drifted with nothing watching. Both SDKs vendoring the
+#   same artifact had a sync script and a drift gate and were both in sync; this
+#   copy had neither. The moment devx grows a `contracts` section, latent
+#   becomes live.
+#
+#   Mirrors the chain-config.yml pattern (guarding the packages/chain-config
+#   snapshot against contracts/addresses/40204.json) one level further out: this
+#   guards against the FEDERATION artifact, which is itself generated from that
+#   address table.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cli/federation-contract.json'
+      - 'cli/src/commands/devx.rs'
+      - 'scripts/sync-federation-contract.py'
+      - '.github/workflows/federation-contract.yml'
+  pull_request:
+    paths:
+      - 'cli/federation-contract.json'
+      - 'cli/src/commands/devx.rs'
+      - 'scripts/sync-federation-contract.py'
+      - '.github/workflows/federation-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: federation-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: citrate-chain
+
+      # `ref: main` on purpose. The canonical artifact is whatever main says it
+      # is; comparing against a feature branch produces an answer that depends on
+      # what someone happened to have checked out, which is precisely how the
+      # staleness went unnoticed locally.
+      - name: Checkout canonical citrate-federation (sparse, main)
+        uses: actions/checkout@v4
+        with:
+          repository: CitrateNetwork/citrate-federation
+          ref: main
+          token: ${{ secrets.CITRATE_FEDERATION_READ_TOKEN }}
+          path: citrate-federation
+          sparse-checkout: |
+            contract
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Federation contract drift gate (blocking)
+        run: python3 scripts/sync-federation-contract.py --check
+        working-directory: citrate-chain
