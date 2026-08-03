@@ -1953,13 +1953,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // producer's tip. The applied tip is the last block we truly
                     // extended state with, so requesting ITS children is the gap
                     // we actually need. Genesis sentinel when nothing is applied.
-                    let start_from = storage_for_sync
+                    let (start_from, start_height) = storage_for_sync
                         .blocks
                         .get_applied_tip()
                         .ok()
                         .flatten()
-                        .map(|(hash, _height)| hash)
-                        .unwrap_or_else(|| citrate_consensus::types::Hash::new([0u8; 32]));
+                        .unwrap_or_else(|| (citrate_consensus::types::Hash::new([0u8; 32]), 0));
                     // Request next headers and blocks from our last known point only if not saturated
                     let (ph, pb) = sync_for_loop.pending_counts().await;
                     // #151: a request that FAILS TO SEND must count against this peer.
@@ -1989,7 +1988,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     if ph < 8 && sync_for_loop.request_headers(&peer, start_from).await.is_err() {
                         send_failed = true;
                     }
-                    if pb < 8 && sync_for_loop.request_blocks(&peer, start_from).await.is_err() {
+                    if pb < 8
+                        && sync_for_loop
+                            .request_blocks(&peer, start_from, start_height)
+                            .await
+                            .is_err()
+                    {
                         send_failed = true;
                     }
                     if send_failed {
@@ -2409,7 +2413,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                             );
                                         } else if let Some(peer) = pm_for_rx.get_peer(&pid) {
                                             if let Err(e) =
-                                                sync_for_rx.request_blocks(&peer, missing_parent).await
+                                                sync_for_rx
+                                                    .request_blocks(
+                                                        &peer,
+                                                        missing_parent,
+                                                        // The selected parent sits exactly one
+                                                        // height below the block that deferred.
+                                                        block.header.height.saturating_sub(1),
+                                                    )
+                                                    .await
                                             {
                                                 tracing::debug!(
                                                     "SYNC-S3: ancestry request to {} for {} failed: {}",
@@ -2588,6 +2600,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             let target = max_seen_for_rx
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             let gap = target.saturating_sub(applied_now);
+                            // #156: did our own applied tip pass the anchor we
+                            // asked from before this answer came back? If so the
+                            // duplicate is ours, not the peer's. Measured live:
+                            // rpc-1 serving a full 32/32 at 0.66s was scored
+                            // Barren 191 times and driven to the -8 floor for
+                            // answering exactly what we asked.
+                            let stale_anchor =
+                                sync_for_rx.last_block_anchor_height() < applied_now;
                             let mut sel = sync_peers_for_rx.lock().await;
                             let quality = sel.record_serve(
                                 &pid.0,
@@ -2595,6 +2615,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 highest_admitted,
                                 gap,
                                 32, // SyncConfig::block_batch_size
+                                stale_anchor,
                             );
                             // #155: INFO, not debug. This is the only external
                             // evidence of how the selector is scoring peers, and
@@ -2607,11 +2628,22 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             // and a misbehaving one is loud. That is the ratio we
                             // want in production, not the reverse.
                             if quality != sync_peer::ServeQuality::Material {
+                                // #156: anchor and applied tip printed WITH the
+                                // verdict. A duplicate whose anchor equals our
+                                // applied tip is a different defect from one
+                                // whose anchor is behind it — the first means
+                                // the server resolved our anchor to nothing
+                                // above it, the second means we asked a stale
+                                // question. Both look identical without these
+                                // two numbers, which is why six runs could not
+                                // separate them.
                                 tracing::info!(
-                                    "SYNCSCORE peer={} {:?} new={} gap={} score={}",
+                                    "SYNCSCORE peer={} {:?} new={} anchor={} applied={} gap={} score={}",
                                     &pid.0[..14.min(pid.0.len())],
                                     quality,
                                     newly_admitted,
+                                    sync_for_rx.last_block_anchor_height(),
+                                    applied_now,
                                     gap,
                                     sel.score(&pid.0)
                                 );
