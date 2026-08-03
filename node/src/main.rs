@@ -1996,20 +1996,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     {
                         send_failed = true;
                     }
-                    // #156 — the anchor-vs-tip pair, which is the one fact that
-                    // separates "the peer has nothing" from "we asked from
-                    // behind our own tip". Six failed cold-sync runs were spent
-                    // inferring this from block-range coincidences in the logs;
-                    // printed directly it is a five-minute read. Logged only
-                    // when they DISAGREE, so a healthy node stays silent.
-                    if sync_for_loop.last_block_anchor_height() < start_height {
-                        tracing::info!(
-                            "SYNCANCHOR anchor={} applied_tip={} behind_by={}",
-                            sync_for_loop.last_block_anchor_height(),
-                            start_height,
-                            start_height.saturating_sub(sync_for_loop.last_block_anchor_height())
-                        );
-                    }
                     if send_failed {
                         let pid = peer.info.read().await.id.clone();
                         let fails = {
@@ -2642,11 +2628,22 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             // and a misbehaving one is loud. That is the ratio we
                             // want in production, not the reverse.
                             if quality != sync_peer::ServeQuality::Material {
+                                // #156: anchor and applied tip printed WITH the
+                                // verdict. A duplicate whose anchor equals our
+                                // applied tip is a different defect from one
+                                // whose anchor is behind it — the first means
+                                // the server resolved our anchor to nothing
+                                // above it, the second means we asked a stale
+                                // question. Both look identical without these
+                                // two numbers, which is why six runs could not
+                                // separate them.
                                 tracing::info!(
-                                    "SYNCSCORE peer={} {:?} new={} gap={} score={}",
+                                    "SYNCSCORE peer={} {:?} new={} anchor={} applied={} gap={} score={}",
                                     &pid.0[..14.min(pid.0.len())],
                                     quality,
                                     newly_admitted,
+                                    sync_for_rx.last_block_anchor_height(),
+                                    applied_now,
                                     gap,
                                     sel.score(&pid.0)
                                 );
