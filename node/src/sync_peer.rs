@@ -183,6 +183,11 @@ pub enum ServeQuality {
     Trickle,
     /// Carried nothing we could admit.
     Barren,
+    /// Carried nothing we could admit, but WE asked the wrong question: the
+    /// anchor we sent had already been passed by our own applied tip before the
+    /// response came back. The peer answered exactly what it was asked. Scored
+    /// neutral — see `classify_serve` for why this cannot be folded into Barren.
+    Redundant,
 }
 
 /// Classify one response RELATIVE TO WHAT WE STILL NEED.
@@ -200,9 +205,46 @@ pub enum ServeQuality {
 /// are one behind is a complete answer; one block when we are 36,000 behind is a
 /// peer that cannot carry us. So the yardstick is the gap itself, capped by what
 /// a single response could physically hold.
-pub fn classify_serve(new_blocks: usize, gap: u64, batch_size: usize) -> ServeQuality {
+/// #156 — WHY AN EMPTY RESPONSE IS NOT ALWAYS THE PEER'S FAULT.
+///
+/// Measured on chain 40204, 2026-08-03, cold-syncing against rpc-1 as the SOLE
+/// peer. rpc-1 was healthy by every server-side measure: producing at the
+/// nominal 2s, answering 965 GetBlocks in 10 minutes at a FULL 32/32 fill, mean
+/// serve latency 0.66s — identical to the peers that were syncing fine. It was
+/// nonetheless scored `Barren` 191 times against 21 `Trickle`, driven to the
+/// -8 floor, because our node kept re-requesting an anchor its own applied tip
+/// had already passed: the same 32-block range imported 6-8 times per cycle,
+/// every duplicate landing as `new_blocks == 0`.
+///
+/// That is our defect being charged to the peer. With one peer it wasted ~7/8 of
+/// throughput; with four it flattened EVERY peer to -8, left nothing selectable,
+/// and collapsed the sync — the mechanism behind six failed tip runs whose
+/// collapse points (175k, 207k, 214k, 220k, 227k) drifted with threshold tuning
+/// that never touched the cause.
+///
+/// `stale_anchor` is the ONLY thing separating this from the #153 pathology, and
+/// the two are indistinguishable from response content alone. Both show
+/// `new_blocks == 0` with the peer's advertised head far above our tip:
+///   - #153: boot3 sat at OUR height with a gossip-inflated head, and served our
+///     own anchor group back 30 times. Anchor was CURRENT; the peer genuinely
+///     had nothing. Must stay Barren, or it is re-promoted and re-wedges us.
+///   - #156: rpc-1 had 293k blocks we needed and would have sent them had we
+///     asked from the right place. Anchor was BEHIND our applied tip.
+///
+/// So the discriminator is not what came back, it is whether the question was
+/// still valid when the answer arrived.
+pub fn classify_serve(
+    new_blocks: usize,
+    gap: u64,
+    batch_size: usize,
+    stale_anchor: bool,
+) -> ServeQuality {
     if new_blocks == 0 {
-        return ServeQuality::Barren;
+        return if stale_anchor {
+            ServeQuality::Redundant
+        } else {
+            ServeQuality::Barren
+        };
     }
     // The most a healthy peer could have sent us in one response.
     let attainable = (gap as usize).min(batch_size);
@@ -300,8 +342,9 @@ impl SyncPeerSelector {
         highest_height: u64,
         gap: u64,
         batch_size: usize,
+        stale_anchor: bool,
     ) -> ServeQuality {
-        let quality = classify_serve(new_blocks, gap, batch_size);
+        let quality = classify_serve(new_blocks, gap, batch_size, stale_anchor);
         let delta = match quality {
             // Answering with real content also clears the timeout penalty: it is
             // live AND useful (I3).
@@ -322,6 +365,15 @@ impl SyncPeerSelector {
             ServeQuality::Barren => {
                 self.failures.remove(id);
                 -2
+            }
+            // #156: the peer answered the question we asked; the question was
+            // stale. Liveness is proven (so the timeout penalty clears) but
+            // standing must not move — crediting it would let a genuinely
+            // useless peer launder duplicates into a positive score, and
+            // debiting it is what drove a healthy sole source to -8.
+            ServeQuality::Redundant => {
+                self.failures.remove(id);
+                0
             }
         };
         let e = self.score.entry(id.to_string()).or_insert(0);
@@ -577,7 +629,7 @@ mod tests {
         // axis now (`score`), so a live-but-useless peer sheds its timeouts and
         // still loses standing. Conflating the two is what let `record_success`
         // reward a peer that had served nothing.
-        sel.record_serve("rpc1", 32, 68_000, 13_491, 32);
+        sel.record_serve("rpc1", 32, 68_000, 13_491, 32, false);
         assert_eq!(sel.failures("rpc1"), 0);
         let peers = [cand("rpc1", 68091), cand("other", 68000)];
         assert_eq!(
@@ -615,16 +667,67 @@ mod tests {
     fn every_response_classifies_somewhere() {
         for gap in [0u64, 1, 5, 31, 32, 1_000, 36_000, 200_000] {
             for blocks in 0..=64usize {
-                let q = classify_serve(blocks, gap, 32);
+                let q = classify_serve(blocks, gap, 32, false);
                 // Total: the match is exhaustive by construction, but pin the
                 // boundary semantics that the dead bands violated.
                 match q {
                     ServeQuality::Barren => assert_eq!(blocks, 0,
                         "only an empty response is barren (gap={})", gap),
+                    // #156: unreachable on a CURRENT anchor — an empty response
+                    // is only excused when we asked from behind our own tip.
+                    ServeQuality::Redundant => panic!(
+                        "a current anchor must never classify Redundant (gap={}, blocks={})",
+                        gap, blocks
+                    ),
                     ServeQuality::Trickle | ServeQuality::Material => assert!(blocks > 0),
                 }
             }
         }
+    }
+
+    /// RED (#156) — a healthy peer answering a question our own applied tip has
+    /// already passed must NOT be penalized. Live shape: rpc-1 serving a full
+    /// 32/32 at 0.66s while we re-asked an anchor 31 blocks behind our tip; it
+    /// was scored Barren 191 times and driven to the -8 floor.
+    #[test]
+    fn a_duplicate_caused_by_our_own_stale_anchor_does_not_penalize_the_peer() {
+        assert_eq!(
+            classify_serve(0, 293_116, 32, true),
+            ServeQuality::Redundant,
+            "our stale anchor is not the peer's failure"
+        );
+        let mut sel = SyncPeerSelector::new();
+        // Six duplicate cycles — the measured per-stall count.
+        for _ in 0..6 {
+            sel.record_serve("noise_6ee5_rpc1", 0, 0, 293_116, 32, true);
+        }
+        assert_eq!(
+            sel.score("noise_6ee5_rpc1"),
+            0,
+            "a peer serving full batches must not drift toward the floor because \
+             WE asked from behind our own tip"
+        );
+    }
+
+    /// The #153 pathology must SURVIVE the #156 fix. A peer sitting at our own
+    /// height with a gossip-inflated head, serving our anchor group back, is
+    /// genuinely useless and must still be demoted — the anchor there is
+    /// CURRENT, so `stale_anchor` is false and the verdict stays Barren.
+    #[test]
+    fn a_peer_with_nothing_new_on_a_current_anchor_is_still_barren() {
+        assert_eq!(
+            classify_serve(0, 35_451, 32, false),
+            ServeQuality::Barren,
+            "#153 must not be laundered into Redundant"
+        );
+        let mut sel = SyncPeerSelector::new();
+        for _ in 0..6 {
+            sel.record_serve("noise_2b49_boot3", 0, 0, 35_451, 32, false);
+        }
+        assert!(
+            sel.score("noise_2b49_boot3") < 0,
+            "a peer that truly has nothing for us must still lose standing"
+        );
     }
 
     /// RED — the #154 dead band, at the exact shape that froze a node at 214,796
@@ -634,11 +737,11 @@ mod tests {
     /// down, so the peer could never be demoted.
     #[test]
     fn one_block_against_a_huge_gap_is_a_trickle() {
-        assert_eq!(classify_serve(1, 36_000, 32), ServeQuality::Trickle);
+        assert_eq!(classify_serve(1, 36_000, 32, false), ServeQuality::Trickle);
         // …and the whole former dead band 1-7 is now on the debit side.
         for blocks in 1..=7 {
             assert_eq!(
-                classify_serve(blocks, 36_000, 32),
+                classify_serve(blocks, 36_000, 32, false),
                 ServeQuality::Trickle,
                 "{} blocks against a 36k gap must count against the peer — this \
                  range was the dead band that froze the node",
@@ -652,11 +755,11 @@ mod tests {
     /// punished, or a healthy at-tip peer would be demoted for being caught up.
     #[test]
     fn a_small_response_near_the_tip_is_material() {
-        assert_eq!(classify_serve(1, 1, 32), ServeQuality::Material);
-        assert_eq!(classify_serve(2, 2, 32), ServeQuality::Material);
-        assert_eq!(classify_serve(1, 0, 32), ServeQuality::Material);
+        assert_eq!(classify_serve(1, 1, 32, false), ServeQuality::Material);
+        assert_eq!(classify_serve(2, 2, 32, false), ServeQuality::Material);
+        assert_eq!(classify_serve(1, 0, 32, false), ServeQuality::Material);
         // A full batch is material at any distance.
-        assert_eq!(classify_serve(32, 200_000, 32), ServeQuality::Material);
+        assert_eq!(classify_serve(32, 200_000, 32, false), ServeQuality::Material);
     }
 
     /// The live 40204 shape: every peer advertises the gossip-inflated tip, so
@@ -679,9 +782,9 @@ mod tests {
         );
 
         // boot3 trickles twice; rpc-1 serves a real batch once.
-        sel.record_serve("noise_2b49_boot3", 1, applied, 35_451, 32);
-        sel.record_serve("noise_2b49_boot3", 1, applied, 35_451, 32);
-        sel.record_serve("noise_6ee5_rpc1", 32, applied + 32, 35_451, 32);
+        sel.record_serve("noise_2b49_boot3", 1, applied, 35_451, 32, false);
+        sel.record_serve("noise_2b49_boot3", 1, applied, 35_451, 32, false);
+        sel.record_serve("noise_6ee5_rpc1", 32, applied + 32, 35_451, 32, false);
 
         assert_eq!(
             sel.select(&peers, applied).map(|c| c.id.as_str()),
@@ -700,8 +803,8 @@ mod tests {
         let peers = [cand("a", 9_000), cand("b", 9_000)];
         let mut sel = SyncPeerSelector::new();
         for _ in 0..50 {
-            sel.record_serve("a", 0, 0, 8_000, 32);
-            sel.record_serve("b", 0, 0, 8_000, 32);
+            sel.record_serve("a", 0, 0, 8_000, 32, false);
+            sel.record_serve("b", 0, 0, 8_000, 32, false);
             sel.record_timeout("a");
             sel.record_timeout("b");
         }
@@ -719,11 +822,11 @@ mod tests {
     fn a_bottomed_out_peer_recovers_in_bounded_time() {
         let mut sel = SyncPeerSelector::new();
         for _ in 0..100 {
-            sel.record_serve("recovering", 0, 0, 50_000, 32);
+            sel.record_serve("recovering", 0, 0, 50_000, 32, false);
         }
         assert_eq!(sel.score("recovering"), SCORE_MIN);
         for _ in 0..(SCORE_MAX - SCORE_MIN) {
-            sel.record_serve("recovering", 32, 99_999, 50_000, 32);
+            sel.record_serve("recovering", 32, 99_999, 50_000, 32, false);
         }
         assert_eq!(
             sel.score("recovering"),
