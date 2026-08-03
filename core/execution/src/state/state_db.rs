@@ -291,7 +291,7 @@ impl StateDB {
         *state_trie = Trie::new();
 
         let mut all = self.accounts.all_accounts();
-        all.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        all.sort_unstable_by_key(|a| a.0 .0);
 
         for (address, mut account) in all {
             // Fold this account's storage_root computed FRESH from its committed slot
@@ -339,7 +339,7 @@ impl StateDB {
     pub fn full_state_fingerprint(&self) -> Hash {
         use sha3::{Digest, Keccak256};
         let mut all = self.accounts.all_accounts();
-        all.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        all.sort_unstable_by_key(|a| a.0 .0);
         let mut h = Keccak256::new();
         for (address, mut account) in all {
             let slots: Vec<(Vec<u8>, Vec<u8>)> = match self.storage_tries.get(&address) {
@@ -373,7 +373,7 @@ impl StateDB {
     /// diff of two nodes' dumps at a wedge height NAMES the diverging account/slot-count.
     pub fn full_state_digest_lines(&self) -> Vec<String> {
         let mut all = self.accounts.all_accounts();
-        all.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        all.sort_unstable_by_key(|a| a.0 .0);
         all.into_iter()
             .map(|(address, mut account)| {
                 let nslots = match self.storage_tries.get(&address) {
