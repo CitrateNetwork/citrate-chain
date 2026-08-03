@@ -83,6 +83,17 @@ unmaintained = "all"
 # mirror the documented ignores in `audit.toml` / `cargo-audit.yml`
 # (cargo-deny reads its own ignore list, so it must be duplicated here).
 ignore = [
+    # ruint Uint shift flags (RUSTSEC-2026-0220) — verified NOT EXPLOITABLE here.
+    # The advisory affects overflowing/checked/strict/saturating shift FLAGS and
+    # wrapping_sh* shift-amount truncation; the SHIFTED VALUES were correct.
+    # citrate-chain calls none of those APIs (gated by
+    # scripts/ci/ruint_shift_advisory_premise_tripwire.sh), and revm's SHL/SHR/SAR
+    # clamp shift < 256 then use plain `<<`/`>>`/`arithmetic_shr`
+    # (revm-interpreter-6.0.0/src/instructions/bitwise.rs:83-118). The to_base_be
+    # DoS is no-alloc-only; we build std. Fix needs ruint>=1.20 -> proptest no_std
+    # -> proptest 1.11+ -> rand 0.9, blocked on the `proptest = "=1.5.0"` pin
+    # (BACKLOG #124); newest ruint under that pin is 1.11.0, still vulnerable.
+    "RUSTSEC-2026-0220",
     # ruint reciprocal_mg10 OOB — verified FALSE POSITIVE for this repo
     # (alloy-primitives normalizes the divisor before the call; no direct
     # ruint use). Closes when alloy bumps ruint. REM-14. See audit.toml.
