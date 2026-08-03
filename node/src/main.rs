@@ -1797,6 +1797,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // Round-robin index for rotating request peers when we are behind but no
             // peer qualified as "best" (forward-sync liveness fix).
             let mut rotate_idx: u64 = 0;
+            // #155: last peer we logged choosing, so SYNCPEER only fires on change.
+            let mut last_logged_choice: Option<String> = None;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
@@ -1863,6 +1865,45 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     let sel = sync_peers_for_loop.lock().await;
                     sel.select(&candidates, applied_height).map(|c| c.id.clone())
                 };
+                // #155: log WHICH PEER WE ARE PULLING FROM — but only when it
+                // CHANGES.
+                //
+                // Every sync bug this week came down to "we were asking the wrong
+                // peer", and answering that took SSH onto the fleet and grepping
+                // the SERVER's journal for our own peer id, because the node never
+                // said who it had chosen. That is the single most valuable line
+                // the sync driver can emit and it did not exist.
+                //
+                // Change-triggered, so volume is near zero on a converged node and
+                // rises exactly when selection is thrashing — which is the thing
+                // worth seeing. A per-tick log would be 30 lines/minute of noise
+                // that nobody reads, and the interesting event would be invisible
+                // inside it.
+                if chosen_id != last_logged_choice {
+                    match (&chosen_id, &last_logged_choice) {
+                        (Some(now), Some(before)) => tracing::info!(
+                            "SYNCPEER switched {} -> {} (applied={} candidates={})",
+                            &before[..14.min(before.len())],
+                            &now[..14.min(now.len())],
+                            applied_height,
+                            candidates.len()
+                        ),
+                        (Some(now), None) => tracing::info!(
+                            "SYNCPEER selected {} (applied={} candidates={})",
+                            &now[..14.min(now.len())],
+                            applied_height,
+                            candidates.len()
+                        ),
+                        (None, Some(before)) => tracing::info!(
+                            "SYNCPEER lost source (was {}, applied={} candidates={})",
+                            &before[..14.min(before.len())],
+                            applied_height,
+                            candidates.len()
+                        ),
+                        (None, None) => {}
+                    }
+                    last_logged_choice = chosen_id.clone();
+                }
                 let request_peer: Option<Arc<citrate_network::peer::Peer>> =
                     if let Some(id) = chosen_id {
                         connected_peers
@@ -2555,11 +2596,20 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 gap,
                                 32, // SyncConfig::block_batch_size
                             );
+                            // #155: INFO, not debug. This is the only external
+                            // evidence of how the selector is scoring peers, and
+                            // having it at `debug!` meant it never appeared under
+                            // the `RUST_LOG=info` every node actually runs — a
+                            // score-based model whose scores were unobservable.
+                            //
+                            // Rate is bounded by construction: only non-Material
+                            // responses log, so a healthy converged node is silent
+                            // and a misbehaving one is loud. That is the ratio we
+                            // want in production, not the reverse.
                             if quality != sync_peer::ServeQuality::Material {
-                                tracing::debug!(
-                                    "Sync peer {} served {:?}: {} new blocks against a gap of \
-                                     {} — score now {}",
-                                    pid.0,
+                                tracing::info!(
+                                    "SYNCSCORE peer={} {:?} new={} gap={} score={}",
+                                    &pid.0[..14.min(pid.0.len())],
                                     quality,
                                     newly_admitted,
                                     gap,
