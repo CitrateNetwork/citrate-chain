@@ -45,6 +45,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
+      # The RUSTSEC-2026-0220 ignore in deny.toml is justified by citrate-chain
+      # never calling an affected ruint shift API. Verify that premise BEFORE
+      # honouring the ignore, so the exception cannot outlive its own reasoning.
+      - name: RUSTSEC-2026-0220 ignore-premise tripwire (blocking)
+        run: scripts/ci/ruint_shift_advisory_premise_tripwire.sh
       - name: Run cargo-deny check
         # RM-B1 / WP-F3.1 (audit SUP-10): fail closed on
         # license / advisory / banned-dep violations.
