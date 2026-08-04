@@ -152,14 +152,30 @@ pub struct Executor {
 /// about state roots and fork. Changing it requires a coordinated fleet upgrade,
 /// not an edit — there is a pinning test attached.
 ///
-/// Chosen against a measured 2.000 s block time (43,200 blocks/day) with the
-/// chain at ~84,240 on 2026-07-29: ~5 days of headroom for the @rule8 audit of
-/// a money-path change, the amd64 build, and the four-node rollout.
+/// **0 since the 2026-08-04 re-roll.** The previous value (300_000) existed for
+/// exactly one reason: chain 40204 already had ~84k blocks of history executed
+/// under the buggy `LegacyDropInternal` rule, and those blocks must stay
+/// replayable, so the repair could only switch on at a future height. It was
+/// chosen for ~5 days of rollout headroom against that live chain.
 ///
-/// NOTE: this does NOT repair state already corrupted below the activation —
-/// `LiquidStakingPool` keeps its phantom `totalPooled` and `ValidatorRegistry`
-/// its 300-SALT shortfall. That repair is a separate, deferred decision.
-pub const VALUE_TRANSFER_ACTIVATION_HEIGHT: u64 = 300_000;
+/// The 2026-08-04 re-roll wiped that history. The chain now starts at genesis on
+/// this binary, so there is no legacy segment to remain bit-compatible with, and
+/// a non-zero activation would instead mean the NEW chain deliberately
+/// reproduces a known money bug for its first 300,000 blocks (~7 days at 2.000 s
+/// blocks) — silently discarding every contract-initiated value transfer. That
+/// blocks the money path outright: `DeployCoreMembership` refuses to deploy
+/// below the activation because `MemberBond.activate`'s
+/// `registerValidator{value: principal}` would register phantom stake.
+///
+/// Activating at genesis means one rule for the entire chain, which is also the
+/// simplest thing to replay: `value_semantics_at` returns `RevmAuthoritative`
+/// for every height, so a cold sync from block 0 can never straddle a semantics
+/// change.
+///
+/// The old note about not repairing already-corrupted state
+/// (`LiquidStakingPool`'s phantom `totalPooled`, `ValidatorRegistry`'s 300-SALT
+/// shortfall) is moot here: that state belonged to the wiped chain.
+pub const VALUE_TRANSFER_ACTIVATION_HEIGHT: u64 = 0;
 
 /// Devnet-only override for [`VALUE_TRANSFER_ACTIVATION_HEIGHT`], mirroring the
 /// MP-DEPTH pattern. Never set this on a node that talks to 40204.
