@@ -106,6 +106,28 @@ log "regenerating canonical contracts/addresses/40204.json …"
 ENV_TESTNET="$ENV_TESTNET" bash "${REPO_ROOT}/scripts/ops/emit-address-table.sh"
 
 # --- verify: every canonical address has code ------------------------
+#
+# The book contains contracts this script does NOT deploy. The quorum/BFR
+# governance set (AnchorRegistry, MeetingRegistry, GovernanceTemplateRegistry,
+# GovernanceProtocolFactory, PolicyBinding, CapabilityGrant, VoteAllowance,
+# Sortition) is deployed by post-reroll-quorum-restore.sh, which runs AFTER
+# this script because emit-address-table.sh above would otherwise overwrite the
+# entries it patches in. Verifying the whole book here therefore fails on a
+# clean re-roll for contracts that are merely not-deployed-YET — it failed the
+# 2026-08-04 ceremony twice, and the same shape lost time on 2026-07-26.
+#
+# REGENESIS_SKIP_BOOK_VERIFY=1 hands the whole-book check to the caller. The
+# orchestrator sets it and then runs the quorum restore, whose own final step
+# verifies EVERY booked address has code — so coverage is unchanged, only the
+# ordering is. Never set it for a standalone run.
+if [ "${REGENESIS_SKIP_BOOK_VERIFY:-0}" = "1" ]; then
+  log "SKIPPING the whole-book code verification (REGENESIS_SKIP_BOOK_VERIFY=1)."
+  log "  The caller owns it — post-reroll-quorum-restore.sh deploys the quorum/BFR"
+  log "  set and verifies every booked address afterwards. If nothing runs that,"
+  log "  this re-roll is UNVERIFIED."
+  log "✅ full stack deployed + canonical table regenerated (book verify deferred)."
+  exit 0
+fi
 log "verifying eth_getCode != 0x for every canonical contract …"
 TABLE="${CONTRACTS_DIR}/addresses/40204.json"
 FAIL=0

@@ -76,8 +76,29 @@ done
 # boot1 142.93.50.217    STAKER_2           boot
 # boot2 143.198.134.151  STAKER_3           boot
 # boot3 142.93.99.212    STAKER_4           boot
-RPC1_IP="142.93.58.145"
-BOOT_IPS=( "142.93.50.217" "143.198.134.151" "142.93.99.212" )
+# Public IPs are the DEFAULT but are not reliably reachable: SSH to them depends
+# on a DigitalOcean allowlist keyed to a home IP that changes on every DHCP
+# lease, which has broken fleet access twice (and blocked this very script on
+# 2026-08-04: "cannot SSH root@142.93.58.145"). The tailnet addresses are stable
+# and are what the fleet is actually administered over, so both are overridable:
+#
+#   RPC1_IP=100.91.61.65 \
+#   BOOT_IPS="100.84.255.11 100.102.135.73 100.87.229.125" \
+#     scripts/ops/fleet-surgical-wipe.sh --tag <tag> --confirm-wipe
+#
+# ORDER IS LOAD-BEARING: BOOT_IPS must stay boot1,boot2,boot3 so each node keeps
+# the coinbase/staker its node.toml already pins (boot1=STAKER_2, boot2=STAKER_3,
+# boot3=STAKER_4). Verified mapping 2026-08-04:
+#   rpc-1 142.93.58.145 = 100.91.61.65   · boot1 142.93.50.217   = 100.84.255.11
+#   boot2 143.198.134.151 = 100.102.135.73 · boot3 142.93.99.212 = 100.87.229.125
+RPC1_IP="${RPC1_IP:-142.93.58.145}"
+if [ -n "${BOOT_IPS:-}" ]; then
+    # shellcheck disable=SC2206  # deliberate word-split of the override list
+    BOOT_IPS=( ${BOOT_IPS} )
+else
+    BOOT_IPS=( "142.93.50.217" "143.198.134.151" "142.93.99.212" )
+fi
+[ "${#BOOT_IPS[@]}" -eq 3 ] || { echo "ERROR: BOOT_IPS must name exactly 3 bootnodes (got ${#BOOT_IPS[@]})" >&2; exit 1; }
 ALL_IPS=( "$RPC1_IP" "${BOOT_IPS[@]}" )
 
 DATA_DIR="/home/citrate/.citrate"
