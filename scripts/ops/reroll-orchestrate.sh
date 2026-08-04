@@ -13,7 +13,8 @@
 #   P1  fleet-surgical-wipe.sh --confirm-wipe        → G1 (genesis) + G2 (consensus)
 #   P2  DeployValidatorRegistry (CREATE2) + register 4 validators (--force)
 #                                                     → G7 (registry) + G5 (activeCount 4)
-#   P3  regenesis.sh --with-aa (44 core+feature+AA)  → G3 (all addrs have code)
+#   P3  regenesis.sh --with-aa (44 core+feature+AA)  → G3 (EntryPoint has code)
+#   P3B quorum/BFR set + book re-pin                 → G3B (EVERY booked addr has code)
 #   P4  post-reroll-membership.sh (SBT+vault+fund)   → G6 (membership + grant signer 200k)
 #   P5  fund-operational-roles.sh --broadcast        → operator gas floats
 #   P6  monitor to activation height 2000            → G8 (sr identical across activation)
@@ -72,7 +73,7 @@ DK="$(get_env DEPLOYER_PRIVATE_KEY)"
 DEPLOYER="$(get_env DEPLOYER_ADDRESS)"
 
 # phase-ordering helper: should we run phase $1 given --from?
-declare -a PHASES=(P0 P1 P2 P3 P4 P5 P6 P7 P8)
+declare -a PHASES=(P0 P1 P2 P3 P3B P4 P5 P6 P7 P8)
 idx() { local p="$1" i; for i in "${!PHASES[@]}"; do [ "${PHASES[$i]}" = "$p" ] && { echo "$i"; return; }; done; echo 99; }
 FROM_I="$(idx "$FROM")"
 should() { [ "$(idx "$1")" -ge "$FROM_I" ]; }
@@ -299,12 +300,38 @@ fi
 # ─────────────────────────── P3: CORE + FEATURE + AA ──────────────────────────
 if should P3; then
   log "── P3 regenesis.sh --with-aa (44 core+feature+AA) → G3 ───────────────────"
-  run bash -c "ENV_TESTNET='$ENV_TESTNET' bash '$OPS/regenesis.sh' --with-aa" \
+  # The whole-book code check is DEFERRED to P3B. regenesis.sh regenerates the
+  # book from its own broadcast artifacts, which do not include the quorum/BFR
+  # governance set — so verifying the whole book here fails on a clean re-roll
+  # for eight contracts that are simply not deployed yet. That killed this
+  # ceremony twice on 2026-08-04. P3B deploys them and verifies the FULL book,
+  # so nothing is lost; if P3B is skipped, the re-roll is unverified and says so.
+  run bash -c "ENV_TESTNET='$ENV_TESTNET' REGENESIS_SKIP_BOOK_VERIFY=1 bash '$OPS/regenesis.sh' --with-aa" \
     || gate_fail P3 "regenesis (core+feature+AA) failed"
   if [ "$CONFIRM" -eq 1 ]; then
     has_code "$EPOINT_EXPECT" || gate_fail P3 "G3: EntryPoint has no code at $EPOINT_EXPECT"
   fi
-  log "  G3 PASS: 44 core+feature+AA deployed address-neutral; EntryPoint has code."
+  log "  G3 PASS: 44 core+feature+AA deployed; EntryPoint has code (book verify → P3B)."
+fi
+
+# ───────────────── P3B: QUORUM / BFR GOVERNANCE SET + FULL-BOOK VERIFY ────────
+# Deploys the 14 DeployBfr* ceremonies, seeds the tenant root, deploys the
+# quorum set (AnchorRegistry, MeetingRegistry, GovernanceTemplateRegistry,
+# GovernanceProtocolFactory, PolicyBinding, CapabilityGrant, VoteAllowance,
+# Sortition), patches the book, and verifies EVERY booked address has code.
+#
+# Must run AFTER P3: emit-address-table.sh regenerates the book from broadcast
+# artifacts and would drop the entries this patches in.
+#
+# These addresses are CREATE (nonce-derived), so they MOVE on every re-roll —
+# which is why the book must be re-pinned in the same run. A stale book is more
+# dangerous after a redeploy than before it: consumers stop hitting empty
+# addresses (fail closed) and start hitting live code of the wrong type.
+if should P3B; then
+  log "── P3B quorum/BFR governance set → G3B (full-book code verify) ───────────"
+  run bash -c "bash '$OPS/post-reroll-quorum-restore.sh' --broadcast" \
+    || gate_fail P3B "quorum/BFR restore failed (it owns the whole-book verify)"
+  log "  G3B PASS: quorum/BFR deployed, book re-pinned, every booked address has code."
 fi
 
 # ─────────────────────────── P4: MEMBERSHIP MONEY PATH ────────────────────────
