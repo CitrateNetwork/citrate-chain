@@ -213,13 +213,13 @@ contract DeployValidatorRegistry is ScriptEnv {
         console.log("");
         console.log("=== FLEET ENV BLOCK (identical on ALL 4 nodes; a single drift forks) ===");
         console.log("CITRATE_BLOCK_V2=1");
-        console.log("CITRATE_VALIDATOR_ACTIVATION_HEIGHT=1000");
+        console.log("CITRATE_VALIDATOR_ACTIVATION_HEIGHT=2000");
         console.log("CITRATE_VALIDATOR_REGISTRY=", address(registry));
         console.log("");
         console.log("=== SEED TIMING (CRITICAL) ===");
         console.log("Run the registration ceremony (register 4 fleet validators)");
-        console.log("BEFORE snapshot S(1)=800 (~height 800). Validators not in the");
-        console.log("registry by S(1) are excluded from the epoch-1 active set and");
-        console.log("cannot propose at/after the 1000 activation height.");
+        console.log("BEFORE snapshot S(2)=1800. Validators not in the registry by");
+        console.log("S(2) are excluded from the active set for the epoch beginning");
+        console.log("at 2000 and cannot propose at/after the 2000 activation height.");
     }
 }
