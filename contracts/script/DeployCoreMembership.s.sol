@@ -54,7 +54,8 @@ import {ValidatorRegistry} from "../src/ValidatorRegistry.sol";
 /// explicit gas limit is mandatory, not optional.
 ///
 /// PRE-FLIGHT: this deployment is only safe once citrate-chain PR #140 is live
-/// and past VALUE_TRANSFER_ACTIVATION_HEIGHT (300,000). Below that height the
+/// and past VALUE_TRANSFER_ACTIVATION_HEIGHT (0 since the 2026-08-04 re-roll;
+/// was 300,000 on the pre-re-roll chain). Below that height the
 /// EVM silently discards contract-initiated value transfers, so
 /// `MemberBond.activate`'s `registerValidator{value: principal}` would register
 /// a validator whose bond does not exist — phantom stake in the consensus
@@ -71,7 +72,14 @@ contract DeployCoreMembership is Script {
 
     /// Height at which citrate-chain #140 makes contract-initiated value
     /// transfers real. Deploying below this would produce phantom bonds.
-    uint256 constant VALUE_TRANSFER_ACTIVATION_HEIGHT = 300_000;
+    ///
+    /// MUST track `citrate_execution::executor::VALUE_TRANSFER_ACTIVATION_HEIGHT`.
+    /// 0 since the 2026-08-04 re-roll: the re-roll wiped the legacy-semantics
+    /// history that forced a future activation, so the fresh chain applies
+    /// RevmAuthoritative from genesis and bonds are real immediately. Leaving
+    /// this at 300_000 would have blocked the money path for ~7 days on a chain
+    /// where the guard no longer protects anything.
+    uint256 constant VALUE_TRANSFER_ACTIVATION_HEIGHT = 0;
 
     function run() external {
         require(block.chainid == 40204, "refusing to deploy off chain 40204 (testnet-beta)");
