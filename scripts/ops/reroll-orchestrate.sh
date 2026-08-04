@@ -164,7 +164,21 @@ if should P2; then
   #   STAKER_1 = rpc-1, STAKER_2 = boot1, STAKER_3 = boot2, STAKER_4 = boot3.
   # A mismatch would register node N's coinbase against node M's proposer key —
   # every such validator would be admitted and then never able to sign a block.
-  FLEET_IPS=( "142.93.58.145" "142.93.50.217" "143.198.134.151" "142.93.99.212" )
+  # Overridable for the same reason as fleet-surgical-wipe.sh: public-IP SSH
+  # depends on a DO allowlist keyed to a home IP that changes on every DHCP
+  # lease, and blocked this ceremony on 2026-08-04. Set FLEET_IPS to the tailnet
+  # addresses to run over Tailscale instead:
+  #   FLEET_IPS="100.91.61.65 100.84.255.11 100.102.135.73 100.87.229.125"
+  # ORDER IS LOAD-BEARING and must match fleet-surgical-wipe.sh's ALL_IPS:
+  # rpc-1(STAKER_1), boot1(STAKER_2), boot2(STAKER_3), boot3(STAKER_4). G5b
+  # catches a crossed order, but only after keys have been fetched.
+  if [ -n "${FLEET_IPS:-}" ]; then
+    # shellcheck disable=SC2206  # deliberate word-split of the override list
+    FLEET_IPS=( ${FLEET_IPS} )
+  else
+    FLEET_IPS=( "142.93.58.145" "142.93.50.217" "143.198.134.151" "142.93.99.212" )
+  fi
+  [ "${#FLEET_IPS[@]}" -eq 4 ] || { err "FLEET_IPS must name exactly 4 nodes (got ${#FLEET_IPS[@]})"; exit 1; }
 
   PROPOSER_KEY_DIR="$(mktemp -d -t citrate-proposer-keys-XXXXXX)"
   chmod 700 "$PROPOSER_KEY_DIR"
