@@ -95,16 +95,41 @@ pub struct GhostDag {
 ///   MERGE_PARENT_MAX_DEPTH (100) < MIN_RETAIN_BLOCKS (1,000) <= retain window
 pub const MERGE_PARENT_MAX_DEPTH: u64 = 100;
 
-/// Height from which MP-DEPTH is enforced on chain 40204. Owner decision,
-/// 2026-07-29 (chain was at ~78,000, adding ~43,200/day — roughly a 12-hour
-/// upgrade window).
+/// Height from which MP-DEPTH is enforced on chain 40204.
+///
+/// **0 since the 2026-08-04 re-roll.** The previous value (100_000) existed
+/// only because chain 40204 already had ~78,000 blocks produced under the old
+/// rule, and re-judging history under a new validity rule forks just as surely
+/// as enforcing it early does — so the rule could only switch on at a future
+/// height (owner decision 2026-07-29, ~12-hour upgrade window).
+///
+/// The re-roll wiped that history, so there is nothing to stay compatible with
+/// and a non-zero activation is now actively dangerous. MP-DEPTH is what makes
+/// bounding the blue-set walk sound, and therefore what makes DAG pruning safe:
+/// the documented invariant is
+///
+///   MERGE_PARENT_MAX_DEPTH (100) < MIN_RETAIN_BLOCKS (1,000) <= retain window
+///
+/// so that no valid block can cite anything the pruner may have dropped. DAG
+/// pruning is now ENABLED fleet-wide (`CITRATE_DAG_PRUNE_RETAIN=10000`, added
+/// 2026-08-04 to stop the bootnodes OOM-looping). With enforcement deferred to
+/// 100_000 that invariant does not hold for the first ~100k blocks: a block
+/// could legally cite a merge parent deeper than the retained window, and a
+/// pruned node then rejects it `MissingParent` while an unpruned peer accepts
+/// it — a silent fork, exactly the shape verified live on 2026-07-29 by
+/// `dag_prune::merge_block_referencing_a_pruned_parent_is_rejected_not_scored`.
+/// The window is live from validator activation (2000), where multi-producer
+/// merges begin.
+///
+/// Enforcing from genesis closes it: one validity rule for the whole chain, and
+/// a cold sync from block 0 never straddles a rule change.
 ///
 /// **Baked into `GhostDag::new` rather than passed by each call site.** There are
 /// six `GhostDag::new` call sites across the node and producer; a validity rule
 /// that depends on every one of them remembering a builder method is a rule that
 /// will eventually be enforced by some nodes and not others, which is a fork. The
 /// default IS the consensus value, and disabling it takes an explicit call.
-pub const MERGE_DEPTH_ACTIVATION_HEIGHT: u64 = 100_000;
+pub const MERGE_DEPTH_ACTIVATION_HEIGHT: u64 = 0;
 
 /// Devnet-only override for [`MERGE_DEPTH_ACTIVATION_HEIGHT`].
 ///
@@ -2144,19 +2169,31 @@ mod tests {
     #[test]
     fn mp_depth_activation_height_is_the_agreed_consensus_value() {
         assert_eq!(
-            MERGE_DEPTH_ACTIVATION_HEIGHT, 100_000,
-            "owner decision 2026-07-29. Changing this changes which blocks are \
-             valid — it requires a coordinated fleet upgrade, not an edit"
+            MERGE_DEPTH_ACTIVATION_HEIGHT, 0,
+            "owner decision 2026-08-04. The re-roll wiped the ~78k blocks of \
+             old-rule history that forced a future activation, so the fresh \
+             chain enforces MP-DEPTH from genesis. Changing this changes which \
+             blocks are valid — it requires a coordinated fleet upgrade AND a \
+             re-roll, not an edit"
         );
         // A const block, so a violating edit fails to COMPILE rather than
         // failing a test somebody might not run. For a consensus constant that
-        // is the right strength: a node that would activate too early cannot be
-        // built at all.
+        // is the right strength.
+        //
+        // The bound is no longer "comfortably ahead of the chain height" (that
+        // guarded a deferred activation on a chain with history). The property
+        // that matters now is pruning safety: enforcement must cover EVERY
+        // height at which the pruner could already have dropped a citable
+        // block. `node::dag_prune::MIN_RETAIN_BLOCKS` (1,000) is the smallest
+        // retain window, and it lives in another crate, so the check here is
+        // the stronger and simpler one — activation at genesis leaves no
+        // unenforced prefix at all.
         const {
             assert!(
-                MERGE_DEPTH_ACTIVATION_HEIGHT > 78_000,
-                "activation must be comfortably ahead of the chain height at the \
-                 time it was chosen, or nodes activate before they can all be upgraded"
+                MERGE_DEPTH_ACTIVATION_HEIGHT == 0,
+                "MP-DEPTH must be enforced from genesis: any unenforced prefix \
+                 is a window where a valid block can cite a parent the pruner \
+                 may drop, and pruned/unpruned nodes then disagree about validity"
             )
         };
     }
@@ -2165,6 +2202,14 @@ mod tests {
     /// the chain were produced under the old rule and must stay valid forever —
     /// re-judging history under a new rule forks just as surely as enforcing it
     /// early does.
+    ///
+    /// The SHIPPED activation is 0 since the 2026-08-04 re-roll, so on this
+    /// chain there is no below-activation region at all. The gating mechanism
+    /// still has to work for any FUTURE deferred activation, so this test now
+    /// drives it explicitly with `with_merge_depth_activation_height` rather
+    /// than leaning on the default. Deleting it would drop the only coverage of
+    /// "do not re-judge history", which is the property that makes a staged
+    /// rollout possible at all.
     #[tokio::test]
     async fn mp_depth_is_not_enforced_below_the_activation_height() {
         fn h(i: u64) -> [u8; 32] {
@@ -2174,17 +2219,29 @@ mod tests {
         }
         const N: u64 = 300; // deeper than MERGE_PARENT_MAX_DEPTH
 
+        // A hypothetical FUTURE deferred activation, well above the fixture.
+        const DEFERRED_ACTIVATION: u64 = 100_000;
+
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
-        let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone())
+            .with_merge_depth_activation_height(DEFERRED_ACTIVATION);
         assert!(
             !ghostdag.merge_depth_enforced_at(N + 1),
             "height {} is below the activation height {} — the rule must not apply",
             N + 1,
-            MERGE_DEPTH_ACTIVATION_HEIGHT
+            DEFERRED_ACTIVATION
         );
         assert!(
-            ghostdag.merge_depth_enforced_at(MERGE_DEPTH_ACTIVATION_HEIGHT),
+            ghostdag.merge_depth_enforced_at(DEFERRED_ACTIVATION),
             "and it must apply from the activation height onward"
+        );
+        // The SHIPPED default leaves no unenforced prefix — that is the whole
+        // point of activating at genesis, and it is what pruning depends on.
+        let shipped = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+        assert!(
+            shipped.merge_depth_enforced_at(0),
+            "the shipped activation ({MERGE_DEPTH_ACTIVATION_HEIGHT}) must enforce \
+             from genesis, or the pruner can drop a block a valid block may cite"
         );
 
         let genesis = create_test_block_with_parents(h(0), Hash::default(), vec![], 0);
