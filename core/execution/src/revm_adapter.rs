@@ -1623,15 +1623,17 @@ mod tests {
     }
 
     /// The gate must flip on block height, at exactly the documented boundary.
+    ///
+    /// With activation at 0 (the 2026-08-04 re-roll) there is no block BELOW
+    /// activation, so the legacy arm is unreachable on this chain by
+    /// construction — asserting it here would only be asserting `0 - 1`. The
+    /// boundary that still matters is that activation is INCLUSIVE and that
+    /// genesis itself is already corrected; the legacy arm keeps its own
+    /// coverage below via the devnet override.
     #[test]
     fn test_value_semantics_activation_boundary() {
         use crate::executor::{value_semantics_at, VALUE_TRANSFER_ACTIVATION_HEIGHT};
 
-        assert_eq!(
-            value_semantics_at(VALUE_TRANSFER_ACTIVATION_HEIGHT - 1),
-            ValueSemantics::LegacyDropInternal,
-            "the block below activation still runs the old rule"
-        );
         assert_eq!(
             value_semantics_at(VALUE_TRANSFER_ACTIVATION_HEIGHT),
             ValueSemantics::RevmAuthoritative,
@@ -1639,10 +1641,17 @@ mod tests {
         );
         assert_eq!(
             value_semantics_at(0),
-            ValueSemantics::LegacyDropInternal,
-            "genesis replays under the old rule"
+            ValueSemantics::RevmAuthoritative,
+            "activation is 0 since the re-roll, so genesis is already corrected \
+             and a cold sync from block 0 never straddles a semantics change"
+        );
+        assert_eq!(
+            value_semantics_at(u64::MAX),
+            ValueSemantics::RevmAuthoritative,
+            "and every later height uses the same rule — one rule for the chain"
         );
     }
+
 
     /// The activation height is a consensus constant: every node must use the
     /// same one or they disagree about state roots. Pinned so a future edit is
@@ -1657,16 +1666,12 @@ mod tests {
         use crate::executor::VALUE_TRANSFER_ACTIVATION_HEIGHT;
 
         assert_eq!(
-            VALUE_TRANSFER_ACTIVATION_HEIGHT, 300_000,
-            "owner decision 2026-07-29, confirmed. Changing this changes which \
-             state roots are valid — it requires a coordinated fleet upgrade, \
-             not an edit"
-        );
-        assert!(
-            VALUE_TRANSFER_ACTIVATION_HEIGHT > 84_240,
-            "activation must be comfortably ahead of the chain height at the \
-             time it was chosen (~84,240 on 2026-07-29, 2.000 s blocks), or \
-             nodes activate before they can all be upgraded"
+            VALUE_TRANSFER_ACTIVATION_HEIGHT, 0,
+            "owner decision 2026-08-04, confirmed. The re-roll wiped the ~84k \
+             legacy-semantics blocks that forced a future activation, so the \
+             fresh chain runs one rule from genesis. Changing this changes \
+             which state roots are valid — it requires a coordinated fleet \
+             upgrade AND a re-roll, not an edit"
         );
     }
 
