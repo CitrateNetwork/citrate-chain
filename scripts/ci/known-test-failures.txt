@@ -1,0 +1,28 @@
+# Tests that are ALREADY failing on main, with the reason and who owns it.
+#
+# The local-ci `test-workspace` gate passes when the set of failing tests is a
+# SUBSET of this file, and fails the moment a test not listed here breaks. That
+# keeps the gate red for regressions you caused and green for debt you
+# inherited — the alternative (a gate that is red on every run for reasons the
+# author did not create) gets ignored within a week.
+#
+# Format: one test name per line. Comments and blank lines ignored.
+#
+# ADDING A LINE IS A DEBT, NOT A FIX. Each entry should be removed by fixing the
+# test, not left to accumulate. If this file grows, the gate is being worked
+# around rather than used.
+#
+# ── entries ─────────────────────────────────────────────────────────────────
+#
+# test_eth_get_block_reports_persisted_gas_and_receipt_fields
+#   crate: citrate-api (tests/integration_rpc.rs:190)
+#   fails: asserts the block's miner/coinbase field is
+#          0xabababab…abab but reads back 0x0000…0000.
+#   status: PRE-EXISTING on main. Confirmed 2026-08-04 by stashing all local
+#          changes and re-running on a clean tree — it fails identically, so it
+#          is not a regression from the re-roll or the consensus activation
+#          changes. Never caught earlier because org-wide GitHub Actions have
+#          been dead (startup_failure) since ~2026-07-18.
+#   owner: unassigned — a real coinbase-plumbing bug in the RPC layer, worth
+#          fixing rather than muting.
+test_eth_get_block_reports_persisted_gas_and_receipt_fields
