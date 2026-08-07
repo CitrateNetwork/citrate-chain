@@ -2393,10 +2393,12 @@ mod tests {
 
         // ── Node Q: an independent producer that seals a COMPETING block B @ 1 on
         //    the same (empty) genesis with a different coinbase and signing key.
-        //    Tip selection breaks an equal-blue-score tie by higher hash
-        //    (core/consensus/src/tip_selection.rs), so we search key/coinbase pairs
-        //    until hash(B) > hash(A) and P's fork-choice deterministically prefers
-        //    B. Without that the harness would not reproduce the live divergence.
+        //    Tip selection breaks an equal-blue-score tie by SMALLEST hash
+        //    (core/consensus/src/tip_selection.rs — the 2026-08-06 convergence fix
+        //    that aligned the producer's tie-break with the drain's), so we search
+        //    key/coinbase pairs until hash(B) < hash(A) and P's fork-choice
+        //    deterministically prefers B. Without that the harness would not
+        //    reproduce the live divergence.
         let mut block_b = None;
         for seed in 0x50u8..0x80u8 {
             let tmp_q = TempDir::new().expect("tempdir q");
@@ -2407,13 +2409,13 @@ mod tests {
                 .get_block(&b_hash)
                 .expect("read B")
                 .expect("B present");
-            if candidate.header.block_hash > block_a.header.block_hash {
+            if candidate.header.block_hash < block_a.header.block_hash {
                 block_b = Some(candidate);
                 break;
             }
         }
         let block_b = block_b.expect(
-            "harness: no competing block hashed above A within the search space — \
+            "harness: no competing block hashed below A within the search space — \
              widen the seed range",
         );
 

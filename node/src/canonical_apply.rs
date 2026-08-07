@@ -941,6 +941,138 @@ impl CanonicalApplicator {
         out.applied.len()
     }
 
+    /// STARTUP RECOVERY for the same-height-sibling wedge (2026-08-06; chain 40204
+    /// halted at 90,998 then 91,109). When a node RESTARTS with its persisted
+    /// applied tip on a NON-canonical sibling, it can never converge on its own:
+    /// `new` seeds the reorg ring with ONLY the tip's snapshot, so `reorg_to(head)`
+    /// walks the winning branch to the fork point (the tip's PARENT) and finds no
+    /// snapshot to revert to — every 1s `drive_drain` tick re-attempts and is
+    /// rejected. The tie-break fix (producer and drain agree on the winner) is
+    /// necessary but not sufficient: a node stranded on the LOSING sibling stays
+    /// wedged, and a plain restart re-seeds the same single-snapshot ring.
+    ///
+    /// This rebuilds deterministically from the node's OWN stored blocks (no
+    /// network / cold-sync): reset the executor to genesis, then re-apply the
+    /// canonical chain forward with the SAME `drain_forward` + fork-choice reorg
+    /// loop the live path uses. Applying forward repopulates the ring, so the reorg
+    /// at each historical fork finds its fork-point snapshot and converges — landing
+    /// on the fork-choice head. Only then is the durable store reconciled from the
+    /// pre-recovery (losing) state, so a crash mid-rebuild leaves the prior state
+    /// intact (the applied-tip pointer is only advanced by the forward apply/reorg,
+    /// and the final store reconcile is the last step).
+    ///
+    /// No-op (`Ok(false)`) when there is no fork choice attached or the applied tip
+    /// is already the head — so a normal restart pays nothing. `Ok(true)` when a
+    /// rebuild ran and reached the head. `genesis_state`/`genesis_hash` are the
+    /// world state and block hash at height 0, supplied by the caller (which owns
+    /// the genesis config); the executor is reset to exactly this before replay.
+    pub async fn recover_to_head(
+        &self,
+        genesis_state: StateSnapshot,
+        genesis_hash: Hash,
+    ) -> anyhow::Result<bool> {
+        let head = match &self.fork_choice {
+            Some(fc) => match fc().await {
+                Some(h) => h,
+                None => return Ok(false),
+            },
+            None => return Ok(false),
+        };
+        let mut state = self.lock.lock().await;
+        if state.tip.hash == head {
+            return Ok(false);
+        }
+        warn!(
+            "canonical recovery: applied tip {} @ {} is NOT the fork-choice head {} — \
+             rebuilding state from genesis (same-height-sibling wedge remediation)",
+            state.tip.hash, state.tip.height, head
+        );
+        // Capture the pre-recovery world state + applied pointer + ring so the whole
+        // operation is ATOMIC: it either fully converges on the head and commits, or
+        // it aborts leaving the node byte-identical to how it started. The store
+        // currently reflects `pre` (the losing applied tip).
+        let pre = self.executor.state_snapshot();
+        let pre_tip = state.tip;
+        let pre_snapshots = std::mem::take(&mut state.snapshots);
+
+        // Reset in-memory world state to genesis and VALIDATE it against the
+        // persisted genesis block BEFORE any durable write. A wrong reconstruction
+        // (chain-id / genesis-profile drift) would otherwise corrupt state; here it
+        // aborts having touched nothing durable (state_restore is in-memory only).
+        self.executor.state_restore(genesis_state.clone());
+        if let Ok(Some(g0)) = self.storage.blocks.get_block(&genesis_hash) {
+            let rebuilt_root = self.executor.calculate_state_root();
+            if rebuilt_root != g0.state_root {
+                self.executor.state_restore(pre);
+                state.snapshots = pre_snapshots;
+                warn!(
+                    "canonical recovery: reconstructed genesis root {} != persisted block-0 root {} — \
+                     aborting without changes (genesis config drift?)",
+                    rebuilt_root, g0.state_root
+                );
+                return Ok(false);
+            }
+        }
+        state.tip = AppliedTip { hash: genesis_hash, height: 0 };
+        state.snapshots = BTreeMap::new();
+        state.snapshots.insert(0, (genesis_hash, genesis_state));
+
+        // Re-apply the canonical chain forward. Each linear run drains; each fork
+        // defers to the fork-choice reorg, which now finds its fork-point snapshot
+        // in the freshly-rebuilt ring and converges toward the head. The tip height
+        // is monotone non-decreasing and bounded by the stored chain height, so the
+        // no-progress break always terminates.
+        loop {
+            let before = state.tip.hash;
+            self.drain_forward(&mut state).await;
+            if let Some(fc) = &self.fork_choice {
+                if let Some(best) = fc().await {
+                    if best != state.tip.hash {
+                        if let ReorgOutcome::Rejected(why) = self.reorg_to(&mut state, best).await {
+                            warn!("canonical recovery: reorg to {best} rejected: {why}");
+                        }
+                    }
+                }
+            }
+            if state.tip.hash == before {
+                break;
+            }
+        }
+
+        if state.tip.hash != head {
+            // Did not converge — exceptional after the genesis validation above (would
+            // require a corrupt/missing stored block). Roll the durable store BACK to
+            // the pre-recovery state via a reverse reconcile, restore the in-memory
+            // tip + ring, and abort so the node is exactly as it started.
+            let partial = self.executor.state_snapshot();
+            self.executor.state_restore(pre);
+            let _ = self.executor.reconcile_store_from(&partial);
+            state.tip = pre_tip;
+            state.snapshots = pre_snapshots;
+            self.publish_applied_height(&state);
+            warn!(
+                "canonical recovery: did not reach head {} (stopped at {} @ {}) — rolled back to prior state",
+                head, pre_tip.hash, pre_tip.height
+            );
+            return Ok(false);
+        }
+
+        // Converged. Make the durable store match the rebuilt canonical state (puts
+        // changed accounts, deletes losing-branch-only entries). Correct regardless
+        // of the per-block persists during replay: the target is current in-memory
+        // state and `pre` is exactly what the store reflected pre-recovery.
+        self.executor.reconcile_store_from(&pre)?;
+        if let Ok(Some(head_block)) = self.storage.blocks.get_block(&state.tip.hash) {
+            self.persist_applied(&state.tip.hash, state.tip.height, &head_block.state_root);
+        }
+        self.publish_applied_height(&state);
+        info!(
+            "canonical recovery: converged to fork-choice head {} @ {}",
+            state.tip.hash, state.tip.height
+        );
+        Ok(true)
+    }
+
     /// Whether `(hash, height)` is the applied block at that height on the current
     /// applied chain (i.e., it was applied — possibly via reorg — and retained).
     fn on_applied_chain(&self, state: &AppliedState, hash: Hash, height: u64) -> bool {
@@ -1765,6 +1897,110 @@ mod tests {
             app.applied_tip().await,
             AppliedTip { hash: a2.header.block_hash, height: 2 },
             "a DAG hole by itself does NOT freeze the applied tip"
+        );
+    }
+
+    /// SAME-HEIGHT-SIBLING WEDGE + RECOVERY (2026-08-06; chain 40204 halted at
+    /// 90,998 then 91,109). A node RESTARTED onto the LOSING sibling can never
+    /// converge on its own: `new` seeds the reorg ring with ONLY the tip snapshot,
+    /// so `reorg_to(winner)` walks the winning branch to the fork point (the tip's
+    /// PARENT) and finds no snapshot to revert to — rejected on every `drive_drain`
+    /// tick. `recover_to_head` rebuilds deterministically from the node's own stored
+    /// blocks (reset to genesis, re-apply the canonical chain forward, repopulating
+    /// the ring) and lands on the fork-choice winner.
+    #[tokio::test]
+    async fn recover_to_head_converges_a_restarted_node_off_the_losing_sibling() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+
+        let (exec, storage, _dir) = fresh();
+        // Genesis world state (empty) — what the executor is reset to before replay.
+        let genesis_state = exec.state_snapshot();
+
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+
+        let r = roots(2);
+        let a1 = mk_block(1, Hash::default(), r[0]);
+        // Two equal-score siblings at height 2 (reward-only state root, distinct VRF
+        // → distinct hash). GhostDag::select_tip breaks the tie by SMALLEST hash.
+        let s_a = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
+        let s_b = mk_block_scored(2, a1.header.block_hash, r[1], 1, [0x5B; 32]);
+        assert_ne!(s_a.header.block_hash, s_b.header.block_hash);
+        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+            (s_a, s_b)
+        } else {
+            (s_b, s_a)
+        };
+
+        // Apply a1 then the LOSER — WITHOUT fork choice, so no reorg fires and the
+        // node's persisted tip lands on the losing sibling (the stranded state a
+        // producer reaches when it seals/applies its own losing sibling). The
+        // applicator is created BEFORE any block is persisted so it seeds its tip at
+        // genesis, then advances incrementally as blocks are persisted + applied.
+        {
+            let app1 = CanonicalApplicator::new(exec.clone(), storage.clone());
+            persist(&storage, &a1);
+            assert!(matches!(app1.apply_received(&a1).await, ApplyOutcome::Applied { .. }));
+            persist(&storage, &loser);
+            assert!(matches!(app1.apply_received(&loser).await, ApplyOutcome::Applied { .. }));
+            assert_eq!(
+                app1.applied_tip().await,
+                AppliedTip { hash: loser.header.block_hash, height: 2 }
+            );
+        }
+
+        // Now expose BOTH siblings to the DAG/fork-choice and persist the winner to
+        // the chain store, so `select_tip` names the winner and recovery can re-apply
+        // it. (Done AFTER app1 so its tip stayed on the loser.)
+        for blk in [&a1, &winner, &loser] {
+            dag.store_block(blk.clone()).await.expect("into DAG");
+            ghostdag.add_block(blk).await.expect("admit");
+        }
+        persist(&storage, &winner);
+        assert_eq!(
+            ghostdag.select_tip().await.expect("select_tip"),
+            winner.header.block_hash,
+            "fork choice picks the smallest-hash sibling"
+        );
+
+        // SIMULATE RESTART: a fresh applicator seeds the ring from the persisted tip
+        // (the loser) with ONLY that snapshot — exactly the post-restart state.
+        let app2 = CanonicalApplicator::new(exec.clone(), storage.clone())
+            .with_fork_choice(ghostdag.clone());
+        assert_eq!(
+            app2.applied_tip().await,
+            AppliedTip { hash: loser.header.block_hash, height: 2 }
+        );
+
+        // BUG REPRODUCED: the periodic drain cannot converge — the reorg to the
+        // winner is rejected because the fork-point snapshot is absent from the
+        // freshly-seeded ring. Ticking (all the live node does) never heals it.
+        for _ in 0..5 {
+            app2.drive_drain().await;
+        }
+        assert_eq!(
+            app2.applied_tip().await,
+            AppliedTip { hash: loser.header.block_hash, height: 2 },
+            "restarted node is WEDGED on the losing sibling (drain can't reorg)"
+        );
+
+        // RECOVERY: rebuild from genesis via the stored blocks → converge to winner.
+        let recovered = app2
+            .recover_to_head(genesis_state, Hash::default())
+            .await
+            .expect("recovery");
+        assert!(recovered, "recovery reached the fork-choice head");
+        assert_eq!(
+            app2.applied_tip().await,
+            AppliedTip { hash: winner.header.block_hash, height: 2 },
+            "recovered node converged onto the canonical (smallest-hash) winner"
+        );
+        // It is now a normal, canonical tip: a further drain is a stable no-op.
+        app2.drive_drain().await;
+        assert_eq!(
+            app2.applied_tip().await,
+            AppliedTip { hash: winner.header.block_hash, height: 2 }
         );
     }
 
