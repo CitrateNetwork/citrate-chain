@@ -1057,12 +1057,17 @@ impl CanonicalApplicator {
                 None => break, // missing block — reach check below rolls back
             };
             let credits = self.reward_credits(&block);
+            // TRUSTED replay: skip the per-block full-trie root recompute (the ~O(N^2)
+            // wall that made a from-genesis rebuild take hours). Correctness is
+            // recovered by verifying the FINAL head root once, below.
             match self
                 .executor
-                .apply_block(&block, block.header.coinbase, &credits)
+                .apply_block_trusted(&block, block.header.coinbase, &credits)
                 .await
             {
                 Ok(_) => {
+                    // Record the block's CLAIMED root (trusted) in the ring; the ring
+                    // snapshot is the executor state, which is correct regardless.
                     let snap = self.executor.state_snapshot();
                     state.record(block.header.block_hash, block.header.height, snap);
                     self.persist_applied(
@@ -1082,11 +1087,25 @@ impl CanonicalApplicator {
             }
         }
 
-        if state.tip.hash != head {
+        // The trusted replay skipped per-block verification, so validate the ENTIRE
+        // rebuild with a SINGLE final root check: a wrong block anywhere in the spine
+        // yields a wrong final state root. Converged iff we reached the head AND its
+        // state root reproduces.
+        let head_root_ok = state.tip.hash == head
+            && self
+                .storage
+                .blocks
+                .get_block(&head)
+                .ok()
+                .flatten()
+                .map(|hb| self.executor.calculate_state_root() == hb.state_root)
+                .unwrap_or(false);
+        if !head_root_ok {
             // Did not converge — exceptional after the genesis validation above (would
-            // require a corrupt/missing stored block). Roll the durable store BACK to
-            // the pre-recovery state via a reverse reconcile, restore the in-memory
-            // tip + ring, and abort so the node is exactly as it started.
+            // require a corrupt/missing stored block or a divergent replay). Roll the
+            // durable store BACK to the pre-recovery state via a reverse reconcile,
+            // restore the in-memory tip + ring, and abort so the node is exactly as it
+            // started.
             let partial = self.executor.state_snapshot();
             self.executor.state_restore(pre);
             let _ = self.executor.reconcile_store_from(&partial);
