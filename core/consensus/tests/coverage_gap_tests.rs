@@ -312,8 +312,16 @@ async fn test_tip_selector_select_tip_multiple_with_stored_blocks() {
         SelectionStrategy::HighestBlueScoreWithTieBreak,
     );
 
+    // block2 is a real CHILD of block1, so GhostDAG computes it a strictly higher
+    // blue_score (select_tip recomputes score from DAG ancestry — it does NOT read
+    // the header field, so the winner must come from real structure, not an injected
+    // number). This keeps the test on the score path; the equal-score tie-break is
+    // covered separately by test_tip_selector_select_tip_same_score_tie_break_by_hash.
     let block1 = make_block(0x01, 0, 5, Hash::default());
-    let block2 = make_block(0x02, 0, 10, Hash::default());
+    // Height-1 child of block1: admission pins the canonical blue_score to
+    // parent.score + 1 = 6 (SECREM-01 score→work relation), which is strictly
+    // higher than block1's 5, so block2 wins on score.
+    let block2 = make_block(0x02, 1, 6, block1.hash());
 
     dag_store.store_block(block1.clone()).await.unwrap();
     dag_store.store_block(block2.clone()).await.unwrap();
@@ -324,7 +332,7 @@ async fn test_tip_selector_select_tip_multiple_with_stored_blocks() {
         .select_tip(&[block1.hash(), block2.hash()])
         .await
         .unwrap();
-    // block2 has higher blue_score, so should win
+    // block2 has the higher (ancestry-derived) blue_score, so it wins on score.
     assert_eq!(result, block2.hash());
 }
 
@@ -351,8 +359,12 @@ async fn test_tip_selector_select_tip_same_score_tie_break_by_hash() {
         .select_tip(&[block1.hash(), block2.hash()])
         .await
         .unwrap();
-    // With tie-break by hash, the higher hash (0x02) should win
-    assert_eq!(result, block2.hash());
+    // Ties break by SMALLEST hash — the one canonical order shared with
+    // `cmp_tip_for_parent_selection` (audit H-08) and `GhostDag::select_tip`. The
+    // producer's parent selection MUST agree with the drain's reorg fork-choice, or
+    // an equal-score sibling tie deadlocks the MP-S1 guard (the 2026-08-06 halt at
+    // height 90,998). The lower hash (0x01) wins regardless of insertion order.
+    assert_eq!(result, block1.hash());
 }
 
 #[tokio::test]

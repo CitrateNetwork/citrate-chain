@@ -101,7 +101,20 @@ impl TipSelector {
             // Try to get block from DAG store
             if let Ok(block) = self.dag_store.get_block(&hash).await {
                 if let Ok(score) = self.ghostdag.calculate_blue_score(&block).await {
-                    if score > best_score || (score == best_score && hash > best_tip) {
+                    // Ties MUST break by SMALLEST hash — the single canonical order
+                    // shared with `cmp_tip_for_parent_selection` (audit H-08) and
+                    // `GhostDag::select_tip` (the drain's reorg fork-choice). This
+                    // path (the producer's parent selection) previously used the
+                    // OPPOSITE order (`hash > best_tip`, largest-hash wins), so on an
+                    // equal-blue_score sibling tie the producer targeted one block
+                    // while the drain's fork-choice targeted the other: the producer
+                    // demanded a parent the drain would never reorg the applied tip
+                    // to, and every production round hit the MP-S1 parent/state guard.
+                    // That deadlocked chain 40204 at height 90,998 on 2026-08-06
+                    // (siblings 0x301d7d58 vs 0x32f48263, equal blueWork) — a ~4h
+                    // halt no restart could clear, because the disagreement is
+                    // deterministic. All three tie-breaks must stay identical.
+                    if score > best_score || (score == best_score && hash < best_tip) {
                         best_tip = hash;
                         best_score = score;
                     }
