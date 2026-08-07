@@ -1167,7 +1167,26 @@ impl Executor {
         coinbase: [u8; 20],
         reward_credits: &[(Address, U256)],
     ) -> Result<Hash, ExecutionError> {
-        self.apply_block_inner(block, coinbase, reward_credits, true)
+        self.apply_block_inner(block, coinbase, reward_credits, true, true)
+            .await
+    }
+
+    /// TRUSTED LOCAL REPLAY (canonical recovery): like [`Self::apply_block`]
+    /// (executes, settles rewards, persists + advances the applied tip), but SKIPS
+    /// the per-block state-root recompute. `calculate_state_root` rebuilds the whole
+    /// account trie from scratch every call (SRP purity), so verifying every block
+    /// while re-applying tens of thousands of already-validated local blocks is an
+    /// ~O(N^2) wall (hours). Execution reads account state from the resident map,
+    /// not the trie, so the state still advances correctly; the caller MUST verify
+    /// the FINAL head root once (a single wrong block yields a wrong final root).
+    /// Only ever used to re-apply blocks this node already validated + stored.
+    pub async fn apply_block_trusted(
+        &self,
+        block: &Block,
+        coinbase: [u8; 20],
+        reward_credits: &[(Address, U256)],
+    ) -> Result<Hash, ExecutionError> {
+        self.apply_block_inner(block, coinbase, reward_credits, true, false)
             .await
     }
 
@@ -1183,7 +1202,7 @@ impl Executor {
         coinbase: [u8; 20],
         reward_credits: &[(Address, U256)],
     ) -> Result<Hash, ExecutionError> {
-        self.apply_block_inner(block, coinbase, reward_credits, false)
+        self.apply_block_inner(block, coinbase, reward_credits, false, true)
             .await
     }
 
@@ -1193,6 +1212,7 @@ impl Executor {
         coinbase: [u8; 20],
         reward_credits: &[(Address, U256)],
         persist: bool,
+        verify_root: bool,
     ) -> Result<Hash, ExecutionError> {
         // Defer eager persistence for the whole apply (execution + reward
         // crediting + contract deploys): set_balance/set_code/set_nonce mutate
@@ -1252,15 +1272,24 @@ impl Executor {
             return Err(e);
         }
 
-        let got = self.calculate_state_root();
-        if got != block.state_root {
-            self.state_db.restore(snapshot);
-            self.set_block_context(prev_ctx);
-            return Err(ExecutionError::StateRootMismatch {
-                expected: block.state_root,
-                got,
-            });
-        }
+        let got = if verify_root {
+            let computed = self.calculate_state_root();
+            if computed != block.state_root {
+                self.state_db.restore(snapshot);
+                self.set_block_context(prev_ctx);
+                return Err(ExecutionError::StateRootMismatch {
+                    expected: block.state_root,
+                    got: computed,
+                });
+            }
+            computed
+        } else {
+            // Trusted local replay: skip the O(N) full-trie recompute. The account
+            // state is advanced correctly by execution + reward settlement above; the
+            // caller verifies the FINAL head root once. We return the block's claimed
+            // root unverified (trusted) so persistence records the right pointer.
+            block.state_root
+        };
 
         if !persist {
             return Ok(got);
