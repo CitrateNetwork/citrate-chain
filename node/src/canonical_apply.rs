@@ -1017,25 +1017,58 @@ impl CanonicalApplicator {
         state.snapshots = BTreeMap::new();
         state.snapshots.insert(0, (genesis_hash, genesis_state));
 
-        // Re-apply the canonical chain forward. Each linear run drains; each fork
-        // defers to the fork-choice reorg, which now finds its fork-point snapshot
-        // in the freshly-rebuilt ring and converges toward the head. The tip height
-        // is monotone non-decreasing and bounded by the stored chain height, so the
-        // no-progress break always terminates.
-        loop {
-            let before = state.tip.hash;
-            self.drain_forward(&mut state).await;
-            if let Some(fc) = &self.fork_choice {
-                if let Some(best) = fc().await {
-                    if best != state.tip.hash {
-                        if let ReorgOutcome::Rejected(why) = self.reorg_to(&mut state, best).await {
-                            warn!("canonical recovery: reorg to {best} rejected: {why}");
-                        }
-                    }
-                }
+        // Re-apply the CANONICAL SPINE forward. We follow the head's own
+        // selected-parent ancestry rather than draining the chain-store child index:
+        // a from-genesis replay via drain_forward would stop at the FIRST historical
+        // fork (there are many across 91k blocks) and then ask `reorg_to(head)` to
+        // bridge tens of thousands of blocks — far beyond MAX_REORG_DEPTH, so it is
+        // rejected ("no common applied ancestor"). The head's ancestry IS the
+        // canonical chain by definition, so walking it and applying each block
+        // reproduces canonical state with no reorg and no depth limit. `state.record`
+        // keeps the ring bounded to the last MAX_REORG_DEPTH heights, so the rebuilt
+        // ring ends populated across the recent window (future live reorgs work).
+        const MAX_RECOVERY_SPINE: usize = 20_000_000;
+        let mut spine: Vec<Hash> = Vec::new();
+        let mut cursor = head;
+        while let Some(block) = self.storage.blocks.get_block(&cursor).ok().flatten() {
+            if block.header.height == 0 {
+                break; // reached genesis (the reset base) — do not re-apply it
             }
-            if state.tip.hash == before {
+            spine.push(cursor);
+            cursor = block.selected_parent();
+            if spine.len() >= MAX_RECOVERY_SPINE {
                 break;
+            }
+        }
+        spine.reverse(); // ascending height: genesis+1 .. head
+        for h in &spine {
+            let block = match self.storage.blocks.get_block(h).ok().flatten() {
+                Some(b) => b,
+                None => break, // missing block — reach check below rolls back
+            };
+            let credits = self.reward_credits(&block);
+            match self
+                .executor
+                .apply_block(&block, block.header.coinbase, &credits)
+                .await
+            {
+                Ok(_) => {
+                    let snap = self.executor.state_snapshot();
+                    state.record(block.header.block_hash, block.header.height, snap);
+                    self.persist_applied(
+                        &block.header.block_hash,
+                        block.header.height,
+                        &block.state_root,
+                    );
+                    self.maybe_sync_registry(block.header.height).await;
+                }
+                Err(e) => {
+                    warn!(
+                        "canonical recovery: re-apply of {} @ {} failed: {} — aborting rebuild",
+                        block.header.block_hash, block.header.height, e
+                    );
+                    break;
+                }
             }
         }
 
