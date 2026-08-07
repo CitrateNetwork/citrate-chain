@@ -1649,48 +1649,55 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     .ok()
                     .flatten()
                     .unwrap_or_default();
-                // The DAG store hydrates its in-memory tips ASYNCHRONOUSLY after boot
-                // (the re-admission pass), so at this point fork-choice cannot yet see
-                // a competing sibling. Wait — off the hot path — until fork-choice
-                // reveals a head at/above our applied height that DIFFERS from our tip
-                // (an unresolved same-height sibling: exactly the wedge), then run the
-                // one-shot rebuild. Bail if the tip advances on its own (the drain
-                // converged), or after a bounded wait (a healthy node never diverges).
+                // The DAG store hydrates its in-memory tips ASYNCHRONOUSLY after boot,
+                // so fork-choice cannot see a competing sibling yet. WAIT until the DAG
+                // is FULLY hydrated (fork-choice head reaches the top stored height),
+                // then converge if we are not already on it. We deliberately do NOT
+                // bail when the applied tip merely advances: the live drain re-applies
+                // a low/wedged tip forward block-by-block, VERIFYING every state root
+                // (calculate_state_root rebuilds the whole trie each call — an ~O(N^2)
+                // crawl, hours for 90k blocks). The fast trusted rebuild converges in
+                // minutes, so we fire it even while the slow drain inches along. Retry
+                // a few times in case an early fork-choice view was still partial.
                 let ghostdag_rec = shared_ghostdag.clone();
+                let latest_stored = storage.blocks.get_latest_height().unwrap_or(0);
                 tokio::spawn(async move {
-                    let start = app.applied_tip().await;
-                    for _ in 0..180u32 {
+                    let mut aborted = 0u32;
+                    for _ in 0..600u32 {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        let cur = app.applied_tip().await;
-                        if cur.hash != start.hash {
-                            return; // advanced on its own — no recovery needed
-                        }
                         let head = match ghostdag_rec.select_tip().await {
                             Ok(h) => h,
                             Err(_) => continue,
                         };
-                        if head == cur.hash {
-                            continue; // fork-choice agrees with our tip (or DAG not loaded)
-                        }
-                        // Only act once the DAG has hydrated to at least our height, so
-                        // we never fire against a partially-loaded fork-choice view.
+                        // Fire only once fork-choice has hydrated to the top stored
+                        // height (both siblings of the wedge loaded), so we never
+                        // rebuild toward a partially-loaded head.
                         let head_h = ghostdag_rec.get_block_height(&head).await.unwrap_or(0);
-                        if head_h < cur.height {
+                        if head_h < latest_stored {
                             continue;
                         }
-                        match app.recover_to_head(genesis_snapshot, genesis_hash).await {
-                            Ok(true) => info!(
-                                "canonical recovery: rebuilt applied state to the fork-choice head"
-                            ),
-                            Ok(false) => warn!(
-                                "canonical recovery: no-op/aborted (already converged, or genesis mismatch)"
-                            ),
-                            Err(e) => warn!(
-                                "canonical recovery failed (continuing on persisted tip): {}",
-                                e
-                            ),
+                        let cur = app.applied_tip().await;
+                        if head == cur.hash {
+                            return; // already converged / healthy — nothing to do
                         }
-                        return;
+                        match app.recover_to_head(genesis_snapshot.clone(), genesis_hash).await {
+                            Ok(true) => {
+                                info!("canonical recovery: rebuilt applied state to the fork-choice head");
+                                return;
+                            }
+                            Ok(false) => {
+                                aborted += 1;
+                                if aborted >= 5 {
+                                    warn!("canonical recovery: gave up after {} aborted attempts", aborted);
+                                    return;
+                                }
+                                warn!("canonical recovery: attempt aborted — retrying");
+                            }
+                            Err(e) => {
+                                warn!("canonical recovery failed (continuing on persisted tip): {}", e);
+                                return;
+                            }
+                        }
                     }
                 });
             }
