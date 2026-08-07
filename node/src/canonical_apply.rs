@@ -995,15 +995,25 @@ impl CanonicalApplicator {
         let pre_tip = state.tip;
         let pre_snapshots = std::mem::take(&mut state.snapshots);
 
-        // Reset in-memory world state to genesis and VALIDATE it against the
-        // persisted genesis block BEFORE any durable write. A wrong reconstruction
-        // (chain-id / genesis-profile drift) would otherwise corrupt state; here it
-        // aborts having touched nothing durable (state_restore is in-memory only).
+        // Reset BOTH in-memory world state AND the durable store to genesis. The
+        // store must be reset too: it is a flat latest-state KV, and an account
+        // absent from the in-memory working set falls THROUGH to the store on read
+        // (REORG-STORE-FIX). Without resetting it, re-execution from "genesis" would
+        // read the LOSING tip's values for any account genesis doesn't hold, and the
+        // very first re-applied block's state root would diverge. `reconcile_store_
+        // from(&pre)` writes the diff pre(losing)->current(genesis) into the store, so
+        // every read-through now resolves to genesis.
         self.executor.state_restore(genesis_state.clone());
+        self.executor.reconcile_store_from(&pre)?;
+        // VALIDATE the reconstructed genesis against the persisted genesis block. A
+        // wrong reconstruction (chain-id / genesis-profile drift) aborts here; restore
+        // both memory and store to the pre-recovery state first.
         if let Ok(Some(g0)) = self.storage.blocks.get_block(&genesis_hash) {
             let rebuilt_root = self.executor.calculate_state_root();
             if rebuilt_root != g0.state_root {
+                let genesis_now = self.executor.state_snapshot();
                 self.executor.state_restore(pre);
+                let _ = self.executor.reconcile_store_from(&genesis_now);
                 state.snapshots = pre_snapshots;
                 warn!(
                     "canonical recovery: reconstructed genesis root {} != persisted block-0 root {} — \
@@ -1090,11 +1100,10 @@ impl CanonicalApplicator {
             return Ok(false);
         }
 
-        // Converged. Make the durable store match the rebuilt canonical state (puts
-        // changed accounts, deletes losing-branch-only entries). Correct regardless
-        // of the per-block persists during replay: the target is current in-memory
-        // state and `pre` is exactly what the store reflected pre-recovery.
-        self.executor.reconcile_store_from(&pre)?;
+        // Converged. The durable store already equals the canonical state: it was
+        // reset to genesis before replay, and each spine block's `apply_block`
+        // persisted its changes forward — so no losing-branch residue remains and no
+        // final reconcile is needed.
         if let Ok(Some(head_block)) = self.storage.blocks.get_block(&state.tip.hash) {
             self.persist_applied(&state.tip.hash, state.tip.height, &head_block.state_root);
         }
