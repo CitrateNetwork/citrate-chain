@@ -190,7 +190,7 @@ mod tip_tiebreak_tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_tip_tie_breaker_prefers_higher_hash() {
+    async fn test_tip_tie_breaker_prefers_smallest_hash() {
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = TipSelector::new(
@@ -212,8 +212,11 @@ mod tip_tiebreak_tests {
         assert_eq!(tips.len(), 2);
         let tip_hashes: Vec<Hash> = tips.iter().map(|t| t.hash).collect();
 
-        // Tie-breaker: choose lexicographically larger hash
-        let expected = if child_a.hash() > child_b.hash() {
+        // Tie-breaker: choose lexicographically SMALLEST hash — the one canonical
+        // order shared with cmp_tip_for_parent_selection (H-08) and
+        // GhostDag::select_tip. (Producer/drain disagreement here caused the
+        // 2026-08-06 height-90,998 halt.)
+        let expected = if child_a.hash() < child_b.hash() {
             child_a.hash()
         } else {
             child_b.hash()
@@ -228,7 +231,7 @@ mod parent_selection_tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_parent_selector_prefers_highest_hash_among_equal_scores() {
+    async fn test_parent_selector_prefers_smallest_hash_among_equal_scores() {
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
         let tip_selector = Arc::new(TipSelector::new(
@@ -543,12 +546,19 @@ mod tip_selection_tests {
         dag_store.store_block(child1.clone()).await.unwrap();
         dag_store.store_block(child2.clone()).await.unwrap();
 
-        // With equal scores, tie-breaker selects higher hash
+        // With equal scores, tie-breaker selects the SMALLEST hash (canonical H-08
+        // order, shared with the drain's GhostDag::select_tip — see the 2026-08-06
+        // height-90,998 halt).
         let tips = dag_store.get_tips().await;
         let tip_hashes: Vec<Hash> = tips.iter().map(|t| t.hash).collect();
 
+        let expected = if child1.hash() < child2.hash() {
+            child1.hash()
+        } else {
+            child2.hash()
+        };
         let selected = tip_selector.select_tip(&tip_hashes).await.unwrap();
-        assert_eq!(selected, child2.hash());
+        assert_eq!(selected, expected);
     }
 }
 
