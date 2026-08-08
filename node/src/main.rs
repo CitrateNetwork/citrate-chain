@@ -1595,6 +1595,114 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // `BlockAdmission` now (SYNC-S1 D2), not cloned into the handler
         // separately, so execute-on-receive cannot be skipped on an ingest
         // path that forgot to call it.
+        // SAME-HEIGHT-SIBLING WEDGE RECOVERY (2026-08-06; chain 40204 halted at
+        // 90,998 then 91,109). Before the periodic drain or the producer starts,
+        // converge a node whose persisted applied tip is a NON-canonical sibling. A
+        // plain restart cannot self-heal this — `CanonicalApplicator::new` seeds the
+        // reorg ring with only the tip's snapshot, so `reorg_to(head)` can never
+        // reach the fork point. `recover_to_head` rebuilds the executor from genesis
+        // and re-applies the canonical chain from the node's OWN stored blocks
+        // (repopulating the ring so the reorg at each fork converges). Atomic + a
+        // no-op on a healthy node (tip already == fork-choice head).
+        if let Some(app) = canonical_applicator.clone() {
+            // Reconstruct the genesis world-state deterministically via the same
+            // single-source init the node used at genesis, in a throwaway store.
+            let scratch_dir = std::env::temp_dir()
+                .join(format!("citrate-genesis-recovery-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&scratch_dir);
+            let genesis_snapshot = match StorageManager::new(&scratch_dir, PruningConfig::default()) {
+                Ok(scratch_storage) => {
+                    let scratch_storage = Arc::new(scratch_storage);
+                    let scratch_exec = Arc::new(Executor::with_storage(
+                        Arc::new(StateDB::new()),
+                        Some(scratch_storage.state.clone()),
+                    ));
+                    let gcfg = genesis::GenesisConfig {
+                        chain_id: config.chain.chain_id,
+                        ..Default::default()
+                    };
+                    match genesis::initialize_genesis_state_with_profile(
+                        scratch_storage.clone(),
+                        scratch_exec.clone(),
+                        &gcfg,
+                        config.chain.genesis_profile.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(_) => Some(scratch_exec.state_snapshot()),
+                        Err(e) => {
+                            warn!("canonical recovery: genesis reconstruction failed: {}", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("canonical recovery: scratch store open failed: {}", e);
+                    None
+                }
+            };
+            let _ = std::fs::remove_dir_all(&scratch_dir);
+            if let Some(genesis_snapshot) = genesis_snapshot {
+                let genesis_hash = storage
+                    .blocks
+                    .get_block_by_height(0)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                // The DAG store hydrates its in-memory tips ASYNCHRONOUSLY after boot,
+                // so fork-choice cannot see a competing sibling yet. WAIT until the DAG
+                // is FULLY hydrated (fork-choice head reaches the top stored height),
+                // then converge if we are not already on it. We deliberately do NOT
+                // bail when the applied tip merely advances: the live drain re-applies
+                // a low/wedged tip forward block-by-block, VERIFYING every state root
+                // (calculate_state_root rebuilds the whole trie each call — an ~O(N^2)
+                // crawl, hours for 90k blocks). The fast trusted rebuild converges in
+                // minutes, so we fire it even while the slow drain inches along. Retry
+                // a few times in case an early fork-choice view was still partial.
+                let ghostdag_rec = shared_ghostdag.clone();
+                let latest_stored = storage.blocks.get_latest_height().unwrap_or(0);
+                tokio::spawn(async move {
+                    let mut aborted = 0u32;
+                    for _ in 0..600u32 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        let head = match ghostdag_rec.select_tip().await {
+                            Ok(h) => h,
+                            Err(_) => continue,
+                        };
+                        // Fire only once fork-choice has hydrated to the top stored
+                        // height (both siblings of the wedge loaded), so we never
+                        // rebuild toward a partially-loaded head.
+                        let head_h = ghostdag_rec.get_block_height(&head).await.unwrap_or(0);
+                        if head_h < latest_stored {
+                            continue;
+                        }
+                        let cur = app.applied_tip().await;
+                        if head == cur.hash {
+                            return; // already converged / healthy — nothing to do
+                        }
+                        match app.recover_to_head(genesis_snapshot.clone(), genesis_hash).await {
+                            Ok(true) => {
+                                info!("canonical recovery: rebuilt applied state to the fork-choice head");
+                                return;
+                            }
+                            Ok(false) => {
+                                aborted += 1;
+                                if aborted >= 5 {
+                                    warn!("canonical recovery: gave up after {} aborted attempts", aborted);
+                                    return;
+                                }
+                                warn!("canonical recovery: attempt aborted — retrying");
+                            }
+                            Err(e) => {
+                                warn!("canonical recovery failed (continuing on persisted tip): {}", e);
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
         // EXECUTE-ON-RECEIVE (step 3): periodic forward-drain self-heal. The receive
         // path persists blocks before applying and only drives the drain for blocks it
         // hasn't already stored, so a node holding stored-but-unapplied blocks ahead of
