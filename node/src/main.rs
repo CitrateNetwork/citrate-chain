@@ -1,18 +1,21 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
 use citrate_api::{EthSubscriptionServer, RpcConfig, RpcServer};
 use citrate_consensus::crypto;
+use citrate_economics::{StakeholderType, UnifiedEconomicsConfig, UnifiedEconomicsManager};
 use citrate_execution::{Executor, StateDB};
-use citrate_economics::{UnifiedEconomicsManager, UnifiedEconomicsConfig, StakeholderType};
 use citrate_network::peer::PeerId;
 use citrate_network::peer::{PeerManager, PeerManagerConfig};
-use citrate_network::{NetworkTransport, GossipProtocol, GossipConfig, Discovery, DiscoveryConfig, SyncManager, SyncConfig};
+use citrate_network::{
+    Discovery, DiscoveryConfig, GossipConfig, GossipProtocol, NetworkTransport, SyncConfig,
+    SyncManager,
+};
 use citrate_sequencer::mempool::{Mempool, MempoolConfig};
-use citrate_storage::{pruning::PruningConfig, StorageConfig, StorageManager};
 use citrate_storage::crypto::at_rest::EncryptionAtRestConfig;
+use citrate_storage::{pruning::PruningConfig, StorageConfig, StorageManager};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -26,6 +29,7 @@ mod canonical_apply;
 mod commands;
 mod config;
 mod consensus_manifest;
+mod contribution_recorder;
 mod dag_prune;
 mod genesis;
 mod inference;
@@ -37,14 +41,13 @@ mod network_inference;
 mod persistent_dag;
 mod producer;
 mod registry_sync;
-mod contribution_recorder;
 mod sync;
 mod sync_peer;
 
-use config::NodeConfig;
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::types::GhostDagParams;
+use config::NodeConfig;
 use genesis::{initialize_genesis_state, initialize_genesis_state_with_profile, GenesisConfig};
 use producer::BlockProducer;
 
@@ -94,10 +97,18 @@ fn first_run_select_config(network_flag: Option<&str>) -> anyhow::Result<NodeCon
         match config.save(&path) {
             Ok(()) => tracing::info!(
                 "First-run setup: wrote {} config to {}",
-                if join_testnet { "testnet" } else { "local devnet" },
+                if join_testnet {
+                    "testnet"
+                } else {
+                    "local devnet"
+                },
                 path.display()
             ),
-            Err(e) => tracing::warn!("Could not persist first-run config to {}: {}", path.display(), e),
+            Err(e) => tracing::warn!(
+                "Could not persist first-run config to {}: {}",
+                path.display(),
+                e
+            ),
         }
     }
     Ok(config)
@@ -117,7 +128,10 @@ fn prompt_join_testnet() -> bool {
     if std::io::stdin().read_line(&mut line).is_err() {
         return true; // default to testnet on read error
     }
-    !matches!(line.trim().to_ascii_lowercase().as_str(), "l" | "local" | "devnet")
+    !matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "l" | "local" | "devnet"
+    )
 }
 
 #[derive(Parser)]
@@ -303,7 +317,10 @@ enum ModelCommands {
 async fn main() -> Result<()> {
     // Initialize structured logging
     // Uses LOG_FORMAT env var (json, pretty, compact) and RUST_LOG for levels
-    let log_config = if std::env::var("LOG_FORMAT").map(|f| f == "json").unwrap_or(false) {
+    let log_config = if std::env::var("LOG_FORMAT")
+        .map(|f| f == "json")
+        .unwrap_or(false)
+    {
         logging::LogConfig::production()
     } else {
         logging::LogConfig::from_env()
@@ -331,7 +348,8 @@ async fn main() -> Result<()> {
                 cli.data_dir.clone(),
                 cli.p2p_addr.clone(),
                 cli.rpc_addr.clone(),
-            ).await?;
+            )
+            .await?;
             return Ok(());
         }
         Some(Commands::Keygen { ed25519 }) => {
@@ -355,7 +373,12 @@ async fn main() -> Result<()> {
             show_genesis_info()?;
             return Ok(());
         }
-        Some(Commands::Wallet { keystore, rpc, wallet_chain_id, command }) => {
+        Some(Commands::Wallet {
+            keystore,
+            rpc,
+            wallet_chain_id,
+            command,
+        }) => {
             commands::wallet::execute(command, keystore, rpc, wallet_chain_id).await?;
             return Ok(());
         }
@@ -518,7 +541,9 @@ async fn main() -> Result<()> {
         },
     )?);
 
-    let has_genesis = probe_storage.blocks.get_block_by_height(0)
+    let has_genesis = probe_storage
+        .blocks
+        .get_block_by_height(0)
         .ok()
         .flatten()
         .and_then(|hash| probe_storage.blocks.get_block(&hash).ok().flatten())
@@ -544,19 +569,26 @@ async fn main() -> Result<()> {
             executor,
             &genesis_config,
             genesis_profile,
-        ).await?;
-        info!("Genesis state initialized for chain ID {}", config.chain.chain_id);
+        )
+        .await?;
+        info!(
+            "Genesis state initialized for chain ID {}",
+            config.chain.chain_id
+        );
     } else {
         // WP-K.6: Verify state root consistency before proceeding.
         // If persisted state diverges from genesis, the node would run with corrupted state.
         info!("Genesis block found in storage, verifying state root...");
-        let genesis_block = probe_storage.blocks.get_block_by_height(0)
+        let genesis_block = probe_storage
+            .blocks
+            .get_block_by_height(0)
             .ok()
             .flatten()
             .and_then(|hash| probe_storage.blocks.get_block(&hash).ok().flatten())
             .ok_or_else(|| anyhow::anyhow!("Genesis block must exist (checked above)"))?;
 
-        let persisted_root = probe_storage.state
+        let persisted_root = probe_storage
+            .state
             .get_state_root(&genesis_block.header.block_hash)
             .ok()
             .flatten();
@@ -596,8 +628,13 @@ async fn main() -> Result<()> {
 async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>) -> Result<()> {
     use model_manager::{ModelManager, ModelManagerConfig};
 
-    let models_dir = data_dir.clone()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".citrate"))
+    let models_dir = data_dir
+        .clone()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".citrate")
+        })
         .join("models");
 
     let config = ModelManagerConfig {
@@ -605,7 +642,8 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
         ..Default::default()
     };
 
-    let manager = ModelManager::new(config).await
+    let manager = ModelManager::new(config)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to create model manager: {}", e))?;
 
     match command {
@@ -660,11 +698,14 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
 
             // Create a RequiredModel entry for the manual pin (unknown size, no hash verification)
             let model = citrate_consensus::types::RequiredModel::new(
-                citrate_consensus::types::ModelId(format!("manual-pin-{}", &cid[..8.min(cid.len())])),
+                citrate_consensus::types::ModelId(format!(
+                    "manual-pin-{}",
+                    &cid[..8.min(cid.len())]
+                )),
                 cid.clone(),
                 citrate_consensus::types::Hash::new([0u8; 32]), // skip hash verification
-                0, // unknown size
-                0, // no slash penalty
+                0,                                              // unknown size
+                0,                                              // no slash penalty
             );
 
             match manager.download_and_pin_model(&model).await {
@@ -678,15 +719,21 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
 
         ModelCommands::Unpin { cid } => {
             info!("Unpinning model: {}", cid);
-            manager.unpin_model(&cid).await
+            manager
+                .unpin_model(&cid)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to unpin model: {}", e))?;
             println!("Successfully unpinned model {}", cid);
         }
 
-        ModelCommands::AutoPin { data_dir: cmd_data_dir } => {
-            let _data_dir = cmd_data_dir
-                .or(data_dir)
-                .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".citrate"));
+        ModelCommands::AutoPin {
+            data_dir: cmd_data_dir,
+        } => {
+            let _data_dir = cmd_data_dir.or(data_dir).unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".citrate")
+            });
 
             info!("Initializing genesis to get required models...");
 
@@ -706,7 +753,8 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
 
             println!("\nRequired Models from Genesis:");
             for model in &genesis_block.required_pins {
-                println!("  - {} (CID: {}, Size: {} MB)",
+                println!(
+                    "  - {} (CID: {}, Size: {} MB)",
                     model.model_id.0,
                     model.ipfs_cid,
                     model.size_bytes / 1_000_000
@@ -724,11 +772,19 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
 
             println!("IPFS daemon is running ✓\n");
             println!("Starting automatic model pinning...");
-            println!("This may take a while for large models (up to {} MB total)\n",
-                genesis_block.required_pins.iter().map(|m| m.size_bytes).sum::<u64>() / 1_000_000
+            println!(
+                "This may take a while for large models (up to {} MB total)\n",
+                genesis_block
+                    .required_pins
+                    .iter()
+                    .map(|m| m.size_bytes)
+                    .sum::<u64>()
+                    / 1_000_000
             );
 
-            manager.auto_pin_required_models(&genesis_block.required_pins).await
+            manager
+                .auto_pin_required_models(&genesis_block.required_pins)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to auto-pin models: {}", e))?;
 
             println!("\n✓ All required models have been pinned successfully!");
@@ -808,7 +864,9 @@ async fn run_devnet(
             PruningConfig::default(),
         )?);
 
-        let has_genesis = storage.blocks.get_block_by_height(0)
+        let has_genesis = storage
+            .blocks
+            .get_block_by_height(0)
             .ok()
             .flatten()
             .and_then(|hash| storage.blocks.get_block(&hash).ok().flatten())
@@ -900,7 +958,10 @@ fn show_genesis_info() -> Result<()> {
     println!("  Height: {}", genesis.header.height);
     println!("  Timestamp: {}", genesis.header.timestamp);
     println!("  Chain ID: {}", genesis_config.chain_id);
-    println!("  Block Hash: {}", hex::encode(genesis.header.block_hash.as_bytes()));
+    println!(
+        "  Block Hash: {}",
+        hex::encode(genesis.header.block_hash.as_bytes())
+    );
     println!();
 
     // Embedded models
@@ -913,12 +974,18 @@ fn show_genesis_info() -> Result<()> {
         println!("  - Model ID: {}", model.model_id);
         println!("    Type: {:?}", model.model_type);
         println!("    Size: {:.2} MB ({} bytes)", size_mb, size_bytes);
-        println!("    Metadata: {} v{}", model.metadata.name, model.metadata.version);
+        println!(
+            "    Metadata: {} v{}",
+            model.metadata.name, model.metadata.version
+        );
         println!();
     }
 
     let total_embedded_mb = total_embedded_size as f64 / (1024.0 * 1024.0);
-    println!("Total Embedded Size: {:.2} MB ({} bytes)", total_embedded_mb, total_embedded_size);
+    println!(
+        "Total Embedded Size: {:.2} MB ({} bytes)",
+        total_embedded_mb, total_embedded_size
+    );
     println!();
 
     // Required pins (IPFS models)
@@ -945,7 +1012,11 @@ fn show_genesis_info() -> Result<()> {
     println!("Summary:");
     println!("  Embedded in genesis: {:.2} MB", total_embedded_mb);
     println!("  Required to pin: {:.2} GB", total_ipfs_gb);
-    println!("  Total AI models: {} embedded + {} IPFS", genesis.embedded_models.len(), genesis.required_pins.len());
+    println!(
+        "  Total AI models: {} embedded + {} IPFS",
+        genesis.embedded_models.len(),
+        genesis.required_pins.len()
+    );
     println!("=========================================");
 
     Ok(())
@@ -1008,8 +1079,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Data directory: {:?}", config.storage.data_dir);
 
     // Initialize metrics server
-    let metrics_addr = std::env::var("CITRATE_METRICS_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9090".to_string());
+    let metrics_addr =
+        std::env::var("CITRATE_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
     if let Err(e) = metrics::init_metrics(&metrics_addr) {
         warn!("Failed to initialize metrics server: {}", e);
     } else {
@@ -1050,15 +1121,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
 
     // Create state DB and executor with persistent storage
     let state_db = Arc::new(StateDB::new());
-    let state_manager = Arc::new(citrate_storage::state_manager::StateManager::new(storage.db.clone()));
+    let state_manager = Arc::new(citrate_storage::state_manager::StateManager::new(
+        storage.db.clone(),
+    ));
 
     // Load existing state from storage into memory
     info!("Loading state from storage...");
     match storage.state.get_all_accounts() {
         Ok(accounts) => {
-            info!("Found {} accounts in storage, loading into memory...", accounts.len());
+            info!(
+                "Found {} accounts in storage, loading into memory...",
+                accounts.len()
+            );
             for (address, account) in accounts {
-                debug!("Loaded account: 0x{} with balance {}", hex::encode(address.0), account.balance);
+                debug!(
+                    "Loaded account: 0x{} with balance {}",
+                    hex::encode(address.0),
+                    account.balance
+                );
                 state_db.accounts.load_account(address, account);
             }
             info!("State loaded successfully");
@@ -1071,9 +1151,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // C6 fix: Also load contract storage slots from persistent storage
     match storage.state.get_all_storage() {
         Ok(storage_slots) => {
-            info!("Found {} storage slots in storage, loading into memory...", storage_slots.len());
+            info!(
+                "Found {} storage slots in storage, loading into memory...",
+                storage_slots.len()
+            );
             for ((address, storage_key), storage_value) in storage_slots {
-                state_db.set_storage(address, storage_key.as_bytes().to_vec(), storage_value.as_bytes().to_vec());
+                state_db.set_storage(
+                    address,
+                    storage_key.as_bytes().to_vec(),
+                    storage_value.as_bytes().to_vec(),
+                );
             }
             // Clear dirty flags since these are loaded from storage, not new writes
             let _ = state_db.take_dirty_storage();
@@ -1152,7 +1239,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     }
                 }
                 _ => {
-                    debug!("No committed state root for applied tip height {} — skipping verification", tip_height);
+                    debug!(
+                        "No committed state root for applied tip height {} — skipping verification",
+                        tip_height
+                    );
                 }
             }
         }
@@ -1285,7 +1375,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     if mempool_max_per_sender != 100 || mempool_max_size != 10000 {
         tracing::info!(
             "Mempool overrides active: max_size={} max_per_sender={}",
-            mempool_max_size, mempool_max_per_sender
+            mempool_max_size,
+            mempool_max_per_sender
         );
     }
     let mempool = Arc::new(Mempool::new(MempoolConfig {
@@ -1320,7 +1411,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let addr: std::net::SocketAddr = match addr_str.parse() {
             Ok(a) => a,
             Err(e) => {
-                tracing::error!("Invalid CITRATE_METRICS_ADDR '{}': {}, skipping metrics server", addr_str, e);
+                tracing::error!(
+                    "Invalid CITRATE_METRICS_ADDR '{}': {}, skipping metrics server",
+                    addr_str,
+                    e
+                );
                 {
                     // Infallible for a valid hardcoded literal
                     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -1377,7 +1472,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             return Err(anyhow::anyhow!(
                 "CITRATE_VALIDATOR_ACTIVATION_HEIGHT {} is below the first snapshot S(1)={}; \
                  §R' vesting cannot be enforced before an epoch policy exists",
-                activation, s1
+                activation,
+                s1
             ));
         }
         // §R' hard-reject: teach the executor the activation height INDEPENDENTLY of the
@@ -1387,9 +1483,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     }
     // The shared proposer selector — the SAME Arc the DAG store admits against and the
     // snapshot-sync rebuilds. production() disables the forgeable legacy VRF path.
-    let validator_selector: Option<Arc<citrate_consensus::vrf::VrfProposerSelector>> = validator_registry
-        .as_ref()
-        .map(|_| Arc::new(citrate_consensus::vrf::VrfProposerSelector::production()));
+    let validator_selector: Option<Arc<citrate_consensus::vrf::VrfProposerSelector>> =
+        validator_registry
+            .as_ref()
+            .map(|_| Arc::new(citrate_consensus::vrf::VrfProposerSelector::production()));
 
     let shared_dag_store = {
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
@@ -1415,14 +1512,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // PIL-42's genesis DAG seed moved into `BlockAdmission::seed_genesis` (see
     // SYNC-S1 D2 below) so that every chain-store/DAG-store consistency concern
     // lives in one module under one set of rules.
-    let shared_ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), shared_dag_store.clone()));
+    let shared_ghostdag = Arc::new(GhostDag::new(
+        GhostDagParams::default(),
+        shared_dag_store.clone(),
+    ));
 
     // WP-W.1: Create CheckpointManager for BFT finality vote handling
     let checkpoint_manager = {
         use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager};
         let cp_config = CheckpointConfig::default();
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
-        Arc::new(CheckpointManager::with_persistence(cp_config, shared_dag_store.clone(), kv))
+        Arc::new(CheckpointManager::with_persistence(
+            cp_config,
+            shared_dag_store.clone(),
+            kv,
+        ))
     };
 
     // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Active under v2 headers
@@ -1449,7 +1553,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // VALIDATOR-S1 (step 5): attach the registry snapshot-sync so a node
             // that RECEIVES or REORGS to a snapshot block S(E) rebuilds its
             // proposer selector from the registry — not only the producer.
-            if let (Some((registry, activation)), Some(sel)) = (&validator_registry, &validator_selector) {
+            if let (Some((registry, activation)), Some(sel)) =
+                (&validator_registry, &validator_selector)
+            {
                 let rs = Arc::new(registry_sync::RegistrySync::new(
                     executor.clone(),
                     sel.clone(),
@@ -1469,7 +1575,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let resumed = app_builder.applied_tip().await.height;
                 match rs.hydrate_on_boot(resumed).await {
                     Ok(desc) => info!("VALIDATOR-S1: boot rehydration — {}", desc),
-                    Err(e) => warn!("VALIDATOR-S1: boot rehydration failed at height {}: {}", resumed, e),
+                    Err(e) => warn!(
+                        "VALIDATOR-S1: boot rehydration failed at height {}: {}",
+                        resumed, e
+                    ),
                 }
                 app_builder = app_builder.with_registry_sync(rs);
                 info!("VALIDATOR-S1: registry snapshot-sync attached to execute-on-receive driver (received/reorged S(E) blocks)");
@@ -1610,7 +1719,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let scratch_dir = std::env::temp_dir()
                 .join(format!("citrate-genesis-recovery-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&scratch_dir);
-            let genesis_snapshot = match StorageManager::new(&scratch_dir, PruningConfig::default()) {
+            let genesis_snapshot = match StorageManager::new(&scratch_dir, PruningConfig::default())
+            {
                 Ok(scratch_storage) => {
                     let scratch_storage = Arc::new(scratch_storage);
                     let scratch_exec = Arc::new(Executor::with_storage(
@@ -1649,6 +1759,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     .ok()
                     .flatten()
                     .unwrap_or_default();
+                // Wire the RUNTIME reorg fallback: with genesis in hand, the periodic
+                // drain can self-heal a fork deeper than the in-memory reorg window by
+                // rebuilding along the canonical spine — no manual restart (2026-08-09).
+                app.set_genesis(genesis_snapshot.clone(), genesis_hash);
                 // The DAG store hydrates its in-memory tips ASYNCHRONOUSLY after boot,
                 // so fork-choice cannot see a competing sibling yet. WAIT until the DAG
                 // is FULLY hydrated (fork-choice head reaches the top stored height),
@@ -1680,7 +1794,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         if head == cur.hash {
                             return; // already converged / healthy — nothing to do
                         }
-                        match app.recover_to_head(genesis_snapshot.clone(), genesis_hash).await {
+                        match app
+                            .recover_to_head(genesis_snapshot.clone(), genesis_hash)
+                            .await
+                        {
                             Ok(true) => {
                                 info!("canonical recovery: rebuilt applied state to the fork-choice head");
                                 return;
@@ -1688,13 +1805,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             Ok(false) => {
                                 aborted += 1;
                                 if aborted >= 5 {
-                                    warn!("canonical recovery: gave up after {} aborted attempts", aborted);
+                                    warn!(
+                                        "canonical recovery: gave up after {} aborted attempts",
+                                        aborted
+                                    );
                                     return;
                                 }
                                 warn!("canonical recovery: attempt aborted — retrying");
                             }
                             Err(e) => {
-                                warn!("canonical recovery failed (continuing on persisted tip): {}", e);
+                                warn!(
+                                    "canonical recovery failed (continuing on persisted tip): {}",
+                                    e
+                                );
                                 return;
                             }
                         }
@@ -1712,15 +1835,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // the node advances to head unattended. No-op when there is nothing to drain.
         if let Some(app) = canonical_applicator.clone() {
             tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 loop {
                     interval.tick().await;
                     app.drive_drain().await;
                 }
             });
         }
-        let gossip = Arc::new(GossipProtocol::new(GossipConfig::default(), peer_manager.clone()));
+        let gossip = Arc::new(GossipProtocol::new(
+            GossipConfig::default(),
+            peer_manager.clone(),
+        ));
         let gossip_for_rx = gossip.clone();
         // Sync manager (basic integration)
         // WEDGE #85: judge sync completion against THIS node's applied chain, not
@@ -1773,13 +1898,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let advertised_head = advertised_head.clone();
             let storage_head = storage.clone();
             tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 loop {
                     interval.tick().await;
-                    if let Ok(Some((hash, height))) =
-                        storage_head.blocks.get_applied_tip()
-                    {
+                    if let Ok(Some((hash, height))) = storage_head.blocks.get_applied_tip() {
                         let mut g = advertised_head.write().await;
                         if g.0 != height {
                             *g = (height, hash);
@@ -1807,7 +1929,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     let _ = transport.connect_to_trusted(addr, pid).await;
                 }
                 Some((Some(_), addr)) => {
-                    warn!("Bootnode {} has no Noise identity — cannot verify trust root", addr);
+                    warn!(
+                        "Bootnode {} has no Noise identity — cannot verify trust root",
+                        addr
+                    );
                     let _ = transport.connect_to(addr).await;
                 }
                 Some((None, addr)) => {
@@ -1843,8 +1968,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             let pm_for_maint = peer_manager.clone();
             let discovery_for_maint = discovery.clone();
             tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(60));
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     interval.tick().await;
                     // TTL-prune + hard-cap the seen block/tx/learning caches
@@ -1888,9 +2012,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // peer that ANSWERS clears its penalty (sync_peer.rs invariant I3) —
         // the tick task alone only ever observes failures, which is how a peer
         // could accumulate penalties it had no way to shed.
-        let sync_peers = Arc::new(
-            tokio::sync::Mutex::new(sync_peer::SyncPeerSelector::new()),
-        );
+        let sync_peers = Arc::new(tokio::sync::Mutex::new(sync_peer::SyncPeerSelector::new()));
 
         // Periodic sync tick: request headers/blocks and check timeouts
         let pm_for_sync = pm_for_rx.clone();
@@ -1971,7 +2093,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     connected_peers.iter().map(|(c, _)| c.clone()).collect();
                 let chosen_id = {
                     let sel = sync_peers_for_loop.lock().await;
-                    sel.select(&candidates, applied_height).map(|c| c.id.clone())
+                    sel.select(&candidates, applied_height)
+                        .map(|c| c.id.clone())
                 };
                 // #155: log WHICH PEER WE ARE PULLING FROM — but only when it
                 // CHANGES.
@@ -2038,29 +2161,29 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     };
                 if let Some(peer) = request_peer {
                     let _ = best_hash; // anchor uses the applied tip, not best_hash
-                    // Anchor every request on our current PERSISTED tip so sync
-                    // walks forward batch by batch. The pre-fix logic preferred
-                    // `last_requested_header`, which latched onto the first anchor
-                    // (the genesis zero-hash) and never advanced — so any chain
-                    // longer than one batch stalled at the first batch forever
-                    // even once pending-clearing let requests complete. The tip
-                    // advances as synced blocks persist (Blocks handler →
-                    // put_block), so this drives forward progress to the head.
-                    // Anchor sync on the APPLIED (execute-on-receive selected)
-                    // tip — NOT the height index. `get_latest_height` /
-                    // `get_block_by_height` return the highest STORED block,
-                    // which on a follower that is behind is a gossiped tip
-                    // stored far ahead of the applied chain (with the whole
-                    // range below it missing), or a non-selected sibling
-                    // (`put_block` is last-writer-wins per height). Anchoring
-                    // there made the node request blocks AFTER a gap it had
-                    // never filled: the server resolves that unknown/ahead
-                    // anchor to nothing servable and replies "Sending 0 blocks",
-                    // so the applied tip never advanced — the exact boot stall at
-                    // 5580 while the stored height silently tracked the
-                    // producer's tip. The applied tip is the last block we truly
-                    // extended state with, so requesting ITS children is the gap
-                    // we actually need. Genesis sentinel when nothing is applied.
+                                       // Anchor every request on our current PERSISTED tip so sync
+                                       // walks forward batch by batch. The pre-fix logic preferred
+                                       // `last_requested_header`, which latched onto the first anchor
+                                       // (the genesis zero-hash) and never advanced — so any chain
+                                       // longer than one batch stalled at the first batch forever
+                                       // even once pending-clearing let requests complete. The tip
+                                       // advances as synced blocks persist (Blocks handler →
+                                       // put_block), so this drives forward progress to the head.
+                                       // Anchor sync on the APPLIED (execute-on-receive selected)
+                                       // tip — NOT the height index. `get_latest_height` /
+                                       // `get_block_by_height` return the highest STORED block,
+                                       // which on a follower that is behind is a gossiped tip
+                                       // stored far ahead of the applied chain (with the whole
+                                       // range below it missing), or a non-selected sibling
+                                       // (`put_block` is last-writer-wins per height). Anchoring
+                                       // there made the node request blocks AFTER a gap it had
+                                       // never filled: the server resolves that unknown/ahead
+                                       // anchor to nothing servable and replies "Sending 0 blocks",
+                                       // so the applied tip never advanced — the exact boot stall at
+                                       // 5580 while the stored height silently tracked the
+                                       // producer's tip. The applied tip is the last block we truly
+                                       // extended state with, so requesting ITS children is the gap
+                                       // we actually need. Genesis sentinel when nothing is applied.
                     let (start_from, start_height) = storage_for_sync
                         .blocks
                         .get_applied_tip()
@@ -2093,7 +2216,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // the penalty box acts on. That feeds the EXISTING escalation rather
                     // than adding a second policy that could disagree with it.
                     let mut send_failed = false;
-                    if ph < 8 && sync_for_loop.request_headers(&peer, start_from).await.is_err() {
+                    if ph < 8
+                        && sync_for_loop
+                            .request_headers(&peer, start_from)
+                            .await
+                            .is_err()
+                    {
                         send_failed = true;
                     }
                     if pb < 8
@@ -2126,7 +2254,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             tracing::warn!(
                                 "Sync request to {} failed to send ({} consecutive) — \
                                  de-preferring it as a source",
-                                pid.0, fails
+                                pid.0,
+                                fails
                             );
                         }
                     }
@@ -2193,10 +2322,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             }
         });
         let network_inf_executor = Arc::new(
-            crate::network_inference::NodeNetworkInferenceExecutor::new(
-                mcp.clone(),
-                provider_addr,
-            ),
+            crate::network_inference::NodeNetworkInferenceExecutor::new(mcp.clone(), provider_addr),
         );
         let ai_handler = Arc::new(
             citrate_network::ai_handler::AINetworkHandler::new(
@@ -2257,7 +2383,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 tracing::debug!("[P2P] from={} msg={:?}", pid.0, msg);
                 // Handle protocol messages
                 match msg {
-                    NetworkMessage::Hello { head_height, head_hash, .. } => {
+                    NetworkMessage::Hello {
+                        head_height,
+                        head_hash,
+                        ..
+                    } => {
                         max_seen_for_rx
                             .fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
                         // Kick off naive sync: request blocks from genesis if behind
@@ -2280,7 +2410,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // Also request headers
                         // Sync manager will request in periodic loop
                     }
-                    NetworkMessage::HelloAck { head_height, head_hash, .. } => {
+                    NetworkMessage::HelloAck {
+                        head_height,
+                        head_hash,
+                        ..
+                    } => {
                         max_seen_for_rx
                             .fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
                         // APPLIED tip, not the stored height index: a follower
@@ -2306,19 +2440,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                      pid.0, count, from);
                         // NET-2 (SECREM-01): `count` is attacker-supplied —
                         // serve through the clamped, tip-bounded path only.
-                        let blocks =
-                            block_serve::serve_blocks(&storage_for_handler, &from, count);
+                        let blocks = block_serve::serve_blocks(&storage_for_handler, &from, count);
 
                         tracing::info!("Sending {} blocks to peer {}", blocks.len(), pid.0);
                         let _ = pm_for_rx
-                            .send_to_peers(std::slice::from_ref(&pid), &NetworkMessage::Blocks { blocks })
+                            .send_to_peers(
+                                std::slice::from_ref(&pid),
+                                &NetworkMessage::Blocks { blocks },
+                            )
                             .await;
                     }
                     NetworkMessage::GetPeers => {
                         // Serve a small list of peers from discovery
                         let peers = discovery.get_peers_for_exchange().await;
                         let _ = pm_for_rx
-                            .send_to_peers(std::slice::from_ref(&pid), &NetworkMessage::Peers { peers })
+                            .send_to_peers(
+                                std::slice::from_ref(&pid),
+                                &NetworkMessage::Peers { peers },
+                            )
                             .await;
                     }
                     NetworkMessage::Peers { peers } => {
@@ -2327,7 +2466,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     NetworkMessage::GetHeaders { from, count } => {
                         tracing::info!(
                             "Received GetHeaders request from peer {} starting {:?} count {}",
-                            pid.0, from, count
+                            pid.0,
+                            from,
+                            count
                         );
                         // NET-1 (SECREM-01 Critical): the previous inline
                         // loop ran `while headers.len() < count` with no tip
@@ -2506,10 +2647,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                             .flatten()
                                             .map(|(_, h)| h)
                                             .unwrap_or(0);
-                                        let within_reach = sync_peer::should_attempt_ancestry_recovery(
-                                            block.header.height,
-                                            applied_now,
-                                        );
+                                        let within_reach =
+                                            sync_peer::should_attempt_ancestry_recovery(
+                                                block.header.height,
+                                                applied_now,
+                                            );
                                         if !within_reach {
                                             tracing::debug!(
                                                 "SYNC-S3: skipping ancestry recovery for block @ {} \
@@ -2520,16 +2662,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                                 applied_now
                                             );
                                         } else if let Some(peer) = pm_for_rx.get_peer(&pid) {
-                                            if let Err(e) =
-                                                sync_for_rx
-                                                    .request_blocks(
-                                                        &peer,
-                                                        missing_parent,
-                                                        // The selected parent sits exactly one
-                                                        // height below the block that deferred.
-                                                        block.header.height.saturating_sub(1),
-                                                    )
-                                                    .await
+                                            if let Err(e) = sync_for_rx
+                                                .request_blocks(
+                                                    &peer,
+                                                    missing_parent,
+                                                    // The selected parent sits exactly one
+                                                    // height below the block that deferred.
+                                                    block.header.height.saturating_sub(1),
+                                                )
+                                                .await
                                             {
                                                 tracing::debug!(
                                                     "SYNC-S3: ancestry request to {} for {} failed: {}",
@@ -2612,9 +2753,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 // permanently (boot-3 @ 10944). Presence is
                                 // now established per-store inside `admit`.
                                 match admission_for_net.admit(&block).await {
-                                    admission::AdmitOutcome::Admitted {
-                                        completed_partial,
-                                    } => {
+                                    admission::AdmitOutcome::Admitted { completed_partial } => {
                                         progressed = true;
                                         // #153: this block was NEW. Only this arm
                                         // counts — `AlreadyAdmitted` is a block we
@@ -2705,8 +2844,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 .flatten()
                                 .map(|(_, h)| h)
                                 .unwrap_or(0);
-                            let target = max_seen_for_rx
-                                .load(std::sync::atomic::Ordering::Relaxed);
+                            let target = max_seen_for_rx.load(std::sync::atomic::Ordering::Relaxed);
                             let gap = target.saturating_sub(applied_now);
                             // #156: did our own applied tip pass the anchor we
                             // asked from before this answer came back? If so the
@@ -2714,8 +2852,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             // rpc-1 serving a full 32/32 at 0.66s was scored
                             // Barren 191 times and driven to the -8 floor for
                             // answering exactly what we asked.
-                            let stale_anchor =
-                                sync_for_rx.last_block_anchor_height() < applied_now;
+                            let stale_anchor = sync_for_rx.last_block_anchor_height() < applied_now;
                             let mut sel = sync_peers_for_rx.lock().await;
                             let quality = sel.record_serve(
                                 &pid.0,
@@ -2784,13 +2921,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             Err(e) => {
                                 tracing::warn!(
                                     "AI handler error for message from {}: {}",
-                                    pid.0, e
+                                    pid.0,
+                                    e
                                 );
                             }
                         }
                     }
                     // WP-W.1: Handle checkpoint vote messages for BFT finality
-                    NetworkMessage::CheckpointVote { height, block_hash, voter_pubkey, signature } => {
+                    NetworkMessage::CheckpointVote {
+                        height,
+                        block_hash,
+                        voter_pubkey,
+                        signature,
+                    } => {
                         use citrate_consensus::types::{PublicKey, Signature};
                         let voter_bytes: [u8; 32] = match voter_pubkey.as_slice().try_into() {
                             Ok(b) => b,
@@ -2814,14 +2957,31 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         };
                         match checkpoint_mgr_for_net.submit_vote(vote).await {
                             Ok(true) => {
-                                tracing::info!("Checkpoint quorum reached at height {}, finalizing", height);
+                                tracing::info!(
+                                    "Checkpoint quorum reached at height {}, finalizing",
+                                    height
+                                );
                                 match checkpoint_mgr_for_net.finalize_checkpoint(height).await {
-                                    Ok(cp) => tracing::info!("Checkpoint finalized at height {} with {} votes", cp.height, cp.votes.len()),
-                                    Err(e) => tracing::warn!("Failed to finalize checkpoint at height {}: {}", height, e),
+                                    Ok(cp) => tracing::info!(
+                                        "Checkpoint finalized at height {} with {} votes",
+                                        cp.height,
+                                        cp.votes.len()
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        "Failed to finalize checkpoint at height {}: {}",
+                                        height,
+                                        e
+                                    ),
                                 }
                             }
-                            Ok(false) => tracing::debug!("Checkpoint vote accepted for height {}", height),
-                            Err(e) => tracing::warn!("Checkpoint vote rejected from peer {}: {}", pid.0, e),
+                            Ok(false) => {
+                                tracing::debug!("Checkpoint vote accepted for height {}", height)
+                            }
+                            Err(e) => tracing::warn!(
+                                "Checkpoint vote rejected from peer {}: {}",
+                                pid.0,
+                                e
+                            ),
                         }
                     }
                     _ => {
@@ -2947,8 +3107,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     let mut coinbase = [0u8; 32];
     let copy_len = coinbase_bytes.len().min(32);
     coinbase[..copy_len].copy_from_slice(&coinbase_bytes[..copy_len]);
-    let validator_address = citrate_execution::types::Address(coinbase[0..20].try_into().unwrap_or([0; 20]));
-    let _ = economics_manager_temp.register_stakeholder(validator_address, StakeholderType::Validator);
+    let validator_address =
+        citrate_execution::types::Address(coinbase[0..20].try_into().unwrap_or([0; 20]));
+    let _ =
+        economics_manager_temp.register_stakeholder(validator_address, StakeholderType::Validator);
 
     let economics_manager = Arc::new(economics_manager_temp);
 
@@ -2962,12 +3124,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         info!("Starting RPC server on {}", config.rpc.listen_addr);
 
         // WP-I.2: Read operator token from env for privileged RPC gating
-        let operator_token = std::env::var("CITRATE_OPERATOR_TOKEN").ok()
+        let operator_token = std::env::var("CITRATE_OPERATOR_TOKEN")
+            .ok()
             .filter(|t| !t.is_empty());
 
         // Sprint 03: API key gating — CLI flag > config file > env var
-        let api_key = config.rpc.api_key.clone()
-            .or_else(|| std::env::var("CITRATE_API_KEY").ok().filter(|k| !k.is_empty()));
+        let api_key = config.rpc.api_key.clone().or_else(|| {
+            std::env::var("CITRATE_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+        });
         if api_key.is_some() {
             info!("RPC API key authentication enabled");
         }
@@ -3040,7 +3206,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let _new_heads_sender = eth_subs.new_heads_sender();
         let eth_subs_for_spawn = eth_subs.clone();
         let ws_handle = tokio::spawn(async move {
-            info!("Starting Ethereum subscription WebSocket server on {}", ws_addr);
+            info!(
+                "Starting Ethereum subscription WebSocket server on {}",
+                ws_addr
+            );
             if let Err(e) = eth_subs_for_spawn.start().await {
                 error!("Ethereum subscription server error: {}", e);
             }
@@ -3078,7 +3247,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     let coinbase_str = config.mining.coinbase.trim_start_matches("0x");
     let coinbase_is_valid = !coinbase_str.is_empty()
         && coinbase_str != "0000000000000000000000000000000000000000"
-        && hex::decode(coinbase_str).map(|b| b.iter().any(|&x| x != 0)).unwrap_or(false);
+        && hex::decode(coinbase_str)
+            .map(|b| b.iter().any(|&x| x != 0))
+            .unwrap_or(false);
 
     // WP-11 (corrected): mint/load the proposer key whenever this node has a
     // coinbase, REGARDLESS of whether mining is currently enabled.
@@ -3162,7 +3333,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             economics_manager,
             shared_dag_store.clone(),
             shared_ghostdag.clone(),
-        ).await;
+        )
+        .await;
 
         // VALIDATOR-S1 (v5): when the ValidatorRegistry is configured, enable BOTH the
         // EquivocationVote signing and the epoch snapshot-sync (rebuilds the shared selector
@@ -3199,7 +3371,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // enablement — a split parse could seal v2 blocks with no applier, or vice-versa.
         if execute_on_receive_enabled {
             producer_instance = producer_instance.with_v2_headers(true);
-            info!("EXECUTE-ON-RECEIVE: sealing version-2 headers (coinbase committed in block hash)");
+            info!(
+                "EXECUTE-ON-RECEIVE: sealing version-2 headers (coinbase committed in block hash)"
+            );
         }
 
         // EXECUTE-ON-RECEIVE (step 2): share the applied-tip lock so the producer's
@@ -3239,7 +3413,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
 }
 
 #[allow(dead_code)]
-fn load_or_create_peer_id(data_dir: &std::path::Path) -> anyhow::Result<citrate_network::peer::PeerId> {
+fn load_or_create_peer_id(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<citrate_network::peer::PeerId> {
     use std::fs;
     use std::io::Write;
     let path = data_dir.join("peer.id");
@@ -3298,11 +3474,8 @@ fn load_or_generate_noise_keypair(
                     "Noise key file {:?} had permissions {:o}; tightening to 0600 (SECREM-01 CFG-1)",
                     noise_key_path, mode
                 );
-                std::fs::set_permissions(
-                    noise_key_path,
-                    std::fs::Permissions::from_mode(0o600),
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to chmod noise key to 0600: {}", e))?;
+                std::fs::set_permissions(noise_key_path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| anyhow::anyhow!("Failed to chmod noise key to 0600: {}", e))?;
             }
         }
         let key_bytes = Zeroizing::new(
@@ -3315,7 +3488,10 @@ fn load_or_generate_noise_keypair(
         let kp = citrate_network::NoiseKeypair::generate();
         let key_bytes = Zeroizing::new(kp.to_bytes());
         write_secret_file_0600(noise_key_path, &key_bytes)?;
-        info!("Generated new persistent Noise identity at {:?}", noise_key_path);
+        info!(
+            "Generated new persistent Noise identity at {:?}",
+            noise_key_path
+        );
         Ok(kp)
     }
 }
@@ -3463,7 +3639,11 @@ mod noise_key_file_tests {
             .expect("loosen permissions");
         assert_eq!(mode_of(&key_path), 0o644);
         let reloaded = load_or_generate_noise_keypair(&key_path).expect("reload noise key");
-        assert_eq!(mode_of(&key_path), 0o600, "loose permissions must be tightened");
+        assert_eq!(
+            mode_of(&key_path),
+            0o600,
+            "loose permissions must be tightened"
+        );
         assert_eq!(kp.derive_peer_id(), reloaded.derive_peer_id());
     }
 }
