@@ -89,7 +89,7 @@ pub fn pruning_point_height(applied_height: u64, retain: u64) -> Option<u64> {
     // would also target genesis itself; skip until the chain is deep enough.
     if point == 0 {
         return None;
-        }
+    }
     Some(point)
 }
 
@@ -184,7 +184,11 @@ mod tests {
         // Applied tip below the window: the whole chain is inside it.
         assert_eq!(pruning_point_height(0, 10_000), None);
         assert_eq!(pruning_point_height(500, 10_000), None);
-        assert_eq!(pruning_point_height(10_000, 10_000), None, "point would be 0");
+        assert_eq!(
+            pruning_point_height(10_000, 10_000),
+            None,
+            "point would be 0"
+        );
     }
 
     #[test]
@@ -202,7 +206,10 @@ mod tests {
             pruning_point_height(50_000, 10),
             Some(50_000 - MIN_RETAIN_BLOCKS)
         );
-        assert_eq!(pruning_point_height(50_000, 0), Some(50_000 - MIN_RETAIN_BLOCKS));
+        assert_eq!(
+            pruning_point_height(50_000, 0),
+            Some(50_000 - MIN_RETAIN_BLOCKS)
+        );
         // And the retained range always clears the reorg window by 10x.
         let point = pruning_point_height(50_000, 1).expect("clamped");
         assert!(
@@ -248,9 +255,8 @@ mod tests {
         const RETAIN: u64 = MIN_RETAIN_BLOCKS; // 1_000
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
-        );
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
 
@@ -270,7 +276,10 @@ mod tests {
 
         // One pass: point = 1500 - 1000 = 500, so heights 1..=499 go.
         let dropped = prune_once(&storage, &dag, N, RETAIN).await;
-        assert_eq!(dropped, 499, "heights 1..=499 dropped (pruning point is 500)");
+        assert_eq!(
+            dropped, 499,
+            "heights 1..=499 dropped (pruning point is 500)"
+        );
         let after = dag.get_stats().await.total_blocks;
         assert_eq!(after, before - 499);
         assert!(
@@ -283,7 +292,12 @@ mod tests {
             dag.has_block(&parent).await,
             "the applied tip must never be pruned"
         );
-        const { assert!(N - 500 >= 10 * 100, "retained range clears MAX_REORG_DEPTH 10x") };
+        const {
+            assert!(
+                N - 500 >= 10 * 100,
+                "retained range clears MAX_REORG_DEPTH 10x"
+            )
+        };
 
         // And the chain still grows: admitting on top of a pruned ancestry works
         // because D3 step 1 replaced the ancestry walk with a durable anchor.
@@ -299,7 +313,10 @@ mod tests {
         // chain with a real height-0 genesis. What matters is that the sequence
         // CONTINUES unbroken across the prune.
         assert_eq!(
-            ghostdag.get_blue_score(&next.header.block_hash).await.unwrap(),
+            ghostdag
+                .get_blue_score(&next.header.block_hash)
+                .await
+                .unwrap(),
             N + 1,
             "score sequence continues across the prune"
         );
@@ -366,7 +383,10 @@ mod tests {
                 .parent(parent)
                 .coinbase([0x33; 20])
                 .timestamp(1000)
-                .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([0x5A; 32]),
+                })
                 .transactions(vec![])
                 .state_root(Hash::default())
                 .blue_score(height)
@@ -378,16 +398,17 @@ mod tests {
 
         const N: u64 = 1_500;
         let dir = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
-        );
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
         // PERSISTENT DagStore — the fixture detail that decides what this test
         // actually exercises. With the non-persistent test store,
         // `put_derived_blue_score` is a silent no-op, so the durable anchor never
         // exists and every lookup falls through to the deep walk. That measures
         // the no-anchor path, not the anchor path, and answers the wrong
         // question. A real node always has persistence here.
-        let kv = Arc::new(crate::persistent_dag::RocksDbKvStore::new(storage.db.clone()));
+        let kv = Arc::new(crate::persistent_dag::RocksDbKvStore::new(
+            storage.db.clone(),
+        ));
         let dag = Arc::new(
             DagStore::persistent_with_strict_vrf(kv, false).expect("persistent dag store"),
         );
@@ -467,7 +488,10 @@ mod tests {
                 .merge_parents(merges)
                 .coinbase([0x33; 20])
                 .timestamp(1000)
-                .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([0x5A; 32]),
+                })
                 .transactions(vec![])
                 .state_root(Hash::default())
                 .blue_score(height)
@@ -479,9 +503,8 @@ mod tests {
 
         const N: u64 = 1_500;
         let dir = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
-        );
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
 
@@ -515,11 +538,10 @@ mod tests {
 
         let merge = mk(N + 1, parent, vec![deep_hash]);
         dag.store_block(merge.clone()).await.expect("dag");
-        ghostdag
-            .add_block(&merge)
-            .await
-            .expect("REMEDY: with pruning off, a block merging a far-below parent must \
-                     admit — this is what lets a cold-syncing node cross 54,600");
+        ghostdag.add_block(&merge).await.expect(
+            "REMEDY: with pruning off, a block merging a far-below parent must \
+                     admit — this is what lets a cold-syncing node cross 54,600",
+        );
         assert_eq!(
             ghostdag
                 .get_blue_score(&merge.header.block_hash)
@@ -596,9 +618,8 @@ mod tests {
         const RETAIN: u64 = MIN_RETAIN_BLOCKS;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
-        );
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
 
@@ -645,7 +666,15 @@ mod tests {
         // The test process may run in any order, so assert the parse rules
         // rather than mutating global env: absent => None is the contract, and
         // a set value is clamped to the floor.
-        assert_eq!(DEFAULT_RETAIN_BLOCKS.max(MIN_RETAIN_BLOCKS), DEFAULT_RETAIN_BLOCKS);
-        const { assert!(MIN_RETAIN_BLOCKS >= 10 * 100, "floor must clear the reorg window") };
+        assert_eq!(
+            DEFAULT_RETAIN_BLOCKS.max(MIN_RETAIN_BLOCKS),
+            DEFAULT_RETAIN_BLOCKS
+        );
+        const {
+            assert!(
+                MIN_RETAIN_BLOCKS >= 10 * 100,
+                "floor must clear the reorg window"
+            )
+        };
     }
 }

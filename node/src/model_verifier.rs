@@ -34,7 +34,7 @@ impl Default for VerifierConfig {
             check_interval_secs: 3600, // Check every hour
             grace_period_hours: 24,    // 24 hour grace period
             ipfs_api_url: "http://127.0.0.1:5001".to_string(),
-            production_mode: false,    // Permissive by default for development
+            production_mode: false, // Permissive by default for development
         }
     }
 }
@@ -163,7 +163,8 @@ impl ModelVerifier {
                      Configure validators via with_validators() or set production_mode=false for development."
                 );
                 return Err(
-                    "Production mode requires validators to be configured before starting".to_string()
+                    "Production mode requires validators to be configured before starting"
+                        .to_string(),
                 );
             }
             info!(
@@ -304,7 +305,10 @@ impl ModelVerifier {
         model_cid: &str,
     ) -> Result<PinStatus, String> {
         // Query IPFS to check if the CID is pinned
-        let url = format!("{}/api/v0/pin/ls?arg={}", self.config.ipfs_api_url, model_cid);
+        let url = format!(
+            "{}/api/v0/pin/ls?arg={}",
+            self.config.ipfs_api_url, model_cid
+        );
 
         match self.ipfs_client.post(&url).send().await {
             Ok(response) => {
@@ -335,10 +339,7 @@ impl ModelVerifier {
         expected_hash: &Hash,
     ) -> Result<bool, String> {
         // Download the model from IPFS and verify its hash
-        let url = format!(
-            "{}/api/v0/cat?arg={}",
-            self.config.ipfs_api_url, model_cid
-        );
+        let url = format!("{}/api/v0/cat?arg={}", self.config.ipfs_api_url, model_cid);
 
         match self.ipfs_client.post(&url).send().await {
             Ok(response) => {
@@ -392,9 +393,7 @@ impl ModelVerifier {
         model_cid: &str,
     ) -> Option<ValidatorPinCheck> {
         let checks = self.pin_checks.read().await;
-        checks
-            .get(&(*validator, model_cid.to_string()))
-            .cloned()
+        checks.get(&(*validator, model_cid.to_string())).cloned()
     }
 
     /// Get all validators who should be slashed

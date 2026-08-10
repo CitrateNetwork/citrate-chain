@@ -2,13 +2,13 @@
 // Adapts wallet CLI functionality as a subcommand of the unified `citrate` binary.
 
 use anyhow::Result;
+use citrate_execution::types::Address;
+use citrate_wallet::{Wallet, WalletConfig};
 use clap::Subcommand;
 use colored::*;
 use console::Term;
 use dialoguer::{Input, Password, Select};
 use indicatif::{ProgressBar, ProgressStyle};
-use citrate_execution::types::Address;
-use citrate_wallet::{Wallet, WalletConfig};
 use primitive_types::U256;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -98,9 +98,13 @@ pub async fn execute(
         WalletCommands::Import { key, alias } => import_account(&mut wallet, key, alias).await,
         WalletCommands::List => list_accounts(&mut wallet).await,
         WalletCommands::Balance { account } => show_balance(&mut wallet, account).await,
-        WalletCommands::Send { from, to, amount, gas_price: _, gas_limit: _ } => {
-            send_transaction(&mut wallet, from, &to, &amount, None, None).await
-        }
+        WalletCommands::Send {
+            from,
+            to,
+            amount,
+            gas_price: _,
+            gas_limit: _,
+        } => send_transaction(&mut wallet, from, &to, &amount, None, None).await,
         WalletCommands::Export { index } => export_key(&mut wallet, index).await,
         WalletCommands::Info => show_info(&wallet).await,
         WalletCommands::Interactive => interactive_mode(&mut wallet).await,
@@ -386,10 +390,7 @@ async fn send_transaction(
 }
 
 async fn export_key(wallet: &mut Wallet, index: usize) -> Result<()> {
-    println!(
-        "{}",
-        "WARNING: Never share your private key!".bright_red()
-    );
+    println!("{}", "WARNING: Never share your private key!".bright_red());
 
     let password = Password::new()
         .with_prompt("Enter password to unlock wallet")
