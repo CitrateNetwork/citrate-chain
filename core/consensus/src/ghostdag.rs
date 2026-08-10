@@ -505,7 +505,9 @@ impl GhostDag {
                 tracing::error!(
                     "is_ancestor_of exceeded MAX_VISITED ({}) walking {} -> {}; \
                      refusing to lie about ancestry",
-                    MAX_VISITED, ancestor, descendant
+                    MAX_VISITED,
+                    ancestor,
+                    descendant
                 );
                 return Err(GhostDagError::CycleDetected);
             }
@@ -950,11 +952,7 @@ impl GhostDag {
                          over the MP-DEPTH bound of {}. A merge parent deeper than the \
                          retained window cannot be scored by a pruned node, so accepting \
                          it would fork pruned nodes away from unpruned ones",
-                        mp,
-                        depth,
-                        mp_block.header.height,
-                        header.height,
-                        MERGE_PARENT_MAX_DEPTH
+                        mp, depth, mp_block.header.height, header.height, MERGE_PARENT_MAX_DEPTH
                     )));
                 }
             }
@@ -966,9 +964,7 @@ impl GhostDag {
         })?;
         let max_score = min_score
             .checked_add(merge_parents.len() as u64)
-            .ok_or_else(|| {
-                GhostDagError::InvalidLinkage("blue_score band overflow".to_string())
-            })?;
+            .ok_or_else(|| GhostDagError::InvalidLinkage("blue_score band overflow".to_string()))?;
         if header.blue_score < min_score || header.blue_score > max_score {
             return Err(GhostDagError::BlueScoreOutOfRange {
                 claimed: header.blue_score,
@@ -1388,6 +1384,134 @@ mod tests {
         assert!(tips.contains(&block1.hash()));
     }
 
+    /// PIN for the 2026-08-09 halt (chain 40204 @ 178,341 — a same-height sibling
+    /// fork, depth 2, NO restart, healed by neither the tie-break (#160) nor the
+    /// reorg-depth work). The producer selects its parent with
+    /// `TipSelector::select_tip(dag_store.get_tips())` (scoring each candidate via
+    /// `calculate_blue_score`), while the drain's reorg fork-choice uses
+    /// `GhostDag::select_tip()` over `GhostDag.self.tips` (reading the STORED
+    /// `blue_set.score`). These are TWO independent fork-choice implementations over
+    /// TWO independent tip sets. #160 only aligned the tie-break COMPARATOR — it did
+    /// nothing about the split state. When the two sets diverge at a sibling fork
+    /// (here: the winning sibling reached the DAG store but not GhostDAG's in-memory
+    /// tips — an admission/reconcile gap), the producer targets the winner while the
+    /// drain still ranks its own losing tip best. The producer is then blocked every
+    /// round by the MP-S1 parent/state guard, and the drain sees `best == applied
+    /// tip` so it NEVER reorgs (a silent `NoChange`, no warn) — a permanent deadlock
+    /// no restart clears.
+    ///
+    /// THE FIX is at the CONSUMER, not here: the producer now selects its parent via
+    /// `GhostDag::select_tip()` (the drain's authority) instead of `TipSelector` over
+    /// `DagStore::get_tips()` — see `producer::select_parents_with_ghostdag`. These
+    /// two selectors remain genuinely different functions over different state, so
+    /// this `assert_ne!` STAYS: it is a permanent guard that they are NOT
+    /// interchangeable and must never both be used as fork choice. Producer-level
+    /// agreement is covered by the MP-S1 end-to-end producer test.
+    #[tokio::test]
+    async fn producer_and_drain_forkchoice_diverge_on_a_sibling_fork() {
+        use crate::tip_selection::{SelectionStrategy, TipSelector};
+
+        let params = GhostDagParams::default();
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(params, dag_store.clone()));
+        let tip_selector = Arc::new(TipSelector::new(
+            dag_store.clone(),
+            ghostdag.clone(),
+            SelectionStrategy::HighestBlueScoreWithTieBreak,
+        ));
+
+        // genesis @0 — seed BOTH the DAG store and GhostDAG (relations + cache + tip).
+        let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+        dag_store
+            .store_block(genesis.clone())
+            .await
+            .expect("store genesis");
+        let mut g_blue = BlueSet::new();
+        g_blue.insert(genesis.hash());
+        g_blue.score = 1;
+        ghostdag
+            .blue_cache
+            .write()
+            .await
+            .insert(genesis.hash(), g_blue.clone());
+        ghostdag.relations.write().await.insert(
+            genesis.hash(),
+            DagRelation {
+                block: genesis.hash(),
+                selected_parent: Hash::default(),
+                merge_parents: vec![],
+                children: vec![],
+                blue_set: g_blue,
+                is_chain_block: true,
+                height: 0,
+            },
+        );
+        ghostdag.tips.write().await.insert(genesis.hash());
+
+        // a1 @1 — the common ancestor (fork point). Admitted to BOTH structures.
+        let a1 = create_test_block_with_parents([1; 32], genesis.hash(), vec![], 1);
+        dag_store.store_block(a1.clone()).await.expect("store a1");
+        ghostdag.add_block(&a1).await.expect("admit a1");
+
+        // Two equal-blue_score siblings at height 2. `winner` has the SMALLER hash,
+        // so the shared tie-break (smallest hash) makes it the canonical head.
+        let winner = create_test_block_with_parents([2; 32], a1.hash(), vec![], 2);
+        let loser = create_test_block_with_parents([9; 32], a1.hash(), vec![], 2);
+        assert!(
+            winner.hash() < loser.hash(),
+            "winner must be the smaller hash"
+        );
+
+        // Production desync: the LOSER (this node's own sibling) is admitted to BOTH;
+        // the WINNER (peer's sibling) reached the DAG store but NOT GhostDAG's tips
+        // (the admission/reconcile gap). Both are children of a1, so the DAG store
+        // sees both as tips; GhostDAG's in-memory tip set sees only the loser.
+        dag_store
+            .store_block(loser.clone())
+            .await
+            .expect("store loser");
+        ghostdag.add_block(&loser).await.expect("admit loser");
+        dag_store
+            .store_block(winner.clone())
+            .await
+            .expect("store winner (DAG only)");
+        // (no ghostdag.add_block(&winner) — that is the gap)
+
+        // The producer maps DAG-store tips to hashes exactly this way (producer.rs).
+        let dag_tips: Vec<Hash> = dag_store.get_tips().await.iter().map(|t| t.hash).collect();
+        assert!(
+            dag_tips.contains(&winner.hash()) && dag_tips.contains(&loser.hash()),
+            "DAG store (the producer's tip source) sees BOTH siblings"
+        );
+
+        // Producer's parent choice vs drain's reorg fork-choice.
+        let producer_pick = tip_selector
+            .select_tip(&dag_tips)
+            .await
+            .expect("producer tip selection");
+        let drain_pick = ghostdag.select_tip().await.expect("drain tip selection");
+
+        assert_eq!(
+            producer_pick,
+            winner.hash(),
+            "producer (TipSelector over DAG-store tips) targets the smaller-hash winner"
+        );
+        assert_eq!(
+            drain_pick,
+            loser.hash(),
+            "drain (GhostDag::select_tip over its own tips) stays on this node's losing sibling"
+        );
+        // THE BUG, pinned: the two selectors disagree → if the producer uses one and
+        // the drain the other, the producer is blocked by MP-S1 while the drain never
+        // reorgs → permanent silent deadlock. The fix routes the producer through the
+        // drain's `GhostDag::select_tip` (producer.rs); this `assert_ne!` stays as a
+        // guard that the two selectors are NOT interchangeable.
+        assert_ne!(
+            producer_pick, drain_pick,
+            "REPRODUCED: producer and drain select different sibling heads"
+        );
+    }
+
     #[tokio::test]
     async fn test_tip_selection() {
         let params = GhostDagParams::default();
@@ -1466,7 +1590,7 @@ mod tests {
         }
 
         let expected = *tie_hashes.iter().min().expect("non-empty"); // 0x05..
-        // HashSet iteration order varies run-to-run; the result must not.
+                                                                     // HashSet iteration order varies run-to-run; the result must not.
         for _ in 0..50 {
             let got = ghostdag.select_tip().await.expect("a tip is available");
             assert_eq!(
@@ -1589,7 +1713,11 @@ mod tests {
             .await
             .expect("count_blue_anticone should succeed");
 
-        assert_eq!(count, 5, "expected early-exit at max_count=5, got {}", count);
+        assert_eq!(
+            count, 5,
+            "expected early-exit at max_count=5, got {}",
+            count
+        );
     }
 
     /// SYNC-S1 D1 — the receive path materialises QUADRATIC blue ancestry.
@@ -1924,7 +2052,10 @@ mod tests {
         // silently making the chain degenerate.
         let genesis = create_test_block_with_parents([0xA1; 32], Hash::default(), vec![], 0);
         let b1 = create_test_block_with_parents([0xB2; 32], genesis.hash(), vec![], 1);
-        assert!(genesis.is_genesis() && !b1.is_genesis(), "fixture must be a real 2-block chain");
+        assert!(
+            genesis.is_genesis() && !b1.is_genesis(),
+            "fixture must be a real 2-block chain"
+        );
         dag_store.store_block(genesis.clone()).await.unwrap();
         dag_store.store_block(b1.clone()).await.unwrap();
 
@@ -2054,7 +2185,11 @@ mod tests {
         let mut gset = BlueSet::new();
         gset.insert(genesis.hash());
         gset.score = 1;
-        ghostdag.blue_cache.write().await.insert(genesis.hash(), gset.clone());
+        ghostdag
+            .blue_cache
+            .write()
+            .await
+            .insert(genesis.hash(), gset.clone());
         let grel = DagRelation {
             block: genesis.hash(),
             selected_parent: Hash::default(),
@@ -2064,7 +2199,11 @@ mod tests {
             is_chain_block: true,
             height: 0,
         };
-        ghostdag.relations.write().await.insert(genesis.hash(), grel);
+        ghostdag
+            .relations
+            .write()
+            .await
+            .insert(genesis.hash(), grel);
         ghostdag.tips.write().await.insert(genesis.hash());
 
         let mut hashes = vec![genesis.hash()];
@@ -2246,7 +2385,10 @@ mod tests {
 
         let genesis = create_test_block_with_parents(h(0), Hash::default(), vec![], 0);
         dag_store.store_block(genesis.clone()).await.expect("store");
-        ghostdag.register_existing_block(&genesis).await.expect("reg");
+        ghostdag
+            .register_existing_block(&genesis)
+            .await
+            .expect("reg");
         let mut tip = genesis.hash();
         let mut deep = genesis.hash();
         for i in 1..=N {
@@ -2287,7 +2429,10 @@ mod tests {
 
         let genesis = create_test_block_with_parents(h(0), Hash::default(), vec![], 0);
         dag_store.store_block(genesis.clone()).await.expect("store");
-        ghostdag.register_existing_block(&genesis).await.expect("reg");
+        ghostdag
+            .register_existing_block(&genesis)
+            .await
+            .expect("reg");
         let mut tip = genesis.hash();
         let mut deep = genesis.hash();
         let mut shallow_parent = genesis.hash();
@@ -2319,7 +2464,10 @@ mod tests {
         // of multi-producer.
         let sibling = create_test_block_with_parents(h(N + 500), shallow_parent, vec![], N);
         dag_store.store_block(sibling.clone()).await.expect("store");
-        ghostdag.register_existing_block(&sibling).await.expect("reg");
+        ghostdag
+            .register_existing_block(&sibling)
+            .await
+            .expect("reg");
         let good = create_test_block_with_parents(h(N + 2), tip, vec![sibling.hash()], N + 1);
         dag_store.store_block(good.clone()).await.expect("store");
         assert!(
@@ -2335,13 +2483,13 @@ mod tests {
     #[test]
     fn mp_depth_bound_is_inside_the_prune_retain_floor() {
         const MIN_RETAIN_BLOCKS: u64 = 1_000; // node::dag_prune::MIN_RETAIN_BLOCKS
-        // Const block for the same reason as the activation-height floor: this
-        // invariant is not something to discover at test time.
-        //
-        // The message lost its `{MERGE_PARENT_MAX_DEPTH}` / `{MIN_RETAIN_BLOCKS}`
-        // interpolation because a const context cannot format panic arguments.
-        // Both are compile-time constants a reader can look up two lines away,
-        // so naming the invariant precisely is worth more than echoing them.
+                                              // Const block for the same reason as the activation-height floor: this
+                                              // invariant is not something to discover at test time.
+                                              //
+                                              // The message lost its `{MERGE_PARENT_MAX_DEPTH}` / `{MIN_RETAIN_BLOCKS}`
+                                              // interpolation because a const context cannot format panic arguments.
+                                              // Both are compile-time constants a reader can look up two lines away,
+                                              // so naming the invariant precisely is worth more than echoing them.
         const {
             assert!(
                 MERGE_PARENT_MAX_DEPTH < MIN_RETAIN_BLOCKS,
@@ -2433,8 +2581,7 @@ mod tests {
             "rehydration must not materialise cumulative ancestry (PIL-13)"
         );
 
-        let merge =
-            create_test_block_with_parents(h(N + 2_000), tip, vec![sibling.hash()], N + 1);
+        let merge = create_test_block_with_parents(h(N + 2_000), tip, vec![sibling.hash()], N + 1);
         dag_store
             .store_block(merge.clone())
             .await

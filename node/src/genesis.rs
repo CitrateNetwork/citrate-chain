@@ -1,10 +1,6 @@
 use citrate_consensus::dag_store::DagStore;
-use citrate_consensus::types::{
-    Block, Hash, PublicKey,
-};
-use citrate_economics::genesis::{
-    self as shared_genesis, GenesisConfig as EconomicsGenesisConfig,
-};
+use citrate_consensus::types::{Block, Hash, PublicKey};
+use citrate_economics::genesis::{self as shared_genesis, GenesisConfig as EconomicsGenesisConfig};
 use citrate_execution::executor::Executor;
 use citrate_storage::StorageManager;
 use std::sync::Arc;
@@ -46,33 +42,36 @@ impl Default for GenesisConfig {
             initial_accounts: vec![
                 // Dev account with initial balance (ed25519)
                 (PublicKey::new([1; 32]), 1_000_000_000_000_000_000), // 1 ETH worth
-
                 // Forge default deployer account (ECDSA - first 20 bytes are the address, rest zeros)
                 // Address: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
-                (PublicKey::new([
-                    0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6,
-                    0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72, 0x79, 0xcf,
-                    0xff, 0xb9, 0x22, 0x66, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                ]), 10_000_000_000_000_000_000_000), // 10000 ETH for testing
-
+                (
+                    PublicKey::new([
+                        0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8,
+                        0x82, 0x72, 0x79, 0xcf, 0xff, 0xb9, 0x22, 0x66, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    ]),
+                    10_000_000_000_000_000_000_000,
+                ), // 10000 ETH for testing
                 // Recovered deployer from failed transaction
                 // Address: 0xfcad0b19bb29d4674531d6f115237e16afce377c
-                (PublicKey::new([
-                    0xfc, 0xad, 0x0b, 0x19, 0xbb, 0x29, 0xd4, 0x67,
-                    0x45, 0x31, 0xd6, 0xf1, 0x15, 0x23, 0x7e, 0x16,
-                    0xaf, 0xce, 0x37, 0x7c, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                ]), 10_000_000_000_000_000_000_000), // 10000 ETH for testing
-
+                (
+                    PublicKey::new([
+                        0xfc, 0xad, 0x0b, 0x19, 0xbb, 0x29, 0xd4, 0x67, 0x45, 0x31, 0xd6, 0xf1,
+                        0x15, 0x23, 0x7e, 0x16, 0xaf, 0xce, 0x37, 0x7c, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    ]),
+                    10_000_000_000_000_000_000_000,
+                ), // 10000 ETH for testing
                 // Faucet signing key account (0x6680b43af09d9b351332bf5378eb580e3b390182)
                 // Deterministic key from "citrate-faucet-testnet-v1". 10M SALT.
-                (PublicKey::new([
-                    0x66, 0x80, 0xb4, 0x3a, 0xf0, 0x9d, 0x9b, 0x35,
-                    0x13, 0x32, 0xbf, 0x53, 0x78, 0xeb, 0x58, 0x0e,
-                    0x3b, 0x39, 0x01, 0x82, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                ]), 10_000_000_000_000_000_000_000_000), // 10M SALT for faucet
+                (
+                    PublicKey::new([
+                        0x66, 0x80, 0xb4, 0x3a, 0xf0, 0x9d, 0x9b, 0x35, 0x13, 0x32, 0xbf, 0x53,
+                        0x78, 0xeb, 0x58, 0x0e, 0x3b, 0x39, 0x01, 0x82, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    ]),
+                    10_000_000_000_000_000_000_000_000,
+                ), // 10M SALT for faucet
             ],
         }
     }
@@ -140,10 +139,8 @@ pub async fn initialize_genesis_state_with_profile(
     // This is the single source of truth — both standalone node and GUI call
     // the same function to ensure identical state roots and genesis hashes.
     // Invariant: DeterministicGenesis (from GenesisSafetyAcrossNodes.tla)
-    let state_root_bytes = citrate_economics::genesis::initialize_shared_genesis_state(
-        &executor,
-        &economics_config,
-    );
+    let state_root_bytes =
+        citrate_economics::genesis::initialize_shared_genesis_state(&executor, &economics_config);
 
     // The shared genesis function initializes the configured account set.
     // Legacy initial_accounts are NOT applied because they would produce a
@@ -222,7 +219,10 @@ mod tests {
         let hash_a = calculate_block_hash(&block_a);
         let hash_b = calculate_block_hash(&block_b);
 
-        assert_eq!(hash_a, hash_b, "Same GenesisConfig must produce same block hash");
+        assert_eq!(
+            hash_a, hash_b,
+            "Same GenesisConfig must produce same block hash"
+        );
     }
 
     #[test]
@@ -255,12 +255,16 @@ mod tests {
     fn test_standalone_genesis_matches_shared_canonical_block() {
         let config = GenesisConfig::default();
         let standalone = create_genesis_block(&config);
-        let shared =
-            shared_genesis::create_canonical_genesis_block(shared_genesis::CANONICAL_GENESIS_TIMESTAMP);
+        let shared = shared_genesis::create_canonical_genesis_block(
+            shared_genesis::CANONICAL_GENESIS_TIMESTAMP,
+        );
 
         assert_eq!(standalone.header.timestamp, shared.header.timestamp);
         assert_eq!(standalone.header.height, shared.header.height);
-        assert_eq!(standalone.embedded_models.len(), shared.embedded_models.len());
+        assert_eq!(
+            standalone.embedded_models.len(),
+            shared.embedded_models.len()
+        );
         assert_eq!(standalone.required_pins.len(), shared.required_pins.len());
         assert_eq!(
             calculate_block_hash(&standalone),

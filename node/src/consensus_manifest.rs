@@ -97,7 +97,10 @@ impl ConsensusManifest {
             "  canonical base fee {} wei",
             self.canonical_base_fee_per_gas
         );
-        println!("  epoch / lag        {} / {}", self.epoch, self.snapshot_lag);
+        println!(
+            "  epoch / lag        {} / {}",
+            self.epoch, self.snapshot_lag
+        );
         println!("  fingerprint        {}", self.fingerprint);
         if self.git_dirty {
             println!(
@@ -120,7 +123,10 @@ mod tests {
     fn fingerprint_is_stable_and_prefixed() {
         let a = ConsensusManifest::current();
         let b = ConsensusManifest::current();
-        assert_eq!(a.fingerprint, b.fingerprint, "fingerprint must be deterministic");
+        assert_eq!(
+            a.fingerprint, b.fingerprint,
+            "fingerprint must be deterministic"
+        );
         assert!(a.fingerprint.starts_with("0x"));
         assert_eq!(a.fingerprint.len(), 2 + 32, "16-byte hex fingerprint");
         assert_eq!(a.canonical_base_fee_per_gas, CANONICAL_BASE_FEE_PER_GAS);
