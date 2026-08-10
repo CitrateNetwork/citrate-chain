@@ -1080,8 +1080,8 @@ impl CanonicalApplicator {
         // RUNTIME REORG FALLBACK (2026-08-09). The lock is released; a deep fork now
         // self-heals without a manual restart by rebuilding the applied state along
         // the fork-choice head's canonical spine (same machinery as startup recovery).
-        if rebuild_toward.is_some() {
-            self.maybe_runtime_rebuild().await;
+        if let Some(head) = rebuild_toward {
+            self.maybe_runtime_rebuild(head).await;
         }
         applied_count
     }
@@ -1094,7 +1094,32 @@ impl CanonicalApplicator {
     /// was never wired via `set_genesis` (a restart-time recovery still covers it).
     ///
     /// Must be called WITHOUT the advance lock held (`recover_to_head` re-locks).
-    async fn maybe_runtime_rebuild(&self) {
+    async fn maybe_runtime_rebuild(&self, head: Hash) {
+        // HYDRATION GUARD (mirrors the startup recovery in main.rs). The DAG store
+        // hydrates its in-memory tips ASYNCHRONOUSLY after boot, so for the first
+        // seconds fork-choice surfaces a LOW, partial tip — it has only loaded blocks
+        // up to some height. `reorg_to` then reports that partial head as
+        // `BeyondReorgWindow` (it is far below the applied tip), and rebuilding toward
+        // it would REGRESS the applied state — and the durable store — down to that
+        // partial height. This is exactly what happened on the 2026-08-10 deploy: one
+        // second after restart the runtime rebuild drove the applied tip from 178,341
+        // down to 301. Only rebuild once fork-choice has hydrated to at least the top
+        // PERSISTED block height, so we never rebuild toward a partially-loaded view.
+        let head_height = self
+            .storage
+            .blocks
+            .get_block(&head)
+            .ok()
+            .flatten()
+            .map(|b| b.header.height)
+            .unwrap_or(0);
+        let latest_stored = self.storage.blocks.get_latest_height().unwrap_or(0);
+        if head_height < latest_stored {
+            debug!(
+                "runtime reorg: fork-choice head {head} @ {head_height} is below the top stored height {latest_stored} (DAG still hydrating) — deferring the spine rebuild"
+            );
+            return;
+        }
         let (genesis_state, genesis_hash) = match self.genesis.get() {
             Some(g) => g.clone(),
             None => {
