@@ -50,7 +50,9 @@ pub fn discover_bundled_models(models_dir: &Path) -> Vec<BundledModelInfo> {
                     Ok(manifest) => {
                         tracing::info!(
                             "Discovered bundled model: {} v{} (hash: {})",
-                            manifest.name, manifest.version, &hash[..16]
+                            manifest.name,
+                            manifest.version,
+                            &hash[..16]
                         );
                         models.push(BundledModelInfo {
                             manifest,
@@ -94,8 +96,8 @@ pub fn verify_model_integrity(model_dir: &Path) -> Result<bool, String> {
             return Err(format!("Missing file: {}", parts[1]));
         }
 
-        let file_bytes = std::fs::read(&file_path)
-            .map_err(|e| format!("Failed to read {}: {}", parts[1], e))?;
+        let file_bytes =
+            std::fs::read(&file_path).map_err(|e| format!("Failed to read {}: {}", parts[1], e))?;
 
         let mut hasher = Sha256::new();
         hasher.update(&file_bytes);
@@ -160,7 +162,8 @@ mod tests {
         fs::write(
             dir.path().join("checksums.sha256"),
             format!("{}  ./test.txt\n", hash),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(verify_model_integrity(dir.path()).unwrap());
     }
@@ -172,7 +175,8 @@ mod tests {
         fs::write(
             dir.path().join("checksums.sha256"),
             "0000000000000000000000000000000000000000000000000000000000000000  ./test.txt\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(verify_model_integrity(dir.path()).is_err());
     }

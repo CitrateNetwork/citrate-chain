@@ -20,10 +20,17 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelStatus {
     NotPinned,
-    Downloading { progress_bytes: u64, total_bytes: u64 },
+    Downloading {
+        progress_bytes: u64,
+        total_bytes: u64,
+    },
     Verifying,
-    Pinned { last_verified: u64 },
-    Failed { error: String },
+    Pinned {
+        last_verified: u64,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 /// Metadata about a pinned model
@@ -111,7 +118,10 @@ impl ModelManager {
                     info!("IPFS daemon is running");
                     Ok(())
                 } else {
-                    Err(format!("IPFS daemon returned status: {}", response.status()))
+                    Err(format!(
+                        "IPFS daemon returned status: {}",
+                        response.status()
+                    ))
                 }
             }
             Err(e) => Err(format!(
@@ -122,7 +132,10 @@ impl ModelManager {
     }
 
     /// Auto-pin all required models from genesis block
-    pub async fn auto_pin_required_models(&self, required_models: &[RequiredModel]) -> Result<(), String> {
+    pub async fn auto_pin_required_models(
+        &self,
+        required_models: &[RequiredModel],
+    ) -> Result<(), String> {
         if !self.config.auto_pin {
             info!("Auto-pinning disabled, skipping");
             return Ok(());
@@ -134,17 +147,26 @@ impl ModelManager {
             return Err(e);
         }
 
-        info!("Starting automatic pinning of {} required models", required_models.len());
+        info!(
+            "Starting automatic pinning of {} required models",
+            required_models.len()
+        );
 
         for model in required_models {
             if !model.must_pin {
-                debug!("Model {} is not required to be pinned, skipping", model.model_id.0);
+                debug!(
+                    "Model {} is not required to be pinned, skipping",
+                    model.model_id.0
+                );
                 continue;
             }
 
             // Check if already pinned
             if self.is_model_pinned(&model.ipfs_cid).await {
-                info!("Model {} ({}) already pinned", model.model_id.0, model.ipfs_cid);
+                info!(
+                    "Model {} ({}) already pinned",
+                    model.model_id.0, model.ipfs_cid
+                );
                 continue;
             }
 
@@ -190,7 +212,10 @@ impl ModelManager {
 
         // Download from IPFS with timeout
         info!("Downloading model from IPFS: {}", model.ipfs_cid);
-        let url = format!("{}/api/v0/cat?arg={}", self.config.ipfs_api_url, model.ipfs_cid);
+        let url = format!(
+            "{}/api/v0/cat?arg={}",
+            self.config.ipfs_api_url, model.ipfs_cid
+        );
 
         let mut response = self
             .ipfs_client
@@ -273,7 +298,10 @@ impl ModelManager {
 
         // Pin in IPFS
         info!("Pinning model in IPFS: {}", model.ipfs_cid);
-        let pin_url = format!("{}/api/v0/pin/add?arg={}", self.config.ipfs_api_url, model.ipfs_cid);
+        let pin_url = format!(
+            "{}/api/v0/pin/add?arg={}",
+            self.config.ipfs_api_url, model.ipfs_cid
+        );
 
         let pin_response = self
             .ipfs_client
@@ -351,7 +379,11 @@ impl ModelManager {
     }
 
     /// Save model metadata to disk
-    async fn save_model_metadata(&self, cid: &str, metadata: PinnedModelMetadata) -> Result<(), String> {
+    async fn save_model_metadata(
+        &self,
+        cid: &str,
+        metadata: PinnedModelMetadata,
+    ) -> Result<(), String> {
         let mut models = self.pinned_models.write().await;
         models.insert(cid.to_string(), metadata);
 
@@ -377,8 +409,8 @@ impl ModelManager {
             .await
             .map_err(|e| format!("Failed to read metadata file: {}", e))?;
 
-        let models: HashMap<String, PinnedModelMetadata> = serde_json::from_str(&json)
-            .map_err(|e| format!("Failed to parse metadata: {}", e))?;
+        let models: HashMap<String, PinnedModelMetadata> =
+            serde_json::from_str(&json).map_err(|e| format!("Failed to parse metadata: {}", e))?;
 
         *self.pinned_models.write().await = models;
 

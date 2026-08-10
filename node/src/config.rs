@@ -372,7 +372,7 @@ impl NodeConfig {
         config.chain.genesis_profile = Some("default".to_string());
         config.mining.enabled = true;
         config.mining.target_block_time = 2; // Fast blocks for testing
-        // C-02: Allow eth_sendTransaction only in devnet mode
+                                             // C-02: Allow eth_sendTransaction only in devnet mode
         config.rpc.allow_eth_send_transaction = true;
         // WP-X.1: Permissive CORS in devnet
         config.rpc.cors_origins = vec!["*".to_string()];
@@ -468,8 +468,7 @@ mod tests {
 
         let original = NodeConfig::default();
         let toml_str = toml::to_string_pretty(&original).expect("serialize to TOML");
-        let deserialized: NodeConfig =
-            toml::from_str(&toml_str).expect("deserialize from TOML");
+        let deserialized: NodeConfig = toml::from_str(&toml_str).expect("deserialize from TOML");
 
         assert_eq!(deserialized.chain.chain_id, original.chain.chain_id);
         assert_eq!(deserialized.chain.block_time, original.chain.block_time);
@@ -517,9 +516,7 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("FAIL-CLOSED"));
+        assert!(result.unwrap_err().contains("FAIL-CLOSED"));
 
         // Production mode with validators should succeed
         let config = ValidatorConfig::production(vec!["aabb".to_string()]);
@@ -555,13 +552,18 @@ mod tests {
         assert!(config.rpc.enabled);
         assert!(config.rpc.allow_eth_send_transaction);
         // Team/public configs must use explicit origins, not wildcard
-        assert_eq!(config.rpc.cors_origins, vec![
-            "http://localhost:3000".to_string(),
-            "https://citrate.ai".to_string(),
-            "https://explorer.citrate.ai".to_string(),
-        ]);
-        assert!(!config.rpc.cors_origins.contains(&"*".to_string()),
-            "Team/public configs must not use wildcard CORS");
+        assert_eq!(
+            config.rpc.cors_origins,
+            vec![
+                "http://localhost:3000".to_string(),
+                "https://citrate.ai".to_string(),
+                "https://explorer.citrate.ai".to_string(),
+            ]
+        );
+        assert!(
+            !config.rpc.cors_origins.contains(&"*".to_string()),
+            "Team/public configs must not use wildcard CORS"
+        );
 
         assert!(config.mining.enabled);
         assert_eq!(config.mining.target_block_time, 2);

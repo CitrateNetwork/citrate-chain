@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use citrate_execution::executor::{AIModelStorage, ModelRegistryAdapter};
 use citrate_execution::{ModelId, ModelState};
 use citrate_mcp::{
-    types::{ComputeRequirements, Currency, ModelMetadata, PricingModel, ModelId as MCPModelId},
+    types::{ComputeRequirements, Currency, ModelId as MCPModelId, ModelMetadata, PricingModel},
     MCPService,
 };
 use citrate_storage::state_manager::StateManager;
