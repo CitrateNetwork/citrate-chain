@@ -206,7 +206,10 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
         Err(_) => return Vec::new(),
     };
     // Deterministic, peer-independent order: height asc, then hash asc.
-    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_bytes().cmp(b.1.as_bytes())));
+    rows.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
+    });
 
     let mut out: Vec<Block> = Vec::new();
     let mut budget = MAX_RESPONSE_BYTES;
@@ -321,9 +324,8 @@ mod tests {
     /// Storage with a contiguous chain at heights 0..=n-1.
     fn chain_of(n: u64) -> (TempDir, Arc<StorageManager>) {
         let dir = TempDir::new().expect("tempdir");
-        let storage = Arc::new(
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
-        );
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
         let mut parent = Hash::default();
         for h in 0..n {
             let b = test_block(h, parent);
@@ -409,8 +411,7 @@ mod tests {
     #[test]
     fn gap_in_height_index_stops_serving() {
         let dir = TempDir::new().expect("tempdir");
-        let storage =
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
         let b0 = test_block(0, Hash::default());
         let b1 = test_block(1, b0.hash());
         // Skip height 2 entirely; store height 3.
@@ -454,8 +455,7 @@ mod tests {
     #[test]
     fn cold_sync_serve_always_delivers_a_block_above_the_anchor() {
         let dir = TempDir::new().expect("tempdir");
-        let storage =
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
         let genesis = dag_block(1, 0, Hash::default(), vec![]);
         let g = genesis.hash();
         // The anchor: the cold node's applied tip, small and alone at its height.
@@ -494,8 +494,7 @@ mod tests {
     #[test]
     fn recovery_anchor_at_a_missing_parent_returns_that_block() {
         let dir = TempDir::new().expect("tempdir");
-        let storage =
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
         let genesis = dag_block(1, 0, Hash::default(), vec![]);
         let g = genesis.hash();
         let shared = dag_block(0xA1, 1, g, vec![]);
@@ -530,13 +529,12 @@ mod tests {
     #[test]
     fn forward_progress_survives_a_nonempty_anchor_height_group() {
         let dir = TempDir::new().expect("tempdir");
-        let storage =
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
         let genesis = dag_block(1, 0, Hash::default(), vec![]);
         let g = genesis.hash();
         let anchor = fat_dag_block(0xA1, 1, g, vec![], 700);
         let sibling = fat_dag_block(0xB1, 1, g, vec![], 700); // merge-parent sibling
-        // Selects the anchor, merges the sibling — and is itself oversized.
+                                                              // Selects the anchor, merges the sibling — and is itself oversized.
         let big = fat_dag_block(0xC2, 2, anchor.hash(), vec![sibling.hash()], 61_000);
         for b in [&genesis, &anchor, &sibling, &big] {
             storage.blocks.put_block(b).expect("put_block");
@@ -644,8 +642,7 @@ mod tests {
     #[test]
     fn serves_all_siblings_before_merging_child() {
         let dir = TempDir::new().expect("tempdir");
-        let storage =
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
         let genesis = dag_block(1, 0, Hash::default(), vec![]);
         let g = genesis.hash();
         let a1 = dag_block(0xA1, 1, g, vec![]);
@@ -661,13 +658,22 @@ mod tests {
         // Both height-1 siblings must be present...
         let hashes: Vec<Hash> = served.iter().map(|b| b.hash()).collect();
         assert!(hashes.contains(&a1.hash()), "sibling A1 must be served");
-        assert!(hashes.contains(&b1.hash()), "sibling B1 (a merge-parent) must be served");
+        assert!(
+            hashes.contains(&b1.hash()),
+            "sibling B1 (a merge-parent) must be served"
+        );
         assert!(hashes.contains(&c2.hash()), "child C2 must be served");
         // ...and every height-1 block must precede the height-2 child.
-        let c_idx = served.iter().position(|b| b.hash() == c2.hash()).expect("C2 present");
+        let c_idx = served
+            .iter()
+            .position(|b| b.hash() == c2.hash())
+            .expect("C2 present");
         for (idx, h) in heights.iter().enumerate() {
             if *h == 1 {
-                assert!(idx < c_idx, "all height-1 siblings must precede the height-2 child");
+                assert!(
+                    idx < c_idx,
+                    "all height-1 siblings must precede the height-2 child"
+                );
             }
         }
     }
@@ -684,8 +690,7 @@ mod tests {
     #[test]
     fn serve_delivers_anchor_height_sibling_merge_parent() {
         let dir = TempDir::new().expect("tempdir");
-        let storage =
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
         let genesis = dag_block(1, 0, Hash::default(), vec![]);
         let g = genesis.hash();
         let a1 = dag_block(0xA1, 1, g, vec![]); // canonical height-1 = follower's applied tip
@@ -699,16 +704,28 @@ mod tests {
         let served = serve_blocks(&storage, &a1.hash(), u32::MAX);
         let hashes: Vec<Hash> = served.iter().map(|b| b.hash()).collect();
 
-        assert!(hashes.contains(&c2.hash()), "the extending block C2 must be served");
+        assert!(
+            hashes.contains(&c2.hash()),
+            "the extending block C2 must be served"
+        );
         assert!(
             hashes.contains(&b1.hash()),
             "the anchor-height sibling B1 (C2's merge parent) MUST be served — pre-fix it was \
              omitted (serve started at anchor+1) and the follower wedged forever"
         );
         // And B1 (height 1) must precede C2 (height 2) so the requester holds it first.
-        let b_idx = served.iter().position(|b| b.hash() == b1.hash()).expect("B1 present");
-        let c_idx = served.iter().position(|b| b.hash() == c2.hash()).expect("C2 present");
-        assert!(b_idx < c_idx, "merge-parent sibling B1 must be served before its child C2");
+        let b_idx = served
+            .iter()
+            .position(|b| b.hash() == b1.hash())
+            .expect("B1 present");
+        let c_idx = served
+            .iter()
+            .position(|b| b.hash() == c2.hash())
+            .expect("C2 present");
+        assert!(
+            b_idx < c_idx,
+            "merge-parent sibling B1 must be served before its child C2"
+        );
     }
 
     /// A height-group is never split across a response: if the item cap lands
@@ -717,12 +734,15 @@ mod tests {
     #[test]
     fn does_not_split_a_height_group() {
         let dir = TempDir::new().expect("tempdir");
-        let storage =
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
         let genesis = dag_block(1, 0, Hash::default(), vec![]);
         let g = genesis.hash();
         // Three siblings at height 1.
-        let s = [dag_block(0x11, 1, g, vec![]), dag_block(0x12, 1, g, vec![]), dag_block(0x13, 1, g, vec![])];
+        let s = [
+            dag_block(0x11, 1, g, vec![]),
+            dag_block(0x12, 1, g, vec![]),
+            dag_block(0x13, 1, g, vec![]),
+        ];
         storage.blocks.put_block(&genesis).expect("put");
         for b in &s {
             storage.blocks.put_block(b).expect("put");
@@ -732,7 +752,10 @@ mod tests {
         // group must be served whole or not at all.
         let served = serve_blocks(&storage, &Hash::new(ZERO_ANCHOR), 2);
         let h1 = served.iter().filter(|b| b.header.height == 1).count();
-        assert!(h1 == 0 || h1 == 3, "height-1 group served whole or not at all, got {h1}");
+        assert!(
+            h1 == 0 || h1 == 3,
+            "height-1 group served whole or not at all, got {h1}"
+        );
     }
 
     /// The serialized response always fits the byte budget (which sits
@@ -758,10 +781,11 @@ mod tests {
     #[test]
     fn byte_budget_truncates_before_frame_cap() {
         let dir = TempDir::new().expect("tempdir");
-        let storage =
-            StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
         let mut parent = Hash::default();
-        let fat_merges: Vec<Hash> = (0..1024).map(|i| Hash::new([(i % 255) as u8; 32])).collect();
+        let fat_merges: Vec<Hash> = (0..1024)
+            .map(|i| Hash::new([(i % 255) as u8; 32]))
+            .collect();
         for h in 0..60u64 {
             let b = BlockBuilder::new()
                 .hash(Hash::new([(h + 1) as u8; 32]))

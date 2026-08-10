@@ -25,7 +25,9 @@ impl NodeArtifactService {
         // Synchronously probe IPFS at startup
         let available = Self::probe_ipfs_sync(&apis);
         if !available {
-            eprintln!("[artifact] IPFS not reachable at startup; artifact operations will return errors");
+            eprintln!(
+                "[artifact] IPFS not reachable at startup; artifact operations will return errors"
+            );
         }
         Self {
             client: reqwest::Client::builder()
@@ -46,7 +48,9 @@ impl NodeArtifactService {
         };
         let available = Self::probe_ipfs_sync(&apis);
         if !available {
-            eprintln!("[artifact] IPFS not reachable at startup; artifact operations will return errors");
+            eprintln!(
+                "[artifact] IPFS not reachable at startup; artifact operations will return errors"
+            );
         }
         Self {
             client: reqwest::Client::builder()
@@ -68,15 +72,18 @@ impl NodeArtifactService {
                 .or_else(|| base.strip_prefix("https://"))
                 .unwrap_or(base);
             let addr_str = if stripped.contains(':') {
-                stripped.split('/').next().unwrap_or("127.0.0.1:5001").to_string()
+                stripped
+                    .split('/')
+                    .next()
+                    .unwrap_or("127.0.0.1:5001")
+                    .to_string()
             } else {
                 format!("{}:5001", stripped.split('/').next().unwrap_or("127.0.0.1"))
             };
             if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
-                if std::net::TcpStream::connect_timeout(
-                    &addr,
-                    std::time::Duration::from_secs(1),
-                ).is_ok() {
+                if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1))
+                    .is_ok()
+                {
                     return true;
                 }
             }
@@ -91,9 +98,7 @@ impl NodeArtifactService {
                 self.ipfs_available.store(true, Ordering::Relaxed);
                 eprintln!("[artifact] IPFS now reachable — re-enabled artifact operations");
             } else {
-                return Err(ExecutionError::Reverted(
-                    "IPFS daemon not available".into(),
-                ));
+                return Err(ExecutionError::Reverted("IPFS daemon not available".into()));
             }
         }
         Ok(())
@@ -132,9 +137,9 @@ impl ArtifactService for NodeArtifactService {
                 return Ok(());
             }
         }
-        Err(ExecutionError::Reverted(
-            last_err.unwrap_or_else(|| "pin failed: no IPFS providers available".into()),
-        ))
+        Err(ExecutionError::Reverted(last_err.unwrap_or_else(|| {
+            "pin failed: no IPFS providers available".into()
+        })))
     }
 
     async fn status(&self, cid: &str) -> Result<String, ExecutionError> {

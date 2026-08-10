@@ -402,7 +402,13 @@ impl BlockAdmission {
         // Mirror direction: present in the chain store, absent from the DAG.
         // Left inadmissible, every descendant fails the consistency gate.
         for height in (applied_height + 1)..=latest {
-            let Some(hash) = self.storage.blocks.get_block_by_height(height).ok().flatten() else {
+            let Some(hash) = self
+                .storage
+                .blocks
+                .get_block_by_height(height)
+                .ok()
+                .flatten()
+            else {
                 continue;
             };
             if self.dag_store.has_block(&hash).await {
@@ -475,7 +481,12 @@ mod tests {
 
     /// Admission with no applicator (v1 / storage-only), which is all these
     /// tests need — the applier is exercised in `canonical_apply`.
-    fn harness() -> (BlockAdmission, Arc<StorageManager>, Arc<DagStore>, tempfile::TempDir) {
+    fn harness() -> (
+        BlockAdmission,
+        Arc<StorageManager>,
+        Arc<DagStore>,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
@@ -501,9 +512,15 @@ mod tests {
         let g = root();
         assert_eq!(
             adm.admit(&g).await,
-            AdmitOutcome::Admitted { completed_partial: false }
+            AdmitOutcome::Admitted {
+                completed_partial: false
+            }
         );
-        assert!(fully_admitted(&storage, dag.has_block(&g.header.block_hash).await, &g));
+        assert!(fully_admitted(
+            &storage,
+            dag.has_block(&g.header.block_hash).await,
+            &g
+        ));
         // Idempotent: a second delivery is a no-op, not a second write.
         assert_eq!(adm.admit(&g).await, AdmitOutcome::AlreadyAdmitted);
     }
@@ -542,7 +559,9 @@ mod tests {
         // Admission repairs it and says so.
         assert_eq!(
             adm.admit(&b2).await,
-            AdmitOutcome::Admitted { completed_partial: true }
+            AdmitOutcome::Admitted {
+                completed_partial: true
+            }
         );
         assert!(storage.blocks.has_block(&b2.header.block_hash).unwrap());
 
@@ -573,7 +592,9 @@ mod tests {
 
         assert_eq!(
             adm.admit(&b2).await,
-            AdmitOutcome::Admitted { completed_partial: true }
+            AdmitOutcome::Admitted {
+                completed_partial: true
+            }
         );
         assert!(dag.has_block(&b2.header.block_hash).await);
 
@@ -581,7 +602,9 @@ mod tests {
         let b3 = mk(3, b2.header.block_hash, 2, [0x5A; 32]);
         assert_eq!(
             adm.admit(&b3).await,
-            AdmitOutcome::Admitted { completed_partial: false }
+            AdmitOutcome::Admitted {
+                completed_partial: false
+            }
         );
     }
 
@@ -666,7 +689,9 @@ mod tests {
 
         assert_eq!(
             adm.admit(&b3).await,
-            AdmitOutcome::Deferred { missing_parent: b2.header.block_hash },
+            AdmitOutcome::Deferred {
+                missing_parent: b2.header.block_hash
+            },
             "the missing parent must be NAMED — the pre-D2 handler discarded it"
         );
         // Nothing was written on the deferred path.
@@ -702,7 +727,11 @@ mod tests {
 
         let report = adm.reconcile().await;
         assert!(report.repaired_anything());
-        assert_eq!(report.chain_writes_completed, vec![2], "height 2 was the hole");
+        assert_eq!(
+            report.chain_writes_completed,
+            vec![2],
+            "height 2 was the hole"
+        );
         assert!(storage.blocks.has_block(&b2.header.block_hash).unwrap());
         // The chain is now contiguous, so a drain can cross the old hole.
         assert!(storage

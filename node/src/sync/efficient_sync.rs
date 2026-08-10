@@ -4,12 +4,12 @@
 // Efficient, non-recursive sync implementation for GhostDAG
 // Avoids stack overflow by using iterative processing and bounded queues
 
+use anyhow::Result;
 use citrate_consensus::types::{Block, BlockHeader, Hash};
 use citrate_consensus::GhostDag;
 use citrate_storage::StorageManager;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use anyhow::Result;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -204,9 +204,10 @@ impl EfficientSyncManager {
         // canonical work) BEFORE persistence — pre-fix the block was
         // written to RocksDB first, poisoning the height/blue-score
         // indexes on a forged header.
-        self.ghostdag.add_block(&block).await.map_err(|e| {
-            anyhow::anyhow!("Failed to add block to GhostDAG: {:?}", e)
-        })?;
+        self.ghostdag
+            .add_block(&block)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to add block to GhostDAG: {:?}", e))?;
 
         // Store block (synchronous storage call) — only after admission.
         self.storage.blocks.put_block(&block)?;
@@ -287,7 +288,9 @@ impl EfficientSyncManager {
         // Check selected parent (only if not genesis)
         if !block.is_genesis() {
             let selected_parent = block.selected_parent();
-            if selected_parent != Hash::default() && !self.storage.blocks.has_block(&selected_parent)? {
+            if selected_parent != Hash::default()
+                && !self.storage.blocks.has_block(&selected_parent)?
+            {
                 missing.push(selected_parent);
             }
         }
@@ -528,7 +531,15 @@ impl ParallelSyncCoordinator {
             let results = self.results.clone();
 
             let handle = tokio::spawn(async move {
-                Self::worker_sync_range(worker_id, storage, ghostdag, worker_start, worker_end, results).await
+                Self::worker_sync_range(
+                    worker_id,
+                    storage,
+                    ghostdag,
+                    worker_start,
+                    worker_end,
+                    results,
+                )
+                .await
             });
 
             handles.push(handle);
@@ -586,7 +597,10 @@ impl ParallelSyncCoordinator {
                                     worker_result.merge(&batch_result);
                                 }
                                 Err(e) => {
-                                    debug!("Worker {} error at height {}: {}", worker_id, height, e);
+                                    debug!(
+                                        "Worker {} error at height {}: {}",
+                                        worker_id, height, e
+                                    );
                                     worker_result.errors += 1;
                                 }
                             }
@@ -595,7 +609,10 @@ impl ParallelSyncCoordinator {
                             worker_result.skipped += 1;
                         }
                         Err(e) => {
-                            debug!("Worker {} failed to get block at height {}: {}", worker_id, height, e);
+                            debug!(
+                                "Worker {} failed to get block at height {}: {}",
+                                worker_id, height, e
+                            );
                             worker_result.errors += 1;
                         }
                     }
@@ -605,7 +622,10 @@ impl ParallelSyncCoordinator {
                     worker_result.skipped += 1;
                 }
                 Err(e) => {
-                    debug!("Worker {} failed to get hash at height {}: {}", worker_id, height, e);
+                    debug!(
+                        "Worker {} failed to get hash at height {}: {}",
+                        worker_id, height, e
+                    );
                     worker_result.errors += 1;
                 }
             }
@@ -704,7 +724,8 @@ mod tests {
     async fn test_efficient_sync_no_recursion() {
         // Test that sync handles deep chains without stack overflow
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
+        let storage =
+            Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
@@ -737,7 +758,8 @@ mod tests {
     async fn test_memory_bounded_queue() {
         // Test that queue respects memory limits
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
+        let storage =
+            Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store));
 
@@ -748,7 +770,16 @@ mod tests {
 
         // Create blocks
         let blocks: Vec<Block> = (0..10)
-            .map(|i| create_test_block(i, if i == 0 { Hash::default() } else { Hash::new([(i - 1) as u8; 32]) }))
+            .map(|i| {
+                create_test_block(
+                    i,
+                    if i == 0 {
+                        Hash::default()
+                    } else {
+                        Hash::new([(i - 1) as u8; 32])
+                    },
+                )
+            })
             .collect();
 
         // Queue memory should never exceed the limit
@@ -766,7 +797,8 @@ mod tests {
     async fn test_checkpoint_resume() {
         // Test checkpoint save and resume functionality
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
+        let storage =
+            Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
@@ -826,7 +858,8 @@ mod tests {
     #[tokio::test]
     async fn test_block_header_validation() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
+        let storage =
+            Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store));
 
@@ -908,7 +941,8 @@ mod tests {
     #[tokio::test]
     async fn test_parallel_sync_coordinator() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
+        let storage =
+            Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store.clone()));
 
@@ -932,7 +966,8 @@ mod tests {
     #[tokio::test]
     async fn test_find_missing_parents() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
+        let storage =
+            Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store));
 
@@ -953,7 +988,8 @@ mod tests {
     #[tokio::test]
     async fn test_manager_reset() {
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
+        let storage =
+            Arc::new(StorageManager::new(temp_dir.path(), PruningConfig::default()).unwrap());
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag_store));
 
