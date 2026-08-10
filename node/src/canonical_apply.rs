@@ -2378,6 +2378,96 @@ mod tests {
         );
     }
 
+    /// REPRO of the ACTUAL 2026-08-09 halt (chain 40204 @ 178,341 — a same-height
+    /// sibling fork, depth 2, NO restart). rpc-1 applied a losing sibling as its
+    /// live tip while its ring was fully intact (it applied every ancestor), the
+    /// clone's sibling won fork-choice, yet the runtime drain never converged for
+    /// ~11.7h. This isolates WHY: same applicator instance (ring intact, no restart
+    /// re-seed), REAL GhostDAG fork choice, and we observe `reorg_to`'s outcome
+    /// directly. If this converges, the intact-ring path is fine and the production
+    /// cause lies elsewhere; if it wedges, the decline reason is right here.
+    #[tokio::test]
+    async fn intact_ring_same_height_sibling_reorg_converges_no_restart() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+
+        let (exec, storage, _dir) = fresh();
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+
+        let r = roots(2);
+        let a1 = mk_block(1, Hash::default(), r[0]);
+        let s_a = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
+        let s_b = mk_block_scored(2, a1.header.block_hash, r[1], 1, [0x5B; 32]);
+        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+            (s_a, s_b)
+        } else {
+            (s_b, s_a)
+        };
+
+        // SAME instance throughout (no restart). Apply a1 then the LOSER with fork
+        // choice NOT yet attached, so the ring records a1@1 AND loser@2 — the intact
+        // live ring a continuously-running node holds (fork point a1@1 present).
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        persist(&storage, &a1);
+        assert!(matches!(
+            app.apply_received(&a1).await,
+            ApplyOutcome::Applied { .. }
+        ));
+        persist(&storage, &loser);
+        assert!(matches!(
+            app.apply_received(&loser).await,
+            ApplyOutcome::Applied { .. }
+        ));
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip {
+                hash: loser.header.block_hash,
+                height: 2
+            }
+        );
+
+        // Expose both siblings to the DAG + persist the winner, then attach the REAL
+        // fork choice — exactly the live state at the wedge (ring intact).
+        for blk in [&a1, &winner, &loser] {
+            dag.store_block(blk.clone()).await.expect("into DAG");
+            ghostdag.add_block(blk).await.expect("admit");
+        }
+        persist(&storage, &winner);
+        assert_eq!(
+            ghostdag.select_tip().await.expect("select_tip"),
+            winner.header.block_hash,
+            "fork choice picks the winner"
+        );
+        app.fork_choice = Some({
+            let g = ghostdag.clone();
+            Arc::new(move || {
+                let g = g.clone();
+                Box::pin(async move { g.select_tip().await.ok() })
+            })
+        });
+
+        // OBSERVE the reorg outcome directly (the reason the live INFO logs hid).
+        {
+            let lock = app.advance_lock();
+            let mut state = lock.lock().await;
+            let outcome = app.reorg_to(&mut state, winner.header.block_hash).await;
+            println!("REPRO reorg_to outcome: {outcome:?}");
+            assert!(
+                matches!(outcome, ReorgOutcome::Reorged { .. }),
+                "intact-ring depth-1 sibling reorg should converge, got: {outcome:?}"
+            );
+        }
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip {
+                hash: winner.header.block_hash,
+                height: 2
+            },
+            "converged onto the winning sibling with the ring intact"
+        );
+    }
+
     /// RUNTIME REORG — PART 1 (2026-08-09; chain 40204 halted at 178,853). A
     /// producer's applied tip sat on a same-height LOSING sibling while the winning
     /// branch extended far above the SHALLOW (1-deep) fork point. The old `reorg_to`
