@@ -3,9 +3,9 @@
 // Delegates to the citrate_cli crate's command modules.
 
 use anyhow::Result;
-use clap::Subcommand;
 use citrate_cli::commands::{account, advanced, contract, governance, network, wizard};
 use citrate_cli::config::Config as CliConfig;
+use clap::Subcommand;
 use std::path::PathBuf;
 
 #[derive(Subcommand)]
@@ -55,10 +55,7 @@ pub async fn execute(
             Ok(())
         }
         other => {
-            let config = CliConfig::load(
-                config_path.as_deref(),
-                rpc_override.as_deref(),
-            )?;
+            let config = CliConfig::load(config_path.as_deref(), rpc_override.as_deref())?;
 
             match other {
                 CliToolCommands::Account(cmd) => account::execute(cmd, &config).await,

@@ -94,11 +94,7 @@ impl ContributionRecorder {
     /// Core method: call ContributionAccounting.recordContribution(address,uint8,uint256).
     ///
     /// Encodes the ABI calldata and sends via eth_sendTransaction.
-    async fn record_contribution(
-        &self,
-        contribution_type: u8,
-        amount: u64,
-    ) -> anyhow::Result<()> {
+    async fn record_contribution(&self, contribution_type: u8, amount: u64) -> anyhow::Result<()> {
         if amount == 0 {
             return Ok(());
         }

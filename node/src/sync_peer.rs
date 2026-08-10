@@ -517,7 +517,11 @@ mod tests {
     #[test]
     fn the_peer_that_is_actually_ahead_wins() {
         let sel = SyncPeerSelector::new();
-        let peers = [cand("boot2", 54600), cand("rpc1", 68091), cand("boot3", 54600)];
+        let peers = [
+            cand("boot2", 54600),
+            cand("rpc1", 68091),
+            cand("boot3", 54600),
+        ];
         assert_eq!(
             sel.select(&peers, 54600).map(|c| c.id.as_str()),
             Some("rpc1")
@@ -543,7 +547,11 @@ mod tests {
         }
         assert_eq!(sel.failures("rpc1"), 4, "parked in the old [3,5) dead band");
 
-        let peers = [cand("boot2", 54600), cand("rpc1", 68091), cand("boot3", 54600)];
+        let peers = [
+            cand("boot2", 54600),
+            cand("rpc1", 68091),
+            cand("boot3", 54600),
+        ];
         assert_eq!(
             sel.select(&peers, 54600).map(|c| c.id.as_str()),
             Some("rpc1"),
@@ -671,8 +679,9 @@ mod tests {
                 // Total: the match is exhaustive by construction, but pin the
                 // boundary semantics that the dead bands violated.
                 match q {
-                    ServeQuality::Barren => assert_eq!(blocks, 0,
-                        "only an empty response is barren (gap={})", gap),
+                    ServeQuality::Barren => {
+                        assert_eq!(blocks, 0, "only an empty response is barren (gap={})", gap)
+                    }
                     // #156: unreachable on a CURRENT anchor — an empty response
                     // is only excused when we asked from behind our own tip.
                     ServeQuality::Redundant => panic!(
@@ -759,7 +768,10 @@ mod tests {
         assert_eq!(classify_serve(2, 2, 32, false), ServeQuality::Material);
         assert_eq!(classify_serve(1, 0, 32, false), ServeQuality::Material);
         // A full batch is material at any distance.
-        assert_eq!(classify_serve(32, 200_000, 32, false), ServeQuality::Material);
+        assert_eq!(
+            classify_serve(32, 200_000, 32, false),
+            ServeQuality::Material
+        );
     }
 
     /// The live 40204 shape: every peer advertises the gossip-inflated tip, so

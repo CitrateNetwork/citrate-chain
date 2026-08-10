@@ -24,10 +24,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing_subscriber::{
-    fmt::format::FmtSpan,
-    layer::SubscriberExt,
-    util::SubscriberInitExt,
-    EnvFilter,
+    fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
 };
 
 /// Counter for generating unique trace IDs
@@ -74,7 +71,6 @@ impl TraceId {
             random: u16::from_str_radix(parts[2], 16).ok()?,
         })
     }
-
 }
 
 impl Default for TraceId {
@@ -85,7 +81,11 @@ impl Default for TraceId {
 
 impl fmt::Display for TraceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:x}-{:x}-{:04x}", self.timestamp, self.counter, self.random)
+        write!(
+            f,
+            "{:x}-{:x}-{:04x}",
+            self.timestamp, self.counter, self.random
+        )
     }
 }
 
@@ -287,49 +287,49 @@ pub fn init_logging(config: &LogConfig) -> anyhow::Result<()> {
 
     match config.format {
         LogFormat::Json => {
-            let subscriber = tracing_subscriber::registry()
-                .with(filter)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .json()
-                        .with_target(config.include_target)
-                        .with_file(config.include_location)
-                        .with_line_number(config.include_location)
-                        .with_thread_ids(config.include_thread_id)
-                        .with_span_events(span_events)
-                        .with_ansi(false),
-                );
-            subscriber.try_init().map_err(|e| anyhow::anyhow!("Failed to init logging: {}", e))?;
+            let subscriber = tracing_subscriber::registry().with(filter).with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_target(config.include_target)
+                    .with_file(config.include_location)
+                    .with_line_number(config.include_location)
+                    .with_thread_ids(config.include_thread_id)
+                    .with_span_events(span_events)
+                    .with_ansi(false),
+            );
+            subscriber
+                .try_init()
+                .map_err(|e| anyhow::anyhow!("Failed to init logging: {}", e))?;
         }
         LogFormat::Pretty => {
-            let subscriber = tracing_subscriber::registry()
-                .with(filter)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .pretty()
-                        .with_target(config.include_target)
-                        .with_file(config.include_location)
-                        .with_line_number(config.include_location)
-                        .with_thread_ids(config.include_thread_id)
-                        .with_span_events(span_events)
-                        .with_ansi(config.ansi_colors),
-                );
-            subscriber.try_init().map_err(|e| anyhow::anyhow!("Failed to init logging: {}", e))?;
+            let subscriber = tracing_subscriber::registry().with(filter).with(
+                tracing_subscriber::fmt::layer()
+                    .pretty()
+                    .with_target(config.include_target)
+                    .with_file(config.include_location)
+                    .with_line_number(config.include_location)
+                    .with_thread_ids(config.include_thread_id)
+                    .with_span_events(span_events)
+                    .with_ansi(config.ansi_colors),
+            );
+            subscriber
+                .try_init()
+                .map_err(|e| anyhow::anyhow!("Failed to init logging: {}", e))?;
         }
         LogFormat::Compact => {
-            let subscriber = tracing_subscriber::registry()
-                .with(filter)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .compact()
-                        .with_target(config.include_target)
-                        .with_file(config.include_location)
-                        .with_line_number(config.include_location)
-                        .with_thread_ids(config.include_thread_id)
-                        .with_span_events(span_events)
-                        .with_ansi(config.ansi_colors),
-                );
-            subscriber.try_init().map_err(|e| anyhow::anyhow!("Failed to init logging: {}", e))?;
+            let subscriber = tracing_subscriber::registry().with(filter).with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_target(config.include_target)
+                    .with_file(config.include_location)
+                    .with_line_number(config.include_location)
+                    .with_thread_ids(config.include_thread_id)
+                    .with_span_events(span_events)
+                    .with_ansi(config.ansi_colors),
+            );
+            subscriber
+                .try_init()
+                .map_err(|e| anyhow::anyhow!("Failed to init logging: {}", e))?;
         }
     }
 
@@ -368,7 +368,12 @@ pub mod formats {
     }
 
     /// Format for RPC response logging
-    pub fn rpc_response(trace_id: &TraceId, method: &str, duration_ms: u64, success: bool) -> String {
+    pub fn rpc_response(
+        trace_id: &TraceId,
+        method: &str,
+        duration_ms: u64,
+        success: bool,
+    ) -> String {
         format!(
             "trace_id={} method={} duration_ms={} success={}",
             trace_id, method, duration_ms, success

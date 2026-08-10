@@ -81,7 +81,9 @@ pub fn decode_active_set(ret: &[u8]) -> Result<Vec<([u8; 32], u128)>, String> {
     let (len_pk, pk_base) = read_array_header(ret, off_pk, "pubkeys")?;
     let (len_st, st_base) = read_array_header(ret, off_st, "stakes")?;
     if len_pk != len_st {
-        return Err(format!("activeSet: array length mismatch {len_pk} != {len_st}"));
+        return Err(format!(
+            "activeSet: array length mismatch {len_pk} != {len_st}"
+        ));
     }
 
     let mut out = Vec::with_capacity(len_pk);
@@ -137,7 +139,10 @@ fn read_array_header(buf: &[u8], off: usize, name: &str) -> Result<(usize, usize
         .checked_add(len.checked_mul(32).ok_or("array size overflow")?)
         .ok_or("array end overflow")?;
     if need > buf.len() {
-        return Err(format!("{name} array truncated: need {need}, have {}", buf.len()));
+        return Err(format!(
+            "{name} array truncated: need {need}, have {}",
+            buf.len()
+        ));
     }
     Ok((len, base))
 }
@@ -182,7 +187,14 @@ impl RegistrySync {
         storage: Arc<citrate_storage::StorageManager>,
     ) -> Self {
         let reward_policy = executor.reward_policy_handle();
-        Self { executor, selector, registry, activation_height, reward_policy, storage }
+        Self {
+            executor,
+            selector,
+            registry,
+            activation_height,
+            reward_policy,
+            storage,
+        }
     }
 
     /// Read activeSet() + minStake() against the CURRENT executor state and atomically
@@ -197,8 +209,12 @@ impl RegistrySync {
     /// `snapshot_height` is used only for the view's block context; the STATE read is the
     /// executor's current state.
     pub async fn sync_for_snapshot(&self, snapshot_height: u64) -> Result<usize, String> {
-        let active_ret = self.view_call(active_set_selector().to_vec(), snapshot_height).await?;
-        let min_ret = self.view_call(min_stake_selector().to_vec(), snapshot_height).await?;
+        let active_ret = self
+            .view_call(active_set_selector().to_vec(), snapshot_height)
+            .await?;
+        let min_ret = self
+            .view_call(min_stake_selector().to_vec(), snapshot_height)
+            .await?;
 
         let entries = decode_active_set(&active_ret)?;
         let min_stake = decode_min_stake(&min_ret)?;
@@ -220,7 +236,8 @@ impl RegistrySync {
         {
             tracing::warn!(
                 "VALIDATOR-S1: materialized epoch-{} snapshot but failed to persist it durably: {}",
-                policy.epoch, e
+                policy.epoch,
+                e
             );
         }
 
@@ -244,7 +261,9 @@ impl RegistrySync {
     /// admission and must stay abort-safe), and durable persistence happens then too
     /// via the post-commit full `sync_for_snapshot`.
     pub async fn resync_policy_only(&self, snapshot_height: u64) -> Result<(), String> {
-        let active_ret = self.view_call(active_set_selector().to_vec(), snapshot_height).await?;
+        let active_ret = self
+            .view_call(active_set_selector().to_vec(), snapshot_height)
+            .await?;
         let entries = decode_active_set(&active_ret)?;
         let policy = self.build_reward_policy(snapshot_height, &entries).await?;
         *self.reward_policy.write() = Some(policy);
@@ -266,7 +285,10 @@ impl RegistrySync {
         let epoch = snapshot_epoch_at(snapshot_height).unwrap_or(0);
 
         let share_ret = self
-            .view_call(br::PRIORITY_FEE_SHARE_BPS_SELECTOR.to_vec(), snapshot_height)
+            .view_call(
+                br::PRIORITY_FEE_SHARE_BPS_SELECTOR.to_vec(),
+                snapshot_height,
+            )
             .await?;
         let priority_fee_share_bps = br::decode_u64_word(&share_ret)?;
 
@@ -559,7 +581,7 @@ mod tests {
         assert_eq!(snapshot_epoch_at(800), Some(1)); // S(1)
         assert_eq!(snapshot_epoch_at(1800), Some(2)); // S(2)
         assert_eq!(snapshot_epoch_at(9800), Some(10)); // S(10)
-        // non-boundaries
+                                                       // non-boundaries
         assert_eq!(snapshot_epoch_at(799), None);
         assert_eq!(snapshot_epoch_at(801), None);
         assert_eq!(snapshot_epoch_at(1000), None);
@@ -713,7 +735,7 @@ mod tests {
         // head
         buf.extend_from_slice(&word(0x40)); // off_pk = 64
         buf.extend_from_slice(&word(0xA0)); // off_st = 160 (= 64 + 32(len) + 64(2 pubkeys))
-        // pk array
+                                            // pk array
         buf.extend_from_slice(&word(2)); // len
         let mut pk0 = [0u8; 32];
         pk0[0] = 0xAA;
@@ -811,7 +833,14 @@ mod tests {
         PublicKey::new(pk)
     }
 
-    fn priority_tx(from: PublicKey, to: PublicKey, nonce: u64, max_fee: u64, max_prio: u64, seed: u8) -> Transaction {
+    fn priority_tx(
+        from: PublicKey,
+        to: PublicKey,
+        nonce: u64,
+        max_fee: u64,
+        max_prio: u64,
+        seed: u8,
+    ) -> Transaction {
         let mut hb = [0u8; 32];
         hb[0] = seed;
         let mut tx = Transaction {
@@ -857,7 +886,14 @@ mod tests {
     }
 
     fn fwd_txs(a: PublicKey, b: PublicKey) -> Vec<Transaction> {
-        vec![priority_tx(a, b, 0, CANONICAL_BASE_FEE_PER_GAS + 900, 250, 0xA1)]
+        vec![priority_tx(
+            a,
+            b,
+            0,
+            CANONICAL_BASE_FEE_PER_GAS + 900,
+            250,
+            0xA1,
+        )]
     }
 
     fn seal_block(height: u64, txs: Vec<Transaction>, root: Hash) -> Block {
@@ -869,7 +905,10 @@ mod tests {
             .proposer(PublicKey::new(PROPOSER))
             .timestamp(1_700_000_000)
             .base_fee_per_gas(CANONICAL_BASE_FEE_PER_GAS)
-            .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new([0x5A; 32]),
+            })
             .transactions(txs)
             .state_root(root)
             .build_unhashed();
@@ -888,7 +927,11 @@ mod tests {
         let tmpl = seal_block(FWD_HEIGHT, txs.to_vec(), Hash::default());
         let mut receipts = Vec::new();
         for tx in txs {
-            receipts.push(exec.execute_transaction(&tmpl, tx).await.expect("tx executes"));
+            receipts.push(
+                exec.execute_transaction(&tmpl, tx)
+                    .await
+                    .expect("tx executes"),
+            );
         }
         let basic = [
             (Address(CB), U256::from(10_000_000_000u64)),
@@ -920,7 +963,9 @@ mod tests {
         u.set_validator_activation_height(ACTIVATION);
         *u.reward_policy_handle().write() = Some(test_policy());
         let sel_u = Arc::new(VrfProposerSelector::production());
-        sel_u.sync_active_set(vec![(PublicKey::new(PROPOSER), 40_000u128)], 32_000u128).await;
+        sel_u
+            .sync_active_set(vec![(PublicKey::new(PROPOSER), 40_000u128)], 32_000u128)
+            .await;
         let (a, b) = fund(&u);
         let txs = fwd_txs(a, b);
         let root_u = produce_fwd(&u, &txs).await;
@@ -934,13 +979,18 @@ mod tests {
         // --- Restarted node R: FRESH executor+selector+store, durable snapshot on disk. ---
         let dir = tempfile::tempdir().expect("dir");
         let storage = Arc::new(
-            citrate_storage::StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            citrate_storage::StorageManager::new(dir.path(), PruningConfig::default())
+                .expect("storage"),
         );
         // Persist the durable snapshot exactly as `sync_for_snapshot` would have at S(1).
         let entries = vec![(PROPOSER, 40_000u128)];
         storage
             .blocks
-            .put_reward_snapshot(&encode_reward_snapshot(&test_policy(), &entries, 32_000u128))
+            .put_reward_snapshot(&encode_reward_snapshot(
+                &test_policy(),
+                &entries,
+                32_000u128,
+            ))
             .expect("persist snapshot");
 
         let r = Arc::new(Executor::new(Arc::new(StateDB::new())));
@@ -963,18 +1013,35 @@ mod tests {
             .apply_block(&sealed, sealed.header.coinbase, &basic)
             .await
             .expect("restarted node reproduces + accepts the forward block");
-        assert_eq!(got, root_u, "BUG-1 closed: restarted state root == continuously-up node");
-        assert_eq!(r.get_balance(&Address(REG)), reg_u, "vested share matches after rehydration");
-        assert!(reg_u > U256::zero(), "a positive §R' share must have vested");
+        assert_eq!(
+            got, root_u,
+            "BUG-1 closed: restarted state root == continuously-up node"
+        );
+        assert_eq!(
+            r.get_balance(&Address(REG)),
+            reg_u,
+            "vested share matches after rehydration"
+        );
+        assert!(
+            reg_u > U256::zero(),
+            "a positive §R' share must have vested"
+        );
 
         // BUG-3 closed: the selector is repopulated → identical admission verdict.
         let admit_r = sel_r
             .is_eligible_proposer(&PublicKey::new(PROPOSER), &Hash::default(), FWD_HEIGHT)
             .await
             .expect("admission verdict R (selector rehydrated)");
-        assert_eq!(admit_r, admit_u, "membership admission verdict matches after boot");
+        assert_eq!(
+            admit_r, admit_u,
+            "membership admission verdict matches after boot"
+        );
         assert!(admit_r, "proposer is eligible on the rehydrated selector");
-        assert_eq!(sel_r.active_validator_count().await, 1, "selector repopulated on boot");
+        assert_eq!(
+            sel_r.active_validator_count().await,
+            1,
+            "selector repopulated on boot"
+        );
     }
 
     /// Fallback path: no durable snapshot present → `hydrate_on_boot` recomputes at
@@ -983,13 +1050,17 @@ mod tests {
     async fn boot_rehydration_below_first_snapshot_is_noop() {
         let dir = tempfile::tempdir().expect("dir");
         let storage = Arc::new(
-            citrate_storage::StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            citrate_storage::StorageManager::new(dir.path(), PruningConfig::default())
+                .expect("storage"),
         );
         let r = Arc::new(Executor::new(Arc::new(StateDB::new())));
         let sel = Arc::new(VrfProposerSelector::production());
         let rs = RegistrySync::new(r.clone(), sel, REG, ACTIVATION, storage);
         let desc = rs.hydrate_on_boot(500).await.expect("hydrate");
         assert!(desc.contains("below first snapshot"), "got: {desc}");
-        assert!(r.reward_policy_handle().read().is_none(), "no policy below S(1)");
+        assert!(
+            r.reward_policy_handle().read().is_none(),
+            "no policy below S(1)"
+        );
     }
 }
