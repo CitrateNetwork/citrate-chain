@@ -24,7 +24,9 @@
 //! record_block_height(100);
 //! ```
 
-use metrics::{counter, gauge, histogram, describe_counter, describe_gauge, describe_histogram, Unit};
+use metrics::{
+    counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram, Unit,
+};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
@@ -123,9 +125,7 @@ pub fn init_metrics(addr: &str) -> anyhow::Result<()> {
 
     // Build Prometheus exporter
     let builder = PrometheusBuilder::new();
-    let handle = builder
-        .with_http_listener(socket_addr)
-        .install_recorder()?;
+    let handle = builder.with_http_listener(socket_addr).install_recorder()?;
 
     PROMETHEUS_HANDLE
         .set(handle)
@@ -154,19 +154,12 @@ fn register_metric_descriptions() {
         Unit::Seconds,
         "Unix timestamp when the node started"
     );
-    describe_gauge!(
-        METRIC_NODE_UPTIME,
-        Unit::Seconds,
-        "Node uptime in seconds"
-    );
+    describe_gauge!(METRIC_NODE_UPTIME, Unit::Seconds, "Node uptime in seconds");
     describe_gauge!(
         METRIC_NODE_INFO,
         "Node information including version and network"
     );
-    describe_counter!(
-        METRIC_NODE_RESTARTS,
-        "Total number of node restarts"
-    );
+    describe_counter!(METRIC_NODE_RESTARTS, "Total number of node restarts");
     describe_gauge!(
         METRIC_PROCESS_RSS,
         Unit::Bytes,
@@ -174,10 +167,7 @@ fn register_metric_descriptions() {
     );
 
     // Peer Connections
-    describe_gauge!(
-        METRIC_PEER_COUNT,
-        "Current number of connected peers"
-    );
+    describe_gauge!(METRIC_PEER_COUNT, "Current number of connected peers");
     describe_counter!(
         METRIC_PEER_CONNECTIONS_TOTAL,
         "Total peer connection events"
@@ -202,24 +192,15 @@ fn register_metric_descriptions() {
         Unit::Bytes,
         "Current mempool size in bytes"
     );
-    describe_counter!(
-        METRIC_TX_RECEIVED_TOTAL,
-        "Total transactions received"
-    );
-    describe_counter!(
-        METRIC_TX_REJECTED_TOTAL,
-        "Total transactions rejected"
-    );
+    describe_counter!(METRIC_TX_RECEIVED_TOTAL, "Total transactions received");
+    describe_counter!(METRIC_TX_REJECTED_TOTAL, "Total transactions rejected");
     describe_counter!(
         METRIC_TX_INCLUDED_TOTAL,
         "Total transactions included in blocks"
     );
 
     // Block Production
-    describe_gauge!(
-        METRIC_BLOCK_HEIGHT,
-        "Current block height"
-    );
+    describe_gauge!(METRIC_BLOCK_HEIGHT, "Current block height");
     describe_counter!(
         METRIC_BLOCKS_PRODUCED_TOTAL,
         "Total blocks produced by this node"
@@ -229,57 +210,23 @@ fn register_metric_descriptions() {
         Unit::Seconds,
         "Time to build a block"
     );
-    describe_histogram!(
-        METRIC_BLOCK_SIZE,
-        Unit::Bytes,
-        "Block size distribution"
-    );
-    describe_histogram!(
-        METRIC_TX_PER_BLOCK,
-        "Transactions per block distribution"
-    );
-    describe_counter!(
-        METRIC_ORPHAN_BLOCKS_TOTAL,
-        "Total orphaned blocks"
-    );
+    describe_histogram!(METRIC_BLOCK_SIZE, Unit::Bytes, "Block size distribution");
+    describe_histogram!(METRIC_TX_PER_BLOCK, "Transactions per block distribution");
+    describe_counter!(METRIC_ORPHAN_BLOCKS_TOTAL, "Total orphaned blocks");
 
     // DAG
-    describe_gauge!(
-        METRIC_DAG_TIPS_COUNT,
-        "Current number of DAG tips"
-    );
-    describe_gauge!(
-        METRIC_DAG_BLUE_SCORE,
-        "Current max blue score"
-    );
-    describe_gauge!(
-        METRIC_DAG_WIDTH,
-        "Current DAG width (parallel blocks)"
-    );
-    describe_gauge!(
-        METRIC_DAG_DEPTH,
-        "Current DAG depth"
-    );
+    describe_gauge!(METRIC_DAG_TIPS_COUNT, "Current number of DAG tips");
+    describe_gauge!(METRIC_DAG_BLUE_SCORE, "Current max blue score");
+    describe_gauge!(METRIC_DAG_WIDTH, "Current DAG width (parallel blocks)");
+    describe_gauge!(METRIC_DAG_DEPTH, "Current DAG depth");
 
     // Sync
-    describe_gauge!(
-        METRIC_SYNC_STATUS,
-        "Sync status (0=synced, 1=syncing)"
-    );
-    describe_gauge!(
-        METRIC_SYNC_PROGRESS,
-        "Sync progress percentage (0-100)"
-    );
-    describe_gauge!(
-        METRIC_SYNC_PEERS,
-        "Number of peers contributing to sync"
-    );
+    describe_gauge!(METRIC_SYNC_STATUS, "Sync status (0=synced, 1=syncing)");
+    describe_gauge!(METRIC_SYNC_PROGRESS, "Sync progress percentage (0-100)");
+    describe_gauge!(METRIC_SYNC_PEERS, "Number of peers contributing to sync");
 
     // RPC
-    describe_counter!(
-        METRIC_RPC_REQUESTS_TOTAL,
-        "Total RPC requests by method"
-    );
+    describe_counter!(METRIC_RPC_REQUESTS_TOTAL, "Total RPC requests by method");
     describe_counter!(
         METRIC_RPC_ERRORS_TOTAL,
         "Total RPC errors by method and error type"
@@ -299,42 +246,23 @@ fn register_metric_descriptions() {
         METRIC_AI_REQUESTS_TOTAL,
         "Total AI inference requests by model"
     );
-    describe_counter!(
-        METRIC_AI_ERRORS_TOTAL,
-        "Total AI inference errors"
-    );
+    describe_counter!(METRIC_AI_ERRORS_TOTAL, "Total AI inference errors");
     describe_histogram!(
         METRIC_AI_LATENCY,
         Unit::Seconds,
         "AI inference latency by model"
     );
-    describe_counter!(
-        METRIC_AI_TOKENS_TOTAL,
-        "Total tokens processed"
-    );
+    describe_counter!(METRIC_AI_TOKENS_TOTAL, "Total tokens processed");
     describe_gauge!(
         METRIC_AI_MODELS_LOADED,
         "Number of AI models currently loaded"
     );
 
     // IPFS
-    describe_counter!(
-        METRIC_IPFS_UPLOADS_TOTAL,
-        "Total IPFS uploads"
-    );
-    describe_counter!(
-        METRIC_IPFS_DOWNLOADS_TOTAL,
-        "Total IPFS downloads"
-    );
-    describe_counter!(
-        METRIC_IPFS_PINS_TOTAL,
-        "Total IPFS pin operations"
-    );
-    describe_histogram!(
-        METRIC_IPFS_LATENCY,
-        Unit::Seconds,
-        "IPFS operation latency"
-    );
+    describe_counter!(METRIC_IPFS_UPLOADS_TOTAL, "Total IPFS uploads");
+    describe_counter!(METRIC_IPFS_DOWNLOADS_TOTAL, "Total IPFS downloads");
+    describe_counter!(METRIC_IPFS_PINS_TOTAL, "Total IPFS pin operations");
+    describe_histogram!(METRIC_IPFS_LATENCY, Unit::Seconds, "IPFS operation latency");
     describe_counter!(
         METRIC_IPFS_BYTES_UPLOADED,
         Unit::Bytes,
@@ -478,7 +406,10 @@ pub fn record_rpc_request(method: &str, latency: Duration, success: bool) {
 
 /// Record RPC error with specific error type
 pub fn record_rpc_error(method: &str, error_type: &str) {
-    let labels = [("method", method.to_string()), ("error", error_type.to_string())];
+    let labels = [
+        ("method", method.to_string()),
+        ("error", error_type.to_string()),
+    ];
     counter!(METRIC_RPC_ERRORS_TOTAL, 1, &labels);
 }
 
@@ -596,7 +527,10 @@ mod tests {
         // A running test binary holds at least 1 MiB and (sanity ceiling)
         // under 100 GiB resident.
         assert!(rss > 1024 * 1024, "RSS {rss} bytes is implausibly small");
-        assert!(rss < 100 * 1024 * 1024 * 1024, "RSS {rss} bytes is implausibly large");
+        assert!(
+            rss < 100 * 1024 * 1024 * 1024,
+            "RSS {rss} bytes is implausibly large"
+        );
         // And the gauge path does not panic without an installed recorder.
         let _ = record_process_rss();
     }

@@ -1,20 +1,18 @@
 use citrate_consensus::chain_selection::ChainSelector;
+use citrate_consensus::crypto::{self, Ed25519SigningKey};
 use citrate_consensus::dag_store::{DagStore, DagStoreError};
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::tip_selection::TipSelector;
-use citrate_consensus::crypto::{self, Ed25519SigningKey};
 use citrate_consensus::types::{
     BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Transaction, VrfProof,
 };
-use citrate_economics::{
-    RewardCalculator, RewardConfig, UnifiedEconomicsManager,
-};
-use citrate_execution::Executor;
+use citrate_economics::{RewardCalculator, RewardConfig, UnifiedEconomicsManager};
 use citrate_execution::revm_adapter::BlockContext;
+use citrate_execution::Executor;
 use citrate_learning::orchestration::{LearningOrchestrator, PeerEmbedding, PeerProfileStore};
 use citrate_learning::profile::ProfileComputer;
-use citrate_network::{GossipProtocol, NetworkMessage, PeerManager};
 use citrate_network::learning_messages::LearningMessage;
+use citrate_network::{GossipProtocol, NetworkMessage, PeerManager};
 use citrate_sequencer::mempool::Mempool;
 use citrate_storage::{state_manager::StateManager as AIStateManager, StorageManager};
 use parking_lot::Mutex;
@@ -36,7 +34,12 @@ use crate::contribution_recorder::ContributionRecorder;
 /// `ecvrf::secret_to_scalar()`. Proof is 114 bytes (self-contained, verifiable).
 ///
 /// Falls back to SHA3 stub if ECVRF fails (should not happen with valid keys).
-fn generate_block_vrf(signing_key: &Ed25519SigningKey, proposer_pubkey: &PublicKey, prev_vrf: &Hash, slot: u64) -> VrfProof {
+fn generate_block_vrf(
+    signing_key: &Ed25519SigningKey,
+    proposer_pubkey: &PublicKey,
+    prev_vrf: &Hash,
+    slot: u64,
+) -> VrfProof {
     let seed_bytes = signing_key.to_bytes();
 
     // Build alpha: proposer_pubkey(32) || prev_vrf(32) || slot(8) = 72 bytes
@@ -167,8 +170,7 @@ pub struct BlockProducer {
     /// the receive-path applier — they both mutate the same executor state) and records
     /// the sealed block as the new applied tip before releasing it. `None` disables the
     /// interlock (pre-reroll / execute-on-receive off), preserving legacy behavior.
-    applied_tip_lock:
-        Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>>,
+    applied_tip_lock: Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>>,
 }
 
 impl BlockProducer {
@@ -384,7 +386,10 @@ impl BlockProducer {
         // Load existing chain data into DAG so we continue from last tip
         let latest_height = storage.blocks.get_latest_height().unwrap_or(0);
         if latest_height > 0 {
-            info!("Loading {} blocks from storage into DAG...", latest_height + 1);
+            info!(
+                "Loading {} blocks from storage into DAG...",
+                latest_height + 1
+            );
             for height in 0..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
                     if let Ok(Some(block)) = storage.blocks.get_block(&block_hash) {
@@ -434,7 +439,11 @@ impl BlockProducer {
                     }
                 }
             }
-            info!("DAG loaded: {} blocks, resuming from height {}", latest_height + 1, latest_height);
+            info!(
+                "DAG loaded: {} blocks, resuming from height {}",
+                latest_height + 1,
+                latest_height
+            );
         }
 
         let tip_selector = Arc::new(TipSelector::new(
@@ -517,7 +526,10 @@ impl BlockProducer {
         // Load existing chain data into DAG so we continue from last tip
         let latest_height = storage.blocks.get_latest_height().unwrap_or(0);
         if latest_height > 0 {
-            info!("Loading {} blocks from storage into DAG...", latest_height + 1);
+            info!(
+                "Loading {} blocks from storage into DAG...",
+                latest_height + 1
+            );
             for height in 0..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
                     if let Ok(Some(block)) = storage.blocks.get_block(&block_hash) {
@@ -567,7 +579,11 @@ impl BlockProducer {
                     }
                 }
             }
-            info!("DAG loaded: {} blocks, resuming from height {}", latest_height + 1, latest_height);
+            info!(
+                "DAG loaded: {} blocks, resuming from height {}",
+                latest_height + 1,
+                latest_height
+            );
         }
 
         let tip_selector = Arc::new(TipSelector::new(
@@ -996,7 +1012,12 @@ impl BlockProducer {
             blue_work,
             pruning_point: Hash::default(),
             proposer_pubkey: PublicKey::new(self.signing_key.verifying_key().to_bytes()),
-            vrf_reveal: generate_block_vrf(&self.signing_key, &PublicKey::new(self.signing_key.verifying_key().to_bytes()), &parent_vrf_output, last_height + 1),
+            vrf_reveal: generate_block_vrf(
+                &self.signing_key,
+                &PublicKey::new(self.signing_key.verifying_key().to_bytes()),
+                &parent_vrf_output,
+                last_height + 1,
+            ),
             base_fee_per_gas: {
                 // EIP-1559 base fee calculation from parent block
                 let parent_base_fee: u64 = 1_000_000_000; // 1 gwei minimum
@@ -1012,10 +1033,11 @@ impl BlockProducer {
                 } else {
                     let delta = target_gas - parent_gas_used;
                     let fee_delta = parent_base_fee * delta / target_gas / 8;
-                    std::cmp::max(parent_base_fee.saturating_sub(fee_delta), 1_000_000_000) // floor at 1 gwei
+                    std::cmp::max(parent_base_fee.saturating_sub(fee_delta), 1_000_000_000)
+                    // floor at 1 gwei
                 }
             },
-            gas_used: 0, // Will be updated after execution
+            gas_used: 0,           // Will be updated after execution
             gas_limit: 30_000_000, // 30M gas default
             // EXECUTE-ON-RECEIVE: commit the beneficiary so receivers can reproduce state_root.
             // Hashed only for v2 (see compute_hash); harmless for v1.
@@ -1065,9 +1087,8 @@ impl BlockProducer {
         // Apply block rewards BEFORE computing the final state root.
         // Rewards modify the executor's in-memory state, so state_root must
         // be computed after this step to include reward balances.
-        let validator_address = citrate_execution::types::Address(
-            self.coinbase.0[0..20].try_into().unwrap_or([0; 20])
-        );
+        let validator_address =
+            citrate_execution::types::Address(self.coinbase.0[0..20].try_into().unwrap_or([0; 20]));
 
         // SRP-S2 (reward/re-apply state-root purity — ADR-2026-07-21-reapply-reward-purity):
         // the block reward MUST be a pure function of COMMITTED state, settled through the
@@ -1204,14 +1225,22 @@ impl BlockProducer {
             );
             return Err(anyhow::anyhow!(
                 "State root mismatch before persistence: block {} vs computed {}",
-                block.state_root, post_persist_root
+                block.state_root,
+                post_persist_root
             ));
         }
 
         // 1) Persist the block + its state-root pointer (block may lead the applied tip).
         self.storage.blocks.put_block(&block)?;
-        if let Err(e) = self.storage.state.put_state_root(&block.header.block_hash, &block.state_root) {
-            warn!("Failed to persist state root for block {}: {}", block.header.height, e);
+        if let Err(e) = self
+            .storage
+            .state
+            .put_state_root(&block.header.block_hash, &block.state_root)
+        {
+            warn!(
+                "Failed to persist state root for block {}: {}",
+                block.header.height, e
+            );
         }
 
         // 2) Persist state changes + advance the durable applied tip ATOMICALLY to THIS
@@ -1221,7 +1250,10 @@ impl BlockProducer {
             .executor
             .persist_state_changes_with_tip(Some((block.header.block_hash, block.header.height)))
             .await?;
-        info!("Persisted {} modified accounts to storage (tip @ {})", modified_count, block.header.height);
+        info!(
+            "Persisted {} modified accounts to storage (tip @ {})",
+            modified_count, block.header.height
+        );
 
         // VALIDATOR-S1 (v5): the executor state is now post-height H. If H is a snapshot
         // boundary S(E), rebuild the proposer selector from the registry as-of this state
@@ -1233,12 +1265,7 @@ impl BlockProducer {
         // invariant "applied_tip == the block whose state the executor reflects" for
         // locally-produced blocks too, so a peer building on our tip fast-path-applies.
         if let Some(guard) = applied_guard.as_mut() {
-            crate::canonical_apply::record_produced(
-                guard,
-                &self.storage,
-                &self.executor,
-                &block,
-            );
+            crate::canonical_apply::record_produced(guard, &self.storage, &self.executor, &block);
         }
 
         // Broadcast block to connected peers
@@ -1443,8 +1470,32 @@ impl BlockProducer {
         // Convert tips to hashes
         let tip_hashes: Vec<Hash> = tips.iter().map(|tip| tip.hash).collect();
 
-        // Use tip selector to find the best tip (highest blue score)
-        let selected_parent = self.tip_selector.select_tip(&tip_hashes).await?;
+        // UNIFIED FORK CHOICE (chain 40204 halt 2026-08-09 @ 178,341). Select the
+        // parent from the SAME authority the execute-on-receive drain reorgs toward —
+        // `GhostDag::select_tip()`, over GhostDAG's own tips + STORED blue scores —
+        // NOT the separate `TipSelector::select_tip` over `DagStore::get_tips()` with
+        // RECOMPUTED scores. Those were two independent fork-choice implementations
+        // over two independent tip sets; #160 aligned only the tie-break COMPARATOR,
+        // so at a same-height sibling fork they still picked different siblings: the
+        // producer targeted one (blocked EVERY round by the MP-S1 parent/state guard
+        // below) while the drain ranked the other best and so never reorged — a
+        // silent, permanent deadlock no restart cleared (~11.7h halt). Using ONE
+        // selector for both makes MP-S1 unreachable-by-disagreement: whatever
+        // `select_tip` returns, if it is not our applied tip the drain reorgs the
+        // applied tip to exactly that block, and the next round produces on it.
+        // Pinned by `citrate_consensus::ghostdag::tests::
+        // producer_and_drain_forkchoice_diverge_on_a_sibling_fork` (the two selectors
+        // are NOT interchangeable) and the MP-S1 end-to-end producer test.
+        //
+        // Fallback: only if GhostDAG holds no in-memory tips yet (e.g. right after a
+        // restart, before relation hydration) do we fall back to the DAG-store tip
+        // selection — a state in which the drain's fork-choice is also inert, so no
+        // producer/drain disagreement (hence no deadlock) is possible, and falling
+        // back preserves liveness instead of stalling production.
+        let selected_parent = match self.ghostdag.select_tip().await {
+            Ok(h) => h,
+            Err(_) => self.tip_selector.select_tip(&tip_hashes).await?,
+        };
 
         // MP-DEPTH: never BUILD a block our own validity rule would reject.
         //
@@ -1477,7 +1528,8 @@ impl BlockProducer {
             if let (Some(child_h), Some(tip_h)) =
                 (child_height, self.ghostdag.get_block_height(&h).await)
             {
-                if child_h.saturating_sub(tip_h) > citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
+                if child_h.saturating_sub(tip_h)
+                    > citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
                 {
                     dropped_deep += 1;
                     continue;
@@ -1559,7 +1611,11 @@ impl BlockProducer {
         &self,
         transactions: &[Transaction],
         header: &BlockHeader,
-    ) -> anyhow::Result<(Hash, Vec<Transaction>, Vec<citrate_execution::types::TransactionReceipt>)> {
+    ) -> anyhow::Result<(
+        Hash,
+        Vec<Transaction>,
+        Vec<citrate_execution::types::TransactionReceipt>,
+    )> {
         let mut executed_transactions = Vec::new();
         let mut receipts = Vec::new();
 
@@ -1716,11 +1772,9 @@ impl BlockProducer {
                 adapter_count: local_profile.adapter_count,
             };
             let local_key = *self.coinbase.as_bytes();
-            self.peer_profile_store.lock().store_profile(
-                block_height,
-                local_key,
-                store_profile,
-            );
+            self.peer_profile_store
+                .lock()
+                .store_profile(block_height, local_key, store_profile);
         }
 
         // Collect peer embeddings from gossip layer (also stores peer profiles)
@@ -1778,7 +1832,10 @@ impl BlockProducer {
         let data = match gossip.get_learning_data(checkpoint_height).await {
             Some(d) => d,
             None => {
-                debug!("No learning data for checkpoint height {}", checkpoint_height);
+                debug!(
+                    "No learning data for checkpoint height {}",
+                    checkpoint_height
+                );
                 return vec![];
             }
         };
@@ -1845,7 +1902,9 @@ impl BlockProducer {
     /// Call this from inference handlers to track accuracy and latency.
     #[allow(dead_code)]
     pub fn record_inference(&self, correct: bool, latency_ms: u64, domain: &str) {
-        self.profile_computer.lock().record_inference(correct, latency_ms, domain);
+        self.profile_computer
+            .lock()
+            .record_inference(correct, latency_ms, domain);
     }
 
     /// WP-F.5: Record that this node observed a block (for uptime tracking).
@@ -1895,11 +1954,11 @@ mod tests {
     use super::*;
     use citrate_consensus::crypto::Ed25519SigningKey;
     use citrate_consensus::types::Signature;
-    use primitive_types::U256;
     use citrate_execution::types::Address;
     use citrate_sequencer::mempool::{MempoolConfig, TxClass};
     use citrate_storage::pruning::PruningConfig;
     use citrate_storage::StorageManager;
+    use primitive_types::U256;
     use tempfile::TempDir;
 
     fn test_signing_key() -> Ed25519SigningKey {
@@ -1939,8 +1998,14 @@ mod tests {
         let vrf_a = generate_block_vrf(&sk, &proposer, &prev_vrf, slot);
         let vrf_b = generate_block_vrf(&sk, &proposer, &prev_vrf, slot);
 
-        assert_eq!(vrf_a.proof, vrf_b.proof, "Same inputs must produce same VRF proof");
-        assert_eq!(vrf_a.output, vrf_b.output, "Same inputs must produce same VRF output");
+        assert_eq!(
+            vrf_a.proof, vrf_b.proof,
+            "Same inputs must produce same VRF proof"
+        );
+        assert_eq!(
+            vrf_a.output, vrf_b.output,
+            "Same inputs must produce same VRF output"
+        );
         assert!(!vrf_a.proof.is_empty(), "VRF proof must not be empty");
     }
 
@@ -1974,9 +2039,13 @@ mod tests {
         alpha.extend_from_slice(proposer.as_bytes());
         alpha.extend_from_slice(prev_vrf.as_bytes());
         alpha.extend_from_slice(&slot.to_le_bytes());
-        let beta = citrate_consensus::ecvrf::verify(&alpha, &ecvrf_proof)
-            .expect("Proof should verify");
-        assert_eq!(Hash::from_bytes(&beta), vrf.output, "Verified beta must match proof output");
+        let beta =
+            citrate_consensus::ecvrf::verify(&alpha, &ecvrf_proof).expect("Proof should verify");
+        assert_eq!(
+            Hash::from_bytes(&beta),
+            vrf.output,
+            "Verified beta must match proof output"
+        );
     }
 
     #[test]
@@ -2012,7 +2081,10 @@ mod tests {
         // Produce block B using A's output as prev_vrf
         let vrf_b = generate_block_vrf(&sk, &proposer, &vrf_a.output, 2);
         assert_eq!(vrf_b.proof.len(), 114);
-        assert_ne!(vrf_a.output, vrf_b.output, "Chain continuity: different blocks must have different VRF outputs");
+        assert_ne!(
+            vrf_a.output, vrf_b.output,
+            "Chain continuity: different blocks must have different VRF outputs"
+        );
 
         // Verify B's proof is bound to A's output
         let ecvrf_proof_b = citrate_consensus::ecvrf::EcvrfProof::from_bytes(&vrf_b.proof).unwrap();
@@ -2084,7 +2156,9 @@ mod tests {
             .accounts
             .set_balance(good_from, U256::from(21_000u64 * 1_000_000_000u64 * 10));
         state_db.accounts.create_account_if_not_exists(bad_from);
-        state_db.accounts.set_balance(bad_from, U256::from(21_000u64 * 1_000_000_000u64 * 10));
+        state_db
+            .accounts
+            .set_balance(bad_from, U256::from(21_000u64 * 1_000_000_000u64 * 10));
 
         let good_tx = transfer_tx(0xA1, good_from, recipient, 0);
         let bad_tx = transfer_tx(0xB2, bad_from, recipient, 7);
@@ -2112,7 +2186,11 @@ mod tests {
         let block_hash = producer.produce_block().await.unwrap();
         let block = storage.blocks.get_block(&block_hash).unwrap().unwrap();
 
-        assert_eq!(block.transactions.len(), 1, "Only executed txs should be included");
+        assert_eq!(
+            block.transactions.len(),
+            1,
+            "Only executed txs should be included"
+        );
         assert_eq!(block.transactions[0].hash, good_tx.hash);
         assert_eq!(block.header.gas_used, 21_000);
 
@@ -2127,11 +2205,19 @@ mod tests {
         assert_eq!(good_receipt.gas_used, 21_000);
 
         assert!(
-            storage.transactions.get_receipt(&bad_tx.hash).unwrap().is_none(),
+            storage
+                .transactions
+                .get_receipt(&bad_tx.hash)
+                .unwrap()
+                .is_none(),
             "Execution errors must not create synthetic receipts"
         );
         assert!(
-            storage.transactions.get_transaction(&bad_tx.hash).unwrap().is_none(),
+            storage
+                .transactions
+                .get_transaction(&bad_tx.hash)
+                .unwrap()
+                .is_none(),
             "Execution errors must not be persisted as block transactions"
         );
     }
@@ -2213,7 +2299,9 @@ mod tests {
             require_valid_signature: false,
             ..Default::default()
         }));
-        let economics = Arc::new(UnifiedEconomicsManager::new(UnifiedEconomicsConfig::default()));
+        let economics = Arc::new(UnifiedEconomicsManager::new(
+            UnifiedEconomicsConfig::default(),
+        ));
         let producer = BlockProducer::with_economics(
             storage.clone(),
             executor.clone(),
@@ -2233,8 +2321,14 @@ mod tests {
             .get_block(&block_hash)
             .expect("read block")
             .expect("block present");
-        assert!(sealed.transactions.is_empty(), "the reproduction block must be empty");
-        assert_eq!(sealed.header.height, 1, "post-activation single-parent block");
+        assert!(
+            sealed.transactions.is_empty(),
+            "the reproduction block must be empty"
+        );
+        assert_eq!(
+            sealed.header.height, 1,
+            "post-activation single-parent block"
+        );
         assert_eq!(
             sealed.header.base_fee_per_gas, CANONICAL_BASE_FEE_PER_GAS,
             "canonical base fee (importer base-fee check must pass)"
@@ -2338,7 +2432,8 @@ mod tests {
                 (Address(block.header.coinbase), reward.validator_reward),
                 (Address(TREASURY), reward.treasury_reward),
             ];
-            exec.apply_block(block, block.header.coinbase, &credits).await
+            exec.apply_block(block, block.header.coinbase, &credits)
+                .await
         }
 
         // Build a standalone producer node (own storage, own executor, own DAG).
@@ -2399,8 +2494,17 @@ mod tests {
         //    key/coinbase pairs until hash(B) < hash(A) and P's fork-choice
         //    deterministically prefers B. Without that the harness would not
         //    reproduce the live divergence.
+        // Stop at the FIRST competitor hashing below A, but search the FULL seed
+        // space (was a narrow 48-seed window). Block hashes are effectively random
+        // in (coinbase, key): ~half of all candidates fall below A, so this stops
+        // within a couple of iterations on average (cheap — one RocksDB per try),
+        // yet the wide range still finds one in the rare runs where A hashes small.
+        // The old 48-seed window occasionally contained nothing below A — a
+        // load-independent harness flake unrelated to the code under test (A/B are
+        // first blocks, produced via the genesis path, not `select_parents_with_
+        // ghostdag`). It only fails now if A is below all 255 competitors (~1/256).
         let mut block_b = None;
-        for seed in 0x50u8..0x80u8 {
+        for seed in 0x01u8..=0xFFu8 {
             let tmp_q = TempDir::new().expect("tempdir q");
             let (storage_q, _exec_q, producer_q) = node(&tmp_q, seed, seed);
             let b_hash = producer_q.produce_block().await.expect("Q seals B @ 1");
@@ -2415,14 +2519,17 @@ mod tests {
             }
         }
         let block_b = block_b.expect(
-            "harness: no competing block hashed below A within the search space — \
-             widen the seed range",
+            "harness: no competing block hashed below A across the full seed space — \
+             astronomically rare (A below all 255 competitors); re-run",
         );
 
         // Give P the competing block WITHOUT applying it — exactly what the
         // network path does on arrival: persist + admit to the DAG, leaving the
         // applied tip where it was until the drain/reorg runs.
-        storage_p.blocks.put_block(&block_b).expect("persist B on P");
+        storage_p
+            .blocks
+            .put_block(&block_b)
+            .expect("persist B on P");
         producer_p
             .dag_store
             .store_block(block_b.clone())
@@ -2573,7 +2680,14 @@ mod tests {
             } else {
                 None
             };
-            Node { storage, dag, ghostdag, app, producer, _dir: dir }
+            Node {
+                storage,
+                dag,
+                ghostdag,
+                app,
+                producer,
+                _dir: dir,
+            }
         }
 
         // Deliver a gossiped block to a node: persist, admit to the DAG, then run
@@ -2585,7 +2699,10 @@ mod tests {
             // them were `let _ =` while put_block used `.expect` — so the helper
             // could swallow the failure it is hunting and report a confusing
             // downstream symptom instead.
-            n.storage.blocks.put_block(block).expect("persist gossiped block");
+            n.storage
+                .blocks
+                .put_block(block)
+                .expect("persist gossiped block");
             n.dag
                 .store_block(block.clone())
                 .await
@@ -2610,7 +2727,9 @@ mod tests {
             // Both producers attempt the round, as two miners on a 2s slot do.
             let mut minted: Vec<(usize, Block)> = Vec::new();
             for (idx, n) in [&p, &q].iter().enumerate() {
-                let Some(prod) = n.producer.as_ref() else { continue };
+                let Some(prod) = n.producer.as_ref() else {
+                    continue;
+                };
                 // An Err here is a DELIBERATE skip (MP-S1: fork-choice and the
                 // applied tip disagree). Liveness is asserted after the loop.
                 if let Ok(hash) = prod.produce_block().await {
@@ -2669,7 +2788,10 @@ mod tests {
         let f_tip = follower.app.applied_tip().await;
         let p_tip = p.app.applied_tip().await;
         let q_tip = q.app.applied_tip().await;
-        assert!(f_tip.height > 1, "the follower must have advanced past genesis");
+        assert!(
+            f_tip.height > 1,
+            "the follower must have advanced past genesis"
+        );
         // The DIAGNOSTIC assertion. A poisoned block does NOT surface as
         // `ApplyOutcome::Rejected` on the receive path — `reorg_to` only LOGS its
         // rejection and `apply_received` classifies the block as `Deferred`. That
@@ -2683,13 +2805,21 @@ mod tests {
              (P={}, Q={}). A follower that cannot keep up with concurrent producers is \
              the 2026-07-27 fork — the producers stay healthy and silent while the rest \
              of the fleet stops advancing.",
-            f_tip.height, ahead, p_tip.height, q_tip.height
+            f_tip.height,
+            ahead,
+            p_tip.height,
+            q_tip.height
         );
         assert!(
             f_tip.hash == p_tip.hash || f_tip.hash == q_tip.hash,
             "the follower's applied tip ({} @ {}) must be a tip a producer also holds \
              (P={} @ {}, Q={} @ {})",
-            f_tip.hash, f_tip.height, p_tip.hash, p_tip.height, q_tip.hash, q_tip.height
+            f_tip.hash,
+            f_tip.height,
+            p_tip.hash,
+            p_tip.height,
+            q_tip.hash,
+            q_tip.height
         );
         // Every block the follower applied was state-root verified by
         // `Executor::apply_block`, so agreeing on the tip means agreeing on state.
