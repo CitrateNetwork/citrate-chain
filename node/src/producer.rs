@@ -800,13 +800,22 @@ impl BlockProducer {
         // Get current tips for parent selection
         let tips = self.dag_store.get_tips().await;
 
+        // The applied tip (if execute-on-receive is wired) — passed into parent
+        // selection so the producer never proposes BACKWARDS onto an ancestor of
+        // its own applied tip after a restart (see select_parents_with_ghostdag).
+        let applied_tip_for_selection = applied_guard.as_ref().map(|g| {
+            let t = g.tip();
+            (t.hash, t.height)
+        });
+
         // Select parents using GhostDAG algorithm
         let (selected_parent, merge_parents) = if tips.is_empty() {
             // Genesis case: no parents
             (Hash::default(), vec![])
         } else {
             // Use GhostDAG to select the best parent and merge parents
-            self.select_parents_with_ghostdag(&tips).await?
+            self.select_parents_with_ghostdag(&tips, applied_tip_for_selection)
+                .await?
         };
 
         // MP-S1 — PARENT/STATE BINDING (consensus-critical; the 2026-07-27 fork).
@@ -1462,10 +1471,57 @@ impl BlockProducer {
         }
     }
 
+    /// Whether this node's already-applied tip SUPERSEDES `candidate` — i.e.
+    /// `candidate` is a strict ANCESTOR of the applied tip on the node's own
+    /// canonical chain. When true, the producer must extend the applied tip rather
+    /// than propose on `candidate` (which would be proposing backwards).
+    ///
+    /// Only fires for a genuine ancestor: a `candidate` at or above the applied
+    /// height, or on a DIFFERENT branch (a real heavier fork GhostDAG selected),
+    /// returns false so the drain's reorg still governs. The walk is bounded — a
+    /// gap wider than `SUPERSEDE_WALK_CAP` is treated as "not the restart-lag case"
+    /// and left to the drain, so this never masks a deep legitimate reorg.
+    async fn applied_tip_supersedes(
+        &self,
+        candidate: Hash,
+        applied_hash: Hash,
+        applied_height: u64,
+    ) -> bool {
+        const SUPERSEDE_WALK_CAP: u64 = 100;
+        if candidate == applied_hash {
+            return false; // same block — extend it normally
+        }
+        let cand_height = match self.ghostdag.get_block_height(&candidate).await {
+            Some(h) => h,
+            None => return false, // unknown height — cannot judge; keep candidate
+        };
+        // Not behind us → a descendant or a different-branch fork; let the drain
+        // reorg the applied tip toward it (do NOT clamp — that would mask a reorg).
+        if cand_height >= applied_height {
+            return false;
+        }
+        let steps = applied_height - cand_height;
+        if steps > SUPERSEDE_WALK_CAP {
+            return false; // too deep to be post-restart DAG lag — leave it to the drain
+        }
+        // Walk the applied tip's selected-parent chain down to cand_height; if we
+        // land on `candidate`, it is an ancestor of the applied tip (same chain).
+        let mut cursor = applied_hash;
+        for _ in 0..steps {
+            let blk = match self.storage.blocks.get_block(&cursor).ok().flatten() {
+                Some(b) => b,
+                None => return false,
+            };
+            cursor = blk.selected_parent();
+        }
+        cursor == candidate
+    }
+
     /// Select parents using GhostDAG algorithm
     async fn select_parents_with_ghostdag(
         &self,
         tips: &[citrate_consensus::types::Tip],
+        applied_tip: Option<(Hash, u64)>,
     ) -> anyhow::Result<(Hash, Vec<Hash>)> {
         // Convert tips to hashes
         let tip_hashes: Vec<Hash> = tips.iter().map(|tip| tip.hash).collect();
@@ -1492,10 +1548,38 @@ impl BlockProducer {
         // selection — a state in which the drain's fork-choice is also inert, so no
         // producer/drain disagreement (hence no deadlock) is possible, and falling
         // back preserves liveness instead of stalling production.
-        let selected_parent = match self.ghostdag.select_tip().await {
+        let mut selected_parent = match self.ghostdag.select_tip().await {
             Ok(h) => h,
             Err(_) => self.tip_selector.select_tip(&tip_hashes).await?,
         };
+
+        // NEVER PROPOSE BACKWARDS (chain 40204, 2026-08-11 restart wedge). After a
+        // restart, GhostDAG's in-memory tip set can transiently point at an ANCESTOR
+        // of this node's already-applied tip — the applied tip's own block was not
+        // yet re-registered as a DAG tip, so `select_tip` returns its parent. Sealing
+        // on that ancestor makes a SIBLING of an already-applied block, whose state
+        // root (folded from the applied tip's state) no peer can reproduce, so the
+        // MP-S1 guard refuses every round and the node wedges — production halts even
+        // though nothing forked. When fork-choice points backwards onto our own
+        // applied chain, extend the APPLIED TIP instead: it is strictly ahead on the
+        // same chain and its state is exactly what the executor holds. This is the
+        // producer-side mirror of the drain's `reorg_to` SRP-S3c backwards-reorg
+        // guard; together they keep the applied tip monotonic on its own chain. The
+        // clamp fires ONLY for a genuine ancestor — a real heavier fork (different
+        // branch) is left to the drain to reorg (see `applied_tip_supersedes`).
+        if let Some((atip_hash, atip_height)) = applied_tip {
+            if self
+                .applied_tip_supersedes(selected_parent, atip_hash, atip_height)
+                .await
+            {
+                debug!(
+                    "producer: fork-choice tip {} is an ancestor of applied tip {} @ {} \
+                     (post-restart DAG lag) — extending the applied tip, not proposing backwards",
+                    selected_parent, atip_hash, atip_height
+                );
+                selected_parent = atip_hash;
+            }
+        }
 
         // MP-DEPTH: never BUILD a block our own validity rule would reject.
         //
@@ -2398,6 +2482,110 @@ mod tests {
     // `dag_store.get_tips()` + GhostDAG tip selection, while the transactions and
     // rewards are settled against the executor's LIVE state — which reflects the
     // APPLIED TIP. Nothing asserts the two are the same block. With a single
+    /// NEVER PROPOSE BACKWARDS (chain 40204, 2026-08-11 restart wedge). Pins
+    /// `applied_tip_supersedes` — the decision that keeps the producer from
+    /// proposing onto an ANCESTOR of its own applied tip after a restart (when
+    /// GhostDAG's tip set transiently lags behind the applied tip and `select_tip`
+    /// returns the applied tip's parent). Without the clamp the producer refused
+    /// every round (MP-S1) and the chain wedged though nothing had forked.
+    #[tokio::test]
+    async fn applied_tip_supersedes_only_a_genuine_ancestor_of_the_applied_tip() {
+        use citrate_execution::StateDB;
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+        let producer = BlockProducer::new(
+            storage.clone(),
+            executor.clone(),
+            mempool,
+            embedded_pubkey(Address([0x44; 20])),
+            Ed25519SigningKey::from_bytes(&[42; 32]),
+            2,
+        )
+        .with_v2_headers(true);
+        let applicator = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let producer = producer.with_applied_tip_lock(applicator.advance_lock());
+
+        // Produce a linear chain A@1 → B@2 → C@3 (each becomes the applied tip and
+        // is registered in this node's DAG exactly as the live produce path does).
+        let a = producer.produce_block().await.expect("A@1");
+        let b = producer.produce_block().await.expect("B@2");
+        let c = producer.produce_block().await.expect("C@3");
+        assert_eq!(
+            applicator.applied_tip().await.hash,
+            c,
+            "applied tip is C @ 3"
+        );
+
+        // Also build a SIBLING of C at height 3 (a different branch, not on the
+        // applied chain) so we can prove the clamp does NOT fire for a real fork.
+        let sibling = {
+            let blk = BlockBuilder::new()
+                .version(2)
+                .height(3)
+                .parent(b)
+                .coinbase([0x77; 20])
+                .timestamp(1234)
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([0x9C; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .build_unhashed();
+            let mut blk = blk;
+            blk.header.block_hash = blk.compute_hash();
+            storage.blocks.put_block(&blk).expect("persist sibling");
+            blk.header.block_hash
+        };
+        assert_ne!(sibling, c, "sibling is a distinct block at height 3");
+
+        let (ctip, cheight) = (c, 3u64);
+
+        // ANCESTORS of the applied tip → supersede (extend the applied tip, do not
+        // propose backwards). This is the exact post-restart wedge (select_tip → B).
+        assert!(
+            producer.applied_tip_supersedes(b, ctip, cheight).await,
+            "B (parent of C) is an ancestor of the applied tip → supersede"
+        );
+        assert!(
+            producer.applied_tip_supersedes(a, ctip, cheight).await,
+            "A (grandparent) is an ancestor → supersede"
+        );
+
+        // NOT superseded: the applied tip itself, a same-height sibling on another
+        // branch (a real fork the drain must reorg), and an unknown block.
+        assert!(
+            !producer.applied_tip_supersedes(ctip, ctip, cheight).await,
+            "the applied tip is not an ancestor of itself → extend normally"
+        );
+        assert!(
+            !producer
+                .applied_tip_supersedes(sibling, ctip, cheight)
+                .await,
+            "a same-height sibling on a different branch must NOT be clamped (let the drain reorg)"
+        );
+        assert!(
+            !producer
+                .applied_tip_supersedes(Hash::new([0xEE; 32]), ctip, cheight)
+                .await,
+            "an unknown block cannot be judged an ancestor → do not clamp"
+        );
+    }
+
     // producer they always are (the DAG's selected tip is that node's own last
     // block). Add a second producer and reorgs make them differ — which is
     // precisely why this only ever appears under concurrent producers, and why
