@@ -1661,6 +1661,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     }
 
+    // RESTART-LIVENESS (2026-08-11): make GhostDAG's in-memory tip set AUTHORITATIVE
+    // at boot. The DAG store already reconstructs its tips from block-header parentage
+    // on load (PIL-42); copy that in so `select_tip` (the fork-choice authority for
+    // BOTH the producer and the drain since #163) never returns a stale ancestor after
+    // a restart, and mark DAG hydration complete so the applicator's runtime deep-fork
+    // rebuild may fire. On a MINING node the producer's own eager-load runs this again
+    // at the end of its load (producer.rs) — idempotent; the later one wins. On a
+    // non-mining FOLLOWER (no producer eager-load) this is the ONLY place it runs, and
+    // is exactly what unwedges the 2026-08-11 follower drain stall.
+    {
+        let n_tips = shared_ghostdag.reconcile_tips_from_dag_store().await;
+        info!(
+            "startup: reconciled GhostDAG to {} authoritative tip(s); DAG hydration complete",
+            n_tips
+        );
+    }
+
     // Forward-sync liveness (handoff 2026-07-23): the highest block height we have
     // EVIDENCE the network is at, from ANY signal — gossiped NewBlock, a rejected
     // far-ahead block (MissingParentAtAdmission proves the sender is ahead of us),
