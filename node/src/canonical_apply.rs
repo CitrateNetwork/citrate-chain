@@ -2790,6 +2790,67 @@ mod tests {
         ))
     }
 
+    /// BUG 1 (chain 40204, 2026-08-11 G9 rolling restart): a restarted FOLLOWER
+    /// whose applied tip is BEHIND blocks already stored on disk must drain forward
+    /// to head on its own. Reproduces the restart directly: apply a linear chain to
+    /// tip 3 (store-backed executor + persisted applied-tip pointer), persist the
+    /// next 3 linear blocks WITHOUT applying (stored-ahead, child index populated),
+    /// then construct a FRESH applicator + fresh store-backed executor over the SAME
+    /// storage — exactly the post-restart state: applied tip re-seeded from the
+    /// persisted pointer (3), executor state rehydrated via read-through, blocks
+    /// 4..6 stored ahead. `drive_drain` MUST walk the applied tip to 6.
+    #[tokio::test]
+    async fn restarted_follower_drains_stored_ahead_blocks_to_head() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.persist_state_changes().await.expect("persist genesis");
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+
+        // Linear reward-only chain of 6; apply the first 3 (applied tip + pointer).
+        let c = chain(6);
+        for b in &c[..3] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        assert_eq!(app.applied_tip().await.height, 3);
+
+        // Persist 4,5,6 AHEAD — stored (with child index) but NOT applied.
+        for b in &c[3..] {
+            persist(&storage, b);
+        }
+        assert_eq!(app.applied_tip().await.height, 3, "applied tip still 3");
+        assert_eq!(
+            storage.blocks.get_latest_height().unwrap_or(0),
+            6,
+            "stored height is 6 (blocks ahead)"
+        );
+
+        // ── SIMULATE RESTART ── fresh applicator + fresh store-backed executor over
+        // the SAME storage: applied tip re-seeds from the persisted pointer (3),
+        // executor state resolves through the durable store.
+        drop(app);
+        let exec2 = store_backed(&storage);
+        let app2 = CanonicalApplicator::new(exec2.clone(), storage.clone());
+        assert_eq!(
+            app2.applied_tip().await.height,
+            3,
+            "restart seeds the applied tip from the persisted pointer"
+        );
+
+        // The periodic drain MUST catch the applied tip up through the stored blocks.
+        app2.drive_drain().await;
+        assert_eq!(
+            app2.applied_tip().await.height,
+            6,
+            "BUG 1: restarted follower failed to drain stored-ahead blocks to head"
+        );
+    }
+
     /// HIGH-2: after a reorg, the DURABLE store must match the new branch — proven
     /// by reading a fresh (cold-cache) executor over the same store. Includes an
     /// account CREATED on the abandoned branch, which must be deleted from the store.
