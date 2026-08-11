@@ -247,6 +247,14 @@ pub struct CanonicalApplicator {
     /// operation). Set while `maybe_runtime_rebuild` runs; a concurrent trigger is a
     /// no-op. See `drive_drain`.
     rebuild_in_progress: AtomicBool,
+    /// "DAG hydration complete" signal (restart-liveness fix, 2026-08-11). Wired from
+    /// `GhostDag::dag_hydrated_handle` in `with_fork_choice`. The runtime deep-fork
+    /// rebuild (`maybe_runtime_rebuild`) gates on THIS instead of a block-height
+    /// heuristic: a genuinely-canonical `select_tip` head is frequently at a LOWER
+    /// height than a longer losing branch, so `head_height < latest_stored` deferred
+    /// the rebuild forever and wedged the miner. `None` (tests without fork-choice, or
+    /// a fixed-tip stub) means "treat as hydrated" so the rebuild is not gated.
+    dag_hydrated: Option<Arc<AtomicBool>>,
 }
 
 impl CanonicalApplicator {
@@ -296,6 +304,7 @@ impl CanonicalApplicator {
             registry_policy_resync: None,
             genesis: OnceLock::new(),
             rebuild_in_progress: AtomicBool::new(false),
+            dag_hydrated: None,
         }
     }
 
@@ -309,11 +318,24 @@ impl CanonicalApplicator {
 
     /// Attach the fork-choice authority (GhostDAG). Enables reorg: after the
     /// forward drain, the driver reorgs the applied tip toward `select_tip()`.
+    ///
+    /// Also captures GhostDAG's "DAG hydration complete" signal, so the runtime
+    /// deep-fork rebuild fires only once the tip set is authoritative after a
+    /// restart (see `dag_hydrated` + `maybe_runtime_rebuild`).
     pub fn with_fork_choice(mut self, ghostdag: Arc<GhostDag>) -> Self {
+        self.dag_hydrated = Some(ghostdag.dag_hydrated_handle());
         self.fork_choice = Some(Arc::new(move || {
             let g = ghostdag.clone();
             Box::pin(async move { g.select_tip().await.ok() })
         }));
+        self
+    }
+
+    /// Test-only: inject the "DAG hydration complete" signal directly (production
+    /// wires it from GhostDAG via `with_fork_choice`).
+    #[cfg(test)]
+    pub fn with_hydration_signal(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.dag_hydrated = Some(flag);
         self
     }
 
@@ -1095,30 +1117,31 @@ impl CanonicalApplicator {
     ///
     /// Must be called WITHOUT the advance lock held (`recover_to_head` re-locks).
     async fn maybe_runtime_rebuild(&self, head: Hash) {
-        // HYDRATION GUARD (mirrors the startup recovery in main.rs). The DAG store
-        // hydrates its in-memory tips ASYNCHRONOUSLY after boot, so for the first
-        // seconds fork-choice surfaces a LOW, partial tip — it has only loaded blocks
-        // up to some height. `reorg_to` then reports that partial head as
-        // `BeyondReorgWindow` (it is far below the applied tip), and rebuilding toward
-        // it would REGRESS the applied state — and the durable store — down to that
-        // partial height. This is exactly what happened on the 2026-08-10 deploy: one
-        // second after restart the runtime rebuild drove the applied tip from 178,341
-        // down to 301. Only rebuild once fork-choice has hydrated to at least the top
-        // PERSISTED block height, so we never rebuild toward a partially-loaded view.
-        let head_height = self
-            .storage
-            .blocks
-            .get_block(&head)
-            .ok()
-            .flatten()
-            .map(|b| b.header.height)
-            .unwrap_or(0);
-        let latest_stored = self.storage.blocks.get_latest_height().unwrap_or(0);
-        if head_height < latest_stored {
-            debug!(
-                "runtime reorg: fork-choice head {head} @ {head_height} is below the top stored height {latest_stored} (DAG still hydrating) — deferring the spine rebuild"
-            );
-            return;
+        // HYDRATION GUARD (rewritten 2026-08-11). The DAG store hydrates its in-memory
+        // tips ASYNCHRONOUSLY after boot, so for the first seconds fork-choice surfaces
+        // a partial tip set; rebuilding toward a partially-loaded head would REGRESS
+        // the applied state (the 2026-08-10 deploy drove the tip from 178,341 → 301).
+        //
+        // The FIRST guard used `head_height < latest_stored` as a proxy for "still
+        // hydrating". That heuristic is WRONG: GhostDAG `select_tip` ranks by
+        // blue_score, not height, so a genuinely-canonical head is frequently at a
+        // LOWER height than a longer LOSING branch — and `get_latest_height` is a
+        // monotonic max over ALL branches, pinned high by a miner's own losing branch.
+        // So on the 2026-08-11 restart the guard was permanently true, deferred the
+        // rebuild forever, and the miner wedged. Gate on an EXPLICIT "DAG hydration
+        // complete" signal instead (set once `GhostDag::reconcile_tips_from_dag_store`
+        // has made the tip set authoritative). Once hydrated we TRUST `select_tip`'s
+        // head regardless of its height — safe because `recover_to_head` is atomic and
+        // self-validating (verifies the reconstructed genesis root AND the final head
+        // root, rolling back byte-identically on any mismatch, so a wrong head can
+        // never regress committed state). When no signal is wired (tests), proceed.
+        if let Some(flag) = &self.dag_hydrated {
+            if !flag.load(Ordering::SeqCst) {
+                debug!(
+                    "runtime reorg: fork-choice head {head} — DAG hydration not yet complete; deferring the spine rebuild"
+                );
+                return;
+            }
         }
         let (genesis_state, genesis_hash) = match self.genesis.get() {
             Some(g) => g.clone(),
@@ -2707,6 +2730,138 @@ mod tests {
         // Now a normal canonical tip: a further drain is a stable no-op.
         app.drive_drain().await;
         assert_eq!(app.applied_tip().await.hash, winner_tip);
+    }
+
+    /// BUG 2 (chain 40204, 2026-08-11 miner wedge): the runtime deep-fork self-heal
+    /// must converge even when the canonical (fork-choice) head is at a LOWER height
+    /// than a LONGER losing branch. GhostDAG `select_tip` ranks by blue_score, not
+    /// height, so the winner is routinely shorter; and `get_latest_height` is a
+    /// monotonic max over ALL branches, pinned high by the miner's own losing branch.
+    /// The OLD hydration guard `head_height < latest_stored` was therefore permanently
+    /// true here and deferred `recover_to_head` FOREVER — the miner wedged. With the
+    /// guard replaced by an explicit "DAG hydration complete" signal (here: none wired
+    /// == hydrated), the rebuild fires and converges onto the shorter winner.
+    #[tokio::test]
+    async fn drive_drain_self_heals_when_the_winning_head_is_lower_than_the_losing_top() {
+        let (exec, storage, _dir) = fresh();
+        let genesis_state = exec.state_snapshot();
+
+        // LOSING branch is LONGER than the ring — its top pins get_latest_height.
+        const LOSER_DEPTH: u64 = MAX_REORG_DEPTH + 5; // 105
+                                                      // WINNING (fork-choice) branch is SHORTER — heavier by blue score in reality,
+                                                      // but at a LOWER height. Forks at genesis, below the retained ring.
+        const WINNER_DEPTH: u64 = 50;
+        let r = roots(LOSER_DEPTH + 1);
+
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+
+        // Apply the LOSING branch LOSER_DEPTH deep — applied tip climbs to 105.
+        let mut parent = Hash::default();
+        let mut loser_tip = Hash::default();
+        for h in 1..=LOSER_DEPTH {
+            let blk = mk_block(h, parent, r[(h - 1) as usize]);
+            parent = blk.header.block_hash;
+            persist(&storage, &blk);
+            assert!(matches!(
+                app.apply_received(&blk).await,
+                ApplyOutcome::Applied { .. }
+            ));
+            loser_tip = blk.header.block_hash;
+        }
+        assert_eq!(app.applied_tip().await.height, LOSER_DEPTH);
+        assert_eq!(
+            storage.blocks.get_latest_height().unwrap_or(0),
+            LOSER_DEPTH,
+            "the longer losing branch pins latest-stored above the winner's height"
+        );
+
+        // Persist a SHORTER winning branch, forking at genesis (not applied).
+        let mut parent = Hash::default();
+        let mut winner_tip = Hash::default();
+        for h in 1..=WINNER_DEPTH {
+            let blk = mk_block_b(h, parent, r[(h - 1) as usize]);
+            parent = blk.header.block_hash;
+            persist(&storage, &blk);
+            winner_tip = blk.header.block_hash;
+        }
+
+        // Genesis wired + fork choice names the LOWER-height winner. Under the old
+        // `head_height (50) < latest_stored (105)` guard this deferred forever; with
+        // the hydration signal (none wired == hydrated) the rebuild converges.
+        app.set_genesis(genesis_state, Hash::default());
+        app.fork_choice = Some(fork_choice_returning(winner_tip));
+        app.drive_drain().await;
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip {
+                hash: winner_tip,
+                height: WINNER_DEPTH
+            },
+            "BUG 2: runtime rebuild must converge onto the shorter canonical winner, \
+             not defer forever because its height is below the losing branch's top"
+        );
+
+        // Stable: a further drain is a no-op on the now-canonical tip.
+        app.drive_drain().await;
+        assert_eq!(app.applied_tip().await.hash, winner_tip);
+    }
+
+    /// BUG 2 guard — the hydration signal itself: while the "DAG hydration complete"
+    /// flag is FALSE, the runtime rebuild must DEFER (never regress the applied state
+    /// toward a partially-loaded tip); once the flag flips true it converges. This
+    /// pins that the flag — not block height — gates the rebuild.
+    #[tokio::test]
+    async fn runtime_rebuild_defers_until_the_hydration_signal_is_set() {
+        use std::sync::atomic::AtomicBool;
+        let (exec, storage, _dir) = fresh();
+        let genesis_state = exec.state_snapshot();
+
+        const DEPTH: u64 = MAX_REORG_DEPTH + 5;
+        let r = roots(DEPTH + 1);
+        let hydrated = Arc::new(AtomicBool::new(false));
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone())
+            .with_hydration_signal(hydrated.clone());
+
+        let mut parent = Hash::default();
+        let mut loser_tip = Hash::default();
+        for h in 1..=DEPTH {
+            let blk = mk_block(h, parent, r[(h - 1) as usize]);
+            parent = blk.header.block_hash;
+            persist(&storage, &blk);
+            assert!(matches!(
+                app.apply_received(&blk).await,
+                ApplyOutcome::Applied { .. }
+            ));
+            loser_tip = blk.header.block_hash;
+        }
+        let mut parent = Hash::default();
+        let mut winner_tip = Hash::default();
+        for h in 1..=(DEPTH + 1) {
+            let blk = mk_block_b(h, parent, r[(h - 1) as usize]);
+            parent = blk.header.block_hash;
+            persist(&storage, &blk);
+            winner_tip = blk.header.block_hash;
+        }
+        app.set_genesis(genesis_state, Hash::default());
+        app.fork_choice = Some(fork_choice_returning(winner_tip));
+
+        // Hydration NOT complete → the rebuild defers; applied tip stays put (no
+        // regression toward a possibly-partial view).
+        app.drive_drain().await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            loser_tip,
+            "while hydration is incomplete the runtime rebuild must defer"
+        );
+
+        // Signal hydration complete → the next tick converges.
+        hydrated.store(true, Ordering::SeqCst);
+        app.drive_drain().await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            winner_tip,
+            "once hydration completes the rebuild converges onto the canonical head"
+        );
     }
 
     /// F1: a block the drain applied but the same call's fork-choice reorg then
