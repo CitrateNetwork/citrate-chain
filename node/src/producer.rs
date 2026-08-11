@@ -446,6 +446,19 @@ impl BlockProducer {
             );
         }
 
+        // RESTART-LIVENESS (2026-08-11): the eager-load above walks only the CANONICAL
+        // single-block-per-height chain, so GhostDag's tip set omits sibling/fork tips
+        // and can strand a stale ancestor. Since #163 `select_tip` is the fork-choice
+        // authority for BOTH the producer and the drain, that wedges restart recovery.
+        // Reconcile the in-memory tips to the DAG store's AUTHORITATIVE set (which
+        // `load_from_persistent` reconstructs from header parentage), and mark DAG
+        // hydration complete so the applicator's runtime deep-fork rebuild may fire.
+        let n_tips = ghostdag.reconcile_tips_from_dag_store().await;
+        info!(
+            "DAG rehydration: reconciled to {} authoritative tip(s)",
+            n_tips
+        );
+
         let tip_selector = Arc::new(TipSelector::new(
             dag_store.clone(),
             ghostdag.clone(),
@@ -585,6 +598,19 @@ impl BlockProducer {
                 latest_height
             );
         }
+
+        // RESTART-LIVENESS (2026-08-11): the eager-load above walks only the CANONICAL
+        // single-block-per-height chain, so GhostDag's tip set omits sibling/fork tips
+        // and can strand a stale ancestor. Since #163 `select_tip` is the fork-choice
+        // authority for BOTH the producer and the drain, that wedges restart recovery.
+        // Reconcile the in-memory tips to the DAG store's AUTHORITATIVE set (which
+        // `load_from_persistent` reconstructs from header parentage), and mark DAG
+        // hydration complete so the applicator's runtime deep-fork rebuild may fire.
+        let n_tips = ghostdag.reconcile_tips_from_dag_store().await;
+        info!(
+            "DAG rehydration: reconciled to {} authoritative tip(s)",
+            n_tips
+        );
 
         let tip_selector = Arc::new(TipSelector::new(
             dag_store.clone(),
