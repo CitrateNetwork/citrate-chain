@@ -247,6 +247,14 @@ pub struct CanonicalApplicator {
     /// operation). Set while `maybe_runtime_rebuild` runs; a concurrent trigger is a
     /// no-op. See `drive_drain`.
     rebuild_in_progress: AtomicBool,
+    /// "DAG hydration complete" signal (restart-liveness fix, 2026-08-11). Wired from
+    /// `GhostDag::dag_hydrated_handle` in `with_fork_choice`. The runtime deep-fork
+    /// rebuild (`maybe_runtime_rebuild`) gates on THIS instead of a block-height
+    /// heuristic: a genuinely-canonical `select_tip` head is frequently at a LOWER
+    /// height than a longer losing branch, so `head_height < latest_stored` deferred
+    /// the rebuild forever and wedged the miner. `None` (tests without fork-choice, or
+    /// a fixed-tip stub) means "treat as hydrated" so the rebuild is not gated.
+    dag_hydrated: Option<Arc<AtomicBool>>,
 }
 
 impl CanonicalApplicator {
@@ -296,6 +304,7 @@ impl CanonicalApplicator {
             registry_policy_resync: None,
             genesis: OnceLock::new(),
             rebuild_in_progress: AtomicBool::new(false),
+            dag_hydrated: None,
         }
     }
 
@@ -309,11 +318,24 @@ impl CanonicalApplicator {
 
     /// Attach the fork-choice authority (GhostDAG). Enables reorg: after the
     /// forward drain, the driver reorgs the applied tip toward `select_tip()`.
+    ///
+    /// Also captures GhostDAG's "DAG hydration complete" signal, so the runtime
+    /// deep-fork rebuild fires only once the tip set is authoritative after a
+    /// restart (see `dag_hydrated` + `maybe_runtime_rebuild`).
     pub fn with_fork_choice(mut self, ghostdag: Arc<GhostDag>) -> Self {
+        self.dag_hydrated = Some(ghostdag.dag_hydrated_handle());
         self.fork_choice = Some(Arc::new(move || {
             let g = ghostdag.clone();
             Box::pin(async move { g.select_tip().await.ok() })
         }));
+        self
+    }
+
+    /// Test-only: inject the "DAG hydration complete" signal directly (production
+    /// wires it from GhostDAG via `with_fork_choice`).
+    #[cfg(test)]
+    pub fn with_hydration_signal(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.dag_hydrated = Some(flag);
         self
     }
 
@@ -768,6 +790,45 @@ impl CanonicalApplicator {
         branch.reverse(); // fork_point+1 .. new_tip
         let mut new_snaps: Vec<(u64, Hash, StateSnapshot)> = Vec::new();
         let mut tip = fork;
+
+        // VALIDATOR-S1 §R' — ACTIVATION-BOUNDARY FIX (chain 40204 cold-sync wedge at
+        // 2000, 2026-08-11). The forward path keeps the epoch policy governing a height
+        // RESIDENT continuously from the last snapshot boundary S(E); the reorg reapply
+        // re-materializes it ONLY when the reapply window CROSSES an S(E) (the in-loop
+        // resync below, gated on `snapshot_epoch_at(h).is_some()`). But the validator
+        // activation height (2000) is NOT a snapshot boundary — with EPOCH=1000,
+        // LAG=200 the boundaries straddling it are S(2)=1800 and S(3)=2800. A reorg
+        // whose window crosses activation but no S(E) (fork point >= the last S(E))
+        // therefore never re-materializes the governing policy, so the first
+        // §R'-active block settles against whatever cell happened to be resident (a
+        // stale or unmaterialized epoch) → its state root can't be reproduced → the
+        // reorg aborts at that block forever. Restore the forward-path invariant: seed
+        // the epoch policy governing the FORK POINT (as-of the greatest S(E) <=
+        // fork.height) BEFORE the reapply, so it holds regardless of which boundaries
+        // the window includes. Policy-only (selector stays deferred + abort-safe);
+        // `pre_policy` is already captured, so every abort arm still restores it.
+        if let Some(hook) = &self.registry_policy_resync {
+            if let Some(gov) = crate::registry_sync::greatest_snapshot_at(fork.height) {
+                if let Err(e) = hook(gov).await {
+                    self.executor.state_restore(pre_state.clone());
+                    self.executor.restore_reward_policy(pre_policy.clone());
+                    if let Err(re) = self.executor.reconcile_store_from(&base_snapshot) {
+                        warn!(
+                            "execute-on-receive: reorg to {} abort — store restore failed: {re}",
+                            new_tip
+                        );
+                    }
+                    warn!(
+                        "execute-on-receive: reorg to {} aborted — governing-epoch policy resync at S({}) failed: {} (reverted to {})",
+                        new_tip, gov, e, pre_tip.hash
+                    );
+                    return ReorgOutcome::Rejected(format!(
+                        "reorg governing-epoch policy resync failed at S({gov}): {e}"
+                    ));
+                }
+            }
+        }
+
         for block in &branch {
             let credits = self.reward_credits(block);
             match self
@@ -1095,30 +1156,31 @@ impl CanonicalApplicator {
     ///
     /// Must be called WITHOUT the advance lock held (`recover_to_head` re-locks).
     async fn maybe_runtime_rebuild(&self, head: Hash) {
-        // HYDRATION GUARD (mirrors the startup recovery in main.rs). The DAG store
-        // hydrates its in-memory tips ASYNCHRONOUSLY after boot, so for the first
-        // seconds fork-choice surfaces a LOW, partial tip — it has only loaded blocks
-        // up to some height. `reorg_to` then reports that partial head as
-        // `BeyondReorgWindow` (it is far below the applied tip), and rebuilding toward
-        // it would REGRESS the applied state — and the durable store — down to that
-        // partial height. This is exactly what happened on the 2026-08-10 deploy: one
-        // second after restart the runtime rebuild drove the applied tip from 178,341
-        // down to 301. Only rebuild once fork-choice has hydrated to at least the top
-        // PERSISTED block height, so we never rebuild toward a partially-loaded view.
-        let head_height = self
-            .storage
-            .blocks
-            .get_block(&head)
-            .ok()
-            .flatten()
-            .map(|b| b.header.height)
-            .unwrap_or(0);
-        let latest_stored = self.storage.blocks.get_latest_height().unwrap_or(0);
-        if head_height < latest_stored {
-            debug!(
-                "runtime reorg: fork-choice head {head} @ {head_height} is below the top stored height {latest_stored} (DAG still hydrating) — deferring the spine rebuild"
-            );
-            return;
+        // HYDRATION GUARD (rewritten 2026-08-11). The DAG store hydrates its in-memory
+        // tips ASYNCHRONOUSLY after boot, so for the first seconds fork-choice surfaces
+        // a partial tip set; rebuilding toward a partially-loaded head would REGRESS
+        // the applied state (the 2026-08-10 deploy drove the tip from 178,341 → 301).
+        //
+        // The FIRST guard used `head_height < latest_stored` as a proxy for "still
+        // hydrating". That heuristic is WRONG: GhostDAG `select_tip` ranks by
+        // blue_score, not height, so a genuinely-canonical head is frequently at a
+        // LOWER height than a longer LOSING branch — and `get_latest_height` is a
+        // monotonic max over ALL branches, pinned high by a miner's own losing branch.
+        // So on the 2026-08-11 restart the guard was permanently true, deferred the
+        // rebuild forever, and the miner wedged. Gate on an EXPLICIT "DAG hydration
+        // complete" signal instead (set once `GhostDag::reconcile_tips_from_dag_store`
+        // has made the tip set authoritative). Once hydrated we TRUST `select_tip`'s
+        // head regardless of its height — safe because `recover_to_head` is atomic and
+        // self-validating (verifies the reconstructed genesis root AND the final head
+        // root, rolling back byte-identically on any mismatch, so a wrong head can
+        // never regress committed state). When no signal is wired (tests), proceed.
+        if let Some(flag) = &self.dag_hydrated {
+            if !flag.load(Ordering::SeqCst) {
+                debug!(
+                    "runtime reorg: fork-choice head {head} — DAG hydration not yet complete; deferring the spine rebuild"
+                );
+                return;
+            }
         }
         let (genesis_state, genesis_hash) = match self.genesis.get() {
             Some(g) => g.clone(),
@@ -2709,6 +2771,136 @@ mod tests {
         assert_eq!(app.applied_tip().await.hash, winner_tip);
     }
 
+    /// BUG 2 (chain 40204, 2026-08-11 miner wedge): the runtime deep-fork self-heal
+    /// must converge even when the canonical (fork-choice) head is at a LOWER height
+    /// than a LONGER losing branch. GhostDAG `select_tip` ranks by blue_score, not
+    /// height, so the winner is routinely shorter; and `get_latest_height` is a
+    /// monotonic max over ALL branches, pinned high by the miner's own losing branch.
+    /// The OLD hydration guard `head_height < latest_stored` was therefore permanently
+    /// true here and deferred `recover_to_head` FOREVER — the miner wedged. With the
+    /// guard replaced by an explicit "DAG hydration complete" signal (here: none wired
+    /// == hydrated), the rebuild fires and converges onto the shorter winner.
+    #[tokio::test]
+    async fn drive_drain_self_heals_when_the_winning_head_is_lower_than_the_losing_top() {
+        let (exec, storage, _dir) = fresh();
+        let genesis_state = exec.state_snapshot();
+
+        // LOSING branch is LONGER than the ring — its top pins get_latest_height.
+        const LOSER_DEPTH: u64 = MAX_REORG_DEPTH + 5; // 105
+                                                      // WINNING (fork-choice) branch is SHORTER — heavier by blue score in reality,
+                                                      // but at a LOWER height. Forks at genesis, below the retained ring.
+        const WINNER_DEPTH: u64 = 50;
+        let r = roots(LOSER_DEPTH + 1);
+
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+
+        // Apply the LOSING branch LOSER_DEPTH deep — applied tip climbs to 105.
+        let mut parent = Hash::default();
+        for h in 1..=LOSER_DEPTH {
+            let blk = mk_block(h, parent, r[(h - 1) as usize]);
+            parent = blk.header.block_hash;
+            persist(&storage, &blk);
+            assert!(matches!(
+                app.apply_received(&blk).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        assert_eq!(app.applied_tip().await.height, LOSER_DEPTH);
+        assert_eq!(
+            storage.blocks.get_latest_height().unwrap_or(0),
+            LOSER_DEPTH,
+            "the longer losing branch pins latest-stored above the winner's height"
+        );
+
+        // Persist a SHORTER winning branch, forking at genesis (not applied).
+        let mut parent = Hash::default();
+        let mut winner_tip = Hash::default();
+        for h in 1..=WINNER_DEPTH {
+            let blk = mk_block_b(h, parent, r[(h - 1) as usize]);
+            parent = blk.header.block_hash;
+            persist(&storage, &blk);
+            winner_tip = blk.header.block_hash;
+        }
+
+        // Genesis wired + fork choice names the LOWER-height winner. Under the old
+        // `head_height (50) < latest_stored (105)` guard this deferred forever; with
+        // the hydration signal (none wired == hydrated) the rebuild converges.
+        app.set_genesis(genesis_state, Hash::default());
+        app.fork_choice = Some(fork_choice_returning(winner_tip));
+        app.drive_drain().await;
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip {
+                hash: winner_tip,
+                height: WINNER_DEPTH
+            },
+            "BUG 2: runtime rebuild must converge onto the shorter canonical winner, \
+             not defer forever because its height is below the losing branch's top"
+        );
+
+        // Stable: a further drain is a no-op on the now-canonical tip.
+        app.drive_drain().await;
+        assert_eq!(app.applied_tip().await.hash, winner_tip);
+    }
+
+    /// BUG 2 guard — the hydration signal itself: while the "DAG hydration complete"
+    /// flag is FALSE, the runtime rebuild must DEFER (never regress the applied state
+    /// toward a partially-loaded tip); once the flag flips true it converges. This
+    /// pins that the flag — not block height — gates the rebuild.
+    #[tokio::test]
+    async fn runtime_rebuild_defers_until_the_hydration_signal_is_set() {
+        use std::sync::atomic::AtomicBool;
+        let (exec, storage, _dir) = fresh();
+        let genesis_state = exec.state_snapshot();
+
+        const DEPTH: u64 = MAX_REORG_DEPTH + 5;
+        let r = roots(DEPTH + 1);
+        let hydrated = Arc::new(AtomicBool::new(false));
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone())
+            .with_hydration_signal(hydrated.clone());
+
+        let mut parent = Hash::default();
+        let mut loser_tip = Hash::default();
+        for h in 1..=DEPTH {
+            let blk = mk_block(h, parent, r[(h - 1) as usize]);
+            parent = blk.header.block_hash;
+            persist(&storage, &blk);
+            assert!(matches!(
+                app.apply_received(&blk).await,
+                ApplyOutcome::Applied { .. }
+            ));
+            loser_tip = blk.header.block_hash;
+        }
+        let mut parent = Hash::default();
+        let mut winner_tip = Hash::default();
+        for h in 1..=(DEPTH + 1) {
+            let blk = mk_block_b(h, parent, r[(h - 1) as usize]);
+            parent = blk.header.block_hash;
+            persist(&storage, &blk);
+            winner_tip = blk.header.block_hash;
+        }
+        app.set_genesis(genesis_state, Hash::default());
+        app.fork_choice = Some(fork_choice_returning(winner_tip));
+
+        // Hydration NOT complete → the rebuild defers; applied tip stays put (no
+        // regression toward a possibly-partial view).
+        app.drive_drain().await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            loser_tip,
+            "while hydration is incomplete the runtime rebuild must defer"
+        );
+
+        // Signal hydration complete → the next tick converges.
+        hydrated.store(true, Ordering::SeqCst);
+        app.drive_drain().await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            winner_tip,
+            "once hydration completes the rebuild converges onto the canonical head"
+        );
+    }
+
     /// F1: a block the drain applied but the same call's fork-choice reorg then
     /// reverted must NOT be reported Applied (pre-fix used the stale pre-reorg
     /// `out.applied`).
@@ -2788,6 +2980,67 @@ mod tests {
             Arc::new(StateDB::new()),
             Some(storage.state.clone()),
         ))
+    }
+
+    /// BUG 1 (chain 40204, 2026-08-11 G9 rolling restart): a restarted FOLLOWER
+    /// whose applied tip is BEHIND blocks already stored on disk must drain forward
+    /// to head on its own. Reproduces the restart directly: apply a linear chain to
+    /// tip 3 (store-backed executor + persisted applied-tip pointer), persist the
+    /// next 3 linear blocks WITHOUT applying (stored-ahead, child index populated),
+    /// then construct a FRESH applicator + fresh store-backed executor over the SAME
+    /// storage — exactly the post-restart state: applied tip re-seeded from the
+    /// persisted pointer (3), executor state rehydrated via read-through, blocks
+    /// 4..6 stored ahead. `drive_drain` MUST walk the applied tip to 6.
+    #[tokio::test]
+    async fn restarted_follower_drains_stored_ahead_blocks_to_head() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.persist_state_changes().await.expect("persist genesis");
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+
+        // Linear reward-only chain of 6; apply the first 3 (applied tip + pointer).
+        let c = chain(6);
+        for b in &c[..3] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        assert_eq!(app.applied_tip().await.height, 3);
+
+        // Persist 4,5,6 AHEAD — stored (with child index) but NOT applied.
+        for b in &c[3..] {
+            persist(&storage, b);
+        }
+        assert_eq!(app.applied_tip().await.height, 3, "applied tip still 3");
+        assert_eq!(
+            storage.blocks.get_latest_height().unwrap_or(0),
+            6,
+            "stored height is 6 (blocks ahead)"
+        );
+
+        // ── SIMULATE RESTART ── fresh applicator + fresh store-backed executor over
+        // the SAME storage: applied tip re-seeds from the persisted pointer (3),
+        // executor state resolves through the durable store.
+        drop(app);
+        let exec2 = store_backed(&storage);
+        let app2 = CanonicalApplicator::new(exec2.clone(), storage.clone());
+        assert_eq!(
+            app2.applied_tip().await.height,
+            3,
+            "restart seeds the applied tip from the persisted pointer"
+        );
+
+        // The periodic drain MUST catch the applied tip up through the stored blocks.
+        app2.drive_drain().await;
+        assert_eq!(
+            app2.applied_tip().await.height,
+            6,
+            "BUG 1: restarted follower failed to drain stored-ahead blocks to head"
+        );
     }
 
     /// HIGH-2: after a reorg, the DURABLE store must match the new branch — proven
@@ -4019,6 +4272,144 @@ mod tests {
                 .map(|p| p.priority_fee_share_bps),
             Some(2500),
             "aborted reorg must restore the pre-reorg reward policy (not leave it at 5000)"
+        );
+    }
+
+    /// BUG 3 (chain 40204 cold-sync wedge at 2000, 2026-08-11): a reorg whose reapply
+    /// window crosses the ACTIVATION height but NO snapshot boundary S(E) must still
+    /// reproduce the branch's claimed roots. The forward path keeps the governing
+    /// epoch policy resident continuously from the last S(E); the reorg reapply only
+    /// re-materialized it when the window CROSSED an S(E). With EPOCH=1000, LAG=200 the
+    /// boundaries are S(1)=800, S(2)=1800, and the validator activation height (here
+    /// 810; on 40204 it is 2000) sits BETWEEN them. Fork at 805 (> S(1)); the reapply
+    /// window 806..812 crosses activation 810 with no boundary, so the in-loop resync
+    /// (`snapshot_epoch_at`) never fires. The victim's resident policy is WRONG (models
+    /// a restart/cold-sync node whose epoch-1 policy was never materialized). The fix
+    /// seeds the governing epoch policy (`greatest_snapshot_at(805) = S(1)=800`) BEFORE
+    /// the reapply, so the §R'-active blocks settle against the epoch-correct policy and
+    /// reproduce B's roots. Without the fix the reorg aborts at b810 (StateRootMismatch)
+    /// and every assertion below FAILS — the literal 2000 wedge from the incident logs.
+    #[tokio::test]
+    async fn reorg_across_activation_between_boundaries_reproduces_root() {
+        const ACT: u64 = 810; // strictly inside (S(1)=800, S(2)=1800), a NON-boundary
+        fn policy(bps: u64) -> citrate_execution::block_rewards::EpochRewardPolicy {
+            let mut staker_of = std::collections::HashMap::new();
+            staker_of.insert(PROPOSER, CB);
+            citrate_execution::block_rewards::EpochRewardPolicy {
+                epoch: 1,
+                snapshot_height: 800,
+                activation_height: ACT,
+                registry: REG,
+                reward_minter: citrate_execution::block_rewards::REWARD_MINTER_ADDRESS,
+                priority_fee_share_bps: bps,
+                block_subsidy: U256::zero(),
+                staker_of,
+            }
+        }
+        // Sanity: the window forks above S(1) and contains no snapshot boundary, so
+        // only the fork-point seed (greatest_snapshot_at) can re-establish the policy.
+        assert_eq!(crate::registry_sync::greatest_snapshot_at(805), Some(800));
+        for h in 806..=812 {
+            assert!(crate::registry_sync::snapshot_epoch_at(h).is_none());
+        }
+
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.set_validator_activation_height(ACT);
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+
+        // Seed the applied tip at the shared fork point s805 (above S(1)). The victim's
+        // resident policy is the WRONG epoch (5000 bps) — a node whose epoch-1 policy
+        // was never materialized (executor.rs's documented cold-sync fault).
+        let a804 = seal_rprime(804, Hash::default(), Hash::default(), VRF_OUT, vec![]);
+        persist(&storage, &a804);
+        // Shared prefix s805 produced under the CORRECT epoch-1 policy (2500).
+        let pchain = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pchain.set_balance(&Address(ALICE), U256::from(FUND));
+        pchain.set_validator_activation_height(ACT);
+        *pchain.reward_policy_handle().write() = Some(policy(2500));
+        let s805 = produce_rprime(&pchain, a804.header.block_hash, 805, VRF_OUT, vec![]).await;
+        // Apply the shared prefix on the victim so its state == s805 (still pre-activation,
+        // so §R' has not vested yet and the wrong-vs-right policy has not mattered).
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        // Hooks materialize the CORRECT epoch-1 policy (2500) when called.
+        let e_full = follower.clone();
+        app.registry_sync = Some(Arc::new(move |_h| {
+            *e_full.reward_policy_handle().write() = Some(policy(2500));
+            Box::pin(async { Ok(1usize) })
+        }));
+        let e_pol = follower.clone();
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            *e_pol.reward_policy_handle().write() = Some(policy(2500));
+            Box::pin(async { Ok(()) })
+        }));
+        storage
+            .blocks
+            .put_applied_tip(&a804.header.block_hash, 804)
+            .expect("seed tip");
+        *follower.reward_policy_handle().write() = Some(policy(2500));
+        persist(&storage, &s805);
+        assert!(matches!(
+            app.apply_received(&s805).await,
+            ApplyOutcome::Applied { .. }
+        ));
+
+        // Now corrupt the resident policy to the WRONG epoch (5000) — the cold-sync
+        // node's unmaterialized/stale cell at reorg time.
+        *follower.reward_policy_handle().write() = Some(policy(5000));
+
+        // Branch B off s805: b806..b812, with §R'-vesting priority-fee transfers at the
+        // activation heights (810/811/812) so the roots are policy-sensitive. Produced
+        // under the CORRECT epoch-1 policy (2500) on a clean mirror at s805's state.
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_validator_activation_height(ACT);
+        *pb.reward_policy_handle().write() = Some(policy(2500));
+        let _s = produce_rprime(&pb, a804.header.block_hash, 805, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5B; 32];
+        let mut parent = s805.header.block_hash;
+        let mut bt: Vec<Block> = Vec::new();
+        for h in 806..=812u64 {
+            let txs = if h >= ACT {
+                vec![prio_tx(ALICE, CAROL, h - ACT, 0xB0 + (h - ACT) as u8)]
+            } else {
+                vec![]
+            };
+            let blk = produce_rprime(&pb, parent, h, vrf_b, txs).await;
+            parent = blk.header.block_hash;
+            bt.push(blk);
+        }
+        let b812 = bt.last().expect("b812").clone();
+        for b in &bt {
+            persist(&storage, b);
+        }
+
+        // Drive the reorg across activation 810 (fork 805, window 806..812, no S(E)).
+        app.fork_choice = Some(fork_choice_returning(b812.header.block_hash));
+        let outcome = app.apply_received(&b812).await;
+
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "reorg across activation must apply b812, got {outcome:?}"
+        );
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip {
+                hash: b812.header.block_hash,
+                height: 812
+            },
+            "victim must reorg to the B tip"
+        );
+        assert_eq!(
+            follower.calculate_state_root(),
+            b812.state_root,
+            "reapplied head must reproduce the claimed activation-branch root"
         );
     }
 

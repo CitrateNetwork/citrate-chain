@@ -3,6 +3,7 @@
 use crate::dag_store::DagStore;
 use crate::types::{Block, BlueSet, DagRelation, GhostDagParams, Hash};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -70,6 +71,12 @@ pub struct GhostDag {
     /// this field is inert until an operator schedules it. See
     /// [`MERGE_PARENT_MAX_DEPTH`] and `handoffs/PRUNE_MERGE_PARENT_BOUND_SPEC.md`.
     merge_depth_activation_height: Option<u64>,
+
+    /// "DAG hydration complete" flag (restart-liveness fix, 2026-08-11). False
+    /// until [`Self::reconcile_tips_from_dag_store`] has made the in-memory tip set
+    /// authoritative after a restart. The applicator's runtime deep-fork rebuild
+    /// gates on this instead of a block-height heuristic. See `dag_hydrated_handle`.
+    dag_hydrated: Arc<AtomicBool>,
 }
 
 /// MP-DEPTH: the deepest a merge parent may sit below the block that merges it.
@@ -151,6 +158,7 @@ impl GhostDag {
             relations: Arc::new(RwLock::new(HashMap::new())),
             blue_cache: Arc::new(RwLock::new(HashMap::new())),
             tips: Arc::new(RwLock::new(HashSet::new())),
+            dag_hydrated: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -773,7 +781,44 @@ impl GhostDag {
         // Still O(1) per block: the eager rehydration loop walks blocks in
         // height order, so the selected parent is already in `relations` and
         // the linear derivation applies.
-        let blue_set = self.derive_score_and_work(block).await?;
+        //
+        // NON-FATAL SCORE DERIVATION (restart-liveness fix, 2026-08-11). Pre-fix
+        // this was `derive_score_and_work(block).await?` — all-or-nothing. When a
+        // merge parent's score was unresolvable on restart (a pruned/holed merge
+        // parent → `BlockNotFound` out of `calculate_blue_set`), the `?` returned
+        // BEFORE the `relations` insert and the tips bookkeeping below, so the block
+        // never entered the tip set AND its selected parent was never removed from
+        // it — leaving a STALE ANCESTOR as a tip. `select_tip` (fork-choice for BOTH
+        // the producer and the drain since #163) then returned that ancestor, so the
+        // follower's drain saw no advance and the miner's rebuild was driven at a
+        // stale head — the 2026-08-11 restart wedge. Fall back to the durable derived
+        // anchor, then the header's own blue_score, so a score is ALWAYS available
+        // and the tips bookkeeping ALWAYS runs. The fallback score is only a
+        // fork-choice ranking input (never a consensus state root); an off-by-a-few
+        // score on a holed merge block cannot fork state, and the authoritative
+        // `calculate_blue_set` still recomputes on demand where cardinality matters.
+        let blue_set = match self.derive_score_and_work(block).await {
+            Ok(bs) => bs,
+            Err(e) => {
+                let fallback = self
+                    .dag_store
+                    .get_derived_blue_score(&block.hash())
+                    .unwrap_or(block.header.blue_score);
+                warn!(
+                    "register_existing_block: score derivation for {} @ {} failed ({}) — \
+                     falling back to score {} so the block still enters the tip set",
+                    block.hash(),
+                    block.header.height,
+                    e,
+                    fallback
+                );
+                BlueSet {
+                    blocks: std::collections::HashSet::new(),
+                    score: fallback,
+                    work: crate::types::blue_work_for_score(fallback),
+                }
+            }
+        };
 
         // SYNC-S1 D3: same durable anchor as `add_block` — the rehydration path
         // must record it too, or a node whose relations were built only by
@@ -814,6 +859,79 @@ impl GhostDag {
         tips.insert(block.hash());
 
         Ok(())
+    }
+
+    /// AUTHORITATIVE TIP REHYDRATION (restart-liveness fix, 2026-08-11). Align this
+    /// GhostDag's in-memory `tips` with the DAG store's AUTHORITATIVE tip set.
+    ///
+    /// After a restart the eager-load loops (`producer.rs`) register only the
+    /// CANONICAL single-block-per-height chain via [`Self::register_existing_block`],
+    /// so `GhostDag.tips` can diverge from the true DAG tips: a sibling/fork tip is
+    /// never registered, or a block whose registration failed left its parent
+    /// stranded as a tip. Since #163 `select_tip` is the fork-choice authority for
+    /// BOTH the producer's parent-selection AND the drain's reorg, a wrong tip set
+    /// wedges restart recovery (the follower drain sees a stale ancestor as best; the
+    /// miner's runtime rebuild is driven at the wrong head). `DagStore` already
+    /// reconstructs its tip set authoritatively from block-header parentage on load
+    /// (PIL-42, `load_from_persistent`: a block is a tip iff no stored block names it
+    /// as a selected/merge parent). This copies that authoritative set in, first
+    /// registering any tip missing from `relations` so `select_tip` can rank it.
+    ///
+    /// O(number of tips), NOT O(chain length): it only registers TIPS (a handful),
+    /// never walks `calculate_blue_set` for interior blocks (PIL-13 stays intact).
+    /// Returns the number of authoritative tips after reconciliation.
+    pub async fn reconcile_tips_from_dag_store(&self) -> usize {
+        let authoritative: Vec<Hash> = self
+            .dag_store
+            .get_tips()
+            .await
+            .into_iter()
+            .map(|t| t.hash)
+            .collect();
+
+        // Ensure every authoritative tip has a `relations` entry (with a score) so
+        // `select_tip` considers it. `register_existing_block` is now non-fatal, so
+        // a tip whose merge-parent score is unresolvable still lands with a fallback
+        // score rather than being skipped.
+        for hash in &authoritative {
+            let known = self.relations.read().await.contains_key(hash);
+            if !known {
+                if let Ok(block) = self.dag_store.get_block(hash).await {
+                    if let Err(e) = self.register_existing_block(&block).await {
+                        warn!(
+                            "reconcile_tips_from_dag_store: could not register tip {}: {}",
+                            hash, e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Replace the in-memory tip set with the authoritative one (register above
+        // may have mutated `tips`; the authoritative set is the final word).
+        let mut tips = self.tips.write().await;
+        *tips = authoritative.iter().copied().collect();
+        let n = tips.len();
+        drop(tips);
+
+        // Mark hydration complete so consumers that gate on it (the applicator's
+        // runtime deep-fork rebuild) stop deferring and start trusting `select_tip`.
+        self.dag_hydrated.store(true, Ordering::SeqCst);
+        info!(
+            "reconcile_tips_from_dag_store: GhostDag tips reconciled to {} authoritative tip(s); DAG hydration complete",
+            n
+        );
+        n
+    }
+
+    /// Shared handle to the "DAG hydration complete" flag — set true by
+    /// [`Self::reconcile_tips_from_dag_store`] once the in-memory tip set is
+    /// authoritative. Consumers (the applicator's runtime deep-fork rebuild) gate on
+    /// this instead of a block-height heuristic: a genuinely-canonical `select_tip`
+    /// head is frequently LOWER than a longer losing branch, so height cannot stand
+    /// in for "hydration done". Defaults false until reconciliation runs.
+    pub fn dag_hydrated_handle(&self) -> Arc<AtomicBool> {
+        self.dag_hydrated.clone()
     }
 
     /// Add a block to the DAG
@@ -1509,6 +1627,75 @@ mod tests {
         assert_ne!(
             producer_pick, drain_pick,
             "REPRODUCED: producer and drain select different sibling heads"
+        );
+    }
+
+    /// BUG 1 FIX (restart-liveness, 2026-08-11): `reconcile_tips_from_dag_store`
+    /// realigns GhostDag's in-memory tip set with the DAG store's AUTHORITATIVE tip
+    /// set after a restart, so `select_tip` stops returning a stale tip and matches
+    /// the DAG store (and therefore the producer). Same divergence shape as the pin
+    /// above — a winner sibling present in the DAG store but MISSING from GhostDAG's
+    /// tips — but here we reconcile and assert `select_tip` converges on the true
+    /// canonical (smaller-hash) winner.
+    #[tokio::test]
+    async fn reconcile_tips_from_dag_store_realigns_select_tip_with_the_authoritative_set() {
+        let params = GhostDagParams::default();
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(params, dag_store.clone()));
+
+        // genesis + a1 admitted to BOTH.
+        let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+        dag_store
+            .store_block(genesis.clone())
+            .await
+            .expect("store genesis");
+        ghostdag.add_block(&genesis).await.expect("admit genesis");
+        let a1 = create_test_block_with_parents([1; 32], genesis.hash(), vec![], 1);
+        dag_store.store_block(a1.clone()).await.expect("store a1");
+        ghostdag.add_block(&a1).await.expect("admit a1");
+
+        // Two equal-score siblings; winner has the smaller hash.
+        let winner = create_test_block_with_parents([2; 32], a1.hash(), vec![], 2);
+        let loser = create_test_block_with_parents([9; 32], a1.hash(), vec![], 2);
+        assert!(winner.hash() < loser.hash());
+
+        // The LOSER is admitted to GhostDAG; the WINNER reaches only the DAG store
+        // (the restart-rehydration gap). select_tip is stuck on the loser.
+        dag_store
+            .store_block(loser.clone())
+            .await
+            .expect("store loser");
+        ghostdag.add_block(&loser).await.expect("admit loser");
+        dag_store
+            .store_block(winner.clone())
+            .await
+            .expect("store winner (DAG only)");
+
+        assert!(!ghostdag.dag_hydrated_handle().load(Ordering::SeqCst));
+        assert_eq!(
+            ghostdag.select_tip().await.expect("select_tip"),
+            loser.hash(),
+            "before reconcile, select_tip is stuck on the stale (loser) tip"
+        );
+
+        // ── THE FIX ── reconcile to the authoritative DAG-store tip set. The
+        // in-memory tip set now equals DagStore's, so the winner (previously absent
+        // from GhostDAG's tips) is considered. (The permissive test store's
+        // incremental get_tips also carries genesis; production's load_from_persistent
+        // excludes the root. Either way the higher-score sibling wins.)
+        let n = ghostdag.reconcile_tips_from_dag_store().await;
+        assert!(
+            n >= 2,
+            "authoritative tip set includes both siblings (got {n})"
+        );
+        assert!(
+            ghostdag.dag_hydrated_handle().load(Ordering::SeqCst),
+            "reconcile marks DAG hydration complete"
+        );
+        assert_eq!(
+            ghostdag.select_tip().await.expect("select_tip"),
+            winner.hash(),
+            "after reconcile, select_tip returns the true canonical (smaller-hash) winner"
         );
     }
 
