@@ -2796,7 +2796,6 @@ mod tests {
 
         // Apply the LOSING branch LOSER_DEPTH deep — applied tip climbs to 105.
         let mut parent = Hash::default();
-        let mut loser_tip = Hash::default();
         for h in 1..=LOSER_DEPTH {
             let blk = mk_block(h, parent, r[(h - 1) as usize]);
             parent = blk.header.block_hash;
@@ -2805,7 +2804,6 @@ mod tests {
                 app.apply_received(&blk).await,
                 ApplyOutcome::Applied { .. }
             ));
-            loser_tip = blk.header.block_hash;
         }
         assert_eq!(app.applied_tip().await.height, LOSER_DEPTH);
         assert_eq!(
