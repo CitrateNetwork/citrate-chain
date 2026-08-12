@@ -265,19 +265,30 @@ if should P2; then
   # pubkey) and SKIP re-registration; G5/G5b/G5c below still verify the result, so
   # correctness is unchanged — a partial/incorrect self-bond (any zero pubkey or
   # activeCount<4) still falls through to the ceremony.
+  # The mining node self-bonds ASYNCHRONOUSLY after it arms mining — which can land
+  # DURING this ceremony's cargo build/run window, exactly when a one-shot check
+  # would miss it and then hit the depleted-balance revert. POLL for the self-bond to
+  # complete (activeCount == the number of mining validators AND every validator
+  # coinbase carries a non-zero registered pubkey) before deciding. Only if it never
+  # lands within the window do we fall through to the explicit registration ceremony.
   SELF_BONDED=0
-  if [ "$CONFIRM" -eq 1 ]; then
-    AC_PRE="$(cast_read call "$REGISTRY_EXPECT" 'activeCount()(uint256)')"
-    if [ "$AC_PRE" = "${#COINBASES[@]}" ] && [ "${#COINBASES[@]}" -gt 0 ]; then
-      SELF_BONDED=1
-      for CB in "${COINBASES[@]}"; do
-        PK="$(cast_read call "$REGISTRY_EXPECT" 'pubkeyOfStaker(address)(bytes32)' "$CB")"
-        case "$PK" in
-          0x0000000000000000000000000000000000000000000000000000000000000000 | "")
-            SELF_BONDED=0 ;;
-        esac
-      done
-    fi
+  if [ "$CONFIRM" -eq 1 ] && [ "${#COINBASES[@]}" -gt 0 ]; then
+    log "  waiting for the mining validator(s) to self-bond (up to 90s)…"
+    for _w in $(seq 1 45); do
+      AC_PRE="$(cast_read call "$REGISTRY_EXPECT" 'activeCount()(uint256)')"
+      if [ "$AC_PRE" = "${#COINBASES[@]}" ]; then
+        SELF_BONDED=1
+        for CB in "${COINBASES[@]}"; do
+          PK="$(cast_read call "$REGISTRY_EXPECT" 'pubkeyOfStaker(address)(bytes32)' "$CB")"
+          case "$PK" in
+            0x0000000000000000000000000000000000000000000000000000000000000000 | "")
+              SELF_BONDED=0 ;;
+          esac
+        done
+        [ "$SELF_BONDED" = "1" ] && break
+      fi
+      sleep 2
+    done
   fi
   if [ "$CONFIRM" -eq 1 ] && [ "$SELF_BONDED" = "1" ]; then
     log "  all 4 validators already registered by node self-bond (activeCount=4, every coinbase has a non-zero pubkey) — SKIPPING the re-registration ceremony (a --force re-stake would revert on depleted balance). G5b/G5c below verify the bindings."
