@@ -1353,6 +1353,30 @@ impl BlockProducer {
         // Update DAG store
         self.dag_store.store_block(block.clone()).await?;
 
+        // FORK-CHOICE PARITY (chain 40204 reroll wedge @ height 101, 2026-08-12).
+        // Register the block we just produced into GhostDAG's in-memory tip set — the
+        // SAME structure admission updates for RECEIVED blocks (`admission.rs` →
+        // `add_block`) and the SAME authority the producer's parent-selection AND the
+        // drain's reorg read through `select_tip` (unified since #163). Storing to the
+        // DAG store above advances `dag_store.get_tips()` (so the chain grows), but
+        // WITHOUT this call the produced block never entered `GhostDag.tips`:
+        // `select_tip` stayed pinned to genesis while a fresh single-producer chain
+        // grew, and the MP-S1 "never propose backwards" clamp — bounded at
+        // `SUPERSEDE_WALK_CAP` (100) — could no longer reach genesis once the applied
+        // tip passed that depth, wedging the sole validator at exactly height 101.
+        // Registering our own block here mirrors how every peer registers it on
+        // receipt, so all nodes' fork-choice sees an identical tip set. Non-fatal: the
+        // block is already durably persisted, and the startup/eager-load
+        // `reconcile_tips_from_dag_store` re-establishes the authoritative tip set — a
+        // registration hiccup must never abort an already-committed block.
+        if let Err(e) = self.ghostdag.add_block(&block).await {
+            warn!(
+                "producer: could not register produced block {} @ {} into GhostDAG tips \
+                 ({}); select_tip will re-align at the next reconcile",
+                block.header.block_hash, block.header.height, e
+            );
+        }
+
         // WP-F.5: Record block seen for uptime tracking.
         self.profile_computer.lock().record_block();
 
@@ -2609,6 +2633,70 @@ mod tests {
                 .applied_tip_supersedes(Hash::new([0xEE; 32]), ctip, cheight)
                 .await,
             "an unknown block cannot be judged an ancestor → do not clamp"
+        );
+    }
+
+    /// REGRESSION (chain 40204 reroll wedge @ height 101, 2026-08-12). `produce_block`
+    /// stores each produced block in the DAG store (so `dag_store.get_tips()`, the
+    /// PARENT source, advances and the chain grows) but never registered it into
+    /// GhostDAG's in-memory tip set. Since #163 the producer's fork-choice is
+    /// `GhostDag::select_tip()` over that in-memory set, so on a fresh SINGLE-producer
+    /// chain `select_tip` stayed pinned to genesis while the chain grew. The "never
+    /// propose backwards" clamp masked it only up to `SUPERSEDE_WALK_CAP` (100) below
+    /// the applied tip, then FAILED at height 101 — the MP-S1 guard refused every round
+    /// and the sole validator wedged though nothing had forked.
+    ///
+    /// INVARIANT: after producing a block, the producer's OWN `select_tip()` must
+    /// reflect it (the DAG tip is this node's own last block). This fails before the
+    /// fix (select_tip returns genesis) and passes after produce registers the block.
+    #[tokio::test]
+    async fn produced_block_advances_the_producer_ghostdag_select_tip() {
+        use citrate_execution::StateDB;
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+        let producer = BlockProducer::new(
+            storage.clone(),
+            executor.clone(),
+            mempool,
+            embedded_pubkey(Address([0x44; 20])),
+            Ed25519SigningKey::from_bytes(&[42; 32]),
+            2,
+        )
+        .with_v2_headers(true);
+        let applicator = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
+            executor.clone(),
+            storage.clone(),
+        ));
+        let producer = producer.with_applied_tip_lock(applicator.advance_lock());
+
+        // Produce a short linear chain on a fresh single-producer node.
+        let a = producer.produce_block().await.expect("A@1");
+        let _b = producer.produce_block().await.expect("B@2");
+        let c = producer.produce_block().await.expect("C@3");
+
+        // The producer's fork-choice authority (`select_tip`, the SAME one the drain
+        // reorgs toward) must track its own production — not remain on the stale
+        // genesis tip. Before the fix this returns genesis (or errs on an empty set).
+        let tip = producer
+            .ghostdag()
+            .select_tip()
+            .await
+            .expect("select_tip after producing a chain");
+        assert_eq!(
+            tip, c,
+            "producer select_tip must be the height-3 tip C, never a stale ancestor \
+             (a={a}, got {tip})"
         );
     }
 
