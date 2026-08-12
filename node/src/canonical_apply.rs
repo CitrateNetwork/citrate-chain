@@ -790,6 +790,45 @@ impl CanonicalApplicator {
         branch.reverse(); // fork_point+1 .. new_tip
         let mut new_snaps: Vec<(u64, Hash, StateSnapshot)> = Vec::new();
         let mut tip = fork;
+
+        // VALIDATOR-S1 §R' — ACTIVATION-BOUNDARY FIX (chain 40204 cold-sync wedge at
+        // 2000, 2026-08-11). The forward path keeps the epoch policy governing a height
+        // RESIDENT continuously from the last snapshot boundary S(E); the reorg reapply
+        // re-materializes it ONLY when the reapply window CROSSES an S(E) (the in-loop
+        // resync below, gated on `snapshot_epoch_at(h).is_some()`). But the validator
+        // activation height (2000) is NOT a snapshot boundary — with EPOCH=1000,
+        // LAG=200 the boundaries straddling it are S(2)=1800 and S(3)=2800. A reorg
+        // whose window crosses activation but no S(E) (fork point >= the last S(E))
+        // therefore never re-materializes the governing policy, so the first
+        // §R'-active block settles against whatever cell happened to be resident (a
+        // stale or unmaterialized epoch) → its state root can't be reproduced → the
+        // reorg aborts at that block forever. Restore the forward-path invariant: seed
+        // the epoch policy governing the FORK POINT (as-of the greatest S(E) <=
+        // fork.height) BEFORE the reapply, so it holds regardless of which boundaries
+        // the window includes. Policy-only (selector stays deferred + abort-safe);
+        // `pre_policy` is already captured, so every abort arm still restores it.
+        if let Some(hook) = &self.registry_policy_resync {
+            if let Some(gov) = crate::registry_sync::greatest_snapshot_at(fork.height) {
+                if let Err(e) = hook(gov).await {
+                    self.executor.state_restore(pre_state.clone());
+                    self.executor.restore_reward_policy(pre_policy.clone());
+                    if let Err(re) = self.executor.reconcile_store_from(&base_snapshot) {
+                        warn!(
+                            "execute-on-receive: reorg to {} abort — store restore failed: {re}",
+                            new_tip
+                        );
+                    }
+                    warn!(
+                        "execute-on-receive: reorg to {} aborted — governing-epoch policy resync at S({}) failed: {} (reverted to {})",
+                        new_tip, gov, e, pre_tip.hash
+                    );
+                    return ReorgOutcome::Rejected(format!(
+                        "reorg governing-epoch policy resync failed at S({gov}): {e}"
+                    ));
+                }
+            }
+        }
+
         for block in &branch {
             let credits = self.reward_credits(block);
             match self
@@ -4235,6 +4274,144 @@ mod tests {
                 .map(|p| p.priority_fee_share_bps),
             Some(2500),
             "aborted reorg must restore the pre-reorg reward policy (not leave it at 5000)"
+        );
+    }
+
+    /// BUG 3 (chain 40204 cold-sync wedge at 2000, 2026-08-11): a reorg whose reapply
+    /// window crosses the ACTIVATION height but NO snapshot boundary S(E) must still
+    /// reproduce the branch's claimed roots. The forward path keeps the governing
+    /// epoch policy resident continuously from the last S(E); the reorg reapply only
+    /// re-materialized it when the window CROSSED an S(E). With EPOCH=1000, LAG=200 the
+    /// boundaries are S(1)=800, S(2)=1800, and the validator activation height (here
+    /// 810; on 40204 it is 2000) sits BETWEEN them. Fork at 805 (> S(1)); the reapply
+    /// window 806..812 crosses activation 810 with no boundary, so the in-loop resync
+    /// (`snapshot_epoch_at`) never fires. The victim's resident policy is WRONG (models
+    /// a restart/cold-sync node whose epoch-1 policy was never materialized). The fix
+    /// seeds the governing epoch policy (`greatest_snapshot_at(805) = S(1)=800`) BEFORE
+    /// the reapply, so the §R'-active blocks settle against the epoch-correct policy and
+    /// reproduce B's roots. Without the fix the reorg aborts at b810 (StateRootMismatch)
+    /// and every assertion below FAILS — the literal 2000 wedge from the incident logs.
+    #[tokio::test]
+    async fn reorg_across_activation_between_boundaries_reproduces_root() {
+        const ACT: u64 = 810; // strictly inside (S(1)=800, S(2)=1800), a NON-boundary
+        fn policy(bps: u64) -> citrate_execution::block_rewards::EpochRewardPolicy {
+            let mut staker_of = std::collections::HashMap::new();
+            staker_of.insert(PROPOSER, CB);
+            citrate_execution::block_rewards::EpochRewardPolicy {
+                epoch: 1,
+                snapshot_height: 800,
+                activation_height: ACT,
+                registry: REG,
+                reward_minter: citrate_execution::block_rewards::REWARD_MINTER_ADDRESS,
+                priority_fee_share_bps: bps,
+                block_subsidy: U256::zero(),
+                staker_of,
+            }
+        }
+        // Sanity: the window forks above S(1) and contains no snapshot boundary, so
+        // only the fork-point seed (greatest_snapshot_at) can re-establish the policy.
+        assert_eq!(crate::registry_sync::greatest_snapshot_at(805), Some(800));
+        for h in 806..=812 {
+            assert!(crate::registry_sync::snapshot_epoch_at(h).is_none());
+        }
+
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.set_validator_activation_height(ACT);
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+
+        // Seed the applied tip at the shared fork point s805 (above S(1)). The victim's
+        // resident policy is the WRONG epoch (5000 bps) — a node whose epoch-1 policy
+        // was never materialized (executor.rs's documented cold-sync fault).
+        let a804 = seal_rprime(804, Hash::default(), Hash::default(), VRF_OUT, vec![]);
+        persist(&storage, &a804);
+        // Shared prefix s805 produced under the CORRECT epoch-1 policy (2500).
+        let pchain = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pchain.set_balance(&Address(ALICE), U256::from(FUND));
+        pchain.set_validator_activation_height(ACT);
+        *pchain.reward_policy_handle().write() = Some(policy(2500));
+        let s805 = produce_rprime(&pchain, a804.header.block_hash, 805, VRF_OUT, vec![]).await;
+        // Apply the shared prefix on the victim so its state == s805 (still pre-activation,
+        // so §R' has not vested yet and the wrong-vs-right policy has not mattered).
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        // Hooks materialize the CORRECT epoch-1 policy (2500) when called.
+        let e_full = follower.clone();
+        app.registry_sync = Some(Arc::new(move |_h| {
+            *e_full.reward_policy_handle().write() = Some(policy(2500));
+            Box::pin(async { Ok(1usize) })
+        }));
+        let e_pol = follower.clone();
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            *e_pol.reward_policy_handle().write() = Some(policy(2500));
+            Box::pin(async { Ok(()) })
+        }));
+        storage
+            .blocks
+            .put_applied_tip(&a804.header.block_hash, 804)
+            .expect("seed tip");
+        *follower.reward_policy_handle().write() = Some(policy(2500));
+        persist(&storage, &s805);
+        assert!(matches!(
+            app.apply_received(&s805).await,
+            ApplyOutcome::Applied { .. }
+        ));
+
+        // Now corrupt the resident policy to the WRONG epoch (5000) — the cold-sync
+        // node's unmaterialized/stale cell at reorg time.
+        *follower.reward_policy_handle().write() = Some(policy(5000));
+
+        // Branch B off s805: b806..b812, with §R'-vesting priority-fee transfers at the
+        // activation heights (810/811/812) so the roots are policy-sensitive. Produced
+        // under the CORRECT epoch-1 policy (2500) on a clean mirror at s805's state.
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_validator_activation_height(ACT);
+        *pb.reward_policy_handle().write() = Some(policy(2500));
+        let _s = produce_rprime(&pb, a804.header.block_hash, 805, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5B; 32];
+        let mut parent = s805.header.block_hash;
+        let mut bt: Vec<Block> = Vec::new();
+        for h in 806..=812u64 {
+            let txs = if h >= ACT {
+                vec![prio_tx(ALICE, CAROL, h - ACT, 0xB0 + (h - ACT) as u8)]
+            } else {
+                vec![]
+            };
+            let blk = produce_rprime(&pb, parent, h, vrf_b, txs).await;
+            parent = blk.header.block_hash;
+            bt.push(blk);
+        }
+        let b812 = bt.last().expect("b812").clone();
+        for b in &bt {
+            persist(&storage, b);
+        }
+
+        // Drive the reorg across activation 810 (fork 805, window 806..812, no S(E)).
+        app.fork_choice = Some(fork_choice_returning(b812.header.block_hash));
+        let outcome = app.apply_received(&b812).await;
+
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "reorg across activation must apply b812, got {outcome:?}"
+        );
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip {
+                hash: b812.header.block_hash,
+                height: 812
+            },
+            "victim must reorg to the B tip"
+        );
+        assert_eq!(
+            follower.calculate_state_root(),
+            b812.state_root,
+            "reapplied head must reproduce the claimed activation-branch root"
         );
     }
 
