@@ -188,21 +188,65 @@ if should P2; then
 
   NODE_ARGS=()
   COINBASES=()
+  VALIDATOR_IPS=()
   for i in 1 2 3 4; do
+    NODE_IP="${FLEET_IPS[$((i-1))]}"
+    # VALIDATOR vs BOOTNODE (2026-08-12). Only nodes that MINE are validators. The
+    # boots (boot1/2/3) are peer-discovery bootnodes, NOT validators: they never arm
+    # mining, never mint/log a proposer identity, and registering one would stake a
+    # node that can never propose — after activation its rotation slots would be
+    # missed. Detect the role from each node's own `[mining] enabled` and register
+    # only the miners; the bootnodes are skipped here and simply relay/discover.
+    if [ "$CONFIRM" -eq 1 ]; then
+      MINING="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "root@${NODE_IP}" \
+        "grep -A6 '^\[mining\]' /home/citrate/.citrate/node.toml 2>/dev/null | grep -oE 'enabled[[:space:]]*=[[:space:]]*(true|false)' | grep -oE '(true|false)' | head -1" 2>/dev/null)"
+      if [ "$MINING" != "true" ]; then
+        log "  node ${i} ${NODE_IP}: bootnode (mining=${MINING:-unset}) — NOT a validator; skipping registration."
+        continue
+      fi
+    fi
     CB="$(get_env "VALIDATOR_STAKER_${i}_ADDRESS")"
     [ -n "$CB" ] || gate_fail P2 "VALIDATOR_STAKER_${i}_ADDRESS missing in $ENV_TESTNET"
     COINBASES+=( "$CB" )
-    NODE_IP="${FLEET_IPS[$((i-1))]}"
+    VALIDATOR_IPS+=( "$NODE_IP" )
     PK_FILE="$PROPOSER_KEY_DIR/node${i}-proposer.key"
     if [ "$CONFIRM" -eq 1 ]; then
       # Nodes mint proposer.key at 0600 on first start; if it is absent the node
       # never came up in P1 and registering would bind a key nothing signs with.
+      #
+      # FETCH-UNTIL-STABLE (2026-08-11 fix). The key is minted asynchronously after
+      # the node starts, and a plain one-shot scp can catch it mid-write: a 32-byte
+      # file of ZEROS. That silently registers a zero staker, which G5b only catches
+      # AFTER the whole set has staked — and the --force retry then reverts on
+      # depleted balance, dead-ending the reroll. Poll the remote for a key that is
+      # present, exactly 32 bytes, NON-ZERO, and UNCHANGED across two reads before
+      # fetching it. `read_sig` prints "<size>:<sha256>" of the remote key, or empty.
+      read_sig() {
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "root@${NODE_IP}" '
+          pk=/home/citrate/.citrate/proposer.key
+          if [ -f "$pk" ]; then
+            sz=$(wc -c < "$pk" | tr -d " ")
+            nz=$(od -An -v -tx1 "$pk" | tr -d " \n" | grep -cvE "^0*$")
+            [ "$sz" = "32" ] && [ "$nz" -ge 1 ] && printf "%s:%s" "$sz" "$(sha256sum "$pk" | cut -d" " -f1)"
+          fi' 2>/dev/null
+      }
+      prev=""; ok=0
+      for _try in $(seq 1 30); do
+        cur="$(read_sig)"
+        if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then ok=1; break; fi
+        prev="$cur"
+        sleep 2
+      done
+      [ "$ok" = "1" ] || gate_fail P2 "proposer.key on ${NODE_IP} never stabilized (present, 32B, non-zero, unchanged) — did P1 start the node and mint the key?"
       scp -q -o BatchMode=yes -o StrictHostKeyChecking=no \
         "root@${NODE_IP}:/home/citrate/.citrate/proposer.key" "$PK_FILE" \
-        || gate_fail P2 "could not fetch proposer.key from ${NODE_IP} — did P1 start the node?"
+        || gate_fail P2 "could not fetch proposer.key from ${NODE_IP} after it stabilized"
       chmod 600 "$PK_FILE"
+      # Belt-and-suspenders: verify the fetched copy is 32 bytes and non-zero.
       SZ="$(wc -c < "$PK_FILE" | tr -d ' ')"
       [ "$SZ" = "32" ] || gate_fail P2 "proposer.key from ${NODE_IP} is ${SZ} bytes, expected 32"
+      NZ="$(od -An -v -tx1 "$PK_FILE" | tr -d ' \n' | grep -cvE '^0*$')"
+      [ "$NZ" -ge 1 ] || gate_fail P2 "proposer.key from ${NODE_IP} is all zeros after fetch"
     fi
     NODE_ARGS+=( --node "${CB}=VALIDATOR_STAKER_${i}_PRIVATE_KEY=${PK_FILE}" )
   done
@@ -211,12 +255,51 @@ if should P2; then
     for i in 1 2 3 4; do export "VALIDATOR_STAKER_${i}_PRIVATE_KEY=$(get_env "VALIDATOR_STAKER_${i}_PRIVATE_KEY")"; done
     export CITRATE_RPC_URL="$RPC" CITRATE_VALIDATOR_REGISTRY="$REGISTRY_EXPECT"
   fi
-  run bash -c "cd '$REPO_ROOT' && cargo run --release --bin validator-registration-ceremony -- \
-      --rpc-url '$RPC' --registry '$REGISTRY_EXPECT' --stake-salt 32000 --force ${NODE_ARGS[*]}" \
-    || gate_fail P2 "validator registration failed"
+  # SELF-BOND AWARENESS (2026-08-11). Each node self-registers its validator on
+  # startup — it deploys the registry (idempotent CREATE2, skipped above) and stakes
+  # its coinbase with its OWN freshly-minted proposer key. When that has already
+  # happened, this ceremony's `--force` re-registration REVERTS: the coinbases have
+  # already staked 32k, so a second stake fails "balance < required" and the whole
+  # P2 aborts even though the validator set is already correct. Detect the fully
+  # self-bonded state (activeCount==4 AND every coinbase has a non-zero registered
+  # pubkey) and SKIP re-registration; G5/G5b/G5c below still verify the result, so
+  # correctness is unchanged — a partial/incorrect self-bond (any zero pubkey or
+  # activeCount<4) still falls through to the ceremony.
+  # The mining node self-bonds ASYNCHRONOUSLY after it arms mining — which can land
+  # DURING this ceremony's cargo build/run window, exactly when a one-shot check
+  # would miss it and then hit the depleted-balance revert. POLL for the self-bond to
+  # complete (activeCount == the number of mining validators AND every validator
+  # coinbase carries a non-zero registered pubkey) before deciding. Only if it never
+  # lands within the window do we fall through to the explicit registration ceremony.
+  SELF_BONDED=0
+  if [ "$CONFIRM" -eq 1 ] && [ "${#COINBASES[@]}" -gt 0 ]; then
+    log "  waiting for the mining validator(s) to self-bond (up to 90s)…"
+    for _w in $(seq 1 45); do
+      AC_PRE="$(cast_read call "$REGISTRY_EXPECT" 'activeCount()(uint256)')"
+      if [ "$AC_PRE" = "${#COINBASES[@]}" ]; then
+        SELF_BONDED=1
+        for CB in "${COINBASES[@]}"; do
+          PK="$(cast_read call "$REGISTRY_EXPECT" 'pubkeyOfStaker(address)(bytes32)' "$CB")"
+          case "$PK" in
+            0x0000000000000000000000000000000000000000000000000000000000000000 | "")
+              SELF_BONDED=0 ;;
+          esac
+        done
+        [ "$SELF_BONDED" = "1" ] && break
+      fi
+      sleep 2
+    done
+  fi
+  if [ "$CONFIRM" -eq 1 ] && [ "$SELF_BONDED" = "1" ]; then
+    log "  all 4 validators already registered by node self-bond (activeCount=4, every coinbase has a non-zero pubkey) — SKIPPING the re-registration ceremony (a --force re-stake would revert on depleted balance). G5b/G5c below verify the bindings."
+  else
+    run bash -c "cd '$REPO_ROOT' && cargo run --release --bin validator-registration-ceremony -- \
+        --rpc-url '$RPC' --registry '$REGISTRY_EXPECT' --stake-salt 32000 --force ${NODE_ARGS[*]}" \
+      || gate_fail P2 "validator registration failed"
+  fi
   if [ "$CONFIRM" -eq 1 ]; then
     AC="$(cast_read call "$REGISTRY_EXPECT" 'activeCount()(uint256)')"
-    [ "$AC" = "4" ] || gate_fail P2 "G5: activeCount()=$AC != 4"
+    [ "$AC" = "${#COINBASES[@]}" ] || gate_fail P2 "G5: activeCount()=$AC != ${#COINBASES[@]} (the number of MINING validators; bootnodes are not registered)"
 
     # ── G5b: KEY↔REGISTRATION BINDING ────────────────────────────────────────
     #
@@ -231,10 +314,14 @@ if should P2; then
     # The authority here is the pubkey THE NODE ITSELF reports at startup (from
     # its own proposer.key), not the one the ceremony used — otherwise we would
     # only be checking the ceremony against itself.
-    log "  G5b: verifying key↔registration binding per node…"
-    for i in 1 2 3 4; do
-      NODE_IP="${FLEET_IPS[$((i-1))]}"
-      CB="${COINBASES[$((i-1))]}"
+    log "  G5b: verifying key↔registration binding per validator…"
+    # Iterate only the MINING validators (parallel VALIDATOR_IPS/COINBASES arrays);
+    # bootnodes are not registered and never log a proposer identity, so they are
+    # correctly excluded from this check.
+    for vi in "${!COINBASES[@]}"; do
+      i=$((vi + 1))
+      NODE_IP="${VALIDATOR_IPS[$vi]}"
+      CB="${COINBASES[$vi]}"
 
       # The node logs `... proposer identity ... (pubkey <64 hex>)` on every boot.
       NODE_PK="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "root@${NODE_IP}" \
