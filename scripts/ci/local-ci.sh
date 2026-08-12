@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
     --fast) FAST=1; shift ;;
     --no-forge) NO_FORGE=1; shift ;;
     --list)
-      echo "gates: fmt-changed, clippy, unwrap-ratchet, test-workspace, forge-build, forge-test"
+      echo "gates: fmt-changed, clippy, unwrap-ratchet, consensus-tripwires, test-workspace, forge-build, forge-test"
       exit 0 ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -147,6 +147,32 @@ unwrap_ratchet() {
   return 0
 }
 gate "unwrap-ratchet" unwrap_ratchet
+
+# ── gate: consensus tripwires (source-level regression fences) ──────────────
+# Each tripwire is a cheap source scan that fences a specific consensus bug CLASS
+# we have already been burned by. They run in --fast too: a wedge-the-chain
+# regression is exactly what you want caught before push, and they cost ~0s.
+# Append-only — never delete a tripwire "to make room"; add the new one here.
+consensus_tripwires() {
+  local rc=0 t
+  for t in \
+    "scripts/ci/fork_choice_add_block_parity_tripwire.sh" \
+  ; do
+    if [ ! -x "$t" ]; then
+      echo "missing/!executable tripwire: $t"; rc=1; continue
+    fi
+    # Prove the tripwire's own engine still detects its bug class (self-test),
+    # then run it against the tree. A blind tripwire is worse than none.
+    if ! "$t" --self-test >/dev/null 2>&1; then
+      echo "tripwire self-test FAILED (engine no longer detects its bug class): $t"; rc=1
+    fi
+    if ! out="$("$t" 2>&1)"; then
+      echo "$out"; rc=1
+    fi
+  done
+  return "$rc"
+}
+gate "consensus-tripwires" consensus_tripwires
 
 if [ "$FAST" -eq 1 ]; then
   skip "test-workspace" "--fast"

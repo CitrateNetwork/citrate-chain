@@ -90,6 +90,29 @@ log "orchestrator: tag=$TAG confirm=$CONFIRM from=$FROM rpc=$RPC env=$ENV_TESTNE
 # ─────────────────────────── P0: PRE-FLIGHT ────────────────────────────────────
 if should P0; then
   log "── P0 pre-flight asserts ─────────────────────────────────────────────────"
+  # ── DEPLOY-FROM-MAIN GUARD (2026-08-12) ────────────────────────────────────
+  # A reroll ships THIS checkout's ops tooling AND the binary built from it to the
+  # droplets. The 2026-08-11/12 incident: consensus work believed "merged to main"
+  # was built/deployed from an UNMERGED branch while the local `main` clone was 10
+  # days stale — so a regressed binary reached the fleet and every diagnosis ran
+  # against the wrong baseline. Policy: the fleet is only ever changed FROM main.
+  # Refuse an actual deploy unless HEAD == origin/main. Dry-run only warns. Override
+  # a real deploy with ALLOW_NON_MAIN_DEPLOY=1 (a deliberate, logged exception).
+  git -C "$REPO_ROOT" fetch origin --quiet 2>/dev/null || true
+  HEAD_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)"
+  MAIN_SHA="$(git -C "$REPO_ROOT" rev-parse origin/main 2>/dev/null)"
+  HEAD_SHORT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null)"
+  MAIN_SHORT="$(git -C "$REPO_ROOT" rev-parse --short origin/main 2>/dev/null)"
+  if [ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" = "$MAIN_SHA" ]; then
+    log "  DEPLOY-FROM-MAIN: HEAD == origin/main ($MAIN_SHORT) ✓"
+  elif [ "${ALLOW_NON_MAIN_DEPLOY:-0}" = "1" ]; then
+    log "  DEPLOY-FROM-MAIN: ⚠ OVERRIDDEN (ALLOW_NON_MAIN_DEPLOY=1) — HEAD $HEAD_SHORT != origin/main $MAIN_SHORT"
+  elif [ "$CONFIRM" -eq 1 ]; then
+    err "DEPLOY-FROM-MAIN: HEAD ($HEAD_SHORT) != origin/main ($MAIN_SHORT). Deploys must build from main — merge to main and pull, or set ALLOW_NON_MAIN_DEPLOY=1 for a logged exception."
+    exit 1
+  else
+    log "  DEPLOY-FROM-MAIN: ⚠ DRY-RUN off main (HEAD $HEAD_SHORT != origin/main $MAIN_SHORT) — a real --confirm run would ABORT here."
+  fi
   command -v forge >/dev/null || { err "forge required"; exit 1; }
   command -v cast  >/dev/null || { err "cast required"; exit 1; }
   command -v jq    >/dev/null || { err "jq required"; exit 1; }
