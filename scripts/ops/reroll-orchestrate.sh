@@ -188,11 +188,27 @@ if should P2; then
 
   NODE_ARGS=()
   COINBASES=()
+  VALIDATOR_IPS=()
   for i in 1 2 3 4; do
+    NODE_IP="${FLEET_IPS[$((i-1))]}"
+    # VALIDATOR vs BOOTNODE (2026-08-12). Only nodes that MINE are validators. The
+    # boots (boot1/2/3) are peer-discovery bootnodes, NOT validators: they never arm
+    # mining, never mint/log a proposer identity, and registering one would stake a
+    # node that can never propose — after activation its rotation slots would be
+    # missed. Detect the role from each node's own `[mining] enabled` and register
+    # only the miners; the bootnodes are skipped here and simply relay/discover.
+    if [ "$CONFIRM" -eq 1 ]; then
+      MINING="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "root@${NODE_IP}" \
+        "grep -A6 '^\[mining\]' /home/citrate/.citrate/node.toml 2>/dev/null | grep -oE 'enabled[[:space:]]*=[[:space:]]*(true|false)' | grep -oE '(true|false)' | head -1" 2>/dev/null)"
+      if [ "$MINING" != "true" ]; then
+        log "  node ${i} ${NODE_IP}: bootnode (mining=${MINING:-unset}) — NOT a validator; skipping registration."
+        continue
+      fi
+    fi
     CB="$(get_env "VALIDATOR_STAKER_${i}_ADDRESS")"
     [ -n "$CB" ] || gate_fail P2 "VALIDATOR_STAKER_${i}_ADDRESS missing in $ENV_TESTNET"
     COINBASES+=( "$CB" )
-    NODE_IP="${FLEET_IPS[$((i-1))]}"
+    VALIDATOR_IPS+=( "$NODE_IP" )
     PK_FILE="$PROPOSER_KEY_DIR/node${i}-proposer.key"
     if [ "$CONFIRM" -eq 1 ]; then
       # Nodes mint proposer.key at 0600 on first start; if it is absent the node
@@ -252,7 +268,7 @@ if should P2; then
   SELF_BONDED=0
   if [ "$CONFIRM" -eq 1 ]; then
     AC_PRE="$(cast_read call "$REGISTRY_EXPECT" 'activeCount()(uint256)')"
-    if [ "$AC_PRE" = "4" ]; then
+    if [ "$AC_PRE" = "${#COINBASES[@]}" ] && [ "${#COINBASES[@]}" -gt 0 ]; then
       SELF_BONDED=1
       for CB in "${COINBASES[@]}"; do
         PK="$(cast_read call "$REGISTRY_EXPECT" 'pubkeyOfStaker(address)(bytes32)' "$CB")"
@@ -272,7 +288,7 @@ if should P2; then
   fi
   if [ "$CONFIRM" -eq 1 ]; then
     AC="$(cast_read call "$REGISTRY_EXPECT" 'activeCount()(uint256)')"
-    [ "$AC" = "4" ] || gate_fail P2 "G5: activeCount()=$AC != 4"
+    [ "$AC" = "${#COINBASES[@]}" ] || gate_fail P2 "G5: activeCount()=$AC != ${#COINBASES[@]} (the number of MINING validators; bootnodes are not registered)"
 
     # ── G5b: KEY↔REGISTRATION BINDING ────────────────────────────────────────
     #
@@ -287,10 +303,14 @@ if should P2; then
     # The authority here is the pubkey THE NODE ITSELF reports at startup (from
     # its own proposer.key), not the one the ceremony used — otherwise we would
     # only be checking the ceremony against itself.
-    log "  G5b: verifying key↔registration binding per node…"
-    for i in 1 2 3 4; do
-      NODE_IP="${FLEET_IPS[$((i-1))]}"
-      CB="${COINBASES[$((i-1))]}"
+    log "  G5b: verifying key↔registration binding per validator…"
+    # Iterate only the MINING validators (parallel VALIDATOR_IPS/COINBASES arrays);
+    # bootnodes are not registered and never log a proposer identity, so they are
+    # correctly excluded from this check.
+    for vi in "${!COINBASES[@]}"; do
+      i=$((vi + 1))
+      NODE_IP="${VALIDATOR_IPS[$vi]}"
+      CB="${COINBASES[$vi]}"
 
       # The node logs `... proposer identity ... (pubkey <64 hex>)` on every boot.
       NODE_PK="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "root@${NODE_IP}" \
