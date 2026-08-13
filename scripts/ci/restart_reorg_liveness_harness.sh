@@ -104,10 +104,12 @@ wait_height() {
   return 1
 }
 
-# count reorg-thrash markers in a node log (the from-genesis rebuild loop)
-thrash_count() { grep -cE "rebuilding state from genesis|beyond the in-memory reorg window|same-height-sibling wedge remediation" "$1" 2>/dev/null || echo 0; }
+# count reorg-thrash markers in a node log (the from-genesis rebuild loop).
+# NB: `grep -c` prints 0 AND exits 1 on no matches, so capture-then-default —
+# never `grep -c ... || echo 0` (that emits "0\n0" and breaks integer tests).
+thrash_count()   { local n; n=$(grep -cE "rebuilding state from genesis|beyond the in-memory reorg window|same-height-sibling wedge remediation" "$1" 2>/dev/null); echo "${n:-0}"; }
 # count hard cold-sync failures in a node log
-mismatch_count() { grep -cE "state root mismatch|Rejected inconsistent|REJECT block" "$1" 2>/dev/null || echo 0; }
+mismatch_count() { local n; n=$(grep -cE "state root mismatch|Rejected inconsistent|REJECT block" "$1" 2>/dev/null); echo "${n:-0}"; }
 
 # ---------------------------------------------------------------------------
 gate_g9() {
@@ -117,7 +119,10 @@ gate_g9() {
   start_node 2 0 "$MP";        local F2=$NODE_RPC;  local F2DIR=$NODE_DIR
   log "miner rpc=$M  followers rpc=$F1,$F2"
   wait_height "$M" 5 40 || { fail "G9: miner never produced (see $MDIR/node.log)"; return; }
-  wait_height "$F1" "$BLOCKS_G9" 90 && wait_height "$F2" "$BLOCKS_G9" 90 || { fail "G9: followers never synced to $BLOCKS_G9 pre-restart"; return; }
+  # The miner must PRODUCE $BLOCKS_G9 first (~1-2s/block), THEN followers catch up.
+  local prod_budget=$(( BLOCKS_G9 * 3 + 30 ))
+  wait_height "$M" "$BLOCKS_G9" "$prod_budget" || { fail "G9: miner did not reach $BLOCKS_G9 in ${prod_budget}s (production stalled — see $MDIR/node.log)"; return; }
+  wait_height "$F1" "$BLOCKS_G9" 120 && wait_height "$F2" "$BLOCKS_G9" 120 || { fail "G9: followers never synced to $BLOCKS_G9 pre-restart (miner at $(hi "$M"))"; return; }
   log "pre-restart heights: miner=$(hi "$M") f1=$(hi "$F1") f2=$(hi "$F2")"
 
   # RESTART the miner (no wipe) and follower 1 (no wipe) mid-run.
