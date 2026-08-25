@@ -236,6 +236,13 @@ pub struct CanonicalApplicator {
     /// settled against the epoch-correct reward policy. Wired together with
     /// `registry_sync`; `None` disables it. See [`RegistryPolicyResyncHook`].
     registry_policy_resync: Option<RegistryPolicyResyncHook>,
+    /// VALIDATOR-S1 §R' (reorg PRE-SEED hardening, 2026-08-25): install the policy
+    /// governing the FORK POINT before the reapply, from the DURABLE persisted S(E)
+    /// snapshot (byte-identical to the producer's) rather than recomputing it from the
+    /// executor's current (fork-point) state — which would diverge if the registry
+    /// changed between S(E) and the fork point. Backed by `RegistrySync::
+    /// seed_governing_policy`; `None` disables it (falls back to `registry_policy_resync`).
+    registry_policy_seed: Option<RegistryPolicyResyncHook>,
     /// RUNTIME REORG FALLBACK (2026-08-09). The genesis world state + block hash,
     /// so `drive_drain` can rebuild the applied state from genesis via the canonical
     /// spine when a fork-choice head is `BeyondReorgWindow` (deeper than the retained
@@ -302,6 +309,7 @@ impl CanonicalApplicator {
             applied_height: Arc::new(AtomicU64::new(seeded_height)),
             registry_sync: None,
             registry_policy_resync: None,
+            registry_policy_seed: None,
             genesis: OnceLock::new(),
             rebuild_in_progress: AtomicBool::new(false),
             dag_hydrated: None,
@@ -371,9 +379,17 @@ impl CanonicalApplicator {
         }));
         // The policy-only resync used inside `reorg_to`'s reapply loop, from the
         // SAME RegistrySync so it reads byte-identical policy inputs.
+        let rs_resync = registry_sync.clone();
         self.registry_policy_resync = Some(Arc::new(move |height| {
-            let rs = registry_sync.clone();
+            let rs = rs_resync.clone();
             Box::pin(async move { rs.resync_policy_only(height).await })
+        }));
+        // The reorg PRE-SEED hook: prefer the durable persisted S(E) snapshot over a
+        // recompute-from-current-state, so seeding the fork-point-governing policy
+        // cannot drift from the producer's when the registry changed mid-epoch.
+        self.registry_policy_seed = Some(Arc::new(move |height| {
+            let rs = registry_sync.clone();
+            Box::pin(async move { rs.seed_governing_policy(height).await })
         }));
         self
     }
@@ -807,7 +823,16 @@ impl CanonicalApplicator {
         // fork.height) BEFORE the reapply, so it holds regardless of which boundaries
         // the window includes. Policy-only (selector stays deferred + abort-safe);
         // `pre_policy` is already captured, so every abort arm still restores it.
-        if let Some(hook) = &self.registry_policy_resync {
+        // PRE-SEED via the durable-first hook (`seed_governing_policy`): install the
+        // fork-point-governing S(E) policy from the persisted snapshot when present,
+        // never a recompute against the reverted fork-point state (hardening 2026-08-25).
+        // Falls back to the recompute hook when the seed hook is unwired (e.g. tests
+        // that inject only `registry_policy_resync`), preserving prior behavior there.
+        if let Some(hook) = self
+            .registry_policy_seed
+            .as_ref()
+            .or(self.registry_policy_resync.as_ref())
+        {
             if let Some(gov) = crate::registry_sync::greatest_snapshot_at(fork.height) {
                 if let Err(e) = hook(gov).await {
                     self.executor.state_restore(pre_state.clone());
@@ -819,11 +844,11 @@ impl CanonicalApplicator {
                         );
                     }
                     warn!(
-                        "execute-on-receive: reorg to {} aborted — governing-epoch policy resync at S({}) failed: {} (reverted to {})",
+                        "execute-on-receive: reorg to {} aborted — governing-epoch policy seed at S({}) failed: {} (reverted to {})",
                         new_tip, gov, e, pre_tip.hash
                     );
                     return ReorgOutcome::Rejected(format!(
-                        "reorg governing-epoch policy resync failed at S({gov}): {e}"
+                        "reorg governing-epoch policy seed failed at S({gov}): {e}"
                     ));
                 }
             }
