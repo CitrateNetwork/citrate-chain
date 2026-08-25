@@ -24,6 +24,14 @@ use sha3::{Digest, Keccak256};
 pub const EPOCH: u64 = 1000;
 pub const SNAPSHOT_LAG: u64 = 200;
 
+/// How many recent epoch snapshots to retain in the per-epoch durable store so a reorg
+/// pre-seed can load the EXACT governing epoch's policy. The in-memory reorg fork point is
+/// bounded to `MAX_REORG_DEPTH` (100) blocks below the applied tip, well under one `EPOCH`
+/// (1000), so a reorg crosses at most one S(E) boundary — 2 epochs would suffice. We keep a
+/// generous margin (snapshots are ~KB) so any interplay with the from-genesis rebuild path
+/// or slightly deeper windows is still covered; older snapshots are pruned on each write.
+pub const REWARD_SNAPSHOT_RETENTION_EPOCHS: u64 = 8;
+
 /// If `height` is the snapshot block S(E) = E*EPOCH - SNAPSHOT_LAG for some epoch E >= 1,
 /// return that epoch E. Otherwise None. This is the trigger predicate for a resync.
 pub fn snapshot_epoch_at(height: u64) -> Option<u64> {
@@ -229,16 +237,38 @@ impl RegistrySync {
         // re-deriving it from a possibly-mutated mid-epoch tip. Non-fatal on failure
         // (the in-memory sync already succeeded); a boot with no durable snapshot
         // falls back to a live recompute.
-        if let Err(e) = self
-            .storage
-            .blocks
-            .put_reward_snapshot(&encode_reward_snapshot(&policy, &entries, min_stake))
-        {
+        let blob = encode_reward_snapshot(&policy, &entries, min_stake);
+        if let Err(e) = self.storage.blocks.put_reward_snapshot(&blob) {
             tracing::warn!(
                 "VALIDATOR-S1: materialized epoch-{} snapshot but failed to persist it durably: {}",
                 policy.epoch,
                 e
             );
+        }
+        // Also persist under the per-epoch S(E) key so a boundary-crossing reorg can
+        // rehydrate THIS exact policy even after the tip advances into a later epoch (the
+        // latest-only key above would then hold a newer epoch). Then prune the snapshot that
+        // has fallen out of the retention window. Both are non-fatal (best-effort durability).
+        if let Err(e) = self
+            .storage
+            .blocks
+            .put_reward_snapshot_at(policy.snapshot_height, &blob)
+        {
+            tracing::warn!(
+                "VALIDATOR-S1: failed to persist per-epoch snapshot S({}): {}",
+                policy.snapshot_height,
+                e
+            );
+        }
+        if let Some(evicted) = policy
+            .snapshot_height
+            .checked_sub(REWARD_SNAPSHOT_RETENTION_EPOCHS * EPOCH)
+        {
+            if let Err(e) = self.storage.blocks.delete_reward_snapshot_at(evicted) {
+                tracing::warn!(
+                    "VALIDATOR-S1: failed to prune per-epoch snapshot S({evicted}): {e}"
+                );
+            }
         }
 
         let mapped: Vec<(PublicKey, u128)> = entries
@@ -291,33 +321,67 @@ impl RegistrySync {
     /// persisted by `sync_for_snapshot`); fallback source: `ValidatorRegistry` via
     /// `resync_policy_only`.
     pub async fn seed_governing_policy(&self, snapshot_height: u64) -> Result<(), String> {
-        match self.storage.blocks.get_reward_snapshot() {
-            Ok(Some(blob)) => match decode_reward_snapshot(&blob) {
-                Ok((policy, _entries, _min_stake)) if policy.snapshot_height == snapshot_height => {
-                    *self.reward_policy.write() = Some(policy);
-                    return Ok(());
-                }
-                // Durable snapshot exists but is for a DIFFERENT epoch (e.g. a reorg
-                // back across an S(E) boundary while the latest persisted is a newer
-                // epoch — `get_reward_snapshot` is latest-only). Recompute below.
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        "VALIDATOR-S1: reorg pre-seed durable snapshot decode failed ({e}); recomputing from state"
-                    );
-                }
-            },
-            Ok(None) => {}
+        if let Some(policy) = self.load_durable_policy_at(snapshot_height) {
+            *self.reward_policy.write() = Some(policy);
+            return Ok(());
+        }
+        // Fallback: no durable snapshot for this exact epoch (a pre-upgrade store, or a
+        // reorg reaching deeper than the retention window). Recompute against the CURRENT
+        // (fork-point) state — the ONLY path that can diverge from the producer if the
+        // registry changed since S(E). Logged so a rare recurrence of the pre-seed
+        // divergence is diagnosable rather than silent.
+        tracing::warn!(
+            "VALIDATOR-S1: reorg pre-seed found no durable snapshot for S({snapshot_height}); \
+             recomputing reward policy from current state (may diverge if the ValidatorRegistry \
+             changed since S(E))"
+        );
+        self.resync_policy_only(snapshot_height).await
+    }
+
+    /// Load the durably-persisted reward policy governing snapshot height `snapshot_height`,
+    /// or `None` if no epoch-matching durable snapshot exists. Tries the PER-EPOCH keyed
+    /// store first (survives a boundary-crossing reorg where the latest-persisted snapshot
+    /// is a newer epoch), then the legacy latest-only key (a pre-upgrade store whose single
+    /// snapshot happens to be this epoch). A blob that decodes to a DIFFERENT epoch, or fails
+    /// to decode, yields `None` so the caller recomputes. Data source:
+    /// `block_store.get_reward_snapshot_at` then `get_reward_snapshot`.
+    fn load_durable_policy_at(
+        &self,
+        snapshot_height: u64,
+    ) -> Option<citrate_execution::block_rewards::EpochRewardPolicy> {
+        let decode_matching = |blob: Vec<u8>| match decode_reward_snapshot(&blob) {
+            Ok((policy, _entries, _min_stake)) if policy.snapshot_height == snapshot_height => {
+                Some(policy)
+            }
+            Ok(_) => None,
             Err(e) => {
                 tracing::warn!(
-                    "VALIDATOR-S1: reorg pre-seed durable snapshot read failed ({e}); recomputing from state"
+                    "VALIDATOR-S1: durable snapshot for S({snapshot_height}) failed to decode ({e})"
                 );
+                None
+            }
+        };
+        // Per-epoch keyed store first — the exact S(E) snapshot, boundary-crossing safe.
+        match self.storage.blocks.get_reward_snapshot_at(snapshot_height) {
+            Ok(Some(blob)) => {
+                if let Some(p) = decode_matching(blob) {
+                    return Some(p);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                "VALIDATOR-S1: reading per-epoch snapshot S({snapshot_height}) failed ({e})"
+            ),
+        }
+        // Legacy latest-only key: covers a store written before per-epoch keys existed.
+        match self.storage.blocks.get_reward_snapshot() {
+            Ok(Some(blob)) => decode_matching(blob),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("VALIDATOR-S1: reading latest reward snapshot failed ({e})");
+                None
             }
         }
-        // Fallback: no epoch-matching durable snapshot — recompute (best effort). This
-        // is the pre-hardening behavior and is correct whenever the registry state is
-        // unchanged between S(E) and the fork point.
-        self.resync_policy_only(snapshot_height).await
     }
 
     /// Read priorityFeeShareBps() + rewardMinter() + each active validator's staker
@@ -989,6 +1053,75 @@ mod tests {
         assert!(
             rs.seed_governing_policy(2800).await.is_err(),
             "epoch mismatch must fall back to recompute (which fails on the empty registry)"
+        );
+    }
+
+    /// FOLLOW-UP HARDENING (PR #168 review, finding 1): the PER-EPOCH durable store lets the
+    /// reorg pre-seed load the EXACT governing epoch even when the LATEST-persisted snapshot is
+    /// a NEWER epoch — the boundary-crossing reorg the old latest-only store could not cover.
+    /// Persist S(1)=800 (2500 bps) and S(2)=1800 (5000 bps) both per-epoch and as latest (so
+    /// the latest key ends up holding S(2)). Seeding the governing epoch S(1) against an EMPTY
+    /// registry (a recompute would revert) must load S(1)'s 2500 bps from the per-epoch key,
+    /// NOT S(2)'s 5000 and NOT a recompute.
+    #[tokio::test]
+    async fn seed_governing_policy_loads_exact_epoch_when_latest_is_newer() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage = Arc::new(
+            citrate_storage::StorageManager::new(dir.path(), PruningConfig::default())
+                .expect("storage"),
+        );
+        let entries = vec![(PROPOSER, 40_000u128)];
+
+        // S(1)=800 (share = SHARE_BPS = 2500): per-epoch AND latest.
+        let p1 = test_policy();
+        let blob1 = encode_reward_snapshot(&p1, &entries, 32_000u128);
+        storage
+            .blocks
+            .put_reward_snapshot_at(800, &blob1)
+            .expect("s1 per-epoch");
+        storage
+            .blocks
+            .put_reward_snapshot(&blob1)
+            .expect("s1 latest");
+
+        // S(2)=1800 (share = 5000): per-epoch AND the NEW latest — the tip advanced past S(2).
+        let mut p2 = test_policy();
+        p2.epoch = 2;
+        p2.snapshot_height = 1800;
+        p2.priority_fee_share_bps = 5000;
+        let blob2 = encode_reward_snapshot(&p2, &entries, 32_000u128);
+        storage
+            .blocks
+            .put_reward_snapshot_at(1800, &blob2)
+            .expect("s2 per-epoch");
+        storage
+            .blocks
+            .put_reward_snapshot(&blob2)
+            .expect("s2 latest");
+
+        // Empty registry — a recompute would revert, so success proves the per-epoch read.
+        let exec = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        exec.set_validator_activation_height(ACTIVATION);
+        let sel = Arc::new(VrfProposerSelector::production());
+        let rs = RegistrySync::new(exec.clone(), sel, REG, ACTIVATION, storage.clone());
+
+        // Seed the GOVERNING epoch S(1)=800 while the LATEST persisted snapshot is S(2)=1800.
+        rs.seed_governing_policy(800)
+            .await
+            .expect("must load the exact S(1) per-epoch snapshot, not recompute");
+        let resident = exec
+            .reward_policy_handle()
+            .read()
+            .clone()
+            .expect("policy installed from per-epoch snapshot");
+        assert_eq!(
+            resident.snapshot_height, 800,
+            "exact governing epoch, not the newer latest S(2)"
+        );
+        assert_eq!(resident.epoch, 1);
+        assert_eq!(
+            resident.priority_fee_share_bps, SHARE_BPS,
+            "loaded S(1)'s 2500 bps, NOT S(2)'s 5000 — the boundary-crossing case is covered"
         );
     }
 
