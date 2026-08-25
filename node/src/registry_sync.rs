@@ -270,6 +270,56 @@ impl RegistrySync {
         Ok(())
     }
 
+    /// VALIDATOR-S1 §R' (reorg PRE-SEED — hardening, 2026-08-25): install the reward
+    /// policy governing `snapshot_height` (the greatest S(E) <= the reorg fork point)
+    /// WITHOUT recomputing it from the executor's current state. Prefer the durably-
+    /// persisted finalized snapshot — captured from state@S(E) at forward-apply time
+    /// and byte-identical to what the producer/fleet settled — when it is for THIS
+    /// exact epoch; only fall back to a live recompute (`resync_policy_only`) if no
+    /// matching durable snapshot exists (e.g. a reorg deeper than any snapshot this
+    /// node ever forward-applied).
+    ///
+    /// WHY this must not just call `resync_policy_only` at the pre-seed: that reads the
+    /// registry via `view_call` -> `simulate_transaction` against CURRENT state, and at
+    /// the pre-seed the executor is reverted to the FORK POINT. If the registry's
+    /// active-set / subsidy / share changed between S(E) and the fork point, the
+    /// recomputed policy diverges from the producer's — the first §R'-active reapplied
+    /// block then settles a different reward and the reorg aborts at it forever. The
+    /// durable snapshot (`block_store.get_reward_snapshot`) was frozen at S(E) and
+    /// cannot drift with the mid-epoch tip. Mirrors `hydrate_on_boot`'s preferred path.
+    /// Data source: `StorageManager.blocks.get_reward_snapshot()` (the S(E) blob
+    /// persisted by `sync_for_snapshot`); fallback source: `ValidatorRegistry` via
+    /// `resync_policy_only`.
+    pub async fn seed_governing_policy(&self, snapshot_height: u64) -> Result<(), String> {
+        match self.storage.blocks.get_reward_snapshot() {
+            Ok(Some(blob)) => match decode_reward_snapshot(&blob) {
+                Ok((policy, _entries, _min_stake)) if policy.snapshot_height == snapshot_height => {
+                    *self.reward_policy.write() = Some(policy);
+                    return Ok(());
+                }
+                // Durable snapshot exists but is for a DIFFERENT epoch (e.g. a reorg
+                // back across an S(E) boundary while the latest persisted is a newer
+                // epoch — `get_reward_snapshot` is latest-only). Recompute below.
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "VALIDATOR-S1: reorg pre-seed durable snapshot decode failed ({e}); recomputing from state"
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "VALIDATOR-S1: reorg pre-seed durable snapshot read failed ({e}); recomputing from state"
+                );
+            }
+        }
+        // Fallback: no epoch-matching durable snapshot — recompute (best effort). This
+        // is the pre-hardening behavior and is correct whenever the registry state is
+        // unchanged between S(E) and the fork point.
+        self.resync_policy_only(snapshot_height).await
+    }
+
     /// Read priorityFeeShareBps() + rewardMinter() + each active validator's staker
     /// (validatorInfo(pubkey).staker) at the snapshot state, and BUILD (not publish)
     /// an `EpochRewardPolicy`. Every value comes from the SAME S(E) state the
@@ -876,6 +926,70 @@ mod tests {
             block_subsidy: U256::zero(),
             staker_of,
         }
+    }
+
+    /// HARDENING (2026-08-25): the reorg PRE-SEED must install the governing-epoch
+    /// policy from the DURABLE persisted snapshot, NOT recompute it from the executor's
+    /// current (fork-point) state. Proof by construction: the executor has an EMPTY
+    /// registry (no `ValidatorRegistry` code/state), so a recompute path
+    /// (`resync_policy_only` -> `view_call` -> `simulate_transaction`) would revert and
+    /// return `Err`. If `seed_governing_policy` SUCCEEDS and installs the epoch-1 policy
+    /// verbatim, it can only have read the durable S(1)=800 blob — the exact property
+    /// that prevents the mid-epoch-registry-change fork.
+    #[tokio::test]
+    async fn seed_governing_policy_prefers_durable_over_recompute() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage = Arc::new(
+            citrate_storage::StorageManager::new(dir.path(), PruningConfig::default())
+                .expect("storage"),
+        );
+        // Durable S(1)=800 snapshot on disk, exactly as `sync_for_snapshot` persists it.
+        let entries = vec![(PROPOSER, 40_000u128)];
+        storage
+            .blocks
+            .put_reward_snapshot(&encode_reward_snapshot(
+                &test_policy(),
+                &entries,
+                32_000u128,
+            ))
+            .expect("persist snapshot");
+
+        // Fresh executor with NO registry contract in state — a recompute WOULD fail.
+        let exec = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        exec.set_validator_activation_height(ACTIVATION);
+        let sel = Arc::new(VrfProposerSelector::production());
+        let rs = RegistrySync::new(exec.clone(), sel, REG, ACTIVATION, storage.clone());
+
+        assert!(
+            exec.reward_policy_handle().read().is_none(),
+            "resident policy starts empty"
+        );
+
+        // Seed the epoch the durable snapshot governs (S(1)=800). Must succeed from the
+        // durable blob without touching the empty registry.
+        rs.seed_governing_policy(800)
+            .await
+            .expect("seed must succeed from the durable snapshot (recompute would revert)");
+
+        let resident = exec
+            .reward_policy_handle()
+            .read()
+            .clone()
+            .expect("policy installed from durable snapshot");
+        assert_eq!(resident.snapshot_height, 800, "durable S(1) height");
+        assert_eq!(resident.epoch, 1, "durable epoch");
+        assert_eq!(
+            resident.priority_fee_share_bps, SHARE_BPS,
+            "installed the durable snapshot policy verbatim, not a recompute"
+        );
+
+        // A governing epoch the durable (latest-only) snapshot does NOT cover falls back
+        // to the recompute path, which reverts against the empty registry → Err. Guards
+        // that the fallback stays wired (no silent success on epoch mismatch).
+        assert!(
+            rs.seed_governing_policy(2800).await.is_err(),
+            "epoch mismatch must fall back to recompute (which fails on the empty registry)"
+        );
     }
 
     fn fund(exec: &Executor) -> (PublicKey, PublicKey) {
