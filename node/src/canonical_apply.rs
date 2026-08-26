@@ -824,10 +824,13 @@ impl CanonicalApplicator {
         // the window includes. Policy-only (selector stays deferred + abort-safe);
         // `pre_policy` is already captured, so every abort arm still restores it.
         // PRE-SEED via the durable-first hook (`seed_governing_policy`): install the
-        // fork-point-governing S(E) policy from the persisted snapshot when present,
-        // never a recompute against the reverted fork-point state (hardening 2026-08-25).
-        // Falls back to the recompute hook when the seed hook is unwired (e.g. tests
-        // that inject only `registry_policy_resync`), preserving prior behavior there.
+        // fork-point-governing S(E) policy from the PER-EPOCH durable snapshot, which is
+        // byte-identical to the producer's and survives a boundary-crossing reorg (the
+        // latest-only snapshot alone would be a newer epoch). It recomputes from the
+        // reverted fork-point state ONLY when no durable snapshot for S(E) exists — a
+        // pre-upgrade store or a reorg past the retention window — and that path is logged
+        // (`seed_governing_policy`). Falls back to the recompute hook entirely when the seed
+        // hook is unwired (e.g. tests that inject only `registry_policy_resync`).
         if let Some(hook) = self
             .registry_policy_seed
             .as_ref()
@@ -4435,6 +4438,120 @@ mod tests {
             follower.calculate_state_root(),
             b812.state_root,
             "reapplied head must reproduce the claimed activation-branch root"
+        );
+    }
+
+    /// FOLLOW-UP HARDENING (PR #168 review, finding 2): a reorg-level test that the pre-seed
+    /// reads the durable SEED hook (`registry_policy_seed`), not the recompute hook, when BOTH
+    /// are wired — the production wiring `with_registry_sync` installs. Same window as the
+    /// activation test (fork 805, reapply 806..812, crossing activation 810 but NO S(E)
+    /// boundary, so the in-loop resync never fires). The seed hook yields the CORRECT epoch-1
+    /// policy (2500 bps); the resync hook yields a WRONG one (9999 bps). The reorg reproduces
+    /// B's roots ONLY if the pre-seed used the seed hook; had it used resync (the pre-#168
+    /// behavior) the §R'-active blocks would settle against 9999 bps and it would abort at b810.
+    #[tokio::test]
+    async fn reorg_pre_seed_prefers_seed_hook_over_resync() {
+        const ACT: u64 = 810;
+        fn policy(bps: u64) -> citrate_execution::block_rewards::EpochRewardPolicy {
+            let mut staker_of = std::collections::HashMap::new();
+            staker_of.insert(PROPOSER, CB);
+            citrate_execution::block_rewards::EpochRewardPolicy {
+                epoch: 1,
+                snapshot_height: 800,
+                activation_height: ACT,
+                registry: REG,
+                reward_minter: citrate_execution::block_rewards::REWARD_MINTER_ADDRESS,
+                priority_fee_share_bps: bps,
+                block_subsidy: U256::zero(),
+                staker_of,
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower.set_validator_activation_height(ACT);
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+
+        let a804 = seal_rprime(804, Hash::default(), Hash::default(), VRF_OUT, vec![]);
+        persist(&storage, &a804);
+        let pchain = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pchain.set_balance(&Address(ALICE), U256::from(FUND));
+        pchain.set_validator_activation_height(ACT);
+        *pchain.reward_policy_handle().write() = Some(policy(2500));
+        let s805 = produce_rprime(&pchain, a804.header.block_hash, 805, VRF_OUT, vec![]).await;
+
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let e_full = follower.clone();
+        app.registry_sync = Some(Arc::new(move |_h| {
+            *e_full.reward_policy_handle().write() = Some(policy(2500));
+            Box::pin(async { Ok(1usize) })
+        }));
+        // SEED hook -> CORRECT (2500); RESYNC hook -> WRONG (9999). If the pre-seed reads
+        // resync, the reapplied §R' roots break and the reorg aborts.
+        let e_seed = follower.clone();
+        app.registry_policy_seed = Some(Arc::new(move |_h| {
+            *e_seed.reward_policy_handle().write() = Some(policy(2500));
+            Box::pin(async { Ok(()) })
+        }));
+        let e_wrong = follower.clone();
+        app.registry_policy_resync = Some(Arc::new(move |_h| {
+            *e_wrong.reward_policy_handle().write() = Some(policy(9999));
+            Box::pin(async { Ok(()) })
+        }));
+
+        storage
+            .blocks
+            .put_applied_tip(&a804.header.block_hash, 804)
+            .expect("seed tip");
+        *follower.reward_policy_handle().write() = Some(policy(2500));
+        persist(&storage, &s805);
+        assert!(matches!(
+            app.apply_received(&s805).await,
+            ApplyOutcome::Applied { .. }
+        ));
+
+        // Corrupt the resident policy to WRONG — the pre-seed must restore the correct one.
+        *follower.reward_policy_handle().write() = Some(policy(9999));
+
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        pb.set_validator_activation_height(ACT);
+        *pb.reward_policy_handle().write() = Some(policy(2500));
+        let _s = produce_rprime(&pb, a804.header.block_hash, 805, VRF_OUT, vec![]).await;
+        let vrf_b = [0x5C; 32];
+        let mut parent = s805.header.block_hash;
+        let mut bt: Vec<Block> = Vec::new();
+        for h in 806..=812u64 {
+            let txs = if h >= ACT {
+                vec![prio_tx(ALICE, CAROL, h - ACT, 0xC0 + (h - ACT) as u8)]
+            } else {
+                vec![]
+            };
+            let blk = produce_rprime(&pb, parent, h, vrf_b, txs).await;
+            parent = blk.header.block_hash;
+            bt.push(blk);
+        }
+        let b812 = bt.last().expect("b812").clone();
+        for b in &bt {
+            persist(&storage, b);
+        }
+
+        app.fork_choice = Some(fork_choice_returning(b812.header.block_hash));
+        let outcome = app.apply_received(&b812).await;
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "pre-seed must use the SEED hook (2500), not resync (9999); got {outcome:?}"
+        );
+        assert_eq!(
+            follower.calculate_state_root(),
+            b812.state_root,
+            "reproduced B's root => the pre-seed read the correct policy via the seed hook"
         );
     }
 
