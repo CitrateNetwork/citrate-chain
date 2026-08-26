@@ -29,6 +29,21 @@ pub const APPLIED_TIP_KEY: &[u8] = b"applied_tip";
 /// would re-derive a possibly governance-mutated policy and fork). Opaque blob —
 /// the node layer owns the encoding.
 const REWARD_SNAPSHOT_KEY: &[u8] = b"reward_snapshot";
+/// Per-epoch reward-snapshot key prefix. The full key is this prefix followed by the
+/// 8-byte big-endian snapshot height S(E). Unlike the latest-only [`REWARD_SNAPSHOT_KEY`],
+/// these let a reorg pre-seed rehydrate the EXACT governing-epoch policy even when the
+/// most-recently-persisted snapshot is a newer epoch (a boundary-crossing reorg).
+/// Bounded retention is enforced by the caller (`RegistrySync`) deleting snapshots that
+/// have fallen out of the reorg window.
+const REWARD_SNAPSHOT_AT_PREFIX: &[u8] = b"reward_snapshot_at:";
+
+/// Build the per-epoch reward-snapshot key for snapshot height S(E).
+fn reward_snapshot_at_key(snapshot_height: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(REWARD_SNAPSHOT_AT_PREFIX.len() + 8);
+    k.extend_from_slice(REWARD_SNAPSHOT_AT_PREFIX);
+    k.extend_from_slice(&snapshot_height.to_be_bytes());
+    k
+}
 
 /// Block storage manager
 pub struct BlockStore {
@@ -301,6 +316,29 @@ impl BlockStore {
         self.db.get_cf(CF_METADATA, REWARD_SNAPSHOT_KEY)
     }
 
+    /// VALIDATOR-S1 §R': persist the epoch reward snapshot under its OWN S(E) key (in
+    /// addition to the latest-only [`put_reward_snapshot`]), so a reorg can rehydrate the
+    /// exact governing epoch's policy regardless of the current tip. Bounded retention is
+    /// the caller's responsibility via [`delete_reward_snapshot_at`].
+    pub fn put_reward_snapshot_at(&self, snapshot_height: u64, blob: &[u8]) -> Result<()> {
+        self.db
+            .put_cf(CF_METADATA, &reward_snapshot_at_key(snapshot_height), blob)
+    }
+
+    /// VALIDATOR-S1 §R': read the per-epoch reward snapshot for snapshot height S(E), or
+    /// `None` if never written / pruned out of the retention window.
+    pub fn get_reward_snapshot_at(&self, snapshot_height: u64) -> Result<Option<Vec<u8>>> {
+        self.db
+            .get_cf(CF_METADATA, &reward_snapshot_at_key(snapshot_height))
+    }
+
+    /// VALIDATOR-S1 §R': delete the per-epoch reward snapshot for snapshot height S(E)
+    /// (retention pruning). Deleting an absent key is a no-op.
+    pub fn delete_reward_snapshot_at(&self, snapshot_height: u64) -> Result<()> {
+        self.db
+            .delete_cf(CF_METADATA, &reward_snapshot_at_key(snapshot_height))
+    }
+
     /// Execute-on-receive: read the persisted applied-tip pointer, or `None`
     /// if never written (fresh node / pre-upgrade store). SECREM-01 CONS-6:
     /// a short/corrupt value decodes to `None` rather than panicking.
@@ -487,7 +525,9 @@ mod tests {
         db.put_cf(CF_METADATA, &height_to_key(7), &short).unwrap();
 
         // Must return Ok(None), not panic.
-        let got = store.get_block_by_height(7).expect("no panic on corrupt value");
+        let got = store
+            .get_block_by_height(7)
+            .expect("no panic on corrupt value");
         assert_eq!(got, None);
 
         // try_from_bytes contract.
@@ -541,7 +581,11 @@ mod tests {
         store.put_block(&block).expect("put");
 
         let children = store.get_children(&parent).expect("children");
-        assert_eq!(children.len(), 1, "duplicate put must not duplicate the child link");
+        assert_eq!(
+            children.len(),
+            1,
+            "duplicate put must not duplicate the child link"
+        );
     }
 
     /// FUA-CHAIN-01 red test (race half): concurrent puts of sibling
@@ -576,7 +620,11 @@ mod tests {
         }
 
         let children = store.get_children(&parent).expect("children");
-        assert_eq!(children.len(), 8, "every sibling child link must survive concurrent ingest");
+        assert_eq!(
+            children.len(),
+            8,
+            "every sibling child link must survive concurrent ingest"
+        );
     }
 
     /// FUA-CHAIN-01 red test (height half): the cached latest height must
@@ -609,6 +657,10 @@ mod tests {
             h.join().expect("thread join");
         }
 
-        assert_eq!(store.get_latest_height().expect("height"), 16, "height must equal the max ingested");
+        assert_eq!(
+            store.get_latest_height().expect("height"),
+            16,
+            "height must equal the max ingested"
+        );
     }
 }
