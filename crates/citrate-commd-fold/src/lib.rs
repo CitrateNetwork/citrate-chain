@@ -19,6 +19,7 @@
 
 pub mod commd_bind_fold;
 pub mod commd_compressed;
+pub mod commd_fixed_fold;
 pub mod merkle_fold;
 pub mod poseidon_gadget;
 
