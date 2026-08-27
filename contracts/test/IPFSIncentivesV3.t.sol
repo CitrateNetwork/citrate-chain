@@ -36,9 +36,39 @@ contract MockVerifier {
     }
 }
 
+/// @notice Faithful stand-in for the M3 recursive-fold verifier (citrate-chain#170). It models the
+///         SOUNDNESS property the real Nova/Spartan verifier provides: a valid proof yields the ONE
+///         true `(commD, dataCommit)` of a real file, and the two are inseparable. A challenger cannot
+///         (a) invent a `(commD, dataCommit)` pair — only `setProof`-registered "real files" verify —
+///         nor (b) decouple them (the pair is fixed per proof). An unknown proof is invalid and the
+///         verifier reverts, exactly as the on-chain precompile will.
+contract MockFoldVerifier {
+    mapping(bytes32 => bytes32) internal _trueCommD;
+    mapping(bytes32 => bytes32) internal _dataCommit;
+    mapping(bytes32 => bool) internal _known;
+
+    /// Register a "real file": the proof identified by `keccak256(proof)` will verify to this pair.
+    function setProof(bytes32 id, bytes32 trueCommD_, bytes32 dataCommit_) external {
+        _trueCommD[id] = trueCommD_;
+        _dataCommit[id] = dataCommit_;
+        _known[id] = true;
+    }
+
+    function verifyCommDFold(bytes calldata proof, uint256, uint256, uint256[] calldata)
+        external
+        view
+        returns (bytes32, bytes32)
+    {
+        bytes32 id = keccak256(proof);
+        require(_known[id], "invalid proof"); // bubbles through the challenge's staticcall
+        return (_trueCommD[id], _dataCommit[id]);
+    }
+}
+
 contract IPFSIncentivesV3Test is Test {
     IPFSIncentivesV3 internal inc;
     KYCRegistry internal kyc;
+    MockFoldVerifier internal fold;
 
     address internal constant VERIFY = 0x0000000000000000000000000000000000000108;
 
@@ -70,6 +100,7 @@ contract IPFSIncentivesV3Test is Test {
 
     function setUp() public {
         kyc = new KYCRegistry(address(0));
+        fold = new MockFoldVerifier();
         inc = new IPFSIncentivesV3(
             kyc,
             BOND,
@@ -84,7 +115,8 @@ contract IPFSIncentivesV3Test is Test {
             REVEAL_DELAY,
             MIN_MODEL_BOND,
             MODEL_CHALLENGE_WINDOW,
-            MODEL_CHALLENGER_BPS
+            MODEL_CHALLENGER_BPS,
+            address(fold)
         );
 
         vm.etch(VERIFY, type(MockVerifier).runtimeCode);
@@ -109,10 +141,12 @@ contract IPFSIncentivesV3Test is Test {
     /// In v3, sealing requires the model's CommD to be registered (Q2 bond)
     /// and to MATCH the sealed CommD. Register once (idempotent across pinners).
     function _ensureModelRegistered() internal {
-        (address owner, , , , , , ) = inc.getModel(cid);
+        (address owner, , , , , , , ) = inc.getModel(cid);
         if (owner == address(0)) {
             vm.prank(modelOwner);
-            inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("D"), keccak256("data"), "ipfs://x");
+            inc.registerModel{value: MIN_MODEL_BOND}(
+                cid, keccak256("D"), keccak256("data"), keccak256("dc"), "ipfs://x"
+            );
         }
     }
 
@@ -401,73 +435,128 @@ contract IPFSIncentivesV3Test is Test {
 
     // ════════════════════════ Q2: CommD registrant bond ══════════════════════════
 
+    // A "real file" fixture: the recursive-fold verifier will prove `PROOF_REAL` verifies to
+    // (REAL_COMMD, REAL_DATACOMMIT). Honest registration commits to this exact pair.
+    bytes internal constant PROOF_REAL = hex"C0FFEE01";
+    bytes32 internal constant REAL_COMMD = bytes32(uint256(0xC0));
+    bytes32 internal constant REAL_DATACOMMIT = bytes32(uint256(0xDC));
+
+    function _z0() internal pure returns (uint256[] memory) {
+        return new uint256[](0);
+    }
+
     function test_registerModel_requiresMinBond() public {
         vm.prank(modelOwner);
         vm.expectRevert("Bond too low");
-        inc.registerModel{value: MIN_MODEL_BOND - 1}(cid, keccak256("commD"), keccak256("data"), "ipfs://x");
+        inc.registerModel{value: MIN_MODEL_BOND - 1}(
+            cid, keccak256("commD"), keccak256("data"), keccak256("dc"), "ipfs://x"
+        );
     }
 
     function test_registerModel_revertsOnDoubleRegister() public {
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD"), keccak256("data"), "ipfs://x");
+        inc.registerModel{value: MIN_MODEL_BOND}(
+            cid, keccak256("commD"), keccak256("data"), keccak256("dc"), "ipfs://x"
+        );
         vm.prank(modelOwner);
         vm.expectRevert("Already registered");
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD2"), keccak256("data"), "ipfs://x");
+        inc.registerModel{value: MIN_MODEL_BOND}(
+            cid, keccak256("commD2"), keccak256("data"), keccak256("dc"), "ipfs://x"
+        );
     }
 
-    /// A proven wrong-CommD challenge slashes the registrant bond and splits it
-    /// into the challenger reward + the honest-pinner pool.
-    function test_challengeWrongCommD_slashesAndSplits() public {
-        bytes memory data = bytes("the-canonical-model-bytes");
-        bytes32 dataHash = keccak256(data);
-        bytes32 registered = keccak256("WRONG_commD");
-        bytes32 truth = keccak256("TRUE_commD"); // != registered → dispute
+    /// A FRAUDULENT registration (wrong commD, but a real dataCommit) is slashable exactly once: the
+    /// challenger's proof proves the TRUE commD, which disagrees with the registered one.
+    function test_challengeWrongCommD_slashesFraudulentAndSplits() public {
+        fold.setProof(keccak256(PROOF_REAL), REAL_COMMD, REAL_DATACOMMIT);
+        // Owner lies about commD but must register the real dataCommit for a challenge to bind.
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, registered, dataHash, "ipfs://x");
+        inc.registerModel{value: MIN_MODEL_BOND}(
+            cid, keccak256("WRONG_commD"), keccak256("data"), REAL_DATACOMMIT, "ipfs://x"
+        );
 
         uint256 poolBefore = inc.honestPinnerCompensationPool();
         vm.prank(challenger);
-        inc.challengeWrongCommD(cid, data, truth);
+        inc.challengeWrongCommD(cid, PROOF_REAL, 1, 0, _z0());
 
         uint256 cr = (MIN_MODEL_BOND * MODEL_CHALLENGER_BPS) / 10000;
         uint256 pr = MIN_MODEL_BOND - cr;
         assertEq(inc.challengerCredit(challenger), cr, "challenger reward from model slash");
         assertEq(inc.honestPinnerCompensationPool(), poolBefore + pr, "remainder to pool");
         assertEq(inc.modelBondsSlashed(), MIN_MODEL_BOND);
+
+        // Only once.
+        vm.prank(challenger);
+        vm.expectRevert("Already slashed");
+        inc.challengeWrongCommD(cid, PROOF_REAL, 1, 0, _z0());
     }
 
-    function test_challengeWrongCommD_revertsWhenRootMatches() public {
-        bytes memory data = bytes("bytes");
-        bytes32 root = keccak256("commD");
+    /// ★ THE ACCEPTANCE INVARIANT (citrate-chain#170): an HONESTLY-registered bond cannot be
+    /// grief-slashed. The owner registers the true (commD, dataCommit); the ONLY proof whose
+    /// dataCommit matches proves trueCommD == the registered commD, so the challenge reverts
+    /// "No dispute". There is no proof a griefer can supply to slash an honest bond.
+    function test_honestRegistration_cannotBeGriefSlashed() public {
+        fold.setProof(keccak256(PROOF_REAL), REAL_COMMD, REAL_DATACOMMIT);
+        // HONEST: commD and dataCommit are the real, mutually-consistent pair.
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, root, keccak256(data), "ipfs://x");
+        inc.registerModel{value: MIN_MODEL_BOND}(
+            cid, REAL_COMMD, keccak256("data"), REAL_DATACOMMIT, "ipfs://x"
+        );
+
+        // The real proof binds dataCommit==reg.dataCommit, but trueCommD==reg.commD ⇒ no dispute.
         vm.prank(challenger);
         vm.expectRevert("No dispute");
-        inc.challengeWrongCommD(cid, data, root); // same root → no dispute
+        inc.challengeWrongCommD(cid, PROOF_REAL, 1, 0, _z0());
+
+        // The bond is intact and reclaimable after the window.
+        assertEq(inc.modelBondsSlashed(), 0, "no honest slash");
+        vm.roll(block.number + MODEL_CHALLENGE_WINDOW + 1);
+        vm.prank(modelOwner);
+        assertEq(inc.reclaimBond(cid), MIN_MODEL_BOND, "honest bond reclaimable");
     }
 
-    function test_challengeWrongCommD_revertsOnDataHashMismatch() public {
-        bytes32 root = keccak256("commD");
+    /// A griefer holding a proof for a DIFFERENT file (different dataCommit) cannot slash: the
+    /// binding check rejects a proof not bound to THIS registration's data.
+    function test_challengeWrongCommD_revertsOnDataCommitMismatch() public {
+        fold.setProof(keccak256(PROOF_REAL), REAL_COMMD, REAL_DATACOMMIT);
+        // Owner honest for their OWN file (a different dataCommit than the griefer's proof).
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, root, keccak256("real"), "ipfs://x");
+        inc.registerModel{value: MIN_MODEL_BOND}(
+            cid, keccak256("owners_commD"), keccak256("data"), keccak256("owners_dataCommit"), "ipfs://x"
+        );
         vm.prank(challenger);
-        vm.expectRevert("Data hash mismatch");
-        inc.challengeWrongCommD(cid, bytes("forged"), keccak256("other"));
+        vm.expectRevert("dataCommit mismatch");
+        inc.challengeWrongCommD(cid, PROOF_REAL, 1, 0, _z0());
+    }
+
+    /// An invalid / unknown proof makes the verifier revert, which bubbles through the challenge.
+    function test_challengeWrongCommD_revertsOnInvalidProof() public {
+        vm.prank(modelOwner);
+        inc.registerModel{value: MIN_MODEL_BOND}(
+            cid, keccak256("WRONG"), keccak256("data"), REAL_DATACOMMIT, "ipfs://x"
+        );
+        vm.prank(challenger);
+        vm.expectRevert("invalid proof"); // MockFoldVerifier rejects an unregistered proof
+        inc.challengeWrongCommD(cid, hex"BADBAD", 1, 0, _z0());
     }
 
     function test_challengeWrongCommD_revertsAfterWindow() public {
-        bytes memory data = bytes("bytes");
+        fold.setProof(keccak256(PROOF_REAL), REAL_COMMD, REAL_DATACOMMIT);
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("WRONG"), keccak256(data), "ipfs://x");
+        inc.registerModel{value: MIN_MODEL_BOND}(
+            cid, keccak256("WRONG"), keccak256("data"), REAL_DATACOMMIT, "ipfs://x"
+        );
         vm.roll(block.number + MODEL_CHALLENGE_WINDOW + 1);
         vm.prank(challenger);
         vm.expectRevert("Window closed");
-        inc.challengeWrongCommD(cid, data, keccak256("TRUTH"));
+        inc.challengeWrongCommD(cid, PROOF_REAL, 1, 0, _z0());
     }
 
     function test_reclaimBond_afterWindow_returnsBond() public {
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD"), keccak256("data"), "ipfs://x");
+        inc.registerModel{value: MIN_MODEL_BOND}(
+            cid, keccak256("commD"), keccak256("data"), keccak256("dc"), "ipfs://x"
+        );
         vm.roll(block.number + MODEL_CHALLENGE_WINDOW + 1);
 
         uint256 before = modelOwner.balance;
@@ -480,7 +569,9 @@ contract IPFSIncentivesV3Test is Test {
 
     function test_reclaimBond_revertsDuringWindow() public {
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("commD"), keccak256("data"), "ipfs://x");
+        inc.registerModel{value: MIN_MODEL_BOND}(
+            cid, keccak256("commD"), keccak256("data"), keccak256("dc"), "ipfs://x"
+        );
         vm.roll(block.number + MODEL_CHALLENGE_WINDOW - 1);
         vm.prank(modelOwner);
         vm.expectRevert("Window open");
@@ -488,11 +579,13 @@ contract IPFSIncentivesV3Test is Test {
     }
 
     function test_reclaimBond_revertsAfterSlash() public {
-        bytes memory data = bytes("bytes");
+        fold.setProof(keccak256(PROOF_REAL), REAL_COMMD, REAL_DATACOMMIT);
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("WRONG"), keccak256(data), "ipfs://x");
+        inc.registerModel{value: MIN_MODEL_BOND}(
+            cid, keccak256("WRONG"), keccak256("data"), REAL_DATACOMMIT, "ipfs://x"
+        );
         vm.prank(challenger);
-        inc.challengeWrongCommD(cid, data, keccak256("TRUTH"));
+        inc.challengeWrongCommD(cid, PROOF_REAL, 1, 0, _z0());
         vm.roll(block.number + MODEL_CHALLENGE_WINDOW + 1);
         vm.prank(modelOwner);
         vm.expectRevert("Bond slashed");
@@ -521,11 +614,13 @@ contract IPFSIncentivesV3Test is Test {
     }
 
     function test_modelBondConservation_afterSlash() public {
-        bytes memory data = bytes("bytes");
+        fold.setProof(keccak256(PROOF_REAL), REAL_COMMD, REAL_DATACOMMIT);
         vm.prank(modelOwner);
-        inc.registerModel{value: MIN_MODEL_BOND}(cid, keccak256("WRONG"), keccak256(data), "ipfs://x");
+        inc.registerModel{value: MIN_MODEL_BOND}(
+            cid, keccak256("WRONG"), keccak256("data"), REAL_DATACOMMIT, "ipfs://x"
+        );
         vm.prank(challenger);
-        inc.challengeWrongCommD(cid, data, keccak256("TRUTH"));
+        inc.challengeWrongCommD(cid, PROOF_REAL, 1, 0, _z0());
 
         // bonded == held(0, slashed) + slashed + refunded (ModelBondConservation)
         uint256 held = inc.modelBondedTotal() - inc.modelBondsSlashed() - inc.modelBondsRefunded();

@@ -6,6 +6,28 @@ import "./lib/ReentrancyGuard.sol";
 import "./KYCRegistry.sol";
 
 /**
+ * @title IFoldVerifier — the recursive-fold CommD proof verifier
+ * @notice Verifies a Nova/Spartan recursive proof that a file's leaves fold to a specific canonical
+ *         `commD` (Poseidon-BN254 Merkle root) AND a specific `dataCommit` (the domain-separated
+ *         sponge), both defined by `citrate-commd` (ADR-2026-08-27, citrate-chain#170). The proof
+ *         binds the two commitments to ONE leaf stream, so a valid proof CANNOT pair a `commD` for one
+ *         file with a `dataCommit` for another.
+ * @dev    In production this is the on-chain verifier precompile (M3); the address is injected at
+ *         construction so it is unit-testable against a faithful mock. `verifyCommDFold` MUST revert
+ *         on an invalid proof (never return a zero pair) — the challenge relies on `staticcall`
+ *         bubbling that revert. `numSteps`/`depth`/`z0` are the public inputs; the returned pair is
+ *         the proof's bound public output.
+ */
+interface IFoldVerifier {
+    function verifyCommDFold(
+        bytes calldata proof,
+        uint256 numSteps,
+        uint256 depth,
+        uint256[] calldata z0
+    ) external view returns (bytes32 trueCommD, bytes32 dataCommit);
+}
+
+/**
  * @title IPFSIncentivesV3 — PIN sealed-PoRep incentive (v3: commit-reveal + CommD bond + SaaS-ready)
  * @notice On-chain realization of the TLA+ spec
  *         `citrate-federation/.agentile/gtm-spine/formal/PINIncentiveV4.tla`,
@@ -145,6 +167,11 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
     ///         (REMAINDER goes to `honestPinnerCompensationPool`).
     uint256 public immutable COMMD_CHALLENGER_BPS;
 
+    /// @notice The recursive-fold CommD proof verifier (citrate-chain#170 M3 precompile in
+    ///         production). `challengeWrongCommD` calls it to prove the true CommD of the
+    ///         registered data; a slash is only possible against a valid proof.
+    IFoldVerifier public immutable foldVerifier;
+
     // ───────────────────────────── Pin state ───────────────────────────────
 
     enum Status {
@@ -253,12 +280,21 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
     struct ModelRegistration {
         address modelOwner;
         bytes32 commD;
-        /// @notice keccak256(canonical model bytes). Anchors the
-        ///         data-identification gate for wrong-CommD challenges:
-        ///         the challenge must supply bytes whose keccak matches
-        ///         this AND a Merkle-recomputed CommD that disagrees with
-        ///         `commD`. Resolves OQ-1 of the planset.
+        /// @notice keccak256(canonical model bytes). Content-identity anchor
+        ///         (informational / off-chain reachability). Superseded as the
+        ///         challenge binding anchor by `dataCommit` — see below.
         bytes32 dataHash;
+        /// @notice citrate-commd `compute_data_commit(data)` — the Poseidon
+        ///         sponge that BINDS the wrong-CommD challenge (ADR-2026-08-27,
+        ///         citrate-chain#170). The owner registers it alongside `commD`;
+        ///         a challenge proves `computeCommD(data) = trueCommD` with THIS
+        ///         `dataCommit` as the public binding input, so a slash requires a
+        ///         proof whose `dataCommit == reg.dataCommit`. Because the fold
+        ///         binds both commitments to one leaf stream, matching `dataCommit`
+        ///         forces `trueCommD` to be the real CommD of the committed data —
+        ///         which makes an honestly-registered bond UNSLASHABLE (any valid
+        ///         proof yields `trueCommD == reg.commD` ⇒ "No dispute").
+        bytes32 dataCommit;
         /// @notice Off-chain URI where the canonical bytes are available.
         ///         The contract does NOT enforce reachability (lives outside
         ///         the L1 trust boundary); informational for clients.
@@ -359,13 +395,17 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         address indexed modelOwner,
         bytes32 commD,
         bytes32 dataHash,
+        bytes32 dataCommit,
         uint256 bondAmount
     );
     event WrongCommDChallengeAccepted(
         bytes32 indexed cid,
         address indexed challenger,
         bytes32 registeredCommD,
-        bytes32 contestedCommD,
+        /// @notice The TRUE CommD proven by the recursive-fold proof (the value
+        ///         the owner should have registered). Distinct from the registered
+        ///         `commD`, which is why the bond is slashable.
+        bytes32 trueCommD,
         uint256 challengerReward,
         uint256 honestPinnerPool
     );
@@ -395,7 +435,10 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         uint256 _revealDelay,
         uint256 _minModelBond,
         uint256 _commdChallengeWindow,
-        uint256 _commdChallengerBps
+        uint256 _commdChallengerBps,
+        // citrate-chain#170 (M4): the recursive-fold CommD proof verifier (the M3 precompile in
+        // production; a mock in tests). Sound wrong-CommD challenges call it.
+        address _foldVerifier
     ) {
         // v2 ASSUMEs (unchanged).
         require(_reward <= _bond, "Reward must be <= Bond");
@@ -412,6 +455,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         require(_minModelBond > 0, "MinModelBond must be > 0");
         require(_commdChallengeWindow > 0, "CommDChallengeWindow must be > 0");
         require(_commdChallengerBps <= 10000, "CommDChallengerBps out of range");
+        require(_foldVerifier != address(0), "FoldVerifier required");
 
         kyc = _kyc;
         BOND = _bond;
@@ -429,6 +473,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         MIN_MODEL_BOND = _minModelBond;
         COMMD_CHALLENGE_WINDOW = _commdChallengeWindow;
         COMMD_CHALLENGER_BPS = _commdChallengerBps;
+        foldVerifier = IFoldVerifier(_foldVerifier);
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
     }
@@ -494,6 +539,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         bytes32 cid,
         bytes32 commD,
         bytes32 dataHash,
+        bytes32 dataCommit,
         string calldata dataUri
     ) external payable nonReentrant {
         require(msg.value >= MIN_MODEL_BOND, "Bond too low");
@@ -504,6 +550,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             modelOwner: msg.sender,
             commD: commD,
             dataHash: dataHash,
+            dataCommit: dataCommit,
             dataUri: dataUri,
             bondAmount: msg.value,
             registeredAt: block.number,
@@ -512,31 +559,40 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
 
         modelBondedTotal += msg.value;
 
-        emit ModelRegistered(cid, msg.sender, commD, dataHash, msg.value);
+        emit ModelRegistered(cid, msg.sender, commD, dataHash, dataCommit, msg.value);
     }
 
     /**
-     * @notice Q2 — permissionless wrong-CommD challenge. The challenger
-     *         supplies bytes whose `keccak256` matches the registered
-     *         `dataHash` (data-identification gate, OQ-1) AND asserts
-     *         their recomputed CommD differs from the registered one.
-     *         The contract verifies the dataHash + recomputes CommD via
-     *         a Merkle-root-style hash AND IF DIFFERENT slashes the bond.
+     * @notice Q2 — permissionless, SOUND wrong-CommD challenge (citrate-chain#170,
+     *         ADR-2026-08-27). The challenger supplies a recursive-fold PROOF that a
+     *         leaf stream folds to a `trueCommD` and a `dataCommit`. The contract
+     *         verifies the proof via {foldVerifier}, requires the proof's public
+     *         `dataCommit == reg.dataCommit` (binding it to THIS registration's data),
+     *         and slashes iff the proven `trueCommD != reg.commD`.
      *
-     * @dev    `recomputedCommD` is computed by the challenger off-chain
-     *         and supplied; the contract checks `keccak256(data) ==
-     *         dataHash` (cheap) + `recomputedCommD != registeredCommD`
-     *         (the challenger claims their CommD is honest, the contract
-     *         doesn't need to verify which one is "right" — only that
-     *         they DISAGREE while the data identity is enforced).
-     *         The dataHash gate is what makes this safe: the challenger
-     *         can't just supply arbitrary data; they must supply bytes
-     *         the model-owner committed to as canonical.
+     * @dev    This closes the grief-slash hole of the prior design, which trusted a
+     *         caller-supplied `recomputedCommD` and never recomputed the root — letting
+     *         anyone who could fetch the public file steal an honest owner's bond.
+     *
+     *         Soundness (why an honest registration is UNSLASHABLE): the fold binds BOTH
+     *         commitments to one leaf stream, so any valid proof with
+     *         `dataCommit == reg.dataCommit` necessarily has
+     *         `trueCommD == computeCommD(the committed data)`. If the owner registered
+     *         honestly (`reg.commD == computeCommD(data)`), then `trueCommD == reg.commD`
+     *         ⇒ the `"No dispute"` guard reverts and no slash is possible. A griefer
+     *         cannot forge a proof yielding `reg.dataCommit` with a different `trueCommD`
+     *         (the sponge binds the leaves), and cannot produce ANY valid proof without
+     *         the real data. See `IPFSIncentivesV3.t.sol`'s no-grief invariant.
+     *
+     *         `numSteps`, `depth`, and `z0` are the proof's public inputs (see
+     *         `citrate-commd-fold`); the verifier reverts on an invalid proof.
      */
     function challengeWrongCommD(
         bytes32 cid,
-        bytes calldata data,
-        bytes32 recomputedCommD
+        bytes calldata proof,
+        uint256 numSteps,
+        uint256 depth,
+        uint256[] calldata z0
     ) external nonReentrant {
         ModelRegistration storage reg = _modelByCid[cid];
         require(reg.modelOwner != address(0), "Not registered");
@@ -546,9 +602,13 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             "Window closed"
         );
 
-        // OQ-1 data-identification gate.
-        require(keccak256(data) == reg.dataHash, "Data hash mismatch");
-        require(recomputedCommD != reg.commD, "No dispute");
+        // Verify the recursive-fold proof. Reverts (bubbling through) on an invalid proof.
+        (bytes32 trueCommD, bytes32 provenDataCommit) =
+            foldVerifier.verifyCommDFold(proof, numSteps, depth, z0);
+
+        // Bind the proof to THIS registration's data, then require a genuine disagreement.
+        require(provenDataCommit == reg.dataCommit, "dataCommit mismatch");
+        require(trueCommD != reg.commD, "No dispute");
 
         // Slash.
         reg.slashed = true;
@@ -567,7 +627,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             cid,
             msg.sender,
             reg.commD,
-            recomputedCommD,
+            trueCommD,
             cr,
             pool
         );
@@ -1161,6 +1221,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             address modelOwner,
             bytes32 commD,
             bytes32 dataHash,
+            bytes32 dataCommit,
             string memory dataUri,
             uint256 bondAmount,
             uint256 registeredAt,
@@ -1172,6 +1233,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             reg.modelOwner,
             reg.commD,
             reg.dataHash,
+            reg.dataCommit,
             reg.dataUri,
             reg.bondAmount,
             reg.registeredAt,
