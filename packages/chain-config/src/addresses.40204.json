@@ -5,7 +5,7 @@
   "rpcUrl": "https://rpc.citrate.ai",
   "explorerUrl": "https://explorer.citrate.ai",
   "deployer": "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732",
-  "deployedAt": "2026-07-27T21:58:00Z",
+  "deployedAt": "2026-08-04T16:16:49Z",
   "regenerator": "scripts/ops/emit-address-table.sh",
   "comment": "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
   "contracts": {
@@ -49,19 +49,19 @@
     "ComputePoolTraining": "0x6eb7d4160ebfaf92cd9377114160da62c09f87bf",
     "KYCRegistry": "0xcf41a81c8dfcdb6e61febfc34670964d226b33ed",
     "IPFSIncentivesV2": "0xc29c439f625c6f5366f93e5b5133ae00c08c3c4c",
-    "IPFSIncentivesV3": "0xb024ad0b5aefa87fa1e10234afc85b6128932df4",
+    "IPFSIncentivesV3": "0xa1a37f794b77292cf8511c4b179af18d5a663683",
     "AggregationChallenge": "0xe7d7ebe1242feec29d514b00c9272fbffc9e69be",
     "ComputePoolPipeline": "0x5a0437ac03ca92113962f1e4f3d15e062b942bde",
     "ValidatorRegistry": "0x61d44d8a14443646b756905410be951e6ece95a6",
     "EduForwarder": "0x50a798eaab184eeb11a27fbc1333b85646c1582a",
-    "AnchorRegistry": "0xecedd7a64f88f577a9c5d6b501291454f2bba3a6",
-    "MeetingRegistry": "0xb0e474647bd2f74da0d90c010234b9e9a7d2b048",
-    "GovernanceTemplateRegistry": "0xe9dd5756d2c01a262caed433f67f36ae2a73d3be",
-    "GovernanceProtocolFactory": "0x260ffedd17cd05a2e4daa41e1339c19a083f9e57",
-    "PolicyBinding": "0x1dc147b73863b1fc662bc9172b19193b4865af5f",
-    "CapabilityGrant": "0xadc2e3849d10cfdc3b83e5c3fe650b29f0478e54",
-    "VoteAllowance": "0x78d71ad3aa68e50fd16c0514e4ff1eb63c4008b5",
-    "Sortition": "0x80d98a7687dd806c1e602c991dc0e3c29be03a0e"
+    "AnchorRegistry": "0xfeaacf58d9a38c60cbc473c3abea55dd629cf660",
+    "MeetingRegistry": "0x8fffde6f66901b30adcd1544763c279ca1e1b30a",
+    "GovernanceTemplateRegistry": "0x90a3d1ccc159501833d1160190a58470db1a0a88",
+    "GovernanceProtocolFactory": "0xbba38be5c9a0ad00c7d24430b53a7049f46c9b3f",
+    "PolicyBinding": "0x76c41259d1454d983a2def855d532bfd67e10ea0",
+    "CapabilityGrant": "0x3139e17e23914e9442e126228f5b14658b50a449",
+    "VoteAllowance": "0xee0f77fb2e6f5f31ac8b5df14932ba4715b558bd",
+    "Sortition": "0x1eabce0dddb74f5c144c7f452a7d27292c62e900"
   },
   "aaStack": {
     "EntryPoint": "0xc698feaf0ff7fdb0d60e2f620c97cb729a694975",
@@ -98,6 +98,6 @@
     "X402TransferAuthVerify": "0x0000000000000000000000000000000000000201",
     "X402BatchPaymentVerify": "0x0000000000000000000000000000000000000202"
   },
-  "CitrateMemberSBT": "0x4CE39F891c0A519Fa0E0De97A1DD3e3f856e0cF1",
-  "MembershipStakeVault": "0x61E324cFd6B7Cb106AC0AD1dF163bdFef2b74268"
+  "CitrateMemberSBT": "0xAD826D0439f7ad5a3512A8927B632Cbca2840e10",
+  "MembershipStakeVault": "0x04c32967816187B2efDcd4937DbBa59E051F99dB"
 }
