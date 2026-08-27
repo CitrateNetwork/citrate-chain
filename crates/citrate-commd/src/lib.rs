@@ -20,6 +20,7 @@
 
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField, Zero};
+use sha3::Digest as _;
 
 mod poseidon;
 pub use poseidon::{poseidon_config, poseidon_hash};
@@ -185,9 +186,69 @@ pub fn compute_comm_d_streaming(data: &[u8]) -> [u8; 32] {
     fr_to_be_bytes(acc.root())
 }
 
+/// M1a — the combined streaming state the recursive proof folds: the Poseidon Merkle root (`commD`)
+/// AND the content identity (`dataHash = keccak256(data)`, the existing IPFSIncentivesV3 field) over
+/// the SAME byte stream. A valid recursive proof exposing both public outputs binds `commD` to the
+/// content-identified data — the property that makes the bond sound and closes the content residual.
+/// This native reference is what the step circuit (M1b) mirrors; `finalize` == (`compute_comm_d`,
+/// keccak256) proven by `fold_matches_batch`.
+pub struct CommDFold {
+    merkle: IncrementalMerkle,
+    keccak: sha3::Keccak256,
+    carry: Vec<u8>, // bytes not yet forming a full 31-byte leaf (fed to the merkle at finalize)
+}
+
+impl CommDFold {
+    /// Start a fold for a file of exactly `total_len` bytes (fixes the Merkle depth up front, as a
+    /// real proof does — the size is known to the prover).
+    pub fn new(total_len: usize) -> Self {
+        let n_leaves = if total_len == 0 {
+            1
+        } else {
+            total_len.div_ceil(BYTES_PER_LEAF)
+        };
+        let depth = n_leaves.next_power_of_two().trailing_zeros();
+        Self {
+            merkle: IncrementalMerkle::new(depth),
+            keccak: sha3::Keccak256::new(),
+            carry: Vec::with_capacity(BYTES_PER_LEAF),
+        }
+    }
+
+    /// Fold in one batch of bytes (a proof step covers B bytes). Updates keccak over the raw bytes
+    /// and inserts every completed 31-byte leaf into the Merkle accumulator.
+    pub fn absorb(&mut self, bytes: &[u8]) {
+        use sha3::Digest as _;
+        self.keccak.update(bytes);
+        self.carry.extend_from_slice(bytes);
+        while self.carry.len() >= BYTES_PER_LEAF {
+            let leaf = Fr::from_le_bytes_mod_order(&self.carry[..BYTES_PER_LEAF]);
+            self.merkle.insert(leaf);
+            self.carry.drain(..BYTES_PER_LEAF);
+        }
+    }
+
+    /// Finish: (commD, dataHash). The trailing partial leaf (and the empty-input single zero leaf)
+    /// are handled to match `compute_comm_d` / `keccak256` exactly.
+    pub fn finalize(mut self) -> ([u8; 32], [u8; 32]) {
+        use sha3::Digest as _;
+        if !self.carry.is_empty() {
+            let leaf = Fr::from_le_bytes_mod_order(&self.carry);
+            self.merkle.insert(leaf);
+        } else if self.merkle.index == 0 {
+            // empty input packs to a single zero leaf (matches pack_bytes(&[])).
+            self.merkle.insert(Fr::zero());
+        }
+        let comm_d = fr_to_be_bytes(self.merkle.root());
+        let data_hash: [u8; 32] = self.keccak.finalize().into();
+        (comm_d, data_hash)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha3::Digest as KeccakDigest; // Keccak256::digest in the fold test
 
     #[test]
     fn pack_is_31_byte_chunks_and_injective() {
@@ -265,6 +326,32 @@ mod tests {
         assert_ne!(compute_comm_d(&a), compute_comm_d(&b));
         a[80] = 1;
         assert_eq!(compute_comm_d(&a), compute_comm_d(&b));
+    }
+
+    #[test]
+    fn fold_matches_batch() {
+        // The combined fold state (M1a) must yield BOTH the batch commD and keccak256(data), fed in
+        // arbitrary batch sizes — the reference the recursive step circuit (M1b) is verified against.
+        for n_bytes in [0usize, 1, 30, 31, 62, 100, 1000, 3000] {
+            for batch in [1usize, 7, 31, 64, 999] {
+                let data: Vec<u8> = (0..n_bytes).map(|i| (i * 13 + 5) as u8).collect();
+                let mut fold = CommDFold::new(data.len());
+                for chunk in data.chunks(batch) {
+                    fold.absorb(chunk);
+                }
+                let (comm_d, data_hash) = fold.finalize();
+                assert_eq!(
+                    comm_d,
+                    compute_comm_d(&data),
+                    "fold commD != batch at {n_bytes}B / batch {batch}"
+                );
+                let expect_kh: [u8; 32] = sha3::Keccak256::digest(&data).into();
+                assert_eq!(
+                    data_hash, expect_kh,
+                    "fold dataHash != keccak256 at {n_bytes}B / batch {batch}"
+                );
+            }
+        }
     }
 
     #[test]
