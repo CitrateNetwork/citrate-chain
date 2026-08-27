@@ -265,4 +265,36 @@ mod tests {
             assert!(execute(&input, 1).is_err());
         }
     }
+
+    /// Feature-ON smoke test (the reroll gate): with `commd-fold-verify` built, `0x0130` is LIVE — it
+    /// gets PAST the feature gate into the real verify path. A malformed call must fail with a
+    /// decode/verify error, NOT the "feature absent" message. This is what the reroll's post-build
+    /// check asserts (an eth_call to 0x0130 must not say "requires the `commd-fold-verify` feature").
+    #[cfg(feature = "commd-fold-verify")]
+    #[test]
+    fn feature_on_reaches_the_verifier_not_the_absent_stub() {
+        // A well-formed head but an empty (invalid) proof → the verifier rejects it; the point is the
+        // error is NOT the feature-absent stub, proving the baked VK + Nova verifier are wired in.
+        let mut input = vec![0u8; 4];
+        let mut w = |v: usize| {
+            let mut x = [0u8; 32];
+            x[24..].copy_from_slice(&(v as u64).to_be_bytes());
+            input.extend_from_slice(&x);
+        };
+        w(128); // offset_proof
+        w(1); // numSteps
+        w(0); // depth
+        w(160); // offset_z0
+        input.extend_from_slice(&[0u8; 32]); // proof len 0
+        input.extend_from_slice(&[0u8; 32]); // z0 len 0
+        let err = execute(&input, u64::MAX).unwrap_err().to_string();
+        assert!(
+            !err.contains("requires the `commd-fold-verify` feature"),
+            "0x0130 hit the absent stub despite the feature being on: {err}"
+        );
+        assert!(
+            err.contains("invalid proof") || err.contains("FOLD_COMMD_VERIFY"),
+            "expected a verifier-path error, got: {err}"
+        );
+    }
 }

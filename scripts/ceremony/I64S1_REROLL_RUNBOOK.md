@@ -46,7 +46,14 @@ cd /home/saul/Projects/Citrate-Labs/citrate-chain
 git checkout main && git pull
 
 # Toolchain is pinned to 1.96.0 (rust-toolchain.toml) — matches the kernel MSRV.
-cargo build --release -p citrate-node
+#
+# citrate-chain#170: to activate the sound CommD-bond verifier (0x0130) this reroll MUST build with
+# `--features commd-fold-verify` (links the Nova verifier + the committed production VK at
+# core/execution/artifacts/commd_fold_vk.bin). ⚠️ ALL nodes must run the SAME feature set or they
+# diverge on any tx exercising 0x0130 — a reroll makes them agree from block 0. The deployed binary is
+# the `citrate` bin (rsync'd to /usr/local/bin/citrate-node). Verify 0x0130 is LIVE after building:
+#   an eth_call to 0x0130 must NOT return the "requires the `commd-fold-verify` feature" error.
+cargo build --release -p citrate-node --features commd-fold-verify
 
 # Consensus-critical sanity:
 cargo test -p citrate-economics --lib \
