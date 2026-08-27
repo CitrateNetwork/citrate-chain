@@ -2,28 +2,43 @@
 
 The `commd-fold-verify` feature embeds a SINGLE Nova `CompressedSNARK` verifier key here via
 `include_bytes!`. One key verifies proofs for **every** file size (the circuit is fixed-arity —
-`FixedCommDFoldStep`, `MAX_DEPTH = 40`). The key is a large (~27 MB) generated artifact and is **not
-committed**; a feature-ON build requires it to exist first.
+`FixedCommDFoldStep`, `MAX_DEPTH = 40`).
 
-## Producing the key (citrate-chain#170, M3)
+## STATUS: production key baked + committed (citrate-chain#170, 2026-08-27)
+
+`commd_fold_vk.bin` (27,152,352 bytes) is the **production** verifier key and **is committed** (shipped
+with the source so validators build with it embedded).
+
+**Provenance — audit by re-baking and comparing the BLAKE3:**
+- **SRS:** PSE **Perpetual Powers of Tau**, `ppot_0080_17.ptau`
+  (`sha256 f807e065fde53f72f4bf4d57140fab85b26daa6cc95bdfec7cce93622b3a367c`), from
+  <https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/>. The community ceremony
+  (80+ contributors) — **not** the insecure `--dev` SRS.
+- **BLAKE3(commd_fold_vk.bin):** `1e20b9244a63f4323fc7b5b6e3770c586a3122e7c43e520d601edbebd6c6e2d4`.
+- The circuit's augmented primary is 42,832 constraints → needs 2^16 generators; `ppot_0080_17` (2^17)
+  covers it with margin and yields the identical key a 2^16 file would (the ceremony is one sequence).
+
+## Re-baking (to audit or regenerate)
 
 ```
-# PRODUCTION — from a trusted-setup ceremony .ptau directory:
+# 1. download the trusted PPOT (once):
+curl -o ppot/ppot_0080_17.ptau \
+  https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/ppot_0080_17.ptau
+# 2. bake + compare the digest:
 cargo run --release --manifest-path ../../crates/citrate-commd-fold/Cargo.toml \
-  --bin bake_vk -- --ptau-dir /path/to/ptau --out artifacts/commd_fold_vk.bin
-
-# DEV / CI only — INSECURE deterministic test-utils SRS (reproducible toxic waste; never ship):
-cargo run --release --manifest-path ../../crates/citrate-commd-fold/Cargo.toml \
-  --bin bake_vk -- --dev --out artifacts/commd_fold_vk.dev.bin   # then rename to commd_fold_vk.bin
+  --bin bake_vk -- --ptau-dir ./ptau --out /tmp/vk.bin
+b3sum /tmp/vk.bin   # must equal 1e20b924…c6e2d4
 ```
 
-The tool prints the key's size and a BLAKE3 digest. **Pin the production digest** in
-`ADR-2026-08-27-pin-commd-bond-zk-challenge` and in the `0x0130` precompile comment so the baked key is
-auditable.
+## ⚠️ Prover must match the SRS
+
+A challenger's proof only verifies against this key if it was produced with the **same** ptau. The
+challenge-proving tooling must build its `PublicParams` via
+`citrate_commd_fold::commd_fixed_fold::fixed_public_params_ptau(<same ppot dir>)` — **not** the
+`fixed_public_params()` (`--dev`) path.
 
 ## Activation (owner-gated — a consensus change)
 
-1. Run a real trusted-setup ceremony → `.ptau`; bake the key here (drop the insecure `--dev` SRS).
-2. Build validators with `--features commd-fold-verify`; **all nodes must agree** — coordinate a fleet
-   upgrade / activation height. Until every node runs it, do NOT route real traffic to `0x0130`.
-3. Redeploy `IPFSIncentivesV3` on 40204 with `foldVerifier = 0x0130`; update the address JSONs.
+Build validators with `--features commd-fold-verify` (the `node` package passthrough) — **all nodes
+must agree** (a genesis/reroll or coordinated activation). Then `IPFSIncentivesV3.challengeWrongCommD`
+(already deployed at `0xa1a37f79…` with `foldVerifier = 0x0130`) becomes enforceable.

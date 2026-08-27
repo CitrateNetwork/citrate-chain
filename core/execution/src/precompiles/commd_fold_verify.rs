@@ -154,10 +154,19 @@ pub fn execute(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     }
 }
 
-/// The SINGLE baked verifier key (one key verifies every file — fixed-arity circuit). Produced by
-/// `crates/citrate-commd-fold`'s `bake_vk` tool from a PRODUCTION trusted-setup `.ptau` and committed
-/// as `artifacts/commd_fold_vk.bin`. The build fails if it is missing — you cannot enable the verifier
-/// without a key. Pin its BLAKE3 digest in review (the ADR + this comment) when the ceremony completes.
+/// The SINGLE baked verifier key (one key verifies every file — fixed-arity circuit), committed as
+/// `artifacts/commd_fold_vk.bin`. The build fails if it is missing — you cannot enable the verifier
+/// without a key.
+///
+/// PROVENANCE (audit these — re-bake and compare to confirm the key was not tampered with):
+///   * SRS: the PSE Perpetual Powers of Tau, `ppot_0080_17.ptau`
+///     (sha256 `f807e065fde53f72f4bf4d57140fab85b26daa6cc95bdfec7cce93622b3a367c`), from
+///     <https://pse-trusted-setup-ppot.s3.eu-central-1.amazonaws.com/pot28_0080/> — the community
+///     ceremony (80+ contributors) trusted across the ecosystem. NOT the insecure `--dev` SRS.
+///   * Baked by `crates/citrate-commd-fold`'s `bake_vk --ptau-dir <dir>` over the fixed-arity circuit.
+///   * BLAKE3(commd_fold_vk.bin) = `1e20b9244a63f4323fc7b5b6e3770c586a3122e7c43e520d601edbebd6c6e2d4`.
+/// A prover's proof only verifies against this key if it used the SAME ptau — challenger tooling must
+/// build its `PublicParams` via `fixed_public_params_ptau(<same ppot dir>)`, not the dev path.
 #[cfg(feature = "commd-fold-verify")]
 fn baked_vk() -> &'static [u8] {
     include_bytes!(concat!(
