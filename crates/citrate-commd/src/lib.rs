@@ -225,6 +225,57 @@ impl IncrementalMerkle {
     }
 }
 
+/// FIXED-ARITY streaming CommD (citrate-chain#170, M3): the byte-identical `compute_comm_d` computed
+/// the way the SINGLE-VK recursive circuit does it — a fold that ALWAYS walks a constant `max_depth`
+/// Merkle levels, but MASKS (skips, passing the running node through unchanged) every level `h >=`
+/// the file's actual depth `d = ceil(log2 N)`. Because a masked walk to `d` levels maintains exactly
+/// the depth-`d` incremental root, `cur` after the last leaf equals `poseidon_merkle(leaves padded to
+/// 2^d) == compute_comm_d` — the next-power-of-two semantics are preserved, so this does NOT re-version
+/// the commitment. A fixed `max_depth` (independent of the file) gives ONE R1CS shape ⇒ ONE baked Nova
+/// verifier key for the 0x0130 precompile. The circuit `FixedCommDFoldStep` mirrors this exactly;
+/// `fixed_depth_matches_batch` pins it. `max_depth` must satisfy `2^max_depth >= N`.
+pub fn compute_comm_d_fixed_depth(data: &[u8], max_depth: u32) -> [u8; 32] {
+    let leaves = pack_bytes(data);
+    let n = leaves.len();
+    let d: u32 = if n <= 1 {
+        0
+    } else {
+        n.next_power_of_two().trailing_zeros()
+    };
+    assert!(
+        d <= max_depth,
+        "max_depth {max_depth} too small for {n} leaves (needs {d})"
+    );
+
+    // zeros[h] = all-zero subtree root at height h.
+    let md = max_depth as usize;
+    let mut zeros = Vec::with_capacity(md + 1);
+    zeros.push(Fr::zero());
+    for h in 1..=md {
+        let z = zeros[h - 1];
+        zeros.push(poseidon_hash(&[z, z]));
+    }
+
+    let mut filled = zeros[0..md].to_vec(); // cached left sibling per height (unused above d)
+    let mut root = Fr::zero();
+    for (index, leaf) in (0u64..).zip(leaves.iter()) {
+        let mut cur = *leaf;
+        for (h, filled_h) in filled.iter_mut().enumerate().take(md) {
+            if (h as u32) < d {
+                if (index >> h) & 1 == 0 {
+                    *filled_h = cur;
+                    cur = poseidon_hash(&[cur, zeros[h]]);
+                } else {
+                    cur = poseidon_hash(&[*filled_h, cur]);
+                }
+            }
+            // h >= d: masked — cur and filled[h] pass through unchanged.
+        }
+        root = cur;
+    }
+    fr_to_be_bytes(root)
+}
+
 /// Streaming (fold-friendly) computation of the SAME CommD as [`compute_comm_d`], via
 /// [`IncrementalMerkle`]. The recursive circuit mirrors this exactly. Degenerate `N ≤ 1` returns
 /// the single leaf (matching `poseidon_merkle`, which does no hashing for a 1-element tree).
@@ -421,6 +472,23 @@ mod tests {
                 compute_comm_d(&data),
                 "streaming != batch CommD at {n_bytes} bytes"
             );
+        }
+    }
+
+    #[test]
+    fn fixed_depth_matches_batch() {
+        // The masked fixed-`max_depth` walk (what the single-VK circuit does) must equal the canonical
+        // `compute_comm_d` for every N — spanning the single-leaf/masked-to-nothing case, exact powers
+        // of two, and non-powers — at a max_depth comfortably above each file's actual depth.
+        for max_depth in [8u32, 40] {
+            for n_bytes in [0usize, 1, 31, 32, 63, 100, 200, 1000, 2048, 3000] {
+                let data: Vec<u8> = (0..n_bytes).map(|i| (i * 7 + 1) as u8).collect();
+                assert_eq!(
+                    compute_comm_d_fixed_depth(&data, max_depth),
+                    compute_comm_d(&data),
+                    "fixed-depth (max {max_depth}) != batch CommD at {n_bytes} bytes"
+                );
+            }
         }
     }
 
