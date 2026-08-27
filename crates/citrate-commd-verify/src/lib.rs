@@ -10,15 +10,15 @@
 //! isolated (it needs the insecure `test-utils` SRS). The `CommDBindFoldStep` circuit type comes from
 //! the prover crate by path.
 //!
-//! ## Open design item before consensus wiring (the fixed-arity requirement)
-//! `CommDBindFoldStep`'s arity is `depth + 6`, so its R1CS shape — and thus the Nova verifier key —
-//! DEPENDS ON `depth`. A precompile with ONE baked VK therefore needs a FIXED-ARITY circuit
-//! (a `MAX_DEPTH` fold that reads the `commD` out at the witnessed level, preserving the
-//! next-power-of-two `compute_comm_d` semantics), or a bounded set of per-depth VKs. Until then this
-//! kernel takes the VK as an argument (as the tests do), and the `0x0130` execution wiring is deferred.
-//! See the crate's tracking notes on #170.
+//! ## Fixed-arity circuit ⇒ ONE baked VK (resolved)
+//! The verifier is parameterized by [`FixedCommDFoldStep`], whose arity is a constant
+//! (`MAX_DEPTH + 7`) — its R1CS shape, and thus the Nova verifier key, do NOT depend on the file.
+//! A single VK (generated once, `fixed_public_params` → `CompressedSNARK::setup`) verifies proofs for
+//! every file size, so the precompile can bake ONE key. `commD`/`dataCommit` sit at the FIXED public
+//! slots `COMMD_INDEX`/`DATACOMMIT_INDEX`. Production still owes the trusted-setup `.ptau` swap (drop
+//! Nova `test-utils`) and the consensus wiring of `0x0130`.
 
-use citrate_commd_fold::commd_bind_fold::CommDBindFoldStep;
+use citrate_commd_fold::commd_fixed_fold::{FixedCommDFoldStep, COMMD_INDEX, DATACOMMIT_INDEX};
 use citrate_commd_fold::{Scalar, E1, E2};
 use ff::PrimeField;
 use nova_snark::nova::{CompressedSNARK, VerifierKey};
@@ -28,8 +28,8 @@ type EE2 = nova_snark::provider::ipa_pc::EvaluationEngine<E2>;
 type S1 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E1, EE1>;
 type S2 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E2, EE2>;
 
-type Vk = VerifierKey<E1, E2, CommDBindFoldStep, S1, S2>;
-type Snark = CompressedSNARK<E1, E2, CommDBindFoldStep, S1, S2>;
+type Vk = VerifierKey<E1, E2, FixedCommDFoldStep, S1, S2>;
+type Snark = CompressedSNARK<E1, E2, FixedCommDFoldStep, S1, S2>;
 
 /// Why a fold-proof verification failed. `Display` is safe to surface (no secret material).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,13 +81,13 @@ pub fn scalar_to_be_bytes(s: Scalar) -> [u8; 32] {
 /// relation the `0x0130` precompile enforces; `IPFSIncentivesV3.challengeWrongCommD` then slashes iff
 /// `dataCommit == reg.dataCommit` and `trueCommD != reg.commD`.
 ///
-/// `z0_be` is the initial public state (each word big-endian); `num_steps` and `depth` are the proof's
-/// public parameters (leaf count and Merkle depth). commD/dataCommit sit at `z[depth+1]`/`z[depth+3]`.
+/// `z0_be` is the initial public state (each word big-endian; it carries the file's `depth` at a fixed
+/// slot); `num_steps` is the leaf count. With the fixed-arity circuit, commD/dataCommit sit at the
+/// CONSTANT slots `COMMD_INDEX`/`DATACOMMIT_INDEX` regardless of file size.
 pub fn verify_fold_proof(
     vk_bytes: &[u8],
     proof_bytes: &[u8],
     num_steps: usize,
-    depth: usize,
     z0_be: &[[u8; 32]],
 ) -> Result<([u8; 32], [u8; 32]), VerifyError> {
     let vk: Vk = bincode::deserialize(vk_bytes).map_err(|_| VerifyError::Decode)?;
@@ -102,31 +102,31 @@ pub fn verify_fold_proof(
         .verify(&vk, num_steps, &z0)
         .map_err(|_| VerifyError::Invalid)?;
 
-    if zn.len() < depth + 4 {
+    if zn.len() <= DATACOMMIT_INDEX {
         return Err(VerifyError::BadArity);
     }
-    let comm_d = scalar_to_be_bytes(zn[depth + 1]);
-    let data_commit = scalar_to_be_bytes(zn[depth + 3]);
+    let comm_d = scalar_to_be_bytes(zn[COMMD_INDEX]);
+    let data_commit = scalar_to_be_bytes(zn[DATACOMMIT_INDEX]);
     Ok((comm_d, data_commit))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use citrate_commd_fold::commd_compressed::prove_commd_compressed;
+    use citrate_commd_fold::commd_fixed_fold::prove_fixed_compressed;
 
-    /// M3 kernel acceptance: a REAL compressed fold proof (produced by the prover crate) verifies in
-    /// this node-linkable verifier, and its bound public output equals the canonical
+    /// M3 kernel acceptance: a REAL fixed-arity compressed proof (produced by the prover crate)
+    /// verifies in this node-linkable verifier, and its bound public output equals the canonical
     /// `(compute_comm_d, compute_data_commit)`. A tampered proof is rejected.
     #[test]
     fn verifies_a_real_fold_proof_and_rejects_tampering() {
         let data: Vec<u8> = (0..200u32).map(|i| (i * 13 + 5) as u8).collect();
-        let p = prove_commd_compressed(&data).expect("prove compressed");
+        let p = prove_fixed_compressed(&data).expect("prove compressed");
 
         let z0_be: Vec<[u8; 32]> = p.z0.iter().copied().map(scalar_to_be_bytes).collect();
 
         let (comm_d, data_commit) =
-            verify_fold_proof(&p.vk_bytes, &p.proof_bytes, p.num_steps, p.depth, &z0_be)
+            verify_fold_proof(&p.vk_bytes, &p.proof_bytes, p.num_steps, &z0_be)
                 .expect("valid proof must verify");
         assert_eq!(
             comm_d,
@@ -143,7 +143,7 @@ mod tests {
         let mut bad = p.proof_bytes.clone();
         bad[64] ^= 0x01;
         assert!(
-            verify_fold_proof(&p.vk_bytes, &bad, p.num_steps, p.depth, &z0_be).is_err(),
+            verify_fold_proof(&p.vk_bytes, &bad, p.num_steps, &z0_be).is_err(),
             "a tampered proof must not verify"
         );
     }
