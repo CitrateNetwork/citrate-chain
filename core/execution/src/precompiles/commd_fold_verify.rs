@@ -1,0 +1,259 @@
+// 0x0130 FOLD_COMMD_VERIFY — the recursive-fold CommD proof verifier precompile (citrate-chain#170,
+// M3). Verifies a Nova/Spartan `CompressedSNARK` that a file's leaves fold to a canonical `commD`
+// (Poseidon-BN254 Merkle root) AND a `dataCommit` (domain-separated sponge), both bound to ONE leaf
+// stream. `IPFSIncentivesV3.challengeWrongCommD` calls this via the `IFoldVerifier` interface and
+// slashes iff `dataCommit == reg.dataCommit` and `trueCommD != reg.commD`.
+//
+// FEATURE-GATED / NOT YET CONSENSUS-ACTIVE. The verifier links Nova (validated to coexist with the
+// pinned PSE-halo2 stack) and embeds the SINGLE baked verifier key (see `crates/citrate-commd-fold`'s
+// `bake_vk` tool) — both only under `--features commd-fold-verify`. The default build returns a
+// discoverable `feature absent` error, exactly like 0x0108 without `halo2-substrate`. Enabling this
+// feature is a CONSENSUS change: every node must agree, so it ships behind a coordinated activation.
+//
+// ADDRESS NOTE: 0x0107–0x0109 are taken (tensor-commit / halo2-proof / merkle-tensor); this new
+// verification family starts at 0x0130. The Solidity side defaults `foldVerifier` to `address(0x0130)`.
+
+use anyhow::{anyhow, Result};
+
+use crate::precompiles::PrecompileResult;
+
+/// 0x0130 — recursive-fold CommD proof verifier.
+pub const FOLD_COMMD_VERIFY: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x30,
+];
+
+pub mod gas_costs {
+    /// Base cost — Nova `CompressedSNARK` verification (Spartan sumcheck + HyperKZG opening on the
+    /// primary, IPA on the secondary): several MSMs + pairings, materially heavier than 0x0108's
+    /// single-pairing SHPLONK verify. Placeholder pending calibration against real verify benches.
+    pub const FOLD_VERIFY_BASE: u64 = 2_000_000;
+    /// Per-byte cost — transcript scanning scales with the (few-KB) proof + public-input length.
+    pub const FOLD_VERIFY_PER_BYTE: u64 = 50;
+}
+
+/// The decoded `verifyCommDFold(bytes proof, uint256 numSteps, uint256 depth, uint256[] z0)` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChallengeInput {
+    pub proof: Vec<u8>,
+    pub num_steps: usize,
+    pub depth: usize,
+    pub z0: Vec<[u8; 32]>,
+}
+
+fn word(input: &[u8], at: usize) -> Result<[u8; 32]> {
+    input
+        .get(at..at + 32)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: input truncated at word offset {at}"))
+}
+
+/// A 32-byte big-endian word as a `usize`, rejecting values that don't fit (offsets/lengths only).
+fn word_as_usize(w: [u8; 32]) -> Result<usize> {
+    if w[..24].iter().any(|&b| b != 0) {
+        return Err(anyhow!("FOLD_COMMD_VERIFY: length/offset exceeds usize"));
+    }
+    Ok(u64::from_be_bytes(w[24..32].try_into().expect("8B")) as usize)
+}
+
+/// Decode the standard Solidity ABI encoding of
+/// `verifyCommDFold(bytes, uint256, uint256, uint256[])` — a 4-byte selector followed by the head
+/// (`offset_proof`, `numSteps`, `depth`, `offset_z0`) and the two dynamic tails. Pure + panic-free
+/// (every malformed input is an `Err`), so it is unit-tested without the verifier feature.
+pub fn decode_challenge_input(input: &[u8]) -> Result<ChallengeInput> {
+    // 4-byte selector + 4 head words.
+    if input.len() < 4 + 4 * 32 {
+        return Err(anyhow!(
+            "FOLD_COMMD_VERIFY: input too short for the call head"
+        ));
+    }
+    let args = &input[4..]; // offsets in the ABI are relative to the start of the args
+
+    let off_proof = word_as_usize(word(args, 0)?)?;
+    let num_steps = word_as_usize(word(args, 32)?)?;
+    let depth = word_as_usize(word(args, 64)?)?;
+    let off_z0 = word_as_usize(word(args, 96)?)?;
+
+    // proof: [len][data], data zero-padded to a multiple of 32.
+    let proof_len = word_as_usize(word(args, off_proof)?)?;
+    let proof_start = off_proof
+        .checked_add(32)
+        .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: proof offset overflow"))?;
+    let proof = args
+        .get(proof_start..proof_start + proof_len)
+        .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: proof bytes out of range"))?
+        .to_vec();
+
+    // z0: [len][word_0 .. word_{len-1}].
+    let z0_len = word_as_usize(word(args, off_z0)?)?;
+    let mut z0 = Vec::with_capacity(z0_len);
+    for i in 0..z0_len {
+        let at = off_z0
+            .checked_add(32)
+            .and_then(|b| b.checked_add(i.checked_mul(32)?))
+            .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: z0 offset overflow"))?;
+        z0.push(word(args, at)?);
+    }
+
+    Ok(ChallengeInput {
+        proof,
+        num_steps,
+        depth,
+        z0,
+    })
+}
+
+/// Charge gas for a verification of `input_len` bytes; `Err` if the limit is insufficient.
+fn charge_gas(input_len: usize, gas_limit: u64) -> Result<u64> {
+    let gas_used = gas_costs::FOLD_VERIFY_BASE
+        .saturating_add(gas_costs::FOLD_VERIFY_PER_BYTE.saturating_mul(input_len as u64));
+    if gas_limit < gas_used {
+        return Err(anyhow!(
+            "Insufficient gas for FOLD_COMMD_VERIFY: need {gas_used}, have {gas_limit}"
+        ));
+    }
+    Ok(gas_used)
+}
+
+/// 0x0130 entry point. Decodes the challenge call, verifies the fold proof against the baked VK, and
+/// returns `abi.encode(trueCommD, dataCommit)` (64 bytes). Reverts (via `Err`) on an invalid proof —
+/// which the Solidity `staticcall` bubbles, so a bad proof cannot slash.
+pub fn execute(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
+    let gas_used = charge_gas(input.len(), gas_limit)?;
+    // Decode is always compiled (and unit-tested) so the wire format is validated regardless of the
+    // verifier feature.
+    let call = decode_challenge_input(input)?;
+
+    #[cfg(not(feature = "commd-fold-verify"))]
+    {
+        let _ = (call, gas_used);
+        Err(anyhow!(
+            "FOLD_COMMD_VERIFY (0x0130) requires the `commd-fold-verify` feature (Nova verifier + \
+             baked VK). This is a consensus-gated activation; rebuild with --features commd-fold-verify."
+        ))
+    }
+
+    #[cfg(feature = "commd-fold-verify")]
+    {
+        let (comm_d, data_commit) = citrate_commd_verify::verify_fold_proof(
+            baked_vk(),
+            &call.proof,
+            call.num_steps,
+            &call.z0,
+        )
+        .map_err(|e| anyhow!("FOLD_COMMD_VERIFY invalid proof: {e}"))?;
+
+        // abi.encode(bytes32 trueCommD, bytes32 dataCommit) — the (bytes32, bytes32) the interface returns.
+        let mut output = Vec::with_capacity(64);
+        output.extend_from_slice(&comm_d);
+        output.extend_from_slice(&data_commit);
+        Ok(PrecompileResult {
+            output,
+            gas_used,
+            success: true,
+        })
+    }
+}
+
+/// The SINGLE baked verifier key (one key verifies every file — fixed-arity circuit). Produced by
+/// `crates/citrate-commd-fold`'s `bake_vk` tool from a PRODUCTION trusted-setup `.ptau` and committed
+/// as `artifacts/commd_fold_vk.bin`. The build fails if it is missing — you cannot enable the verifier
+/// without a key. Pin its BLAKE3 digest in review (the ADR + this comment) when the ceremony completes.
+#[cfg(feature = "commd-fold-verify")]
+fn baked_vk() -> &'static [u8] {
+    include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/artifacts/commd_fold_vk.bin"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip the ABI decoder against a hand-built `verifyCommDFold` encoding: selector + head
+    /// (offset_proof, numSteps, depth, offset_z0) + the two dynamic tails. Exercises the wire format
+    /// the Solidity `IFoldVerifier` produces, independent of the verifier feature.
+    #[test]
+    fn decodes_verify_commd_fold_abi() {
+        // Build: proof = 5 bytes [1,2,3,4,5]; numSteps = 7; depth = 3; z0 = [w_a, w_b].
+        let mut input = Vec::new();
+        input.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // selector (ignored)
+
+        // head: 4 words. Dynamic tails laid out after the 4 head words (offsets are arg-relative).
+        let head_words = 4usize;
+        let off_proof = head_words * 32; // 128
+                                         // proof tail = 1 len word + ceil(5/32)=1 data word = 64 bytes → z0 starts at 128+64=192
+        let off_z0 = off_proof + 32 + 32;
+
+        let mut w = |v: usize| {
+            let mut x = [0u8; 32];
+            x[24..].copy_from_slice(&(v as u64).to_be_bytes());
+            input.extend_from_slice(&x);
+        };
+        w(off_proof); // offset_proof
+        w(7); // numSteps
+        w(3); // depth
+        w(off_z0); // offset_z0
+
+        // proof tail: len=5, then 5 bytes zero-padded to 32.
+        let mut lenw = [0u8; 32];
+        lenw[31] = 5;
+        input.extend_from_slice(&lenw);
+        let mut data = [0u8; 32];
+        data[..5].copy_from_slice(&[1, 2, 3, 4, 5]);
+        input.extend_from_slice(&data);
+
+        // z0 tail: len=2, then 2 words.
+        let mut zlen = [0u8; 32];
+        zlen[31] = 2;
+        input.extend_from_slice(&zlen);
+        let wa = [0x11u8; 32];
+        let wb = [0x22u8; 32];
+        input.extend_from_slice(&wa);
+        input.extend_from_slice(&wb);
+
+        let decoded = decode_challenge_input(&input).expect("decode");
+        assert_eq!(decoded.proof, vec![1, 2, 3, 4, 5]);
+        assert_eq!(decoded.num_steps, 7);
+        assert_eq!(decoded.depth, 3);
+        assert_eq!(decoded.z0, vec![wa, wb]);
+    }
+
+    #[test]
+    fn rejects_truncated_input() {
+        assert!(decode_challenge_input(&[0u8; 10]).is_err());
+        assert!(decode_challenge_input(&[]).is_err());
+    }
+
+    #[test]
+    fn address_is_0x0130() {
+        assert_eq!(FOLD_COMMD_VERIFY[18], 0x01);
+        assert_eq!(FOLD_COMMD_VERIFY[19], 0x30);
+    }
+
+    #[test]
+    fn feature_absent_build_charges_gas_then_errors() {
+        // Default (no feature): a well-formed call decodes but the verifier is absent → discoverable
+        // error. (With the feature on, this path verifies instead — covered by the verify crate.)
+        #[cfg(not(feature = "commd-fold-verify"))]
+        {
+            // Minimal well-formed empty-proof / empty-z0 call.
+            let mut input = vec![0u8; 4];
+            let mut w = |v: usize| {
+                let mut x = [0u8; 32];
+                x[24..].copy_from_slice(&(v as u64).to_be_bytes());
+                input.extend_from_slice(&x);
+            };
+            w(128); // offset_proof
+            w(1); // numSteps
+            w(0); // depth
+            w(160); // offset_z0
+            input.extend_from_slice(&[0u8; 32]); // proof len 0
+            input.extend_from_slice(&[0u8; 32]); // z0 len 0
+            let err = execute(&input, u64::MAX).unwrap_err().to_string();
+            assert!(err.contains("commd-fold-verify"), "got: {err}");
+            // Insufficient gas is surfaced too.
+            assert!(execute(&input, 1).is_err());
+        }
+    }
+}

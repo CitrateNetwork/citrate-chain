@@ -4,6 +4,7 @@
 // Standard Ethereum precompiles + Citrate AI extensions
 
 pub mod attestation;
+pub mod commd_fold_verify;
 pub mod compute;
 pub mod ed25519;
 pub mod inference;
@@ -36,49 +37,40 @@ pub mod standard {
     use crate::types::Address;
 
     /// ECRECOVER
-    pub const ECRECOVER: Address = Address([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
-    ]);
+    pub const ECRECOVER: Address =
+        Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
 
     /// SHA256
-    pub const SHA256: Address = Address([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2
-    ]);
+    pub const SHA256: Address =
+        Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
 
     /// RIPEMD160
-    pub const RIPEMD160: Address = Address([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3
-    ]);
+    pub const RIPEMD160: Address =
+        Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
 
     /// IDENTITY
-    pub const IDENTITY: Address = Address([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4
-    ]);
+    pub const IDENTITY: Address =
+        Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]);
 
     /// MODEXP
-    pub const MODEXP: Address = Address([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5
-    ]);
+    pub const MODEXP: Address =
+        Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5]);
 
     /// ECADD
-    pub const ECADD: Address = Address([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6
-    ]);
+    pub const ECADD: Address =
+        Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6]);
 
     /// ECMUL
-    pub const ECMUL: Address = Address([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7
-    ]);
+    pub const ECMUL: Address =
+        Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7]);
 
     /// ECPAIRING
-    pub const ECPAIRING: Address = Address([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8
-    ]);
+    pub const ECPAIRING: Address =
+        Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8]);
 
     /// BLAKE2F
-    pub const BLAKE2F: Address = Address([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9
-    ]);
+    pub const BLAKE2F: Address =
+        Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
 }
 
 /// Route the PURE (stateless) Citrate precompile families without a
@@ -124,6 +116,13 @@ pub fn execute_pure(address: &Address, input: &[u8], gas_limit: u64) -> Result<P
         if selector == 0x20 {
             return ed25519::execute(input, gas_limit);
         }
+        // citrate-chain#170 (M3): 0x0130 recursive-fold CommD proof verifier. Its verifier + baked VK
+        // are gated behind the `commd-fold-verify` feature (a consensus-gated activation); the routing
+        // is always present so the address is a known precompile (feature-off returns a discoverable
+        // "feature absent" error, mirroring 0x0108 without halo2-substrate).
+        if selector == 0x30 {
+            return commd_fold_verify::execute(input, gas_limit);
+        }
     }
     Err(anyhow::anyhow!(
         "Not a Citrate pure precompile address: 0x{:02x}{:02x}",
@@ -136,10 +135,11 @@ pub fn execute_pure(address: &Address, input: &[u8], gas_limit: u64) -> Result<P
 /// contract code (WP-B0). Kept next to `execute_pure` so the two cannot
 /// drift: every address listed here MUST route in `execute_pure`, and the
 /// `pure_precompile_table_routes` unit test enforces it.
-pub const PURE_PRECOMPILE_ADDRESSES: [[u8; 20]; 15] = [
+pub const PURE_PRECOMPILE_ADDRESSES: [[u8; 20]; 16] = [
     verify::addresses::TENSOR_COMMIT,          // 0x0107
     verify::addresses::INFERENCE_PROOF_VERIFY, // 0x0108
     verify::addresses::MERKLE_VERIFY_TENSOR,   // 0x0109
+    commd_fold_verify::FOLD_COMMD_VERIFY,      // 0x0130 (citrate-chain#170; feature-gated verifier)
     compute::addresses::TENSOR_MATMUL_Q16,     // 0x010A
     compute::addresses::TENSOR_DOT_Q16,        // 0x010B
     compute::addresses::TENSOR_SOFTMAX_Q16,    // 0x010C
@@ -167,9 +167,7 @@ impl Default for PrecompileExecutor {
 
 impl PrecompileExecutor {
     pub fn new() -> Self {
-        Self {
-            inference: None,
-        }
+        Self { inference: None }
     }
 
     /// Initialize with AI runtime
@@ -182,9 +180,8 @@ impl PrecompileExecutor {
     pub fn is_precompile(&self, address: &Address) -> bool {
         // Standard Ethereum precompiles (0x01 - 0x09)
         let addr_bytes = address.as_bytes();
-        let is_standard = addr_bytes[..19].iter().all(|&b| b == 0)
-            && addr_bytes[19] >= 1
-            && addr_bytes[19] <= 9;
+        let is_standard =
+            addr_bytes[..19].iter().all(|&b| b == 0) && addr_bytes[19] >= 1 && addr_bytes[19] <= 9;
 
         // Citrate AI precompiles (0x0100 - 0x010F) — WP-B0 canonical scheme:
         // the EVM address IS the documented short name, e.g. 0x0108 =
@@ -210,10 +207,15 @@ impl PrecompileExecutor {
         let is_crypto =
             prefix_check && addr_bytes[18] == 1 && (0x20..=0x2F).contains(&addr_bytes[19]);
 
+        // Citrate recursive-fold verification precompiles (0x0130 - 0x013F) — citrate-chain#170
+        // 0x0130: recursive-fold CommD proof verifier (FOLD_COMMD_VERIFY; feature-gated activation)
+        let is_fold_verify =
+            prefix_check && addr_bytes[18] == 1 && (0x30..=0x3F).contains(&addr_bytes[19]);
+
         // Citrate x402 payment precompiles (0x0200 - 0x0209)
         let is_x402 = prefix_check && addr_bytes[18] == 2 && addr_bytes[19] <= 9;
 
-        is_standard || is_ai || is_learning || is_crypto || is_x402
+        is_standard || is_ai || is_learning || is_crypto || is_fold_verify || is_x402
     }
 
     /// Execute a precompile
@@ -269,9 +271,7 @@ impl PrecompileExecutor {
         }
 
         // AI precompiles (0x0100–0x010F; canonical byte 18 = 1, selector ≤ 0x0F)
-        if addr_bytes[..18].iter().all(|&b| b == 0)
-            && addr_bytes[18] == 1
-            && addr_bytes[19] <= 0x0F
+        if addr_bytes[..18].iter().all(|&b| b == 0) && addr_bytes[18] == 1 && addr_bytes[19] <= 0x0F
         {
             // RM-M1: 0x0107–0x0109 are AI verification precompiles
             // (commitments / proof verification / Merkle paths).
@@ -389,7 +389,7 @@ impl PrecompileExecutor {
             return Err(anyhow::anyhow!("Insufficient gas"));
         }
 
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(input);
         let result = hasher.finalize();
@@ -498,11 +498,18 @@ impl PrecompileExecutor {
                 e_bytes[32 - copy_len..].copy_from_slice(&input[e_start..e_end]);
             }
             let exp_head = BigUint::from_bytes_be(&e_bytes);
-            let head_bits = if exp_head.is_zero() { 0 } else { exp_head.bits() as usize - 1 };
+            let head_bits = if exp_head.is_zero() {
+                0
+            } else {
+                exp_head.bits() as usize - 1
+            };
             8 * (e_len - 32) + head_bits
         };
 
-        let gas_cost = std::cmp::max(200, (multiplication_complexity * std::cmp::max(iteration_count, 1)) as u64 / 3);
+        let gas_cost = std::cmp::max(
+            200,
+            (multiplication_complexity * std::cmp::max(iteration_count, 1)) as u64 / 3,
+        );
 
         if gas_limit < gas_cost {
             return Err(anyhow::anyhow!("Insufficient gas"));
@@ -733,7 +740,10 @@ impl PrecompileExecutor {
         // Output: 64 bytes (updated state vector h)
 
         if input.len() != 213 {
-            return Err(anyhow::anyhow!("Invalid BLAKE2F input length: expected 213, got {}", input.len()));
+            return Err(anyhow::anyhow!(
+                "Invalid BLAKE2F input length: expected 213, got {}",
+                input.len()
+            ));
         }
 
         // Parse rounds (4 bytes big-endian)
@@ -755,8 +765,14 @@ impl PrecompileExecutor {
         for (i, h_val) in h.iter_mut().enumerate() {
             let offset = 4 + i * 8;
             *h_val = u64::from_le_bytes([
-                input[offset], input[offset + 1], input[offset + 2], input[offset + 3],
-                input[offset + 4], input[offset + 5], input[offset + 6], input[offset + 7],
+                input[offset],
+                input[offset + 1],
+                input[offset + 2],
+                input[offset + 3],
+                input[offset + 4],
+                input[offset + 5],
+                input[offset + 6],
+                input[offset + 7],
             ]);
         }
 
@@ -765,19 +781,25 @@ impl PrecompileExecutor {
         for (i, m_val) in m.iter_mut().enumerate() {
             let offset = 68 + i * 8;
             *m_val = u64::from_le_bytes([
-                input[offset], input[offset + 1], input[offset + 2], input[offset + 3],
-                input[offset + 4], input[offset + 5], input[offset + 6], input[offset + 7],
+                input[offset],
+                input[offset + 1],
+                input[offset + 2],
+                input[offset + 3],
+                input[offset + 4],
+                input[offset + 5],
+                input[offset + 6],
+                input[offset + 7],
             ]);
         }
 
         // Parse offset counters t (16 bytes = 2 x u64 little-endian)
         let t0 = u64::from_le_bytes([
-            input[196], input[197], input[198], input[199],
-            input[200], input[201], input[202], input[203],
+            input[196], input[197], input[198], input[199], input[200], input[201], input[202],
+            input[203],
         ]);
         let t1 = u64::from_le_bytes([
-            input[204], input[205], input[206], input[207],
-            input[208], input[209], input[210], input[211],
+            input[204], input[205], input[206], input[207], input[208], input[209], input[210],
+            input[211],
         ]);
 
         // BLAKE2b compression function F
@@ -801,10 +823,14 @@ impl PrecompileExecutor {
     fn blake2b_compress(h: &mut [u64; 8], m: &[u64; 16], t0: u64, t1: u64, f: bool, rounds: usize) {
         // BLAKE2b IV
         const IV: [u64; 8] = [
-            0x6a09e667f3bcc908, 0xbb67ae8584caa73b,
-            0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
-            0x510e527fade682d1, 0x9b05688c2b3e6c1f,
-            0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+            0x6a09e667f3bcc908,
+            0xbb67ae8584caa73b,
+            0x3c6ef372fe94f82b,
+            0xa54ff53a5f1d36f1,
+            0x510e527fade682d1,
+            0x9b05688c2b3e6c1f,
+            0x1f83d9abfb41bd6b,
+            0x5be0cd19137e2179,
         ];
 
         // Sigma permutation
@@ -1007,8 +1033,7 @@ pub fn recover_address(hash: &[u8], r: &[u8], s: &[u8], recovery_id: u8) -> Opti
     let recid = RecoveryId::from_byte(recovery_id)?;
 
     // Recover the verifying (public) key
-    let recovered_key =
-        VerifyingKey::recover_from_prehash(hash, &signature, recid).ok()?;
+    let recovered_key = VerifyingKey::recover_from_prehash(hash, &signature, recid).ok()?;
 
     // Get the uncompressed public key bytes (65 bytes: 0x04 prefix + 64 bytes)
     let pubkey_bytes = recovered_key.to_encoded_point(false);
@@ -1238,7 +1263,10 @@ mod tests {
         // The negation is the high-s form because |scalar| < n/2 on
         // input → |-scalar mod n| > n/2 on output.
         let neg_s = -s_scalar;
-        assert!(bool::from(neg_s.is_high()), "neg_s must be high-s by construction");
+        assert!(
+            bool::from(neg_s.is_high()),
+            "neg_s must be high-s by construction"
+        );
 
         let mut sig_bytes_high = [0u8; 64];
         sig_bytes_high[0..32].copy_from_slice(&sig_bytes_low[0..32]);
@@ -1319,7 +1347,9 @@ mod tests {
         let result = executor.sha256(&input, 10000).unwrap();
 
         // SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-        let expected = hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap();
+        let expected =
+            hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+                .unwrap();
 
         assert!(result.success);
         assert_eq!(result.output, expected);
@@ -1332,7 +1362,9 @@ mod tests {
         let result = executor.sha256(&input, 10000).unwrap();
 
         // SHA256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
-        let expected = hex::decode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad").unwrap();
+        let expected =
+            hex::decode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+                .unwrap();
 
         assert!(result.success);
         assert_eq!(result.output, expected);
@@ -1398,7 +1430,7 @@ mod tests {
         let mut input = vec![0u8; 96];
         input[31] = 1; // Base length = 1
         input[63] = 1; // Exponent length = 1
-        // Modulus length = 0 (default)
+                       // Modulus length = 0 (default)
 
         let result = executor.modexp(&input, 10000).unwrap();
 
@@ -1452,7 +1484,7 @@ mod tests {
         let mut input = vec![0u8; 128];
         input[31] = 1; // x = 1
         input[63] = 2; // y = 2
-        // Second point is infinity (zeros)
+                       // Second point is infinity (zeros)
 
         let result = executor.ecadd(&input, 10000).unwrap();
 
@@ -1481,7 +1513,7 @@ mod tests {
         let mut input = vec![0u8; 96];
         input[31] = 1; // x = 1
         input[63] = 2; // y = 2
-        // Scalar = 0 (last 32 bytes)
+                       // Scalar = 0 (last 32 bytes)
 
         let result = executor.ecmul(&input, 10000).unwrap();
 
@@ -1638,11 +1670,11 @@ mod tests {
         assert!(executor.is_precompile(&Address(x402::addresses::BATCH_PAYMENT_VERIFY)));
 
         // Future x402 slots (0x0203-0x0209) should also be recognized
-        let future_x402 = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 2, 5]);
+        let future_x402 = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 5]);
         assert!(executor.is_precompile(&future_x402));
 
         // 0x020A should NOT be recognized (out of range)
-        let out_of_range = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 2, 10]);
+        let out_of_range = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 10]);
         assert!(!executor.is_precompile(&out_of_range));
     }
 
@@ -1666,7 +1698,7 @@ mod tests {
         assert_eq!(result.gas_used, x402::gas_costs::TRANSFER_AUTH_VERIFY);
 
         // Unknown x402 address should error
-        let unknown_x402 = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 2, 9]);
+        let unknown_x402 = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 9]);
         let result = executor.execute(&unknown_x402, &input, 10_000);
         assert!(result.is_err());
     }
@@ -1684,19 +1716,25 @@ mod tests {
 
         // Future learning slots (0x0111 routing model, etc.) should
         // also be recognized — the page reserves 0x0110-0x011F.
-        let future_routing = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 1, 0x11]);
+        let future_routing = Address([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x11,
+        ]);
         assert!(executor.is_precompile(&future_routing));
 
         // 0x0120 is now the crypto sub-page (Ed25519 verify), so it IS a
         // precompile — it opens a new page (0x0120-0x012F) rather than
         // extending the learning page.
-        let ed25519_addr = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 1, 0x20]);
+        let ed25519_addr = Address([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x20,
+        ]);
         assert!(executor.is_precompile(&ed25519_addr));
 
         // Just past the crypto page (0x0130) MUST NOT be recognized —
         // that would silently route to nothing and break the dispatcher
         // contract.
-        let out_of_page = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0, 1, 0x30]);
+        let out_of_page = Address([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x30,
+        ]);
         assert!(!executor.is_precompile(&out_of_page));
     }
 
@@ -1720,7 +1758,7 @@ mod tests {
         input.extend_from_slice(&q16::Q16::from_int(1).0.to_be_bytes()); // emb (8 bytes)
         input.extend_from_slice(&q16::Q16::from_int(1).0.to_be_bytes()); // conf
         input.extend_from_slice(&q16::Q16::from_int(1).0.to_be_bytes()); // weight
-        // threshold_pos = Q16(0x4000) ≈ 0.5, threshold_neg ≈ -0.5 (8 bytes each)
+                                                                         // threshold_pos = Q16(0x4000) ≈ 0.5, threshold_neg ≈ -0.5 (8 bytes each)
         input.extend_from_slice(&0x4000_i64.to_be_bytes());
         input.extend_from_slice(&(-0x4000_i64).to_be_bytes());
         assert_eq!(input.len(), 48); // header + body, 8-byte Q16
@@ -1741,7 +1779,9 @@ mod tests {
         // Within the learning page but not 0x10 — the dispatcher
         // returns an "unknown selector" error rather than silently
         // doing nothing.
-        let unknown = Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1, 1, 0x1F]);
+        let unknown = Address([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0x1F,
+        ]);
         let result = executor.execute(&unknown, &[], 10_000);
         assert!(result.is_err(), "unknown learning selector must error");
     }
@@ -1775,7 +1815,7 @@ mod tests {
         let routing_addr = Address(q16::routing::ROUTING_INFERENCE);
 
         let mut input = vec![0u8; 16];
-        input[0..4].copy_from_slice(&1u32.to_be_bytes());   // arch_version
+        input[0..4].copy_from_slice(&1u32.to_be_bytes()); // arch_version
         input[4..8].copy_from_slice(&768u32.to_be_bytes()); // input_dim
         input[8..12].copy_from_slice(&128u32.to_be_bytes()); // hidden_dim
         input[12..16].copy_from_slice(&3u32.to_be_bytes()); // output_dim
@@ -1783,7 +1823,10 @@ mod tests {
         // gas_limit must be high enough to cover the full canonical
         // params count's gas pre-charge (~465K). Pass 1M.
         let result = executor.execute(&routing_addr, &input, 1_000_000);
-        assert!(result.is_err(), "decode fails on canonical-header empty body; dispatcher surfaces the error");
+        assert!(
+            result.is_err(),
+            "decode fails on canonical-header empty body; dispatcher surfaces the error"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("Routing forward"),
