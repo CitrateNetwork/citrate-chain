@@ -18,6 +18,7 @@
 //! on-chain verify. **M3/M4:** verifier precompile + contract rewrite.
 
 pub mod commd_bind_fold;
+pub mod commd_compressed;
 pub mod merkle_fold;
 pub mod poseidon_gadget;
 
