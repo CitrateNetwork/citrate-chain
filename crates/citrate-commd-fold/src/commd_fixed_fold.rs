@@ -297,6 +297,28 @@ pub struct FoldedFixed {
     pub num_steps: usize,
 }
 
+/// PRODUCTION public parameters: same fixed-arity circuit, but the commitment key comes from a
+/// trusted-setup `.ptau` directory (Nova auto-selects the right-sized file) instead of the insecure
+/// `test-utils` deterministic SRS. This is what the VK-bake tool uses for the baked precompile key.
+/// The circuit (and thus the VK) is identical regardless of SRS source — only the toxic-waste
+/// provenance differs.
+pub fn fixed_public_params_ptau(
+    ptau_dir: &std::path::Path,
+) -> Result<PublicParams<E1, E2, FixedCommDFoldStep>, Box<dyn std::error::Error>> {
+    let c0 = FixedCommDFoldStep {
+        leaf: Scalar::ZERO,
+        is_last: true,
+        zeros: zeros_scalars(),
+        gadget: Arc::new(PoseidonBn254Gadget::from_citrate_commd()),
+    };
+    Ok(PublicParams::setup_with_ptau_dir(
+        &c0,
+        &*S1::ck_floor(),
+        &*S2::ck_floor(),
+        ptau_dir,
+    )?)
+}
+
 /// Run the fixed-arity binding fold over `data` against a SHARED `pp` (borrowed, so one `pp`/`vk`
 /// serves every file). NOT yet verified.
 pub fn fold_fixed_with_pp(
@@ -371,6 +393,16 @@ pub fn build_fixed_fold(data: &[u8]) -> Result<BuiltFixedFold, Box<dyn std::erro
 /// commD / dataCommit slots in the fixed public state.
 pub const COMMD_INDEX: usize = MAX_DEPTH + 1;
 pub const DATACOMMIT_INDEX: usize = MAX_DEPTH + 3;
+
+/// The serialized `CompressedSNARK` verifier key for `pp` — the artifact the `0x0130` precompile
+/// bakes (via `include_bytes!`). One key covers every file (fixed arity). Bincode-encoded, matching
+/// `citrate-commd-verify`'s deserialization.
+pub fn compressed_verifier_key(
+    pp: &PublicParams<E1, E2, FixedCommDFoldStep>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let (_pk, vk) = CompressedSNARK::<E1, E2, FixedCommDFoldStep, S1, S2>::setup(pp)?;
+    Ok(bincode::serialize(&vk)?)
+}
 
 /// A compressed fixed-arity proof + everything the verifier needs. `vk_bytes` is the SAME for every
 /// file (the single baked key); `proof_bytes` is ~a few KB. This is the artifact the `0x0130`
