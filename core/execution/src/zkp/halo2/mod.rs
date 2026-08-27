@@ -107,7 +107,9 @@ pub enum VerifyError {
     #[error("verifier rejected the proof (cryptographic failure)")]
     InvalidProof,
 
-    #[error("Halo2 substrate is not built into this binary — compile with --features halo2-substrate")]
+    #[error(
+        "Halo2 substrate is not built into this binary — compile with --features halo2-substrate"
+    )]
     SubstrateAbsent,
 }
 
@@ -171,8 +173,11 @@ pub fn verify_proof_dispatch(input: &[u8]) -> Result<bool, VerifyError> {
             got: input.len(),
         });
     }
-    let circuit_version =
-        u32::from_be_bytes(input[VERSION_OFFSET..VERSION_OFFSET + 4].try_into().expect("4B"));
+    let circuit_version = u32::from_be_bytes(
+        input[VERSION_OFFSET..VERSION_OFFSET + 4]
+            .try_into()
+            .expect("4B"),
+    );
 
     match circuit_version {
         // v1 — UNCHANGED inference path. Hand the original input straight
@@ -218,8 +223,7 @@ pub fn verify_inference_proof(input: &[u8]) -> Result<bool, VerifyError> {
     let input_commit_be: [u8; 32] = input[0..32].try_into().expect("32B");
     let model_commit_be: [u8; 32] = input[32..64].try_into().expect("32B");
     let output_commit_be: [u8; 32] = input[64..96].try_into().expect("32B");
-    let circuit_version =
-        u32::from_be_bytes(input[96..100].try_into().expect("4B"));
+    let circuit_version = u32::from_be_bytes(input[96..100].try_into().expect("4B"));
     let _chain_id = u32::from_be_bytes(input[100..104].try_into().expect("4B"));
     let proof_bytes = &input[HEADER_LEN..];
 
@@ -231,8 +235,7 @@ pub fn verify_inference_proof(input: &[u8]) -> Result<bool, VerifyError> {
     let to_fr = |be: [u8; 32]| -> Result<Halo2Fr, VerifyError> {
         let mut le = be;
         le.reverse();
-        Option::<Halo2Fr>::from(Halo2Fr::from_repr(le.into()))
-            .ok_or(VerifyError::PublicInputShape)
+        Option::<Halo2Fr>::from(Halo2Fr::from_repr(le.into())).ok_or(VerifyError::PublicInputShape)
     };
     let input_commit = to_fr(input_commit_be)?;
     let model_commit = to_fr(model_commit_be)?;
@@ -242,23 +245,16 @@ pub fn verify_inference_proof(input: &[u8]) -> Result<bool, VerifyError> {
     let (params, vk) = inference_kzg_artifacts_v1();
 
     // Run the Halo2-KZG verifier.
-    let public_inputs: Vec<Vec<Halo2Fr>> =
-        vec![vec![input_commit, model_commit, output_commit]];
+    let public_inputs: Vec<Vec<Halo2Fr>> = vec![vec![input_commit, model_commit, output_commit]];
     let verifier_params = params.verifier_params();
-    let mut transcript =
-        Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof_bytes);
+    let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof_bytes);
     let verified = verify_proof_multi::<
         KZGCommitmentScheme<Bn256>,
         VerifierSHPLONK<Bn256>,
         _,
         _,
         SingleStrategy<_>,
-    >(
-        &verifier_params,
-        vk,
-        &[public_inputs],
-        &mut transcript,
-    );
+    >(&verifier_params, vk, &[public_inputs], &mut transcript);
 
     Ok(verified)
 }
@@ -307,7 +303,10 @@ mod chain_003_srs_policy_tests {
         // No ceremony params + dev NOT allowed → refuse (the production
         // forgot-the-env-var case must not silently use toxic-waste SRS).
         assert_eq!(resolve_srs_source(None, false), SrsSource::Refuse);
-        assert_eq!(resolve_srs_source(Some(String::new()), false), SrsSource::Refuse);
+        assert_eq!(
+            resolve_srs_source(Some(String::new()), false),
+            SrsSource::Refuse
+        );
 
         // Dev/test opt-in (debug_assertions or insecure-dev-srs) → seed ok.
         assert_eq!(resolve_srs_source(None, true), SrsSource::InsecureDevSeed);
@@ -369,9 +368,8 @@ fn inference_kzg_artifacts_v1() -> (
     use std::sync::OnceLock;
 
     static PARAMS: OnceLock<ParamsKZG<Bn256>> = OnceLock::new();
-    static VK: OnceLock<
-        halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>,
-    > = OnceLock::new();
+    static VK: OnceLock<halo2_proofs::plonk::VerifyingKey<halo2curves::bn256::G1Affine>> =
+        OnceLock::new();
 
     const V1_K: u32 = 12;
 
@@ -380,8 +378,7 @@ fn inference_kzg_artifacts_v1() -> (
     // `insecure-dev-srs` feature. A production release build with neither
     // and no CITRATE_PTAU_PATH refuses to construct an SRS at all, rather
     // than silently using a reproducible-toxic-waste SRS.
-    let insecure_dev_allowed =
-        cfg!(debug_assertions) || cfg!(feature = "insecure-dev-srs");
+    let insecure_dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-srs");
     let source = resolve_srs_source(
         std::env::var("CITRATE_PTAU_PATH").ok(),
         insecure_dev_allowed,
@@ -522,8 +519,7 @@ pub fn verify_porep_proof(input: &[u8]) -> Result<bool, VerifyError> {
     let to_fr = |be: &[u8]| -> Result<Halo2Fr, VerifyError> {
         let mut le: [u8; 32] = be.try_into().map_err(|_| VerifyError::PublicInputShape)?;
         le.reverse();
-        Option::<Halo2Fr>::from(Halo2Fr::from_repr(le.into()))
-            .ok_or(VerifyError::PublicInputShape)
+        Option::<Halo2Fr>::from(Halo2Fr::from_repr(le.into())).ok_or(VerifyError::PublicInputShape)
     };
 
     // Parse the 8 PoRep public inputs from their fixed offsets.
@@ -628,8 +624,10 @@ fn porep_kzg_artifacts_v2() -> (
 
     // SAME CHAIN-003 fail-closed policy as the inference path.
     let insecure_dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-srs");
-    let source =
-        resolve_srs_source(std::env::var("CITRATE_PTAU_PATH").ok(), insecure_dev_allowed);
+    let source = resolve_srs_source(
+        std::env::var("CITRATE_PTAU_PATH").ok(),
+        insecure_dev_allowed,
+    );
 
     let params = PARAMS.get_or_init(|| match source {
         SrsSource::Ceremony(path) => {
@@ -743,8 +741,7 @@ pub fn verify_post_proof(input: &[u8]) -> Result<bool, VerifyError> {
     let to_fr = |be: &[u8]| -> Result<Halo2Fr, VerifyError> {
         let mut le: [u8; 32] = be.try_into().map_err(|_| VerifyError::PublicInputShape)?;
         le.reverse();
-        Option::<Halo2Fr>::from(Halo2Fr::from_repr(le.into()))
-            .ok_or(VerifyError::PublicInputShape)
+        Option::<Halo2Fr>::from(Halo2Fr::from_repr(le.into())).ok_or(VerifyError::PublicInputShape)
     };
 
     // Parse the 7 PoSt public inputs from their fixed offsets (NO CommD).
@@ -835,8 +832,10 @@ fn post_kzg_artifacts_v3() -> (
 
     // SAME CHAIN-003 fail-closed policy as the inference + PoRep paths.
     let insecure_dev_allowed = cfg!(debug_assertions) || cfg!(feature = "insecure-dev-srs");
-    let source =
-        resolve_srs_source(std::env::var("CITRATE_PTAU_PATH").ok(), insecure_dev_allowed);
+    let source = resolve_srs_source(
+        std::env::var("CITRATE_PTAU_PATH").ok(),
+        insecure_dev_allowed,
+    );
 
     let params = PARAMS.get_or_init(|| match source {
         SrsSource::Ceremony(path) => {
@@ -1041,6 +1040,7 @@ pub mod circuits;
 /// NOT touch the inference circuit or the live 0x0108 verifier.
 #[cfg(feature = "halo2-substrate")]
 pub mod commd_step;
+#[cfg(feature = "halo2-substrate")]
 pub mod porep;
 
 /// PIN-P1 (f.2a) — Parameterised native PoRep sealing on `(N, L, K)`,
