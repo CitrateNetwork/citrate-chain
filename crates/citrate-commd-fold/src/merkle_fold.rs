@@ -186,7 +186,7 @@ pub fn fold_commd(data: &[u8]) -> Result<[u8; 32], Box<dyn std::error::Error>> {
 
 /// Low 64 bits of a scalar (little-endian). The fold's `index` is always `< 2^depth <= 2^63`, so the
 /// low word carries the full value.
-fn scalar_low_u64(s: Scalar) -> u64 {
+pub(crate) fn scalar_low_u64(s: Scalar) -> u64 {
     let repr = s.to_repr();
     let le = repr.as_ref();
     let mut v = 0u64;
@@ -197,7 +197,7 @@ fn scalar_low_u64(s: Scalar) -> u64 {
 }
 
 /// Scalar -> 32-byte big-endian (matches `citrate-commd::fr_to_be_bytes` / on-chain `bytes32`).
-fn scalar_to_be_bytes(s: Scalar) -> [u8; 32] {
+pub(crate) fn scalar_to_be_bytes(s: Scalar) -> [u8; 32] {
     let repr = s.to_repr();
     let le = repr.as_ref();
     let mut be = [0u8; 32];
@@ -208,7 +208,7 @@ fn scalar_to_be_bytes(s: Scalar) -> [u8; 32] {
 }
 
 /// Allocate a wire constrained to the constant `c` (one linear row `x·1 = c`).
-fn alloc_const<CS: ConstraintSystem<Scalar>>(
+pub(crate) fn alloc_const<CS: ConstraintSystem<Scalar>>(
     mut cs: CS,
     c: Scalar,
 ) -> Result<AllocatedNum<Scalar>, SynthesisError> {
@@ -223,7 +223,7 @@ fn alloc_const<CS: ConstraintSystem<Scalar>>(
 }
 
 /// `out = cond ? a : b`. One R1CS row: `(a - b)·cond = out - b`.
-fn conditionally_select<CS: ConstraintSystem<Scalar>>(
+pub(crate) fn conditionally_select<CS: ConstraintSystem<Scalar>>(
     mut cs: CS,
     a: &AllocatedNum<Scalar>,
     b: &AllocatedNum<Scalar>,
