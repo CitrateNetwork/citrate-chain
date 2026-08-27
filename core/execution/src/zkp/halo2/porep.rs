@@ -1622,4 +1622,39 @@ mod tests {
         let pis = PoRepCircuit::public_inputs(&sealed, 0);
         assert_eq!(pis.len(), 8);
     }
+
+    /// citrate-chain#170 PARITY GUARD: the canonical `citrate-commd` crate MUST agree
+    /// byte-for-byte with this crate's frozen Poseidon-BN254 and `merkle_root_4`, so the
+    /// challenge circuit, the sealer/PoRep circuit, and the CX-S2.2 client all compute the
+    /// same CommD. If this fails, the crate and the on-chain/circuit substrate have drifted.
+    #[test]
+    fn commd_crate_is_byte_identical_to_this_crate() {
+        use ark_bn254::Fr as ArkFr;
+        use ark_ff::PrimeField as _;
+        let to_ark = |h: &Halo2Fr| ArkFr::from_le_bytes_mod_order(h.to_repr().as_ref());
+
+        // (1) Poseidon parity — the load-bearing substrate.
+        let inputs_h = [Halo2Fr::from(11u64), Halo2Fr::from(22u64), Halo2Fr::from(33u64)];
+        let inputs_a: Vec<ArkFr> = inputs_h.iter().map(to_ark).collect();
+        assert_eq!(
+            citrate_commd::poseidon_hash(&inputs_a),
+            crate::zkp::poseidon_bn254::poseidon_hash(&inputs_a),
+            "citrate-commd Poseidon-BN254 drifted from poseidon_bn254"
+        );
+
+        // (2) Merkle parity — the crate's poseidon_merkle over 4 leaves == merkle_root_4.
+        let leaves_h = [
+            Halo2Fr::from(1u64),
+            Halo2Fr::from(2u64),
+            Halo2Fr::from(3u64),
+            Halo2Fr::from(4u64),
+        ];
+        let root_h = merkle_root_4(&leaves_h);
+        let leaves_a: Vec<ArkFr> = leaves_h.iter().map(to_ark).collect();
+        assert_eq!(
+            to_ark(&root_h),
+            citrate_commd::poseidon_merkle(&leaves_a),
+            "citrate-commd Merkle drifted from merkle_root_4"
+        );
+    }
 }
