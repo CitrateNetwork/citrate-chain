@@ -96,6 +96,9 @@ tokio-test = "0.4"
 proptest = { workspace = true }
 rand = { workspace = true }
 criterion = { workspace = true }
+# citrate-chain#170: parity guard — the canonical CommD crate's Poseidon-BN254 and
+# Merkle must stay byte-identical to this crate's frozen poseidon_bn254 / merkle_root_4.
+citrate-commd = { path = "../../crates/citrate-commd" }
 
 [[bench]]
 name = "parallel_bench"

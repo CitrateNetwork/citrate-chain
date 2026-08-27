@@ -1,0 +1,18 @@
+[package]
+name = "citrate-commd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Canonical Citrate CommD over file bytes (ADR-2026-08-27): fr32-style 31-byte->BN254-Fr pack + Poseidon-BN254 binary Merkle root, plus the flat-sponge dataCommit anchor. Single source of truth shared by the contract's challenge circuit, the sealer/PoRep circuit, and the CX-S2.2 client. Lean (ark-bn254 + poseidon only; no halo2 proving stack)."
+
+[dependencies]
+ark-bn254 = "0.4"
+ark-ff = "0.4"
+ark-crypto-primitives = { version = "0.4", features = ["sponge"] }
+once_cell = "1.19"
+# Content identity: the recursive proof binds commD to dataHash = keccak256(data) (the existing
+# IPFSIncentivesV3 registration field), streamed alongside the Poseidon Merkle root.
+sha3 = "0.10"
+
+[dev-dependencies]
+hex = "0.4"
