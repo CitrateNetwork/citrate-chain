@@ -100,6 +100,91 @@ pub fn fr_to_be_bytes(f: Fr) -> [u8; 32] {
     out
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// M0 (ADR-2026-08-27 recursive path) — the FOLD-FRIENDLY streaming accumulator.
+//
+// The recursive proof cannot recompute the whole Merkle tree in one circuit; it folds the file in
+// fixed-size steps. `IncrementalMerkle` is the off-circuit REFERENCE the fold step must mirror: a
+// bounded state (`filled`, one cached left-sibling per height) updated one leaf at a time, whose
+// `root()` equals the batch `poseidon_merkle` (padded-to-2^depth) exactly. Proving `insert`-then-
+// `root` == the batch root (see `streaming_matches_batch`) de-risks the whole recursion: the step
+// circuit is correct iff it matches this reference.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A left-to-right append-only Poseidon-BN254 incremental Merkle tree of fixed `depth`. Empty
+/// positions default to the zero-subtree roots, so after appending N ≤ 2^depth leaves the root is
+/// the perfect-tree root with the rest zero — identical to `poseidon_merkle(&leaves)` when
+/// `depth = ceil(log2(N))`. State is O(depth) (fold-friendly).
+pub struct IncrementalMerkle {
+    depth: u32,
+    zeros: Vec<Fr>,  // zeros[h] = root of an all-zero subtree of height h
+    filled: Vec<Fr>, // filled[h] = cached left sibling at height h for the current path
+    index: u64,
+    root: Fr, // running root of leaves[0..index] with the rest zero (updated per insert)
+}
+
+impl IncrementalMerkle {
+    /// A tree of the given depth (all positions empty; root = the all-zero root).
+    pub fn new(depth: u32) -> Self {
+        let d = depth as usize;
+        let mut zeros = Vec::with_capacity(d + 1);
+        zeros.push(Fr::zero());
+        for h in 1..=d {
+            let z = zeros[h - 1];
+            zeros.push(poseidon_hash(&[z, z]));
+        }
+        let root = zeros[d];
+        Self {
+            depth,
+            filled: zeros.clone(),
+            zeros,
+            index: 0,
+            root,
+        }
+    }
+
+    /// Append one leaf (the fold step over a single element; a real step folds a batch). `cur` at
+    /// the top of the path IS the root of the tree with this leaf placed and the remainder zero —
+    /// correct for both partial and FULL trees — so we cache it (a plain re-walk breaks when full).
+    pub fn insert(&mut self, leaf: Fr) {
+        let mut cur = leaf;
+        let mut idx = self.index;
+        for h in 0..self.depth as usize {
+            if idx & 1 == 0 {
+                self.filled[h] = cur;
+                cur = poseidon_hash(&[cur, self.zeros[h]]);
+            } else {
+                cur = poseidon_hash(&[self.filled[h], cur]);
+            }
+            idx >>= 1;
+        }
+        self.root = cur;
+        self.index += 1;
+    }
+
+    /// The root of the tree with `index` leaves appended and the rest zero.
+    pub fn root(&self) -> Fr {
+        self.root
+    }
+}
+
+/// Streaming (fold-friendly) computation of the SAME CommD as [`compute_comm_d`], via
+/// [`IncrementalMerkle`]. The recursive circuit mirrors this exactly. Degenerate `N ≤ 1` returns
+/// the single leaf (matching `poseidon_merkle`, which does no hashing for a 1-element tree).
+pub fn compute_comm_d_streaming(data: &[u8]) -> [u8; 32] {
+    let leaves = pack_bytes(data);
+    let n = leaves.len();
+    if n <= 1 {
+        return fr_to_be_bytes(leaves.into_iter().next().unwrap_or(Fr::zero()));
+    }
+    let depth = (n.next_power_of_two()).trailing_zeros();
+    let mut acc = IncrementalMerkle::new(depth);
+    for leaf in &leaves {
+        acc.insert(*leaf);
+    }
+    fr_to_be_bytes(acc.root())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +265,33 @@ mod tests {
         assert_ne!(compute_comm_d(&a), compute_comm_d(&b));
         a[80] = 1;
         assert_eq!(compute_comm_d(&a), compute_comm_d(&b));
+    }
+
+    #[test]
+    fn streaming_matches_batch() {
+        // The fold reference (M0) must produce the byte-identical CommD to the batch computation
+        // for every N — this is what makes the recursive step circuit's correctness checkable.
+        for n_bytes in [0usize, 1, 31, 32, 63, 100, 200, 1000, 2048, 3000] {
+            let data: Vec<u8> = (0..n_bytes).map(|i| (i * 7 + 1) as u8).collect();
+            assert_eq!(
+                compute_comm_d_streaming(&data),
+                compute_comm_d(&data),
+                "streaming != batch CommD at {n_bytes} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_root_matches_merkle_for_partial_trees() {
+        // Directly: an incremental tree of depth k with N<=2^k leaves == poseidon_merkle over the
+        // same N leaves (batch pads to next_power_of_two).
+        let leaves: Vec<Fr> = (1..=5u64).map(Fr::from).collect(); // N=5 -> next_pow2 8 -> depth 3
+        let depth = leaves.len().next_power_of_two().trailing_zeros();
+        let mut acc = IncrementalMerkle::new(depth);
+        for l in &leaves {
+            acc.insert(*l);
+        }
+        assert_eq!(acc.root(), poseidon_merkle(&leaves));
     }
 
     #[test]
