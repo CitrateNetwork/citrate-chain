@@ -69,9 +69,17 @@ contract DeployFederatedLearning is ScriptEnv {
     // ── IPFSIncentivesV3 (adds model-CommD challenge layer) ──────────────
     uint256 internal constant IPFS3_CHALLENGER_BOND = 1 ether;
     uint256 internal constant IPFS3_REVEAL_DELAY = 32; // commit→reveal gap (blocks)
-    uint256 internal constant IPFS3_MIN_MODEL_BOND = 5 ether;
-    uint256 internal constant IPFS3_MODEL_CHALLENGE_WINDOW = 100; // blocks
+    // citrate-chain#170 D3: align with ADR-2026-08-27. MIN_MODEL_BOND 5→55 ether (meaningful skin in
+    // the game for a model-owner CommD bond) and the challenge window 100→302400 blocks (~1 week @
+    // 2s/block), so a wrong-CommD proof has a realistic window to be produced and submitted.
+    uint256 internal constant IPFS3_MIN_MODEL_BOND = 55 ether;
+    uint256 internal constant IPFS3_MODEL_CHALLENGE_WINDOW = 302400; // blocks (~1 week)
     uint256 internal constant IPFS3_MODEL_CHALLENGER_BPS = 5000; // 50/50
+
+    // citrate-chain#170 (M3): the recursive-fold CommD proof verifier precompile. 0x0107–0x0109 are
+    // taken (tensor-commit / halo2 proof / merkle-tensor); this new family verifies the Nova/Spartan
+    // fold proof. Env-overridable so the precompile address can be finalized when M3 lands + activates.
+    address internal constant FOLD_VERIFIER_PRECOMPILE = address(0x0130);
 
     /// Canonical 40204 TEEAttestationRegistry — redeploys to the same CREATE2
     /// address on the reroll (unchanged bytecode/args). The dry-run table diff
@@ -125,7 +133,8 @@ contract DeployFederatedLearning is ScriptEnv {
             IPFS3_REVEAL_DELAY,
             IPFS3_MIN_MODEL_BOND,
             IPFS3_MODEL_CHALLENGE_WINDOW,
-            IPFS3_MODEL_CHALLENGER_BPS
+            IPFS3_MODEL_CHALLENGER_BPS,
+            envAddressOr("FOLD_VERIFIER", FOLD_VERIFIER_PRECOMPILE)
         );
 
         // 4. AggregationChallenge — Governable(msg.sender) like NematocystSlashing;

@@ -75,7 +75,9 @@ contract Handler is Test {
         // Register both cids' models so seals are admissible (CommD must match).
         for (uint256 j = 0; j < cids.length; j++) {
             vm.prank(MODEL_OWNER);
-            inc.registerModel{value: MIN_MODEL_BOND}(cids[j], COMM_D, keccak256("data"), "ipfs://x");
+            inc.registerModel{value: MIN_MODEL_BOND}(
+                cids[j], COMM_D, keccak256("data"), keccak256("dc"), "ipfs://x"
+            );
         }
     }
 
@@ -261,7 +263,9 @@ contract IPFSIncentivesV3InvariantTest is Test {
             REVEAL_DELAY,
             MIN_MODEL_BOND,
             COMMD_WINDOW,
-            COMMD_BPS
+            COMMD_BPS,
+            // This suite never challenges; a nonzero fold-verifier address satisfies the constructor.
+            address(0xF01D)
         );
         vm.deal(address(this), 1_000_000 ether);
         inc.fund{value: 100_000 ether}();
