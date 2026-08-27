@@ -13,3 +13,13 @@ description = "citrate-chain#170 M2 — Nova/folding prover for the recursive Co
 # (M2c/M4) must switch to `PublicParams::setup_with_ptau_dir` with a trusted-setup .ptau and drop this.
 nova-snark = { version = "0.75", features = ["test-utils"] }
 ff = "0.13"
+
+# M2b: the in-circuit Poseidon-BN254 gadget loads its ARK+MDS constants from the SAME source as the
+# native reference — `citrate-commd::poseidon_config()` — and is differentially tested against
+# `citrate-commd::poseidon_hash`. Single source of the frozen constants; no hand-copied numbers.
+# (path dep across the workspace boundary: citrate-commd stays a member of the parent chain workspace.)
+citrate-commd = { path = "../citrate-commd" }
+# ark, only to read the frozen constants out of the PoseidonConfig and to convert Fr <-> Scalar in the
+# differential test. ark's field type never unifies with nova's `ff` — separate crates, separate trees.
+ark-bn254 = "0.4"
+ark-ff = "0.4"
