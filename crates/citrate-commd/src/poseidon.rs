@@ -56,3 +56,68 @@ pub fn poseidon_hash(inputs: &[Fr]) -> Fr {
 pub fn poseidon_config() -> &'static PoseidonConfig<Fr> {
     &POSEIDON_CONFIG_BN254
 }
+
+/// The raw Poseidon-BN254 permutation over a full-width state (`rate + capacity = 3` lanes),
+/// exactly as `ark_crypto_primitives`' `PoseidonSponge::permute`: for each round, `ARK` (add the
+/// round constants), the S-box (`x^alpha` on every lane in full rounds, on lane 0 only in partial
+/// rounds), then the `MDS` mix. Full rounds are the first and last `full_rounds/2`; the
+/// `partial_rounds` sit in the middle.
+///
+/// Exposed so the recursive fold prover (`citrate-commd-fold`) can (a) seed the `dataCommit` sponge
+/// with the post-preamble state and (b) differentially test its in-circuit permutation gadget against
+/// this native one, lane-for-lane — a strictly stronger check than `poseidon_hash` alone. It is the
+/// single canonical source of the permutation; `permute([0, a, b])[1] == poseidon_hash(&[a, b])` is
+/// asserted in the tests below.
+pub fn poseidon_permute(state_in: &[Fr]) -> Vec<Fr> {
+    use ark_ff::{Field as _, Zero as _};
+    let cfg = &*POSEIDON_CONFIG_BN254;
+    let width = state_in.len();
+    let mut state = state_in.to_vec();
+    let half = cfg.full_rounds / 2;
+    let total = cfg.full_rounds + cfg.partial_rounds;
+    for r in 0..total {
+        let is_full = r < half || r >= half + cfg.partial_rounds;
+        // ARK.
+        for (i, s) in state.iter_mut().enumerate() {
+            *s += cfg.ark[r][i];
+        }
+        // S-box (x^alpha).
+        if is_full {
+            for s in state.iter_mut() {
+                *s = s.pow([cfg.alpha]);
+            }
+        } else {
+            state[0] = state[0].pow([cfg.alpha]);
+        }
+        // MDS mix.
+        let mut mixed = vec![Fr::zero(); width];
+        for (i, m) in mixed.iter_mut().enumerate() {
+            let mut acc = Fr::zero();
+            for (j, s) in state.iter().enumerate() {
+                acc += cfg.mds[i][j] * s;
+            }
+            *m = acc;
+        }
+        state = mixed;
+    }
+    state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_ff::Zero as _;
+
+    #[test]
+    fn permute_matches_hash_for_two_inputs() {
+        // The 2-input compression the Merkle tree uses IS `permute([0, a, b])[1]` (rate 2 / capacity
+        // 1, one absorb of the rate lanes, one permutation, squeeze the first rate lane). This ties
+        // the raw permutation to the frozen `poseidon_hash`.
+        for (a, b) in [(1u64, 2u64), (7, 7), (0, 0), (123456789, 987654321)] {
+            let a = Fr::from(a);
+            let b = Fr::from(b);
+            let out = poseidon_permute(&[Fr::zero(), a, b]);
+            assert_eq!(out[1], poseidon_hash(&[a, b]), "permute[1] != hash(a,b)");
+        }
+    }
+}

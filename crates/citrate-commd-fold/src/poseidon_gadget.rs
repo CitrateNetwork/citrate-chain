@@ -97,6 +97,20 @@ impl PoseidonBn254Gadget {
         Ok(state[1].clone())
     }
 
+    /// One full Poseidon permutation over a 3-lane state, returned functionally — the sponge fold
+    /// (`dataCommit`) permutes `[capacity, rate0, rate1]` whenever a rate-pair completes and once more
+    /// at squeeze. Bit-identical to `citrate-commd::poseidon_permute` (asserted by the fold's
+    /// differential test against `compute_data_commit`).
+    pub fn permute3<CS: ConstraintSystem<Scalar>>(
+        &self,
+        mut cs: CS,
+        state: [AllocatedNum<Scalar>; 3],
+    ) -> Result<[AllocatedNum<Scalar>; 3], SynthesisError> {
+        let mut v = state.to_vec();
+        self.permute(cs.namespace(|| "permute3"), &mut v)?;
+        Ok([v[0].clone(), v[1].clone(), v[2].clone()])
+    }
+
     /// One full Poseidon permutation over `state` (length `width`), in place. Mirrors ark's
     /// `PoseidonSponge::permute` exactly: ARK → S-box → MDS, with the full/partial round schedule.
     // The lane index reads parallel arrays (`state[i]` and the constant `ark[r][i]`), so an explicit
