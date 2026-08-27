@@ -209,10 +209,30 @@ impl StepCircuit<Scalar> for CommDBindFoldStep {
     }
 }
 
-/// Fold `data` through a Nova `RecursiveSNARK`, verify, and return `(commD, dataCommit)` — both 32
-/// big-endian bytes — proven from ONE in-circuit leaf stream. Returns them iff the recursive proof
-/// verifies. This is the M2b-cont binding proof.
-pub fn fold_commd_bound(data: &[u8]) -> Result<([u8; 32], [u8; 32]), Box<dyn std::error::Error>> {
+/// The built recursive-fold pipeline for a file: the public parameters, the fully-folded
+/// `RecursiveSNARK`, the initial public state `z0`, the Merkle `depth`, and the step count `n`.
+/// Shared by the recursive-verify path ([`fold_commd_bound`]) and the compressed path
+/// ([`crate::commd_compressed`]) so the (expensive) fold is written once.
+pub struct BuiltFold {
+    pub pp: PublicParams<E1, E2, CommDBindFoldStep>,
+    pub rs: RecursiveSNARK<E1, E2, CommDBindFoldStep>,
+    pub z0: Vec<Scalar>,
+    pub depth: usize,
+    pub num_steps: usize,
+}
+
+impl BuiltFold {
+    /// `(commD, dataCommit)` indices within the public state `z`.
+    pub fn commd_index(&self) -> usize {
+        self.depth + 1
+    }
+    pub fn datacommit_index(&self) -> usize {
+        self.depth + 3
+    }
+}
+
+/// Build `pp`, run the full binding fold over `data`, and return the pipeline (NOT yet verified).
+pub fn build_bound_fold(data: &[u8]) -> Result<BuiltFold, Box<dyn std::error::Error>> {
     let leaves: Vec<Scalar> = citrate_commd::pack_bytes(data)
         .into_iter()
         .map(ark_fr_to_scalar)
@@ -266,10 +286,23 @@ pub fn fold_commd_bound(data: &[u8]) -> Result<([u8; 32], [u8; 32]), Box<dyn std
     for (i, &leaf) in leaves.iter().enumerate() {
         rs.prove_step(&pp, &mk(leaf, i + 1 == n))?;
     }
-    let out = rs.verify(&pp, leaves.len(), &z0)?;
+    Ok(BuiltFold {
+        pp,
+        rs,
+        z0,
+        depth,
+        num_steps: n,
+    })
+}
 
-    let comm_d = scalar_to_be_bytes(out[depth + 1]);
-    let data_commit = scalar_to_be_bytes(out[depth + 3]);
+/// Fold `data` through a Nova `RecursiveSNARK`, verify, and return `(commD, dataCommit)` — both 32
+/// big-endian bytes — proven from ONE in-circuit leaf stream. Returns them iff the recursive proof
+/// verifies. This is the M2b-cont binding proof.
+pub fn fold_commd_bound(data: &[u8]) -> Result<([u8; 32], [u8; 32]), Box<dyn std::error::Error>> {
+    let built = build_bound_fold(data)?;
+    let out = built.rs.verify(&built.pp, built.num_steps, &built.z0)?;
+    let comm_d = scalar_to_be_bytes(out[built.commd_index()]);
+    let data_commit = scalar_to_be_bytes(out[built.datacommit_index()]);
     Ok((comm_d, data_commit))
 }
 
