@@ -53,6 +53,11 @@ ndarray-rand = "0.14"
 halo2_proofs = { workspace = true, optional = true }
 halo2curves = { workspace = true, optional = true }
 
+# citrate-chain#170 (M3) — the Nova recursive-fold CommD verifier for the 0x0130 precompile. Optional,
+# gated by `commd-fold-verify`; OFF by default so Nova (halo2curves 0.9) stays OUT of the default build.
+# It is its own workspace (keeps the prover isolated); path-dep'd here only when the feature is enabled.
+citrate-commd-verify = { path = "../../crates/citrate-commd-verify", optional = true }
+
 # Zero-knowledge proofs (experimental — circuits are placeholder implementations)
 # Production Groth16 verification gated behind `zkp_production` in core/mcp
 # Arkworks suite — all crates pinned to the 0.4 line so the ecosystem
@@ -147,6 +152,14 @@ coreml = []  # Enable CoreML support on macOS
 # both. See ADR-RM-M1b-1 for the chosen substrate (Aztec Ignition
 # SRS over BN254).
 halo2-substrate = ["dep:halo2_proofs", "dep:halo2curves"]
+
+# citrate-chain#170 (M3) — the 0x0130 recursive-fold CommD proof verifier. OFF by default: enabling it
+# links the Nova verifier (`citrate-commd-verify`, validated to coexist with the pinned PSE-halo2 stack)
+# and embeds the SINGLE baked verifier key. Turning it on is a CONSENSUS change (all nodes must agree),
+# so it ships behind a coordinated activation. Requires `crates/citrate-commd-fold`'s `bake_vk` tool to
+# have produced `core/execution/artifacts/commd_fold_vk.bin` from a trusted-setup .ptau (the feature
+# build `include_bytes!`s it and fails if absent — you cannot verify without a key).
+commd-fold-verify = ["dep:citrate-commd-verify"]
 
 # RM-E.1 / CHAIN-003 — explicit opt-in for the INSECURE deterministic
 # seed-based KZG SRS (`StdRng::from_seed([0x4D;32])`) used by the 0x0108
