@@ -23,3 +23,6 @@ citrate-commd = { path = "../citrate-commd" }
 # differential test. ark's field type never unifies with nova's `ff` — separate crates, separate trees.
 ark-bn254 = "0.4"
 ark-ff = "0.4"
+# M2c: serialize the compressed proof + verifier key (both derive serde) to size and round-trip the
+# artifact the on-chain verifier (M3) will consume.
+bincode = "1.3"
