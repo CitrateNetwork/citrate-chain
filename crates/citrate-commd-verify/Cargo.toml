@@ -1,0 +1,24 @@
+[package]
+name = "citrate-commd-verify"
+version = "0.1.0"
+edition = "2021"
+description = "citrate-chain#170 M3 — in-node verifier for the recursive CommD fold proof (0x0130 precompile). Wraps Nova's CompressedSNARK verifier; proven to coexist with the pinned PSE-halo2 stack (halo2curves 0.7 + 0.9 build side-by-side)."
+
+# Own workspace (like citrate-commd-fold): keeps Nova out of the DEFAULT chain build + CI until the
+# fold-verify precompile is actually consensus-wired. The dep-link with the pinned PSE-halo2 stack is
+# VALIDATED (see the lib docs): with this crate temporarily added to the parent workspace,
+# `cargo build -p citrate-execution --features halo2-substrate` compiled with Nova (halo2curves 0.9)
+# and the pinned halo2curves 0.7 coexisting in the lock. Re-join the workspace at consensus wiring.
+[workspace]
+
+[dependencies]
+# The prover crate carries the CommDBindFoldStep circuit TYPE the proof is parameterized by; the
+# verifier needs that type (not test-utils) to deserialize + verify. Path dep across the workspace
+# boundary (the fold crate is its own workspace for the PROVER's isolation).
+citrate-commd-fold = { path = "../citrate-commd-fold" }
+nova-snark = "0.75"
+ff = "0.13"
+bincode = "1.3"
+
+[dev-dependencies]
+citrate-commd = { path = "../citrate-commd" }
