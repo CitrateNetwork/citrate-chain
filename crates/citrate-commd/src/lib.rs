@@ -148,19 +148,36 @@ impl IncrementalMerkle {
     /// the top of the path IS the root of the tree with this leaf placed and the remainder zero —
     /// correct for both partial and FULL trees — so we cache it (a plain re-walk breaks when full).
     pub fn insert(&mut self, leaf: Fr) {
+        let _ = self.insert_returning_siblings(leaf);
+    }
+
+    /// Insert `leaf` and return the sibling value hashed with the running node at each height
+    /// (`zeros[h]` when the current index bit is 0, else the cached `filled[h]`). These are exactly
+    /// the witness a step circuit needs to reconstruct the new root via a `cond_swap`-per-level
+    /// Merkle recompute (`SwapMerkleChip::merkle_root_generic`): `root == fold(leaf, index_bits, siblings)`.
+    pub fn insert_returning_siblings(&mut self, leaf: Fr) -> Vec<Fr> {
+        let mut sibs = Vec::with_capacity(self.depth as usize);
         let mut cur = leaf;
         let mut idx = self.index;
         for h in 0..self.depth as usize {
             if idx & 1 == 0 {
+                sibs.push(self.zeros[h]);
                 self.filled[h] = cur;
                 cur = poseidon_hash(&[cur, self.zeros[h]]);
             } else {
+                sibs.push(self.filled[h]);
                 cur = poseidon_hash(&[self.filled[h], cur]);
             }
             idx >>= 1;
         }
         self.root = cur;
         self.index += 1;
+        sibs
+    }
+
+    /// The current append index (number of leaves inserted so far).
+    pub fn index(&self) -> u64 {
+        self.index
     }
 
     /// The root of the tree with `index` leaves appended and the rest zero.
