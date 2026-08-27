@@ -23,7 +23,7 @@ use ark_ff::{BigInteger, PrimeField, Zero};
 use sha3::Digest as _;
 
 mod poseidon;
-pub use poseidon::{poseidon_config, poseidon_hash};
+pub use poseidon::{poseidon_config, poseidon_hash, poseidon_permute};
 
 /// Bytes per leaf. 31 < ceil(BN254 modulus bits / 8) so every 31-byte chunk is strictly
 /// below the field modulus and maps injectively (no modular reduction / no collisions).
@@ -81,6 +81,16 @@ pub fn poseidon_sponge(leaves: &[Fr]) -> Fr {
     poseidon_hash(&inputs)
 }
 
+/// The `dataCommit` sponge state AFTER the fixed preamble — absorbing `[domain, len]` into the two
+/// rate lanes and running one permutation — for a file of `n_leaves` leaves. This is exactly the
+/// sponge state the leaf stream is folded into (the recursive prover seeds its `dataCommit` fold with
+/// this, then absorbs one leaf per step). `len` is public (bound into the commitment), so this is a
+/// pure function of the leaf count. Returns the full 3-lane state `[capacity, rate0, rate1]`.
+pub fn data_commit_preamble_state(n_leaves: usize) -> [Fr; 3] {
+    let s = poseidon_permute(&[Fr::zero(), data_commit_domain(), Fr::from(n_leaves as u64)]);
+    [s[0], s[1], s[2]]
+}
+
 /// The canonical CommD of `data`: big-endian bytes of `poseidon_merkle(pack_bytes(data))`.
 pub fn compute_comm_d(data: &[u8]) -> [u8; 32] {
     fr_to_be_bytes(poseidon_merkle(&pack_bytes(data)))
@@ -89,6 +99,35 @@ pub fn compute_comm_d(data: &[u8]) -> [u8; 32] {
 /// The `dataCommit` anchor of `data`: big-endian bytes of `poseidon_sponge(pack_bytes(data))`.
 pub fn compute_data_commit(data: &[u8]) -> [u8; 32] {
     fr_to_be_bytes(poseidon_sponge(&pack_bytes(data)))
+}
+
+/// Streaming (fold-friendly) `dataCommit`, byte-identical to [`compute_data_commit`], computed the
+/// way the recursive circuit does it: seed with [`data_commit_preamble_state`] (the sponge after
+/// `[domain, len]` + one permutation), then absorb ONE leaf per step into the current rate lane,
+/// permuting whenever a rate-pair (2 leaves) completes; finally squeeze — one extra permutation iff a
+/// half-pair is pending (odd leaf count). The recursive `dataCommit` fold step mirrors this exactly,
+/// so matching it here (`data_commit_streaming_matches_batch`) de-risks the circuit before it is built.
+pub fn compute_data_commit_streaming(data: &[u8]) -> [u8; 32] {
+    let leaves = pack_bytes(data);
+    let mut state = data_commit_preamble_state(leaves.len());
+    let mut pos = 0usize; // which rate lane (0 or 1) the next leaf lands in
+    for leaf in &leaves {
+        state[1 + pos] += leaf; // absorb = ADD into the current rate lane
+        if pos == 1 {
+            let p = poseidon_permute(&state);
+            state = [p[0], p[1], p[2]];
+            pos = 0;
+        } else {
+            pos = 1;
+        }
+    }
+    // Squeeze: a pending half-pair (odd leaf count, pos==1) triggers the final permutation. An even
+    // count already permuted when its last pair completed above.
+    if pos == 1 {
+        let p = poseidon_permute(&state);
+        state = [p[0], p[1], p[2]];
+    }
+    fr_to_be_bytes(state[1])
 }
 
 /// Canonical BN254 `Fr` -> 32-byte big-endian (`bytes32` on-chain / uint256 public input).
@@ -381,6 +420,21 @@ mod tests {
                 compute_comm_d_streaming(&data),
                 compute_comm_d(&data),
                 "streaming != batch CommD at {n_bytes} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn data_commit_streaming_matches_batch() {
+        // The per-step dataCommit model the circuit mirrors must equal the batch sponge for every N —
+        // spanning odd/even leaf counts and the single-leaf case. This is the sponge analogue of
+        // `streaming_matches_batch` and gates the M2b-cont binding circuit's correctness.
+        for n_bytes in [0usize, 1, 30, 31, 32, 62, 63, 100, 200, 1000, 2048, 3000] {
+            let data: Vec<u8> = (0..n_bytes).map(|i| (i * 11 + 3) as u8).collect();
+            assert_eq!(
+                compute_data_commit_streaming(&data),
+                compute_data_commit(&data),
+                "streaming dataCommit != batch at {n_bytes} bytes"
             );
         }
     }

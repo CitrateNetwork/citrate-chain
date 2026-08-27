@@ -17,6 +17,7 @@
 //! bind the leaves to the registered file identity. **M2c:** compress (Spartan/HyperKZG) and wrap for
 //! on-chain verify. **M3/M4:** verifier precompile + contract rewrite.
 
+pub mod commd_bind_fold;
 pub mod merkle_fold;
 pub mod poseidon_gadget;
 
