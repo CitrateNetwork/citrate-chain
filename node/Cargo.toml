@@ -98,6 +98,13 @@ devnet = []
 # ALL VALIDATORS MUST AGREE ON THIS FEATURE or they diverge on any
 # transaction that exercises 0x0108 — coordinate via a release, never mix.
 halo2-verifier = ["citrate-execution/halo2-substrate"]
+# citrate-chain#170: build the node with the live recursive-fold CommD verifier at 0x0130 (the sound
+# wrong-CommD challenge). Without this feature the precompile fails closed with a discoverable
+# "feature absent" error. ALL VALIDATORS MUST AGREE ON THIS FEATURE or they diverge on any transaction
+# that exercises 0x0130 — coordinate via a release / reroll, never mix. Requires the baked verifier key
+# at core/execution/artifacts/commd_fold_vk.bin (produced by citrate-commd-fold's bake_vk from a
+# trusted-setup .ptau).
+commd-fold-verify = ["citrate-execution/commd-fold-verify"]
 # Feature flag for embedding BGE-M3 model at compile time
 # Only needed when creating a new genesis block
 # Contributors can build without this feature
