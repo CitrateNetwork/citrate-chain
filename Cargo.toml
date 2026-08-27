@@ -57,7 +57,7 @@ default-members = [
 # citrate-chain#170 M2: the Nova/folding prover is its OWN workspace so its deps (nova-snark, bellpepper,
 # its halo2curves pin) never unify with the pinned PSE-halo2/ark-0.4 stack. The chain verifies only the
 # final wrapped proof; the fold prover runs out-of-process (like the citrate-sealer sidecar).
-exclude = ["core/federated", "crates/citrate-commd-fold"]
+exclude = ["core/federated", "crates/citrate-commd-fold", "crates/citrate-commd-verify"]
 resolver = "2"
 
 [workspace.package]
