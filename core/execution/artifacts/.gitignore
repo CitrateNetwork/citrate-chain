@@ -1,4 +1,4 @@
-# The baked verifier key is a large (~27 MB) generated artifact, produced by the bake_vk tool from a
-# trusted-setup .ptau. It is NOT committed — a feature-ON build (`--features commd-fold-verify`)
-# requires it to be generated locally/in-release first. See README.md.
-*.bin
+# The PRODUCTION recursive-fold verifier key (commd_fold_vk.bin) IS committed and shipped — the
+# `commd-fold-verify` feature `include_bytes!`s it into the validator binary (citrate-chain#170
+# activation). Dev / scratch keys (baked with the insecure --dev SRS) stay out of the tree.
+*.dev.bin
