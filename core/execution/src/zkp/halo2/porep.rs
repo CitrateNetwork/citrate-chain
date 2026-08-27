@@ -541,8 +541,7 @@ impl SwapMerkleConfig {
                 self.s_bool.enable(&mut region, 0)?;
                 // boolean-constrain bit1: put it on column b @ row 1 and
                 // copy from the c-cell.
-                let b1_again =
-                    b1.copy_advice(|| "bit1 for bool", &mut region, self.b, 1)?;
+                let b1_again = b1.copy_advice(|| "bit1 for bool", &mut region, self.b, 1)?;
                 self.s_bool.enable(&mut region, 1)?;
                 Ok((idx_cell, [b0, b1_again]))
             },
@@ -826,8 +825,7 @@ impl SwapMerkleConfig {
             let mut acc: Vec<Value<Halo2Fr>> = vec![Value::known(Halo2Fr::ZERO); depth];
             acc[depth - 1] = bit_vals[depth - 1];
             for i in (0..depth - 1).rev() {
-                acc[i] = bit_vals[i]
-                    + Value::known(Halo2Fr::from(2u64)) * acc[i + 1];
+                acc[i] = bit_vals[i] + Value::known(Halo2Fr::from(2u64)) * acc[i + 1];
             }
             acc
         };
@@ -839,17 +837,11 @@ impl SwapMerkleConfig {
                 // For i < depth-1: enable s_recompose (horner[i] = bit_i + 2*horner[i+1]).
                 // For every row: enable s_bool on column b (bit_i ∈ {0,1}).
                 // Then idx is constrained equal to horner[0] by copy.
-                let mut bit_cells: Vec<AssignedCell<Halo2Fr, Halo2Fr>> =
-                    Vec::with_capacity(depth);
+                let mut bit_cells: Vec<AssignedCell<Halo2Fr, Halo2Fr>> = Vec::with_capacity(depth);
                 let mut horner_cells: Vec<AssignedCell<Halo2Fr, Halo2Fr>> =
                     Vec::with_capacity(depth);
                 for i in 0..depth {
-                    let h = region.assign_advice(
-                        || "horner",
-                        self.a,
-                        i,
-                        || horner_vals[i],
-                    )?;
+                    let h = region.assign_advice(|| "horner", self.a, i, || horner_vals[i])?;
                     let bit = region.assign_advice(|| "bit", self.b, i, || bit_vals[i])?;
                     self.s_bool.enable(&mut region, i)?;
                     let next_val = if i + 1 < depth {
@@ -1146,8 +1138,7 @@ impl Circuit<Halo2Fr> for PoRepCircuit {
 
         // ---- Step 3: labeling relation (the finding-1.1 core). ----
         // prev_same = has_drg ? drg_parent : replicaID  (mux, not host branch).
-        let prev_same1_cell =
-            swap.mux(&mut layouter, &replica_id_cell, &drg1_cell, &has_drg)?;
+        let prev_same1_cell = swap.mux(&mut layouter, &replica_id_cell, &drg1_cell, &has_drg)?;
         let label1_cell = PoseidonChip::hash_n_from_cells(
             &config.poseidon,
             &mut layouter,
@@ -1159,8 +1150,7 @@ impl Circuit<Halo2Fr> for PoRepCircuit {
             ],
         )?;
 
-        let prev_same2_cell =
-            swap.mux(&mut layouter, &replica_id_cell, &drg2_cell, &has_drg)?;
+        let prev_same2_cell = swap.mux(&mut layouter, &replica_id_cell, &drg2_cell, &has_drg)?;
         let label2_cell = PoseidonChip::hash_n_from_cells(
             &config.poseidon,
             &mut layouter,
@@ -1197,15 +1187,28 @@ impl Circuit<Halo2Fr> for PoRepCircuit {
         // Each recomputes the root from the leaf + v*'s bits + siblings, then
         // equality-checks against the public root.
         let sib_d = self.assign_siblings(swap, &mut layouter, &self.sib_d, "sib_d")?;
-        let root_d = swap.merkle_root(&config.poseidon, &mut layouter, data_cell.clone(), &bits, &sib_d)?;
+        let root_d = swap.merkle_root(
+            &config.poseidon,
+            &mut layouter,
+            data_cell.clone(),
+            &bits,
+            &sib_d,
+        )?;
         layouter.constrain_instance(root_d.cell(), config.instance, pi::COMM_D)?;
 
         let sib_r = self.assign_siblings(swap, &mut layouter, &self.sib_r, "sib_r")?;
-        let root_r = swap.merkle_root(&config.poseidon, &mut layouter, replica_leaf_cell, &bits, &sib_r)?;
+        let root_r = swap.merkle_root(
+            &config.poseidon,
+            &mut layouter,
+            replica_leaf_cell,
+            &bits,
+            &sib_r,
+        )?;
         layouter.constrain_instance(root_r.cell(), config.instance, pi::COMM_R)?;
 
         let sib_c = self.assign_siblings(swap, &mut layouter, &self.sib_c, "sib_c")?;
-        let root_c = swap.merkle_root(&config.poseidon, &mut layouter, column_cell, &bits, &sib_c)?;
+        let root_c =
+            swap.merkle_root(&config.poseidon, &mut layouter, column_cell, &bits, &sib_c)?;
         layouter.constrain_instance(root_c.cell(), config.instance, pi::COMM_C)?;
 
         // ---- Step 7: PARENT SOUNDNESS — prove the DRG parent labels are the
@@ -1507,13 +1510,7 @@ mod tests {
 
         // Recompute v*'s labels/column/replica from the FORGED parents so the
         // labeling relation + v* inclusions are internally consistent.
-        let l1 = native_hash(&label_preimage(
-            sealed.replica_id,
-            1,
-            v,
-            forged_p1,
-            None,
-        ));
+        let l1 = native_hash(&label_preimage(sealed.replica_id, 1, v, forged_p1, None));
         let l2 = native_hash(&label_preimage(
             sealed.replica_id,
             2,
@@ -1621,5 +1618,44 @@ mod tests {
         let sealed = seal_sample(Halo2Fr::from(1u64));
         let pis = PoRepCircuit::public_inputs(&sealed, 0);
         assert_eq!(pis.len(), 8);
+    }
+
+    /// citrate-chain#170 PARITY GUARD: the canonical `citrate-commd` crate MUST agree
+    /// byte-for-byte with this crate's frozen Poseidon-BN254 and `merkle_root_4`, so the
+    /// challenge circuit, the sealer/PoRep circuit, and the CX-S2.2 client all compute the
+    /// same CommD. If this fails, the crate and the on-chain/circuit substrate have drifted.
+    #[test]
+    fn commd_crate_is_byte_identical_to_this_crate() {
+        use ark_bn254::Fr as ArkFr;
+        use ark_ff::PrimeField as _;
+        let to_ark = |h: &Halo2Fr| ArkFr::from_le_bytes_mod_order(h.to_repr().as_ref());
+
+        // (1) Poseidon parity — the load-bearing substrate.
+        let inputs_h = [
+            Halo2Fr::from(11u64),
+            Halo2Fr::from(22u64),
+            Halo2Fr::from(33u64),
+        ];
+        let inputs_a: Vec<ArkFr> = inputs_h.iter().map(to_ark).collect();
+        assert_eq!(
+            citrate_commd::poseidon_hash(&inputs_a),
+            crate::zkp::poseidon_bn254::poseidon_hash(&inputs_a),
+            "citrate-commd Poseidon-BN254 drifted from poseidon_bn254"
+        );
+
+        // (2) Merkle parity — the crate's poseidon_merkle over 4 leaves == merkle_root_4.
+        let leaves_h = [
+            Halo2Fr::from(1u64),
+            Halo2Fr::from(2u64),
+            Halo2Fr::from(3u64),
+            Halo2Fr::from(4u64),
+        ];
+        let root_h = merkle_root_4(&leaves_h);
+        let leaves_a: Vec<ArkFr> = leaves_h.iter().map(to_ark).collect();
+        assert_eq!(
+            to_ark(&root_h),
+            citrate_commd::poseidon_merkle(&leaves_a),
+            "citrate-commd Merkle drifted from merkle_root_4"
+        );
     }
 }

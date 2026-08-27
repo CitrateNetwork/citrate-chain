@@ -1,0 +1,15 @@
+[package]
+name = "citrate-commd-fold"
+version = "0.1.0"
+edition = "2021"
+description = "citrate-chain#170 M2 — Nova/folding prover for the recursive CommD proof. ISOLATED workspace: its nova-snark/bellpepper/halo2curves deps never unify with the pinned PSE-halo2/ark-0.4 stack. Runs out-of-process; the chain verifies only the final wrapped proof."
+
+# Own workspace root — deps resolve independently of the parent citrate-chain workspace.
+[workspace]
+
+[dependencies]
+# `test-utils` enables Nova's insecure deterministic HyperKZG SRS (its `setup` is otherwise disabled
+# without a ptau, exactly like the chain's CHAIN-003 0x0108 policy). Fine for M2a de-risking; PRODUCTION
+# (M2c/M4) must switch to `PublicParams::setup_with_ptau_dir` with a trusted-setup .ptau and drop this.
+nova-snark = { version = "0.75", features = ["test-utils"] }
+ff = "0.13"
