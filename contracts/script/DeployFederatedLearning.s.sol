@@ -81,11 +81,13 @@ contract DeployFederatedLearning is ScriptEnv {
     // fold proof. Env-overridable so the precompile address can be finalized when M3 lands + activates.
     address internal constant FOLD_VERIFIER_PRECOMPILE = address(0x0130);
 
-    /// Canonical 40204 TEEAttestationRegistry — redeploys to the same CREATE2
-    /// address on the reroll (unchanged bytecode/args). The dry-run table diff
-    /// confirms equality; override via TEE_REGISTRY only if it intentionally moves.
+    /// Canonical 40204 TEEAttestationRegistry (the LIVE deployed one, = book / DeployTEEAttestationRegistry
+    /// output; `cast code` confirms it has bytecode). ComputePoolPipeline binds to this in its constructor.
+    /// Fixed 2026-08-27: was 0xc1c0d858…E777E, which has NO code on-chain — ComputePoolPipeline was wired
+    /// to a dead registry. Correcting it moves ComputePoolPipeline's own CREATE2 address (its init_code
+    /// changes); the address book is updated to the new value. Override via TEE_REGISTRY only if it moves.
     address internal constant TEE_REGISTRY_40204 =
-        0xc1c0d8587a2a36ca8a7E95275C5CAd0D523E777E;
+        0x4dF26aae3619f449a142d237ed818Ebf7C186Ed5;
 
     function run() external {
         address deployer = deployerAddress();
@@ -135,6 +137,14 @@ contract DeployFederatedLearning is ScriptEnv {
             IPFS3_MODEL_CHALLENGE_WINDOW,
             IPFS3_MODEL_CHALLENGER_BPS,
             envAddressOr("FOLD_VERIFIER", FOLD_VERIFIER_PRECOMPILE)
+        );
+        // citrate-chain#170 (P3): IPFSIncentivesV3 is deployable by BOTH this script and
+        // RedeployIPFSIncentivesV3.s.sol under the SAME salt. On a from-main build both land at the
+        // canonical #170 address; assert it here so a stale-bytecode build FAILS LOUDLY instead of
+        // silently forking V3. (Deterministic given kyc + these params + FOLD_VERIFIER default 0x0130.)
+        require(
+            address(ipfsV3) == 0xA1a37f794B77292Cf8511c4b179Af18d5A663683,
+            "IPFSIncentivesV3 address drift: not the #170 sound-CommD-bond bytecode/args"
         );
 
         // 4. AggregationChallenge — Governable(msg.sender) like NematocystSlashing;
