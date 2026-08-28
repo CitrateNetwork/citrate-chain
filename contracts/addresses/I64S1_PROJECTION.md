@@ -45,8 +45,10 @@ args are determinism inputs. To land the addresses above, the ceremony must use:
    address (e.g. TreasuryGovernor `0x4cd381…`), set `GOVERNANCE` and **re-run the
    dry-run** — the ComputePoolPipeline address WILL change, and this table must be
    regenerated before the ceremony.
-3. **teeRegistry = `0xc1c0d8587a2a36ca8a7E95275C5CAd0D523E777E`** (the canonical
-   40204 TEEAttestationRegistry, which itself redeploys to the same CREATE2 address).
+3. **teeRegistry = `0x4dF26aae3619f449a142d237ed818Ebf7C186Ed5`** (the canonical, LIVE
+   40204 TEEAttestationRegistry). ⚠️ CORRECTED 2026-08-27: this doc previously listed
+   `0xc1c0d858…E777E`, which has NO code on-chain — that stale pin wired ComputePoolPipeline to a dead
+   registry. The canonical TEE is `0x4dF26aae…` (has bytecode; = book / DeployTEEAttestationRegistry).
 4. **Economic params exactly as pinned** in `DeployFederatedLearning.s.sol` (see
    below). These fix both the protocol economics AND the addresses.
 
