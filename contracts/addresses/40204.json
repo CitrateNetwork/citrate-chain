@@ -5,7 +5,7 @@
   "rpcUrl": "https://rpc.citrate.ai",
   "explorerUrl": "https://explorer.citrate.ai",
   "deployer": "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732",
-  "deployedAt": "2026-08-04T16:16:49Z",
+  "deployedAt": "2026-08-28T01:47:01Z",
   "regenerator": "scripts/ops/emit-address-table.sh",
   "comment": "Canonical contract-address table for chain 40204 \u2014 the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
   "contracts": {
