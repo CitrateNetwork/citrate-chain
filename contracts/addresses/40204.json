@@ -7,7 +7,7 @@
   "deployer": "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732",
   "deployedAt": "2026-08-28T01:47:01Z",
   "regenerator": "scripts/ops/emit-address-table.sh",
-  "comment": "Canonical contract-address table for chain 40204 \u2014 the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
+  "comment": "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
   "contracts": {
     "ModelRegistry": "0xf64636d56ec9e0c406149b34ea9c5c5d80b342c0",
     "WrappedSALT": "0xaa918302b94a4b0e75e01e019cc6b819b4f7c906",
@@ -61,7 +61,9 @@
     "PolicyBinding": "0x76c41259d1454d983a2def855d532bfd67e10ea0",
     "CapabilityGrant": "0x3139e17e23914e9442e126228f5b14658b50a449",
     "VoteAllowance": "0xee0f77fb2e6f5f31ac8b5df14932ba4715b558bd",
-    "Sortition": "0x1eabce0dddb74f5c144c7f452a7d27292c62e900"
+    "Sortition": "0x1eabce0dddb74f5c144c7f452a7d27292c62e900",
+    "PatronageLedger": "0xdcd9eea1693121aedc32bfdc6bbe6ad939912cdc",
+    "ModelCooperative": "0x3dcbd520ac344ae34386fc455d6534667289ab40"
   },
   "aaStack": {
     "EntryPoint": "0xc698feaf0ff7fdb0d60e2f620c97cb729a694975",
