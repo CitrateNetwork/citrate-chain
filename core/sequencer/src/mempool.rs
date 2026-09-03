@@ -555,17 +555,17 @@ impl Mempool {
                     self.config.chain_id,
                     tx_chain_id
                 );
-                return Err(MempoolError::InvalidTransaction(
-                    format!("Wrong chain ID: expected {}, got {}", self.config.chain_id, tx_chain_id),
-                ));
+                return Err(MempoolError::InvalidTransaction(format!(
+                    "Wrong chain ID: expected {}, got {}",
+                    self.config.chain_id, tx_chain_id
+                )));
             }
             None => {
-                tracing::warn!(
-                    "Transaction missing chain ID (pre-EIP-155 not accepted)"
-                );
-                return Err(MempoolError::InvalidTransaction(
-                    format!("Missing chain ID: all transactions must specify chain_id={}", self.config.chain_id),
-                ));
+                tracing::warn!("Transaction missing chain ID (pre-EIP-155 not accepted)");
+                return Err(MempoolError::InvalidTransaction(format!(
+                    "Missing chain ID: all transactions must specify chain_id={}",
+                    self.config.chain_id
+                )));
             }
         }
 
@@ -794,7 +794,9 @@ impl Mempool {
     /// storage the way the old `self.nonces` counter could.
     pub async fn pending_nonce_for(&self, sender: &PublicKey) -> Option<u64> {
         let set = self.sender_nonces.read().await;
-        set.get(sender).and_then(|s| s.iter().next_back().copied()).map(|n| n + 1)
+        set.get(sender)
+            .and_then(|s| s.iter().next_back().copied())
+            .map(|n| n + 1)
     }
 
     /// Get AI transactions (model operations, inference requests)
@@ -1158,9 +1160,7 @@ impl MempoolAccess for Arc<RwLock<Mempool>> {
     fn chain_id(&self) -> u64 {
         // We need to block briefly to get the chain_id
         // This is a sync method so we use try_read or block_in_place
-        futures::executor::block_on(async {
-            self.read().await.chain_id()
-        })
+        futures::executor::block_on(async { self.read().await.chain_id() })
     }
 
     async fn add_transaction(&self, tx: Transaction, class: TxClass) -> Result<(), MempoolError> {
@@ -1274,13 +1274,20 @@ mod tests {
         }
         // ...and the CAP newest entries must all be retained.
         for i in EXTRA..(CAP + EXTRA) {
-            assert!(set.contains(&hash_for(i)), "newest entry {} must be retained", i);
+            assert!(
+                set.contains(&hash_for(i)),
+                "newest entry {} must be retained",
+                i
+            );
         }
 
         // Duplicate insert must not grow the set or perturb ordering.
         set.insert(hash_for(CAP + EXTRA - 1));
         assert_eq!(set.len(), CAP);
-        assert!(set.contains(&hash_for(EXTRA)), "duplicate insert must not evict");
+        assert!(
+            set.contains(&hash_for(EXTRA)),
+            "duplicate insert must not evict"
+        );
 
         // clear() empties both the set and the order queue.
         set.clear();
@@ -1385,10 +1392,7 @@ mod tests {
         let second = create_test_tx(7, 3_000_000_000, sender);
         let result = mempool.add_transaction(second, TxClass::Standard).await;
         assert!(
-            matches!(
-                result,
-                Err(MempoolError::DuplicateNonce { nonce: 7 })
-            ),
+            matches!(result, Err(MempoolError::DuplicateNonce { nonce: 7 })),
             "same-nonce different-hash must be DuplicateNonce, got {result:?}"
         );
     }
@@ -1432,7 +1436,11 @@ mod tests {
         let best = mempool.get_best_transactions(16, 1_000_000).await;
         assert_eq!(best.len(), 8);
         for (i, tx) in best.iter().enumerate() {
-            assert_eq!(tx.nonce, i as u64, "block position {i} has nonce {}", tx.nonce);
+            assert_eq!(
+                tx.nonce, i as u64,
+                "block position {i} has nonce {}",
+                tx.nonce
+            );
         }
     }
 
@@ -1464,10 +1472,7 @@ mod tests {
             .add_transaction(future_tx, TxClass::Standard)
             .await
             .unwrap();
-        assert_eq!(
-            mempool.pending_nonce_for(&sender_pk).await,
-            Some(99_001)
-        );
+        assert_eq!(mempool.pending_nonce_for(&sender_pk).await, Some(99_001));
 
         // Evict the forward-jumped tx — simulate capacity pressure,
         // expiration, or any other non-inclusion drop.
@@ -1488,15 +1493,10 @@ mod tests {
             mempool
                 .add_transaction(tx, TxClass::Standard)
                 .await
-                .unwrap_or_else(|e| {
-                    panic!("nonce {n} rejected after phantom eviction: {e}")
-                });
+                .unwrap_or_else(|e| panic!("nonce {n} rejected after phantom eviction: {e}"));
         }
         assert_eq!(mempool.stats().await.total_transactions, 6);
-        assert_eq!(
-            mempool.pending_nonce_for(&sender_pk).await,
-            Some(6)
-        );
+        assert_eq!(mempool.pending_nonce_for(&sender_pk).await, Some(6));
     }
 
     #[tokio::test]
@@ -1668,7 +1668,7 @@ mod tests {
             data: vec![],
             signature: Signature::new([1; 64]),
             chain_id: Some(40204), // Matches canonical MempoolConfig::default()
-            ecdsa_verified: true, // Attacker-forged value
+            ecdsa_verified: true,  // Attacker-forged value
             ..Default::default()
         };
 
@@ -1698,6 +1698,46 @@ mod tests {
         let tx = create_test_tx(0, 2_000_000_000, [1; 32]);
         let result = mempool.add_transaction(tx, TxClass::Standard).await;
         assert!(result.is_ok(), "Native sender should pass ECDSA gate");
+    }
+
+    /// WP-E1 tripwire (UNCONDITIONAL — must hold on every build profile, including the
+    /// shipped default). An EVM-shaped transaction whose `ecdsa_verified` flag is false
+    /// must be rejected at mempool admission. This is RED whenever `devnet` is a default
+    /// cargo feature (the production ECDSA gate at validate_transaction is compiled out and
+    /// the forged tx is accepted); it is GREEN once `[features] default = []`. It also guards
+    /// against `devnet` ever being restored to the default set. See audit D010 / RM-Q WP-E1.
+    #[tokio::test]
+    async fn test_wp_e1_evm_forged_sig_rejected_on_default_build() {
+        let config = MempoolConfig {
+            require_valid_signature: false, // isolate the ecdsa_verified gate, not crypto recovery
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+
+        let mut evm_sender = [0u8; 32];
+        evm_sender[..20].copy_from_slice(&[0xAA; 20]); // 20-byte EVM shape, last 12 zero
+
+        let forged = Transaction {
+            hash: Hash::new([0x42; 32]),
+            nonce: 0,
+            from: PublicKey::new(evm_sender),
+            to: Some(PublicKey::new([2; 32])),
+            value: 1000,
+            gas_limit: 21000,
+            gas_price: 2_000_000_000,
+            data: vec![],
+            signature: Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ecdsa_verified: false,
+            ..Default::default()
+        };
+
+        let result = mempool.add_transaction(forged, TxClass::Standard).await;
+        assert!(
+            matches!(result, Err(MempoolError::InvalidSignature)),
+            "WP-E1: an EVM-shaped tx with ecdsa_verified=false must be rejected on the DEFAULT              build; got {:?}. If it was accepted, `devnet` is compiled into the shipped binary              and the production signature gate is absent.",
+            result
+        );
     }
 
     #[tokio::test]
@@ -1799,9 +1839,7 @@ mod tests {
 
         // Re-submit with nonce 0 should succeed (use different gas price for unique hash)
         let tx0_retry = create_test_tx(0, 3_000_000_000, sender);
-        let result = mempool
-            .add_transaction(tx0_retry, TxClass::Standard)
-            .await;
+        let result = mempool.add_transaction(tx0_retry, TxClass::Standard).await;
         assert!(
             result.is_ok(),
             "Re-submitting nonce 0 after removal should succeed: {:?}",
@@ -1830,9 +1868,18 @@ mod tests {
         let tx2 = create_test_tx(2, 2_000_000_000, sender);
         let tx1_hash = tx1.hash;
 
-        mempool.add_transaction(tx0, TxClass::Standard).await.unwrap();
-        mempool.add_transaction(tx1, TxClass::Standard).await.unwrap();
-        mempool.add_transaction(tx2, TxClass::Standard).await.unwrap();
+        mempool
+            .add_transaction(tx0, TxClass::Standard)
+            .await
+            .unwrap();
+        mempool
+            .add_transaction(tx1, TxClass::Standard)
+            .await
+            .unwrap();
+        mempool
+            .add_transaction(tx2, TxClass::Standard)
+            .await
+            .unwrap();
 
         // Pending nonce should be 3 (max of {0,1,2} + 1).
         assert_eq!(mempool.pending_nonce_for(&sender_pk).await, Some(3));
@@ -1881,7 +1928,10 @@ mod tests {
         // Add and remove a transaction
         let tx0 = create_test_tx(0, 2_000_000_000, sender);
         let tx0_hash = tx0.hash;
-        mempool.add_transaction(tx0, TxClass::Standard).await.unwrap();
+        mempool
+            .add_transaction(tx0, TxClass::Standard)
+            .await
+            .unwrap();
         mempool.remove_transaction(&tx0_hash).await;
 
         // The sender entry should be pruned eagerly by remove_transaction.
@@ -1922,21 +1972,39 @@ mod tests {
         let tx_mid = create_test_tx(0, 2_000_000_000, [11; 32]);
         let tx_high = create_test_tx(0, 3_000_000_000, [12; 32]);
 
-        mempool.add_transaction(tx_low.clone(), TxClass::Standard).await.unwrap();
-        mempool.add_transaction(tx_mid.clone(), TxClass::Standard).await.unwrap();
-        mempool.add_transaction(tx_high.clone(), TxClass::Standard).await.unwrap();
+        mempool
+            .add_transaction(tx_low.clone(), TxClass::Standard)
+            .await
+            .unwrap();
+        mempool
+            .add_transaction(tx_mid.clone(), TxClass::Standard)
+            .await
+            .unwrap();
+        mempool
+            .add_transaction(tx_high.clone(), TxClass::Standard)
+            .await
+            .unwrap();
         assert_eq!(mempool.stats().await.total_transactions, 3);
 
         // Add a 4th tx with higher gas price than the lowest — should evict tx_low
         let tx_new = create_test_tx(0, 5_000_000_000, [13; 32]);
-        mempool.add_transaction(tx_new.clone(), TxClass::Standard).await.unwrap();
+        mempool
+            .add_transaction(tx_new.clone(), TxClass::Standard)
+            .await
+            .unwrap();
 
         // Still 3 txs (one evicted)
         assert_eq!(mempool.stats().await.total_transactions, 3);
         // The lowest-priority tx should have been evicted
-        assert!(!mempool.contains(&tx_low.hash).await, "Lowest priority tx should be evicted");
+        assert!(
+            !mempool.contains(&tx_low.hash).await,
+            "Lowest priority tx should be evicted"
+        );
         // The new tx should be present
-        assert!(mempool.contains(&tx_new.hash).await, "New higher-priority tx should be present");
+        assert!(
+            mempool.contains(&tx_new.hash).await,
+            "New higher-priority tx should be present"
+        );
     }
 
     /// Add transactions, call clear(), verify the mempool is empty.
@@ -1950,16 +2018,28 @@ mod tests {
 
         let tx1 = create_test_tx(0, 2_000_000_000, [20; 32]);
         let tx2 = create_test_tx(0, 2_000_000_000, [21; 32]);
-        mempool.add_transaction(tx1, TxClass::Standard).await.unwrap();
-        mempool.add_transaction(tx2, TxClass::Inference).await.unwrap();
+        mempool
+            .add_transaction(tx1, TxClass::Standard)
+            .await
+            .unwrap();
+        mempool
+            .add_transaction(tx2, TxClass::Inference)
+            .await
+            .unwrap();
         assert_eq!(mempool.stats().await.total_transactions, 2);
 
         mempool.clear().await;
 
         let stats = mempool.stats().await;
-        assert_eq!(stats.total_transactions, 0, "Mempool should be empty after clear");
+        assert_eq!(
+            stats.total_transactions, 0,
+            "Mempool should be empty after clear"
+        );
         assert_eq!(stats.total_size, 0, "Total size should be 0 after clear");
-        assert_eq!(stats.unique_senders, 0, "No senders should remain after clear");
+        assert_eq!(
+            stats.unique_senders, 0,
+            "No senders should remain after clear"
+        );
     }
 
     /// Add a tx with very short expiry, then call clear_expired() and verify removal.
@@ -1976,7 +2056,10 @@ mod tests {
 
         let tx = create_test_tx(0, 2_000_000_000, [30; 32]);
         let tx_hash = tx.hash;
-        mempool.add_transaction(tx, TxClass::Standard).await.unwrap();
+        mempool
+            .add_transaction(tx, TxClass::Standard)
+            .await
+            .unwrap();
         assert_eq!(mempool.stats().await.total_transactions, 1);
 
         // Wait >1s so the tx timestamp (second-precision) is strictly in the past
@@ -1984,7 +2067,10 @@ mod tests {
 
         mempool.clear_expired().await;
 
-        assert!(!mempool.contains(&tx_hash).await, "Expired tx should be removed");
+        assert!(
+            !mempool.contains(&tx_hash).await,
+            "Expired tx should be removed"
+        );
         assert_eq!(mempool.stats().await.total_transactions, 0);
     }
 
@@ -1998,10 +2084,31 @@ mod tests {
         let mempool = Mempool::new(config);
 
         // Add 2 Standard, 1 System, 1 Inference from different senders
-        mempool.add_transaction(create_test_tx(0, 2_000_000_000, [40; 32]), TxClass::Standard).await.unwrap();
-        mempool.add_transaction(create_test_tx(0, 2_000_000_000, [41; 32]), TxClass::Standard).await.unwrap();
-        mempool.add_transaction(create_test_tx(0, 2_000_000_000, [42; 32]), TxClass::System).await.unwrap();
-        mempool.add_transaction(create_test_tx(0, 2_000_000_000, [43; 32]), TxClass::Inference).await.unwrap();
+        mempool
+            .add_transaction(
+                create_test_tx(0, 2_000_000_000, [40; 32]),
+                TxClass::Standard,
+            )
+            .await
+            .unwrap();
+        mempool
+            .add_transaction(
+                create_test_tx(0, 2_000_000_000, [41; 32]),
+                TxClass::Standard,
+            )
+            .await
+            .unwrap();
+        mempool
+            .add_transaction(create_test_tx(0, 2_000_000_000, [42; 32]), TxClass::System)
+            .await
+            .unwrap();
+        mempool
+            .add_transaction(
+                create_test_tx(0, 2_000_000_000, [43; 32]),
+                TxClass::Inference,
+            )
+            .await
+            .unwrap();
 
         let stats = mempool.stats().await;
         assert_eq!(stats.total_transactions, 4);
@@ -2031,9 +2138,18 @@ mod tests {
         let mut tx_large = create_test_tx(0, 1_000_000_000, [52; 32]);
         tx_large.data = vec![0u8; 500]; // ~700 bytes total
 
-        mempool.add_transaction(tx_small.clone(), TxClass::Standard).await.unwrap();
-        mempool.add_transaction(tx_medium.clone(), TxClass::Standard).await.unwrap();
-        mempool.add_transaction(tx_large.clone(), TxClass::Standard).await.unwrap();
+        mempool
+            .add_transaction(tx_small.clone(), TxClass::Standard)
+            .await
+            .unwrap();
+        mempool
+            .add_transaction(tx_medium.clone(), TxClass::Standard)
+            .await
+            .unwrap();
+        mempool
+            .add_transaction(tx_large.clone(), TxClass::Standard)
+            .await
+            .unwrap();
 
         // Set max_size that fits only the small and medium txs (~510 bytes)
         // but not the large one too
@@ -2041,12 +2157,22 @@ mod tests {
 
         // The small tx has highest gas price so it's selected first (~210 bytes),
         // then medium (~300 bytes, total ~510), then large won't fit.
-        assert!(best.len() <= 2, "Should not include all 3 txs under the size limit");
+        assert!(
+            best.len() <= 2,
+            "Should not include all 3 txs under the size limit"
+        );
         // Verify no tx was included that would push total over the limit
-        let total: usize = best.iter().map(|t| {
-            // Replicate the size calculation: 32+8+32+32+16+8+8+data.len()+64
-            32 + 8 + 32 + 32 + 16 + 8 + 8 + t.data.len() + 64
-        }).sum();
-        assert!(total <= 510, "Total selected tx size {} should not exceed max_size 510", total);
+        let total: usize = best
+            .iter()
+            .map(|t| {
+                // Replicate the size calculation: 32+8+32+32+16+8+8+data.len()+64
+                32 + 8 + 32 + 32 + 16 + 8 + 8 + t.data.len() + 64
+            })
+            .sum();
+        assert!(
+            total <= 510,
+            "Total selected tx size {} should not exceed max_size 510",
+            total
+        );
     }
 }
