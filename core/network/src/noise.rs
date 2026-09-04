@@ -10,24 +10,36 @@ use snow::{Builder, TransportState};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
+use zeroize::Zeroizing;
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 const MAX_NOISE_MSG_LEN: usize = 65535;
 
 /// Static keypair for Noise protocol identity.
-#[derive(Clone)]
+///
+/// CRY-M1: the static `private` key is held in `Zeroizing` so its bytes are
+/// wiped when the keypair is dropped, and `Clone` is intentionally NOT derived
+/// so the long-lived secret cannot be silently copied. The transport shares a
+/// single instance via `Arc<NoiseKeypair>`. There is no `Debug` derive, so the
+/// key can never be formatted into a log line.
 pub struct NoiseKeypair {
-    pub private: Vec<u8>,
+    private: Zeroizing<Vec<u8>>,
     pub public: Vec<u8>,
 }
 
 impl NoiseKeypair {
     /// Generate a new random X25519 keypair.
     pub fn generate() -> Self {
-        let builder = Builder::new(NOISE_PATTERN.parse().unwrap_or_else(|e| panic!("valid noise pattern: {e}")));
-        let kp = builder.generate_keypair().unwrap_or_else(|e| panic!("keypair generation: {e}"));
+        let builder = Builder::new(
+            NOISE_PATTERN
+                .parse()
+                .unwrap_or_else(|e| panic!("valid noise pattern: {e}")),
+        );
+        let kp = builder
+            .generate_keypair()
+            .unwrap_or_else(|e| panic!("keypair generation: {e}"));
         Self {
-            private: kp.private.clone(),
+            private: Zeroizing::new(kp.private.clone()),
             public: kp.public.clone(),
         }
     }
@@ -63,7 +75,7 @@ impl NoiseKeypair {
             )));
         }
         Ok(Self {
-            private: bytes[..32].to_vec(),
+            private: Zeroizing::new(bytes[..32].to_vec()),
             public: bytes[32..].to_vec(),
         })
     }
@@ -232,7 +244,10 @@ pub async fn handshake_responder<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 // After handshake, the regular LengthDelimitedCodec takes over.
 // ---------------------------------------------------------------------------
 
-async fn send_frame<W: AsyncWriteExt + Unpin>(stream: &mut W, data: &[u8]) -> Result<(), NetworkError> {
+async fn send_frame<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    data: &[u8],
+) -> Result<(), NetworkError> {
     let len = (data.len() as u32).to_be_bytes();
     stream
         .write_all(&len)
@@ -283,7 +298,7 @@ mod tests {
         let kp = NoiseKeypair::generate();
         assert_eq!(kp.private.len(), 32);
         assert_eq!(kp.public.len(), 32);
-        assert_ne!(kp.private, kp.public);
+        assert_ne!(kp.private.as_slice(), kp.public.as_slice());
     }
 
     #[test]
@@ -298,10 +313,25 @@ mod tests {
         let kp = NoiseKeypair::generate();
         let bytes = kp.to_bytes();
         assert_eq!(bytes.len(), 64);
-        let restored = NoiseKeypair::from_bytes(&bytes).unwrap();
-        assert_eq!(kp.private, restored.private);
+        let restored = NoiseKeypair::from_bytes(&bytes).expect("roundtrip from_bytes");
+        assert_eq!(kp.private.as_slice(), restored.private.as_slice());
         assert_eq!(kp.public, restored.public);
         assert_eq!(kp.derive_peer_id(), restored.derive_peer_id());
+    }
+
+    /// CRY-M1 tripwire: the Noise static private key must be held in
+    /// `Zeroizing` so it is wiped on drop. The type annotation below only
+    /// compiles while `private` is `Zeroizing<Vec<u8>>` — reverting it to a
+    /// plain `Vec<u8>` breaks the build.
+    #[test]
+    fn test_cry_m1_private_key_is_zeroizing() {
+        let kp = NoiseKeypair::generate();
+        let _assert_type: &zeroize::Zeroizing<Vec<u8>> = &kp.private;
+        assert_eq!(
+            kp.private.len(),
+            32,
+            "X25519 static private key is 32 bytes"
+        );
     }
 
     #[test]
@@ -321,9 +351,14 @@ mod tests {
 
         let (mut client_stream, mut server_stream) = tokio::io::duplex(8192);
 
-        let server_kp_clone = server_kp.clone();
+        // NoiseKeypair is intentionally not Clone (CRY-M1); reconstruct an
+        // independent copy for the spawned responder task via its byte form.
+        let server_kp_clone = NoiseKeypair::from_bytes(&server_kp.to_bytes())
+            .expect("roundtrip server keypair bytes");
         let server = tokio::spawn(async move {
-            handshake_responder(&mut server_stream, &server_kp_clone).await.expect("responder handshake")
+            handshake_responder(&mut server_stream, &server_kp_clone)
+                .await
+                .expect("responder handshake")
         });
 
         let client_session = handshake_initiator(&mut client_stream, &client_kp)

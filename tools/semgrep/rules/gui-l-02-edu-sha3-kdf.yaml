@@ -17,6 +17,12 @@
 #     paths.
 #   - Any direct `Sha3_256::digest(<password>)` pattern in
 #     `gui/citrate_edu_app/` (the cross-cutting variant the audit found).
+#
+# CHAIN-B-E001: scope extended to `cli/` so the same manual-SHA3 password
+# KDF pattern is caught in the CLI keystore going forward. The CLI keystore
+# file itself is excluded (like `encryption.rs` in the gui) because it
+# defines the read-only legacy path `derive_key_legacy_sha3`; production
+# writes there now use Argon2id (`derive_key_argon2id`).
 
 rules:
   - id: gui-l-02-edu-sha3-kdf
@@ -32,6 +38,7 @@ rules:
         - "gui/citrate_edu_app/**/*.rs"
         - "gui/citrate_learning_center/**/*.rs"
         - "gui/citrate_edu_native/**/*.rs"
+        - "cli/**/*.rs"  # CHAIN-B-E001: catch the SHA3-KDF class in the CLI too
       exclude:
         - "**/tests/**"
         - "**/test_*.rs"
@@ -39,6 +46,7 @@ rules:
         - "**/*_tests.rs"
         - "**/benches/**"
         - "**/encryption.rs"  # `encryption.rs` defines the legacy fn itself
+        - "cli/src/utils/keystore.rs"  # defines the read-only legacy SHA3 path (CHAIN-B-E001)
     pattern-either:
       - pattern: from_password_legacy_sha3(...)
       - patterns:
