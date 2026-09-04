@@ -3,7 +3,7 @@
 use crate::types::{Block, Hash, Tip};
 use crate::vrf::VrfProposerSelector;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -164,6 +164,15 @@ pub struct DagStore {
     /// means "enforce whenever a selector is attached" (test/back-compat). Set via
     /// [`Self::with_enforcement_activation_height`]; the scheduled re-roll seeds it.
     enforcement_activation_height: Option<u64>,
+
+    /// SECREM-A001: this chain's canonical genesis hash, threaded from
+    /// the node's `HandshakeParams.genesis_hash` via
+    /// [`Self::set_configured_genesis`] at startup, before any block is
+    /// admitted. Admission gates bind the genesis exemption to this
+    /// identity so a block merely *shaped* like genesis (parentless,
+    /// arbitrary height) cannot bypass them. Write-once — a chain's
+    /// genesis never changes.
+    configured_genesis: Arc<OnceLock<Hash>>,
 }
 
 /// Column family names for persistent DAG storage
@@ -202,6 +211,7 @@ impl DagStore {
             persistent: None,
             proposer_selector: None,
             enforcement_activation_height: None,
+            configured_genesis: Arc::new(OnceLock::new()),
         }
     }
 
@@ -221,6 +231,18 @@ impl DagStore {
     pub fn with_enforcement_activation_height(mut self, height: u64) -> Self {
         self.enforcement_activation_height = Some(height);
         self
+    }
+
+    /// SECREM-A001: bind this store to its chain's canonical genesis hash.
+    /// Called once at node startup with `HandshakeParams.genesis_hash`
+    /// BEFORE any block is admitted. Idempotent (write-once).
+    pub fn set_configured_genesis(&self, hash: Hash) {
+        let _ = self.configured_genesis.set(hash);
+    }
+
+    /// SECREM-A001: the configured canonical genesis hash, if set.
+    pub fn configured_genesis(&self) -> Option<Hash> {
+        self.configured_genesis.get().copied()
     }
 
     /// Create a DagStore with explicit VRF strictness.
@@ -258,6 +280,7 @@ impl DagStore {
             persistent: Some(kv),
             proposer_selector: None,
             enforcement_activation_height: None,
+            configured_genesis: Arc::new(OnceLock::new()),
         };
         store.load_from_persistent()?;
         Ok(store)
@@ -525,7 +548,7 @@ impl DagStore {
     /// Non-genesis blocks must have a structurally valid VRF proof and non-zero proposer.
     fn validate_block_admission(&self, block: &Block) -> Result<(), String> {
         // Genesis blocks are exempt from VRF checks
-        if block.is_genesis() {
+        if block.is_configured_genesis(self.configured_genesis()) {
             return Ok(());
         }
 
@@ -562,7 +585,7 @@ impl DagStore {
     /// `signed_payload` is the block hash, which is what
     /// `crypto::sign_block` signs.
     async fn verify_block_vrf_crypto(&self, block: &Block) -> Result<(), String> {
-        if block.is_genesis() {
+        if block.is_configured_genesis(self.configured_genesis()) {
             return Ok(());
         }
 
@@ -709,7 +732,7 @@ impl DagStore {
         }
 
         // WP-W.2: Cryptographic VRF proof verification (when strict_vrf is enabled)
-        if self.strict_vrf && !block.is_genesis() {
+        if self.strict_vrf && !block.is_configured_genesis(self.configured_genesis()) {
             if let Err(e) = self.verify_block_vrf_crypto(&block).await {
                 return Err(DagStoreError::InvalidVrf(e));
             }
