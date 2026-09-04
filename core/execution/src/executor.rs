@@ -3755,18 +3755,27 @@ impl Executor {
             AccessPolicy::Private if model.owner == from => {}
             AccessPolicy::Restricted(allowed) if allowed.contains(&from) => {}
             AccessPolicy::PayPerUse { fee } => {
-                // Split fee: 10% protocol treasury, 90% to model owner
+                // Split fee: 10% protocol treasury, 90% to model owner.
+                //
+                // WP-R-B001 (audit CHAIN-B-B001): route BOTH the payer debit
+                // and the owner/treasury credits through the per-tx MVCC
+                // journal via `journal_transfer`, exactly like every other
+                // value movement on this executor. The previous code debited
+                // the payer with a DIRECT `state_db.accounts.transfer`, which
+                // is invisible to the journal — so at `drain_journal` time the
+                // payer's balance was overwritten with the journal's pre-fee
+                // pending value, un-doing the debit, while the owner and
+                // treasury kept their direct credits. Net effect: `fee` minted
+                // from nothing on every PayPerUse call. Keeping the whole split
+                // in the journal makes the debit and credits drain atomically
+                // on success and discard atomically on revert.
                 let treasury_address = Address([0x11; 20]);
                 let treasury_cut = *fee / U256::from(10u8);
                 let owner_cut = *fee - treasury_cut;
-                // Perform transfers
-                self.state_db
-                    .accounts
-                    .transfer(&from, &model.owner, owner_cut)?;
+                let owner = model.owner;
+                self.journal_transfer(from, owner, owner_cut, context)?;
                 if treasury_cut > U256::zero() {
-                    self.state_db
-                        .accounts
-                        .transfer(&from, &treasury_address, treasury_cut)?;
+                    self.journal_transfer(from, treasury_address, treasury_cut, context)?;
                 }
                 model.usage_stats.total_fees_earned += *fee;
             }
@@ -3783,11 +3792,13 @@ impl Executor {
             if gas_used > 0 {
                 context.use_gas(gas_used)?;
             }
-            // Pay provider
+            // Pay provider — journal-routed (WP-R-B001, audit CHAIN-B-B001) so
+            // the payer debit and provider credit drain (on success) or
+            // discard (on revert) atomically with the rest of the tx, instead
+            // of a direct `state_db.accounts.transfer` that `drain_journal`
+            // would clobber (minting the provider fee).
             if provider_fee > U256::zero() {
-                self.state_db
-                    .accounts
-                    .transfer(&from, &provider_addr, provider_fee)?;
+                self.journal_transfer(from, provider_addr, provider_fee, context)?;
             }
             // Store proof artifact if provided
             if let Some(proof_bytes) = proof_bytes_opt {
