@@ -545,10 +545,12 @@ mod tests {
         (adm, storage, dag, dir)
     }
 
-    /// Root of the test chain: parent == default and no merge parents, so
-    /// `is_genesis()` holds and it is admitted unconditionally.
+    /// Root of the test chain: the height-0 genesis (parentless, no merge
+    /// parents), so `is_configured_genesis()` holds and it is admitted. (SECREM-A001
+    /// RC-8: was height 1 — a shape-only pseudo-genesis — before genesis became an
+    /// identity bound to height 0.)
     fn root() -> Block {
-        mk(1, Hash::default(), 0, [0x5A; 32])
+        mk(0, Hash::default(), 0, [0x5A; 32])
     }
 
     fn fully_admitted(storage: &StorageManager, dag_has: bool, b: &Block) -> bool {
@@ -585,7 +587,7 @@ mod tests {
         let (adm, storage, dag, _d) = harness();
         let g = root();
         adm.admit(&g).await;
-        let b2 = mk(2, g.header.block_hash, 1, [0x5A; 32]);
+        let b2 = mk(1, g.header.block_hash, 1, [0x5A; 32]);
 
         // Manufacture the exact post-crash state: DAG write committed, process
         // killed before the chain write.
@@ -634,7 +636,7 @@ mod tests {
         let (adm, storage, dag, _d) = harness();
         let g = root();
         adm.admit(&g).await;
-        let b2 = mk(2, g.header.block_hash, 1, [0x5A; 32]);
+        let b2 = mk(1, g.header.block_hash, 1, [0x5A; 32]);
 
         storage.blocks.put_block(&b2).expect("chain write");
         assert!(!dag.has_block(&b2.header.block_hash).await);
@@ -648,7 +650,7 @@ mod tests {
         assert!(dag.has_block(&b2.header.block_hash).await);
 
         // Which is what makes descendants admissible again.
-        let b3 = mk(3, b2.header.block_hash, 2, [0x5A; 32]);
+        let b3 = mk(2, b2.header.block_hash, 2, [0x5A; 32]);
         assert_eq!(
             adm.admit(&b3).await,
             AdmitOutcome::Admitted {
@@ -679,7 +681,7 @@ mod tests {
             let (adm, storage, dag, _d) = harness();
             let g = root();
             adm.admit(&g).await;
-            let b2 = mk(2, g.header.block_hash, 1, [0x5A; 32]);
+            let b2 = mk(1, g.header.block_hash, 1, [0x5A; 32]);
             let h = b2.header.block_hash;
 
             // Replay the writes that had landed before the kill.
@@ -732,8 +734,8 @@ mod tests {
         let (adm, storage, dag, _d) = harness();
         let g = root();
         // b3's parent b2 is never admitted.
-        let b2 = mk(2, g.header.block_hash, 1, [0x5A; 32]);
-        let b3 = mk(3, b2.header.block_hash, 2, [0x5A; 32]);
+        let b2 = mk(1, g.header.block_hash, 1, [0x5A; 32]);
+        let b3 = mk(2, b2.header.block_hash, 2, [0x5A; 32]);
         adm.admit(&g).await;
 
         assert_eq!(
@@ -759,8 +761,8 @@ mod tests {
         let g = root();
         adm.admit(&g).await;
 
-        let b2 = mk(2, g.header.block_hash, 1, [0x5A; 32]);
-        let b3 = mk(3, b2.header.block_hash, 2, [0x5A; 32]);
+        let b2 = mk(1, g.header.block_hash, 1, [0x5A; 32]);
+        let b3 = mk(2, b2.header.block_hash, 2, [0x5A; 32]);
 
         // The hole: b2 in the DAG only (the interrupted admission).
         dag.store_block(b2.clone()).await.expect("dag");
@@ -769,7 +771,7 @@ mod tests {
         adm.admit(&b3).await;
         storage
             .blocks
-            .put_applied_tip(&g.header.block_hash, 1)
+            .put_applied_tip(&g.header.block_hash, 0)
             .expect("applied tip");
 
         assert!(!storage.blocks.has_block(&b2.header.block_hash).unwrap());
@@ -778,8 +780,8 @@ mod tests {
         assert!(report.repaired_anything());
         assert_eq!(
             report.chain_writes_completed,
-            vec![2],
-            "height 2 was the hole"
+            vec![1],
+            "height 1 was the hole"
         );
         assert!(storage.blocks.has_block(&b2.header.block_hash).unwrap());
         // The chain is now contiguous, so a drain can cross the old hole.
@@ -800,11 +802,11 @@ mod tests {
         let (adm, storage, _dag, _d) = harness();
         let g = root();
         adm.admit(&g).await;
-        let b2 = mk(2, g.header.block_hash, 1, [0x5A; 32]);
+        let b2 = mk(1, g.header.block_hash, 1, [0x5A; 32]);
         adm.admit(&b2).await;
         storage
             .blocks
-            .put_applied_tip(&b2.header.block_hash, 2)
+            .put_applied_tip(&b2.header.block_hash, 1)
             .expect("applied tip");
 
         let report = adm.reconcile().await;
@@ -819,17 +821,17 @@ mod tests {
         let (adm, storage, dag, _d) = harness();
         let g = root();
         adm.admit(&g).await;
-        let b2 = mk(2, g.header.block_hash, 1, [0x5A; 32]);
+        let b2 = mk(1, g.header.block_hash, 1, [0x5A; 32]);
 
         storage.blocks.put_block(&b2).expect("chain only");
         storage
             .blocks
-            .put_applied_tip(&g.header.block_hash, 1)
+            .put_applied_tip(&g.header.block_hash, 0)
             .expect("applied tip");
         assert!(!dag.has_block(&b2.header.block_hash).await);
 
         let report = adm.reconcile().await;
-        assert_eq!(report.dag_writes_completed, vec![2]);
+        assert_eq!(report.dag_writes_completed, vec![1]);
         assert!(dag.has_block(&b2.header.block_hash).await);
     }
 
