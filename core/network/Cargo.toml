@@ -35,6 +35,7 @@ sha3 = { workspace = true }
 parking_lot = { workspace = true }
 snow = "0.9"
 hex = "0.4"
+zeroize = "1.7"                 # Zeroize the Noise static private key (CRY-M1)
 
 [dev-dependencies]
 tokio-test = "0.4"
