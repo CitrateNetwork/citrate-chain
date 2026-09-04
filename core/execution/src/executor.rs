@@ -1,24 +1,41 @@
 // citrate/core/execution/src/executor.rs
 
+use crate::inference::metal_runtime::MetalRuntime;
 use crate::metrics::{PRECOMPILE_CALLS_TOTAL, VM_EXECUTIONS_TOTAL, VM_GAS_USED};
 use crate::mvcc::{CommitCoordinator, JournalHandle, ScratchJournal, WriteSet};
-use crate::precompiles::{PrecompileExecutor, inference::{InferenceMode, InferencePrecompile}};
-use crate::inference::metal_runtime::MetalRuntime;
+use crate::precompiles::{
+    inference::{InferenceMode, InferencePrecompile},
+    PrecompileExecutor,
+};
 use crate::state::StateDB;
 use crate::types::{
     AccessPolicy, Address, ExecutionError, GasSchedule, JobId, JobStatus, Log, ModelId,
     ModelMetadata, ModelState, TransactionReceipt, TransactionType,
 };
 use async_trait::async_trait;
-use hex;
 use citrate_consensus::types::{Block, Hash, Transaction};
+use hex;
 use primitive_types::U256;
-use std::time::Instant;
 use serde_json;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// Execution context for a transaction
+/// Extract a human-readable message from a caught panic payload
+/// (`Box<dyn Any + Send>` from `catch_unwind`). Panics carry either a
+/// `&'static str` or a `String`; anything else is reported generically.
+/// Used by EXEC-02 panic isolation in `execute_tx_into_journal`.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 pub struct ExecutionContext {
     pub block_number: u64,
     pub block_hash: Hash,
@@ -493,10 +510,9 @@ impl Executor {
                 Ok(runtime) => {
                     let inference_precompile =
                         InferencePrecompile::new_with_mode(Arc::new(runtime), inference_mode);
-                    let executor = PrecompileExecutor::new()
-                        .with_inference(inference_precompile);
+                    let executor = PrecompileExecutor::new().with_inference(inference_precompile);
                     Some(Arc::new(tokio::sync::RwLock::new(executor)))
-                },
+                }
                 Err(e) => {
                     warn!("Failed to initialize Metal runtime: {}", e);
                     None
@@ -596,10 +612,9 @@ impl Executor {
                 Ok(runtime) => {
                     let inference_precompile =
                         InferencePrecompile::new_with_mode(Arc::new(runtime), inference_mode);
-                    let executor = PrecompileExecutor::new()
-                        .with_inference(inference_precompile);
+                    let executor = PrecompileExecutor::new().with_inference(inference_precompile);
                     Some(Arc::new(tokio::sync::RwLock::new(executor)))
-                },
+                }
                 Err(e) => {
                     warn!("Failed to initialize Metal runtime: {}", e);
                     None
@@ -623,24 +638,16 @@ impl Executor {
             state_store.map(|s| s as Arc<dyn StateStoreTrait>);
         let commit_coordinator = Arc::new(CommitCoordinator::new());
         if let Some(store) = &state_store_dyn {
-            let account_versions = store
-                .get_all_account_versions()
-                .unwrap_or_else(|e| {
-                    warn!("account_versions eager-load failed: {} — starting fresh", e);
-                    Vec::new()
-                });
-            let persisted_global = store
-                .get_global_version()
-                .unwrap_or_else(|e| {
-                    warn!("global_version eager-load failed: {} — starting fresh", e);
-                    None
-                });
+            let account_versions = store.get_all_account_versions().unwrap_or_else(|e| {
+                warn!("account_versions eager-load failed: {} — starting fresh", e);
+                Vec::new()
+            });
+            let persisted_global = store.get_global_version().unwrap_or_else(|e| {
+                warn!("global_version eager-load failed: {} — starting fresh", e);
+                None
+            });
 
-            let max_account_v = account_versions
-                .iter()
-                .map(|(_, v)| *v)
-                .max()
-                .unwrap_or(0);
+            let max_account_v = account_versions.iter().map(|(_, v)| *v).max().unwrap_or(0);
             let global_to_restore = persisted_global.unwrap_or(0).max(max_account_v);
 
             // Restore per-account versions
@@ -715,10 +722,7 @@ impl Executor {
         &self.state_db
     }
 
-    fn get_account_from_store(
-        &self,
-        address: &Address,
-    ) -> Option<crate::types::AccountState> {
+    fn get_account_from_store(&self, address: &Address) -> Option<crate::types::AccountState> {
         self.state_store
             .as_ref()
             .and_then(|store| match store.get_account(address) {
@@ -732,10 +736,7 @@ impl Executor {
 
     /// Return the persisted "latest" account state when storage exists.
     /// Falls back to in-memory state for test-only or non-persistent executors.
-    pub fn get_canonical_account(
-        &self,
-        address: &Address,
-    ) -> crate::types::AccountState {
+    pub fn get_canonical_account(&self, address: &Address) -> crate::types::AccountState {
         self.get_account_from_store(address)
             .unwrap_or_else(|| self.state_db.accounts.get_account(address))
     }
@@ -760,18 +761,20 @@ impl Executor {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        tracing::error!("sync_model_to_registry: failed to build tokio runtime: {}", e);
+                        tracing::error!(
+                            "sync_model_to_registry: failed to build tokio runtime: {}",
+                            e
+                        );
                         return;
                     }
                 };
-                if let Err(e) = rt.block_on(adapter.register_model(
-                    model_id,
-                    &state,
-                    cid.as_deref(),
-                )) {
+                if let Err(e) =
+                    rt.block_on(adapter.register_model(model_id, &state, cid.as_deref()))
+                {
                     tracing::warn!(
                         "sync_model_to_registry: MCP registration failed for {:?}: {}",
-                        model_id, e
+                        model_id,
+                        e
                     );
                 } else {
                     tracing::info!(
@@ -868,7 +871,9 @@ impl Executor {
         }
 
         if let Some(account) = self.get_account_from_store(address) {
-            self.state_db.accounts.load_account(*address, account.clone());
+            self.state_db
+                .accounts
+                .load_account(*address, account.clone());
             return account.balance;
         }
 
@@ -882,7 +887,9 @@ impl Executor {
         }
 
         if let Some(account) = self.get_account_from_store(address) {
-            self.state_db.accounts.load_account(*address, account.clone());
+            self.state_db
+                .accounts
+                .load_account(*address, account.clone());
             return account.nonce;
         }
 
@@ -896,7 +903,9 @@ impl Executor {
         }
 
         if let Some(account) = self.get_account_from_store(address) {
-            self.state_db.accounts.load_account(*address, account.clone());
+            self.state_db
+                .accounts
+                .load_account(*address, account.clone());
             return account.code_hash;
         }
 
@@ -930,8 +939,7 @@ impl Executor {
 
     #[inline]
     fn defer_persist(&self) -> bool {
-        self.defer_persist
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.defer_persist.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Set account nonce
@@ -961,11 +969,9 @@ impl Executor {
         name: &str,
         created_at: u64,
     ) {
-        use sha3::{Digest, Keccak256};
-        use crate::types::{
-            ModelId, ModelMetadata, ModelState, AccessPolicy, UsageStats,
-        };
+        use crate::types::{AccessPolicy, ModelId, ModelMetadata, ModelState, UsageStats};
         use citrate_consensus::types::Hash;
+        use sha3::{Digest, Keccak256};
 
         let mut hasher = Keccak256::new();
         hasher.update(onnx_bytes);
@@ -1346,10 +1352,7 @@ impl Executor {
     /// VALIDATOR-S1 §R': restore a previously [`Self::capture_reward_policy`]d cell.
     /// The reorg driver calls this on every abort arm so a failed reorg never leaves
     /// the shared policy mutated (mirrors `state_restore` for world state).
-    pub fn restore_reward_policy(
-        &self,
-        policy: Option<crate::block_rewards::EpochRewardPolicy>,
-    ) {
+    pub fn restore_reward_policy(&self, policy: Option<crate::block_rewards::EpochRewardPolicy>) {
         *self.reward_policy.write() = policy;
     }
 
@@ -1678,12 +1681,13 @@ impl Executor {
             let pin = coord.current_version();
             context.journal.lock().pin_at(pin);
 
-            let (receipt, writes) = match self.execute_tx_into_journal(block, tx, &mut context).await {
-                Ok(pair) => pair,
-                // Validation errors (InvalidNonce, InsufficientBalance) are
-                // deterministic — no point retrying.
-                Err(e) => return Err(e),
-            };
+            let (receipt, writes) =
+                match self.execute_tx_into_journal(block, tx, &mut context).await {
+                    Ok(pair) => pair,
+                    // Validation errors (InvalidNonce, InsufficientBalance) are
+                    // deterministic — no point retrying.
+                    Err(e) => return Err(e),
+                };
 
             let outcome = {
                 let journal = context.journal.lock();
@@ -1726,16 +1730,10 @@ impl Executor {
     /// Sprint P950-A-4 WP-A.4.3. Non-fatal: failures are logged but do
     /// not abort the tx. A restart without persisted versions is
     /// conservatively-safe (in-memory tracker starts at v0).
-    fn persist_account_versions(
-        &self,
-        writes: &WriteSet,
-        new_version: crate::mvcc::ReadVersion,
-    ) {
+    fn persist_account_versions(&self, writes: &WriteSet, new_version: crate::mvcc::ReadVersion) {
         if let Some(store) = &self.state_store {
-            let entries: Vec<(Address, u64)> = writes
-                .iter()
-                .map(|a| (*a, new_version.as_u64()))
-                .collect();
+            let entries: Vec<(Address, u64)> =
+                writes.iter().map(|a| (*a, new_version.as_u64())).collect();
             if let Err(e) = store.put_account_versions(&entries) {
                 warn!("account_versions persistence failed (non-fatal): {}", e);
             }
@@ -1805,13 +1803,48 @@ impl Executor {
         // Sprint P950-A-5 WP-A.5.2: deduct gas cost into the journal rather
         // than state_db. REVM's `Database::basic` does journal-first lookup
         // so the EVM sees the post-deduction balance during execution.
-        context.journal.lock().record_balance(from, balance - gas_cost);
+        context
+            .journal
+            .lock()
+            .record_balance(from, balance - gas_cost);
 
         // Parse and execute transaction type.
         let tx_type = self.parse_transaction_type(tx)?;
-        let result = self
-            .execute_transaction_type(tx_type, context, from)
-            .await;
+
+        // EXEC-02 / WP-C3 — PANIC ISOLATION.
+        //
+        // Any panic inside transaction or precompile dispatch (e.g. an
+        // unchecked-arithmetic overflow on attacker-controlled input, with
+        // `overflow-checks = true` and no other unwind barrier in the crate)
+        // would otherwise unwind past `execute_transaction`, out of the block
+        // producer / validator task, and abort the process — a one-transaction
+        // chain halt. We poll the dispatch future under `catch_unwind` so a
+        // panic becomes an ordinary `Err`, which the failure arm below turns
+        // into a revert: `journal.discard_writes()` drops every partial
+        // mutation the panicking tx recorded (both pending balances/nonces and
+        // pending storage), so NOTHING it wrote is drained to `state_db`; only
+        // gas is burned and the nonce advances. The journal is a
+        // `parking_lot::Mutex` (non-poisoning) and every lock guard is released
+        // during unwinding, so it is safe to touch afterward. `AssertUnwindSafe`
+        // is sound precisely because we discard all writes on the caught-panic
+        // path — no logically-inconsistent state escapes.
+        use futures::future::FutureExt;
+        let result = match std::panic::AssertUnwindSafe(
+            self.execute_transaction_type(tx_type, context, from),
+        )
+        .catch_unwind()
+        .await
+        {
+            Ok(r) => r,
+            Err(panic_payload) => {
+                let msg = panic_payload_message(panic_payload.as_ref());
+                error!(
+                    "EXEC-02: panic isolated during tx {} dispatch, reverting: {}",
+                    tx.hash, msg
+                );
+                Err(ExecutionError::ExecutionPanicked(msg))
+            }
+        };
 
         // BFR-VM-1 WP-8 — capture the human-readable failure reason
         // before `result` is moved into the match below. Surfaced
@@ -1828,8 +1861,7 @@ impl Executor {
         let status = match result {
             Ok(()) => {
                 // Success: nonce increment + gas refund via journal.
-                let refund =
-                    U256::from(tx.gas_limit - context.gas_used) * U256::from(tx.gas_price);
+                let refund = U256::from(tx.gas_limit - context.gas_used) * U256::from(tx.gas_price);
                 let current_balance = {
                     let j = context.journal.lock();
                     j.pending_balance(&from)
@@ -1987,7 +2019,9 @@ impl Executor {
 
         // Override the sender balance/nonce ON THE ISOLATED state only.
         let from = crate::address_utils::normalize_address(&tx.from);
-        sim.state_db.accounts.set_balance(from, U256::from(u128::MAX));
+        sim.state_db
+            .accounts
+            .set_balance(from, U256::from(u128::MAX));
         let current_nonce = sim.state_db.accounts.get_nonce(&from);
         if tx.nonce != current_nonce {
             sim.state_db.accounts.set_nonce(from, tx.nonce);
@@ -2210,8 +2244,8 @@ impl Executor {
         let metadata_bytes = &data[offset..offset + meta_len];
         offset += meta_len;
 
-        let mut metadata: ModelMetadata = serde_json::from_slice(metadata_bytes)
-            .map_err(|_| ExecutionError::InvalidInput)?;
+        let mut metadata: ModelMetadata =
+            serde_json::from_slice(metadata_bytes).map_err(|_| ExecutionError::InvalidInput)?;
 
         if metadata.name.is_empty() {
             metadata.name = format!("Model-{}", hex::encode(&model_id.0.as_bytes()[..4]));
@@ -2528,6 +2562,15 @@ impl Executor {
         value: U256,
         context: &mut ExecutionContext,
     ) -> Result<(), ExecutionError> {
+        // EXEC-02 tripwire hook (test-only): a call to the sentinel address
+        // 0xEE..EE deliberately panics inside dispatch, exercising the
+        // `catch_unwind` panic-isolation barrier in `execute_tx_into_journal`.
+        // Compiled out of every non-test build.
+        #[cfg(test)]
+        if to == Address([0xEE; 20]) {
+            panic!("EXEC-02 deliberate test panic in dispatch");
+        }
+
         context.use_gas(self.gas_schedule.call)?;
 
         // Precompile dispatch first (value transfer handled by precompile if needed)
@@ -2821,15 +2864,23 @@ impl Executor {
             eta_bytes.copy_from_slice(&args[64..96]);
             let eta_u256 = primitive_types::U256::from_big_endian(&eta_bytes);
             let eta: u64 = eta_u256.try_into().unwrap_or(u64::MAX);
-            let dyn_start = 4 + off_usize;
-            if data.len() < dyn_start + 32 {
+            // CHAIN-B-B002 variant: `off_usize == usize::MAX` is rejected above,
+            // but `usize::MAX - 3` still overflows `4 + off_usize`. Use checked
+            // arithmetic so a malformed offset reverts rather than panicking.
+            let dyn_start = off_usize
+                .checked_add(4)
+                .ok_or(ExecutionError::InvalidInput)?;
+            let dyn_end = dyn_start
+                .checked_add(32)
+                .ok_or(ExecutionError::InvalidInput)?;
+            if data.len() < dyn_end {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut lenb = [0u8; 32];
-            lenb.copy_from_slice(&data[dyn_start..dyn_start + 32]);
+            lenb.copy_from_slice(&data[dyn_start..dyn_end]);
             let len = primitive_types::U256::from_big_endian(&lenb);
             let l: usize = len.try_into().unwrap_or(usize::MAX);
-            let val_start = dyn_start + 32;
+            let val_start = dyn_end;
             let val_end = val_start
                 .checked_add(l)
                 .ok_or(ExecutionError::InvalidInput)?;
@@ -2931,15 +2982,22 @@ impl Executor {
             if offset_usize == usize::MAX {
                 return Err(ExecutionError::InvalidInput);
             }
-            let dyn_start = 4 + offset_usize;
-            if data.len() < dyn_start + 32 {
+            // CHAIN-B-B002: checked ABI-offset arithmetic (variant of pin/status;
+            // `offset_usize` can be `usize::MAX - 3` and still overflow `4 + off`).
+            let dyn_start = offset_usize
+                .checked_add(4)
+                .ok_or(ExecutionError::InvalidInput)?;
+            let dyn_end = dyn_start
+                .checked_add(32)
+                .ok_or(ExecutionError::InvalidInput)?;
+            if data.len() < dyn_end {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut lb = [0u8; 32];
-            lb.copy_from_slice(&data[dyn_start..dyn_start + 32]);
+            lb.copy_from_slice(&data[dyn_start..dyn_end]);
             let len = primitive_types::U256::from_big_endian(&lb);
             let len_usize: usize = len.try_into().unwrap_or(usize::MAX);
-            let cid_start = dyn_start + 32;
+            let cid_start = dyn_end;
             let cid_end = cid_start
                 .checked_add(len_usize)
                 .ok_or(ExecutionError::InvalidInput)?;
@@ -3014,15 +3072,22 @@ impl Executor {
             if offset_usize == usize::MAX {
                 return Err(ExecutionError::InvalidInput);
             }
-            let dyn_start = 4 + offset_usize;
-            if data.len() < dyn_start + 32 {
+            // CHAIN-B-B002: checked ABI-offset arithmetic (variant of pin/status;
+            // `offset_usize` can be `usize::MAX - 3` and still overflow `4 + off`).
+            let dyn_start = offset_usize
+                .checked_add(4)
+                .ok_or(ExecutionError::InvalidInput)?;
+            let dyn_end = dyn_start
+                .checked_add(32)
+                .ok_or(ExecutionError::InvalidInput)?;
+            if data.len() < dyn_end {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut lb = [0u8; 32];
-            lb.copy_from_slice(&data[dyn_start..dyn_start + 32]);
+            lb.copy_from_slice(&data[dyn_start..dyn_end]);
             let len = primitive_types::U256::from_big_endian(&lb);
             let len_usize: usize = len.try_into().unwrap_or(usize::MAX);
-            let bytes_start = dyn_start + 32;
+            let bytes_start = dyn_end;
             let bytes_end = bytes_start
                 .checked_add(len_usize)
                 .ok_or(ExecutionError::InvalidInput)?;
@@ -3058,20 +3123,30 @@ impl Executor {
             let mut off = [0u8; 32];
             off.copy_from_slice(&args[0..32]);
             let offset = primitive_types::U256::from_big_endian(&off);
+            // CHAIN-B-B002: the ABI offset word is attacker-controlled.
+            // `unwrap_or(usize::MAX)` followed by `4 + off_usize` overflows and,
+            // under `overflow-checks = true` with no unwind barrier, PANICS the
+            // validator (chain halt). Use checked arithmetic so a malformed
+            // offset becomes a revert (`InvalidInput`), never a panic.
             let off_usize: usize = offset.try_into().unwrap_or(usize::MAX);
             let mut repb = [0u8; 32];
             repb.copy_from_slice(&args[32..64]);
             let replicas_u256 = primitive_types::U256::from_big_endian(&repb);
             let replicas: usize = replicas_u256.try_into().unwrap_or(1);
-            let dyn_start = 4 + off_usize;
-            if data.len() < dyn_start + 32 {
+            let dyn_start = off_usize
+                .checked_add(4)
+                .ok_or(ExecutionError::InvalidInput)?;
+            let dyn_end = dyn_start
+                .checked_add(32)
+                .ok_or(ExecutionError::InvalidInput)?;
+            if data.len() < dyn_end {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut lenb = [0u8; 32];
-            lenb.copy_from_slice(&data[dyn_start..dyn_start + 32]);
+            lenb.copy_from_slice(&data[dyn_start..dyn_end]);
             let len = primitive_types::U256::from_big_endian(&lenb);
             let l: usize = len.try_into().unwrap_or(usize::MAX);
-            let s = dyn_start + 32;
+            let s = dyn_end;
             let e = s.checked_add(l).ok_or(ExecutionError::InvalidInput)?;
             if data.len() < e {
                 return Err(ExecutionError::InvalidInput);
@@ -3090,16 +3165,23 @@ impl Executor {
             let mut off = [0u8; 32];
             off.copy_from_slice(&args[0..32]);
             let offset = primitive_types::U256::from_big_endian(&off);
+            // CHAIN-B-B002: see pin() above — checked arithmetic so an
+            // attacker-controlled ABI offset reverts instead of panicking.
             let off_usize: usize = offset.try_into().unwrap_or(usize::MAX);
-            let dyn_start = 4 + off_usize;
-            if data.len() < dyn_start + 32 {
+            let dyn_start = off_usize
+                .checked_add(4)
+                .ok_or(ExecutionError::InvalidInput)?;
+            let dyn_end = dyn_start
+                .checked_add(32)
+                .ok_or(ExecutionError::InvalidInput)?;
+            if data.len() < dyn_end {
                 return Err(ExecutionError::InvalidInput);
             }
             let mut lenb = [0u8; 32];
-            lenb.copy_from_slice(&data[dyn_start..dyn_start + 32]);
+            lenb.copy_from_slice(&data[dyn_start..dyn_end]);
             let len = primitive_types::U256::from_big_endian(&lenb);
             let l: usize = len.try_into().unwrap_or(usize::MAX);
-            let s = dyn_start + 32;
+            let s = dyn_end;
             let e = s.checked_add(l).ok_or(ExecutionError::InvalidInput)?;
             if data.len() < e {
                 return Err(ExecutionError::InvalidInput);
@@ -3554,10 +3636,9 @@ impl Executor {
         // matching the Solidity event signature an indexer would filter on.
         // The model hash sits in topics[1] as the indexed field.
         const MODEL_REGISTERED_TOPIC: [u8; 32] = [
-            0xa4, 0xb0, 0xaf, 0x38, 0xd0, 0x49, 0xba, 0x81,
-            0x70, 0x3a, 0x0d, 0x0e, 0x46, 0xcc, 0x2f, 0xf3,
-            0x96, 0x81, 0x21, 0x03, 0x02, 0x13, 0x40, 0x46,
-            0x23, 0x71, 0x11, 0xa8, 0xfb, 0x7d, 0xee, 0x72,
+            0xa4, 0xb0, 0xaf, 0x38, 0xd0, 0x49, 0xba, 0x81, 0x70, 0x3a, 0x0d, 0x0e, 0x46, 0xcc,
+            0x2f, 0xf3, 0x96, 0x81, 0x21, 0x03, 0x02, 0x13, 0x40, 0x46, 0x23, 0x71, 0x11, 0xa8,
+            0xfb, 0x7d, 0xee, 0x72,
         ];
         context.add_log(Log {
             address: from,
@@ -3606,7 +3687,8 @@ impl Executor {
                 }
             }
             if let Some(storage) = &self.ai_storage {
-                if let Err(err) = storage.update_model_weights(model_id, &cid, updated_model.version)
+                if let Err(err) =
+                    storage.update_model_weights(model_id, &cid, updated_model.version)
                 {
                     warn!(
                         "AI storage weight update failed for {:?}: {}",
@@ -3937,7 +4019,10 @@ mod tests {
         BlockBuilder::new()
             .height(100)
             .timestamp(1000000)
-            .vrf_reveal(VrfProof { proof: vec![], output: Hash::new([0x5A; 32]) })
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new([0x5A; 32]),
+            })
             .transactions(txs)
             .state_root(state_root)
             .build_unhashed()
@@ -3984,8 +4069,15 @@ mod tests {
             .apply_block(&blk, CB, &[(cb_addr, reward)])
             .await
             .expect("valid block must apply");
-        assert_eq!(got, expected, "apply_block must reproduce the claimed state_root");
-        assert_eq!(exec.get_balance(&bob_addr), U256::from(1000u64), "tx effect applied");
+        assert_eq!(
+            got, expected,
+            "apply_block must reproduce the claimed state_root"
+        );
+        assert_eq!(
+            exec.get_balance(&bob_addr),
+            U256::from(1000u64),
+            "tx effect applied"
+        );
         assert_eq!(exec.get_balance(&cb_addr), reward, "reward credited");
     }
 
@@ -4017,10 +4109,22 @@ mod tests {
         );
 
         // Invariant I3: world state byte-identical to before the rejected attempt.
-        assert_eq!(exec.calculate_state_root(), root_before, "state must be reverted");
-        assert_eq!(exec.get_balance(&bob_addr), U256::zero(), "tx effect reverted");
+        assert_eq!(
+            exec.calculate_state_root(),
+            root_before,
+            "state must be reverted"
+        );
+        assert_eq!(
+            exec.get_balance(&bob_addr),
+            U256::zero(),
+            "tx effect reverted"
+        );
         assert_eq!(exec.get_balance(&cb_addr), U256::zero(), "reward reverted");
-        assert_eq!(exec.get_balance(&alice_addr), fund, "sender balance restored");
+        assert_eq!(
+            exec.get_balance(&alice_addr),
+            fund,
+            "sender balance restored"
+        );
     }
 
     /// PIN-P1(d): end-to-end proof that the block-execution entrypoint surfaces
@@ -4057,10 +4161,9 @@ mod tests {
 
         // Known VRF output (stands in for header.vrf_reveal.output).
         let vrf_output: [u8; 32] = [
-            0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x02, 0x03, 0x04,
-            0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
-            0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14,
-            0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+            0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+            0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1A, 0x1B, 0x1C,
         ];
 
         // This mirrors exactly what produce_block does with the block header.
@@ -4295,11 +4398,7 @@ mod tests {
         // ADMIN storage slot here to mirror what genesis-block
         // bootstrap code does on a real chain, so the test can
         // continue exercising the queue/execute/get path.
-        state_db.set_storage(
-            gov_addr,
-            b"ADMIN".to_vec(),
-            admin_addr.0.to_vec(),
-        );
+        state_db.set_storage(gov_addr, b"ADMIN".to_vec(), admin_addr.0.to_vec());
         let mut gov_pk = [0u8; 32];
         gov_pk[..20].copy_from_slice(&gov_addr.0);
         let gov_pk = PublicKey::new(gov_pk);
@@ -4626,6 +4725,112 @@ mod tests {
         assert!(
             !receipt.status,
             "C-04: queueSetParam against uninitialized admin must fail"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // WP-C2/C3 — execution panic isolation (CHAIN-B-B002 + EXEC-02).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// CHAIN-B-B002 tripwire: `pin(string,uint256)` and `status(string)` with
+    /// an ABI offset word of `U256::MAX` must REVERT as `InvalidInput`, never
+    /// panic the executor via `4 + off_usize` overflow. Calls the precompile
+    /// dispatcher directly (below the EXEC-02 `catch_unwind` barrier), so this
+    /// pins the arithmetic fix on its own: on the unfixed code it panics with
+    /// "attempt to add with overflow" (RED); fixed, it returns `Err` (GREEN).
+    #[tokio::test]
+    async fn tripwire_b002_model_precompile_offset_overflow_reverts() {
+        use sha3::{Digest, Keccak256};
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db);
+        let block = create_test_block();
+        let from = Address([0xAB; 20]);
+        let tx = create_test_tx(PublicKey::new([1; 32]), Some(PublicKey::new([2; 32])), 0, 0);
+
+        // pin(string,uint256): args = offset(32) | replicas(32).
+        let sel_pin = &Keccak256::digest(b"pin(string,uint256)")[..4];
+        let mut pin_data = Vec::new();
+        pin_data.extend_from_slice(sel_pin);
+        pin_data.extend_from_slice(&[0xFF; 32]); // offset = U256::MAX
+        pin_data.extend_from_slice(&[0u8; 32]); // replicas
+        let mut ctx = ExecutionContext::new(&block, &tx);
+        let res = executor
+            .execute_model_precompile(&pin_data, from, &mut ctx)
+            .await;
+        assert!(
+            matches!(res, Err(ExecutionError::InvalidInput)),
+            "pin() with overflowing ABI offset must revert as InvalidInput, got {:?}",
+            res
+        );
+
+        // status(string): args = offset(32).
+        let sel_status = &Keccak256::digest(b"status(string)")[..4];
+        let mut status_data = Vec::new();
+        status_data.extend_from_slice(sel_status);
+        status_data.extend_from_slice(&[0xFF; 32]); // offset = U256::MAX
+        let mut ctx2 = ExecutionContext::new(&block, &tx);
+        let res2 = executor
+            .execute_model_precompile(&status_data, from, &mut ctx2)
+            .await;
+        assert!(
+            matches!(res2, Err(ExecutionError::InvalidInput)),
+            "status() with overflowing ABI offset must revert as InvalidInput, got {:?}",
+            res2
+        );
+    }
+
+    /// EXEC-02 tripwire: a panic raised inside transaction dispatch must be
+    /// isolated by `catch_unwind` and surface as a reverted receipt
+    /// (`status == false`) — the executor process must SURVIVE. Without the
+    /// barrier the panic unwinds out of `execute_transaction` and the test
+    /// (and, in production, the validator) aborts (RED).
+    #[tokio::test]
+    async fn tripwire_exec02_dispatch_panic_isolated_as_revert() {
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+
+        // Sender with funds for gas.
+        let mut from_pk = [0u8; 32];
+        from_pk[..20].copy_from_slice(&[0xAA; 20]);
+        let from_pk = PublicKey::new(from_pk);
+        let from_addr = Address([0xAA; 20]);
+        state_db
+            .accounts
+            .set_balance(from_addr, U256::from(1_000_000_000_000_000u128));
+
+        // Recipient 0xEE..EE triggers the test-only deliberate panic in
+        // execute_call (embedded-EVM pubkey: first 20 bytes = addr, rest zero).
+        let mut to_pk = [0u8; 32];
+        to_pk[..20].copy_from_slice(&[0xEE; 20]);
+        let to_pk = PublicKey::new(to_pk);
+
+        let block = create_test_block();
+        let tx = Transaction {
+            hash: Hash::new([0x77; 32]),
+            nonce: 0,
+            from: from_pk,
+            to: Some(to_pk),
+            value: 0,
+            gas_limit: 100000,
+            gas_price: 1_000_000_000,
+            data: vec![0xAB, 0xCD, 0xEF, 0x01], // non-empty → generic Call → panic hook
+            signature: Signature::new([0; 64]),
+            tx_type: None,
+            ..Default::default()
+        };
+
+        let receipt = executor
+            .execute_transaction(&block, &tx)
+            .await
+            .expect("panic in dispatch must be isolated as a revert, not propagated");
+        assert!(
+            !receipt.status,
+            "a panicking transaction must revert (status=false), not commit"
+        );
+        assert_eq!(
+            state_db.accounts.get_nonce(&from_addr),
+            1,
+            "nonce must advance on the isolated-panic revert (sender paid gas)"
         );
     }
 }
