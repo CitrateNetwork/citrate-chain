@@ -1,29 +1,29 @@
 // citrate/core/api/src/server.rs
 
 use crate::filter::FilterRegistry;
-use crate::rate_limit::{RateLimitConfig, RateLimiter};
-use crate::{ai_rpc, economics_rpc, eth_rpc};
 use crate::methods::{
     mempool::PendingQuery, AiApi, ChainApi, MempoolApi, NetworkApi, StateApi, TransactionApi,
 };
 use crate::metrics::rpc_request;
+use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{
     error::ApiError,
     request::{BlockId, CallRequest},
 };
+use crate::{ai_rpc, economics_rpc, eth_rpc};
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 // PIL-49: shared Tokio runtime so block_on can drive tokio::sync::* wakers.
 use crate::rpc_runtime::block_on;
-use jsonrpc_core::{IoHandler, Params, Value};
-use jsonrpc_http_server::CloseHandle;
-use jsonrpc_http_server::{AccessControlAllowOrigin, DomainsValidation, ServerBuilder};
 use citrate_consensus::types::Hash;
 use citrate_execution::executor::Executor;
 use citrate_execution::types::{AccessPolicy, Address};
 use citrate_network::peer::PeerManager;
 use citrate_sequencer::mempool::Mempool;
 use citrate_storage::StorageManager;
+use jsonrpc_core::{IoHandler, Params, Value};
+use jsonrpc_http_server::CloseHandle;
+use jsonrpc_http_server::{AccessControlAllowOrigin, DomainsValidation, ServerBuilder};
 use once_cell::sync::Lazy;
 use serde_json::json;
 use std::collections::HashMap;
@@ -62,8 +62,12 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// exercise the gate directly. RM-B1 / WP-C1.1 (audit H-API-01) uses
 /// this for `citrate_getMempoolSnapshot`; the emergency pause/resume/
 /// status methods use it as of SECREM-01.
-pub fn require_operator_auth(params: &serde_json::Map<String, Value>) -> Result<(), jsonrpc_core::Error> {
-    let configured_token = std::env::var("CITRATE_OPERATOR_TOKEN").ok().filter(|t| !t.is_empty());
+pub fn require_operator_auth(
+    params: &serde_json::Map<String, Value>,
+) -> Result<(), jsonrpc_core::Error> {
+    let configured_token = std::env::var("CITRATE_OPERATOR_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     let supplied_token = params.get("operator_token").and_then(|v| v.as_str());
 
     match (configured_token, supplied_token) {
@@ -102,20 +106,24 @@ pub fn require_operator_auth(params: &serde_json::Map<String, Value>) -> Result<
 }
 
 /// Helper function to parse optional u64 field from JSON Value
-fn parse_optional_u64_field(value: Option<&Value>, field_name: &str) -> Result<Option<u64>, jsonrpc_core::Error> {
+fn parse_optional_u64_field(
+    value: Option<&Value>,
+    field_name: &str,
+) -> Result<Option<u64>, jsonrpc_core::Error> {
     match value {
         Some(Value::String(s)) => {
             let trimmed = s.trim_start_matches("0x");
-            u64::from_str_radix(trimmed, 16)
-                .map(Some)
-                .map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid {} format", field_name)))
+            u64::from_str_radix(trimmed, 16).map(Some).map_err(|_| {
+                jsonrpc_core::Error::invalid_params(format!("Invalid {} format", field_name))
+            })
         }
-        Some(Value::Number(n)) => {
-            n.as_u64()
-                .map(Some)
-                .ok_or_else(|| jsonrpc_core::Error::invalid_params(format!("Invalid {} number", field_name)))
-        }
-        Some(_) => Err(jsonrpc_core::Error::invalid_params(format!("{} must be string or number", field_name))),
+        Some(Value::Number(n)) => n.as_u64().map(Some).ok_or_else(|| {
+            jsonrpc_core::Error::invalid_params(format!("Invalid {} number", field_name))
+        }),
+        Some(_) => Err(jsonrpc_core::Error::invalid_params(format!(
+            "{} must be string or number",
+            field_name
+        ))),
         None => Ok(None),
     }
 }
@@ -142,12 +150,18 @@ fn ipfs_add_blocking(data: Vec<u8>) -> Result<String, String> {
         let url = format!("{}/api/v0/add?pin=true", api_base);
         let part = reqwest::multipart::Part::bytes(data).file_name("artifact.bin");
         let form = reqwest::multipart::Form::new().part("file", part);
-        let resp = client.post(&url).multipart(form).send().await
+        let resp = client
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
             .map_err(|e| format!("IPFS upload error: {}", e))?;
         if !resp.status().is_success() {
             return Err(format!("IPFS status: {}", resp.status()));
         }
-        let json: serde_json::Value = resp.json().await
+        let json: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| format!("IPFS parse error: {}", e))?;
         let cid = json["Hash"].as_str().unwrap_or("").to_string();
         if cid.is_empty() {
@@ -173,7 +187,10 @@ fn ipfs_pin_blocking(cid: &str) -> Result<(), String> {
             .build()
             .map_err(|e| format!("client error: {}", e))?;
         let url = format!("{}/api/v0/pin/add?arg={}&timeout=5s", api_base, cid_owned);
-        let resp = client.post(&url).send().await
+        let resp = client
+            .post(&url)
+            .send()
+            .await
             .map_err(|e| format!("IPFS pin error: {}", e))?;
         if !resp.status().is_success() {
             return Err(format!("IPFS pin status: {}", resp.status()));
@@ -199,12 +216,10 @@ fn ipfs_status_blocking(cid: &str) -> Result<String, String> {
             .map_err(|e| format!("client error: {}", e))?;
         let url = format!("{}/api/v0/pin/ls?arg={}", api_base, cid_owned);
         let status = match client.post(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.text().await {
-                    Ok(body) if body.contains(&cid_owned) => "pinned",
-                    _ => "unpinned",
-                }
-            }
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(body) if body.contains(&cid_owned) => "pinned",
+                _ => "unpinned",
+            },
             _ => "unknown",
         };
         Ok(serde_json::json!([{"provider": api_base, "status": status}]).to_string())
@@ -438,7 +453,9 @@ pub struct RpcConfig {
 impl Default for RpcConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "127.0.0.1:8545".parse().unwrap_or_else(|e| panic!("valid hardcoded address: {e}")),
+            listen_addr: "127.0.0.1:8545"
+                .parse()
+                .unwrap_or_else(|e| panic!("valid hardcoded address: {e}")),
             max_connections: 100,
             // C-02 FIX: No wildcard CORS by default — prevents browser-to-localhost abuse
             cors_origins: vec!["http://localhost:*".to_string()],
@@ -533,6 +550,13 @@ impl RpcServer {
         // Create filter registry for eth_newFilter/eth_getFilterChanges
         let filter_registry = Arc::new(FilterRegistry::new());
 
+        // CHAIN-B-D003: start the stale-filter sweeper. Previously
+        // `cleanup_stale_filters()` had zero call sites, so an unauthenticated
+        // `eth_newFilter` flood grew retained heap for the process lifetime.
+        filter_registry
+            .clone()
+            .spawn_cleanup(std::time::Duration::from_secs(60));
+
         // Register Ethereum-compatible RPC methods
         // WP-I.3: Pass pause_flag so emergency methods are actually registered
         eth_rpc::register_eth_methods(
@@ -577,7 +601,11 @@ impl RpcServer {
         }
 
         // Register economics-related RPC methods
-        economics_rpc::register_economics_methods(&mut io_handler, economics_manager, Some(mempool.clone()));
+        economics_rpc::register_economics_methods(
+            &mut io_handler,
+            economics_manager,
+            Some(mempool.clone()),
+        );
 
         // Register AI-related RPC methods
         ai_rpc::register_ai_methods(
@@ -605,8 +633,11 @@ impl RpcServer {
         let mempool_ai_update = mempool.clone();
         io_handler.add_sync_method("citrate_updateModel", move |params: Params| {
             rpc_request("citrate_updateModel");
-            let _tx_api =
-                TransactionApi::new(mempool_ai_update.clone(), executor_ai_update.clone(), chain_id);
+            let _tx_api = TransactionApi::new(
+                mempool_ai_update.clone(),
+                executor_ai_update.clone(),
+                chain_id,
+            );
             let value: serde_json::Value = match params.parse() {
                 Ok(v) => v,
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
@@ -656,9 +687,9 @@ impl RpcServer {
 
             let mut model_bytes: Option<Vec<u8>> = None;
             if let Some(data_str) = map.get("model_data").and_then(|v| v.as_str()) {
-                let decoded = STANDARD
-                    .decode(data_str)
-                    .map_err(|_| jsonrpc_core::Error::invalid_params("Invalid base64 in 'model_data'"))?;
+                let decoded = STANDARD.decode(data_str).map_err(|_| {
+                    jsonrpc_core::Error::invalid_params("Invalid base64 in 'model_data'")
+                })?;
                 metadata_obj.insert("size_bytes".to_string(), json!(decoded.len()));
                 model_bytes = Some(decoded);
             }
@@ -714,7 +745,9 @@ impl RpcServer {
             let model_hash = citrate_consensus::types::Hash::new(model_id_array);
             let model_id = citrate_execution::types::ModelId(model_hash);
 
-            let existing = executor_ai_update.state_db().get_model(&model_id)
+            let existing = executor_ai_update
+                .state_db()
+                .get_model(&model_id)
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("Model not found"))?;
 
             // C-01 FIX: Validate caller ownership before allowing update
@@ -740,14 +773,26 @@ impl RpcServer {
 
             // Merge metadata: update only the fields that were provided
             let updated_metadata = citrate_execution::types::ModelMetadata {
-                name: metadata_obj.get("name").and_then(|v| v.as_str())
-                    .map(String::from).unwrap_or(existing.metadata.name.clone()),
-                version: metadata_obj.get("version").and_then(|v| v.as_str())
-                    .map(String::from).unwrap_or(existing.metadata.version.clone()),
-                description: metadata_obj.get("description").and_then(|v| v.as_str())
-                    .map(String::from).unwrap_or(existing.metadata.description.clone()),
-                framework: metadata_obj.get("framework").and_then(|v| v.as_str())
-                    .map(String::from).unwrap_or(existing.metadata.framework.clone()),
+                name: metadata_obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or(existing.metadata.name.clone()),
+                version: metadata_obj
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or(existing.metadata.version.clone()),
+                description: metadata_obj
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or(existing.metadata.description.clone()),
+                framework: metadata_obj
+                    .get("framework")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or(existing.metadata.framework.clone()),
                 input_shape: existing.metadata.input_shape.clone(),
                 output_shape: existing.metadata.output_shape.clone(),
                 size_bytes: existing.metadata.size_bytes,
@@ -763,8 +808,12 @@ impl RpcServer {
                 usage_stats: existing.usage_stats.clone(),
             };
 
-            executor_ai_update.state_db().update_model(model_id, updated_model)
-                .map_err(|e| jsonrpc_core::Error::invalid_params(format!("update failed: {}", e)))?;
+            executor_ai_update
+                .state_db()
+                .update_model(model_id, updated_model)
+                .map_err(|e| {
+                    jsonrpc_core::Error::invalid_params(format!("update failed: {}", e))
+                })?;
 
             if let Some(ref cid) = artifact_cid {
                 executor_ai_update.add_model_artifact(&model_hash, cid);
@@ -1050,12 +1099,14 @@ impl RpcServer {
             // Check sender balance covers value + gas
             let sender_addr = citrate_execution::address_utils::normalize_address(&tx.from);
             let balance = exec.get_canonical_account(&sender_addr).balance; // SRP-S4 WP-2.2: non-warming committed read
-            let gas_cost = primitive_types::U256::from(tx.gas_limit) * primitive_types::U256::from(tx.gas_price);
+            let gas_cost = primitive_types::U256::from(tx.gas_limit)
+                * primitive_types::U256::from(tx.gas_price);
             let total_cost = gas_cost + primitive_types::U256::from(tx.value);
             if balance < total_cost {
-                return Err(jsonrpc_core::Error::invalid_params(
-                    format!("Insufficient funds: account balance {} < required {}", balance, total_cost),
-                ));
+                return Err(jsonrpc_core::Error::invalid_params(format!(
+                    "Insufficient funds: account balance {} < required {}",
+                    balance, total_cost
+                )));
             }
 
             let hash = tx.hash;
@@ -1398,7 +1449,12 @@ impl RpcServer {
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
             // Try memory
-            if let Some(val) = VERIFICATIONS.read().unwrap_or_else(|e| e.into_inner()).get(&addr).cloned() {
+            if let Some(val) = VERIFICATIONS
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&addr)
+                .cloned()
+            {
                 return Ok(val);
             }
             // Try storage
@@ -1852,10 +1908,27 @@ impl RpcServer {
             let exec = executor_ai_deploy.clone();
 
             let model_metadata = citrate_execution::types::ModelMetadata {
-                name: metadata_obj.get("name").and_then(|v| v.as_str()).unwrap_or("Unnamed Model").to_string(),
-                version: metadata_obj.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0").to_string(),
-                description: metadata_obj.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                framework: metadata_obj.get("framework").or_else(|| metadata_obj.get("format")).and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
+                name: metadata_obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unnamed Model")
+                    .to_string(),
+                version: metadata_obj
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("1.0.0")
+                    .to_string(),
+                description: metadata_obj
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                framework: metadata_obj
+                    .get("framework")
+                    .or_else(|| metadata_obj.get("format"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string(),
                 input_shape: vec![1],
                 output_shape: vec![1],
                 size_bytes,
@@ -1876,14 +1949,19 @@ impl RpcServer {
                     1 => citrate_execution::types::AccessPolicy::Private,
                     2 => citrate_execution::types::AccessPolicy::Restricted(Vec::new()),
                     3 => citrate_execution::types::AccessPolicy::PayPerUse {
-                        fee: price_bytes.map(|p| primitive_types::U256::from_big_endian(&p)).unwrap_or_default(),
+                        fee: price_bytes
+                            .map(|p| primitive_types::U256::from_big_endian(&p))
+                            .unwrap_or_default(),
                     },
                     _ => citrate_execution::types::AccessPolicy::Public,
                 },
                 usage_stats: Default::default(),
             };
 
-            match exec.state_db().register_model(model_id, model_state.clone()) {
+            match exec
+                .state_db()
+                .register_model(model_id, model_state.clone())
+            {
                 Ok(()) => {
                     // Store artifact CID mapping
                     exec.add_model_artifact(&model_hash, &cid);
@@ -2054,7 +2132,9 @@ impl RpcServer {
                     })
                 })
                 .collect();
-            if let Some(l) = limit { models.truncate(l); }
+            if let Some(l) = limit {
+                models.truncate(l);
+            }
             Ok(serde_json::json!({ "models": models }))
         });
 
@@ -2097,7 +2177,9 @@ impl RpcServer {
                     })
                 })
                 .collect();
-            if let Some(l) = limit { models.truncate(l); }
+            if let Some(l) = limit {
+                models.truncate(l);
+            }
             Ok(serde_json::json!({ "models": models }))
         });
 
@@ -2182,13 +2264,11 @@ impl RpcServer {
                 timestamp,
                 now_secs,
             )
-            .map_err(|e| {
-                jsonrpc_core::Error::invalid_params(format!("inference auth: {e}"))
-            })?;
+            .map_err(|e| jsonrpc_core::Error::invalid_params(format!("inference auth: {e}")))?;
 
             // optional max_gas
-            let max_gas = parse_optional_u64_field(obj.get("max_gas"), "max_gas")?
-                .unwrap_or(1_000_000);
+            let max_gas =
+                parse_optional_u64_field(obj.get("max_gas"), "max_gas")?.unwrap_or(1_000_000);
 
             let res = match block_on(executor_ai_inf.run_inference_preview(
                 from_addr,
@@ -2206,14 +2286,11 @@ impl RpcServer {
             };
 
             // Try to decode output as JSON; fallback to base64
-            let (output_val, encoding) = match serde_json::from_slice::<serde_json::Value>(&res.output)
-            {
-                Ok(v) => (v, "json"),
-                Err(_) => (
-                    json!(STANDARD.encode(&res.output)),
-                    "base64",
-                ),
-            };
+            let (output_val, encoding) =
+                match serde_json::from_slice::<serde_json::Value>(&res.output) {
+                    Ok(v) => (v, "json"),
+                    Err(_) => (json!(STANDARD.encode(&res.output)), "base64"),
+                };
 
             Ok(json!({
                 "status": "success",
@@ -2340,16 +2417,17 @@ impl RpcServer {
                 timestamp,
                 now_secs,
             )
-            .map_err(|e| {
-                jsonrpc_core::Error::invalid_params(format!("inference auth: {e}"))
-            })?;
+            .map_err(|e| jsonrpc_core::Error::invalid_params(format!("inference auth: {e}")))?;
 
             // optional max_gas
-            let max_gas = parse_optional_u64_field(obj.get("max_gas"), "max_gas")?
-                .unwrap_or(1_000_000);
+            let max_gas =
+                parse_optional_u64_field(obj.get("max_gas"), "max_gas")?.unwrap_or(1_000_000);
 
             // optional with_proof (not used in preview other than returning proof if available)
-            let _with_proof = obj.get("with_proof").and_then(|v| v.as_bool()).unwrap_or(false);
+            let _with_proof = obj
+                .get("with_proof")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             // PIL-49b: use the shared rpc_runtime::block_on instead of the
             // per-call `std::thread::spawn + new_current_thread` dance. The
@@ -2374,14 +2452,14 @@ impl RpcServer {
             };
 
             // Try to decode output as JSON; fallback to base64
-            let (output_val, encoding) = match serde_json::from_slice::<serde_json::Value>(&res.output)
-            {
-                Ok(v) => (v, "json"),
-                Err(_) => (
-                    json!(base64::engine::general_purpose::STANDARD.encode(&res.output)),
-                    "base64",
-                ),
-            };
+            let (output_val, encoding) =
+                match serde_json::from_slice::<serde_json::Value>(&res.output) {
+                    Ok(v) => (v, "json"),
+                    Err(_) => (
+                        json!(base64::engine::general_purpose::STANDARD.encode(&res.output)),
+                        "base64",
+                    ),
+                };
 
             Ok(json!({
                 "output": output_val,
@@ -2596,8 +2674,8 @@ impl RpcServer {
             std::sync::mpsc::sync_channel::<Result<CloseHandle, String>>(1);
 
         let join_handle = std::thread::spawn(move || {
-            let mut builder = ServerBuilder::new(io)
-                .request_middleware(RateLimiter::new(rate_limit_config));
+            let mut builder =
+                ServerBuilder::new(io).request_middleware(RateLimiter::new(rate_limit_config));
             // WP-X.1: Config-driven CORS — wildcard only allowed on localhost
             if cors_origins.iter().any(|o| o == "*") {
                 tracing::warn!("CORS wildcard '*' configured — this is unsafe for public deployments. Use explicit origins in production.");
@@ -2612,8 +2690,7 @@ impl RpcServer {
                 builder = builder.cors(DomainsValidation::AllowOnly(origins));
             }
             // Empty cors_origins = no CORS headers (browser cross-origin blocked by default)
-            info!("RPC rate limiting enabled: {} req/{}s per IP",
-                  100, 1); // defaults
+            info!("RPC rate limiting enabled: {} req/{}s per IP", 100, 1); // defaults
             match builder
                 .max_request_body_size(10 * 1024 * 1024)
                 .threads(threads)
@@ -2768,11 +2845,8 @@ mod tests {
     fn add_test_tx(mempool: &Arc<Mempool>, nonce: u64, data: Vec<u8>) {
         // PIL-49: use the shared rpc_runtime so block_on can drive
         // tokio::sync::* wakers used inside Mempool::add_transaction.
-        block_on(mempool.add_transaction(
-            make_test_tx(nonce, data),
-            TxClass::Standard,
-        ))
-        .expect("test transaction admitted to relaxed mempool");
+        block_on(mempool.add_transaction(make_test_tx(nonce, data), TxClass::Standard))
+            .expect("test transaction admitted to relaxed mempool");
     }
 
     // PIL-49: needs multi_thread so rpc_runtime::block_on can use
@@ -2962,9 +3036,19 @@ mod tests {
         let resp = futures::executor::block_on(rpc.io_handler.handle_request(&req)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
 
-        assert!(v.get("error").is_none(), "T0-07 capped request failed: {}", v);
-        assert_eq!(v["result"]["limit"], crate::methods::mempool::MAX_PENDING_LIMIT);
-        assert_eq!(v["result"]["returned"], crate::methods::mempool::MAX_PENDING_LIMIT);
+        assert!(
+            v.get("error").is_none(),
+            "T0-07 capped request failed: {}",
+            v
+        );
+        assert_eq!(
+            v["result"]["limit"],
+            crate::methods::mempool::MAX_PENDING_LIMIT
+        );
+        assert_eq!(
+            v["result"]["returned"],
+            crate::methods::mempool::MAX_PENDING_LIMIT
+        );
         assert_eq!(v["result"]["truncated"], true);
         assert!(
             resp.len() < crate::methods::mempool::MAX_PENDING_RESPONSE_BYTES,
@@ -2979,8 +3063,7 @@ mod tests {
         let pending_idx = server_src
             .find("add_sync_method(\"mempool_getPending\"")
             .expect("server.rs must register mempool_getPending");
-        let pending_window =
-            &server_src[pending_idx..(pending_idx + 1_500).min(server_src.len())];
+        let pending_window = &server_src[pending_idx..(pending_idx + 1_500).min(server_src.len())];
         assert!(
             pending_window.contains("require_operator_auth"),
             "T0-07: mempool_getPending closure must require operator auth"

@@ -9,21 +9,54 @@ use crate::methods::{mempool::PendingQuery, ChainApi, MempoolApi, StateApi};
 // deadlocks — under chatbot load this stranded the RPC accept queue and
 // rpc.citrate.ai went silent while the node was still producing blocks.
 use crate::rpc_runtime::block_on;
-use hex;
-use jsonrpc_core::{IoHandler, Params, Value};
 use citrate_consensus::types::{Hash, Transaction};
+use citrate_economics::{
+    EstimationParams, InstitutionalOperatorProfile, InstitutionalRewardConfig,
+    InstitutionalRewardEstimator, InstitutionalSlashingConfig,
+};
 use citrate_execution::executor::Executor;
 use citrate_execution::types::Address;
 use citrate_sequencer::mempool::{Mempool, TxClass};
 use citrate_storage::StorageManager;
-use citrate_economics::{
-    InstitutionalRewardConfig, InstitutionalRewardEstimator, EstimationParams,
-    InstitutionalSlashingConfig, InstitutionalOperatorProfile,
-};
+use hex;
+use jsonrpc_core::{IoHandler, Params, Value};
 use primitive_types::U256;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// CHAIN-B-D002: hard ceiling on the gas limit an unauthenticated `eth_call` /
+/// `eth_estimateGas` may drive EVM execution with. `simulate_transaction` funds
+/// the sender with `u128::MAX`, so gas is never actually paid out and the ONLY
+/// bound on EVM work would otherwise be the caller's own number — four
+/// concurrent `gas = 0xffffffffffffffff` calls against an unbounded-loop
+/// contract wedged the public endpoint (documented past outage, PIL-49). geth's
+/// default `rpc.gascap` is 50M; match it.
+pub const RPC_GAS_CAP: u64 = 50_000_000;
+
+/// CHAIN-B-D002: wall-clock deadline for a single simulated call. Defense in
+/// depth behind the gas cap: bounds any call that stalls on an await point
+/// inside the executor rather than on gas.
+pub const RPC_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The all-zero logs bloom (256 bytes) returned for receipts/blocks that carry
+/// no bloom. Extracted to a named constant so the 512-char literal appears once;
+/// it also sidesteps a rustfmt internal bug that leaves trailing whitespace when
+/// formatting a `json!` macro containing a literal this long.
+const EMPTY_LOGS_BLOOM: &str = "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
+/// CHAIN-B-D002: reject a caller-supplied gas limit above the RPC gas cap.
+/// Extracted as a seam so the bound is unit-testable without standing up a
+/// full RPC server + executor.
+fn enforce_rpc_gas_cap(gas_limit: u64) -> Result<(), jsonrpc_core::Error> {
+    if gas_limit > RPC_GAS_CAP {
+        return Err(jsonrpc_core::Error::invalid_params(format!(
+            "gas limit {} exceeds the node RPC gas cap of {}",
+            gas_limit, RPC_GAS_CAP
+        )));
+    }
+    Ok(())
+}
 
 /// Build EIP-typed fields for a transaction JSON response.
 /// Appends `type`, `chainId`, and optionally `accessList`, `maxFeePerGas`,
@@ -121,7 +154,10 @@ fn pubkey_hex_opt_to_evm_address(hex_opt: Option<&String>) -> Option<String> {
     hex_opt.map(|s| pubkey_hex_to_evm_address(s))
 }
 
-fn eth_block_json(block: &crate::types::response::BlockResponse, transactions: Vec<Value>) -> Value {
+fn eth_block_json(
+    block: &crate::types::response::BlockResponse,
+    transactions: Vec<Value>,
+) -> Value {
     // PIL-50: GHOSTDAG topology fields. The consensus header already
     // carries blue_score / blue_work / selected_parent_hash /
     // merge_parent_hashes, but the public RPC was stripping them down to
@@ -166,7 +202,7 @@ fn eth_block_json(block: &crate::types::response::BlockResponse, transactions: V
         "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
         "nonce": "0x0000000000000000",
         "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
-        "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "logsBloom": EMPTY_LOGS_BLOOM,
         "transactionsRoot": format!("0x{}", hex::encode(block.tx_root.as_bytes())),
         "stateRoot": format!("0x{}", hex::encode(block.state_root.as_bytes())),
         "receiptsRoot": format!("0x{}", hex::encode(block.receipt_root.as_bytes())),
@@ -209,39 +245,41 @@ pub fn register_eth_methods(
     let storage_gbn = storage.clone();
     io_handler.add_sync_method("eth_getBlockByNumber", move |params: Params| {
         let api = ChainApi::new(storage_gbn.clone());
-        
+
         // Parse params: [blockNumber, includeTransactions]
         let params: Vec<Value> = match params.parse() {
             Ok(p) => p,
             Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
         };
-        
+
         if params.is_empty() {
             return Err(jsonrpc_core::Error::invalid_params("Missing block number"));
         }
-        
+
         // Parse includeTransactions flag (default false)
-        let include_transactions = params.get(1)
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        
+        let include_transactions = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+
         // Parse block number from hex string or "latest"
         let is_latest = params[0].as_str() == Some("latest");
         let block_number = match params[0].as_str() {
-            Some("latest") | Some("pending") => {
-                match block_on(api.get_height()) {
-                    Ok(h) => h,
-                    Err(_) => return Ok(Value::Null),
-                }
+            Some("latest") | Some("pending") => match block_on(api.get_height()) {
+                Ok(h) => h,
+                Err(_) => return Ok(Value::Null),
             },
             Some("earliest") => 0,
             Some(hex_str) if hex_str.starts_with("0x") => {
                 match u64::from_str_radix(&hex_str[2..], 16) {
                     Ok(n) => n,
-                    Err(_) => return Err(jsonrpc_core::Error::invalid_params("Invalid block number")),
+                    Err(_) => {
+                        return Err(jsonrpc_core::Error::invalid_params("Invalid block number"))
+                    }
                 }
-            },
-            _ => return Err(jsonrpc_core::Error::invalid_params("Invalid block number format")),
+            }
+            _ => {
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "Invalid block number format",
+                ))
+            }
         };
 
         // Get block from storage.
@@ -261,9 +299,10 @@ pub fn register_eth_methods(
         match block_result {
             Ok(block) => {
                 // Build transactions array based on includeTransactions flag
-                let transactions = if include_transactions {
-                    // Return full transaction objects
-                    block.transactions.iter().enumerate().map(|(index, tx)| {
+                let transactions =
+                    if include_transactions {
+                        // Return full transaction objects
+                        block.transactions.iter().enumerate().map(|(index, tx)| {
                         json!({
                             "hash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
                             "from": pubkey_hex_to_evm_address(&tx.from),
@@ -278,15 +317,19 @@ pub fn register_eth_methods(
                             "transactionIndex": format!("0x{:x}", index)
                         })
                     }).collect::<Vec<_>>()
-                } else {
-                    // Return just transaction hashes
-                    block.transactions.iter()
-                        .map(|tx| Value::String(format!("0x{}", hex::encode(tx.hash.as_bytes()))))
-                        .collect::<Vec<_>>()
-                };
-                
+                    } else {
+                        // Return just transaction hashes
+                        block
+                            .transactions
+                            .iter()
+                            .map(|tx| {
+                                Value::String(format!("0x{}", hex::encode(tx.hash.as_bytes())))
+                            })
+                            .collect::<Vec<_>>()
+                    };
+
                 Ok(eth_block_json(&block, transactions))
-            },
+            }
             Err(_) => Ok(Value::Null),
         }
     });
@@ -295,43 +338,42 @@ pub fn register_eth_methods(
     let storage_gbh = storage.clone();
     io_handler.add_sync_method("eth_getBlockByHash", move |params: Params| {
         let api = ChainApi::new(storage_gbh.clone());
-        
+
         let params: Vec<Value> = match params.parse() {
             Ok(p) => p,
             Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
         };
-        
+
         if params.is_empty() {
             return Err(jsonrpc_core::Error::invalid_params("Missing block hash"));
         }
-        
+
         // Parse includeTransactions flag (default false)
-        let include_transactions = params.get(1)
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        
+        let include_transactions = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+
         // Parse block hash
         let hash_str = match params[0].as_str() {
             Some(h) if h.starts_with("0x") => &h[2..],
             Some(h) => h,
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid hash format")),
         };
-        
+
         let hash_bytes = match hex::decode(hash_str) {
             Ok(b) if b.len() == 32 => {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&b);
                 arr
-            },
+            }
             _ => return Err(jsonrpc_core::Error::invalid_params("Invalid hash length")),
         };
-        
+
         match block_on(api.get_block(crate::types::request::BlockId::Hash(Hash::new(hash_bytes)))) {
             Ok(block) => {
                 // Build transactions array based on includeTransactions flag
-                let transactions = if include_transactions {
-                    // Return full transaction objects
-                    block.transactions.iter().enumerate().map(|(index, tx)| {
+                let transactions =
+                    if include_transactions {
+                        // Return full transaction objects
+                        block.transactions.iter().enumerate().map(|(index, tx)| {
                         json!({
                             "hash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
                             "from": pubkey_hex_to_evm_address(&tx.from),
@@ -346,15 +388,19 @@ pub fn register_eth_methods(
                             "transactionIndex": format!("0x{:x}", index)
                         })
                     }).collect::<Vec<_>>()
-                } else {
-                    // Return just transaction hashes
-                    block.transactions.iter()
-                        .map(|tx| Value::String(format!("0x{}", hex::encode(tx.hash.as_bytes()))))
-                        .collect::<Vec<_>>()
-                };
-                
+                    } else {
+                        // Return just transaction hashes
+                        block
+                            .transactions
+                            .iter()
+                            .map(|tx| {
+                                Value::String(format!("0x{}", hex::encode(tx.hash.as_bytes())))
+                            })
+                            .collect::<Vec<_>>()
+                    };
+
                 Ok(eth_block_json(&block, transactions))
-            },
+            }
             Err(_) => Ok(Value::Null),
         }
     });
@@ -364,40 +410,48 @@ pub fn register_eth_methods(
     let mempool_tx_lookup = mempool.clone();
     io_handler.add_sync_method("eth_getTransactionByHash", move |params: Params| {
         let api = ChainApi::new(storage_tx.clone());
-        
+
         let params: Vec<Value> = match params.parse() {
             Ok(p) => p,
             Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
         };
-        
+
         if params.is_empty() {
-            return Err(jsonrpc_core::Error::invalid_params("Missing transaction hash"));
+            return Err(jsonrpc_core::Error::invalid_params(
+                "Missing transaction hash",
+            ));
         }
-        
+
         let hash_str = match params[0].as_str() {
             Some(h) if h.starts_with("0x") => &h[2..],
             Some(h) => h,
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid hash format")),
         };
-        
+
         let hash_bytes = match hex::decode(hash_str) {
             Ok(b) if b.len() == 32 => {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&b);
                 arr
-            },
+            }
             _ => return Err(jsonrpc_core::Error::invalid_params("Invalid hash length")),
         };
-        
+
         let h = Hash::new(hash_bytes);
         match block_on(api.get_transaction(h)) {
             Ok(tx) => {
                 let from_hex = pubkey_hex_to_evm_address(&tx.from);
                 let to_hex_opt = pubkey_hex_opt_to_evm_address(tx.to.as_ref());
                 let mut obj = serde_json::Map::new();
-                obj.insert("hash".into(), json!(format!("0x{}", hex::encode(tx.hash.as_bytes()))));
+                obj.insert(
+                    "hash".into(),
+                    json!(format!("0x{}", hex::encode(tx.hash.as_bytes()))),
+                );
                 obj.insert("nonce".into(), json!(format!("0x{:x}", tx.nonce)));
-                obj.insert("blockHash".into(), json!("0x0000000000000000000000000000000000000000000000000000000000000000"));
+                obj.insert(
+                    "blockHash".into(),
+                    json!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+                );
                 obj.insert("blockNumber".into(), json!("0x0"));
                 obj.insert("transactionIndex".into(), json!("0x0"));
                 obj.insert("from".into(), json!(from_hex));
@@ -405,10 +459,19 @@ pub fn register_eth_methods(
                 obj.insert("value".into(), json!(format!("0x{:x}", tx.value)));
                 obj.insert("gasPrice".into(), json!(format!("0x{:x}", tx.gas_price)));
                 obj.insert("gas".into(), json!(format!("0x{:x}", tx.gas_limit)));
-                obj.insert("input".into(), json!(format!("0x{}", hex::encode(&tx.data))));
+                obj.insert(
+                    "input".into(),
+                    json!(format!("0x{}", hex::encode(&tx.data))),
+                );
                 obj.insert("v".into(), json!("0x1b"));
-                obj.insert("r".into(), json!("0x0000000000000000000000000000000000000000000000000000000000000000"));
-                obj.insert("s".into(), json!("0x0000000000000000000000000000000000000000000000000000000000000000"));
+                obj.insert(
+                    "r".into(),
+                    json!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+                );
+                obj.insert(
+                    "s".into(),
+                    json!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+                );
                 append_eip_fields(
                     &mut obj,
                     tx.eth_tx_type,
@@ -418,27 +481,48 @@ pub fn register_eth_methods(
                     &tx.access_list,
                 );
                 Ok(Value::Object(obj))
-            },
+            }
             Err(_) => {
                 // Fallback: check mempool for pending transaction
                 if let Some(tx) = block_on(mempool_tx_lookup.get_transaction(&h)) {
                     let from_addr = citrate_execution::address_utils::normalize_address(&tx.from);
-                    let to_addr_opt = tx.to.as_ref().map(citrate_execution::address_utils::normalize_address);
+                    let to_addr_opt = tx
+                        .to
+                        .as_ref()
+                        .map(citrate_execution::address_utils::normalize_address);
                     let mut obj = serde_json::Map::new();
-                    obj.insert("hash".into(), json!(format!("0x{}", hex::encode(tx.hash.as_bytes()))));
+                    obj.insert(
+                        "hash".into(),
+                        json!(format!("0x{}", hex::encode(tx.hash.as_bytes()))),
+                    );
                     obj.insert("nonce".into(), json!(format!("0x{:x}", tx.nonce)));
                     obj.insert("blockHash".into(), Value::Null);
                     obj.insert("blockNumber".into(), Value::Null);
                     obj.insert("transactionIndex".into(), Value::Null);
-                    obj.insert("from".into(), json!(format!("0x{}", hex::encode(from_addr.0))));
-                    obj.insert("to".into(), json!(to_addr_opt.map(|a| format!("0x{}", hex::encode(a.0)))));
+                    obj.insert(
+                        "from".into(),
+                        json!(format!("0x{}", hex::encode(from_addr.0))),
+                    );
+                    obj.insert(
+                        "to".into(),
+                        json!(to_addr_opt.map(|a| format!("0x{}", hex::encode(a.0)))),
+                    );
                     obj.insert("value".into(), json!(format!("0x{:x}", tx.value)));
                     obj.insert("gasPrice".into(), json!(format!("0x{:x}", tx.gas_price)));
                     obj.insert("gas".into(), json!(format!("0x{:x}", tx.gas_limit)));
-                    obj.insert("input".into(), json!(format!("0x{}", hex::encode(&tx.data))));
+                    obj.insert(
+                        "input".into(),
+                        json!(format!("0x{}", hex::encode(&tx.data))),
+                    );
                     obj.insert("v".into(), json!("0x1b"));
-                    obj.insert("r".into(), json!("0x0000000000000000000000000000000000000000000000000000000000000000"));
-                    obj.insert("s".into(), json!("0x0000000000000000000000000000000000000000000000000000000000000000"));
+                    obj.insert(
+                        "r".into(),
+                        json!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+                    );
+                    obj.insert(
+                        "s".into(),
+                        json!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+                    );
                     append_eip_fields(
                         &mut obj,
                         tx.eth_tx_type,
@@ -451,7 +535,7 @@ pub fn register_eth_methods(
                 } else {
                     Ok(Value::Null)
                 }
-            },
+            }
         }
     });
 
@@ -459,31 +543,33 @@ pub fn register_eth_methods(
     let storage_rcpt = storage.clone();
     io_handler.add_sync_method("eth_getTransactionReceipt", move |params: Params| {
         let api = ChainApi::new(storage_rcpt.clone());
-        
+
         let params: Vec<Value> = match params.parse() {
             Ok(p) => p,
             Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
         };
-        
+
         if params.is_empty() {
-            return Err(jsonrpc_core::Error::invalid_params("Missing transaction hash"));
+            return Err(jsonrpc_core::Error::invalid_params(
+                "Missing transaction hash",
+            ));
         }
-        
+
         let hash_str = match params[0].as_str() {
             Some(h) if h.starts_with("0x") => &h[2..],
             Some(h) => h,
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid hash format")),
         };
-        
+
         let hash_bytes = match hex::decode(hash_str) {
             Ok(b) if b.len() == 32 => {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&b);
                 arr
-            },
+            }
             _ => return Err(jsonrpc_core::Error::invalid_params("Invalid hash length")),
         };
-        
+
         match block_on(api.get_receipt(Hash::new(hash_bytes))) {
             Ok(receipt) => {
                 // Derive contractAddress if deployment output encodes address
@@ -517,11 +603,11 @@ pub fn register_eth_methods(
                         "removed": false
                     })).collect::<Vec<_>>(),
                     "status": if receipt.status { "0x1" } else { "0x0" },
-                    "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                    "logsBloom": EMPTY_LOGS_BLOOM,
                     "type": format!("0x{:x}", receipt.eth_tx_type),
                     "effectiveGasPrice": format!("0x{:x}", receipt.effective_gas_price)
                 }))
-            },
+            }
             Err(_) => Ok(Value::Null),
         }
     });
@@ -537,9 +623,7 @@ pub fn register_eth_methods(
     // `RpcServer::with_economics_and_pause` and OVERRIDES this (last registration
     // wins) when the node wires its sync driver in; standalone/test callers of
     // register_eth_methods keep this simple default.
-    io_handler.add_sync_method("eth_syncing", move |_params: Params| {
-        Ok(Value::Bool(false))
-    });
+    io_handler.add_sync_method("eth_syncing", move |_params: Params| Ok(Value::Bool(false)));
 
     // net_peerCount handled in server.rs with NetworkApi to reflect real peers
 
@@ -787,7 +871,8 @@ pub fn register_eth_methods(
             if tx_chain_id != raw_tx_chain_id {
                 tracing::error!(
                     "Chain ID mismatch: tx has {}, node expects {}",
-                    tx_chain_id, raw_tx_chain_id
+                    tx_chain_id,
+                    raw_tx_chain_id
                 );
                 return Err(jsonrpc_core::Error {
                     code: jsonrpc_core::ErrorCode::InvalidParams,
@@ -809,7 +894,8 @@ pub fn register_eth_methods(
             if sender_balance < tx_cost {
                 tracing::error!(
                     "Insufficient balance: sender has {}, tx requires {}",
-                    sender_balance, tx_cost
+                    sender_balance,
+                    tx_cost
                 );
                 return Err(jsonrpc_core::Error {
                     code: jsonrpc_core::ErrorCode::InvalidParams,
@@ -919,9 +1005,13 @@ pub fn register_eth_methods(
         let value_u128: u128 = if let Some(vs) = obj.get("value").and_then(|v| v.as_str()) {
             let s = vs.trim();
             if let Some(hexs) = s.strip_prefix("0x") {
-                u128::from_str_radix(hexs, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex value: {}", vs)))?
+                u128::from_str_radix(hexs, 16).map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!("Invalid hex value: {}", vs))
+                })?
             } else {
-                s.parse::<u128>().map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid value: {}", vs)))?
+                s.parse::<u128>().map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!("Invalid value: {}", vs))
+                })?
             }
         } else {
             0u128
@@ -931,20 +1021,31 @@ pub fn register_eth_methods(
         let gas_limit: u64 = if let Some(gs) = obj.get("gas").and_then(|v| v.as_str()) {
             let s = gs.trim();
             if let Some(hexs) = s.strip_prefix("0x") {
-                u64::from_str_radix(hexs, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex gas: {}", gs)))?
+                u64::from_str_radix(hexs, 16).map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!("Invalid hex gas: {}", gs))
+                })?
             } else {
-                s.parse::<u64>().map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid gas: {}", gs)))?
+                s.parse::<u64>().map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!("Invalid gas: {}", gs))
+                })?
             }
         } else {
             1_000_000
         };
 
+        // CHAIN-B-D002: bound EVM work by rejecting an over-cap gas limit.
+        enforce_rpc_gas_cap(gas_limit)?;
+
         let gas_price: u64 = if let Some(gps) = obj.get("gasPrice").and_then(|v| v.as_str()) {
             let s = gps.trim();
             if let Some(hexs) = s.strip_prefix("0x") {
-                u64::from_str_radix(hexs, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex gasPrice: {}", gps)))?
+                u64::from_str_radix(hexs, 16).map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!("Invalid hex gasPrice: {}", gps))
+                })?
             } else {
-                s.parse::<u64>().map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid gasPrice: {}", gps)))?
+                s.parse::<u64>().map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!("Invalid gasPrice: {}", gps))
+                })?
             }
         } else {
             1
@@ -989,7 +1090,24 @@ pub fn register_eth_methods(
 
         // Simulate without persisting state — avoids race condition where
         // the block producer could persist the inflated balance to RocksDB.
-        let res = block_on(exec.simulate_transaction(&blk, &tx));
+        // CHAIN-B-D002: bound the call by a wall-clock deadline in addition to
+        // the gas cap, so a single request cannot occupy an RPC worker forever.
+        let res = match block_on(tokio::time::timeout(
+            RPC_CALL_TIMEOUT,
+            exec.simulate_transaction(&blk, &tx),
+        )) {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::ServerError(-32000),
+                    message: format!(
+                        "call exceeded the {}s execution deadline",
+                        RPC_CALL_TIMEOUT.as_secs()
+                    ),
+                    data: None,
+                });
+            }
+        };
 
         match res {
             Ok(receipt) => {
@@ -1003,9 +1121,8 @@ pub fn register_eth_methods(
                 // jsonrpc_core::Error code -32000 ("execution
                 // reverted") with the reason in the message.
                 if !receipt.status {
-                    let mut err = jsonrpc_core::Error::new(
-                        jsonrpc_core::ErrorCode::ServerError(-32000),
-                    );
+                    let mut err =
+                        jsonrpc_core::Error::new(jsonrpc_core::ErrorCode::ServerError(-32000));
                     err.message = match receipt.revert_reason.as_deref() {
                         Some(r) => format!("execution reverted: {r}"),
                         None => "execution reverted (no reason)".to_string(),
@@ -1094,7 +1211,9 @@ pub fn register_eth_methods(
         // data (optional)
         let data = if let Some(d) = obj.get("data").and_then(|v| v.as_str()) {
             let ds = d.trim().trim_start_matches("0x");
-            hex::decode(ds).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex data: {}", d)))?
+            hex::decode(ds).map_err(|_| {
+                jsonrpc_core::Error::invalid_params(format!("Invalid hex data: {}", d))
+            })?
         } else {
             Vec::new()
         };
@@ -1103,9 +1222,13 @@ pub fn register_eth_methods(
         let value_u128: u128 = if let Some(vs) = obj.get("value").and_then(|v| v.as_str()) {
             let s = vs.trim();
             if let Some(hexs) = s.strip_prefix("0x") {
-                u128::from_str_radix(hexs, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex value: {}", vs)))?
+                u128::from_str_radix(hexs, 16).map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!("Invalid hex value: {}", vs))
+                })?
             } else {
-                s.parse::<u128>().map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid value: {}", vs)))?
+                s.parse::<u128>().map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!("Invalid value: {}", vs))
+                })?
             }
         } else {
             0
@@ -1115,13 +1238,20 @@ pub fn register_eth_methods(
         let gas_limit: u64 = if let Some(gs) = obj.get("gas").and_then(|v| v.as_str()) {
             let s = gs.trim();
             if let Some(hexs) = s.strip_prefix("0x") {
-                u64::from_str_radix(hexs, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex gas: {}", gs)))?
+                u64::from_str_radix(hexs, 16).map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!("Invalid hex gas: {}", gs))
+                })?
             } else {
-                s.parse::<u64>().map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid gas: {}", gs)))?
+                s.parse::<u64>().map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!("Invalid gas: {}", gs))
+                })?
             }
         } else {
             15_000_000 // Default to block gas limit for estimation
         };
+
+        // CHAIN-B-D002: bound EVM work by rejecting an over-cap gas limit.
+        enforce_rpc_gas_cap(gas_limit)?;
 
         // Check if this is a simple transfer (no data, has to address)
         if data.is_empty() && to_pk.is_some() {
@@ -1189,7 +1319,24 @@ pub fn register_eth_methods(
 
         // Simulate without persisting state — avoids race condition where
         // the block producer could persist the inflated balance to RocksDB.
-        let res = block_on(exec.simulate_transaction(&blk, &tx));
+        // CHAIN-B-D002: bound the call by a wall-clock deadline in addition to
+        // the gas cap, so a single request cannot occupy an RPC worker forever.
+        let res = match block_on(tokio::time::timeout(
+            RPC_CALL_TIMEOUT,
+            exec.simulate_transaction(&blk, &tx),
+        )) {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::ServerError(-32000),
+                    message: format!(
+                        "call exceeded the {}s execution deadline",
+                        RPC_CALL_TIMEOUT.as_secs()
+                    ),
+                    data: None,
+                });
+            }
+        };
 
         match res {
             Ok(receipt) => {
@@ -1253,7 +1400,8 @@ pub fn register_eth_methods(
         };
 
         // Parse block count (default 1)
-        let block_count: u64 = params.first()
+        let block_count: u64 = params
+            .first()
             .and_then(|v| v.as_str())
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
             .unwrap_or(1)
@@ -1281,11 +1429,10 @@ pub fn register_eth_methods(
         let mut rewards: Vec<Vec<String>> = Vec::new();
 
         // Parse reward percentiles if provided
-        let percentiles: Vec<f64> = params.get(2)
+        let percentiles: Vec<f64> = params
+            .get(2)
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter()
-                .filter_map(|p| p.as_f64())
-                .collect())
+            .map(|arr| arr.iter().filter_map(|p| p.as_f64()).collect())
             .unwrap_or_default();
 
         for height in start_height..=current_height {
@@ -1310,7 +1457,9 @@ pub fn register_eth_methods(
                         let mut has_receipt_data = false;
 
                         for tx in &block.transactions {
-                            if let Ok(Some(receipt)) = storage_fee.transactions.get_receipt(&tx.hash) {
+                            if let Ok(Some(receipt)) =
+                                storage_fee.transactions.get_receipt(&tx.hash)
+                            {
                                 gas_from_receipts += receipt.gas_used;
                                 has_receipt_data = true;
                             }
@@ -1320,7 +1469,9 @@ pub fn register_eth_methods(
                             gas_from_receipts
                         } else {
                             // Last resort: estimate from transactions
-                            block.transactions.iter()
+                            block
+                                .transactions
+                                .iter()
                                 .map(|tx| {
                                     if tx.to.is_none() {
                                         tx.gas_limit.min(100_000) // Contract creation
@@ -1346,18 +1497,24 @@ pub fn register_eth_methods(
                         let target_gas = block_gas_limit / 2;
                         if total_gas_used > target_gas {
                             let delta = total_gas_used - target_gas;
-                            1_000_000_000_u64 + (delta as f64 / target_gas as f64 * 125_000_000.0) as u64
+                            1_000_000_000_u64
+                                + (delta as f64 / target_gas as f64 * 125_000_000.0) as u64
                         } else {
                             let delta = target_gas - total_gas_used;
-                            1_000_000_000_u64.saturating_sub((delta as f64 / target_gas as f64 * 125_000_000.0) as u64)
-                        }.max(1_000_000_000)
+                            1_000_000_000_u64.saturating_sub(
+                                (delta as f64 / target_gas as f64 * 125_000_000.0) as u64,
+                            )
+                        }
+                        .max(1_000_000_000)
                     };
                     base_fees.push(format!("0x{:x}", base_fee));
 
                     // Calculate reward percentiles from transactions (priority fees)
                     // For legacy transactions, tip = gas_price - base_fee
                     if !percentiles.is_empty() && !block.transactions.is_empty() {
-                        let mut tips: Vec<u64> = block.transactions.iter()
+                        let mut tips: Vec<u64> = block
+                            .transactions
+                            .iter()
                             .map(|tx| tx.gas_price.saturating_sub(base_fee))
                             .collect();
                         tips.sort();
@@ -1387,7 +1544,12 @@ pub fn register_eth_methods(
         }
 
         // Add one more base fee for the next block
-        base_fees.push(base_fees.last().cloned().unwrap_or_else(|| "0x3b9aca00".to_string()));
+        base_fees.push(
+            base_fees
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "0x3b9aca00".to_string()),
+        );
 
         Ok(json!({
             "oldestBlock": format!("0x{:x}", start_height),
@@ -1427,22 +1589,37 @@ pub fn register_eth_methods(
         let from_block = match filter.get("fromBlock").and_then(|v| v.as_str()) {
             Some("latest") | Some("pending") => current_height,
             Some("earliest") => 0,
-            Some(hex_str) if hex_str.starts_with("0x") => {
-                u64::from_str_radix(&hex_str[2..], 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex fromBlock: {}", hex_str)))?
-            }
+            Some(hex_str) if hex_str.starts_with("0x") => u64::from_str_radix(&hex_str[2..], 16)
+                .map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!(
+                        "Invalid hex fromBlock: {}",
+                        hex_str
+                    ))
+                })?,
             None => 0,
-            Some(other) => return Err(jsonrpc_core::Error::invalid_params(format!("Invalid fromBlock: {}", other))),
+            Some(other) => {
+                return Err(jsonrpc_core::Error::invalid_params(format!(
+                    "Invalid fromBlock: {}",
+                    other
+                )))
+            }
         };
 
         // Parse toBlock (default to latest)
         let to_block = match filter.get("toBlock").and_then(|v| v.as_str()) {
             Some("latest") | Some("pending") => current_height,
             Some("earliest") => 0,
-            Some(hex_str) if hex_str.starts_with("0x") => {
-                u64::from_str_radix(&hex_str[2..], 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex toBlock: {}", hex_str)))?
-            }
+            Some(hex_str) if hex_str.starts_with("0x") => u64::from_str_radix(&hex_str[2..], 16)
+                .map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!("Invalid hex toBlock: {}", hex_str))
+                })?,
             None => current_height,
-            Some(other) => return Err(jsonrpc_core::Error::invalid_params(format!("Invalid toBlock: {}", other))),
+            Some(other) => {
+                return Err(jsonrpc_core::Error::invalid_params(format!(
+                    "Invalid toBlock: {}",
+                    other
+                )))
+            }
         };
 
         // Limit block range to prevent excessive queries
@@ -1465,24 +1642,22 @@ pub fn register_eth_methods(
                     vec![]
                 }
             }
-            Some(Value::Array(addrs)) => {
-                addrs
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .filter_map(|addr_str| {
-                        let addr_hex = addr_str.trim_start_matches("0x");
-                        hex::decode(addr_hex).ok().and_then(|bytes| {
-                            if bytes.len() == 20 {
-                                let mut arr = [0u8; 20];
-                                arr.copy_from_slice(&bytes);
-                                Some(Address(arr))
-                            } else {
-                                None
-                            }
-                        })
+            Some(Value::Array(addrs)) => addrs
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|addr_str| {
+                    let addr_hex = addr_str.trim_start_matches("0x");
+                    hex::decode(addr_hex).ok().and_then(|bytes| {
+                        if bytes.len() == 20 {
+                            let mut arr = [0u8; 20];
+                            arr.copy_from_slice(&bytes);
+                            Some(Address(arr))
+                        } else {
+                            None
+                        }
                     })
-                    .collect()
-            }
+                })
+                .collect(),
             _ => vec![],
         };
 
@@ -1551,7 +1726,10 @@ pub fn register_eth_methods(
             };
 
             // Get all transaction hashes in this block
-            let tx_hashes = match storage_logs.transactions.get_block_transactions(&block_hash) {
+            let tx_hashes = match storage_logs
+                .transactions
+                .get_block_transactions(&block_hash)
+            {
                 Ok(hashes) => hashes,
                 Err(_) => continue,
             };
@@ -1666,81 +1844,80 @@ pub fn register_eth_methods(
                     vec![]
                 }
             }
-            Some(Value::Array(addrs)) => {
-                addrs
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .filter_map(|addr_str| {
-                        let addr_hex = addr_str.trim_start_matches("0x");
-                        hex::decode(addr_hex).ok().and_then(|bytes| {
-                            if bytes.len() == 20 {
-                                let mut arr = [0u8; 20];
-                                arr.copy_from_slice(&bytes);
-                                Some(Address(arr))
-                            } else {
-                                None
-                            }
-                        })
+            Some(Value::Array(addrs)) => addrs
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|addr_str| {
+                    let addr_hex = addr_str.trim_start_matches("0x");
+                    hex::decode(addr_hex).ok().and_then(|bytes| {
+                        if bytes.len() == 20 {
+                            let mut arr = [0u8; 20];
+                            arr.copy_from_slice(&bytes);
+                            Some(Address(arr))
+                        } else {
+                            None
+                        }
                     })
-                    .collect()
-            }
+                })
+                .collect(),
             _ => vec![],
         };
 
         // Parse topics filter
         let topics: Vec<Option<Vec<Hash>>> = match filter.get("topics") {
-            Some(Value::Array(topics)) => {
-                topics
-                    .iter()
-                    .map(|topic_entry| {
-                        match topic_entry {
-                            Value::Null => None,
-                            Value::String(hash_str) => {
+            Some(Value::Array(topics)) => topics
+                .iter()
+                .map(|topic_entry| match topic_entry {
+                    Value::Null => None,
+                    Value::String(hash_str) => {
+                        let hash_hex = hash_str.trim_start_matches("0x");
+                        hex::decode(hash_hex).ok().and_then(|bytes| {
+                            if bytes.len() == 32 {
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(&bytes);
+                                Some(vec![Hash::new(arr)])
+                            } else {
+                                None
+                            }
+                        })
+                    }
+                    Value::Array(hashes) => {
+                        let parsed: Vec<Hash> = hashes
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .filter_map(|hash_str| {
                                 let hash_hex = hash_str.trim_start_matches("0x");
                                 hex::decode(hash_hex).ok().and_then(|bytes| {
                                     if bytes.len() == 32 {
                                         let mut arr = [0u8; 32];
                                         arr.copy_from_slice(&bytes);
-                                        Some(vec![Hash::new(arr)])
+                                        Some(Hash::new(arr))
                                     } else {
                                         None
                                     }
                                 })
-                            }
-                            Value::Array(hashes) => {
-                                let parsed: Vec<Hash> = hashes
-                                    .iter()
-                                    .filter_map(|v| v.as_str())
-                                    .filter_map(|hash_str| {
-                                        let hash_hex = hash_str.trim_start_matches("0x");
-                                        hex::decode(hash_hex).ok().and_then(|bytes| {
-                                            if bytes.len() == 32 {
-                                                let mut arr = [0u8; 32];
-                                                arr.copy_from_slice(&bytes);
-                                                Some(Hash::new(arr))
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                    })
-                                    .collect();
-                                if parsed.is_empty() { None } else { Some(parsed) }
-                            }
-                            _ => None,
+                            })
+                            .collect();
+                        if parsed.is_empty() {
+                            None
+                        } else {
+                            Some(parsed)
                         }
-                    })
-                    .collect()
-            }
+                    }
+                    _ => None,
+                })
+                .collect(),
             _ => vec![],
         };
 
-        let filter_id = filter_registry_new.new_log_filter(
-            from_block,
-            to_block,
-            addresses,
-            topics,
-            current_height,
-        );
+        let filter_id = filter_registry_new
+            .new_log_filter(from_block, to_block, addresses, topics, current_height)
+            .ok_or_else(|| jsonrpc_core::Error {
+                // CHAIN-B-D003: registry at capacity — refuse rather than grow.
+                code: jsonrpc_core::ErrorCode::ServerError(-32005),
+                message: "filter limit reached".to_string(),
+                data: None,
+            })?;
 
         Ok(Value::String(format!("0x{:x}", filter_id)))
     });
@@ -1750,14 +1927,26 @@ pub fn register_eth_methods(
     let filter_registry_block = filter_registry.clone();
     io_handler.add_sync_method("eth_newBlockFilter", move |_params: Params| {
         let current_height = storage_block_filter.blocks.get_latest_height().unwrap_or(0);
-        let filter_id = filter_registry_block.new_block_filter(current_height);
+        let filter_id = filter_registry_block
+            .new_block_filter(current_height)
+            .ok_or_else(|| jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::ServerError(-32005),
+                message: "filter limit reached".to_string(),
+                data: None,
+            })?;
         Ok(Value::String(format!("0x{:x}", filter_id)))
     });
 
     // eth_newPendingTransactionFilter - Create a new pending transaction filter
     let filter_registry_pending = filter_registry.clone();
     io_handler.add_sync_method("eth_newPendingTransactionFilter", move |_params: Params| {
-        let filter_id = filter_registry_pending.new_pending_transaction_filter();
+        let filter_id = filter_registry_pending
+            .new_pending_transaction_filter()
+            .ok_or_else(|| jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::ServerError(-32005),
+                message: "filter limit reached".to_string(),
+                data: None,
+            })?;
         Ok(Value::String(format!("0x{:x}", filter_id)))
     });
 
@@ -1776,7 +1965,12 @@ pub fn register_eth_methods(
         let filter_id = match params[0].as_str() {
             Some(hex_str) => {
                 let hex = hex_str.trim_start_matches("0x");
-                u64::from_str_radix(hex, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex filter ID: {}", hex_str)))?
+                u64::from_str_radix(hex, 16).map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!(
+                        "Invalid hex filter ID: {}",
+                        hex_str
+                    ))
+                })?
             }
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid filter ID")),
         };
@@ -1801,7 +1995,12 @@ pub fn register_eth_methods(
         let filter_id = match params[0].as_str() {
             Some(hex_str) => {
                 let hex = hex_str.trim_start_matches("0x");
-                u64::from_str_radix(hex, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex filter ID: {}", hex_str)))?
+                u64::from_str_radix(hex, 16).map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!(
+                        "Invalid hex filter ID: {}",
+                        hex_str
+                    ))
+                })?
             }
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid filter ID")),
         };
@@ -1817,7 +2016,10 @@ pub fn register_eth_methods(
             }
         };
 
-        let current_height = storage_filter_changes.blocks.get_latest_height().unwrap_or(0);
+        let current_height = storage_filter_changes
+            .blocks
+            .get_latest_height()
+            .unwrap_or(0);
         let last_poll_block = filter.last_poll_block;
 
         match filter.filter_type {
@@ -1825,8 +2027,11 @@ pub fn register_eth_methods(
                 // Return new block hashes since last poll
                 let mut block_hashes = Vec::new();
                 for height in (last_poll_block + 1)..=current_height {
-                    if let Ok(Some(hash)) = storage_filter_changes.blocks.get_block_by_height(height) {
-                        block_hashes.push(Value::String(format!("0x{}", hex::encode(hash.as_bytes()))));
+                    if let Ok(Some(hash)) =
+                        storage_filter_changes.blocks.get_block_by_height(height)
+                    {
+                        block_hashes
+                            .push(Value::String(format!("0x{}", hex::encode(hash.as_bytes()))));
                     }
                 }
                 filter_registry_changes.update_last_poll_block(filter_id, current_height);
@@ -1837,7 +2042,12 @@ pub fn register_eth_methods(
                 // This is a simplified implementation that returns empty array
                 Ok(Value::Array(vec![]))
             }
-            FilterType::Log { from_block, to_block, ref addresses, ref topics } => {
+            FilterType::Log {
+                from_block,
+                to_block,
+                ref addresses,
+                ref topics,
+            } => {
                 // Calculate effective block range
                 let effective_from = last_poll_block + 1;
                 let effective_to = match to_block {
@@ -1856,18 +2066,23 @@ pub fn register_eth_methods(
                 let mut result_logs: Vec<Value> = Vec::new();
 
                 for height in effective_from..=effective_to {
-                    let block_hash = match storage_filter_changes.blocks.get_block_by_height(height) {
+                    let block_hash = match storage_filter_changes.blocks.get_block_by_height(height)
+                    {
                         Ok(Some(hash)) => hash,
                         _ => continue,
                     };
 
-                    let tx_hashes = match storage_filter_changes.transactions.get_block_transactions(&block_hash) {
+                    let tx_hashes = match storage_filter_changes
+                        .transactions
+                        .get_block_transactions(&block_hash)
+                    {
                         Ok(hashes) => hashes,
                         Err(_) => continue,
                     };
 
                     for (tx_index, tx_hash) in tx_hashes.iter().enumerate() {
-                        let receipt = match storage_filter_changes.transactions.get_receipt(tx_hash) {
+                        let receipt = match storage_filter_changes.transactions.get_receipt(tx_hash)
+                        {
                             Ok(Some(r)) => r,
                             _ => continue,
                         };
@@ -1879,8 +2094,8 @@ pub fn register_eth_methods(
                             }
 
                             // Check topics filter
-                            let topics_match = topics.iter().enumerate().all(|(i, topic_filter)| {
-                                match topic_filter {
+                            let topics_match = topics.iter().enumerate().all(
+                                |(i, topic_filter)| match topic_filter {
                                     None => true,
                                     Some(allowed_topics) => {
                                         if i >= log.topics.len() {
@@ -1889,8 +2104,8 @@ pub fn register_eth_methods(
                                             allowed_topics.contains(&log.topics[i])
                                         }
                                     }
-                                }
-                            });
+                                },
+                            );
 
                             if !topics_match {
                                 continue;
@@ -1935,7 +2150,12 @@ pub fn register_eth_methods(
         let filter_id = match params[0].as_str() {
             Some(hex_str) => {
                 let hex = hex_str.trim_start_matches("0x");
-                u64::from_str_radix(hex, 16).map_err(|_| jsonrpc_core::Error::invalid_params(format!("Invalid hex filter ID: {}", hex_str)))?
+                u64::from_str_radix(hex, 16).map_err(|_| {
+                    jsonrpc_core::Error::invalid_params(format!(
+                        "Invalid hex filter ID: {}",
+                        hex_str
+                    ))
+                })?
             }
             None => return Err(jsonrpc_core::Error::invalid_params("Invalid filter ID")),
         };
@@ -1954,7 +2174,12 @@ pub fn register_eth_methods(
         let current_height = storage_filter_logs.blocks.get_latest_height().unwrap_or(0);
 
         match filter.filter_type {
-            FilterType::Log { from_block, to_block, ref addresses, ref topics } => {
+            FilterType::Log {
+                from_block,
+                to_block,
+                ref addresses,
+                ref topics,
+            } => {
                 let effective_from = from_block.unwrap_or(0);
                 let effective_to = to_block.unwrap_or(current_height).min(current_height);
                 let max_range = 1000u64;
@@ -1968,7 +2193,10 @@ pub fn register_eth_methods(
                         _ => continue,
                     };
 
-                    let tx_hashes = match storage_filter_logs.transactions.get_block_transactions(&block_hash) {
+                    let tx_hashes = match storage_filter_logs
+                        .transactions
+                        .get_block_transactions(&block_hash)
+                    {
                         Ok(hashes) => hashes,
                         Err(_) => continue,
                     };
@@ -1984,8 +2212,8 @@ pub fn register_eth_methods(
                                 continue;
                             }
 
-                            let topics_match = topics.iter().enumerate().all(|(i, topic_filter)| {
-                                match topic_filter {
+                            let topics_match = topics.iter().enumerate().all(
+                                |(i, topic_filter)| match topic_filter {
                                     None => true,
                                     Some(allowed_topics) => {
                                         if i >= log.topics.len() {
@@ -1994,8 +2222,8 @@ pub fn register_eth_methods(
                                             allowed_topics.contains(&log.topics[i])
                                         }
                                     }
-                                }
-                            });
+                                },
+                            );
 
                             if !topics_match {
                                 continue;
@@ -2020,13 +2248,11 @@ pub fn register_eth_methods(
 
                 Ok(Value::Array(result_logs))
             }
-            _ => {
-                Err(jsonrpc_core::Error {
-                    code: jsonrpc_core::ErrorCode::InvalidRequest,
-                    message: "eth_getFilterLogs only works with log filters".to_string(),
-                    data: None,
-                })
-            }
+            _ => Err(jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::InvalidRequest,
+                message: "eth_getFilterLogs only works with log filters".to_string(),
+                data: None,
+            }),
         }
     });
 
@@ -2188,9 +2414,8 @@ pub fn register_eth_methods(
             .as_str()
             .ok_or_else(|| jsonrpc_core::Error::invalid_params("address must be a hex string"))?;
         let addr_hex = addr_str.trim_start_matches("0x");
-        let addr_bytes = hex::decode(addr_hex).map_err(|e| {
-            jsonrpc_core::Error::invalid_params(format!("bad address hex: {e}"))
-        })?;
+        let addr_bytes = hex::decode(addr_hex)
+            .map_err(|e| jsonrpc_core::Error::invalid_params(format!("bad address hex: {e}")))?;
         if addr_bytes.len() != 20 {
             return Err(jsonrpc_core::Error::invalid_params(
                 "address must be 20 bytes",
@@ -2211,9 +2436,8 @@ pub fn register_eth_methods(
         } else {
             slot_hex.to_string()
         };
-        let mut slot_bytes = hex::decode(&slot_padded_hex).map_err(|e| {
-            jsonrpc_core::Error::invalid_params(format!("bad slot hex: {e}"))
-        })?;
+        let mut slot_bytes = hex::decode(&slot_padded_hex)
+            .map_err(|e| jsonrpc_core::Error::invalid_params(format!("bad slot hex: {e}")))?;
         if slot_bytes.len() > 32 {
             return Err(jsonrpc_core::Error::invalid_params(
                 "slot must be ≤ 32 bytes",
@@ -2246,9 +2470,9 @@ pub fn register_eth_methods(
         "eth_getBlockTransactionCountByNumber",
         move |params: Params| {
             let api = ChainApi::new(storage_btcbn.clone());
-            let parsed: Vec<Value> = params
-                .parse()
-                .map_err(|e: jsonrpc_core::Error| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+            let parsed: Vec<Value> = params.parse().map_err(|e: jsonrpc_core::Error| {
+                jsonrpc_core::Error::invalid_params(e.to_string())
+            })?;
             if parsed.is_empty() {
                 return Err(jsonrpc_core::Error::invalid_params("missing block tag"));
             }
@@ -2272,9 +2496,9 @@ pub fn register_eth_methods(
         "eth_getBlockTransactionCountByHash",
         move |params: Params| {
             let api = ChainApi::new(storage_btcbh.clone());
-            let parsed: Vec<Value> = params
-                .parse()
-                .map_err(|e: jsonrpc_core::Error| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+            let parsed: Vec<Value> = params.parse().map_err(|e: jsonrpc_core::Error| {
+                jsonrpc_core::Error::invalid_params(e.to_string())
+            })?;
             if parsed.is_empty() {
                 return Err(jsonrpc_core::Error::invalid_params("missing block hash"));
             }
@@ -2305,9 +2529,9 @@ pub fn register_eth_methods(
         "eth_getTransactionByBlockNumberAndIndex",
         move |params: Params| {
             let api = ChainApi::new(storage_tbni.clone());
-            let parsed: Vec<Value> = params
-                .parse()
-                .map_err(|e: jsonrpc_core::Error| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+            let parsed: Vec<Value> = params.parse().map_err(|e: jsonrpc_core::Error| {
+                jsonrpc_core::Error::invalid_params(e.to_string())
+            })?;
             if parsed.len() < 2 {
                 return Err(jsonrpc_core::Error::invalid_params(
                     "expected [blockTag, index]",
@@ -2325,11 +2549,11 @@ pub fn register_eth_methods(
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("index must be hex string"))?;
             let idx = usize::from_str_radix(idx_str.trim_start_matches("0x"), 16)
                 .map_err(|_| jsonrpc_core::Error::invalid_params("bad hex index"))?;
-            let block = match block_on(api.get_block(crate::types::request::BlockId::Number(number)))
-            {
-                Ok(b) => b,
-                Err(_) => return Ok(Value::Null),
-            };
+            let block =
+                match block_on(api.get_block(crate::types::request::BlockId::Number(number))) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(Value::Null),
+                };
             if let Some(tx) = block.transactions.get(idx) {
                 Ok(json!({
                     "hash": format!("0x{}", hex::encode(tx.hash.as_bytes())),
@@ -2357,9 +2581,9 @@ pub fn register_eth_methods(
         "eth_getTransactionByBlockHashAndIndex",
         move |params: Params| {
             let api = ChainApi::new(storage_tbhi.clone());
-            let parsed: Vec<Value> = params
-                .parse()
-                .map_err(|e: jsonrpc_core::Error| jsonrpc_core::Error::invalid_params(e.to_string()))?;
+            let parsed: Vec<Value> = params.parse().map_err(|e: jsonrpc_core::Error| {
+                jsonrpc_core::Error::invalid_params(e.to_string())
+            })?;
             if parsed.len() < 2 {
                 return Err(jsonrpc_core::Error::invalid_params(
                     "expected [blockHash, index]",
@@ -2409,15 +2633,11 @@ pub fn register_eth_methods(
     // eth_accounts — read-only RPC always returns []. Wallets that
     // expect "the node has unlocked accounts" should look elsewhere
     // (and shouldn't — partners sign client-side and submit raw).
-    io_handler.add_sync_method("eth_accounts", |_params: Params| {
-        Ok(Value::Array(vec![]))
-    });
+    io_handler.add_sync_method("eth_accounts", |_params: Params| Ok(Value::Array(vec![])));
 
     // eth_mining — block production is internal; RPC doesn't expose it.
     // Returning false stops tools from probing eth_hashrate / pendingWork.
-    io_handler.add_sync_method("eth_mining", |_params: Params| {
-        Ok(Value::Bool(false))
-    });
+    io_handler.add_sync_method("eth_mining", |_params: Params| Ok(Value::Bool(false)));
 
     // eth_hashrate — we're not PoW; canonical zero.
     io_handler.add_sync_method("eth_hashrate", |_params: Params| {
@@ -2473,7 +2693,9 @@ pub fn register_eth_methods(
         // Get blue score from the highest tip block
         let mut blue_score = 0u64;
         if let Some(tip_hash) = tips.first() {
-            if let Ok(block) = block_on(api.get_block(crate::types::request::BlockId::Hash(*tip_hash))) {
+            if let Ok(block) =
+                block_on(api.get_block(crate::types::request::BlockId::Hash(*tip_hash)))
+            {
                 blue_score = block.blue_score;
             }
         }
@@ -2482,7 +2704,8 @@ pub fn register_eth_methods(
         let ghostdag_params = citrate_consensus::types::GhostDagParams::default();
 
         // Convert tips to hex strings
-        let tips_hex: Vec<String> = tips.iter()
+        let tips_hex: Vec<String> = tips
+            .iter()
             .map(|h| format!("0x{}", hex::encode(h.as_bytes())))
             .collect();
 
@@ -2521,9 +2744,7 @@ pub fn register_eth_methods(
     // `true` and HALT BLOCK PRODUCTION. Request-scoped authz must never
     // ride a thread-local across an async boundary.
     if let Some(ref flag) = pause_flag {
-        fn emergency_params_map(
-            params: Params,
-        ) -> serde_json::Map<String, serde_json::Value> {
+        fn emergency_params_map(params: Params) -> serde_json::Map<String, serde_json::Value> {
             match params {
                 Params::Map(map) => map,
                 Params::None => serde_json::Map::new(),
@@ -2565,57 +2786,60 @@ pub fn register_eth_methods(
         // ---------------------------------------------------------------
 
         // citrate_estimateInstitutionalRewards — project monthly rewards
-        io_handler.add_sync_method("citrate_estimateInstitutionalRewards", move |params: Params| {
-            let params: Vec<Value> = params.parse().unwrap_or_default();
+        io_handler.add_sync_method(
+            "citrate_estimateInstitutionalRewards",
+            move |params: Params| {
+                let params: Vec<Value> = params.parse().unwrap_or_default();
 
-            let expected_uptime = params.first()
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.95);
-            let models_to_host = params.get(1)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(2) as u32;
-            let adapters_per_month = params.get(2)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(3) as u32;
-            let datasets_per_month = params.get(3)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5) as u32;
-            let projection_months = params.get(4)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(12) as u32;
+                let expected_uptime = params.first().and_then(|v| v.as_f64()).unwrap_or(0.95);
+                let models_to_host = params.get(1).and_then(|v| v.as_u64()).unwrap_or(2) as u32;
+                let adapters_per_month = params.get(2).and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+                let datasets_per_month = params.get(3).and_then(|v| v.as_u64()).unwrap_or(5) as u32;
+                // CHAIN-B-F002: clamp the attacker-controlled projection horizon at
+                // the RPC boundary (defense in depth; `estimate()` also clamps).
+                // Pre-fix an unauthenticated caller could pass u32::MAX here and the
+                // handler looped that many times (~315 GB / ~28,741 s CPU).
+                let projection_months = (params.get(4).and_then(|v| v.as_u64()).unwrap_or(12)
+                    as u32)
+                    .min(citrate_economics::estimator::MAX_PROJECTION_MONTHS);
 
-            let config = InstitutionalRewardConfig::default();
-            let estimator = InstitutionalRewardEstimator::new(config);
-            let est_params = EstimationParams {
-                expected_uptime,
-                models_to_host,
-                adapters_per_month,
-                datasets_per_month,
-                projection_months,
-            };
+                let config = InstitutionalRewardConfig::default();
+                let estimator = InstitutionalRewardEstimator::new(config);
+                let est_params = EstimationParams {
+                    expected_uptime,
+                    models_to_host,
+                    adapters_per_month,
+                    datasets_per_month,
+                    projection_months,
+                };
 
-            let result = estimator.estimate(&est_params);
+                let result = estimator.estimate(&est_params);
 
-            let monthly: Vec<Value> = result.monthly_projections.iter().map(|m| {
-                json!({
-                    "month": m.month,
-                    "blockValidationSalt": m.block_validation_salt,
-                    "modelHostingSalt": m.model_hosting_salt,
-                    "adapterCreationSalt": m.adapter_creation_salt,
-                    "dataProvisionSalt": m.data_provision_salt,
-                    "totalSalt": m.total_salt,
-                    "cumulativeSalt": m.cumulative_salt,
-                })
-            }).collect();
+                let monthly: Vec<Value> = result
+                    .monthly_projections
+                    .iter()
+                    .map(|m| {
+                        json!({
+                            "month": m.month,
+                            "blockValidationSalt": m.block_validation_salt,
+                            "modelHostingSalt": m.model_hosting_salt,
+                            "adapterCreationSalt": m.adapter_creation_salt,
+                            "dataProvisionSalt": m.data_provision_salt,
+                            "totalSalt": m.total_salt,
+                            "cumulativeSalt": m.cumulative_salt,
+                        })
+                    })
+                    .collect();
 
-            Ok(json!({
-                "monthlyProjections": monthly,
-                "totalProjectedSalt": result.total_projected_salt,
-                "averageMonthlySalt": result.average_monthly_salt,
-                "minMonthlySalt": result.min_monthly_salt,
-                "maxMonthlySalt": result.max_monthly_salt,
-            }))
-        });
+                Ok(json!({
+                    "monthlyProjections": monthly,
+                    "totalProjectedSalt": result.total_projected_salt,
+                    "averageMonthlySalt": result.average_monthly_salt,
+                    "minMonthlySalt": result.min_monthly_salt,
+                    "maxMonthlySalt": result.max_monthly_salt,
+                }))
+            },
+        );
 
         // citrate_getInstitutionalConfig — return current reward + slashing config
         io_handler.add_sync_method("citrate_getInstitutionalConfig", move |_params: Params| {
@@ -2653,26 +2877,34 @@ pub fn register_eth_methods(
                 Err(e) => return Err(jsonrpc_core::Error::invalid_params(e.to_string())),
             };
 
-            let institution_name = params.first()
+            let institution_name = params
+                .first()
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing institution_name"))?
                 .to_string();
 
-            let contact_email = params.get(1)
+            let contact_email = params
+                .get(1)
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing contact_email"))?
                 .to_string();
 
-            let operator_address_hex = params.get(2)
+            let operator_address_hex = params
+                .get(2)
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| jsonrpc_core::Error::invalid_params("Missing operator_address"))?;
 
-            let addr_hex = operator_address_hex.strip_prefix("0x").unwrap_or(operator_address_hex);
-            let addr_bytes = hex::decode(addr_hex)
-                .map_err(|e| jsonrpc_core::Error::invalid_params(format!("Invalid address hex: {}", e)))?;
+            let addr_hex = operator_address_hex
+                .strip_prefix("0x")
+                .unwrap_or(operator_address_hex);
+            let addr_bytes = hex::decode(addr_hex).map_err(|e| {
+                jsonrpc_core::Error::invalid_params(format!("Invalid address hex: {}", e))
+            })?;
 
             if addr_bytes.len() < 20 {
-                return Err(jsonrpc_core::Error::invalid_params("Address must be at least 20 bytes"));
+                return Err(jsonrpc_core::Error::invalid_params(
+                    "Address must be at least 20 bytes",
+                ));
             }
 
             let mut addr_arr = [0u8; 20];
@@ -2708,6 +2940,31 @@ pub fn register_eth_methods(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// CHAIN-B-D002 tripwire: the RPC gas cap rejects a caller-supplied gas
+    /// limit above the ceiling. `eth_call`/`eth_estimateGas` call this before
+    /// EVM simulation, so an unbounded `gas = 0xffffffffffffffff` can no longer
+    /// drive uncapped EVM work on a synchronous RPC worker. RED if the check is
+    /// reverted (helper returns Ok for everything); GREEN as written.
+    #[test]
+    fn d002_rpc_gas_cap_rejects_oversized_gas() {
+        assert!(
+            enforce_rpc_gas_cap(21_000).is_ok(),
+            "an ordinary gas limit must pass"
+        );
+        assert!(
+            enforce_rpc_gas_cap(RPC_GAS_CAP).is_ok(),
+            "exactly the cap must pass"
+        );
+        assert!(
+            enforce_rpc_gas_cap(RPC_GAS_CAP + 1).is_err(),
+            "one over the cap must be rejected"
+        );
+        assert!(
+            enforce_rpc_gas_cap(u64::MAX).is_err(),
+            "0xffffffffffffffff must be rejected"
+        );
+    }
 
     // ---------------------------------------------------------------
     // pubkey_hex_to_evm_address tests
@@ -2813,8 +3070,14 @@ mod tests {
         let mut map = empty_map();
         append_eip_fields(&mut map, 0, None, None, None, &None);
         assert_eq!(map.get("type"), Some(&json!("0x0")));
-        assert!(map.get("accessList").is_none(), "type 0 should not have accessList");
-        assert!(map.get("maxFeePerGas").is_none(), "type 0 should not have maxFeePerGas");
+        assert!(
+            map.get("accessList").is_none(),
+            "type 0 should not have accessList"
+        );
+        assert!(
+            map.get("maxFeePerGas").is_none(),
+            "type 0 should not have maxFeePerGas"
+        );
         assert!(
             map.get("maxPriorityFeePerGas").is_none(),
             "type 0 should not have maxPriorityFeePerGas"
@@ -2828,7 +3091,10 @@ mod tests {
         append_eip_fields(&mut map, 1, None, Some(100), Some(10), &None);
         assert_eq!(map.get("type"), Some(&json!("0x1")));
         // accessList should be present (empty array since access_list is None)
-        assert!(map.get("accessList").is_some(), "type 1 should have accessList");
+        assert!(
+            map.get("accessList").is_some(),
+            "type 1 should have accessList"
+        );
         // maxFeePerGas should NOT be present for type 1 even if values were passed
         assert!(
             map.get("maxFeePerGas").is_none(),
@@ -2846,7 +3112,10 @@ mod tests {
         let mut map = empty_map();
         append_eip_fields(&mut map, 2, None, Some(1000), Some(50), &None);
         assert_eq!(map.get("type"), Some(&json!("0x2")));
-        assert!(map.get("accessList").is_some(), "type 2 should have accessList");
+        assert!(
+            map.get("accessList").is_some(),
+            "type 2 should have accessList"
+        );
         assert_eq!(map.get("maxFeePerGas"), Some(&json!("0x3e8")));
         assert_eq!(map.get("maxPriorityFeePerGas"), Some(&json!("0x32")));
     }
@@ -2864,7 +3133,10 @@ mod tests {
     fn test_eip_no_chain_id() {
         let mut map = empty_map();
         append_eip_fields(&mut map, 0, None, None, None, &None);
-        assert!(map.get("chainId").is_none(), "chainId should not be present when None");
+        assert!(
+            map.get("chainId").is_none(),
+            "chainId should not be present when None"
+        );
     }
 
     /// 14. access list with entries → proper JSON array of {address, storageKeys}
@@ -2884,7 +3156,9 @@ mod tests {
         let entry = &arr[0];
         assert_eq!(entry["address"], json!(format!("0x{}", hex::encode(&addr))));
 
-        let storage_keys = entry["storageKeys"].as_array().expect("storageKeys should be array");
+        let storage_keys = entry["storageKeys"]
+            .as_array()
+            .expect("storageKeys should be array");
         assert_eq!(storage_keys.len(), 2);
         assert_eq!(storage_keys[0], json!(format!("0x{}", hex::encode(&key1))));
         assert_eq!(storage_keys[1], json!(format!("0x{}", hex::encode(&key2))));
@@ -2897,7 +3171,10 @@ mod tests {
         append_eip_fields(&mut map, 1, None, None, None, &None);
         let al = map.get("accessList").expect("accessList should be present");
         let arr = al.as_array().expect("accessList should be an array");
-        assert!(arr.is_empty(), "accessList should be empty when input is None");
+        assert!(
+            arr.is_empty(),
+            "accessList should be empty when input is None"
+        );
     }
 
     /// 16. Type hex format: type 2 → "0x2", type 1 → "0x1"
