@@ -1708,6 +1708,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .ok()
             .flatten()
             .unwrap_or_default();
+        // SECREM-A001: bind the shared DAG store to this chain's canonical
+        // genesis identity BEFORE any network block is admitted, so a block
+        // merely shaped like genesis (parentless, arbitrary height) cannot
+        // bypass the admission gates.
+        shared_dag_store.set_configured_genesis(genesis_hash);
         let network_id: u32 = config.chain.chain_id as u32;
 
         // Incoming message channel (log-only for now)
@@ -1860,7 +1865,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             });
         }
         let gossip = Arc::new(GossipProtocol::new(
-            GossipConfig::default(),
+            GossipConfig {
+                genesis_hash: Some(genesis_hash),
+                ..GossipConfig::default()
+            },
             peer_manager.clone(),
         ));
         let gossip_for_rx = gossip.clone();
