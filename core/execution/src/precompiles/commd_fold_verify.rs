@@ -41,8 +41,13 @@ pub struct ChallengeInput {
 }
 
 fn word(input: &[u8], at: usize) -> Result<[u8; 32]> {
+    // EXEC-01/CHAIN-B-B003: `at` is an attacker-controlled ABI offset up to usize::MAX; `at + 32`
+    // must be checked or it overflows and (with `overflow-checks = true`) PANICS the validator.
+    let end = at
+        .checked_add(32)
+        .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: word offset overflow at {at}"))?;
     input
-        .get(at..at + 32)
+        .get(at..end)
         .and_then(|s| s.try_into().ok())
         .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: input truncated at word offset {at}"))
 }
@@ -78,13 +83,34 @@ pub fn decode_challenge_input(input: &[u8]) -> Result<ChallengeInput> {
     let proof_start = off_proof
         .checked_add(32)
         .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: proof offset overflow"))?;
+    // EXEC-01: `proof_start + proof_len` must be checked — an attacker sets proof_len near
+    // usize::MAX to overflow it (panic under overflow-checks).
+    let proof_end = proof_start
+        .checked_add(proof_len)
+        .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: proof range overflow"))?;
     let proof = args
-        .get(proof_start..proof_start + proof_len)
+        .get(proof_start..proof_end)
         .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: proof bytes out of range"))?
         .to_vec();
 
-    // z0: [len][word_0 .. word_{len-1}].
+    // z0: [len][word_0 .. word_{len-1}]. EXEC-01/CHAIN-B-B003: `z0_len` is attacker-controlled up
+    // to usize::MAX; `Vec::with_capacity(z0_len)` allocates z0_len*32 bytes BEFORE the loop reads a
+    // single word, so a ~100-byte tx can request a 32-TiB allocation and abort the validator. Bound
+    // it to what the input can actually contain (each word is 32 bytes at off_z0 + 32) and reject a
+    // length that cannot fit — so the capacity hint is provably ≤ the input size.
     let z0_len = word_as_usize(word(args, off_z0)?)?;
+    let z0_base = off_z0
+        .checked_add(32)
+        .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: z0 offset overflow"))?;
+    let z0_bytes = z0_len
+        .checked_mul(32)
+        .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: z0 length overflow"))?;
+    let z0_end = z0_base
+        .checked_add(z0_bytes)
+        .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: z0 range overflow"))?;
+    if z0_end > args.len() {
+        return Err(anyhow!("FOLD_COMMD_VERIFY: z0 words out of range"));
+    }
     let mut z0 = Vec::with_capacity(z0_len);
     for i in 0..z0_len {
         let at = off_z0
@@ -232,6 +258,45 @@ mod tests {
     fn rejects_truncated_input() {
         assert!(decode_challenge_input(&[0u8; 10]).is_err());
         assert!(decode_challenge_input(&[]).is_err());
+    }
+
+    // EXEC-01 / CHAIN-B-B003: a ~130-byte call must NOT be able to halt the validator. Each of
+    // these encodes an attacker-controlled offset/length that (pre-fix) overflows or over-allocates.
+    fn head(off_proof: u64, off_z0: u64) -> Vec<u8> {
+        let mut input = vec![0xAAu8, 0xBB, 0xCC, 0xDD]; // selector
+        let mut w = |v: u64| {
+            let mut x = [0u8; 32];
+            x[24..].copy_from_slice(&v.to_be_bytes());
+            input.extend_from_slice(&x);
+        };
+        w(off_proof);
+        w(0); // numSteps
+        w(0); // depth
+        w(off_z0);
+        input
+    }
+
+    #[test]
+    fn decode_rejects_an_overflowing_proof_offset_without_panicking() {
+        // off_proof = u64::MAX → word(args, off_proof) computes off_proof + 32, which overflows.
+        // Pre-fix (overflow-checks = true) this PANICS the process = chain halt. Now it is an Err.
+        let input = head(u64::MAX, 128);
+        assert!(decode_challenge_input(&input).is_err());
+    }
+
+    #[test]
+    fn decode_bounds_a_huge_z0_len_instead_of_allocating() {
+        // A valid empty proof, then z0_len = 2^40 words (32 TiB via Vec::with_capacity pre-fix).
+        // Now the length is checked against the input BEFORE any allocation → Err, no OOM.
+        let off_proof = 128u64;
+        let off_z0 = 128u64 + 32; // proof len word only
+        let mut input = head(off_proof, off_z0);
+        input.extend_from_slice(&[0u8; 32]); // proof len = 0
+        let mut zlen = [0u8; 32];
+        zlen[24..].copy_from_slice(&(1u64 << 40).to_be_bytes()); // z0_len = 2^40
+        input.extend_from_slice(&zlen);
+        let err = decode_challenge_input(&input).unwrap_err().to_string();
+        assert!(err.contains("z0 words out of range"), "got: {err}");
     }
 
     #[test]
