@@ -1257,7 +1257,11 @@ mod tests {
 
         // The restarted node reproduces the continuously-up node's forward-block root.
         let got = r
-            .apply_block(&sealed, sealed.header.coinbase, &basic)
+            .apply_block(
+                &sealed,
+                sealed.header.coinbase,
+                &citrate_execution::executor::fixed_reward(&basic),
+            )
             .await
             .expect("restarted node reproduces + accepts the forward block");
         assert_eq!(

@@ -21,6 +21,30 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
+/// A deterministic reward-credit function of a block's EXECUTED receipts.
+///
+/// CHAIN-B-F001: the node injects the economics `RewardCalculator` here, so the
+/// executor stays free of economics policy while the block reward is still a pure
+/// function of committed state (the receipts). Because the producer and every
+/// receiver run the SAME function over the SAME deterministic receipts, they all
+/// credit byte-identical mints — no fork, and no way to inflate the reward from
+/// unexecuted calldata. Returns the credit list applied by `settle_block_rewards`,
+/// e.g. `[(beneficiary, validator_reward), (treasury, treasury_reward)]`.
+pub type RewardFn<'a> = &'a (dyn Fn(&[TransactionReceipt]) -> Vec<(Address, U256)> + Send + Sync);
+
+/// Adapt an already-computed, receipt-independent credit list to a [`RewardFn`].
+///
+/// For callers that legitimately have the credits up front and do not need to read
+/// receipts — trusted local replay from a validated store, and tests. The
+/// production RECEIVE path must instead inject a function that reads the receipts
+/// (see `node/src/canonical_apply.rs::reward_fn`), so its reward cannot be inflated
+/// by unexecuted calldata (CHAIN-B-F001).
+pub fn fixed_reward(
+    credits: &[(Address, U256)],
+) -> impl Fn(&[TransactionReceipt]) -> Vec<(Address, U256)> + Send + Sync + '_ {
+    move |_receipts| credits.to_vec()
+}
+
 /// Execution context for a transaction
 /// Extract a human-readable message from a caught panic payload
 /// (`Box<dyn Any + Send>` from `catch_unwind`). Panics carry either a
@@ -1171,9 +1195,9 @@ impl Executor {
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
     ) -> Result<Hash, ExecutionError> {
-        self.apply_block_inner(block, coinbase, reward_credits, true, true)
+        self.apply_block_inner(block, coinbase, reward, true, true)
             .await
     }
 
@@ -1190,9 +1214,9 @@ impl Executor {
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
     ) -> Result<Hash, ExecutionError> {
-        self.apply_block_inner(block, coinbase, reward_credits, true, false)
+        self.apply_block_inner(block, coinbase, reward, true, false)
             .await
     }
 
@@ -1206,9 +1230,9 @@ impl Executor {
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
     ) -> Result<Hash, ExecutionError> {
-        self.apply_block_inner(block, coinbase, reward_credits, false, true)
+        self.apply_block_inner(block, coinbase, reward, false, true)
             .await
     }
 
@@ -1216,7 +1240,7 @@ impl Executor {
         &self,
         block: &Block,
         coinbase: [u8; 20],
-        reward_credits: &[(Address, U256)],
+        reward: RewardFn<'_>,
         persist: bool,
         verify_root: bool,
     ) -> Result<Hash, ExecutionError> {
@@ -1254,6 +1278,14 @@ impl Executor {
                 }
             }
         }
+
+        // CHAIN-B-F001: the basic block-reward credits are derived HERE, from the
+        // EXECUTED receipts, via the caller-injected reward function. Producer and
+        // receiver run the SAME pure function over the SAME (deterministic)
+        // receipts, so they credit byte-identical mints and the reward can never be
+        // inflated by unexecuted calldata.
+        let reward_credits = reward(&receipts);
+        let reward_credits: &[(Address, U256)] = &reward_credits;
 
         // Post-execution reward settlement — the SINGLE shared entrypoint the
         // PRODUCER also calls (node/src/producer.rs). It applies the basic block
@@ -4066,7 +4098,7 @@ mod tests {
         let blk = block_with(vec![tx], expected);
 
         let got = exec
-            .apply_block(&blk, CB, &[(cb_addr, reward)])
+            .apply_block(&blk, CB, &fixed_reward(&[(cb_addr, reward)]))
             .await
             .expect("valid block must apply");
         assert_eq!(
@@ -4100,7 +4132,7 @@ mod tests {
         let blk = block_with(vec![tx], Hash::new([0xFF; 32]));
 
         let err = exec
-            .apply_block(&blk, CB, &[(cb_addr, U256::from(500u64))])
+            .apply_block(&blk, CB, &fixed_reward(&[(cb_addr, U256::from(500u64))]))
             .await
             .expect_err("bad state_root must be rejected");
         assert!(

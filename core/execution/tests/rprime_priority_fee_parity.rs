@@ -32,6 +32,7 @@ use citrate_execution::block_rewards::{
     EpochRewardPolicy, CANONICAL_BASE_FEE_PER_GAS, REWARD_MINTER_ADDRESS,
 };
 use citrate_execution::types::{Address, ExecutionError};
+use citrate_execution::executor::fixed_reward;
 use citrate_execution::{address_utils, Executor, StateDB};
 use primitive_types::U256;
 use std::collections::HashMap;
@@ -232,7 +233,7 @@ async fn producer_receiver_state_root_parity() {
     inject_policy(&er, 0);
     fund_senders(&er);
     let got = er
-        .apply_block(&sealed, sealed.header.coinbase, &basic_credits())
+        .apply_block(&sealed, sealed.header.coinbase, &fixed_reward(&basic_credits()))
         .await
         .expect("receiver reproduces + accepts the producer's block");
 
@@ -272,7 +273,7 @@ async fn reorg_reapply_state_root_parity() {
     // Revert to the fork point and re-apply the SAME block (reorg).
     e.state_restore(pre);
     let root2 = e
-        .apply_block_no_persist(&sealed, sealed.header.coinbase, &basic_credits())
+        .apply_block_no_persist(&sealed, sealed.header.coinbase, &fixed_reward(&basic_credits()))
         .await
         .expect("reorg re-apply succeeds");
 
@@ -299,7 +300,7 @@ async fn tampered_base_fee_is_rejected_on_import() {
     inject_policy(&er, 0);
     fund_senders(&er);
     let err = er
-        .apply_block(&tampered, tampered.header.coinbase, &basic_credits())
+        .apply_block(&tampered, tampered.header.coinbase, &fixed_reward(&basic_credits()))
         .await
         .expect_err("a tampered base fee must be rejected");
     match err {
@@ -315,7 +316,7 @@ async fn tampered_base_fee_is_rejected_on_import() {
     inject_policy(&er2, 0);
     fund_senders(&er2);
     assert!(
-        er2.apply_block(&honest, honest.header.coinbase, &basic_credits())
+        er2.apply_block(&honest, honest.header.coinbase, &fixed_reward(&basic_credits()))
             .await
             .is_ok(),
         "the canonical base fee must be accepted"
@@ -336,7 +337,7 @@ async fn sub_base_fee_tx_is_rejected_on_import() {
     // root check.
     let block = build_block(CANONICAL_BASE_FEE_PER_GAS, vec![bad], Hash::new([0xAB; 32]));
     let err = er
-        .apply_block(&block, block.header.coinbase, &basic_credits())
+        .apply_block(&block, block.header.coinbase, &fixed_reward(&basic_credits()))
         .await
         .expect_err("sub-base-fee tx must be rejected");
     assert!(
@@ -361,7 +362,7 @@ async fn none_policy_at_or_above_activation_is_rejected() {
     // A block AT the activation height with a None policy → HARD REJECT.
     let block = build_block_h(800, CANONICAL_BASE_FEE_PER_GAS, txs.clone(), Hash::new([0xAB; 32]));
     let err = er
-        .apply_block(&block, block.header.coinbase, &basic_credits())
+        .apply_block(&block, block.header.coinbase, &fixed_reward(&basic_credits()))
         .await
         .expect_err("None policy at/above activation must be rejected");
     match err {
@@ -412,7 +413,7 @@ async fn none_policy_below_activation_is_accepted() {
     er.set_validator_activation_height(800);
     fund_senders(&er);
     let got = er
-        .apply_block(&sealed, sealed.header.coinbase, &basic_credits())
+        .apply_block(&sealed, sealed.header.coinbase, &fixed_reward(&basic_credits()))
         .await
         .expect("accepted below activation with a None policy");
     assert_eq!(got, root, "parity holds below activation with a None policy");
@@ -480,7 +481,7 @@ async fn below_activation_no_vesting() {
     inject_policy(&er, 1_000_000);
     fund_senders(&er);
     let got = er
-        .apply_block(&sealed, sealed.header.coinbase, &basic_credits())
+        .apply_block(&sealed, sealed.header.coinbase, &fixed_reward(&basic_credits()))
         .await
         .expect("accepted below activation");
     assert_eq!(got, root, "parity holds below activation too");

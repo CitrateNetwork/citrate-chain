@@ -108,12 +108,24 @@ fn test_ai_contribution(a: Address) -> AIContribution {
     }
 }
 
-fn make_block(height: u64, txs: Vec<citrate_consensus::types::Transaction>) -> citrate_consensus::types::Block {
-    use citrate_consensus::types::*;
-    BlockBuilder::new()
-        .height(height)
-        .transactions(txs)
-        .build_unhashed()
+/// Minimal executed receipt for reward tests: `status` = success/revert, `to` =
+/// top-level call target (`None` = contract creation). CHAIN-B-F001: the reward
+/// path reads receipts (executed state), not calldata.
+fn mk_rcpt(status: bool, to: Option<[u8; 20]>) -> citrate_execution::types::TransactionReceipt {
+    citrate_execution::types::TransactionReceipt {
+        tx_hash: Default::default(),
+        block_hash: Default::default(),
+        block_number: 0,
+        from: Address([0u8; 20]),
+        to: to.map(Address),
+        gas_used: 21_000,
+        status,
+        logs: vec![],
+        output: vec![],
+        eth_tx_type: 0,
+        effective_gas_price: 0,
+        revert_reason: None,
+    }
 }
 
 // ===========================================================================
@@ -985,71 +997,79 @@ fn test_enhanced_high_vs_low_utilization() {
 // 6. REWARDS — inference counting, model deployment, supply calculation
 // ===========================================================================
 
+// RC-8 (CHAIN-B-F001): these four fixtures previously ENCODED the vulnerable
+// behaviour — they asserted that a byte prefix on UNEXECUTED calldata earned a
+// mint bonus, so the suite stayed green while the invariant was absent. They are
+// inverted here, in the same commit as the fix, to assert the correct invariant:
+// only a SUCCESSFUL, gas-charged inference/model call in the block's RECEIPTS
+// earns a bonus. Each is red at the parent commit (the pre-fix `calculate_reward`
+// took `&Block` and paid on calldata).
+
 #[test]
 fn test_rewards_with_inferences() {
-    use citrate_consensus::types::*;
+    use citrate_execution::precompiles::inference::addresses::MODEL_INFERENCE;
 
     let config = RewardConfig { inference_bonus: 1, ..RewardConfig::default() };
     let calc = RewardCalculator::new(config);
 
-    let tx = Transaction {
-        data: vec![0x02, 0x00, 0x00, 0x00, 0xFF],
-        ..Transaction::default()
-    };
-    let block = make_block(0, vec![tx.clone(), tx]);
-    let reward = calc.calculate_reward(&block);
+    // Unexecuted / reverted "inference" calldata earns NOTHING (was: > salt(10)).
+    let reverted = mk_rcpt(false, Some(MODEL_INFERENCE));
+    assert_eq!(
+        calc.calculate_reward(0, &[reverted.clone(), reverted]).total_reward,
+        salt(10),
+        "reverted inference precompile calls must earn no bonus"
+    );
 
-    assert!(reward.total_reward > salt(10)); // 10 SALT base + inference bonuses
+    // Two SUCCESSFUL inference-precompile calls earn the bonus.
+    let executed = mk_rcpt(true, Some(MODEL_INFERENCE));
+    let reward = calc.calculate_reward(0, &[executed.clone(), executed]);
+    assert_eq!(reward.total_reward, salt(10) + salt(2) / 100); // 10 + 2 * 0.01
 }
 
 #[test]
 fn test_rewards_with_model_deployment() {
-    use citrate_consensus::types::*;
-
     let calc = RewardCalculator::new(RewardConfig::default());
-    let tx = Transaction { to: None, data: vec![0x60, 0x80], ..Transaction::default() };
-    let block = make_block(0, vec![tx]);
-    let reward = calc.calculate_reward(&block);
-
-    assert_eq!(reward.total_reward, salt(11)); // 10 base + 1 deployment
+    // A SUCCESSFUL contract creation (to == None) earns the deployment bonus.
+    assert_eq!(calc.calculate_reward(0, &[mk_rcpt(true, None)]).total_reward, salt(11));
+    // A REVERTED creation earns nothing (was: paid off `tx.to == None` calldata).
+    assert_eq!(calc.calculate_reward(0, &[mk_rcpt(false, None)]).total_reward, salt(10));
 }
 
 #[test]
 fn test_rewards_with_model_registration_call() {
-    use citrate_consensus::types::*;
+    use citrate_execution::precompiles::inference::addresses::MODEL_DEPLOY;
 
     let calc = RewardCalculator::new(RewardConfig::default());
-    let tx = Transaction {
-        to: Some(PublicKey::new([2; 32])),
-        data: vec![0x01, 0x00, 0x00, 0x00, 0xAB],
-        ..Transaction::default()
-    };
-    let block = make_block(0, vec![tx]);
-    let reward = calc.calculate_reward(&block);
-
-    assert_eq!(reward.total_reward, salt(11)); // 10 base + 1 model bonus
+    // A SUCCESSFUL call to the model-registration precompile (0x0100) earns it.
+    assert_eq!(
+        calc.calculate_reward(0, &[mk_rcpt(true, Some(MODEL_DEPLOY))]).total_reward,
+        salt(11)
+    );
+    // A successful call to an ORDINARY address (whatever its calldata) does not.
+    assert_eq!(
+        calc.calculate_reward(0, &[mk_rcpt(true, Some([9u8; 20]))]).total_reward,
+        salt(10)
+    );
 }
 
 #[test]
 fn test_rewards_no_bonuses_with_regular_tx() {
-    use citrate_consensus::types::*;
-
     let calc = RewardCalculator::new(RewardConfig::default());
-    let tx = Transaction {
-        to: Some(PublicKey::new([2; 32])),
-        data: vec![0xFF, 0xAB, 0xCD, 0xEF],
-        ..Transaction::default()
-    };
-    let block = make_block(0, vec![tx]);
-    assert_eq!(calc.calculate_reward(&block).total_reward, salt(10));
+    // An ordinary successful transfer earns the base subsidy only.
+    assert_eq!(
+        calc.calculate_reward(0, &[mk_rcpt(true, Some([2u8; 20]))]).total_reward,
+        salt(10)
+    );
 }
 
 #[test]
 fn test_rewards_beyond_64_halvings() {
     let config = RewardConfig::default();
     let calc = RewardCalculator::new(config.clone());
-    let block = make_block(config.halving_interval * 65, vec![]);
-    assert_eq!(calc.calculate_reward(&block).total_reward, U256::zero());
+    assert_eq!(
+        calc.calculate_reward(config.halving_interval * 65, &[]).total_reward,
+        U256::zero()
+    );
 }
 
 #[test]

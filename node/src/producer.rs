@@ -1139,17 +1139,14 @@ impl BlockProducer {
         // and the enhanced branch are gone; block rewards NEVER read `economics_manager`.
         // (economics_manager remains for RPC/telemetry only.)
         //
-        // `calculate_reward` reads only header.height + transactions (never state_root), so
-        // this temp block is a safe reward-input carrier.
-        let temp_block = BlockBuilder::new()
-            .header(header.clone())
-            .tx_root(tx_root)
-            .receipt_root(receipt_root)
-            .artifact_root(artifact_root)
-            .ghostdag_params(self.ghostdag.params().clone())
-            .transactions(executed_transactions.clone())
-            .build_unhashed();
-        let reward = self.reward_calculator.calculate_reward(&temp_block);
+        // CHAIN-B-F001: the block reward is a PURE function of this block's height
+        // and its EXECUTED receipts — never of unexecuted calldata. The receiver
+        // recomputes the identical value from the identical receipts (execute-on-
+        // receive), so producer and receiver credit byte-identical mints and the
+        // reward-settled state root is reproducible on every node.
+        let reward = self
+            .reward_calculator
+            .calculate_reward(header.height, &receipts);
         // `basic_credits` mirrors `canonical_apply::reward_credits` exactly:
         // [(coinbase, validator_reward), (0x11..treasury, treasury_reward)]. Below the
         // VALIDATOR-S1 activation (or before a snapshot is materialized) this credits only
@@ -2473,15 +2470,21 @@ mod tests {
         let receiver = Arc::new(Executor::new(Arc::new(citrate_execution::StateDB::new())));
         *receiver.reward_policy_handle().write() = Some(mk_policy());
         receiver.set_validator_activation_height(0);
-        let reward = RewardCalculator::new(crate::canonical_apply::canonical_reward_config())
-            .calculate_reward(&sealed);
-        let basic_credits = [
-            (Address(sealed.header.coinbase), reward.validator_reward),
-            (Address(TREASURY), reward.treasury_reward),
-        ];
+        let cfg = crate::canonical_apply::canonical_reward_config();
+        // `sealed` is an empty block, so the canonical reward is the base subsidy.
+        let reward = RewardCalculator::new(cfg.clone()).calculate_reward(sealed.header.height, &[]);
+        let sealed_height = sealed.header.height;
+        let sealed_coinbase = Address(sealed.header.coinbase);
+        let reward_fn = move |receipts: &[citrate_execution::types::TransactionReceipt]| {
+            let r = RewardCalculator::new(cfg.clone()).calculate_reward(sealed_height, receipts);
+            vec![
+                (sealed_coinbase, r.validator_reward),
+                (Address(TREASURY), r.treasury_reward),
+            ]
+        };
 
         let got = receiver
-            .apply_block(&sealed, sealed.header.coinbase, &basic_credits)
+            .apply_block(&sealed, sealed.header.coinbase, &reward_fn)
             .await
             .expect(
                 "SRP-S2 INVARIANT: a fleet node re-applying the producer's block through the \
@@ -2728,13 +2731,18 @@ mod tests {
             exec: &Executor,
             block: &Block,
         ) -> Result<Hash, citrate_execution::types::ExecutionError> {
-            let reward = RewardCalculator::new(crate::canonical_apply::canonical_reward_config())
-                .calculate_reward(block);
-            let credits = [
-                (Address(block.header.coinbase), reward.validator_reward),
-                (Address(TREASURY), reward.treasury_reward),
-            ];
-            exec.apply_block(block, block.header.coinbase, &credits)
+            let calc = RewardCalculator::new(crate::canonical_apply::canonical_reward_config());
+            let height = block.header.height;
+            let coinbase = Address(block.header.coinbase);
+            let treasury = Address(TREASURY);
+            let reward_fn = move |receipts: &[citrate_execution::types::TransactionReceipt]| {
+                let reward = calc.calculate_reward(height, receipts);
+                vec![
+                    (coinbase, reward.validator_reward),
+                    (treasury, reward.treasury_reward),
+                ]
+            };
+            exec.apply_block(block, block.header.coinbase, &reward_fn)
                 .await
         }
 

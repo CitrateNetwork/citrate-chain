@@ -434,22 +434,36 @@ impl CanonicalApplicator {
         self.lock.lock().await.tip
     }
 
-    /// Deterministic reward credits for `block` — the SAME mints the producer
-    /// applied on the basic reward path: `[(coinbase, validator_reward),
-    /// (treasury, treasury_reward)]`. `coinbase` comes from the committed v2
-    /// header field (`block.header.coinbase`).
-    fn reward_credits(&self, block: &Block) -> Vec<(citrate_execution::types::Address, U256)> {
-        let reward = self.reward_calculator.calculate_reward(block);
-        vec![
-            (
-                citrate_execution::types::Address(block.header.coinbase),
-                reward.validator_reward,
-            ),
-            (
-                citrate_execution::types::Address(TREASURY_ADDR),
-                reward.treasury_reward,
-            ),
-        ]
+    /// Build the deterministic reward function for `block` — the SAME mints the
+    /// producer applied on the basic reward path: `[(coinbase, validator_reward),
+    /// (treasury, treasury_reward)]`, with `coinbase` from the committed v2 header
+    /// field.
+    ///
+    /// CHAIN-B-F001: the reward is a pure function of the block's EXECUTED
+    /// receipts, evaluated by the executor AFTER it runs the block. The producer
+    /// and every receiver run the identical `calculate_reward(height, receipts)`
+    /// over the identical (deterministic) receipts, so they credit byte-identical
+    /// mints — the reward can never be inflated by a byte prefix on unexecuted
+    /// calldata, and no fork is introduced.
+    fn reward_fn(
+        &self,
+        block: &Block,
+    ) -> impl Fn(
+        &[citrate_execution::types::TransactionReceipt],
+    ) -> Vec<(citrate_execution::types::Address, U256)>
+           + Send
+           + Sync {
+        let calc = self.reward_calculator.clone();
+        let height = block.header.height;
+        let coinbase = citrate_execution::types::Address(block.header.coinbase);
+        let treasury = citrate_execution::types::Address(TREASURY_ADDR);
+        move |receipts| {
+            let reward = calc.calculate_reward(height, receipts);
+            vec![
+                (coinbase, reward.validator_reward),
+                (treasury, reward.treasury_reward),
+            ]
+        }
     }
 
     /// Persist the applied-tip pointer + this block's verified state root (crash
@@ -536,10 +550,10 @@ impl CanonicalApplicator {
             };
             let block_hash = block.header.block_hash;
             let height = block.header.height;
-            let credits = self.reward_credits(&block);
+            let reward_fn = self.reward_fn(&block);
             match self
                 .executor
-                .apply_block(&block, block.header.coinbase, &credits)
+                .apply_block(&block, block.header.coinbase, &reward_fn)
                 .await
             {
                 Ok(_root) => {
@@ -858,10 +872,10 @@ impl CanonicalApplicator {
         }
 
         for block in &branch {
-            let credits = self.reward_credits(block);
+            let reward_fn = self.reward_fn(block);
             match self
                 .executor
-                .apply_block_no_persist(block, block.header.coinbase, &credits)
+                .apply_block_no_persist(block, block.header.coinbase, &reward_fn)
                 .await
             {
                 Ok(_) => {
@@ -1354,13 +1368,14 @@ impl CanonicalApplicator {
                 Some(b) => b,
                 None => break, // missing block — reach check below rolls back
             };
-            let credits = self.reward_credits(&block);
+            let reward_fn = self.reward_fn(&block);
             // TRUSTED replay: skip the per-block full-trie root recompute (the ~O(N^2)
             // wall that made a from-genesis rebuild take hours). Correctness is
-            // recovered by verifying the FINAL head root once, below.
+            // recovered by verifying the FINAL head root once, below. The reward is
+            // still derived from the receipts this replay produces (CHAIN-B-F001).
             match self
                 .executor
-                .apply_block_trusted(&block, block.header.coinbase, &credits)
+                .apply_block_trusted(&block, block.header.coinbase, &reward_fn)
                 .await
             {
                 Ok(_) => {
@@ -1525,9 +1540,12 @@ mod tests {
         mk_block_vrf(height, parent, state_root, [0x5B; 32])
     }
 
-    /// Reward credits the driver applies, computed the same way it does internally.
+    /// Reward credits the driver applies, computed the same way it does
+    /// internally. These are reward-only blocks (no executed txs), so the receipt
+    /// set is empty and the reward is the base subsidy (CHAIN-B-F001).
     fn reward_for(block: &Block) -> (U256, U256) {
-        let r = RewardCalculator::new(canonical_reward_config()).calculate_reward(block);
+        let r = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(block.header.height, &[]);
         (r.validator_reward, r.treasury_reward)
     }
 
@@ -3403,13 +3421,16 @@ mod tests {
         });
         // Reward calc reads only header.height + txs — a provisional block suffices.
         let provisional = mk_block_txs(height, parent, Hash::default(), vrf, txs.clone());
+        let mut receipts = Vec::new();
         for tx in &txs {
-            exec.execute_transaction(&provisional, tx)
-                .await
-                .expect("producer tx must execute");
+            receipts.push(
+                exec.execute_transaction(&provisional, tx)
+                    .await
+                    .expect("producer tx must execute"),
+            );
         }
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(provisional.header.height, &receipts);
         for (addr, amt) in [
             (Address(CB), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),
@@ -3726,8 +3747,8 @@ mod tests {
                     .expect("producer tx executes"),
             );
         }
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(provisional.header.height, &receipts);
         let basic = [
             (Address(CB), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),
@@ -5068,8 +5089,9 @@ mod tests {
             block_hashes: std::collections::HashMap::new(),
         });
         let provisional = mk_block_cb(height, parent, Hash::default(), vrf, coinbase);
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        // Reward-only block (no executed txs) → empty receipt set (CHAIN-B-F001).
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(provisional.header.height, &[]);
         for (addr, amt) in [
             (Address(coinbase), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),
@@ -6105,8 +6127,8 @@ mod tests {
                     .expect("producer tx executes"),
             );
         }
-        let reward =
-            RewardCalculator::new(canonical_reward_config()).calculate_reward(&provisional);
+        let reward = RewardCalculator::new(canonical_reward_config())
+            .calculate_reward(provisional.header.height, &receipts);
         let basic = [
             (Address(coinbase), reward.validator_reward),
             (Address(TREASURY_ADDR), reward.treasury_reward),

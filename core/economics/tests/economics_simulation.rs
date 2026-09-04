@@ -43,7 +43,10 @@ fn test_reward_calculation_no_overflow_max_values() {
     // Height that would cause 64+ halvings
     let extreme_height = config.halving_interval * 65;
     let block = make_block(extreme_height, vec![]);
-    let reward = calculator.calculate_reward(&block);
+    // CHAIN-B-F001: reward is a function of executed receipts. These simulation
+    // txs are ordinary transfers (empty calldata, real `to`) that earned no bonus
+    // under the old calldata heuristic either, so an empty receipt set is faithful.
+    let reward = calculator.calculate_reward(block.header.height, &[]);
 
     assert_eq!(reward.total_reward, U256::zero(), "Reward after 64 halvings must be zero");
     assert_eq!(reward.validator_reward, U256::zero());
@@ -51,7 +54,7 @@ fn test_reward_calculation_no_overflow_max_values() {
 
     // u64::MAX height — should not panic
     let block_max = make_block(u64::MAX, vec![]);
-    let reward_max = calculator.calculate_reward(&block_max);
+    let reward_max = calculator.calculate_reward(block_max.header.height, &[]);
     assert_eq!(reward_max.total_reward, U256::zero());
 }
 
@@ -72,7 +75,10 @@ fn test_total_supply_conservation() {
     // Simulate 100 reward distributions
     for i in 0u64..100 {
         let block = make_block(i, vec![]);
-        let reward = calculator.calculate_reward(&block);
+        // CHAIN-B-F001: reward is a function of executed receipts. These simulation
+    // txs are ordinary transfers (empty calldata, real `to`) that earned no bonus
+    // under the old calldata heuristic either, so an empty receipt set is faithful.
+    let reward = calculator.calculate_reward(block.header.height, &[]);
         token.mint(&validator, reward.total_reward).unwrap();
         expected_total_minted += reward.total_reward;
     }
@@ -301,7 +307,10 @@ fn economic_simulation_10k_blocks_supply_conservation() {
         let block = make_block(height, transactions);
 
         // --- Calculate and distribute reward ---
-        let reward = calculator.calculate_reward(&block);
+        // CHAIN-B-F001: reward is a function of executed receipts. These simulation
+    // txs are ordinary transfers (empty calldata, real `to`) that earned no bonus
+    // under the old calldata heuristic either, so an empty receipt set is faithful.
+    let reward = calculator.calculate_reward(block.header.height, &[]);
 
         // Invariant (c): no overflow — if mint would exceed supply, that's
         // fine for the simulation because 10k blocks at 10 SALT/block is only
@@ -451,7 +460,10 @@ fn economic_simulation_max_u256_height_no_panic() {
 
     for &h in &extreme_heights {
         let block = make_block(h, make_transactions(100));
-        let reward = calculator.calculate_reward(&block);
+        // CHAIN-B-F001: reward is a function of executed receipts. These simulation
+    // txs are ordinary transfers (empty calldata, real `to`) that earned no bonus
+    // under the old calldata heuristic either, so an empty receipt set is faithful.
+    let reward = calculator.calculate_reward(block.header.height, &[]);
 
         // At these extreme heights (far past 64 halvings), reward is zero
         if h > halving_interval * 64 {
@@ -541,7 +553,10 @@ fn economic_simulation_reward_proportionality_across_halvings() {
     for halving in 0u64..5 {
         let height = halving_interval * halving;
         let block = make_block(height, vec![]);
-        let reward = calculator.calculate_reward(&block);
+        // CHAIN-B-F001: reward is a function of executed receipts. These simulation
+    // txs are ordinary transfers (empty calldata, real `to`) that earned no bonus
+    // under the old calldata heuristic either, so an empty receipt set is faithful.
+    let reward = calculator.calculate_reward(block.header.height, &[]);
 
         // Expected reward: base_reward >> halvings, converted to wei.
         let expected_base = base_reward >> halving;
