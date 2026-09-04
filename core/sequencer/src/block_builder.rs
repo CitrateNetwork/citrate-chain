@@ -2,7 +2,8 @@
 
 use crate::mempool::{Mempool, TxClass};
 use citrate_consensus::{
-    Block, BlockBuilder as ConsensusBlockBuilder, BlockHeader, Hash, PublicKey, Signature, Transaction, VrfProof,
+    Block, BlockBuilder as ConsensusBlockBuilder, BlockHeader, Hash, PublicKey, Signature,
+    Transaction, VrfProof,
 };
 use citrate_execution::executor::Executor;
 use citrate_execution::parallel::ParallelExecutor;
@@ -100,8 +101,12 @@ impl TxBundle {
     }
 
     pub fn add_transaction(&mut self, tx: Transaction) {
-        self.total_gas += tx.gas_limit;
-        self.total_fees += (tx.gas_price * tx.gas_limit) as u128;
+        // SEQ-H2: saturating fee/gas math. u64 `gas_price * gas_limit` overflows
+        // and panics the producer under release `overflow-checks = true`.
+        self.total_gas = self.total_gas.saturating_add(tx.gas_limit);
+        self.total_fees = self
+            .total_fees
+            .saturating_add((tx.gas_price as u128).saturating_mul(tx.gas_limit as u128));
         self.transactions.push(tx);
     }
 
@@ -292,14 +297,22 @@ impl BlockBuilder {
             .await;
 
         // Apply gas limit
-        let mut total_gas = 0;
+        let mut total_gas: u64 = 0;
         let mut selected = Vec::new();
 
         for tx in transactions {
-            if total_gas + tx.gas_limit > max_gas {
-                break;
+            // SEQ-H2: a single oversized tx must NOT halt selection. Pre-fix
+            // this `break` emptied the block the moment the fee-ordered queue's
+            // head had `gas_limit > max_gas` — a free, repeatable network-wide
+            // empty-block halt. `continue` past it and keep filling; the tx is
+            // also rejected at mempool admission now (`MAX_GAS_PER_BLOCK`), so
+            // it should never reach here. `saturating_add` removes the u64
+            // overflow-panic variant (`total_gas + u64::MAX`).
+            let next_gas = total_gas.saturating_add(tx.gas_limit);
+            if next_gas > max_gas {
+                continue;
             }
-            total_gas += tx.gas_limit;
+            total_gas = next_gas;
             selected.push(tx);
         }
 
@@ -446,7 +459,10 @@ impl BlockBuilder {
 
         // Get real state root from executor's state database
         executor.get_state_root().map_err(|e| {
-            BlockBuilderError::StateRootError(format!("Failed to get state root from executor: {}", e))
+            BlockBuilderError::StateRootError(format!(
+                "Failed to get state root from executor: {}",
+                e
+            ))
         })
     }
 
@@ -514,7 +530,10 @@ impl BlockBuilder {
         parent_blue_score: u64,
         vrf_proof: VrfProof,
     ) -> Result<Block, BlockBuilderError> {
-        info!("Building TEST block with parent {} (synthetic roots)", selected_parent);
+        info!(
+            "Building TEST block with parent {} (synthetic roots)",
+            selected_parent
+        );
 
         let transactions = self.select_transactions().await?;
 
@@ -677,11 +696,12 @@ pub struct BlockTemplate {
 
 impl BlockTemplate {
     pub fn new(block: Block) -> Self {
+        // SEQ-H2: saturating fee math (u64 product overflows / panics).
         let fees = block
             .transactions
             .iter()
-            .map(|tx| (tx.gas_price * tx.gas_limit) as u128)
-            .sum();
+            .map(|tx| (tx.gas_price as u128).saturating_mul(tx.gas_limit as u128))
+            .fold(0u128, |acc, f| acc.saturating_add(f));
 
         Self {
             transactions: block.transactions.clone(),
@@ -773,12 +793,13 @@ mod tests {
 
         // Without executor, building a block with transactions should fail
         // This is the fail-loud behavior for consensus safety
-        let result = builder
-            .build_block(parent, vec![], 0, 1, vrf_proof)
-            .await;
+        let result = builder.build_block(parent, vec![], 0, 1, vrf_proof).await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), BlockBuilderError::StateRootError(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            BlockBuilderError::StateRootError(_)
+        ));
     }
 
     #[tokio::test]
@@ -1392,6 +1413,65 @@ mod tests {
         assert_eq!(
             new_fee, expected_fee,
             "Base fee decrease should follow EIP-1559 formula"
+        );
+    }
+
+    /// SEQ-H2 tripwire: a single oversized tx sitting at the head of the
+    /// fee-ordered queue must NOT halt block production. Pre-fix the selection
+    /// loop `break`ed on the first over-cap tx, emptying the block — a free,
+    /// repeatable, network-wide empty-block halt. Here the mempool admits a tx
+    /// whose gas_limit exceeds the BUILDER's per-block cap (mempool cap raised
+    /// so the tx is stored); the builder must skip it (`continue`) and still
+    /// include the fitting tx behind it. RED with `break`; GREEN with `continue`.
+    #[tokio::test]
+    async fn seq_h2_oversized_tx_does_not_halt_block_selection() {
+        // The mempool admits both txs (both under the 30M admission ceiling);
+        // the BLOCK BUILDER is configured with a small per-block cap so the
+        // "big" tx is over-cap for the block but still a valid mempool entry.
+        let mempool_config = MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        };
+        let mempool = Arc::new(Mempool::new(mempool_config));
+        let cfg = BlockBuilderConfig {
+            min_transactions: 0,
+            max_gas_per_block: 100_000, // small block cap
+            ..Default::default()
+        };
+        let builder = BlockBuilder::new(cfg, mempool.clone(), PublicKey::new([1; 32]));
+
+        // Over-block-cap tx sorts FIRST (highest gas_price) but can never fit.
+        let mut big = create_test_tx(0, 5_000_000_000);
+        big.hash = Hash::new([7; 32]);
+        big.from = PublicKey::new([7; 32]);
+        big.gas_limit = 150_000; // > block cap (100k), < mempool ceiling (30M)
+                                 // A normal tx that DOES fit, behind it in the queue.
+        let mut small = create_test_tx(0, 2_000_000_000);
+        small.hash = Hash::new([8; 32]);
+        small.from = PublicKey::new([8; 32]);
+        small.gas_limit = 21_000;
+
+        mempool
+            .add_transaction(big, TxClass::Standard)
+            .await
+            .expect("mempool admits the big tx (< 30M ceiling)");
+        mempool
+            .add_transaction(small, TxClass::Standard)
+            .await
+            .expect("mempool admits the small tx");
+
+        let selected = builder
+            .select_transactions()
+            .await
+            .expect("select_transactions");
+
+        assert!(
+            !selected.is_empty(),
+            "an oversized head-of-queue tx must not empty the block (break→continue)"
+        );
+        assert!(
+            selected.iter().all(|tx| tx.gas_limit <= 100_000),
+            "no selected tx may exceed the per-block gas cap"
         );
     }
 }

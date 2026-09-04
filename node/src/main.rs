@@ -2739,9 +2739,25 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // orphans buffered from earlier batches alongside the fresh
                         // drain: a parent delivered now can unblock a child that
                         // arrived (and was buffered) in a prior, out-of-order batch.
-                        pending.append(&mut orphan_blocks);
-                        pending.sort_by_key(|b| b.header.height);
-                        pending.dedup_by_key(|b| b.header.block_hash);
+                        // CHAIN-B-A005: only re-scan the orphan buffer when this
+                        // batch actually delivered something new. An empty (or
+                        // duplicate-only) `Blocks` message used to trigger a full
+                        // O(buffer) pass — append + fixpoint loop, each entry a
+                        // chain has_block + DAG has_block + validate — on the
+                        // single inbound task, at up to 200 msg/s. When the fresh
+                        // drain is empty, nothing can have become admissible, so
+                        // leave the buffer untouched and skip the scan (the
+                        // peer-credit logic below still runs with newly_admitted=0).
+                        let reprocessed_orphans = !pending.is_empty();
+                        if reprocessed_orphans {
+                            pending.append(&mut orphan_blocks);
+                            // CHAIN-B-A005: de-duplicate by HASH (interleaving-
+                            // proof) and bound by BOTH count and serialized bytes.
+                            // The old `sort_by_key(height)+dedup_by_key(hash)` only
+                            // collapsed adjacent equal hashes and bounded by count
+                            // alone (20_000 × ~1 MiB ≈ 20 GB).
+                            pending = admission::bound_orphan_buffer(pending);
+                        }
 
                         // Fixpoint: a block that fails admission ONLY because its
                         // parent isn't applied yet is DEFERRED (buffered), never
@@ -2820,14 +2836,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             }
                         }
                         // Buffer unresolved orphans for the next Blocks batch (their
-                        // parents are still en route); bound the buffer so a parent
-                        // that never arrives can't grow it without limit.
-                        const MAX_ORPHAN_BLOCKS: usize = 20_000;
-                        if pending.len() > MAX_ORPHAN_BLOCKS {
-                            pending.sort_by_key(|b| b.header.height);
-                            pending.truncate(MAX_ORPHAN_BLOCKS);
+                        // parents are still en route). CHAIN-B-A005: bound the
+                        // buffer by BOTH count and serialized bytes, de-duplicated
+                        // by hash, so a parent that never arrives can't grow it.
+                        // Only touch the buffer when we actually reprocessed it;
+                        // otherwise the fresh drain was empty and `orphan_blocks`
+                        // already holds the (bounded) buffer unchanged.
+                        if reprocessed_orphans {
+                            orphan_blocks =
+                                admission::bound_orphan_buffer(std::mem::take(&mut pending));
                         }
-                        orphan_blocks = pending;
 
                         // #153 — CREDIT THE PEER ON WHAT IT ACTUALLY DELIVERED.
                         //
@@ -3166,7 +3184,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             max_connections: 100,
             // WP-X.1: Propagate CORS config instead of hardcoding wildcard
             cors_origins: config.rpc.cors_origins.clone(),
-            threads: 4,
+            // CHAIN-B-D002: 4 sync workers were trivially saturated by ~4
+            // concurrent slow eth_call requests (documented PIL-49 outage);
+            // the RpcConfig::default() is 16. Match it so a handful of slow
+            // calls cannot silence the accept queue. The per-call gas cap +
+            // wall-clock timeout in eth_rpc bound each call's cost as well.
+            threads: 16,
             // C-02: Only allow eth_sendTransaction in devnet/dev mode
             allow_eth_send_transaction: config.rpc.allow_eth_send_transaction,
             rate_limit: citrate_api::rate_limit::RateLimitConfig {

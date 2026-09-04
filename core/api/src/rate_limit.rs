@@ -77,11 +77,13 @@ pub fn check_method_budget(method_cost: u32) -> Result<(), jsonrpc_core::Error> 
     let now = Instant::now();
     let window = std::time::Duration::from_secs(WINDOW_SECS);
 
-    let mut entry = METHOD_BUDGETS.entry(key).or_insert_with(|| MethodBudgetEntry {
-        cost_used: 0,
-        window_start: now,
-        last_access: now,
-    });
+    let mut entry = METHOD_BUDGETS
+        .entry(key)
+        .or_insert_with(|| MethodBudgetEntry {
+            cost_used: 0,
+            window_start: now,
+            last_access: now,
+        });
 
     if now.duration_since(entry.window_start) >= window {
         entry.cost_used = 0;
@@ -201,8 +203,8 @@ impl Default for RateLimitConfig {
             window_secs: 1,
             trusted_proxies: Vec::new(), // WP-I.1: secure default — no header trust
             method_costs: Vec::new(),
-            operator_token: None, // WP-I.2: no auth in devnet by default
-            api_key: None, // Sprint 03: no API key required by default
+            operator_token: None,  // WP-I.2: no auth in devnet by default
+            api_key: None,         // Sprint 03: no API key required by default
             is_public_bind: false, // WP-K.4: safe default for devnet/localhost
         }
     }
@@ -261,11 +263,13 @@ impl RateLimiter {
         let ttl = std::time::Duration::from_secs(BUCKET_TTL_SECS);
 
         // Evict stale per-client buckets
-        self.buckets.retain(|_, entry| now.duration_since(entry.last_access) < ttl);
+        self.buckets
+            .retain(|_, entry| now.duration_since(entry.last_access) < ttl);
 
         // If still over capacity, remove oldest entries
         if self.buckets.len() > MAX_BUCKETS {
-            let mut entries: Vec<(String, Instant)> = self.buckets
+            let mut entries: Vec<(String, Instant)> = self
+                .buckets
                 .iter()
                 .map(|e| (e.key().clone(), e.value().last_access))
                 .collect();
@@ -318,9 +322,7 @@ impl RequestMiddleware for RateLimiter {
                 // SECREM-02 5.6: constant-time compare — same class as the
                 // operator-token fix in server.rs (2026-05-31 audit -006).
                 let key_valid = Self::extract_api_key(&request)
-                    .map(|k| {
-                        crate::server::constant_time_eq(k.as_bytes(), expected_key.as_bytes())
-                    })
+                    .map(|k| crate::server::constant_time_eq(k.as_bytes(), expected_key.as_bytes()))
                     .unwrap_or(false);
                 if !key_valid {
                     warn!("API key authentication failed for {}", path);
@@ -365,11 +367,14 @@ impl RequestMiddleware for RateLimiter {
             }
         }
 
-        let mut entry = self.buckets.entry(client_key.clone()).or_insert_with(|| BucketEntry {
-            count: 0,
-            window_start: now,
-            last_access: now,
-        });
+        let mut entry = self
+            .buckets
+            .entry(client_key.clone())
+            .or_insert_with(|| BucketEntry {
+                count: 0,
+                window_start: now,
+                last_access: now,
+            });
 
         // Reset window if expired
         if now.duration_since(entry.window_start) >= window {
@@ -387,7 +392,10 @@ impl RequestMiddleware for RateLimiter {
 
         if entry.count > max {
             drop(entry);
-            warn!("Rate limit exceeded for client {}: {} requests in {}s", client_key, max, self.config.window_secs);
+            warn!(
+                "Rate limit exceeded for client {}: {} requests in {}s",
+                client_key, max, self.config.window_secs
+            );
             let body = r#"{"jsonrpc":"2.0","error":{"code":-32099,"message":"Rate limit exceeded. Try again later."},"id":null}"#;
             let response = hyper::Response::builder()
                 .status(429)
@@ -423,7 +431,10 @@ impl RequestMiddleware for RateLimiter {
 /// The fallback no longer collapses to 127.0.0.1 (which created a single
 /// global bucket). Instead, it uses the URI authority + Host header to
 /// differentiate clients when the connection IP is unavailable.
-pub fn extract_client_key(request: &hyper::Request<Body>, trusted_proxies: &HashSet<IpAddr>) -> String {
+pub fn extract_client_key(
+    request: &hyper::Request<Body>,
+    trusted_proxies: &HashSet<IpAddr>,
+) -> String {
     // Only trust forwarding headers when proxies are explicitly configured
     if !trusted_proxies.is_empty() {
         // Try X-Forwarded-For
@@ -447,33 +458,31 @@ pub fn extract_client_key(request: &hyper::Request<Body>, trusted_proxies: &Hash
         }
     }
 
-    // No trusted proxy or no valid forwarding header — use connection-level info.
-    // jsonrpc-http-server doesn't expose the TCP peer address in Request,
-    // so we use the Host header as a differentiator. This is imperfect but
-    // prevents the global-bucket collapse of the old localhost fallback.
-    //
-    // In production, operators MUST configure a reverse proxy that sets
-    // X-Forwarded-For and add its address to trusted_proxies.
+    // CHAIN-B-D009: FAIL CLOSED. jsonrpc-http-server does not expose the TCP
+    // peer address here, so when no *trusted* proxy has supplied a forwarding
+    // header we cannot attribute the request to a real client. The previous
+    // fallback keyed the bucket on the `Host` header (and then the URI
+    // authority) — both attacker-controlled. That gave an unlimited quota
+    // bypass: rotating `Host:` minted a fresh bucket per request, so neither
+    // the rate limiter nor the method budget ever fired. Keying on any
+    // attacker-controlled value is strictly worse than one shared bucket, so
+    // return a single constant key here. Operators who need per-client limits
+    // MUST front the node with a reverse proxy that sets X-Forwarded-For and
+    // list its address in `trusted_proxies`.
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static WARNED_HOST_FALLBACK: AtomicBool = AtomicBool::new(false);
         if !WARNED_HOST_FALLBACK.swap(true, Ordering::Relaxed) {
-            tracing::warn!("Rate limiting using Host header (spoofable). Configure trusted_proxies for production deployments.");
+            tracing::warn!(
+                "Rate limiting cannot identify clients without a trusted proxy; \
+                 failing closed to a single shared bucket. Configure trusted_proxies \
+                 (and a reverse proxy that sets X-Forwarded-For) for per-client limits."
+            );
         }
     }
-    if let Some(host) = request.headers().get("host") {
-        if let Ok(h) = host.to_str() {
-            return format!("direct_{}", h);
-        }
-    }
-
-    // Final fallback: use URI authority
-    if let Some(authority) = request.uri().authority() {
-        return format!("direct_{}", authority);
-    }
-
-    // Absolute last resort — still better than shared localhost bucket
-    "direct_unknown".to_string()
+    // A single, non-attacker-controlled bucket. Everyone unidentifiable shares
+    // it — safe against the Host-rotation bypass.
+    "untrusted_shared".to_string()
 }
 
 /// Fast extraction of JSON-RPC method name from request body bytes.
@@ -558,8 +567,13 @@ mod tests {
         let no_trust: HashSet<IpAddr> = HashSet::new();
         let req = make_req_with_header("x-forwarded-for", "203.0.113.50, 70.41.3.18");
         let key = extract_client_key(&req, &no_trust);
-        // Should NOT return the XFF IP — should fall back to host-based key
-        assert!(key.starts_with("direct_"), "XFF must be ignored without trusted proxies, got: {}", key);
+        // CHAIN-B-D009: must NOT return the XFF IP, and must NOT key on any
+        // attacker-controlled value — fail closed to the shared bucket.
+        assert_eq!(
+            key, "untrusted_shared",
+            "XFF must be ignored and the key must fail closed without trusted proxies, got: {}",
+            key
+        );
     }
 
     #[test]
@@ -568,7 +582,10 @@ mod tests {
         trusted.insert("127.0.0.1".parse().unwrap());
         let req = make_req_with_header("x-forwarded-for", "203.0.113.50, 70.41.3.18");
         let key = extract_client_key(&req, &trusted);
-        assert_eq!(key, "203.0.113.50", "XFF should be honored with trusted proxy configured");
+        assert_eq!(
+            key, "203.0.113.50",
+            "XFF should be honored with trusted proxy configured"
+        );
     }
 
     #[test]
@@ -576,7 +593,11 @@ mod tests {
         let no_trust: HashSet<IpAddr> = HashSet::new();
         let req = make_req_with_header("x-real-ip", "10.0.0.1");
         let key = extract_client_key(&req, &no_trust);
-        assert!(key.starts_with("direct_"), "X-Real-IP must be ignored without trusted proxies, got: {}", key);
+        assert_eq!(
+            key, "untrusted_shared",
+            "X-Real-IP must be ignored and the key must fail closed without trusted proxies, got: {}",
+            key
+        );
     }
 
     #[test]
@@ -585,17 +606,37 @@ mod tests {
         trusted.insert("127.0.0.1".parse().unwrap());
         let req = make_req_with_header("x-real-ip", "10.0.0.1");
         let key = extract_client_key(&req, &trusted);
-        assert_eq!(key, "10.0.0.1", "X-Real-IP should be honored with trusted proxy");
+        assert_eq!(
+            key, "10.0.0.1",
+            "X-Real-IP should be honored with trusted proxy"
+        );
     }
 
+    /// CHAIN-B-D009 tripwire: without a trusted proxy, the client key must be a
+    /// single constant bucket that an attacker cannot vary. Pre-fix the fallback
+    /// keyed on the `Host` header, so two requests differing only in `Host`
+    /// produced two buckets — an unlimited quota bypass. RED before the
+    /// fail-closed change (distinct Hosts → distinct `direct_<host>` keys);
+    /// GREEN after (both map to `untrusted_shared`).
     #[test]
-    fn test_fallback_uses_host_header() {
+    fn d009_host_header_cannot_split_the_rate_limit_bucket() {
         let no_trust: HashSet<IpAddr> = HashSet::new();
-        let req = make_req(); // has Host: localhost:8545 implicitly via URI
-        let key = extract_client_key(&req, &no_trust);
-        // Should use host or URI authority, not collapse to a single bucket
-        assert!(key.starts_with("direct_"), "Fallback should produce direct_ prefix, got: {}", key);
-        assert_ne!(key, "direct_unknown", "Should extract host, not fall to unknown");
+
+        let a = make_req_with_header("host", "attacker-1.example");
+        let b = make_req_with_header("host", "attacker-2.example");
+        let key_a = extract_client_key(&a, &no_trust);
+        let key_b = extract_client_key(&b, &no_trust);
+
+        assert_eq!(
+            key_a, key_b,
+            "two requests differing only in Host must share one bucket, got {} vs {}",
+            key_a, key_b
+        );
+        assert_eq!(
+            key_a, "untrusted_shared",
+            "the fail-closed key must not embed any attacker-controlled value, got {}",
+            key_a
+        );
     }
 
     // WP-I.4: Method cost extraction tests
@@ -678,7 +719,9 @@ mod tests {
         let req = make_req_with_header("x-api-key", "test-secret-key");
         match limiter.on_request(req) {
             RequestMiddlewareAction::Proceed { .. } => {} // Expected 200
-            RequestMiddlewareAction::Respond { .. } => panic!("Should accept valid X-API-Key header"),
+            RequestMiddlewareAction::Respond { .. } => {
+                panic!("Should accept valid X-API-Key header")
+            }
         }
     }
 
@@ -707,7 +750,9 @@ mod tests {
         // No API key configured → all requests pass
         match limiter.on_request(make_req()) {
             RequestMiddlewareAction::Proceed { .. } => {} // Expected
-            RequestMiddlewareAction::Respond { .. } => panic!("Should allow all requests when no API key configured"),
+            RequestMiddlewareAction::Respond { .. } => {
+                panic!("Should allow all requests when no API key configured")
+            }
         }
     }
 
@@ -723,7 +768,9 @@ mod tests {
             .unwrap();
         match limiter.on_request(req) {
             RequestMiddlewareAction::Proceed { .. } => {} // Expected: /health exempt
-            RequestMiddlewareAction::Respond { .. } => panic!("/health should be exempt from API key"),
+            RequestMiddlewareAction::Respond { .. } => {
+                panic!("/health should be exempt from API key")
+            }
         }
     }
 
@@ -754,18 +801,24 @@ mod tests {
 
         // Manually insert a "stale" entry with very old last_access
         let past = Instant::now() - std::time::Duration::from_secs(BUCKET_TTL_SECS + 10);
-        limiter.buckets.insert("stale_client".to_string(), BucketEntry {
-            count: 5,
-            window_start: past,
-            last_access: past,
-        });
+        limiter.buckets.insert(
+            "stale_client".to_string(),
+            BucketEntry {
+                count: 5,
+                window_start: past,
+                last_access: past,
+            },
+        );
 
         // Insert a fresh entry
-        limiter.buckets.insert("fresh_client".to_string(), BucketEntry {
-            count: 1,
-            window_start: Instant::now(),
-            last_access: Instant::now(),
-        });
+        limiter.buckets.insert(
+            "fresh_client".to_string(),
+            BucketEntry {
+                count: 1,
+                window_start: Instant::now(),
+                last_access: Instant::now(),
+            },
+        );
 
         assert_eq!(limiter.buckets.len(), 2);
 
@@ -784,11 +837,14 @@ mod tests {
         // Insert entries up to MAX_BUCKETS + 10
         let now = Instant::now();
         for i in 0..(MAX_BUCKETS + 10) {
-            limiter.buckets.insert(format!("client_{}", i), BucketEntry {
-                count: 1,
-                window_start: now,
-                last_access: now,
-            });
+            limiter.buckets.insert(
+                format!("client_{}", i),
+                BucketEntry {
+                    count: 1,
+                    window_start: now,
+                    last_access: now,
+                },
+            );
         }
 
         assert!(limiter.buckets.len() > MAX_BUCKETS);
@@ -796,8 +852,10 @@ mod tests {
         // Eviction should cap at MAX_BUCKETS (none are stale, so cap enforced)
         limiter.evict_stale_buckets(now);
 
-        assert!(limiter.buckets.len() <= MAX_BUCKETS,
-            "Bucket count should be capped at MAX_BUCKETS after eviction");
+        assert!(
+            limiter.buckets.len() <= MAX_BUCKETS,
+            "Bucket count should be capped at MAX_BUCKETS after eviction"
+        );
     }
 
     // SECREM-01 API-1/API-2: the K-4 trio below replaced tests of the
@@ -844,9 +902,15 @@ mod tests {
         let _guard = K4_ENV_LOCK.lock().expect("env lock");
         std::env::set_var("CITRATE_OPERATOR_TOKEN", "my-secret");
         let mut ok = serde_json::Map::new();
-        ok.insert("operator_token".into(), serde_json::Value::String("my-secret".into()));
+        ok.insert(
+            "operator_token".into(),
+            serde_json::Value::String("my-secret".into()),
+        );
         let mut bad = serde_json::Map::new();
-        bad.insert("operator_token".into(), serde_json::Value::String("wrong".into()));
+        bad.insert(
+            "operator_token".into(),
+            serde_json::Value::String("wrong".into()),
+        );
         assert!(crate::server::require_operator_auth(&ok).is_ok());
         assert!(crate::server::require_operator_auth(&bad).is_err());
         std::env::remove_var("CITRATE_OPERATOR_TOKEN");
@@ -861,7 +925,10 @@ mod tests {
             let _ = check_method_budget(10); // 100 * 10 = 1000
         }
         // Next call should exceed 1000 budget
-        assert!(check_method_budget(10).is_err(), "Should reject after budget exceeded");
+        assert!(
+            check_method_budget(10).is_err(),
+            "Should reject after budget exceeded"
+        );
     }
 
     /// REM-3 (re-audit Stream 2 / RM-I WP-I1.6):
