@@ -42,7 +42,7 @@ rand = { workspace = true }
 pqcrypto-kyber = "0.8"          # CRYSTALS-Kyber (ML-KEM) - NIST PQC standard
 pqcrypto-traits = "0.3"         # Common traits for pqcrypto
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }  # X25519 ECDH
-zeroize = "1.7"                 # Secure memory zeroing
+zeroize = { version = "1.7", features = ["derive"] }  # Secure memory zeroing + ZeroizeOnDrop derive (CRY-H1)
 argon2 = "0.5"                  # Real Argon2id password-based key derivation
 
 # Compression
