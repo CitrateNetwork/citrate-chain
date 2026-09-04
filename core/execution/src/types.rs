@@ -265,15 +265,18 @@ mod tests {
         // Verify that addresses derived from embedded EVM format match the original bytes
         let mut evm_bytes = [0u8; 32];
         let expected_addr: [u8; 20] = [
-            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x12, 0x34,
-            0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44,
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC,
+            0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44,
         ];
         evm_bytes[..20].copy_from_slice(&expected_addr);
         // Last 12 bytes are zero
 
         let pk = PublicKey::new(evm_bytes);
         let addr = Address::from_public_key(&pk);
-        assert_eq!(addr.0, expected_addr, "Embedded EVM address should match original bytes exactly");
+        assert_eq!(
+            addr.0, expected_addr,
+            "Embedded EVM address should match original bytes exactly"
+        );
     }
 }
 
@@ -637,4 +640,12 @@ pub enum ExecutionError {
     /// Deterministic: every correctly-synced node reaches the identical verdict.
     #[error("Reward settlement rejected: {0}")]
     RewardSettlement(String),
+
+    /// EXEC-02 / WP-C3: a panic was caught inside transaction/precompile
+    /// dispatch and converted into a transaction revert (rather than being
+    /// allowed to abort the validator process). The partial writes of the
+    /// panicking transaction are discarded; only gas is burned and the nonce
+    /// advances. Deterministic given identical inputs, so it does not fork.
+    #[error("Execution panicked (isolated as revert): {0}")]
+    ExecutionPanicked(String),
 }
