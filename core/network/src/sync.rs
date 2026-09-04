@@ -15,6 +15,24 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// CHAIN-B-A004: hard byte budget for the retained header-download buffer.
+/// `downloaded_headers` is fed by every inbound `Headers` message; without a
+/// bound one peer could drive the node to OOM. 64 MiB is far above any honest
+/// in-flight header window (`header_batch_size * max_concurrent_downloads`
+/// headers) yet a firm ceiling on attacker-controlled growth.
+pub(crate) const MAX_DOWNLOADED_HEADERS_BYTES: usize = 64 * 1024 * 1024;
+
+/// Estimated retained heap for one downloaded header. The fixed-size scalar
+/// fields plus the pubkey/VRF material floor at a few hundred bytes; the only
+/// caller-inflatable component is `merge_parent_hashes` (32 B each). Used only
+/// to bound `downloaded_headers`, so a conservative lower-bound estimate is
+/// what keeps the true memory footprint under `MAX_DOWNLOADED_HEADERS_BYTES`.
+pub(crate) fn estimated_header_bytes(h: &BlockHeader) -> usize {
+    // Measured ~485 B/header retained (CHAIN-B-A004 PoC); use 384 B fixed floor
+    // plus the merge-parent vector so a fat header counts for more, not less.
+    384 + h.merge_parent_hashes.len() * std::mem::size_of::<Hash>()
+}
+
 /// Synchronization state
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncState {
@@ -172,7 +190,9 @@ impl SyncManager {
 
     /// This node's applied height, when the handle is wired.
     fn applied_height(&self) -> Option<u64> {
-        self.local_height.as_ref().map(|h| h.load(Ordering::Relaxed))
+        self.local_height
+            .as_ref()
+            .map(|h| h.load(Ordering::Relaxed))
     }
 
     /// Is the node genuinely synced to `target`?
@@ -417,8 +437,35 @@ impl SyncManager {
         // (Pending retirement already done unconditionally at the top of this
         // function — see the comment there.)
 
-        // Store validated headers
-        self.downloaded_headers.write().await.extend(headers);
+        // Store validated headers, bounded by BYTES.
+        // CHAIN-B-A004: `downloaded_headers` was previously an unbounded `Vec`
+        // that every inbound `Headers` message extended and nothing ever
+        // drained — a single peer could drive the node to OOM at ~200 MB/s by
+        // streaming solicited-looking header batches. Cap the retained heap by
+        // an estimated byte budget and drop the OLDEST headers first (FIFO):
+        // the un-consumed tail is always re-derivable from a fresh request.
+        {
+            let mut dl = self.downloaded_headers.write().await;
+            dl.extend(headers);
+            let mut total: usize = dl.iter().map(estimated_header_bytes).sum();
+            if total > MAX_DOWNLOADED_HEADERS_BYTES {
+                let mut drop_count = 0usize;
+                for h in dl.iter() {
+                    if total <= MAX_DOWNLOADED_HEADERS_BYTES {
+                        break;
+                    }
+                    total -= estimated_header_bytes(h);
+                    drop_count += 1;
+                }
+                if drop_count > 0 {
+                    warn!(
+                        "SYNC_CAP: downloaded_headers over {} bytes, evicting {} oldest headers",
+                        MAX_DOWNLOADED_HEADERS_BYTES, drop_count
+                    );
+                    dl.drain(0..drop_count);
+                }
+            }
+        }
 
         // Update progress
         let current = *self.current_height.read().await;
@@ -550,10 +597,7 @@ impl SyncManager {
         }
 
         if rejected > 0 {
-            warn!(
-                "Sync validation: {}/{} blocks rejected",
-                rejected, total
-            );
+            warn!("Sync validation: {}/{} blocks rejected", rejected, total);
         }
 
         if validated.is_empty() {
@@ -649,7 +693,7 @@ impl SyncManager {
         );
 
         // Queue block downloads based on headers
-        let headers = self.downloaded_headers.read().await;
+        let mut headers = self.downloaded_headers.write().await;
         let mut block_queue = self.block_queue.write().await;
 
         // Queue blocks from downloaded headers
@@ -658,6 +702,11 @@ impl SyncManager {
         }
 
         debug!("Queued {} blocks for download", block_queue.len());
+
+        // CHAIN-B-A004: drain the header buffer once consumed so it cannot
+        // accumulate across sync ticks. Any header still needed is re-requested
+        // from the node's current tip on the next tick.
+        headers.clear();
 
         Ok(())
     }
@@ -738,7 +787,10 @@ impl SyncManager {
 
     /// Current pending counts (headers, blocks)
     pub async fn pending_counts(&self) -> (usize, usize) {
-        (self.pending_headers.read().await.len(), self.pending_blocks.read().await.len())
+        (
+            self.pending_headers.read().await.len(),
+            self.pending_blocks.read().await.len(),
+        )
     }
 
     /// Drain all validated blocks that have been downloaded and verified.
@@ -798,7 +850,10 @@ mod tests {
             "a low-advertising peer must not lower the sync target"
         );
         // And we must still be draining (not prematurely Synced).
-        assert!(!sync.is_synced().await, "must keep draining toward the real head");
+        assert!(
+            !sync.is_synced().await,
+            "must keep draining toward the real head"
+        );
 
         // A peer advertising an even higher head DOES raise it.
         sync.start_sync(80_000, Hash::new([3u8; 32])).await.unwrap();
@@ -1000,13 +1055,25 @@ mod tests {
         let ba = Hash::new([8u8; 32]);
         sync.pending_headers.write().await.insert(
             ha,
-            BlockRequest { hash: ha, peer_id: PeerId("p".into()), requested_at: Instant::now(), retries: 0 },
+            BlockRequest {
+                hash: ha,
+                peer_id: PeerId("p".into()),
+                requested_at: Instant::now(),
+                retries: 0,
+            },
         );
         sync.pending_blocks.write().await.insert(
             ba,
-            BlockRequest { hash: ba, peer_id: PeerId("p".into()), requested_at: Instant::now(), retries: 0 },
+            BlockRequest {
+                hash: ba,
+                peer_id: PeerId("p".into()),
+                requested_at: Instant::now(),
+                retries: 0,
+            },
         );
-        sync.handle_headers(vec![]).await.expect("handle empty headers");
+        sync.handle_headers(vec![])
+            .await
+            .expect("handle empty headers");
         let _ = sync.handle_blocks(vec![]).await;
         assert!(
             sync.pending_headers.read().await.is_empty(),
@@ -1033,7 +1100,12 @@ mod tests {
         let anchor = Hash::new([3u8; 32]);
         sync.pending_blocks.write().await.insert(
             anchor,
-            BlockRequest { hash: anchor, peer_id: PeerId("p".into()), requested_at: Instant::now(), retries: 0 },
+            BlockRequest {
+                hash: anchor,
+                peer_id: PeerId("p".into()),
+                requested_at: Instant::now(),
+                retries: 0,
+            },
         );
         // First served block's parent is a DIFFERENT hash than the requested
         // anchor — i.e. the height-index successor is a non-selected sibling.
@@ -1094,5 +1166,49 @@ mod tests {
         // The node applies forward; sync must observe it without rewiring.
         handle.store(56_128, Ordering::Relaxed);
         assert_eq!(sync.applied_height(), Some(56_128));
+    }
+
+    /// CHAIN-B-A004 tripwire: an unbounded flood of `Headers` messages must not
+    /// grow `downloaded_headers` past the byte budget. Pre-fix `handle_headers`
+    /// did a bare `.extend(headers)` and nothing ever drained the vector, so a
+    /// single peer could OOM the node (~200 MB/s at the rate limit). RED before
+    /// the cap (the retained heap would be ~150 MB here); GREEN after. We assert
+    /// the bound rather than exercising a true OOM, which would be unsafe.
+    #[tokio::test]
+    async fn downloaded_headers_stay_within_byte_cap_under_flood() {
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+
+        let sync = SyncManager::new(SyncConfig::default());
+        let template = BlockBuilder::new()
+            .parent(Hash::new([7u8; 32]))
+            .height(1)
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed()
+            .header;
+
+        // 400 batches x 1024 headers ≈ 409k headers. Uncapped that retains
+        // ~150 MB (> the 64 MiB cap), so this flood is a genuine RED case.
+        let per_batch: u64 = 1024;
+        for batch in 0..400u64 {
+            let mut headers = Vec::with_capacity(per_batch as usize);
+            for i in 0..per_batch {
+                let mut h = template.clone();
+                h.height = batch * per_batch + i + 1; // strictly monotonic in-batch
+                headers.push(h);
+            }
+            sync.handle_headers(headers)
+                .await
+                .expect("handle_headers should accept a monotonic batch");
+        }
+
+        let dl = sync.downloaded_headers.read().await;
+        let bytes: usize = dl.iter().map(estimated_header_bytes).sum();
+        assert!(
+            bytes <= MAX_DOWNLOADED_HEADERS_BYTES,
+            "downloaded_headers must stay within the {}-byte cap; got {} bytes across {} headers",
+            MAX_DOWNLOADED_HEADERS_BYTES,
+            bytes,
+            dl.len()
+        );
     }
 }
