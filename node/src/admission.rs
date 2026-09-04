@@ -449,6 +449,55 @@ impl BlockAdmission {
     }
 }
 
+/// CHAIN-B-A005: hard cap on the count of buffered orphan (deferred) blocks.
+pub const MAX_ORPHAN_BLOCKS: usize = 20_000;
+
+/// CHAIN-B-A005: hard cap on the SERIALIZED bytes of the orphan buffer. The
+/// pre-fix code bounded only by count (20_000 × up to ~1 MiB ≈ 20 GB of heap).
+pub const MAX_ORPHAN_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// CHAIN-B-A005: de-duplicate and bound the orphan (deferred-block) buffer.
+///
+/// Pre-fix the buffer was de-duplicated with `sort_by_key(height)` +
+/// `dedup_by_key(hash)`, which only collapses *adjacent* equal hashes — an
+/// attacker defeats it by interleaving two copies of a block around a sibling
+/// at the same height, so both survive. And it was bounded only by COUNT, so
+/// 20_000 near-1-MiB blocks could retain ~20 GB.
+///
+/// This helper de-duplicates by a `HashSet<Hash>` (interleaving-proof) and
+/// bounds by BOTH count and serialized bytes, keeping the lowest-height blocks
+/// first (those are the ones whose parents are most likely to arrive next and
+/// unblock them).
+pub fn bound_orphan_buffer(blocks: Vec<Block>) -> Vec<Block> {
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<Hash> = HashSet::with_capacity(blocks.len());
+    let mut deduped: Vec<Block> = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        if seen.insert(b.header.block_hash) {
+            deduped.push(b);
+        }
+    }
+
+    // Lowest-height first.
+    deduped.sort_by_key(|b| b.header.height);
+
+    let mut total_bytes: usize = 0;
+    let mut out: Vec<Block> = Vec::with_capacity(deduped.len().min(MAX_ORPHAN_BLOCKS));
+    for b in deduped {
+        if out.len() >= MAX_ORPHAN_BLOCKS {
+            break;
+        }
+        let sz = bincode::serialized_size(&b).unwrap_or(u64::MAX) as usize;
+        if total_bytes.saturating_add(sz) > MAX_ORPHAN_BYTES {
+            break;
+        }
+        total_bytes += sz;
+        out.push(b);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,5 +831,64 @@ mod tests {
         let report = adm.reconcile().await;
         assert_eq!(report.dag_writes_completed, vec![2]);
         assert!(dag.has_block(&b2.header.block_hash).await);
+    }
+
+    /// CHAIN-B-A005 tripwire: the orphan buffer must de-duplicate by HASH even
+    /// when duplicate copies are interleaved around a same-height sibling. The
+    /// pre-fix `sort_by_key(height) + dedup_by_key(hash)` only collapses
+    /// *adjacent* equal hashes, so two copies of a block separated by a sibling
+    /// at the same height both survived — an attacker defeats the dedup by
+    /// interleaving. RED with the adjacency dedup; GREEN with the HashSet dedup.
+    #[test]
+    fn orphan_buffer_dedups_by_hash_despite_interleaving() {
+        let a = mk(5, Hash::new([1; 32]), 5, [0xA1; 32]);
+        let b = mk(5, Hash::new([2; 32]), 5, [0xB2; 32]); // same height, different hash
+        assert_ne!(a.header.block_hash, b.header.block_hash);
+
+        // Interleave: A, B, A  — all height 5. A height sort leaves them in
+        // stable order [A, B, A], so adjacency dedup keeps both A's.
+        let input = vec![a.clone(), b.clone(), a.clone()];
+        let out = bound_orphan_buffer(input);
+
+        assert_eq!(out.len(), 2, "interleaved duplicate must be collapsed");
+        let mut hashes: Vec<_> = out.iter().map(|x| x.header.block_hash).collect();
+        hashes.sort();
+        let mut want = vec![a.header.block_hash, b.header.block_hash];
+        want.sort();
+        assert_eq!(hashes, want);
+    }
+
+    /// CHAIN-B-A005 tripwire: the orphan buffer is bounded by COUNT (and by
+    /// bytes — asserted via the count cap being ≤ MAX_ORPHAN_BLOCKS). Pre-fix
+    /// only a by-count truncate existed and the byte size was unbounded.
+    #[test]
+    fn orphan_buffer_is_count_bounded() {
+        // A handful over the cap; lowest-height-first retention.
+        let over = 8usize;
+        let mut input = Vec::with_capacity(MAX_ORPHAN_BLOCKS + over);
+        for i in 0..(MAX_ORPHAN_BLOCKS + over) as u64 {
+            let mut vrf = [0u8; 32];
+            vrf[..8].copy_from_slice(&i.to_le_bytes());
+            // distinct parent per block → distinct hash
+            let mut parent = [0u8; 32];
+            parent[..8].copy_from_slice(&i.to_le_bytes());
+            input.push(mk(i + 1, Hash::new(parent), i, vrf));
+        }
+        let out = bound_orphan_buffer(input);
+        assert!(
+            out.len() <= MAX_ORPHAN_BLOCKS,
+            "orphan buffer must be count-bounded; got {}",
+            out.len()
+        );
+        // Serialized footprint must be within the byte cap.
+        let bytes: usize = out
+            .iter()
+            .map(|b| bincode::serialized_size(b).unwrap_or(u64::MAX) as usize)
+            .sum();
+        assert!(
+            bytes <= MAX_ORPHAN_BYTES,
+            "orphan buffer must be byte-bounded; got {} bytes",
+            bytes
+        );
     }
 }

@@ -29,6 +29,17 @@ pub struct GossipConfig {
     pub max_relay_peers: usize,
     /// Delay before relaying AI transactions (for bundling)
     pub ai_tx_delay: Duration,
+    /// CHAIN-B-NET-H4: hard cap on tx hashes tracked per peer in
+    /// `peer_inventory`. Without it a peer streaming unique valid txs grows its
+    /// own inventory set without bound → remote memory exhaustion.
+    pub max_peer_inventory: usize,
+    /// CHAIN-B-NET-H4: hard cap on the number of distinct peers tracked in
+    /// `peer_inventory` (bounds the outer map).
+    pub max_tracked_peers: usize,
+    /// CHAIN-B-NET-H4: hard cap on the `pending_ai_txs` relay buffer.
+    pub max_pending_ai_txs: usize,
+    /// CHAIN-B-NET-H4: interval at which `spawn_maintenance` drives `cleanup()`.
+    pub cleanup_interval: Duration,
 }
 
 impl Default for GossipConfig {
@@ -38,6 +49,10 @@ impl Default for GossipConfig {
             tx_ttl: Duration::from_secs(600), // 10 minutes
             max_relay_peers: 10,
             ai_tx_delay: Duration::from_millis(100), // 100ms delay for AI tx bundling
+            max_peer_inventory: 50_000,
+            max_tracked_peers: 1_024,
+            max_pending_ai_txs: 8_192,
+            cleanup_interval: Duration::from_secs(60),
         }
     }
 }
@@ -98,7 +113,8 @@ impl TransactionGossip {
         if !Self::validate_transaction_static(&tx, MAX_TX_GOSSIP_MESSAGE_SIZE) {
             tracing::debug!(
                 "H-NET-01 (tx-gossip): rejecting invalid tx {} from peer {}",
-                tx_hash, peer_id
+                tx_hash,
+                peer_id
             );
             return Ok(false);
         }
@@ -138,13 +154,29 @@ impl TransactionGossip {
             true
         };
 
-        // Update peer inventory
-        self.peer_inventory
-            .write()
-            .await
-            .entry(peer_id.clone())
-            .or_insert_with(HashSet::new)
-            .insert(tx_hash);
+        // Update peer inventory — bounded (CHAIN-B-NET-H4). The per-peer set
+        // and the outer peer map were previously unbounded: a peer streaming
+        // unique valid txs grew `peer_inventory[attacker]` forever until OOM.
+        {
+            let mut inv = self.peer_inventory.write().await;
+            // Bound the number of distinct peers tracked. If we're at capacity
+            // and this is a peer we don't already track, evict one arbitrary
+            // existing peer to make room (FIFO-equivalent under HashMap order).
+            if !inv.contains_key(peer_id) && inv.len() >= self.config.max_tracked_peers {
+                if let Some(victim) = inv.keys().next().cloned() {
+                    inv.remove(&victim);
+                }
+            }
+            let set = inv.entry(peer_id.clone()).or_insert_with(HashSet::new);
+            // Bound the per-peer inventory set. Drop one arbitrary existing
+            // hash before inserting when at capacity.
+            if set.len() >= self.config.max_peer_inventory && !set.contains(&tx_hash) {
+                if let Some(victim) = set.iter().next().copied() {
+                    set.remove(&victim);
+                }
+            }
+            set.insert(tx_hash);
+        }
 
         // Handle based on transaction type
         match tx.tx_type {
@@ -153,8 +185,21 @@ impl TransactionGossip {
             | Some(TransactionType::InferenceRequest)
             | Some(TransactionType::TrainingJob)
             | Some(TransactionType::LoraAdapter) => {
-                // AI transaction - add to pending for bundled relay
-                self.pending_ai_txs.write().await.push(tx.clone());
+                // AI transaction - add to pending for bundled relay.
+                // CHAIN-B-NET-H4: bound the buffer. Under a flood the relay
+                // timer may not drain fast enough; drop new AI txs once the
+                // buffer is full rather than growing without limit.
+                {
+                    let mut pending = self.pending_ai_txs.write().await;
+                    if pending.len() < self.config.max_pending_ai_txs {
+                        pending.push(tx.clone());
+                    } else {
+                        debug!(
+                            "CHAIN-B-NET-H4: pending_ai_txs at cap ({}), dropping AI tx {}",
+                            self.config.max_pending_ai_txs, tx_hash
+                        );
+                    }
+                }
 
                 // Schedule bundled relay
                 let gossip = self.clone();
@@ -398,10 +443,52 @@ impl TransactionGossip {
             }
         }
 
-        debug!(
-            "Cleaned up transaction cache, {} entries remaining",
-            seen.len()
-        );
+        // CHAIN-B-NET-H4: `peer_inventory` used to grow forever because nothing
+        // pruned it. Retain only hashes still present in `seen_txs`, drop peers
+        // whose set became empty, and enforce the outer peer cap.
+        let live: std::collections::HashSet<Hash> = seen.keys().copied().collect();
+        drop(seen);
+        {
+            let mut inv = self.peer_inventory.write().await;
+            inv.retain(|_peer, set| {
+                set.retain(|h| live.contains(h));
+                !set.is_empty()
+            });
+            while inv.len() > self.config.max_tracked_peers {
+                if let Some(victim) = inv.keys().next().cloned() {
+                    inv.remove(&victim);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Bound the AI relay buffer as a backstop to the inline cap.
+        {
+            let mut pending = self.pending_ai_txs.write().await;
+            if pending.len() > self.config.max_pending_ai_txs {
+                let overflow = pending.len() - self.config.max_pending_ai_txs;
+                pending.drain(0..overflow);
+            }
+        }
+
+        debug!("Cleaned up transaction gossip state");
+    }
+
+    /// CHAIN-B-NET-H4: schedule `cleanup()` on a fixed interval. Before this,
+    /// `cleanup()` had zero production callers, so `max_seen_txs`/`tx_ttl` and
+    /// the `peer_inventory` bound were dead config. Callers hold the returned
+    /// `JoinHandle` for the lifetime of the node; the task shares the same Arc
+    /// state via `Clone`.
+    pub fn spawn_maintenance(&self) -> tokio::task::JoinHandle<()> {
+        let gossip = self.clone();
+        let interval = gossip.config.cleanup_interval;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                gossip.cleanup().await;
+            }
+        })
     }
 }
 
@@ -556,6 +643,112 @@ mod tests {
         assert!(
             TransactionGossip::validate_transaction_static(&good, MAX),
             "H-NET-01: a valid tx must pass the validator"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // CHAIN-B-NET-H4 — bounded transaction-gossip state.
+    // ────────────────────────────────────────────────────────────────
+
+    /// Build a valid standard tx with a caller-chosen 32-byte hash so a flood
+    /// produces distinct dedup keys.
+    fn valid_tx_with_hash(seed: u32) -> Transaction {
+        let mut h = [0u8; 32];
+        h[..4].copy_from_slice(&seed.to_le_bytes());
+        let mut tx = valid_tx(0, TransactionType::Standard);
+        tx.hash = Hash::new(h);
+        tx
+    }
+
+    /// CHAIN-B-NET-H4 tripwire: one peer streaming unique valid txs must not
+    /// grow its `peer_inventory` set without bound. Pre-fix the per-peer
+    /// `HashSet<Hash>` was inserted into unconditionally → remote OOM. RED
+    /// before the cap (set would reach 5_000); GREEN after (≤ cap).
+    #[tokio::test]
+    async fn peer_inventory_set_is_capped_under_single_peer_flood() {
+        let peer_manager = Arc::new(PeerManager::new(Default::default()));
+        let cfg = GossipConfig {
+            max_peer_inventory: 100,
+            max_tracked_peers: 8,
+            max_pending_ai_txs: 16,
+            ..Default::default()
+        };
+        let gossip = TransactionGossip::new(peer_manager, cfg);
+
+        let peer = PeerId::new("flooder".to_string());
+        for i in 0..5_000u32 {
+            let _ = gossip
+                .handle_new_transaction(&peer, valid_tx_with_hash(i))
+                .await;
+        }
+
+        let inv = gossip.peer_inventory.read().await;
+        let set_len = inv.get(&peer).map(|s| s.len()).unwrap_or(0);
+        assert!(
+            set_len <= 100,
+            "per-peer inventory must stay within the cap; got {}",
+            set_len
+        );
+    }
+
+    /// CHAIN-B-NET-H4 tripwire: the outer peer map is bounded — a flood of
+    /// distinct peer ids cannot grow `peer_inventory` past `max_tracked_peers`.
+    #[tokio::test]
+    async fn peer_inventory_map_is_capped_under_many_peers() {
+        let peer_manager = Arc::new(PeerManager::new(Default::default()));
+        let cfg = GossipConfig {
+            max_peer_inventory: 100,
+            max_tracked_peers: 8,
+            max_pending_ai_txs: 16,
+            ..Default::default()
+        };
+        let gossip = TransactionGossip::new(peer_manager, cfg);
+
+        for i in 0..2_000u32 {
+            let peer = PeerId::new(format!("peer-{i}"));
+            let _ = gossip
+                .handle_new_transaction(&peer, valid_tx_with_hash(i))
+                .await;
+        }
+
+        let inv = gossip.peer_inventory.read().await;
+        assert!(
+            inv.len() <= 8,
+            "tracked-peer count must stay within the cap; got {}",
+            inv.len()
+        );
+    }
+
+    /// CHAIN-B-NET-H4: `cleanup()` prunes `peer_inventory` entries for hashes
+    /// that have aged out of `seen_txs`. Pre-fix `cleanup()` touched only
+    /// `seen_txs`, so inventory kept dead hashes forever.
+    #[tokio::test]
+    async fn cleanup_prunes_stale_peer_inventory() {
+        let peer_manager = Arc::new(PeerManager::new(Default::default()));
+        // tx_ttl = 0 so every seen tx is immediately stale on cleanup.
+        let cfg = GossipConfig {
+            tx_ttl: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let gossip = TransactionGossip::new(peer_manager, cfg);
+
+        let peer = PeerId::new("p".to_string());
+        for i in 0..50u32 {
+            let _ = gossip
+                .handle_new_transaction(&peer, valid_tx_with_hash(i))
+                .await;
+        }
+        assert!(!gossip.peer_inventory.read().await.is_empty());
+
+        gossip.cleanup().await;
+
+        assert!(
+            gossip.seen_txs.read().await.is_empty(),
+            "stale seen_txs must be swept"
+        );
+        assert!(
+            gossip.peer_inventory.read().await.is_empty(),
+            "peer_inventory must be pruned of hashes no longer in seen_txs"
         );
     }
 }

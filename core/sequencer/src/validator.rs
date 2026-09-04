@@ -273,7 +273,12 @@ impl<S: StateProvider> TxValidator<S> {
 
         // Check balance
         if self.rules.check_balance {
-            let required = tx.value + (tx.gas_limit * tx.gas_price) as u128;
+            // SEQ-H2: saturating math. `gas_limit * gas_price` is a u64 product
+            // that overflows and, with release `overflow-checks = true`, panics
+            // the validator thread on a crafted tx (e.g. gas_limit=21000,
+            // gas_price=u64::MAX). Compute the fee in u128 and saturate.
+            let fee = (tx.gas_limit as u128).saturating_mul(tx.gas_price as u128);
+            let required = tx.value.saturating_add(fee);
             if account.balance < required {
                 return Err(ValidationError::InsufficientBalance {
                     required,

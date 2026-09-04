@@ -11,6 +11,18 @@ use crate::institutional::{
 };
 use crate::token::DECIMALS;
 
+/// CHAIN-B-F002: hard ceiling on the projection horizon. `estimate()` loops
+/// once per month and pushes a `MonthlyProjection` each iteration; the
+/// unauthenticated `citrate_estimateInstitutionalRewards` RPC took
+/// `projection_months` straight from the caller with no clamp, so a single
+/// request with `projection_months = u32::MAX` demanded ~315 GB / ~28,741 s of
+/// CPU. 120 months (10 years) is well beyond any real projection horizon.
+pub const MAX_PROJECTION_MONTHS: u32 = 120;
+
+/// CHAIN-B-F002: hard ceiling on the per-month activity counts, so the reward
+/// arithmetic cannot be driven with absurd inputs either.
+pub const MAX_ESTIMATION_UNITS: u32 = 100_000;
+
 /// Input parameters for reward estimation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EstimationParams {
@@ -75,12 +87,20 @@ impl InstitutionalRewardEstimator {
         let calc = InstitutionalRewardCalculator::new(self.reward_config.clone());
         let wei_per_salt = U256::from(10).pow(U256::from(DECIMALS));
 
-        let mut projections = Vec::new();
+        // CHAIN-B-F002: clamp every attacker-controllable size before it drives
+        // a loop / allocation or the reward arithmetic. This is the load-bearing
+        // bound — it protects the RPC handler and every other caller.
+        let projection_months = params.projection_months.min(MAX_PROJECTION_MONTHS);
+        let models_to_host = params.models_to_host.min(MAX_ESTIMATION_UNITS);
+        let adapters_per_month = params.adapters_per_month.min(MAX_ESTIMATION_UNITS);
+        let datasets_per_month = params.datasets_per_month.min(MAX_ESTIMATION_UNITS);
+
+        let mut projections = Vec::with_capacity(projection_months as usize);
         let mut cumulative = 0.0f64;
         let mut min_monthly = f64::MAX;
         let mut max_monthly = 0.0f64;
 
-        for month in 1..=params.projection_months {
+        for month in 1..=projection_months {
             // Build a synthetic profile for this month
             let mut profile = InstitutionalOperatorProfile::new(
                 citrate_execution::types::Address([0; 20]),
@@ -89,9 +109,9 @@ impl InstitutionalRewardEstimator {
                 0,
             );
             profile.uptime_ratio = params.expected_uptime;
-            profile.models_hosted = params.models_to_host;
-            profile.adapters_created = params.adapters_per_month;
-            profile.datasets_contributed = params.datasets_per_month;
+            profile.models_hosted = models_to_host;
+            profile.adapters_created = adapters_per_month;
+            profile.datasets_contributed = datasets_per_month;
             profile.is_active = true;
             profile.current_epoch = month as u64;
 
@@ -127,8 +147,8 @@ impl InstitutionalRewardEstimator {
             });
         }
 
-        let avg = if params.projection_months > 0 {
-            cumulative / params.projection_months as f64
+        let avg = if projection_months > 0 {
+            cumulative / projection_months as f64
         } else {
             0.0
         };
@@ -137,7 +157,11 @@ impl InstitutionalRewardEstimator {
             monthly_projections: projections,
             total_projected_salt: cumulative,
             average_monthly_salt: avg,
-            min_monthly_salt: if min_monthly == f64::MAX { 0.0 } else { min_monthly },
+            min_monthly_salt: if min_monthly == f64::MAX {
+                0.0
+            } else {
+                min_monthly
+            },
             max_monthly_salt: max_monthly,
         }
     }
@@ -157,6 +181,42 @@ mod tests {
         assert_eq!(result.monthly_projections.len(), 12);
         assert!(result.total_projected_salt > 0.0);
         assert!(result.average_monthly_salt > 0.0);
+    }
+
+    /// CHAIN-B-F002 tripwire: an absurd `projection_months` must be clamped, so
+    /// the loop and the projections Vec cannot be driven to ~315 GB / hours of
+    /// CPU by a single unauthenticated RPC. RED before the clamp (the Vec would
+    /// hold u32::MAX entries — an OOM, so we assert the bound rather than run
+    /// the unclamped path); GREEN after (capped at MAX_PROJECTION_MONTHS).
+    #[test]
+    fn f002_projection_months_is_clamped() {
+        let estimator = InstitutionalRewardEstimator::new(InstitutionalRewardConfig::default());
+        let params = EstimationParams {
+            projection_months: u32::MAX,
+            ..Default::default()
+        };
+
+        let result = estimator.estimate(&params);
+        assert_eq!(
+            result.monthly_projections.len(),
+            MAX_PROJECTION_MONTHS as usize,
+            "projection_months must be clamped to MAX_PROJECTION_MONTHS"
+        );
+    }
+
+    /// CHAIN-B-F002: the per-month activity counts are clamped too, so the
+    /// reward arithmetic cannot be driven with absurd inputs.
+    #[test]
+    fn f002_activity_counts_are_clamped() {
+        let estimator = InstitutionalRewardEstimator::new(InstitutionalRewardConfig::default());
+        let result = estimator.estimate(&EstimationParams {
+            models_to_host: u32::MAX,
+            adapters_per_month: u32::MAX,
+            datasets_per_month: u32::MAX,
+            projection_months: 1,
+            ..Default::default()
+        });
+        assert_eq!(result.monthly_projections.len(), 1);
     }
 
     #[test]
