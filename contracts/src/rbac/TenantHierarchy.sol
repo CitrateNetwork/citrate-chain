@@ -91,6 +91,10 @@ contract TenantHierarchy {
     error LevelMismatch(uint8 expected, uint8 got);
     error InvalidClassification(uint8 max);
     error ClassificationExceedsParent(uint8 child_max, uint8 parent_max);
+    /// @notice `setClassificationMax` may only lower a node's ceiling.
+    error ClassificationNotMonotoneDown(uint8 requested, uint8 current);
+    /// @notice A child already holds a max above the requested value.
+    error ChildExceedsClassification(bytes32 child, uint8 child_max, uint8 requested);
     error NotAdmin(address caller);
     error InvalidThreshold(uint8 threshold, uint256 admin_count);
     error EmptyAdmins();
@@ -229,6 +233,22 @@ contract TenantHierarchy {
                     max, parentNode.classification_max
                 );
             }
+        }
+        // This function is a *ceiling reduction*: `ClearanceMaxMonotonicDownTree`
+        // must hold after the call, not only at creation. Raising the ceiling —
+        // even up to the parent's max — would let a node's own admins clear their
+        // scope above what the parent deliberately capped, without the parent's
+        // consent. Only allow lowering.
+        if (max > node.classification_max) {
+            revert ClassificationNotMonotoneDown(max, node.classification_max);
+        }
+        // A reduction that drops below an already-created child's ceiling would
+        // silently leave the child cleared above this node — the mirror hole.
+        bytes32[] storage kids = _children[tenant_id];
+        uint256 kidCount = kids.length;
+        for (uint256 i; i < kidCount; ++i) {
+            uint8 childMax = _nodes[kids[i]].classification_max;
+            if (childMax > max) revert ChildExceedsClassification(kids[i], childMax, max);
         }
         if (!_isAdmin(node, msg.sender)) revert NotAdmin(msg.sender);
 
