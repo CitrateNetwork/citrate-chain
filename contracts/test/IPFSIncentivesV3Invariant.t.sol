@@ -142,11 +142,15 @@ contract Handler is Test {
         if (st != IPFSIncentivesV3.Status.Active || round >= ROUNDS) return;
         (address ch, , ) = inc.getChallenge(who, cid, SECTOR);
         if (ch != address(0)) return;
-        (, , , uint256 commitBlock, , ) = inc.getSlot(cid, SECTOR);
-        if (commitBlock == 0) {
-            (, bool ok) = _freshCommit(cid);
-            if (!ok) return;
-        }
+        // Always ensure a fresh, not-yet-evaluated commit backs the challenge.
+        // A commit can be slashed only once (slash requires
+        // commitBlock > lastSlashedCommitBlock), so re-using a prior (already
+        // slashed) commit would make every slash after the first revert
+        // "Commit already evaluated" and the pin could never cross MAX_MISSED.
+        // `_freshCommit` reuses a still-live commit and rolls a fresh one past a
+        // stale window, so calling it unconditionally is safe.
+        (, bool ok) = _freshCommit(cid);
+        if (!ok) return;
         vm.prank(CHALLENGER);
         try inc.challengePin{value: CH_BOND}(who, cid, SECTOR) {} catch {}
     }
