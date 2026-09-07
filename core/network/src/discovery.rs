@@ -54,6 +54,22 @@ impl Default for DiscoveryConfig {
 /// host or one rented /24.
 pub const MAX_PEERS_PER_SUBNET_GROUP: usize = 3;
 
+/// CHAIN-B-A010: hard cap on the `known_peers` map. It is fed directly from
+/// unsolicited `Peers` peer-exchange messages with attacker-controlled `id`
+/// strings, and `config.max_peers` was only ever consulted as a *dial* limit —
+/// nothing bounded insertion, and expiry is one hour, so a single peer could
+/// grow the map without limit (tens of MB/s) and stuff the dial-candidate set.
+/// Cap it at a small multiple of `max_peers`; bootstrap peers are exempt from
+/// eviction (they are protected and few).
+fn known_peers_cap(max_peers: usize) -> usize {
+    max_peers.saturating_mul(8).max(64)
+}
+
+/// CHAIN-B-A010: reject an attacker-oversized peer id before it is stored.
+/// A `KnownPeer` id is a Noise-key / short-hex handle in practice; anything
+/// longer is a memory-amplification attempt.
+pub const MAX_PEER_ID_LEN: usize = 256;
+
 /// SECREM-01 NET-4(a): subnet-diversity group key for an IP.
 ///
 /// IPv4 addresses group by /24 (first 3 octets); IPv6 by /48 (first
@@ -169,6 +185,12 @@ impl Discovery {
 
     /// Add a discovered peer (non-bootstrap).
     pub async fn add_peer(&self, id: String, addr: SocketAddr, score: i32) {
+        // CHAIN-B-A010: bound the attacker-controlled id and cap the map size.
+        if id.len() > MAX_PEER_ID_LEN {
+            debug!("Discovery: rejecting oversized peer id ({} bytes)", id.len());
+            return;
+        }
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -182,6 +204,45 @@ impl Discovery {
             attempts: 0,
             is_bootstrap: false,
         };
+
+        // CHAIN-B-A010: enforce the size cap on INSERTION. When the map is at
+        // capacity and this is a new (non-updating) entry, evict the
+        // lowest-score, then oldest, NON-bootstrap entry to make room. Bootstrap
+        // peers are protected. If the incoming entry would be the weakest and
+        // the map is full of stronger non-bootstrap peers, drop the incoming one
+        // rather than a better-standing peer.
+        let cap = known_peers_cap(self.config.max_peers);
+        if !self.known_peers.contains_key(&id) && self.known_peers.len() >= cap {
+            // Find the weakest evictable (non-bootstrap) entry.
+            let weakest = self
+                .known_peers
+                .iter()
+                .filter(|e| !e.value().is_bootstrap)
+                .min_by(|a, b| {
+                    a.value()
+                        .score
+                        .cmp(&b.value().score)
+                        .then(a.value().last_seen.cmp(&b.value().last_seen))
+                })
+                .map(|e| (e.key().clone(), e.value().score, e.value().last_seen));
+
+            match weakest {
+                Some((victim_id, victim_score, victim_seen))
+                    if (score, now) > (victim_score, victim_seen) =>
+                {
+                    self.known_peers.remove(&victim_id);
+                }
+                Some(_) => {
+                    // Incoming entry is no better than the weakest resident —
+                    // refuse it rather than evict a better peer.
+                    return;
+                }
+                None => {
+                    // Map is full of bootstrap peers only — refuse the insert.
+                    return;
+                }
+            }
+        }
 
         self.known_peers.insert(id, peer);
         debug!("Added peer to discovery: {}", addr);
@@ -301,7 +362,13 @@ impl Discovery {
     pub async fn handle_peer_exchange(&self, peers: Vec<PeerAddress>) {
         const INITIAL_DISCOVERED_SCORE: i32 = 0;
 
-        for peer in peers {
+        // CHAIN-B-A010: a `Peers` frame can carry thousands of entries up to the
+        // 1 MiB transport cap. We only ever advertise `peer_exchange_size` of
+        // our own, so accept no more than that many from a single exchange —
+        // the rest is amplification. `known_peers` is separately hard-capped in
+        // `add_peer`.
+        let accept = self.config.peer_exchange_size;
+        for peer in peers.into_iter().take(accept) {
             if let Ok(addr) = peer.addr.parse::<SocketAddr>() {
                 // Skip if already connected or banned
                 if self.connected_peers.read().await.contains(&peer.id) {
@@ -568,6 +635,75 @@ mod tests {
         ];
         let accepted = filter_by_subnet_cap(&candidates, &[], 3);
         assert_eq!(accepted, vec![0, 1, 2, 3]);
+    }
+
+    // CHAIN-B-A010: `known_peers` is fed from unsolicited `Peers` peer-exchange
+    // messages with attacker-controlled ids. It must stay bounded on insertion,
+    // reject oversized ids, and a single exchange must not add more than
+    // `peer_exchange_size` entries.
+    #[tokio::test]
+    async fn known_peers_is_capped_under_add_peer_flood() {
+        let config = DiscoveryConfig {
+            max_peers: 10,
+            ..Default::default()
+        };
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let discovery = Discovery::new(config.clone(), peer_manager);
+
+        let cap = known_peers_cap(config.max_peers);
+        for i in 0..(cap * 10) {
+            let addr: SocketAddr = format!("10.0.{}.{}:30303", (i / 250) % 250, i % 250)
+                .parse()
+                .unwrap();
+            discovery.add_peer(format!("peer-{i}"), addr, 0).await;
+        }
+        assert!(
+            discovery.known_peers.len() <= cap,
+            "known_peers ({}) must stay within cap ({})",
+            discovery.known_peers.len(),
+            cap
+        );
+    }
+
+    #[tokio::test]
+    async fn add_peer_rejects_oversized_id() {
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let discovery = Discovery::new(DiscoveryConfig::default(), peer_manager);
+        let addr: SocketAddr = "10.0.0.1:30303".parse().unwrap();
+        discovery
+            .add_peer("x".repeat(MAX_PEER_ID_LEN + 1), addr, 0)
+            .await;
+        assert_eq!(
+            discovery.known_peers.len(),
+            0,
+            "an oversized peer id must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_exchange_accepts_at_most_exchange_size() {
+        let config = DiscoveryConfig {
+            peer_exchange_size: 5,
+            max_peers: 100,
+            ..Default::default()
+        };
+        let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let discovery = Discovery::new(config, peer_manager);
+
+        let batch: Vec<PeerAddress> = (0..1000)
+            .map(|i| PeerAddress {
+                id: format!("peer-{i}"),
+                addr: format!("10.1.{}.{}:30303", (i / 250) % 250, i % 250),
+                last_seen: 0,
+                score: 100,
+            })
+            .collect();
+        discovery.handle_peer_exchange(batch).await;
+        assert!(
+            discovery.known_peers.len() <= 5,
+            "a single peer-exchange must add at most peer_exchange_size entries; got {}",
+            discovery.known_peers.len()
+        );
     }
 
     #[tokio::test]

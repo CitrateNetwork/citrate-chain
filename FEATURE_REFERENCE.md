@@ -22,12 +22,21 @@ Complete reference of all features, APIs, opcodes, consensus mechanisms, and lib
 - **Backward compatible**: Accepts both ECVRF (114-byte) and legacy SHA3 (32-byte) proofs
 
 ### BFT Committee Checkpoints
+> **STATUS (CHAIN-B-A009): NOT WIRED IN THE SHIPPED BINARY.** The
+> `CheckpointManager` machinery below is implemented and unit-tested, but
+> `CheckpointManager::propose` has **no production call site**, no committee is
+> selected in the node, and `latest_finalized_height()` therefore stays `0`.
+> As a result the reorg "never revert past finality" floor is pinned at 0 and
+> the "finality override" is inert. Finality in effect today is the **100-block
+> in-memory reorg preference** (`MAX_REORG_DEPTH`), not BFT checkpoint finality.
+> The parameters below describe the intended design, not current behavior;
+> wiring the proposal path is an OWNER decision (consensus change → reroll).
 - **Committee size**: 100 validators
 - **Quorum**: 67 (2/3 + 1)
 - **Checkpoint interval**: 50 blocks (~25s at 0.5s block time)
 - **Selection**: Deterministic via VRF seed + validator pubkey + checkpoint height
 - **Persistence**: RocksDB `checkpoints` column family
-- **Finality override**: Checkpoint finality overrides depth-based finality
+- **Finality override**: Checkpoint finality overrides depth-based finality *(design intent; not yet active — see status note above)*
 
 ### Signature Schemes
 - **Native**: ed25519 (block signing, validator identity)
