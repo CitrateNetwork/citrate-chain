@@ -254,24 +254,32 @@ impl GossipProtocol {
         block: Block,
         exclude_peer: &PeerId,
     ) -> Result<(), NetworkError> {
+        let block_hash = block.hash();
+
+        // CHAIN-B-A014: mark the block seen-and-handled BEFORE the empty-peer
+        // early return. The `propagated` flag is `handle_new_block`'s only
+        // duplicate suppressor; when a node has no other peers (e.g. a single
+        // attacker peer), the old code returned here before setting it, so the
+        // guard never fired and the attacker could replay one block indefinitely
+        // — each replay paying a full `bincode::serialize` + ed25519 verify and
+        // earning `SCORE_VALID_BLOCK`. Handling is complete once validation has
+        // passed; whether we had peers to relay to is irrelevant to dedup.
+        if let Some(mut seen) = self.seen_blocks.get_mut(&block_hash) {
+            seen.propagated = true;
+        }
+
         let peers = self.select_gossip_peers(exclude_peer).await;
 
         if peers.is_empty() {
             return Ok(());
         }
 
-        let block_hash = block.hash();
         let message = NetworkMessage::NewBlock { block };
 
         for peer in peers {
             if let Err(e) = peer.send(message.clone()).await {
                 debug!("Failed to propagate block to peer: {}", e);
             }
-        }
-
-        // Mark as propagated
-        if let Some(mut seen) = self.seen_blocks.get_mut(&block_hash) {
-            seen.propagated = true;
         }
 
         self.stats.write().await.blocks_propagated += 1;
@@ -285,24 +293,26 @@ impl GossipProtocol {
         tx: Transaction,
         exclude_peer: &PeerId,
     ) -> Result<(), NetworkError> {
+        let tx_hash = tx.hash;
+
+        // CHAIN-B-A014: mark seen-and-handled BEFORE the empty-peer early return
+        // (same replay-farming gap as `propagate_block`).
+        if let Some(mut seen) = self.seen_transactions.get_mut(&tx_hash) {
+            seen.propagated = true;
+        }
+
         let peers = self.select_gossip_peers(exclude_peer).await;
 
         if peers.is_empty() {
             return Ok(());
         }
 
-        let tx_hash = tx.hash;
         let message = NetworkMessage::NewTransaction { transaction: tx };
 
         for peer in peers {
             if let Err(e) = peer.send(message.clone()).await {
                 debug!("Failed to propagate transaction to peer: {}", e);
             }
-        }
-
-        // Mark as propagated
-        if let Some(mut seen) = self.seen_transactions.get_mut(&tx_hash) {
-            seen.propagated = true;
         }
 
         self.stats.write().await.transactions_propagated += 1;

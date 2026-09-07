@@ -2087,10 +2087,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // node one growth-window short of the tip — the forward-sync stall.
                 // set_target only RAISES, never lowers.
                 let seen = max_seen_for_sync.load(std::sync::atomic::Ordering::Relaxed);
-                let target = best_h.max(seen);
-                if target > 0 {
-                    sync_for_loop.set_target(target).await;
-                }
                 // Our true synced head (applied tip height). When this is below the
                 // target we KNOW we are behind and must keep pulling.
                 let applied_height = storage_for_sync
@@ -2100,6 +2096,22 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     .flatten()
                     .map(|(_, h)| h)
                     .unwrap_or(0);
+                // CHAIN-B-A007: clamp the target to a sane distance above our own
+                // applied tip. `seen` is fed (in part) by unauthenticated
+                // `Hello`/`HelloAck` `head_height` and gossip; a single peer
+                // advertising `head_height = u64::MAX` would otherwise pin the
+                // target — and `eth_syncing.highestBlock` — at u64::MAX for the
+                // life of the process, and flatten the serve-quality classifier
+                // whose `gap = target - applied` then never shrinks. The bound is
+                // generous (10M blocks ahead) so no honest deep-sync gap is ever
+                // throttled, but an absurd claim can no longer pin the target.
+                const MAX_SYNC_LOOKAHEAD: u64 = 10_000_000;
+                let target = best_h
+                    .max(seen)
+                    .min(applied_height.saturating_add(MAX_SYNC_LOOKAHEAD));
+                if target > 0 {
+                    sync_for_loop.set_target(target).await;
+                }
                 // Choose a peer to pull from — see node/src/sync_peer.rs for the
                 // policy and the two live wedges it closes. In short: only peers
                 // whose advertised head is ABOVE our applied tip are candidates
@@ -2503,7 +2515,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await;
                     }
                     NetworkMessage::Headers { headers } => {
-                        let _ = sync_for_rx.handle_headers(headers).await;
+                        let _ = sync_for_rx.handle_headers(&pid, headers).await;
                     }
                     NetworkMessage::GetTransactions { hashes } => {
                         let mut txs = Vec::new();
@@ -2551,12 +2563,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::NewBlock { block } => {
-                        // Record network-height evidence from ANY gossip — even a relay
-                        // peer not in our peer manager. This is the signal that raises
-                        // the sync target for a far-behind follower (fed to the 2s tick
-                        // + eth_syncing).
-                        max_seen_for_rx
-                            .fetch_max(block.header.height, std::sync::atomic::Ordering::Relaxed);
+                        // CHAIN-B-A007: network-height evidence from gossip is
+                        // recorded AFTER the block passes `gossip::validate_block`
+                        // (in the `Ok(_)`/`Deferred` arms below), never on the raw
+                        // pre-validation header. Previously this ran an
+                        // unconditional `max_seen.fetch_max(block.header.height)`
+                        // here — before any structural or signature check — so one
+                        // unauthenticated packet claiming `height = u64::MAX` pinned
+                        // the sync target (and `eth_syncing.highestBlock`) at
+                        // u64::MAX for the life of the process, which also flattens
+                        // the serve-quality classifier (gap = target - applied).
                         // Keep this peer's advertised head FRESH from its gossip.
                         // PeerInfo.head_height is seeded once at the transport
                         // handshake and never refreshed afterward, so the sync target
@@ -2587,7 +2603,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await
                         {
                             match gossip_for_rx.handle_new_block(block.clone(), &pid).await {
-                                Ok(_) => match admission_for_net.admit(&block).await {
+                                Ok(_) => {
+                                    // CHAIN-B-A007: the block passed gossip
+                                    // validation (structure + signature). Only now
+                                    // is its height trustworthy network-height
+                                    // evidence for the sync target.
+                                    max_seen_for_rx.fetch_max(
+                                        block.header.height,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    match admission_for_net.admit(&block).await {
                                     admission::AdmitOutcome::Admitted { completed_partial } => {
                                         if completed_partial {
                                             tracing::warn!(
@@ -2706,7 +2731,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                             why
                                         );
                                     }
-                                },
+                                    }
+                                }
                                 Err(e) => {
                                     tracing::warn!(
                                         "Rejected invalid block {} from {}: {}",
@@ -2726,7 +2752,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // a single block had been examined, so answering at all was
                         // enough to clear the penalty and stay the preferred source.
                         // WP-H.4: handle_blocks now validates each block
-                        let _ = sync_for_rx.handle_blocks(blocks).await;
+                        let _ = sync_for_rx.handle_blocks(&pid, blocks).await;
                         // WP-H.5: Drain validated blocks and persist to chain store.
                         // Without this, synced blocks live only in SyncManager memory
                         // and are never integrated into the DAG.
