@@ -92,11 +92,18 @@ contract PolicyBindingTest is Test {
     address constant STRANGER = address(0xBEEF);
     address constant PRINCIPAL = address(0xA11CE);
 
-    bytes32 constant ALICE = keccak256("alice");
-    bytes32 constant BOB = keccak256("bob");
+    // CHAIN-B-C008: MultiSigEnvelope binds sign() to the caller's own subjectKey,
+    // so ALICE/BOB must be the subjectKey of a real address we prank as. Assigned
+    // in setUp via `_subject` (the same derivation as QuorumIdentity.subjectKey).
+    address constant ALICE_ADDR = address(0xA11CE5);
+    address constant BOB_ADDR = address(0xB0B5);
+    bytes32 ALICE;
+    bytes32 BOB;
     bytes32 constant VOTERS = keccak256("role:shareholders");
 
     function setUp() public {
+        ALICE = _subject(ALICE_ADDR);
+        BOB = _subject(BOB_ADDR);
         registry = new GovernanceTemplateRegistry(GOV);
         tenants = new TenantHierarchy();
         classifications = new ClassificationRegistry(address(this));
@@ -502,6 +509,7 @@ contract PolicyBindingTest is Test {
         required[0] = ALICE;
         required[1] = BOB;
         envelopes.draft(envelopeId, ALICE, keccak256("artifact"), "bafyArtifact", required, 2, 0, keccak256("corr"));
+        vm.prank(ALICE_ADDR);
         envelopes.sign(envelopeId, ALICE, hex"ab", "ceremony");
 
         (IGovernanceProtocol.Verdict half, bytes32 r2, bytes32[] memory outstanding) = _check(0);
@@ -510,6 +518,7 @@ contract PolicyBindingTest is Test {
         assertEq(outstanding.length, 1);
         assertEq(outstanding[0], BOB);
 
+        vm.prank(BOB_ADDR);
         envelopes.sign(envelopeId, BOB, hex"cd", "ceremony");
 
         // The binding's own answer is `PB_ALLOWED`: a combined allow is the
