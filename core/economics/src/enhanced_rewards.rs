@@ -238,7 +238,10 @@ impl EnhancedRewardCalculator {
             return Ok(rewards);
         }
 
-        let validator_pool = *total_pool * U256::from(self.config.performance_bonus_pool + self.config.staking_bonus_pool) / U256::from(100);
+        // Widen to u16 before summing: `u8 + u8` panics under overflow-checks
+        // when the two configured percentages sum above 255.
+        let pool_pct = self.config.performance_bonus_pool as u16 + self.config.staking_bonus_pool as u16;
+        let validator_pool = *total_pool * U256::from(pool_pct) / U256::from(100);
 
         // Calculate total performance score
         let total_score: f64 = performances.iter()
@@ -264,7 +267,10 @@ impl EnhancedRewardCalculator {
             let uptime_bonus = self.calculate_uptime_bonus(performance, &base_reward);
             let penalty = self.calculate_validator_penalty(performance, &base_reward);
 
-            let total_reward = base_reward + performance_bonus + staking_bonus + uptime_bonus - penalty;
+            // saturating_sub: the penalty can exceed the gross reward (≥10 slashes
+            // at 10%/slash), and a plain U256 subtraction panics on underflow.
+            let gross = base_reward + performance_bonus + staking_bonus + uptime_bonus;
+            let total_reward = gross.saturating_sub(penalty);
 
             rewards.insert(performance.address, ValidatorReward {
                 base_reward,
@@ -331,12 +337,14 @@ impl EnhancedRewardCalculator {
     fn calculate_network_health_bonus(&self, health: &NetworkHealth, total_pool: &U256) -> Result<U256> {
         let health_pool = *total_pool * U256::from(self.config.network_health_pool) / U256::from(100);
 
-        // Network health score (0.0 to 1.0)
-        let health_score = (health.average_uptime * 0.3 +
+        // Network health score (0.0 to 1.0). The component weights already sum
+        // to 1.0, so the result is a weighted mean — dividing by 5.0 again capped
+        // the score at 0.2 and under-paid the health bonus 5×.
+        let health_score = health.average_uptime * 0.3 +
                            health.consensus_efficiency * 0.25 +
                            health.transaction_success_rate * 0.2 +
                            health.ai_operation_success_rate * 0.15 +
-                           health.network_decentralization * 0.1) / 5.0;
+                           health.network_decentralization * 0.1;
 
         let bonus = health_pool * U256::from((health_score * 100.0) as u64) / U256::from(100);
         Ok(bonus)
@@ -413,7 +421,11 @@ impl EnhancedRewardCalculator {
 
     fn calculate_validator_penalty(&self, performance: &ValidatorPerformance, base: &U256) -> U256 {
         if performance.slash_count > 0 {
-            *base * U256::from(performance.slash_count * 10) / U256::from(100) // 10% penalty per slash
+            // Cap the penalty at 100% of base. `slash_count * 10` overflows u64
+            // for very large counts, and an uncapped percentage would exceed the
+            // gross reward and (before the saturating_sub above) panic.
+            let pct = (performance.slash_count.saturating_mul(10)).min(100);
+            *base * U256::from(pct) / U256::from(100)
         } else {
             U256::zero()
         }

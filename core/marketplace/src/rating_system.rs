@@ -146,6 +146,23 @@ impl RatingSystem {
 
     /// Submit a new review
     pub async fn submit_review(&self, review: UserReview, verified_purchase: bool) -> Result<()> {
+        // Reject non-finite or out-of-range ratings. `min_rating`/`max_rating`
+        // were declared but never enforced, so `f32::INFINITY`/`NaN` flowed into
+        // the weighted mean and the `partial_cmp(..).unwrap_or(Equal)` sorts —
+        // NaN there panics on modern Rust ("comparison does not implement a total
+        // order").
+        if !review.rating.is_finite()
+            || review.rating < self.config.min_rating
+            || review.rating > self.config.max_rating
+        {
+            return Err(anyhow::anyhow!(
+                "rating {} out of range [{}, {}]",
+                review.rating,
+                self.config.min_rating,
+                self.config.max_rating
+            ));
+        }
+
         // Create enhanced review with initial quality metrics
         let quality = self.calculate_review_quality(&review, verified_purchase).await?;
         let enhanced_review = EnhancedUserReview {
@@ -211,9 +228,13 @@ impl RatingSystem {
         if let Some(mut review_entry) = self.enhanced_reviews.get_mut(&key) {
             review_entry.reported_count += 1;
 
-            // Update spam probability
+            // Update spam probability against the total ENGAGEMENT (votes plus
+            // reports), not just votes. Dividing by `total_votes.max(1)` made the
+            // first report of a review with no votes yield spam_probability = 1.0,
+            // zeroing its weight — free, repeatable, unauthenticated censorship.
+            let engagement = (review_entry.total_votes + review_entry.reported_count).max(1);
             review_entry.quality.spam_probability =
-                (review_entry.reported_count as f32 / review_entry.total_votes.max(1) as f32).min(1.0);
+                (review_entry.reported_count as f32 / engagement as f32).min(1.0);
 
             // If spam probability exceeds threshold, mark as low quality
             if review_entry.quality.spam_probability > self.config.spam_detection_threshold {
@@ -514,7 +535,10 @@ impl RatingSystem {
         let mut weight_sum = 0.0;
 
         for review in &reviews {
-            let age_days = (Utc::now() - review.review.created_at).num_days() as f32;
+            // Clamp age to >= 0: a future-dated `created_at` otherwise makes the
+            // exponent positive and the weight grow without bound (and go NaN),
+            // letting a review buy unbounded influence by lying about its date.
+            let age_days = (Utc::now() - review.review.created_at).num_days().max(0) as f32;
             let age_weight = (-age_days / self.config.review_weight_decay_days as f32).exp();
 
             let quality_weight = (review.quality.helpfulness_score * 0.3) +

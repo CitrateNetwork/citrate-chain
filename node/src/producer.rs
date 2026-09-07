@@ -2009,9 +2009,18 @@ impl BlockProducer {
                     vec![0.5; emb.embedding.len()]
                 };
 
-                // Use accuracy * 100 as a proxy for blue_score when actual
-                // blue score is not available from the gossip message.
-                let blue_score = (emb.profile.accuracy * 100.0) as f32;
+                // Trust weight must NOT be derived from the peer's own
+                // self-reported `accuracy`: it is an unauthenticated gossip
+                // field bounded only to [0,1], so a peer claiming accuracy=1.0
+                // would out-weigh an honest 0.90 peer by e^10 ≈ 22026:1 through
+                // the softmax, letting a handful of throwaway keys own the
+                // aggregate. Until a *consensus* blue score for a
+                // validator-set-checked participant is plumbed through the
+                // gossip message (see belnap::blue_scores_to_trust_weights),
+                // every contribution gets a uniform weight so no single peer can
+                // buy influence by lying about its accuracy.
+                // OWNER: wire real consensus blue score before arming learning.
+                let blue_score = 1.0f32;
 
                 peer_embeddings.push(PeerEmbedding {
                     embedding: emb.embedding.clone(),
