@@ -604,6 +604,27 @@ contract TreasuryGovernorTest is Test {
         assertEq(governor.quorumThreshold(), TOTAL_SUPPLY / 10);
     }
 
+    function test_C013_countedVotingPower_cannotExceedDeclaredSupply() public {
+        uint256 proposalId = _createSpendProposal();
+        vm.roll(block.number + 2);
+
+        address first = address(0xC0131);
+        address second = address(0xC0132);
+        address third = address(0xC0133);
+        vm.deal(first, 600_000_000 ether);
+        vm.deal(second, 400_000_000 ether);
+        vm.deal(third, 1 ether);
+
+        vm.prank(first);
+        governor.castVote(proposalId, TreasuryGovernor.VoteType.For);
+        vm.prank(second);
+        governor.castVote(proposalId, TreasuryGovernor.VoteType.For);
+
+        vm.prank(third);
+        vm.expectRevert("TreasuryGovernor: voting power exceeds supply");
+        governor.castVote(proposalId, TreasuryGovernor.VoteType.For);
+    }
+
     // ============================================================
     // Test 12: Get spend details
     // ============================================================

@@ -405,7 +405,7 @@ source of truth for any client default, SDK, wallet, or docs:
 - **Logging**: tracing
 
 ### Solidity
-- **Compiler**: solc 0.8.26
+- **Compiler**: solc 0.8.36 (pinned; see `contracts/foundry.toml`)
 - **EVM target**: Cancun
 - **Framework**: Foundry (forge build/test/deploy)
 

@@ -36,7 +36,7 @@ import {CitratePaymaster} from "../../src/aa/paymaster/CitratePaymaster.sol";
  *               canonical nonce-0 EntryPoint, so a node/bundler pointed at the
  *               wrong one is detectable by address alone.
  *
- * Determinism holds ONLY under the DEFAULT foundry profile (solc 0.8.26,
+ * Determinism holds ONLY under the DEFAULT foundry profile (solc 0.8.36,
  * optimizer 200, via_ir, cancun, bytecode_hash=none, cbor_metadata=false).
  * Run with FOUNDRY_PROFILE unset — under [profile.citrate] (optimizer_runs=10000)
  * the creationCode, hence every address, changes and the tripwire fails by design.

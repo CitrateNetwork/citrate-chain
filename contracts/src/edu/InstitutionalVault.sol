@@ -316,6 +316,18 @@ contract InstitutionalVault is IInstitutionalVault {
         if (p.rejected) revert SignerProposalAlreadyRejected();
         if (p.approvalCount < _threshold) revert SignerProposalQuorumNotMet();
 
+        // Re-check mutable signer-set preconditions at execution time. Two
+        // removals can be approved concurrently; validating only at propose
+        // time would allow the second one to leave signerCount < threshold
+        // and permanently freeze the vault.
+        if (p.isAdd) {
+            if (_isSigner[p.target]) revert AlreadySigner();
+        } else {
+            if (!_isSigner[p.target] || _signerList.length <= _threshold) {
+                revert InvalidThreshold();
+            }
+        }
+
         p.executed = true;
 
         if (p.isAdd) {

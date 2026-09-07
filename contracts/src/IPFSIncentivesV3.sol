@@ -217,6 +217,14 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         /// @notice Block by which the pinner must refute (the slot reveal-window
         ///         end at challenge time); past it the pin is slashable.
         uint256 challengeDeadline;
+        /// @notice Commit block used for the most recent slash evaluation.
+        ///         A slot commit can justify at most one slash attempt for
+        ///         this pin.
+        uint256 lastSlashedCommitBlock;
+        /// @notice Commit block for the most recent successful PoSt. This
+        ///         prevents a correctly answered challenge from being
+        ///         treated as unanswered after its window closes.
+        uint256 lastAnsweredCommitBlock;
         /// @notice PIN-S4: the pinner's KYC identity (`subHash`) at seal, when
         ///         the Sybil binding was active. Used to free the slot's
         ///         identity slot on slash. 0 if binding was inactive at seal.
@@ -328,6 +336,10 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
     uint256 public honestPinnerCompensationPool;
 
     uint256 public totalSlotBudgetFunded;
+    /// @notice Native SALT deposited by governance but not yet assigned to a
+    ///         slot budget. Slot budgets are liabilities and must consume this
+    ///         backing before a slot can be created.
+    uint256 public unallocatedSlotFunding;
 
     mapping(address => uint256) public challengerCredit;
 
@@ -507,6 +519,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
 
     function fund() external payable onlyRole(DEFAULT_ADMIN_ROLE) {
         require(msg.value > 0, "Amount required");
+        unallocatedSlotFunding += msg.value;
     }
 
     // ─────────────────────────────── IDs ───────────────────────────────────
@@ -664,6 +677,8 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         if (!s.funded) {
             s.funded = true;
             uint256 seed = QUORUM * REWARD;
+            require(unallocatedSlotFunding >= seed, "Insufficient slot funding");
+            unallocatedSlotFunding -= seed;
             s.budget = seed;
             totalSlotBudgetFunded += seed;
             emit SlotFunded(sid, seed);
@@ -839,6 +854,8 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
      *         CHALLENGE_WINDOW).
      */
     function commitChallenge(bytes32 cid, uint256 sector) external {
+        ModelRegistration storage reg = _modelByCid[cid];
+        require(reg.modelOwner != address(0) && !reg.slashed, "Model not registered");
         bytes32 sid = slotId(cid, sector);
         Slot storage s = _ensureSlotFunded(sid);
 
@@ -899,6 +916,10 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
 
         Slot storage s = _slots[slotId(cid, sector)];
         require(s.commitBlock != 0, "No committed challenge");
+        require(
+            block.number <= s.commitBlock + REVEAL_DELAY + CHALLENGE_WINDOW,
+            "Challenge window closed"
+        );
 
         p.challenger = msg.sender;
         p.challengerBond = msg.value;
@@ -1010,6 +1031,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         s.budget -= PER_ROUND;
         p.round += 1;
         p.missed = 0;
+        p.lastAnsweredCommitBlock = s.commitBlock;
 
         Status newStatus = (uint256(p.round) == ROUNDS) ? Status.Done : Status.Active;
         p.status = newStatus;
@@ -1062,6 +1084,9 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             block.number > s.commitBlock + REVEAL_DELAY + CHALLENGE_WINDOW,
             "Window not yet closed"
         );
+        require(s.commitBlock > p.lastSlashedCommitBlock, "Commit already evaluated");
+        require(s.commitBlock > p.lastAnsweredCommitBlock, "Challenge answered");
+        p.lastSlashedCommitBlock = s.commitBlock;
 
         // PIN-S3: the pinner failed to refute. Return any bonded challenger's
         // bond and route the slash reward to THEM (an honest challenge pays);

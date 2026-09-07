@@ -87,7 +87,7 @@ contract DisputeResolutionTest is Test {
         DisputeResolution.Dispute memory d = dispute.getDispute(disputeId);
 
         assertEq(d.challengerBond, BOND);
-        assertEq(d.defenderBond, BOND);
+        assertEq(d.defenderBond, 0);
         assertEq(d.challenger, challenger);
         assertEq(d.defender, defender);
         assertTrue(d.state == DisputeResolution.DisputeState.Initiated);
@@ -302,10 +302,6 @@ contract DisputeResolutionTimeoutTest is Test {
     function test_timeout_defender_fails_to_acknowledge() public {
         uint256 disputeId = _initiate();
 
-        // Fund contract with defender's conceptual bond so _payWinner can pay both bonds.
-        // In production, this would come from the defender's stake being slashed/locked.
-        vm.deal(address(dispute), address(dispute).balance + BOND);
-
         DisputeResolution.Dispute memory d = dispute.getDispute(disputeId);
         vm.roll(d.deadline + 1);
 
@@ -316,8 +312,10 @@ contract DisputeResolutionTimeoutTest is Test {
         assertTrue(d.state == DisputeResolution.DisputeState.Resolved);
         assertTrue(d.outcome == DisputeResolution.Outcome.ChallengerWon);
 
-        // Challenger gets their bond back + defender's conceptual bond
-        assertEq(challenger.balance, challengerBefore + BOND * 2);
+        // Only the actually posted challenger bond is refundable. No
+        // defender bond exists until the defender acknowledges.
+        assertEq(challenger.balance, challengerBefore + BOND);
+        assertEq(mockSlashing.slashCount(), 0);
     }
 
     function test_timeout_before_deadline_reverts() public {

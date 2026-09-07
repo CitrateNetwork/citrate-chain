@@ -700,6 +700,52 @@ contract InstitutionalVaultTest is Test {
         vm.expectRevert(InstitutionalVault.InvalidThreshold.selector);
         vault.proposeSignerChange(signer2, false);
     }
+
+    /// Two removals can both be approved while the original signer set is
+    /// still valid. Execution must re-check the live set so the second cannot
+    /// leave a 2-of-3 vault with one signer.
+    function test_C004_concurrent_removals_cannot_freeze_vault() public {
+        vm.prank(signer1);
+        uint256 remove2 = vault.proposeSignerChange(signer2, false);
+        vm.prank(signer2);
+        vault.approveSignerChange(remove2);
+
+        vm.prank(signer1);
+        uint256 remove3 = vault.proposeSignerChange(signer3, false);
+        vm.prank(signer2);
+        vault.approveSignerChange(remove3);
+
+        vm.prank(signer1);
+        vault.executeSignerChange(remove2);
+
+        vm.prank(signer1);
+        vm.expectRevert(InstitutionalVault.InvalidThreshold.selector);
+        vault.executeSignerChange(remove3);
+
+        assertEq(vault.getSignerCount(), 2);
+        assertEq(vault.getThreshold(), 2);
+    }
+
+    /// A stale add proposal must not append the same signer twice.
+    function test_C005_concurrent_adds_cannot_duplicate_signer() public {
+        vm.prank(signer1);
+        uint256 add1 = vault.proposeSignerChange(signer4, true);
+        vm.prank(signer2);
+        vault.approveSignerChange(add1);
+
+        vm.prank(signer1);
+        uint256 add2 = vault.proposeSignerChange(signer4, true);
+        vm.prank(signer2);
+        vault.approveSignerChange(add2);
+
+        vm.prank(signer1);
+        vault.executeSignerChange(add1);
+
+        vm.prank(signer1);
+        vm.expectRevert(InstitutionalVault.AlreadySigner.selector);
+        vault.executeSignerChange(add2);
+        assertEq(vault.getSignerCount(), 4);
+    }
 }
 
 // ===================================================================

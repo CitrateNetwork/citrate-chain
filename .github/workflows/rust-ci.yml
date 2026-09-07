@@ -77,7 +77,7 @@ jobs:
       # CI-fix (2026-06-05): install a real `solc` binary so the verifier
       # tests EXERCISE compile_runtime_bytecode instead of skipping via
       # the solc_is_usable() guard in server.rs. We pull the canonical
-      # linux-amd64 static build of solc 0.8.24 (the version the tests
+      # linux-amd64 static build of solc 0.8.36 (the version the tests
       # pin) directly from the ethereum/solidity GitHub release and put
       # it on PATH as `solc`. The SHA-256 is pinned so a tampered mirror
       # / replaced asset fails the install step.
@@ -86,12 +86,12 @@ jobs:
       # wrapper was the source of the original "Exec format error" — its
       # versioned artifact got into a bad state. Pulling the static
       # binary straight from the release skips that whole layer.
-      - name: Install solc 0.8.24
+      - name: Install solc 0.8.36
         run: |
           set -euo pipefail
           curl -fsSL -o /tmp/solc \
-            https://github.com/ethereum/solidity/releases/download/v0.8.24/solc-static-linux
-          echo "fb03a29a517452b9f12bcf459ef37d0a543765bb3bbc911e70a87d6a37c30d5f  /tmp/solc" \
+            https://github.com/ethereum/solidity/releases/download/v0.8.36/solc-static-linux
+          echo "c8d35afdddc3cd2743ee88b8f25e0fecd16e2bdd5f2120f37e52cd9cc45ae0e6  /tmp/solc" \
             | sha256sum -c -
           sudo install -m 0755 /tmp/solc /usr/local/bin/solc
           solc --version
