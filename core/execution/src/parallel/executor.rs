@@ -3,11 +3,9 @@
 use super::conflict::{ConflictScheduler, DefaultAccessSetExtractor};
 use crate::executor::Executor;
 use crate::types::TransactionReceipt;
-use futures::future::join_all;
 use citrate_consensus::types::{Block, Transaction};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::task;
 
 /// Parallel executor for transaction batches
 pub struct ParallelExecutor {
@@ -21,53 +19,40 @@ impl ParallelExecutor {
         }
     }
 
-    /// Execute a batch of transactions with parallel scheduling
+    /// Execute a batch of transactions through the conflict scheduler.
+    ///
+    /// CHAIN-B-B012: this path is NOT wired to block production today
+    /// (`block_builder` runs `execute_transaction` sequentially). The prior
+    /// implementation spawned each conflict group as a concurrent tokio task
+    /// over one shared `Executor` and *logged-and-continued* on any tx error.
+    /// That is doubly non-deterministic — the MVCC CAS abort/retry ordering
+    /// depends on task interleaving, and a failing tx silently vanishes from
+    /// the receipt set — so two nodes running the same tx list could compute
+    /// different state and different receipts (a fork) the moment it was wired.
+    ///
+    /// Until a *deterministic* parallel scheduler exists, execute the groups in
+    /// a FIXED order and HARD-FAIL on the first error, exactly like
+    /// `apply_block_inner`. Correctness (determinism + all-or-nothing) beats
+    /// throughput for a path that feeds consensus.
     pub async fn execute_batch_with(
         &self,
         executor: Arc<Executor>,
         block: &Block,
         transactions: Vec<Transaction>,
     ) -> anyhow::Result<Vec<TransactionReceipt>> {
-        // Schedule transactions into non-conflicting groups
+        // Schedule transactions into non-conflicting groups (deterministic).
         let groups = self.conflict_scheduler.schedule(transactions);
 
-        // Record metrics
-        #[cfg(feature = "metrics")]
-        let _ = groups.len(); // metrics_server integration placeholder
-
-        // Execute groups in parallel
-        let mut tasks = Vec::new();
-        for group in groups {
-            let executor = executor.clone();
-            let block = block.clone();
-
-            let task = task::spawn(async move {
-                let mut receipts = Vec::new();
-                for tx in group {
-                    match executor.execute_transaction(&block, &tx).await {
-                        Ok(receipt) => receipts.push(receipt),
-                        Err(e) => {
-                            // Log error but continue with other transactions
-                            tracing::error!("Transaction execution failed: {:?}", e);
-                        }
-                    }
-                }
-                receipts
-            });
-
-            tasks.push(task);
-        }
-
-        // Collect all receipts
-        let results = join_all(tasks).await;
         let mut all_receipts = Vec::new();
-
-        for result in results {
-            match result {
-                Ok(receipts) => all_receipts.extend(receipts),
-                Err(e) => {
-                    tracing::error!("Task execution failed: {:?}", e);
-                }
+        for group in groups {
+            for tx in group {
+                let receipt = executor
+                    .execute_transaction(block, &tx)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("batch transaction {} failed: {:?}", tx.hash, e)
+                    })?;
+                all_receipts.push(receipt);
             }
         }
 
