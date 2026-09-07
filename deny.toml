@@ -115,6 +115,17 @@ ignore = [
     "RUSTSEC-2024-0381",  # (transitive unmaintained — REM-21)
     "RUSTSEC-2026-0162",  # (transitive unmaintained — REM-21)
     "RUSTSEC-2025-0124",  # (transitive unmaintained — REM-21)
+    # lru LruCache::pop use-after-free (RUSTSEC-2026-0253, CHAIN-B-E004) —
+    # UNSOUND, NOT EXPLOITABLE here. The advisory requires a key whose `Drop`
+    # panics while `pop` is unwinding under `catch_unwind`; citrate-chain
+    # stores only plain-data keys (hashes, addresses, small integers) with
+    # non-panicking Drops in every LruCache, and never wraps a `pop` in
+    # `catch_unwind`. The fix needs lru >=0.18.2, which is a minor API bump
+    # of the `lru = "0.16"` (core/execution) and `lru = "0.17"` (core/storage)
+    # pins — tracked for a follow-up bump. The companion h2 DoS
+    # (RUSTSEC-2026-0258) was PATCHED via a Cargo.lock bump to h2 0.4.16
+    # rather than ignored.
+    "RUSTSEC-2026-0253",
 ]
 
 [bans]
