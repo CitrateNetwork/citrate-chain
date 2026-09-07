@@ -400,6 +400,82 @@ contract CitratePaymasterTest is Test {
         _validate(account, op, FIRST_OP + 1);
     }
 
+    // ── CHAIN-B-C033: sponsor signature is bound to the op nonce ──
+
+    /// RED (pre-fix): the sponsor digest omitted any per-op value, so one
+    /// signature was replayable for every op from the sender. GREEN: a blob
+    /// signed for nonce 0 does not authorize an op at nonce 1.
+    function test_C033_signature_bound_to_nonce() public {
+        PackedUserOperation memory op = _baseOp(account);
+        op.nonce = 0;
+        op.paymasterAndData = _signedPmdNonce(account, 0, _until(), _after(), 0, SPONSOR_PK);
+        _validate(account, op, 0.001 ether); // authorized for nonce 0
+
+        // Replay the SAME paymasterAndData on a different nonce → rejected.
+        PackedUserOperation memory op2 = _baseOp(account);
+        op2.nonce = 1;
+        op2.paymasterAndData = op.paymasterAndData;
+        vm.expectRevert(CitratePaymaster.InvalidSponsorSignature.selector);
+        _validate(account, op2, 0.001 ether);
+    }
+
+    /// CHAIN-B-C033: an infinite window (validUntil == 0) is rejected.
+    function test_C033_infinite_window_rejected() public {
+        PackedUserOperation memory op = _baseOp(account);
+        op.paymasterAndData = _signedPmd(account, 2, 0 /*validUntil*/, _after(), SPONSOR_PK);
+        vm.expectRevert(CitratePaymaster.SponsorshipExpired.selector);
+        _validate(account, op, _wei(1));
+    }
+
+    // ── CHAIN-B-C021: caps are reserved during validation ──────────
+
+    /// RED (pre-fix): `_validatePaymasterUserOp` was read-only — all counters
+    /// advanced only in `_postOp` — and EntryPoint v0.7 validates ALL ops in a
+    /// bundle before executing ANY. So N first-ops for one sender in one
+    /// `handleOps` all validated against `hasUsedFirstOp == false` and every
+    /// cap was bypassed at once. GREEN: the first-op flag is consumed in
+    /// validation, so a second first-op in the same bundle (validate-then-
+    /// validate, no postOp between) is rejected.
+    function test_C021_two_first_ops_in_a_bundle_rejected() public {
+        PackedUserOperation memory op1 = _baseOp(account);
+        op1.nonce = 0;
+        op1.paymasterAndData = _signedPmdNonce(account, 2, _until(), _after(), 0, SPONSOR_PK);
+        _validate(account, op1, 0.015 ether); // reserves the one-shot first-op
+
+        // Second first-op in the SAME bundle: EntryPoint runs this validation
+        // before op1's postOp, so the flag must already be consumed.
+        PackedUserOperation memory op2 = _baseOp(account);
+        op2.nonce = 1;
+        op2.paymasterAndData = _signedPmdNonce(account, 2, _until(), _after(), 1, SPONSOR_PK);
+        vm.expectRevert(abi.encodeWithSelector(CitratePaymaster.FirstOpAlreadyUsed.selector, account));
+        _validate(account, op2, 0.015 ether);
+    }
+
+    /// CHAIN-B-C021: the standard daily cap is reserved across validations in a
+    /// bundle. Two 0.006-ether ops (cap 0.01) validated back-to-back with no
+    /// postOp between must not both pass.
+    function test_C021_standard_cap_reserved_across_bundle() public {
+        PackedUserOperation memory op1 = _baseOp(account);
+        op1.nonce = 0;
+        op1.paymasterAndData = _signedPmdNonce(account, 0, _until(), _after(), 0, SPONSOR_PK);
+        _validate(account, op1, 0.006 ether); // reserves 0.006
+
+        PackedUserOperation memory op2 = _baseOp(account);
+        op2.nonce = 1;
+        op2.paymasterAndData = _signedPmdNonce(account, 0, _until(), _after(), 1, SPONSOR_PK);
+        vm.expectRevert(); // StandardCapExceeded — reservation persisted
+        _validate(account, op2, 0.006 ether);
+    }
+
+    /// GREEN: after settlement the reservation is trued up to the actual gas
+    /// cost, so accounting still reflects reality (not the reserved maxCost).
+    function test_C021_postOp_trues_up_reservation() public {
+        bytes memory ctx = _validate(account, _userOpStandard(account), 0.006 ether);
+        _postOp(ctx, 0.001 ether); // actual << reserved
+        (uint128 usedWei,) = pm.dailyUsage(account);
+        assertEq(uint256(usedWei), 0.001 ether, "counter reflects actual, not reserved");
+    }
+
     // ── E8-2: maxFeePerGas ceiling (over-sponsor drain guard) ──
 
     /// An op whose maxFeePerGas exceeds the ceiling is refused even though
@@ -449,7 +525,7 @@ contract CitratePaymasterTest is Test {
 
         // Op 1: account first-op 0.02 ether — under global.
         _validateGlobal(capped, account, 2, 0.02 ether);
-        _postOpOn(capped, abi.encode(account, uint8(2)), 0.02 ether);
+        _postOpOn(capped, abi.encode(account, uint8(2), uint256(0.02 ether)), 0.02 ether);
 
         // Op 2: otherAccount first-op 0.02 ether — would push aggregate to
         // 0.04 ether > 0.03 ether global cap → revert.
@@ -473,7 +549,7 @@ contract CitratePaymasterTest is Test {
         capped.registerWallet(account);
 
         _validateGlobal(capped, account, 2, 0.02 ether);
-        _postOpOn(capped, abi.encode(account, uint8(2)), 0.02 ether);
+        _postOpOn(capped, abi.encode(account, uint8(2), uint256(0.02 ether)), 0.02 ether);
         (uint128 spent,) = capped.globalUsage();
         assertEq(uint256(spent), 0.02 ether);
 
@@ -643,10 +719,22 @@ contract CitratePaymasterTest is Test {
         view
         returns (bytes memory)
     {
-        bytes32 digest = target.sponsorDigest(sender, cat, until, aft);
+        // CHAIN-B-C033: digest now binds the UserOp nonce (0 in these unit ops).
+        bytes32 digest = target.sponsorDigest(sender, cat, until, aft, 0);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signPk, digest.toEthSignedMessageHash());
         bytes memory sig = abi.encodePacked(r, s, v);
         return _pmdWithSigFor(target, cat, until, aft, sig);
+    }
+
+    /// CHAIN-B-C033: sign the sponsorship for a specific op nonce.
+    function _signedPmdNonce(address sender, uint8 cat, uint48 until, uint48 aft, uint256 nonce, uint256 signPk)
+        internal
+        view
+        returns (bytes memory)
+    {
+        bytes32 digest = pm.sponsorDigest(sender, cat, until, aft, nonce);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signPk, digest.toEthSignedMessageHash());
+        return _pmdWithSig(cat, until, aft, abi.encodePacked(r, s, v));
     }
 
     function _sponsorSig(address sender, uint8 cat, uint48 until, uint48 aft, uint256 signPk)
@@ -654,7 +742,8 @@ contract CitratePaymasterTest is Test {
         view
         returns (bytes memory)
     {
-        bytes32 digest = pm.sponsorDigest(sender, cat, until, aft);
+        // CHAIN-B-C033: digest now binds the UserOp nonce (0 in these unit ops).
+        bytes32 digest = pm.sponsorDigest(sender, cat, until, aft, 0);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signPk, digest.toEthSignedMessageHash());
         return abi.encodePacked(r, s, v);
     }

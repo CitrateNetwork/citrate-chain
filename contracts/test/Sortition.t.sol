@@ -15,13 +15,20 @@ contract SortitionTest is Test {
     Sortition s;
 
     bytes32 constant DRAW = keccak256("panel-2026-q3");
-    bytes32 constant POOL_ROOT = keccak256("pool-root");
     uint32 constant POOL = 12;
     uint32 constant K = 4;
 
     address constant ALICE = address(0xA11CE);
     address constant BOB = address(0xB0B);
     address constant CAROL = address(0xCA401);
+    address constant DUMMY = address(0xD00D);
+
+    /// CHAIN-B-C022: the pool root is now a Merkle tree over member leaves
+    /// `keccak256(abi.encode(member))`, so `commit` can prove membership.
+    /// A 4-leaf tree: [ALICE(0), BOB(1), CAROL(2), DUMMY(3)].
+    bytes32 POOL_ROOT;
+    bytes32 internal _n01;
+    bytes32 internal _n23;
 
     uint64 constant START = 1000;
     uint64 TARGET;
@@ -30,6 +37,41 @@ contract SortitionTest is Test {
         vm.roll(START);
         s = new Sortition();
         TARGET = START + s.MIN_DELTA();
+
+        bytes32 l0 = _leaf(ALICE);
+        bytes32 l1 = _leaf(BOB);
+        bytes32 l2 = _leaf(CAROL);
+        bytes32 l3 = _leaf(DUMMY);
+        _n01 = keccak256(abi.encode(l0, l1));
+        _n23 = keccak256(abi.encode(l2, l3));
+        POOL_ROOT = keccak256(abi.encode(_n01, _n23));
+    }
+
+    function _leaf(address who) internal pure returns (bytes32) {
+        return keccak256(abi.encode(who));
+    }
+
+    /// CHAIN-B-C022: (index, Merkle proof) for a pool member.
+    function _memberProof(address who) internal view returns (uint32 index, bytes32[] memory proof) {
+        proof = new bytes32[](2);
+        if (who == ALICE) {
+            index = 0;
+            proof[0] = _leaf(BOB);
+            proof[1] = _n23;
+        } else if (who == BOB) {
+            index = 1;
+            proof[0] = _leaf(ALICE);
+            proof[1] = _n23;
+        } else if (who == CAROL) {
+            index = 2;
+            proof[0] = _leaf(DUMMY);
+            proof[1] = _n01;
+        } else {
+            // A non-member: return an index but a proof that cannot verify.
+            index = 0;
+            proof[0] = bytes32(0);
+            proof[1] = bytes32(0);
+        }
     }
 
     function _open() internal {
@@ -50,8 +92,9 @@ contract SortitionTest is Test {
     /// contract rather than as `who`, silently.
     function _commit(address who, bytes32 r, bytes32 salt) internal {
         bytes32 c = s.commitmentFor(r, salt);
+        (uint32 index, bytes32[] memory proof) = _memberProof(who);
         vm.prank(who);
-        s.commit(DRAW, c);
+        s.commit(DRAW, c, index, proof);
     }
 
     function _reveal(address who, bytes32 r, bytes32 salt) internal {
@@ -183,8 +226,9 @@ contract SortitionTest is Test {
         vm.roll(START);
         s.openDraw(other, POOL_ROOT, POOL, K, TARGET);
         bytes32 c = s.commitmentFor(keccak256("different"), keccak256("salt"));
+        (uint32 aIdx, bytes32[] memory aProof) = _memberProof(ALICE);
         vm.prank(ALICE);
-        s.commit(other, c);
+        s.commit(other, c, aIdx, aProof);
         vm.roll(TARGET + s.FINALITY_DELAY());
         vm.setBlockhash(TARGET, keccak256("anchor"));
         vm.prank(ALICE);
@@ -203,10 +247,11 @@ contract SortitionTest is Test {
         _commit(ALICE, keccak256("in-time"), keccak256("salt"));
 
         bytes32 late = s.commitmentFor(keccak256("too-late"), keccak256("salt"));
+        (uint32 bIdx, bytes32[] memory bProof) = _memberProof(BOB);
         vm.roll(TARGET);
         vm.prank(BOB);
         vm.expectRevert(abi.encodeWithSelector(Sortition.CommitWindowClosed.selector, TARGET));
-        s.commit(DRAW, late);
+        s.commit(DRAW, late, bIdx, bProof);
     }
 
     /// A draw cannot target a block close enough for its opener to be about to
@@ -278,9 +323,10 @@ contract SortitionTest is Test {
         _commit(ALICE, keccak256("r"), keccak256("salt"));
 
         bytes32 second = s.commitmentFor(keccak256("r2"), keccak256("salt"));
+        (uint32 aIdx, bytes32[] memory aProof) = _memberProof(ALICE);
         vm.prank(ALICE);
         vm.expectRevert(abi.encodeWithSelector(Sortition.AlreadyCommitted.selector, DRAW, ALICE));
-        s.commit(DRAW, second);
+        s.commit(DRAW, second, aIdx, aProof);
 
         _reachFinalizeWindow(keccak256("anchor"));
         _reveal(ALICE, keccak256("r"), keccak256("salt"));
@@ -489,8 +535,39 @@ contract SortitionTest is Test {
         vm.expectRevert(abi.encodeWithSelector(Sortition.UnknownDraw.selector, ghost));
         s.drawOf(ghost);
 
+        (uint32 aIdx, bytes32[] memory aProof) = _memberProof(ALICE);
         vm.expectRevert(abi.encodeWithSelector(Sortition.UnknownDraw.selector, ghost));
-        s.commit(ghost, keccak256("c"));
+        s.commit(ghost, keccak256("c"), aIdx, aProof);
+    }
+
+    // ── CHAIN-B-C022: commit is pool-membership gated ───────────────
+
+    /// RED (pre-fix): any address with no stake and no relationship to the
+    /// pool could commit junk to an open draw and never reveal, guaranteeing
+    /// the draw voids — a costless, unslashable DoS. GREEN: an outsider's
+    /// commit is rejected, and a real member's is accepted.
+    function test_C022_outsider_cannot_grief_open_draw() public {
+        _open();
+        address outsider = address(0xBAD);
+        bytes32 c = s.commitmentFor(keccak256("junk"), keccak256("salt"));
+        (uint32 idx, bytes32[] memory proof) = _memberProof(outsider); // invalid proof
+        vm.prank(outsider);
+        vm.expectRevert(abi.encodeWithSelector(Sortition.NotPoolMember.selector, DRAW, outsider));
+        s.commit(DRAW, c, idx, proof);
+
+        // An outsider cannot borrow a real member's proof either — the leaf is
+        // derived from msg.sender, so ALICE's (index, proof) does not verify
+        // for the outsider.
+        (uint32 aIdx, bytes32[] memory aProof) = _memberProof(ALICE);
+        vm.prank(outsider);
+        vm.expectRevert(abi.encodeWithSelector(Sortition.NotPoolMember.selector, DRAW, outsider));
+        s.commit(DRAW, c, aIdx, aProof);
+
+        assertEq(s.drawOf(DRAW).commitCount, 0, "no junk commit landed");
+
+        // A real member commits fine.
+        _commit(ALICE, keccak256("r"), keccak256("salt"));
+        assertEq(s.drawOf(DRAW).commitCount, 1);
     }
 
     /// The commitment derivation is exposed so a contributor computes it the
