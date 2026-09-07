@@ -92,9 +92,11 @@ contract ScopedSBTTest is Test {
 
     function test_org_authority_can_set_attribute() public {
         uint256 id = _mintFacility();
+        bytes32 key = fac.LOCATION_REF(); // read before prank (an external call would consume it)
+        bytes memory val = abi.encode(keccak256("hashed-site-ref"));
         vm.prank(orgCtl);
-        fac.setAttribute(id, fac.LOCATION_REF(), abi.encode(keccak256("hashed-site-ref")));
-        assertEq(fac.locationRef(id), abi.encode(keccak256("hashed-site-ref")));
+        fac.setAttribute(id, key, val);
+        assertEq(fac.locationRef(id), val);
     }
 
     function test_stranger_cannot_configure() public {
@@ -123,8 +125,9 @@ contract ScopedSBTTest is Test {
         vm.prank(minter);
         uint256 id = net.mint(holder, DID_B, 1, orgCtl, o);
         assertEq(net.chainIdOf(id), 0);
+        bytes32 key = net.CHAIN_ID(); // read before prank
         vm.prank(orgCtl);
-        net.setAttribute(id, net.CHAIN_ID(), abi.encode(uint256(40205)));
+        net.setAttribute(id, key, abi.encode(uint256(40205)));
         assertEq(net.chainIdOf(id), 40205);
     }
 
