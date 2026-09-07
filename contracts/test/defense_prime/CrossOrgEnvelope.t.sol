@@ -30,8 +30,16 @@ contract CrossOrgEnvelopeTest is Test {
         nobody = makeAddr("nobody");
         vm.prank(governance);
         env = new CrossOrgEnvelope(governance);
-        vm.prank(governance);
+        vm.startPrank(governance);
         env.setRecorder(recorder, true);
+        // CHAIN-B-C026 (a) RC-8: sign() is now per-org gated. Register the
+        // shared test recorder for each org root used across these
+        // fixtures so the existing single-recorder flows still exercise
+        // the guarded path; cross-org forging is covered in the RmQ suite.
+        env.setOrgRecorder(DEFENSE_PRIME, recorder, true);
+        env.setOrgRecorder(TIER1, recorder, true);
+        env.setOrgRecorder(DOD, recorder, true);
+        vm.stopPrank();
     }
 
     function _draft_2org_2of2() internal {
@@ -248,12 +256,16 @@ contract CrossOrgEnvelopeTest is Test {
 
     function test_full_happy_path() public {
         _all_signed();
+        // CHAIN-B-C026 (b) RC-8: the delivery/accept/close transitions are
+        // now recorder-gated (previously permissionless).
+        vm.startPrank(recorder);
         env.markDelivered(ENV_1);
         assertEq(env.getEnvelope(ENV_1).state, 4);
         env.accept(ENV_1);
         assertEq(env.getEnvelope(ENV_1).state, 5);
         env.close(ENV_1);
         assertEq(env.getEnvelope(ENV_1).state, 7);
+        vm.stopPrank();
     }
 
     function test_accept_only_from_delivered() public {
@@ -266,6 +278,7 @@ contract CrossOrgEnvelopeTest is Test {
 
     function test_close_only_from_accepted() public {
         _all_signed();
+        vm.prank(recorder);
         env.markDelivered(ENV_1);
         vm.expectRevert(
             abi.encodeWithSelector(CrossOrgEnvelope.NotInState.selector, ENV_1, 5, 4)
@@ -303,9 +316,11 @@ contract CrossOrgEnvelopeTest is Test {
 
     function test_cannot_reject_terminal() public {
         _all_signed();
+        vm.startPrank(recorder);
         env.markDelivered(ENV_1);
         env.accept(ENV_1);
         env.close(ENV_1);
+        vm.stopPrank();
         vm.prank(recorder);
         vm.expectRevert(
             abi.encodeWithSelector(CrossOrgEnvelope.NotInState.selector, ENV_1, 1, 7)
