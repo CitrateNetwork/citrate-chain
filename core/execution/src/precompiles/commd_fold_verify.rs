@@ -164,6 +164,7 @@ pub fn execute(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
             baked_vk(),
             &call.proof,
             call.num_steps,
+            call.depth,
             &call.z0,
         )
         .map_err(|e| anyhow!("FOLD_COMMD_VERIFY invalid proof: {e}"))?;
