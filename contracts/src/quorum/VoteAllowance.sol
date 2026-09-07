@@ -106,6 +106,7 @@ contract VoteAllowance {
     error AlreadyExpired(uint64 expiresAtMs, uint64 nowMs);
     error CannotReduceBelowSpent(bytes32 allowanceId, uint256 requested, uint256 spent);
     error ZeroIncrease();
+    error DecreaseWouldWiden(bytes32 allowanceId, uint256 requested, uint256 weightCap);
 
     event AllowanceGranted(
         bytes32 indexed allowanceId,
@@ -206,6 +207,10 @@ contract VoteAllowance {
     function decrease(bytes32 allowanceId, uint256 to) external {
         Allowance storage a = _principalOnly(allowanceId);
         if (to < a.spent) revert CannotReduceBelowSpent(allowanceId, to, a.spent);
+        // `decrease` may only narrow. Without this it could *raise* the cap
+        // past `grant`/`increase`'s `type(uint64).max` bound and desync the
+        // on-chain franchise from the u64 `quorum-policy` mirror.
+        if (to > a.weightCap) revert DecreaseWouldWiden(allowanceId, to, a.weightCap);
         a.weightCap = to;
         emit AllowanceDecreased(allowanceId, to, a.spent);
     }
