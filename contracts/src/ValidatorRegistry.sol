@@ -442,7 +442,11 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
             slashedPubkey[pubkey] = true;
             slashedStaker[v.staker] = true;
             if (_activeIndexPlusOne[pubkey] != 0) _removeFromActive(pubkey);
-            pubkeyOfStaker[v.staker] = bytes32(0);
+            // CHAIN-B-C045: only clear the staker→pubkey binding if it still
+            // points at THIS pubkey. If the staker has since registered a new
+            // validator, `pubkeyOfStaker` names that one, and blindly zeroing it
+            // would erase the binding of an unrelated, unslashed validator.
+            if (pubkeyOfStaker[v.staker] == pubkey) pubkeyOfStaker[v.staker] = bytes32(0);
         } else if (v.status == Status.Active && v.bondedStake < v.admissionMinStake) {
             // A non-Byzantine slash that drops the bond below admission minStake demotes the
             // validator — no sub-minStake member is left Active / in the set. The reduced bond
@@ -517,7 +521,12 @@ contract ValidatorRegistry is ReentrancyGuard, Governable {
     function claimRewards(bytes32 pubkey) external nonReentrant {
         Validator storage v = _validators[pubkey];
         if (v.staker != msg.sender) revert NotStaker();
-        if (v.status == Status.Slashed) revert AlreadySlashed();
+        // CHAIN-B-C045: a Byzantine-slashed validator was blocked here, which
+        // silently confiscated its matured `ripeRewards` — rewards ADR-5 places
+        // OUTSIDE the slashable base (the slash sweeps maturity before computing
+        // the penalty, so ripe is never part of it). Confiscation-by-freeze is a
+        // third behaviour the ADR does not describe. Allow the claim: this only
+        // ever pays `ripeRewards`, never the still-slashable `vestedRewards`.
 
         _sweepMatured(pubkey, v);
         uint256 amt = v.ripeRewards;
