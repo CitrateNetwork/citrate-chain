@@ -75,6 +75,12 @@ contract InferenceRouter is AccessControl, ReentrancyGuard {
     uint256 public minProviderStake = 100 ether; // 100 LATT
     uint256 public platformFee = 250; // 2.5% in basis points
     uint256 public cacheReward = 100; // 1% reward for cache hits
+
+    /// @notice CHAIN-B-C028 (HELD/reroll): platform fees actually accrued
+    /// on completed inferences. `withdrawPlatformFees` may only take this
+    /// accumulator — never `address(this).balance` minus provider
+    /// balances, which also holds provider stakes and open-request escrow.
+    uint256 public accruedPlatformFees;
     
     // Events
     event InferenceRequested(
@@ -271,6 +277,7 @@ contract InferenceRouter is AccessControl, ReentrancyGuard {
         
         request.pricePaid = price;
         providerBalances[msg.sender] += providerAmount;
+        accruedPlatformFees += platformAmount; // C028
         
         // Update provider stats
         provider.currentLoad--;
@@ -469,17 +476,20 @@ contract InferenceRouter is AccessControl, ReentrancyGuard {
     
     // Admin functions
     
+    /// @dev CHAIN-B-C028 (HELD/reroll): withdraw only the platform fees
+    /// actually accrued on completed inferences. Pre-fix this computed
+    /// "fees" as `address(this).balance` minus provider balances, which
+    /// swept provider stakes (>=100 SALT each) and the escrow of open
+    /// Pending/Processing requests, bricking withdrawStake / cancelRequest
+    /// / withdrawEarnings. The unbounded loop over the never-pruned
+    /// `allProviders` array is also removed.
     function withdrawPlatformFees() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        uint256 balance = address(this).balance;
-        
-        // Subtract provider balances
-        for (uint i = 0; i < allProviders.length; i++) {
-            balance -= providerBalances[allProviders[i]];
-        }
-        
-        require(balance > 0, "No fees to withdraw");
-        
-        (bool success, ) = msg.sender.call{value: balance}("");
+        uint256 amount = accruedPlatformFees;
+        require(amount > 0, "No fees to withdraw");
+
+        accruedPlatformFees = 0;
+
+        (bool success, ) = msg.sender.call{value: amount}("");
         require(success, "Withdrawal failed");
     }
 }
