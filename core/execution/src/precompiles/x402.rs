@@ -162,6 +162,12 @@ fn eip712_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
 ///   Byte 0: 1 if valid (signer == from), 0 if invalid
 ///   Bytes 12-31: recovered signer address (20 bytes)
 ///
+/// CHAIN-B-B021 — SEMANTICS: `1` means ONLY that the signature recovers to
+/// `from`. `validAfter`/`validBefore`/`nonce` are bound into the struct hash
+/// but are NOT checked against the block timestamp and there is no replay set
+/// (pure precompiles have no block/env or state). The calling contract MUST
+/// enforce the time window and burn the nonce before acting on a `1`.
+///
 /// Gas: 4,200
 ///
 /// RM-B1 / WP-B5.7 (audit Info-02): doc previously said 233 bytes
@@ -274,11 +280,21 @@ fn transfer_auth_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult
 /// Input format:
 ///   domain_separator (32) | count (2) |
 ///   (from(20) | to(20) | value(32) | validAfter(32) | validBefore(32) | nonce(32) | v(1) | r(32) | s(32))[]
-///   Each payment entry: 201 bytes
+///   Each payment entry: 233 bytes (CHAIN-B-B021: doc said 201; the parser
+///   below uses `entry_size = 233`, matching the field layout above).
 ///
 /// Output:
 ///   verified_count (2 bytes, big-endian) |
 ///   (valid(1) | signer(20))[] each zero-padded to 32 bytes
+///
+/// CHAIN-B-B021 — SEMANTICS: a `valid` byte of `1` means ONLY that the
+/// signature recovers to `from`. This precompile is a stateless signature
+/// verifier: it binds `validAfter`/`validBefore`/`nonce` into the EIP-3009
+/// struct hash but does NOT compare them to the block timestamp and keeps no
+/// replay set (pure precompiles have no block/env or state access). A calling
+/// contract MUST enforce the `[validAfter, validBefore]` window against
+/// `block.timestamp` and burn the `nonce` itself before treating an
+/// authorization as presently usable.
 ///
 /// Gas: 2,000 base + 3,800 per payment
 fn batch_payment_verify(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {

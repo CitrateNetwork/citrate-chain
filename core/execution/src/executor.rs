@@ -85,10 +85,20 @@ impl ExecutionContext {
 
     /// Consume gas
     pub fn use_gas(&mut self, amount: u64) -> Result<(), ExecutionError> {
-        if self.gas_used + amount > self.gas_limit {
+        // CHAIN-B-B010: the guard `gas_used + amount > gas_limit` can itself
+        // overflow if a caller passes a large computed `amount` (with
+        // `overflow-checks = true` that is a production panic = node kill).
+        // Compute the new total with `checked_add` so an overflow rejects the
+        // op as OutOfGas instead of aborting the process. Inert on honest
+        // traffic: real gas totals never approach u64::MAX.
+        let new_used = self
+            .gas_used
+            .checked_add(amount)
+            .ok_or(ExecutionError::OutOfGas)?;
+        if new_used > self.gas_limit {
             return Err(ExecutionError::OutOfGas);
         }
-        self.gas_used += amount;
+        self.gas_used = new_used;
         Ok(())
     }
 
@@ -1595,23 +1605,46 @@ impl Executor {
         // the same height as user transactions in that block.
         let value_semantics = crate::executor::value_semantics_at(height);
         let block_ctx = self.get_block_context();
-        let result = crate::revm_adapter::execute_contract_call_with_context(
-            self.state_db.clone(),
-            minter,
-            registry_addr,
-            calldata,
-            amount,
-            crate::block_rewards::SYSTEM_CALL_GAS_LIMIT,
-            U256::zero(), // gasless system call.
-            self.chain_id,
-            height, // block.number → creditReward's currentEpoch() = height / EPOCH.
-            0,      // creditReward ignores block.timestamp; fixed for determinism.
-            block_ctx,
-            None, // no MVCC WriteSet capture (end-of-block system op, not a user tx).
-            None, // no journal buffering — writes go straight to state_db (direct call).
-            self.state_store.clone(),
-            value_semantics,
-        );
+        // CHAIN-B-B019: the minter was transiently funded `+amount` above to
+        // satisfy REVM's caller-balance precheck; the Ok/Err arms below undo it.
+        // But this runs at end-of-block, OUTSIDE `execute_transaction`'s
+        // panic-isolation barrier, so a panic inside the system call (e.g. a
+        // panicking precompile reached from `creditReward`) would unwind past
+        // both restore arms and leave the unbacked mint committed. Poll the
+        // sync call under `catch_unwind`; on a caught panic, undo the transient
+        // funding and burn the fee this block (mirrors the Err arm). Inert on
+        // honest traffic — no panic means `result` is the ordinary `Ok`/`Err`.
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::revm_adapter::execute_contract_call_with_context(
+                self.state_db.clone(),
+                minter,
+                registry_addr,
+                calldata,
+                amount,
+                crate::block_rewards::SYSTEM_CALL_GAS_LIMIT,
+                U256::zero(), // gasless system call.
+                self.chain_id,
+                height, // block.number → creditReward's currentEpoch() = height / EPOCH.
+                0,      // creditReward ignores block.timestamp; fixed for determinism.
+                block_ctx,
+                None, // no MVCC WriteSet capture (end-of-block system op, not a user tx).
+                None, // no journal buffering — writes go straight to state_db (direct call).
+                self.state_store.clone(),
+                value_semantics,
+            )
+        })) {
+            Ok(r) => r,
+            Err(_) => {
+                self.set_balance(&minter, minter_before);
+                warn!(
+                    "§R': creditReward PANICKED at height {} for proposer {} (amount {}) — transient mint reverted, fee burned this block",
+                    height,
+                    hex::encode(pubkey),
+                    amount
+                );
+                return Ok(false);
+            }
+        };
 
         match result {
             Ok(_) => {
@@ -1861,7 +1894,13 @@ impl Executor {
         let status = match result {
             Ok(()) => {
                 // Success: nonce increment + gas refund via journal.
-                let refund = U256::from(tx.gas_limit - context.gas_used) * U256::from(tx.gas_price);
+                // CHAIN-B-B010: `saturating_sub` on the money path. A bare
+                // `gas_limit - gas_used` panics under overflow-checks (or, with
+                // checks off, underflows to a ~2^64 refund = a SALT mint). On
+                // honest traffic `gas_used <= gas_limit`, so this equals the
+                // subtraction; it only diverges on the (attacker/underflow) edge.
+                let refund =
+                    U256::from(tx.gas_limit.saturating_sub(context.gas_used)) * U256::from(tx.gas_price);
                 let current_balance = {
                     let j = context.journal.lock();
                     j.pending_balance(&from)
@@ -3737,7 +3776,10 @@ impl Executor {
 
         // Additional gas per MB of input
         let input_mb = (input_data.len() / 1_048_576) as u64;
-        context.use_gas(self.gas_schedule.inference_per_mb * input_mb)?;
+        // CHAIN-B-B010: `saturating_mul` on an attacker-sized input length;
+        // `use_gas` then rejects if the (capped) cost exceeds the limit,
+        // rather than panicking on an overflowing multiply.
+        context.use_gas(self.gas_schedule.inference_per_mb.saturating_mul(input_mb))?;
 
         // Check gas limit
         if context.gas_used > max_gas {
@@ -3807,7 +3849,10 @@ impl Executor {
 
         // Update usage stats
         model.usage_stats.total_inferences += 1;
-        model.usage_stats.total_gas_used += context.gas_used;
+        // CHAIN-B-B010: monotonically-growing accumulator over a model's
+        // lifetime; `saturating_add` so a long-lived model cannot panic here.
+        model.usage_stats.total_gas_used =
+            model.usage_stats.total_gas_used.saturating_add(context.gas_used);
         model.usage_stats.last_used = context.timestamp;
         self.state_db.update_model(model_id, model)?;
 
