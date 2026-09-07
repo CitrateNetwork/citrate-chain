@@ -12,14 +12,73 @@ use bincode;
 use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use citrate_consensus::types::Hash;
-use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
+
+/// NET-M7: sliding window for the per-IP inbound accept rate limit.
+const INBOUND_ACCEPT_WINDOW: Duration = Duration::from_secs(10);
+/// NET-M7: max inbound TCP accepts (each forcing a Noise handshake) permitted
+/// from a single source IP within `INBOUND_ACCEPT_WINDOW`. Honest peers dial
+/// once and stay connected, so this is generous headroom for reconnect churn.
+const MAX_INBOUND_ACCEPTS_PER_IP: u32 = 10;
+/// NET-M7: hard cap on the number of distinct source IPs tracked by the accept
+/// limiter, so the limiter's own map cannot be turned into a memory-growth
+/// vector by spoofed/rotating source addresses. When exceeded, the whole window
+/// is reset (fail-open on the accounting, never fail-open on capacity — PT-11
+/// still gates at `max_peers`).
+const MAX_ACCEPT_RL_ENTRIES: usize = 16_384;
+
+/// NET-M7: returns `true` if an inbound connection from `ip` may proceed to the
+/// Noise handshake, `false` if it has exceeded the per-IP accept rate in the
+/// current window. Prunes expired windows opportunistically.
+fn inbound_accept_permitted(
+    rl: &Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    ip: IpAddr,
+) -> bool {
+    let now = Instant::now();
+    let mut map = match rl.lock() {
+        Ok(m) => m,
+        // A poisoned lock must not wedge the listener — fail open on accounting;
+        // PT-11 capacity gating still applies downstream.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    // Opportunistic prune of expired windows on every call keeps the map small
+    // under honest churn.
+    map.retain(|_, (start, _)| now.duration_since(*start) < INBOUND_ACCEPT_WINDOW);
+
+    // If the map is still oversized (a spoofed-source flood), reset it rather
+    // than let it grow unbounded.
+    if map.len() > MAX_ACCEPT_RL_ENTRIES {
+        map.clear();
+    }
+
+    match map.get_mut(&ip) {
+        Some((start, count)) => {
+            if now.duration_since(*start) >= INBOUND_ACCEPT_WINDOW {
+                *start = now;
+                *count = 1;
+                true
+            } else if *count < MAX_INBOUND_ACCEPTS_PER_IP {
+                *count += 1;
+                true
+            } else {
+                false
+            }
+        }
+        None => {
+            map.insert(ip, (now, 1));
+            true
+        }
+    }
+}
 
 /// Parameters sent during handshake.
 #[derive(Debug, Clone)]
@@ -115,10 +174,32 @@ impl NetworkTransport {
         let noise_kp = self.noise_keypair.clone();
         let allowed = self.allowed_peers.clone();
 
+        // CHAIN-B-A007 / NET-M7: per-IP inbound accept rate limiter. The PT-11
+        // at-capacity check below stops a flood only once the peer table is
+        // FULL; before that, every inbound TCP connect runs a full (CPU-heavy)
+        // Noise_XX X25519 handshake before any identity/whitelist check, so a
+        // single host can churn connect/handshake/drop to burn pre-auth CPU and
+        // monopolize inbound slots. Bound the rate at which any one IP can force
+        // a handshake. Honest peers reconnect rarely, so this is inert on honest
+        // traffic. The map is pruned opportunistically so it cannot itself grow
+        // without bound.
+        let accept_rl: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, remote)) => {
+                        // NET-M7: per-IP accept rate limit (pre-Noise).
+                        if !inbound_accept_permitted(&accept_rl, remote.ip()) {
+                            debug!(
+                                "Rejecting inbound from {} — per-IP accept rate exceeded",
+                                remote
+                            );
+                            drop(stream);
+                            continue;
+                        }
+
                         // PT-11: Reject inbound connections before Noise handshake
                         // when at capacity, preventing CPU-expensive handshake flooding
                         let (total, _inbound, _outbound) = pm.get_peer_counts().await;
