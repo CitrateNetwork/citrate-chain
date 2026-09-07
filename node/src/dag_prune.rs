@@ -262,7 +262,7 @@ mod tests {
 
         // Admit a linear chain into BOTH stores, as the admission path does.
         let mut parent = Hash::default();
-        for h in 1..=N {
+        for h in 0..=N {
             let b = mk(h, parent);
             parent = b.header.block_hash;
             dag.store_block(b.clone()).await.expect("dag");
@@ -272,16 +272,16 @@ mod tests {
         storage.blocks.put_applied_tip(&parent, N).expect("tip");
 
         let before = dag.get_stats().await.total_blocks;
-        assert_eq!(before, N as usize, "every block retained pre-prune");
+        assert_eq!(before, N as usize + 1, "every block retained pre-prune (genesis + N)");
 
-        // One pass: point = 1500 - 1000 = 500, so heights 1..=499 go.
+        // One pass: point = 1500 - 1000 = 500, so heights 0..=499 go.
         let dropped = prune_once(&storage, &dag, N, RETAIN).await;
         assert_eq!(
-            dropped, 499,
-            "heights 1..=499 dropped (pruning point is 500)"
+            dropped, 500,
+            "heights 0..=499 dropped (pruning point is 500)"
         );
         let after = dag.get_stats().await.total_blocks;
-        assert_eq!(after, before - 499);
+        assert_eq!(after, before - 500);
         assert!(
             after < before,
             "the DAG store must actually shrink — this is the O(N) -> O(window) fix"
@@ -307,17 +307,15 @@ mod tests {
             .add_block(&next)
             .await
             .expect("admission must survive a pruned ancestry");
-        // In this fixture the chain ROOT is the height-1 block (its selected
-        // parent is `Hash::default()`, so `is_genesis()` holds and it scores 1).
-        // The convention is therefore score == height here, one lower than a
-        // chain with a real height-0 genesis. What matters is that the sequence
-        // CONTINUES unbroken across the prune.
+        // SECREM-A001 RC-8: the chain ROOT is now the real height-0 genesis
+        // (`is_configured_genesis()` holds), so a block at height h scores h+1.
+        // What matters is that the sequence CONTINUES unbroken across the prune.
         assert_eq!(
             ghostdag
                 .get_blue_score(&next.header.block_hash)
                 .await
                 .unwrap(),
-            N + 1,
+            N + 2,
             "score sequence continues across the prune"
         );
 
@@ -415,7 +413,7 @@ mod tests {
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
 
         let mut parent = Hash::default();
-        for h in 1..=N {
+        for h in 0..=N {
             let b = mk(h, parent);
             parent = b.header.block_hash;
             dag.store_block(b.clone()).await.expect("dag");
@@ -428,7 +426,7 @@ mod tests {
             "the tip's durable anchor must exist, or this test is exercising the \
              no-anchor path again rather than the question being asked"
         );
-        assert_eq!(prune_once(&storage, &dag, N, MIN_RETAIN_BLOCKS).await, 499);
+        assert_eq!(prune_once(&storage, &dag, N, MIN_RETAIN_BLOCKS).await, 500);
         assert!(
             dag.get_derived_blue_score(&parent).is_some(),
             "pruning must not delete the RETAINED tip's anchor"
@@ -450,7 +448,7 @@ mod tests {
                 .get_blue_score(&next.header.block_hash)
                 .await
                 .expect("score"),
-            N + 1,
+            N + 2,
             "the score sequence continues unbroken across prune AND restart"
         );
     }
@@ -520,7 +518,10 @@ mod tests {
         let mut parent = Hash::default();
         let mut within_bound_hash = Hash::default();
         let mut over_bound_hash = Hash::default();
-        for h in 1..=N {
+        // SECREM-A001 RC-8: the chain roots at the real height-0 configured
+        // genesis, so the loop starts at 0 (a height-1 root fails admission with
+        // InvalidParents under the genesis-identity binding).
+        for h in 0..=N {
             let b = mk(h, parent, vec![]);
             parent = b.header.block_hash;
             if h == within_bound_height {
@@ -558,7 +559,9 @@ mod tests {
                 .get_blue_score(&ok.header.block_hash)
                 .await
                 .expect("score"),
-            N + 1,
+            // SECREM-A001 RC-8: with the real height-0 genesis a block at height
+            // h scores h+1, so the merge at height N+1 scores N+2.
+            N + 2,
             "the applied chain advances past a legal merge"
         );
 

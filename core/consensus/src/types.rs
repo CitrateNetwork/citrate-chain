@@ -390,10 +390,42 @@ impl Block {
         self.header.blue_score
     }
 
-    /// Check if this is a genesis block
+    /// Check if this block has the *structural* genesis shape: no selected
+    /// parent and no merge parents.
+    ///
+    /// SECREM-A001: this is a SHAPE test, NOT an identity. It MUST NOT be used
+    /// on its own to exempt a block from any consensus-admission check — an
+    /// unauthenticated peer can shape any block like genesis (arbitrary height
+    /// and content, empty VRF proof, zero proposer key, zero signature) and
+    /// thereby skip every `!is_genesis()`-gated parent / VRF / proposer /
+    /// signature check. Admission gates MUST use [`Self::is_configured_genesis`]
+    /// instead, which additionally binds height and the canonical genesis hash.
     pub fn is_genesis(&self) -> bool {
         self.header.selected_parent_hash == Hash::default()
             && self.header.merge_parent_hashes.is_empty()
+    }
+
+    /// SECREM-A001: consensus-admission genesis IDENTITY predicate.
+    ///
+    /// A block is this chain's genesis only if it is structurally parentless
+    /// (`is_genesis()`), at height 0, and — once the node knows the canonical
+    /// genesis hash for its chain (threaded from `HandshakeParams.genesis_hash`)
+    /// — its self-consistent block hash equals that configured hash. A block
+    /// merely *shaped* like genesis at any non-zero height is rejected outright,
+    /// and (when the hash is configured) so is a rogue alternate height-0 block.
+    ///
+    /// `configured == None` (early bootstrap before the node has set its genesis
+    /// hash, and isolated unit tests) accepts the height-0 parentless shape; the
+    /// height-0 requirement alone already rejects the shaped-height attack, and
+    /// production wiring always configures the hash before admitting any block.
+    pub fn is_configured_genesis(&self, configured: Option<Hash>) -> bool {
+        if self.header.height != 0 || !self.is_genesis() {
+            return false;
+        }
+        match configured {
+            Some(h) => self.header.block_hash == h && self.verify_hash(),
+            None => true,
+        }
     }
 }
 

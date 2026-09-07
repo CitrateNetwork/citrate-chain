@@ -967,7 +967,10 @@ impl GhostDag {
     ///   function of score (single source of truth in `types.rs`); a
     ///   self-reported work value is never stored.
     pub async fn validate_block_consistency(&self, block: &Block) -> Result<(), GhostDagError> {
-        if block.is_genesis() {
+        // SECREM-A001: exempt genesis by IDENTITY, not by shape. A block
+        // merely shaped like genesis (parentless, arbitrary height) must
+        // fall through to the missing-parent check below, not short-circuit.
+        if block.is_configured_genesis(self.dag_store.configured_genesis()) {
             return Ok(());
         }
 
@@ -1441,7 +1444,7 @@ mod tests {
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
-        let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+        let genesis = create_test_block_with_parents([0xEE; 32], Hash::default(), vec![], 0);
 
         // Store genesis in dag_store
         dag_store.store_block(genesis.clone()).await.unwrap();
@@ -1458,7 +1461,7 @@ mod tests {
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         // Add genesis
-        let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+        let genesis = create_test_block_with_parents([0xEE; 32], Hash::default(), vec![], 0);
 
         // Store genesis in dag_store
         dag_store.store_block(genesis.clone()).await.unwrap();
@@ -1539,7 +1542,7 @@ mod tests {
         ));
 
         // genesis @0 — seed BOTH the DAG store and GhostDAG (relations + cache + tip).
-        let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+        let genesis = create_test_block_with_parents([0xEE; 32], Hash::default(), vec![], 0);
         dag_store
             .store_block(genesis.clone())
             .await
@@ -1644,7 +1647,7 @@ mod tests {
         let ghostdag = Arc::new(GhostDag::new(params, dag_store.clone()));
 
         // genesis + a1 admitted to BOTH.
-        let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+        let genesis = create_test_block_with_parents([0xEE; 32], Hash::default(), vec![], 0);
         dag_store
             .store_block(genesis.clone())
             .await
@@ -1706,7 +1709,7 @@ mod tests {
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         // Create simple chain
-        let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+        let genesis = create_test_block_with_parents([0xEE; 32], Hash::default(), vec![], 0);
 
         // Add genesis manually
         let mut genesis_blue = BlueSet::new();
@@ -1926,7 +1929,7 @@ mod tests {
         async fn entries_after(n: u64, use_receive_path: bool) -> usize {
             let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
             let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
-            let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+            let genesis = create_test_block_with_parents([0xEE; 32], Hash::default(), vec![], 0);
             dag_store.store_block(genesis.clone()).await.unwrap();
             let mut prev = genesis.hash();
             let mut blocks = vec![genesis];
@@ -2296,7 +2299,7 @@ mod tests {
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         // Genesis, primed into dag_store only (not into blue_cache).
-        let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+        let genesis = create_test_block_with_parents([0xEE; 32], Hash::default(), vec![], 0);
         dag_store.store_block(genesis.clone()).await.unwrap();
         let mut prev = genesis.hash();
 
@@ -2366,7 +2369,7 @@ mod tests {
         let ghostdag = GhostDag::new(params, dag_store.clone());
 
         // Genesis
-        let genesis = create_test_block_with_parents([0; 32], Hash::default(), vec![], 0);
+        let genesis = create_test_block_with_parents([0xEE; 32], Hash::default(), vec![], 0);
         dag_store.store_block(genesis.clone()).await.unwrap();
 
         let mut gset = BlueSet::new();

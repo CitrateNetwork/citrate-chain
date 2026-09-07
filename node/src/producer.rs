@@ -2096,7 +2096,7 @@ impl BlockProducer {
 mod tests {
     use super::*;
     use citrate_consensus::crypto::Ed25519SigningKey;
-    use citrate_consensus::types::Signature;
+    use citrate_consensus::types::{Block, Signature};
     use citrate_execution::types::Address;
     use citrate_sequencer::mempool::{MempoolConfig, TxClass};
     use citrate_storage::pruning::PruningConfig;
@@ -2112,6 +2112,59 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[..20].copy_from_slice(&address.0);
         PublicKey::new(bytes)
+    }
+
+    /// Build the deterministic height-0 block used by producer integration
+    /// fixtures. Production startup writes and applies this block before the
+    /// first producer round; keeping it in the fixture makes A001 exercise the
+    /// configured-genesis path rather than the legacy zero-hash sentinel.
+    fn test_genesis() -> Block {
+        let mut genesis = BlockBuilder::new()
+            .version(2)
+            .height(0)
+            .parent(Hash::default())
+            .coinbase([0x33; 20])
+            .timestamp(1000)
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new([0x5A; 32]),
+            })
+            .transactions(vec![])
+            .state_root(Hash::default())
+            .blue_score(0)
+            .blue_work(citrate_consensus::types::blue_work_for_score(0))
+            .build_unhashed();
+        genesis.header.block_hash = genesis.compute_hash();
+        genesis
+    }
+
+    /// Reproduce node startup's chain/DAG/applied-tip genesis wiring for a
+    /// producer fixture. Genesis is seeded before any applicator or producer
+    /// can select a parent, so the first block is height 1 with the real
+    /// genesis hash.
+    async fn seed_test_genesis(
+        storage: &StorageManager,
+        dag: &DagStore,
+        ghostdag: &GhostDag,
+    ) -> Block {
+        let genesis = test_genesis();
+        storage
+            .blocks
+            .put_block(&genesis)
+            .expect("persist test genesis");
+        storage
+            .blocks
+            .put_applied_tip(&genesis.header.block_hash, 0)
+            .expect("persist test genesis applied tip");
+        dag.set_configured_genesis(genesis.header.block_hash);
+        dag.store_block(genesis.clone())
+            .await
+            .expect("store test genesis in DAG");
+        ghostdag
+            .add_block(&genesis)
+            .await
+            .expect("admit test genesis to GhostDAG");
+        genesis
     }
 
     fn transfer_tx(hash_byte: u8, from: Address, to: Address, nonce: u64) -> Transaction {
@@ -2755,7 +2808,7 @@ mod tests {
         }
 
         // Build a standalone producer node (own storage, own executor, own DAG).
-        fn node(
+        async fn node(
             dir: &TempDir,
             coinbase_byte: u8,
             key_byte: u8,
@@ -2781,13 +2834,16 @@ mod tests {
                 2,
             )
             .with_v2_headers(true); // the fleet runs CITRATE_BLOCK_V2=1
+            let dag = producer.dag_store();
+            let ghostdag = producer.ghostdag();
+            seed_test_genesis(&storage, &dag, &ghostdag).await;
             (storage, executor, producer)
         }
 
         // ── Node P: the node under test, wired to a real applied-tip lock exactly
         //    as main.rs wires it (this is what makes the applied tip observable).
         let tmp_p = TempDir::new().expect("tempdir p");
-        let (storage_p, exec_p, producer_p) = node(&tmp_p, 0x44, 42);
+        let (storage_p, exec_p, producer_p) = node(&tmp_p, 0x44, 42).await;
         let applicator_p = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
             exec_p.clone(),
             storage_p.clone(),
@@ -2824,7 +2880,7 @@ mod tests {
         let mut block_b = None;
         for seed in 0x01u8..=0xFFu8 {
             let tmp_q = TempDir::new().expect("tempdir q");
-            let (storage_q, _exec_q, producer_q) = node(&tmp_q, seed, seed);
+            let (storage_q, _exec_q, producer_q) = node(&tmp_q, seed, seed).await;
             let b_hash = producer_q.produce_block().await.expect("Q seals B @ 1");
             let candidate = storage_q
                 .blocks
@@ -2969,6 +3025,7 @@ mod tests {
             ));
             let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
             let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+            let _genesis = seed_test_genesis(&storage, &dag, &ghostdag).await;
             let app = CanonicalApplicator::new(executor.clone(), storage.clone())
                 .with_fork_choice(ghostdag.clone());
             let producer = if producing {

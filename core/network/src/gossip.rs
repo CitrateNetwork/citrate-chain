@@ -62,6 +62,14 @@ pub struct GossipConfig {
     /// FWA-C2-01: chain id bound into learning-gossip signature
     /// verification (cross-chain replay defense). Citrate mainnet = 40204.
     pub chain_id: u64,
+
+    /// SECREM-A001: this chain's canonical genesis hash (from the node's
+    /// `HandshakeParams.genesis_hash`). Bound into the block-admission
+    /// genesis IDENTITY check so a block merely SHAPED like genesis
+    /// (parentless, arbitrary height, empty VRF / zero proposer / zero
+    /// signature) cannot bypass validation. `None` (the Default) accepts
+    /// only the height-0 parentless shape; production sets it at startup.
+    pub genesis_hash: Option<Hash>,
 }
 
 impl Default for GossipConfig {
@@ -73,6 +81,7 @@ impl Default for GossipConfig {
             max_message_size: 1024 * 1024, // 1MB
             validation_timeout: Duration::from_millis(100),
             chain_id: 40204,
+            genesis_hash: None,
         }
     }
 }
@@ -503,6 +512,11 @@ impl GossipProtocol {
     /// 8. TX_ROOT_MISMATCH — recomputed tx_root differs from header
     /// 9. INVALID_SIGNATURE — ed25519 signature verification failed (WP-G.2)
     async fn validate_block(&self, block: &Block) -> bool {
+        // SECREM-A001: genesis is an IDENTITY, not a shape. Compute it once
+        // and use it for every exemption below, so a block shaped like
+        // genesis at an arbitrary height cannot skip the parent / VRF /
+        // proposer / signature checks.
+        let is_genesis = block.is_configured_genesis(self.config.genesis_hash);
         // 1. BLOCK_OVERSIZED
         // RM-B1 / WP-B1.5 (audit M-06): on serialize failure reject
         // outright — a block that doesn't serialize cannot be sized,
@@ -524,7 +538,7 @@ impl GossipProtocol {
         }
 
         // 2. INVALID_HEIGHT
-        if block.header.height == 0 && !block.is_genesis() {
+        if block.header.height == 0 && !is_genesis {
             warn!("[INVALID_HEIGHT] block={}", block.header.block_hash);
             return false;
         }
@@ -540,13 +554,13 @@ impl GossipProtocol {
         }
 
         // 4. ZERO_BLUE_SCORE
-        if block.header.blue_score == 0 && !block.is_genesis() {
+        if block.header.blue_score == 0 && !is_genesis {
             warn!("[ZERO_BLUE_SCORE] block={}", block.header.block_hash);
             return false;
         }
 
         // 5. MISSING_VRF
-        if !block.is_genesis() && block.header.vrf_reveal.proof.is_empty() {
+        if !is_genesis && block.header.vrf_reveal.proof.is_empty() {
             warn!("[MISSING_VRF] block={}", block.header.block_hash);
             return false;
         }
@@ -558,7 +572,7 @@ impl GossipProtocol {
         // a "natural-looking" 32-byte byte string that bypasses the
         // dual-format check while remaining off-curve. (Genesis is
         // exempt — its proposer field carries the network identity.)
-        if !block.is_genesis() && !block.header.proposer_pubkey.is_admissible() {
+        if !is_genesis && !block.header.proposer_pubkey.is_admissible() {
             warn!(
                 "[INVALID_PROPOSER_PUBKEY] block={} pubkey={}",
                 block.header.block_hash,
@@ -568,7 +582,7 @@ impl GossipProtocol {
         }
 
         // 6. MISSING_PARENT — non-genesis must reference a selected parent
-        if !block.is_genesis() && block.header.selected_parent_hash == Hash::default() {
+        if !is_genesis && block.header.selected_parent_hash == Hash::default() {
             warn!("[MISSING_PARENT] block={}", block.header.block_hash);
             return false;
         }
@@ -604,7 +618,7 @@ impl GossipProtocol {
         }
 
         // 9. INVALID_SIGNATURE — verify ed25519 block signature (skip genesis)
-        if !block.is_genesis() {
+        if !is_genesis {
             match citrate_consensus::crypto::verify_block_signature(block) {
                 Ok(true) => { /* valid */ }
                 Ok(false) => {
