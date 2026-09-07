@@ -134,7 +134,16 @@ impl KeyCommitment {
 
     /// Parse from on-chain data
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CommitmentError> {
-        if bytes.len() < 76 {
+        // CHAIN-B-B015: the fixed header is
+        //   version(1) + key_version(4) + purpose(1) + commitment(32)
+        //   + timestamp(8) + node_id(32) + sig_len(2) = 80 bytes.
+        // The old guard checked `< 76` but the reader slices `bytes[46..78]`
+        // (needs 78) and `bytes[78..80]` (needs 80), so inputs of length 76-79
+        // passed the guard and then panicked on the slice — a node kill the
+        // moment this parser is wired to on-chain data. Derive the bound from
+        // the layout so it cannot drift again.
+        const HEADER_LEN: usize = 1 + 4 + 1 + 32 + 8 + 32 + 2; // = 80
+        if bytes.len() < HEADER_LEN {
             return Err(CommitmentError::InvalidFormat);
         }
 
@@ -486,6 +495,25 @@ mod tests {
         assert_eq!(commitment.version, 1);
         assert_eq!(commitment.key_version, 1);
         assert!(commitment.timestamp > 0);
+    }
+
+    /// CHAIN-B-B015 tripwire: inputs of length 76-79 passed the old `< 76`
+    /// guard and then panicked slicing `bytes[46..78]` / `bytes[78..80]`.
+    /// Post-fix they return `InvalidFormat` with no panic.
+    #[test]
+    fn from_bytes_rejects_short_header_without_panicking() {
+        for len in 0..80usize {
+            let bytes = vec![0u8; len];
+            assert!(
+                matches!(
+                    KeyCommitment::from_bytes(&bytes),
+                    Err(CommitmentError::InvalidFormat)
+                ),
+                "len {len} must be rejected, not panic"
+            );
+        }
+        // The exact header length parses (with an empty signature).
+        assert!(KeyCommitment::from_bytes(&vec![0u8; 80]).is_ok());
     }
 
     #[test]
