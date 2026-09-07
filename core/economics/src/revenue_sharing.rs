@@ -298,24 +298,34 @@ impl RevenueShareManager {
             return Ok(None);
         }
 
-        // Check if enough time has passed since last distribution
+        // Check if enough time has passed since last distribution.
+        // saturating_sub: a plain `current_block - last_distribution` underflows
+        // (and panics under overflow-checks) on any reorg/replay where the
+        // current block is at or below the recorded last-distribution height.
         let last_distribution = self.last_distribution_block.get(&pool).copied().unwrap_or(0);
-        if current_block - last_distribution < self.config.distribution_frequency {
+        if current_block.saturating_sub(last_distribution) < self.config.distribution_frequency {
             return Ok(None);
         }
 
         let distributions = self.calculate_distributions(&pool, pool_balance)?;
 
+        // Any share whose stakeholder type has no registered members contributes
+        // nothing to `distributions`, so the sum can be less than `pool_balance`.
+        // Carry that undistributed remainder forward instead of destroying it by
+        // unconditionally zeroing the pool.
+        let distributed: U256 = distributions.values().copied().fold(U256::zero(), |a, b| a + b);
+        let remainder = pool_balance.saturating_sub(distributed);
+
         let distribution = RevenueDistribution {
             block_height: current_block,
             pool_type: pool.clone(),
-            total_revenue: pool_balance,
+            total_revenue: distributed,
             distributions: distributions.clone(),
             timestamp: current_block, // In real implementation, use actual timestamp
         };
 
-        // Reset pool balance
-        self.revenue_pools.insert(pool.clone(), U256::zero());
+        // Reset pool balance to the undistributed remainder (0 when fully distributed).
+        self.revenue_pools.insert(pool.clone(), remainder);
         self.last_distribution_block.insert(pool.clone(), current_block);
         self.distribution_history.push(distribution.clone());
 
@@ -632,8 +642,20 @@ mod tests {
         assert!(distribution.is_some());
 
         let dist = distribution.unwrap();
-        assert_eq!(dist.total_revenue, fee_amount);
         assert!(!dist.distributions.is_empty());
+
+        // RC-8: only Validator + ModelCreator are registered, so the
+        // Infrastructure and Treasury slices of the AIInference split have no
+        // recipient. The old code zeroed the whole pool and reported
+        // total_revenue == fee_amount, silently destroying those slices.
+        // Corrected: total_revenue equals what was actually distributed
+        // (conservation), it is strictly less than the collected fee, and the
+        // undistributed remainder is carried forward in the pool, not burned.
+        let distributed: U256 = dist.distributions.values().copied().fold(U256::zero(), |a, b| a + b);
+        assert_eq!(dist.total_revenue, distributed);
+        assert!(dist.total_revenue < fee_amount);
+        let carried = manager.get_pool_balance(&RevenuePool::AIInference);
+        assert_eq!(distributed + carried, fee_amount);
     }
 
     #[test]
