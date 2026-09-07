@@ -1545,6 +1545,7 @@ pub fn record_produced(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use citrate_consensus::dag_store::DagStore;
     use citrate_consensus::types::{BlockBuilder, PublicKey, Signature, Transaction, VrfProof};
     use citrate_execution::revm_adapter::BlockContext;
     use citrate_execution::types::Address;
@@ -1626,6 +1627,30 @@ mod tests {
     /// driver), so the drain can find it via the DAG parent→children index.
     fn persist(storage: &StorageManager, block: &Block) {
         storage.blocks.put_block(block).expect("put_block");
+    }
+
+    /// Seed a test node with the real height-0 genesis state. A production
+    /// node applies genesis during startup; `CanonicalApplicator::new` only
+    /// seeds its in-memory ring from the durable applied-tip pointer. Tests
+    /// that exercise the configured-genesis admission path must reproduce both
+    /// pieces of startup wiring instead of sending genesis through
+    /// `apply_received` as if it were a post-genesis block.
+    async fn seed_genesis(
+        storage: &StorageManager,
+        dag: &DagStore,
+        ghostdag: &GhostDag,
+        genesis: &Block,
+    ) {
+        persist(storage, genesis);
+        storage
+            .blocks
+            .put_applied_tip(&genesis.header.block_hash, 0)
+            .expect("persist genesis applied tip");
+        dag.set_configured_genesis(genesis.header.block_hash);
+        dag.store_block(genesis.clone())
+            .await
+            .expect("genesis into DAG");
+        ghostdag.add_block(genesis).await.expect("genesis admitted");
     }
 
     /// Build a linked chain of `n` reward-only blocks from genesis, each carrying
@@ -2236,11 +2261,11 @@ mod tests {
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
 
         let r = roots(3);
-        // Height 1 has no selected parent, so `is_genesis()` holds and it is
-        // admitted unconditionally — the chain root for this test.
-        let g = mk_block(1, Hash::default(), r[0]);
-        let b2 = mk_block_scored(2, g.header.block_hash, r[1], 1, VRF_OUT);
-        let b3 = mk_block_scored(3, b2.header.block_hash, r[2], 2, VRF_OUT);
+        // SECREM-A001 RC-8: the chain root is the real height-0 genesis
+        // (`is_configured_genesis()` holds); descendants carry real parents.
+        let g = mk_block(0, Hash::default(), r[0]);
+        let b2 = mk_block_scored(1, g.header.block_hash, r[1], 1, VRF_OUT);
+        let b3 = mk_block_scored(2, b2.header.block_hash, r[2], 2, VRF_OUT);
 
         // Healthy state: the root is in BOTH stores.
         dag.store_block(g.clone()).await.expect("root into DAG");
@@ -2311,35 +2336,31 @@ mod tests {
         let (exec, storage, _dir) = fresh();
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let genesis = mk_block(0, Hash::default(), exec.calculate_state_root());
+        seed_genesis(&storage, &dag, &ghostdag, &genesis).await;
         let app =
             CanonicalApplicator::new(exec, storage.clone()).with_fork_choice(ghostdag.clone());
 
         let r = roots(2);
-        let a1 = mk_block(1, Hash::default(), r[0]);
-        // Two competing children of a1 at height 2: same (reward-only) state
+        // Two competing children of the real genesis at height 1: same
+        // (reward-only) state
         // root, different VRF → different hashes. Exactly the sibling pair a
         // follower downloads when a serve response carries an anchor-height
         // group, or when two producers published at the same height.
-        let a2 = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
-        let b2 = mk_block_scored(2, a1.header.block_hash, r[1], 1, [0x5B; 32]);
+        let a2 = mk_block_scored(1, genesis.header.block_hash, r[0], 1, VRF_OUT);
+        let b2 = mk_block_scored(1, genesis.header.block_hash, r[0], 1, [0x5B; 32]);
         assert_ne!(a2.header.block_hash, b2.header.block_hash);
 
-        // Apply a1 through both stores — a healthy tip at height 1.
-        dag.store_block(a1.clone()).await.expect("a1 into DAG");
-        ghostdag.add_block(&a1).await.expect("a1 admitted");
-        persist(&storage, &a1);
-        assert!(matches!(
-            app.apply_received(&a1).await,
-            ApplyOutcome::Applied { .. }
-        ));
-        assert_eq!(app.applied_tip().await.height, 1);
+        // Genesis is already the applied tip, as it is after production
+        // startup. The applicator must receive only post-genesis blocks.
+        assert_eq!(app.applied_tip().await.height, 0);
 
         // Both siblings reach the CHAIN store; neither reaches the DAG store.
         persist(&storage, &a2);
         persist(&storage, &b2);
         assert_eq!(
             storage.blocks.get_latest_height().expect("latest"),
-            2,
+            1,
             "stored height climbed"
         );
 
@@ -2354,13 +2375,13 @@ mod tests {
             );
             assert_eq!(
                 app.applied_tip().await.height,
-                1,
+                0,
                 "tick {tick}: APPLIED TIP FROZEN while the stored height is 2"
             );
         }
         assert_eq!(
             ghostdag.select_tip().await.expect("select_tip"),
-            a1.header.block_hash,
+            genesis.header.block_hash,
             "fork choice cannot see either sibling, so it re-names the frozen tip"
         );
 
@@ -2375,7 +2396,7 @@ mod tests {
         }
         app.drive_drain().await;
         let tip = app.applied_tip().await;
-        assert_eq!(tip.height, 2, "fork choice drained the wedge");
+        assert_eq!(tip.height, 1, "fork choice drained the wedge");
         assert!(
             tip.hash == a2.header.block_hash || tip.hash == b2.header.block_hash,
             "tip settled on one of the two siblings"
@@ -2401,20 +2422,13 @@ mod tests {
         let (exec, storage, _dir) = fresh();
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let genesis = mk_block(0, Hash::default(), exec.calculate_state_root());
+        seed_genesis(&storage, &dag, &ghostdag, &genesis).await;
         let app =
             CanonicalApplicator::new(exec, storage.clone()).with_fork_choice(ghostdag.clone());
 
         let r = roots(2);
-        let a1 = mk_block(1, Hash::default(), r[0]);
-        let a2 = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
-
-        dag.store_block(a1.clone()).await.expect("a1 into DAG");
-        ghostdag.add_block(&a1).await.expect("a1 admitted");
-        persist(&storage, &a1);
-        assert!(matches!(
-            app.apply_received(&a1).await,
-            ApplyOutcome::Applied { .. }
-        ));
+        let a2 = mk_block_scored(1, genesis.header.block_hash, r[0], 1, VRF_OUT);
 
         // ONE child, chain-present but DAG-absent — the same hole as above.
         persist(&storage, &a2);
@@ -2425,7 +2439,7 @@ mod tests {
             app.applied_tip().await,
             AppliedTip {
                 hash: a2.header.block_hash,
-                height: 2
+                height: 1
             },
             "a DAG hole by itself does NOT freeze the applied tip"
         );
@@ -2450,13 +2464,15 @@ mod tests {
 
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let genesis = mk_block(0, Hash::default(), exec.calculate_state_root());
+        seed_genesis(&storage, &dag, &ghostdag, &genesis).await;
 
         let r = roots(2);
-        let a1 = mk_block(1, Hash::default(), r[0]);
+        let a1 = genesis.clone();
         // Two equal-score siblings at height 2 (reward-only state root, distinct VRF
         // → distinct hash). GhostDag::select_tip breaks the tie by SMALLEST hash.
-        let s_a = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
-        let s_b = mk_block_scored(2, a1.header.block_hash, r[1], 1, [0x5B; 32]);
+        let s_a = mk_block_scored(1, a1.header.block_hash, r[0], 1, VRF_OUT);
+        let s_b = mk_block_scored(1, a1.header.block_hash, r[0], 1, [0x5B; 32]);
         assert_ne!(s_a.header.block_hash, s_b.header.block_hash);
         let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
             (s_a, s_b)
@@ -2464,18 +2480,11 @@ mod tests {
             (s_b, s_a)
         };
 
-        // Apply a1 then the LOSER — WITHOUT fork choice, so no reorg fires and the
-        // node's persisted tip lands on the losing sibling (the stranded state a
-        // producer reaches when it seals/applies its own losing sibling). The
-        // applicator is created BEFORE any block is persisted so it seeds its tip at
-        // genesis, then advances incrementally as blocks are persisted + applied.
+        // Apply the LOSER — WITHOUT fork choice, so no reorg fires and the node's
+        // persisted tip lands on the losing sibling (the stranded state a producer
+        // reaches when it seals/applies its own losing sibling).
         {
             let app1 = CanonicalApplicator::new(exec.clone(), storage.clone());
-            persist(&storage, &a1);
-            assert!(matches!(
-                app1.apply_received(&a1).await,
-                ApplyOutcome::Applied { .. }
-            ));
             persist(&storage, &loser);
             assert!(matches!(
                 app1.apply_received(&loser).await,
@@ -2485,7 +2494,7 @@ mod tests {
                 app1.applied_tip().await,
                 AppliedTip {
                     hash: loser.header.block_hash,
-                    height: 2
+                    height: 1
                 }
             );
         }
@@ -2493,7 +2502,7 @@ mod tests {
         // Now expose BOTH siblings to the DAG/fork-choice and persist the winner to
         // the chain store, so `select_tip` names the winner and recovery can re-apply
         // it. (Done AFTER app1 so its tip stayed on the loser.)
-        for blk in [&a1, &winner, &loser] {
+        for blk in [&winner, &loser] {
             dag.store_block(blk.clone()).await.expect("into DAG");
             ghostdag.add_block(blk).await.expect("admit");
         }
@@ -2512,7 +2521,7 @@ mod tests {
             app2.applied_tip().await,
             AppliedTip {
                 hash: loser.header.block_hash,
-                height: 2
+                height: 1
             }
         );
 
@@ -2526,14 +2535,14 @@ mod tests {
             app2.applied_tip().await,
             AppliedTip {
                 hash: loser.header.block_hash,
-                height: 2
+                height: 1
             },
             "restarted node is WEDGED on the losing sibling (drain can't reorg)"
         );
 
         // RECOVERY: rebuild from genesis via the stored blocks → converge to winner.
         let recovered = app2
-            .recover_to_head(genesis_state, Hash::default())
+            .recover_to_head(genesis_state, genesis.header.block_hash)
             .await
             .expect("recovery");
         assert!(recovered, "recovery reached the fork-choice head");
@@ -2541,7 +2550,7 @@ mod tests {
             app2.applied_tip().await,
             AppliedTip {
                 hash: winner.header.block_hash,
-                height: 2
+                height: 1
             },
             "recovered node converged onto the canonical (smallest-hash) winner"
         );
@@ -2551,7 +2560,7 @@ mod tests {
             app2.applied_tip().await,
             AppliedTip {
                 hash: winner.header.block_hash,
-                height: 2
+                height: 1
             }
         );
     }
@@ -2653,26 +2662,23 @@ mod tests {
         let (exec, storage, _dir) = fresh();
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let genesis = mk_block(0, Hash::default(), exec.calculate_state_root());
+        seed_genesis(&storage, &dag, &ghostdag, &genesis).await;
 
         let r = roots(2);
-        let a1 = mk_block(1, Hash::default(), r[0]);
-        let s_a = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
-        let s_b = mk_block_scored(2, a1.header.block_hash, r[1], 1, [0x5B; 32]);
+        let a1 = genesis.clone();
+        let s_a = mk_block_scored(1, a1.header.block_hash, r[0], 1, VRF_OUT);
+        let s_b = mk_block_scored(1, a1.header.block_hash, r[0], 1, [0x5B; 32]);
         let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
             (s_a, s_b)
         } else {
             (s_b, s_a)
         };
 
-        // SAME instance throughout (no restart). Apply a1 then the LOSER with fork
-        // choice NOT yet attached, so the ring records a1@1 AND loser@2 — the intact
-        // live ring a continuously-running node holds (fork point a1@1 present).
+        // SAME instance throughout (no restart). Apply the LOSER with fork choice
+        // NOT yet attached, so the ring retains the real genesis fork point and the
+        // losing child — the intact live ring a continuously-running node holds.
         let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        persist(&storage, &a1);
-        assert!(matches!(
-            app.apply_received(&a1).await,
-            ApplyOutcome::Applied { .. }
-        ));
         persist(&storage, &loser);
         assert!(matches!(
             app.apply_received(&loser).await,
@@ -2682,13 +2688,13 @@ mod tests {
             app.applied_tip().await,
             AppliedTip {
                 hash: loser.header.block_hash,
-                height: 2
+                height: 1
             }
         );
 
         // Expose both siblings to the DAG + persist the winner, then attach the REAL
         // fork choice — exactly the live state at the wedge (ring intact).
-        for blk in [&a1, &winner, &loser] {
+        for blk in [&winner, &loser] {
             dag.store_block(blk.clone()).await.expect("into DAG");
             ghostdag.add_block(blk).await.expect("admit");
         }
@@ -2721,7 +2727,7 @@ mod tests {
             app.applied_tip().await,
             AppliedTip {
                 hash: winner.header.block_hash,
-                height: 2
+                height: 1
             },
             "converged onto the winning sibling with the ring intact"
         );
