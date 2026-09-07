@@ -278,6 +278,22 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
             "TEERegistry: vm claim not in jwt"
         );
 
+        // CHAIN-B-C019 (audit 2026-09-02): bind the JWT to the caller. The
+        // strict-bound path USED to write `attestations[msg.sender]` from any
+        // valid MAA JWT without checking the JWT named the caller — so an
+        // attacker who observed a JWT in the mempool (or obtained a leaked one)
+        // could resubmit it from their own address, claim the Attested record,
+        // and — because the one-time-use `usedJwtSignatures` guard then fires —
+        // permanently lock the genuine worker out. The JWT payload must now
+        // literally contain the caller's address as a `"holder"` claim.
+        // OWNER/reroll-provisioning: the worker enclave's MAA JWT MUST embed a
+        // `"holder":"<lowercase 0x address>"` runtime claim naming the address
+        // that will submit it.
+        require(
+            JWTParser.containsClaim(payloadJson, _holderClaim(msg.sender)),
+            "TEERegistry: jwt not bound to caller"
+        );
+
         bytes32 vmMeasurement = keccak256(vmMeasurementClaim);
 
         uint64 blockNum = uint64(block.number);
@@ -299,6 +315,23 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
             modelHash,
             kidHash
         );
+    }
+
+    /// @notice CHAIN-B-C019: the exact claim bytes the strict-bound JWT must
+    ///         contain to bind the attestation to `who`:
+    ///         `"holder":"0x<40 lowercase hex chars>"`.
+    function _holderClaim(address who) internal pure returns (bytes memory) {
+        bytes16 digits = "0123456789abcdef";
+        bytes memory hexAddr = new bytes(42);
+        hexAddr[0] = "0";
+        hexAddr[1] = "x";
+        uint160 v = uint160(who);
+        for (uint256 i = 0; i < 20; ++i) {
+            uint8 b = uint8(v >> (8 * (19 - i)));
+            hexAddr[2 + i * 2] = digits[b >> 4];
+            hexAddr[3 + i * 2] = digits[b & 0x0f];
+        }
+        return abi.encodePacked('"holder":"', hexAddr, '"');
     }
 
     // ── Views ───────────────────────────────────────────────────────

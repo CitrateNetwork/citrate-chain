@@ -25,32 +25,40 @@ contract RmD3BoundTest is Test {
     bytes32 internal constant MODEL_HASH = keccak256("model-v1");
 
     // The base64url(header).base64url(payload) bytes that were
-    // RS256-signed.
+    // RS256-signed. CHAIN-B-C019 (audit 2026-09-02): the payload now embeds a
+    // `"holder":"0x…cafe"` claim naming `worker` (address(0xCAFE)); the
+    // strict-bound path requires the JWT to name its submitter. Fixture
+    // regenerated with a fresh RSA-2048 key (see the openssl recipe in the
+    // header) so the signature covers the holder claim.
+    //   PAYLOAD='{"iss":"sharedeus2.eus2.attest.azure.net",
+    //     "x-ms-vm-measurement":"0xdeadbeefcafe",
+    //     "holder":"0x000000000000000000000000000000000000cafe",
+    //     "iat":1745520000}'
     bytes constant SIGNED_JWT = bytes(
         "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2lkIn0."
-        "eyJpc3MiOiJzaGFyZWRldXMyLmV1czIuYXR0ZXN0LmF6dXJlLm5ldCIsIngtbXMtdm0tbWVhc3VyZW1lbnQiOiIweGRlYWRiZWVmY2FmZSIsImlhdCI6MTc0NTUyMDAwMH0"
+        "eyJpc3MiOiJzaGFyZWRldXMyLmV1czIuYXR0ZXN0LmF6dXJlLm5ldCIsIngtbXMtdm0tbWVhc3VyZW1lbnQiOiIweGRlYWRiZWVmY2FmZSIsImhvbGRlciI6IjB4MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwY2FmZSIsImlhdCI6MTc0NTUyMDAwMH0"
     );
 
     bytes constant MAA_RSA_MODULUS =
-        hex"CCD36A5718C9CE85E0538385FDEDF541F95E2E7630CC6C4CA93CF24A6EA266CD"
-        hex"E68721ACC53E2203899F79F3FC55903A723D124962648DAE179C2B6A7C81BC7E"
-        hex"96A7DA9232AD0B0FB87414918F14254D2E9060AE95243CE62260E5F9281F8A3F"
-        hex"F662404DF8A6A2B33CCB60B0C96B6DFF5F7E3A41D4AC02C9C61717EEB352A955"
-        hex"809018ED60D357859F197DF79B556C7ADC8175CA431A243AD0B72F30E8C178BA"
-        hex"15D8F4D94A1C6AB8D3F82B0E46B64615256CF999644946D7C185DDB6A617B5E9"
-        hex"AE578ED0365BA32907B714EDBFF1CF218D0A9FE9AAA8AE9F1895CAC599EF82D8"
-        hex"BF5E97FCAFDB6D68EC82B1E3921C17BD1342BF9E8D0D00C4295F112799031457";
+        hex"8968a575e3c2896fdf42b735207c0bc76867a80f1b5848a9f29e91c5074c79b3"
+        hex"14542429a91fdb004a7176ef2cbfcf9c93255afb9d6c2bd5b549ae386c49b1e4"
+        hex"719069adffe155a6a876ed696f856c7a6448ab7779dbb9705c5c05ed93f04d73"
+        hex"dd9d8fc227b35b7682150124e57e6a66ebafcf9d90780fb0a7cb92248c5c0c8e"
+        hex"77815f3acd82f20f8e55fb99c43e2d008f1097f409cd916a891189cb976cbade"
+        hex"39dddaf5491eac484a4c9a6066ff18dd40754fb346e7289b4d7182ec7e9b2f83"
+        hex"1a7045c903dfd85e02bbc064c0005ba0a7bd18f5a476bb3a27d8dbe5eda6f2aa"
+        hex"e3af31c6b0e8dd1f4eff4d5a7497335125818898150ad7e50fc890cc0a405929";
     bytes constant MAA_RSA_EXPONENT = hex"010001";
 
     bytes constant MAA_RSA_SIGNATURE =
-        hex"31214f289d954465d72c80f19255aa613e13818b609262a926a9279f598a6b9c"
-        hex"95a0027010176407bc23aec13b9176740dc271acac2bbae6008fbd8d2edfe44b"
-        hex"4d694cfe0c40bb939a054cb071de7e42e54ed5fd3bc02e08df3e4805498841c0"
-        hex"078b421b8afeeb9906201cf9e45c012eb474d71a0f335752d5e87122803165f3"
-        hex"c19b4fb01448c62643a7bf98559dbb3f8aaca4094f2e787f0a67aeeb5cf02208"
-        hex"3f622e2c647b0d6695c363912f973db29f08d9e7c9f3b9a082148574d6c9e360"
-        hex"f8433bef023dd627dc392cb33fd822c67b01340e029af63aa6ebceba6b2e487c"
-        hex"f6c39ea01ff0793e718e707c176e3edf08fbd514c7f52f3eff4027796584e7b1";
+        hex"239f979fd70d784ca8a32dd63bcc1d6ce9a06532d0f15c24155e544be7f84644"
+        hex"d6fcc420252f52814f9701c068981b6d05c240479182adb4468f3761626f7f4f"
+        hex"60b3eed7cc32775fc5180ee19bf03c2171dfd3f25be85ee5de36446d722668cf"
+        hex"15217a0d843ab4b2924a28e3c76adf9526cd3513014ea411fbd568bb23268bee"
+        hex"b281c06f09d47f4230ebc18fc344ad14894c3e3717f048f824cc282338514599"
+        hex"4582ce27ff11f609a2aaa1bae73e16adde69798d553a2a8eafe0efcb57b9c4a8"
+        hex"f145493685e879d8c402dedca81186dfcec2a9f1a885ea41451fb4a88a65b96a"
+        hex"57cc68dedbeac606ad991624fb91aaec068c0e7277d170a04505732a23a2c197";
 
     /// The exact JSON pair as it appears in the JWT payload.
     bytes constant VM_MEASUREMENT_CLAIM = bytes('"x-ms-vm-measurement":"0xdeadbeefcafe"');
@@ -112,6 +120,44 @@ contract RmD3BoundTest is Test {
             MODEL_HASH,
             NRAS_KEY
         );
+    }
+
+    // ── CHAIN-B-C019: the JWT must name its submitter ───────────────
+
+    /// RED (pre-fix): the strict-bound path wrote `attestations[msg.sender]`
+    /// from any valid MAA JWT without checking it named the caller, so an
+    /// attacker who observed the JWT in the mempool could resubmit it from
+    /// their OWN address, seize the Attested record, and — via the one-time
+    /// `usedJwtSignatures` guard — permanently lock the genuine worker out.
+    /// GREEN: the JWT's `"holder"` claim must equal the caller's address, so
+    /// an attacker's resubmission is rejected and the worker keeps its record.
+    function test_C019_jwt_must_name_the_submitter() public {
+        address attacker = address(0xBEEF);
+        vm.prank(attacker);
+        vm.expectRevert("TEERegistry: jwt not bound to caller");
+        registry.submitAttestationStrictBound(
+            SIGNED_JWT,
+            MAA_RSA_SIGNATURE,
+            MAA_KID_HASH,
+            VM_MEASUREMENT_CLAIM,
+            keccak256("gpu"),
+            MODEL_HASH,
+            NRAS_KEY
+        );
+        // The attacker did NOT consume the JWT (revert rolled it back), so the
+        // real worker can still attest.
+        vm.prank(worker);
+        registry.submitAttestationStrictBound(
+            SIGNED_JWT,
+            MAA_RSA_SIGNATURE,
+            MAA_KID_HASH,
+            VM_MEASUREMENT_CLAIM,
+            keccak256("gpu"),
+            MODEL_HASH,
+            NRAS_KEY
+        );
+        assertTrue(registry.isAttested(worker, block.number));
+        assertFalse(registry.isAttested(attacker, block.number));
     }
 
     // ── Replay protection still applies ─────────────────────────────
