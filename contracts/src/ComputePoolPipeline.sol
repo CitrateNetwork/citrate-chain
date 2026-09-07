@@ -271,7 +271,7 @@ contract ComputePoolPipeline is ReentrancyGuard, Governable {
     /// @notice Marks a stage faulted. The old owner is removed; a
     /// `ReassignStage` call with a new worker must follow. Any
     /// joined stage-owner or governance can trigger.
-    function faultStage(uint256 jobId, uint32 stage) external jobExists(jobId) {
+    function faultStage(uint256 jobId, uint32 stage) external jobExists(jobId) nonReentrant {
         Job storage job = jobs[jobId];
         require(job.state == JobState.Active || job.state == JobState.Draining, "Pipeline: wrong state");
         address former = stageOwner[jobId][stage];
@@ -286,7 +286,24 @@ contract ComputePoolPipeline is ReentrancyGuard, Governable {
         // SOL-13: clear `hasStage` so the former owner can be
         // reassigned to a different stage in this job.
         hasStage[jobId][former] = false;
+
+        // C040: return the faulted worker's OWN stake and its accrued earnings
+        // rather than freezing them. `terminateJob` only pays *current* stage
+        // owners, and `reassignStage` requires the replacement to post fresh
+        // stake — so without this the former owner's `stageStake`/`paymentEarned`
+        // are unreachable forever. Zero state before the external call (CEI).
+        uint128 stake = stageStake[jobId][former];
+        uint128 earned = paymentEarned[jobId][former];
+        stageStake[jobId][former] = 0;
+        paymentEarned[jobId][former] = 0;
+
         emit StageFaulted(jobId, stage, former);
+
+        uint256 payout = uint256(stake) + uint256(earned);
+        if (payout > 0) {
+            (bool ok, ) = former.call{value: payout}("");
+            require(ok, "Pipeline: fault payout failed");
+        }
     }
 
     function reassignStage(uint256 jobId, uint32 stage) external payable jobExists(jobId) {
