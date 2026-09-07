@@ -18,6 +18,10 @@ use std::sync::Arc;
 /// work, so an unbounded array is an inference-cost DoS.
 const MAX_EMBEDDING_INPUTS: usize = 256;
 const MAX_CHAT_MESSAGES: usize = 256;
+/// CHAIN-B-D006: hard ceiling on caller-supplied `max_tokens`. Without it, an
+/// unauthenticated caller can request an unbounded number of tokens and pin a
+/// synchronous RPC worker in `llama-cli` for the whole generation.
+const MAX_COMPLETION_TOKENS: u32 = 4096;
 
 /// OpenAI-compatible chat completion request
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -717,6 +721,12 @@ impl AiApi {
                 request.messages.len()
             )));
         }
+        // CHAIN-B-D006: clamp caller-supplied `max_tokens` to a hard ceiling so
+        // it cannot drive an unbounded blocking subprocess on a sync RPC worker.
+        let max_tokens = request
+            .max_tokens
+            .unwrap_or(512)
+            .min(MAX_COMPLETION_TOKENS);
         // For streaming responses, we'd need WebSocket support
         if request.stream.unwrap_or(false) {
             return Err(ApiError::InternalError(
@@ -743,7 +753,7 @@ impl AiApi {
         // Prepare input data with parameters
         let _input_data = serde_json::to_vec(&serde_json::json!({
             "prompt": prompt,
-            "max_tokens": request.max_tokens.unwrap_or(512),
+            "max_tokens": max_tokens,
             "temperature": request.temperature.unwrap_or(0.7),
             "top_p": request.top_p.unwrap_or(1.0),
         }))
@@ -765,12 +775,22 @@ impl AiApi {
         use citrate_mcp::gguf_engine::{GGUFEngine, GGUFEngineConfig};
         use std::path::PathBuf;
 
-        // Resolve model name to filename
+        // Resolve model name to filename.
+        // CHAIN-B-D006: reject any model name that is not in the allowlist.
+        // The previous `other => other` passthrough forwarded the caller's
+        // string straight into `dir.join(model_filename)`, so an absolute path
+        // (`/etc/shadow`) or `../` traversal escaped the model directory —
+        // yielding a filesystem existence oracle and an arbitrary `-m <path>`
+        // argument to `llama-cli`.
         let model_filename = match request.model.as_str() {
             "mistral-7b-instruct-v0.3" | "mistral-7b" => "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
             "bge-m3" => "bge-m3-fp16.gguf",
             "qwen2-0.5b" | "qwen" | "qwen2.5" | "qwen2.5-1.5b" => "qwen2.5-1.5b-instruct-q4_0.gguf",
-            other => other,
+            other => {
+                return Err(ApiError::InvalidParams(format!(
+                    "unknown model: {other:?}"
+                )));
+            }
         };
 
         // Search for model in multiple locations
@@ -841,7 +861,7 @@ impl AiApi {
             .generate_text(
                 &model_path,
                 &prompt,
-                request.max_tokens.unwrap_or(512) as usize,
+                max_tokens as usize,
                 request.temperature.unwrap_or(0.7),
             )
             .await

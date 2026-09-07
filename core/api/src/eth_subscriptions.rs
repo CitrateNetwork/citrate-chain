@@ -13,8 +13,26 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_async_with_config,
+    tungstenite::{protocol::WebSocketConfig, Message},
+};
 use tracing::{debug, error, info};
+
+/// CHAIN-B-D013: structural caps on the WebSocket server the node actually binds
+/// (`EthSubscriptionServer`). Pre-fix it had none — no connection cap, no frame
+/// cap, no idle timeout, no per-connection subscription cap — while the hardened
+/// (dead) `WebSocketServer` had all of them. An unauthenticated attacker could
+/// open unbounded idle connections or send 64 MiB frames (tungstenite's default).
+///
+/// Maximum concurrent connections; new connections past this are dropped.
+const MAX_WS_CONNECTIONS: usize = 1024;
+/// Maximum subscriptions per connection.
+const MAX_SUBSCRIPTIONS_PER_CONN: usize = 64;
+/// Maximum WebSocket message/frame size in bytes (1 MiB); default is 64 MiB.
+const WS_MAX_MESSAGE_SIZE: usize = 1_048_576;
+/// Idle timeout: a connection with no inbound message for this long is dropped.
+const WS_IDLE_TIMEOUT_SECS: u64 = 60;
 
 /// Subscription types for eth_subscribe
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -289,15 +307,32 @@ impl EthSubscriptionServer {
     ) -> anyhow::Result<()> {
         debug!("New WebSocket connection from {}", peer_addr);
 
-        let ws_stream = accept_async(stream).await?;
+        // CHAIN-B-D013: cap the frame/message size at accept time (1 MiB) rather
+        // than tungstenite's 64 MiB default.
+        let ws_config = WebSocketConfig {
+            max_message_size: Some(WS_MAX_MESSAGE_SIZE),
+            max_frame_size: Some(WS_MAX_MESSAGE_SIZE),
+            ..Default::default()
+        };
+        let ws_stream = accept_async_with_config(stream, Some(ws_config)).await?;
         let (mut write, mut read) = ws_stream.split();
 
         let conn_id = format!("{}-{}", peer_addr, chrono::Utc::now().timestamp_millis());
         let conn_state = Arc::new(RwLock::new(ConnectionState::new()));
 
-        // Register connection
+        // Register connection.
+        // CHAIN-B-D013: enforce the concurrent-connection cap. Refuse (and drop)
+        // the connection when the server is already at capacity, so an attacker
+        // cannot open unbounded idle connections until the node exhausts memory.
         {
             let mut connections = self.connections.write().await;
+            if connections.len() >= MAX_WS_CONNECTIONS {
+                debug!(
+                    "Refusing WebSocket from {} — max_connections ({}) reached",
+                    peer_addr, MAX_WS_CONNECTIONS
+                );
+                return Ok(());
+            }
             connections.insert(conn_id.clone(), conn_state.clone());
         }
 
@@ -305,11 +340,24 @@ impl EthSubscriptionServer {
         let mut new_heads_rx = self.new_heads_tx.subscribe();
         let mut pending_tx_rx = self.pending_tx_tx.subscribe();
 
-        // Message handling loop
+        // Message handling loop.
+        // CHAIN-B-D013: drop the connection after WS_IDLE_TIMEOUT_SECS with no
+        // inbound message so idle connections cannot accumulate forever.
+        let idle_timeout = std::time::Duration::from_secs(WS_IDLE_TIMEOUT_SECS);
+        let mut last_activity = std::time::Instant::now();
+        let mut idle_check = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             tokio::select! {
+                _ = idle_check.tick() => {
+                    if last_activity.elapsed() >= idle_timeout {
+                        debug!("WebSocket connection {} idle-timed-out", conn_id);
+                        break;
+                    }
+                }
+
                 // Handle incoming messages
                 msg = read.next() => {
+                    last_activity = std::time::Instant::now();
                     match msg {
                         Some(Ok(Message::Text(text))) => {
                             if let Some(response) = self.handle_message(&conn_state, &text).await {
@@ -470,6 +518,24 @@ impl EthSubscriptionServer {
         };
 
         let mut state = conn_state.write().await;
+        // CHAIN-B-D013: cap subscriptions per connection so a single socket
+        // cannot register unbounded subscriptions.
+        if state.subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_CONN {
+            return Some(
+                serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request.id,
+                    "error": {
+                        "code": -32005,
+                        "message": format!(
+                            "Too many subscriptions (max {})",
+                            MAX_SUBSCRIPTIONS_PER_CONN
+                        )
+                    }
+                }))
+                .unwrap_or_default(),
+            );
+        }
         let sub_id = state.next_subscription_id();
 
         state.subscriptions.insert(

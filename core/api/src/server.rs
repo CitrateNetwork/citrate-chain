@@ -186,9 +186,14 @@ fn ipfs_pin_blocking(cid: &str) -> Result<(), String> {
             .timeout(std::time::Duration::from_secs(8))
             .build()
             .map_err(|e| format!("client error: {}", e))?;
-        let url = format!("{}/api/v0/pin/add?arg={}&timeout=5s", api_base, cid_owned);
+        // CHAIN-B-D012: pass the CID as a properly-encoded query parameter
+        // rather than interpolating it into the URL string, so an attacker
+        // cannot inject extra `&`-separated parameters (or truncate with `#`)
+        // into the node's own IPFS API call.
+        let url = format!("{}/api/v0/pin/add", api_base);
         let resp = client
             .post(&url)
+            .query(&[("arg", cid_owned.as_str()), ("timeout", "5s")])
             .send()
             .await
             .map_err(|e| format!("IPFS pin error: {}", e))?;
@@ -214,8 +219,14 @@ fn ipfs_status_blocking(cid: &str) -> Result<String, String> {
             .timeout(std::time::Duration::from_secs(8))
             .build()
             .map_err(|e| format!("client error: {}", e))?;
-        let url = format!("{}/api/v0/pin/ls?arg={}", api_base, cid_owned);
-        let status = match client.post(&url).send().await {
+        // CHAIN-B-D012: encoded query parameter, not string interpolation.
+        let url = format!("{}/api/v0/pin/ls", api_base);
+        let status = match client
+            .post(&url)
+            .query(&[("arg", cid_owned.as_str())])
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => match resp.text().await {
                 Ok(body) if body.contains(&cid_owned) => "pinned",
                 _ => "unpinned",
@@ -229,6 +240,12 @@ fn ipfs_status_blocking(cid: &str) -> Result<String, String> {
 // In-memory verification store (address -> record)
 static VERIFICATIONS: Lazy<StdRwLock<HashMap<String, serde_json::Value>>> =
     Lazy::new(|| StdRwLock::new(HashMap::new()));
+
+/// CHAIN-B-D007: memoise the `llama-cli --version` probe. Before this,
+/// `citrate_getAIStatus` forked/exec'd `llama-cli` on every call — a 60-byte
+/// unauthenticated request costing a full fork/exec/wait. Probe once and cache
+/// for the process lifetime.
+static GGUF_BINARY_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Helper: parse optional pagination from params object
 fn parse_pagination(obj: &serde_json::Map<String, serde_json::Value>) -> (usize, Option<usize>) {
@@ -295,6 +312,12 @@ fn compile_runtime_bytecode(
     compile_runtime_bytecode_external(source, optimized, contract_name)
 }
 
+/// CHAIN-B-D005: upper bound on attacker-supplied Solidity source /
+/// standard-json handed to the `solc` subprocess. The JSON-RPC body is already
+/// capped at 10 MiB, but a single pathological contract far smaller than that
+/// can drive unbounded compile cost; 1 MiB is well above any honest contract.
+const MAX_SOLC_INPUT_BYTES: usize = 1_048_576;
+
 fn compile_runtime_bytecode_external(
     source: &str,
     optimized: bool,
@@ -303,61 +326,75 @@ fn compile_runtime_bytecode_external(
     use std::fs::{self, File};
     use std::io::Write;
     use std::process::Command;
+    // CHAIN-B-D005: bound source size before shelling out to solc.
+    if source.len() > MAX_SOLC_INPUT_BYTES {
+        return Err(format!(
+            "source too large: {} bytes (max {})",
+            source.len(),
+            MAX_SOLC_INPUT_BYTES
+        ));
+    }
     // Prepare temp directory and file
     let dir = std::env::temp_dir().join(format!("citrate_verify_{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let src_dir = dir.join("src");
-    fs::create_dir_all(&src_dir).map_err(|e| e.to_string())?;
-    let path = src_dir.join("Contract.sol");
-    let mut f = File::create(&path).map_err(|e| e.to_string())?;
-    f.write_all(source.as_bytes()).map_err(|e| e.to_string())?;
+    // CHAIN-B-D005: run the compile in an inner closure so the per-call temp
+    // dir is removed on every exit path (previously it leaked one dir per call).
+    let result = (|| -> Result<Vec<u8>, String> {
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).map_err(|e| e.to_string())?;
+        let path = src_dir.join("Contract.sol");
+        let mut f = File::create(&path).map_err(|e| e.to_string())?;
+        f.write_all(source.as_bytes()).map_err(|e| e.to_string())?;
 
-    // Build solc args
-    let path_lossy = path.to_string_lossy().to_string();
-    let mut args = vec!["--combined-json", "abi,bin,bin-runtime", &path_lossy];
-    if optimized {
-        args.splice(0..0, ["--optimize"]);
-    }
+        // Build solc args
+        let path_lossy = path.to_string_lossy().to_string();
+        let mut args = vec!["--combined-json", "abi,bin,bin-runtime", &path_lossy];
+        if optimized {
+            args.splice(0..0, ["--optimize"]);
+        }
 
-    let out = Command::new("solc")
-        .args(&args)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("solc failed: {}", stderr));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
-    let contracts = v
-        .get("contracts")
-        .and_then(|c| c.as_object())
-        .ok_or("no contracts in output")?;
-    // Find entry
-    let mut binrt_opt: Option<String> = None;
-    if let Some(name) = contract_name {
-        for (k, val) in contracts {
-            if k.ends_with(&format!(":{}", name)) {
+        let out = Command::new("solc")
+            .args(&args)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("solc failed: {}", stderr));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let v: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
+        let contracts = v
+            .get("contracts")
+            .and_then(|c| c.as_object())
+            .ok_or("no contracts in output")?;
+        // Find entry
+        let mut binrt_opt: Option<String> = None;
+        if let Some(name) = contract_name {
+            for (k, val) in contracts {
+                if k.ends_with(&format!(":{}", name)) {
+                    binrt_opt = val
+                        .get("bin-runtime")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string());
+                    break;
+                }
+            }
+        }
+        if binrt_opt.is_none() {
+            if let Some((_k, val)) = contracts.iter().next() {
                 binrt_opt = val
                     .get("bin-runtime")
                     .and_then(|s| s.as_str())
                     .map(|s| s.to_string());
-                break;
             }
         }
-    }
-    if binrt_opt.is_none() {
-        if let Some((_k, val)) = contracts.iter().next() {
-            binrt_opt = val
-                .get("bin-runtime")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-        }
-    }
-    let binrt = binrt_opt.ok_or("missing bin-runtime")?;
-    let s = binrt.trim();
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    hex::decode(s).map_err(|e| e.to_string())
+        let binrt = binrt_opt.ok_or("missing bin-runtime")?;
+        let s = binrt.trim();
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        hex::decode(s).map_err(|e| e.to_string())
+    })();
+    let _ = fs::remove_dir_all(&dir);
+    result
 }
 
 /// Compile using solc --standard-json. Returns (creation, runtime) bytecode for a selected contract.
@@ -367,6 +404,14 @@ fn compile_standard_json(
     contract_name: Option<&str>,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     use std::process::Command;
+    // CHAIN-B-D005: bound attacker-supplied standard-json before solc.
+    if standard_json.len() > MAX_SOLC_INPUT_BYTES {
+        return Err(format!(
+            "standard_json too large: {} bytes (max {})",
+            standard_json.len(),
+            MAX_SOLC_INPUT_BYTES
+        ));
+    }
     let mut child = Command::new("solc")
         .arg("--standard-json")
         .stdin(std::process::Stdio::piped())
@@ -1276,6 +1321,13 @@ impl RpcServer {
             let obj = match payload.as_object() { Some(m) => m, None => {
                 return Err(jsonrpc_core::Error::invalid_params("Expected object payload"));
             }};
+            // CHAIN-B-D004 / CHAIN-B-D005: gate the write + compile path behind
+            // the operator token. Unauthenticated, this handler let anyone
+            // overwrite a real contract's verification record with
+            // `verified:false`, and (via source_code/standard_json) shell out to
+            // `solc` with no timeout. verifyContract is an operator/explorer
+            // tool — legitimate callers carry CITRATE_OPERATOR_TOKEN.
+            require_operator_auth(obj)?;
             let address_str = obj.get("address").and_then(|v| v.as_str()).unwrap_or("");
             let runtime_hex = obj.get("runtime_bytecode").and_then(|v| v.as_str());
             let compiler_version = obj.get("compiler_version").and_then(|v| v.as_str()).unwrap_or("");
@@ -1620,6 +1672,10 @@ impl RpcServer {
                 Params::Map(m) => m.into_iter().collect::<serde_json::Map<_, _>>(),
                 _ => serde_json::Map::new(),
             };
+            // CHAIN-B-D004: prune deletes every verification record any legit
+            // verifier ever published, with no code check. Gate it behind the
+            // operator token so an unauthenticated caller cannot wipe the index.
+            require_operator_auth(&obj)?;
             let max_age = obj.get("max_age_seconds").and_then(|v| v.as_u64());
             let max_records = obj.get("max_records").and_then(|v| v.as_u64());
             let prefix = b"verify:addr:";
@@ -2312,14 +2368,17 @@ impl RpcServer {
             let all_models = executor_ai_status.state_db().all_models();
             let model_count = all_models.len();
 
-            // Check if llama.cpp binary is reachable
-            let gguf_available = std::process::Command::new("llama-cli")
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            // CHAIN-B-D007: probe the llama.cpp binary once and cache the
+            // result, rather than forking a process on every RPC call.
+            let gguf_available = *GGUF_BINARY_AVAILABLE.get_or_init(|| {
+                std::process::Command::new("llama-cli")
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            });
 
             let has_inference_service = executor_ai_status.has_inference_service();
 

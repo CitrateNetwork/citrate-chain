@@ -3,7 +3,6 @@
 use citrate_consensus::types::Hash;
 use citrate_execution::types::Address;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -41,7 +40,6 @@ pub const MAX_FILTERS: usize = 10_000;
 /// Filter registry for managing eth_newFilter/eth_getFilterChanges state
 pub struct FilterRegistry {
     filters: RwLock<HashMap<u64, Filter>>,
-    next_id: AtomicU64,
     /// Filters older than this are eligible for cleanup
     max_filter_age: Duration,
     /// CHAIN-B-D003: maximum number of concurrently-registered filters.
@@ -59,9 +57,24 @@ impl FilterRegistry {
     pub fn new() -> Self {
         Self {
             filters: RwLock::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
             max_filter_age: Duration::from_secs(5 * 60), // 5 minute timeout
             max_filters: MAX_FILTERS,
+        }
+    }
+
+    /// CHAIN-B-D011: mint a filter ID from a CSPRNG rather than a sequential
+    /// counter. Filters have no owner and the handlers reach no caller identity
+    /// (a jsonrpc-core limitation, same root cause as CHAIN-B-D009), so
+    /// sequential IDs let any client enumerate `0x1..0x1000` and uninstall or
+    /// drain every other client's filter. Unguessable 64-bit IDs make that
+    /// enumeration infeasible. Called while holding the `filters` write lock so
+    /// the collision check is race-free.
+    fn mint_id(filters: &HashMap<u64, Filter>) -> u64 {
+        loop {
+            let id = rand::random::<u64>();
+            if id != 0 && !filters.contains_key(&id) {
+                return id;
+            }
         }
     }
 
@@ -91,7 +104,7 @@ impl FilterRegistry {
         if !self.has_capacity(&mut filters) {
             return None;
         }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = Self::mint_id(&filters);
 
         let filter = Filter {
             filter_type: FilterType::Log {
@@ -116,7 +129,7 @@ impl FilterRegistry {
         if !self.has_capacity(&mut filters) {
             return None;
         }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = Self::mint_id(&filters);
 
         let filter = Filter {
             filter_type: FilterType::Block,
@@ -136,7 +149,7 @@ impl FilterRegistry {
         if !self.has_capacity(&mut filters) {
             return None;
         }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = Self::mint_id(&filters);
 
         let filter = Filter {
             filter_type: FilterType::PendingTransaction,
@@ -320,5 +333,23 @@ mod tests {
             "a stale filter must be swept, and the sweeper must have a caller"
         );
         let _ = id;
+    }
+
+    /// CHAIN-B-D011 tripwire: filter IDs must not be a sequential counter. Pre-fix
+    /// `new_*_filter` minted `1, 2, 3, …` from an `AtomicU64`, so any client could
+    /// enumerate `0x1..` and uninstall or drain another client's filter. Post-fix
+    /// they are unguessable 64-bit CSPRNG values.
+    #[test]
+    fn d011_filter_ids_are_not_sequential() {
+        let registry = FilterRegistry::new();
+        let ids: Vec<u64> = (0..8)
+            .map(|_| registry.new_block_filter(1).expect("under cap"))
+            .collect();
+        let sequential: Vec<u64> = (1..=8).collect();
+        assert_ne!(ids, sequential, "filter ids must not be a sequential counter");
+        assert!(
+            ids.iter().all(|&id| id > 0xffff),
+            "filter ids must be unguessable, not trivially-enumerable small integers"
+        );
     }
 }

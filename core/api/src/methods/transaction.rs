@@ -23,8 +23,17 @@ impl TransactionApi {
     /// Send raw transaction
     pub async fn send_raw_transaction(&self, raw_tx: Vec<u8>) -> Result<Hash, ApiError> {
         // Deserialize transaction
-        let tx: Transaction = bincode::deserialize(&raw_tx)
+        let mut tx: Transaction = bincode::deserialize(&raw_tx)
             .map_err(|e| ApiError::InvalidTransaction(e.to_string()))?;
+
+        // CHAIN-B-D001: never trust the wire-serialized `ecdsa_verified` flag.
+        // A malicious client could craft a bincode payload with
+        // `ecdsa_verified=true` to bypass EVM signature verification (the flag
+        // is the entire signature gate for EVM-shaped senders in
+        // crypto::verify_transaction). Force it false here so the flag can only
+        // ever be set by real secp256k1 recovery in eth_tx_decoder, mirroring
+        // the WP-K.1 reset at eth_tx_decoder.rs:287-291.
+        tx.ecdsa_verified = false;
 
         let hash = tx.hash;
 
