@@ -109,7 +109,16 @@ cmd_import() {
     fi
     
     echo "Importing account with alias: $alias"
-    run_wallet_command import --key "$private_key" --alias "$alias"
+    # CHAIN-B-E003: never pass the private key on the wallet binary's argv
+    # (visible in `ps`, shell history, audit logs). Stage it in a 0600 temp
+    # file and hand it to the hardened import via --key-file, then shred it.
+    local key_file
+    key_file="$(mktemp)"
+    chmod 600 "$key_file"
+    # shellcheck disable=SC2064
+    trap "shred -u '$key_file' 2>/dev/null || rm -f '$key_file'" RETURN
+    printf '%s' "$private_key" > "$key_file"
+    run_wallet_command import --key-file "$key_file" --alias "$alias"
     echo
 }
 
