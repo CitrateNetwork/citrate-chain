@@ -321,6 +321,15 @@ contract TreasuryGovernor is ReentrancyGuard {
         uint256 weight = getVotingPower(msg.sender);
         require(weight > 0, "TreasuryGovernor: no voting power");
 
+        // Native SALT is not an ERC20Votes token and cannot be checkpointed
+        // by this contract. Bound aggregate counted voting power to the
+        // declared supply so the same balance cannot be recycled through
+        // fresh addresses to manufacture quorum.
+        require(
+            p.forVotes + p.againstVotes + p.abstainVotes + weight <= totalSaltSupply,
+            "TreasuryGovernor: voting power exceeds supply"
+        );
+
         hasVoted[proposalId][msg.sender] = true;
         votes[proposalId][msg.sender] = Vote({
             support: support,

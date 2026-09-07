@@ -28,7 +28,7 @@ pragma solidity ^0.8.26;
  *           BUT several constructors take `deployer` as an arg (governance/treasury),
  *           so the genesis-allocated DEPLOYER (0x4250675F…) must stay constant.
  *        2. salts — this file.
- *        3. creationCode — solc 0.8.26 + optimizer(200) + bytecode_hash=none (foundry.toml).
+ *        3. creationCode — solc 0.8.36 + optimizer(200) + bytecode_hash=none (foundry.toml).
  *        4. constructor args — the literals in the deploy scripts.
  */
 library Salts {

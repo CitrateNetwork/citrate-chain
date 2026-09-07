@@ -3,7 +3,7 @@ pragma solidity ^0.8.21;
 
 // Vendored from https://github.com/daimo-eth/p256-verifier (MIT) at
 // commit pinned in lib/p256-verifier — only the pragma is widened from
-// `0.8.21` to `^0.8.21` so we can compile under our 0.8.26 toolchain.
+// `0.8.21` to `^0.8.21` so we can compile under the chain's pinned toolchain.
 // Path layout adjusted (Base64URL.sol moved alongside instead of under
 // utils/) for our project's tree.
 
