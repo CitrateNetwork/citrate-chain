@@ -379,6 +379,34 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         emit ProviderStakeUpdated(msg.sender, providers[msg.sender].stake);
     }
 
+    /// @notice CHAIN-B-C039: withdraw provider stake. Pre-fix there was no
+    ///         unstake/deregister path at all, so the minimum stake plus any
+    ///         top-ups were locked forever. Gated on having no in-flight jobs;
+    ///         a partial withdrawal must leave the provider at or above the
+    ///         minimum, and a full withdrawal deregisters the provider.
+    function withdrawStake(uint256 amount) external nonReentrant {
+        ProviderProfile storage prov = providers[msg.sender];
+        require(prov.isRegistered, "ComputeMarketplace: not registered");
+        require(prov.currentActiveJobs == 0, "ComputeMarketplace: active jobs");
+        require(amount > 0 && amount <= prov.stake, "ComputeMarketplace: bad amount");
+
+        uint256 remaining = prov.stake - amount;
+        require(
+            remaining == 0 || remaining >= MIN_PROVIDER_STAKE,
+            "ComputeMarketplace: below minimum"
+        );
+
+        prov.stake = remaining;
+        if (remaining == 0) {
+            prov.isRegistered = false; // full exit
+        }
+
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "ComputeMarketplace: withdraw failed");
+
+        emit ProviderStakeUpdated(msg.sender, remaining);
+    }
+
     // ============================================================
     // Job Posting
     // ============================================================
@@ -1189,6 +1217,15 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         prov.reputationScore = ComputeLib.calculateReputation(
             prov.totalJobsCompleted, prov.totalJobsFailed
         );
+
+        // CHAIN-B-C039: route slashed principal OUT to the treasury rather than
+        // leaving it commingled on the contract with job escrow and live stake
+        // (which silently inflated the balance funding C014/C015). Treasury is
+        // a trusted sink; callers of this function are nonReentrant.
+        if (slashAmount > 0 && treasury != address(0)) {
+            (bool ok, ) = payable(treasury).call{value: slashAmount}("");
+            require(ok, "ComputeMarketplace: slash routing failed");
+        }
     }
 
     /// @dev Score a provider for bid selection (delegates to ComputeLib)
