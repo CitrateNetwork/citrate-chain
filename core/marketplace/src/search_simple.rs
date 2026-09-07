@@ -209,9 +209,10 @@ impl SearchEngine {
         // Sort results
         self.sort_results(&mut results, query);
 
-        // Apply pagination
-        let start = query.offset;
-        let end = (start + query.limit).min(results.len());
+        // Apply pagination. Clamp `start` to the result count: an `offset`
+        // beyond the results otherwise gives start > end and panics the slice.
+        let start = query.offset.min(results.len());
+        let end = start.saturating_add(query.limit).min(results.len());
 
         Ok(results[start..end].to_vec())
     }
@@ -379,8 +380,26 @@ impl SearchEngine {
         let text_lower = text.to_lowercase();
 
         if let Some(pos) = text_lower.find(&query_lower) {
-            let start = pos.saturating_sub(50);
-            let end = (pos + query.len() + 50).min(text.len());
+            // `pos` is a byte offset into the LOWERCASED text, and to_lowercase()
+            // is not length-preserving (e.g. 'İ' 2 bytes → 3), so slicing the
+            // ORIGINAL `text` at these offsets can land mid-character and panic.
+            // Snap every offset to a valid char boundary of `text`, and clamp
+            // `pos` itself into range first.
+            let clamp_boundary = |mut i: usize| -> usize {
+                if i > text.len() {
+                    i = text.len();
+                }
+                while i < text.len() && !text.is_char_boundary(i) {
+                    i += 1;
+                }
+                while i > 0 && !text.is_char_boundary(i) {
+                    i -= 1;
+                }
+                i
+            };
+            let pos = clamp_boundary(pos);
+            let start = clamp_boundary(pos.saturating_sub(50));
+            let end = clamp_boundary(pos.saturating_add(query.len()).saturating_add(50).min(text.len()));
 
             let mut snippet = text[start..end].to_string();
             if start > 0 {

@@ -274,6 +274,21 @@ impl MetadataCache {
     // Private methods
 
     async fn fetch_from_ipfs(&self, cid: &str) -> Result<ModelMetadata> {
+        // Cap the response body: an owner-controlled URI otherwise let a gateway
+        // stream unbounded bytes into `response.json()` (memory exhaustion).
+        const MAX_METADATA_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+        // Validate the CID's charset before concatenating it into a gateway URL.
+        // An unvalidated owner-supplied value could carry '/', '?', '#', or a
+        // scheme to redirect the fetch off the intended gateway.
+        // OWNER: additionally verify the fetched bytes hash to `cid`
+        // (content-addressing) before trusting the metadata.
+        if cid.is_empty()
+            || !cid.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return Err(anyhow::anyhow!("invalid CID: {cid:?}"));
+        }
+
         let mut last_error = None;
 
         // Try each gateway
@@ -285,6 +300,17 @@ impl MetadataCache {
             match self.client.get(&url).send().await {
                 Ok(response) => {
                     if response.status().is_success() {
+                        if let Some(len) = response.content_length() {
+                            if len > MAX_METADATA_BYTES {
+                                last_error = Some(anyhow::anyhow!(
+                                    "metadata body {} exceeds {} byte cap from gateway {}",
+                                    len,
+                                    MAX_METADATA_BYTES,
+                                    gateway
+                                ));
+                                continue;
+                            }
+                        }
                         match response.json::<ModelMetadata>().await {
                             Ok(metadata) => {
                                 info!(cid = cid, gateway = %gateway, "Successfully fetched metadata");

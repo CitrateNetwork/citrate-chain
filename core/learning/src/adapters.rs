@@ -278,7 +278,7 @@ impl AdapterFactory {
             }
         }
 
-        let id = Self::compute_lora_id(&matrix_a, &matrix_b, &metadata);
+        let id = Self::compute_lora_id(&matrix_a, &matrix_b, &metadata, &creator, checkpoint_height);
 
         let provenance = ProvenanceChain::new(ProvenanceEntry {
             creator,
@@ -307,6 +307,8 @@ impl AdapterFactory {
         matrix_a: &[Vec<f32>],
         matrix_b: &[Vec<f32>],
         metadata: &AdapterMetadata,
+        creator: &PublicKey,
+        checkpoint_height: u64,
     ) -> Hash {
         let mut hasher = Sha3_256::new();
         for row in matrix_a {
@@ -322,6 +324,10 @@ impl AdapterFactory {
         hasher.update(metadata.name.as_bytes());
         hasher.update(metadata.round.to_le_bytes());
         hasher.update(metadata.created_at.to_le_bytes());
+        // Bind creator + checkpoint into the identity so an attacker cannot take
+        // a victim's adapter, rewrite `creator`, and still pass hash verification.
+        hasher.update(creator);
+        hasher.update(checkpoint_height.to_le_bytes());
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
@@ -330,7 +336,7 @@ impl AdapterFactory {
 
     /// Verify a LoRA adapter's hash matches its content.
     pub fn verify_lora_hash(adapter: &LoraAdapter) -> bool {
-        let expected = Self::compute_lora_id(&adapter.matrix_a, &adapter.matrix_b, &adapter.metadata);
+        let expected = Self::compute_lora_id(&adapter.matrix_a, &adapter.matrix_b, &adapter.metadata, &adapter.creator, adapter.checkpoint_height);
         adapter.id == expected
     }
 }
@@ -524,7 +530,7 @@ pub fn compose_lora(
         }
     }
 
-    let id = AdapterFactory::compute_lora_id(&matrix_a, &matrix_b, &metadata);
+    let id = AdapterFactory::compute_lora_id(&matrix_a, &matrix_b, &metadata, &creator, checkpoint_height);
 
     let mut provenance = first.provenance.clone();
     for entry in &second.provenance.entries {
@@ -606,9 +612,23 @@ impl AdapterRegistry {
 
     /// Register an adapter. Returns its hash.
     pub fn register(&self, adapter: LoraAdapter) -> LearningResult<Hash> {
-        let hash = adapter.id;
-        self.adapters.insert(hash, adapter);
-        Ok(hash)
+        // Recompute the id rather than trusting the caller's self-declared
+        // `adapter.id`. Keying on an unverified id let an attacker register under
+        // a legitimate adapter's hash (and `insert` silently overwrote it),
+        // stealing and replacing attribution for a paid contribution type.
+        let expected = AdapterFactory::compute_lora_id(&adapter.matrix_a, &adapter.matrix_b, &adapter.metadata, &adapter.creator, adapter.checkpoint_height);
+        if adapter.id != expected {
+            return Err(LearningError::AdapterError {
+                reason: "adapter id does not match its content hash".to_string(),
+            });
+        }
+        if self.adapters.contains_key(&expected) {
+            return Err(LearningError::AdapterError {
+                reason: "an adapter with this id is already registered".to_string(),
+            });
+        }
+        self.adapters.insert(expected, adapter);
+        Ok(expected)
     }
 
     /// Query an adapter by hash.
@@ -1017,17 +1037,42 @@ mod tests {
         assert_eq!(by_c2[0].id, hash2);
     }
 
-    // PC-T40a: Duplicate registration
+    // PC-T40a (RC-8 inverted): duplicate registration must be REJECTED, not
+    // silently overwrite. The old body asserted the overwrite that let an
+    // attacker replace a registered adapter under its own hash.
     #[test]
     fn test_adapter_registry_duplicate() {
         let registry = AdapterRegistry::new();
         let e = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
         let adapter = AdapterFactory::create_lora(&e, 1, test_metadata(1), [1u8; 32], 100, vec![0u8; 64]).unwrap();
 
-        let hash1 = registry.register(adapter.clone()).unwrap();
-        let hash2 = registry.register(adapter).unwrap();
+        let _hash1 = registry.register(adapter.clone()).unwrap();
+        // Second registration of an already-present id is refused.
+        assert!(registry.register(adapter).is_err());
+        assert_eq!(registry.count(), 1);
+    }
 
-        assert_eq!(hash1, hash2);
-        assert_eq!(registry.count(), 1); // Same hash, overwrites
+    // F005: creator is bound into the adapter id, and register rejects an
+    // adapter whose declared id does not match its recomputed content hash —
+    // closing attribution theft (rewrite `creator`, keep a victim's id).
+    #[test]
+    fn test_creator_bound_into_id_and_register_rejects_forgery() {
+        let e = EmbeddingVector::new(vec![1.0, 2.0]).unwrap();
+        let honest =
+            AdapterFactory::create_lora(&e, 1, test_metadata(1), [1u8; 32], 100, vec![0u8; 64]).unwrap();
+        let other_creator =
+            AdapterFactory::create_lora(&e, 1, test_metadata(1), [2u8; 32], 100, vec![0u8; 64]).unwrap();
+
+        // Same matrices/metadata, different creator ⇒ different id.
+        assert_ne!(honest.id, other_creator.id);
+
+        // Forge: keep the victim's id but rewrite the creator. register must reject.
+        let mut forged = honest.clone();
+        forged.creator = [9u8; 32];
+        assert!(!AdapterFactory::verify_lora_hash(&forged));
+
+        let registry = AdapterRegistry::new();
+        assert!(registry.register(forged).is_err());
+        assert_eq!(registry.count(), 0);
     }
 }
