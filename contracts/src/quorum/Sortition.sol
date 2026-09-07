@@ -105,6 +105,8 @@ contract Sortition {
     error CommitWindowClosed(uint64 targetBlock);
     error AlreadyCommitted(bytes32 drawId, address who);
     error ZeroCommitment();
+    /// CHAIN-B-C022: the caller did not prove membership of the draw's pool.
+    error NotPoolMember(bytes32 drawId, address who);
     error NothingCommitted(bytes32 drawId, address who);
     error AlreadyRevealed(bytes32 drawId, address who);
     error RevealTooEarly(uint64 targetBlock);
@@ -153,17 +155,55 @@ contract Sortition {
     // ── Commit / reveal ─────────────────────────────────────────────
 
     /// `commitment = keccak256(abi.encode(r, salt))`. One per address.
-    function commit(bytes32 drawId, bytes32 commitment) external {
+    ///
+    /// CHAIN-B-C022 (audit 2026-09-02): `commit` USED to be permissionless and
+    /// costless beyond gas. Because `finalize` requires `revealCount ==
+    /// commitCount`, any address with no stake and no relationship to the pool
+    /// could commit junk to every open draw and never reveal, guaranteeing the
+    /// draw voids — an unbounded, unslashable DoS on committee selection. The
+    /// caller must now prove membership of the draw's committed pool with a
+    /// Merkle inclusion proof of its OWN leaf, so only actual pool members can
+    /// contribute entropy (and a griefing member is a named, bounded party, the
+    /// inherent last-revealer trade this contract already documents).
+    ///
+    /// The proven leaf is `keccak256(abi.encode(msg.sender))`; pool roots MUST
+    /// be built over that leaf encoding (OWNER/reroll pool-provisioning note).
+    /// `index` is the caller's position in the committed pool and `proof` its
+    /// Merkle authentication path.
+    function commit(bytes32 drawId, bytes32 commitment, uint32 index, bytes32[] calldata proof) external {
         Draw storage d = _open(drawId);
         // A commitment made at or after the target block could be chosen with
         // the block hash in hand, which is the whole thing this defends against.
         if (block.number >= d.targetBlock) revert CommitWindowClosed(d.targetBlock);
         if (commitment == bytes32(0)) revert ZeroCommitment();
+        // CHAIN-B-C022: bind the commit to a real pool member. The leaf is
+        // derived from msg.sender, so an outsider cannot forge membership and
+        // cannot commit on another member's behalf.
+        if (!_isPoolMember(d, index, keccak256(abi.encode(msg.sender)), proof)) {
+            revert NotPoolMember(drawId, msg.sender);
+        }
         if (commitmentOf[drawId][msg.sender] != bytes32(0)) revert AlreadyCommitted(drawId, msg.sender);
 
         commitmentOf[drawId][msg.sender] = commitment;
         d.commitCount += 1;
         emit EntropyCommitted(drawId, msg.sender, commitment);
+    }
+
+    /// Merkle inclusion check of `leaf` at `index` against the draw's pool
+    /// root. Same authentication-path convention as {verifyMember}.
+    function _isPoolMember(Draw storage d, uint32 index, bytes32 leaf, bytes32[] calldata proof)
+        private
+        view
+        returns (bool)
+    {
+        if (index >= d.poolSize) return false;
+        bytes32 node = leaf;
+        uint256 path = index;
+        for (uint256 i = 0; i < proof.length; ++i) {
+            node = path & 1 == 0 ? keccak256(abi.encode(node, proof[i])) : keccak256(abi.encode(proof[i], node));
+            path >>= 1;
+        }
+        return node == d.poolRoot;
     }
 
     function reveal(bytes32 drawId, bytes32 r, bytes32 salt) external {
