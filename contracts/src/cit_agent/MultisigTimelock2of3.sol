@@ -24,6 +24,12 @@ contract MultisigTimelock2of3 is IERC1155Receiver {
     /// without redeploy.
     uint256 public immutable minDelay;
 
+    /// C044(a): a hard floor on `minDelay`. A zero delay (e.g.
+    /// `CIT_AGENT_TIMELOCK_DELAY=0`) collapses the timelock into an
+    /// immediate 2-of-3 executor — the delay window an operator relies on
+    /// to notice and `cancel` a hostile proposal disappears.
+    uint256 public constant MIN_DELAY_FLOOR = 1 hours;
+
     enum OpState { None, Proposed, Approved, Executed, Cancelled }
 
     struct Operation {
@@ -57,6 +63,7 @@ contract MultisigTimelock2of3 is IERC1155Receiver {
     error BadOwnerIndex(uint8 index);
     error ZeroOwner();
     error DuplicateOwner(address owner);
+    error DelayTooShort(uint256 provided, uint256 floor);
 
     event Proposed(bytes32 indexed opId, address indexed proposer, address target);
     event Approved(bytes32 indexed opId, address indexed approver, uint8 approvalCount);
@@ -71,6 +78,16 @@ contract MultisigTimelock2of3 is IERC1155Receiver {
     }
 
     constructor(address[3] memory _owners, uint256 _minDelay) {
+        // C044(a): apply the same load-bearing checks the constructor was
+        // missing that `replaceOwner` already documents — a zero owner or a
+        // duplicated owner collapses 2-of-3 into 1-of-1 — plus a delay floor.
+        for (uint8 i = 0; i < 3; i++) {
+            if (_owners[i] == address(0)) revert ZeroOwner();
+            for (uint8 j = i + 1; j < 3; j++) {
+                if (_owners[i] == _owners[j]) revert DuplicateOwner(_owners[i]);
+            }
+        }
+        if (_minDelay < MIN_DELAY_FLOOR) revert DelayTooShort(_minDelay, MIN_DELAY_FLOOR);
         owners = _owners;
         minDelay = _minDelay;
     }

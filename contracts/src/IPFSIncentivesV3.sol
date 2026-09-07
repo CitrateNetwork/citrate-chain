@@ -522,6 +522,30 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         unallocatedSlotFunding += msg.value;
     }
 
+    /// @notice Emitted when the honest-pinner compensation pool is disbursed.
+    event CompensationPoolWithdrawn(address indexed to, uint256 amount);
+
+    /// @notice CON-02: drain the honest-pinner compensation pool to a
+    ///         distributor. 50% of every slashed model bond accrues to
+    ///         `honestPinnerCompensationPool` (`challengeWrongCommD`) but was
+    ///         read nowhere and had no distribution or sweep path, so it was
+    ///         permanently frozen. Route it out (to governance/treasury or a
+    ///         distributor contract) for disbursement to honest pinners.
+    /// @param to The recipient of the accrued pool (must be non-zero).
+    function withdrawCompensationPool(address to)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        nonReentrant
+    {
+        require(to != address(0), "Zero recipient");
+        uint256 amt = honestPinnerCompensationPool;
+        require(amt > 0, "Empty pool");
+        honestPinnerCompensationPool = 0;
+        (bool ok, ) = payable(to).call{value: amt}("");
+        require(ok, "Transfer failed");
+        emit CompensationPoolWithdrawn(to, amt);
+    }
+
     // ─────────────────────────────── IDs ───────────────────────────────────
 
     function pinId(address pinner, bytes32 cid, uint256 sector) public pure returns (bytes32) {

@@ -253,7 +253,13 @@ contract Sortition {
         bytes32 anchor = blockhash(d.targetBlock);
         if (anchor == bytes32(0)) revert UnreadableAnchor(d.targetBlock);
 
-        d.seed = keccak256(abi.encode(anchor, d.revealedXor, drawId, d.poolRoot));
+        // C038: `drawId` is caller-chosen at `openDraw` and must NOT enter the
+        // seed. Mixing it in let an opener grind — open M draws over one pool
+        // with different ids and finalize only the favourable committee. The
+        // seed now depends solely on the chain anchor, the revealed entropy and
+        // the (committed) pool root, so distinct ids over the same pool/target
+        // yield the same committee and the id is no longer an entropy knob.
+        d.seed = keccak256(abi.encode(anchor, d.revealedXor, d.poolRoot));
         d.state = State.Final;
 
         emit DrawFinalized(drawId, d.seed, d.commitCount);

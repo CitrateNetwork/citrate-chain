@@ -198,11 +198,15 @@ contract TenantHierarchyTest is Test {
 
     function test_setClassificationMax_revertsWhenExceedsParent() public {
         _createBcaUnderRoot();
-        // Try to set BCA.max higher than ROOT's parent_max=3 — but
-        // first we need the parent's max to be lower than this child's.
-        // Lower root's max to 1 first.
+        // C035: a parent may not be lowered below an existing child's ceiling,
+        // so first lower BCA to 1 before lowering ROOT to 1 (otherwise the
+        // ChildExceedsClassification guard fires — which its own test covers).
+        vm.prank(admin1);
+        th.setClassificationMax(BCA, 1);
+        // Lower root's max to 1.
         vm.prank(admin1);
         th.setClassificationMax(ROOT, 1);
+        // Now raising BCA back to 3 exceeds the parent's (root's) max of 1.
         vm.prank(admin1);
         vm.expectRevert(
             abi.encodeWithSelector(

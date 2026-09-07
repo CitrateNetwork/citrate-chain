@@ -45,7 +45,17 @@ contract X402Paywall {
     /// @param value      Payment amount (must be >= resourcePrice)
     /// @param validAfter Earliest valid timestamp
     /// @param validBefore Latest valid timestamp
-    /// @param nonce      Authorization nonce
+    /// @param nonce      Authorization nonce. C047: MUST equal
+    ///        `keccak256(abi.encode(resourceId, salt))` so the resource is
+    ///        cryptographically bound to the EIP-3009 authorization (whose
+    ///        signed fields do not include `resourceId`). Without this a
+    ///        front-runner could replay the same authorization against a
+    ///        different `resourceId`, burning the one-shot nonce and paying the
+    ///        provider while granting access to the wrong resource — the
+    ///        payer's legitimate call then reverts "authorization already used".
+    /// @param salt       Per-purchase salt that, with `resourceId`, derives the
+    ///        nonce — lets a payer re-purchase the same resource after expiry
+    ///        with a fresh, still-bound nonce.
     /// @param v          Signature v
     /// @param r          Signature r
     /// @param s          Signature s
@@ -56,11 +66,14 @@ contract X402Paywall {
         uint256 validAfter,
         uint256 validBefore,
         bytes32 nonce,
+        bytes32 salt,
         uint8 v,
         bytes32 r,
         bytes32 s
     ) external {
         require(value >= resourcePrice, "Paywall: insufficient payment");
+        // C047: the nonce must commit to the resource being granted.
+        require(nonce == keccak256(abi.encode(resourceId, salt)), "Paywall: nonce not bound to resource");
         bytes32 key = keccak256(abi.encodePacked(from, resourceId));
         // SOL-12 fix: allow re-purchase after expiry. Pre-fix the
         // access flag was permanent; re-purchase was blocked.
