@@ -108,6 +108,6 @@
     "X402TransferAuthVerify": "0x0000000000000000000000000000000000000201",
     "X402BatchPaymentVerify": "0x0000000000000000000000000000000000000202"
   },
-  "CitrateMemberSBT": "0xAD826D0439f7ad5a3512A8927B632Cbca2840e10",
-  "MembershipStakeVault": "0x04c32967816187B2efDcd4937DbBa59E051F99dB"
+  "CitrateMemberSBT": "0xf0badd9eed5a81871a2f0d309b1f0a225646448a",
+  "MembershipStakeVault": "0x53fb4badffaceedd575d47d0e74bb721504f786e"
 }
