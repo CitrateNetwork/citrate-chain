@@ -37,21 +37,30 @@ impl ModelCache {
 
     /// Get model from cache
     pub async fn get(&self, model_id: &ModelId) -> Option<Model> {
-        let mut cache = self.cache.write().await;
+        // CHAIN-B-D018: release the `cache` lock BEFORE taking `lru_queue` in
+        // `update_lru`. Previously `get` held `cache` (write) across
+        // `update_lru` (which takes `lru_queue`), while `evict_lru` takes the
+        // two in the opposite order — an ABBA inversion that permanently
+        // deadlocks a validator under concurrent `get` + evicting `put`.
+        let model = {
+            let mut cache = self.cache.write().await;
+            match cache.get_mut(model_id) {
+                Some(cached) => {
+                    cached.last_accessed = chrono::Utc::now().timestamp() as u64;
+                    cached.access_count += 1;
+                    Some(cached.model.clone())
+                }
+                None => None,
+            }
+        }; // `cache` guard dropped here
 
-        if let Some(cached) = cache.get_mut(model_id) {
-            // Update access info
-            cached.last_accessed = chrono::Utc::now().timestamp() as u64;
-            cached.access_count += 1;
-
-            // Move to front of LRU queue
+        if model.is_some() {
+            // Move to front of LRU queue (no `cache` guard held).
             self.update_lru(model_id).await;
-
             debug!("Cache hit for model {:?}", hex::encode(&model_id.0[..8]));
-            return Some(cached.model.clone());
         }
 
-        None
+        model
     }
 
     /// Put model in cache
@@ -63,9 +72,25 @@ impl ModelCache {
             return Err(anyhow::anyhow!("Model too large for cache"));
         }
 
-        // Evict models if necessary
+        // CHAIN-B-D018: if this key is already cached, remove its old accounting
+        // first. Previously a re-insert replaced the map entry but still did
+        // `*current_size += model_size` and pushed a duplicate into
+        // `lru_queue`, so `current_size` drifted upward until the eviction loop
+        // below could never satisfy its condition and spun forever.
+        {
+            let existing = self.cache.write().await.remove(&model_id);
+            if let Some(old) = existing {
+                *self.current_size.write().await -= old.size;
+                self.lru_queue.write().await.retain(|id| id != &model_id);
+            }
+        }
+
+        // Evict models if necessary. `evict_lru` now reports whether it actually
+        // evicted anything; if the queue is empty we stop rather than spin.
         while *self.current_size.read().await + model_size > self.max_size {
-            self.evict_lru().await?;
+            if !self.evict_lru().await? {
+                break;
+            }
         }
 
         // Add to cache
@@ -160,8 +185,12 @@ impl ModelCache {
         queue.push_front(*model_id);
     }
 
-    /// Evict least recently used model
-    async fn evict_lru(&self) -> Result<()> {
+    /// Evict least recently used model.
+    ///
+    /// CHAIN-B-D018: returns `true` iff an entry was popped from the LRU queue.
+    /// The `put` eviction loop uses this to terminate when there is nothing left
+    /// to evict, instead of spinning forever on a drifted `current_size`.
+    async fn evict_lru(&self) -> Result<bool> {
         let mut queue = self.lru_queue.write().await;
 
         if let Some(model_id) = queue.pop_back() {
@@ -173,9 +202,10 @@ impl ModelCache {
                     hex::encode(&model_id.0[..8])
                 );
             }
+            Ok(true)
+        } else {
+            Ok(false)
         }
-
-        Ok(())
     }
 
     /// Calculate model size
@@ -391,5 +421,30 @@ mod tests {
         let stats = cache.stats().await;
         assert!(stats.utilization > 0.0);
         assert!(stats.utilization < 100.0);
+    }
+
+    /// CHAIN-B-D018 tripwire: re-inserting the same key must not drift
+    /// `current_size` or push duplicate LRU entries. Pre-fix, `put` on an
+    /// existing key still did `*current_size += model_size`, so the size grew
+    /// each time until the eviction loop could never terminate.
+    #[tokio::test]
+    async fn d018_reinsert_does_not_drift_size() {
+        let cache = ModelCache::new(10_000);
+        let id = ModelId([7u8; 32]);
+        let model = create_test_model([7u8; 32], 500);
+
+        cache.put(id, model.clone()).await.unwrap();
+        let size_after_first = cache.stats().await.current_size;
+
+        for _ in 0..5 {
+            cache.put(id, model.clone()).await.unwrap();
+        }
+
+        let stats = cache.stats().await;
+        assert_eq!(
+            stats.current_size, size_after_first,
+            "re-inserting the same key must not drift current_size"
+        );
+        assert_eq!(stats.total_models, 1, "re-insert must not duplicate the entry");
     }
 }
