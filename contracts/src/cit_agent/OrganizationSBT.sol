@@ -24,6 +24,9 @@ contract OrganizationSBT is ERC721, Ownable {
 
     /// Token id → org metadata.
     mapping(uint256 => Org) private _orgs;
+    /// did → minted. Enforces one-org-per-DID (E09: `OrgAlreadyMinted` was
+    /// declared but never checked, so a DID could be minted repeatedly).
+    mapping(bytes32 => bool) private _didUsed;
     uint256 public nextTokenId;
 
     error TransferNotAllowed();
@@ -43,6 +46,8 @@ contract OrganizationSBT is ERC721, Ownable {
         address signing_authority,
         bytes32[] calldata overlays
     ) external onlyOwner returns (uint256 tokenId) {
+        if (_didUsed[did]) revert OrgAlreadyMinted();
+        _didUsed[did] = true;
         tokenId = nextTokenId++;
         _orgs[tokenId] = Org({
             did: did,
