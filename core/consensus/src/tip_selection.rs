@@ -186,20 +186,20 @@ impl TipSelector {
         Ok(selected)
     }
 
-    /// Select tip with highest blue score
+    /// Select tip with highest blue score.
+    ///
+    /// CHAIN-B-A013: this MUST break ties deterministically. The pre-fix body
+    /// used a bare `if score > best_score` from `best_score = 0`, which (i)
+    /// resolved equal-blue_score tips by the iteration order of
+    /// `dag_store.get_tips()` — the exact H-08 non-determinism class that
+    /// deadlocked chain 40204 for ~4h on 2026-08-06 — and (ii) returned
+    /// `Err(NoTips)` when every tip scored 0 rather than picking one. Fork
+    /// choice is the highest-consequence surface in the repo, so this variant
+    /// now delegates to the canonical hash-tie-break path shared with
+    /// `select_tip`, `cmp_tip_for_parent_selection` and `GhostDag::select_tip`.
+    /// All blue-score comparisons in this module must carry a hash tie-break.
     async fn select_highest_blue_score(&self, tips: &[Tip]) -> Result<Hash, TipSelectionError> {
-        let mut best_tip = None;
-        let mut best_score = 0;
-
-        for tip in tips {
-            let score = self.get_blue_score(&tip.hash).await?;
-            if score > best_score {
-                best_score = score;
-                best_tip = Some(tip.hash);
-            }
-        }
-
-        best_tip.ok_or(TipSelectionError::NoTips)
+        self.select_highest_blue_score_with_tiebreak(tips).await
     }
 
     /// Select tip with highest blue score, breaking ties deterministically
