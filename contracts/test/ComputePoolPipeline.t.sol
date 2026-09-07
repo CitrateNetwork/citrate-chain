@@ -268,4 +268,33 @@ contract ComputePoolPipelineTest is Test {
         vm.expectRevert("Pipeline: bad stageCount");
         pool.createPipelineJob(33, PAYMENT, STAGE_STAKE, MODEL_HASH);
     }
+
+    // ── CHAIN-B-C040: faultStage returns the faulted worker's stake +
+    //    accrued earnings rather than freezing them ─────────────────
+    //
+    // RED (pre-fix): `faultStage` zeroed `stageOwner` but never touched
+    // `stageStake`/`paymentEarned` for the former owner, and `terminateJob`
+    // only pays *current* owners — so the faulted worker's own stake and its
+    // accrued earnings were unreachable forever.
+    function test_C040_faultStageRefundsFormerOwner() public {
+        uint256 jobId = _createJob();
+        _assignFour(jobId);
+        pool.activateJob(jobId);
+
+        // One in-flight advance credits stage 0 (w1) with payment/4 = 1 ether.
+        vm.prank(requester);
+        uint256 reqId = pool.submitRequest{value: PAYMENT}(jobId);
+        vm.prank(w1);
+        pool.advanceRequest(reqId);
+        assertEq(pool.paymentEarned(jobId, w1), 1 ether, "w1 earned one stage");
+
+        uint256 balBefore = w1.balance;
+
+        // Governance faults stage 0. w1 must get stake (2 ether) + earned (1).
+        pool.faultStage(jobId, 0);
+
+        assertEq(w1.balance, balBefore + STAGE_STAKE + 1 ether, "stake + earnings refunded");
+        assertEq(pool.paymentEarned(jobId, w1), 0, "earnings cleared");
+        assertEq(pool.getStageOwner(jobId, 0), address(0), "stage vacated");
+    }
 }

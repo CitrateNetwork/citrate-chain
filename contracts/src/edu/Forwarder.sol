@@ -139,6 +139,17 @@ contract Forwarder is IForwarder {
         // For v1, we verify the device's user is still active
         address deviceUser = cluster.getDeviceUser(request.deviceCertHash);
         if (deviceUser == address(0)) revert PrincipalRevoked();
+        // CHAIN-B-C042: `_deviceToUser` is written only by registerDevice and is
+        // NEVER cleared by setAccountStatus, so the != address(0) check above
+        // does not stop meta-transactions after the principal's account is
+        // suspended, expelled, withdrawn, etc. The device-bound principal here
+        // is a classroom member (a Student holds a classroom role, not an org
+        // role — so `isActiveMember`, which requires an org role, is the wrong
+        // predicate for this surface), so the live revocation lever is the
+        // account status: anything other than Active revokes the barrier.
+        if (cluster.getAccountStatus(deviceUser) != IClassroomCluster.AccountStatus.Active) {
+            revert PrincipalRevoked();
+        }
 
         address signer = _recoverSigner(txHash, signature);
         if (signer != deviceUser) revert InvalidSignature();

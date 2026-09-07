@@ -120,12 +120,16 @@ contract ComputePricingOracleTest is Test {
     function test_oracle_member_can_propose_salt_price() public {
         // 105 is within 10% of 100
         uint256 newPrice = 105;
+        // C037(b): membership changes now bump BOTH tracks, so the salt nonce
+        // is not 0 after setUp's three addOracleMember calls. A single vote does
+        // not finalize, so the nonce is unchanged by the proposal itself.
+        uint256 saltNonceBefore = oracle.saltPriceNonce();
         vm.prank(oracle1);
         oracle.proposeSaltPrice(newPrice);
 
         (,, uint256 saltVotes, uint256 saltNonce) = oracle.getPendingVotes();
         assertEq(saltVotes, 1, "vote count");
-        assertEq(saltNonce, 0, "nonce should still be 0");
+        assertEq(saltNonce, saltNonceBefore, "nonce unchanged before quorum");
         assertEq(oracle.saltPriceUsdCents(), INITIAL_SALT_PRICE, "price should not change yet");
     }
 
@@ -163,10 +167,13 @@ contract ComputePricingOracleTest is Test {
 
     function test_salt_price_updates_at_quorum() public {
         uint256 newPrice = 110; // within 10% of 100
+        // C037(b): setUp's membership changes bump saltPriceNonce, so assert a
+        // +1 delta from the quorum finalize rather than an absolute value.
+        uint256 nonceBefore = oracle.saltPriceNonce();
         _reachSaltPriceQuorum(newPrice);
 
         assertEq(oracle.saltPriceUsdCents(), newPrice, "SALT price should have updated");
-        assertEq(oracle.saltPriceNonce(), 1, "nonce should have incremented");
+        assertEq(oracle.saltPriceNonce(), nonceBefore + 1, "nonce +1 from quorum finalize");
     }
 
     // ============================================================
@@ -537,6 +544,11 @@ contract ComputePricingOracleTest is Test {
         // First update: 13 -> 14
         _reachComputePriceQuorum(14);
         assertEq(oracle.computePriceUsdCents(), 14);
+
+        // C037(a): a per-track cooldown now separates finalized updates, so the
+        // second update must wait MIN_UPDATE_INTERVAL blocks. Pre-fix both
+        // finalized in the same block, letting movement compound.
+        vm.roll(block.number + oracle.MIN_UPDATE_INTERVAL());
 
         // Second update: 14 -> 15 (within 10% of 14: max delta = 1.4 => 1)
         _reachComputePriceQuorum(15);

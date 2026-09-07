@@ -286,4 +286,52 @@ contract AIInferenceRouterPortableTest is Test {
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         return abi.encodePacked(r, s, v);
     }
+
+    // ===================================================================
+    // CHAIN-B-C041: escrow can always be recovered (cancel + pull-payment)
+    // ===================================================================
+
+    /// RED (pre-fix): the contract had no withdraw/refund/cancel path, so an
+    /// unfulfilled request's escrow was locked forever. GREEN: after the
+    /// timeout the requester cancels and withdraws.
+    function test_C041_cancelAfterTimeoutRefundsRequester() public {
+        vm.prank(requester);
+        uint256 id = router.requestInference{value: 1 ether}(modelId, keccak256("q"), 1 ether);
+
+        vm.warp(block.timestamp + router.REQUEST_TIMEOUT());
+
+        vm.prank(requester);
+        router.cancelRequest(id);
+        assertEq(router.pendingWithdrawals(requester), 1 ether, "escrow credited on cancel");
+
+        uint256 bal = requester.balance;
+        vm.prank(requester);
+        router.withdraw();
+        assertEq(requester.balance, bal + 1 ether, "requester reclaims escrow");
+        assertEq(address(router).balance, 0, "no funds stranded in router");
+    }
+
+    /// RED (pre-fix): overpayment above `maxPrice` was locked forever. GREEN:
+    /// the excess is credited for withdrawal at request time.
+    function test_C041_excessOverMaxPriceIsRefundable() public {
+        vm.prank(requester);
+        router.requestInference{value: 1.5 ether}(modelId, keccak256("q"), 1 ether);
+        assertEq(router.pendingWithdrawals(requester), 0.5 ether, "excess credited");
+
+        uint256 bal = requester.balance;
+        vm.prank(requester);
+        router.withdraw();
+        assertEq(requester.balance, bal + 0.5 ether, "excess reclaimed");
+        // The router still holds exactly the maxPrice escrow.
+        assertEq(address(router).balance, 1 ether, "escrow retained");
+    }
+
+    /// Cancel is refused before the timeout elapses.
+    function test_C041_cancelBeforeTimeoutReverts() public {
+        vm.prank(requester);
+        uint256 id = router.requestInference{value: 1 ether}(modelId, keccak256("q"), 1 ether);
+        vm.prank(requester);
+        vm.expectRevert(abi.encodeWithSelector(AIInferenceRouterPortable.TimeoutNotElapsed.selector, id));
+        router.cancelRequest(id);
+    }
 }

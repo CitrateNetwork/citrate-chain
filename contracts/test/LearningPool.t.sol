@@ -658,4 +658,43 @@ contract LearningPoolTest is Test {
         vm.prank(creator);
         lp.whitelistModel(poolId, keccak256("default-test-model"));
     }
+
+    // ── CHAIN-B-C042: the creator can reclaim their stake by dissolving ──
+    //
+    // RED (pre-fix): leavePool forbids the creator and nothing else refunds
+    // them, so a creator's stake was locked forever. GREEN: once the creator is
+    // the last member, dissolvePool returns it.
+    function test_C042_creatorCanDissolveAndReclaim() public {
+        uint256 poolId = _createOpenPool(alice, 1 ether);
+
+        // Someone joins then leaves; creator is once again the only member.
+        vm.prank(bob);
+        lp.joinPool{value: 1 ether}(poolId);
+        vm.prank(bob);
+        lp.leavePool(poolId);
+
+        // Creator still cannot use the ordinary leave path.
+        vm.prank(alice);
+        vm.expectRevert("Creator cannot leave");
+        lp.leavePool(poolId);
+
+        uint256 bal = alice.balance;
+        vm.prank(alice);
+        lp.dissolvePool(poolId);
+
+        assertEq(alice.balance, bal + 1 ether, "creator reclaims stake");
+        assertFalse(lp.isMember(poolId, alice), "creator no longer a member");
+        assertEq(lp.stakes(poolId, alice), 0, "stake cleared");
+    }
+
+    /// The creator may not dissolve while other members remain.
+    function test_C042_cannotDissolveWithMembersRemaining() public {
+        uint256 poolId = _createOpenPool(alice, 1 ether);
+        vm.prank(bob);
+        lp.joinPool{value: 1 ether}(poolId);
+
+        vm.prank(alice);
+        vm.expectRevert("Members remain");
+        lp.dissolvePool(poolId);
+    }
 }
