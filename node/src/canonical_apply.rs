@@ -2584,10 +2584,18 @@ mod tests {
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
 
+        // SECREM-A001 RC-8: root the chain at the real height-0 configured genesis
+        // so descendants pass genesis-identity admission (a height-1 block off
+        // Hash::default() is refused as InvalidParents under the genesis binding).
+        let genesis = mk_block(0, Hash::default(), exec.calculate_state_root());
+        seed_genesis(&storage, &dag, &ghostdag, &genesis).await;
+
         let r = roots(2);
-        let a1 = mk_block(1, Hash::default(), r[0]);
-        let s_a = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
-        let s_b = mk_block_scored(2, a1.header.block_hash, r[1], 1, [0x5B; 32]);
+        // SECREM-A001 RC-8: blue_score == height off the real height-0 genesis
+        // (h1 scores 1, the h2 siblings score 2 and tie on hash).
+        let a1 = mk_block_scored(1, genesis.header.block_hash, r[0], 1, VRF_OUT);
+        let s_a = mk_block_scored(2, a1.header.block_hash, r[1], 2, VRF_OUT);
+        let s_b = mk_block_scored(2, a1.header.block_hash, r[1], 2, [0x5B; 32]);
         let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
             (s_a, s_b)
         } else {
