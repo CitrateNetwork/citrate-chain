@@ -530,13 +530,9 @@ impl ModelExecutor {
 
     /// Generate execution proof
     ///
-    /// Creates a cryptographic proof of execution that can be verified.
-    /// Uses a commitment-based scheme where:
-    /// - statement = structured representation of the computation
-    /// - proof_data = commitment || response (64 bytes total)
-    /// - commitment = H(statement || response)
-    ///
-    /// In production, this would use a full ZK proving system (arkworks, halo2, etc.)
+    /// Creates an execution proof only when a real ZK prover is configured.
+    /// The former hash-commitment placeholder was removed because it was not a
+    /// proof and could create misleading artifacts.
     fn generate_proof(
         &self,
         model: &Model,
@@ -582,7 +578,7 @@ impl ModelExecutor {
             &output_hash,
             &io_commitment,
             &provider,
-        );
+        )?;
 
         Ok(ExecutionProof {
             model_hash,
@@ -598,61 +594,20 @@ impl ModelExecutor {
 
     /// Generate proof data.
     ///
-    /// When the `zkp_production` feature is enabled, this should generate a
-    /// Groth16 proof via arkworks (not yet implemented — see ADR-003).
-    /// Currently uses a commitment-based scheme as an interim measure.
-    ///
-    /// Creates a commitment-based proof that binds the statement to the execution.
-    /// The proof follows a simple Schnorr-like protocol:
-    /// 1. Generate response from execution parameters (deterministic)
-    /// 2. Compute commitment = H(statement || response)
-    /// 3. Return (statement, commitment || response)
+    /// A real ZK prover is not wired into this MCP execution path yet. Refuse
+    /// to manufacture a hash commitment that could be mistaken for a proof;
+    /// callers receive an explicit unavailable error and no artifact is emitted.
     fn generate_zk_proof_data(
         &self,
-        model_hash: &Hash,
-        input_hash: &Hash,
-        output_hash: &Hash,
-        io_commitment: &Hash,
-        provider: &Address,
-    ) -> (Vec<u8>, Vec<u8>) {
-        use sha3::{Digest, Sha3_256};
-
-        // Create statement: structured representation of the computation
-        // Format: "CITRATE_EXECUTION_V1" || model_hash || input_hash || output_hash || io_commitment
-        let mut statement = Vec::with_capacity(32 * 4 + 20);
-        statement.extend_from_slice(b"CITRATE_EXECUTION_V1");
-        statement.extend_from_slice(model_hash.as_bytes());
-        statement.extend_from_slice(input_hash.as_bytes());
-        statement.extend_from_slice(output_hash.as_bytes());
-        statement.extend_from_slice(io_commitment.as_bytes());
-
-        // Generate response: derived from statement + provider for determinism
-        // In a real ZK system, this would be the prover's response to a challenge
-        let response = {
-            let mut hasher = Sha3_256::new();
-            hasher.update(b"CITRATE_RESPONSE_V1");
-            hasher.update(&statement);
-            hasher.update(provider.0);
-            // Add timestamp entropy for uniqueness across executions
-            let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            hasher.update(timestamp.to_le_bytes());
-            hasher.finalize()
-        };
-
-        // Compute commitment: H(statement || response)
-        let commitment = {
-            let mut hasher = Sha3_256::new();
-            hasher.update(&statement);
-            hasher.update(response);
-            hasher.finalize()
-        };
-
-        // proof_data = commitment || response (64 bytes)
-        let mut proof_data = Vec::with_capacity(64);
-        proof_data.extend_from_slice(&commitment);
-        proof_data.extend_from_slice(&response);
-
-        (statement, proof_data)
+        _model_hash: &Hash,
+        _input_hash: &Hash,
+        _output_hash: &Hash,
+        _io_commitment: &Hash,
+        _provider: &Address,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        Err(anyhow!(
+            "execution proof generation unavailable: a real ZK prover is not configured"
+        ))
     }
 
     /// Generate training proof

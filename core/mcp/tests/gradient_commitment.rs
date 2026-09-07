@@ -124,7 +124,7 @@ fn test_nonce_enhanced_commitment_matches() {
 
     let result = verifier.verify_execution(&model, input, output, &proof);
     assert!(result.is_ok(), "Verification should succeed");
-    assert!(result.unwrap(), "Valid nonce-enhanced commitment should verify");
+    assert!(!result.unwrap(), "legacy nonce commitment must fail closed");
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn test_legacy_commitment_matches() {
 
     let result = verifier.verify_execution(&model, input, output, &proof);
     assert!(result.is_ok());
-    assert!(result.unwrap(), "Valid legacy commitment should verify");
+    assert!(!result.unwrap(), "legacy commitment must fail closed");
 }
 
 // =============================================================================
@@ -280,7 +280,7 @@ fn test_future_nonce_rejected() {
 }
 
 #[test]
-fn test_nonce_at_boundary_accepted() {
+fn test_nonce_at_boundary_still_fails_closed() {
     let verifier = ExecutionVerifier::new();
     let model = make_model();
     let input = b"gradient data";
@@ -296,7 +296,7 @@ fn test_nonce_at_boundary_accepted() {
 
     let result = verifier.verify_execution(&model, input, output, &proof);
     assert!(result.is_ok());
-    assert!(result.unwrap(), "Nonce within 5-min window should succeed");
+    assert!(!result.unwrap(), "legacy nonce commitment must fail closed");
 }
 
 #[test]
@@ -340,7 +340,7 @@ fn test_commitment_across_checkpoint_boundary() {
 
     let result_1 = verifier.verify_execution(&model, b"input1", b"output1", &proof_1);
     assert!(result_1.is_ok());
-    assert!(result_1.unwrap(), "Commitment in current checkpoint should verify");
+    assert!(!result_1.unwrap(), "legacy commitment must fail closed");
 
     // Second checkpoint window (different response/statement to simulate new window)
     let ts_window_2 = current_ts();
@@ -351,7 +351,7 @@ fn test_commitment_across_checkpoint_boundary() {
 
     let result_2 = verifier.verify_execution(&model, b"input2", b"output2", &proof_2);
     assert!(result_2.is_ok());
-    assert!(result_2.unwrap(), "Commitment in next checkpoint should verify");
+    assert!(!result_2.unwrap(), "legacy commitment must fail closed");
 }
 
 #[test]
