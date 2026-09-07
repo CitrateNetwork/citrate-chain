@@ -543,6 +543,31 @@ impl Mempool {
             }
         }
 
+        // CHAIN-B-A015: sender authenticity for EVM-shaped (20-byte embedded) senders must
+        // rest on a REAL secp256k1 recovery, never on a compile-time feature, the
+        // `ecdsa_verified` flag alone, or the `require_valid_signature` switch. The WP-K.1
+        // gate above lives under `#[cfg(not(feature = "devnet"))]`, and `citrate-sequencer`
+        // ships `default = ["devnet"]`, so in a default build that gate is compiled OUT; and
+        // the `require_valid_signature=false` early-return below skips all cryptography. Both
+        // P2P ingress paths deliver transactions with `ecdsa_verified=false`, so without this
+        // an unauthenticated peer can insert transactions from ANY address. Recover here,
+        // unconditionally: if the sender is EVM-shaped and not already decoder-verified,
+        // require `verify_eth_ecdsa` to recover exactly `from[0..20]`. This is INERT on honest
+        // traffic (a validly-signed tx always recovers) and rejects only forgeries.
+        {
+            let from_bytes = tx.from.as_bytes();
+            let is_evm_address = from_bytes[20..].iter().all(|&b| b == 0)
+                && !from_bytes[..20].iter().all(|&b| b == 0);
+            if is_evm_address && !tx.ecdsa_verified && !self.verify_eth_ecdsa(tx).unwrap_or(false) {
+                tracing::warn!(
+                    "CHAIN-B-A015: EVM-shaped tx from {:?} rejected — secp256k1 recovery did \
+                     not match the claimed sender (feature/config-independent gate)",
+                    tx.from
+                );
+                return Err(MempoolError::InvalidSignature);
+            }
+        }
+
         // Check gas price
         if tx.gas_price < self.config.min_gas_price {
             tracing::warn!(
@@ -1710,7 +1735,12 @@ mod tests {
     /// an EVM-shaped address (20-byte embedded) must be rejected by the mempool.
     /// The tx decoder now forces ecdsa_verified=false on bincode fallback, and
     /// the mempool checks the flag for EVM-shaped senders.
-    #[cfg(not(feature = "devnet"))]
+    ///
+    /// CHAIN-B-A015: no longer `#[cfg(not(feature = "devnet"))]`. The
+    /// feature/config-independent recovery gate rejects this forgery in a DEFAULT
+    /// (devnet) build too — the whole point of the finding is that the gate must not
+    /// be compiled out. `require_valid_signature=false` is set here precisely to prove
+    /// the gate does not depend on that switch.
     #[tokio::test]
     async fn test_k1_forged_ecdsa_verified_rejected() {
         let config = MempoolConfig {
@@ -1753,7 +1783,9 @@ mod tests {
 
     /// WP-K.1: Verify that native (non-EVM) senders are NOT affected by the ECDSA gate.
     /// Full 32-byte pubkeys don't trigger the EVM address check.
-    #[cfg(not(feature = "devnet"))]
+    ///
+    /// CHAIN-B-A015: ungated so it runs in the default (devnet) build — proves the new
+    /// feature-independent gate does not reject honest non-EVM traffic.
     #[tokio::test]
     async fn test_k1_native_sender_not_affected() {
         let config = MempoolConfig {

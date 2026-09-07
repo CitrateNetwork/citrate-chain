@@ -304,6 +304,12 @@ contract LiquidStakingPoolTest is Test {
         pool.addOracle(oracle2);
         pool.addOracle(oracle3);
 
+        // CHAIN-B-C018 (HELD/reroll): a reward report now consumes real
+        // donated SALT backing, so `totalPooled` can only grow by SALT the
+        // contract actually holds. RC-8: this fixture previously minted the
+        // 10-ether liability with no backing (the vulnerable behavior).
+        pool.donate{value: 10 ether}();
+
         // First oracle votes — no change yet
         vm.prank(oracle1);
         pool.reportRewards(10 ether, 0);

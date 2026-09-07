@@ -2118,6 +2118,13 @@ mod tests {
             signature: Signature::new([1; 64]),
             tx_type: None,
             chain_id: Some(40204),
+            // CHAIN-B-A015: these represent honest, decoder-verified EVM transactions (the
+            // test exercises producer FILTERING and receipt persistence, not signature
+            // checking). The mempool's feature-independent EVM-recovery gate now requires
+            // either a real secp256k1 recovery or `ecdsa_verified` for EVM-shaped senders, so
+            // mark them decoder-verified rather than relying on a dummy signature slipping
+            // through the disabled-crypto path.
+            ecdsa_verified: true,
             ..Default::default()
         }
     }

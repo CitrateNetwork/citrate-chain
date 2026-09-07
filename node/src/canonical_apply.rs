@@ -421,6 +421,45 @@ impl CanonicalApplicator {
         self.finalized_height.load(Ordering::SeqCst)
     }
 
+    /// Walk `start`'s selected-parent ancestry down to `target` height and return the hash of
+    /// the ancestor at that height (`None` if a block is missing or `target` is above `start`).
+    /// Used by the I4 finality guard on the spine-rebuild path (CHAIN-B-A002).
+    fn ancestor_hash_at_height(&self, start: Hash, target: u64) -> Option<Hash> {
+        let mut cursor = start;
+        loop {
+            let block = self.storage.blocks.get_block(&cursor).ok().flatten()?;
+            let h = block.header.height;
+            if h == target {
+                return Some(cursor);
+            }
+            if h < target || h == 0 {
+                return None;
+            }
+            cursor = block.selected_parent();
+        }
+    }
+
+    /// Whether `head`'s selected-parent ancestry passes through `ancestor` (at
+    /// `ancestor_height`). Used by the I4 finality guard (CHAIN-B-A002) to confirm a
+    /// spine-rebuild target still contains the currently-finalized block.
+    fn head_descends_from(&self, head: Hash, ancestor: Hash, ancestor_height: u64) -> bool {
+        let mut cursor = head;
+        loop {
+            if cursor == ancestor {
+                return true;
+            }
+            let block = match self.storage.blocks.get_block(&cursor).ok().flatten() {
+                Some(b) => b,
+                None => return false,
+            };
+            if block.header.height <= ancestor_height {
+                // Reached (or passed) the finalized height without hitting `ancestor`.
+                return cursor == ancestor;
+            }
+            cursor = block.selected_parent();
+        }
+    }
+
     /// The shared state-advance lock (applied tip + reorg snapshot ring). The
     /// producer acquires this across its execute→persist critical section so
     /// production never races the receive path, and records the sealed block via
@@ -1276,6 +1315,30 @@ impl CanonicalApplicator {
         let mut state = self.lock.lock().await;
         if state.tip.hash == head {
             return Ok(false);
+        }
+        // I4 (CHAIN-B-A002): NEVER revert past finality on the spine-rebuild path either.
+        // `reorg_to` checks `fork.height < finalized_height()`, but the deep-reorg escape
+        // hatch (`BeyondReorgWindow` → `maybe_runtime_rebuild` → here) reset world state to
+        // genesis and replayed to `head` with NO finality reference — so the DEEPER the
+        // reorg, the FEWER guards applied. Mirror the guard here: the block this node has
+        // applied at the finalized height must still lie on `head`'s ancestry; if it does
+        // not, this rebuild would abandon finalized history, so refuse it and raise a
+        // consensus alarm instead of self-healing onto a finality-violating fork. (Inert
+        // while `finalized_height()` is 0 — no checkpoint proposed yet — so this changes no
+        // honest-traffic outcome today; it is the floor the guard needs once finality wires.)
+        let floor = self.finalized_height();
+        if floor > 0 && floor <= state.tip.height {
+            if let Some(finalized_hash) = self.ancestor_hash_at_height(state.tip.hash, floor) {
+                if !self.head_descends_from(head, finalized_hash, floor) {
+                    warn!(
+                        "CONSENSUS ALARM (I4/CHAIN-B-A002): refusing spine rebuild to head {} — \
+                         it does not descend from the finalized block {} @ {} (applied tip {} @ {}). \
+                         A deep reorg below finality was blocked; NOT self-healing.",
+                        head, finalized_hash, floor, state.tip.hash, state.tip.height
+                    );
+                    return Ok(false);
+                }
+            }
         }
         warn!(
             "canonical recovery: applied tip {} @ {} is NOT the fork-choice head {} — \
@@ -2490,6 +2553,87 @@ mod tests {
                 hash: winner.header.block_hash,
                 height: 2
             }
+        );
+    }
+
+    /// CHAIN-B-A002: the mirror of `reorg_refused_below_finalized_floor`, on the
+    /// spine-rebuild path. `recover_to_head` reset world state to genesis and replayed to the
+    /// fork-choice head with NO finality reference, so a deep reorg — the very thing the I4
+    /// guard exists to stop — bypassed the floor entirely. Here the node has FINALIZED its
+    /// applied tip (the losing sibling at height 2); fork-choice then names a DIFFERENT
+    /// sibling at height 2 that does not descend from the finalized block. The rebuild must
+    /// be REFUSED (it would abandon finalized history), leaving the applied tip untouched.
+    #[tokio::test]
+    async fn recover_to_head_refused_below_finalized_floor() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+        use std::sync::atomic::Ordering;
+
+        let (exec, storage, _dir) = fresh();
+        let genesis_state = exec.state_snapshot();
+
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+
+        let r = roots(2);
+        let a1 = mk_block(1, Hash::default(), r[0]);
+        let s_a = mk_block_scored(2, a1.header.block_hash, r[1], 1, VRF_OUT);
+        let s_b = mk_block_scored(2, a1.header.block_hash, r[1], 1, [0x5B; 32]);
+        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+            (s_a, s_b)
+        } else {
+            (s_b, s_a)
+        };
+
+        // Strand the node on the losing sibling (as in the converge test).
+        {
+            let app1 = CanonicalApplicator::new(exec.clone(), storage.clone());
+            persist(&storage, &a1);
+            assert!(matches!(
+                app1.apply_received(&a1).await,
+                ApplyOutcome::Applied { .. }
+            ));
+            persist(&storage, &loser);
+            assert!(matches!(
+                app1.apply_received(&loser).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        for blk in [&a1, &winner, &loser] {
+            dag.store_block(blk.clone()).await.expect("into DAG");
+            ghostdag.add_block(blk).await.expect("admit");
+        }
+        persist(&storage, &winner);
+
+        let app2 = CanonicalApplicator::new(exec.clone(), storage.clone())
+            .with_fork_choice(ghostdag.clone());
+        assert_eq!(
+            app2.applied_tip().await,
+            AppliedTip {
+                hash: loser.header.block_hash,
+                height: 2
+            }
+        );
+
+        // FINALIZE the applied tip's height. The finalized block at height 2 is the LOSER;
+        // the fork-choice head (winner) does NOT descend from it.
+        app2.finalized_height_handle().store(2, Ordering::SeqCst);
+
+        let recovered = app2
+            .recover_to_head(genesis_state, Hash::default())
+            .await
+            .expect("recovery call returns");
+        assert!(
+            !recovered,
+            "spine rebuild below the finalized floor must be REFUSED"
+        );
+        assert_eq!(
+            app2.applied_tip().await,
+            AppliedTip {
+                hash: loser.header.block_hash,
+                height: 2
+            },
+            "applied tip must be untouched after a refused finality-violating rebuild"
         );
     }
 

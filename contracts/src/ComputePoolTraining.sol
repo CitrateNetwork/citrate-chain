@@ -331,11 +331,24 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
     /// @notice Close the recruitment window and elect the initial
     /// coordinator. Callable by anyone once minWorkers is met. The
     /// coordinator must be a joined worker.
+    /// @dev CHAIN-B-C018/C017 (HELD/reroll): pre-fix `closeRecruitment`
+    /// was permissionless AND let the caller name any joined worker —
+    /// including itself — as coordinator. A sybil could join `minWorkers`
+    /// times, self-appoint as coordinator the instant the threshold was
+    /// met, then `commitEpoch` arbitrary roots back-to-back and drain the
+    /// buyer's entire `perEpochBudget × epochCount` escrow with no
+    /// verification. The coordinator wields real spend authority, so only
+    /// the party whose funds are at stake (the requester) or governance
+    /// may appoint it.
     function closeRecruitment(uint256 jobId, address coordinator_)
         external
         jobExists(jobId)
     {
         TrainingJob storage job = jobs[jobId];
+        require(
+            msg.sender == job.requester || msg.sender == governance(),
+            "ComputePoolTraining: not authorized"
+        );
         require(job.state == JobState.Recruiting, "ComputePoolTraining: not recruiting");
         require(job.workerCount >= job.minWorkers, "ComputePoolTraining: below min workers");
         require(workers[jobId][coordinator_].joined, "ComputePoolTraining: coord not joined");

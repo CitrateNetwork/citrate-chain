@@ -214,6 +214,34 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
     /// signature.
     mapping(uint256 => PaymentMethod) public jobPaymentMethod;
 
+    /// @notice CHAIN-B-C014 (HELD/reroll): whether a job's `escrow` is
+    /// backed by native SALT actually held by this contract (the SALT
+    /// path and `autoAssignJob`) or is a credit-denominated liability with
+    /// NO native backing (the BulkCredits path, where the caller's
+    /// stablecoins go to `StablecoinTreasury` and never reach this
+    /// contract). A native refund/payout must NEVER be derived from a
+    /// non-native escrow — pre-fix a credits job set `escrow = maxPrice`
+    /// while requiring `msg.value == 0`, so `expireJob`/`timeoutJob`/
+    /// completion paid real SALT out of OTHER users' escrow, draining the
+    /// contract to insolvency. Defaults to false; set true on every
+    /// native-funded post.
+    mapping(uint256 => bool) public jobEscrowNative;
+
+    /// @notice CHAIN-B-C014: credits owed back to a requester when a
+    /// credit-path job's escrow is refunded (expire/timeout/fail/dispute).
+    /// Settled off-native by operations (treasury credit replenishment);
+    /// never paid in SALT from this contract's balance.
+    mapping(address => uint256) public creditsRefundOwed;
+
+    /// @notice CHAIN-B-C015 (HELD/reroll): providers who have explicitly
+    /// consented to being auto-assigned jobs. `autoAssignJob` conscripts a
+    /// provider into a job with a 100-block deadline and `timeoutJob` then
+    /// slashes their stake; pre-fix ANY provider could be conscripted
+    /// without consent, so an attacker could grief an offline/unaware
+    /// provider's stake away for the cost of gas. Only opted-in providers
+    /// are eligible for auto-assignment.
+    mapping(address => bool) public autoAssignOptIn;
+
     /// @notice Total SALT burned via BME (lifetime)
     uint256 public totalBurned;
 
@@ -247,6 +275,17 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
     /// the chosen PaymentMethod. Kept as a separate event so
     /// existing JobPosted indexers don't break on a new field.
     event JobPaymentMethodSet(uint256 indexed jobId, PaymentMethod method);
+
+    /// @notice CHAIN-B-C014: a credit-path job's escrow was "refunded" as a
+    /// credit liability (no native SALT moved).
+    event CreditsRefundOwed(uint256 indexed jobId, address indexed requester, uint256 amount);
+
+    /// @notice CHAIN-B-C014: a credit-path job completed; the provider is
+    /// owed payment through operational credit settlement, not native SALT.
+    event CreditsProviderOwed(uint256 indexed jobId, address indexed provider, uint256 amount);
+
+    /// @notice CHAIN-B-C015: a provider changed their auto-assign consent.
+    event AutoAssignOptInSet(address indexed provider, bool optedIn);
 
     /// @notice Emitted when governance updates the BulkComputeGateway
     /// reference. Setting to address(0) disables the credits path.
@@ -367,6 +406,16 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         allProviders.push(msg.sender);
 
         emit ProviderRegistered(msg.sender, msg.value, supportedModels);
+    }
+
+    /// @notice CHAIN-B-C015 (HELD/reroll): opt in/out of auto-assignment.
+    /// A registered provider must explicitly consent before
+    /// `autoAssignJob` can conscript them into a slashable-deadline job.
+    /// @param optIn Whether to accept auto-assigned jobs.
+    function setAutoAssignOptIn(bool optIn) external {
+        require(providers[msg.sender].isRegistered, "ComputeMarketplace: not registered");
+        autoAssignOptIn[msg.sender] = optIn;
+        emit AutoAssignOptInSet(msg.sender, optIn);
     }
 
     /// @notice Add stake as a registered provider
@@ -502,6 +551,9 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         job.escrow = maxPrice;
         job.bidDeadline = deadline;
         job.createdAt = block.number;
+
+        // C014: only the SALT path deposits native backing for `escrow`.
+        jobEscrowNative[jobId] = (paymentMethod == PaymentMethod.SALT);
 
         // Track payment method out-of-band of the Job struct so
         // existing struct consumers (off-chain decoders, etc.) don't
@@ -687,6 +739,9 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         job.executionDeadline = block.number + 100; // ~5 min at 3s blocks
         job.createdAt = block.number;
 
+        // C014: auto-assign is funded by msg.value — escrow is native.
+        jobEscrowNative[jobId] = true;
+
         // Configure verification
         verifier.configureJob(jobId, maxPrice, tier);
 
@@ -823,15 +878,14 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
 
         job.state = JobState.Expired;
 
-        // INV-7: ExpiredJobsRefunded
-        uint256 refund = job.escrow;
-        job.escrow = 0;
-
-        (bool success, ) = payable(job.requester).call{value: refund}("");
-        require(success, "ComputeMarketplace: refund failed");
+        // INV-7: ExpiredJobsRefunded. C014: native refund only for
+        // native-backed escrow; credit-path escrow is refunded as credits.
+        address requester = job.requester;
+        uint256 owed = job.escrow;
+        uint256 refund = _refundEscrowToRequester(jobId);
 
         emit JobExpired(jobId, refund);
-        emit EscrowRefunded(jobId, job.requester, refund);
+        emit EscrowRefunded(jobId, requester, owed);
     }
 
     /// @notice Timeout a job where provider didn't deliver in time
@@ -855,15 +909,14 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         uint256 slashAmount = _slashProviderOnFailure(timedOutProvider);
 
         // INV-8: TimeoutEscrowHeld — escrow remains for potential reassignment
-        // Refund escrow to requester since there's no reassignment mechanism yet in this state
-        uint256 refund = job.escrow;
-        job.escrow = 0;
-
-        (bool success, ) = payable(job.requester).call{value: refund}("");
-        require(success, "ComputeMarketplace: refund failed");
+        // Refund escrow to requester since there's no reassignment mechanism yet in this state.
+        // C014: native refund only for native-backed escrow.
+        address requester = job.requester;
+        uint256 owed = job.escrow;
+        _refundEscrowToRequester(jobId);
 
         emit JobTimedOut(jobId, timedOutProvider, slashAmount);
-        emit EscrowRefunded(jobId, job.requester, refund);
+        emit EscrowRefunded(jobId, requester, owed);
     }
 
     /// @notice Mark a job as failed (verification returned Invalid)
@@ -962,24 +1015,23 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         // Requester wins: job marked Disputed, escrow refunded, bond returned
         job.state = JobState.Disputed;
 
-        uint256 refund = job.escrow;
-        job.escrow = 0;
+        address requester = job.requester;
+        uint256 owed = job.escrow;
 
         // Slash provider
         _slashProviderOnFailure(job.assignedProvider);
 
-        // Return bond to disputer
+        // Return bond to disputer (the dispute bond IS native — posted as
+        // msg.value in disputeResult — so it is returned in SALT).
         (bool s1, ) = payable(disputer).call{value: bond}("");
         require(s1, "ComputeMarketplace: bond return failed");
 
-        // Refund escrow to requester
-        if (refund > 0) {
-            (bool s2, ) = payable(job.requester).call{value: refund}("");
-            require(s2, "ComputeMarketplace: escrow refund failed");
-        }
+        // Refund escrow to requester. C014: native refund only for
+        // native-backed escrow; credit-path escrow refunds as credits.
+        _refundEscrowToRequester(jobId);
 
         emit DisputeResolved(jobId, true, bond);
-        emit EscrowRefunded(jobId, job.requester, refund);
+        emit EscrowRefunded(jobId, requester, owed);
     }
 
     /// @dev Handle dispute resolution when the provider wins
@@ -1120,8 +1172,21 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         );
     }
 
-    /// @dev Distribute payment: 95% provider, 2.5% burned, 2.5% treasury
+    /// @dev Distribute payment: 95% provider, 2.5% burned, 2.5% treasury.
+    ///
+    /// CHAIN-B-C014 (HELD/reroll): a credit-path job holds NO native SALT
+    /// backing for its `escrow`. Paying the provider (and burning/treasury)
+    /// in native SALT here would draw from other users' escrow and drain
+    /// the contract. For credit-path jobs the settlement is recorded as a
+    /// credit liability and settled operationally (treasury credit
+    /// replenishment); no native SALT is transferred.
     function _distributeJobPayment(uint256 jobId, address providerAddr, uint256 payment) internal {
+        if (!jobEscrowNative[jobId]) {
+            emit CreditsProviderOwed(jobId, providerAddr, payment);
+            emit JobCompleted(jobId, providerAddr, payment, 0, 0);
+            return;
+        }
+
         ComputeLib.BMEResult memory bme = ComputeLib.calculateBME(payment);
 
         // Update global accounting
@@ -1153,6 +1218,30 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         emit JobCompleted(jobId, providerAddr, bme.providerAmount, bme.burnAmount, bme.treasuryAmount);
     }
 
+    /// @dev CHAIN-B-C014 (HELD/reroll): release a job's escrow back to its
+    /// requester. For a native-backed (SALT-path / auto-assign) job this
+    /// transfers real SALT; for a credit-path job — whose `escrow` has NO
+    /// native backing in this contract — it records a credit liability
+    /// instead of moving SALT out of other users' escrow. Zeroes
+    /// `job.escrow`. Returns the amount of native SALT actually sent.
+    function _refundEscrowToRequester(uint256 jobId) internal returns (uint256 nativeRefunded) {
+        Job storage job = jobs[jobId];
+        uint256 amount = job.escrow;
+        job.escrow = 0;
+        if (amount == 0) {
+            return 0;
+        }
+        if (jobEscrowNative[jobId]) {
+            (bool ok, ) = payable(job.requester).call{value: amount}("");
+            require(ok, "ComputeMarketplace: refund failed");
+            return amount;
+        }
+        // Credit-path: no native SALT was ever deposited for this job.
+        creditsRefundOwed[job.requester] += amount;
+        emit CreditsRefundOwed(jobId, job.requester, amount);
+        return 0;
+    }
+
     /// @dev Fail a job: refund escrow, slash provider, update stats
     function _failJob(uint256 jobId) internal {
         Job storage job = jobs[jobId];
@@ -1162,17 +1251,14 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         // Slash provider
         _slashProviderOnFailure(job.assignedProvider);
 
-        // Refund escrow to requester
-        uint256 refund = job.escrow;
-        job.escrow = 0;
-
-        if (refund > 0) {
-            (bool success, ) = payable(job.requester).call{value: refund}("");
-            require(success, "ComputeMarketplace: refund failed");
-        }
+        // Refund escrow to requester. C014: native refund only for
+        // native-backed escrow; credit-path escrow refunds as credits.
+        address requester = job.requester;
+        uint256 owed = job.escrow;
+        _refundEscrowToRequester(jobId);
 
         emit JobFailed(jobId, job.assignedProvider);
-        emit EscrowRefunded(jobId, job.requester, refund);
+        emit EscrowRefunded(jobId, requester, owed);
     }
 
     /// @dev Slash a provider on job failure/timeout: deduct stake, increment failures,
@@ -1223,6 +1309,10 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
             ProviderProfile storage prov = providers[p];
 
             if (!prov.isRegistered) continue;
+            // C015: never conscript a provider who hasn't consented to
+            // auto-assignment — auto-assigned jobs carry a slashable
+            // deadline the provider never accepted otherwise.
+            if (!autoAssignOptIn[p]) continue;
             if (prov.currentActiveJobs >= prov.maxConcurrentJobs) continue;
             if (!providerModels[p][modelHash]) continue;
 
