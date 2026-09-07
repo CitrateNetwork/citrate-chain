@@ -68,7 +68,9 @@ contract DeployCoreMembership is Script {
 
     /// The deployed ValidatorRegistry on 40204. PINNED — it feeds the vault
     /// proxy's init_code hash through the initialize calldata.
-    address constant REGISTRY = 0x61D44D8A14443646B756905410BE951e6eCE95A6;
+    /// Updated for the solc-0.8.36 reroll (2026-09-07): the registry moved with
+    /// the compiler bump; this is its new deterministic address.
+    address constant REGISTRY = 0x2655d9fbbe599E75ff6E53790F99EbC9A20c93BF;
 
     /// Height at which citrate-chain #140 makes contract-initiated value
     /// transfers real. Deploying below this would produce phantom bonds.

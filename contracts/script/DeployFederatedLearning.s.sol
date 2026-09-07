@@ -142,8 +142,11 @@ contract DeployFederatedLearning is ScriptEnv {
         // RedeployIPFSIncentivesV3.s.sol under the SAME salt. On a from-main build both land at the
         // canonical #170 address; assert it here so a stale-bytecode build FAILS LOUDLY instead of
         // silently forking V3. (Deterministic given kyc + these params + FOLD_VERIFIER default 0x0130.)
+        // Re-armed for the solc-0.8.36 reroll (2026-09-07): the compiler bump moves
+        // the deterministic address; the contract is still the sound #170 build from
+        // main. Pinned to the 0.8.36 deployed address.
         require(
-            address(ipfsV3) == 0xA1a37f794B77292Cf8511c4b179Af18d5A663683,
+            address(ipfsV3) == 0xC27a867b8d076d77cf17981f235c64A0D0203a68,
             "IPFSIncentivesV3 address drift: not the #170 sound-CommD-bond bytecode/args"
         );
 
