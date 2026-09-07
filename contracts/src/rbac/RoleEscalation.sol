@@ -70,6 +70,10 @@ contract RoleEscalation {
     ///         entry. The setter list is itself governed by the
     ///         root-tenant multi-sig (initialized at construction).
     mapping(address => bool) public is_role_admin;
+    /// @notice CHAIN-B-C044(c): count of live role-admins, so the last one can
+    ///         never be removed (which would permanently brick every
+    ///         admin-gated path — base roles, elevations and the admin set).
+    uint256 public roleAdminCount;
 
     // ── Events ──────────────────────────────────────────────────────
 
@@ -134,6 +138,8 @@ contract RoleEscalation {
     /// @notice The subject has no base role set in this tenant, so there
     ///         is nothing to elevate FROM. FWA-C3-01 hardening.
     error NoBaseRole(bytes32 user, bytes32 tenant);
+    /// @notice The last role-admin may not be removed (would brick the contract).
+    error CannotRemoveLastAdmin();
 
     // ── Constructor ─────────────────────────────────────────────────
 
@@ -144,6 +150,7 @@ contract RoleEscalation {
     constructor(address initialAdmin) {
         require(initialAdmin != address(0), "RoleEscalation: zero admin");
         is_role_admin[initialAdmin] = true;
+        roleAdminCount = 1;
         emit RoleAdminSet(initialAdmin, true);
     }
 
@@ -153,6 +160,19 @@ contract RoleEscalation {
     ///         existing role-admin can adjust the set.
     function setRoleAdmin(address admin, bool authorized) external {
         if (!is_role_admin[msg.sender]) revert NotRoleAdmin(msg.sender);
+        // CHAIN-B-C044(c): maintain a live count and refuse to remove the last
+        // admin. Pre-fix any role-admin could remove every other admin
+        // (including the bootstrap one), leaving the contract with no admin and
+        // permanently un-administrable. Idempotent writes change no count.
+        bool was = is_role_admin[admin];
+        if (was != authorized) {
+            if (authorized) {
+                roleAdminCount++;
+            } else {
+                if (roleAdminCount <= 1) revert CannotRemoveLastAdmin();
+                roleAdminCount--;
+            }
+        }
         is_role_admin[admin] = authorized;
         emit RoleAdminSet(admin, authorized);
     }
