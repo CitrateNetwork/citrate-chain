@@ -60,6 +60,15 @@ contract LearningCycleManager is ReentrancyGuard, Governable {
     /// @dev Whether an address has registered for a cycle.
     mapping(uint256 => mapping(address => bool)) private _isParticipant;
 
+    /// @notice Governance-managed participant allowlist. Registration is
+    ///         gated on eligibility to close CHAIN-B-C029: previously any
+    ///         address could self-register, letting a sybil both dilute
+    ///         the participant reward pool arbitrarily and — past the
+    ///         block gas limit on the `finalizeCycle` participant loop —
+    ///         permanently brick the contract (openCycle requires the
+    ///         prior cycle to be Finalized).
+    mapping(address => bool) public eligibleParticipant;
+
     /// @dev Embedding commitment hashes per cycle.
     mapping(uint256 => mapping(address => bytes32)) public embeddingCommitments;
 
@@ -88,6 +97,7 @@ contract LearningCycleManager is ReentrancyGuard, Governable {
 
     event CycleOpened(uint256 indexed cycleId, uint256 checkpointHeight);
     event ParticipantRegistered(uint256 indexed cycleId, address indexed participant);
+    event ParticipantEligibilitySet(address indexed participant, bool eligible);
     event EmbeddingCommitted(uint256 indexed cycleId, address indexed participant, bytes32 commitment);
     event StateAdvanced(uint256 indexed cycleId, CycleState oldState, CycleState newState);
     event MentorAssigned(uint256 indexed cycleId, address indexed mentor, address indexed mentee);
@@ -103,6 +113,29 @@ contract LearningCycleManager is ReentrancyGuard, Governable {
     // ── Constructor ──────────────────────────────────────────────────
 
     constructor() Governable(msg.sender) {}
+
+    // ── Participant eligibility (CHAIN-B-C029) ───────────────────────
+
+    /// @notice Authorize (or revoke) an address permitted to register as
+    ///         a participant. Governance-only.
+    function setParticipantEligibility(address participant, bool eligible)
+        external
+        onlyGovernance
+    {
+        eligibleParticipant[participant] = eligible;
+        emit ParticipantEligibilitySet(participant, eligible);
+    }
+
+    /// @notice Batch variant of `setParticipantEligibility`.
+    function setParticipantEligibilityBatch(address[] calldata participants, bool eligible)
+        external
+        onlyGovernance
+    {
+        for (uint256 i = 0; i < participants.length; i++) {
+            eligibleParticipant[participants[i]] = eligible;
+            emit ParticipantEligibilitySet(participants[i], eligible);
+        }
+    }
 
     // ── Cycle Lifecycle ──────────────────────────────────────────────
 
@@ -144,6 +177,11 @@ contract LearningCycleManager is ReentrancyGuard, Governable {
             ci.state == CycleState.Open || ci.state == CycleState.Collecting,
             "Registration closed"
         );
+        // CHAIN-B-C029: registration is gated on a governance allowlist so
+        // sybils cannot dilute the reward pool or grow the finalize loop
+        // past the block gas limit. Placed after the state check so a
+        // closed-cycle registration still reports "Registration closed".
+        require(eligibleParticipant[msg.sender], "Not eligible participant");
         require(!_isParticipant[cycleId][msg.sender], "Already registered");
 
         _isParticipant[cycleId][msg.sender] = true;

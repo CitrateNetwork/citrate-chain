@@ -205,16 +205,30 @@ contract AppRegistryTest is Test {
 
     function test_recordFailure_when_envelope_not_met() public {
         _proposeAppBasic(APP_1, SCOPE_UNIT, ENV_1);
-        // Envelope is not met → caller's claim is accepted.
+        // CHAIN-B-C025 RC-8: the Failed transition is now recorder-gated.
+        // Envelope is not met → an authorized recorder's claim is accepted.
+        vm.prank(recorder);
         registry.recordFailureOnEnvelopeReject(APP_1);
         AppRegistry.AppEntry memory a = registry.getApp(APP_1);
         assertEq(uint8(a.state), uint8(AppRegistry.AppState.Failed));
+    }
+
+    /// CHAIN-B-C025 RC-8: an unprivileged caller can no longer burn a
+    /// pending app id by racing `recordFailureOnEnvelopeReject`.
+    function test_recordFailure_rejects_unauthorized() public {
+        _proposeAppBasic(APP_1, SCOPE_UNIT, ENV_1);
+        vm.prank(nobody);
+        vm.expectRevert(abi.encodeWithSelector(AppRegistry.NotRecorder.selector, nobody));
+        registry.recordFailureOnEnvelopeReject(APP_1);
+        // App stays Pending → still deployable.
+        assertEq(uint8(registry.getApp(APP_1).state), uint8(AppRegistry.AppState.Pending));
     }
 
     function test_recordFailure_reverts_if_envelope_actually_met() public {
         _proposeAppBasic(APP_1, SCOPE_UNIT, ENV_1);
         oracle.setMet(ENV_1, true);
         // Caller claims rejection but envelope IS met; safer to revert.
+        vm.prank(recorder);
         vm.expectRevert(abi.encodeWithSelector(AppRegistry.EnvelopeThresholdNotMet.selector, ENV_1));
         registry.recordFailureOnEnvelopeReject(APP_1);
     }

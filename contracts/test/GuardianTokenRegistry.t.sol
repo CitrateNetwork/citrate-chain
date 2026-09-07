@@ -19,12 +19,26 @@ contract GuardianTokenRegistryTest is Test {
     address public districtB = address(0xD15B);
     address public guardianPortal = address(0x901);
 
-    bytes32 public token1Hash = keccak256("guardian-token-1");
-    bytes32 public token2Hash = keccak256("guardian-token-2");
-    bytes32 public token3Hash = keccak256("guardian-token-3");
+    // CHAIN-B-C010 RC-8: consumeToken now takes the RAW token and hashes
+    // it internally with SHA-256, so the on-chain commitment (the hash)
+    // is no longer the credential. The district commits sha256(raw); the
+    // guardian presents the raw token.
+    string internal constant RAW1 = "guardian-token-1";
+    string internal constant RAW2 = "guardian-token-2";
+    string internal constant RAW3 = "guardian-token-3";
+
+    bytes32 public token1Hash = sha256(bytes(RAW1));
+    bytes32 public token2Hash = sha256(bytes(RAW2));
+    bytes32 public token3Hash = sha256(bytes(RAW3));
+
+    address internal governance = address(this);
 
     function setUp() public {
-        registry = new GuardianTokenRegistry();
+        registry = new GuardianTokenRegistry(governance);
+        // CHAIN-B-C010: claimToken is now district-gated. Authorize the
+        // two districts used across these fixtures.
+        registry.setDistrict(districtA, true);
+        registry.setDistrict(districtB, true);
         // Start at a non-zero block timestamp so expiresAt math is sane
         vm.warp(1_700_000_000);
     }
@@ -110,7 +124,7 @@ contract GuardianTokenRegistryTest is Test {
         registry.claimToken(token1Hash, expiresAt);
 
         vm.prank(guardianPortal);
-        address returnedDistrict = registry.consumeToken(token1Hash);
+        address returnedDistrict = registry.consumeToken(bytes(RAW1));
         assertEq(returnedDistrict, districtA);
 
         (, , , GuardianTokenRegistry.TokenState state) = registry.tokens(token1Hash);
@@ -126,7 +140,7 @@ contract GuardianTokenRegistryTest is Test {
         emit GuardianTokenRegistry.TokenConsumed(token1Hash);
 
         vm.prank(guardianPortal);
-        registry.consumeToken(token1Hash);
+        registry.consumeToken(bytes(RAW1));
     }
 
     function test_consume_rejects_double_consume() public {
@@ -135,19 +149,19 @@ contract GuardianTokenRegistryTest is Test {
         registry.claimToken(token1Hash, expiresAt);
 
         vm.prank(guardianPortal);
-        registry.consumeToken(token1Hash);
+        registry.consumeToken(bytes(RAW1));
 
         // Second consume — refused
         vm.prank(guardianPortal);
         vm.expectRevert(GuardianTokenRegistry.TokenAlreadyConsumed.selector);
-        registry.consumeToken(token1Hash);
+        registry.consumeToken(bytes(RAW1));
     }
 
     function test_consume_rejects_unclaimed_token() public {
         // Never claimed — refuse with TokenNotClaimed
         vm.prank(guardianPortal);
         vm.expectRevert(GuardianTokenRegistry.TokenNotClaimed.selector);
-        registry.consumeToken(token1Hash);
+        registry.consumeToken(bytes(RAW1));
     }
 
     function test_consume_rejects_after_expiry() public {
@@ -160,7 +174,7 @@ contract GuardianTokenRegistryTest is Test {
 
         vm.prank(guardianPortal);
         vm.expectRevert(GuardianTokenRegistry.TokenAlreadyExpired.selector);
-        registry.consumeToken(token1Hash);
+        registry.consumeToken(bytes(RAW1));
     }
 
     // ============================================================
@@ -217,7 +231,7 @@ contract GuardianTokenRegistryTest is Test {
         registry.claimToken(token1Hash, expiresAt);
 
         vm.prank(guardianPortal);
-        registry.consumeToken(token1Hash);
+        registry.consumeToken(bytes(RAW1));
 
         // Try to expire after consume — refused
         vm.warp(expiresAt + 1);
@@ -261,7 +275,7 @@ contract GuardianTokenRegistryTest is Test {
         registry.claimToken(token1Hash, expiresAt);
 
         vm.prank(guardianPortal);
-        registry.consumeToken(token1Hash);
+        registry.consumeToken(bytes(RAW1));
 
         // Try to revoke after consume — refused
         vm.prank(districtA);
@@ -286,7 +300,7 @@ contract GuardianTokenRegistryTest is Test {
         // Even if guardian gets the link, consume fails
         vm.prank(guardianPortal);
         vm.expectRevert(GuardianTokenRegistry.TokenAlreadyRevoked.selector);
-        registry.consumeToken(token1Hash);
+        registry.consumeToken(bytes(RAW1));
     }
 
     // ============================================================
@@ -307,7 +321,7 @@ contract GuardianTokenRegistryTest is Test {
         vm.prank(districtA);
         registry.claimToken(token1Hash, uint64(block.timestamp + 7 days));
         vm.prank(guardianPortal);
-        registry.consumeToken(token1Hash);
+        registry.consumeToken(bytes(RAW1));
         assertFalse(registry.isRedeemable(token1Hash));
     }
 
@@ -328,7 +342,7 @@ contract GuardianTokenRegistryTest is Test {
         assertEq(uint8(registry.getTokenState(token1Hash)), uint8(GuardianTokenRegistry.TokenState.Claimed));
 
         vm.prank(guardianPortal);
-        registry.consumeToken(token1Hash);
+        registry.consumeToken(bytes(RAW1));
         assertEq(uint8(registry.getTokenState(token1Hash)), uint8(GuardianTokenRegistry.TokenState.Consumed));
     }
 
@@ -349,7 +363,7 @@ contract GuardianTokenRegistryTest is Test {
 
         // Consume one; others remain claimed
         vm.prank(guardianPortal);
-        registry.consumeToken(token2Hash);
+        registry.consumeToken(bytes(RAW2));
 
         assertTrue(registry.isRedeemable(token1Hash));
         assertFalse(registry.isRedeemable(token2Hash));

@@ -69,6 +69,15 @@ contract GuardianTokenRegistry {
     /// @dev Hashed token → Token record.
     mapping(bytes32 => Token) public tokens;
 
+    /// @notice Governance address managing the district allowlist.
+    ///         Closes CHAIN-B-C010 (claimToken front-run).
+    address public governance;
+
+    /// @notice District allowlist. Only an authorized district may claim a
+    ///         guardian token, so a front-runner cannot become the
+    ///         district-of-record. Closes CHAIN-B-C010.
+    mapping(address => bool) public authorizedDistrict;
+
     /// @notice Total tokens ever claimed (monotonic; for off-chain
     ///         analytics / audit traces).
     uint256 public totalClaimed;
@@ -89,6 +98,8 @@ contract GuardianTokenRegistry {
     event TokenConsumed(bytes32 indexed hashedToken);
     event TokenExpired(bytes32 indexed hashedToken);
     event TokenRevoked(bytes32 indexed hashedToken, address indexed district);
+    event GovernanceTransferred(address indexed previous, address indexed current);
+    event DistrictSet(address indexed district, bool authorized);
 
     // ──────────────────────────────────────────────────────────────
     // Errors
@@ -103,6 +114,38 @@ contract GuardianTokenRegistry {
     error ExpiryInPast();
     error NotTokenIssuer();
     error NotYetExpired();
+    error ZeroGovernance();
+    error NotGovernance();
+    error NotAuthorizedDistrict();
+    error EmptyToken();
+
+    // ──────────────────────────────────────────────────────────────
+    // Constructor + governance
+    // ──────────────────────────────────────────────────────────────
+
+    constructor(address governance_) {
+        if (governance_ == address(0)) revert ZeroGovernance();
+        governance = governance_;
+        emit GovernanceTransferred(address(0), governance_);
+    }
+
+    modifier onlyGovernance() {
+        if (msg.sender != governance) revert NotGovernance();
+        _;
+    }
+
+    /// @notice Authorize (or revoke) a district permitted to call
+    ///         `claimToken`. Governance-only. Closes CHAIN-B-C010.
+    function setDistrict(address district, bool authorized) external onlyGovernance {
+        authorizedDistrict[district] = authorized;
+        emit DistrictSet(district, authorized);
+    }
+
+    function transferGovernance(address newGovernance) external onlyGovernance {
+        if (newGovernance == address(0)) revert ZeroGovernance();
+        emit GovernanceTransferred(governance, newGovernance);
+        governance = newGovernance;
+    }
 
     // ──────────────────────────────────────────────────────────────
     // Mutators
@@ -114,6 +157,7 @@ contract GuardianTokenRegistry {
     /// @param hashedToken SHA-256 of the raw token (32 bytes).
     /// @param expiresAt   Unix timestamp at which the token auto-expires.
     function claimToken(bytes32 hashedToken, uint64 expiresAt) external {
+        if (!authorizedDistrict[msg.sender]) revert NotAuthorizedDistrict();
         if (tokens[hashedToken].state != TokenState.Unclaimed) {
             revert TokenAlreadyClaimed();
         }
@@ -140,10 +184,18 @@ contract GuardianTokenRegistry {
     ///         computes SHA-256(rawToken) and calls this. Returns the
     ///         district address so the portal knows which school's
     ///         keystore to consult for the next step in the flow.
-    /// @dev    Anyone can call (the portal is public-facing); the
-    ///         consume action itself is the proof of possession of the
-    ///         raw token, and consume-once is enforced here.
-    function consumeToken(bytes32 hashedToken) external returns (address district) {
+    /// @dev    Anyone can call (the portal is public-facing); possession
+    ///         of the RAW token is the proof — the contract hashes it
+    ///         internally, so the world-readable on-chain commitment
+    ///         (`hashedToken`) is NOT itself the credential. Closes
+    ///         CHAIN-B-C010: previously the function took the hash, which
+    ///         is a public mapping key and an indexed event topic, so any
+    ///         observer could burn a live guardian token.
+    /// @param  rawToken The raw one-time token bytes issued to the
+    ///         guardian; `sha256(rawToken)` must equal the claimed hash.
+    function consumeToken(bytes calldata rawToken) external returns (address district) {
+        if (rawToken.length == 0) revert EmptyToken();
+        bytes32 hashedToken = sha256(rawToken);
         Token storage tk = tokens[hashedToken];
 
         if (tk.state == TokenState.Unclaimed) revert TokenNotClaimed();

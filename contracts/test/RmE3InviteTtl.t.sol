@@ -43,7 +43,7 @@ contract RmE3InviteTtlTest is Test {
 
         // Within TTL → succeeds.
         vm.prank(student);
-        registry.enrollWithCode(code);
+        registry.enrollWithCode(bytes("class-code"));
         assertTrue(registry.isEnrolled(teacher, student));
     }
 
@@ -57,7 +57,7 @@ contract RmE3InviteTtlTest is Test {
 
         vm.prank(student);
         vm.expectRevert("Invite code expired");
-        registry.enrollWithCode(code);
+        registry.enrollWithCode(bytes("class-code"));
     }
 
     function test_guil03_classroom_rotate_with_explicit_ttl() public {
