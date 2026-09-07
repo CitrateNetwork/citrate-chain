@@ -1677,6 +1677,14 @@ impl Executor {
 
         // -- Fast path: bounded CAS retries with NO exec_lock held --
         for _attempt in 0..MAX_RETRIES {
+            // CHAIN-B-B007: capture pre-execution world state so any DIRECT `state_db`
+            // writes made during execution (governance/model/inference precompiles that
+            // bypass the journal — `set_storage`, `delete_storage`, `accounts.transfer`,
+            // `register_model`, …) can be undone if this tx FAILS or its optimistic commit
+            // ABORTS. `discard_writes` only unwinds journalled writes, so without this a
+            // status=false tx still moves money and mutates governance storage, and an
+            // aborted attempt re-applies those direct writes on every retry.
+            let pre_exec = self.state_snapshot();
             let mut context = ExecutionContext::new(block, tx);
             let pin = coord.current_version();
             context.journal.lock().pin_at(pin);
@@ -1696,13 +1704,20 @@ impl Executor {
             use crate::mvcc::CommitOutcome;
             match outcome {
                 CommitOutcome::Committed { new_version } => {
+                    // A FAILED tx (status=false) must leave no state change but the gas
+                    // burn + nonce bump. Restore direct writes away; the journal (holding
+                    // only gas+nonce after `discard_writes`) is then drained on top.
+                    if !receipt.status {
+                        self.state_restore(pre_exec);
+                    }
                     self.drain_journal(&context.journal);
                     self.persist_account_versions(&writes, new_version);
                     return Ok(receipt);
                 }
                 CommitOutcome::Aborted { .. } => {
-                    // Nothing drained → nothing to undo.
-                    // Journal will be recreated fresh on next attempt.
+                    // Undo any DIRECT state_db writes from this aborted attempt before the
+                    // journal is recreated fresh on the next attempt.
+                    self.state_restore(pre_exec);
                     continue;
                 }
             }
@@ -1714,12 +1729,17 @@ impl Executor {
         // we then commit unconditionally (no read-set validation needed).
         // Progress is guaranteed (TLA+ `Progress` temporal property).
         let _guard = coord.acquire_exec_lock().await;
+        // CHAIN-B-B007: same direct-write undo as the fast path (see above).
+        let pre_exec = self.state_snapshot();
         let mut context = ExecutionContext::new(block, tx);
         context.journal.lock().pin_at(coord.current_version());
         let (receipt, writes) = self
             .execute_tx_into_journal(block, tx, &mut context)
             .await?;
         let new_version = coord.commit_writes_serialized(&writes);
+        if !receipt.status {
+            self.state_restore(pre_exec);
+        }
         self.drain_journal(&context.journal);
         self.persist_account_versions(&writes, new_version);
         Ok(receipt)
@@ -2568,6 +2588,13 @@ impl Executor {
         // Compiled out of every non-test build.
         #[cfg(test)]
         if to == Address([0xEE; 20]) {
+            // CHAIN-B-B007 tripwire hook: perform a DIRECT `state_db` write (bypassing the
+            // journal, as governance/model/inference precompiles do) THEN panic. A correct
+            // failure path must undo this write; without the fix `discard_writes` leaves it
+            // behind. The test `tripwire_b007_failed_tx_undoes_direct_state_db_write` asserts
+            // the slot is gone after the revert.
+            self.state_db
+                .set_storage(Address([0xB7; 20]), b"B007_DIRECT".to_vec(), vec![0xB7; 8]);
             panic!("EXEC-02 deliberate test panic in dispatch");
         }
 
@@ -4831,6 +4858,62 @@ mod tests {
             state_db.accounts.get_nonce(&from_addr),
             1,
             "nonce must advance on the isolated-panic revert (sender paid gas)"
+        );
+    }
+
+    /// CHAIN-B-B007 tripwire: a transaction that makes a DIRECT `state_db` write and then
+    /// FAILS must leave no trace of that write. The panic hook writes storage slot
+    /// `0xB7..B7 / "B007_DIRECT"` directly (bypassing the journal) before panicking; the
+    /// failure path must restore state so the slot is gone. Without the fix, `discard_writes`
+    /// only unwinds journalled writes and the direct slot survives the revert (RED).
+    #[tokio::test]
+    async fn tripwire_b007_failed_tx_undoes_direct_state_db_write() {
+        let state_db = Arc::new(StateDB::new());
+        let executor = Executor::new(state_db.clone());
+
+        let mut from_pk = [0u8; 32];
+        from_pk[..20].copy_from_slice(&[0xAA; 20]);
+        let from_pk = PublicKey::new(from_pk);
+        let from_addr = Address([0xAA; 20]);
+        state_db
+            .accounts
+            .set_balance(from_addr, U256::from(1_000_000_000_000_000u128));
+
+        let mut to_pk = [0u8; 32];
+        to_pk[..20].copy_from_slice(&[0xEE; 20]);
+        let to_pk = PublicKey::new(to_pk);
+
+        let direct_addr = Address([0xB7; 20]);
+        assert_eq!(
+            state_db.get_storage(&direct_addr, b"B007_DIRECT"),
+            None,
+            "precondition: the direct slot is empty before the tx"
+        );
+
+        let block = create_test_block();
+        let tx = Transaction {
+            hash: Hash::new([0x78; 32]),
+            nonce: 0,
+            from: from_pk,
+            to: Some(to_pk),
+            value: 0,
+            gas_limit: 100000,
+            gas_price: 1_000_000_000,
+            data: vec![0xAB, 0xCD, 0xEF, 0x01],
+            signature: Signature::new([0; 64]),
+            tx_type: None,
+            ..Default::default()
+        };
+
+        let receipt = executor
+            .execute_transaction(&block, &tx)
+            .await
+            .expect("panic isolated as revert");
+        assert!(!receipt.status, "the tx must have failed");
+        assert_eq!(
+            state_db.get_storage(&direct_addr, b"B007_DIRECT"),
+            None,
+            "a DIRECT state_db write made by a FAILED tx must be undone (CHAIN-B-B007)"
         );
     }
 }

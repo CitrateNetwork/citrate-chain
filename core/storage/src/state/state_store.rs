@@ -284,6 +284,43 @@ impl StateStore {
         Ok(storage)
     }
 
+    /// Full-fidelity restart hydration of contract storage (CHAIN-B-B005).
+    ///
+    /// `get_all_storage` reconstructs only records whose DB key is EXACTLY 52 bytes
+    /// (`address(20) + storage_key(32)`) and zero-fills any value shorter than 32 bytes.
+    /// But the executor writes VARIABLE-length keys into the same column family via
+    /// `put_storage(addr, key, value)` — `b"ADMIN"` (25-byte key), `b"PARAM:"‖key32`,
+    /// `b"PENDING:"‖key32`, `b"MODEL_CID:"‖hash32`, `b"MODEL_ARTS:"‖hash32`, … — with
+    /// values that are not 32 bytes (a 20-byte admin address, a CID string, a JSON array).
+    /// Those records are silently DROPPED by the 52-byte filter, so a routine restart loses
+    /// the governance admin, every governance parameter, and every model artifact index from
+    /// in-memory consensus state (governance bricks: `setAdmin` is only allowed at height 0).
+    ///
+    /// This reader preserves the FULL key and value bytes so hydration round-trips every
+    /// `put_storage` byte-identically, and ERRORS on a key shorter than the 20-byte address
+    /// prefix (corrupt) rather than skipping it silently.
+    #[allow(clippy::type_complexity)]
+    pub fn get_all_storage_raw(&self) -> Result<Vec<((Address, Vec<u8>), Vec<u8>)>> {
+        let mut storage = Vec::new();
+        let iter = self.db.iter_cf(CF_STORAGE)?;
+
+        for (key, value) in iter {
+            if key.len() < 20 {
+                return Err(anyhow::anyhow!(
+                    "corrupt storage key in CF_STORAGE: {} bytes (< 20-byte address prefix)",
+                    key.len()
+                ));
+            }
+            let mut addr_bytes = [0u8; 20];
+            addr_bytes.copy_from_slice(&key[..20]);
+            let address = Address(addr_bytes);
+            let storage_key = key[20..].to_vec();
+            storage.push(((address, storage_key), value.to_vec()));
+        }
+
+        Ok(storage)
+    }
+
     /// Delete account state
     pub fn delete_account(&self, address: &Address) -> Result<()> {
         self.db.delete_cf(CF_ACCOUNTS, &address.0)?;
@@ -538,5 +575,57 @@ mod tests {
         // Delete value
         store.delete_storage(&address, b"key1").unwrap();
         assert!(store.get_storage(&address, b"key1").unwrap().is_none());
+    }
+
+    /// CHAIN-B-B005 tripwire: every `put_storage(addr, key, value)` — INCLUDING the
+    /// executor's variable-length bespoke keys (`b"ADMIN"`, `b"PARAM:"‖…`, `b"MODEL_CID:"‖…`)
+    /// with non-32-byte values — must survive restart hydration byte-identically. The old
+    /// `get_all_storage` filtered to exactly-52-byte keys and zero-filled short values, so a
+    /// restart silently lost the governance admin and every parameter. `get_all_storage_raw`
+    /// must round-trip them all.
+    #[test]
+    fn every_written_storage_slot_round_trips_through_hydration() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = StateStore::new(db);
+
+        let gov = Address([0x77; 20]);
+        // The exact executor key/value shapes the finding calls out.
+        let writes: Vec<(&[u8], Vec<u8>)> = vec![
+            (b"ADMIN", vec![0xAB; 20]),                  // 25-byte key, 20-byte value
+            (b"PARAM:artifact_replication", vec![0x03]), // short value
+            (b"MODEL_CID:xyz", b"bafyCID...".to_vec()),  // string value
+            (&[0u8; 32], vec![0x11; 32]),                // a normal 52-byte EVM slot
+        ];
+        for (k, v) in &writes {
+            store.put_storage(&gov, k, v).unwrap();
+        }
+
+        let hydrated = store.get_all_storage_raw().unwrap();
+        for (k, v) in &writes {
+            let found = hydrated
+                .iter()
+                .find(|((addr, key), _)| *addr == gov && key.as_slice() == *k)
+                .map(|(_, val)| val.clone());
+            assert_eq!(
+                found.as_deref(),
+                Some(v.as_slice()),
+                "slot {:?} lost or mangled on restart hydration",
+                String::from_utf8_lossy(k)
+            );
+        }
+        // And the legacy 52-byte-only reader is exactly what DROPPED the bespoke keys.
+        let legacy = store.get_all_storage().unwrap();
+        assert!(
+            !legacy
+                .iter()
+                .any(|((addr, _), _)| *addr == gov && legacy.len() == writes.len()),
+            "legacy get_all_storage must not be relied on for hydration"
+        );
+        assert_eq!(
+            legacy.len(),
+            1,
+            "legacy reader keeps only the one 52-byte EVM slot, dropping the 3 bespoke keys"
+        );
     }
 }

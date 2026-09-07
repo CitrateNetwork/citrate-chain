@@ -297,8 +297,28 @@ impl StateDB {
             // Fold this account's storage_root computed FRESH from its committed slot
             // trie — for EVERY account, not just dirty ones — so a slot change via any
             // path is reflected. (Recomputes identically each call → idempotent.)
+            //
+            // CHAIN-B-B004: the persistent per-account storage `Trie` is an accumulator
+            // whose `root_hash()` is a function of its MUTATION HISTORY, not of its final
+            // key/value set — a trie built by `insert(A,B,C); remove(A)` hashes differently
+            // from one built by `insert(B,C)`, because `remove` can leave an `Extension`
+            // shape that an insert-only rebuild never produces. So a node that replayed a
+            // storage deletion and a node that rebuilt the same final slot set on restart
+            // (via `get_all_storage`) would fold DIFFERENT `storage_root`s into the
+            // consensus state root — a fork. Rebuild the storage trie FRESH from its
+            // committed slot set (address-key-sorted, insert-only) before hashing, exactly
+            // as the account trie above is rebuilt, so `storage_root` is a pure function of
+            // the final map. `entries_map()` is the authoritative slot set (`remove` prunes
+            // the cache), so this captures deletions correctly.
             if let Some(storage_trie) = self.storage_tries.get(&address) {
-                account.storage_root = storage_trie.root_hash();
+                let mut slots: Vec<(Vec<u8>, Vec<u8>)> =
+                    storage_trie.entries_map().into_iter().collect();
+                slots.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                let mut fresh = Trie::new();
+                for (k, v) in slots {
+                    fresh.insert(k, v);
+                }
+                account.storage_root = fresh.root_hash();
                 // Keep the resident account consistent with what we hash.
                 self.accounts.set_account(address, account.clone());
             }
@@ -561,6 +581,43 @@ mod tests {
         // Delete storage
         db.delete_storage(addr, b"key1");
         assert_eq!(db.get_storage(&addr, b"key1"), None);
+    }
+
+    /// CHAIN-B-B004 tripwire: an account's `storage_root` — and therefore the consensus
+    /// state root — must be a function of the FINAL slot set only, never of the
+    /// insert-vs-remove history that produced it. The minimal history-dependent example is
+    /// from the finding's PoC: keys A=[0,1], B=[0,3,0], C=[3]. Before the fix, the
+    /// `remove(A)` path left an `Extension`-shaped trie that hashed differently from the
+    /// insert-only `{B,C}` tree, so a node that replayed the deletion and a node that
+    /// rebuilt the same slots on restart forked. After the fix both paths must agree.
+    #[test]
+    fn storage_root_is_a_function_of_the_final_slot_set_not_history() {
+        let addr = Address([0x42; 20]);
+
+        // Path 1: insert A, B, C then remove A -> final slot set {B, C}.
+        let db1 = StateDB::new();
+        db1.accounts.set_balance(addr, U256::from(1u64)); // non-empty so it is folded
+        db1.set_storage(addr, vec![0, 1], vec![9]); // A
+        db1.set_storage(addr, vec![0, 3, 0], vec![1]); // B
+        db1.set_storage(addr, vec![3], vec![2]); // C
+        db1.delete_storage(addr, &[0, 1]); // remove A
+
+        // Path 2: insert B, C only — the same final slot set.
+        let db2 = StateDB::new();
+        db2.accounts.set_balance(addr, U256::from(1u64));
+        db2.set_storage(addr, vec![0, 3, 0], vec![1]);
+        db2.set_storage(addr, vec![3], vec![2]);
+
+        // Sanity: both hold exactly {B, C}.
+        assert_eq!(db1.get_storage(&addr, &[0, 1]), None);
+        assert_eq!(db1.get_storage(&addr, &[0, 3, 0]), Some(vec![1]));
+        assert_eq!(db2.get_storage(&addr, &[3]), Some(vec![2]));
+
+        assert_eq!(
+            db1.calculate_state_root(),
+            db2.calculate_state_root(),
+            "storage_root must depend on the final slot set, not the mutation history"
+        );
     }
 
     // -----------------------------------------------------------------------

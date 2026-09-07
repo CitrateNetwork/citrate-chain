@@ -29,17 +29,39 @@ pub use poseidon::{poseidon_config, poseidon_hash, poseidon_permute};
 /// below the field modulus and maps injectively (no modular reduction / no collisions).
 pub const BYTES_PER_LEAF: usize = 31;
 
-/// Pack arbitrary bytes into BN254 field-element leaves via 31-byte chunks. Empty input
-/// yields a single zero leaf (so `compute_comm_d(&[])` is well-defined, not a panic).
-/// Identical pack to `citrate-execution`'s `chunk_bytes_into_fr` / `tensor_commit`.
+/// Pack arbitrary bytes into BN254 field-element leaves via 31-byte chunks, then bind the
+/// exact byte length as a dedicated trailing leaf.
+///
+/// CHAIN-B-B006: `Fr::from_le_bytes_mod_order` over the trailing PARTIAL chunk cannot see
+/// trailing zero bytes, so `F` and `F ‖ 0x00…` — and every all-zero file up to 31 bytes,
+/// and the empty file — packed to the SAME leaves, hence the SAME `commD` Merkle root AND
+/// the SAME `dataCommit` sponge (the sponge length-bound only the LEAF count, identical
+/// for all such collisions). That defeats the wrong-CommD bond: a provider could serve
+/// `F ‖ 0x00…` in place of `F` and pass every challenge. Appending `data.len()` as its own
+/// leaf makes the leaf vector — and therefore both commitments over it — injective over
+/// bytes: two inputs collide in the chunk leaves ONLY when they differ by trailing NULs or
+/// total length, and the length leaf then differs. It also lifts the empty / all-zero
+/// input off the `0x00…00` "absent commitment" sentinel (the empty file now packs to
+/// `[0, 0]`, whose Merkle root `H(0, 0) != 0`).
+///
+/// NOTE (HELD — rides the coordinated reroll): this changes EVERY `commD`/`dataCommit`
+/// value, so registered bonds and the on-chain challenge circuit must be recomputed in
+/// lockstep. The mirrored packs in `citrate-execution` (`chunk_bytes_into_fr`,
+/// `tensor_commit` at `precompiles/verify.rs`, `porep::merkle_root_4`) carry the same
+/// non-injectivity and must be updated in the same reroll.
 pub fn pack_bytes(bytes: &[u8]) -> Vec<Fr> {
-    if bytes.is_empty() {
-        return vec![Fr::zero()];
-    }
-    bytes
-        .chunks(BYTES_PER_LEAF)
-        .map(Fr::from_le_bytes_mod_order)
-        .collect()
+    // Chunk part: empty input keeps its single zero leaf so the tree shape stays defined.
+    let mut leaves: Vec<Fr> = if bytes.is_empty() {
+        vec![Fr::zero()]
+    } else {
+        bytes
+            .chunks(BYTES_PER_LEAF)
+            .map(Fr::from_le_bytes_mod_order)
+            .collect()
+    };
+    // Byte-length binding leaf (the fix). `data.len()` always fits in a u64, hence in Fr.
+    leaves.push(Fr::from(bytes.len() as u64));
+    leaves
 }
 
 /// Poseidon-BN254 binary Merkle root over `leaves`, padded up to the next power of two
@@ -303,22 +325,26 @@ pub struct CommDFold {
     merkle: IncrementalMerkle,
     keccak: sha3::Keccak256,
     carry: Vec<u8>, // bytes not yet forming a full 31-byte leaf (fed to the merkle at finalize)
+    total_len: usize, // CHAIN-B-B006: bound as the trailing length leaf (mirrors pack_bytes)
 }
 
 impl CommDFold {
     /// Start a fold for a file of exactly `total_len` bytes (fixes the Merkle depth up front, as a
     /// real proof does — the size is known to the prover).
     pub fn new(total_len: usize) -> Self {
-        let n_leaves = if total_len == 0 {
+        // Chunk leaves + ONE trailing byte-length leaf (CHAIN-B-B006), mirroring `pack_bytes`.
+        let chunk_leaves = if total_len == 0 {
             1
         } else {
             total_len.div_ceil(BYTES_PER_LEAF)
         };
+        let n_leaves = chunk_leaves + 1;
         let depth = n_leaves.next_power_of_two().trailing_zeros();
         Self {
             merkle: IncrementalMerkle::new(depth),
             keccak: sha3::Keccak256::new(),
             carry: Vec::with_capacity(BYTES_PER_LEAF),
+            total_len,
         }
     }
 
@@ -343,9 +369,12 @@ impl CommDFold {
             let leaf = Fr::from_le_bytes_mod_order(&self.carry);
             self.merkle.insert(leaf);
         } else if self.merkle.index == 0 {
-            // empty input packs to a single zero leaf (matches pack_bytes(&[])).
+            // empty input packs to a single zero chunk leaf (matches pack_bytes(&[])).
             self.merkle.insert(Fr::zero());
         }
+        // CHAIN-B-B006: trailing byte-length leaf, so the fold matches the injective
+        // `pack_bytes` (chunk leaves ‖ len leaf).
+        self.merkle.insert(Fr::from(self.total_len as u64));
         let comm_d = fr_to_be_bytes(self.merkle.root());
         let data_hash: [u8; 32] = self.keccak.finalize().into();
         (comm_d, data_hash)
@@ -359,11 +388,58 @@ mod tests {
 
     #[test]
     fn pack_is_31_byte_chunks_and_injective() {
-        assert_eq!(pack_bytes(&[]).len(), 1); // empty -> one zero leaf
-        assert_eq!(pack_bytes(&[0u8; 31]).len(), 1);
-        assert_eq!(pack_bytes(&[0u8; 32]).len(), 2); // 32 bytes -> 2 leaves
-        assert_eq!(pack_bytes(&[0u8; 62]).len(), 2);
-        assert_eq!(pack_bytes(&[0u8; 63]).len(), 3);
+        // CHAIN-B-B006: every pack now carries ONE trailing byte-length leaf on top of the
+        // 31-byte chunk leaves, so the counts below are (chunk leaves + 1).
+        assert_eq!(pack_bytes(&[]).len(), 2); // empty -> [zero chunk, len=0]
+        assert_eq!(pack_bytes(&[0u8; 31]).len(), 2); // 1 chunk + len
+        assert_eq!(pack_bytes(&[0u8; 32]).len(), 3); // 2 chunks + len
+        assert_eq!(pack_bytes(&[0u8; 62]).len(), 3);
+        assert_eq!(pack_bytes(&[0u8; 63]).len(), 4);
+    }
+
+    /// CHAIN-B-B006 tripwire: `compute_comm_d` / `compute_data_commit` must be INJECTIVE over
+    /// bytes. The old `commd_is_collision_sensitive_to_bytes` only mutated a byte in place — it
+    /// never varied the LENGTH, which is exactly where the pre-fix commitment collided. These
+    /// are the finding's five PoCs; each pair must now differ.
+    #[test]
+    fn compute_comm_d_binds_byte_length() {
+        // PoC-1/5: a string and the same string with a trailing NUL (final partial leaf).
+        assert_ne!(
+            compute_comm_d(b"hello world"),
+            compute_comm_d(b"hello world\0"),
+            "trailing NUL must change commD"
+        );
+        assert_ne!(
+            compute_data_commit(b"hello world"),
+            compute_data_commit(b"hello world\0"),
+            "trailing NUL must change dataCommit"
+        );
+        // 11B / 12B / 31B all held "hello world" before the fix — now all distinct.
+        let a = compute_comm_d(b"hello world");
+        let mut b12 = b"hello world".to_vec();
+        b12.push(0);
+        let mut c31 = b"hello world".to_vec();
+        c31.resize(31, 0);
+        assert_ne!(a, compute_comm_d(&b12));
+        assert_ne!(a, compute_comm_d(&c31));
+        assert_ne!(compute_comm_d(&b12), compute_comm_d(&c31));
+
+        // PoC-3: empty file must NOT equal any all-zero file, and must NOT be the 0x00..00
+        // "absent commitment" sentinel.
+        assert_ne!(
+            compute_comm_d(&[]),
+            [0u8; 32],
+            "empty must not be the absent sentinel"
+        );
+        assert_ne!(compute_comm_d(&[]), compute_comm_d(&[0u8; 31]));
+        assert_ne!(compute_comm_d(&[0u8; 1]), compute_comm_d(&[0u8; 31]));
+
+        // PoC-4: a large file and the same file with appended NULs.
+        let big: Vec<u8> = (0..31_007usize).map(|i| (i * 7 + 1) as u8).collect();
+        let mut big2 = big.clone();
+        big2.resize(31_031, 0);
+        assert_ne!(compute_comm_d(&big), compute_comm_d(&big2));
+        assert_ne!(compute_data_commit(&big), compute_data_commit(&big2));
     }
 
     #[test]

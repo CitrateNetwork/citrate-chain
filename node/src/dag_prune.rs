@@ -455,28 +455,31 @@ mod tests {
         );
     }
 
-    /// THE REMEDY, proven: with pruning OFF, the very block shape that wedges a
-    /// pruned node admits cleanly.
+    /// THE REMEDY, proven (post-reroll semantics, CHAIN-B-A002/A006).
     ///
-    /// This is the companion to
-    /// `merge_block_referencing_a_pruned_parent_is_rejected_not_scored`, and it
-    /// is what makes "unset `CITRATE_DAG_PRUNE_RETAIN`" a proven fix rather than
-    /// a plausible suggestion. Identical topology — a block merging a parent far
-    /// below the would-be pruning point — with the single difference that no
-    /// prune pass runs. The merge parent is still present, so admission succeeds
-    /// and the applied head advances.
+    /// After the 2026-08-04 re-roll, `MERGE_DEPTH_ACTIVATION_HEIGHT` is **0**: MP-DEPTH is
+    /// enforced from genesis, one validity rule for the whole chain (the pre-reroll history
+    /// that once carried block 54,601 merging a height-32 parent was WIPED, so there is
+    /// nothing left to stay compatible with, and a non-zero activation would itself be a
+    /// fork-by-configuration hazard). This test now pins the invariant that MP-DEPTH exists
+    /// to guarantee, which is exactly what makes DAG pruning safe fleet-wide:
     ///
-    /// Mirrors the live 40204 case: block 54,601 merges `0x175fdf2b…` at height
-    /// 32. A cold-syncing node has height 32 from its own linear sync; only
-    /// pruning takes it away.
+    ///   MERGE_PARENT_MAX_DEPTH (100) < MIN_RETAIN_BLOCKS (1,000) <= retain window
     ///
-    /// If this test ever fails, the remedy in
-    /// `handoffs/FRESH_NODE_SYNC_WEDGE_54600_2026-07-30.md` is wrong and cold
-    /// sync is broken for a second, independent reason.
+    /// so no VALID block can cite a merge parent the pruner may have dropped. Concretely:
+    ///   * a merge parent WITHIN the bound (depth ≤ 100) admits — the legal merges a
+    ///     cold-syncing node crosses; and
+    ///   * a merge parent OVER the bound (depth > 100) is REJECTED at every height,
+    ///     including height 1 — so a pruned node and an unpruned node can never disagree
+    ///     about such a block, because it is invalid for both.
+    ///
+    /// (Before this test was corrected it asserted the OPPOSITE — that a 1,301-deep merge
+    /// must admit — which encoded the pre-reroll `activation = 100_000` world and failed
+    /// against `activation = 0`. RC-8: the fixture, not the code, was stale.)
     #[tokio::test]
     async fn no_pruning_admits_the_deep_merge_parent_that_wedges_a_pruned_node() {
         use citrate_consensus::dag_store::DagStore;
-        use citrate_consensus::ghostdag::GhostDag;
+        use citrate_consensus::ghostdag::{GhostDag, MERGE_PARENT_MAX_DEPTH};
         use citrate_consensus::types::{BlockBuilder, GhostDagParams, Hash, VrfProof};
         use citrate_storage::pruning::PruningConfig;
 
@@ -508,14 +511,23 @@ mod tests {
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
 
+        // The merge block lands at height N+1, so a merge parent at height
+        // `N + 1 - MERGE_PARENT_MAX_DEPTH` is EXACTLY at the bound (admits) and one at
+        // `N - MERGE_PARENT_MAX_DEPTH` is one-past the bound (rejected).
+        let within_bound_height = N + 1 - MERGE_PARENT_MAX_DEPTH; // depth == 100
+        let over_bound_height = N - MERGE_PARENT_MAX_DEPTH; // depth == 101
+
         let mut parent = Hash::default();
-        let mut deep_hash = Hash::default();
+        let mut within_bound_hash = Hash::default();
+        let mut over_bound_hash = Hash::default();
         for h in 1..=N {
             let b = mk(h, parent, vec![]);
             parent = b.header.block_hash;
-            // Height 200: below the point a retain-1000 window WOULD have pruned.
-            if h == 200 {
-                deep_hash = b.header.block_hash;
+            if h == within_bound_height {
+                within_bound_hash = b.header.block_hash;
+            }
+            if h == over_bound_height {
+                over_bound_hash = b.header.block_hash;
             }
             dag.store_block(b.clone()).await.expect("dag");
             ghostdag.add_block(&b).await.expect("admit");
@@ -523,36 +535,50 @@ mod tests {
         }
         storage.blocks.put_applied_tip(&parent, N).expect("tip");
 
-        // THE ONLY DIFFERENCE from the wedge case: no prune pass. This is exactly
-        // what unsetting CITRATE_DAG_PRUNE_RETAIN does — `spawn` returns early and
-        // no task is created.
+        // No prune pass runs (as when CITRATE_DAG_PRUNE_RETAIN is unset), so both candidate
+        // merge parents are still held — this isolates MP-DEPTH from pruning.
         assert!(
             configured_retain().is_none() || std::env::var(RETAIN_ENV).is_err(),
             "this test asserts the UNPRUNED path; it is meaningless if the env var \
              is set in the test process"
         );
-        assert!(
-            dag.has_block(&deep_hash).await,
-            "without pruning the deep merge parent is still held"
-        );
+        assert!(dag.has_block(&within_bound_hash).await);
+        assert!(dag.has_block(&over_bound_hash).await);
 
-        let merge = mk(N + 1, parent, vec![deep_hash]);
-        dag.store_block(merge.clone()).await.expect("dag");
-        ghostdag.add_block(&merge).await.expect(
-            "REMEDY: with pruning off, a block merging a far-below parent must \
-                     admit — this is what lets a cold-syncing node cross 54,600",
-        );
+        // (1) A merge parent at exactly MERGE_PARENT_MAX_DEPTH admits — the legal merge a
+        // cold-syncing node must be able to cross.
+        let ok = mk(N + 1, parent, vec![within_bound_hash]);
+        dag.store_block(ok.clone()).await.expect("dag");
+        ghostdag
+            .add_block(&ok)
+            .await
+            .expect("a merge parent within MP-DEPTH must admit");
         assert_eq!(
             ghostdag
-                .get_blue_score(&merge.header.block_hash)
+                .get_blue_score(&ok.header.block_hash)
                 .await
                 .expect("score"),
             N + 1,
-            "and the applied chain advances past the merge block"
+            "the applied chain advances past a legal merge"
+        );
+
+        // (2) A merge parent one-past the bound is REJECTED from genesis (activation = 0).
+        // This is the property that makes pruning safe: no valid block cites a droppable
+        // parent, so pruned and unpruned nodes never diverge on it.
+        let bad = mk(N + 1, parent, vec![over_bound_hash]);
+        dag.store_block(bad.clone()).await.expect("dag");
+        let err = ghostdag
+            .add_block(&bad)
+            .await
+            .expect_err("a merge parent deeper than MP-DEPTH must be rejected from genesis");
+        assert!(
+            format!("{err:?}").contains("MP-DEPTH")
+                || format!("{err:?}").contains("below this block"),
+            "rejection must be the MP-DEPTH linkage error, got: {err:?}"
         );
     }
 
-    /// NO LONGER HYPOTHETICAL — this is the live 54,600 cold-sync wedge on 40204.
+    /// HISTORICAL — the pre-reroll 54,600 cold-sync wedge on 40204 (chain history since WIPED).
     ///
     /// Written 2026-07-29 as a synthetic hazard. Confirmed 2026-07-30 as the
     /// actual cause of "a fresh node cannot cold-sync past block 54,600":
@@ -561,32 +587,30 @@ mod tests {
     ///   block 54,601 `0xa267188c…`  mergeParentHashes: ["0x175fdf2b…"]
     ///   `0x175fdf2b…` is at **height 32** (blueScore 0x20)
     ///
-    /// Block 54,601 legally merges a parent 54,569 blocks below it — a artefact
-    /// of the 2026-07-27 concurrent-producer fork. With
-    /// `CITRATE_DAG_PRUNE_RETAIN=10000` and an applied height of 54,600 the
-    /// pruning point is 44,600, so height 32 is GONE. Admission of 54,601 then
-    /// fails `validate_block_consistency` with `MissingParent` forever: blocks
-    /// 54,601+ are stored, the applied head never moves, and the node re-imports
-    /// the same range indefinitely.
+    /// Block 54,601 legally merged a parent 54,569 blocks below it — an artefact
+    /// of the 2026-07-27 concurrent-producer fork, under the OLD rule set where
+    /// merge depth was unbounded. With `CITRATE_DAG_PRUNE_RETAIN=10000` and an
+    /// applied height of 54,600 the pruning point was 44,600, so height 32 was
+    /// GONE, and admission of 54,601 failed `validate_block_consistency` with
+    /// `MissingParent` forever.
     ///
-    /// The fleet is unaffected because **no fleet node sets
-    /// `CITRATE_DAG_PRUNE_RETAIN`** (verified: all four run only
-    /// CITRATE_BLOCK_V2 / VALIDATOR_ACTIVATION_HEIGHT / VALIDATOR_REGISTRY, and
-    /// rpc-1 has zero `dag-prune` log lines in 30 days). It is not that the fleet
-    /// "stayed online through the fork" — it simply does not prune.
+    /// POST-REROLL (2026-08-04, CHAIN-B-A006): this can no longer occur. The re-roll
+    /// wiped that history AND set `MERGE_DEPTH_ACTIVATION_HEIGHT = 0`, so MP-DEPTH
+    /// (#138) is enforced from genesis: a block merging a parent deeper than
+    /// `MERGE_PARENT_MAX_DEPTH` (100) is INVALID at every height and is rejected on
+    /// admission before pruning is ever consulted. Because `MERGE_PARENT_MAX_DEPTH
+    /// (100) < MIN_RETAIN_BLOCKS (1,000)`, no valid block can cite a parent the pruner
+    /// may drop, so pruned and unpruned nodes cannot diverge. The corrected companion
+    /// `no_pruning_admits_the_deep_merge_parent_that_wedges_a_pruned_node` pins this.
     ///
-    /// MP-DEPTH (#138) makes such a block INVALID going forward, but activates at
-    /// height 100,000 and cannot apply retroactively: 54,601 is valid history
-    /// forever. So this test stays `#[ignore]`d — it documents a permanent
-    /// property of this chain's history, not a defect awaiting a code fix. The
-    /// remedy for cold sync is `no_pruning_admits_the_deep_merge_parent_that_
-    /// wedges_a_pruned_node` below.
+    /// This stays `#[ignore]`d: it reconstructs a block shape that is now simply
+    /// invalid, kept as the audit record of the wedge it once caused.
     ///
     /// Run it with: `cargo test -p citrate-node --bin citrate -- --ignored`
     #[tokio::test]
-    #[ignore = "Reproduces the LIVE 54,600 cold-sync wedge (block 54,601 merges height 32). \
-                Not fixable retroactively — MP-DEPTH #138 prevents recurrence from height \
-                100,000. Remedy is to not enable pruning; see the companion test."]
+    #[ignore = "Reconstructs the pre-reroll 54,600 cold-sync wedge (block 54,601 merges height \
+                32). Cannot recur post-reroll: MP-DEPTH #138 is enforced from genesis \
+                (MERGE_DEPTH_ACTIVATION_HEIGHT = 0). See the corrected companion test."]
     async fn merge_block_referencing_a_pruned_parent_is_rejected_not_scored() {
         use citrate_consensus::dag_store::DagStore;
         use citrate_consensus::ghostdag::GhostDag;

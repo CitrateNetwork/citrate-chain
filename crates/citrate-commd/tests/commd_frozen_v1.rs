@@ -11,6 +11,15 @@
 // CommD version), bump the crate's commitment version, publish new vectors alongside these,
 // and coordinate the circuit + contract + client — a contract already deployed against v1
 // vectors cannot be slashed correctly under v2.
+//
+// ── v2 (CHAIN-B-B006) ────────────────────────────────────────────────────────────────────
+// These vectors are the v2 commitment: `pack_bytes` now appends a byte-length leaf so the
+// commitment is INJECTIVE over bytes (v1 mapped the empty file, every all-zero file ≤31B,
+// and any F / F‖0x00… to the SAME value, and the empty file to the 0x00..00 "absent"
+// sentinel — the wrong-CommD bond was unsound). This is a HELD change: it rides the
+// coordinated reroll together with the on-chain challenge circuit, the sealer/PoRep circuit,
+// and the CX-S2.2 client, which must all recompute against v2. The old v1 vectors are
+// retained as comments beside each case as the audit trail of the values that were unsound.
 
 use citrate_commd::{compute_comm_d, compute_data_commit};
 
@@ -22,45 +31,49 @@ fn h(s: &str) -> [u8; 32] {
 }
 
 #[test]
-fn commd_frozen_vectors_v1() {
-    // (label, input, expected commD, expected dataCommit)
+fn commd_frozen_vectors_v2() {
+    // (label, input, expected commD (v2), expected dataCommit (v2))
     let cases: &[(&str, Vec<u8>, &str, &str)] = &[
-        // empty and 31 zero bytes both pack to a single zero leaf -> identical (documented).
+        // v1 collided empty == 31_zeros == 0x00..00; v2 distinguishes all three.
         (
             "empty",
             vec![],
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            "294d5514bcdc323b146ef99c58c637945d2d3b43a5cb5efc0b0c057c36f28d3a",
-        ),
-        (
-            "one_byte_0x01",
-            vec![1],
-            "0000000000000000000000000000000000000000000000000000000000000001",
-            "0403682fea89ee0ec92726d683e023ebd8c5b78f6ab3098175e81455620f48b7",
-        ),
-        (
-            "31_zeros_one_leaf",
-            vec![0u8; 31],
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            "294d5514bcdc323b146ef99c58c637945d2d3b43a5cb5efc0b0c057c36f28d3a",
-        ),
-        (
-            "32_zeros_two_leaves",
-            vec![0u8; 32],
+            // v1 commD was 0x00..00 (== absent sentinel) — the core soundness break.
             "221b3ba83d3ba29c81faf792c0456758b3a085bcdb02254e0ab72fb22a4904f7",
             "1765de73ee6ec17e6013ee48ab97ec71f8ef5fa8f7ab35fd704af8a3912c44c0",
         ),
         (
+            "one_byte_0x01",
+            vec![1],
+            // v1 commD was 0x00..01 (plaintext leaked as the commitment for ≤31B).
+            "1a52c1c2a744f6ae53557e48efa6d62f4483338b8c415dc4a6bf81a4dbf1c4bc",
+            "0746beb1bcd5f26df6b6c7187ec08853263b266099291003ab2d8d2fef896d4e",
+        ),
+        (
+            "31_zeros",
+            vec![0u8; 31],
+            // v1 commD collided with empty (0x00..00); v2 binds len=31.
+            "1470eeb39e0ab3667bfcb483f393a49a68148c5e61e74b6f8a589b3771650690",
+            "265be5ce4909502b4067910e432af0525a3e7c70a6a735924789470d4a01ea0a",
+        ),
+        (
+            "32_zeros",
+            vec![0u8; 32],
+            "232e09229a5a4b60169ff211bff7fbdca2a18f6e4f66cef2e434be1f50a7dc9a",
+            "233469b1023a084188e76f616da7ce2eb33310957f1b4b397b4d30c03fcb16c1",
+        ),
+        (
             "hello_pin",
             b"hello pin".to_vec(),
-            "00000000000000000000000000000000000000000000006e6970206f6c6c6568",
-            "2b0894c438660404477b872ced1b10a5ebc3d83263238cb38eae09355c202d7f",
+            // v1 commD was 0x..6e6970206f6c6c6568 (the plaintext "hello pin" little-endian).
+            "135ab2dc065b8ba028ada33af58513ca03b241f8096c70be71042c0b538c97ae",
+            "1e563f8e1bbb82a3ee40be50e20e0ae4ee7cc5fc8aab00bc29df27c8b33114c5",
         ),
         (
             "100_incrementing",
             (0..100u32).map(|i| i as u8).collect(),
-            "02765621f5f7e5c569458c89aff1f46adf4d6bf58a135d66eb2dc9c3a6e64290",
-            "03f2fcdf67adea13e3d76eed02265bc432473b09c5bd89d26b7d6a275ffe1216",
+            "1fd3a6682060b92357b2f3225e84a20d53a6a145f56199dca7d98444df4219e9",
+            "0fae803ef6fb71921ce5d661e79204d612d4d4660f27ba7d232be0821da754c0",
         ),
     ];
     for (label, data, commd, datacommit) in cases {
@@ -71,4 +84,8 @@ fn commd_frozen_vectors_v1() {
             "dataCommit drift at {label}"
         );
     }
+    // The v1 soundness break, pinned as a regression: empty must never again be the
+    // 0x00..00 absent-commitment sentinel, and must differ from any all-zero file.
+    assert_ne!(compute_comm_d(&[]), [0u8; 32]);
+    assert_ne!(compute_comm_d(&[]), compute_comm_d(&[0u8; 31]));
 }

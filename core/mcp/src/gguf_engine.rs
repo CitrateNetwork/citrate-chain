@@ -90,21 +90,22 @@ impl GGUFEngine {
         // Find llama.cpp binary (try both old and new names)
         let binary = self.find_llama_binary("llama-cli", "main")?;
 
+        // CHAIN-B-D015: when this runs INSIDE consensus transaction execution, the output
+        // (and the gas derived from it) is committed to state, so it MUST be deterministic
+        // across nodes. `temperature` (caller-supplied) and `-t num_cpus::get()` made two
+        // honest validators with different core counts / RNG reach different outputs and
+        // therefore different state roots — a fork on ordinary traffic. Force greedy,
+        // single-threaded, seeded decoding regardless of caller input. (Residual
+        // cross-architecture floating-point divergence is a deeper limitation; the sound
+        // long-term fix is to move inference out of consensus and commit only a hash — see
+        // the finding. This closes the finding's exact scenario: differing core counts.)
+        let _ = temperature; // deliberately ignored on the consensus path
+        let args =
+            deterministic_generate_args(model_path, prompt, max_tokens, self.config.context_size);
+
         // Build command
         let output = Command::new(binary)
-            .arg("-m")
-            .arg(model_path)
-            .arg("-p")
-            .arg(prompt)
-            .arg("-n")
-            .arg(max_tokens.to_string())
-            .arg("--temp")
-            .arg(temperature.to_string())
-            .arg("-t")
-            .arg(self.config.threads.to_string())
-            .arg("-c")
-            .arg(self.config.context_size.to_string())
-            .arg("--no-display-prompt")
+            .args(&args)
             .output()
             .context("Failed to execute llama.cpp")?;
 
@@ -274,6 +275,42 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// CHAIN-B-D015: build the `llama-cli` argument vector for a DETERMINISTIC text generation.
+///
+/// Inference output committed to consensus state must be reproducible across nodes, so the
+/// decoder is pinned to greedy (`--top-k 1 --temp 0`), seeded (`--seed 0`), single-threaded
+/// (`-t 1`) generation — independent of any caller-supplied temperature or the host core
+/// count. Factored into a pure function so a test can assert these flags are present without
+/// spawning the subprocess.
+fn deterministic_generate_args(
+    model_path: &Path,
+    prompt: &str,
+    max_tokens: usize,
+    context_size: usize,
+) -> Vec<String> {
+    vec![
+        "-m".to_string(),
+        model_path.to_string_lossy().into_owned(),
+        "-p".to_string(),
+        prompt.to_string(),
+        "-n".to_string(),
+        max_tokens.to_string(),
+        // Deterministic decoding (consensus-safety): seeded, greedy, zero-temperature.
+        "--seed".to_string(),
+        "0".to_string(),
+        "--top-k".to_string(),
+        "1".to_string(),
+        "--temp".to_string(),
+        "0".to_string(),
+        // Single thread: thread count must not change the result across differently-sized nodes.
+        "-t".to_string(),
+        "1".to_string(),
+        "-c".to_string(),
+        context_size.to_string(),
+        "--no-display-prompt".to_string(),
+    ]
+}
+
 /// Compute cosine similarity between two embeddings
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
@@ -294,6 +331,47 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CHAIN-B-D015 tripwire: consensus inference must pin deterministic decoding flags and
+    /// a single thread, and must NOT thread the host core count or a caller temperature into
+    /// the subprocess. If any of these regress, two honest validators fork.
+    #[test]
+    fn generate_args_are_deterministic_and_thread_count_independent() {
+        let args = deterministic_generate_args(Path::new("/models/m.gguf"), "hello", 128, 4096);
+
+        // Helper: value following a flag.
+        let val = |flag: &str| -> Option<String> {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1).cloned())
+        };
+
+        assert_eq!(val("--seed").as_deref(), Some("0"), "must seed the RNG");
+        assert_eq!(
+            val("--top-k").as_deref(),
+            Some("1"),
+            "must be greedy (top-k 1)"
+        );
+        assert_eq!(
+            val("--temp").as_deref(),
+            Some("0"),
+            "must be zero-temperature"
+        );
+        assert_eq!(
+            val("-t").as_deref(),
+            Some("1"),
+            "must be single-threaded; a num_cpus-derived thread count forks the fleet"
+        );
+        // The host core count must never appear as the thread argument.
+        let cpus = num_cpus::get();
+        if cpus != 1 {
+            assert_ne!(
+                val("-t").as_deref(),
+                Some(cpus.to_string().as_str()),
+                "thread count must not be derived from num_cpus::get()"
+            );
+        }
+    }
 
     #[test]
     fn test_cosine_similarity() {

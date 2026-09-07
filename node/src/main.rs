@@ -1148,19 +1148,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     }
 
-    // C6 fix: Also load contract storage slots from persistent storage
-    match storage.state.get_all_storage() {
+    // C6 fix: Also load contract storage slots from persistent storage.
+    // CHAIN-B-B005: use the full-fidelity reader so variable-length executor keys
+    // (governance ADMIN/PARAM/PENDING, model artifact indexes) survive restart — the
+    // 52-byte-only `get_all_storage` silently dropped them and bricked governance.
+    match storage.state.get_all_storage_raw() {
         Ok(storage_slots) => {
             info!(
                 "Found {} storage slots in storage, loading into memory...",
                 storage_slots.len()
             );
             for ((address, storage_key), storage_value) in storage_slots {
-                state_db.set_storage(
-                    address,
-                    storage_key.as_bytes().to_vec(),
-                    storage_value.as_bytes().to_vec(),
-                );
+                state_db.set_storage(address, storage_key, storage_value);
             }
             // Clear dirty flags since these are loaded from storage, not new writes
             let _ = state_db.take_dirty_storage();
