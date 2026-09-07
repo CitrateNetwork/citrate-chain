@@ -1,7 +1,7 @@
 // node/src/commands/wallet.rs
 // Adapts wallet CLI functionality as a subcommand of the unified `citrate` binary.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use citrate_execution::types::Address;
 use citrate_wallet::{Wallet, WalletConfig};
 use clap::Subcommand;
@@ -22,11 +22,33 @@ pub enum WalletCommands {
         alias: Option<String>,
     },
 
-    /// Import account from private key
+    /// Import account from private key.
+    ///
+    /// RM-K / WP-K1.6 (CHAIN-B-E003): secrets MUST NOT be passed on the
+    /// command line in normal operation — argv is visible in the OS process
+    /// list (`ps`), in shell history, and in command-audit logs. The default
+    /// is to read the key from stdin with no echo (`--key-stdin`) or from a
+    /// file (`--key-file`). `--insecure-key-from-arg` is the legacy opt-in
+    /// that puts the key on argv and emits a loud warning; it exists only for
+    /// scripts that have not yet migrated. This mirrors the hardened
+    /// `citrate account import` path.
     Import {
-        /// Private key in hex format
-        #[arg(short, long)]
-        key: Option<String>,
+        /// Read the 32-byte hex private key from stdin (no echo).
+        /// This is the recommended path for interactive imports.
+        #[arg(long, conflicts_with_all = ["key_file", "insecure_key_from_arg"])]
+        key_stdin: bool,
+
+        /// Read the 32-byte hex private key from a file. The file is read
+        /// once and not modified; operators should `shred` or delete it
+        /// after import.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["key_stdin", "insecure_key_from_arg"])]
+        key_file: Option<PathBuf>,
+
+        /// LEGACY: pass the private key on the command line. Visible in
+        /// argv, shell history, and process listings. Emits a warning.
+        /// Prefer --key-stdin or --key-file.
+        #[arg(long, value_name = "HEX", conflicts_with_all = ["key_stdin", "key_file"])]
+        insecure_key_from_arg: Option<String>,
 
         /// Account alias
         #[arg(short, long)]
@@ -95,7 +117,15 @@ pub async fn execute(
 
     match cmd {
         WalletCommands::New { alias } => create_account(&mut wallet, alias).await,
-        WalletCommands::Import { key, alias } => import_account(&mut wallet, key, alias).await,
+        WalletCommands::Import {
+            key_stdin,
+            key_file,
+            insecure_key_from_arg,
+            alias,
+        } => {
+            let key = read_import_key(key_stdin, key_file, insecure_key_from_arg)?;
+            import_account(&mut wallet, key, alias).await
+        }
         WalletCommands::List => list_accounts(&mut wallet).await,
         WalletCommands::Balance { account } => show_balance(&mut wallet, account).await,
         WalletCommands::Send {
@@ -136,20 +166,50 @@ async fn create_account(wallet: &mut Wallet, alias: Option<String>) -> Result<()
     Ok(())
 }
 
+/// RM-K / WP-K1.6 (CHAIN-B-E003): resolve the private key from a
+/// non-argv source. Mirrors `cli/src/commands/account.rs::read_import_key`.
+/// `--key-stdin` prompts with no echo, `--key-file` reads from disk, and the
+/// legacy `--insecure-key-from-arg` puts it on argv with a loud warning.
+fn read_import_key(
+    key_stdin: bool,
+    key_file: Option<PathBuf>,
+    insecure_key_from_arg: Option<String>,
+) -> Result<String> {
+    let raw = match (key_stdin, key_file, insecure_key_from_arg) {
+        (true, _, _) => Password::new()
+            .with_prompt("Paste 32-byte hex private key (no echo)")
+            .interact()
+            .context("Failed to read private key from stdin")?,
+        (_, Some(path), _) => std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read key file {}", path.display()))?
+            .trim()
+            .to_string(),
+        (_, _, Some(hex_arg)) => {
+            // Loud warning: argv is visible in the OS.
+            eprintln!(
+                "{}",
+                "WARNING: --insecure-key-from-arg passes the private key on the \
+                 command line. argv is visible in `ps`, shell history, and audit \
+                 logs. Use --key-stdin or --key-file in production."
+                    .yellow()
+                    .bold()
+            );
+            hex_arg
+        }
+        (false, None, None) => anyhow::bail!(
+            "Provide one of --key-stdin (recommended), --key-file <PATH>, or \
+             --insecure-key-from-arg <HEX> (legacy)."
+        ),
+    };
+    Ok(raw.trim().to_string())
+}
+
 async fn import_account(
     wallet: &mut Wallet,
-    key: Option<String>,
+    private_key: String,
     alias: Option<String>,
 ) -> Result<()> {
     println!("{}", "Importing account...".bright_cyan());
-
-    let private_key = if let Some(key) = key {
-        key
-    } else {
-        Password::new()
-            .with_prompt("Enter private key (hex)")
-            .interact()?
-    };
 
     let password = Password::new()
         .with_prompt("Enter password to encrypt key")
@@ -465,7 +525,10 @@ async fn interactive_mode(wallet: &mut Wallet) -> Result<()> {
                 create_account(wallet, alias).await?;
             }
             1 => {
-                import_account(wallet, None, None).await?;
+                // Interactive import reads the key from stdin with no echo
+                // (never from argv) — see CHAIN-B-E003 / read_import_key.
+                let key = read_import_key(true, None, None)?;
+                import_account(wallet, key, None).await?;
             }
             2 => {
                 list_accounts(wallet).await?;
@@ -548,4 +611,91 @@ fn latt_to_wei(latt: f64) -> U256 {
     let wei_per_latt = 1_000_000_000_000_000_000u128;
     let wei = (latt * wei_per_latt as f64) as u128;
     U256::from(wei)
+}
+
+#[cfg(test)]
+mod tests_e003 {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    #[command(name = "test-wallet")]
+    struct TestCli {
+        #[command(subcommand)]
+        cmd: WalletCommands,
+    }
+
+    #[test]
+    fn test_e003_import_requires_explicit_key_source() {
+        // No key source provided → the runtime must reject with a message
+        // naming the secure alternatives.
+        let result = read_import_key(false, None, None);
+        assert!(
+            result.is_err(),
+            "E003: import without --key-stdin / --key-file / \
+             --insecure-key-from-arg must fail at runtime"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("--key-stdin") && msg.contains("--key-file"),
+            "E003: error must name the secure alternatives, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_e003_import_key_file_path() {
+        let tmp = std::env::temp_dir()
+            .join(format!("e003_wallet_import_{}.key", std::process::id()));
+        let hex_key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        std::fs::write(&tmp, format!("0x{hex_key}\n")).expect("write test key file");
+
+        let read = read_import_key(false, Some(tmp.clone()), None).expect("read key file");
+        assert_eq!(read, format!("0x{hex_key}"));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_e003_argparse_rejects_legacy_short_flags() {
+        // Legacy `wallet import --key <hex>` MUST fail to parse — that shape
+        // put the private key on argv (CHAIN-B-E003).
+        let result = TestCli::try_parse_from(["test-wallet", "import", "--key", "abcd"]);
+        assert!(
+            result.is_err(),
+            "E003: legacy `--key` flag must no longer parse"
+        );
+    }
+
+    #[test]
+    fn test_e003_argparse_accepts_stdin_flag() {
+        let result = TestCli::try_parse_from(["test-wallet", "import", "--key-stdin"]);
+        assert!(
+            result.is_ok(),
+            "E003: `--key-stdin` is the recommended secure path and must parse"
+        );
+    }
+
+    #[test]
+    fn test_e003_argparse_accepts_key_file_flag() {
+        let result =
+            TestCli::try_parse_from(["test-wallet", "import", "--key-file", "/tmp/k.key"]);
+        assert!(
+            result.is_ok(),
+            "E003: `--key-file` must parse"
+        );
+    }
+
+    #[test]
+    fn test_e003_argparse_stdin_conflicts_with_insecure_arg() {
+        let result = TestCli::try_parse_from([
+            "test-wallet",
+            "import",
+            "--key-stdin",
+            "--insecure-key-from-arg",
+            "abcd",
+        ]);
+        assert!(
+            result.is_err(),
+            "E003: --key-stdin and --insecure-key-from-arg must conflict"
+        );
+    }
 }
