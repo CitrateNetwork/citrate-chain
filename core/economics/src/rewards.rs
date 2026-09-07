@@ -32,7 +32,10 @@ impl Default for RewardConfig {
     fn default() -> Self {
         Self {
             block_reward: 10,                   // 10 SALT per block
-            halving_interval: 2_100_000,        // ~4 years at 2s blocks
+            // 2_100_000 blocks × 2s ≈ 48.6 days (NOT "~4 years"; the old comment
+            // was off by ~30×). A true 4-year interval would need ~63M blocks —
+            // changing it alters emission and is an OWNER/reroll decision.
+            halving_interval: 2_100_000,
             inference_bonus: 0,                 // 0.01 SALT per inference
             model_deployment_bonus: 1,          // 1 SALT per model deployment
             treasury_percentage: 10,            // 10% to treasury
@@ -61,16 +64,23 @@ impl RewardCalculator {
 
     /// Calculate block reward for a given block
     pub fn calculate_reward(&self, block: &Block) -> BlockReward {
-        // Calculate base reward with halving
+        // Calculate base reward with halving.
+        //
+        // The halving is applied to the *wei-denominated* subsidy, not to the
+        // whole-SALT `block_reward` field. Halving the whole-SALT u64 first
+        // (`block_reward >> halvings`) truncated 2.5 SALT to 2 and reached a
+        // permanent 0 after only four halvings, collapsing the security budget.
+        // Scaling to wei before the shift keeps fractional-SALT emission
+        // (10 -> 5 -> 2.5 -> 1.25 -> …) representable.
         let halvings = block.header.height / self.config.halving_interval;
-        let base_reward = if halvings >= 64 {
-            0 // No more rewards after 64 halvings
+        let base_reward_wei = if halvings >= 64 {
+            U256::zero() // No more rewards after 64 halvings
         } else {
-            self.config.block_reward >> halvings // Divide by 2^halvings
+            let full = U256::from(self.config.block_reward) * U256::from(10).pow(U256::from(DECIMALS));
+            full / U256::from(2).pow(U256::from(halvings))
         };
 
-        // Convert to wei
-        let mut total_reward = U256::from(base_reward) * U256::from(10).pow(U256::from(DECIMALS));
+        let mut total_reward = base_reward_wei;
 
         // Add inference bonuses
         let inference_count = self.count_inferences(block);
@@ -128,10 +138,16 @@ impl RewardCalculator {
         false
     }
 
-    /// Calculate total supply at a given block height
+    /// Calculate total supply at a given block height.
+    ///
+    /// Projection only (drives RPC/economics estimates, not consensus). Kept in
+    /// lockstep with `calculate_reward`: the per-period subsidy is halved in
+    /// wei, so the projection tracks the fractional-SALT schedule instead of the
+    /// truncated `current_reward /= 2` (whole-SALT) figure it used before.
     pub fn total_supply_at_height(&self, height: u64) -> U256 {
         let mut total = U256::zero();
-        let mut current_reward = self.config.block_reward;
+        let mut current_reward_wei =
+            U256::from(self.config.block_reward) * U256::from(10).pow(U256::from(DECIMALS));
         let mut blocks_processed = 0u64;
 
         for halving in 0..64 {
@@ -146,9 +162,7 @@ impl RewardCalculator {
                 end - start
             };
 
-            let period_reward = U256::from(current_reward)
-                * U256::from(blocks_in_period)
-                * U256::from(10).pow(U256::from(DECIMALS));
+            let period_reward = current_reward_wei * U256::from(blocks_in_period);
             total += period_reward;
 
             blocks_processed += blocks_in_period;
@@ -156,8 +170,8 @@ impl RewardCalculator {
                 break;
             }
 
-            current_reward /= 2;
-            if current_reward == 0 {
+            current_reward_wei /= U256::from(2);
+            if current_reward_wei.is_zero() {
                 break;
             }
         }
@@ -205,5 +219,31 @@ mod tests {
         // After halving: 5 SALT = 5 * 10^18 wei
         let expected_total = U256::from(5) * U256::from(10).pow(U256::from(18));
         assert_eq!(reward.total_reward, expected_total);
+    }
+
+    // RC-8: the buggy schedule truncated the whole-SALT subsidy and hit a
+    // permanent 0 after four halvings (10→5→2→1→0). The corrected schedule
+    // halves in wei, so fractional-SALT emission stays representable and does
+    // not collapse to 0 within 64 halvings.
+    #[test]
+    fn test_halving_no_whole_salt_truncation() {
+        let config = RewardConfig::default();
+        let calculator = RewardCalculator::new(config.clone());
+        let one_salt = U256::from(10).pow(U256::from(18));
+
+        // Third halving → 1.25 SALT (was truncated to 1 SALT before the fix).
+        let block = BlockBuilder::new()
+            .height(3 * config.halving_interval)
+            .build_unhashed();
+        let reward = calculator.calculate_reward(&block);
+        assert_eq!(reward.total_reward, one_salt * U256::from(125) / U256::from(100));
+
+        // Fourth halving → 0.625 SALT (was 0 before the fix: the bug's smoking gun).
+        let block = BlockBuilder::new()
+            .height(4 * config.halving_interval)
+            .build_unhashed();
+        let reward = calculator.calculate_reward(&block);
+        assert_eq!(reward.total_reward, one_salt * U256::from(625) / U256::from(1000));
+        assert!(!reward.total_reward.is_zero());
     }
 }
