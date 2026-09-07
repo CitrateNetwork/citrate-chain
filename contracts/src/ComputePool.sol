@@ -323,6 +323,18 @@ contract ComputePool is ReentrancyGuard, Governable {
         member.gpuCount = 0;
         member.stake = 0;
 
+        // Keep the payout and coordination index limited to current members.
+        // Leaving only cleared the mapping before this removal, so a later
+        // rejoin appended a second entry and paid the provider twice.
+        address[] storage memberList = _poolMembers[poolId];
+        for (uint256 i = 0; i < memberList.length; i++) {
+            if (memberList[i] == msg.sender) {
+                memberList[i] = memberList[memberList.length - 1];
+                memberList.pop();
+                break;
+            }
+        }
+
         // MinProvidersMaintained: auto-pause if below minimum
         if (pool.memberCount < pool.minProviders && pool.state == PoolState.Active) {
             pool.state = PoolState.Paused;

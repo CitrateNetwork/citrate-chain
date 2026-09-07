@@ -143,7 +143,8 @@ contract E8FirstOpRegistrarTest is Test {
         op.sender = sender;
         uint48 until = uint48(block.timestamp + 1 hours);
         uint48 aft = uint48(block.timestamp);
-        bytes32 digest = pm.sponsorDigest(sender, CAT_FIRST_OP, until, aft);
+        // CHAIN-B-C033: bind the sponsor digest to the op nonce (0 here).
+        bytes32 digest = pm.sponsorDigest(sender, CAT_FIRST_OP, until, aft, op.nonce);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_PK, digest.toEthSignedMessageHash());
         op.paymasterAndData = abi.encodePacked(
             address(pm), uint128(0), uint128(0), bytes1(CAT_FIRST_OP), until, aft, abi.encodePacked(r, s, v)
@@ -331,7 +332,8 @@ contract E8RealEntryPointE2ETest is Test {
         // E8-1: sign the sponsorship for this sender + first-op + window.
         uint48 until = uint48(block.timestamp + 1 hours);
         uint48 aft = uint48(block.timestamp);
-        bytes32 sd = p.sponsorDigest(predicted, CAT_FIRST_OP, until, aft);
+        // CHAIN-B-C033: bind the sponsor digest to the op nonce.
+        bytes32 sd = p.sponsorDigest(predicted, CAT_FIRST_OP, until, aft, ep.getNonce(predicted, 0));
         (uint8 sv, bytes32 sr, bytes32 ss) = vm.sign(IDENTITY_PK, sd.toEthSignedMessageHash());
 
         op = PackedUserOperation({

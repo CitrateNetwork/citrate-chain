@@ -152,9 +152,16 @@ contract ClassroomRegistry {
     ///      - enrollment count < maxStudents (INV-2: EnrollmentBounded)
     ///      INV-6 (StudentAccessOnlyWhitelisted): enrollment links student to teacher
     ///      who controls the whitelist.
-    /// @param inviteCodeHash keccak256 of the invite code provided by teacher
-    function enrollWithCode(bytes32 inviteCodeHash) external {
-        require(inviteCodeHash != bytes32(0), "Invalid invite code hash");
+    /// @param inviteCode The RAW invite code (secret preimage) issued by
+    ///        the teacher. The contract hashes it internally, so the
+    ///        credential presented on chain is the secret itself, not the
+    ///        public commitment. Closes CHAIN-B-C009: previously the
+    ///        function authenticated on the invite-code HASH, which is
+    ///        world-readable chain state (public mappings + event), so any
+    ///        observer could enrol without knowing the secret.
+    function enrollWithCode(bytes calldata inviteCode) external {
+        require(inviteCode.length > 0, "Empty invite code");
+        bytes32 inviteCodeHash = keccak256(inviteCode);
         address teacher = codeToTeacher[inviteCodeHash];
         require(teacher != address(0), "Invalid invite code");
         require(classrooms[teacher].exists, "Classroom does not exist");

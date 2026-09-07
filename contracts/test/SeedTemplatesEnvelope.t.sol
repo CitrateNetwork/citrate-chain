@@ -32,11 +32,16 @@ contract SeedTemplatesEnvelopeTest is Test {
     address constant EXECUTOR_ADDR = address(0xB0B);
     address constant THIRD_ADDR = address(0xC0FFEE);
 
+    address constant BOARD_A_ADDR = address(0xB0A2DA);
+    address constant BOARD_B_ADDR = address(0xB0A2DB);
     bytes32 PROPOSER;
     bytes32 EXECUTOR;
     bytes32 THIRD;
-    bytes32 constant BOARD_A = keccak256("board-a");
-    bytes32 constant BOARD_B = keccak256("board-b");
+    // CHAIN-B-C008: board identities must be the subjectKey of a real address we
+    // prank as when signing for them (assigned in setUp, before the constructors).
+    bytes32 BOARD_A;
+    bytes32 BOARD_B;
+    mapping(bytes32 => address) internal _idAddr;
 
     uint64 constant START = 1_700_000_000;
     uint64 constant REVIEW = 2 days;
@@ -48,6 +53,13 @@ contract SeedTemplatesEnvelopeTest is Test {
         PROPOSER = QuorumIdentity.subjectKey(PROPOSER_ADDR);
         EXECUTOR = QuorumIdentity.subjectKey(EXECUTOR_ADDR);
         THIRD = QuorumIdentity.subjectKey(THIRD_ADDR);
+        BOARD_A = QuorumIdentity.subjectKey(BOARD_A_ADDR);
+        BOARD_B = QuorumIdentity.subjectKey(BOARD_B_ADDR);
+        _idAddr[PROPOSER] = PROPOSER_ADDR;
+        _idAddr[EXECUTOR] = EXECUTOR_ADDR;
+        _idAddr[THIRD] = THIRD_ADDR;
+        _idAddr[BOARD_A] = BOARD_A_ADDR;
+        _idAddr[BOARD_B] = BOARD_B_ADDR;
 
         sod = new SegregationOfDuties(
             TENANT, keccak256("sod"), 1, SPEC_HASH, SPEC_CID, address(envelopes), 1
@@ -87,6 +99,20 @@ contract SeedTemplatesEnvelopeTest is Test {
         r[1] = b;
     }
 
+    // ── pranked envelope helpers (CHAIN-B-C008) ─────────────────────
+    // sign/markDelivered/close bind to `subjectKey(msg.sender)`; act as the
+    // address behind the identity. (reject/accept are unbound — call directly.)
+
+    function _sign(bytes32 id, bytes32 who, bytes memory sig, string memory mode) internal {
+        vm.prank(_idAddr[who]);
+        envelopes.sign(id, who, sig, mode);
+    }
+
+    function _markDelivered(bytes32 id, bytes32 initiator) internal {
+        vm.prank(_idAddr[initiator]);
+        envelopes.markDelivered(id);
+    }
+
     // ══ SegregationOfDuties ═════════════════════════════════════════
 
     function _sodCheck(address actor)
@@ -104,7 +130,7 @@ contract SeedTemplatesEnvelopeTest is Test {
     function test_SOD_proposerApprovingTheirOwnChangeIsDeniedNotQueued() public {
         bytes32 id = sod.approvalEnvelopeId(ACTION, PARAMS, CORR);
         _draft(id, PROPOSER, _two(PROPOSER, THIRD), 1, keccak256("a"), "bafyA");
-        envelopes.sign(id, PROPOSER, hex"ab", "ceremony");
+        _sign(id, PROPOSER, hex"ab", "ceremony");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason) = _sodCheck(EXECUTOR_ADDR);
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.Deny));
@@ -115,7 +141,7 @@ contract SeedTemplatesEnvelopeTest is Test {
     function test_SOD_executorMayNotHaveApproved() public {
         bytes32 id = sod.approvalEnvelopeId(ACTION, PARAMS, CORR);
         _draft(id, PROPOSER, _two(EXECUTOR, THIRD), 1, keccak256("a"), "bafyA");
-        envelopes.sign(id, EXECUTOR, hex"ab", "ceremony");
+        _sign(id, EXECUTOR, hex"ab", "ceremony");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason) = _sodCheck(EXECUTOR_ADDR);
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.Deny));
@@ -126,7 +152,7 @@ contract SeedTemplatesEnvelopeTest is Test {
     function test_SOD_executorMayNotHaveProposed() public {
         bytes32 id = sod.approvalEnvelopeId(ACTION, PARAMS, CORR);
         _draft(id, EXECUTOR, _two(PROPOSER, THIRD), 1, keccak256("a"), "bafyA");
-        envelopes.sign(id, THIRD, hex"ab", "ceremony");
+        _sign(id, THIRD, hex"ab", "ceremony");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason) = _sodCheck(EXECUTOR_ADDR);
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.Deny));
@@ -143,7 +169,7 @@ contract SeedTemplatesEnvelopeTest is Test {
         assertEq(uint8(pending), uint8(IGovernanceProtocol.Verdict.RequireApproval));
         assertEq(r1, sod.REASON_PENDING(), "a shortfall is a queue, and says so");
 
-        envelopes.sign(id, THIRD, hex"ab", "ceremony");
+        _sign(id, THIRD, hex"ab", "ceremony");
         (IGovernanceProtocol.Verdict v, bytes32 r2) = _sodCheck(EXECUTOR_ADDR);
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.Allow));
         assertEq(r2, sod.REASON_SATISFIED());
@@ -191,13 +217,13 @@ contract SeedTemplatesEnvelopeTest is Test {
         // the verdict, not the signing. Here the board signs after it, so the
         // three stages appear separately.
         vm.warp(START + REVIEW);
-        envelopes.sign(id, BOARD_A, hex"ab", "ceremony");
+        _sign(id, BOARD_A, hex"ab", "ceremony");
 
         (IGovernanceProtocol.Verdict v2, bytes32 r2) = _ccbCheck();
         assertEq(uint8(v2), uint8(IGovernanceProtocol.Verdict.RequireApproval));
         assertEq(r2, ccb.REASON_PENDING_BOARD());
 
-        envelopes.sign(id, BOARD_B, hex"cd", "ceremony");
+        _sign(id, BOARD_B, hex"cd", "ceremony");
         (IGovernanceProtocol.Verdict v3, bytes32 r3) = _ccbCheck();
         assertEq(uint8(v3), uint8(IGovernanceProtocol.Verdict.RequireApproval));
         assertEq(r3, ccb.REASON_IN_TIMELOCK());
@@ -222,8 +248,8 @@ contract SeedTemplatesEnvelopeTest is Test {
     function test_CCB_theTimelockRunsFromApprovalNotFromTheEndOfReview() public {
         bytes32 id = ccb.approvalEnvelopeId(ACTION, PARAMS, CORR);
         _draft(id, PROPOSER, _two(BOARD_A, BOARD_B), 2, keccak256("a"), "bafyA");
-        envelopes.sign(id, BOARD_A, hex"ab", "ceremony");
-        envelopes.sign(id, BOARD_B, hex"cd", "ceremony");
+        _sign(id, BOARD_A, hex"ab", "ceremony");
+        _sign(id, BOARD_B, hex"cd", "ceremony");
 
         // TIMELOCK (1 day) elapses well inside REVIEW (2 days).
         vm.warp(START + REVIEW - 1);
@@ -242,7 +268,7 @@ contract SeedTemplatesEnvelopeTest is Test {
     function test_CCB_aBoardShortfallIsNotATimingProblem() public {
         bytes32 id = ccb.approvalEnvelopeId(ACTION, PARAMS, CORR);
         _draft(id, PROPOSER, _two(BOARD_A, BOARD_B), 2, keccak256("a"), "bafyA");
-        envelopes.sign(id, BOARD_A, hex"ab", "ceremony");
+        _sign(id, BOARD_A, hex"ab", "ceremony");
 
         vm.warp(START + REVIEW + TIMELOCK * 10);
         (IGovernanceProtocol.Verdict v, bytes32 reason) = _ccbCheck();
@@ -259,9 +285,9 @@ contract SeedTemplatesEnvelopeTest is Test {
         required[1] = THIRD;
         required[2] = PROPOSER;
         _draft(id, PROPOSER, required, 3, keccak256("a"), "bafyA");
-        envelopes.sign(id, BOARD_A, hex"ab", "ceremony");
-        envelopes.sign(id, THIRD, hex"cd", "ceremony");
-        envelopes.sign(id, PROPOSER, hex"ef", "ceremony");
+        _sign(id, BOARD_A, hex"ab", "ceremony");
+        _sign(id, THIRD, hex"cd", "ceremony");
+        _sign(id, PROPOSER, hex"ef", "ceremony");
 
         vm.warp(START + REVIEW + TIMELOCK * 2);
         (IGovernanceProtocol.Verdict v, bytes32 reason) = _ccbCheck();
@@ -281,8 +307,8 @@ contract SeedTemplatesEnvelopeTest is Test {
         required[1] = BOARD_B;
         required[2] = THIRD;
         _draft(id, PROPOSER, required, 3, keccak256("a"), "bafyA");
-        envelopes.sign(id, BOARD_A, hex"ab", "ceremony");
-        envelopes.sign(id, BOARD_B, hex"cd", "ceremony");
+        _sign(id, BOARD_A, hex"ab", "ceremony");
+        _sign(id, BOARD_B, hex"cd", "ceremony");
 
         vm.warp(START + REVIEW + TIMELOCK * 5);
         (IGovernanceProtocol.Verdict v, bytes32 reason) = _ccbCheck();
@@ -303,8 +329,8 @@ contract SeedTemplatesEnvelopeTest is Test {
     function test_SA_approvalWithoutEvidenceIsStillARefusal() public {
         bytes32 id = sa.admissionEnvelopeId(ACTION, PARAMS, CORR);
         _draft(id, PROPOSER, _two(BOARD_A, BOARD_B), 2, bytes32(0), "bafyDocs");
-        envelopes.sign(id, BOARD_A, hex"ab", "ceremony");
-        envelopes.sign(id, BOARD_B, hex"cd", "ceremony");
+        _sign(id, BOARD_A, hex"ab", "ceremony");
+        _sign(id, BOARD_B, hex"cd", "ceremony");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason) = _saCheck();
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.Deny));
@@ -331,8 +357,8 @@ contract SeedTemplatesEnvelopeTest is Test {
         assertEq(uint8(pending), uint8(IGovernanceProtocol.Verdict.RequireApproval));
         assertEq(r1, sa.REASON_PENDING());
 
-        envelopes.sign(id, BOARD_A, hex"ab", "ceremony");
-        envelopes.sign(id, BOARD_B, hex"cd", "ceremony");
+        _sign(id, BOARD_A, hex"ab", "ceremony");
+        _sign(id, BOARD_B, hex"cd", "ceremony");
 
         (IGovernanceProtocol.Verdict v, bytes32 r2) = _saCheck();
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.Allow));
@@ -342,9 +368,9 @@ contract SeedTemplatesEnvelopeTest is Test {
     function test_SA_aRefusedAdmissionStaysRefused() public {
         bytes32 id = sa.admissionEnvelopeId(ACTION, PARAMS, CORR);
         _draft(id, PROPOSER, _two(BOARD_A, BOARD_B), 2, keccak256("root"), "bafyDocs");
-        envelopes.sign(id, BOARD_A, hex"ab", "ceremony");
-        envelopes.sign(id, BOARD_B, hex"cd", "ceremony");
-        envelopes.markDelivered(id);
+        _sign(id, BOARD_A, hex"ab", "ceremony");
+        _sign(id, BOARD_B, hex"cd", "ceremony");
+        _markDelivered(id, PROPOSER);
         envelopes.reject(id, "failed diligence");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason) = _saCheck();

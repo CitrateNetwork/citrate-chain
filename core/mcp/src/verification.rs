@@ -6,7 +6,9 @@ use crate::types::ExecutionProof;
 use anyhow::Result;
 use citrate_execution::Hash;
 use sha3::{Digest, Sha3_256};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
+#[cfg(test)]
+use tracing::info;
 
 /// Execution verifier for validating model execution proofs
 pub struct ExecutionVerifier {
@@ -159,7 +161,9 @@ impl ExecutionVerifier {
         Hash::new(hash.into())
     }
 
-    /// Verify ZK proof using commitment-based scheme.
+    /// Verify a real execution proof. The legacy commitment scheme is never
+    /// accepted; until the production verifier is enabled, verification fails
+    /// closed.
     ///
     /// When the `zkp_production` feature is enabled, this should dispatch to
     /// `verify_groth16_proof` (not yet implemented — see ADR-003).
@@ -173,7 +177,9 @@ impl ExecutionVerifier {
 
         #[cfg(not(feature = "zkp_production"))]
         {
-            self.verify_commitment_proof(statement, proof_data)
+            let _ = (statement, proof_data);
+            warn!("ZK verification unavailable: production verifier is disabled");
+            Ok(false)
         }
     }
 
@@ -216,7 +222,9 @@ impl ExecutionVerifier {
         Ok(result)
     }
 
-    /// Commitment-based proof verification (interim scheme).
+    /// Legacy commitment verifier retained only for unit-test coverage of old
+    /// artifacts. It is not compiled into production and is never an accepted
+    /// execution-proof scheme.
     ///
     /// Supports two formats:
     /// - **Nonce-enhanced** (72+ bytes): commitment(32) || response(32) || nonce(8) || extra
@@ -225,6 +233,7 @@ impl ExecutionVerifier {
     /// - **Legacy** (64-71 bytes): commitment(32) || response(32)
     ///   Verification: commitment == SHA3(statement || response)
     ///   No replay protection.
+    #[cfg(test)]
     fn verify_commitment_proof(&self, statement: &[u8], proof_data: &[u8]) -> Result<bool> {
         use sha3::{Digest, Sha3_256};
 
@@ -539,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_execution_valid() {
+    fn test_verify_execution_fails_closed_without_real_zk_verifier() {
         let verifier = ExecutionVerifier::new();
         let model = create_test_model(b"arch", b"weights", b"meta");
         let input = b"test input";
@@ -548,7 +557,7 @@ mod tests {
 
         let result = verifier.verify_execution(&model, input, output, &proof);
         assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -985,17 +994,17 @@ mod tests {
     }
 
     #[test]
-    fn test_zk_proof_verifies_correctly() {
+    fn test_zk_proof_placeholder_is_not_accepted() {
         let verifier = ExecutionVerifier::new();
         let model = create_test_model(b"arch", b"weights", b"meta");
         let input = b"test input";
         let output = b"test output";
         let proof = create_valid_proof(&model, input, output);
 
-        // A properly generated proof should verify
+        // The old test fixture is only a hash commitment, not a real proof.
         let result = verifier.verify_execution(&model, input, output, &proof);
         assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert!(!result.unwrap());
     }
 
     // ========== WP-X.6: Nonce-enhanced commitment tests ==========

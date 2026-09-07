@@ -18,7 +18,9 @@
 //! slots `COMMD_INDEX`/`DATACOMMIT_INDEX`. Production still owes the trusted-setup `.ptau` swap (drop
 //! Nova `test-utils`) and the consensus wiring of `0x0130`.
 
-use citrate_commd_fold::commd_fixed_fold::{FixedCommDFoldStep, COMMD_INDEX, DATACOMMIT_INDEX};
+use citrate_commd_fold::commd_fixed_fold::{
+    canonical_initial_state, FixedCommDFoldStep, COMMD_INDEX, DATACOMMIT_INDEX, MAX_DEPTH,
+};
 use citrate_commd_fold::{Scalar, E1, E2};
 use ff::PrimeField;
 use nova_snark::nova::{CompressedSNARK, VerifierKey};
@@ -42,6 +44,8 @@ pub enum VerifyError {
     Invalid,
     /// `depth` is inconsistent with the public-state arity (`z` too short for commD/dataCommit).
     BadArity,
+    /// The supplied initial state is not the canonical state for the leaf count/depth.
+    NonCanonicalInitialState,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -51,6 +55,7 @@ impl std::fmt::Display for VerifyError {
             VerifyError::NonCanonicalInput => "public input is not a canonical field element",
             VerifyError::Invalid => "fold proof did not verify",
             VerifyError::BadArity => "depth inconsistent with public-state arity",
+            VerifyError::NonCanonicalInitialState => "initial fold state is not canonical",
         };
         f.write_str(s)
     }
@@ -88,18 +93,28 @@ pub fn verify_fold_proof(
     vk_bytes: &[u8],
     proof_bytes: &[u8],
     num_steps: usize,
+    depth: usize,
     z0_be: &[[u8; 32]],
 ) -> Result<([u8; 32], [u8; 32]), VerifyError> {
-    let vk: Vk = bincode::deserialize(vk_bytes).map_err(|_| VerifyError::Decode)?;
-    let snark: Snark = bincode::deserialize(proof_bytes).map_err(|_| VerifyError::Decode)?;
+    if z0_be.len() != MAX_DEPTH + 7 {
+        return Err(VerifyError::BadArity);
+    }
 
     let z0: Vec<Scalar> = z0_be
         .iter()
         .map(|b| be_bytes_to_scalar(*b))
         .collect::<Result<_, _>>()?;
+    let canonical_z0 = canonical_initial_state(num_steps, depth)
+        .map_err(|_| VerifyError::NonCanonicalInitialState)?;
+    if z0 != canonical_z0 {
+        return Err(VerifyError::NonCanonicalInitialState);
+    }
+
+    let vk: Vk = bincode::deserialize(vk_bytes).map_err(|_| VerifyError::Decode)?;
+    let snark: Snark = bincode::deserialize(proof_bytes).map_err(|_| VerifyError::Decode)?;
 
     let zn = snark
-        .verify(&vk, num_steps, &z0)
+        .verify(&vk, num_steps, &canonical_z0)
         .map_err(|_| VerifyError::Invalid)?;
 
     if zn.len() <= DATACOMMIT_INDEX {
@@ -126,7 +141,7 @@ mod tests {
         let z0_be: Vec<[u8; 32]> = p.z0.iter().copied().map(scalar_to_be_bytes).collect();
 
         let (comm_d, data_commit) =
-            verify_fold_proof(&p.vk_bytes, &p.proof_bytes, p.num_steps, &z0_be)
+            verify_fold_proof(&p.vk_bytes, &p.proof_bytes, p.num_steps, p.depth, &z0_be)
                 .expect("valid proof must verify");
         assert_eq!(
             comm_d,
@@ -143,7 +158,7 @@ mod tests {
         let mut bad = p.proof_bytes.clone();
         bad[64] ^= 0x01;
         assert!(
-            verify_fold_proof(&p.vk_bytes, &bad, p.num_steps, &z0_be).is_err(),
+            verify_fold_proof(&p.vk_bytes, &bad, p.num_steps, p.depth, &z0_be).is_err(),
             "a tampered proof must not verify"
         );
     }
@@ -155,6 +170,15 @@ mod tests {
         assert_eq!(
             be_bytes_to_scalar(all_ff),
             Err(VerifyError::NonCanonicalInput)
+        );
+    }
+
+    #[test]
+    fn non_canonical_initial_state_is_rejected_before_proof_decode() {
+        let z0 = vec![[0u8; 32]; MAX_DEPTH + 7];
+        assert_eq!(
+            verify_fold_proof(&[], &[], 1, 0, &z0),
+            Err(VerifyError::NonCanonicalInitialState)
         );
     }
 }

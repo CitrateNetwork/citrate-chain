@@ -256,9 +256,9 @@ fn test_execution_proof_generation_and_verification() {
         provider,
     };
 
-    // Verify the proof
+    // A hash commitment is not a real execution proof; verification fails closed.
     let result = verifier.verify_execution(&model, input, output, &proof).unwrap();
-    assert!(result, "Valid proof should verify successfully");
+    assert!(!result, "legacy commitment must not verify as a real proof");
 }
 
 // ---------------------------------------------------------------------------

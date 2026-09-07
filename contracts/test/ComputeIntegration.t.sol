@@ -851,6 +851,12 @@ contract ComputeIntegrationTest is Test {
     function test_autoAssign_skipsDirectBidding() public {
         _registerProvider(provider1);
 
+        // CHAIN-B-C015 (HELD/reroll): auto-assignment requires provider
+        // consent. RC-8: this fixture previously encoded conscription
+        // without consent as the expected happy path.
+        vm.prank(provider1);
+        marketplace.setAutoAssignOptIn(true);
+
         vm.prank(requester);
         uint256 jobId = marketplace.autoAssignJob{value: TEST_PRICE}(
             modelHash, inputHash,

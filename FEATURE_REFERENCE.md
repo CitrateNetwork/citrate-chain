@@ -74,7 +74,7 @@ These addresses handle runtime AI operations (inference, ZK proofs):
 | 0x0101 | InferenceRunPrecompile | 10,000+ | Execute AI inference with ZK proof option |
 | 0x0102 | InferenceBatchPrecompile | 8,000 | Batch inference for efficiency |
 | 0x0103 | InferenceMetadataPrecompile | 3,000 | Query model metadata |
-| 0x0104 | InferenceVerifyPrecompile | 50,000 | Verify inference proof (Groth16, BLS12-381) |
+| 0x0104 | Retired legacy proof address | — | Disabled; caller-forgeable commitment route removed. Use the real 0x0108 verifier. |
 | 0x0105 | InferenceBenchmarkPrecompile | 6,000 | Benchmark model performance |
 | 0x0106 | InferenceEncryptPrecompile | 3,000 | Model encryption operations |
 
@@ -414,7 +414,7 @@ source of truth for any client default, SDK, wallet, or docs:
 - **Logging**: tracing
 
 ### Solidity
-- **Compiler**: solc 0.8.26
+- **Compiler**: solc 0.8.36 (pinned; see `contracts/foundry.toml`)
 - **EVM target**: Cancun
 - **Framework**: Foundry (forge build/test/deploy)
 

@@ -37,6 +37,15 @@ contract AIInferenceRouterPortable is IAIInferenceRouter {
     mapping(address => bool) public authorizedWorkers;
     uint256 public requestCount;
 
+    /// @notice C041: pull-payment credits. Excess over `maxPrice`, refunds from
+    ///         cancelled requests, and payouts whose push transfer failed all
+    ///         accrue here and are claimed via `withdraw` — nothing is stranded.
+    mapping(address => uint256) public pendingWithdrawals;
+
+    /// @notice How long a requester must wait before reclaiming an unfulfilled
+    ///         request's escrow. Compared against `block.timestamp` (seconds).
+    uint256 public constant REQUEST_TIMEOUT = 1 hours;
+
     error RequestNotFound(uint256 requestId);
     error AlreadyFulfilled(uint256 requestId);
     error ModelNotRegistered(bytes32 modelId);
@@ -45,6 +54,14 @@ contract AIInferenceRouterPortable is IAIInferenceRouter {
     error NotAuthorizedWorker(address worker);
     error InvalidSignature();
     error ZeroCommitment();
+    error NotRequester(uint256 requestId, address caller);
+    error TimeoutNotElapsed(uint256 requestId);
+    error NothingToWithdraw();
+    error WithdrawFailed();
+
+    event WithdrawalCredited(address indexed account, uint256 amount);
+    event Withdrawn(address indexed account, uint256 amount);
+    event RequestCancelled(uint256 indexed requestId, address indexed requester, uint256 refund);
 
     modifier onlyGovernance() {
         if (msg.sender != governance) revert NotGovernance();
@@ -101,7 +118,46 @@ contract AIInferenceRouterPortable is IAIInferenceRouter {
             exists: true
         });
 
+        // C041: refund any overpayment above `maxPrice` immediately (as a
+        // pull credit) — the escrow the router needs to hold is exactly
+        // `maxPrice`, and the surplus was previously locked forever.
+        uint256 excess = msg.value - maxPrice;
+        if (excess > 0) {
+            pendingWithdrawals[msg.sender] += excess;
+            emit WithdrawalCredited(msg.sender, excess);
+        }
+
         emit InferenceRequested(requestId, modelId, msg.sender);
+    }
+
+    /// @notice C041: reclaim the escrow of a request that was never fulfilled,
+    ///         once `REQUEST_TIMEOUT` has elapsed. Marks the request terminal so
+    ///         it can never later pay a worker, then credits the requester.
+    function cancelRequest(uint256 requestId) external {
+        InferenceRequest storage req = requests[requestId];
+        if (!req.exists) revert RequestNotFound(requestId);
+        if (req.fulfilled) revert AlreadyFulfilled(requestId);
+        if (msg.sender != req.requester) revert NotRequester(requestId, msg.sender);
+        if (block.timestamp < req.timestamp + REQUEST_TIMEOUT) revert TimeoutNotElapsed(requestId);
+
+        req.fulfilled = true; // terminal: no replay, no double-refund
+        uint256 refund = req.maxPrice;
+        if (refund > 0) {
+            pendingWithdrawals[req.requester] += refund;
+            emit WithdrawalCredited(req.requester, refund);
+        }
+        emit RequestCancelled(requestId, req.requester, refund);
+    }
+
+    /// @notice C041: claim accrued credits (excess refunds, cancelled escrows,
+    ///         and payouts whose push transfer failed).
+    function withdraw() external {
+        uint256 amount = pendingWithdrawals[msg.sender];
+        if (amount == 0) revert NothingToWithdraw();
+        pendingWithdrawals[msg.sender] = 0;
+        (bool ok, ) = msg.sender.call{value: amount}("");
+        if (!ok) revert WithdrawFailed();
+        emit Withdrawn(msg.sender, amount);
     }
 
     /// @inheritdoc IAIInferenceRouter
@@ -126,8 +182,12 @@ contract AIInferenceRouterPortable is IAIInferenceRouter {
         if (req.maxPrice > 0) {
             (bool sent,) = signer.call{value: req.maxPrice}("");
             if (!sent) {
-                // If transfer fails, allow governance to recover later
-                req.fulfilled = true; // Still mark fulfilled to prevent replay
+                // C041: credit the worker's pull-payment balance instead of
+                // silently swallowing the funds under a governance-recovery
+                // comment that was never implemented. The request stays
+                // fulfilled (replay-safe) and the worker claims via `withdraw`.
+                pendingWithdrawals[signer] += req.maxPrice;
+                emit WithdrawalCredited(signer, req.maxPrice);
             }
         }
 

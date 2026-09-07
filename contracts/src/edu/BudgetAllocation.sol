@@ -23,9 +23,17 @@ contract BudgetAllocation is IBudgetAllocation {
 
     mapping(uint256 => Budget) private _budgets;
 
+    /// @notice Governance-managed spender allowlist. Only an authorized
+    /// spender (or governance itself) may draw down a classroom budget.
+    /// Closes CHAIN-B-C006: `spendFromBudget` was permissionless, letting
+    /// any address exhaust any classroom's allocation.
+    mapping(address => bool) public authorizedSpender;
+
     error NotGovernance();
     error NotPendingGovernance();
+    error NotAuthorizedSpender();
     error ZeroGovernance();
+    error ZeroSpender();
     error BudgetNotActive();
     error BudgetAlreadyActive();
     error InsufficientBudget();
@@ -34,9 +42,18 @@ contract BudgetAllocation is IBudgetAllocation {
 
     event GovernanceProposed(address indexed pending);
     event GovernanceAccepted(address indexed previous, address indexed current);
+    event SpenderSet(address indexed spender, bool authorized);
 
     modifier onlyGovernance() {
         if (msg.sender != governance) revert NotGovernance();
+        _;
+    }
+
+    /// @dev Governance always counts as an authorized spender.
+    modifier onlySpender() {
+        if (msg.sender != governance && !authorizedSpender[msg.sender]) {
+            revert NotAuthorizedSpender();
+        }
         _;
     }
 
@@ -84,6 +101,14 @@ contract BudgetAllocation is IBudgetAllocation {
         return _budgets[classroomId].monthlyLimit;
     }
 
+    /// @notice Authorize (or revoke) an address permitted to call
+    /// `spendFromBudget`. Governance-only. Closes CHAIN-B-C006.
+    function setSpender(address spender, bool authorized) external onlyGovernance {
+        if (spender == address(0)) revert ZeroSpender();
+        authorizedSpender[spender] = authorized;
+        emit SpenderSet(spender, authorized);
+    }
+
     function allocateBudget(uint256 classroomId, uint256 amount, uint256 monthlyLimit) external onlyGovernance {
         if (amount == 0) revert ZeroAmount();
         Budget storage b = _budgets[classroomId];
@@ -94,7 +119,9 @@ contract BudgetAllocation is IBudgetAllocation {
     }
 
     /// @dev Reverts if spending would exceed allocated budget.
-    function spendFromBudget(uint256 classroomId, uint256 amount) external {
+    /// @dev Access-gated (CHAIN-B-C006): only governance or a
+    ///      governance-authorized spender may draw a classroom budget.
+    function spendFromBudget(uint256 classroomId, uint256 amount) external onlySpender {
         Budget storage b = _budgets[classroomId];
         if (!b.active) revert BudgetNotActive();
         if (amount == 0) revert ZeroAmount();

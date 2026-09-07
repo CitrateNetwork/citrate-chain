@@ -37,7 +37,7 @@ import {EntryPoint} from "@account-abstraction/core/EntryPoint.sol";
  *   DETERMINISM INPUTS (must be pinned; same set as script/Salts.sol):
  *     1. deployer — the Arachnid 0x4e59… factory (CREATE2 ignores broadcaster nonce).
  *     2. salt — Salts.salt("EntryPoint").
- *     3. creationCode — solc 0.8.26 + optimizer(200) + via_ir + bytecode_hash=none
+ *     3. creationCode — solc 0.8.36 + optimizer(200) + via_ir + bytecode_hash=none
  *        (foundry.toml [profile.default]). Do NOT deploy under FOUNDRY_PROFILE=citrate
  *        (optimizer_runs=10000) — that yields different bytecode and a different address.
  */

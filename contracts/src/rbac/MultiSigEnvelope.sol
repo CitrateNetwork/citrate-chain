@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import {QuorumIdentity} from "../quorum/QuorumIdentity.sol";
+
 /// @title MultiSigEnvelope — N-of-M signed decisions, cross-org
 /// @notice Generic multi-signer envelope generalizing Docusign+CLEAR
 ///         semantics. Any decision that requires multiple signers
@@ -98,6 +100,10 @@ contract MultiSigEnvelope {
     error InvalidStateForDeliver(EnvelopeState state);
     error InvalidStateForAcceptReject(EnvelopeState state);
     error InvalidStateForClose(EnvelopeState state);
+    /// CHAIN-B-C008: the caller does not own the `signer` identity it named.
+    error SignerNotCaller(bytes32 signer, address caller);
+    /// CHAIN-B-C008: the caller is not the envelope initiator.
+    error NotInitiator(bytes32 initiator, address caller);
 
     // ── Mutators ────────────────────────────────────────────────────
 
@@ -145,11 +151,18 @@ contract MultiSigEnvelope {
 
     /// @notice Sign an envelope. Transitions Drafted→Signing on first
     ///         signature; Signing→Signed when threshold reached.
-    /// @dev `signer` is the hashed identity of the signing party
-    ///      (typically `keccak256(user_id)`); the actual signature
-    ///      authentication is the caller's responsibility (the
-    ///      orchestrator's HSM verifies the cryptographic proof
-    ///      before invoking this method).
+    /// @dev `signer` is the hashed identity of the signing party — the
+    ///      canonical `QuorumIdentity.subjectKey(msg.sender)` of the caller.
+    ///
+    ///      CHAIN-B-C008 (audit 2026-09-02): `signer` USED to be an
+    ///      unauthenticated caller-supplied argument, so one address could
+    ///      drive any envelope to `Signed` by naming each required signer in
+    ///      turn — forging a full N-of-M multisig that `ThresholdApproval`,
+    ///      `SegregationOfDuties`, `ChangeControlBoard`, `SupplierAdmission`
+    ///      and `defense_prime/AppRegistry.deploy` then read on-chain as a governance
+    ///      verdict. The signature is now bound to `msg.sender`: the named
+    ///      `signer` MUST equal the caller's own subject key, so each required
+    ///      signer's signature can only be produced by that signer's address.
     function sign(
         bytes32 envelope_id,
         bytes32 signer,
@@ -165,6 +178,11 @@ contract MultiSigEnvelope {
             revert PastExpiry(e.expires_at, uint64(block.timestamp));
         }
         if (bytes(auth_mode).length == 0) revert EmptyAuthMode();
+        // CHAIN-B-C008: bind the signature to the caller. The named `signer`
+        // identity must be the caller's own canonical subject key.
+        if (signer != QuorumIdentity.subjectKey(msg.sender)) {
+            revert SignerNotCaller(signer, msg.sender);
+        }
         if (!_isRequiredSigner(e, signer)) revert NotRequiredSigner(signer);
         if (_alreadySigned(e, signer)) revert AlreadySigned(signer);
 
@@ -185,11 +203,16 @@ contract MultiSigEnvelope {
     }
 
     /// @notice Mark an envelope as delivered to the counterparty.
-    /// @dev Only callable on Signed-state envelopes.
+    /// @dev Only callable on Signed-state envelopes, and only by the
+    ///      envelope initiator (the drafting side delivers to its
+    ///      counterparty). CHAIN-B-C008: previously had no caller check.
     function markDelivered(bytes32 envelope_id) external {
         Envelope storage e = _envelopes[envelope_id];
         if (e.state == EnvelopeState.NotExist) revert DoesNotExist(envelope_id);
         if (e.state != EnvelopeState.Signed) revert InvalidStateForDeliver(e.state);
+        if (e.initiator != QuorumIdentity.subjectKey(msg.sender)) {
+            revert NotInitiator(e.initiator, msg.sender);
+        }
         EnvelopeState oldState = e.state;
         e.state = EnvelopeState.Delivered;
         emit EnvelopeStateChanged(envelope_id, oldState, e.state);
@@ -232,7 +255,14 @@ contract MultiSigEnvelope {
         ) {
             revert InvalidStateForClose(e.state);
         }
-        require(e.initiator == initiator, "MultiSigEnvelope: not initiator");
+        // CHAIN-B-C008: `initiator` used to be a caller-supplied argument
+        // compared against the public stored value, so anyone could close
+        // (and permanently kill) any pending approval. Bind close to the
+        // caller: the stored initiator must be the caller's own subject key.
+        if (e.initiator != initiator) revert NotInitiator(e.initiator, msg.sender);
+        if (e.initiator != QuorumIdentity.subjectKey(msg.sender)) {
+            revert NotInitiator(e.initiator, msg.sender);
+        }
         EnvelopeState oldState = e.state;
         e.state = EnvelopeState.Closed;
         emit EnvelopeStateChanged(envelope_id, oldState, e.state);

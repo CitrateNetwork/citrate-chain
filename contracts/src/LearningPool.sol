@@ -230,6 +230,39 @@ contract LearningPool is ReentrancyGuard {
         emit MemberLeft(poolId, msg.sender, stakeReturn);
     }
 
+    /// @notice CHAIN-B-C042: dissolve a pool and reclaim the creator's stake.
+    /// @dev `leavePool` forbids the creator and nothing else ever refunds them,
+    ///      so a creator's staked SALT was un-withdrawable by anyone. The creator
+    ///      may dissolve once they are the last member (everyone else has left),
+    ///      which ends their membership and returns their stake. INV-2 ("creator
+    ///      is always a member") continues to hold for a pool that still has
+    ///      other members.
+    /// @param poolId The pool to dissolve.
+    function dissolvePool(uint256 poolId)
+        external
+        nonReentrant
+        poolExists(poolId)
+        onlyCreator(poolId)
+    {
+        Pool storage pool = pools[poolId];
+        require(pool.state != PoolState.ActiveCycle, "Cannot dissolve during active cycle");
+        require(pool.memberCount == 1, "Members remain");
+
+        uint256 stakeReturn = stakes[poolId][msg.sender];
+        isMember[poolId][msg.sender] = false;
+        stakes[poolId][msg.sender] = 0;
+        pool.memberCount = 0;
+        pool.state = PoolState.Closed;
+
+        if (stakeReturn > 0) {
+            (bool success, ) = payable(msg.sender).call{value: stakeReturn}("");
+            require(success, "Stake transfer failed");
+        }
+
+        emit MemberLeft(poolId, msg.sender, stakeReturn);
+        emit PoolClosed(poolId);
+    }
+
     // ============================================================
     // Pool State Management
     // ============================================================

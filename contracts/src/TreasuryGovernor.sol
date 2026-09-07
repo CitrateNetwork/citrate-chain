@@ -69,7 +69,14 @@ contract TreasuryGovernor is ReentrancyGuard {
         TreasurySpend,
         ParameterChange,
         OracleUpdate,
-        Emergency
+        Emergency,
+        /// CHAIN-B-C030: generic (target, value, calldata) execution. Without
+        /// it, `execute` could only call `treasury.distribute`, so once a
+        /// Governable target's governance was handed to this governor, every
+        /// OTHER governance function on that target (e.g. `addStablecoin`,
+        /// `addOracle`/`removeOracle`, `emergencyWithdraw`) became permanently
+        /// unreachable — a documented-deployment-flow governance capture.
+        Call
     }
 
     enum ProposalState {
@@ -114,6 +121,10 @@ contract TreasuryGovernor is ReentrancyGuard {
         // For OracleUpdate proposals
         address oracleTarget;
         address newOracleAddress;
+        // CHAIN-B-C030: for Call proposals — an arbitrary governed-target call.
+        address callTarget;
+        uint256 callValue;
+        bytes callData;
     }
 
     struct Vote {
@@ -284,6 +295,35 @@ contract TreasuryGovernor is ReentrancyGuard {
         p.newOracleAddress = newOracle;
     }
 
+    /// @notice Create a generic Call proposal — CHAIN-B-C030.
+    /// @dev Executes `target.call{value}(data)` on success, after vote +
+    ///      timelock. This is what keeps every governance function on a
+    ///      Governable target reachable once its governance is transferred to
+    ///      this governor.
+    /// @param title Proposal title
+    /// @param description Proposal description
+    /// @param target Contract to call
+    /// @param value Native value to forward
+    /// @param data Calldata to invoke on `target`
+    /// @return proposalId The new proposal ID
+    function proposeCall(
+        string calldata title,
+        string calldata description,
+        address target,
+        uint256 value,
+        bytes calldata data
+    ) external payable returns (uint256 proposalId) {
+        require(target != address(0), "TreasuryGovernor: zero target");
+        require(data.length >= 4, "TreasuryGovernor: empty calldata");
+
+        proposalId = _createProposal(msg.sender, ProposalType.Call, title, description);
+
+        Proposal storage p = _proposals[proposalId];
+        p.callTarget = target;
+        p.callValue = value;
+        p.callData = data;
+    }
+
     /// @notice Create an Emergency proposal (requires 3x threshold)
     /// @param title Proposal title
     /// @param description Proposal description
@@ -320,6 +360,15 @@ contract TreasuryGovernor is ReentrancyGuard {
 
         uint256 weight = getVotingPower(msg.sender);
         require(weight > 0, "TreasuryGovernor: no voting power");
+
+        // Native SALT is not an ERC20Votes token and cannot be checkpointed
+        // by this contract. Bound aggregate counted voting power to the
+        // declared supply so the same balance cannot be recycled through
+        // fresh addresses to manufacture quorum.
+        require(
+            p.forVotes + p.againstVotes + p.abstainVotes + weight <= totalSaltSupply,
+            "TreasuryGovernor: voting power exceeds supply"
+        );
 
         hasVoted[proposalId][msg.sender] = true;
         votes[proposalId][msg.sender] = Vote({
@@ -380,6 +429,11 @@ contract TreasuryGovernor is ReentrancyGuard {
 
         if (p.proposalType == ProposalType.TreasurySpend) {
             _executeTreasurySpend(p);
+        } else if (p.proposalType == ProposalType.Call) {
+            // CHAIN-B-C030: generic on-chain execution of a governed-target
+            // call, so vote + timelock can reach any function on a target this
+            // governor governs.
+            _executeCall(p);
         }
         // ParameterChange, OracleUpdate, and Emergency proposals emit events
         // and are executed off-chain by the guardian/multisig reading the event
@@ -605,6 +659,20 @@ contract TreasuryGovernor is ReentrancyGuard {
         require(p.spendRecipients.length > 0, "TreasuryGovernor: no spend data");
 
         treasury.distribute(p.spendStablecoin, p.spendRecipients, p.spendAmounts);
+    }
+
+    /// @dev CHAIN-B-C030: execute a generic Call proposal.
+    function _executeCall(Proposal storage p) internal {
+        (bool ok, bytes memory ret) = p.callTarget.call{value: p.callValue}(p.callData);
+        if (!ok) {
+            // Bubble up the revert reason if any.
+            if (ret.length > 0) {
+                assembly {
+                    revert(add(ret, 0x20), mload(ret))
+                }
+            }
+            revert("TreasuryGovernor: call failed");
+        }
     }
 
     // ============================================================

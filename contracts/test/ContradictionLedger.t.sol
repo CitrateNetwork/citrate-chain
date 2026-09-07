@@ -28,6 +28,36 @@ contract ContradictionLedgerTest is Test {
         cl = new ContradictionLedger(governance);
         vm.prank(governance);
         cl.setResolver(resolver, true);
+        // CHAIN-B-C023: `report` is now detector-gated. Authorize this test
+        // contract (the default reporter for the happy-path cases below).
+        vm.prank(governance);
+        cl.setDetector(address(this), true);
+    }
+
+    // ── CHAIN-B-C023: report is detector-gated ─────────────────────
+
+    /// RED (pre-fix): `report` was fully permissionless, so any address could
+    /// push any subject to `Deny` via IncidentEscalation and grow the
+    /// unbounded `_by_subject` array to grief the policy check on gas. GREEN:
+    /// an unauthorized reporter is rejected.
+    function test_C023_report_requires_detector() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ContradictionLedger.NotDetector.selector, stranger));
+        cl.report(CON_A, SUBJECT, "lot_number", SOURCE_A, SOURCE_B, "1", "2", DETECTOR, CORR);
+        assertFalse(cl.exists(CON_A));
+    }
+
+    function test_C023_setDetector_onlyGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ContradictionLedger.NotGovernance.selector, stranger));
+        cl.setDetector(stranger, true);
+
+        // An authorized detector can file.
+        vm.prank(governance);
+        cl.setDetector(stranger, true);
+        vm.prank(stranger);
+        cl.report(CON_B, SUBJECT, "lot_number", SOURCE_A, SOURCE_B, "1", "2", DETECTOR, CORR);
+        assertTrue(cl.exists(CON_B));
     }
 
     // ── Constructor + governance ───────────────────────────────────

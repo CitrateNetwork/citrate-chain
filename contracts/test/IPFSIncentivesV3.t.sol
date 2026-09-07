@@ -365,6 +365,16 @@ contract IPFSIncentivesV3Test is Test {
         inc.challengePin{value: CHALLENGER_BOND}(pinner, cid, sector);
     }
 
+    function test_challengePin_rejects_closed_response_window() public {
+        _registerAndSeal(pinner);
+        _commit();
+        vm.roll(block.number + REVEAL_DELAY + WINDOW + 1);
+
+        vm.prank(challenger);
+        vm.expectRevert("Challenge window closed");
+        inc.challengePin{value: CHALLENGER_BOND}(pinner, cid, sector);
+    }
+
     /// Frivolous: challenger bonds against a pinner who IS storing; the pinner
     /// refutes (submitPoSt) → the challenger's bond is forfeit to the pinner.
     function test_frivolousChallenge_bondForfeitToPinner() public {
@@ -431,6 +441,48 @@ contract IPFSIncentivesV3Test is Test {
         inc.slash(pinner, cid, sector);
         uint256 cr = (BOND * CHALLENGER_BPS) / 10000;
         assertEq(inc.challengerCredit(pinner2), cr, "unbonded slash pays the caller");
+    }
+
+    /// A slot commit is single-use per pin. A second slash against the same
+    /// commit must not increment missed again or seize a healthy pinner's bond.
+    function test_slash_sameCommit_canOnlyBeEvaluatedOnce() public {
+        _registerAndSeal(pinner);
+        _commit();
+        vm.roll(block.number + REVEAL_DELAY + WINDOW + 1);
+
+        inc.slash(pinner, cid, sector);
+        // This fixture uses MAX_MISSED=0, so the first evaluation terminates
+        // the pin. A later call must still be impossible; deployments with a
+        // larger MAX_MISSED additionally hit the per-pin commit guard.
+        vm.expectRevert("Pin not active");
+        inc.slash(pinner, cid, sector);
+
+        (IPFSIncentivesV3.Status st, , uint64 missed, , uint256 bondHeld, ) =
+            inc.getPin(pinner, cid, sector);
+        assertEq(uint256(st), uint256(IPFSIncentivesV3.Status.Slashed));
+        assertEq(missed, 1);
+        assertEq(bondHeld, 0);
+    }
+
+    /// A successful PoSt consumes the current challenge for this pin; closing
+    /// that same window cannot later slash the pinner.
+    function test_slash_afterSuccessfulPoSt_sameCommit_reverts() public {
+        _registerAndSeal(pinner);
+        uint256 nonce = _commit();
+        vm.roll(block.number + REVEAL_DELAY);
+        vm.prank(pinner);
+        inc.submitPoSt(cid, sector, keccak256("R"), keccak256("C"), nonce, PROOF);
+
+        vm.roll(block.number + WINDOW + 1);
+        vm.expectRevert("Challenge answered");
+        inc.slash(pinner, cid, sector);
+    }
+
+    function test_commitChallenge_requiresRegisteredModel() public {
+        bytes32 unknownCid = keccak256("unregistered-model");
+        vm.expectRevert("Model not registered");
+        inc.commitChallenge(unknownCid, sector);
+        assertEq(inc.unallocatedSlotFunding(), 5_000 ether);
     }
 
     // ════════════════════════ Q2: CommD registrant bond ══════════════════════════
