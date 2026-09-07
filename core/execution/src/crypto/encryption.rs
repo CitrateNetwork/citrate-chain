@@ -13,6 +13,12 @@ use aes_gcm::{
 use rand::RngCore;
 use sha3::{Sha3_256, Digest};
 use primitive_types::{H256, H160};
+use std::collections::HashMap;
+
+use super::ecdh::{ECIES, ECIESMessage};
+
+/// Public keys used to wrap a model key for each authorized address.
+pub type RecipientPublicKeys = HashMap<H160, [u8; 33]>;
 
 /// Encrypted model structure for storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +81,18 @@ pub struct EncryptedKey {
 
     /// Ephemeral public key for ECDH (33 bytes)
     pub ephemeral_pubkey: Vec<u8>,
+
+    /// AES-GCM nonce for the ECIES key-wrap ciphertext.
+    #[serde(default)]
+    pub nonce: [u8; 12],
+
+    /// AES-GCM authentication tag for the ECIES key-wrap ciphertext.
+    #[serde(default)]
+    pub auth_tag: [u8; 16],
+
+    /// Key-wrap scheme version. Version 0 is the removed XOR format.
+    #[serde(default)]
+    pub version: u32,
 }
 
 /// Encrypted chunk data for IPFS storage
@@ -136,10 +154,25 @@ impl ModelEncryption {
     /// Encrypt model weights
     pub fn encrypt_model(
         &self,
+        _model_id: H256,
+        _model_data: &[u8],
+        _owner: H160,
+        _access_list: Vec<H160>,
+    ) -> Result<EncryptedModel> {
+        Err(anyhow!(
+            "recipient public keys are required; use encrypt_model_with_keys"
+        ))
+    }
+
+    /// Encrypt model weights and wrap the generated key with ECIES for every
+    /// authorized recipient. An address alone is not key-encryption material.
+    pub fn encrypt_model_with_keys(
+        &self,
         model_id: H256,
         model_data: &[u8],
         owner: H160,
         access_list: Vec<H160>,
+        recipient_public_keys: &RecipientPublicKeys,
     ) -> Result<EncryptedModel> {
         // Generate random AES-256 key
         let mut key_bytes = [0u8; 32];
@@ -201,23 +234,28 @@ impl ModelEncryption {
         }
 
         for recipient in &full_access_list {
-            // In production, this would use ECIES with the recipient's public key
-            // For now, we'll use a simplified approach
-            let encrypted_key = self.encrypt_key_for_recipient(&key_bytes, recipient)?;
+            let recipient_pubkey = recipient_public_keys
+                .get(recipient)
+                .ok_or_else(|| anyhow!("missing public key for recipient {}", recipient))?;
+            let encrypted_key = self.encrypt_key_for_recipient(
+                &key_bytes,
+                recipient,
+                recipient_pubkey,
+            )?;
             encrypted_keys.push(encrypted_key);
         }
 
         // Create metadata
         let metadata = EncryptionMetadata {
             algorithm: "AES-256-GCM".to_string(),
-            kdf: "Argon2id".to_string(),
+            kdf: "HKDF-SHA256".to_string(),
             encrypted_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
             original_size: model_data.len(),
             plaintext_hash,
-            version: 1,
+            version: 2,
         };
 
         Ok(EncryptedModel {
@@ -236,7 +274,7 @@ impl ModelEncryption {
     pub fn decrypt_model(
         &self,
         encrypted_model: &EncryptedModel,
-        _recipient_key: &[u8; 32],
+        recipient_key: &[u8; 32],
         recipient_address: H160,
     ) -> Result<Vec<u8>> {
         // Check access list
@@ -251,10 +289,7 @@ impl ModelEncryption {
             .ok_or_else(|| anyhow!("No encrypted key found for recipient"))?;
 
         // Decrypt the symmetric key
-        let symmetric_key = self.decrypt_key_for_recipient(
-            &encrypted_key.encrypted_key,
-            &encrypted_key.ephemeral_pubkey,
-        )?;
+        let symmetric_key = self.decrypt_key_for_recipient(encrypted_key, recipient_key)?;
 
         // Reconstruct full ciphertext with auth tag
         let mut full_ciphertext = encrypted_model.ciphertext.clone();
@@ -292,70 +327,62 @@ impl ModelEncryption {
     }
 
     /// Encrypt symmetric key for a recipient
-    fn encrypt_key_for_recipient(
+    pub fn encrypt_key_for_recipient(
         &self,
         symmetric_key: &[u8; 32],
         recipient: &H160,
+        recipient_pubkey: &[u8; 33],
     ) -> Result<EncryptedKey> {
-        // Generate ephemeral keypair for ECDH
-        let mut ephemeral_key = [0u8; 32];
-        OsRng.fill_bytes(&mut ephemeral_key);
-
-        // In production, this would:
-        // 1. Generate ephemeral ECDSA keypair
-        // 2. Perform ECDH with recipient's public key
-        // 3. Derive shared secret
-        // 4. Encrypt symmetric key with shared secret
-
-        // Simplified version for demonstration - just XOR with ephemeral key
-        let mut encrypted = Vec::new();
-        encrypted.extend_from_slice(symmetric_key);
-        for i in 0..32 {
-            encrypted[i] ^= ephemeral_key[i];
+        if !ECIES::validate_public_key(recipient_pubkey) {
+            return Err(anyhow!("invalid recipient public key"));
         }
 
-        // Store the ephemeral key so we can decrypt later
-        let mut ephemeral_pubkey = vec![0u8; 32];
-        ephemeral_pubkey.copy_from_slice(&ephemeral_key);
+        let ephemeral = ECIES::generate()?;
+        let message = ephemeral.encrypt(symmetric_key, recipient_pubkey)?;
 
         Ok(EncryptedKey {
             recipient: *recipient,
-            encrypted_key: encrypted,
-            ephemeral_pubkey,
+            encrypted_key: message.ciphertext,
+            ephemeral_pubkey: message.ephemeral_pubkey.to_vec(),
+            nonce: message.nonce,
+            auth_tag: message.auth_tag,
+            version: 1,
         })
     }
 
     /// Decrypt symmetric key for a recipient
-    fn decrypt_key_for_recipient(
+    pub fn decrypt_key_for_recipient(
         &self,
-        encrypted_key: &[u8],
-        ephemeral_pubkey: &[u8],
+        encrypted_key: &EncryptedKey,
+        recipient_key: &[u8; 32],
     ) -> Result<[u8; 32]> {
-        // In production, this would:
-        // 1. Use recipient's private key
-        // 2. Perform ECDH with ephemeral public key
-        // 3. Derive shared secret
-        // 4. Decrypt symmetric key
-
-        // Simplified version that reverses the XOR encryption
-        if encrypted_key.len() != 32 {
+        if encrypted_key.version != 1 {
+            return Err(anyhow!("unsupported or legacy key-wrap version"));
+        }
+        if encrypted_key.encrypted_key.len() != 32 {
             return Err(anyhow!("Invalid encrypted key length"));
         }
-
-        if ephemeral_pubkey.len() != 32 {
-            return Err(anyhow!("Invalid ephemeral key length"));
+        let ephemeral_pubkey: [u8; 33] = encrypted_key
+            .ephemeral_pubkey
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Invalid ephemeral public key length"))?;
+        if !ECIES::validate_public_key(&ephemeral_pubkey) {
+            return Err(anyhow!("Invalid ephemeral public key"));
         }
 
-        // Reverse the XOR operation from encrypt_key_for_recipient
-        let mut decrypted = [0u8; 32];
-        decrypted.copy_from_slice(encrypted_key);
-
-        // Apply XOR decryption using the ephemeral key
-        for i in 0..32 {
-            decrypted[i] ^= ephemeral_pubkey[i];
-        }
-
-        Ok(decrypted)
+        let recipient = ECIES::from_private_key(*recipient_key)?;
+        let message = ECIESMessage {
+            ephemeral_pubkey,
+            ciphertext: encrypted_key.encrypted_key.clone(),
+            auth_tag: encrypted_key.auth_tag,
+            nonce: encrypted_key.nonce,
+        };
+        let decrypted = recipient.decrypt(&message)?;
+        decrypted
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Invalid symmetric key length"))
     }
 
     /// Compress data using zstd
@@ -379,15 +406,30 @@ impl ModelEncryption {
         old_key: &[u8; 32],
         owner: H160,
     ) -> Result<EncryptedModel> {
+        let _ = (encrypted_model, old_key, owner);
+        Err(anyhow!(
+            "recipient public keys are required; use rotate_key_with_keys"
+        ))
+    }
+
+    /// Rotate the model key using the recipients' current public keys.
+    pub fn rotate_key_with_keys(
+        &self,
+        encrypted_model: &EncryptedModel,
+        old_key: &[u8; 32],
+        owner: H160,
+        recipient_public_keys: &RecipientPublicKeys,
+    ) -> Result<EncryptedModel> {
         // Decrypt with old key
         let plaintext = self.decrypt_model(encrypted_model, old_key, owner)?;
 
         // Re-encrypt with new key
-        self.encrypt_model(
+        self.encrypt_model_with_keys(
             encrypted_model.model_id,
             &plaintext,
             owner,
             encrypted_model.access_list.clone(),
+            recipient_public_keys,
         )
     }
 
@@ -396,6 +438,21 @@ impl ModelEncryption {
         &self,
         encrypted_model: &mut EncryptedModel,
         new_user: H160,
+        owner_key: &[u8; 32],
+        owner: H160,
+    ) -> Result<()> {
+        let _ = (encrypted_model, new_user, owner_key, owner);
+        Err(anyhow!(
+            "recipient public key is required; use grant_access_with_key"
+        ))
+    }
+
+    /// Add a user to the access list using that user's public key.
+    pub fn grant_access_with_key(
+        &self,
+        encrypted_model: &mut EncryptedModel,
+        new_user: H160,
+        new_user_pubkey: &[u8; 33],
         owner_key: &[u8; 32],
         owner: H160,
     ) -> Result<()> {
@@ -415,13 +472,14 @@ impl ModelEncryption {
             .find(|k| k.recipient == owner)
             .ok_or_else(|| anyhow!("Owner key not found"))?;
 
-        let symmetric_key = self.decrypt_key_for_recipient(
-            &encrypted_key.encrypted_key,
-            owner_key,
-        )?;
+        let symmetric_key = self.decrypt_key_for_recipient(encrypted_key, owner_key)?;
 
         // Encrypt for new user
-        let new_encrypted_key = self.encrypt_key_for_recipient(&symmetric_key, &new_user)?;
+        let new_encrypted_key = self.encrypt_key_for_recipient(
+            &symmetric_key,
+            &new_user,
+            new_user_pubkey,
+        )?;
 
         // Update access list
         encrypted_model.access_list.push(new_user);
@@ -437,6 +495,21 @@ impl ModelEncryption {
         revoked_user: H160,
         owner_key: &[u8; 32],
         owner: H160,
+    ) -> Result<EncryptedModel> {
+        let _ = (encrypted_model, revoked_user, owner_key, owner);
+        Err(anyhow!(
+            "recipient public keys are required; use revoke_access_with_keys"
+        ))
+    }
+
+    /// Re-encrypt a model after removing a user from its access list.
+    pub fn revoke_access_with_keys(
+        &self,
+        encrypted_model: &EncryptedModel,
+        revoked_user: H160,
+        owner_key: &[u8; 32],
+        owner: H160,
+        recipient_public_keys: &RecipientPublicKeys,
     ) -> Result<EncryptedModel> {
         // Verify owner
         if !encrypted_model.access_list.contains(&owner) {
@@ -457,11 +530,12 @@ impl ModelEncryption {
             .cloned()
             .collect();
 
-        self.encrypt_model(
+        self.encrypt_model_with_keys(
             encrypted_model.model_id,
             &plaintext,
             owner,
             new_access_list,
+            recipient_public_keys,
         )
     }
 
@@ -539,10 +613,17 @@ pub fn encrypt_model(
     model_data: &[u8],
     owner: H160,
     access_list: Vec<H160>,
+    recipient_public_keys: &RecipientPublicKeys,
 ) -> Result<EncryptedModel> {
     let model_id = H256::random();
     let encryption = ModelEncryption::new(EncryptionConfig::default());
-    encryption.encrypt_model(model_id, model_data, owner, access_list)
+    encryption.encrypt_model_with_keys(
+        model_id,
+        model_data,
+        owner,
+        access_list,
+        recipient_public_keys,
+    )
 }
 
 pub fn decrypt_model(
@@ -558,24 +639,37 @@ pub fn decrypt_model(
 mod tests {
     use super::*;
 
+    fn key_material() -> (H160, H160, RecipientPublicKeys, [u8; 32]) {
+        let owner = H160::random();
+        let user = H160::random();
+        let owner_private = [1u8; 32];
+        let user_private = [2u8; 32];
+        let owner_ecies = ECIES::from_private_key(owner_private).unwrap();
+        let user_ecies = ECIES::from_private_key(user_private).unwrap();
+        let keys = HashMap::from([
+            (owner, owner_ecies.public_key()),
+            (user, user_ecies.public_key()),
+        ]);
+        (owner, user, keys, owner_private)
+    }
+
     #[test]
     fn test_encrypt_decrypt() {
         let model_data = b"test model weights";
-        let owner = H160::random();
-        let user = H160::random();
+        let (owner, user, public_keys, owner_key) = key_material();
 
         // Encrypt
         let encrypted = encrypt_model(
             model_data,
             owner,
             vec![user],
+            &public_keys,
         ).unwrap();
 
         assert_ne!(encrypted.ciphertext, model_data);
         assert_eq!(encrypted.access_list.len(), 2); // owner + user
 
         // Decrypt
-        let owner_key = [1u8; 32];
         let decrypted = decrypt_model(
             &encrypted,
             &owner_key,
@@ -595,6 +689,10 @@ mod tests {
             model_data,
             owner,
             vec![], // Only owner has access
+            &HashMap::from([(
+                owner,
+                ECIES::from_private_key([1u8; 32]).unwrap().public_key(),
+            )]),
         ).unwrap();
 
         // Unauthorized user should fail
@@ -607,5 +705,17 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[test]
+    fn test_legacy_api_fails_closed() {
+        let encryption = ModelEncryption::new(EncryptionConfig::default());
+        let result = encryption.encrypt_model(
+            H256::random(),
+            b"model",
+            H160::random(),
+            vec![],
+        );
+        assert!(result.unwrap_err().to_string().contains("public keys are required"));
     }
 }
