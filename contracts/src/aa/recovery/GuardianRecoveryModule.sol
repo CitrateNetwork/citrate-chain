@@ -52,6 +52,15 @@ contract GuardianRecoveryModule is IValidator, IHook {
     uint256 internal constant MIN_GUARDIANS = 2;
     uint256 internal constant MAX_GUARDIANS = 7;
 
+    // --- CHAIN-B-C032: recovery-action allowlist ---
+    /// Kernel `execute(bytes32 execMode, bytes executionData)` selector — the
+    /// only outer call a recovery UserOp may carry.
+    bytes4 internal constant EXECUTE_SELECTOR = bytes4(keccak256("execute(bytes32,bytes)"));
+    /// Kernel `changeRootValidator(bytes21,address,bytes,bytes)` selector — the
+    /// only inner action guardians may authorize (rotate the primary signer).
+    bytes4 internal constant CHANGE_ROOT_SELECTOR =
+        bytes4(keccak256("changeRootValidator(bytes21,address,bytes,bytes)"));
+
     // --- Errors ---
     error AlreadyInstalled(address smartAccount);
     error InvalidInstallData();
@@ -176,6 +185,21 @@ contract GuardianRecoveryModule is IValidator, IHook {
         RecoveryConfig storage cfg = _config[msg.sender];
         if (cfg.count == 0) return SIG_VALIDATION_FAILED_UINT;
 
+        // CHAIN-B-C032 (audit 2026-09-02): constrain WHAT a guardian quorum may
+        // authorize. Previously the module returned success for ANY userOpHash
+        // M guardians signed and never inspected `userOp.callData`, so a
+        // colluding / phished 2-of-3 could sign a recovery op whose callData
+        // drains the wallet (arbitrary `execute` target) or delegatecalls
+        // attacker code — the "rotate the primary signer" constraint lived only
+        // in the frontend. The chain now enforces it: the op must be a single,
+        // non-delegatecall `execute` to the account ITSELF, zero value, whose
+        // inner call is `changeRootValidator`. Anything else fails closed.
+        // (A per-account recovery timelock with an owner-cancel window is a
+        // separate OWNER/reroll follow-up; this closes the drain surface.)
+        if (!_isAllowedRecoveryAction(userOp.callData, msg.sender)) {
+            return SIG_VALIDATION_FAILED_UINT;
+        }
+
         uint8 threshold = cfg.threshold;
         bytes calldata blob = userOp.signature;
         if (blob.length != uint256(threshold) * 65) return SIG_VALIDATION_FAILED_UINT;
@@ -256,6 +280,47 @@ contract GuardianRecoveryModule is IValidator, IHook {
             if (cfg.guardians[i] == signer) return i;
         }
         return type(uint8).max;
+    }
+
+    /// CHAIN-B-C032: true iff `cd` is a single, non-delegatecall Kernel
+    /// `execute` to `account` itself, with zero value, whose inner call is
+    /// `changeRootValidator`. Fails closed (returns false) on any malformed or
+    /// non-conforming callData. `executionData` for a single call is
+    /// `abi.encodePacked(target(20), value(32), innerCallData)`.
+    function _isAllowedRecoveryAction(bytes calldata cd, address account) internal pure returns (bool) {
+        // selector(4) + mode(32) + offset(32) + length(32) minimum.
+        if (cd.length < 100) return false;
+        if (bytes4(cd[0:4]) != EXECUTE_SELECTOR) return false;
+
+        // ERC-7579 ModeCode: the most-significant byte is the CallType.
+        // 0x00 = single (revert-default); reject batch (0x01) and
+        // delegatecall (0xff).
+        if (cd[4] != bytes1(0x00)) return false;
+
+        // Offset to the `executionData` dynamic argument, relative to the
+        // start of the args region (immediately after the 4-byte selector).
+        uint256 offset = uint256(bytes32(cd[36:68]));
+        uint256 lenPos = 4 + offset;
+        if (lenPos + 32 < lenPos) return false; // overflow guard
+        if (cd.length < lenPos + 32) return false;
+
+        uint256 execLen = uint256(bytes32(cd[lenPos:lenPos + 32]));
+        uint256 dataStart = lenPos + 32;
+        if (dataStart + execLen < dataStart) return false; // overflow guard
+        if (cd.length < dataStart + execLen) return false;
+
+        // Need target(20) + value(32) + inner selector(4) at minimum.
+        if (execLen < 56) return false;
+
+        address target = address(bytes20(cd[dataStart:dataStart + 20]));
+        uint256 value = uint256(bytes32(cd[dataStart + 20:dataStart + 52]));
+        bytes4 innerSelector = bytes4(cd[dataStart + 52:dataStart + 56]);
+
+        if (target != account) return false; // must be a self-call
+        if (value != 0) return false; // no value transfer
+        if (innerSelector != CHANGE_ROOT_SELECTOR) return false; // rotate only
+
+        return true;
     }
 
     // --- IValidator: EIP-1271 ---
