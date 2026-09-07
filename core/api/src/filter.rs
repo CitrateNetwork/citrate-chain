@@ -346,7 +346,10 @@ mod tests {
             .map(|_| registry.new_block_filter(1).expect("under cap"))
             .collect();
         let sequential: Vec<u64> = (1..=8).collect();
-        assert_ne!(ids, sequential, "filter ids must not be a sequential counter");
+        assert_ne!(
+            ids, sequential,
+            "filter ids must not be a sequential counter"
+        );
         assert!(
             ids.iter().all(|&id| id > 0xffff),
             "filter ids must be unguessable, not trivially-enumerable small integers"

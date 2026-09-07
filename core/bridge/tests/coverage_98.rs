@@ -428,7 +428,7 @@ fn test_oracle_registry_set_threshold() {
         let k = test_signing_key(60 + i);
         registry
             .register_oracle(k.verifying_key().to_bytes(), format!("O{i}"))
-            .unwrap();
+            .expect("register oracle");
     }
     registry
         .set_threshold(5)

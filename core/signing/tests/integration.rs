@@ -34,7 +34,10 @@ fn d022_debug_redacts_secrets() {
         !dbg.contains("shhhhhhhhhhhh-this-is-a-test-secret"),
         "webhook_secret leaked in Debug: {dbg}"
     );
-    assert!(dbg.contains("<redacted>"), "secrets must be redacted: {dbg}");
+    assert!(
+        dbg.contains("<redacted>"),
+        "secrets must be redacted: {dbg}"
+    );
     // Non-secret fields are still visible.
     assert!(dbg.contains("demo.docusign.net"));
 }

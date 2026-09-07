@@ -168,8 +168,7 @@ impl ProviderRegistry {
         // CHAIN-B-D017: compute in u128 to avoid the multiply overflowing (the
         // crate builds release with `overflow-checks = true`, so an
         // attacker-influenced `latency` would panic the node).
-        score.average_latency = ((score.average_latency as u128
-            * (score.total_jobs as u128 - 1)
+        score.average_latency = ((score.average_latency as u128 * (score.total_jobs as u128 - 1)
             + latency as u128)
             / score.total_jobs as u128) as u64;
         score.last_active = chrono::Utc::now().timestamp() as u64;
@@ -341,7 +340,10 @@ mod tests {
         cap.total_compute = 1;
         let score = registry.calculate_provider_score(&cap, None);
         assert!(score.is_finite(), "score must be finite");
-        assert!(score <= 100.0, "capacity ratios must be clamped, got {score}");
+        assert!(
+            score <= 100.0,
+            "capacity ratios must be clamped, got {score}"
+        );
 
         // Attacker: zero denominator -> would be NaN pre-fix.
         let mut cap0 = create_test_provider(2, 16, 100).capacity;
