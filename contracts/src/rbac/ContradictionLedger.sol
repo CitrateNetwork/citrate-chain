@@ -63,6 +63,14 @@ contract ContradictionLedger {
     /// @notice Authorized resolvers (admin set; report() is open-permission).
     mapping(address => bool) public is_resolver;
 
+    /// @notice Authorized contradiction detectors. CHAIN-B-C023: `report`
+    ///         USED to be fully permissionless, letting anyone push any
+    ///         subject to `Deny` through `IncidentEscalation.check` and, by
+    ///         filing thousands of reports, grow the unbounded `_by_subject`
+    ///         array until the policy check runs out of gas permanently. Only
+    ///         governance-authorized detectors may now file.
+    mapping(address => bool) public is_detector;
+
     /// @notice Governance admin (root-tenant multi-sig executor).
     address public governance;
 
@@ -87,11 +95,14 @@ contract ContradictionLedger {
         bytes32 indexed corr_id
     );
     event ResolverSet(address indexed resolver, bool authorized);
+    event DetectorSet(address indexed detector, bool authorized);
 
     // ── Errors ──────────────────────────────────────────────────────
 
     error NotGovernance(address caller);
     error NotResolver(address caller);
+    /// CHAIN-B-C023: caller is not an authorized contradiction detector.
+    error NotDetector(address caller);
     error ZeroGovernance();
     error AlreadyExists(bytes32 contradiction_id);
     error DoesNotExist(bytes32 contradiction_id);
@@ -162,6 +173,15 @@ contract ContradictionLedger {
         emit ResolverSet(resolver, authorized);
     }
 
+    /// @notice Authorize or de-authorize a contradiction detector.
+    ///         CHAIN-B-C023: gates `report` so open-contradiction griefing
+    ///         and unbounded-array gas exhaustion require an authorized key.
+    function setDetector(address detector, bool authorized) external {
+        if (msg.sender != governance) revert NotGovernance(msg.sender);
+        is_detector[detector] = authorized;
+        emit DetectorSet(detector, authorized);
+    }
+
     // ── Mutators ────────────────────────────────────────────────────
 
     /// @notice Open-permission report. Any attested source can report
@@ -180,6 +200,10 @@ contract ContradictionLedger {
         bytes32 detected_by,
         bytes32 corr_id
     ) external {
+        // CHAIN-B-C023: only authorized detectors may file. Closes the
+        // permissionless forced-`Deny` grief and the unbounded `_by_subject`
+        // growth that could brick `IncidentEscalation.check` on gas.
+        if (!is_detector[msg.sender]) revert NotDetector(msg.sender);
         if (_contradictions[contradiction_id].exists) {
             revert AlreadyExists(contradiction_id);
         }

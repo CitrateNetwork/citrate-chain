@@ -58,6 +58,8 @@ contract SeedTemplatesStateTest is Test {
 
         ledger = new ContradictionLedger(address(this));
         ledger.setResolver(address(this), true);
+        // CHAIN-B-C023: report is now detector-gated.
+        ledger.setDetector(address(this), true);
         bytes32[] memory responders = new bytes32[](1);
         responders[0] = RESPONDER;
         ie = new IncidentEscalation(
