@@ -16,7 +16,20 @@ library P256 {
     ) internal view returns (bool) {
         bytes memory args = abi.encode(message_hash, r, s, x, y);
         (bool success, bytes memory ret) = VERIFIER.staticcall(args);
-        assert(success); // never reverts, always returns 0 or 1
+        // CHAIN-B-C031 (audit 2026-09-02): fail CLOSED rather than revert. A
+        // `staticcall` to a codeless address returns `success == true` with
+        // EMPTY returndata, so the previous `assert(success); abi.decode(ret)`
+        // reverted inside the EntryPoint validation phase whenever the RIP-7212
+        // verifier at VERIFIER was absent — permanently freezing every wallet
+        // whose root validator is the passkey validator. Returning `false` on a
+        // short/failed response surfaces as SIG_VALIDATION_FAILED instead of a
+        // hard revert, so the account stays recoverable.
+        // OWNER/reroll-provisioning: the P-256 verifier MUST be deployed at
+        // VERIFIER on chain 40204 for passkey signatures to ever succeed; this
+        // fallback only prevents the freeze, it does not substitute for it.
+        if (!success || ret.length != 32) {
+            return false;
+        }
 
         return abi.decode(ret, (uint256)) == 1;
     }
