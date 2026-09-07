@@ -2923,14 +2923,20 @@ pub fn register_eth_methods(
                 now,
             );
 
+            // This method validates its inputs but does NOT persist anything —
+            // there is no institutional-operator registry on the node. Returning
+            // "registered"/"isActive: true" for a no-op let callers believe an
+            // (unauthenticated) onboarding had happened. Report the request as
+            // accepted-but-not-persisted so no downstream system treats it as a
+            // confirmed registration.
+            // OWNER: persist behind require_operator_auth, or remove the method.
             Ok(json!({
-                "status": "registered",
+                "status": "not_persisted",
+                "persisted": false,
+                "note": "input validated only; no institutional-operator registry is implemented on this node",
                 "institutionName": profile.institution_name,
                 "contactEmail": profile.contact_email,
                 "operatorAddress": format!("0x{}", hex::encode(addr_arr)),
-                "registeredAt": profile.registered_at,
-                "isActive": profile.is_active,
-                "currentEpoch": profile.current_epoch,
             }))
         });
     }

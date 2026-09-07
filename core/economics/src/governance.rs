@@ -376,14 +376,31 @@ impl GovernanceManager {
 
     /// Update governance configuration via executed proposal
     pub fn update_config(&mut self, parameter: &str, value: U256) -> Result<()> {
+        // Governance values arrive as U256. `value.as_u64()` PANICS above
+        // u64::MAX, and `as u8` silently truncates (256 -> 0), which would set
+        // quorum/approval to 0% and make every future proposal pass trivially.
+        // Guard the width- and range-sensitive parameters explicitly.
+        let as_u64 = |v: U256| -> Result<u64> {
+            if v > U256::from(u64::MAX) {
+                return Err(anyhow!("value {} exceeds u64::MAX for '{}'", v, parameter));
+            }
+            Ok(v.low_u64())
+        };
+        let as_percentage = |v: U256| -> Result<u8> {
+            let n = as_u64(v)?;
+            if !(1..=100).contains(&n) {
+                return Err(anyhow!("percentage {} out of range 1..=100 for '{}'", n, parameter));
+            }
+            Ok(n as u8)
+        };
         match parameter {
             "proposal_threshold" => self.config.proposal_threshold = value,
             "vote_threshold" => self.config.vote_threshold = value,
-            "voting_period" => self.config.voting_period = value.as_u64(),
-            "execution_delay" => self.config.execution_delay = value.as_u64(),
-            "quorum_percentage" => self.config.quorum_percentage = value.as_u64() as u8,
-            "approval_threshold" => self.config.approval_threshold = value.as_u64() as u8,
-            "grace_period" => self.config.grace_period = value.as_u64(),
+            "voting_period" => self.config.voting_period = as_u64(value)?,
+            "execution_delay" => self.config.execution_delay = as_u64(value)?,
+            "quorum_percentage" => self.config.quorum_percentage = as_percentage(value)?,
+            "approval_threshold" => self.config.approval_threshold = as_percentage(value)?,
+            "grace_period" => self.config.grace_period = as_u64(value)?,
             _ => return Err(anyhow!("Unknown parameter: {}", parameter)),
         }
         Ok(())

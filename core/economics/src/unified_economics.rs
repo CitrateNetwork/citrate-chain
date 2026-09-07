@@ -343,7 +343,10 @@ impl UnifiedEconomicsManager {
         let history = self.gas_usage_history.get(address);
         if let Some(history) = history {
             let recent_usage: U256 = history.iter()
-                .filter(|(height, _)| block_height - height <= 100) // Last 100 blocks
+                // saturating_sub: `block_height - height` underflows (and panics
+                // under overflow-checks) when a recorded height is above the
+                // query height — reachable via getVotingPower's hard-coded 0.
+                .filter(|(height, _)| block_height.saturating_sub(*height) <= 100) // Last 100 blocks
                 .map(|(_, gas)| *gas)
                 .fold(U256::zero(), |acc, x| acc + x);
 
