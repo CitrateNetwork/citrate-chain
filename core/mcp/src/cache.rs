@@ -433,11 +433,17 @@ mod tests {
         let id = ModelId([7u8; 32]);
         let model = create_test_model([7u8; 32], 500);
 
-        cache.put(id, model.clone()).await.unwrap();
+        cache
+            .put(id, model.clone())
+            .await
+            .expect("first put under cap");
         let size_after_first = cache.stats().await.current_size;
 
         for _ in 0..5 {
-            cache.put(id, model.clone()).await.unwrap();
+            cache
+                .put(id, model.clone())
+                .await
+                .expect("re-put under cap");
         }
 
         let stats = cache.stats().await;

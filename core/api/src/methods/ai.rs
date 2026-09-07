@@ -723,10 +723,7 @@ impl AiApi {
         }
         // CHAIN-B-D006: clamp caller-supplied `max_tokens` to a hard ceiling so
         // it cannot drive an unbounded blocking subprocess on a sync RPC worker.
-        let max_tokens = request
-            .max_tokens
-            .unwrap_or(512)
-            .min(MAX_COMPLETION_TOKENS);
+        let max_tokens = request.max_tokens.unwrap_or(512).min(MAX_COMPLETION_TOKENS);
         // For streaming responses, we'd need WebSocket support
         if request.stream.unwrap_or(false) {
             return Err(ApiError::InternalError(

@@ -228,10 +228,7 @@ async fn require_rest_api_key(
             // byte-by-byte — the same class the operator-token and RPC api_key
             // compares already close. This is the third credential.
             Some(token)
-                if crate::server::constant_time_eq(
-                    token.as_bytes(),
-                    expected_key.as_bytes(),
-                ) =>
+                if crate::server::constant_time_eq(token.as_bytes(), expected_key.as_bytes()) =>
             {
                 Ok(next.run(req).await)
             }
