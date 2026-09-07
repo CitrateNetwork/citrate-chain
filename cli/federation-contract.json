@@ -61,8 +61,8 @@
     "CapabilityGrant": "0x260ffedd17cd05a2e4daa41e1339c19a083f9e57",
     "VoteAllowance": "0x1dc147b73863b1fc662bc9172b19193b4865af5f",
     "Sortition": "0xadc2e3849d10cfdc3b83e5c3fe650b29f0478e54",
-    "PatronageLedger": "0xdcd9eea1693121aedc32bfdc6bbe6ad939912cdc",
-    "ModelCooperative": "0x3dcbd520ac344ae34386fc455d6534667289ab40",
+    "PatronageLedger": "0x726f2c8a0bfa4145dca7c154577705803c8dafa3",
+    "ModelCooperative": "0x54b70368373b0b22ac8ad9882961228d790133bf",
     "FacilitySBTImpl": "0xa8ad418a0be3877a797f183bade8dc52b1608ad0",
     "NetworkSBTImpl": "0x3a6ff326f83cd77ed936dcb1620ece2f5b41d7af",
     "FacilitySBT": "0x2520b5307752318b03047cf547b38b99311f65fb",
@@ -70,7 +70,9 @@
     "CitrateMemberSBT": "0xf0badd9eed5a81871a2f0d309b1f0a225646448a",
     "MemberBond": "0x7d6b92757e928ab4207be3b54166ecd2c491aa92",
     "MembershipStakeVaultImpl": "0x72035977f3ec295c70e2a734acbdffb0c98e6f0b",
-    "MembershipStakeVault": "0x53fb4badffaceedd575d47d0e74bb721504f786e"
+    "MembershipStakeVault": "0x53fb4badffaceedd575d47d0e74bb721504f786e",
+    "CitrateCooperativeFactory": "0x3b88731d65f044cc43c5d4589212c0f32a8c1667",
+    "CoopDeployer": "0xd7cbaeb1c1d3a3a12707297a96ae454b37ec56fe"
   },
   "aaStack": {
     "EntryPoint": "0x97d5391a647429233e202f99231743c53a648f3c",
@@ -139,7 +141,7 @@
     "deployer": "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732",
     "deployedAt": "2026-09-07T20:37:05Z",
     "sourceHashes": {
-      "chainAddresses": "24cd0bb21781f078800b96ec09d7acdc27c693cf4bbfbdfcaed797b1715e6bf1",
+      "chainAddresses": "84d6832ba0e9a66bfb240426bbc9064765cbef3ebcf948d1aaadaf6db9371be2",
       "entitlements": "d7c1167466eafbc3d2f8233c2adc32d310b4c73026b998e46e1b4f0c1fa461a1"
     }
   }
