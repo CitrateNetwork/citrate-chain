@@ -571,6 +571,16 @@ contract ComputeMarketplaceTest is Test {
         _registerProvider(provider1);
         _registerProvider(provider2);
 
+        // CHAIN-B-C015 (HELD/reroll): auto-assignment now requires the
+        // provider's explicit consent (a provider must not be conscripted
+        // into a slashable-deadline job without opting in). RC-8: this
+        // fixture previously encoded conscription-without-consent as the
+        // expected happy path.
+        vm.prank(provider1);
+        marketplace.setAutoAssignOptIn(true);
+        vm.prank(provider2);
+        marketplace.setAutoAssignOptIn(true);
+
         vm.prank(requester);
         uint256 jobId = marketplace.autoAssignJob{value: 5 ether}(
             modelHash,
