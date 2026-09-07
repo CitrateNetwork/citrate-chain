@@ -107,6 +107,13 @@ contract MentorMatcher {
     /// this is at-most-one.
     mapping(address => address) public menteeMentor;
 
+    /// Governance-managed matcher allowlist. Only an authorized matcher
+    /// (or governance itself) may commit pairings via `assignMentees`.
+    /// Closes CHAIN-B-C007: the create path was permissionless, letting
+    /// any address forge pairings, saturate mentors and front-run the
+    /// honest matcher daemon.
+    mapping(address => bool) public authorizedMatcher;
+
     /// Address of the ContributionAccounting contract used by the
     /// lazy-profile views (WP-4.9). Zero until wired by governance —
     /// the matcher otherwise functions normally; only the lazy
@@ -158,6 +165,7 @@ contract MentorMatcher {
     // ============================================================
 
     error NotGovernance();
+    error NotAuthorizedMatcher(address caller);
     error MentorAtCapacity(address mentor);
     error AccuracyGapTooSmall(uint32 mentorAcc, uint32 menteeAcc);
     error MentorBelowTrustFloor(address mentor, uint32 mentorAcc);
@@ -176,6 +184,25 @@ contract MentorMatcher {
     modifier onlyGovernance() {
         if (msg.sender != governance) revert NotGovernance();
         _;
+    }
+
+    /// Governance is always an authorized matcher. Closes CHAIN-B-C007.
+    modifier onlyMatcher() {
+        if (msg.sender != governance && !authorizedMatcher[msg.sender]) {
+            revert NotAuthorizedMatcher(msg.sender);
+        }
+        _;
+    }
+
+    /// Emitted when governance changes the matcher allowlist.
+    event MatcherSet(address indexed matcher, bool authorized);
+
+    /// Authorize (or revoke) an address permitted to call `assignMentees`.
+    /// Governance-only. Closes CHAIN-B-C007.
+    function setMatcher(address matcher, bool authorized) external onlyGovernance {
+        require(matcher != address(0), "MentorMatcher: zero matcher");
+        authorizedMatcher[matcher] = authorized;
+        emit MatcherSet(matcher, authorized);
     }
 
     // ============================================================
@@ -336,7 +363,7 @@ contract MentorMatcher {
         uint32 mentorAcc,
         uint32[] calldata menteeAccs,
         bytes32 dimension
-    ) external {
+    ) external onlyMatcher {
         require(
             mentees.length == menteeAccs.length,
             "MentorMatcher: length mismatch"

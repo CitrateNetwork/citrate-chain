@@ -17,6 +17,39 @@ contract BudgetCashoutTest is Test {
     function setUp() public {
         budget = new BudgetAllocation(governance);
         cashout = new CashoutRequest(governance, 100); // $0.01 per SALT
+        // CHAIN-B-C006 RC-8: spendFromBudget is now access-gated. These
+        // fixtures previously encoded permissionless spend as the spec;
+        // authorize the test contract as a governance-blessed spender so
+        // the spend-logic tests exercise the guarded path.
+        vm.prank(governance);
+        budget.setSpender(address(this), true);
+    }
+
+    // ── CHAIN-B-C006: spend authorization ──────────────────────────────
+
+    function test_c006_unauthorized_spender_reverts() public {
+        vm.prank(governance);
+        budget.allocateBudget(0, 1000, 100);
+        // `nobody` is not a governance-authorized spender.
+        vm.prank(nobody);
+        vm.expectRevert(BudgetAllocation.NotAuthorizedSpender.selector);
+        budget.spendFromBudget(0, 1000);
+        // Budget untouched.
+        assertEq(budget.getRemaining(0), 1000);
+    }
+
+    function test_c006_governance_can_spend_directly() public {
+        vm.prank(governance);
+        budget.allocateBudget(0, 1000, 100);
+        vm.prank(governance);
+        budget.spendFromBudget(0, 400);
+        assertEq(budget.getRemaining(0), 600);
+    }
+
+    function test_c006_setSpender_only_governance() public {
+        vm.prank(nobody);
+        vm.expectRevert(BudgetAllocation.NotGovernance.selector);
+        budget.setSpender(nobody, true);
     }
 
     // ===================================================================
