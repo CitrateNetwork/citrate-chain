@@ -258,8 +258,18 @@ impl OracleRegistry {
     }
 
     /// Update the threshold.
-    pub fn set_threshold(&mut self, threshold: usize) {
+    ///
+    /// CHAIN-B-D020: reject `0` (which would degrade the M-of-N gate to
+    /// 0-of-N — every event mints with zero attestations) and any value above
+    /// the active-oracle count (unreachable, so nothing would ever mint).
+    /// Previously this was an unbounded, unauthenticated setter.
+    pub fn set_threshold(&mut self, threshold: usize) -> Result<(), BridgeError> {
+        let active = self.active_oracle_count();
+        if threshold == 0 || threshold > active {
+            return Err(BridgeError::InvalidThreshold { threshold, active });
+        }
         self.threshold = threshold;
+        Ok(())
     }
 
     /// Submit an attestation from an oracle.
@@ -391,6 +401,13 @@ impl OracleRegistry {
     /// different events (which silently degraded to 1-of-N for the
     /// integrity-critical fields).
     pub fn is_threshold_met_for(&self, event_id: &EventId, expected_hash: &[u8; 32]) -> bool {
+        // CHAIN-B-D020: fail closed on a zero threshold. `matching_attestation_count`
+        // returns 0 for an event with no attestations, and `0 >= 0` is `true` —
+        // so a threshold of 0 would mint every event with zero attestations.
+        // A mint gate must never be satisfiable by the absence of attestations.
+        if self.threshold == 0 {
+            return false;
+        }
         self.matching_attestation_count(event_id, expected_hash) >= self.threshold
     }
 

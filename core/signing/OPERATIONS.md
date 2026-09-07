@@ -147,7 +147,7 @@ sourced by systemd):
 | `DOCUSIGN_ACCOUNT_ID` | yes | Account GUID from the Docusign admin console |
 | `DOCUSIGN_ACCESS_TOKEN` | yes | OAuth 2.0 JWT bearer — refreshed periodically |
 | `DOCUSIGN_WEBHOOK_SECRET` | yes | HMAC signing key — matches Connect endpoint config |
-| `DOCUSIGN_CLEAR_RBV_ENABLED` | optional | `true` if CLEAR RBV is enabled on this tenant; default `false` (downgrades High → Medium) |
+| `DOCUSIGN_CLEAR_RBV_ENABLED` | **required** (`true`/`false`) | `true` if CLEAR RBV is enabled on this tenant; `false` downgrades High → Medium. CHAIN-B-D022: hard-fails if unset — no silent default. |
 
 `DocusignConfig::from_env()` hard-fails if any required var is missing.
 This is intentional — silently defaulting on security configuration

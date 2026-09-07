@@ -20,6 +20,28 @@ fn config() -> DocusignConfig {
     }
 }
 
+/// CHAIN-B-D022 tripwire: the OAuth token and HMAC secret must never appear in
+/// the struct's Debug output. Pre-fix, `#[derive(Debug)]` printed both verbatim,
+/// so any `{:?}` (a tracing field, a panic, an anyhow context) leaked them.
+#[test]
+fn d022_debug_redacts_secrets() {
+    let cfg = config();
+    let dbg = format!("{cfg:?}");
+    // The secret VALUES (quoted) must not appear — the field NAME `access_token`
+    // legitimately contains "token", so assert on the quoted value.
+    assert!(!dbg.contains("\"token\""), "access_token value leaked in Debug: {dbg}");
+    assert!(
+        !dbg.contains("shhhhhhhhhhhh-this-is-a-test-secret"),
+        "webhook_secret leaked in Debug: {dbg}"
+    );
+    assert!(
+        dbg.contains("<redacted>"),
+        "secrets must be redacted: {dbg}"
+    );
+    // Non-secret fields are still visible.
+    assert!(dbg.contains("demo.docusign.net"));
+}
+
 fn signature_for(secret: &str, body: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("hmac key");
     mac.update(body);
