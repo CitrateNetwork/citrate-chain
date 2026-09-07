@@ -441,4 +441,23 @@ contract ForwarderTest is Test {
         vm.expectRevert();
         _executeAsRelayer(req, signature);
     }
+
+    // ── CHAIN-B-C042: account revocation stops meta-transactions ──
+    //
+    // RED (pre-fix): the RevocationBarrier only checked getDeviceUser != 0,
+    // which setAccountStatus never clears — so suspending/expelling the
+    // principal did NOT stop forwarded meta-transactions. GREEN: a
+    // non-Active account status now revokes the barrier.
+    function test_C042_suspendedAccountBlocksMetaTx() public {
+        IForwarder.ForwardRequest memory req = _makeRequest(0);
+        bytes memory signature = _studentSignature(req);
+
+        // Suspend the device-bound principal (admin has OrgRole.Admin).
+        vm.prank(admin);
+        cluster.setAccountStatus(student, IClassroomCluster.AccountStatus.Suspended);
+
+        vm.prank(relayer);
+        vm.expectRevert(Forwarder.PrincipalRevoked.selector);
+        forwarder.execute(req, signature);
+    }
 }
