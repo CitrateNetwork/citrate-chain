@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ThresholdApproval, IMultiSigEnvelope} from "../src/quorum/ThresholdApproval.sol";
 import {IGovernanceProtocol} from "../src/quorum/IGovernanceProtocol.sol";
 import {MultiSigEnvelope} from "../src/rbac/MultiSigEnvelope.sol";
+import {QuorumIdentity} from "../src/quorum/QuorumIdentity.sol";
 
 /// @title ThresholdApproval — invariant tests (QRM-S6.3)
 ///
@@ -23,10 +24,18 @@ contract ThresholdApprovalTest is Test {
     bytes32 constant SPEC_HASH = keccak256("the spec text");
     string constant SPEC_CID = "bafyThresholdApprovalSpecV1";
 
-    bytes32 constant ALICE = keccak256("alice");
-    bytes32 constant BOB = keccak256("bob");
-    bytes32 constant CAROL = keccak256("carol");
-    bytes32 constant MALLORY = keccak256("mallory");
+    // CHAIN-B-C008: MultiSigEnvelope binds sign/close/deliver to the caller's
+    // own subjectKey, so each identity must be the subjectKey of a REAL address
+    // that we prank as when acting for it. The identities are assigned in setUp.
+    address constant ALICE_ADDR = address(0xA11CE);
+    address constant BOB_ADDR = address(0xB0B);
+    address constant CAROL_ADDR = address(0xCAB01);
+    address constant MALLORY_ADDR = address(0x1A11005);
+    bytes32 ALICE;
+    bytes32 BOB;
+    bytes32 CAROL;
+    bytes32 MALLORY;
+    mapping(bytes32 => address) internal _idAddr;
 
     bytes32 constant ACTION = keccak256("repo.write");
     bytes32 constant PARAMS = keccak256("the exact call parameters");
@@ -34,7 +43,34 @@ contract ThresholdApprovalTest is Test {
 
     function setUp() public {
         envelopes = new MultiSigEnvelope();
+        ALICE = QuorumIdentity.subjectKey(ALICE_ADDR);
+        BOB = QuorumIdentity.subjectKey(BOB_ADDR);
+        CAROL = QuorumIdentity.subjectKey(CAROL_ADDR);
+        MALLORY = QuorumIdentity.subjectKey(MALLORY_ADDR);
+        _idAddr[ALICE] = ALICE_ADDR;
+        _idAddr[BOB] = BOB_ADDR;
+        _idAddr[CAROL] = CAROL_ADDR;
+        _idAddr[MALLORY] = MALLORY_ADDR;
         protocol = _deploy(2);
+    }
+
+    // ── pranked envelope helpers (CHAIN-B-C008) ─────────────────────
+    // sign/close/markDelivered are bound to `subjectKey(msg.sender)`, so each is
+    // called while pranking as the address behind the acting identity.
+
+    function _sign(bytes32 id, bytes32 who, bytes memory sig, string memory mode) internal {
+        vm.prank(_idAddr[who]);
+        envelopes.sign(id, who, sig, mode);
+    }
+
+    function _close(bytes32 id, bytes32 initiator) internal {
+        vm.prank(_idAddr[initiator]);
+        envelopes.close(id, initiator);
+    }
+
+    function _markDelivered(bytes32 id, bytes32 initiator) internal {
+        vm.prank(_idAddr[initiator]);
+        envelopes.markDelivered(id);
     }
 
     function _deploy(uint8 threshold) internal returns (ThresholdApproval) {
@@ -64,7 +100,7 @@ contract ThresholdApprovalTest is Test {
         envelopes.draft(id, ALICE, keccak256("artifact"), "bafyArtifact", required, envThreshold, expiresAt, CORR);
     }
 
-    function _requiredAll() internal pure returns (bytes32[] memory r) {
+    function _requiredAll() internal view returns (bytes32[] memory r) {
         r = new bytes32[](3);
         r[0] = ALICE;
         r[1] = BOB;
@@ -91,7 +127,7 @@ contract ThresholdApprovalTest is Test {
     /// app that re-listed everyone would keep asking people who already acted.
     function test_partialApprovalListsOnlyWhoStillHasToSign() public {
         bytes32 id = _draft(_requiredAll(), 3, 0);
-        envelopes.sign(id, ALICE, hex"ab", "ceremony");
+        _sign(id, ALICE, hex"ab", "ceremony");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason, bytes32[] memory signers) = _check();
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.RequireApproval));
@@ -103,8 +139,8 @@ contract ThresholdApprovalTest is Test {
 
     function test_thresholdMetAllows() public {
         bytes32 id = _draft(_requiredAll(), 3, 0);
-        envelopes.sign(id, ALICE, hex"ab", "ceremony");
-        envelopes.sign(id, BOB, hex"cd", "ceremony");
+        _sign(id, ALICE, hex"ab", "ceremony");
+        _sign(id, BOB, hex"cd", "ceremony");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason, bytes32[] memory signers) = _check();
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.Allow));
@@ -127,7 +163,7 @@ contract ThresholdApprovalTest is Test {
         bytes32[] memory attackerSet = new bytes32[](1);
         attackerSet[0] = MALLORY;
         bytes32 id = _draft(attackerSet, 1, 0);
-        envelopes.sign(id, MALLORY, hex"ff", "self");
+        _sign(id, MALLORY, hex"ff", "self");
 
         // The envelope itself is satisfied, by its own rules.
         assertTrue(envelopes.isSignedThresholdMet(id), "the envelope believes it is signed");
@@ -144,8 +180,8 @@ contract ThresholdApprovalTest is Test {
     /// contract accepts an empty blob; this protocol does not count it.
     function test_signatureWithNoMaterialIsNotCounted() public {
         bytes32 id = _draft(_requiredAll(), 3, 0);
-        envelopes.sign(id, ALICE, hex"", "ceremony");
-        envelopes.sign(id, BOB, hex"cd", "ceremony");
+        _sign(id, ALICE, hex"", "ceremony");
+        _sign(id, BOB, hex"cd", "ceremony");
 
         (IGovernanceProtocol.Verdict v,, bytes32[] memory signers) = _check();
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.RequireApproval), "one real signature is not two");
@@ -160,8 +196,8 @@ contract ThresholdApprovalTest is Test {
     /// one of them would still pass a test that varied only the others.
     function test_approvalDoesNotTransferToAnotherAction() public {
         bytes32 id = _draft(_requiredAll(), 3, 0);
-        envelopes.sign(id, ALICE, hex"ab", "ceremony");
-        envelopes.sign(id, BOB, hex"cd", "ceremony");
+        _sign(id, ALICE, hex"ab", "ceremony");
+        _sign(id, BOB, hex"cd", "ceremony");
         (IGovernanceProtocol.Verdict ok,,) = _check();
         assertEq(uint8(ok), uint8(IGovernanceProtocol.Verdict.Allow));
 
@@ -211,8 +247,8 @@ contract ThresholdApprovalTest is Test {
     /// the approvals would satisfy it.
     function test_wrongTenantIsDeniedEvenWhenFullySigned() public {
         bytes32 id = _draft(_requiredAll(), 3, 0);
-        envelopes.sign(id, ALICE, hex"ab", "ceremony");
-        envelopes.sign(id, BOB, hex"cd", "ceremony");
+        _sign(id, ALICE, hex"ab", "ceremony");
+        _sign(id, BOB, hex"cd", "ceremony");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason,) = protocol.check(OTHER_TENANT, ACTION, _ctx());
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.Deny));
@@ -223,9 +259,9 @@ contract ThresholdApprovalTest is Test {
 
     function test_rejectedEnvelopeDenies() public {
         bytes32 id = _draft(_requiredAll(), 2, 0);
-        envelopes.sign(id, ALICE, hex"ab", "ceremony");
-        envelopes.sign(id, BOB, hex"cd", "ceremony");
-        envelopes.markDelivered(id);
+        _sign(id, ALICE, hex"ab", "ceremony");
+        _sign(id, BOB, hex"cd", "ceremony");
+        _markDelivered(id, ALICE);
         envelopes.reject(id, "not this quarter");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason,) = _check();
@@ -235,7 +271,7 @@ contract ThresholdApprovalTest is Test {
 
     function test_withdrawnEnvelopeDenies() public {
         bytes32 id = _draft(_requiredAll(), 3, 0);
-        envelopes.close(id, ALICE);
+        _close(id, ALICE);
 
         (IGovernanceProtocol.Verdict v, bytes32 reason,) = _check();
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.Deny));
@@ -248,8 +284,8 @@ contract ThresholdApprovalTest is Test {
     function test_expiryOutranksACompletedApproval() public {
         uint64 deadline = uint64(block.timestamp + 1 days);
         bytes32 id = _draft(_requiredAll(), 3, deadline);
-        envelopes.sign(id, ALICE, hex"ab", "ceremony");
-        envelopes.sign(id, BOB, hex"cd", "ceremony");
+        _sign(id, ALICE, hex"ab", "ceremony");
+        _sign(id, BOB, hex"cd", "ceremony");
 
         (IGovernanceProtocol.Verdict live,,) = _check();
         assertEq(uint8(live), uint8(IGovernanceProtocol.Verdict.Allow), "valid before the deadline");
@@ -328,7 +364,7 @@ contract ThresholdApprovalTest is Test {
     function test_oneOfThreeIsSatisfiedByAnySingleApprover() public {
         protocol = _deploy(1);
         bytes32 id = _draft(_requiredAll(), 3, 0);
-        envelopes.sign(id, CAROL, hex"ee", "ceremony");
+        _sign(id, CAROL, hex"ee", "ceremony");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason,) = _check();
         assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.Allow));

@@ -14,6 +14,13 @@ contract ClassroomRegistryTest is Test {
     address public student3;
     address public outsider;
 
+    // CHAIN-B-C009 RC-8: enrollWithCode now authenticates on the RAW
+    // invite code (secret preimage), not its public hash. The teacher
+    // still commits the hash at creation; students present the secret.
+    string internal constant CODE1 = "STEM-2026-ALPHA";
+    string internal constant CODE2 = "MATH-2026-BETA";
+    string internal constant CODE3 = "ART-2026-GAMMA";
+
     bytes32 public code1Hash;
     bytes32 public code2Hash;
     bytes32 public code3Hash;
@@ -113,7 +120,7 @@ contract ClassroomRegistryTest is Test {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
 
         vm.prank(student1);
-        cr.enrollWithCode(code1Hash);
+        cr.enrollWithCode(bytes(CODE1));
 
         assertTrue(cr.isEnrolled(teacher1, student1));
         assertEq(cr.studentTeacher(student1), teacher1);
@@ -129,22 +136,21 @@ contract ClassroomRegistryTest is Test {
         emit ClassroomRegistry.StudentEnrolled(teacher1, student1, code1Hash);
 
         vm.prank(student1);
-        cr.enrollWithCode(code1Hash);
+        cr.enrollWithCode(bytes(CODE1));
     }
 
     function test_enroll_invalid_code_reverts() public {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
 
-        bytes32 badCode = keccak256(abi.encodePacked("wrong-code"));
         vm.prank(student1);
         vm.expectRevert("Invalid invite code");
-        cr.enrollWithCode(badCode);
+        cr.enrollWithCode(bytes("wrong-code"));
     }
 
-    function test_enroll_zero_code_hash_reverts() public {
+    function test_enroll_empty_code_reverts() public {
         vm.prank(student1);
-        vm.expectRevert("Invalid invite code hash");
-        cr.enrollWithCode(bytes32(0));
+        vm.expectRevert("Empty invite code");
+        cr.enrollWithCode(bytes(""));
     }
 
     function test_teacher_cannot_self_enroll() public {
@@ -152,7 +158,7 @@ contract ClassroomRegistryTest is Test {
 
         vm.prank(teacher1);
         vm.expectRevert("Teacher cannot enroll as student");
-        cr.enrollWithCode(code1Hash);
+        cr.enrollWithCode(bytes(CODE1));
     }
 
     // ============================================================
@@ -161,7 +167,7 @@ contract ClassroomRegistryTest is Test {
 
     function test_student_unenroll() public {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
-        _enrollStudent(student1, code1Hash);
+        _enrollStudent(student1, CODE1);
 
         vm.prank(student1);
         cr.unenroll();
@@ -175,7 +181,7 @@ contract ClassroomRegistryTest is Test {
 
     function test_unenroll_emits_event() public {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
-        _enrollStudent(student1, code1Hash);
+        _enrollStudent(student1, CODE1);
 
         vm.expectEmit(true, true, false, false);
         emit ClassroomRegistry.StudentUnenrolled(teacher1, student1);
@@ -192,7 +198,7 @@ contract ClassroomRegistryTest is Test {
 
     function test_teacher_remove_student() public {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
-        _enrollStudent(student1, code1Hash);
+        _enrollStudent(student1, CODE1);
 
         vm.prank(teacher1);
         cr.removeStudent(student1);
@@ -214,7 +220,7 @@ contract ClassroomRegistryTest is Test {
 
     function test_non_teacher_cannot_remove_student() public {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
-        _enrollStudent(student1, code1Hash);
+        _enrollStudent(student1, CODE1);
 
         vm.prank(outsider);
         vm.expectRevert("Not a teacher with a classroom");
@@ -370,11 +376,11 @@ contract ClassroomRegistryTest is Test {
         // Old code no longer works
         vm.prank(student1);
         vm.expectRevert("Invalid invite code");
-        cr.enrollWithCode(code1Hash);
+        cr.enrollWithCode(bytes(CODE1));
 
         // New code works
         vm.prank(student1);
-        cr.enrollWithCode(code2Hash);
+        cr.enrollWithCode(bytes(CODE2));
 
         assertTrue(cr.isEnrolled(teacher1, student1));
         assertEq(cr.studentTeacher(student1), teacher1);
@@ -386,7 +392,7 @@ contract ClassroomRegistryTest is Test {
 
     function test_can_student_access_model() public {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
-        _enrollStudent(student1, code1Hash);
+        _enrollStudent(student1, CODE1);
 
         vm.prank(teacher1);
         cr.whitelistModel(model1Hash);
@@ -413,7 +419,7 @@ contract ClassroomRegistryTest is Test {
 
         assertEq(cr.getStudentTeacher(student1), address(0));
 
-        _enrollStudent(student1, code1Hash);
+        _enrollStudent(student1, CODE1);
         assertEq(cr.getStudentTeacher(student1), teacher1);
     }
 
@@ -437,8 +443,8 @@ contract ClassroomRegistryTest is Test {
     function test_inv2_enrollment_bounded() public {
         _createClassroom(teacher1, "Small Class", 2, code1Hash);
 
-        _enrollStudent(student1, code1Hash);
-        _enrollStudent(student2, code1Hash);
+        _enrollStudent(student1, CODE1);
+        _enrollStudent(student2, CODE1);
 
         ClassroomRegistry.Classroom memory room = cr.getClassroom(teacher1);
         assertEq(room.studentCount, 2);
@@ -447,7 +453,7 @@ contract ClassroomRegistryTest is Test {
         // Third student should be rejected
         vm.prank(student3);
         vm.expectRevert("Classroom is full");
-        cr.enrollWithCode(code1Hash);
+        cr.enrollWithCode(bytes(CODE1));
 
         // Count still 2
         room = cr.getClassroom(teacher1);
@@ -459,12 +465,12 @@ contract ClassroomRegistryTest is Test {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
         _createClassroom(teacher2, "Art History", 20, code2Hash);
 
-        _enrollStudent(student1, code1Hash);
+        _enrollStudent(student1, CODE1);
 
         // student1 tries to enroll in second classroom
         vm.prank(student1);
         vm.expectRevert("Already enrolled in a classroom");
-        cr.enrollWithCode(code2Hash);
+        cr.enrollWithCode(bytes(CODE2));
 
         // student1 is still only with teacher1
         assertEq(cr.studentTeacher(student1), teacher1, "INV-3: Student in at most one classroom");
@@ -477,7 +483,7 @@ contract ClassroomRegistryTest is Test {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
         _createClassroom(teacher2, "Art History", 20, code2Hash);
 
-        _enrollStudent(student1, code1Hash);
+        _enrollStudent(student1, CODE1);
 
         // Unenroll from teacher1
         vm.prank(student1);
@@ -486,7 +492,7 @@ contract ClassroomRegistryTest is Test {
 
         // Enroll with teacher2
         vm.prank(student1);
-        cr.enrollWithCode(code2Hash);
+        cr.enrollWithCode(bytes(CODE2));
 
         assertEq(cr.studentTeacher(student1), teacher2);
         assertFalse(cr.isEnrolled(teacher1, student1));
@@ -546,7 +552,7 @@ contract ClassroomRegistryTest is Test {
         cr.whitelistModel(model2Hash);
 
         // student1 enrolls with teacher1
-        _enrollStudent(student1, code1Hash);
+        _enrollStudent(student1, CODE1);
 
         // student1 can access model1 (teacher1's whitelist) but NOT model2
         assertTrue(
@@ -600,7 +606,7 @@ contract ClassroomRegistryTest is Test {
         // student1 cannot join teacher2
         vm.prank(student1);
         vm.expectRevert("Invalid invite code");
-        cr.enrollWithCode(code2Hash);
+        cr.enrollWithCode(bytes(CODE2));
 
         // Teacher2's enrollment count is 0
         ClassroomRegistry.Classroom memory room = cr.getClassroom(teacher2);
@@ -615,8 +621,8 @@ contract ClassroomRegistryTest is Test {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
         _createClassroom(teacher2, "Art History", 15, code2Hash);
 
-        _enrollStudent(student1, code1Hash);
-        _enrollStudent(student2, code2Hash);
+        _enrollStudent(student1, CODE1);
+        _enrollStudent(student2, CODE2);
 
         // Each student is in exactly one classroom
         assertEq(cr.studentTeacher(student1), teacher1);
@@ -655,8 +661,8 @@ contract ClassroomRegistryTest is Test {
         cr.whitelistModel(model2Hash);
 
         // 3. Students enroll
-        _enrollStudent(student1, code1Hash);
-        _enrollStudent(student2, code1Hash);
+        _enrollStudent(student1, CODE1);
+        _enrollStudent(student2, CODE1);
 
         ClassroomRegistry.Classroom memory room = cr.getClassroom(teacher1);
         assertEq(room.studentCount, 2);
@@ -676,7 +682,7 @@ contract ClassroomRegistryTest is Test {
         cr.rotateInviteCode(code3Hash);
 
         // 7. New student enrolls with new code
-        _enrollStudent(student3, code3Hash);
+        _enrollStudent(student3, CODE3);
         room = cr.getClassroom(teacher1);
         assertEq(room.studentCount, 3);
 
@@ -684,7 +690,7 @@ contract ClassroomRegistryTest is Test {
         address student4 = address(0x54);
         vm.prank(student4);
         vm.expectRevert("Classroom is full");
-        cr.enrollWithCode(code3Hash);
+        cr.enrollWithCode(bytes(CODE3));
 
         // 9. Teacher removes a student, freeing a slot
         vm.prank(teacher1);
@@ -694,7 +700,7 @@ contract ClassroomRegistryTest is Test {
 
         // 10. New student can now enroll
         vm.prank(student4);
-        cr.enrollWithCode(code3Hash);
+        cr.enrollWithCode(bytes(CODE3));
         room = cr.getClassroom(teacher1);
         assertEq(room.studentCount, 3);
 
@@ -721,7 +727,7 @@ contract ClassroomRegistryTest is Test {
 
         assertEq(cr.whitelistCount(teacher1), 3);
 
-        _enrollStudent(student1, code1Hash);
+        _enrollStudent(student1, CODE1);
         assertTrue(cr.canStudentAccessModel(student1, model1Hash));
         assertTrue(cr.canStudentAccessModel(student1, model2Hash));
         assertTrue(cr.canStudentAccessModel(student1, model3Hash));
@@ -742,18 +748,18 @@ contract ClassroomRegistryTest is Test {
     function test_classroom_with_one_student_max() public {
         _createClassroom(teacher1, "Tutorial", 1, code1Hash);
 
-        _enrollStudent(student1, code1Hash);
+        _enrollStudent(student1, CODE1);
 
         // INV-2: Second student rejected
         vm.prank(student2);
         vm.expectRevert("Classroom is full");
-        cr.enrollWithCode(code1Hash);
+        cr.enrollWithCode(bytes(CODE1));
 
         // After first student leaves, another can join
         vm.prank(student1);
         cr.unenroll();
 
-        _enrollStudent(student2, code1Hash);
+        _enrollStudent(student2, CODE1);
         assertTrue(cr.isEnrolled(teacher1, student2));
     }
 
@@ -771,8 +777,8 @@ contract ClassroomRegistryTest is Test {
         cr.createClassroom(name, maxStudents, codeHash);
     }
 
-    function _enrollStudent(address student, bytes32 codeHash) internal {
+    function _enrollStudent(address student, string memory rawCode) internal {
         vm.prank(student);
-        cr.enrollWithCode(codeHash);
+        cr.enrollWithCode(bytes(rawCode));
     }
 }

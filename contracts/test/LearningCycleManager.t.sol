@@ -35,6 +35,12 @@ contract LearningCycleManagerTest is Test {
     }
 
     function _registerParticipant(uint256 cycleId, address participant) internal {
+        // CHAIN-B-C029 RC-8: registration is now gated on a governance
+        // allowlist. `governance` is address(this) in this suite, so
+        // authorize the participant before they self-register. This
+        // inverts the fixture that previously encoded permissionless
+        // (sybil-open) registration.
+        lcm.setParticipantEligibility(participant, true);
         vm.prank(participant);
         lcm.registerParticipant(cycleId);
     }

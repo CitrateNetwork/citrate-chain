@@ -272,6 +272,50 @@ fn zeros_scalars() -> Vec<Scalar> {
     zeros
 }
 
+/// Construct the only valid initial public state for a fixed fold.
+///
+/// The precompile receives `z0` over the wire for ABI compatibility, but all of
+/// its load-bearing fields are derived here from the public leaf count and
+/// depth. This prevents an attacker from supplying forged `filled`, sponge,
+/// position, or depth state to a sound Nova step circuit.
+pub fn canonical_initial_state(
+    num_steps: usize,
+    depth: usize,
+) -> Result<Vec<Scalar>, Box<dyn std::error::Error>> {
+    if num_steps == 0 {
+        return Err("fold must contain at least one leaf".into());
+    }
+
+    let max_leaves = 1u64 << MAX_DEPTH;
+    if num_steps as u64 > max_leaves {
+        return Err(format!("leaf count exceeds MAX_DEPTH {MAX_DEPTH}").into());
+    }
+
+    let expected_depth = if num_steps <= 1 {
+        0
+    } else {
+        num_steps.next_power_of_two().trailing_zeros() as usize
+    };
+    if depth != expected_depth || depth > MAX_DEPTH {
+        return Err(format!(
+            "depth {depth} does not match leaf count {num_steps} (expected {expected_depth})"
+        )
+        .into());
+    }
+
+    let zeros = zeros_scalars();
+    let pre = citrate_commd::data_commit_preamble_state(num_steps);
+    let mut z0: Vec<Scalar> = zeros[0..MAX_DEPTH].to_vec();
+    z0.push(Scalar::ZERO); // index
+    z0.push(Scalar::ZERO); // commD (overwritten by the first step)
+    z0.push(ark_fr_to_scalar(pre[0]));
+    z0.push(ark_fr_to_scalar(pre[1]));
+    z0.push(ark_fr_to_scalar(pre[2]));
+    z0.push(Scalar::ZERO); // pos
+    z0.push(Scalar::from(depth as u64));
+    Ok(z0)
+}
+
 /// The file-INDEPENDENT public parameters for the fixed-arity circuit. Because the R1CS shape is fixed
 /// (MAX_DEPTH), one `pp` (and thus one `CompressedSNARK` verifier key) covers EVERY file — this is the
 /// whole point of the fixed-arity rework. Derived from a canonical empty-file sample circuit.
@@ -295,6 +339,7 @@ pub struct FoldedFixed {
     pub rs: RecursiveSNARK<E1, E2, FixedCommDFoldStep>,
     pub z0: Vec<Scalar>,
     pub num_steps: usize,
+    pub depth: usize,
 }
 
 /// PRODUCTION public parameters: same fixed-arity circuit, but the commitment key comes from a
@@ -340,13 +385,6 @@ pub fn fold_fixed_with_pp(
     }
 
     let zeros = zeros_scalars();
-    let pre = citrate_commd::data_commit_preamble_state(n);
-    let (ps0, ps1, ps2) = (
-        ark_fr_to_scalar(pre[0]),
-        ark_fr_to_scalar(pre[1]),
-        ark_fr_to_scalar(pre[2]),
-    );
-
     let gadget = Arc::new(PoseidonBn254Gadget::from_citrate_commd());
     let mk = |leaf: Scalar, is_last: bool| FixedCommDFoldStep {
         leaf,
@@ -355,15 +393,8 @@ pub fn fold_fixed_with_pp(
         gadget: gadget.clone(),
     };
 
-    // z0 = [filled = zeros[0..MAX_DEPTH], index=0, commD=0, s0,s1,s2 = preamble, pos=0, depth].
-    let mut z0: Vec<Scalar> = zeros[0..MAX_DEPTH].to_vec();
-    z0.push(Scalar::ZERO); // index
-    z0.push(Scalar::ZERO); // commD (overwritten each step)
-    z0.push(ps0);
-    z0.push(ps1);
-    z0.push(ps2);
-    z0.push(Scalar::ZERO); // pos
-    z0.push(Scalar::from(depth as u64)); // depth (public)
+    // z0 is derived from the public leaf count/depth, never caller-supplied.
+    let z0 = canonical_initial_state(n, depth)?;
 
     let mut rs =
         RecursiveSNARK::<E1, E2, FixedCommDFoldStep>::new(pp, &mk(leaves[0], n == 1), &z0)?;
@@ -374,6 +405,7 @@ pub fn fold_fixed_with_pp(
         rs,
         z0,
         num_steps: n,
+        depth,
     })
 }
 
@@ -411,6 +443,7 @@ pub struct FixedCompressedProof {
     pub comm_d: [u8; 32],
     pub data_commit: [u8; 32],
     pub num_steps: usize,
+    pub depth: usize,
     pub z0: Vec<Scalar>,
     pub proof_bytes: Vec<u8>,
     pub vk_bytes: Vec<u8>,
@@ -430,6 +463,7 @@ pub fn prove_fixed_compressed(
         comm_d: scalar_to_be_bytes(zn[COMMD_INDEX]),
         data_commit: scalar_to_be_bytes(zn[DATACOMMIT_INDEX]),
         num_steps: folded.num_steps,
+        depth: folded.depth,
         z0: folded.z0,
         proof_bytes: bincode::serialize(&snark)?,
         vk_bytes: bincode::serialize(&vk)?,

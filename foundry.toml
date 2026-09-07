@@ -1,11 +1,20 @@
+# Root convenience config. The CANONICAL contract project lives in ./contracts
+# (contracts/foundry.toml) — builds SHOULD run from there:  cd contracts && forge build
+# This root profile mirrors the canonical deterministic settings so a `forge build`
+# from the repo root produces byte-identical, reroll-stable CREATE2 init_code.
+# solc pinned to the latest stable (0.8.36); evm_version stays `cancun` to match the
+# chain's REVM target. Keep in sync with contracts/foundry.toml.
 [profile.default]
-src = "contracts"
-out = "out"
-libs = ["lib"]
-solc = "0.8.24"
+src = "contracts/src"
+out = "contracts/out"
+libs = ["contracts/lib"]
+solc = "0.8.36"
 via_ir = true
 optimizer = true
 optimizer_runs = 200
+evm_version = "cancun"
+bytecode_hash = "none"     # CREATE2 determinism — do not change
+cbor_metadata = false      # CREATE2 determinism — do not change
 
 [rpc_endpoints]
 citrate = "http://localhost:8545"

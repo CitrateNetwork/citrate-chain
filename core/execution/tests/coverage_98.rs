@@ -639,9 +639,47 @@ fn cache_storage_key_equality() {
 // ===================================================================
 
 use citrate_execution::crypto::encryption::{
-    EncryptionConfig, ModelEncryption,
+    EncryptionConfig, ModelEncryption, RecipientPublicKeys,
 };
+use citrate_execution::crypto::ecdh::ECIES;
 use primitive_types::{H160, H256};
+use std::collections::HashMap;
+
+fn encryption_test_material(
+    owner: H160,
+    access_list: &[H160],
+) -> (RecipientPublicKeys, HashMap<H160, [u8; 32]>) {
+    let mut addresses = vec![owner];
+    for address in access_list {
+        if !addresses.contains(address) {
+            addresses.push(*address);
+        }
+    }
+
+    let mut public_keys = HashMap::new();
+    let mut private_keys = HashMap::new();
+    for (index, address) in addresses.into_iter().enumerate() {
+        let private_key = [(index + 1) as u8; 32];
+        let ecies = ECIES::from_private_key(private_key).unwrap();
+        public_keys.insert(address, ecies.public_key());
+        private_keys.insert(address, private_key);
+    }
+    (public_keys, private_keys)
+}
+
+fn encrypt_test_model(
+    enc: &ModelEncryption,
+    model_id: H256,
+    data: &[u8],
+    owner: H160,
+    access_list: Vec<H160>,
+) -> (citrate_execution::crypto::encryption::EncryptedModel, HashMap<H160, [u8; 32]>) {
+    let (public_keys, private_keys) = encryption_test_material(owner, &access_list);
+    let encrypted = enc
+        .encrypt_model_with_keys(model_id, data, owner, access_list, &public_keys)
+        .unwrap();
+    (encrypted, private_keys)
+}
 
 #[test]
 fn encryption_roundtrip_no_compress() {
@@ -655,12 +693,11 @@ fn encryption_roundtrip_no_compress() {
     let data = b"model weights payload";
     let model_id = H256::random();
 
-    let encrypted = enc.encrypt_model(model_id, data, owner, vec![]).unwrap();
+    let (encrypted, keys) = encrypt_test_model(&enc, model_id, data, owner, vec![]);
     assert_ne!(encrypted.ciphertext, data);
     assert!(encrypted.access_list.contains(&owner));
 
-    let key = [0u8; 32]; // dummy key for simplified XOR path
-    let decrypted = enc.decrypt_model(&encrypted, &key, owner).unwrap();
+    let decrypted = enc.decrypt_model(&encrypted, &keys[&owner], owner).unwrap();
     assert_eq!(decrypted, data);
 }
 
@@ -676,9 +713,8 @@ fn encryption_roundtrip_with_compress() {
     let data = b"some model data for compression test";
     let model_id = H256::random();
 
-    let encrypted = enc.encrypt_model(model_id, data, owner, vec![]).unwrap();
-    let key = [0u8; 32];
-    let decrypted = enc.decrypt_model(&encrypted, &key, owner).unwrap();
+    let (encrypted, keys) = encrypt_test_model(&enc, model_id, data, owner, vec![]);
+    let decrypted = enc.decrypt_model(&encrypted, &keys[&owner], owner).unwrap();
     assert_eq!(decrypted, data);
 }
 
@@ -688,7 +724,7 @@ fn encryption_access_denied_for_unauthorized() {
     let owner = H160::random();
     let data = b"secret weights";
 
-    let encrypted = enc.encrypt_model(H256::random(), data, owner, vec![]).unwrap();
+    let (encrypted, _keys) = encrypt_test_model(&enc, H256::random(), data, owner, vec![]);
 
     let unauthorized = H160::random();
     let result = enc.decrypt_model(&encrypted, &[0u8; 32], unauthorized);
@@ -704,9 +740,13 @@ fn encryption_multiple_authorized_users() {
     let user2 = H160::random();
     let data = b"shared model weights";
 
-    let encrypted = enc
-        .encrypt_model(H256::random(), data, owner, vec![user1, user2])
-        .unwrap();
+    let (encrypted, keys) = encrypt_test_model(
+        &enc,
+        H256::random(),
+        data,
+        owner,
+        vec![user1, user2],
+    );
 
     assert_eq!(encrypted.access_list.len(), 3); // owner + user1 + user2
     assert!(encrypted.access_list.contains(&owner));
@@ -714,10 +754,9 @@ fn encryption_multiple_authorized_users() {
     assert!(encrypted.access_list.contains(&user2));
 
     // Each authorized user can decrypt
-    let key = [0u8; 32];
-    assert!(enc.decrypt_model(&encrypted, &key, owner).is_ok());
-    assert!(enc.decrypt_model(&encrypted, &key, user1).is_ok());
-    assert!(enc.decrypt_model(&encrypted, &key, user2).is_ok());
+    assert!(enc.decrypt_model(&encrypted, &keys[&owner], owner).is_ok());
+    assert!(enc.decrypt_model(&encrypted, &keys[&user1], user1).is_ok());
+    assert!(enc.decrypt_model(&encrypted, &keys[&user2], user2).is_ok());
 }
 
 #[test]
@@ -726,9 +765,13 @@ fn encryption_owner_auto_added_to_access_list() {
     let owner = H160::random();
     let user = H160::random();
 
-    let encrypted = enc
-        .encrypt_model(H256::random(), b"data", owner, vec![user, owner])
-        .unwrap();
+    let (encrypted, _keys) = encrypt_test_model(
+        &enc,
+        H256::random(),
+        b"data",
+        owner,
+        vec![user, owner],
+    );
 
     // Owner should appear exactly once (not duplicated)
     let owner_count = encrypted.access_list.iter().filter(|&&a| a == owner).count();
@@ -780,9 +823,8 @@ fn encryption_with_master_key() {
     let owner = H160::random();
     let data = b"master key test";
 
-    let encrypted = enc.encrypt_model(H256::random(), data, owner, vec![]).unwrap();
-    let key = [0u8; 32];
-    let decrypted = enc.decrypt_model(&encrypted, &key, owner).unwrap();
+    let (encrypted, keys) = encrypt_test_model(&enc, H256::random(), data, owner, vec![]);
+    let decrypted = enc.decrypt_model(&encrypted, &keys[&owner], owner).unwrap();
     assert_eq!(decrypted, data);
 }
 
@@ -792,13 +834,15 @@ fn encryption_key_rotation() {
     let owner = H160::random();
     let data = b"model to rotate keys";
 
-    let encrypted = enc.encrypt_model(H256::random(), data, owner, vec![]).unwrap();
+    let (encrypted, keys) = encrypt_test_model(&enc, H256::random(), data, owner, vec![]);
 
-    let old_key = [0u8; 32];
-    let rotated = enc.rotate_key(&encrypted, &old_key, owner).unwrap();
+    let old_key = keys[&owner];
+    let rotated = enc
+        .rotate_key_with_keys(&encrypted, &old_key, owner, &encryption_test_material(owner, &[]).0)
+        .unwrap();
 
     // Re-encrypted model should still be decryptable
-    let new_key = [0u8; 32];
+    let new_key = old_key;
     let decrypted = enc.decrypt_model(&rotated, &new_key, owner).unwrap();
     assert_eq!(decrypted, data);
 }
@@ -810,15 +854,28 @@ fn encryption_grant_access() {
     let new_user = H160::random();
     let data = b"grant access test";
 
-    let mut encrypted = enc.encrypt_model(H256::random(), data, owner, vec![]).unwrap();
+    let (mut encrypted, keys) = encrypt_test_model(&enc, H256::random(), data, owner, vec![]);
     assert!(!encrypted.access_list.contains(&new_user));
 
-    let owner_key = [0u8; 32];
-    enc.grant_access(&mut encrypted, new_user, &owner_key, owner).unwrap();
+    let new_user_key = [2u8; 32];
+    let new_user_pubkey = ECIES::from_private_key(new_user_key).unwrap().public_key();
+    enc.grant_access_with_key(
+        &mut encrypted,
+        new_user,
+        &new_user_pubkey,
+        &keys[&owner],
+        owner,
+    ).unwrap();
     assert!(encrypted.access_list.contains(&new_user));
 
     // Granting again is idempotent
-    enc.grant_access(&mut encrypted, new_user, &owner_key, owner).unwrap();
+    enc.grant_access_with_key(
+        &mut encrypted,
+        new_user,
+        &new_user_pubkey,
+        &keys[&owner],
+        owner,
+    ).unwrap();
     let count = encrypted.access_list.iter().filter(|&&a| a == new_user).count();
     assert_eq!(count, 1);
 }
@@ -830,9 +887,16 @@ fn encryption_grant_access_non_owner_rejected() {
     let non_owner = H160::random();
     let new_user = H160::random();
 
-    let mut encrypted = enc.encrypt_model(H256::random(), b"data", owner, vec![]).unwrap();
+    let (mut encrypted, _keys) = encrypt_test_model(&enc, H256::random(), b"data", owner, vec![]);
 
-    let result = enc.grant_access(&mut encrypted, new_user, &[0u8; 32], non_owner);
+    let new_user_pubkey = ECIES::from_private_key([2u8; 32]).unwrap().public_key();
+    let result = enc.grant_access_with_key(
+        &mut encrypted,
+        new_user,
+        &new_user_pubkey,
+        &[1u8; 32],
+        non_owner,
+    );
     assert!(result.is_err());
 }
 
@@ -843,11 +907,18 @@ fn encryption_revoke_access() {
     let user = H160::random();
     let data = b"revoke test";
 
-    let encrypted = enc.encrypt_model(H256::random(), data, owner, vec![user]).unwrap();
+    let (encrypted, keys) = encrypt_test_model(&enc, H256::random(), data, owner, vec![user]);
     assert!(encrypted.access_list.contains(&user));
 
-    let owner_key = [0u8; 32];
-    let new_encrypted = enc.revoke_access(&encrypted, user, &owner_key, owner).unwrap();
+    let new_encrypted = enc
+        .revoke_access_with_keys(
+            &encrypted,
+            user,
+            &keys[&owner],
+            owner,
+            &encryption_test_material(owner, &[user]).0,
+        )
+        .unwrap();
     assert!(!new_encrypted.access_list.contains(&user));
 }
 
@@ -857,8 +928,14 @@ fn encryption_revoke_owner_rejected() {
     let owner = H160::random();
     let data = b"can't self-revoke";
 
-    let encrypted = enc.encrypt_model(H256::random(), data, owner, vec![]).unwrap();
-    let result = enc.revoke_access(&encrypted, owner, &[0u8; 32], owner);
+    let (encrypted, keys) = encrypt_test_model(&enc, H256::random(), data, owner, vec![]);
+    let result = enc.revoke_access_with_keys(
+        &encrypted,
+        owner,
+        &keys[&owner],
+        owner,
+        &encryption_test_material(owner, &[]).0,
+    );
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("Cannot revoke owner"));
 }
@@ -870,9 +947,9 @@ fn encryption_convenience_functions() {
     let owner = H160::random();
     let data = b"convenience test";
 
-    let encrypted = encrypt_model(data, owner, vec![]).unwrap();
-    let key = [0u8; 32];
-    let decrypted = decrypt_model(&encrypted, &key, owner).unwrap();
+    let (public_keys, private_keys) = encryption_test_material(owner, &[]);
+    let encrypted = encrypt_model(data, owner, vec![], &public_keys).unwrap();
+    let decrypted = decrypt_model(&encrypted, &private_keys[&owner], owner).unwrap();
     assert_eq!(decrypted, data);
 }
 
@@ -882,11 +959,11 @@ fn encryption_metadata_fields() {
     let owner = H160::random();
     let data = b"metadata check";
 
-    let encrypted = enc.encrypt_model(H256::random(), data, owner, vec![]).unwrap();
+    let (encrypted, _keys) = encrypt_test_model(&enc, H256::random(), data, owner, vec![]);
     assert_eq!(encrypted.metadata.algorithm, "AES-256-GCM");
-    assert_eq!(encrypted.metadata.kdf, "Argon2id");
+    assert_eq!(encrypted.metadata.kdf, "HKDF-SHA256");
     assert_eq!(encrypted.metadata.original_size, data.len());
-    assert_eq!(encrypted.metadata.version, 1);
+    assert_eq!(encrypted.metadata.version, 2);
     assert!(encrypted.metadata.encrypted_at > 0);
 }
 
@@ -1773,7 +1850,7 @@ fn shamir_convenience_reconstruct_validation() {
 // 13. ECDH / ECIES TESTS (additional coverage)
 // ===================================================================
 
-use citrate_execution::crypto::ecdh::{ECIES, ModelKeyExchange};
+use citrate_execution::crypto::ecdh::ModelKeyExchange;
 
 #[test]
 fn ecies_encrypt_decrypt_roundtrip() {

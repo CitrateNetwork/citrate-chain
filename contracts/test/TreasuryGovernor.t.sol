@@ -444,6 +444,57 @@ contract TreasuryGovernorTest is Test {
         assertEq(uint8(governor.state(proposalId)), uint8(TreasuryGovernor.ProposalState.Executed));
     }
 
+    // ── CHAIN-B-C030: governed-target functions stay reachable ─────
+
+    /// RED (pre-fix): `execute` had exactly one on-chain effect —
+    /// `treasury.distribute`. Once treasury governance was handed to the
+    /// governor (the documented deployment flow, done in setUp), every OTHER
+    /// governance function on the treasury — `addStablecoin`,
+    /// `emergencyWithdraw`, `removeStablecoin` — became permanently
+    /// unreachable: no proposal type could call them, and no other caller
+    /// satisfies `onlyGovernance`. GREEN: a generic `Call` proposal routes any
+    /// such call through vote + timelock.
+    function test_C030_governed_function_reachable_via_call_proposal() public {
+        MockERC20Gov newToken = new MockERC20Gov("Second Coin", "SEC", 6);
+        assertFalse(treasury.acceptedStablecoins(address(newToken)));
+
+        // The governed function is unreachable by any direct caller: treasury
+        // governance is the governor, so no EOA can call it.
+        vm.prank(outsider);
+        vm.expectRevert();
+        treasury.addStablecoin(address(newToken));
+
+        // A Call proposal reaches it through governance.
+        bytes memory cd = abi.encodeWithSignature("addStablecoin(address)", address(newToken));
+        vm.prank(proposer);
+        uint256 id = governor.proposeCall(
+            "Add SEC as accepted stablecoin", "governed-target call", address(treasury), 0, cd
+        );
+        _voteAndPass(id);
+        vm.roll(block.number + 50_500);
+        governor.queue(id);
+        vm.roll(block.number + 7_200 + 1);
+        governor.execute(id);
+
+        assertTrue(treasury.acceptedStablecoins(address(newToken)), "governed call must take effect");
+        assertEq(uint8(governor.state(id)), uint8(TreasuryGovernor.ProposalState.Executed));
+    }
+
+    /// A failing governed call bubbles up and does not mark the proposal
+    /// executed-with-silent-success.
+    function test_C030_failing_call_reverts_execute() public {
+        // addStablecoin(address(0)) reverts inside the treasury.
+        bytes memory cd = abi.encodeWithSignature("addStablecoin(address)", address(0));
+        vm.prank(proposer);
+        uint256 id = governor.proposeCall("Bad add", "desc", address(treasury), 0, cd);
+        _voteAndPass(id);
+        vm.roll(block.number + 50_500);
+        governor.queue(id);
+        vm.roll(block.number + 7_200 + 1);
+        vm.expectRevert();
+        governor.execute(id);
+    }
+
     function test_execute_before_timelock_reverts() public {
         uint256 proposalId = _createSpendProposal();
         _voteAndPass(proposalId);
@@ -602,6 +653,27 @@ contract TreasuryGovernorTest is Test {
     function test_quorum_threshold() public view {
         // 10% of 1B SALT = 100M SALT
         assertEq(governor.quorumThreshold(), TOTAL_SUPPLY / 10);
+    }
+
+    function test_C013_countedVotingPower_cannotExceedDeclaredSupply() public {
+        uint256 proposalId = _createSpendProposal();
+        vm.roll(block.number + 2);
+
+        address first = address(0xC0131);
+        address second = address(0xC0132);
+        address third = address(0xC0133);
+        vm.deal(first, 600_000_000 ether);
+        vm.deal(second, 400_000_000 ether);
+        vm.deal(third, 1 ether);
+
+        vm.prank(first);
+        governor.castVote(proposalId, TreasuryGovernor.VoteType.For);
+        vm.prank(second);
+        governor.castVote(proposalId, TreasuryGovernor.VoteType.For);
+
+        vm.prank(third);
+        vm.expectRevert("TreasuryGovernor: voting power exceeds supply");
+        governor.castVote(proposalId, TreasuryGovernor.VoteType.For);
     }
 
     // ============================================================

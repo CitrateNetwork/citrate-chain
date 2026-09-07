@@ -592,8 +592,10 @@ contract ComputeAdversarialTest is Test {
         assertGe(profile.stake, marketplace.MIN_PROVIDER_STAKE(), "Provider stake must meet minimum even with low bid");
     }
 
-    /// @notice Provider cannot withdraw stake while they have active jobs.
-    ///         (No withdraw function exists — stake is only reduced via slashing)
+    /// @notice CHAIN-B-C039: a provider may withdraw stake, but not while any
+    ///         job is in flight. Pre-fix there was no withdraw path at all
+    ///         (stake locked forever); the invariant now is "no withdrawal
+    ///         during active jobs", enforced by `withdrawStake`.
     function test_providerCantWithdrawStakeDuringActiveJob() public {
         _registerProvider(provider1);
 
@@ -604,10 +606,31 @@ contract ComputeAdversarialTest is Test {
         ComputeMarketplace.ProviderProfile memory profile = marketplace.getProvider(provider1);
         assertEq(profile.currentActiveJobs, 1, "Provider should have 1 active job");
 
-        // There is no withdrawStake function — stake can only be reduced via slashing
-        // This is by design: stake is locked for the lifetime of provider registration
-        // The invariant is satisfied: no withdrawal path exists during active jobs
+        // The withdraw path exists but is gated on having no in-flight jobs.
+        vm.prank(provider1);
+        vm.expectRevert("ComputeMarketplace: active jobs");
+        marketplace.withdrawStake(1 ether);
+
+        profile = marketplace.getProvider(provider1);
         assertGe(profile.stake, marketplace.MIN_PROVIDER_STAKE(), "Stake must remain locked during active job");
+    }
+
+    /// @notice CHAIN-B-C039: with no in-flight jobs, a provider can withdraw and
+    ///         fully exit — recovering stake that was previously locked forever.
+    function test_C039_providerCanWithdrawStakeWhenIdle() public {
+        _registerProvider(provider1);
+        ComputeMarketplace.ProviderProfile memory profile = marketplace.getProvider(provider1);
+        uint256 staked = profile.stake;
+        assertEq(profile.currentActiveJobs, 0, "no active jobs");
+
+        uint256 balBefore = provider1.balance;
+        vm.prank(provider1);
+        marketplace.withdrawStake(staked);
+
+        assertEq(provider1.balance, balBefore + staked, "full stake returned");
+        profile = marketplace.getProvider(provider1);
+        assertEq(profile.stake, 0, "stake drained");
+        assertFalse(profile.isRegistered, "full withdrawal deregisters");
     }
 
     // =====================================================================

@@ -190,6 +190,20 @@ contract ComputePoolTest is Test {
         assertEq(provider1.balance, balBefore + 100 ether);
     }
 
+    function test_C012_leaveAndRejoin_doesNotDuplicatePayoutMember() public {
+        uint256 poolId = _createPool();
+
+        vm.startPrank(provider1);
+        pool.joinPool{value: 100 ether}(poolId, 10);
+        pool.leavePool(poolId);
+        pool.joinPool{value: 100 ether}(poolId, 10);
+        vm.stopPrank();
+
+        address[] memory memberList = pool.getPoolMembers(poolId);
+        assertEq(memberList.length, 1);
+        assertEq(memberList[0], provider1);
+    }
+
     function test_leavePool_not_member_reverts() public {
         uint256 poolId = _createPool();
 

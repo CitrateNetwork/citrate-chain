@@ -14,6 +14,7 @@ pub use encryption::{
     EncryptionConfig,
     EncryptionMetadata,
     EncryptedKey,
+    RecipientPublicKeys,
     decrypt_model,
     encrypt_model,
 };

@@ -2952,7 +2952,7 @@ mod tests {
             return;
         }
         let src = r#"// SPDX-License-Identifier: MIT
-        pragma solidity ^0.8.24;
+        pragma solidity ^0.8.36;
         contract Single {
             uint256 private x;
             function set(uint256 v) public { x = v; }
@@ -2960,9 +2960,9 @@ mod tests {
         }
         "#;
 
-        let bin_opt = super::compile_runtime_bytecode(src, "0.8.24", true, Some("Single"))
+        let bin_opt = super::compile_runtime_bytecode(src, "0.8.36", true, Some("Single"))
             .expect("compile optimized");
-        let bin_unopt = super::compile_runtime_bytecode(src, "0.8.24", false, Some("Single"))
+        let bin_unopt = super::compile_runtime_bytecode(src, "0.8.36", false, Some("Single"))
             .expect("compile unoptimized");
         assert!(!bin_opt.is_empty());
         assert!(!bin_unopt.is_empty());
@@ -2978,14 +2978,14 @@ mod tests {
             return;
         }
         let src = r#"// SPDX-License-Identifier: MIT
-        pragma solidity ^0.8.24;
+        pragma solidity ^0.8.36;
         contract A { function a() public pure returns (uint256) { return 1; } }
         contract B { function b() public pure returns (uint256) { return 2; } }
         "#;
         let bin_a =
-            super::compile_runtime_bytecode(src, "0.8.24", true, Some("A")).expect("compile A");
+            super::compile_runtime_bytecode(src, "0.8.36", true, Some("A")).expect("compile A");
         let bin_b =
-            super::compile_runtime_bytecode(src, "0.8.24", true, Some("B")).expect("compile B");
+            super::compile_runtime_bytecode(src, "0.8.36", true, Some("B")).expect("compile B");
         assert!(!bin_a.is_empty());
         assert!(!bin_b.is_empty());
         assert_ne!(bin_a, bin_b);

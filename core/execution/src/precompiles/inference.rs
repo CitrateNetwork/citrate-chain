@@ -1,7 +1,8 @@
 // citrate/core/execution/src/precompiles/inference.rs
 
 // AI Inference Precompiles for EVM
-// Addresses 0x0100 - 0x0105 reserved for AI operations
+// Addresses 0x0100 - 0x0106 are reserved for AI operations. The legacy 0x0104
+// commitment route is retained as an address tombstone and always rejects.
 
 use anyhow::{anyhow, Result};
 use ethereum_types::{H160, H256, U256};
@@ -31,7 +32,7 @@ pub mod addresses {
     pub const MODEL_METADATA: [u8; 20] =
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3];
 
-    /// 0x0104: Proof verification for inference
+    /// 0x0104: Retired legacy proof-verification address (always rejects)
     pub const PROOF_VERIFY: [u8; 20] =
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 4];
 
@@ -282,7 +283,9 @@ impl InferencePrecompile {
         } else if addr == &addresses::MODEL_METADATA {
             self.get_metadata(input, gas_limit)
         } else if addr == &addresses::PROOF_VERIFY {
-            self.verify_proof(input, gas_limit)
+            Err(anyhow!(
+                "CRY-H2: retired 0x0104 inference proof route is disabled; use the real 0x0108 verifier"
+            ))
         } else if addr == &addresses::MODEL_BENCHMARK {
             self.benchmark_model(input, gas_limit)
         } else if addr == &addresses::MODEL_ENCRYPTION {
@@ -532,39 +535,6 @@ impl InferencePrecompile {
         })
     }
 
-    /// Verify inference proof (0x0104)
-    ///
-    /// Commitment-based verification scheme:
-    /// Input format: model_id (32 bytes) || proof_data
-    /// Proof format: commitment (32 bytes) || response (32 bytes) || statement (remaining)
-    ///
-    /// Verification: commitment == SHA3(statement || response)
-    /// This provides cryptographic binding between the inference statement,
-    /// the model's response, and the commitment published on-chain.
-    fn verify_proof(&self, input: &[u8], gas_limit: u64) -> Result<PrecompileOutput> {
-        if input.len() < 32 {
-            return Err(anyhow!("Invalid proof data: need at least model_id (32 bytes)"));
-        }
-
-        let gas_cost = gas_costs::PROOF_VERIFICATION;
-        if gas_cost > gas_limit {
-            return Err(anyhow!("Insufficient gas"));
-        }
-
-        let _model_id = H256::from_slice(&input[0..32]);
-        let proof_data = &input[32..];
-
-        let is_valid = verify_commitment_proof(proof_data);
-
-        let result = if is_valid { 1u8 } else { 0u8 };
-
-        Ok(PrecompileOutput {
-            output: vec![result],
-            gas_used: gas_cost,
-            logs: vec![format!("Proof verification (commitment): {}", if is_valid { "VALID" } else { "INVALID" })],
-        })
-    }
-
     /// Benchmark model performance (0x0105)
     ///
     /// Returns model metadata and hardware capabilities. Latency and throughput
@@ -699,7 +669,9 @@ impl InferencePrecompile {
     }
 }
 
-/// Verify a commitment-based inference proof.
+/// Verify the retired commitment format for compatibility tests and migration
+/// tooling. This helper is deliberately not reachable through the 0x0104
+/// precompile route; real inference proofs must use the 0x0108 verifier.
 ///
 /// Proof format: commitment (32 bytes) || response (32 bytes) || statement (remaining)
 /// Verification: commitment == SHA3(statement || response)

@@ -245,12 +245,26 @@ contract LiquidStakingPool is ReentrancyGuard, Governable {
         }
     }
 
-    /// @dev Apply a finalized reward report to the pool
+    /// @dev Apply a finalized reward report to the pool.
+    ///
+    /// CHAIN-B-C018 (HELD/reroll): a reward report increases `totalPooled`
+    /// (a native-SALT liability to stakers) but the oracle call carries no
+    /// value. Pre-fix that was a pure liability mint — after reporting
+    /// `rewards`, the pool owed more SALT than its balance held, so late
+    /// withdrawals reverted permanently. The backing already exists in the
+    /// contract: `donate()` adds real SALT to the balance and to
+    /// `totalDonated` without touching `totalPooled`. The fix consumes that
+    /// donated backing when a report is applied, so every unit added to
+    /// `totalPooled` is matched by a unit of SALT actually held.
     function _applyRewardReport(uint256 rewards, uint256 slashed) internal {
         if (slashed > 0 && slashed <= totalPooled) {
             totalPooled -= slashed;
         }
-        totalPooled += rewards;
+        if (rewards > 0) {
+            require(rewards <= totalDonated, "Rewards exceed donated backing");
+            totalDonated -= rewards;
+            totalPooled += rewards;
+        }
 
         emit RewardsReported(rewards, slashed, getSharePrice());
     }

@@ -85,6 +85,13 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
     mapping(bytes32 => uint256) public stakingRequirements;
     mapping(address => mapping(bytes32 => uint256)) public userStakes;
 
+    // CHAIN-B-C027 (HELD/reroll): running accumulators of per-user
+    // liabilities held in `address(this).balance`. `emergencyWithdraw`
+    // must never sweep these — they belong to stakers (`userStakes`) and
+    // to revenue recipients (`pendingWithdrawals`), not to the owner.
+    uint256 public totalUserStakes;
+    uint256 public totalPendingWithdrawals;
+
     // Model categories and metadata
     mapping(bytes32 => string) public modelCategories;
     mapping(bytes32 => string) public modelDescriptions;
@@ -322,6 +329,7 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
         // Record revenue
         modelRevenue[request.modelId] += request.payment;
         pendingWithdrawals[msg.sender] += request.payment;
+        totalPendingWithdrawals += request.payment; // C027
 
         emit AccessGranted(
             request.modelId,
@@ -351,6 +359,7 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
             require(msg.value >= price, "Insufficient payment");
             modelRevenue[modelId] += msg.value;
             pendingWithdrawals[models[modelId].owner] += msg.value;
+            totalPendingWithdrawals += msg.value; // C027
         }
 
         // Update usage count
@@ -426,6 +435,7 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
     function stakeForAccess(bytes32 modelId) external payable {
         require(msg.value >= stakingRequirements[modelId], "Insufficient stake");
         userStakes[msg.sender][modelId] += msg.value;
+        totalUserStakes += msg.value; // C027
     }
 
     /**
@@ -440,6 +450,7 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
     function unstake(bytes32 modelId, uint256 amount) external nonReentrant {
         require(userStakes[msg.sender][modelId] >= amount, "Insufficient stake");
         userStakes[msg.sender][modelId] -= amount;
+        totalUserStakes -= amount; // C027
         payable(msg.sender).sendValue(amount);
     }
 
@@ -453,6 +464,7 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
         require(amount > 0, "No pending withdrawals");
 
         pendingWithdrawals[msg.sender] = 0;
+        totalPendingWithdrawals -= amount; // C027
         payable(msg.sender).sendValue(amount);
 
         emit RevenueWithdrawn(msg.sender, amount);
@@ -537,8 +549,18 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
     /**
      * @notice Emergency pause (only owner)
      */
+    /// @dev CHAIN-B-C027 (HELD/reroll): the sweep may only take the
+    /// contract's OWN surplus — never the SALT users staked
+    /// (`totalUserStakes`) or the revenue owed to model owners
+    /// (`totalPendingWithdrawals`), which are per-user liabilities held
+    /// in this same balance. Pre-fix `emergencyWithdraw` swept the entire
+    /// balance to the owner, converting every stake and every accrued
+    /// payout into owner funds and bricking `unstake`/`withdrawRevenue`.
     function emergencyWithdraw() external onlyOwner nonReentrant {
-        payable(owner()).sendValue(address(this).balance);
+        uint256 liabilities = totalUserStakes + totalPendingWithdrawals;
+        uint256 balance = address(this).balance;
+        require(balance > liabilities, "No surplus to withdraw");
+        payable(owner()).sendValue(balance - liabilities);
     }
 
     /**

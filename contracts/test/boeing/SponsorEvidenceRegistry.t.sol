@@ -112,6 +112,7 @@ contract SponsorEvidenceRegistryTest is Test {
     // ── Sponsor signatures ─────────────────────────────────────────
 
     function test_addSponsorSignature_rejects_unknown_bundle() public {
+        vm.prank(recorder);
         vm.expectRevert(
             abi.encodeWithSelector(SponsorEvidenceRegistry.UnknownBundle.selector, B_1)
         );
@@ -119,15 +120,16 @@ contract SponsorEvidenceRegistryTest is Test {
     }
 
     function test_addSponsorSignature_increments_count() public {
-        vm.prank(recorder);
+        vm.startPrank(recorder);
         reg.anchor(B_1, ROOT, CID, 0);
         reg.addSponsorSignature(B_1, SPONSOR_A);
+        vm.stopPrank();
         assertEq(reg.getBundle(B_1).sponsor_sig_count, 1);
         assertTrue(reg.sponsorHasSigned(B_1, SPONSOR_A));
     }
 
     function test_addSponsorSignature_rejects_duplicate() public {
-        vm.prank(recorder);
+        vm.startPrank(recorder);
         reg.anchor(B_1, ROOT, CID, 0);
         reg.addSponsorSignature(B_1, SPONSOR_A);
         vm.expectRevert(
@@ -138,13 +140,15 @@ contract SponsorEvidenceRegistryTest is Test {
             )
         );
         reg.addSponsorSignature(B_1, SPONSOR_A);
+        vm.stopPrank();
     }
 
     function test_addSponsorSignature_multiple_distinct() public {
-        vm.prank(recorder);
+        vm.startPrank(recorder);
         reg.anchor(B_1, ROOT, CID, 0);
         reg.addSponsorSignature(B_1, SPONSOR_A);
         reg.addSponsorSignature(B_1, SPONSOR_B);
+        vm.stopPrank();
         assertEq(reg.getBundle(B_1).sponsor_sig_count, 2);
         bytes32[] memory signers = reg.signersOf(B_1);
         assertEq(signers.length, 2);
@@ -152,21 +156,28 @@ contract SponsorEvidenceRegistryTest is Test {
         assertEq(signers[1], SPONSOR_B);
     }
 
-    function test_addSponsorSignature_is_permissionless() public {
+    /// CHAIN-B-C024 RC-8: this fixture previously asserted that
+    /// `addSponsorSignature` was permissionless (the bug). Inverted: an
+    /// unauthorized caller is now rejected with `NotRecorder`.
+    function test_addSponsorSignature_is_recorder_gated() public {
         vm.prank(recorder);
         reg.anchor(B_1, ROOT, CID, 0);
-        // nobody can submit a sponsor signature (verification is off-chain).
+        // A non-recorder can no longer fabricate a sponsor countersignature.
         vm.prank(nobody);
+        vm.expectRevert(
+            abi.encodeWithSelector(SponsorEvidenceRegistry.NotRecorder.selector, nobody)
+        );
         reg.addSponsorSignature(B_1, SPONSOR_A);
-        assertEq(reg.getBundle(B_1).sponsor_sig_count, 1);
+        assertEq(reg.getBundle(B_1).sponsor_sig_count, 0);
     }
 
     function test_addSponsorSignature_emits_event() public {
-        vm.prank(recorder);
+        vm.startPrank(recorder);
         reg.anchor(B_1, ROOT, CID, 0);
         vm.expectEmit(true, true, false, true);
         emit SponsorEvidenceRegistry.SponsorSigned(B_1, SPONSOR_A, 1);
         reg.addSponsorSignature(B_1, SPONSOR_A);
+        vm.stopPrank();
     }
 
     // ── Indices ─────────────────────────────────────────────────────

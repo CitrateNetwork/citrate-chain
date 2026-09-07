@@ -332,7 +332,7 @@ async fn handle_inbound(
         None => return Err(NetworkError::TransportError("eof".into())),
     };
 
-    let hello: NetworkMessage = bincode::deserialize(&hello_bytes)
+    let hello = NetworkMessage::decode_inbound(&hello_bytes)
         .map_err(|e| NetworkError::ProtocolError(format!("decode: {}", e)))?;
 
     let (remote_id, remote_head_height, remote_head_hash) = match hello {
@@ -694,7 +694,7 @@ async fn handle_outbound(
         None => return Err(NetworkError::TransportError("eof".into())),
     };
 
-    let ack: NetworkMessage = bincode::deserialize(&ack_bytes)
+    let ack = NetworkMessage::decode_inbound(&ack_bytes)
         .map_err(|e| NetworkError::ProtocolError(format!("decode: {}", e)))?;
 
     if let NetworkMessage::HelloAck {

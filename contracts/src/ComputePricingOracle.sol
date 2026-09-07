@@ -37,6 +37,13 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
     /// @notice Maximum price change per update in basis points (10% = 1000 BPS)
     uint256 public constant MAX_PRICE_CHANGE_BPS = 1000;
 
+    /// @notice Minimum blocks between two finalized updates of the SAME price
+    ///         track. C037(a): without a cooldown the 10% cap is per-update and
+    ///         `computePriceNonce++`/`saltPriceNonce++` reopen a fresh vote in
+    ///         the same block, so N sequential proposals compound to 1.1^N in one
+    ///         block. This bounds movement to MAX_PRICE_CHANGE_BPS per interval.
+    uint256 public constant MIN_UPDATE_INTERVAL = 20;
+
     /// @notice Conversion factor: tokens to PFLOP-hours
     ///         Approximation: 1 token inference ~= 1e-12 PFLOP-hours
     ///         So 1e12 tokens = 1 PFLOP-hour. Factor is denominator.
@@ -57,8 +64,13 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
     /// @notice SALT price in USD cents (e.g., 100 = $1.00)
     uint256 public override saltPriceUsdCents;
 
-    /// @notice Block number of last successful price update
+    /// @notice Block number of last successful price update (either track).
     uint256 public lastUpdateBlock;
+
+    /// @notice Block number of the last finalized compute-price update.
+    uint256 public lastComputeUpdateBlock;
+    /// @notice Block number of the last finalized SALT-price update.
+    uint256 public lastSaltUpdateBlock;
 
     /// @notice Historical price snapshots for market maker data
     struct PriceSnapshot {
@@ -173,9 +185,13 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
 
         isOracleMember[member] = true;
         oracleCount++;
-        // SOL-10: invalidate any in-flight proposal under the
-        // pre-change membership.
+        // SOL-10 / C037(b): invalidate any in-flight proposal under the
+        // pre-change membership — BOTH price tracks. The pre-fix code bumped
+        // only `computePriceNonce`, leaving a live salt-price vote to finalize
+        // against a `votesNeeded` computed from the new count while retaining
+        // votes from the old membership.
         computePriceNonce++;
+        saltPriceNonce++;
 
         emit OracleMemberAdded(member);
     }
@@ -187,7 +203,9 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
 
         isOracleMember[member] = false;
         oracleCount--;
+        // SOL-10 / C037(b): bump BOTH tracks (see addOracleMember).
         computePriceNonce++;
+        saltPriceNonce++;
 
         emit OracleMemberRemoved(member);
     }
@@ -238,11 +256,21 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
             votesNeeded = 1;
         }
         if (_computeVoteCount[nonce] >= votesNeeded) {
+            // C037(a): enforce a per-track cooldown so updates cannot compound
+            // within one block. The first-ever update (lastComputeUpdateBlock==0)
+            // is unconstrained.
+            if (lastComputeUpdateBlock != 0) {
+                require(
+                    block.number >= lastComputeUpdateBlock + MIN_UPDATE_INTERVAL,
+                    "ComputePricingOracle: update cooldown"
+                );
+            }
             uint256 oldPrice = computePriceUsdCents;
             computePriceUsdCents = newPrice;
             _computeFinalized[nonce] = true;
             computePriceNonce++;
             lastUpdateBlock = block.number;
+            lastComputeUpdateBlock = block.number;
 
             _recordPriceSnapshot();
 
@@ -287,11 +315,19 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
         // Check quorum
         uint256 votesNeeded = (oracleCount * QUORUM + 99) / 100;
         if (_saltVoteCount[nonce] >= votesNeeded) {
+            // C037(a): per-track cooldown (see proposeComputePrice).
+            if (lastSaltUpdateBlock != 0) {
+                require(
+                    block.number >= lastSaltUpdateBlock + MIN_UPDATE_INTERVAL,
+                    "ComputePricingOracle: update cooldown"
+                );
+            }
             uint256 oldPrice = saltPriceUsdCents;
             saltPriceUsdCents = newPrice;
             _saltFinalized[nonce] = true;
             saltPriceNonce++;
             lastUpdateBlock = block.number;
+            lastSaltUpdateBlock = block.number;
 
             _recordPriceSnapshot();
 

@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 
 use citrate_execution::crypto::encryption::{
     ModelEncryption, EncryptionConfig,
-    EncryptionMetadata, EncryptedKey,
+    EncryptionMetadata, EncryptedKey, RecipientPublicKeys,
 };
 use citrate_execution::crypto::key_manager::{
     KeyManager, KeyPurpose,
@@ -143,6 +143,7 @@ impl EncryptedIPFSStore {
         metadata: ModelMetadata,
         owner: H160,
         access_list: Vec<H160>,
+        recipient_public_keys: &RecipientPublicKeys,
     ) -> Result<Cid> {
         // Derive encryption key for this model using BIP-44 style path
         // m/44'/60'/0'/1/{model_index} where model_index is derived from model_id
@@ -188,23 +189,24 @@ impl EncryptedIPFSStore {
             encrypted_chunks,
             encryption_metadata: EncryptionMetadata {
                 algorithm: "AES-256-GCM".to_string(),
-                kdf: "PBKDF2".to_string(),
+                kdf: "HKDF-SHA256".to_string(),
                 encrypted_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
                 original_size: model_data.len(),
                 plaintext_hash: self.calculate_hash(model_data),
-                version: 1,
+                version: 2,
             },
             access_list: access_list.clone(),
             encrypted_keys: self.create_encrypted_keys(
                 &derived_key.key,
                 &access_list,
                 owner,
+                recipient_public_keys,
             )?,
             model_metadata: metadata,
-            version: 1,
+            version: 2,
         };
 
         // Store manifest on IPFS
@@ -246,8 +248,8 @@ impl EncryptedIPFSStore {
             .ok_or_else(|| anyhow!("No encrypted key found for recipient"))?;
 
         // Decrypt the symmetric key
-        let symmetric_key = self.decrypt_key_for_recipient(
-            &encrypted_key.encrypted_key,
+        let symmetric_key = self.encryption.decrypt_key_for_recipient(
+            encrypted_key,
             recipient_key,
         )?;
 
@@ -284,6 +286,7 @@ impl EncryptedIPFSStore {
         new_user: H160,
         owner: H160,
         owner_key: &[u8; 32],
+        new_user_pubkey: &[u8; 33],
     ) -> Result<Cid> {
         // Fetch current manifest
         let manifest_data = self.ipfs.cat(&manifest_cid.0).await?;
@@ -305,15 +308,16 @@ impl EncryptedIPFSStore {
             .find(|k| k.recipient == owner)
             .ok_or_else(|| anyhow!("Owner key not found"))?;
 
-        let symmetric_key = self.decrypt_key_for_recipient(
-            &owner_encrypted_key.encrypted_key,
+        let symmetric_key = self.encryption.decrypt_key_for_recipient(
+            owner_encrypted_key,
             owner_key,
         )?;
 
         // Create encrypted key for new user
-        let new_encrypted_key = self.encrypt_key_for_recipient(
+        let new_encrypted_key = self.encryption.encrypt_key_for_recipient(
             &symmetric_key,
             &new_user,
+            new_user_pubkey,
         )?;
 
         // Update manifest
@@ -394,6 +398,7 @@ impl EncryptedIPFSStore {
         symmetric_key: &[u8; 32],
         access_list: &[H160],
         owner: H160,
+        recipient_public_keys: &RecipientPublicKeys,
     ) -> Result<Vec<EncryptedKey>> {
         let mut encrypted_keys = Vec::new();
 
@@ -404,58 +409,18 @@ impl EncryptedIPFSStore {
         }
 
         for recipient in &full_list {
-            let encrypted_key = self.encrypt_key_for_recipient(
+            let recipient_pubkey = recipient_public_keys
+                .get(recipient)
+                .ok_or_else(|| anyhow!("missing public key for recipient {}", recipient))?;
+            let encrypted_key = self.encryption.encrypt_key_for_recipient(
                 symmetric_key,
                 recipient,
+                recipient_pubkey,
             )?;
             encrypted_keys.push(encrypted_key);
         }
 
         Ok(encrypted_keys)
-    }
-
-    /// Encrypt symmetric key for recipient
-    fn encrypt_key_for_recipient(
-        &self,
-        symmetric_key: &[u8; 32],
-        recipient: &H160,
-    ) -> Result<EncryptedKey> {
-        // In production, use recipient's public key with ECIES
-        // For now, simplified encryption
-        use rand::RngCore;
-        use aes_gcm::aead::OsRng;
-
-        let mut ephemeral_key = [0u8; 32];
-        OsRng.fill_bytes(&mut ephemeral_key);
-
-        let mut encrypted = symmetric_key.to_vec();
-        for i in 0..32 {
-            encrypted[i] ^= ephemeral_key[i] ^ recipient.as_bytes()[i % 20];
-        }
-
-        Ok(EncryptedKey {
-            recipient: *recipient,
-            encrypted_key: encrypted,
-            ephemeral_pubkey: vec![0u8; 33], // Would be actual public key
-        })
-    }
-
-    /// Decrypt symmetric key for recipient
-    fn decrypt_key_for_recipient(
-        &self,
-        encrypted_key: &[u8],
-        _recipient_key: &[u8; 32],
-    ) -> Result<[u8; 32]> {
-        // Simplified decryption (production would use ECIES)
-        if encrypted_key.len() != 32 {
-            return Err(anyhow!("Invalid encrypted key length"));
-        }
-
-        let mut decrypted = [0u8; 32];
-        decrypted.copy_from_slice(encrypted_key);
-
-        // In production, perform proper ECDH and derive shared secret
-        Ok(decrypted)
     }
 
     /// Calculate hash for integrity verification
@@ -548,6 +513,20 @@ mod tests {
         let model_id = H256::random();
         let owner = H160::random();
         let user = H160::random();
+        let public_keys = HashMap::from([
+            (
+                owner,
+                citrate_execution::crypto::ecdh::ECIES::from_private_key([1u8; 32])
+                    .unwrap()
+                    .public_key(),
+            ),
+            (
+                user,
+                citrate_execution::crypto::ecdh::ECIES::from_private_key([2u8; 32])
+                    .unwrap()
+                    .public_key(),
+            ),
+        ]);
 
         let metadata = ModelMetadata {
             name: "test_model".to_string(),
@@ -570,6 +549,7 @@ mod tests {
             metadata,
             owner,
             vec![user],
+            &public_keys,
         ).await.unwrap();
 
         assert!(!manifest_cid.0.is_empty());

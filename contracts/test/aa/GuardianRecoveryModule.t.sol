@@ -264,7 +264,10 @@ contract GuardianRecoveryModuleTest is Test {
         // the account, so a signature for kernelA fails on kernelB.
         bytes32 digestForA = _digest(userOpHash, kernelA).toEthSignedMessageHash();
         bytes memory blob = bytes.concat(_sign(PK_A, digestForA), _sign(PK_B, digestForA));
-        PackedUserOperation memory op = _op(blob);
+        // CHAIN-B-C032: callData must target the account being validated. Build
+        // it for kernelA (where success is expected); under kernelB the target
+        // no longer matches msg.sender, which is one more reason it fails.
+        PackedUserOperation memory op = _opFor(blob, kernelA);
 
         // The signatures were over a digest bound to kernelA; submitting
         // them to kernelB's validation must FAIL because the digest
@@ -389,7 +392,84 @@ contract GuardianRecoveryModuleTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
-    function _op(bytes memory sig) internal pure returns (PackedUserOperation memory op) {
+    /// CHAIN-B-C032: a valid recovery op is a self-`execute` whose inner call
+    /// is `changeRootValidator`. Default ops target `kernel`.
+    function _op(bytes memory sig) internal view returns (PackedUserOperation memory op) {
         op.signature = sig;
+        op.callData = _rotateCallData(kernel);
+    }
+
+    function _opFor(bytes memory sig, address account) internal pure returns (PackedUserOperation memory op) {
+        op.signature = sig;
+        op.callData = _rotateCallData(account);
+    }
+
+    function _rotateCallData(address account) internal pure returns (bytes memory) {
+        bytes memory inner = abi.encodeWithSignature(
+            "changeRootValidator(bytes21,address,bytes,bytes)",
+            bytes21(0), address(0), bytes(""), bytes("")
+        );
+        return abi.encodeWithSignature(
+            "execute(bytes32,bytes)", bytes32(0), abi.encodePacked(account, uint256(0), inner)
+        );
+    }
+
+    // ── CHAIN-B-C032: the recovery action is constrained ────────────
+
+    /// RED (pre-fix): a guardian quorum could authorize ANY userOp — including
+    /// one that drains the wallet — because the module never inspected
+    /// callData. GREEN: a guardian-signed transfer (external target + value)
+    /// is rejected even with a valid M-of-N signature set.
+    function test_C032_guardian_signed_transfer_is_rejected() public {
+        _installFresh(kernel, 2, _threeGuardians());
+        bytes32 userOpHash = keccak256("drain");
+        bytes32 ethDigest = _digest(userOpHash, kernel).toEthSignedMessageHash();
+        bytes memory blob = bytes.concat(_sign(PK_A, ethDigest), _sign(PK_B, ethDigest));
+
+        // callData: execute a 1-ether transfer to an attacker EOA.
+        PackedUserOperation memory op;
+        op.signature = blob;
+        op.callData = abi.encodeWithSignature(
+            "execute(bytes32,bytes)",
+            bytes32(0),
+            abi.encodePacked(address(0xBAD), uint256(1 ether), bytes(""))
+        );
+
+        vm.prank(kernel);
+        uint256 res = module.validateUserOp(op, userOpHash);
+        assertEq(res, SIG_VALIDATION_FAILED_UINT, "guardian-signed drain must be rejected");
+    }
+
+    /// GREEN: a delegatecall-mode recovery op is rejected.
+    function test_C032_delegatecall_recovery_rejected() public {
+        _installFresh(kernel, 2, _threeGuardians());
+        bytes32 userOpHash = keccak256("dc");
+        bytes32 ethDigest = _digest(userOpHash, kernel).toEthSignedMessageHash();
+        bytes memory blob = bytes.concat(_sign(PK_A, ethDigest), _sign(PK_B, ethDigest));
+
+        // CALLTYPE_DELEGATECALL == 0xff in the top byte of execMode.
+        bytes32 dcMode = bytes32(uint256(0xff) << 248);
+        PackedUserOperation memory op;
+        op.signature = blob;
+        op.callData = abi.encodeWithSignature(
+            "execute(bytes32,bytes)", dcMode, abi.encodePacked(kernel, uint256(0), bytes(""))
+        );
+
+        vm.prank(kernel);
+        uint256 res = module.validateUserOp(op, userOpHash);
+        assertEq(res, SIG_VALIDATION_FAILED_UINT, "delegatecall recovery must be rejected");
+    }
+
+    /// GREEN: the intended action (self-call changeRootValidator) still works.
+    function test_C032_rotate_root_is_allowed() public {
+        _installFresh(kernel, 2, _threeGuardians());
+        bytes32 userOpHash = keccak256("rotate");
+        bytes32 ethDigest = _digest(userOpHash, kernel).toEthSignedMessageHash();
+        bytes memory blob = bytes.concat(_sign(PK_A, ethDigest), _sign(PK_B, ethDigest));
+
+        PackedUserOperation memory op = _op(blob);
+        vm.prank(kernel);
+        uint256 res = module.validateUserOp(op, userOpHash);
+        assertEq(res, SIG_VALIDATION_SUCCESS_UINT, "self-rotate must remain allowed");
     }
 }

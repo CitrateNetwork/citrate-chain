@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
 
 import "./lib/ReentrancyGuard.sol";
 import "./lib/Governable.sol";
@@ -168,7 +168,10 @@ contract DisputeResolution is ReentrancyGuard, Governable {
         d.challenger = msg.sender;
         d.defender = defender;
         d.challengerBond = msg.value;
-        d.defenderBond = disputeBond;
+        // The defender has not deposited anything yet. Do not create a
+        // liability that is absent from the contract balance; the defender's
+        // bond is populated only by acknowledgeDispute.
+        d.defenderBond = 0;
         d.rangeStart = rangeStart;
         d.rangeEnd = rangeEnd;
         d.state = DisputeState.Initiated;
@@ -269,13 +272,17 @@ contract DisputeResolution is ReentrancyGuard, Governable {
         );
         require(block.number > d.deadline, "Deadline not expired");
 
+        bool defenderAcknowledged = d.state == DisputeState.Bisecting;
+
         d.state = DisputeState.Resolved;
         d.outcome = Outcome.ChallengerWon;
 
         emit DisputeTimedOut(disputeId, d.outcome);
 
         _payWinner(disputeId);
-        _slashDefender(disputeId);
+        if (defenderAcknowledged) {
+            _slashDefender(disputeId);
+        }
     }
 
     // ── View Functions ──────────────────────────────────────────────

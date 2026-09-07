@@ -682,7 +682,7 @@ fn test_benchmark_wrong_input_length() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_insufficient_gas_for_proof_verify() {
+fn test_retired_proof_verify_route_is_disabled() {
     let runtime = std::sync::Arc::new(
         citrate_execution::inference::metal_runtime::MetalRuntime::new().unwrap(),
     );
@@ -698,7 +698,7 @@ fn test_insufficient_gas_for_proof_verify() {
     let result = precompile.execute(&addr, &input, gas_costs::PROOF_VERIFICATION - 1);
     assert!(result.is_err());
     let msg = err_msg(result);
-    assert!(msg.to_lowercase().contains("gas"), "Error: {}", msg);
+    assert!(msg.contains("retired"), "Error: {}", msg);
 }
 
 #[test]

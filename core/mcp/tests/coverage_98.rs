@@ -980,12 +980,13 @@ fn test_nonce_proof_at_5min_boundary() {
     let model = make_model(1);
     let input = b"boundary input";
     let output = b"boundary output";
-    // Just within 5-minute window (299 seconds ago)
+    // The retired nonce commitment format must not pass as a real proof,
+    // regardless of its timestamp.
     let ts = chrono::Utc::now().timestamp() as u64 - 299;
     let proof = build_execution_proof_with_nonce(&model, input, output, ts);
 
     let result = verifier.verify_execution(&model, input, output, &proof);
-    assert!(result.unwrap(), "Nonce at 299s old should still be valid");
+    assert!(!result.unwrap(), "legacy nonce commitment must fail closed");
 }
 
 #[test]
@@ -994,15 +995,12 @@ fn test_nonce_proof_just_within_future_tolerance() {
     let model = make_model(2);
     let input = b"future input";
     let output = b"future output";
-    // 59 seconds in the future (within 60s tolerance)
+    // Even an otherwise timely legacy commitment is not a real proof.
     let ts = chrono::Utc::now().timestamp() as u64 + 59;
     let proof = build_execution_proof_with_nonce(&model, input, output, ts);
 
     let result = verifier.verify_execution(&model, input, output, &proof);
-    assert!(
-        result.unwrap(),
-        "Nonce 59s in future should be within tolerance"
-    );
+    assert!(!result.unwrap(), "legacy nonce commitment must fail closed");
 }
 
 #[test]
@@ -1030,11 +1028,11 @@ fn test_nonce_proof_with_extra_bytes_beyond_72() {
     let output = b"extra output";
     let ts = chrono::Utc::now().timestamp() as u64;
     let mut proof = build_execution_proof_with_nonce(&model, input, output, ts);
-    // Append extra bytes beyond 72 — nonce-enhanced path uses first 72 only
+    // Appended bytes cannot turn the retired format into a real proof.
     proof.proof_data.extend_from_slice(&[0xFF; 100]);
 
     let result = verifier.verify_execution(&model, input, output, &proof);
-    assert!(result.unwrap(), "Extra bytes beyond 72 should not affect verification");
+    assert!(!result.unwrap(), "legacy nonce commitment must fail closed");
 }
 
 // =============================================================================
