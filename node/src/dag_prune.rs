@@ -504,7 +504,17 @@ mod tests {
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
-        let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
+        // SECREM-A001 / reroll: MP-DEPTH is default-on (activation 0) after the
+        // re-roll, so on the LIVE chain a merge parent this far below its child
+        // can never exist — it is refused at admission (see
+        // `merge_block_referencing_a_pruned_parent_is_rejected_not_scored` and
+        // ghostdag's MP-DEPTH tests). This test covers the *other* half: the
+        // pre-MP-DEPTH cold-sync remedy — a node importing a chain whose deep
+        // merges predate MP-DEPTH activation must still admit them when it is
+        // not pruning. That regime is exactly `without_merge_depth_enforcement`,
+        // so we opt out of the bound here to exercise it.
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone())
+            .without_merge_depth_enforcement();
 
         let mut parent = Hash::default();
         let mut deep_hash = Hash::default();
@@ -545,7 +555,11 @@ mod tests {
                 .get_blue_score(&merge.header.block_hash)
                 .await
                 .expect("score"),
-            N + 1,
+            // SECREM-A001 RC-8: with the real height-0 configured genesis, a
+            // block at height h scores h+1 (one higher than the pre-A001 model
+            // where the root was height 1). The merge sits at height N+1, so it
+            // scores N+2.
+            N + 2,
             "and the applied chain advances past the merge block"
         );
     }
