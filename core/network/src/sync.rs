@@ -392,21 +392,37 @@ impl SyncManager {
     /// Handle received headers
     ///
     /// WP-H.4: Headers are validated for height monotonicity before storage.
-    pub async fn handle_headers(&self, headers: Vec<BlockHeader>) -> Result<(), NetworkError> {
-        // A response from our sync peer answers our in-flight header request
-        // REGARDLESS of its contents. Retire ALL pending header requests up
-        // front — this covers (a) an EMPTY "you're already at my tip" batch,
-        // previously early-returned *before* retirement, and (b) a batch whose
-        // first header's selected-parent does not exactly equal the requested
-        // `from` (a multi-producer GhostDAG sibling, since both the anchor and
-        // the server resolve `from` through the last-writer-wins height index).
-        // Either case used to leave a phantom `pending_headers` entry that
-        // `check_timeouts` then flagged as a FALSE timeout, monotonically
-        // penalizing and finally dropping the responding peer — the mechanism
-        // that isolated a bootnode from its only block source and split-brained
-        // the fleet. Any still-needed request is re-issued on the next 2s sync
-        // tick from the node's current tip, so clearing here loses nothing.
-        self.pending_headers.write().await.clear();
+    pub async fn handle_headers(
+        &self,
+        from_peer: &PeerId,
+        headers: Vec<BlockHeader>,
+    ) -> Result<(), NetworkError> {
+        // A response from a sync peer answers OUR in-flight header request to
+        // THAT peer, REGARDLESS of its contents. Retire the responding peer's
+        // pending header requests up front — this covers (a) an EMPTY "you're
+        // already at my tip" batch, previously early-returned *before*
+        // retirement, and (b) a batch whose first header's selected-parent does
+        // not exactly equal the requested `from` (a multi-producer GhostDAG
+        // sibling, since both the anchor and the server resolve `from` through
+        // the last-writer-wins height index). Either case used to leave a
+        // phantom `pending_headers` entry that `check_timeouts` then flagged as
+        // a FALSE timeout, dropping the responding peer — the mechanism that
+        // isolated a bootnode from its only block source and split-brained the
+        // fleet. Any still-needed request is re-issued on the next 2s sync tick.
+        //
+        // CHAIN-B-A008: retirement is now keyed by the RESPONDING PEER. The
+        // pre-fix code did a wholesale `clear()` that retired requests
+        // outstanding against EVERY peer, so one attacker emitting empty
+        // `Headers` frames retired honest peers' requests too and `check_timeouts`
+        // could never observe a real timeout — disabling the entire sync-peer
+        // penalty/eviction escalation. A response from peer X now only clears X's
+        // entries (`BlockRequest.peer_id` is set from the same `peer.info.id` the
+        // rx loop uses as `pid`), leaving other peers' requests to time out
+        // normally.
+        self.pending_headers
+            .write()
+            .await
+            .retain(|_, req| req.peer_id != *from_peer);
         if headers.is_empty() {
             return Ok(());
         }
@@ -518,14 +534,25 @@ impl SyncManager {
     /// 3. tx_root consistency (recomputed from transactions)
     ///
     /// Only validated blocks are stored and count toward progress.
-    pub async fn handle_blocks(&self, blocks: Vec<Block>) -> Result<(), NetworkError> {
-        // Retire ALL pending block requests up front — a response answers our
-        // in-flight request regardless of contents (empty batch, or a batch
-        // whose first block's selected-parent differs from the requested `from`
-        // on a multi-producer DAG). See the matching note in `handle_headers`;
-        // leaving a phantom pending entry is what false-timed-out the sole block
-        // source and isolated the node. Re-issued next tick from the current tip.
-        self.pending_blocks.write().await.clear();
+    pub async fn handle_blocks(
+        &self,
+        from_peer: &PeerId,
+        blocks: Vec<Block>,
+    ) -> Result<(), NetworkError> {
+        // Retire the RESPONDING peer's pending block requests up front — a
+        // response answers our in-flight request to that peer regardless of
+        // contents (empty batch, or a batch whose first block's selected-parent
+        // differs from the requested `from` on a multi-producer DAG). See the
+        // matching note in `handle_headers`; leaving a phantom pending entry is
+        // what false-timed-out the sole block source and isolated the node.
+        //
+        // CHAIN-B-A008: keyed by peer (was a wholesale `clear()`), so one peer's
+        // (or an attacker's) response can no longer retire another peer's
+        // outstanding request and neuter `check_timeouts`.
+        self.pending_blocks
+            .write()
+            .await
+            .retain(|_, req| req.peer_id != *from_peer);
         if blocks.is_empty() {
             return Ok(());
         }
@@ -909,7 +936,7 @@ mod tests {
             .height(5)
             .proposer(PublicKey::new([1; 32]))
             .build_unhashed();
-        sync.handle_headers(vec![served.header])
+        sync.handle_headers(&PeerId("peer-a".to_string()), vec![served.header])
             .await
             .expect("handle_headers");
 
@@ -949,7 +976,9 @@ mod tests {
             .height(1)
             .proposer(PublicKey::new([1; 32]))
             .build_unhashed();
-        let _ = sync.handle_blocks(vec![served]).await;
+        let _ = sync
+            .handle_blocks(&PeerId("peer-b".to_string()), vec![served])
+            .await;
 
         assert!(
             !sync.pending_blocks.read().await.contains_key(&anchor),
@@ -1009,14 +1038,14 @@ mod tests {
 
         // The peer answers with a range entirely BELOW our applied tip.
         let batch = vec![signed_block_at(8_000), signed_block_at(8_001)];
-        sync.handle_blocks(batch)
+        sync.handle_blocks(&crate::PeerId("p".into()), batch)
             .await
             .expect("a behind-us batch is normal traffic, not an error");
 
         // And the node is still usable afterwards: not wedged into Synced, and
         // still able to take the next batch.
         let ahead = vec![signed_block_at(8_200)];
-        sync.handle_blocks(ahead)
+        sync.handle_blocks(&crate::PeerId("p".into()), ahead)
             .await
             .expect("the manager keeps working after a behind-us batch");
     }
@@ -1032,7 +1061,7 @@ mod tests {
         *sync.current_height.write().await = 500;
         sync.set_target(500).await;
 
-        sync.handle_blocks(vec![signed_block_at(500)])
+        sync.handle_blocks(&crate::PeerId("p".into()), vec![signed_block_at(500)])
             .await
             .expect("an at-tip batch is handled");
         assert!(
@@ -1071,10 +1100,10 @@ mod tests {
                 retries: 0,
             },
         );
-        sync.handle_headers(vec![])
+        sync.handle_headers(&PeerId("p".into()), vec![])
             .await
             .expect("handle empty headers");
-        let _ = sync.handle_blocks(vec![]).await;
+        let _ = sync.handle_blocks(&PeerId("p".into()), vec![]).await;
         assert!(
             sync.pending_headers.read().await.is_empty(),
             "an empty header response must retire the pending request"
@@ -1114,10 +1143,58 @@ mod tests {
             .height(1)
             .proposer(PublicKey::new([1; 32]))
             .build_unhashed();
-        let _ = sync.handle_blocks(vec![served]).await;
+        let _ = sync.handle_blocks(&PeerId("p".into()), vec![served]).await;
         assert!(
             sync.pending_blocks.read().await.is_empty(),
             "a sibling-first-block response must still retire the pending request"
+        );
+    }
+
+    /// CHAIN-B-A008 REGRESSION. A response from one peer must retire only THAT
+    /// peer's pending requests, never another peer's. The pre-fix code did a
+    /// wholesale `pending_*.clear()` on every inbound `Headers`/`Blocks`, so an
+    /// attacker emitting empty responses retired honest peers' outstanding
+    /// requests and `check_timeouts` could never observe a real timeout —
+    /// disabling the whole sync-peer penalty/eviction escalation.
+    #[tokio::test]
+    async fn response_from_one_peer_does_not_retire_another_peers_request() {
+        use crate::PeerId;
+
+        let sync = SyncManager::new(SyncConfig::default());
+
+        // Peer A and peer B each have one outstanding block request.
+        let anchor_a = Hash::new([0xAA; 32]);
+        let anchor_b = Hash::new([0xBB; 32]);
+        sync.pending_blocks.write().await.insert(
+            anchor_a,
+            BlockRequest {
+                hash: anchor_a,
+                peer_id: PeerId("peer-a".into()),
+                requested_at: Instant::now(),
+                retries: 0,
+            },
+        );
+        sync.pending_blocks.write().await.insert(
+            anchor_b,
+            BlockRequest {
+                hash: anchor_b,
+                peer_id: PeerId("peer-b".into()),
+                requested_at: Instant::now(),
+                retries: 0,
+            },
+        );
+
+        // Peer B answers with an empty batch. This must retire only B's entry.
+        let _ = sync.handle_blocks(&PeerId("peer-b".into()), vec![]).await;
+
+        let pending = sync.pending_blocks.read().await;
+        assert!(
+            pending.contains_key(&anchor_a),
+            "peer A's request MUST survive a response from peer B (pre-fix bug)"
+        );
+        assert!(
+            !pending.contains_key(&anchor_b),
+            "peer B's own request is retired by its response"
         );
     }
 
@@ -1196,7 +1273,7 @@ mod tests {
                 h.height = batch * per_batch + i + 1; // strictly monotonic in-batch
                 headers.push(h);
             }
-            sync.handle_headers(headers)
+            sync.handle_headers(&crate::PeerId("p".into()), headers)
                 .await
                 .expect("handle_headers should accept a monotonic batch");
         }
