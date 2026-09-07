@@ -410,8 +410,34 @@ fn test_metrics_prometheus_all_fields() {
 fn test_oracle_registry_set_threshold() {
     let mut registry = OracleRegistry::new(2);
     assert_eq!(registry.threshold(), 2);
-    registry.set_threshold(5);
+
+    // CHAIN-B-D020: set_threshold now validates against the active-oracle count.
+    // A threshold of 0 (0-of-N mints every event with no attestations) and any
+    // value above the active-oracle count are rejected, and a rejected update
+    // must not mutate the threshold.
+    assert!(registry.set_threshold(5).is_err(), "no oracles => 5 rejected");
+    assert!(registry.set_threshold(0).is_err(), "0-of-N must be rejected");
+    assert_eq!(
+        registry.threshold(),
+        2,
+        "a rejected update must not change the threshold"
+    );
+
+    // Register enough active oracles, then a valid update succeeds.
+    for i in 0..5u8 {
+        let k = test_signing_key(60 + i);
+        registry
+            .register_oracle(k.verifying_key().to_bytes(), format!("O{i}"))
+            .unwrap();
+    }
+    registry
+        .set_threshold(5)
+        .expect("threshold within active-oracle count is accepted");
     assert_eq!(registry.threshold(), 5);
+    assert!(
+        registry.set_threshold(6).is_err(),
+        "threshold above active-oracle count is rejected"
+    );
 }
 
 #[test]
