@@ -24,7 +24,7 @@ impl Default for TokenConfig {
             name: "Citrate".to_string(),
             symbol: "SALT".to_string(),
             decimals: DECIMALS,
-            total_supply: U256::from(1_000_000_000) * U256::from(10).pow(U256::from(DECIMALS)),
+            total_supply: U256::from(crate::TOTAL_SUPPLY) * U256::from(10).pow(U256::from(DECIMALS)),
             initial_distribution: HashMap::new(),
         }
     }
@@ -87,16 +87,20 @@ impl Token {
 
     /// Mint new tokens (for block rewards)
     pub fn mint(&mut self, to: &Address, amount: U256) -> Result<(), TokenError> {
-        let new_total = self.total_minted + amount;
-
-        // Check if minting would exceed total supply
-        if new_total > self.config.total_supply {
+        // Enforce the cap against *circulating* supply (minted − burned), not the
+        // cumulative `total_minted` counter. Burning (e.g. staking) increments
+        // total_burned without decrementing total_minted, so a burn+mint round
+        // trip (stake→unstake) otherwise walks total_minted toward total_supply
+        // and eventually makes every mint — including unstaking — fail, freezing
+        // staked funds. Circulating supply is unchanged by a stake/unstake cycle.
+        let new_circulating = self.circulating_supply() + amount;
+        if new_circulating > self.config.total_supply {
             return Err(TokenError::ExceedsSupply);
         }
 
         let balance = self.balance_of(to);
         self.balances.insert(*to, balance + amount);
-        self.total_minted = new_total;
+        self.total_minted += amount;
 
         Ok(())
     }
