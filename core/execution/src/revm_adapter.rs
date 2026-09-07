@@ -95,6 +95,15 @@ pub struct StateDBAdapter {
     /// opting in; the executor explicitly selects the legacy rule below
     /// the activation height.
     value_semantics: ValueSemantics,
+    /// EIP-161 CREATE-nonce fix. When `true` (post-activation, the correct
+    /// rule), `commit` persists REVM's nonce for CONTRACT accounts so a
+    /// contract that runs `CREATE` in its constructor keeps the resulting
+    /// nonce. When `false` (pre-activation legacy), all nonces stay dropped
+    /// here, reproducing the bug so historical blocks replay identically.
+    /// Defaults to `true` so new code and tests get the correct rule; the
+    /// executor selects the legacy behaviour below
+    /// [`CREATE_NONCE_FIX_ACTIVATION_HEIGHT`](crate::executor::CREATE_NONCE_FIX_ACTIVATION_HEIGHT).
+    persist_contract_nonces: bool,
 }
 
 /// Which party owns native value movement during a REVM execution.
@@ -131,6 +140,7 @@ impl StateDBAdapter {
             writes: None,
             journal: None,
             value_semantics: ValueSemantics::RevmAuthoritative,
+            persist_contract_nonces: true,
         }
     }
 
@@ -138,6 +148,16 @@ impl StateDBAdapter {
     /// block height — see [`ValueSemantics`]).
     pub fn with_value_semantics(mut self, value_semantics: ValueSemantics) -> Self {
         self.value_semantics = value_semantics;
+        self
+    }
+
+    /// Select the EIP-161 CREATE-nonce rule for this execution (consensus-gated
+    /// by block height — see
+    /// [`CREATE_NONCE_FIX_ACTIVATION_HEIGHT`](crate::executor::CREATE_NONCE_FIX_ACTIVATION_HEIGHT)).
+    /// `true` persists contract-account nonces (correct, post-activation);
+    /// `false` reproduces the legacy nonce-drop (pre-activation replay).
+    pub fn with_contract_nonce_persistence(mut self, persist: bool) -> Self {
+        self.persist_contract_nonces = persist;
         self
     }
 
@@ -468,6 +488,32 @@ impl DatabaseCommit for StateDBAdapter {
                 }
             }
 
+            // ---- Nonce: EIP-161 CREATE-nonce fix (consensus-gated) ----
+            // The block near the top of `commit` drops the sender's nonce here
+            // because the executor owns it (`record_nonce(from, tx.nonce + 1)`).
+            // That over-broad drop also discarded CONTRACT-account nonces: a
+            // contract that ran `CREATE` in its own constructor committed with
+            // nonce 0 instead of `1 + (constructor CREATEs)`, so a later
+            // method-level CREATE recomputed an address at a nonce slot the
+            // constructor already filled → `CreateCollision` (observed live on
+            // 40204 blocking `createCooperative`).
+            //
+            // At/above the activation height, persist REVM's nonce for CONTRACT
+            // accounts. The transaction sender is an EOA (contracts cannot
+            // originate transactions — EIP-3607), so gating on `is_contract`
+            // leaves the executor's sole ownership of the sender nonce intact —
+            // there is no double-increment. Below the activation height
+            // `persist_contract_nonces` is false and the legacy drop is
+            // reproduced exactly, so historical blocks replay unchanged.
+            if self.persist_contract_nonces && is_contract {
+                let new_nonce = account.info.nonce;
+                if let Some(journal) = &self.journal {
+                    journal.lock().record_nonce(addr, new_nonce);
+                } else {
+                    self.state_db.accounts.set_nonce(addr, new_nonce);
+                }
+            }
+
             debug!(
                 "REVM commit: addr={} storage_slots={} code_changed={}",
                 addr, account.storage.len(), has_code
@@ -625,7 +671,8 @@ pub fn execute_contract_create_with_context(
     // Create database adapter with block hashes + optional write/journal capture
     let mut db = StateDBAdapter::new(state_db.clone())
         .with_block_hashes(block_ctx.block_hashes)
-        .with_value_semantics(value_semantics);
+        .with_value_semantics(value_semantics)
+        .with_contract_nonce_persistence(crate::executor::persist_contract_nonces_at(block_number));
     if let Some(h) = writes_handle {
         db = db.with_writes(h);
     }
@@ -824,7 +871,8 @@ pub fn execute_contract_call_with_context(
     // Create database adapter with block hashes + optional write/journal capture
     let mut db = StateDBAdapter::new(state_db)
         .with_block_hashes(block_ctx.block_hashes)
-        .with_value_semantics(value_semantics);
+        .with_value_semantics(value_semantics)
+        .with_contract_nonce_persistence(crate::executor::persist_contract_nonces_at(block_number));
     if let Some(h) = writes_handle {
         db = db.with_writes(h);
     }
@@ -981,6 +1029,86 @@ mod tests {
 
         let result = adapter.block_hash(RevmU256::from(0)).unwrap();
         assert_eq!(result, B256::ZERO);
+    }
+
+    /// Build a REVM `changes` map with one contract account (has code, nonce N)
+    /// and one EOA account (no code, nonce N) at distinct addresses.
+    fn nonce_commit_changes(
+        contract: [u8; 20],
+        contract_nonce: u64,
+        eoa: [u8; 20],
+        eoa_nonce: u64,
+    ) -> revm::primitives::HashMap<RevmAddress, revm::primitives::Account> {
+        let code = Bytecode::new_raw(Bytes::from(vec![0x60u8, 0x00, 0x60, 0x00, 0xf3]));
+        let code_hash = code.hash_slow();
+        let mk = |nonce: u64, code: Option<Bytecode>, code_hash: B256| revm::primitives::Account {
+            info: AccountInfo { balance: RevmU256::ZERO, nonce, code_hash, code },
+            storage: Default::default(),
+            status: revm::primitives::AccountStatus::Touched,
+        };
+        let mut changes = revm::primitives::HashMap::default();
+        changes.insert(
+            RevmAddress::from(contract),
+            mk(contract_nonce, Some(code), code_hash),
+        );
+        changes.insert(RevmAddress::from(eoa), mk(eoa_nonce, None, KECCAK_EMPTY));
+        changes
+    }
+
+    #[test]
+    fn commit_persists_contract_nonce_when_activated() {
+        // EIP-161 CREATE-nonce fix: at/above activation, a contract account's
+        // nonce (e.g. 2 = 1 initial + 1 constructor CREATE) is persisted; the
+        // EOA sender's nonce is still the executor's, so it stays dropped.
+        let state_db = Arc::new(StateDB::new());
+        let contract = [0x11u8; 20];
+        let eoa = [0x22u8; 20];
+        let mut adapter =
+            StateDBAdapter::new(state_db).with_contract_nonce_persistence(true);
+        adapter.commit(nonce_commit_changes(contract, 2, eoa, 5));
+
+        assert_eq!(
+            adapter.state_db.accounts.get_nonce(&Address(contract)),
+            2,
+            "contract nonce must persist post-activation (else CreateCollision)"
+        );
+        assert_eq!(
+            adapter.state_db.accounts.get_nonce(&Address(eoa)),
+            0,
+            "EOA sender nonce stays the executor's — never committed here"
+        );
+    }
+
+    #[test]
+    fn commit_drops_contract_nonce_pre_activation() {
+        // Below the activation height the legacy behaviour is reproduced
+        // exactly: ALL nonces stay dropped, so historical blocks replay to the
+        // roots they were produced with.
+        let state_db = Arc::new(StateDB::new());
+        let contract = [0x33u8; 20];
+        let eoa = [0x44u8; 20];
+        let mut adapter =
+            StateDBAdapter::new(state_db).with_contract_nonce_persistence(false);
+        adapter.commit(nonce_commit_changes(contract, 2, eoa, 5));
+
+        assert_eq!(
+            adapter.state_db.accounts.get_nonce(&Address(contract)),
+            0,
+            "pre-activation must drop the contract nonce (byte-identical replay)"
+        );
+        assert_eq!(adapter.state_db.accounts.get_nonce(&Address(eoa)), 0);
+    }
+
+    #[test]
+    fn create_nonce_fix_activation_boundary() {
+        use crate::executor::{
+            create_nonce_fix_activation_height, persist_contract_nonces_at,
+        };
+        let h = create_nonce_fix_activation_height();
+        assert!(h > 0, "must ship as a FUTURE height on the live chain, not 0");
+        assert!(!persist_contract_nonces_at(h - 1), "below activation → legacy drop");
+        assert!(persist_contract_nonces_at(h), "at activation → persist");
+        assert!(persist_contract_nonces_at(h + 1), "above activation → persist");
     }
 
     #[test]

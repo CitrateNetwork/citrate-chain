@@ -225,6 +225,55 @@ pub fn value_semantics_at(height: u64) -> crate::revm_adapter::ValueSemantics {
     }
 }
 
+/// EIP-161 CREATE-nonce fix — activation height.
+///
+/// Before this height, [`StateDBAdapter::commit`](crate::revm_adapter) DROPPED
+/// every account nonce REVM computed. That is correct for the transaction
+/// sender (the executor owns that nonce via `record_nonce(from, tx.nonce + 1)`)
+/// but WRONG for **contract accounts**: a contract that runs `CREATE` inside its
+/// own constructor never persisted the resulting nonce, so it committed with
+/// nonce 0 instead of `1 + (constructor CREATEs)`. Any later method-level
+/// `CREATE` from that contract then recomputed an address at a nonce slot the
+/// constructor already filled → `CreateCollision`. Reproduced live on 40204: a
+/// `Probe { constructor() { new Child(); } }` committed with `cast nonce == 0`
+/// where EIP-161 requires 2, and the cooperative factory's `createCooperative`
+/// reverted for exactly this reason.
+///
+/// At/above this height, `commit` persists REVM's nonce for CONTRACT accounts
+/// (never the EOA sender), matching EIP-161.
+///
+/// This is a **consensus rule**: it changes the state root of any block that
+/// deploys a contract, so it is gated by height. Unlike
+/// [`VALUE_TRANSFER_ACTIVATION_HEIGHT`] (which ships at 0 because the 2026-09-07
+/// re-roll gave a clean genesis), this fix lands on an ALREADY-RUNNING chain
+/// whose history was produced with the bug — so it MUST activate at a height
+/// safely ABOVE the tip at rollout. Below it the legacy nonce-drop is reproduced
+/// byte-for-byte, so blocks already on the chain (and a cold sync from genesis)
+/// replay to the roots they were produced with; the new binary is therefore
+/// safe to deploy fleet-wide before the height is reached.
+///
+/// Chosen 2026-09-07 with the tip at ~5,506 (~1 block / 2 s): 30,000 gives ~13 h
+/// of runway to roll the binary to all four nodes and verify before activation.
+pub const CREATE_NONCE_FIX_ACTIVATION_HEIGHT: u64 = 30_000;
+
+/// Devnet-only override for [`CREATE_NONCE_FIX_ACTIVATION_HEIGHT`], mirroring the
+/// MP-DEPTH / value-transfer pattern. Never set this on a node that talks to
+/// 40204 unless the whole fleet sets the identical value.
+pub const CREATE_NONCE_FIX_ACTIVATION_ENV: &str = "CITRATE_CREATE_NONCE_FIX_ACTIVATION_HEIGHT";
+
+/// Resolve the activation height, honouring the devnet override.
+pub fn create_nonce_fix_activation_height() -> u64 {
+    std::env::var(CREATE_NONCE_FIX_ACTIVATION_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(CREATE_NONCE_FIX_ACTIVATION_HEIGHT)
+}
+
+/// Whether a block at `height` persists contract-account nonces per EIP-161.
+pub fn persist_contract_nonces_at(height: u64) -> bool {
+    height >= create_nonce_fix_activation_height()
+}
+
 /// RAII guard for `Executor::defer_persist`: sets it on `engage` and restores the
 /// prior value on drop, so `apply_block`'s deferral is reset on every exit path
 /// (early `return`, `?`, or normal). `apply_block` is not nested, but restoring
