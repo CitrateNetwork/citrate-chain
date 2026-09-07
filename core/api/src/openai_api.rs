@@ -222,7 +222,16 @@ async fn require_rest_api_key(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
         match auth_header {
-            Some(token) if token == expected_key.as_str() => Ok(next.run(req).await),
+            // CHAIN-B-D008 (SECREM-02 5.6): constant-time compare. A
+            // short-circuiting `==` lets a remote caller measure how many
+            // leading bytes matched and brute-force CITRATE_REST_API_KEY
+            // byte-by-byte — the same class the operator-token and RPC api_key
+            // compares already close. This is the third credential.
+            Some(token)
+                if crate::server::constant_time_eq(token.as_bytes(), expected_key.as_bytes()) =>
+            {
+                Ok(next.run(req).await)
+            }
             Some(_) => {
                 warn!("REST API auth failed: invalid Bearer token");
                 Err(StatusCode::UNAUTHORIZED)

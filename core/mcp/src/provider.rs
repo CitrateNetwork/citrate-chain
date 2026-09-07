@@ -164,9 +164,13 @@ impl ProviderRegistry {
             score.failed_jobs += 1;
         }
 
-        // Update average latency
-        score.average_latency =
-            (score.average_latency * (score.total_jobs - 1) + latency) / score.total_jobs;
+        // Update average latency.
+        // CHAIN-B-D017: compute in u128 to avoid the multiply overflowing (the
+        // crate builds release with `overflow-checks = true`, so an
+        // attacker-influenced `latency` would panic the node).
+        score.average_latency = ((score.average_latency as u128 * (score.total_jobs as u128 - 1)
+            + latency as u128)
+            / score.total_jobs as u128) as u64;
         score.last_active = chrono::Utc::now().timestamp() as u64;
 
         // Update provider info reputation
@@ -216,9 +220,23 @@ impl ProviderRegistry {
     ) -> f64 {
         let mut score = 0.0;
 
-        // Capacity score (0-40 points)
-        let memory_ratio = capacity.available_memory as f64 / capacity.total_memory as f64;
-        let compute_ratio = capacity.available_compute as f64 / capacity.total_compute as f64;
+        // Capacity score (0-40 points).
+        // CHAIN-B-D017: clamp the self-reported ratios to [0,1] and guard the
+        // zero-denominator case. Previously a provider reporting
+        // `available_memory = u64::MAX, total_memory = 1` scored ~3.7e20 and
+        // always won `select_provider`; `total_memory = 0` produced `0/0 = NaN`,
+        // which makes the `sort_by` comparator a non-total order that Rust's
+        // sort can panic on.
+        let memory_ratio = if capacity.total_memory == 0 {
+            0.0
+        } else {
+            (capacity.available_memory as f64 / capacity.total_memory as f64).clamp(0.0, 1.0)
+        };
+        let compute_ratio = if capacity.total_compute == 0 {
+            0.0
+        } else {
+            (capacity.available_compute as f64 / capacity.total_compute as f64).clamp(0.0, 1.0)
+        };
         score += memory_ratio * 20.0 + compute_ratio * 20.0;
 
         // Reputation score (0-60 points)
@@ -241,7 +259,13 @@ impl ProviderRegistry {
             score += 30.0; // Default score for new providers
         }
 
-        score
+        // CHAIN-B-D017: never let a non-finite score enter the `select_provider`
+        // sort — a NaN there makes the comparator a non-total order.
+        if score.is_finite() {
+            score
+        } else {
+            0.0
+        }
     }
 
     /// Get provider info
@@ -298,6 +322,35 @@ mod tests {
         let registry = ProviderRegistry::new();
         let providers = registry.list_providers().await;
         assert!(providers.is_empty());
+    }
+
+    /// CHAIN-B-D017 tripwire: a self-reported capacity cannot produce an
+    /// unbounded score (`u64::MAX / 1`) or a NaN (`0 / 0`). Pre-fix, the first
+    /// gave ~3.7e20 (always wins `select_provider`) and the second poisoned the
+    /// sort comparator.
+    #[tokio::test]
+    async fn d017_capacity_score_is_bounded_and_finite() {
+        let registry = ProviderRegistry::new();
+
+        // Attacker: available >> total.
+        let mut cap = create_test_provider(1, 16, 100).capacity;
+        cap.available_memory = u64::MAX;
+        cap.total_memory = 1;
+        cap.available_compute = u64::MAX;
+        cap.total_compute = 1;
+        let score = registry.calculate_provider_score(&cap, None);
+        assert!(score.is_finite(), "score must be finite");
+        assert!(
+            score <= 100.0,
+            "capacity ratios must be clamped, got {score}"
+        );
+
+        // Attacker: zero denominator -> would be NaN pre-fix.
+        let mut cap0 = create_test_provider(2, 16, 100).capacity;
+        cap0.total_memory = 0;
+        cap0.total_compute = 0;
+        let score0 = registry.calculate_provider_score(&cap0, None);
+        assert!(score0.is_finite(), "zero-denominator score must not be NaN");
     }
 
     #[tokio::test]

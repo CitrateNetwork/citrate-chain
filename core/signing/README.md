@@ -38,7 +38,7 @@ DOCUSIGN_BASE_URL=https://www.docusign.net/restapi   # or demo.docusign.net for 
 DOCUSIGN_ACCOUNT_ID=<account-uuid>
 DOCUSIGN_ACCESS_TOKEN=<oauth-jwt-bearer>
 DOCUSIGN_WEBHOOK_SECRET=<configured-in-tenant>
-DOCUSIGN_CLEAR_RBV_ENABLED=true   # optional; downgrades High → Medium when false
+DOCUSIGN_CLEAR_RBV_ENABLED=true   # REQUIRED (true/false); false downgrades High → Medium (CHAIN-B-D022: no silent default)
 ```
 
 `from_env()` hard-fails if a required var is missing — defaulting silently

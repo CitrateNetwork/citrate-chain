@@ -14,6 +14,9 @@ pub enum BridgeError {
     #[error("Insufficient oracle attestations: got {got}, need {need}")]
     InsufficientAttestations { got: usize, need: usize },
 
+    #[error("Invalid oracle threshold {threshold}: must be 1..={active} active oracles")]
+    InvalidThreshold { threshold: usize, active: usize },
+
     #[error("Oracle already registered: {oracle_id}")]
     OracleAlreadyRegistered { oracle_id: String },
 
