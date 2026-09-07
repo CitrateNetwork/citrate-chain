@@ -2,6 +2,7 @@
 
 // Peer connection and management
 use crate::{NetworkError, NetworkMessage, ProtocolVersion};
+use crate::protocol::MAX_INBOUND_MESSAGE_BYTES;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use citrate_consensus::types::Hash;
@@ -843,14 +844,19 @@ async fn handle_incoming(
     head_height: u64,
     head_hash: Hash,
 ) -> Result<(), NetworkError> {
-    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+    let mut framed = Framed::new(
+        stream,
+        LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_INBOUND_MESSAGE_BYTES as usize)
+            .new_codec(),
+    );
     // Expect Hello
     let bytes = framed
         .next()
         .await
         .ok_or_else(|| NetworkError::ProtocolError("EOF before hello".into()))
         .map_err(|_| NetworkError::ProtocolError("Stream closed".into()))??;
-    let hello: NetworkMessage = bincode::deserialize(&bytes)
+    let hello = NetworkMessage::decode_inbound(&bytes)
         .map_err(|e| NetworkError::DecodeError(format!("handshake decode: {}", e)))?;
     let (peer_id_str, ver, net_ok, genesis_ok) = match hello {
         NetworkMessage::Hello {
@@ -982,7 +988,12 @@ async fn perform_handshake_outbound(
     head_height: u64,
     head_hash: Hash,
 ) -> Result<(), NetworkError> {
-    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+    let mut framed = Framed::new(
+        stream,
+        LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_INBOUND_MESSAGE_BYTES as usize)
+            .new_codec(),
+    );
     // Send Hello
     let hello = NetworkMessage::Hello {
         version: ProtocolVersion::CURRENT,
@@ -999,7 +1010,7 @@ async fn perform_handshake_outbound(
         .await
         .ok_or_else(|| NetworkError::ProtocolError("EOF before ack".into()))
         .map_err(|_| NetworkError::ProtocolError("Stream closed".into()))??;
-    let ack: NetworkMessage = bincode::deserialize(&bytes)
+    let ack = NetworkMessage::decode_inbound(&bytes)
         .map_err(|e| NetworkError::DecodeError(format!("ack decode: {}", e)))?;
     match ack {
         NetworkMessage::HelloAck { version, .. }
