@@ -22,7 +22,11 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Configuration for the Docusign backend. Constructed from environment
 /// variables in production (`DOCUSIGN_*`); tests use the builder.
-#[derive(Debug, Clone)]
+// CHAIN-B-D022: NOT `#[derive(Debug)]`. A derived Debug prints `access_token`
+// and `webhook_secret` verbatim, so any `{:?}` on this struct — a `tracing`
+// field, a panic message, an `anyhow` context — leaks the OAuth bearer token
+// and the HMAC signing secret into logs. See the manual redacting impl below.
+#[derive(Clone)]
 pub struct DocusignConfig {
     /// Docusign account API base URL — `https://www.docusign.net/restapi` for production
     /// or `https://demo.docusign.net/restapi` for sandbox.
@@ -40,6 +44,19 @@ pub struct DocusignConfig {
     pub clear_rbv_enabled: bool,
 }
 
+// CHAIN-B-D022: redacting Debug so secrets never reach logs.
+impl std::fmt::Debug for DocusignConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocusignConfig")
+            .field("base_url", &self.base_url)
+            .field("account_id", &self.account_id)
+            .field("access_token", &"<redacted>")
+            .field("webhook_secret", &"<redacted>")
+            .field("clear_rbv_enabled", &self.clear_rbv_enabled)
+            .finish()
+    }
+}
+
 impl DocusignConfig {
     /// Construct from `DOCUSIGN_BASE_URL`, `DOCUSIGN_ACCOUNT_ID`,
     /// `DOCUSIGN_ACCESS_TOKEN`, `DOCUSIGN_WEBHOOK_SECRET`,
@@ -55,9 +72,23 @@ impl DocusignConfig {
             .map_err(|_| SigningError::Config("DOCUSIGN_ACCESS_TOKEN not set".to_string()))?;
         let webhook_secret = std::env::var("DOCUSIGN_WEBHOOK_SECRET")
             .map_err(|_| SigningError::Config("DOCUSIGN_WEBHOOK_SECRET not set".to_string()))?;
-        let clear_rbv_enabled = std::env::var("DOCUSIGN_CLEAR_RBV_ENABLED")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        // CHAIN-B-D022: hard-fail like every sibling var — an unset or typo'd
+        // value must not silently fall open to the weaker KBA path, which would
+        // downgrade every `RiskLevel::High` envelope (DPA / COPPA institutional
+        // consent) from CLEAR biometric to knowledge-based auth. `unwrap_or`
+        // defaults are inappropriate for security configuration (see the doc
+        // comment on this method).
+        let clear_rbv_raw = std::env::var("DOCUSIGN_CLEAR_RBV_ENABLED")
+            .map_err(|_| SigningError::Config("DOCUSIGN_CLEAR_RBV_ENABLED not set".to_string()))?;
+        let clear_rbv_enabled = match clear_rbv_raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            other => {
+                return Err(SigningError::Config(format!(
+                    "DOCUSIGN_CLEAR_RBV_ENABLED must be true/false, got {other:?}"
+                )));
+            }
+        };
         Ok(Self {
             base_url,
             account_id,
