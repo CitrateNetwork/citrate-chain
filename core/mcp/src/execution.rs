@@ -15,6 +15,14 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+/// CHAIN-B-D016: hard upper bounds on a model manifest fetched from an
+/// attacker-chosen IPFS CID, applied before any capacity-based allocation so a
+/// tiny manifest cannot request a multi-exabyte `Vec` and `abort()` the node.
+/// 32 GiB is well above any model the marketplace serves.
+const MAX_ASSEMBLED_MODEL_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// Maximum number of chunks a manifest may declare (bounds the fetch loop).
+const MAX_MODEL_CHUNKS: usize = 1_000_000;
+
 /// Result of model inference
 #[derive(Debug, Clone)]
 pub struct InferenceResult {
@@ -188,7 +196,29 @@ impl ModelExecutor {
             let cid = Cid(weight_cid.clone());
             let raw = ipfs.retrieve_model(&cid).await?;
             if let Ok(manifest) = serde_json::from_slice::<chunking::ChunkManifest>(&raw) {
-                let mut assembled = Vec::with_capacity(manifest.total_size as usize);
+                // CHAIN-B-D016: `total_size` and `chunks` come from an
+                // attacker-chosen IPFS document. `Vec::with_capacity` on an
+                // unbounded `u64` (e.g. `u64::MAX`) triggers Rust's
+                // `handle_alloc_error` -> `abort()`, which is uncatchable and
+                // kills the whole node; a merely-large value OOM-kills it.
+                // Clamp both against configured maxima before allocating.
+                if manifest.total_size > MAX_ASSEMBLED_MODEL_BYTES {
+                    return Err(anyhow!(
+                        "model manifest total_size {} exceeds maximum {}",
+                        manifest.total_size,
+                        MAX_ASSEMBLED_MODEL_BYTES
+                    ));
+                }
+                if manifest.chunks.len() > MAX_MODEL_CHUNKS {
+                    return Err(anyhow!(
+                        "model manifest chunk count {} exceeds maximum {}",
+                        manifest.chunks.len(),
+                        MAX_MODEL_CHUNKS
+                    ));
+                }
+                let mut assembled = Vec::with_capacity(
+                    (manifest.total_size as usize).min(MAX_ASSEMBLED_MODEL_BYTES as usize),
+                );
                 for chunk_cid in manifest.chunks {
                     match ipfs.fetch_raw(&chunk_cid).await {
                         Ok(bytes) => assembled.extend(bytes),
