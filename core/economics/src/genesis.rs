@@ -108,8 +108,10 @@ pub const VALIDATOR_STAKER_4_ADDRESS: Address = Address([
     0x6c, 0x38, 0x51, 0x6b, 0x93, 0xaf, 0x37, 0x4f, 0x69, 0x75,
 ]);
 
-/// Per-staker genesis funding: 40,000 SALT (32k minStake bond + gas/re-stake headroom).
-pub const VALIDATOR_STAKER_GENESIS_SALT: u64 = 40_000;
+/// Per-staker genesis funding: 40,000,000 SALT. Scaled 1000× with the 1T-supply
+/// reroll (2026-09). The 32k minStake threshold is unchanged, so this is now
+/// generous headroom over the bond rather than a tight 40k-over-32k margin.
+pub const VALIDATOR_STAKER_GENESIS_SALT: u64 = 40_000_000;
 
 fn account(address: Address, balance_latt: u64) -> GenesisAccount {
     GenesisAccount {
@@ -351,29 +353,30 @@ impl GenesisConfig {
     pub fn testnet_beta() -> Self {
         // Re-genesis 2026-04-01: Clean start with real wallet addresses.
         // Keys stored in .env.testnet (NOT committed to repo).
-        // Total: 1B SALT allocated across 5 accounts.
+        // 1T-supply reroll (2026-09): every allocation below scaled 1000×,
+        // preserving the original distribution proportions. Total: 1T SALT.
         Self {
             chain_id: 40204,
             accounts: vec![
-                // Treasury — main supply, funds future allocations (500M SALT)
-                account(TESTNET_TREASURY_ADDRESS, 500_000_000),
-                // Reserve — legacy faucet wallet, retained as a reserve (50M SALT).
+                // Treasury — main supply, funds future allocations (500B SALT)
+                account(TESTNET_TREASURY_ADDRESS, 500_000_000_000),
+                // Reserve — legacy faucet wallet, retained as a reserve (50B SALT).
                 // The LIVE faucet service does NOT sign with this address; it
                 // derives its signer deterministically (see the faucet signing
                 // key below). Matches DEPLOYED_ADDRESSES.md ("Reserve").
-                account(TESTNET_FAUCET_ADDRESS, 50_000_000),
-                // Deployer — deploys all smart contracts (10M SALT)
-                account(TESTNET_DEPLOYER_ADDRESS, 10_000_000),
-                // Team/Dev — development and testing (10M SALT)
-                account(TESTNET_TEAM_ADDRESS, 10_000_000),
-                // Validator — block production and staking (5M SALT)
-                account(TESTNET_VALIDATOR_ADDRESS, 5_000_000),
+                account(TESTNET_FAUCET_ADDRESS, 50_000_000_000),
+                // Deployer — deploys all smart contracts (10B SALT)
+                account(TESTNET_DEPLOYER_ADDRESS, 10_000_000_000),
+                // Team/Dev — development and testing (10B SALT)
+                account(TESTNET_TEAM_ADDRESS, 10_000_000_000),
+                // Validator — block production and staking (5B SALT)
+                account(TESTNET_VALIDATOR_ADDRESS, 5_000_000_000),
                 // Faucet signing key — the address the live faucet service derives
                 // from keccak256("citrate-faucet-testnet-v1") (faucet/src/main.rs).
                 // RELEASE R1 / OPS_DGX_HANDOFF D-2: fold the pre-fund into genesis
                 // so a re-roll no longer needs a manual `cast send` to top it up.
-                // (10M SALT — matches DEPLOYED_ADDRESSES.md + team_testnet_genesis.)
-                account(DETERMINISTIC_FAUCET_SIGNER_ADDRESS, 10_000_000),
+                // (10B SALT — 1000×-scaled with the 1T reroll.)
+                account(DETERMINISTIC_FAUCET_SIGNER_ADDRESS, 10_000_000_000),
                 // VALIDATOR-S1 (WS-5): 4 dedicated validator-staker EOAs, one per
                 // fleet node, each pre-funded with 40,000 SALT (>= 32k minStake +
                 // gas) so the registration ceremony can bond them before S(1)=800.
@@ -389,10 +392,10 @@ impl GenesisConfig {
             treasury_address: TESTNET_TREASURY_ADDRESS,
             team_allocations: HashMap::new(),
             ecosystem_fund: TESTNET_TREASURY_ADDRESS, // Treasury doubles as ecosystem fund
-            // 585.16M pre-allocated (585M + 4×40k validator stakers) + 414.84M mining
-            // = the 1B supply cap. The staker pre-fund (160k) comes out of the mining
-            // pool, exactly as the faucet-signer pre-fund does.
-            mining_pool_max: latt_to_wei(414_840_000),
+            // 585.16B pre-allocated (585B + 4×40M validator stakers) + 414.84B mining
+            // = the 1T supply cap. The staker pre-fund (160M) comes out of the mining
+            // pool, exactly as the faucet-signer pre-fund does. (1000×-scaled.)
+            mining_pool_max: latt_to_wei(414_840_000_000),
         }
     }
 
@@ -505,7 +508,7 @@ impl GenesisConfig {
     /// Validate genesis configuration
     pub fn validate(&self) -> Result<(), GenesisError> {
         // Check total allocation doesn't exceed supply
-        let total_supply = U256::from(1_000_000_000) * U256::from(10).pow(U256::from(DECIMALS));
+        let total_supply = U256::from(crate::TOTAL_SUPPLY) * U256::from(10).pow(U256::from(DECIMALS));
         let preallocated = self.total_preallocation();
 
         if preallocated + self.mining_pool_max > total_supply {
@@ -837,7 +840,7 @@ mod tests {
             .find(|account| account.address == TESTNET_FAUCET_ADDRESS)
             .expect("testnet beta must fund faucet address");
 
-        assert_eq!(faucet_account.balance, latt_to_wei(50_000_000));
+        assert_eq!(faucet_account.balance, latt_to_wei(50_000_000_000));
     }
 
     /// RELEASE R1 / OPS_DGX_HANDOFF D-2 regression: testnet_beta() MUST pre-fund
@@ -857,7 +860,7 @@ mod tests {
             .find(|account| account.address == DETERMINISTIC_FAUCET_SIGNER_ADDRESS)
             .expect("testnet beta must pre-fund the deterministic faucet signer (R1/D-2)");
 
-        assert_eq!(faucet_signer.balance, latt_to_wei(10_000_000));
+        assert_eq!(faucet_signer.balance, latt_to_wei(10_000_000_000));
     }
 
     #[test]
@@ -865,10 +868,10 @@ mod tests {
         let config = GenesisConfig::testnet_beta();
         let total = config.total_preallocation();
 
-        // 500M treasury + 50M reserve + 10M deployer + 10M team + 5M validator
-        // + 10M deterministic faucet signer (R1/D-2) + 4×40k VALIDATOR-S1 stakers
-        // (WS-5, 160k) = 585.16M.
-        let expected = latt_to_wei(585_160_000);
+        // 500B treasury + 50B reserve + 10B deployer + 10B team + 5B validator
+        // + 10B deterministic faucet signer (R1/D-2) + 4×40M VALIDATOR-S1 stakers
+        // (WS-5, 160M) = 585.16B. (1000×-scaled with the 1T reroll.)
+        let expected = latt_to_wei(585_160_000_000);
         assert_eq!(total, expected);
     }
 
@@ -923,10 +926,10 @@ mod tests {
     fn test_exceeds_supply_rejected() {
         // Create a config that exceeds total supply
         let mut config = GenesisConfig::default();
-        // Add an account with balance that pushes over 1B total
+        // Add an account with balance that pushes over the 1T total supply cap
         config.accounts.push(GenesisAccount {
             address: Address([0xAA; 20]),
-            balance: latt_to_wei(999_999_999), // This + existing ~360M > 1B with mining_pool_max
+            balance: latt_to_wei(999_999_999_999), // This + existing ~360M > 1T with mining_pool_max
             nonce: 0,
             code: None,
         });

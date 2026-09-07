@@ -55,8 +55,11 @@ pub const TOKEN_SYMBOL: &str = "SALT";
 /// Native token name
 pub const TOKEN_NAME: &str = "Citrate";
 
-/// Total supply: 1 billion SALT
-pub const TOTAL_SUPPLY: u128 = 1_000_000_000;
+/// Total supply cap: 1 trillion SALT (reroll 2026-09: scaled 1000× from the
+/// former 1B cap, with the testnet_beta genesis distribution scaled in step).
+/// This is the single source of truth — `TokenConfig::default` and
+/// `GenesisConfig::validate` derive the wei cap from it.
+pub const TOTAL_SUPPLY: u128 = 1_000_000_000_000;
 
 /// Convert SALT amount to wei (smallest unit)
 pub fn latt_to_wei(latt: u64) -> U256 {
