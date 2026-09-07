@@ -89,6 +89,31 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     /// @notice Total jobs verified
     uint256 public totalVerified;
 
+    /// @notice CHAIN-B-C016 (HELD/reroll): credential-bearing proof material
+    /// already used to settle a job. The two verification tiers that carry a
+    /// reusable credential bound their proof to nothing job-specific: the TEE
+    /// tier signs only `keccak(attestation)` (no jobId, no expiry, no
+    /// used-attestation set) and the ZK tier's public inputs are
+    /// provider-supplied and unchecked against the job — so one legitimate
+    /// oracle-signed attestation (or one valid proof) could settle unlimited
+    /// distinct jobIds by replaying its bytes. Consuming the proof material
+    /// on first Valid verification enforces the invariant "no two distinct
+    /// jobIds can be settled by the same TEE/ZK proof bytes". Off-chain
+    /// callers MUST use fresh per-job proof material. (The Commitment tier is
+    /// the low-value optimistic tier gated by VALUE_THRESHOLD; its self-
+    /// reveal is not a transferable credential and is backstopped by the
+    /// dispute path, so it is not consumed here.)
+    mapping(bytes32 => bool) public proofConsumed;
+
+    /// @dev Mark `key` consumed; returns false if it was already used.
+    function _consumeProof(bytes32 key) internal returns (bool firstUse) {
+        if (proofConsumed[key]) {
+            return false;
+        }
+        proofConsumed[key] = true;
+        return true;
+    }
+
     // ============================================================
     // Events
     // ============================================================
@@ -315,6 +340,12 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         // Call ZK verification precompile
         bool valid = _callZKVerifyPrecompile(proof, publicInputs);
 
+        // C016: bind this proof to a single job — replayed proof bytes
+        // cannot settle a second jobId.
+        if (valid && !_consumeProof(keccak256(abi.encodePacked(proof, publicInputs)))) {
+            valid = false;
+        }
+
         rec.result = valid ? VerificationResult.Valid : VerificationResult.Invalid;
 
         if (valid) {
@@ -346,6 +377,12 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
 
         // Verify TEE attestation via oracle signature
         bool valid = _verifyTEESignature(attestation, signature);
+
+        // C016: bind this attestation to a single job — replaying the same
+        // oracle-signed attestation cannot settle a second jobId.
+        if (valid && !_consumeProof(keccak256(abi.encodePacked(attestation, signature)))) {
+            valid = false;
+        }
 
         rec.result = valid ? VerificationResult.Valid : VerificationResult.Invalid;
 
@@ -545,10 +582,12 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     ///      (32-byte big-endian Fr field elements). These three commitments are
     ///      the public inputs the inference circuit binds. See
     ///      _callZKVerifyPrecompile for how they are framed for 0x0108.
+    /// @dev C016: not `view` — consumes the proof on success so replayed
+    /// proof bytes cannot settle a second jobId.
     function _verifyZKProof(
         uint256 /* jobId */,
         bytes calldata proofData
-    ) internal view returns (VerificationResult) {
+    ) internal returns (VerificationResult) {
         // proofData encodes: proof length (32 bytes) + proof + public inputs
         require(proofData.length >= 32, "ComputeVerifier: insufficient proof data");
 
@@ -559,14 +598,20 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         bytes calldata publicInputs = proofData[32 + proofLen:];
 
         bool valid = _callZKVerifyPrecompile(proof, publicInputs);
+        // C016: one-time-use binding to this job.
+        if (valid && !_consumeProof(keccak256(abi.encodePacked(proof, publicInputs)))) {
+            valid = false;
+        }
         return valid ? VerificationResult.Valid : VerificationResult.Invalid;
     }
 
     /// @dev Verify TEE attestation via oracle signature (Tier 3)
+    /// @dev C016: not `view` — consumes the attestation on success so a
+    /// replayed oracle-signed attestation cannot settle a second jobId.
     function _verifyTEEAttestation(
         uint256 /* jobId */,
         bytes calldata proofData
-    ) internal view returns (VerificationResult) {
+    ) internal returns (VerificationResult) {
         // proofData encodes: attestation length (32 bytes) + attestation + signature
         require(proofData.length >= 32, "ComputeVerifier: insufficient proof data");
 
@@ -577,6 +622,10 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         bytes calldata signature = proofData[32 + attestLen:];
 
         bool valid = _verifyTEESignature(attestation, signature);
+        // C016: one-time-use binding to this job.
+        if (valid && !_consumeProof(keccak256(abi.encodePacked(attestation, signature)))) {
+            valid = false;
+        }
         return valid ? VerificationResult.Valid : VerificationResult.Invalid;
     }
 
