@@ -151,6 +151,16 @@ contract CitrateWalletFactory {
         // No state change and no `initData` execution happen on this path.
         account = predictAddress(userId);
         if (account.code.length != 0) {
+            // CHAIN-B-C046(c): the account already exists, so no deploy runs —
+            // but this function is `payable`. Pre-fix any `msg.value` on this
+            // short-circuit stayed in the factory, which has no `receive`, no
+            // withdraw and no selfdestruct, so a front-run of the public permit
+            // calldata burned the victim's funding. Forward the value to the
+            // wallet it was meant to fund rather than trapping it.
+            if (msg.value > 0) {
+                (bool ok, ) = payable(account).call{value: msg.value}("");
+                require(ok, "CitrateWalletFactory: value forward failed");
+            }
             return account;
         }
 
