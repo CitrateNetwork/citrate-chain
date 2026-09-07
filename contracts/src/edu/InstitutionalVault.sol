@@ -254,12 +254,21 @@ contract InstitutionalVault is IInstitutionalVault {
 
     /// @dev Invariant: UnpauseRequiresQuorum — needs k-of-n
     function unpause() external onlySigner whenPaused {
-        if (!_unpauseApprovals[msg.sender]) {
-            _unpauseApprovals[msg.sender] = true;
-            _unpauseApprovalCount++;
-        }
+        _unpauseApprovals[msg.sender] = true;
 
-        if (_unpauseApprovalCount >= _threshold) {
+        // CHAIN-B-C044(b): count approvals over the LIVE signer set. Pre-fix a
+        // running `_unpauseApprovalCount` was incremented per approval but never
+        // decremented when a signer was removed, and the reset loops only clear
+        // flags for CURRENT signers — so a removed signer's stale approval kept
+        // counting toward quorum. Recomputing over `_signerList` each call makes
+        // a stale flag on a non-signer unreachable.
+        uint256 count = 0;
+        for (uint256 i = 0; i < _signerList.length; i++) {
+            if (_unpauseApprovals[_signerList[i]]) count++;
+        }
+        _unpauseApprovalCount = count;
+
+        if (count >= _threshold) {
             _paused = false;
             // Reset
             for (uint256 i = 0; i < _signerList.length; i++) {
@@ -324,6 +333,9 @@ contract InstitutionalVault is IInstitutionalVault {
             emit SignerAdded(p.target);
         } else {
             _isSigner[p.target] = false;
+            // CHAIN-B-C044(b): clear any stale unpause approval the removed
+            // signer held, so a later re-add does not inherit a phantom vote.
+            _unpauseApprovals[p.target] = false;
             for (uint256 i = 0; i < _signerList.length; i++) {
                 if (_signerList[i] == p.target) {
                     _signerList[i] = _signerList[_signerList.length - 1];
