@@ -73,3 +73,10 @@ coverage/
 
 # TLC model checker (auto-downloaded by specs/tla/run_all.sh)
 specs/tla/tla2tools.jar
+
+# Foundry deploy logs — regenerated on every deploy; reroll clears them.
+# Durable address record is contracts/addresses/40204.json, not raw broadcasts.
+contracts/broadcast/
+
+# Local Claude Code state (agent worktrees, session data) — never commit.
+.claude/
