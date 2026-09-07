@@ -7,6 +7,34 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 
+/// CHAIN-B-B017: absorb a variable-length field with an explicit `u64`
+/// little-endian length prefix. Without it, adjacent variable-length fields
+/// concatenate ambiguously — e.g. `("Test","Model1.0")` and
+/// `("TestModel","1.0")` hash identically — so these roots were not injective
+/// over their inputs. Prefixing the length makes the boundary unambiguous.
+#[inline]
+fn absorb_var(hasher: &mut Sha3_256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+/// CHAIN-B-B017: canonicalize an `f32` before it enters a hashed root. A raw
+/// `f32` has multiple bit patterns for equal values (signed zero) and for NaN;
+/// map all NaNs to one quiet-NaN pattern and `-0.0` to `+0.0` so equal values
+/// hash equally. (A float has no business in a consensus commitment; this is
+/// the minimal fix short of migrating the field to fixed point.)
+#[inline]
+fn canonical_f32_bits(v: f32) -> [u8; 4] {
+    let canonical = if v.is_nan() {
+        f32::from_bits(0x7fc0_0000)
+    } else if v == 0.0 {
+        0.0f32
+    } else {
+        v
+    };
+    canonical.to_bits().to_le_bytes()
+}
+
 /// AI-specific state tree for managing model and training state
 #[derive(Debug, Clone)]
 pub struct AIStateTree {
@@ -98,9 +126,10 @@ impl AIStateTree {
             hasher.update(model_state.model_hash.as_bytes());
             hasher.update(model_state.version.to_le_bytes());
 
-            // Hash metadata
-            hasher.update(model_state.metadata.name.as_bytes());
-            hasher.update(model_state.metadata.version.as_bytes());
+            // Hash metadata (CHAIN-B-B017: length-prefix the variable-length
+            // name/version so ("Test","Model1.0") != ("TestModel","1.0")).
+            absorb_var(&mut hasher, model_state.metadata.name.as_bytes());
+            absorb_var(&mut hasher, model_state.metadata.version.as_bytes());
             hasher.update(model_state.metadata.size_bytes.to_le_bytes());
 
             // Hash usage stats
@@ -132,7 +161,9 @@ impl AIStateTree {
             hasher.update(job.gradients_submitted.to_le_bytes());
             hasher.update(job.gradients_required.to_le_bytes());
 
-            // Hash participants
+            // Hash participants (CHAIN-B-B017: count-prefix the list so a
+            // participant set cannot be confused with a longer/shorter one).
+            hasher.update((job.participants.len() as u64).to_le_bytes());
             for participant in &job.participants {
                 hasher.update(participant.0);
             }
@@ -168,12 +199,18 @@ impl AIStateTree {
             hasher.update(cache_key.as_bytes());
             hasher.update(result.model_id.0.as_bytes());
             hasher.update(result.input_hash.as_bytes());
-            hasher.update(&result.output);
+            // CHAIN-B-B017: length-prefix the variable-length output, and encode
+            // proof presence explicitly so None != Some(vec![]).
+            absorb_var(&mut hasher, &result.output);
             hasher.update(result.gas_used.to_le_bytes());
             hasher.update(result.timestamp.to_le_bytes());
 
-            if let Some(proof) = &result.proof {
-                hasher.update(proof);
+            match &result.proof {
+                Some(proof) => {
+                    hasher.update([1u8]);
+                    absorb_var(&mut hasher, proof);
+                }
+                None => hasher.update([0u8]),
             }
         }
 
@@ -196,12 +233,16 @@ impl AIStateTree {
         for (base_model, adapters) in lora_entries {
             hasher.update(base_model.0.as_bytes());
 
+            // CHAIN-B-B017: count-prefix the per-base-model adapter list.
+            hasher.update((adapters.len() as u64).to_le_bytes());
             for adapter in adapters {
                 hasher.update(adapter.adapter_id.as_bytes());
                 hasher.update(adapter.owner.0);
-                hasher.update(adapter.weight_cid.as_bytes());
+                // length-prefix the variable-length CID string.
+                absorb_var(&mut hasher, adapter.weight_cid.as_bytes());
                 hasher.update(adapter.rank.to_le_bytes());
-                hasher.update(adapter.alpha.to_le_bytes());
+                // canonicalize the f32 alpha (signed zero / NaN).
+                hasher.update(canonical_f32_bits(adapter.alpha));
                 hasher.update(adapter.created_at.to_le_bytes());
             }
         }

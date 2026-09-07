@@ -459,6 +459,21 @@ impl PrecompileExecutor {
         let e_len = read_len(input, 32);
         let m_len = read_len(input, 64);
 
+        // CHAIN-B-B022 / EXEC-04: this custom MODEXP is dead code (REVM serves
+        // the standard 0x01-0x0a precompiles) but it ships. Attacker-controlled
+        // length words otherwise flow into unchecked `words*words`,
+        // `96 + b_len`, `8*(e_len-32)` and `vec![0u8; b_len]`, which panic under
+        // `overflow-checks = true` (a node kill) or drive multi-GiB allocations.
+        // The EIP-198 payload must actually carry B‖E‖M, so a declared length
+        // exceeding the input is malformed: reject it up front. This single
+        // bound makes every downstream index safe and the allocations bounded.
+        if b_len > input.len() || e_len > input.len() || m_len > input.len() {
+            return Err(anyhow::anyhow!(
+                "MODEXP length field exceeds input ({} bytes)",
+                input.len()
+            ));
+        }
+
         // Handle edge case: if modulus length is 0, return empty
         if m_len == 0 {
             return Ok(PrecompileResult {
@@ -471,7 +486,8 @@ impl PrecompileExecutor {
         // Calculate gas cost (EIP-2565 simplified formula)
         let max_len = std::cmp::max(b_len, m_len);
         let words = max_len.div_ceil(8);
-        let multiplication_complexity = words * words;
+        // B022: saturating so the gas estimate can never overflow-panic.
+        let multiplication_complexity = words.saturating_mul(words);
 
         // Calculate iteration count from exponent
         let e_start = 96 + b_len;
@@ -508,7 +524,9 @@ impl PrecompileExecutor {
 
         let gas_cost = std::cmp::max(
             200,
-            (multiplication_complexity * std::cmp::max(iteration_count, 1)) as u64 / 3,
+            // B022: saturating so an attacker length cannot overflow-panic here.
+            (multiplication_complexity.saturating_mul(std::cmp::max(iteration_count, 1)) as u64)
+                / 3,
         );
 
         if gas_limit < gas_cost {
@@ -1769,8 +1787,9 @@ mod tests {
         assert_eq!(result.output.len(), 9);
         // State byte is the last; True = 1.
         assert_eq!(result.output[8], 1, "single-participant agree → state=True");
-        // Gas: 2000 + 50 * 1 = 2050 (per-dim, unchanged by byte width).
-        assert_eq!(result.gas_used, 2050);
+        // CHAIN-B-B014: Gas = 2000 + 4 * dim * n = 2000 + 4*1*1 = 2004
+        // (now priced per mul-add, including the participant count n).
+        assert_eq!(result.gas_used, 2004);
     }
 
     #[test]

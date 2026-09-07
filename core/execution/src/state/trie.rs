@@ -236,14 +236,31 @@ impl Trie {
         Hash::new(hasher.finalize().into())
     }
 
+    // CHAIN-B-B008: node-type domain-separation tags. Without them
+    // `encode_node(Leaf{k,v})` (rlp_list[k,v]) and `encode_node(Extension{p,n})`
+    // (rlp_list[p, encode_node(n)]) collide whenever `v == encode_node(n)`
+    // (smallest witness: `c2 80 80`), and a `Branch{value:None}` was byte-equal
+    // to `Branch{value:Some(vec![])}` — so the state/storage roots were not
+    // sound commitments to the trie STRUCTURE, only to a lossy projection of it.
+    // Prefixing every node's encoding with a distinct one-byte type tag, and
+    // encoding branch-value presence explicitly, makes distinct structures hash
+    // distinctly. NOTE: this CHANGES every state/storage root → consensus-
+    // breaking, held for the coordinated reroll.
+    const TAG_EMPTY: u8 = 0x00;
+    const TAG_LEAF: u8 = 0x01;
+    const TAG_BRANCH: u8 = 0x02;
+    const TAG_EXTENSION: u8 = 0x03;
+
     #[allow(clippy::only_used_in_recursion)]
     fn encode_node(&self, node: &TrieNode) -> Vec<u8> {
         match node {
-            TrieNode::Empty => vec![],
+            TrieNode::Empty => vec![Self::TAG_EMPTY],
 
             TrieNode::Leaf { key, value } => {
                 let items: [&[u8]; 2] = [key.as_slice(), value.as_slice()];
-                rlp::encode_list::<&[u8], _>(&items).to_vec()
+                let mut out = vec![Self::TAG_LEAF];
+                out.extend_from_slice(&rlp::encode_list::<&[u8], _>(&items));
+                out
             }
 
             TrieNode::Branch { children, value } => {
@@ -251,19 +268,28 @@ impl Trie {
                 for child in children.iter() {
                     items.push(self.encode_node(child));
                 }
-                if let Some(v) = value {
-                    items.push(v.clone());
-                } else {
-                    items.push(vec![]);
+                // Encode value presence explicitly: `[0x01] ++ v` for Some(v),
+                // `[0x00]` for None, so None and Some(vec![]) never coincide.
+                match value {
+                    Some(v) => {
+                        let mut slot = vec![1u8];
+                        slot.extend_from_slice(v);
+                        items.push(slot);
+                    }
+                    None => items.push(vec![0u8]),
                 }
                 let items_refs: Vec<&[u8]> = items.iter().map(|v| v.as_slice()).collect();
-                rlp::encode_list::<&[u8], _>(&items_refs).to_vec()
+                let mut out = vec![Self::TAG_BRANCH];
+                out.extend_from_slice(&rlp::encode_list::<&[u8], _>(&items_refs));
+                out
             }
 
             TrieNode::Extension { prefix, node } => {
                 let node_encoded = self.encode_node(node);
                 let items: [&[u8]; 2] = [prefix.as_slice(), node_encoded.as_slice()];
-                rlp::encode_list::<&[u8], _>(&items).to_vec()
+                let mut out = vec![Self::TAG_EXTENSION];
+                out.extend_from_slice(&rlp::encode_list::<&[u8], _>(&items));
+                out
             }
         }
     }
@@ -514,6 +540,49 @@ mod tests {
 
         assert_eq!(trie.get(b"key1"), None);
         assert_eq!(trie.get(b"key2"), Some(b"value2".to_vec()));
+    }
+
+    /// CHAIN-B-B008 tripwire: node-type / branch-value structural separation.
+    /// Pre-fix (no tags) these two assertions FAIL — a Leaf and an Extension
+    /// encode byte-identically, and Branch{None} equals Branch{Some(vec![])}.
+    #[test]
+    fn encode_node_is_structurally_separated() {
+        let t = Trie::new();
+
+        // The finding's minimal 2nd-preimage witness:
+        //   encode(Leaf{key:[7], value:[0xc2,0x80,0x80]})
+        //   == encode(Extension{prefix:[7], node:Leaf{[],[]}})  (pre-fix)
+        let leaf = TrieNode::Leaf {
+            key: vec![7],
+            value: vec![0xc2, 0x80, 0x80],
+        };
+        let ext = TrieNode::Extension {
+            prefix: vec![7],
+            node: Box::new(TrieNode::Leaf {
+                key: vec![],
+                value: vec![],
+            }),
+        };
+        assert_ne!(
+            t.encode_node(&leaf),
+            t.encode_node(&ext),
+            "Leaf and Extension must not encode identically"
+        );
+
+        // Branch value presence must be explicit: None != Some(empty).
+        let branch_none = TrieNode::Branch {
+            children: default_children(),
+            value: None,
+        };
+        let branch_some_empty = TrieNode::Branch {
+            children: default_children(),
+            value: Some(vec![]),
+        };
+        assert_ne!(
+            t.encode_node(&branch_none),
+            t.encode_node(&branch_some_empty),
+            "Branch{{None}} must not encode identically to Branch{{Some(vec![])}}"
+        );
     }
 
     #[test]

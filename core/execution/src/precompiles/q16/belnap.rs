@@ -383,8 +383,16 @@ pub const BELNAP_AGGREGATE: [u8; 20] = [
 
 /// Base gas cost (per Gherkin scenario 1).
 const GAS_BASE: u64 = 2000;
-/// Per-dimension gas cost.
+/// Per-dimension gas cost (legacy; retained for the base term).
+#[allow(dead_code)]
 const GAS_PER_DIM: u64 = 50;
+/// CHAIN-B-B014: per mul-add gas. The aggregate work is a doubly-nested
+/// `n × dim` loop of `Q16::saturating_mul` (step 1) plus up to as many again
+/// (step 2), but the old price `GAS_BASE + GAS_PER_DIM·dim` omitted `n`
+/// entirely — a ~160x under-price at the worst case (n=dim=1024). Price the
+/// work per mul-add, reconciled with the `4 gas/mul-add` already used by
+/// `routing.rs` (GAS_PER_PARAM) and `compute.rs` (MATMUL_PER_MULADD).
+const GAS_PER_MULADD: u64 = 4;
 
 // ---------------------------------------------------------------------------
 // Aggregate (WP-1.5 GREEN)
@@ -527,7 +535,8 @@ pub fn aggregate_decoded(input: &BelnapInput) -> BelnapOutput {
 
 /// Precompile entry. Charges gas, then runs `aggregate()`.
 ///
-/// Gas: `GAS_BASE + GAS_PER_DIM * dim` = `2000 + 50 * dim`.
+/// Gas (CHAIN-B-B014): `GAS_BASE + GAS_PER_MULADD * dim * n`
+/// = `2000 + 4 * dim * n`, pricing the O(n·dim) mul-add work.
 /// Decode failures (`InputTooShort`, malformed bytes) charge `GAS_BASE`
 /// so a malformed-input griefer still pays for the parse work.
 pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
@@ -539,16 +548,26 @@ pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::Preco
         ));
     }
 
-    // Peek the dim from the header (without full-decoding) so we can
-    // gas-charge accurately. If the input is too short, decode() below
-    // catches it; we fall back to GAS_BASE.
+    // Peek `dim` AND `n` from the header (`dim:u32 || n:u32`, without
+    // full-decoding) so we can gas-charge for the real O(n·dim) work. If the
+    // input is too short, decode() below catches it; we fall back to GAS_BASE.
     let dim_hint = if input.len() >= 4 {
         u32::from_be_bytes(input[0..4].try_into().expect("4 bytes")) as u64
     } else {
         0
     };
     let dim_hint = dim_hint.min(MAX_DIM as u64);
-    let total_gas = GAS_BASE.saturating_add(GAS_PER_DIM.saturating_mul(dim_hint));
+    // CHAIN-B-B014: include the participant count `n` in the price.
+    // (Indexed directly to avoid a `try_into().expect(..)` that would trip the
+    // unwrap ratchet; bounds are guaranteed by the `>= 8` check.)
+    let n_hint = if input.len() >= 8 {
+        u32::from_be_bytes([input[4], input[5], input[6], input[7]]) as u64
+    } else {
+        0
+    };
+    let n_hint = n_hint.min(MAX_N as u64);
+    let muladds = dim_hint.saturating_mul(n_hint);
+    let total_gas = GAS_BASE.saturating_add(GAS_PER_MULADD.saturating_mul(muladds));
     if gas_limit < total_gas {
         return Err(anyhow::anyhow!(
             "Belnap aggregate: insufficient gas (need {total_gas}, got {gas_limit})"
@@ -1116,14 +1135,36 @@ mod tests {
     }
 
     #[test]
-    fn execute_gas_charged_per_dim() {
-        // Gas = 2000 + 50 * dim. dim=2 → 2100. dim=4 → 2200.
+    fn execute_gas_charged_per_muladd() {
+        // CHAIN-B-B014: Gas = 2000 + 4 * dim * n.
+        // dim=2,n=1 → 2008. dim=4,n=1 → 2016.
         let input2 = make_input(2, 1, 0.5, 0.9, 1.0, 0.8);
         let input4 = make_input(4, 1, 0.5, 0.9, 1.0, 0.8);
         let g2 = execute(&encode_input(&input2), 100_000).unwrap().gas_used;
         let g4 = execute(&encode_input(&input4), 100_000).unwrap().gas_used;
-        assert_eq!(g2, 2000 + 50 * 2);
-        assert_eq!(g4, 2000 + 50 * 4);
+        assert_eq!(g2, 2000 + 4 * 2 * 1);
+        assert_eq!(g4, 2000 + 4 * 4 * 1);
+    }
+
+    /// CHAIN-B-B014 tripwire: gas must grow with the participant count `n`.
+    /// Pre-fix the price omitted `n`, so these two calls cost the same and an
+    /// attacker bought ~1M mul-adds for a flat fee. Post-fix `n` is priced.
+    #[test]
+    fn execute_gas_grows_with_participant_count() {
+        let few = make_input(8, 1, 0.5, 0.9, 1.0, 0.8);
+        let many = make_input(8, 16, 0.5, 0.9, 1.0, 0.8);
+        let g_few = execute(&encode_input(&few), 1_000_000)
+            .expect("few executes")
+            .gas_used;
+        let g_many = execute(&encode_input(&many), 1_000_000)
+            .expect("many executes")
+            .gas_used;
+        assert!(
+            g_many > g_few,
+            "gas must increase with n: g_few={g_few} g_many={g_many}"
+        );
+        assert_eq!(g_few, 2000 + 4 * 8 * 1);
+        assert_eq!(g_many, 2000 + 4 * 8 * 16);
     }
 
     #[test]
@@ -1136,9 +1177,9 @@ mod tests {
 
     #[test]
     fn execute_insufficient_gas_below_dim_total() {
-        let input = make_input(8, 1, 0.5, 0.9, 1.0, 0.8); // needs 2400 gas
+        let input = make_input(8, 1, 0.5, 0.9, 1.0, 0.8); // needs 2000 + 4*8*1 = 2032 gas
         let bytes = encode_input(&input);
-        let result = execute(&bytes, 2300); // above base, below total
+        let result = execute(&bytes, 2020); // above base (2000), below total (2032)
         assert!(result.is_err(), "execute must reject below-total gas limit");
     }
 
@@ -1151,8 +1192,9 @@ mod tests {
         bytes[0..4].copy_from_slice(&u32::MAX.to_be_bytes()); // huge dim
         bytes[4..8].copy_from_slice(&1u32.to_be_bytes()); // n=1
         // input is too short for the actual decode; the gas pre-charge
-        // path will compute total_gas = GAS_BASE + GAS_PER_DIM * MAX_DIM
-        // = 2000 + 50*1024 = 53200. Pass 100_000.
+        // path clamps dim to MAX_DIM and computes
+        // total_gas = GAS_BASE + GAS_PER_MULADD * MAX_DIM * n
+        // = 2000 + 4*1024*1 = 6096. Pass 100_000.
         let result = execute(&bytes, 100_000);
         // Decode fails (length mismatch); execute surfaces it as anyhow.
         assert!(result.is_err());

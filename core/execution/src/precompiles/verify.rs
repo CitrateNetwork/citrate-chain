@@ -55,10 +55,19 @@ pub mod gas_costs {
     /// TENSOR_COMMIT base cost. Validates header, sets up sponge.
     pub const TENSOR_COMMIT_BASE: u64 = 3_000;
 
-    /// TENSOR_COMMIT per-32-byte-word cost. Each word becomes one Fr
-    /// absorb (or fraction of one with rate=2). 30 gas/word matches the
-    /// existing zkp/poseidon costing.
-    pub const TENSOR_COMMIT_PER_WORD: u64 = 30;
+    /// TENSOR_COMMIT per-32-byte-word cost. Each word becomes one Fr absorb;
+    /// with the rate-2 sponge, one Poseidon permutation covers 2 words.
+    ///
+    /// CHAIN-B-B018: this was `30`, i.e. ~58 gas per permutation, while the
+    /// SAME Poseidon-BN254 permutation is priced at `MERKLE_VERIFY_PER_LEVEL =
+    /// 200` (~200 gas/permutation) in 0x0109 in this file — a 3.4x internal
+    /// inconsistency that under-priced 0x0107's O(n) hashing work. Reconcile to
+    /// 0x0109's per-permutation cost: 200 gas/permutation ÷ 2 words = 100
+    /// gas/word. NOTE: raising a live gas constant CHANGES per-block gas
+    /// accounting → consensus-breaking, held for the coordinated reroll. The
+    /// absolute value still wants a criterion bench of `poseidon_hash`; 100 is
+    /// the internally-consistent floor, not a benched optimum.
+    pub const TENSOR_COMMIT_PER_WORD: u64 = 100;
 
     /// MERKLE_VERIFY_TENSOR base cost — header parsing + leaf hash.
     pub const MERKLE_VERIFY_BASE: u64 = 3_000;
