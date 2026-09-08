@@ -57,7 +57,7 @@ The chain itself — everything that makes Citrate a blockchain:
 ## Network parameters
 
 - **Chain ID**: `40204` (testnet beta)
-- **Token**: SALT (1 B supply, 18 decimals)
+- **Token**: SALT (1 trillion supply, 18 decimals)
 - **VM**: Lattice Virtual Machine (LVM) — EVM-compatible via REVM
 - **Consensus**: GhostDAG with `k=18`, max-parents=10
 - **Proposer election**: ECVRF-P256-SHA256 (RFC 9381)
