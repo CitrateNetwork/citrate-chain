@@ -36,7 +36,9 @@ fn signed_tx(sender: PublicKey, nonce: u64) -> Transaction {
         gas_limit: 21000,
         gas_price: 1_000_000_000,
         data: vec![],
-        signature: Signature::new([0u8; 64]),
+        // WP-E1: non-zero dummy sig — these tests exercise nonce-gap admission, not
+        // signatures, and must not rely on the (now removed) devnet zero-sig leniency.
+        signature: Signature::new([1u8; 64]),
         tx_type: None,
         chain_id: Some(40204),
         ..Default::default()

@@ -1800,6 +1800,46 @@ mod tests {
         assert!(result.is_ok(), "Native sender should pass ECDSA gate");
     }
 
+    /// WP-E1 tripwire (UNCONDITIONAL — must hold on every build profile, including the
+    /// shipped default). An EVM-shaped transaction whose `ecdsa_verified` flag is false
+    /// must be rejected at mempool admission. This is RED whenever `devnet` is a default
+    /// cargo feature (the production ECDSA gate at validate_transaction is compiled out and
+    /// the forged tx is accepted); it is GREEN once `[features] default = []`. It also guards
+    /// against `devnet` ever being restored to the default set. See audit D010 / RM-Q WP-E1.
+    #[tokio::test]
+    async fn test_wp_e1_evm_forged_sig_rejected_on_default_build() {
+        let config = MempoolConfig {
+            require_valid_signature: false, // isolate the ecdsa_verified gate, not crypto recovery
+            ..Default::default()
+        };
+        let mempool = Mempool::new(config);
+
+        let mut evm_sender = [0u8; 32];
+        evm_sender[..20].copy_from_slice(&[0xAA; 20]); // 20-byte EVM shape, last 12 zero
+
+        let forged = Transaction {
+            hash: Hash::new([0x42; 32]),
+            nonce: 0,
+            from: PublicKey::new(evm_sender),
+            to: Some(PublicKey::new([2; 32])),
+            value: 1000,
+            gas_limit: 21000,
+            gas_price: 2_000_000_000,
+            data: vec![],
+            signature: Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ecdsa_verified: false,
+            ..Default::default()
+        };
+
+        let result = mempool.add_transaction(forged, TxClass::Standard).await;
+        assert!(
+            matches!(result, Err(MempoolError::InvalidSignature)),
+            "WP-E1: an EVM-shaped tx with ecdsa_verified=false must be rejected on the DEFAULT              build; got {:?}. If it was accepted, `devnet` is compiled into the shipped binary              and the production signature gate is absent.",
+            result
+        );
+    }
+
     #[tokio::test]
     async fn test_mixed_class_priority_with_gas_cap() {
         let config = MempoolConfig {
