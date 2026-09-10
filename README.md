@@ -1,152 +1,175 @@
----
-created: 2026-05-18T01:00:00Z
-branch: main
-author: monorepo-split
-status: active
-split-from-monorepo-at: b3ccd5c7
-split-from-monorepo-tag: pre-split-v0.4.0
-archived-monorepo: https://github.com/CitrateNetwork/citrate-monorepo-archive
-agentile-archive: https://github.com/CitrateNetwork/citrate-agentile-archive
----
-
 # citrate-chain
 
-> The **AI-native Layer-1 BlockDAG blockchain** with GhostDAG consensus, EVM-compatible execution (LVM), and a standardized Model Context Protocol (MCP) layer. Makes AI models first-class on-chain assets — registries, weights, training and eval logs, verifiable provenance.
+> The AI-native Layer-1 BlockDAG at the base of the Citrate Network — GhostDAG
+> consensus, EVM-compatible execution (LVM), and the on-chain contract book that
+> every other Citrate daemon settles against. This is the anchor of the local stack:
+> run a devnet node here first, and everything else points at its JSON-RPC.
 
-## What's in this repo
+## What it is
 
-The chain itself — everything that makes Citrate a blockchain:
+`citrate-chain` is the chain itself: the `citrate` node binary (GhostDAG engine +
+LVM/REVM execution + libp2p networking + JSON-RPC), the `citrate-cli`/wallet
+tooling, and the Foundry contract book under `contracts/` (ModelRegistry,
+WrappedSALT, the x402 facilitator, the compute marketplace, the ERC-4337 AA stack,
+and more). Chain ID is **40204**; the native token is **SALT** (18 decimals).
 
-| Path | Crate | Role |
-|---|---|---|
-| `core/consensus` | `citrate-consensus` | GhostDAG engine, tip selection, finality, ECVRF proposer election, BFT committee checkpoints |
-| `core/execution` | `citrate-execution` | LVM (EVM-compatible via REVM) + AI/ZKP precompiles |
-| `core/storage` | `citrate-storage` | State DB (MPT), block store, artifact pinning, RocksDB |
-| `core/sequencer` | `citrate-sequencer` | Mempool policy, bundling, parent selection |
-| `core/primitives` | `primitives` | Core types and utilities |
-| `core/api` | `citrate-api` | JSON-RPC, REST, OpenAI/Anthropic-compatible endpoints |
-| `core/network` | `citrate-network` | libp2p networking, block + tx propagation |
-| `core/mcp` | `citrate-mcp` | Model Context Protocol layer |
-| `core/economics` | `citrate-economics` | Rewards, tokenomics, fee router |
-| `core/marketplace` | `citrate-marketplace` | Marketplace contracts integration |
-| `core/learning` | `citrate-learning` | Federated learning pool primitives |
-| `core/learning-daemon` | `citrate-learning-daemon` | Background learning coordinator |
-| `core/experiment-runner` | `citrate-experiment-runner` | Training experiment harness |
-| `core/bridge` | `citrate-bridge` | Cross-chain bridge primitives |
-| `core/security` | `citrate-security` | Security primitives, attestation gates |
-| `core/signing` | `citrate-signing` | Multi-sig + threshold signing |
-| `node` | `citrate-node` | Main node binary |
-| `node-app` | (node-app) | Node application wrapper |
-| `cli` | `citrate-cli` | CLI tools |
-| `wallet` | `citrate-wallet` | CLI wallet (ed25519) |
-| `wallet-core` | `citrate-wallet-core` | Wallet substrate |
-| `wallet-sdk` | `citrate-wallet-sdk` | Higher-level wallet SDK |
-| `faucet` | `citrate-faucet` | Test token faucet |
-| `crates/citrate-hkdf-chain` | `citrate-hkdf-chain` | HKDF-based chain key derivation |
-| `contracts/` | (Solidity, Foundry) | 37+ on-chain contracts |
-| `specs/tla/` | TLA+ specs | Formal verification of consensus + safety properties |
-| `specs/gherkin/` | BDD scenarios | Behavior-driven specifications |
-| `tests/` | Integration tests | Workspace-level + load tests |
-| `fuzz/` | Fuzz targets | Continuous fuzzing |
-| `tools/` | Operator tooling | Misc CLI tools, devnet helpers |
+Everything else in the federation — the [bundler](https://github.com/CitrateNetwork/citrate-bundler),
+the [inference gateway](https://github.com/CitrateNetwork/citrate-inference-gateway),
+the [node agent](https://github.com/CitrateNetwork/citrate-node-agent), and the
+[compute pool](https://github.com/CitrateNetwork/citrate-compute-pool) — reads
+chain state and settles through the contracts deployed here. Start here.
 
-> **Operators:** the production runbook lives at
-> [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — start with "Producer health"
-> (PIL-13 memory thresholds + the `mining = false` circuit-breaker).
+- Concept docs: https://docs.citrate.ai/chain · Consensus: https://docs.citrate.ai/consensus
+- Contract reference: https://docs.citrate.ai/contracts
 
-## Network parameters
-
-- **Chain ID**: `40204` (testnet beta)
-- **Token**: SALT (1 trillion supply, 18 decimals)
-- **VM**: Lattice Virtual Machine (LVM) — EVM-compatible via REVM
-- **Consensus**: GhostDAG with `k=18`, max-parents=10
-- **Proposer election**: ECVRF-P256-SHA256 (RFC 9381)
-- **Finality**: Committee BFT checkpoints, 100 validators, 67 quorum, 50-block interval
-- **Performance**: 5,000 TPS sustained (10,000 ceiling); ≤12 s finality
-
-See [`config/`](config/) for devnet/testnet TOML samples.
-
-## Quick start
+## Prerequisites
 
 ```bash
-# Build everything
-cargo build --release
+# Rust (chain is pinned to the 1.96.0 toolchain; stable 1.96+ works)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup toolchain install 1.96.0
 
-# Run a local devnet
-cargo run --bin citrate-node -- devnet
+# System packages (Debian/Ubuntu). OpenSSL is vendored & static-linked by the
+# build, so you do NOT need a matching system libssl — but you do need a C
+# toolchain, clang, and pkg-config for RocksDB and the crypto crates.
+sudo apt-get update && sudo apt-get install -y \
+  build-essential clang cmake pkg-config git curl python3
 
-# Or use the orchestration script
-scripts/lattice.sh dev up
-
-# Run all workspace tests
-cargo test --workspace --locked
-
-# Build + test Solidity contracts
-forge build && forge test
-
-# Run benchmark suite (after node is up)
-cd tests/load
-./target/release/benchmark-suite http://127.0.0.1:8545 10000 60 ../../benchmarks/
+# Foundry — only needed to build/deploy the contract book (contracts/)
+curl -L https://foundry.paradigm.xyz | bash && foundryup
 ```
 
-For full developer instructions, see [`CLAUDE.md`](CLAUDE.md) — it documents the workspace, commands, and conventions in depth.
+macOS: `brew install cmake pkg-config` and install Xcode command-line tools;
+the Rust and Foundry installers above are identical.
 
-## Repository context
+## Build from source
 
-This repo was split from the **Citrate monorepo** on 2026-05-18. For the full history of decisions, sprints, audits, remediations, and ADRs that led to the split, see:
+```bash
+git clone https://github.com/CitrateNetwork/citrate-chain
+cd citrate-chain
 
-- **Monorepo archive**: https://github.com/CitrateNetwork/citrate-monorepo-archive
-- **Agentile archive**: https://github.com/CitrateNetwork/citrate-agentile-archive — methodology corpus (rules, planset, sprints, audits)
+# Build the node binary (workspace default target). Produces target/release/citrate
+cargo build --release -p citrate-node
 
-Other components of the Citrate Network live in sibling repos:
+# Build + test the contract book
+cd contracts && forge build && forge test -vv && cd ..
+```
 
-- **`citrate-gui-native`** — Slint desktop wallet + DAG explorer
-- **`citrate-learning-center`** — School pilot desktop app
-- **`citrate-wallet-extension`** — Browser wallet extension
-- **`citrate-agent-runtime`** — Agent execution runtime + capsules
-- **`citrate-inference-gateway`** — x402-compatible inference gateway
-- **`citrate-compute-pool`** — Training pool coordinator + worker
-- **`citrate-buyer-webapp`** — Buyer-side marketplace webapp
-- **`citrate-dashboard`** — Network monitoring dashboard
-- **`citrate-sdk-js`** / **`citrate-sdk-python`** / **`citrate-sdk-marketplace`** — Client SDKs
-- **`citrate-docs`** — User docs, tutorials, public-goods, Gradient Papers v3
+Expected artifact: `target/release/citrate` (the node binary is named `citrate`,
+crate `citrate-node`). A cold release build with LTO takes ~10–20 min and wants
+≥8 GB RAM (the vendored OpenSSL adds ~30s once). `cargo test --workspace` runs the
+Rust test suite.
 
-## Crates.io publishes (staged — not yet pushed)
+## Run locally
 
-When the first audited release tag (`v0.5.0`) ships, these 4 crates publish to crates.io for downstream consumption:
+The fastest path is a single self-mining devnet node:
 
-- `citrate-wallet-core` (wallet substrate)
-- `citrate-wallet-sdk` (higher-level wrapper)
-- `citrate-api` types (JSON-RPC type definitions)
-- A rename of `primitives` → `citrate-primitives` is required first (current name is too generic for crates.io)
+```bash
+# One-shot devnet: initializes genesis, mines, serves JSON-RPC on 127.0.0.1:8545
+./target/release/citrate devnet
+# (equivalently: cargo run --release -p citrate-node -- devnet)
+```
 
-Internal crates (`consensus`, `execution`, `storage`, `network`, `mcp`, `bridge`, `marketplace`, `learning*`, `economics`, `security`, `signing`) stay path-only inside this workspace. Downstream repos shouldn't depend on implementation internals.
+Defaults (from `node/config/devnet.toml`): JSON-RPC `127.0.0.1:8545`, WebSocket
+`127.0.0.1:8546`, P2P `127.0.0.1:30303`, data dir `.citrate-devnet`, mining on,
+chain ID `40204`. RPC/WS bind to loopback with no TLS/auth by design — front them
+with a reverse proxy before exposing.
 
-## On-chain contracts
+Explicit form (first-run network selection, custom data dir, mining on):
 
-37+ Solidity contracts in [`contracts/src/`](contracts/src/), built with Foundry. Solidity ABIs publish to npm as `@CitrateNetwork/contracts-abi` when a release tag ships.
+```bash
+./target/release/citrate --network local --mine --data-dir .citrate-devnet
+```
+
+Verify it's up — `eth_chainId` returns `0x9d0c` (40204), `eth_blockNumber` climbs:
+
+```bash
+curl -s http://localhost:8545 -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'
+# -> {"jsonrpc":"2.0","id":1,"result":"0x9d0c"}
+
+curl -s http://localhost:8545 -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+```
+
+Multi-node local testnet (3 bootstrap nodes on 8545/8555/8565):
+
+```bash
+./scripts/launch_local_testnet.sh --clean      # start fresh
+./scripts/launch_local_testnet.sh --status     # health/block heights
+./scripts/stop_local_testnet.sh                # stop
+```
+
+### Deploy the contract book locally
+
+The devnet genesis pre-funds the standard Hardhat/Foundry account #0
+(`0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`) so you can deploy immediately with
+its well-known dev private key (the same key Anvil/Hardhat print on startup):
 
 ```bash
 cd contracts
 forge build
-forge test -vvv
+export PRIVATE_KEY=<hardhat account #0 private key>   # address 0xf39Fd6…2266
+
+# Core book (ModelRegistry, WrappedSALT, X402Facilitator, ModelMarketplace, InferenceRouter)
+forge script script/Deploy.s.sol \
+  --rpc-url http://localhost:8545 \
+  --private-key "$PRIVATE_KEY" \
+  --broadcast
 ```
 
-## Releases
+The script logs each deployed address. For the full federation book use
+`script/DeployAll.s.sol` and the domain-specific `Deploy*.s.sol` scripts
+(AA stack, compute pool, membership, etc.). Foundry is pinned to solc `0.8.36`,
+`evm_version = cancun`, with deterministic CREATE2 settings (`bytecode_hash =
+none`, `cbor_metadata = false`) — do not change these; they keep addresses
+reroll-stable.
 
-This repo versions **independently** from other CitrateNetwork repos.
+## Connect it locally  ← the differentiator
 
-- **Current**: `v0.4.0` (pre-split heritage tag; see `pre-split-v0.4.0` on the monorepo archive)
-- **Next**: `v0.5.0` (chain-only release after audit pass)
+`citrate-chain` is the root of the local stack — it has no upstreams; every other
+program points at **its** RPC and **its** deployed contracts. Bring-up order:
 
-Audit gate: per the CitrateNetwork release policy, **every stable release tag requires a re-audit pass**. Prerelease tags (`v0.5.0-rc.N`) can ship without re-audit; stable tags cannot.
+1. **Run the devnet node** (above). Note the RPC URL `http://localhost:8545`.
+2. **Deploy the contract book** (above). Record the printed addresses — the
+   downstream daemons need them (e.g. the bundler needs the ERC-4337 EntryPoint +
+   `CitratePaymaster`; the gateway needs `ModelRegistry`/`InferenceRouter`).
+3. Point each daemon's RPC env var at `http://localhost:8545`:
+   - bundler → `BUNDLER_NETWORK_RPC=http://localhost:8545`
+   - inference gateway → `CITRATE_GATEWAY_RPC_URL=http://localhost:8545`
+   - node agent → `CITRATE_RPC_URL=http://localhost:8545`
+   - compute pool coordinator → `CITRATE_POOL_RPC_URL=http://localhost:8545`
 
-## Contributing
+Minimal end-to-end check: after deploy, `cast call <ModelRegistry> "modelCount()"
+--rpc-url http://localhost:8545` returns a value, and a downstream daemon started
+against `:8545` logs `chain_id=40204`.
 
-This repo follows the **Agentile methodology**. The 13 non-negotiable rules (CORE_RULES) live in the archive at https://github.com/CitrateNetwork/citrate-agentile-archive/blob/main/rules/CORE_RULES.md. Active sprints for chain work live in this repo's local `.agentile/sprints/` (post-split).
+See the full multi-repo bring-up in `LOCAL_STACK.md` (citrate-docs):
+https://docs.citrate.ai/local-stack
 
-See [`CLAUDE.md`](CLAUDE.md) for the workspace conventions and [`CHANGELOG.md`](CHANGELOG.md) for the change log.
+## Configuration
+
+- Node config: `node/config/*.toml` (`devnet.toml`, `testnet.toml`, …) selected
+  with `--config`, or use the `devnet` subcommand / `--network local`.
+- Key CLI flags: `--data-dir`, `--rpc-addr`, `--p2p-addr`, `--mine`,
+  `--bootstrap-nodes`, `--chain-id` (default 40204), `--coinbase`, `--no-rpc`.
+- Env: `RUST_LOG` (log level), `LOG_FORMAT` (`json|pretty|compact`),
+  `CITRATE_METRICS_ADDR` (Prometheus bind), `CITRATE_OPERATOR_TOKEN` (required for
+  operator RPC methods on a non-loopback bind).
+- Foundry: `contracts/foundry.toml` (canonical) and the root `foundry.toml` mirror
+  the deterministic CREATE2 settings.
+
+## Links
+
+- Docs: https://docs.citrate.ai/chain
+- Consumed by: [citrate-bundler](https://github.com/CitrateNetwork/citrate-bundler) ·
+  [citrate-inference-gateway](https://github.com/CitrateNetwork/citrate-inference-gateway) ·
+  [citrate-node-agent](https://github.com/CitrateNetwork/citrate-node-agent) ·
+  [citrate-compute-pool](https://github.com/CitrateNetwork/citrate-compute-pool)
+- Contributing (DCO): CONTRIBUTING.md · Security: SECURITY.md · License: LICENSE
 
 ## License
 
-[MIT](LICENSE). See [`LICENSING_FRAMEWORK.md`](LICENSING_FRAMEWORK.md) and [`TRADEMARK_POLICY.md`](TRADEMARK_POLICY.md) for the full licensing posture.
+Source-available (BUSL-1.1) — free for personal/non-commercial use;
+commercial/hosted use requires a membership license. This is not an open-source
+license.
