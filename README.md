@@ -1,5 +1,7 @@
 # citrate-chain
 
+*Part of the **[Citrate Network](https://citrate.ai)** — own the means of computation. · [Docs](https://docs.citrate.ai) · [Run a node](https://citrate.ai/download) · [Contribute → free membership](https://github.com/CitrateNetwork/.github/blob/main/CONTRIBUTING.md)*
+
 > The AI-native Layer-1 BlockDAG at the base of the Citrate Network — GhostDAG
 > consensus, EVM-compatible execution (LVM), and the on-chain contract book that
 > every other Citrate daemon settles against. This is the anchor of the local stack:
