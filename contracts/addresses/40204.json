@@ -10,6 +10,7 @@
   "comment": "Canonical contract-address table for chain 40204 \u2014 the single source of truth the federation reads from. Regenerated from broadcast/*.s.sol/40204/run-latest.json + .env.testnet AA pins. See contracts/addresses/README.md.",
   "contracts": {
     "ModelRegistry": "0xba36fa0da9327030bd14351db968c8c43c5a67e4",
+    "SkillRegistry": "0x896cd29369cd08e5343cf89fa90db92f7f316313",
     "WrappedSALT": "0xaa918302b94a4b0e75e01e019cc6b819b4f7c906",
     "AgentDecisionRegistry": "0xd4008e0b4f0bd00d630810d1f7f0f78db0ba837a",
     "SpecRegistry": "0x8ce7000c83d0ef5276a70bdc34bf2fa2fe0159ff",
@@ -72,8 +73,8 @@
     "MemberBond": "0x7d6b92757e928ab4207be3b54166ecd2c491aa92",
     "MembershipStakeVaultImpl": "0x72035977f3ec295c70e2a734acbdffb0c98e6f0b",
     "MembershipStakeVault": "0x53fb4badffaceedd575d47d0e74bb721504f786e",
-    "CitrateCooperativeFactory": "0x3b88731d65f044cc43c5d4589212c0f32a8c1667",
-    "CoopDeployer": "0xd7cbaeb1c1d3a3a12707297a96ae454b37ec56fe",
+    "CitrateCooperativeFactory": "0xd4750aa00f0634cb2d5154dfc19eb8dcbc885e9f",
+    "CoopDeployer": "0xccdfcb866f42dcde3aa19d2aa1434e4c3c6a3b48",
     "PatronageLedger": "0x726f2c8a0bfa4145dca7c154577705803c8dafa3",
     "ModelCooperative": "0x54b70368373b0b22ac8ad9882961228d790133bf",
     "CoopMembershipSBT": "0xb455c14880aca8eeddf95f6e1dcfddb13d8b6a83",
