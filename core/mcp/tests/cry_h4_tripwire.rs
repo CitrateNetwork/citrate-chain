@@ -52,9 +52,8 @@ fn cry_h4_forgeable_commitment_is_not_an_execution_proof() {
         provider: citrate_execution::Address([9u8; 20]),
     };
 
-    assert_eq!(
-        verifier.verify_execution(&model, input, output, &proof).unwrap(),
-        false,
+    assert!(
+        !verifier.verify_execution(&model, input, output, &proof).unwrap(),
         "a caller-computed SHA3 commitment must not satisfy execution-proof verification"
     );
 }
