@@ -165,14 +165,19 @@ mod tests {
 
     #[test]
     fn predicts_the_onchain_vector() {
-        // On-chain CitrateWalletFactory.predictAddress(0x4242…) = 0x1615Af12… (2026-07-25),
-        // and the JS + Python SDKs produce the same. Rust parity.
+        // On-chain CitrateWalletFactory.predictAddress(0x4242…) = 0xfb43484C…
+        // against the CURRENT vendored AA-stack addresses (factory
+        // 0x2d742b98…768d, impl 0x86486d1d…a51a). The citrate-sdk-js prediction
+        // test asserts the same value, so this is Rust↔JS↔on-chain parity. The
+        // previous golden 0x1615Af12… was captured 2026-07-25, before the AA
+        // stack was redeployed; citrate-sdk-python still bundles the old
+        // factory/impl and must be re-synced (tracked separately).
         let c = contract().expect("artifact parses");
         let factory = parse_addr20(&c["aaStack"]["CitrateWalletFactory"]).expect("factory");
         let implementation = parse_addr20(&c["aaStack"]["CitrateWallet"]).expect("impl");
         let uid = [0x42u8; 32];
         let addr = predict_address(factory, implementation, &uid);
-        assert_eq!(to_checksum(&addr), "0x1615Af127952c4e4987D7b597bDD7cb8B49aFB89");
+        assert_eq!(to_checksum(&addr), "0xfb43484CDbA25C6457C2775C1d6dfeD71cE4e720");
     }
 
     #[test]
