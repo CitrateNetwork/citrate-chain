@@ -148,6 +148,11 @@ async fn test_eth_get_block_reports_persisted_gas_and_receipt_fields() {
         .height(1)
         .timestamp(1_000_001)
         .proposer(proposer)
+        // Coinbase (the staker EOA that earns the reward) is deliberately a
+        // different value from the proposer's embedded 0xAB.. address, so the
+        // `miner` assertion below proves `miner` is sourced from the coinbase,
+        // not from truncating the proposer pubkey (CBF-S1 WP-3).
+        .coinbase([0xCD; 20])
         .gas_limit(30_000_000)
         .gas_used(42_000)
         .base_fee_per_gas(1_000_000_007)
@@ -187,7 +192,13 @@ async fn test_eth_get_block_reports_persisted_gas_and_receipt_fields() {
         v["result"]["receiptsRoot"],
         format!("0x{}", hex::encode(block.receipt_root.as_bytes()))
     );
-    assert_eq!(v["result"]["miner"], "0xabababababababababababababababababababab");
+    // CBF-S1 WP-3: `miner` is the block's coinbase, NOT the low-20-bytes of the
+    // proposer pubkey. It equals the coinbase set above (0xCD..), proving the
+    // miner is sourced from the coinbase and not from truncating the proposer.
+    assert_eq!(v["result"]["miner"], "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd");
+    // The consensus signing key is surfaced separately (a key, not an account),
+    // so it must NOT equal the miner address.
+    assert_ne!(v["result"]["proposerPubkey"], v["result"]["miner"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -125,10 +125,17 @@ fn i1_collateral_throttling_attack_prevented() {
     }
 }
 
-/// Host header fallback produces different keys for different hosts,
-/// preventing global-bucket collapse.
+/// CHAIN-B-D009: without a trusted proxy the node cannot attribute a request
+/// to a real TCP client, so `extract_client_key` fails CLOSED to a single
+/// shared bucket. The old fallback keyed on the `Host` header (and URI
+/// authority) — both attacker-controlled — which let a client mint a fresh
+/// quota per request simply by rotating `Host:`, defeating the limiter and the
+/// per-method budget entirely. Different untrusted hosts MUST therefore
+/// collapse to the same key: that shared bucket is the fix, not a regression.
+/// Operators who need per-client limits front the node with a reverse proxy
+/// that sets X-Forwarded-For and list it in `trusted_proxies`.
 #[test]
-fn i1_fallback_does_not_collapse_to_single_bucket() {
+fn i1_host_rotation_cannot_bypass_shared_bucket() {
     let no_trust: HashSet<IpAddr> = HashSet::new();
     let req1 = make_req_with_header("host", "node1.example.com:8545");
     let req2 = make_req_with_header("host", "node2.example.com:8545");
@@ -136,9 +143,10 @@ fn i1_fallback_does_not_collapse_to_single_bucket() {
     let key1 = citrate_api::rate_limit::extract_client_key(&req1, &no_trust);
     let key2 = citrate_api::rate_limit::extract_client_key(&req2, &no_trust);
 
-    assert_ne!(
+    assert_eq!(
         key1, key2,
-        "I.1: Different hosts must produce different client keys"
+        "I.1/CHAIN-B-D009: untrusted Host values must share one bucket \
+         (keying on the attacker-controlled Host is an unlimited quota bypass)"
     );
 }
 
