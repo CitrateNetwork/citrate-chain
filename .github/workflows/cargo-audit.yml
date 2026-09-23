@@ -57,8 +57,17 @@ jobs:
         #
         # REM-16b (deferred — arkworks 0.4 → 0.6 bump needed, ZK-eng decision):
         #   RUSTSEC-2025-0055 — tracing-subscriber ANSI log injection via ark-relations 0.4 transitive (direct deps already on 0.3).
+        #
+        # REM-14b (closes with the same alloy-primitives ruint bump as REM-14):
+        #   RUSTSEC-2026-0220 — ruint overflowing_shl/shr returned a wrong
+        #   overflow FLAG (shifted values were correct). Patched >= 1.20.0, but
+        #   alloy-primitives 0.7.7 pins ruint ^1.12 and 1.20 needs a proptest
+        #   no_std feature that conflicts, so it is not bumpable from this
+        #   lockfile. Low severity (flag-only correctness edge). Remove when
+        #   alloy-primitives moves to a ruint >= 1.20 line.
         run: |
           cargo audit \
             --color always \
             --ignore RUSTSEC-2025-0137 \
-            --ignore RUSTSEC-2025-0055
+            --ignore RUSTSEC-2025-0055 \
+            --ignore RUSTSEC-2026-0220

@@ -513,7 +513,7 @@ mod tests {
             );
         }
         // The exact header length parses (with an empty signature).
-        assert!(KeyCommitment::from_bytes(&vec![0u8; 80]).is_ok());
+        assert!(KeyCommitment::from_bytes(&[0u8; 80]).is_ok());
     }
 
     #[test]
