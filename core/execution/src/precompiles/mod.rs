@@ -1729,11 +1729,17 @@ mod tests {
         ]);
         assert!(executor.is_precompile(&ed25519_addr));
 
-        // Just past the crypto page (0x0130) MUST NOT be recognized —
-        // that would silently route to nothing and break the dispatcher
-        // contract.
-        let out_of_page = Address([
+        // 0x0130 opens the recursive-fold verification page (0x0130-0x013F,
+        // citrate-chain#170: FOLD_COMMD_VERIFY), so it IS a precompile.
+        let fold_verify_addr = Address([
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x30,
+        ]);
+        assert!(executor.is_precompile(&fold_verify_addr));
+
+        // Just past the fold page (0x0140) MUST NOT be recognized — that would
+        // silently route to nothing and break the dispatcher contract.
+        let out_of_page = Address([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x40,
         ]);
         assert!(!executor.is_precompile(&out_of_page));
     }
