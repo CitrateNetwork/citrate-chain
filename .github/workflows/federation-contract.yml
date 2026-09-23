@@ -51,8 +51,19 @@ concurrency:
 jobs:
   drift:
     runs-on: ubuntu-latest
+    # Internal-only gate: it checks the vendored contract artifact against the canonical
+    # intermediate in the PRIVATE citrate-federation. Skips on public/fork CI when the read
+    # token is absent (so public CI never tries to check out a private repo — which stays
+    # private permanently); runs authoritatively on internal pushes once the token is set.
+    # The local mirror `scripts/sync-federation-contract.py --check` runs the identical check.
+    env:
+      FED_TOKEN: ${{ secrets.CITRATE_FEDERATION_READ_TOKEN }}
     steps:
+      - name: Skipped on public/fork CI (no federation read token)
+        if: env.FED_TOKEN == ''
+        run: echo "federation-contract is an internal supply-chain gate; skipped without CITRATE_FEDERATION_READ_TOKEN."
       - name: Checkout this repo
+        if: env.FED_TOKEN != ''
         uses: actions/checkout@v4
         with:
           path: citrate-chain
@@ -62,6 +73,7 @@ jobs:
       # what someone happened to have checked out, which is precisely how the
       # staleness went unnoticed locally.
       - name: Checkout canonical citrate-federation (sparse, main)
+        if: env.FED_TOKEN != ''
         uses: actions/checkout@v4
         with:
           repository: CitrateNetwork/citrate-federation
@@ -72,9 +84,11 @@ jobs:
             contract
 
       - uses: actions/setup-python@v5
+        if: env.FED_TOKEN != ''
         with:
           python-version: '3.11'
 
       - name: Federation contract drift gate (blocking)
+        if: env.FED_TOKEN != ''
         run: python3 scripts/sync-federation-contract.py --check
         working-directory: citrate-chain
