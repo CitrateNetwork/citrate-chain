@@ -2,15 +2,15 @@
 # bootstrap.sh — one-step bootstrap for developers and agent operators
 #
 # Example:
-#   curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile developer
-#   curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile agent
+#   curl -fsSL https://raw.githubusercontent.com/CitrateNetwork/citrate-chain/main/scripts/bootstrap.sh | bash -s -- --profile developer
+#   curl -fsSL https://raw.githubusercontent.com/CitrateNetwork/citrate-chain/main/scripts/bootstrap.sh | bash -s -- --profile agent
 
 set -euo pipefail
 
 PROFILE="developer"
 INSTALL_ROOT="${CITRATE_INSTALL_ROOT:-$HOME/src}"
-REPO_URL="${CITRATE_REPO_URL:-https://github.com/SaulBuilds/citrate.git}"
-WORKTREE_DIR="${CITRATE_WORKTREE_DIR:-$INSTALL_ROOT/citrate}"
+REPO_URL="${CITRATE_REPO_URL:-https://github.com/CitrateNetwork/citrate-chain.git}"
+WORKTREE_DIR="${CITRATE_WORKTREE_DIR:-$INSTALL_ROOT/citrate-chain}"
 SKIP_SYSTEM_PACKAGES=0
 SKIP_BUILD=0
 WITH_GUI=0
@@ -61,7 +61,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --install-root)
             INSTALL_ROOT="$2"
-            WORKTREE_DIR="$INSTALL_ROOT/citrate"
+            WORKTREE_DIR="$INSTALL_ROOT/citrate-chain"
             shift 2
             ;;
         --repo-url)
@@ -182,18 +182,20 @@ clone_or_update_repo() {
 
 build_targets() {
     export PATH="$HOME/.cargo/bin:$HOME/.foundry/bin:$PATH"
-    cd "$WORKTREE_DIR/citrate_v0.01.1"
+    cd "$WORKTREE_DIR"
 
     local targets=(-p citrate-node -p citrate-cli -p citrate-faucet)
     if [[ "$WITH_GUI" -eq 1 ]]; then
-        targets+=(-p citrate-gui-native)
+        # The desktop GUI moved to its own repo at the federation split.
+        echo "The GUI is built from https://github.com/CitrateNetwork/citrate-native, not this repo." >&2
+        exit 1
     fi
 
     run cargo build --release "${targets[@]}"
 }
 
 run_first_launch() {
-    cd "$WORKTREE_DIR/citrate_v0.01.1"
+    cd "$WORKTREE_DIR"
     export PATH="$PWD/target/release:$HOME/.cargo/bin:$PATH"
     run bash scripts/installers/first_launch.sh
 }
@@ -228,7 +230,7 @@ main() {
 Bootstrap complete.
 
 Next steps:
-  1. cd "$WORKTREE_DIR/citrate_v0.01.1"
+  1. cd "$WORKTREE_DIR"
   2. Start a local devnet:
        ./target/release/citrate --config "$HOME/.citrate/configs/devnet.toml"
   3. Or inspect the public testnet profile:

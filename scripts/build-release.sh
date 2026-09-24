@@ -382,7 +382,7 @@ encryption_enabled = true
 ## Support
 
 - **Documentation:** https://docs.citrate.ai
-- **GitHub Issues:** https://github.com/SaulBuilds/citrate/issues
+- **GitHub Issues:** https://github.com/CitrateNetwork/citrate-chain/issues
 - **Discord:** https://discord.gg/A3Uwe4BvdN
 EOF
 

@@ -7,10 +7,16 @@
 # Ubuntu 22.04+ server with TLS-terminated RPC via Caddy.
 #
 # Usage:
-#   sudo ./deploy_testnet.sh <domain>
-#   sudo ./deploy_testnet.sh testnet.citrate.ai
-#   sudo ./deploy_testnet.sh testnet.citrate.ai --build-from-source
-#   sudo ./deploy_testnet.sh testnet.citrate.ai --skip-tls
+#   sudo ./deploy_testnet.sh <domain> --version <tag> --coinbase <0x-address>
+#   sudo ./deploy_testnet.sh testnet.citrate.ai --version v0.5.0-beta1 --coinbase 0xYourAddress
+#   sudo ./deploy_testnet.sh testnet.citrate.ai --version v0.5.0-beta1 --coinbase 0x... --build-from-source
+#   sudo ./deploy_testnet.sh testnet.citrate.ai --version v0.5.0-beta1 --coinbase 0x... --skip-tls
+#
+# Supply chain (PBA-L6-001): binaries come only from
+# github.com/CitrateNetwork/citrate-chain releases at the explicit --version,
+# and are installed only after the SHA-256 checksum AND the cosign keyless
+# signature (issued to CitrateNetwork/citrate-chain release workflows) verify.
+# Any verification failure aborts; there is no fallback. Requires `cosign`.
 #
 # Prerequisites:
 #   - Ubuntu 22.04+ (Debian 12+ also works)
@@ -40,6 +46,8 @@ CONFIG_DIR="/etc/citrate"
 CONFIG_FILE="$CONFIG_DIR/testnet.toml"
 LOG_DIR="/var/log/citrate"
 BIN_PATH="/usr/local/bin/citrate"
+RELEASE_REPO="CitrateNetwork/citrate-chain"
+COSIGN_IDENTITY_RE='^https://github\.com/CitrateNetwork/citrate-chain/\.github/workflows/(release|release-tier2)\.yml@refs/(heads/main|tags/v[0-9A-Za-z._-]+)$'
 RPC_PORT=8545
 WS_PORT=8546
 P2P_PORT=30303
@@ -64,6 +72,8 @@ bail() { log_err "$1"; exit 1; }
 
 # ---- Argument parsing ----
 DOMAIN=""
+VERSION=""
+COINBASE=""
 BUILD_FROM_SOURCE=false
 SKIP_TLS=false
 
@@ -71,11 +81,15 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --build-from-source) BUILD_FROM_SOURCE=true; shift ;;
         --skip-tls)          SKIP_TLS=true; shift ;;
+        --version)           VERSION="${2:-}"; shift 2 || bail "--version needs a value" ;;
+        --coinbase)          COINBASE="${2:-}"; shift 2 || bail "--coinbase needs a value" ;;
         --help|-h)
-            echo "Usage: sudo $0 <domain> [--build-from-source] [--skip-tls]"
+            echo "Usage: sudo $0 <domain> --version <tag> --coinbase <0x-address> [--build-from-source] [--skip-tls]"
             echo ""
             echo "  <domain>              FQDN for TLS (e.g., testnet.citrate.ai)"
-            echo "  --build-from-source   Clone repo and compile instead of downloading binary"
+            echo "  --version <tag>       citrate-chain release tag to install (required; never 'latest')"
+            echo "  --coinbase <address>  20-byte 0x address you control, for block rewards (required)"
+            echo "  --build-from-source   Clone $RELEASE_REPO at --version and compile instead of downloading"
             echo "  --skip-tls            Skip Caddy/TLS setup (RPC on plain HTTP only)"
             echo ""
             exit 0
@@ -95,7 +109,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$DOMAIN" ]]; then
-    bail "Domain is required.  Usage: sudo $0 <domain>"
+    bail "Domain is required.  Usage: sudo $0 <domain> --version <tag> --coinbase <0x-address>"
+fi
+if [[ -z "$VERSION" ]]; then
+    bail "--version <tag> is required (e.g. --version v0.5.0-beta1). Unpinned installs are not supported."
+fi
+if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+    bail "--version must be a release tag like v0.5.0-beta1 (got '$VERSION')"
+fi
+if [[ -z "$COINBASE" ]]; then
+    bail "--coinbase <0x-address> is required: rewards go to an address whose key you hold."
+fi
+if [[ ! "$COINBASE" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+    bail "--coinbase must be a 0x-prefixed 20-byte address (got '$COINBASE')"
 fi
 
 # ---- Pre-flight checks ----
@@ -156,53 +182,56 @@ if $BUILD_FROM_SOURCE; then
     RUST_VERSION=$(rustc --version)
     log_ok "Rust: $RUST_VERSION"
 
-    # Clone and build
-    BUILD_DIR="/tmp/citrate-build-$$"
-    log_info "Cloning repository..."
-    git clone --depth 1 https://github.com/citrate-ai/citrate.git "$BUILD_DIR"
+    # Clone the canonical repo at the pinned release tag (release tags are
+    # protected by the protect-release-tags ruleset).
+    BUILD_DIR="$(mktemp -d /tmp/citrate-build.XXXXXX)"
+    log_info "Cloning $RELEASE_REPO at $VERSION..."
+    git clone --depth 1 --branch "$VERSION" "https://github.com/$RELEASE_REPO.git" "$BUILD_DIR"
 
     log_info "Building release binary (this takes 5-15 minutes)..."
-    cd "$BUILD_DIR/citrate_v0.01.1"
-    cargo build --release -p citrate-node
+    (cd "$BUILD_DIR" && cargo build --release --locked -p citrate-node)
 
-    cp "target/release/citrate" "$BIN_PATH"
-    chmod +x "$BIN_PATH"
-
-    # Cleanup build directory
+    install -m 0755 "$BUILD_DIR/target/release/citrate" "$BIN_PATH"
     rm -rf "$BUILD_DIR"
-    cd /
 else
-    # Download pre-built binary
+    # Download the pinned release asset and verify it before installing.
+    # No fallback: any failure below aborts the deploy.
+    command -v cosign &>/dev/null \
+        || bail "cosign is required to verify the release signature. Install it (https://docs.sigstore.dev/cosign/system_config/installation/) or use --build-from-source."
+
     ARCH=$(uname -m)
     case "$ARCH" in
-        x86_64)  PLATFORM="linux-x86_64" ;;
-        aarch64) PLATFORM="linux-aarch64" ;;
+        x86_64)  TRIPLE="x86_64-unknown-linux-gnu" ;;
+        aarch64) TRIPLE="aarch64-unknown-linux-gnu" ;;
         *)       bail "Unsupported architecture: $ARCH" ;;
     esac
 
-    RELEASE_URL="https://github.com/citrate-ai/citrate/releases/latest/download/citrate-${PLATFORM}"
-    log_info "Downloading from: $RELEASE_URL"
+    ASSET="citrate-chain-${TRIPLE}.tar.gz"
+    BASE_URL="https://github.com/$RELEASE_REPO/releases/download/$VERSION"
+    DL_DIR="$(mktemp -d /tmp/citrate-dl.XXXXXX)"
+    log_info "Downloading $ASSET ($VERSION) from $RELEASE_REPO..."
+    for f in "$ASSET" "$ASSET.sha256" "$ASSET.sig" "$ASSET.pem"; do
+        curl --proto '=https' --tlsv1.2 -fsSL -o "$DL_DIR/$f" "$BASE_URL/$f" \
+            || bail "Download failed: $BASE_URL/$f (does release $VERSION exist?)"
+    done
 
-    if curl -fSL -o "$BIN_PATH" "$RELEASE_URL"; then
-        chmod +x "$BIN_PATH"
-        log_ok "Binary downloaded and installed to $BIN_PATH"
-    else
-        log_warn "Download failed. Falling back to build from source..."
-        # Install Rust if not present
-        if ! command -v rustc &>/dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-            source "$HOME/.cargo/env"
-        fi
+    log_info "Verifying SHA-256 checksum..."
+    (cd "$DL_DIR" && sha256sum -c "$ASSET.sha256") \
+        || bail "Checksum verification FAILED for $ASSET. Not installing."
 
-        BUILD_DIR="/tmp/citrate-build-$$"
-        git clone --depth 1 https://github.com/citrate-ai/citrate.git "$BUILD_DIR"
-        cd "$BUILD_DIR/citrate_v0.01.1"
-        cargo build --release -p citrate-node
-        cp "target/release/citrate" "$BIN_PATH"
-        chmod +x "$BIN_PATH"
-        rm -rf "$BUILD_DIR"
-        cd /
-    fi
+    log_info "Verifying cosign signature (issuer + CitrateNetwork workflow identity)..."
+    cosign verify-blob "$DL_DIR/$ASSET" \
+        --signature "$DL_DIR/$ASSET.sig" \
+        --certificate "$DL_DIR/$ASSET.pem" \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
+        || bail "Signature verification FAILED for $ASSET. Not installing."
+    log_ok "Checksum and signature verified."
+
+    tar -xzf "$DL_DIR/$ASSET" -C "$DL_DIR"
+    install -m 0755 "$DL_DIR/citrate-chain-${TRIPLE}/citrate-node" "$BIN_PATH"
+    rm -rf "$DL_DIR"
+    log_ok "Binary installed to $BIN_PATH"
 fi
 
 if [[ ! -x "$BIN_PATH" ]]; then
@@ -228,12 +257,11 @@ log_ok "Directories created."
 # ---- Step 4: Generate coinbase address and write config ----
 log_step "[4/9] Writing testnet configuration..."
 
-# Generate a deterministic-looking coinbase from the domain for the genesis allocation.
-# In production you would use a proper key pair; this gives each deployment a unique
-# coinbase so the mined tokens land somewhere identifiable.
-COINBASE_SEED=$(echo -n "$DOMAIN-citrate-testnet-coinbase" | sha256sum | awk '{print $1}')
-# Take the first 40 hex chars as a 20-byte EVM address, pad to 64 hex (32 bytes)
-COINBASE_ADDR="${COINBASE_SEED:0:40}000000000000000000000000"
+# Coinbase comes from the operator (--coinbase, validated above) so block
+# rewards land at an address whose key the operator holds. Config format is
+# the 20-byte address without 0x, right-padded to 32 bytes.
+COINBASE_HEX=$(echo "${COINBASE#0x}" | tr 'A-F' 'a-f')
+COINBASE_ADDR="${COINBASE_HEX}000000000000000000000000"
 
 cat > "$CONFIG_FILE" << TOML
 # Citrate Testnet Configuration

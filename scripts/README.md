@@ -24,7 +24,7 @@ Operational shell scripts for deployment, testing, and orchestration. We recomme
 |--------|-------------|
 | `deploy_bootstrap.sh` | Deploy a bootstrap node |
 | `health_check_bootstrap.sh` | Health check for bootstrap nodes |
-| `deploy_testnet.sh` | Deploy to testnet infrastructure |
+| `deploy_testnet.sh` | Deploy a testnet node. Requires `--version <tag>` and `--coinbase <0x-address>`; installs only a checksum- and cosign-verified `CitrateNetwork/citrate-chain` release (or builds that tag from source). Tripwire: `tests/test_deploy_testnet_supply_chain.sh` |
 | `deploy_monitoring.sh` | Deploy Prometheus + Grafana monitoring stack |
 | `build-release.sh` | Build local release binaries; GitHub Release publication is restricted to the root release workflow |
 
@@ -72,10 +72,10 @@ Platform-specific installer configs in `installers/linux/`, `installers/macos/`,
 
 ```bash
 # Bootstrap a full developer environment from a fresh machine
-curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile developer
+curl -fsSL https://raw.githubusercontent.com/CitrateNetwork/citrate-chain/main/scripts/bootstrap.sh | bash -s -- --profile developer
 
 # Bootstrap an agent workstation (best-effort Ollama install included)
-curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile agent
+curl -fsSL https://raw.githubusercontent.com/CitrateNetwork/citrate-chain/main/scripts/bootstrap.sh | bash -s -- --profile agent
 
 # Bring up a local testnet, run tests, tear it down
 ./scripts/launch_local_testnet.sh

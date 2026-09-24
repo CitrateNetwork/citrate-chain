@@ -380,14 +380,17 @@ jobs:
         uses: sigstore/cosign-installer@v3
 
       - name: Sign installers (keyless OIDC)
+        # Fail closed (PBA-L6-001): an unsigned artefact must never be
+        # published, because deploy_testnet.sh and users verify these signatures.
         run: |
+          set -euo pipefail
           cd dist
           shopt -s nullglob
           for f in *.dmg *.msi *.exe *.deb *.rpm *.AppImage *.app.zip ; do
             [[ -f "$f" ]] || continue
             COSIGN_EXPERIMENTAL=1 cosign sign-blob --yes "$f" \
               --output-signature "$f.sig" \
-              --output-certificate "$f.pem" || true
+              --output-certificate "$f.pem"
           done
 
       - name: Create or update GitHub Release
