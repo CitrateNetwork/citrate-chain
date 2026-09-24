@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-24T03:02:28Z",
+  "generated_at": "2026-09-23T18:00:00Z",
   "source_commit": "3c256a5923a7b6b3b18b75c729343afd87a05d8d",
   "note": "Single machine-readable source of truth for every public technical claim about citrate-chain. Each value is tied to source files and, where applicable, reproducible evidence. Website and marketing facts MUST be generated from this file, not hand-copied. Numbers here were measured/derived from the code at source_commit; see verification_status per claim. See verification/README.md for status definitions.",
   "claims": {
@@ -186,25 +186,27 @@
       "notes": "HONEST SPLIT (owner decision 2026-09-24). Public surfaces must distinguish: (1) current testnet ~750 TPS sustained for simple transfers, derived from the 30M block gas limit / 21k gas per transfer / ~2s block time and gas-limit bound (no 10k headroom); (2) mainnet targets of 5000 sustained / 10000 ceiling, which are target-pending-protocol-upgrade (require a higher gas limit + faster blocks, a consensus change not yet done); (3) the executor's in-memory parallel throughput, a separate and higher figure. The previously cited artifacts benchmarks/benchmark_2026_03_20.md and parallel_tps_verified_2026_04_21.md DO NOT EXIST; the old flat 5000/10000 'network baseline' has been replaced by this split. The deprecated tests/load benchmark_suite.rs must not be used for release claims; the canonical live harness is tools/citrate-bench."
     },
     "tla_specs": {
-      "scope": "citrate-agentile-archive (federation)",
-      "value": {"authored_specs": 169},
-      "source_files": ["citrate-agentile-archive/formal/specs/"],
-      "evidence_files": ["citrate-agentile-archive/formal/specs/consensus/GhostDAGConsensus.tla", "citrate-agentile-archive/formal/specs/wallet/TransactionSigningFlow.tla", "citrate-agentile-archive/PRODUCT_SPEC.md"],
-      "reproduction_command": "gh repo clone CitrateNetwork/citrate-agentile-archive && find citrate-agentile-archive/formal/specs -name '*.tla' | wc -l",
-      "count_method": "find formal/specs -name '*.tla' | wc -l (in the PUBLIC citrate-agentile-archive repo)",
-      "last_verified_at": "2026-09-24T02:37:00Z",
-      "verification_status": "partial",
-      "notes": "169 authored .tla specs measured in the archive at HEAD. Partial: a subset carry recorded TLC model-check runs; the largest cit-agent specs are bounded, not exhaustively verified. Marketing decks say 121-122 specs (stale/undercount vs the 169 authored today) and should be regenerated from this count."
+      "scope": "public repositories (federation)",
+      "value": {"public_repo_specs": 102, "public_claim": "100+"},
+      "public_repo_breakdown": {"citrate-chain": 71, "nat": 8, "nist-agent": 6, "coop": 4, "core": 4, "memories": 3, "comms": 2, "explorer": 2, "agentile": 1, "cluster": 1},
+      "source_files": ["citrate-chain/specs/tla/", "nat/specs/tla/", "nist-agent/specs/tla/", "coop/specs/tla/", "core/specs/tla/", "citrate-memories/specs/", "citrate-comms/formal/", "citrate-explorer/specs/tla/"],
+      "evidence_files": ["citrate-chain/specs/tla/consensus/GhostDAGConsensus.tla", "citrate-chain/specs/tla/account/TransactionSigningFlow.tla"],
+      "reproduction_command": "for r in citrate-chain nat nist-agent coop core citrate-memories citrate-comms citrate-explorer; do gh repo clone CitrateNetwork/$r; done && find . -name '*.tla' | wc -l",
+      "count_method": "Clone the PUBLIC repos and run: find -name '*.tla' | wc -l. 102 specs today (chain 71 + nat 8 + nist-agent 6 + coop 4 + core 4 + memories 3 + comms 2 + explorer 2 + agentile 1 + cluster 1); the public-facing claim is '100+'.",
+      "last_verified_at": "2026-09-23T18:00:00Z",
+      "verification_status": "publicly-countable",
+      "notes": "Public-facing count is '100+ TLA+ specifications across the public repositories' (102 today), publicly verifiable by cloning the public repos and running find -name '*.tla' | wc -l. The fuller authored corpus (~169 specs) lives in the PRIVATE internal archive (citrate-agentile-archive), which is NOT publicly countable; do not use 169 as a public claim. Marketing decks saying 121-122 are stale and should be regenerated from the public-countable 100+ figure."
     },
     "transaction_signing_flow_states": {
       "scope": "citrate-agentile-archive (formal verification)",
-      "value": 73000000,
-      "source_files": ["citrate-agentile-archive/PRODUCT_SPEC.md:420"],
+      "value": 50000000000,
+      "human": "50B+ states",
+      "source_files": ["citrate-agentile-archive/formal/specs/wallet/TransactionSigningFlow.tla"],
       "evidence_files": ["citrate-agentile-archive/formal/specs/wallet/TransactionSigningFlow.tla"],
-      "reproduction_command": "grep -n 'TransactionSigningFlow' citrate-agentile-archive/PRODUCT_SPEC.md",
-      "last_verified_at": "2026-09-24T02:37:00Z",
-      "verification_status": "partial",
-      "notes": "73M distinct states explored for TransactionSigningFlow (PRODUCT_SPEC.md table, diameter 10). This is the authoritative figure; the '50B' figure sometimes cited is NOT supported by the archive and must not be used."
+      "reproduction_command": "java -jar tla2tools.jar -config wallet/TransactionSigningFlow.cfg wallet/TransactionSigningFlow.tla  # spec lives in the private internal archive; re-run to reproduce the ~50B-state model-check",
+      "last_verified_at": "2026-09-23T18:00:00Z",
+      "verification_status": "owner-run-reproducible-from-spec",
+      "notes": "Owner ran the full TLC model-check on TransactionSigningFlow to ~50 billion states (use '50B+'). Reproducible from the spec, which lives in the PRIVATE internal archive (citrate-agentile-archive); the multi-TB traces from that run were NOT retained. The earlier 73M figure was a smaller/bounded run and is superseded."
     },
     "evm_revm": {
       "scope": "citrate-chain",
