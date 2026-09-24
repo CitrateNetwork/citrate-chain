@@ -1,0 +1,214 @@
+{
+  "generated_at": "2026-09-24T02:37:00Z",
+  "source_commit": "3c256a5923a7b6b3b18b75c729343afd87a05d8d",
+  "note": "Single machine-readable source of truth for every public technical claim about citrate-chain. Each value is tied to source files and, where applicable, reproducible evidence. Website and marketing facts MUST be generated from this file, not hand-copied. Numbers here were measured/derived from the code at source_commit; see verification_status per claim. See verification/README.md for status definitions.",
+  "claims": {
+    "salt_total_supply": {
+      "scope": "citrate-chain",
+      "value": 1000000000000,
+      "unit": "whole SALT (base tokens; multiply by 10^decimals for wei)",
+      "human": "1 trillion SALT",
+      "source_files": ["core/economics/src/lib.rs:62"],
+      "evidence_files": ["core/economics/src/token.rs:26-27"],
+      "reproduction_command": "grep -n 'TOTAL_SUPPLY' core/economics/src/lib.rs",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "reproducible-from-source",
+      "notes": "Code comment: scaled 1000x from a former 1B cap at the 2026-09 reroll. TOTAL_SUPPLY is the single source of truth; TokenConfig::default and GenesisConfig::validate derive the wei cap from it. Any 1-billion figure on public surfaces is stale."
+    },
+    "decimals": {
+      "scope": "citrate-chain",
+      "value": 18,
+      "source_files": ["core/economics/src/token.rs:9"],
+      "evidence_files": ["core/economics/src/lib.rs:66-71"],
+      "reproduction_command": "grep -n 'DECIMALS' core/economics/src/token.rs",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "reproducible-from-source"
+    },
+    "chain_id": {
+      "scope": "citrate-chain",
+      "value": 40204,
+      "value_hex": "0x9d0c",
+      "source_files": ["node/config/mainnet.toml:6", "node/config/testnet.toml:5", "testnet-config.toml:2"],
+      "evidence_files": ["contracts/addresses/40204.json"],
+      "reproduction_command": "grep -rn 'chain_id' node/config/*.toml testnet-config.toml",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "reproducible-from-source",
+      "notes": "Testnet and mainnet configs both pin 40204. 40204 == 0x9d0c."
+    },
+    "ghostdag_k": {
+      "scope": "citrate-chain",
+      "value": 18,
+      "source_files": ["node/config/testnet.toml:8", "node/config/mainnet.toml:9", "testnet-config.toml:5"],
+      "evidence_files": ["core/consensus/src/ghostdag.rs"],
+      "reproduction_command": "grep -rn 'ghostdag_k' node/config/*.toml testnet-config.toml",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "reproducible-from-source",
+      "notes": "GhostDAG blue-set anticone bound k = 18, consumed by core/consensus/src/ghostdag.rs via GhostDagParams."
+    },
+    "block_time": {
+      "scope": "citrate-chain",
+      "value": 1,
+      "unit": "seconds",
+      "source_files": ["node/config/testnet.toml:7", "node/config/testnet.toml:40"],
+      "evidence_files": [],
+      "reproduction_command": "grep -n 'block_time\\|target_block_time' node/config/testnet.toml",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "reproducible-from-source",
+      "notes": "Config parser requires an integer number of seconds; the config comment records a whitepaper 500ms target. Testnet runs at 1s. (Legacy testnet-config.toml at repo root uses block_time=2.)"
+    },
+    "checkpoint_interval": {
+      "scope": "citrate-chain",
+      "value": 50,
+      "unit": "blocks",
+      "source_files": ["node/config/testnet.toml:49-52"],
+      "evidence_files": ["core/consensus/tests/checkpoint_tests.rs", "core/consensus/tests/h01_h02_checkpoint_safety.rs"],
+      "reproduction_command": "sed -n '48,53p' node/config/testnet.toml",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "reproducible-from-source",
+      "notes": "[checkpoint] interval=50, committee_size=100, quorum_threshold=67 (2/3+1 BFT committee finality, WP-W.2)."
+    },
+    "deterministic_checkpoint_finality": {
+      "scope": "citrate-chain",
+      "value": {"seconds_estimate": 50, "interval_blocks": 50, "block_time_seconds": 1, "committee_size": 100, "quorum_threshold": 67},
+      "source_files": ["node/config/testnet.toml:7", "node/config/testnet.toml:49-52"],
+      "evidence_files": ["docs/consensus/EXECUTE_ON_RECEIVE_state_application.md:70-71", "core/consensus/tests/h01_h02_checkpoint_safety.rs"],
+      "reproduction_command": "sed -n '48,53p' node/config/testnet.toml  # interval*block_time = 50*1s ~= 50s to a BFT checkpoint",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "reproducible-from-source",
+      "notes": "Deterministic BFT finality is reached at the next checkpoint: interval(50 blocks) x block_time(1s) ~= 50s worst case, ~25s average. State is never reverted below the last finalized checkpoint (invariant I4). The '~25-50s' public figure derives directly from these two config values."
+    },
+    "confirmation_latency": {
+      "scope": "citrate-chain",
+      "value": {"probabilistic_block_seconds": 1, "deterministic_checkpoint_seconds_estimate": 50, "finality_depth_blocks": 100},
+      "source_files": ["node/config/testnet.toml:7"],
+      "evidence_files": ["docs/consensus/EXECUTE_ON_RECEIVE_state_application.md:70-82"],
+      "reproduction_command": "grep -n 'finality\\|checkpoint' docs/consensus/EXECUTE_ON_RECEIVE_state_application.md",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "documented-pre-audit",
+      "notes": "Probabilistic confirmation is one block (~1s); deterministic BFT finality lands at the next checkpoint (~25-50s). Finality depth bound is 100 blocks. No end-to-end measured latency artifact is published yet."
+    },
+    "foundry_tests": {
+      "scope": "citrate-chain/contracts",
+      "value": {"passed": 2913, "failed": 0, "skipped": 0, "suites": 158},
+      "source_files": ["contracts/"],
+      "evidence_files": ["contracts/foundry.toml", "foundry.toml"],
+      "reproduction_command": "cd contracts && forge test --use 0.8.36",
+      "count_method": "forge test --use 0.8.36 final summary line ('2913 tests passed, 0 failed, 0 skipped')",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "measured-here",
+      "notes": "Measured on forge 1.5.1-stable at source_commit. 158 test suites, 2913 passed / 0 failed / 0 skipped."
+    },
+    "rust_tests": {
+      "scope": "citrate-chain",
+      "value": {"tests": 4379, "doctests_included": false},
+      "source_files": ["Cargo.toml"],
+      "evidence_files": [],
+      "reproduction_command": "cargo test --workspace -- --list 2>/dev/null | grep -c ': test'",
+      "count_method": "cargo test --workspace -- --list | grep -c ': test' (each ': test' line is one #[test]/#[tokio::test] case). The per-binary 'N tests' summary lines sum to the same 4379, cross-checking the count.",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "measured-here",
+      "notes": "4379 unit/integration test cases across the workspace, measured at source_commit (whole workspace compiled clean, exit 0). Doctests are NOT included (cargo --list does not enumerate them). Marketing surfaces have quoted 5,377 and 6,720 Rust tests; DO NOT copy those — 4379 is the measured figure. (Static grep of #[test]/#[tokio::test] annotations gives ~4,696, an upper-ish approximation that miscounts cfg-gated/macro-generated cases.)"
+    },
+    "deployed_contracts": {
+      "scope": "citrate-chain",
+      "value": {"contracts": 69, "aa_stack": 7, "core_plus_aa_total": 76, "genesis_deployers": 1, "top_level_extra": 2, "precompile_addresses_listed": 21},
+      "source_files": ["contracts/addresses/40204.json"],
+      "evidence_files": ["contracts/addresses/40204.json"],
+      "reproduction_command": "python3 -c \"import json;d=json.load(open('contracts/addresses/40204.json'));print('contracts',len(d['contracts']),'aaStack',len(d['aaStack']),'precompiles',len(d['precompiles']))\"",
+      "count_method": "len(contracts)=69 + len(aaStack)=7 = 76 deployed application/AA contracts on chain 40204 (the public '76+' claim). genesis.ArachnidDeterministicDeployer (1) and two top-level entries (CitrateMemberSBT, MembershipStakeVault) are tracked separately.",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "measured-here",
+      "notes": "40204.json is the canonical address table (deployedAt 2026-09-12). The '76+' figure = 69 app contracts + 7 AA-stack contracts."
+    },
+    "precompiles": {
+      "scope": "citrate-chain",
+      "value": {
+        "hosted_inference": "0x0100-0x0106",
+        "verification": "0x0107-0x0109",
+        "deterministic_q16_16_compute": "0x010A-0x010F",
+        "learning": "0x0110-0x0111",
+        "recursive_fold_commd": "0x0130",
+        "ed25519": "0x0120",
+        "x402": "0x0200-0x0202",
+        "listed_in_address_table": 21
+      },
+      "source_files": ["core/execution/src/precompiles/mod.rs:139-154", "core/execution/src/precompiles/inference.rs:19-35"],
+      "evidence_files": ["contracts/addresses/40204.json", "core/execution/src/precompiles/"],
+      "reproduction_command": "sed -n '80,160p' core/execution/src/precompiles/mod.rs; python3 -c \"import json;print(json.load(open('contracts/addresses/40204.json'))['precompiles'])\"",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "reproducible-from-source",
+      "notes": "Canonical scheme (WP-B0): the EVM address IS the documented short name. ModelDeploy=0x0100, ModelInference=0x0101 per the dispatcher and 40204.json. FLAG: contracts/src/ModelRegistry.sol:17-18 hardcodes MODEL_PRECOMPILE=0x...1000 and ARTIFACT_PRECOMPILE=0x...1002, which DISAGREE with the canonical inference family (0x0100-0x0106). ModelRegistry's precompile calls therefore target 0x1000/0x1002, addresses outside the pure-precompile set and not present in 40204.json. Tracked as a discrepancy to reconcile."
+    },
+    "model_registry_precompile_flag": {
+      "scope": "citrate-chain/contracts",
+      "value": {"model_registry_constant": "0x0000000000000000000000000000000000001000", "artifact_constant": "0x0000000000000000000000000000000000001002", "canonical_model_deploy": "0x0000000000000000000000000000000000000100", "canonical_model_inference": "0x0000000000000000000000000000000000000101", "agrees": false},
+      "source_files": ["contracts/src/ModelRegistry.sol:17-18"],
+      "evidence_files": ["core/execution/src/precompiles/inference.rs:19-35", "contracts/addresses/40204.json"],
+      "reproduction_command": "grep -n 'PRECOMPILE' contracts/src/ModelRegistry.sol",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "measured-here",
+      "notes": "DISAGREEMENT CONFIRMED. ModelRegistry.sol calls address 0x1000 (=4096) / 0x1002, but the canonical model precompiles live at 0x0100/0x0101. 0x1000 is not a registered pure precompile in the dispatcher nor in 40204.json's precompiles table."
+    },
+    "network_tps": {
+      "scope": "citrate-chain",
+      "value": {"sustained_tps": 5000, "ceiling_tps": 10000, "executor_ceiling_tx_s_8worker": 773000, "executor_1worker_tx_s": 321000, "parallel_speedup_1_to_8": 2.41},
+      "source_files": ["CLAUDE.md:165-171"],
+      "evidence_files": ["tests/load/src/bin/benchmark_suite.rs", "tools/citrate-bench/", "core/execution/benches/tps_parallel.rs", "core/execution/benches/parallel_bench.rs", "core/execution/benches/mvcc_bench.rs"],
+      "reproduction_command": "cargo bench -p citrate-execution --bench tps_parallel  # executor ceiling; canonical live-network harness: tools/citrate-bench (signs client-side via eth_sendRawTransaction)",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "baseline-unreproduced-artifact-pending",
+      "notes": "The cited artifacts benchmarks/benchmark_2026_03_20.md and benchmarks/parallel_tps_verified_2026_04_21.md DO NOT EXIST in the repo. 5000 sustained / 10000 ceiling is a March-2026 baseline recorded in CLAUDE.md, not currently reproducible from a committed artifact. The 773K tx/s @ 8 workers is an in-process executor microbench (tps_parallel.rs), NOT a live-network number. benchmark_suite.rs is explicitly DEPRECATED for release claims (uses fake unlocked sender on devnet); the canonical harness is tools/citrate-bench. Re-run + committed artifact pending."
+    },
+    "tla_specs": {
+      "scope": "citrate-agentile-archive (federation)",
+      "value": {"authored_specs": 169},
+      "source_files": ["citrate-agentile-archive/formal/specs/"],
+      "evidence_files": ["citrate-agentile-archive/formal/specs/consensus/GhostDAGConsensus.tla", "citrate-agentile-archive/formal/specs/wallet/TransactionSigningFlow.tla", "citrate-agentile-archive/PRODUCT_SPEC.md"],
+      "reproduction_command": "gh repo clone CitrateNetwork/citrate-agentile-archive && find citrate-agentile-archive/formal/specs -name '*.tla' | wc -l",
+      "count_method": "find formal/specs -name '*.tla' | wc -l (in the PUBLIC citrate-agentile-archive repo)",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "partial",
+      "notes": "169 authored .tla specs measured in the archive at HEAD. Partial: a subset carry recorded TLC model-check runs; the largest cit-agent specs are bounded, not exhaustively verified. Marketing decks say 121-122 specs (stale/undercount vs the 169 authored today) and should be regenerated from this count."
+    },
+    "transaction_signing_flow_states": {
+      "scope": "citrate-agentile-archive (formal verification)",
+      "value": 73000000,
+      "source_files": ["citrate-agentile-archive/PRODUCT_SPEC.md:420"],
+      "evidence_files": ["citrate-agentile-archive/formal/specs/wallet/TransactionSigningFlow.tla"],
+      "reproduction_command": "grep -n 'TransactionSigningFlow' citrate-agentile-archive/PRODUCT_SPEC.md",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "partial",
+      "notes": "73M distinct states explored for TransactionSigningFlow (PRODUCT_SPEC.md table, diameter 10). This is the authoritative figure; the '50B' figure sometimes cited is NOT supported by the archive and must not be used."
+    },
+    "evm_revm": {
+      "scope": "citrate-chain",
+      "value": {"engine": "revm", "version": "=10"},
+      "source_files": ["core/execution/Cargo.toml:45"],
+      "evidence_files": ["core/execution/src/revm_adapter.rs"],
+      "reproduction_command": "grep -n 'revm = ' core/execution/Cargo.toml",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "reproducible-from-source",
+      "notes": "EVM execution via revm pinned to exact version =10 (default-features off; std + serde). Adapter in src/revm_adapter.rs."
+    },
+    "consensus_ghostdag": {
+      "scope": "citrate-chain",
+      "value": {"algorithm": "GhostDAG", "k": 18, "finality": "BFT checkpoint committee", "vrf": "strict"},
+      "source_files": ["core/consensus/src/ghostdag.rs", "node/config/testnet.toml:8"],
+      "evidence_files": ["core/consensus/README.md", "core/consensus/SAFETY_AUDIT.md", "core/consensus/tests/proptest_consensus.rs", "core/consensus/tests/real_tests.rs"],
+      "reproduction_command": "ls core/consensus/src/ghostdag.rs && grep -n 'ghostdag_k' node/config/testnet.toml",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "reproducible-from-source",
+      "notes": "GhostDAG (Kaspa-family) blue-set consensus with k=18, VRF leader election (strict_vrf=true), and a BFT checkpoint committee (size 100, quorum 67) for deterministic finality."
+    },
+    "audit_status": {
+      "scope": "citrate-chain",
+      "value": "pre external audit",
+      "source_files": ["AUDIT_TIER.md"],
+      "evidence_files": ["audit.toml", "SECURITY.md", "audits/"],
+      "reproduction_command": "sed -n '1,20p' AUDIT_TIER.md",
+      "last_verified_at": "2026-09-24T02:37:00Z",
+      "verification_status": "documented-pre-audit",
+      "notes": "Classified Tier 1 (full external audit required before first stable v1.0.0 tag). No written external-firm audit attestation exists yet; internal adversarial re-audits and cargo-audit tripwires are in place. Prerelease tags may ship with a prerelease flag + warning."
+    }
+  }
+}
