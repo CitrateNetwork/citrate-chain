@@ -1,3 +1,23 @@
+//! ⚠ SCOPE — this file is the **zero-knowledge leg** of Citrate's proof-of-inference,
+//! and it is deliberately NOT the primary verification mechanism. Do not cite the v1
+//! circuit below (a single Q16.16 linear layer, `in_dim=2 / out_dim=1`) as "Citrate's
+//! proof of inference" — it is one tier of three, and the least load-bearing today.
+//!
+//! Citrate verifies "the committed model produced this output" in THREE tiers
+//! (canonical reference: `docs/PROOF_OF_INFERENCE.md`):
+//!   1. **Deterministic re-execution (Q16.16)** — PRIMARY. Fixed-point integer math is
+//!      bit-identical across hardware, so any validator re-runs the computation and
+//!      compares commitments; the determinism *is* the proof, and it scales to whole
+//!      models. See `core/execution/src/precompiles/q16/` + `inference.rs` (strict mode).
+//!   2. **TEE attestation (CM-08)** — for non-deterministic / GPU / large-model inference:
+//!      an attested enclave, anchored on-chain by `TEEAttestationRegistry`. Gated by the
+//!      inference precompile's attestation gate (Phase-1 default: reject). Needs hardware
+//!      enclaves; target: by mainnet.
+//!   3. **This ZK circuit** — an *additive* cryptographic proof requiring neither
+//!      re-execution nor trusted hardware. v1 proves the smallest non-trivial layer;
+//!      scaling it toward real models is an open frontier problem under active research
+//!      (see the "Proof of Inference" GitHub project).
+//
 // citrate/core/execution/src/zkp/halo2/circuits.rs
 //
 // RM-M1b WP-M1b.3 — InferenceCircuit composition.
