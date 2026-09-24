@@ -72,10 +72,10 @@ Platform-specific installer configs in `installers/linux/`, `installers/macos/`,
 
 ```bash
 # Bootstrap a full developer environment from a fresh machine
-curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile developer
+curl -fsSL https://raw.githubusercontent.com/CitrateNetwork/citrate-chain/main/scripts/bootstrap.sh | bash -s -- --profile developer
 
 # Bootstrap an agent workstation (best-effort Ollama install included)
-curl -fsSL https://raw.githubusercontent.com/SaulBuilds/citrate/main/citrate_v0.01.1/scripts/bootstrap.sh | bash -s -- --profile agent
+curl -fsSL https://raw.githubusercontent.com/CitrateNetwork/citrate-chain/main/scripts/bootstrap.sh | bash -s -- --profile agent
 
 # Bring up a local testnet, run tests, tear it down
 ./scripts/launch_local_testnet.sh
