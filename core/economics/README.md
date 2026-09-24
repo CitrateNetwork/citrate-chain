@@ -4,7 +4,7 @@ Tokenomics, reward distribution, governance, and economic policy for the Citrate
 
 ## Overview
 
-This crate implements the complete economic layer for Citrate's SALT token (1 billion total supply, 18 decimals). It covers the full lifecycle of network economics: genesis configuration with initial token distribution, block reward calculation with halving schedules, enhanced multi-factor reward distribution based on validator performance and AI contributions, dynamic gas pricing that responds to network utilization, on-chain governance with proposal/vote mechanics, and multi-party revenue sharing across validators, model creators, infrastructure providers, and the treasury.
+This crate implements the complete economic layer for Citrate's SALT token (1 trillion total supply, 18 decimals). It covers the full lifecycle of network economics: genesis configuration with initial token distribution, block reward calculation with halving schedules, enhanced multi-factor reward distribution based on validator performance and AI contributions, dynamic gas pricing that responds to network utilization, on-chain governance with proposal/vote mechanics, and multi-party revenue sharing across validators, model creators, infrastructure providers, and the treasury.
 
 The crate also provides specialized support for institutional operators (e.g., school node pilots) with tailored reward profiles covering block validation, model hosting, adapter creation, and data provision. A lenient slashing policy accommodates institutional scheduling constraints while maintaining network security through equivocation penalties. The estimator module enables forward-looking reward projections for institutional onboarding.
 
@@ -94,7 +94,7 @@ All economic parameters are configurable and can be modified through the governa
 ### Constants & Helpers
 - **`TOKEN_SYMBOL`** -- `"SALT"`
 - **`TOKEN_NAME`** -- `"Citrate"`
-- **`TOTAL_SUPPLY`** -- `1_000_000_000`
+- **`TOTAL_SUPPLY`** -- `1_000_000_000_000`
 - **`latt_to_wei(latt)`** -- Convert SALT to wei (smallest unit)
 - **`wei_to_latt(wei)`** -- Convert wei to SALT
 

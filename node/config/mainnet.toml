@@ -3,7 +3,7 @@
 
 [chain]
 # Mainnet chain ID
-chain_id = 1
+chain_id = 40204
 genesis_hash = ""
 block_time = 5
 ghostdag_k = 18

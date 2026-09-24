@@ -162,7 +162,7 @@ These addresses handle runtime AI operations (inference, ZK proofs):
 
 ### SALT Token
 - **Type**: Native gas token (not ERC-20)
-- **Total supply**: 1,000,000,000 (1 billion)
+- **Total supply**: 1,000,000,000,000 (1 trillion)
 - **Decimals**: 18
 - **Distribution**: 50% mining, 25% ecosystem, 10% treasury, 15% team
 
