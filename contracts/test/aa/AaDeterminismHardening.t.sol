@@ -50,10 +50,15 @@ import {CitratePaymaster} from "../../src/aa/paymaster/CitratePaymaster.sol";
  * projection uses `CREATE2_FACTORY` (0x4e59…).
  */
 contract AaDeterminismHardeningTest is Test {
-    // --- Canonical constructor args for chain 40204 (mirror of AaDeterminism.t.sol) ---
-    address internal constant IDENTITY_SIGNER = 0x8A9062625E98666Fc0072Ee2E7CB8AB08Bd1b651;
-    address internal constant OWNER = 0x4250675F9015E65fC866F3a373F82bb9DFc000c6;
-    address internal constant SPONSOR_SIGNER = 0x03067c230C3a13F801B2C285f43D1C6264d6b2a4;
+    // --- Canonical constructor args for chain 40204 ---
+    // Verified against the LIVE deployed factory/paymaster on 40204 (rpc.citrate.ai):
+    //   factory.identitySigner() / factory.owner() / paymaster.owner() / paymaster.sponsorSigner().
+    // OWNER + SPONSOR_SIGNER moved at the deployer-rotation (0x4250675F→0x4fAB35c8)
+    // and the KEYSAFE sponsor-key rotation; re-pinned here so the projections land
+    // on the canonical 40204.json addresses.
+    address internal constant IDENTITY_SIGNER = 0x8A9062625E98666Fc0072Ee2E7CB8AB08Bd1b651; // factory.identitySigner()
+    address internal constant OWNER = 0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732; // factory.owner()/paymaster.owner() (canonical deployer)
+    address internal constant SPONSOR_SIGNER = 0x676b00c12A958de4901CFa1c81C84086C5DA8ed8; // paymaster.sponsorSigner()
 
     uint256 internal constant DAILY_CAP = 0.01 ether;
     uint256 internal constant RECOVERY_CAP = 0.01 ether;
@@ -66,11 +71,13 @@ contract AaDeterminismHardeningTest is Test {
     // at this reroll and NEVER again. If a value here changes, a determinism input
     // silently moved — treat a failure of test_pinned_production_addresses_tripwire
     // as a release blocker, not a test to "update".
-    address internal constant EP_PIN = 0xC698feAf0FF7FdB0D60E2F620C97cB729A694975;
-    address internal constant GUARDIAN_PIN = 0x381B5848f3B5d73FF67b745624780a43682456Ce;
-    address internal constant WALLET_IMPL_PIN = 0x79c4A8367d2d65B162DE841fF678DB4875490b2e;
-    address internal constant FACTORY_PIN = 0x5a45B6F83050a76A81D0F2E6c857F16B37B2693b;
-    address internal constant PAYMASTER_PIN = 0xF14F56e812cE93544e75E841Ac6316F2d7E561b0;
+    // canonical: contracts/addresses/40204.json (aaStack) — re-pinned at the
+    // solc-0.8.36 / OZ-5.7 reroll + AA redeploy (2026-09-12 ceremony).
+    address internal constant EP_PIN = 0x97d5391a647429233E202f99231743C53a648f3c; // aaStack.EntryPoint
+    address internal constant GUARDIAN_PIN = 0x0A909769160C1945401b8f37a9310d37DbB6a891; // aaStack.GuardianRecoveryModule
+    address internal constant WALLET_IMPL_PIN = 0x2D742B98D867Fc7363F530DD6d756622e4Eb768D; // aaStack.CitrateWallet
+    address internal constant FACTORY_PIN = 0x86486d1dE9F256E2CBa327C46Ac11120Df0AA51a; // aaStack.CitrateWalletFactory
+    address internal constant PAYMASTER_PIN = 0xfDc9F7a72163b5d45bECDB8a9d8D44b970f77318; // aaStack.CitratePaymaster
 
     // ERC-4337 v0.7 canonical EntryPoint (nonce-0 deploy, same on every EVM chain).
     // Ours is deliberately NOT this — see test_our_entryPoint_distinct_from_canonical_v07.
@@ -412,9 +419,11 @@ contract AaDeterminismHardeningTest is Test {
     /// it (no redeploy, no revert) and builds the whole cascade on that exact
     /// EntryPoint — landing every downstream contract at its pinned address.
     function test_deployAA_embeds_preexisting_entryPoint() public {
+        // Canonical ceremony inputs (see IDENTITY_SIGNER/OWNER/SPONSOR_SIGNER above);
+        // must match so DeployAA's factory/paymaster land on the pinned addresses.
         vm.setEnv("CITRATE_AA_IDENTITY_SIGNER", "0x8A9062625E98666Fc0072Ee2E7CB8AB08Bd1b651");
-        vm.setEnv("CITRATE_AA_OWNER", "0x4250675F9015E65fC866F3a373F82bb9DFc000c6");
-        vm.setEnv("CITRATE_AA_SPONSOR_SIGNER", "0x03067c230C3a13F801B2C285f43D1C6264d6b2a4");
+        vm.setEnv("CITRATE_AA_OWNER", "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732");
+        vm.setEnv("CITRATE_AA_SPONSOR_SIGNER", "0x676b00c12A958de4901CFa1c81C84086C5DA8ed8");
 
         // Stand the EntryPoint up FIRST (standalone), then let DeployAA find it.
         DeployEntryPoint dep = new DeployEntryPoint();

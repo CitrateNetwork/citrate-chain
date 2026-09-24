@@ -49,7 +49,9 @@ contract CoreMembershipCreate2Test is Test {
     // Determinism inputs — PINNED, identical to DeployCoreMembership.s.sol.
     address internal constant ARACHNID = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     address internal constant FROZEN_OWNER = 0xF42a19194fee89E71dC4b8631a71a9CeCf42B483;
-    address internal constant REGISTRY = 0x61D44D8A14443646B756905410BE951e6eCE95A6;
+    // canonical: contracts/addresses/40204.json ValidatorRegistry — re-pinned at
+    // the solc-0.8.36 / OZ-5.7 reroll (prior 0x61D44D8A… pin was pre-reroll stale).
+    address internal constant REGISTRY = 0x2655d9fbbe599E75ff6E53790F99EbC9A20c93BF;
 
     // ── init_code builders (keccak256(creationCode ++ abi.encode(ctorArgs))) ──
 
@@ -145,10 +147,12 @@ contract CoreMembershipCreate2Test is Test {
     // changed, and the federation's address book, the desktop app's compile-time
     // pins and the droplet signer env all have to move with it.
 
-    address internal constant SBT_FROZEN = 0xAD826D0439f7ad5a3512A8927B632Cbca2840e10;
-    address internal constant BOND_FROZEN = 0x394660A2d48DB86c04B5838c7117E2D4B5DE4513;
-    address internal constant VAULT_IMPL_FROZEN = 0xCd59F9c2d8cD1D41f2F4911b5a171C62F1b6bEA8;
-    address internal constant VAULT_FROZEN = 0x04c32967816187B2efDcd4937DbBa59E051F99dB;
+    // canonical: contracts/addresses/40204.json — re-pinned at the solc-0.8.36 /
+    // OZ-5.7 reroll (2026-09-12 ceremony); prior M-2 pins were pre-reroll stale.
+    address internal constant SBT_FROZEN = 0xf0bADD9Eed5A81871a2F0D309b1f0a225646448a; // CitrateMemberSBT
+    address internal constant BOND_FROZEN = 0x7D6B92757e928ab4207Be3B54166Ecd2C491Aa92; // MemberBond
+    address internal constant VAULT_IMPL_FROZEN = 0x72035977F3Ec295C70e2A734AcbDFfB0C98E6F0b; // MembershipStakeVaultImpl
+    address internal constant VAULT_FROZEN = 0x53fB4baDfFacEEDD575D47D0E74Bb721504F786e; // MembershipStakeVault (proxy)
 
     function test_sbt_frozen_projection() public pure {
         assertEq(_sbtAddr(), SBT_FROZEN, "SBT frozen address moved");
