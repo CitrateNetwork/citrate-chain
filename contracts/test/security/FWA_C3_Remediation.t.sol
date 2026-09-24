@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
 // FWA-C3 remediation red→green tests (Agentile-Audit v0.2).

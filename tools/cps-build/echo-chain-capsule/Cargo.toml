@@ -11,7 +11,7 @@ name = "echo-chain-capsule"
 version = "0.1.0"
 edition = "2021"
 publish = false
-license = "MIT"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["cdylib"]

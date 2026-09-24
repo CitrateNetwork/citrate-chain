@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
 /// @title BenchmarkRegistry — RFC-CIT-AGENT-0001 §11.2 + planset

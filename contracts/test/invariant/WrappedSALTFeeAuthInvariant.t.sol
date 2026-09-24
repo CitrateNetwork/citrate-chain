@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.24;
 
 // RFI-01 / WP-H1.1 — Front-run fee redirect must be blocked.

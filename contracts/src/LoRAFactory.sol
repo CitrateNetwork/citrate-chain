@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 
 // citrate-v3/contracts/src/LoRAFactory.sol
 pragma solidity ^0.8.26;

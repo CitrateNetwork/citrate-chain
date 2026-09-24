@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Database Encryption Layer
 //
 // Provides transparent encryption for RocksDB operations using the

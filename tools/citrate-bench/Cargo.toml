@@ -4,7 +4,7 @@ version = "0.4.0"
 edition = "2021"
 publish = false
 description = "Production-correct TPS benchmark for the Citrate testnet. Not a devnet load toy."
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [[bin]]
 name = "citrate-bench"

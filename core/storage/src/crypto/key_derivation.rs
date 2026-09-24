@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Quantum-Safe Key Derivation
 //
 // Implements secure key derivation for database encryption:

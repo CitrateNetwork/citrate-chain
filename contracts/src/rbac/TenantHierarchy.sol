@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
 /// @title TenantHierarchy — root of the DPF-02 RBAC access model

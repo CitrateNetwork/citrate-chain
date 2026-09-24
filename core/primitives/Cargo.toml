@@ -8,7 +8,7 @@ name = "citrate-primitives"
 version = "0.4.0"
 edition = "2024"
 description = "Citrate Network: core primitive types and utilities. (Placeholder during federation transition — substantive content arrives with subsequent chain releases.)"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/CitrateNetwork/citrate-chain"
 
 [dependencies]

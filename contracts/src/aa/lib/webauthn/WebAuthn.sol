@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.21;
 
 // Vendored from https://github.com/daimo-eth/p256-verifier (MIT) at

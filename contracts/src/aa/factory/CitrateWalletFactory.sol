@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
 import {LibClone} from "../../../lib/kernel/lib/solady/src/utils/LibClone.sol";

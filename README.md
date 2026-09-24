@@ -172,6 +172,4 @@ https://docs.citrate.ai/local-stack
 
 ## License
 
-Source-available (BUSL-1.1) — free for personal/non-commercial use;
-commercial/hosted use requires a membership license. This is not an open-source
-license.
+Licensed under the Apache License, Version 2.0 (see [`LICENSE`](LICENSE)). This is the open-source infrastructure tier of Citrate's open-core model. The commercial application layer is source-available under BUSL-1.1. Licensor: Citrate Inc.

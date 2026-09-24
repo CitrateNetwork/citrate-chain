@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Blockchain-Anchored Key Commitment
 //
 // This module provides on-chain key lifecycle management:

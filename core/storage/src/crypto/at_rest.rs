@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Encryption at rest for the RocksDB access layer (STOR-EAR, 2026-07-04).
 //
 // This module is the engine behind `RocksDB::open_encrypted`. Design:

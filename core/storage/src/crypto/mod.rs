@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Citrate Quantum-Safe Storage Protocol (QSSP)
 //
 // This module implements post-quantum cryptography for database encryption at rest.
