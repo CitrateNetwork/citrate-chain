@@ -24,7 +24,7 @@ Operational shell scripts for deployment, testing, and orchestration. We recomme
 |--------|-------------|
 | `deploy_bootstrap.sh` | Deploy a bootstrap node |
 | `health_check_bootstrap.sh` | Health check for bootstrap nodes |
-| `deploy_testnet.sh` | Deploy to testnet infrastructure |
+| `deploy_testnet.sh` | Deploy a testnet node. Requires `--version <tag>` and `--coinbase <0x-address>`; installs only a checksum- and cosign-verified `CitrateNetwork/citrate-chain` release (or builds that tag from source). Tripwire: `tests/test_deploy_testnet_supply_chain.sh` |
 | `deploy_monitoring.sh` | Deploy Prometheus + Grafana monitoring stack |
 | `build-release.sh` | Build local release binaries; GitHub Release publication is restricted to the root release workflow |
 

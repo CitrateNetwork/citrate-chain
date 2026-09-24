@@ -255,7 +255,10 @@ jobs:
         uses: sigstore/cosign-installer@v3
 
       - name: Sign artifacts (keyless OIDC)
+        # Fail closed (PBA-L6-001): deploy_testnet.sh verifies these
+        # signatures, so an unsigned tarball must never be published.
         run: |
+          set -euo pipefail
           cd dist
           # nullglob: unmatched globs expand to nothing instead of literal.
           # The previous `for f in *.tar.gz *.zip *.json 2>/dev/null` syntax
@@ -264,7 +267,7 @@ jobs:
           shopt -s nullglob
           for f in *.tar.gz *.zip *.json; do
             if [[ -f "$f" ]]; then
-              COSIGN_EXPERIMENTAL=1 cosign sign-blob --yes "$f" --output-signature "$f.sig" --output-certificate "$f.pem" || true
+              COSIGN_EXPERIMENTAL=1 cosign sign-blob --yes "$f" --output-signature "$f.sig" --output-certificate "$f.pem"
             fi
           done
 
