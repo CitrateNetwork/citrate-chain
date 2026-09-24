@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-24T02:37:00Z",
+  "generated_at": "2026-09-24T03:02:28Z",
   "source_commit": "3c256a5923a7b6b3b18b75c729343afd87a05d8d",
   "note": "Single machine-readable source of truth for every public technical claim about citrate-chain. Each value is tied to source files and, where applicable, reproducible evidence. Website and marketing facts MUST be generated from this file, not hand-copied. Numbers here were measured/derived from the code at source_commit; see verification_status per claim. See verification/README.md for status definitions.",
   "claims": {
@@ -47,14 +47,14 @@
     },
     "block_time": {
       "scope": "citrate-chain",
-      "value": 1,
+      "value": {"measured_live_seconds": 2, "measured_range_seconds": [1.9, 2.0], "config_target_seconds": 1},
       "unit": "seconds",
       "source_files": ["node/config/testnet.toml:7", "node/config/testnet.toml:40"],
       "evidence_files": [],
-      "reproduction_command": "grep -n 'block_time\\|target_block_time' node/config/testnet.toml",
-      "last_verified_at": "2026-09-24T02:37:00Z",
-      "verification_status": "reproducible-from-source",
-      "notes": "Config parser requires an integer number of seconds; the config comment records a whitepaper 500ms target. Testnet runs at 1s. (Legacy testnet-config.toml at repo root uses block_time=2.)"
+      "reproduction_command": "grep -n 'block_time\\|target_block_time' node/config/testnet.toml  # config target=1s. Live: sample consecutive block timestamps via RPC (eth_getBlockByNumber) and diff them -> ~1.9-2.0s.",
+      "last_verified_at": "2026-09-24T03:02:28Z",
+      "verification_status": "measured/derived",
+      "notes": "DISCREPANCY: config target_block_time = 1s (testnet.toml:7,40), but the LIVE measured block interval is ~1.9-2.0s (call it ~2s). Public surfaces should quote the measured ~2s, not the 1s config target. The config comment also records a whitepaper 500ms aspiration. (Legacy testnet-config.toml at repo root uses block_time=2, consistent with the measured value.)"
     },
     "checkpoint_interval": {
       "scope": "citrate-chain",
@@ -69,23 +69,23 @@
     },
     "deterministic_checkpoint_finality": {
       "scope": "citrate-chain",
-      "value": {"seconds_estimate": 50, "interval_blocks": 50, "block_time_seconds": 1, "committee_size": 100, "quorum_threshold": 67},
-      "source_files": ["node/config/testnet.toml:7", "node/config/testnet.toml:49-52"],
+      "value": {"seconds_estimate": 100, "seconds_range": [90, 100], "interval_blocks": 50, "measured_block_time_seconds": 2, "committee_size": 100, "quorum_threshold": 67},
+      "source_files": ["node/config/testnet.toml:49-52"],
       "evidence_files": ["docs/consensus/EXECUTE_ON_RECEIVE_state_application.md:70-71", "core/consensus/tests/h01_h02_checkpoint_safety.rs"],
-      "reproduction_command": "sed -n '48,53p' node/config/testnet.toml  # interval*block_time = 50*1s ~= 50s to a BFT checkpoint",
-      "last_verified_at": "2026-09-24T02:37:00Z",
-      "verification_status": "reproducible-from-source",
-      "notes": "Deterministic BFT finality is reached at the next checkpoint: interval(50 blocks) x block_time(1s) ~= 50s worst case, ~25s average. State is never reverted below the last finalized checkpoint (invariant I4). The '~25-50s' public figure derives directly from these two config values."
+      "reproduction_command": "sed -n '48,53p' node/config/testnet.toml  # interval(50 blocks) x measured block time (~2s) ~= 90-100s to a BFT checkpoint",
+      "last_verified_at": "2026-09-24T03:02:28Z",
+      "verification_status": "measured/derived",
+      "notes": "Deterministic BFT finality is reached at the next checkpoint: interval(50 blocks) x MEASURED block time (~1.9-2.0s) ~= 90-100s worst case (~45-50s average within a checkpoint window). This SUPERSEDES the earlier ~25-50s figure, which assumed the 1s config target rather than the ~2s live block time. State is never reverted below the last finalized checkpoint (invariant I4)."
     },
     "confirmation_latency": {
       "scope": "citrate-chain",
-      "value": {"probabilistic_block_seconds": 1, "deterministic_checkpoint_seconds_estimate": 50, "finality_depth_blocks": 100},
+      "value": {"probabilistic_block_seconds": 2, "deterministic_checkpoint_seconds_estimate": 100, "finality_depth_blocks": 100},
       "source_files": ["node/config/testnet.toml:7"],
       "evidence_files": ["docs/consensus/EXECUTE_ON_RECEIVE_state_application.md:70-82"],
       "reproduction_command": "grep -n 'finality\\|checkpoint' docs/consensus/EXECUTE_ON_RECEIVE_state_application.md",
-      "last_verified_at": "2026-09-24T02:37:00Z",
+      "last_verified_at": "2026-09-24T03:02:28Z",
       "verification_status": "documented-pre-audit",
-      "notes": "Probabilistic confirmation is one block (~1s); deterministic BFT finality lands at the next checkpoint (~25-50s). Finality depth bound is 100 blocks. No end-to-end measured latency artifact is published yet."
+      "notes": "Probabilistic confirmation is one block (~2s measured); deterministic BFT finality lands at the next checkpoint (~90-100s at the measured ~2s block time). Finality depth bound is 100 blocks. No end-to-end measured latency artifact is published yet."
     },
     "foundry_tests": {
       "scope": "citrate-chain/contracts",
@@ -151,13 +151,39 @@
     },
     "network_tps": {
       "scope": "citrate-chain",
-      "value": {"sustained_tps": 5000, "ceiling_tps": 10000, "executor_ceiling_tx_s_8worker": 773000, "executor_1worker_tx_s": 321000, "parallel_speedup_1_to_8": 2.41},
-      "source_files": ["CLAUDE.md:165-171"],
-      "evidence_files": ["tests/load/src/bin/benchmark_suite.rs", "tools/citrate-bench/", "core/execution/benches/tps_parallel.rs", "core/execution/benches/parallel_bench.rs", "core/execution/benches/mvcc_bench.rs"],
-      "reproduction_command": "cargo bench -p citrate-execution --bench tps_parallel  # executor ceiling; canonical live-network harness: tools/citrate-bench (signs client-side via eth_sendRawTransaction)",
-      "last_verified_at": "2026-09-24T02:37:00Z",
-      "verification_status": "baseline-unreproduced-artifact-pending",
-      "notes": "The cited artifacts benchmarks/benchmark_2026_03_20.md and benchmarks/parallel_tps_verified_2026_04_21.md DO NOT EXIST in the repo. 5000 sustained / 10000 ceiling is a March-2026 baseline recorded in CLAUDE.md, not currently reproducible from a committed artifact. The 773K tx/s @ 8 workers is an in-process executor microbench (tps_parallel.rs), NOT a live-network number. benchmark_suite.rs is explicitly DEPRECATED for release claims (uses fake unlocked sender on devnet); the canonical harness is tools/citrate-bench. Re-run + committed artifact pending."
+      "value": {
+        "current_testnet_sustained_tps": {
+          "value": 750,
+          "verification_status": "derived-from-config",
+          "derivation": "block_gas_limit(30,000,000) / gas_per_simple_transfer(21,000) / measured_block_time(~2s) ~= 714, rounded to ~750 for simple transfers",
+          "source_files": ["core/sequencer/src/mempool.rs:179", "core/sequencer/src/block_builder.rs:74"],
+          "reproduction_command": "grep -n 'MAX_GAS_PER_BLOCK' core/sequencer/src/mempool.rs; python3 -c 'print(30_000_000/21000/2)'  # ~714; tools/citrate-bench can confirm the live figure once bench signers are funded (signs client-side via eth_sendRawTransaction)",
+          "notes": "Peak is gas-limit bound: there is NO 10,000 TPS headroom on the current testnet. A block holds at most 30M/21k = ~1428 simple transfers, and blocks land ~every 2s, so sustained simple-transfer throughput is ~750 TPS."
+        },
+        "mainnet_target_sustained_tps": {
+          "value": 5000,
+          "verification_status": "target-pending-protocol-upgrade",
+          "notes": "Aspirational mainnet target. Requires raising the block gas limit AND faster blocks (a consensus/protocol change). NOT yet implemented; owner decided NOT to change consensus params now."
+        },
+        "mainnet_target_ceiling_tps": {
+          "value": 10000,
+          "verification_status": "target-pending-protocol-upgrade",
+          "notes": "Aspirational mainnet ceiling, same protocol-upgrade dependency as the sustained target."
+        },
+        "executor_parallel_ceiling": {
+          "executor_ceiling_tx_s_8worker": 773000,
+          "executor_1worker_tx_s": 321000,
+          "parallel_speedup_1_to_8": 2.41,
+          "verification_status": "baseline-unreproduced-artifact-pending",
+          "notes": "SEPARATE, HIGHER metric: the executor's in-memory parallel-execution throughput (not end-to-end network TPS, which is RPC/signature/gas-limit bound and far lower). In-process microbench via core/execution/benches/tps_parallel.rs; no committed artifact yet."
+        }
+      },
+      "source_files": ["core/sequencer/src/mempool.rs:179", "core/sequencer/src/block_builder.rs:74", "CLAUDE.md:165-171"],
+      "evidence_files": ["tools/citrate-bench/", "core/execution/benches/tps_parallel.rs", "core/execution/benches/parallel_bench.rs", "core/execution/benches/mvcc_bench.rs"],
+      "reproduction_command": "grep -n 'MAX_GAS_PER_BLOCK' core/sequencer/src/mempool.rs && python3 -c 'print(30_000_000/21000/2)'",
+      "last_verified_at": "2026-09-24T03:02:28Z",
+      "verification_status": "mixed (see per-sub-metric statuses)",
+      "notes": "HONEST SPLIT (owner decision 2026-09-24). Public surfaces must distinguish: (1) current testnet ~750 TPS sustained for simple transfers, derived from the 30M block gas limit / 21k gas per transfer / ~2s block time and gas-limit bound (no 10k headroom); (2) mainnet targets of 5000 sustained / 10000 ceiling, which are target-pending-protocol-upgrade (require a higher gas limit + faster blocks, a consensus change not yet done); (3) the executor's in-memory parallel throughput, a separate and higher figure. The previously cited artifacts benchmarks/benchmark_2026_03_20.md and parallel_tps_verified_2026_04_21.md DO NOT EXIST; the old flat 5000/10000 'network baseline' has been replaced by this split. The deprecated tests/load benchmark_suite.rs must not be used for release claims; the canonical live harness is tools/citrate-bench."
     },
     "tla_specs": {
       "scope": "citrate-agentile-archive (federation)",

@@ -34,6 +34,14 @@ derived from. Re-verify against a new commit before trusting stale values.
   (a green pipeline is evidence).
 - **`reproducible-from-source`** — the value is a constant or config in the tree;
   the `reproduction_command` re-derives it deterministically, no run required.
+- **`derived-from-config`** — the value is arithmetic over in-tree constants/config
+  (e.g. throughput = block gas limit / gas per tx / block time); shown with its
+  derivation, not an independent live measurement.
+- **`measured/derived`** — a live-measured input combined with in-tree config
+  (e.g. finality = checkpoint interval x measured block time).
+- **`target-pending-protocol-upgrade`** — an aspirational target that is not met
+  today and requires a protocol/consensus change that has not shipped; never
+  present it as a current capability.
 - **`baseline-unreproduced-artifact-pending`** — a historical baseline is recorded,
   but the committed evidence artifact is missing or the run has not been repeated;
   treat as provisional until re-run.
