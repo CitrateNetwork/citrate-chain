@@ -22,11 +22,35 @@ test('exports match the embedded canonical snapshot', () => {
 
 test('flatten covers contracts + aaStack + precompiles + the two singletons, collision-free', () => {
   const flat = flatten()
-  const n = Object.keys(embedded.contracts).length + Object.keys(embedded.aaStack).length +
-    Object.keys(embedded.precompiles).length + 2
-  assert.equal(Object.keys(flat).length, n)
+  // every name from every section is present exactly once
+  const names = new Set([
+    ...Object.keys(embedded.contracts), ...Object.keys(embedded.aaStack),
+    ...Object.keys(embedded.precompiles), 'CitrateMemberSBT', 'MembershipStakeVault',
+  ])
+  assert.equal(Object.keys(flat).length, names.size)
+  // a name that appears in more than one section must agree on the address
+  const sections = [embedded.contracts, embedded.aaStack, embedded.precompiles,
+    { CitrateMemberSBT: embedded.CitrateMemberSBT, MembershipStakeVault: embedded.MembershipStakeVault }]
+  for (const name of names) {
+    const addrs = new Set(sections.filter((s) => name in s).map((s) => s[name].toLowerCase()))
+    assert.equal(addrs.size, 1, `${name} resolves to ${addrs.size} distinct addresses`)
+    assert.equal(flat[name].toLowerCase(), [...addrs][0])
+  }
   assert.equal(flat.EntryPoint, embedded.aaStack.EntryPoint)
   assert.equal(flat.CitrateMemberSBT, embedded.CitrateMemberSBT)
+})
+
+test('flatten throws when one name maps to two different addresses', () => {
+  const corrupt = {
+    contracts: { CitrateMemberSBT: '0x1111111111111111111111111111111111111111' },
+    CitrateMemberSBT: '0x2222222222222222222222222222222222222222',
+  }
+  assert.throws(() => flatten(corrupt), /conflicting addresses for CitrateMemberSBT/)
+  const crossSection = {
+    contracts: { EntryPoint: '0x1111111111111111111111111111111111111111' },
+    aaStack: { EntryPoint: '0x2222222222222222222222222222222222222222' },
+  }
+  assert.throws(() => flatten(crossSection), /conflicting addresses for EntryPoint/)
 })
 
 test('getAddress resolves and throws on unknown', () => {
