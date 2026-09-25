@@ -7,13 +7,40 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono;
 use citrate_consensus::types::Hash;
-use citrate_execution::{AccessPolicy, Address, JobId, JobStatus, ModelId, ModelState, UsageStats};
+use citrate_execution::ModelId;
 use citrate_storage::state_manager::StateManager;
-use tracing::{debug, error, info, warn};
-use primitive_types::U256;
+use tracing::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PBA-L1b-004: peer AI gossip is ADVISORY and BOUNDED.
+//
+// Every message handled here comes from an unauthenticated peer. Before this
+// fix each fresh `ModelAnnounce` model id (and each `TrainingJobAnnounce` job
+// id, `WeightSync`, `InferenceResponse`) became a permanent RocksDB record with
+// attacker-sized fields: ~222 MiB/s of disk growth from one connection, kept
+// across restarts. Peer claims now live only in bounded, expiring in-memory
+// maps and never reach persistent state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Upper bound on an announcement's variable-size fields, in bytes.
+pub const MAX_ANNOUNCE_METADATA_BYTES: usize = 4 * 1024;
+/// Upper bound on cached peer model announcements (all peers).
+pub const MAX_CACHED_MODELS: usize = 1024;
+/// Upper bound on cached announcements originated by one peer.
+pub const MAX_MODELS_PER_PEER: usize = 32;
+/// Upper bound on providers recorded for one model.
+pub const MAX_PROVIDERS_PER_MODEL: usize = 16;
+/// How long a peer announcement is remembered.
+pub const MODEL_ANNOUNCE_TTL: std::time::Duration = std::time::Duration::from_secs(3_600);
+/// Upper bound on tracked peer training-job announcements (all peers).
+pub const MAX_TRAINING_JOBS: usize = 256;
+/// Upper bound on tracked training-job announcements originated by one peer.
+pub const MAX_TRAINING_JOBS_PER_PEER: usize = 8;
+/// Peer score penalty for an oversized AI announcement.
+const SCORE_OVERSIZED_AI_ANNOUNCE: i32 = -5;
 
 /// Result of a network inference execution.
 #[derive(Debug, Clone)]
@@ -75,7 +102,11 @@ struct TrainingJob {
     dataset_hash: Hash,
     participants: Vec<PeerId>,
     gradients_received: u32,
+    gradients_required: u32,
     reward_per_gradient: u128,
+    /// PBA-L1b-004: who announced it (per-peer quota) and when (expiry).
+    announcer: PeerId,
+    announced_at: std::time::Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +117,20 @@ struct ModelInfo {
     metadata: ModelMetadata,
     version: u32,
     providers: Vec<PeerId>,
+    /// PBA-L1b-004: who announced it (per-peer quota) and when (expiry).
+    announcer: PeerId,
+    announced_at: std::time::Instant,
+}
+
+/// Bytes an announcement asks us to hold, for the size cap.
+fn announcement_bytes(owner: &[u8], metadata: &ModelMetadata, weight_cid: &str) -> usize {
+    owner.len()
+        + metadata.name.len()
+        + metadata.version.len()
+        + metadata.description.len()
+        + metadata.framework.len()
+        + (metadata.input_shape.len() + metadata.output_shape.len()) * 8
+        + weight_cid.len()
 }
 
 impl AINetworkHandler {
@@ -104,6 +149,25 @@ impl AINetworkHandler {
     pub fn with_inference_executor(mut self, executor: Arc<dyn NetworkInferenceExecutor>) -> Self {
         self.inference_executor = Some(executor);
         self
+    }
+
+    /// Number of peer model announcements currently cached (PBA-L1b-004).
+    pub async fn cached_model_count(&self) -> usize {
+        self.model_cache.read().await.len()
+    }
+
+    /// Whether a (non-expired) peer announcement for `model_id` is cached.
+    pub async fn has_cached_model(&self, model_id: &Hash) -> bool {
+        self.model_cache
+            .read()
+            .await
+            .get(model_id)
+            .is_some_and(|m| m.announced_at.elapsed() < MODEL_ANNOUNCE_TTL)
+    }
+
+    /// Number of peer training-job announcements currently tracked.
+    pub async fn active_training_count(&self) -> usize {
+        self.active_training.read().await.len()
     }
 
     /// Handle incoming AI network message
@@ -224,58 +288,70 @@ impl AINetworkHandler {
         metadata: ModelMetadata,
         weight_cid: String,
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received model announcement from peer {}: model_id={:?}",
             peer_id, model_id
         );
 
-        // Cache model info
+        // PBA-L1b-004: size cap first — never hold attacker-sized fields.
+        let bytes = announcement_bytes(owner, &metadata, &weight_cid);
+        if bytes > MAX_ANNOUNCE_METADATA_BYTES {
+            warn!(
+                "PBA-L1b-004: dropping oversized ModelAnnounce from {} ({} bytes > {})",
+                peer_id, bytes, MAX_ANNOUNCE_METADATA_BYTES
+            );
+            self.peer_manager
+                .update_peer_score(peer_id, SCORE_OVERSIZED_AI_ANNOUNCE)
+                .await;
+            return Ok(None);
+        }
+        let _ = (owner, model_hash); // advisory only: never persisted as a model record
+
+        let now = std::time::Instant::now();
         let mut cache = self.model_cache.write().await;
-        let model_info = cache.entry(model_id).or_insert(ModelInfo {
+        cache.retain(|_, m| now.duration_since(m.announced_at) < MODEL_ANNOUNCE_TTL);
+
+        // Known model: record this peer as a provider (bounded).
+        if let Some(existing) = cache.get_mut(&model_id) {
+            if !existing.providers.contains(peer_id)
+                && existing.providers.len() < MAX_PROVIDERS_PER_MODEL
+            {
+                existing.providers.push(peer_id.clone());
+            }
+            return Ok(None);
+        }
+
+        // New model: per-peer quota, then the global cap (oldest evicted).
+        let from_peer = cache.values().filter(|m| &m.announcer == peer_id).count();
+        if from_peer >= MAX_MODELS_PER_PEER {
+            debug!(
+                "PBA-L1b-004: {} is at its announcement quota ({}); dropping {}",
+                peer_id, MAX_MODELS_PER_PEER, model_id
+            );
+            return Ok(None);
+        }
+        if cache.len() >= MAX_CACHED_MODELS {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, m)| m.announced_at)
+                .map(|(k, _)| *k)
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(
             model_id,
-            weight_cid: weight_cid.clone(),
-            metadata: metadata.clone(),
-            version: 1,
-            providers: Vec::new(),
-        });
-
-        // Add peer as provider if not already present
-        if !model_info.providers.contains(peer_id) {
-            model_info.providers.push(peer_id.clone());
-        }
-
-        // Register model in state if we don't have it
-        if let Some(_existing) = self.state_manager.get_model(&ModelId(model_id)) {
-            debug!("Model {} already registered", model_id);
-        } else {
-            // Convert metadata to execution layer format
-            let exec_metadata = citrate_execution::ModelMetadata {
-                name: metadata.name,
-                version: metadata.version,
-                description: metadata.description,
-                framework: metadata.framework,
-                input_shape: metadata.input_shape,
-                output_shape: metadata.output_shape,
-                size_bytes: metadata.size_bytes,
-                created_at: metadata.created_at,
-            };
-
-            // Create model state
-            let model_state = ModelState {
-                owner: Address(owner.try_into().unwrap_or([0; 20])),
-                model_hash,
+            ModelInfo {
+                model_id,
+                weight_cid,
+                metadata,
                 version: 1,
-                metadata: exec_metadata,
-                access_policy: AccessPolicy::Public,
-                usage_stats: UsageStats::default(),
-            };
-
-            // Register model
-            self.state_manager
-                .register_model(ModelId(model_id), model_state, weight_cid)?;
-
-            info!("Registered new model {} from peer {}", model_id, peer_id);
-        }
+                providers: vec![peer_id.clone()],
+                announcer: peer_id.clone(),
+                announced_at: now,
+            },
+        );
+        debug!("Cached peer model announcement {} from {}", model_id, peer_id);
 
         Ok(None)
     }
@@ -310,8 +386,12 @@ impl AINetworkHandler {
             .await
             .insert(request_id, request);
 
-        // Check if we can serve this inference
-        if self.state_manager.get_model(&ModelId(model_id)).is_some() {
+        // Check if we can serve this inference: a locally registered model, or
+        // a live (bounded, expiring) peer announcement (PBA-L1b-004: peer
+        // announcements are no longer persisted as model records).
+        if self.state_manager.get_model(&ModelId(model_id)).is_some()
+            || self.has_cached_model(&model_id).await
+        {
             debug!("Running inference for model {}", model_id);
 
             // Use the pluggable inference executor (MCP/GGUF backed)
@@ -376,19 +456,16 @@ impl AINetworkHandler {
         // Check if we have this pending request
         let mut pending = self.pending_inferences.write().await;
         if let Some(request) = pending.remove(&request_id) {
-            // Cache the inference result
-            let result = citrate_storage::state::InferenceResult {
-                model_id: ModelId(request.model_id),
-                input_hash: request.input_hash,
-                output: vec![],   // Would be fetched from IPFS using output_hash
-                gas_used: 100000, // Estimated
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                proof: Some(proof),
-            };
-
-            self.state_manager.cache_inference_result(result)?;
-
-            debug!("Cached inference result for request {}", request_id);
+            // PBA-L1b-004 variant: a peer's response is an unauthenticated
+            // claim (an attacker can pair its own request + response ids). It
+            // retires the pending entry; it is never persisted.
+            debug!(
+                "Inference response {} for model {} from {} ({} proof bytes); not persisted",
+                request_id,
+                request.model_id,
+                peer_id,
+                proof.len()
+            );
         }
 
         Ok(None)
@@ -411,34 +488,44 @@ impl AINetworkHandler {
             job_id, peer_id, owner
         );
 
-        let job = TrainingJob {
+        // PBA-L1b-004 variant: bounded, expiring, in memory only — the
+        // unauthenticated announcement (with a peer-chosen `owner`) used to be
+        // written to persistent state per fresh job id.
+        let _ = owner;
+        let now = std::time::Instant::now();
+        let mut training = self.active_training.write().await;
+        training.retain(|_, j| now.duration_since(j.announced_at) < MODEL_ANNOUNCE_TTL);
+        if training.contains_key(&job_id) {
+            return Ok(None);
+        }
+        let from_peer = training.values().filter(|j| &j.announcer == peer_id).count();
+        if from_peer >= MAX_TRAINING_JOBS_PER_PEER {
+            debug!("PBA-L1b-004: {} is at its training-announce quota", peer_id);
+            return Ok(None);
+        }
+        if training.len() >= MAX_TRAINING_JOBS {
+            if let Some(oldest) = training
+                .iter()
+                .min_by_key(|(_, j)| j.announced_at)
+                .map(|(k, _)| *k)
+            {
+                training.remove(&oldest);
+            }
+        }
+        training.insert(
             job_id,
-            model_id,
-            dataset_hash,
-            participants: vec![peer_id.clone()],
-            gradients_received: 0,
-            reward_per_gradient,
-        };
-
-        self.active_training.write().await.insert(job_id, job);
-
-        // Register training job in state with the actual owner from the message
-        let training_job = citrate_execution::TrainingJob {
-            id: JobId(job_id),
-            owner: Address(owner), // Use owner from message
-            model_id: ModelId(model_id),
-            dataset_hash,
-            gradients_submitted: 0,
-            gradients_required: participants_needed,
-            participants: Vec::new(),
-            reward_pool: U256::from(reward_per_gradient) * U256::from(participants_needed),
-            status: JobStatus::Pending,
-            created_at: chrono::Utc::now().timestamp() as u64,
-            completed_at: None,
-        };
-
-        self.state_manager
-            .add_training_job(JobId(job_id), training_job)?;
+            TrainingJob {
+                job_id,
+                model_id,
+                dataset_hash,
+                participants: vec![peer_id.clone()],
+                gradients_received: 0,
+                gradients_required: participants_needed,
+                reward_per_gradient,
+                announcer: peer_id.clone(),
+                announced_at: now,
+            },
+        );
 
         Ok(None)
     }
@@ -457,61 +544,32 @@ impl AINetworkHandler {
             job_id, epoch, peer_id
         );
 
-        let mut training = self.active_training.write().await;
-
-        // Update local tracking
-        let gradients_complete = if let Some(job) = training.get_mut(&job_id) {
-            job.gradients_received += 1;
-
-            // Add participant if not already tracked
-            if !job.participants.contains(peer_id) {
-                job.participants.push(peer_id.clone());
+        let _ = participant;
+        // PBA-L1b-004 variant: in-memory bookkeeping on a bounded, expiring
+        // announcement only; a peer's gradient claim is never persisted.
+        let known = {
+            let mut training = self.active_training.write().await;
+            match training.get_mut(&job_id) {
+                Some(job) => {
+                    job.gradients_received = job.gradients_received.saturating_add(1);
+                    if !job.participants.contains(peer_id)
+                        && job.participants.len() < MAX_PROVIDERS_PER_MODEL
+                    {
+                        job.participants.push(peer_id.clone());
+                    }
+                    debug!(
+                        "Job {} now has {}/{} gradients from {} participants",
+                        job_id,
+                        job.gradients_received,
+                        job.gradients_required,
+                        job.participants.len()
+                    );
+                    true
+                }
+                None => false,
             }
-
-            debug!(
-                "Job {} now has {}/{} gradients from {} participants",
-                job_id,
-                job.gradients_received,
-                job.participants.len() as u32,
-                job.participants.len()
-            );
-
-            // Check if we have enough gradients
-            job.gradients_received >= job.participants.len() as u32
-        } else {
-            false
         };
-
-        // Drop the lock before doing state updates
-        drop(training);
-
-        // Update state manager with gradient submission
-        if let Some(mut state_job) = self.state_manager.get_training_job(&JobId(job_id)) {
-            // Convert participant bytes to Address
-            let participant_addr = Address(participant.try_into().unwrap_or([0; 20]));
-
-            // Record gradient submission
-            if !state_job.participants.contains(&participant_addr) {
-                state_job.participants.push(participant_addr);
-            }
-            state_job.gradients_submitted += 1;
-
-            // Update status based on progress
-            if gradients_complete || state_job.gradients_submitted >= state_job.gradients_required {
-                state_job.status = JobStatus::Completed;
-                state_job.completed_at = Some(chrono::Utc::now().timestamp() as u64);
-                info!(
-                    "Training job {} completed with {} gradients",
-                    job_id, state_job.gradients_submitted
-                );
-            } else if state_job.status == JobStatus::Pending {
-                state_job.status = JobStatus::Active;
-            }
-
-            // Persist updated job state
-            self.state_manager.add_training_job(JobId(job_id), state_job)?;
-
-            // Store gradient reference for aggregation
+        if known {
             self.store_gradient_reference(job_id, gradient_hash, epoch).await?;
         }
 
@@ -571,15 +629,10 @@ impl AINetworkHandler {
         // and storing them on IPFS to get the actual CID
         let new_weight_cid = self.compute_new_weight_cid(&model_id, &weight_delta, version);
 
-        // Update model weights in state manager
-        if let Err(e) = self.state_manager.update_model_weights(
-            ModelId(model_id),
-            new_weight_cid.clone(),
-            version,
-        ) {
-            error!("Failed to update model weights in state: {}", e);
-            return Ok(None);
-        }
+        // PBA-L1b-004 variant: an unauthenticated peer's weight update is
+        // never written to persistent state (it used to overwrite the weight
+        // CID of any locally registered model). It only refreshes the bounded
+        // in-memory announcement cache below.
 
         // Update local cache
         let mut cache = self.model_cache.write().await;
@@ -735,6 +788,7 @@ impl AINetworkHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use citrate_execution::{AccessPolicy, Address, ModelState, UsageStats};
     use citrate_network_test_helpers::*;
 
     // ---- test helpers inlined to avoid extra crate ----
