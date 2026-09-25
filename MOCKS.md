@@ -26,7 +26,7 @@ All 15 learning IPC commands have been wired to real contract calls via `Contrac
 | 6 | `learning_create_classroom` | ClassroomRegistry.createClassroom(string,uint256,bytes32) via eth_sendTransaction | DONE |
 | 7 | `learning_get_students` | Requires event indexer for StudentEnrolled events | DONE (returns empty list — known limitation) |
 | 8 | `learning_generate_invite_code` | ClassroomRegistry.rotateInviteCode(bytes32) via eth_sendTransaction | DONE |
-| 9 | `learning_join_classroom` | ClassroomRegistry.enrollWithCode(bytes) via eth_sendTransaction (raw code; hashed on-chain since CHAIN-B-C009) | DONE |
+| 9 | `learning_join_classroom` | ClassroomRegistry.enrollWithInvite(address,bytes) via eth_sendTransaction (invite key plus the student's signed enrolment proof) | DONE |
 | 10 | `learning_add_whitelisted_model` | ClassroomRegistry.whitelistModel(bytes32) via eth_sendTransaction | DONE |
 | 11 | `learning_remove_whitelisted_model` | ClassroomRegistry.removeModel(bytes32) via eth_sendTransaction | DONE |
 | 12 | `learning_get_cycle_status` | LearningCycleManager.currentCycleId() + getCycleInfo(uint256) via eth_call | DONE |
