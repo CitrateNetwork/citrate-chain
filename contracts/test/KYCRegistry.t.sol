@@ -10,7 +10,7 @@ contract KYCRegistryTest is Test {
     address internal user = address(0xBEEF);
 
     function setUp() public {
-        kyc = new KYCRegistry(updater);
+        kyc = new KYCRegistry(updater, address(this));
     }
 
     function test_constructorGrantsUpdater() public view {

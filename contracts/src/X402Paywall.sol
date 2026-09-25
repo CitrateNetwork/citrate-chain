@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "./lib/InitialAdmin.sol";
+
 import "./WrappedSALT.sol";
 
 /// @title X402Paywall
@@ -31,10 +33,13 @@ contract X402Paywall {
     event PriceUpdated(uint256 oldPrice, uint256 newPrice);
     event AccessTtlUpdated(uint256 oldTtl, uint256 newTtl);
 
-    constructor(address _wSALT, uint256 _resourcePrice) {
+    /// @param _provider Explicit payee/admin (PBA-L2-002: `msg.sender` is the CREATE2
+    ///        factory under a salted ceremony deploy, which made every payment
+    ///        to the live paywall go to an address nobody controls).
+    constructor(address _wSALT, uint256 _resourcePrice, address _provider) {
         require(_wSALT != address(0), "Paywall: zero wSALT");
         wSALT = WrappedSALT(payable(_wSALT));
-        provider = msg.sender;
+        provider = InitialAdmin.check(_provider);
         resourcePrice = _resourcePrice;
         accessTTL = DEFAULT_ACCESS_TTL;
     }

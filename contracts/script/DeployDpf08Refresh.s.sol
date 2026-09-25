@@ -67,13 +67,16 @@ contract DeployDpf08Refresh is ScriptEnv {
 
         // 1. ComputeVerifier — initial marketplace = deployer placeholder.
         //    The constructor requires non-zero; we rewire below.
-        ComputeVerifier verifier = new ComputeVerifier(deployer);
+        // PBA-L2-002: governance is explicit (the broadcasting deployer, which
+        // performs the setMarketplace rewire below; hand over afterwards).
+        ComputeVerifier verifier = new ComputeVerifier(deployer, deployer);
         console.log("ComputeVerifier:", address(verifier));
 
         // 2. ComputeMarketplace — depends on the fresh verifier.
         ComputeMarketplace marketplace = new ComputeMarketplace(
             address(verifier),
-            treasury
+            treasury,
+            deployer
         );
         console.log("ComputeMarketplace:", address(marketplace));
 

@@ -29,7 +29,7 @@ contract ComputePricingOracleTest is Test {
         oracle5 = address(0x0AC1E5);
         nonMember = address(0xDEAD);
 
-        oracle = new ComputePricingOracle(INITIAL_COMPUTE_PRICE, INITIAL_SALT_PRICE);
+        oracle = new ComputePricingOracle(INITIAL_COMPUTE_PRICE, INITIAL_SALT_PRICE, address(this));
 
         // Add 3 oracle members (quorum = ceil(3 * 67 / 100) = ceil(2.01) = 3 ... let's use 5 for easier quorum)
         // With 3 oracles: votesNeeded = ceil(3*67/100) = ceil(201/100) = 3 (all must agree)
@@ -80,12 +80,12 @@ contract ComputePricingOracleTest is Test {
 
     function test_deploy_reverts_zero_compute_price() public {
         vm.expectRevert("ComputePricingOracle: zero compute price");
-        new ComputePricingOracle(0, INITIAL_SALT_PRICE);
+        new ComputePricingOracle(0, INITIAL_SALT_PRICE, address(this));
     }
 
     function test_deploy_reverts_zero_salt_price() public {
         vm.expectRevert("ComputePricingOracle: zero SALT price");
-        new ComputePricingOracle(INITIAL_COMPUTE_PRICE, 0);
+        new ComputePricingOracle(INITIAL_COMPUTE_PRICE, 0, address(this));
     }
 
     // ============================================================

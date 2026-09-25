@@ -163,18 +163,18 @@ contract ComputeAdversarialTest is Test {
         governance = address(this);
 
         // Deploy verifier with temp marketplace address
-        verifier = new ComputeVerifier(address(1));
-        marketplace = new ComputeMarketplace(address(verifier), treasury);
+        verifier = new ComputeVerifier(address(1), address(this));
+        marketplace = new ComputeMarketplace(address(verifier), treasury, address(this));
         verifier.setMarketplace(address(marketplace));
 
         // Deploy heartbeat monitor (100 block interval, 3 max missed)
-        heartbeat = new HeartbeatMonitor(100, 3);
+        heartbeat = new HeartbeatMonitor(100, 3, address(this));
 
         // Deploy dispute resolution (10 ether bond, 20 max rounds)
-        dispute = new DisputeResolution(10 ether, 20);
+        dispute = new DisputeResolution(10 ether, 20, address(this));
 
         // Deploy compute pool
-        pool = new ComputePool();
+        pool = new ComputePool(address(this));
 
         // Fund accounts
         vm.deal(requester, 10000 ether);

@@ -19,7 +19,7 @@ contract LiquidStakingPoolTest is Test {
 
     function setUp() public {
         governance = address(this);
-        pool = new LiquidStakingPool();
+        pool = new LiquidStakingPool(address(this));
 
         alice = address(0xA11CE);
         bob = address(0xB0B);

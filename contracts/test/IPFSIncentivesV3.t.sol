@@ -99,7 +99,7 @@ contract IPFSIncentivesV3Test is Test {
     bytes internal constant PROOF = hex"DEADBEEF";
 
     function setUp() public {
-        kyc = new KYCRegistry(address(0));
+        kyc = new KYCRegistry(address(0), address(this));
         fold = new MockFoldVerifier();
         inc = new IPFSIncentivesV3(
             kyc,
@@ -116,7 +116,7 @@ contract IPFSIncentivesV3Test is Test {
             MIN_MODEL_BOND,
             MODEL_CHALLENGE_WINDOW,
             MODEL_CHALLENGER_BPS,
-            address(fold)
+            address(fold), address(this)
         );
 
         vm.etch(VERIFY, type(MockVerifier).runtimeCode);

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "./lib/InitialAdmin.sol";
+
 import "./lib/AccessControl.sol";
 import "./lib/ReentrancyGuard.sol";
 import "./KYCRegistry.sol";
@@ -450,8 +452,11 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         uint256 _commdChallengerBps,
         // citrate-chain#170 (M4): the recursive-fold CommD proof verifier (the M3 precompile in
         // production; a mock in tests). Sound wrong-CommD challenges call it.
-        address _foldVerifier
+        address _foldVerifier,
+        // PBA-L2-002: explicit DEFAULT_ADMIN (never msg.sender = CREATE2 factory).
+        address admin
     ) {
+        InitialAdmin.check(admin);
         // v2 ASSUMEs (unchanged).
         require(_reward <= _bond, "Reward must be <= Bond");
         require(_rounds > 0, "Rounds must be > 0");
@@ -487,7 +492,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         COMMD_CHALLENGER_BPS = _commdChallengerBps;
         foldVerifier = IFoldVerifier(_foldVerifier);
 
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
     }
 
     /// @notice Q1 follow-up: governance can re-tune `REVEAL_DELAY` if the

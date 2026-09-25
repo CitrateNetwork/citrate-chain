@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "./lib/InitialAdmin.sol";
+
 import "./lib/AccessControl.sol";
 import "./lib/ReentrancyGuard.sol";
 import "./KYCRegistry.sol";
@@ -158,8 +160,11 @@ contract IPFSIncentivesV2 is AccessControl, ReentrancyGuard {
         uint256 _challengerBps,
         uint256 _quorum,
         uint256 _challengeWindow,
-        uint256 _challengeN
+        uint256 _challengeN,
+        // PBA-L2-002: explicit DEFAULT_ADMIN (never msg.sender = CREATE2 factory).
+        address admin
     ) {
+        InitialAdmin.check(admin);
         // TLA ASSUMEs, enforced at deploy so the invariants are well-formed:
         require(_reward <= _bond, "Reward must be <= Bond");        // RewardBounded
         require(_rounds > 0, "Rounds must be > 0");                  // RoundsPos
@@ -181,7 +186,7 @@ contract IPFSIncentivesV2 is AccessControl, ReentrancyGuard {
         CHALLENGE_WINDOW = _challengeWindow;
         CHALLENGE_N = _challengeN;
 
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
     }
 
     /**

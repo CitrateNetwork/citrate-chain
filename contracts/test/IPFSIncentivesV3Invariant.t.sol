@@ -252,7 +252,7 @@ contract IPFSIncentivesV3InvariantTest is Test {
 
     function setUp() public {
         vm.etch(VERIFY, type(InvVerifier).runtimeCode);
-        kyc = new KYCRegistry(address(0));
+        kyc = new KYCRegistry(address(0), address(this));
         inc = new IPFSIncentivesV3(
             kyc,
             BOND,
@@ -269,7 +269,7 @@ contract IPFSIncentivesV3InvariantTest is Test {
             COMMD_WINDOW,
             COMMD_BPS,
             // This suite never challenges; a nonzero fold-verifier address satisfies the constructor.
-            address(0xF01D)
+            address(0xF01D), address(this)
         );
         vm.deal(address(this), 1_000_000 ether);
         inc.fund{value: 100_000 ether}();

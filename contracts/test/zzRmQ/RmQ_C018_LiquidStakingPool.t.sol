@@ -18,7 +18,7 @@ contract RmQ_C018_LiquidStakingPool is Test {
     address internal oracle1 = makeAddr("oracle1");
 
     function setUp() public {
-        pool = new LiquidStakingPool(); // Governable(msg.sender) = this
+        pool = new LiquidStakingPool(address(this)); // Governable(msg.sender) = this
         vm.deal(alice, 1000 ether);
         vm.deal(address(this), 1000 ether);
         pool.addOracle(oracle1); // oracleCount == 1 => votesNeeded == 1

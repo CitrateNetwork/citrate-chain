@@ -19,7 +19,7 @@ contract RmQ_C029 is Test {
     address internal honest = address(0x600D);
 
     function setUp() public {
-        lcm = new LearningCycleManager();
+        lcm = new LearningCycleManager(address(this));
         lcm.openCycle(1000);
     }
 

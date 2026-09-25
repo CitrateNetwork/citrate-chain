@@ -54,9 +54,9 @@ contract IPFSIncentivesV2Test is Test {
     bytes internal constant PROOF = hex"DEADBEEF";
 
     function setUp() public {
-        kyc = new KYCRegistry(address(0));
+        kyc = new KYCRegistry(address(0), address(this));
         inc = new IPFSIncentivesV2(
-            kyc, BOND, REWARD, ROUNDS, MAX_MISSED, CHALLENGER_BPS, QUORUM, WINDOW, CHALLENGE_N
+            kyc, BOND, REWARD, ROUNDS, MAX_MISSED, CHALLENGER_BPS, QUORUM, WINDOW, CHALLENGE_N, address(this)
         );
 
         // Etch the mock verifier at 0x0108 and default it to "valid".
@@ -328,7 +328,7 @@ contract IPFSIncentivesV2Test is Test {
     function test_reSeal_cannotExceedSlotBudget() public {
         // Push MAX_MISSED to 0 conceptually via a fresh deploy where one miss slashes.
         IPFSIncentivesV2 inc2 = new IPFSIncentivesV2(
-            kyc, BOND, REWARD, ROUNDS, 0, CHALLENGER_BPS, QUORUM, WINDOW, CHALLENGE_N
+            kyc, BOND, REWARD, ROUNDS, 0, CHALLENGER_BPS, QUORUM, WINDOW, CHALLENGE_N, address(this)
         );
         vm.deal(admin, 1000 ether);
         inc2.fund{value: 500 ether}();

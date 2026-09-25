@@ -16,7 +16,7 @@ contract Deploy is ScriptEnv {
         vm.startBroadcast();
 
         // 1. Deploy ModelRegistry
-        ModelRegistry registry = new ModelRegistry();
+        ModelRegistry registry = new ModelRegistry(deployer); // PBA-L2-002: explicit admin
         console.log("ModelRegistry:", address(registry));
 
         // 2. Deploy WrappedSALT (wSALT)
@@ -24,15 +24,15 @@ contract Deploy is ScriptEnv {
         console.log("WrappedSALT:", address(wsalt));
 
         // 3. Deploy X402Facilitator (wSALT, treasury=deployer, 100bps=1% fee)
-        X402Facilitator facilitator = new X402Facilitator(address(wsalt), deployer, 100);
+        X402Facilitator facilitator = new X402Facilitator(address(wsalt), deployer, 100, deployer);
         console.log("X402Facilitator:", address(facilitator));
 
         // 4. Deploy ModelMarketplace (registry, treasury=deployer)
-        ModelMarketplace marketplace = new ModelMarketplace(address(registry), deployer);
+        ModelMarketplace marketplace = new ModelMarketplace(address(registry), deployer, deployer);
         console.log("ModelMarketplace:", address(marketplace));
 
         // 5. Deploy InferenceRouter
-        InferenceRouter router = new InferenceRouter(address(registry));
+        InferenceRouter router = new InferenceRouter(address(registry), deployer);
         console.log("InferenceRouter:", address(router));
 
         vm.stopBroadcast();

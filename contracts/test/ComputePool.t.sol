@@ -40,7 +40,7 @@ contract ComputePoolTest is Test {
     uint256 internal constant PRICE = 1 ether;
 
     function setUp() public {
-        pool = new ComputePool();
+        pool = new ComputePool(address(this));
         mockSlashing = new MockSlashingForPool();
         pool.setSlashingContract(address(mockSlashing));
 

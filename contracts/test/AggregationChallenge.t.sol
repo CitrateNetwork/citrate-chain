@@ -40,7 +40,7 @@ contract AggregationChallengeTest is Test {
     bytes32 internal constant ROUND = keccak256("round-1");
 
     function setUp() public {
-        ac = new AggregationChallenge(BOND, WINDOW); // governance = this
+        ac = new AggregationChallenge(BOND, WINDOW, address(this)); // governance = this
         slashing = new MockSlashing();
         ac.setSlashingContract(address(slashing));
         vm.deal(challenger, 100 ether);

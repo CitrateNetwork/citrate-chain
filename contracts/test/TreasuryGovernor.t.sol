@@ -77,7 +77,7 @@ contract TreasuryGovernorTest is Test {
         recipient2 = address(0xB002);
 
         // Deploy LiquidStakingPool (governance = this test contract)
-        stakingPool = new LiquidStakingPool();
+        stakingPool = new LiquidStakingPool(address(this));
 
         // Deploy StablecoinTreasury (governance = this test contract)
         treasury = new StablecoinTreasury(address(this));

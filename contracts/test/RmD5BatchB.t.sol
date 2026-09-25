@@ -29,7 +29,7 @@ contract RmD5BatchBTest is Test {
         wSALT = new WrappedSALT();
 
         vm.prank(provider);
-        paywall = new X402Paywall(address(wSALT), PRICE);
+        paywall = new X402Paywall(address(wSALT), PRICE, provider);
 
         vm.deal(payer, 100 ether);
         vm.startPrank(payer);

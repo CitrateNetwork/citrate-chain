@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./Salts.sol";
+import "./lib/AdminChecks.sol";
 
 // Core
 import "../src/ModelRegistry.sol";
@@ -60,10 +61,56 @@ import "../src/SpecRegistry.sol";
  *           5. DeployEduStack.s.sol             (5 contracts — Learning Center)
  *           6. DeployAIGateway.s.sol            (3 contracts — edu/ai-gateway)
  *         Total: 39 contracts. See scripts/regenesis.sh for the orchestration.
+ *
+ *         PBA-L2-002 (pre-bounty audit 2026-09-24): every contract whose admin /
+ *         owner / governance used to be `msg.sender` now receives it explicitly
+ *         (`GOVERNANCE` env, default = the deployer). `msg.sender` inside a
+ *         salted constructor is the CREATE2 factory, which orphaned 21 live
+ *         contracts. After deploying, `_assertAdmins` re-reads every admin slot
+ *         and reverts the run if any names the factory or not the intended key.
  */
-contract DeployAll is ScriptEnv {
+contract DeployAll is ScriptEnv, AdminChecks {
+    /// Every address this script deploys (returned for the post-deploy check
+    /// and for the in-process test in test/pba_r2/).
+    struct Deployed {
+        address registry;
+        address wsalt;
+        address agentRegistry;
+        address specRegistry;
+        address ipfs;
+        address facilitator;
+        address paywall;
+        address stakingPool;
+        address contributions;
+        address slashing;
+        address mmAlloc;
+        address modelMarketplace;
+        address router;
+        address loraFactory;
+        address learningPool;
+        address cycleManager;
+        address classroom;
+        address mentorMatcher;
+        address verifier;
+        address computeMarketplace;
+        address computePool;
+        address heartbeat;
+        address dispute;
+        address oracle;
+        address treasury;
+        address gateway;
+        address farming;
+        address governor;
+    }
+
     function run() external {
+        deploy();
+    }
+
+    function deploy() public returns (Deployed memory d) {
         address deployer = deployerAddress();
+        // PBA-L2-002: the admin every formerly-msg.sender contract receives.
+        address governance = envAddressOr("GOVERNANCE", deployer);
 
         console.log("=== Citrate Full Contract Deployment ===");
         console.log("Deployer:", deployer);
@@ -78,7 +125,7 @@ contract DeployAll is ScriptEnv {
         // =====================================================================
         console.log("--- Layer 1: Core Infrastructure ---");
 
-        ModelRegistry registry = new ModelRegistry{salt: Salts.salt("ModelRegistry")}();
+        ModelRegistry registry = new ModelRegistry{salt: Salts.salt("ModelRegistry")}(governance);
         console.log("  ModelRegistry:", address(registry));
 
         WrappedSALT wsalt = new WrappedSALT{salt: Salts.salt("WrappedSALT")}();
@@ -93,7 +140,7 @@ contract DeployAll is ScriptEnv {
         SpecRegistry specRegistry = new SpecRegistry{salt: Salts.salt("SpecRegistry")}(deployer);
         console.log("  SpecRegistry:", address(specRegistry));
 
-        IPFSIncentives ipfs = new IPFSIncentives{salt: Salts.salt("IPFSIncentives")}();
+        IPFSIncentives ipfs = new IPFSIncentives{salt: Salts.salt("IPFSIncentives")}(governance);
         console.log("  IPFSIncentives:", address(ipfs));
 
         // =====================================================================
@@ -104,11 +151,12 @@ contract DeployAll is ScriptEnv {
         X402Facilitator facilitator = new X402Facilitator{salt: Salts.salt("X402Facilitator")}(
             address(wsalt),
             deployer,  // treasury
-            100        // 1% fee
+            100,       // 1% fee
+            governance // admin + facilitator (PBA-L2-002)
         );
         console.log("  X402Facilitator:", address(facilitator));
 
-        X402Paywall paywall = new X402Paywall{salt: Salts.salt("X402Paywall")}(address(wsalt), 1 ether);
+        X402Paywall paywall = new X402Paywall{salt: Salts.salt("X402Paywall")}(address(wsalt), 1 ether, governance);
         console.log("  X402Paywall:", address(paywall));
 
         // ModelAccessControl is deployed by DeployModelAccessControl.s.sol
@@ -119,13 +167,14 @@ contract DeployAll is ScriptEnv {
         // =====================================================================
         console.log("--- Layer 3: Economics ---");
 
-        LiquidStakingPool stakingPool = new LiquidStakingPool{salt: Salts.salt("LiquidStakingPool")}();
+        LiquidStakingPool stakingPool = new LiquidStakingPool{salt: Salts.salt("LiquidStakingPool")}(governance);
         console.log("  LiquidStakingPool:", address(stakingPool));
 
-        ContributionAccounting contributions = new ContributionAccounting{salt: Salts.salt("ContributionAccounting")}();
+        ContributionAccounting contributions =
+            new ContributionAccounting{salt: Salts.salt("ContributionAccounting")}(governance);
         console.log("  ContributionAccounting:", address(contributions));
 
-        NematocystSlashing slashing = new NematocystSlashing{salt: Salts.salt("NematocystSlashing")}();
+        NematocystSlashing slashing = new NematocystSlashing{salt: Salts.salt("NematocystSlashing")}(governance);
         console.log("  NematocystSlashing:", address(slashing));
 
         MarketMakerAllocation mmAlloc = new MarketMakerAllocation{salt: Salts.salt("MarketMakerAllocation")}(
@@ -141,20 +190,22 @@ contract DeployAll is ScriptEnv {
 
         ModelMarketplace modelMarketplace = new ModelMarketplace{salt: Salts.salt("ModelMarketplace")}(
             address(registry),
-            deployer   // treasury
+            deployer,  // treasury
+            governance // admin (PBA-L2-002)
         );
         console.log("  ModelMarketplace:", address(modelMarketplace));
 
-        InferenceRouter router = new InferenceRouter{salt: Salts.salt("InferenceRouter")}(address(registry));
+        InferenceRouter router = new InferenceRouter{salt: Salts.salt("InferenceRouter")}(address(registry), governance);
         console.log("  InferenceRouter:", address(router));
 
-        LoRAFactory loraFactory = new LoRAFactory{salt: Salts.salt("LoRAFactory")}(address(registry));
+        LoRAFactory loraFactory = new LoRAFactory{salt: Salts.salt("LoRAFactory")}(address(registry), governance);
         console.log("  LoRAFactory:", address(loraFactory));
 
         LearningPool learningPool = new LearningPool{salt: Salts.salt("LearningPool")}();
         console.log("  LearningPool:", address(learningPool));
 
-        LearningCycleManager cycleManager = new LearningCycleManager{salt: Salts.salt("LearningCycleManager")}();
+        LearningCycleManager cycleManager =
+            new LearningCycleManager{salt: Salts.salt("LearningCycleManager")}(governance);
         console.log("  LearningCycleManager:", address(cycleManager));
 
         ClassroomRegistry classroom = new ClassroomRegistry{salt: Salts.salt("ClassroomRegistry")}();
@@ -175,33 +226,37 @@ contract DeployAll is ScriptEnv {
         console.log("--- Layer 5: Compute Marketplace ---");
 
         // Deploy verifier first (ComputeMarketplace depends on it)
-        ComputeVerifier verifier = new ComputeVerifier{salt: Salts.salt("ComputeVerifier")}(deployer);
+        ComputeVerifier verifier = new ComputeVerifier{salt: Salts.salt("ComputeVerifier")}(deployer, governance);
         console.log("  ComputeVerifier:", address(verifier));
 
         ComputeMarketplace computeMarketplace = new ComputeMarketplace{salt: Salts.salt("ComputeMarketplace")}(
             address(verifier),
-            deployer  // treasury
+            deployer,  // treasury
+            governance // governance (PBA-L2-002)
         );
         console.log("  ComputeMarketplace:", address(computeMarketplace));
 
-        ComputePool computePool = new ComputePool{salt: Salts.salt("ComputePool")}();
+        ComputePool computePool = new ComputePool{salt: Salts.salt("ComputePool")}(governance);
         console.log("  ComputePool:", address(computePool));
 
         HeartbeatMonitor heartbeat = new HeartbeatMonitor{salt: Salts.salt("HeartbeatMonitor")}(
-            50,   // heartbeat interval (blocks)
-            3     // max missed before suspension
+            50,        // heartbeat interval (blocks)
+            3,         // max missed before suspension
+            governance // governance (PBA-L2-002)
         );
         console.log("  HeartbeatMonitor:", address(heartbeat));
 
         DisputeResolution dispute = new DisputeResolution{salt: Salts.salt("DisputeResolution")}(
             10 ether,  // 10 SALT dispute bond
-            10         // max bisection rounds
+            10,        // max bisection rounds
+            governance // governance (PBA-L2-002)
         );
         console.log("  DisputeResolution:", address(dispute));
 
         ComputePricingOracle oracle = new ComputePricingOracle{salt: Salts.salt("ComputePricingOracle")}(
-            13,    // $0.13/PFLOP-hour
-            100    // $1.00/SALT
+            13,        // $0.13/PFLOP-hour
+            100,       // $1.00/SALT
+            governance // governance (PBA-L2-002)
         );
         console.log("  ComputePricingOracle:", address(oracle));
 
@@ -231,12 +286,45 @@ contract DeployAll is ScriptEnv {
         TreasuryGovernor governor = new TreasuryGovernor{salt: Salts.salt("TreasuryGovernor")}(
             address(stakingPool),
             address(treasury),
-            deployer,           // guardian
+            envAddressOr("GUARDIAN", deployer), // guardian (PBA-L2-001: set GUARDIAN to the multisig)
             1_000_000_000 ether // total SALT supply (1B)
         );
         console.log("  TreasuryGovernor:", address(governor));
 
         vm.stopBroadcast();
+
+        d = Deployed({
+            registry: address(registry),
+            wsalt: address(wsalt),
+            agentRegistry: address(agentRegistry),
+            specRegistry: address(specRegistry),
+            ipfs: address(ipfs),
+            facilitator: address(facilitator),
+            paywall: address(paywall),
+            stakingPool: address(stakingPool),
+            contributions: address(contributions),
+            slashing: address(slashing),
+            mmAlloc: address(mmAlloc),
+            modelMarketplace: address(modelMarketplace),
+            router: address(router),
+            loraFactory: address(loraFactory),
+            learningPool: address(learningPool),
+            cycleManager: address(cycleManager),
+            classroom: address(classroom),
+            mentorMatcher: address(mentorMatcher),
+            verifier: address(verifier),
+            computeMarketplace: address(computeMarketplace),
+            computePool: address(computePool),
+            heartbeat: address(heartbeat),
+            dispute: address(dispute),
+            oracle: address(oracle),
+            treasury: address(treasury),
+            gateway: address(gateway),
+            farming: address(farming),
+            governor: address(governor)
+        });
+        // PBA-L2-002 tripwire: fail the run if any admin slot is orphaned.
+        _assertAdmins(d, deployer, governance);
 
         // =====================================================================
         // Summary
@@ -276,5 +364,43 @@ contract DeployAll is ScriptEnv {
         console.log("BulkComputeGateway    :", address(gateway));
         console.log("TestnetFarmingAcct    :", address(farming));
         console.log("TreasuryGovernor      :", address(governor));
+    }
+
+    /// @notice PBA-L2-002 post-deploy assertion: every admin / owner /
+    ///         governance slot names the intended key and never the CREATE2
+    ///         factory. Also sweeps every deployed address generically.
+    function _assertAdmins(Deployed memory d, address deployer, address governance) internal view {
+        _assertAdminRole("ModelRegistry", d.registry, governance);
+        _assertAdminRole("IPFSIncentives", d.ipfs, governance);
+        _assertAdminRole("X402Facilitator", d.facilitator, governance);
+        _assertAdminRole("ModelMarketplace", d.modelMarketplace, governance);
+        _assertAdminRole("InferenceRouter", d.router, governance);
+        _assertAdminRole("LoRAFactory", d.loraFactory, governance);
+        _assertGovernance("LiquidStakingPool", d.stakingPool, governance);
+        _assertGovernance("ContributionAccounting", d.contributions, governance);
+        _assertGovernance("NematocystSlashing", d.slashing, governance);
+        _assertGovernance("LearningCycleManager", d.cycleManager, governance);
+        _assertGovernance("ComputeVerifier", d.verifier, governance);
+        _assertGovernance("ComputeMarketplace", d.computeMarketplace, governance);
+        _assertGovernance("ComputePool", d.computePool, governance);
+        _assertGovernance("HeartbeatMonitor", d.heartbeat, governance);
+        _assertGovernance("DisputeResolution", d.dispute, governance);
+        _assertGovernance("ComputePricingOracle", d.oracle, governance);
+        // Contracts that already took an explicit key (deployer) keep it.
+        _assertGovernance("MentorMatcher", d.mentorMatcher, deployer);
+        _assertGovernance("StablecoinTreasury", d.treasury, deployer);
+        (bool ok, address provider) = _readAddress(d.paywall, abi.encodeWithSignature("provider()"));
+        require(ok && provider == governance, "X402Paywall: provider is not the intended key");
+
+        address[28] memory all = [
+            d.registry, d.wsalt, d.agentRegistry, d.specRegistry, d.ipfs, d.facilitator, d.paywall,
+            d.stakingPool, d.contributions, d.slashing, d.mmAlloc, d.modelMarketplace, d.router,
+            d.loraFactory, d.learningPool, d.cycleManager, d.classroom, d.mentorMatcher, d.verifier,
+            d.computeMarketplace, d.computePool, d.heartbeat, d.dispute, d.oracle, d.treasury,
+            d.gateway, d.farming, d.governor
+        ];
+        for (uint256 i = 0; i < all.length; i++) {
+            _assertNoFactoryAdmin("DeployAll", all[i]);
+        }
     }
 }

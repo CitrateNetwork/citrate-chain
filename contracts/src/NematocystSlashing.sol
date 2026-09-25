@@ -77,7 +77,9 @@ contract NematocystSlashing is ReentrancyGuard, Governable {
 
     // ── Constructor ──────────────────────────────────────────────────
 
-    constructor() Governable(msg.sender) {}
+    /// @param initialGovernance Explicit governance (PBA-L2-002: never msg.sender,
+    ///        which is the CREATE2 factory under a salted ceremony deploy).
+    constructor(address initialGovernance) Governable(initialGovernance) {}
 
     // ── Provider Staking ─────────────────────────────────────────────
 

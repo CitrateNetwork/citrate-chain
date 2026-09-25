@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./Salts.sol";
+import "./lib/AdminChecks.sol";
 import "../src/KYCRegistry.sol";
 import "../src/IPFSIncentivesV3.sol";
 
@@ -39,7 +40,7 @@ import "../src/IPFSIncentivesV3.sol";
 /// Env overrides (all optional; defaults are the canonical 40204 values):
 ///   KYC_REGISTRY   existing KYCRegistry (default 0xcf41a81c8dfcdb6e61febfc34670964d226b33ed)
 ///   FOLD_VERIFIER  fold-verifier precompile (default 0x0130)
-contract RedeployIPFSIncentivesV3 is ScriptEnv {
+contract RedeployIPFSIncentivesV3 is ScriptEnv, AdminChecks {
     // Canonical 40204 KYCRegistry (deterministic CREATE2 output of DeployFederatedLearning).
     address internal constant KYC_REGISTRY_40204 =
         0xcf41A81c8dFCDb6E61FeBfC34670964D226B33ED;
@@ -66,6 +67,7 @@ contract RedeployIPFSIncentivesV3 is ScriptEnv {
     function run() external {
         address kyc = envAddressOr("KYC_REGISTRY", KYC_REGISTRY_40204);
         address foldVerifier = envAddressOr("FOLD_VERIFIER", FOLD_VERIFIER_PRECOMPILE);
+        address admin = envAddressOr("GOVERNANCE", deployerAddress());
 
         console.log("=== citrate-chain#170: redeploy IPFSIncentivesV3 (sound CommD bond) ===");
         console.log("KYCRegistry (existing):", kyc);
@@ -90,9 +92,11 @@ contract RedeployIPFSIncentivesV3 is ScriptEnv {
             IPFS3_MIN_MODEL_BOND,
             IPFS3_MODEL_CHALLENGE_WINDOW,
             IPFS3_MODEL_CHALLENGER_BPS,
-            foldVerifier
+            foldVerifier,
+            admin // PBA-L2-002: explicit DEFAULT_ADMIN (never the CREATE2 factory)
         );
         vm.stopBroadcast();
+        _assertAdminRole("IPFSIncentivesV3", address(v3), admin);
 
         console.log("IPFSIncentivesV3 (NEW #170 address):", address(v3));
         console.log("Update contracts/addresses/40204.json + packages/chain-config to this address.");

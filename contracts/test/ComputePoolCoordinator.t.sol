@@ -39,7 +39,7 @@ contract ComputePoolCoordinatorTest is Test {
     uint256 internal constant PRICE = 1 ether;
 
     function setUp() public {
-        pool = new ComputePool();
+        pool = new ComputePool(address(this));
         vm.deal(creator, 1000 ether);
         vm.deal(p1, 1000 ether);
         vm.deal(p2, 1000 ether);

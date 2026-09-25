@@ -40,8 +40,8 @@ contract ComputeMarketplaceTest is Test {
         governance = address(this);
 
         // Deploy verifier first (marketplace address will be set after)
-        verifier = new ComputeVerifier(address(1)); // Temp marketplace addr
-        marketplace = new ComputeMarketplace(address(verifier), treasury);
+        verifier = new ComputeVerifier(address(1), address(this)); // Temp marketplace addr
+        marketplace = new ComputeMarketplace(address(verifier), treasury, address(this));
 
         // Set the real marketplace address in the verifier
         verifier.setMarketplace(address(marketplace));

@@ -38,7 +38,7 @@ contract X402FacilitatorTest is Test {
         wSALT = new WrappedSALT();
 
         vm.prank(admin);
-        facilitator = new X402Facilitator(address(wSALT), treasury, FEE_BPS);
+        facilitator = new X402Facilitator(address(wSALT), treasury, FEE_BPS, admin);
 
         // Alice deposits.
         // RM-B1 / WP-D2.1 (audit SOL-01): note that we do NOT

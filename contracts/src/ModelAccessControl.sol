@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "./lib/InitialAdmin.sol";
+
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Address.sol";
@@ -170,7 +172,9 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
 
     // ============ Constructor ============
 
-    constructor() Ownable(msg.sender) {}
+    /// @param initialOwner Explicit owner (PBA-L2-002: never msg.sender, which is
+    ///        the CREATE2 factory under a salted ceremony deploy).
+    constructor(address initialOwner) Ownable(InitialAdmin.check(initialOwner)) {}
 
     // ============ Model Management ============
 

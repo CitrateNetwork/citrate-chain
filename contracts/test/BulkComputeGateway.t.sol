@@ -73,7 +73,7 @@ contract BulkComputeGatewayTest is Test {
         outsider = address(0xBAD1);
 
         // Deploy oracle
-        oracle = new ComputePricingOracle(COMPUTE_PRICE, SALT_PRICE);
+        oracle = new ComputePricingOracle(COMPUTE_PRICE, SALT_PRICE, address(this));
 
         // Deploy treasury
         treasury = new StablecoinTreasury(governance);
@@ -338,7 +338,7 @@ contract BulkComputeGatewayTest is Test {
     }
 
     function test_set_oracle() public {
-        ComputePricingOracle newOracle = new ComputePricingOracle(20, 200);
+        ComputePricingOracle newOracle = new ComputePricingOracle(20, 200, address(this));
         gateway.setOracle(address(newOracle));
         assertEq(address(gateway.oracle()), address(newOracle));
     }

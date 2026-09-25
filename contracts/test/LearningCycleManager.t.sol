@@ -17,7 +17,7 @@ contract LearningCycleManagerTest is Test {
     address internal outsider = address(0xBAD1);
 
     function setUp() public {
-        lcm = new LearningCycleManager();
+        lcm = new LearningCycleManager(address(this));
 
         vm.deal(governance, 1000 ether);
         vm.deal(alice, 100 ether);

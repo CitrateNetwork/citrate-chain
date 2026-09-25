@@ -18,7 +18,7 @@ contract NematocystSlashingTest is Test {
     bytes internal dummyEvidence = hex"deadbeef";
 
     function setUp() public {
-        slashing = new NematocystSlashing();
+        slashing = new NematocystSlashing(address(this));
 
         vm.deal(provider1, 1000 ether);
         vm.deal(provider2, 1000 ether);

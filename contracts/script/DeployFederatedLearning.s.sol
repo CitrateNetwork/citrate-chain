@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./Salts.sol";
+import "./lib/AdminChecks.sol";
 import "../src/AggregationChallenge.sol";
 import "../src/KYCRegistry.sol";
 import "../src/ComputePoolPipeline.sol";
@@ -51,7 +52,7 @@ import "../src/IPFSIncentivesV3.sol";
 ///   - TEE_REGISTRY — existing TEEAttestationRegistry address (default: the
 ///     canonical 40204 address; must equal the reroll's TEE CREATE2 output —
 ///     the dry-run diff verifies this).
-contract DeployFederatedLearning is ScriptEnv {
+contract DeployFederatedLearning is ScriptEnv, AdminChecks {
     // ── AggregationChallenge (GATE4 referee) ─────────────────────────────
     uint256 internal constant AGG_CHALLENGE_BOND = 1 ether;
     uint256 internal constant AGG_CHALLENGE_WINDOW = 150; // = AggregationChallenge.DEFAULT_WINDOW
@@ -103,9 +104,10 @@ contract DeployFederatedLearning is ScriptEnv {
         vm.startBroadcast();
 
         // 1. KYCRegistry — initial authorized updater = deployer (admin can
-        //    add the production IDP updater post-deploy). DEFAULT_ADMIN_ROLE
-        //    goes to the constructor caller per the contract.
-        KYCRegistry kyc = new KYCRegistry{salt: Salts.salt("KYCRegistry")}(deployer);
+        //    add the production IDP updater post-deploy). PBA-L2-002:
+        //    DEFAULT_ADMIN_ROLE is the explicit `governance` argument, NOT the
+        //    constructor caller (which is the CREATE2 factory here).
+        KYCRegistry kyc = new KYCRegistry{salt: Salts.salt("KYCRegistry")}(deployer, governance);
 
         // 2. IPFSIncentivesV2 — consumes KYCRegistry.
         IPFSIncentivesV2 ipfsV2 = new IPFSIncentivesV2{salt: Salts.salt("IPFSIncentivesV2")}(
@@ -117,7 +119,8 @@ contract DeployFederatedLearning is ScriptEnv {
             IPFS_CHALLENGER_BPS,
             IPFS_QUORUM,
             IPFS_WINDOW,
-            IPFS_CHALLENGE_N
+            IPFS_CHALLENGE_N,
+            governance // PBA-L2-002: explicit DEFAULT_ADMIN
         );
 
         // 3. IPFSIncentivesV3 — V2 params + model-CommD challenge layer.
@@ -136,7 +139,8 @@ contract DeployFederatedLearning is ScriptEnv {
             IPFS3_MIN_MODEL_BOND,
             IPFS3_MODEL_CHALLENGE_WINDOW,
             IPFS3_MODEL_CHALLENGER_BPS,
-            envAddressOr("FOLD_VERIFIER", FOLD_VERIFIER_PRECOMPILE)
+            envAddressOr("FOLD_VERIFIER", FOLD_VERIFIER_PRECOMPILE),
+            governance // PBA-L2-002: explicit DEFAULT_ADMIN
         );
         // citrate-chain#170 (P3): IPFSIncentivesV3 is deployable by BOTH this script and
         // RedeployIPFSIncentivesV3.s.sol under the SAME salt. On a from-main build both land at the
@@ -145,16 +149,30 @@ contract DeployFederatedLearning is ScriptEnv {
         // Re-armed for the solc-0.8.36 reroll (2026-09-07): the compiler bump moves
         // the deterministic address; the contract is still the sound #170 build from
         // main. Pinned to the 0.8.36 deployed address.
-        require(
-            address(ipfsV3) == 0xC27a867b8d076d77cf17981f235c64A0D0203a68,
-            "IPFSIncentivesV3 address drift: not the #170 sound-CommD-bond bytecode/args"
-        );
+        // PBA-L2-002 (2026-09-24): the old pin (0xC27a…3a68) is the V3 whose
+        // DEFAULT_ADMIN is the CREATE2 factory; the explicit-admin constructor
+        // necessarily moves the address, and it moves again with the governance
+        // key. The pin is now supplied by the ceremony: on 40204 the run REFUSES
+        // to proceed unless EXPECTED_IPFS_V3 is set to the reviewed dry-run
+        // address and matches. Off 40204 (dev/test dry-runs) it is checked when set.
+        address expectedV3 = envAddressOr("EXPECTED_IPFS_V3", address(0));
+        if (block.chainid == 40204) {
+            require(expectedV3 != address(0), "EXPECTED_IPFS_V3 must be pinned on 40204");
+        }
+        if (expectedV3 != address(0)) {
+            require(
+                address(ipfsV3) == expectedV3,
+                "IPFSIncentivesV3 address drift: not the reviewed bytecode/args"
+            );
+        }
 
-        // 4. AggregationChallenge — Governable(msg.sender) like NematocystSlashing;
-        //    governance + the slashing contract are wired post-deploy (see checklist).
+        // 4. AggregationChallenge — PBA-L2-002: governance is explicit (it was
+        //    Governable(msg.sender) = the CREATE2 factory). The slashing contract
+        //    is still wired post-deploy by governance (see checklist).
         AggregationChallenge agg = new AggregationChallenge{salt: Salts.salt("AggregationChallenge")}(
             AGG_CHALLENGE_BOND,
-            AGG_CHALLENGE_WINDOW
+            AGG_CHALLENGE_WINDOW,
+            governance
         );
 
         // 5. ComputePoolPipeline — governance + existing TEE registry.
@@ -165,6 +183,13 @@ contract DeployFederatedLearning is ScriptEnv {
 
         vm.stopBroadcast();
 
+        // PBA-L2-002 tripwire: every admin slot names `governance`, never the factory.
+        _assertAdminRole("KYCRegistry", address(kyc), governance);
+        _assertAdminRole("IPFSIncentivesV2", address(ipfsV2), governance);
+        _assertAdminRole("IPFSIncentivesV3", address(ipfsV3), governance);
+        _assertGovernance("AggregationChallenge", address(agg), governance);
+        _assertNoFactoryAdmin("ComputePoolPipeline", address(pipeline));
+
         console.log("KYCRegistry:        ", address(kyc));
         console.log("IPFSIncentivesV2:   ", address(ipfsV2));
         console.log("IPFSIncentivesV3:   ", address(ipfsV3));
@@ -173,8 +198,7 @@ contract DeployFederatedLearning is ScriptEnv {
         console.log("");
         console.log("=== Post-deploy governance wiring (NOT in the deterministic set) ===");
         console.log("1. AggregationChallenge.setSlashingContract(NematocystSlashing 0xfeb2...)");
-        console.log("2. AggregationChallenge governance bootstrap (transferGovernance/accept),");
-        console.log("   matching the existing NematocystSlashing pattern.");
+        console.log("2. (PBA-L2-002) governance is already the GOVERNANCE key; no bootstrap.");
         console.log("3. KYCRegistry: grant updater role to the production IDP signer.");
         console.log("4. emit-address-table.sh, then sync-addresses across the federation.");
     }

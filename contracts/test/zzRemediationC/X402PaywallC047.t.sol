@@ -29,7 +29,7 @@ contract X402PaywallC047Test is Test {
         (payer, payerPk) = makeAddrAndKey("payer");
         wSALT = new WrappedSALT();
         vm.prank(provider);
-        paywall = new X402Paywall(address(wSALT), PRICE);
+        paywall = new X402Paywall(address(wSALT), PRICE, provider);
         vm.deal(payer, 100 ether);
         vm.prank(payer);
         wSALT.deposit{value: 50 ether}();

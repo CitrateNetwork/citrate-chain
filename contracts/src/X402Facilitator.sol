@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "./lib/InitialAdmin.sol";
+
 import "./WrappedSALT.sol";
 import "./lib/AccessControl.sol";
 import "./lib/ReentrancyGuard.sol";
@@ -47,7 +49,10 @@ contract X402Facilitator is AccessControl, ReentrancyGuard {
     /// @param _wSALT   Address of the WrappedSALT contract
     /// @param _treasury Address to receive facilitator fees
     /// @param _feeBps  Initial fee in basis points (max 1000 = 10%)
-    constructor(address _wSALT, address _treasury, uint256 _feeBps) {
+    /// @param admin Explicit DEFAULT_ADMIN (PBA-L2-002: never msg.sender, which is
+    ///        the CREATE2 factory under a salted ceremony deploy).
+    constructor(address _wSALT, address _treasury, uint256 _feeBps, address admin) {
+        InitialAdmin.check(admin);
         require(_wSALT != address(0), "X402: zero wSALT address");
         require(_treasury != address(0), "X402: zero treasury address");
         require(_feeBps <= 1000, "X402: fee exceeds 10%");
@@ -56,8 +61,8 @@ contract X402Facilitator is AccessControl, ReentrancyGuard {
         treasury = _treasury;
         feeBps = _feeBps;
 
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(FACILITATOR_ROLE, msg.sender);
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(FACILITATOR_ROLE, admin);
     }
 
     /// @notice Settle a single x402 payment via transferWithFeeAuthorization.

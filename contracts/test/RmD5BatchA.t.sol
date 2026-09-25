@@ -22,8 +22,8 @@ contract RmD5BatchATest is Test {
     address public requester = address(0x1111);
 
     function setUp() public {
-        verifier = new ComputeVerifier(address(1));
-        marketplace = new ComputeMarketplace(address(verifier), treasury);
+        verifier = new ComputeVerifier(address(1), address(this));
+        marketplace = new ComputeMarketplace(address(verifier), treasury, address(this));
         verifier.setMarketplace(address(marketplace));
         vm.deal(requester, 100 ether);
     }

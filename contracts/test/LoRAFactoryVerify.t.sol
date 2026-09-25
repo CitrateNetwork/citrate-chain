@@ -76,7 +76,7 @@ contract LoRAFactoryVerifyTest is Test {
 
     function setUp() public {
         registry = new MockModelRegistry();
-        factory = new LoRAFactory(address(registry));
+        factory = new LoRAFactory(address(registry), address(this));
 
         operator = address(this);
         mentor = address(0xA11CE);

@@ -28,7 +28,7 @@ contract BulkGatewayAuthorizationTest is Test {
     address internal outsider = address(0xBAD1);
 
     function setUp() public {
-        oracle = new ComputePricingOracle(13, 100);  // $0.13/PFLOP-h, $1/SALT
+        oracle = new ComputePricingOracle(13, 100, address(this));  // $0.13/PFLOP-h, $1/SALT
         treasury = new StablecoinTreasury(governance);
         gateway = new BulkComputeGateway(
             address(treasury),

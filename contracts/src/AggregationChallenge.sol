@@ -76,7 +76,9 @@ contract AggregationChallenge is ReentrancyGuard, Governable {
 
     // ── Constructor ─────────────────────────────────────────────────
 
-    constructor(uint256 _challengeBond, uint256 _challengeWindow) Governable(msg.sender) {
+    constructor(uint256 _challengeBond, uint256 _challengeWindow, address initialGovernance)
+        Governable(initialGovernance)
+    {
         require(_challengeBond >= 1, "Bond must be >= 1");
         require(_challengeWindow >= 1, "Window must be >= 1");
         challengeBond = _challengeBond;

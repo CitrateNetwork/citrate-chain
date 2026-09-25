@@ -19,7 +19,7 @@ contract RmQ_C028_InferenceRouter is Test {
     bytes32 internal constant MODEL = bytes32(uint256(0xB1));
 
     function setUp() public {
-        router = new InferenceRouter(address(0xDEAD)); // modelRegistry unused here
+        router = new InferenceRouter(address(0xDEAD), address(this)); // modelRegistry unused here
         vm.deal(provider, 200 ether);
     }
 

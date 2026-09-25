@@ -151,7 +151,7 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     // Constructor
     // ============================================================
 
-    constructor(address _marketplace) Governable(msg.sender) {
+    constructor(address _marketplace, address initialGovernance) Governable(initialGovernance) {
         require(_marketplace != address(0), "ComputeVerifier: zero marketplace address");
         marketplace = _marketplace;
     }
