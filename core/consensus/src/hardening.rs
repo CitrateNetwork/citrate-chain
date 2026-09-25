@@ -143,7 +143,11 @@ pub const PINNED_ACTIVATIONS: &[(u64, Option<u64>)] = &[(40204, None)];
 
 /// The activation height this release pins for `chain_id`, if any.
 pub fn pinned_activation(chain_id: u64) -> Option<u64> {
-    PINNED_ACTIVATIONS
+    pinned_in(PINNED_ACTIVATIONS, chain_id)
+}
+
+fn pinned_in(table: &[(u64, Option<u64>)], chain_id: u64) -> Option<u64> {
+    table
         .iter()
         .find(|(id, _)| *id == chain_id)
         .and_then(|(_, h)| *h)
@@ -543,6 +547,15 @@ mod tests {
         assert_eq!(pinned_activation(1), None);
         assert_eq!(pinned_activation(1337), None);
         assert!(PINNED_ACTIVATIONS.iter().any(|(id, _)| *id == 40204));
+    }
+
+    #[test]
+    fn pin_lookup_picks_the_running_chain() {
+        let table = [(1, Some(10)), (40204, Some(500)), (7, None)];
+        assert_eq!(pinned_in(&table, 40204), Some(500));
+        assert_eq!(pinned_in(&table, 1), Some(10));
+        assert_eq!(pinned_in(&table, 7), None);
+        assert_eq!(pinned_in(&table, 2), None);
     }
 
     #[test]

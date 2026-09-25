@@ -712,6 +712,11 @@ mod tests {
             "the surviving sibling holds the height"
         );
         assert_eq!(storage.blocks.get_block_by_height(3).unwrap(), None);
+        assert!(storage
+            .blocks
+            .get_blocks_by_blue_score(2, 3)
+            .unwrap()
+            .is_empty());
         assert_eq!(storage.blocks.get_latest_height().unwrap(), 2);
         assert_eq!(
             storage.blocks.get_children(&b1.header.block_hash).unwrap(),
@@ -733,6 +738,28 @@ mod tests {
             .get_receipt(&tx.hash)
             .unwrap()
             .is_none());
+        // DAG store, raw entries.
+        use citrate_consensus::dag_store::{cf, KvStore};
+        assert!(kv
+            .kv_get(cf::DAG_CHILDREN, legacy2.header.block_hash.as_bytes())
+            .unwrap()
+            .is_none());
+        let at2: Vec<Hash> = bincode::deserialize(
+            &kv.kv_get(cf::DAG_HEIGHT_INDEX, &2u64.to_be_bytes())
+                .unwrap()
+                .expect("height 2 index kept"),
+        )
+        .unwrap();
+        assert_eq!(at2, vec![good2.header.block_hash]);
+        assert!(kv
+            .kv_get(cf::DAG_HEIGHT_INDEX, &3u64.to_be_bytes())
+            .unwrap()
+            .is_none());
+        // Idempotent, and it reports what it removed.
+        assert_eq!(
+            DagStore::purge_persisted_blocks(kv.as_ref(), &want).unwrap(),
+            0
+        );
         // DAG store, as it loads on the next start.
         let dag = DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("dag reload");
         for h in &want {
@@ -751,6 +778,54 @@ mod tests {
         let again = purge_invalid_post_activation(&storage, on, CHAIN).expect("again");
         assert_eq!(again.checked, 0);
         assert!(again.purged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dag_purge_reports_what_it_removed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
+        let g = genesis();
+        let old = PbaHardening::off();
+        let b1 = template(
+            old,
+            1,
+            g.header.block_hash,
+            CB_STALE,
+            1,
+            vec![],
+            Hash::default(),
+        );
+        let b2 = template(
+            old,
+            2,
+            b1.header.block_hash,
+            CB_STALE,
+            2,
+            vec![],
+            Hash::default(),
+        );
+        {
+            let dag = DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("dag");
+            dag.set_configured_genesis(g.header.block_hash);
+            for b in [&g, &b1, &b2] {
+                dag.store_block(b.clone()).await.expect("dag put");
+            }
+        }
+        let doomed: HashSet<Hash> = [b1.header.block_hash, b2.header.block_hash].into();
+        assert_eq!(
+            DagStore::purge_persisted_blocks(kv.as_ref(), &doomed).unwrap(),
+            2
+        );
+        assert_eq!(
+            DagStore::purge_persisted_blocks(kv.as_ref(), &doomed).unwrap(),
+            0
+        );
+        assert_eq!(
+            DagStore::purge_persisted_blocks(kv.as_ref(), &HashSet::new()).unwrap(),
+            0
+        );
     }
 
     #[test]

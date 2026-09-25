@@ -4084,6 +4084,8 @@ mod producer_panic_breaker {
         for _ in 0..4 {
             if let RoundOutcome::Produced(b) = n.round().await {
                 let blk = n.storage.blocks.get_block(&b).unwrap().unwrap();
+                // A committed round keeps its state in memory too.
+                assert_eq!(n.executor.calculate_state_root(), blk.state_root);
                 if blk.transactions.iter().any(|x| x.hash == t) {
                     mined = true;
                     break;
