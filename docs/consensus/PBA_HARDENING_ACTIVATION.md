@@ -57,18 +57,6 @@ This is a consensus parameter. Two nodes on 40204 with different values disagree
 
 **After `H`:** don't unset it. Blocks at or above `H` are only valid under the new rules. A node without the setting accepts blocks the rest of the fleet rejects, and it will fork off.
 
-## Residual risk until `H`
+## Before `H`
 
-Below the activation height the legacy validity rules stand:
-
-- a proposer can include a forged-sender transaction (PBA-L1b-001);
-- a relaying peer can rewrite a block body (PBA-L1b-002);
-- a proposer can future-date a block (PBA-L1b-003).
-
-The always-on parts of R2 reduce these while the rules are off:
-
-- The producer stamps `max(now, parent.ts)`, so a future-dated tip no longer halts production.
-- Sync, like gossip, rejects blocks more than 900 s in the future.
-- Gossip and the mempool authenticate transactions from their contents.
-
-The theft and wedge vectors remain open until `H`. Schedule `H` before the bug bounty opens.
+Below the activation height the legacy validity rules apply unchanged. The always-on parts of R2 (producer timestamp stamping, the sync wall-clock bound, content authentication in gossip and the mempool) are in effect regardless. Schedule `H` before the bug bounty opens. The residual-risk detail is in the private audit record.

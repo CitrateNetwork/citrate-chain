@@ -953,6 +953,63 @@ mod tests {
         }
     }
 
+
+    /// Each EVM envelope field alone makes a native tx unauthenticated (the
+    /// native signature does not cover any of them).
+    #[test]
+    fn native_rejects_each_envelope_field_alone() {
+        let base = native_signed(4, 0);
+        let muts: Vec<Mutation> = vec![
+            ("eth_tx_type", Box::new(|t| t.eth_tx_type = 1)),
+            ("max_fee", Box::new(|t| t.max_fee_per_gas = Some(1))),
+            ("max_prio", Box::new(|t| t.max_priority_fee_per_gas = Some(1))),
+            ("access_list", Box::new(|t| t.access_list = Some(vec![]))),
+        ];
+        for (name, m) in muts {
+            let mut t = base.clone();
+            m(&mut t);
+            assert!(
+                matches!(authenticate(&t), Err(TxAuthError::UnsignedField(_))),
+                "{name} alone must be rejected"
+            );
+        }
+    }
+
+    /// EIP-2: the malleated twin (r, n - s) of a valid signature recovers the
+    /// SAME signer with the other recovery id; it must still be rejected, or a
+    /// relayer could mint a second id for one signed transaction.
+    #[test]
+    fn evm_malleated_high_s_twin_is_rejected() {
+        const N: [u8; 32] = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C,
+            0xD0, 0x36, 0x41, 0x41,
+        ];
+        for e in evm_cases() {
+            let (tx, want) = evm_signed(0x4c, &e);
+            assert_eq!(authenticate(&tx), Ok(want));
+            let sig = *tx.signature.as_bytes();
+            // s' = n - s (big-endian, 256-bit).
+            let mut s2 = [0u8; 32];
+            let mut borrow = 0i16;
+            for i in (0..32).rev() {
+                let mut d = N[i] as i16 - sig[32 + i] as i16 - borrow;
+                borrow = if d < 0 {
+                    d += 256;
+                    1
+                } else {
+                    0
+                };
+                s2[i] = d as u8;
+            }
+            let mut twin = sig;
+            twin[32..].copy_from_slice(&s2);
+            let mut t = tx.clone();
+            t.signature = Signature::new(twin);
+            assert_eq!(authenticate(&t), Err(TxAuthError::HighS), "type {}", e.ty);
+        }
+    }
+
     #[test]
     fn commitment_covers_every_field() {
         let base = native_signed(3, 7);

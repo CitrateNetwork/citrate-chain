@@ -1302,6 +1302,151 @@ mod tests {
         }
     }
 
+
+    // ── PBA-R2 mutation-survivor kills (validate_transaction /
+    // get_best_transactions / is_next_nonce / MempoolAccess). ──
+
+    fn signed_native(seed: u8, nonce: u64, chain_id: Option<u64>, gas_limit: u64) -> Transaction {
+        let sk = citrate_consensus::crypto::Ed25519SigningKey::from_bytes(&[seed; 32]);
+        let mut tx = Transaction {
+            nonce,
+            to: Some(PublicKey::new([9; 32])),
+            value: 1,
+            gas_limit,
+            gas_price: 1_000_000_000,
+            chain_id,
+            ..Default::default()
+        };
+        citrate_consensus::crypto::sign_transaction(&mut tx, &sk).unwrap();
+        tx
+    }
+
+    #[tokio::test]
+    async fn pba_r2_chain_id_must_match() {
+        let mp = Mempool::new(MempoolConfig::default());
+        assert!(mp
+            .add_transaction(signed_native(1, 0, Some(1), 21_000), TxClass::Standard)
+            .await
+            .is_err());
+        assert!(mp
+            .add_transaction(signed_native(1, 0, None, 21_000), TxClass::Standard)
+            .await
+            .is_err());
+        mp.add_transaction(signed_native(1, 0, Some(40204), 21_000), TxClass::Standard)
+            .await
+            .expect("matching chain id admitted");
+    }
+
+    #[tokio::test]
+    async fn pba_r2_gas_limit_ceiling_is_inclusive() {
+        let mp = Mempool::new(MempoolConfig::default());
+        mp.add_transaction(signed_native(2, 0, Some(40204), MAX_GAS_PER_BLOCK), TxClass::Standard)
+            .await
+            .expect("exactly the per-block ceiling is admissible");
+        assert!(mp
+            .add_transaction(
+                signed_native(3, 0, Some(40204), MAX_GAS_PER_BLOCK + 1),
+                TxClass::Standard
+            )
+            .await
+            .is_err());
+    }
+
+    /// With signature checking disabled by config, the empty-sender gate is
+    /// the only thing standing between an all-zero `from` and admission.
+    #[tokio::test]
+    async fn pba_r2_empty_sender_rejected_even_without_signature_checks() {
+        let mp = Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        });
+        let mut tx = create_test_tx(0, 1_000_000_000, [0; 32]);
+        tx.from = PublicKey::new([0; 32]);
+        assert!(mp.add_transaction(tx, TxClass::Standard).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pba_r2_selection_respects_count_and_size_limits() {
+        let mp = Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        });
+        let txs: Vec<Transaction> = (0..3u8)
+            .map(|i| create_test_tx(0, 1_000_000_000 + i as u64, [i + 1; 32]))
+            .collect();
+        for t in &txs {
+            mp.add_transaction(t.clone(), TxClass::Standard).await.unwrap();
+        }
+        assert_eq!(mp.get_best_transactions(1, usize::MAX).await.len(), 1, "count cap");
+        assert_eq!(mp.get_best_transactions(2, usize::MAX).await.len(), 2, "count cap");
+        let one = mp.calculate_tx_size(&txs[0]);
+        assert_eq!(
+            mp.get_best_transactions(10, 2 * one).await.len(),
+            2,
+            "size cap: exactly two fit"
+        );
+        assert_eq!(mp.get_best_transactions(10, 2 * one - 1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pba_r2_is_next_nonce_semantics() {
+        let mp = Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        });
+        let a = create_test_tx(5, 1_000_000_000, [7; 32]);
+        let b = create_test_tx(6, 1_000_000_000, [7; 32]);
+        mp.add_transaction(a.clone(), TxClass::Standard).await.unwrap();
+        mp.add_transaction(b.clone(), TxClass::Standard).await.unwrap();
+        let none: HashSet<Hash> = HashSet::new();
+        assert!(mp.is_next_nonce(&a, &none).await, "the minimum pending nonce is next");
+        assert!(mp.is_next_nonce(&b, &none).await, "contiguous run from the minimum");
+        let below = create_test_tx(4, 1_000_000_000, [7; 32]);
+        assert!(!mp.is_next_nonce(&below, &none).await, "below the minimum is not next");
+        let included: HashSet<Hash> = [a.hash].into_iter().collect();
+        assert!(mp.is_next_nonce(&b, &included).await);
+        assert!(!mp.is_next_nonce(&a, &included).await);
+        let fresh = create_test_tx(0, 1_000_000_000, [8; 32]);
+        assert!(mp.is_next_nonce(&fresh, &none).await, "first tx of an unknown sender");
+    }
+
+    /// The trait impls the node uses must propagate admission errors.
+    #[tokio::test]
+    async fn pba_r2_mempool_access_impls_propagate_rejections() {
+        let bad = signed_native(4, u64::MAX, Some(40204), 21_000);
+        let arc = Arc::new(Mempool::new(MempoolConfig::default()));
+        assert!(MempoolAccess::add_transaction(&arc, bad.clone(), TxClass::Standard)
+            .await
+            .is_err());
+        let locked = Arc::new(RwLock::new(Mempool::new(MempoolConfig::default())));
+        assert!(MempoolAccess::add_transaction(&locked, bad, TxClass::Standard)
+            .await
+            .is_err());
+    }
+
+    /// The A015 gate alone (signature checks disabled by config) must reject
+    /// an EVM-shaped sender that does not recover from the tx contents.
+    #[tokio::test]
+    async fn pba_r2_a015_gate_holds_without_signature_checks() {
+        let mp = Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        });
+        let mut from = [0u8; 32];
+        from[..20].copy_from_slice(&[0xAA; 20]);
+        let mut tx = create_test_tx(0, 1_000_000_000, from);
+        tx.ecdsa_verified = false;
+        assert!(mp.add_transaction(tx, TxClass::Standard).await.is_err());
+        // A mixed-byte address (some zero bytes) is still EVM-shaped.
+        let mut from2 = [0u8; 32];
+        from2[..20].copy_from_slice(&[
+            0xAA, 0, 0xBB, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        ]);
+        let mut tx2 = create_test_tx(0, 1_000_000_000, from2);
+        tx2.ecdsa_verified = false;
+        assert!(mp.add_transaction(tx2, TxClass::Standard).await.is_err());
+    }
+
     /// PBA-L1a-001 defence in depth: even if a `nonce = u64::MAX` tx reached
     /// the pool by some path that skipped admission (an older binary's state,
     /// a future ingress), selection must skip it, not panic. Inserted directly

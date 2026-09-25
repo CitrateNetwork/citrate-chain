@@ -2479,6 +2479,17 @@ mod tests {
         );
         assert_eq!(block.transactions[0].hash, good_tx.hash);
         assert_eq!(block.header.gas_used, 21_000);
+        // PBA-L1b-002: the sealed root is the consensus rule's root for this
+        // block (kills `calculate_tx_root -> Default::default()`).
+        assert_eq!(
+            block.tx_root,
+            citrate_consensus::tx_auth::tx_root_for_height(
+                producer.ghostdag.pba_hardening(),
+                block.header.height,
+                &block.transactions,
+            )
+        );
+        assert_ne!(block.tx_root, Hash::default());
 
         let good_receipt = storage
             .transactions

@@ -1013,3 +1013,299 @@ mod tests {
         );
     }
 }
+
+/// PBA-L1b-004 / PBA-L1b-005: exact bounds of the in-memory peer AI state
+/// (added to kill cargo-mutants survivors: every cap, TTL and counter is
+/// pinned at its edge).
+#[cfg(test)]
+mod pba_r2_bounds {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn handler() -> (AINetworkHandler, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(citrate_storage::db::RocksDB::open(dir.path()).unwrap());
+        let pm = Arc::new(PeerManager::new(crate::peer::PeerManagerConfig::default()));
+        (AINetworkHandler::new(Arc::new(StateManager::new(db)), pm), dir)
+    }
+
+    fn id(i: u32) -> Hash {
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&i.to_le_bytes());
+        Hash::new(b)
+    }
+
+    fn meta(description: String) -> ModelMetadata {
+        ModelMetadata {
+            name: "n".into(),
+            version: "1".into(),
+            description,
+            framework: "f".into(),
+            input_shape: vec![],
+            output_shape: vec![],
+            size_bytes: 0,
+            created_at: 0,
+        }
+    }
+
+    fn announce(i: u32, description: String) -> NetworkMessage {
+        NetworkMessage::ModelAnnounce {
+            model_id: id(i),
+            model_hash: Hash::new([1; 32]),
+            owner: vec![0xAB; 20],
+            metadata: meta(description),
+            weight_cid: "cid".into(),
+        }
+    }
+
+    fn peer(s: &str) -> PeerId {
+        PeerId(s.to_string())
+    }
+
+    fn request(i: u32) -> NetworkMessage {
+        NetworkMessage::InferenceRequest {
+            request_id: id(i),
+            model_id: Hash::new([9; 32]),
+            input_hash: Hash::new([1; 32]),
+            requester: vec![],
+            max_fee: 0,
+        }
+    }
+
+    fn training(i: u32) -> NetworkMessage {
+        NetworkMessage::TrainingJobAnnounce {
+            job_id: id(i),
+            model_id: id(i),
+            dataset_hash: Hash::new([2; 32]),
+            participants_needed: 3,
+            reward_per_gradient: 1,
+            owner: [0xAB; 20],
+        }
+    }
+
+    fn expired() -> Instant {
+        Instant::now()
+            .checked_sub(MODEL_ANNOUNCE_TTL + Duration::from_secs(1))
+            .expect("monotonic clock far enough from boot")
+    }
+
+    #[test]
+    fn announcement_bytes_counts_every_field_exactly() {
+        let m = ModelMetadata {
+            name: "ab".into(),
+            version: "1".into(),
+            description: "xyz".into(),
+            framework: "f".into(),
+            input_shape: vec![1, 2],
+            output_shape: vec![3],
+            size_bytes: 99,
+            created_at: 7,
+        };
+        // 20 owner + 2 + 1 + 3 + 1 + (2 + 1) * 8 + 3 cid
+        assert_eq!(announcement_bytes(&[0u8; 20], &m, "cid"), 54);
+        assert_eq!(announcement_bytes(&[], &meta(String::new()), ""), 3);
+    }
+
+    #[tokio::test]
+    async fn size_cap_is_inclusive() {
+        let (h, _d) = handler();
+        // owner 20 + "n" + "1" + "f" + "cid" = 26 bytes of fixed fields.
+        let at_cap = "x".repeat(MAX_ANNOUNCE_METADATA_BYTES - 26);
+        h.handle_message(&peer("p"), &announce(1, at_cap.clone())).await.unwrap();
+        assert!(h.has_cached_model(&id(1)).await, "exactly at the cap is accepted");
+        h.handle_message(&peer("p"), &announce(2, at_cap + "x")).await.unwrap();
+        assert!(!h.has_cached_model(&id(2)).await, "one byte over is refused");
+    }
+
+    #[tokio::test]
+    async fn cache_expiry_and_counters() {
+        let (h, _d) = handler();
+        assert!(!h.has_cached_model(&id(1)).await);
+        h.handle_message(&peer("p"), &announce(1, "d".into())).await.unwrap();
+        h.handle_message(&peer("p"), &announce(2, "d".into())).await.unwrap();
+        assert!(h.has_cached_model(&id(1)).await);
+        assert_eq!(h.cached_model_count().await, 2);
+        h.model_cache.write().await.get_mut(&id(1)).unwrap().announced_at = expired();
+        assert!(!h.has_cached_model(&id(1)).await, "an expired announcement is not live");
+        // The next announcement prunes it.
+        h.handle_message(&peer("q"), &announce(3, "d".into())).await.unwrap();
+        assert_eq!(h.cached_model_count().await, 2);
+        assert!(!h.model_cache.read().await.contains_key(&id(1)));
+    }
+
+    #[tokio::test]
+    async fn expired_entries_free_the_per_peer_quota() {
+        let (h, _d) = handler();
+        for i in 0..MAX_MODELS_PER_PEER as u32 {
+            h.handle_message(&peer("p"), &announce(i, "d".into())).await.unwrap();
+        }
+        h.handle_message(&peer("p"), &announce(10_000, "d".into())).await.unwrap();
+        assert!(!h.has_cached_model(&id(10_000)).await, "quota reached");
+        for m in h.model_cache.write().await.values_mut() {
+            m.announced_at = expired();
+        }
+        h.handle_message(&peer("p"), &announce(10_000, "d".into())).await.unwrap();
+        assert!(h.has_cached_model(&id(10_000)).await, "expired entries no longer count");
+        assert_eq!(h.cached_model_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn providers_are_deduplicated_and_capped() {
+        let (h, _d) = handler();
+        for p in 0..(MAX_PROVIDERS_PER_MODEL + 5) {
+            let who = peer(&format!("p{p}"));
+            h.handle_message(&who, &announce(1, "d".into())).await.unwrap();
+            h.handle_message(&who, &announce(1, "d".into())).await.unwrap();
+        }
+        let cache = h.model_cache.read().await;
+        let providers = &cache.get(&id(1)).unwrap().providers;
+        assert_eq!(providers.len(), MAX_PROVIDERS_PER_MODEL);
+        let unique: std::collections::HashSet<_> = providers.iter().collect();
+        assert_eq!(unique.len(), providers.len(), "no duplicate providers");
+        assert_eq!(cache.get(&id(1)).unwrap().announcer, peer("p0"));
+    }
+
+    #[tokio::test]
+    async fn global_model_cap_evicts_oldest() {
+        let (h, _d) = handler();
+        let peers = MAX_CACHED_MODELS / MAX_MODELS_PER_PEER;
+        for p in 0..peers {
+            for j in 0..MAX_MODELS_PER_PEER {
+                let i = (p * MAX_MODELS_PER_PEER + j) as u32;
+                h.handle_message(&peer(&format!("p{p}")), &announce(i, "d".into()))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(h.cached_model_count().await, MAX_CACHED_MODELS);
+        h.handle_message(&peer("late"), &announce(999_999, "d".into())).await.unwrap();
+        assert_eq!(h.cached_model_count().await, MAX_CACHED_MODELS, "cap holds");
+        assert!(h.has_cached_model(&id(999_999)).await, "newest admitted, oldest evicted");
+    }
+
+    #[tokio::test]
+    async fn pending_requests_counted_capped_expired_and_retired() {
+        let (h, _d) = handler();
+        for i in 0..3 {
+            h.handle_message(&peer("a"), &request(i)).await.unwrap();
+        }
+        assert_eq!(h.pending_inference_count().await, 3);
+        // A response retires its request.
+        h.handle_message(
+            &peer("b"),
+            &NetworkMessage::InferenceResponse {
+                request_id: id(0),
+                output_hash: Hash::new([0; 32]),
+                proof: vec![1],
+                provider: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(h.pending_inference_count().await, 2);
+        // Per-peer cap, exactly.
+        for i in 100..(100 + MAX_PENDING_INFERENCES_PER_PEER as u32 + 3) {
+            h.handle_message(&peer("c"), &request(i)).await.unwrap();
+        }
+        let from_c = h
+            .pending_inferences
+            .read()
+            .await
+            .values()
+            .filter(|r| r.from_peer == peer("c"))
+            .count();
+        assert_eq!(from_c, MAX_PENDING_INFERENCES_PER_PEER);
+        // An entry exactly TTL seconds old is expired by the next request.
+        {
+            let mut p = h.pending_inferences.write().await;
+            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            p.get_mut(&id(1)).unwrap().timestamp = now - PENDING_INFERENCE_TTL_SECS;
+        }
+        h.handle_message(&peer("d"), &request(5_000)).await.unwrap();
+        assert!(!h.pending_inferences.read().await.contains_key(&id(1)));
+        assert!(h.pending_inferences.read().await.contains_key(&id(2)));
+    }
+
+    #[tokio::test]
+    async fn pending_global_cap_evicts_oldest() {
+        let (h, _d) = handler();
+        let peers = MAX_PENDING_INFERENCES / MAX_PENDING_INFERENCES_PER_PEER;
+        for p in 0..peers {
+            for j in 0..MAX_PENDING_INFERENCES_PER_PEER {
+                let i = (p * MAX_PENDING_INFERENCES_PER_PEER + j) as u32;
+                h.handle_message(&peer(&format!("p{p}")), &request(i)).await.unwrap();
+            }
+        }
+        assert_eq!(h.pending_inference_count().await, MAX_PENDING_INFERENCES);
+        h.handle_message(&peer("late"), &request(999_999)).await.unwrap();
+        assert_eq!(h.pending_inference_count().await, MAX_PENDING_INFERENCES);
+        assert!(h.pending_inferences.read().await.contains_key(&id(999_999)));
+    }
+
+    #[tokio::test]
+    async fn training_announcements_bounded_expiring_and_counted() {
+        let (h, _d) = handler();
+        h.handle_message(&peer("a"), &training(1)).await.unwrap();
+        h.handle_message(&peer("a"), &training(1)).await.unwrap(); // duplicate
+        h.handle_message(&peer("b"), &training(2)).await.unwrap();
+        assert_eq!(h.active_training_count().await, 2);
+        // Per-peer quota, exactly (peer "a" already has one).
+        for i in 10..(10 + MAX_TRAINING_JOBS_PER_PEER as u32 + 3) {
+            h.handle_message(&peer("a"), &training(i)).await.unwrap();
+        }
+        let from_a = h
+            .active_training
+            .read()
+            .await
+            .values()
+            .filter(|j| j.announcer == peer("a"))
+            .count();
+        assert_eq!(from_a, MAX_TRAINING_JOBS_PER_PEER);
+        // Expiry frees the quota.
+        for j in h.active_training.write().await.values_mut() {
+            j.announced_at = expired();
+        }
+        h.handle_message(&peer("a"), &training(500)).await.unwrap();
+        assert_eq!(h.active_training_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn training_global_cap_evicts_oldest() {
+        let (h, _d) = handler();
+        let peers = MAX_TRAINING_JOBS / MAX_TRAINING_JOBS_PER_PEER;
+        for p in 0..peers {
+            for j in 0..MAX_TRAINING_JOBS_PER_PEER {
+                let i = (p * MAX_TRAINING_JOBS_PER_PEER + j) as u32;
+                h.handle_message(&peer(&format!("p{p}")), &training(i)).await.unwrap();
+            }
+        }
+        assert_eq!(h.active_training_count().await, MAX_TRAINING_JOBS);
+        h.handle_message(&peer("late"), &training(999_999)).await.unwrap();
+        assert_eq!(h.active_training_count().await, MAX_TRAINING_JOBS);
+        assert!(h.active_training.read().await.contains_key(&id(999_999)));
+    }
+
+    #[tokio::test]
+    async fn gradients_update_only_known_jobs_with_bounded_participants() {
+        let (h, _d) = handler();
+        let grad = |job: u32| NetworkMessage::GradientSubmission {
+            job_id: id(job),
+            gradient_hash: Hash::new([3; 32]),
+            epoch: 1,
+            participant: vec![],
+        };
+        h.handle_message(&peer("x"), &grad(7)).await.unwrap(); // unknown job: ignored
+        assert_eq!(h.active_training_count().await, 0);
+        h.handle_message(&peer("owner"), &training(7)).await.unwrap();
+        for p in 0..(MAX_PROVIDERS_PER_MODEL + 4) {
+            h.handle_message(&peer(&format!("g{p}")), &grad(7)).await.unwrap();
+        }
+        h.handle_message(&peer("g0"), &grad(7)).await.unwrap(); // repeat participant
+        let t = h.active_training.read().await;
+        let job = t.get(&id(7)).unwrap();
+        assert_eq!(job.gradients_received as usize, MAX_PROVIDERS_PER_MODEL + 5);
+        assert_eq!(job.participants.len(), MAX_PROVIDERS_PER_MODEL);
+        let unique: std::collections::HashSet<_> = job.participants.iter().collect();
+        assert_eq!(unique.len(), job.participants.len());
+    }
+}

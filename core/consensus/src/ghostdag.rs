@@ -1477,6 +1477,69 @@ mod tests {
             .build_unhashed()
     }
 
+
+    /// Mutation-survivor kills inside validate_block_consistency (the
+    /// function PBA-L1b-003 changed): the blue-score band edges and the
+    /// MP-DEPTH boundary are pinned exactly.
+    #[tokio::test]
+    async fn pba_r2_blue_score_band_edges_are_enforced() {
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let genesis = create_test_block_with_parents([0x21; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        let gd = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+        let with_score = |score: u64, h: u8| {
+            let mut b = create_test_block_with_parents([h; 32], genesis.hash(), vec![], 1);
+            b.header.blue_score = score;
+            b.header.blue_work = crate::types::blue_work_for_score(score);
+            b
+        };
+        assert!(gd.validate_block_consistency(&with_score(1, 0x22)).await.is_ok());
+        assert!(
+            gd.validate_block_consistency(&with_score(0, 0x23)).await.is_err(),
+            "below the band"
+        );
+        assert!(
+            gd.validate_block_consistency(&with_score(2, 0x24)).await.is_err(),
+            "above the band (no merge parents)"
+        );
+    }
+
+    #[tokio::test]
+    async fn pba_r2_mp_depth_boundary_is_exact() {
+        fn h(i: u64) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&i.to_le_bytes());
+            b[31] = 0x77;
+            b
+        }
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let gd = GhostDag::new(GhostDagParams::default(), dag_store.clone())
+            .with_merge_depth_activation_height(0);
+        let mut chain = vec![create_test_block_with_parents(h(0), Hash::default(), vec![], 0)];
+        dag_store.store_block(chain[0].clone()).await.unwrap();
+        let top = MERGE_PARENT_MAX_DEPTH + 1;
+        for i in 1..top {
+            let b = create_test_block_with_parents(h(i), chain[(i - 1) as usize].hash(), vec![], i);
+            dag_store.store_block(b.clone()).await.unwrap();
+            chain.push(b);
+        }
+        // A side block at height 1 (sibling of chain[1]) to merge.
+        let side1 = create_test_block_with_parents([0xA1; 32], chain[0].hash(), vec![], 1);
+        dag_store.store_block(side1.clone()).await.unwrap();
+        let sp = chain[(top - 1) as usize].hash();
+        let merging = |mp: Hash, tag: u8| {
+            let mut b = create_test_block_with_parents([tag; 32], sp, vec![mp], top);
+            b.header.blue_score = top;
+            b.header.blue_work = crate::types::blue_work_for_score(top);
+            b
+        };
+        // depth = top - 1 = MERGE_PARENT_MAX_DEPTH: allowed.
+        assert!(gd.validate_block_consistency(&merging(side1.hash(), 0xB1)).await.is_ok());
+        // depth = top - 0 = MERGE_PARENT_MAX_DEPTH + 1: rejected.
+        let side0 = chain[0].hash();
+        assert!(gd.validate_block_consistency(&merging(side0, 0xB2)).await.is_err());
+    }
+
     /// PBA-L1b-003: the parent-relative timestamp bound, both sides of the
     /// activation height and both edges of the bound.
     #[tokio::test]
