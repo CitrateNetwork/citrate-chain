@@ -184,13 +184,14 @@ contract ReleaseManifestRegistryTest is Test {
         reg.markNotarized(R_1);
         vm.stopPrank();
         vm.roll(block.number + 5);
+        vm.prank(recorder); // PBA-L2-057: publish is recorder-gated
         reg.publish(R_1);
         ReleaseManifestRegistry.Release memory r = reg.getRelease(R_1);
         assertEq(r.state, 5);
         assertEq(r.published_at_block, block.number);
     }
 
-    function test_publish_is_permissionless() public {
+    function test_publish_is_recorder_gated() public {
         vm.startPrank(recorder);
         reg.draftRelease(R_1, V_050);
         reg.addArtifact(R_1, PLATFORM_LINUX, ART_HASH, SIG_HASH, 1000);
@@ -198,8 +199,14 @@ contract ReleaseManifestRegistryTest is Test {
         reg.markTested(R_1);
         reg.markNotarized(R_1);
         vm.stopPrank();
-        // Nobody can call publish.
+        // PBA-L2-057: publish is now recorder-gated. (This test used to assert
+        // it was permissionless — the defect: an observer could publish a
+        // Notarized release to front-run the recorder's withdraw.)
         vm.prank(nobody);
+        vm.expectRevert(abi.encodeWithSelector(ReleaseManifestRegistry.NotRecorder.selector, nobody));
+        reg.publish(R_1);
+        assertEq(reg.getRelease(R_1).state, 4);
+        vm.prank(recorder);
         reg.publish(R_1);
         assertEq(reg.getRelease(R_1).state, 5);
     }
@@ -214,6 +221,7 @@ contract ReleaseManifestRegistryTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(ReleaseManifestRegistry.NotInState.selector, R_1, 4, 3)
         );
+        vm.prank(recorder); // PBA-L2-057: publish is recorder-gated
         reg.publish(R_1);
     }
 
@@ -245,6 +253,7 @@ contract ReleaseManifestRegistryTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(ReleaseManifestRegistry.NotInState.selector, R_1, 4, 6)
         );
+        vm.prank(recorder); // PBA-L2-057: publish is recorder-gated
         reg.publish(R_1);
     }
 
@@ -256,6 +265,7 @@ contract ReleaseManifestRegistryTest is Test {
         reg.markTested(R_1);
         reg.markNotarized(R_1);
         vm.stopPrank();
+        vm.prank(recorder); // PBA-L2-057: publish is recorder-gated
         reg.publish(R_1);
         vm.prank(recorder);
         vm.expectRevert(

@@ -174,8 +174,13 @@ contract ReleaseManifestRegistry {
         emit StateChanged(release_id, 3, 4);
     }
 
-    /// @notice Transition Notarized (4) → Published (5). Permissionless.
+    /// @notice Transition Notarized (4) → Published (5). Recorder-gated.
+    /// @dev PBA-L2-057 (pre-bounty audit 2026-09-24): `publish` used to be
+    ///      permissionless, so anyone who saw a recorder's `withdraw` of a bad
+    ///      Notarized release in the mempool could publish it first, making it
+    ///      terminal and un-withdrawable.
     function publish(bytes32 release_id) external {
+        if (!is_recorder[msg.sender]) revert NotRecorder(msg.sender);
         Release storage r = releases[release_id];
         if (r.state != 4) revert NotInState(release_id, 4, r.state);
         r.state = 5;
