@@ -1434,6 +1434,14 @@ mod tests {
             "executor AI ops only, highest fee first"
         );
         assert_eq!(pool.get_ai_transactions(2).await.len(), 2);
+        // The trait views used by the node forward to the same selection.
+        let shared = Arc::new(pool);
+        let via_arc = MempoolAccess::get_ai_transactions(&shared, 10).await;
+        assert_eq!(via_arc.iter().map(|t| t.data[0]).collect::<Vec<_>>(), sels);
+        let pool2 = Arc::try_unwrap(shared).map_err(|_| ()).expect("sole owner");
+        let locked = Arc::new(RwLock::new(pool2));
+        let via_lock = MempoolAccess::get_ai_transactions(&locked, 10).await;
+        assert_eq!(via_lock.iter().map(|t| t.data[0]).collect::<Vec<_>>(), sels);
     }
 
     /// PBA-L1a-021: the pending-nonce lookup has no successor for u64::MAX

@@ -1797,8 +1797,6 @@ impl BlockProducer {
         const MAX_BLOCK_SIZE: usize = 1_000_000; // 1 MB — matches transport (H-08)
         const MAX_GAS_PER_BLOCK: u64 = PRODUCER_BLOCK_GAS_LIMIT; // Chain genesis constant
         const MAX_AI_TXS_PER_BLOCK: usize = 10;
-        // AI operations may declare at most a third of the block's gas.
-        const MAX_AI_GAS_PER_BLOCK: u64 = MAX_GAS_PER_BLOCK / 3;
         const MAX_STANDARD_TXS: usize = 5_000;
 
         // AI transactions first (model ops, inference). Small reserved slice.
@@ -1909,6 +1907,13 @@ impl BlockProducer {
                 }
             }
         }
+
+        debug!(
+            "executed {} txs using {} block gas ({} senders deferred)",
+            executed_transactions.len(),
+            meter.used(),
+            deferred_senders.len()
+        );
 
         // WP-G.4: Compute state root from the executor's in-memory post-execution state.
         // This uses the state trie that has been updated by transaction execution,
@@ -2239,6 +2244,9 @@ impl BlockProducer {
 /// execution, so declared-but-unused gas never holds block space.
 /// Block gas limit the producer fills to (the chain's genesis constant).
 pub(crate) const PRODUCER_BLOCK_GAS_LIMIT: u64 = 30_000_000;
+
+/// AI operations may declare at most a third of the block's gas.
+pub(crate) const MAX_AI_GAS_PER_BLOCK: u64 = PRODUCER_BLOCK_GAS_LIMIT / 3;
 
 /// PBA-L1a-004: block gas metered on ACTUAL use, like geth's gas pool.
 pub(crate) struct BlockGasMeter {
@@ -2642,6 +2650,12 @@ mod tests {
             !b.try_admit(&too_big, state(U256::MAX)),
             "larger than a block"
         );
+        let mut exact = transfer_tx(4, Address([0x7A; 20]), r, 0);
+        exact.gas_limit = 30_000_000;
+        assert!(
+            b.try_admit(&exact, state(U256::MAX)),
+            "exactly a block fits"
+        );
         let mut big = transfer_tx(2, Address([0x78; 20]), r, 0);
         big.gas_limit = 29_999_000;
         assert!(b.try_admit(&big, state(U256::MAX)));
@@ -2694,6 +2708,11 @@ mod tests {
         let mut b = SelectionBudget::new(30_000_000);
         let max = transfer_tx(11, a, r, u64::MAX);
         assert!(!b.try_admit(&max, |_: &PublicKey| (u64::MAX, U256::MAX)));
+    }
+
+    #[test]
+    fn producer_ai_slice_cap_value() {
+        assert_eq!(MAX_AI_GAS_PER_BLOCK, 10_000_000);
     }
 
     /// Block gas meter: admission against what is left, charge on actual use.
@@ -2797,6 +2816,145 @@ mod tests {
                 producer_budget_case(prefix.to_vec(), 1_000_000_000).await;
             assert!(transfer_in, "prefix {prefix:?}: transfer must be included");
         }
+    }
+
+    fn funded(state_db: &citrate_execution::StateDB, a: Address) {
+        state_db.accounts.create_account_if_not_exists(a);
+        state_db
+            .accounts
+            .set_balance(a, U256::from(10u64).pow(U256::from(21u64)));
+    }
+
+    fn test_producer(
+        storage: &Arc<StorageManager>,
+        executor: &Arc<Executor>,
+        mempool: &Arc<Mempool>,
+    ) -> BlockProducer {
+        BlockProducer::new(
+            storage.clone(),
+            executor.clone(),
+            mempool.clone(),
+            embedded_pubkey(Address([0x44; 20])),
+            test_signing_key(),
+            2,
+        )
+    }
+
+    fn producer_fixture() -> (
+        TempDir,
+        Arc<StorageManager>,
+        Arc<citrate_execution::StateDB>,
+        Arc<Executor>,
+        Arc<Mempool>,
+    ) {
+        let tmp = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+        let state_db = Arc::new(citrate_execution::StateDB::new());
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            state_db.clone(),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+        (tmp, storage, state_db, executor, mempool)
+    }
+
+    /// The AI slice is capped at a third of the block's declared gas; AI ops
+    /// beyond it compete in the fee-ordered standard pass.
+    #[tokio::test]
+    async fn producer_ai_slice_gas_cap() {
+        let (_tmp, storage, state_db, executor, mempool) = producer_fixture();
+        let (a1, a2, s) = (
+            Address([0x51; 20]),
+            Address([0x52; 20]),
+            Address([0x53; 20]),
+        );
+        for a in [a1, a2, s] {
+            funded(&state_db, a);
+        }
+        let r = Address([0x33; 20]);
+        let mut ai1 = transfer_tx(0xB1, a1, r, 0);
+        ai1.data = vec![0x02, 0, 0, 0, 1];
+        ai1.gas_limit = PRODUCER_BLOCK_GAS_LIMIT / 3;
+        ai1.gas_price = 2_000_000_000;
+        let mut ai2 = transfer_tx(0xB2, a2, r, 0);
+        ai2.data = vec![0x02, 0, 0, 0, 2];
+        ai2.gas_limit = 21_000;
+        ai2.gas_price = 1_000_000_000;
+        let mut std_tx = transfer_tx(0xB3, s, r, 0);
+        std_tx.gas_price = 100_000_000_000;
+        for t in [&ai1, &ai2, &std_tx] {
+            mempool
+                .add_transaction(t.clone(), TxClass::Standard)
+                .await
+                .expect("admit");
+        }
+        let producer = test_producer(&storage, &executor, &mempool);
+        let sel: Vec<Hash> = producer
+            .select_transactions_with_ai_priority()
+            .await
+            .expect("select")
+            .iter()
+            .map(|t| t.hash)
+            .collect();
+        assert_eq!(
+            sel,
+            vec![ai1.hash, std_tx.hash, ai2.hash],
+            "ai1 fills the AI slice exactly; ai2 falls to the fee-ordered pass"
+        );
+    }
+
+    /// A sender whose transaction does not fit what is left of the block is
+    /// deferred with all its later nonces; they stay in the mempool.
+    #[tokio::test]
+    async fn producer_defers_whole_sender_when_block_is_full() {
+        let (_tmp, storage, state_db, executor, mempool) = producer_fixture();
+        let (x, s) = (Address([0x61; 20]), Address([0x62; 20]));
+        funded(&state_db, x);
+        funded(&state_db, s);
+        let r = Address([0x33; 20]);
+        let mut first = transfer_tx(0xC1, x, r, 0);
+        first.gas_price = 100_000_000_000;
+        let mut big = transfer_tx(0xC2, s, r, 0);
+        big.gas_limit = PRODUCER_BLOCK_GAS_LIMIT - 1_000;
+        big.gas_price = 50_000_000_000;
+        let mut next = transfer_tx(0xC3, s, r, 1);
+        next.gas_price = 50_000_000_000;
+        for t in [&first, &big, &next] {
+            mempool
+                .add_transaction(t.clone(), TxClass::Standard)
+                .await
+                .expect("admit");
+        }
+        let producer = test_producer(&storage, &executor, &mempool);
+        let hash = producer.produce_block().await.expect("produce");
+        let block = storage
+            .blocks
+            .get_block(&hash)
+            .expect("read")
+            .expect("block");
+        let hashes: Vec<Hash> = block.transactions.iter().map(|t| t.hash).collect();
+        assert!(hashes.contains(&first.hash));
+        assert!(
+            !hashes.contains(&big.hash),
+            "does not fit after the first tx"
+        );
+        assert!(
+            !hashes.contains(&next.hash),
+            "later nonce deferred with its sender"
+        );
+        assert!(
+            mempool.contains(&next.hash).await,
+            "deferred tx stays pooled"
+        );
+        assert!(
+            mempool.contains(&big.hash).await,
+            "deferred tx stays pooled"
+        );
     }
 
     /// The mempool's AI view and the executor's dispatch use one classifier.
