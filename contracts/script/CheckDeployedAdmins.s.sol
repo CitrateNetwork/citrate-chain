@@ -20,13 +20,16 @@ import {P256} from "../src/aa/lib/webauthn/P256.sol";
 ///
 ///         READ-ONLY: never broadcasts. Run after every ceremony step:
 ///           forge script script/CheckDeployedAdmins.s.sol --rpc-url https://rpc.citrate.ai
+///         The post-redeploy run (against the regenerated book) always uses
+///         REQUIRE_ALL_CODE=true, so a NO-CODE entry fails it:
+///           REQUIRE_ALL_CODE=true forge script script/CheckDeployedAdmins.s.sol --rpc-url https://rpc.citrate.ai
 ///         Env: ADDRESS_BOOK (default addresses/40204.json), REQUIRE_ALL_CODE.
 ///
 ///         Expected on the 2026-09-24 deployment (a fork of 40204): 22
 ///         FACTORY-ADMIN (21 admin slots + X402Paywall.provider), VERIFIER
 ///         missing, ~20 NO-CODE -> FAIL. After the PBA-L2-002 redeploy and
-///         DeployP256Verifier: 0 FACTORY-ADMIN, VERIFIER present -> PASS
-///         (NO-CODE entries still listed for the owner to reconcile).
+///         DeployP256Verifier, run with REQUIRE_ALL_CODE=true: 0 FACTORY-ADMIN,
+///         VERIFIER present, 0 NO-CODE -> PASS (reconcile the book first).
 contract CheckDeployedAdmins is Script, AdminChecks {
     uint256 public factoryAdmin;
     uint256 public noCode;
