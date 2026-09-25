@@ -531,6 +531,43 @@ pub fn aggregate_decoded(input: &BelnapInput) -> BelnapOutput {
 /// Decode failures (`InputTooShort`, malformed bytes) charge `GAS_BASE`
 /// so a malformed-input griefer still pays for the parse work.
 pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
+    execute_at(input, gas_limit, false)
+}
+
+/// PBA-L1a-025: the O(n x dim) aggregation work used to be priced on `dim`
+/// alone (`2000 + 50*dim`), so `n = 1024` participants cost the same as one.
+/// At/after `pba_hardening_height` (`hardened`) the charge is
+/// `2000 + 50 * dim * max(n, 1)`; before it the legacy price is kept
+/// bit-for-bit so historical blocks replay.
+pub fn gas_for(input: &[u8], hardened: bool) -> u64 {
+    let dim_hint = if input.len() >= 4 {
+        u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as u64
+    } else {
+        0
+    };
+    let dim_hint = dim_hint.min(MAX_DIM as u64);
+    if !hardened {
+        return GAS_BASE.saturating_add(GAS_PER_DIM.saturating_mul(dim_hint));
+    }
+    let n_hint = if input.len() >= 8 {
+        u32::from_be_bytes([input[4], input[5], input[6], input[7]]) as u64
+    } else {
+        0
+    };
+    let n_hint = n_hint.clamp(1, MAX_N as u64);
+    GAS_BASE.saturating_add(
+        GAS_PER_DIM
+            .saturating_mul(dim_hint)
+            .saturating_mul(n_hint),
+    )
+}
+
+/// Precompile entry with the consensus activation flag (see [`gas_for`]).
+pub fn execute_at(
+    input: &[u8],
+    gas_limit: u64,
+    hardened: bool,
+) -> Result<crate::precompiles::PrecompileResult, anyhow::Error> {
     use crate::precompiles::PrecompileResult;
 
     if gas_limit < GAS_BASE {
@@ -539,16 +576,10 @@ pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::Preco
         ));
     }
 
-    // Peek the dim from the header (without full-decoding) so we can
-    // gas-charge accurately. If the input is too short, decode() below
-    // catches it; we fall back to GAS_BASE.
-    let dim_hint = if input.len() >= 4 {
-        u32::from_be_bytes(input[0..4].try_into().expect("4 bytes")) as u64
-    } else {
-        0
-    };
-    let dim_hint = dim_hint.min(MAX_DIM as u64);
-    let total_gas = GAS_BASE.saturating_add(GAS_PER_DIM.saturating_mul(dim_hint));
+    // Peek the header (without full-decoding) so we can gas-charge
+    // accurately. If the input is too short, decode() below catches it; we
+    // fall back to GAS_BASE.
+    let total_gas = gas_for(input, hardened);
     if gas_limit < total_gas {
         return Err(anyhow::anyhow!(
             "Belnap aggregate: insufficient gas (need {total_gas}, got {gas_limit})"

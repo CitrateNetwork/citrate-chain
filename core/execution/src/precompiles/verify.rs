@@ -116,7 +116,21 @@ pub mod gas_costs {
 
 /// Route to the right precompile by address.
 pub fn execute(address: &Address, input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
+    execute_at(address, input, gas_limit, false)
+}
+
+/// Route with the consensus activation flag (`hardened` = at/after
+/// `pba_hardening_height`). Only 0x0109 changes behaviour (PBA-L1a-013).
+pub fn execute_at(
+    address: &Address,
+    input: &[u8],
+    gas_limit: u64,
+    hardened: bool,
+) -> Result<PrecompileResult> {
     let addr = address.as_fixed_bytes();
+    if hardened && addr == &addresses::MERKLE_VERIFY_TENSOR {
+        return merkle_verify_tensor_hardened(input, gas_limit);
+    }
     if addr == &addresses::TENSOR_COMMIT {
         tensor_commit(input, gas_limit)
     } else if addr == &addresses::INFERENCE_PROOF_VERIFY {
@@ -371,6 +385,32 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
         gas_used,
         success: true, // success=true means "the precompile ran"; the bool result is in `output`.
     })
+}
+
+/// PBA-L1a-013: 0x0109 with the depth-0 / inner-node second-preimage closed.
+///
+/// Leaves `H(index, value)` and inner nodes `H(left, right)` share one
+/// Poseidon arity-2 hash and the caller picks the proof depth, so an inner
+/// pair `(L, R)` of a committed tree "verified" as a depth-0 leaf with
+/// `index = L`. An honest leaf index always fits in `proof_depth` bits (the
+/// path walks exactly those bits), whereas `L` is a ~254-bit hash output. At
+/// and after `pba_hardening_height` a `leaf_index >= 2^proof_depth` is
+/// therefore rejected (result word 0), which rejects the forgery at every
+/// depth while leaving every honest proof's result, and the frozen commitment
+/// format, unchanged.
+pub fn merkle_verify_tensor_hardened(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
+    let mut result = merkle_verify_tensor(input, gas_limit)?;
+    // merkle_verify_tensor validated the layout: input[32..64] is leaf_index,
+    // input[96] is the proof depth (<= 32).
+    let depth = input[96] as u32;
+    let index = &input[32..64];
+    let high_zero = index[..28].iter().all(|&b| b == 0);
+    let lo32 = u32::from_be_bytes([index[28], index[29], index[30], index[31]]);
+    let fits = high_zero && (depth >= 32 || (lo32 >> depth) == 0);
+    if !fits {
+        result.output = vec![0u8; 32];
+    }
+    Ok(result)
 }
 
 /// 0x0108 INFERENCE_PROOF_VERIFY — Halo2-KZG verifier, **version-

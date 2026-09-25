@@ -90,6 +90,19 @@ pub mod standard {
 /// (non-deterministic across nodes) and is deliberately NOT routed here —
 /// it stays behind `PrecompileExecutor::execute`.
 pub fn execute_pure(address: &Address, input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
+    execute_pure_at(address, input, gas_limit, false)
+}
+
+/// [`execute_pure`] with the consensus activation flag: `hardened` is true
+/// for blocks at/after `pba_hardening_height` (see `crate::activation`). The
+/// REVM bridge passes it; before activation every result is bit-identical to
+/// [`execute_pure`]. Gated changes: PBA-L1a-013 (0x0109), PBA-L1a-025 (0x0110).
+pub fn execute_pure_at(
+    address: &Address,
+    input: &[u8],
+    gas_limit: u64,
+    hardened: bool,
+) -> Result<PrecompileResult> {
     let addr_bytes = address.as_bytes();
     if !addr_bytes[..18].iter().all(|&b| b == 0) {
         return Err(anyhow::anyhow!("Not a Citrate pure precompile address"));
@@ -102,13 +115,13 @@ pub fn execute_pure(address: &Address, input: &[u8], gas_limit: u64) -> Result<P
     }
     if family == 1 {
         if (0x07..=0x09).contains(&selector) {
-            return verify::execute(address, input, gas_limit);
+            return verify::execute_at(address, input, gas_limit, hardened);
         }
         if (0x0A..=0x0F).contains(&selector) {
             return compute::execute(address, input, gas_limit);
         }
         if selector == 0x10 {
-            return q16::belnap::execute(input, gas_limit);
+            return q16::belnap::execute_at(input, gas_limit, hardened);
         }
         if selector == 0x11 {
             return q16::routing::execute(input, gas_limit);
@@ -153,6 +166,32 @@ pub const PURE_PRECOMPILE_ADDRESSES: [[u8; 20]; 16] = [
     x402::addresses::TRANSFER_AUTH_VERIFY,     // 0x0201
     x402::addresses::BATCH_PAYMENT_VERIFY,     // 0x0202
 ];
+
+/// PBA-L1a-022: addresses inside the Citrate precompile ranges
+/// (`PrecompileExecutor::is_precompile`) that are NOT bridged into REVM — the
+/// node-local inference family 0x0100–0x0106 and the unassigned slots of each
+/// family. Unregistered, a CALL to them hit an empty account and returned
+/// success with empty data (e.g. `ModelAccessControl.executeInference` charged
+/// for nothing). At/after `pba_hardening_height` the REVM bridge registers
+/// them as precompiles that always fail, so such a call reverts.
+pub fn reserved_unbridged_addresses() -> Vec<[u8; 20]> {
+    let mut out = Vec::new();
+    let mut push = |family: u8, selector: u8| {
+        let mut a = [0u8; 20];
+        a[18] = family;
+        a[19] = selector;
+        if !PURE_PRECOMPILE_ADDRESSES.contains(&a) {
+            out.push(a);
+        }
+    };
+    for sel in 0x00..=0x3Fu8 {
+        push(1, sel);
+    }
+    for sel in 0x00..=0x09u8 {
+        push(2, sel);
+    }
+    out
+}
 
 /// Precompile executor
 pub struct PrecompileExecutor {
