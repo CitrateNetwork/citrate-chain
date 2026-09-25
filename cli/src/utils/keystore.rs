@@ -108,7 +108,24 @@ pub fn save_key(signing_key: &SigningKey, password: &str, path: &Path) -> Result
     }
 
     let json = serde_json::to_string_pretty(&keystore)?;
-    fs::write(path, json).with_context(|| format!("Failed to write keystore to {:?}", path))?;
+    // PBA-L4-009: create the file 0600 from the start. `fs::write` created it
+    // with the umask mode (commonly 0644) and chmod-ed afterwards, leaving a
+    // window in which the encrypted key was world-readable.
+    {
+        use std::io::Write;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(path)
+            .with_context(|| format!("Failed to write keystore to {:?}", path))?;
+        f.write_all(json.as_bytes())
+            .with_context(|| format!("Failed to write keystore to {:?}", path))?;
+    }
 
     // CHAIN-B-E002: restrict the keystore file to owner-only (0600). Without
     // this the file inherits umask (commonly 0644, world-readable).
@@ -140,6 +157,14 @@ pub fn load_key(path: &Path, password: &str) -> Result<SigningKey> {
     // Decode salt and nonce
     let salt = hex::decode(&keystore.salt).context("Invalid salt format")?;
     let nonce_bytes = hex::decode(&keystore.nonce).context("Invalid nonce format")?;
+    // PBA-L4-009: `Nonce::from_slice` PANICS on a length other than 12; a
+    // corrupted or hostile keystore must be an error, not a crash.
+    if nonce_bytes.len() != 12 {
+        anyhow::bail!(
+            "Invalid keystore nonce length: {} bytes (expected 12)",
+            nonce_bytes.len()
+        );
+    }
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     // Derive key from password under the entry's declared KDF version.
@@ -210,6 +235,28 @@ fn derive_key_legacy_sha3(password: &str, salt: &[u8]) -> Zeroizing<[u8; 32]> {
 
     key.copy_from_slice(&hash);
     key
+}
+
+#[cfg(test)]
+mod tests_pba_l4_009 {
+    use super::*;
+
+    /// PBA-L4-009: a keystore whose nonce is not 12 bytes must fail cleanly
+    /// (it used to panic inside `Nonce::from_slice`).
+    #[test]
+    fn pba_l4_009_bad_nonce_length_is_an_error_not_a_panic() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("ks.json");
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        save_key(&key, "correct horse battery", &path).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let mut v: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        v["nonce"] = serde_json::Value::String(hex::encode([0u8; 11]));
+        std::fs::write(&path, v.to_string()).expect("write");
+        let r = std::panic::catch_unwind(|| load_key(&path, "correct horse battery"));
+        let r = r.expect("load_key must not panic on an 11-byte nonce");
+        assert!(r.is_err(), "an 11-byte nonce must be rejected");
+    }
 }
 
 #[cfg(test)]
