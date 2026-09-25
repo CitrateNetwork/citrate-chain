@@ -2462,8 +2462,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         head_hash,
                         ..
                     } => {
-                        max_seen_for_rx
-                            .fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
+                        // PBA-L1b-006: an unauthenticated handshake height is NOT
+                        // network-height evidence (it pinned eth_syncing.highestBlock
+                        // at u64::MAX for the life of the process). It still seeds
+                        // this peer's advertised head, which the sync tick clamps.
                         // Kick off naive sync: request blocks from genesis if behind
                         // APPLIED tip, not the stored height index: a follower
                         // stores gossiped tips far ahead of its applied chain, so
@@ -2489,8 +2491,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         head_hash,
                         ..
                     } => {
-                        max_seen_for_rx
-                            .fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
+                        // PBA-L1b-006: see Hello — not recorded as network height.
                         // APPLIED tip, not the stored height index: a follower
                         // stores gossiped tips far ahead of its applied chain, so
                         // get_latest_height() would report it as already caught up
@@ -2649,16 +2650,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         {
                             match gossip_for_rx.handle_new_block(block.clone(), &pid).await {
                                 Ok(_) => {
-                                    // CHAIN-B-A007: the block passed gossip
-                                    // validation (structure + signature). Only now
-                                    // is its height trustworthy network-height
-                                    // evidence for the sync target.
-                                    max_seen_for_rx.fetch_max(
-                                        block.header.height,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
+                                    // PBA-L1b-006: gossip validation proves only a
+                                    // self-consistent, self-signed header — any key
+                                    // can sign height u64::MAX. The height becomes
+                                    // network-height evidence once ADMITTED
+                                    // (linkage verified from genesis), or clamped
+                                    // when deferred (below).
                                     match admission_for_net.admit(&block).await {
                                     admission::AdmitOutcome::Admitted { completed_partial } => {
+                                        sync_peer::record_verified_height(
+                                            &max_seen_for_rx,
+                                            block.header.height,
+                                        );
                                         if completed_partial {
                                             tracing::warn!(
                                                 "Completed a partial admission of gossiped block {} @ {}",
@@ -2675,9 +2678,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         // dropping that height signal is what stalled a
                                         // far-behind follower — record it so the sync tick
                                         // pulls the gap forward instead of parking.
-                                        max_seen_for_rx.fetch_max(
+                                        sync_peer::record_unverified_height(
+                                            &max_seen_for_rx,
                                             block.header.height,
-                                            std::sync::atomic::Ordering::Relaxed,
+                                            storage_for_handler
+                                                .blocks
+                                                .get_applied_tip()
+                                                .ok()
+                                                .flatten()
+                                                .map(|(_, h)| h)
+                                                .unwrap_or(0),
                                         );
                                         tracing::debug!(
                                             "Deferred gossiped block {} @ {} from {}: missing parent {}",
