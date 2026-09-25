@@ -43,29 +43,32 @@ If deployment fails, verify the node is reachable with `curl http://localhost:85
 
 ## Live Testnet Contracts
 
-27 contracts are deployed on the Citrate testnet (chain ID 40204). Key addresses:
+Addresses are not copied into this README, because hand-copied tables go stale at every re-roll and a
+transfer to a stale, codeless address strands the value. Read them from one of these instead:
 
-| Contract | Testnet Address |
-|----------|----------------|
-| ModelRegistry | `0x02F03Ac1aAFf621D458F403965A3355F720D077b` |
-| WrappedSALT | `0x4Cba023420A6B0aeD33204082D9E29f9a450a9A2` |
-| ComputeMarketplace | `0x6003aD2727BF4253A5c0bd9F0d10713829320B98` |
-| LearningPool | `0xE701D7368DD7fF46C63DfA7fE439f61011cEb6b2` |
-| LiquidStakingPool | `0xcDb76eb5D32ea31DD9c05095C970b8A44AE89390` |
-| X402Facilitator | `0x05209FE13D705CfECE27C7084F741B65Ae45c5c8` |
+- The address book: [`contracts/addresses/40204.json`](addresses/40204.json) (the single source of truth).
+- The rendered page: [docs.citrate.ai/chain/addresses](https://docs.citrate.ai/chain/addresses).
 
-Full list: [DEPLOYED_ADDRESSES.md](./DEPLOYED_ADDRESSES.md)
+Not every book entry is deployed. At the last check, 57 of the 76 application and account-abstraction
+entries have code on chain 40204; the 19 governance and cooperative entries listed in
+[`verification/claims.json`](../verification/claims.json) (`deployed_contracts`) have no code. Before you
+send value to any address, confirm it has code:
+
+```bash
+cast code <address> --rpc-url https://rpc.citrate.ai   # "0x" means nothing is deployed there
+python3 verification/check_address_code.py --check      # read-only sweep of the whole book
+```
 
 ## Interacting with Contracts
 
 ```bash
-# Query the ModelRegistry on testnet
-cast call 0x02F03Ac1aAFf621D458F403965A3355F720D077b "modelCount()" \
-  --rpc-url https://rpc.citrate.ai
+# Read an address from the book, then query it
+BOOK=contracts/addresses/40204.json
+MODEL_REGISTRY=$(jq -r '.contracts.ModelRegistry' $BOOK)
+WSALT=$(jq -r '.contracts.WrappedSALT' $BOOK)
 
-# Check WrappedSALT supply
-cast call 0x4Cba023420A6B0aeD33204082D9E29f9a450a9A2 "totalSupply()" \
-  --rpc-url https://rpc.citrate.ai
+cast call $MODEL_REGISTRY "modelCount()" --rpc-url https://rpc.citrate.ai
+cast call $WSALT "totalSupply()" --rpc-url https://rpc.citrate.ai
 
 # Deploy your own contract
 forge create src/Counter.sol:Counter --rpc-url https://rpc.citrate.ai \

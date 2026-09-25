@@ -93,7 +93,7 @@ against the Citrate testnet happens there.
 ```bash
 cd tools/citrate-bench
 cargo run --release -- bench \
-  --rpc-url https://rpc2.citrate.ai \
+  --rpc-url https://rpc.citrate.ai \
   --keystore-dir ~/.foundry/keystores \
   --accounts bench-01,bench-02,bench-03 \
   --passphrase-file ~/.bench-pw \

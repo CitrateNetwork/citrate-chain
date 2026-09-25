@@ -71,11 +71,17 @@ Platform-specific installer configs in `installers/linux/`, `installers/macos/`,
 ## Common Workflows
 
 ```bash
-# Bootstrap a full developer environment from a fresh machine
-curl -fsSL https://raw.githubusercontent.com/CitrateNetwork/citrate-chain/main/scripts/bootstrap.sh | bash -s -- --profile developer
+# Bootstrap from a pinned, reviewed ref. Do not pipe a script from the mutable
+# main branch into bash: check out a release tag or a commit you have read.
+git clone https://github.com/CitrateNetwork/citrate-chain.git && cd citrate-chain
+git checkout <release-tag-or-commit>
+less scripts/bootstrap.sh                               # read it before running it
 
-# Bootstrap an agent workstation (best-effort Ollama install included)
-curl -fsSL https://raw.githubusercontent.com/CitrateNetwork/citrate-chain/main/scripts/bootstrap.sh | bash -s -- --profile agent
+# Full developer environment
+./scripts/bootstrap.sh --profile developer
+
+# Agent workstation (best-effort Ollama install included)
+./scripts/bootstrap.sh --profile agent
 
 # Bring up a local testnet, run tests, tear it down
 ./scripts/launch_local_testnet.sh

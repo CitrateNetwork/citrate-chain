@@ -13,7 +13,7 @@
 
 Paraconsistent Consensus unifies BlockDAG consensus and federated meta-learning into a single protocol. The core innovation is a formal aggregation function grounded in Belnap's four-valued logic (FOUR) that classifies each node's model output into one of four epistemic states — relevant (T), irrelevant (F), contradictory (B), or unknown (N) — and preserves all four states through aggregation rather than collapsing them via averaging.
 
-The framework operates **on top of** Citrate's existing GhostDAG consensus with BFT finality checkpoints (Paper I), extending checkpoint commitments to include learning state. Learning never modifies consensus — this is the critical safety invariant.
+The framework operates **on top of** Citrate's GhostDAG consensus and its BFT finality checkpoints (Paper I; checkpoint finality is specified, not yet running on the testnet), extending checkpoint commitments to include learning state. Learning never modifies consensus: this is the critical safety invariant.
 
 **Implementation Status**: `[Specified]` — designed but not yet integrated with the consensus layer. The `core/learning/` crate contains foundation types and algorithms (81 tests) but is not yet wired into the node binary.
 
@@ -292,7 +292,7 @@ Three new optional fields per block for learning-participating nodes:
 
 ### 6.2 Extended Checkpoint Fields
 
-Three new fields at BFT finality checkpoints:
+Three new fields at BFT finality checkpoints (specified; checkpoints are not yet running):
 
 | Field | Type | Purpose |
 |-------|------|---------|

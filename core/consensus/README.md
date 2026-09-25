@@ -6,7 +6,9 @@ GhostDAG consensus engine for the Citrate BlockDAG blockchain.
 
 This crate implements the core consensus layer for Citrate, a DAG-based blockchain using the GhostDAG protocol. Unlike traditional chain-based consensus (GHOST), GhostDAG operates on a directed acyclic graph where blocks can have multiple parents. The protocol partitions blocks into a "blue set" (honest-majority consistent) and a "red set" using a k-cluster rule, then derives a deterministic total ordering over all blocks.
 
-The crate provides the full consensus stack: blue set calculation, tip and parent selection, chain selection with reorganization support, depth-based finality with committee BFT checkpoints, deterministic total ordering of blocks and transactions, and VRF-based proposer election using ECVRF-P256-SHA256 (RFC 9381).
+The crate provides the full consensus stack: blue set calculation, tip and parent selection, chain selection with reorganization support, depth-based finality tracking and committee BFT checkpoint types, deterministic total ordering of blocks and transactions, and VRF-based proposer election using ECVRF-P256-SHA256 (RFC 9381).
+
+**Status on the public testnet (chain 40204).** Confirmation is probabilistic: a block gains weight as later blocks build on it. Checkpoint finality is specified, not running: `CheckpointManager` is constructed by the node, but no production code path calls `propose()` yet. `FinalityTracker` and `ChainSelector::with_finality` are exercised only by tests. The testnet runs a single block producer; stake-gated proposer eligibility is off by default and turns on when a validator registry is configured (`CITRATE_VALIDATOR_REGISTRY`). The 100-member committee with a 67 quorum is the target design. The machine-readable record is `verification/claims.json` (`deterministic_checkpoint_finality`, `consensus_ghostdag`).
 
 The DAG store supports both in-memory operation and persistent write-through to a RocksDB backend via the `KvStore` trait, ensuring DAG state survives node restarts without requiring a full re-sync.
 
@@ -18,11 +20,11 @@ The DAG store supports both in-memory operation and persistent write-through to 
 | `ghostdag` | `src/ghostdag.rs` | GhostDAG consensus engine: blue set calculation, k-cluster rule enforcement, block addition, tip selection by blue score |
 | `dag_store` | `src/dag_store.rs` | DAG storage manager with in-memory maps and optional persistent `KvStore` backend, VRF admission gating, pruning, finalization tracking |
 | `tip_selection` | `src/tip_selection.rs` | Tip selection strategies (highest blue score, tie-breaking, weighted random) and parent selection for new blocks |
-| `chain_selection` | `src/chain_selection.rs` | Chain selection and reorganization manager with finality-aware reorg protection |
-| `finality` | `src/finality.rs` | Depth-based finality tracker with configurable confirmation depth, finality events via broadcast channel, reorg protection |
-| `checkpoint` | `src/checkpoint.rs` | Committee BFT checkpoint system: deterministic committee selection, ed25519-signed checkpoint votes, quorum-based finalization |
+| `chain_selection` | `src/chain_selection.rs` | Chain selection and reorganization manager; finality-aware reorg protection via `with_finality` (not wired in the node today) |
+| `finality` | `src/finality.rs` | Depth-based finality tracker with configurable confirmation depth and finality events via broadcast channel (not constructed by the node today) |
+| `checkpoint` | `src/checkpoint.rs` | Committee BFT checkpoint system: deterministic committee selection, ed25519-signed checkpoint votes, quorum-based finalization (specified and tested; no production caller proposes checkpoints yet) |
 | `ordering` | `src/ordering.rs` | Deterministic total ordering of DAG blocks: selected-parent chain walk with mergeset interleaving, transaction ordering |
-| `vrf` | `src/vrf.rs` | VRF-based proposer selection with stake-weighted eligibility, supports both ECVRF and legacy SHA3 proof verification |
+| `vrf` | `src/vrf.rs` | VRF-based proposer selection with stake-weighted eligibility (stake gating is off by default in the node), supports both ECVRF and legacy SHA3 proof verification |
 | `ecvrf` | `src/ecvrf.rs` | ECVRF-P256-SHA256-TAI implementation per RFC 9381: prove, verify, deterministic nonce generation, proof serialization (114 bytes) |
 | `crypto` | `src/crypto.rs` | Cryptographic operations: ed25519 transaction signing/verification, ECDSA bypass protection (C-01 fix), block signing |
 | `lib` | `src/lib.rs` | Module declarations and public re-exports |
@@ -83,7 +85,7 @@ The pre-2026-04-21 design carried raw GGUF bytes in an `EmbeddedModel.weights: V
 ### Tip & Chain Selection
 - **`TipSelector`** -- Configurable tip selection with `SelectionStrategy` enum
 - **`ParentSelector`** -- Selects (selected_parent, merge_parents) for new blocks
-- **`ChainSelector`** -- Chain selection with reorg detection, finality-aware reorg rejection
+- **`ChainSelector`** -- Chain selection with reorg detection; finality-aware reorg rejection only when built `with_finality` (tests today)
 
 ### Finality
 - **`FinalityTracker`** -- Depth-based finality with configurable `FinalityConfig`
@@ -91,7 +93,7 @@ The pre-2026-04-21 design carried raw GGUF bytes in an `EmbeddedModel.weights: V
 - **`FinalityEvent`** -- Broadcast event when a block becomes final
 
 ### Checkpoints
-- **`CheckpointManager`** -- Propose, vote, and finalize committee BFT checkpoints
+- **`CheckpointManager`** -- Propose, vote, and finalize committee BFT checkpoints (no production caller of `propose()` yet)
 - **`CommitteeSelector::select(validators, height, vrf_seed, size)`** -- Deterministic committee selection
 - **`CheckpointVote`** -- ed25519-signed vote over (height || block_hash)
 

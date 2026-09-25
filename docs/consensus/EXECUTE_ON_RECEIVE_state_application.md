@@ -67,8 +67,9 @@ After a block is DAG-admitted and fork-choice picks the selected chain:
   walk the selected-parent chain from `applied_tip` forward, `apply_block` each in order.
 - **Reorg** — new selected tip is on a different branch: find the common ancestor `A` on the
   current applied chain, **revert state to `A`**, then `apply_block` forward along the new
-  selected chain `A → … → tip`. Bound by finality depth (100) / the nearest BFT checkpoint —
-  never revert below a finalized checkpoint (reject such a reorg as a safety violation).
+  selected chain `A → … → tip`. Design: bound by finality depth (100) and the nearest BFT
+  checkpoint, never reverting below a finalized checkpoint. Checkpoint finality is specified, not
+  running on the testnet (see `verification/claims.json`), so this bound is not in effect today.
 - **Not yet connected** (missing ancestors): defer; the driver re-runs when ancestors arrive.
 
 The producer's local path collapses to the fast path (it already executed while sealing, so
@@ -157,7 +158,8 @@ bad-state_root block is rejected AND leaves state untouched, (c) re-apply is ide
      exists without fork choice, then is drained with it). The fork choice is a boxed async hook
      (GhostDAG in prod, injectable in tests). *Residual:* a state-INVALID block with high blue work
      can still wedge a branch (see step 4 residual) — needs consensus↔execution feedback.
-4. ✅ **Reorg** — revert-to-fork-point + re-apply; finalized floor guard. **DONE** (2026-07-16).
+4. ✅ **Reorg**: revert-to-fork-point + re-apply. **DONE** (2026-07-16). The finalized-floor guard is
+   implemented but has no effect until checkpoint finality runs (it is specified, not running).
    - **Snapshot ring:** `AppliedState` folds the applied tip together with a bounded ring of
      full `StateSnapshot`s (one per applied block, keyed by height, capped at `MAX_REORG_DEPTH`
      = 100). Every state advance — drain apply, producer `record_produced`, and reorg re-apply —
@@ -219,8 +221,9 @@ bad-state_root block is rejected AND leaves state untouched, (c) re-apply is ide
   (`two_node_state_root_parity_with_transactions`, `two_nodes_converge_after_reorg`.)
 - I3 ✅: a rejected (bad-root) block leaves world state byte-identical to before the attempt.
   (`rejects_bad_state_root…`, `reorg_aborts_on_bad_block…`, `follower_rejects_corrupted_state_root`.)
-- I4 ✅: state is never reverted below the last finalized BFT checkpoint. (`reorg_refused_below_finalized_floor`;
-  the floor is synced from `CheckpointManager` in `main.rs`.)
+- I4 (specified): state is never reverted below the last finalized BFT checkpoint. The guard is tested
+  (`reorg_refused_below_finalized_floor`) and the floor is synced from `CheckpointManager` in `main.rs`, but
+  checkpoint finality is not running on the testnet, so the invariant is not in effect there yet.
 - I5 (partial): `applied_tip` is an ancestor-or-equal of the DAG selected tip. The reorg trigger drives
   `applied_tip` toward `select_tip()` after every received block; a fully live cross-check awaits a real
   multi-node deployment (the harness uses an injected fork choice). Tracked for the post-reroll fleet.
