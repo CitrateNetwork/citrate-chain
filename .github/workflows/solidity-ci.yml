@@ -111,7 +111,24 @@ jobs:
       - name: Run Forge tests
         working-directory: contracts
         run: |
-          forge test -vvv --use 0.8.36 --threads 1
+          forge test -vvv --use 0.8.36 --threads 1 --no-match-path test/CoreMembershipCreate2.t.sol
+      # Core-membership frozen CREATE2 projections, compiled in their OWN
+      # (closure-scoped) compilation, like `forge script DeployCoreMembership`.
+      # Why a separate step: under via-IR, solc's output for an unchanged
+      # contract depends on which other sources share the compilation job
+      # (AST ids feed IR function naming). Measured with forge 1.8.3 on main
+      # b10f304 with NO source change: CitrateMemberSBT bytecode is identical
+      # for a src-only and a full build (the pinned one) but differs for
+      # `forge build --skip test`; an unrelated test/script added elsewhere can
+      # therefore move the projection inside the full-build job. The deploy
+      # itself compiles only its script's closure, and a closure-scoped compile
+      # reproduces the pinned addresses exactly. Separate out/cache dirs keep
+      # the full build's artifacts from being reused. Still blocking.
+      - name: Core-membership frozen CREATE2 projections (closure-scoped compile)
+        working-directory: contracts
+        run: |
+          FOUNDRY_OUT=out-membership FOUNDRY_CACHE_PATH=cache-membership \
+            forge test -vvv --use 0.8.36 --threads 1 --match-path test/CoreMembershipCreate2.t.sol
 
   slither:
     if: github.event_name == 'workflow_dispatch'
