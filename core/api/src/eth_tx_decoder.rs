@@ -878,3 +878,20 @@ mod secrem01_exec1_tests {
         assert!(is_high_s(&[0u8; 31]));
     }
 }
+
+#[cfg(test)]
+mod tests_pba_l1a_018 {
+    use super::*;
+
+    /// PBA-L1a-018: signature words are canonical integers of 1..=32 bytes.
+    #[test]
+    fn canonical_sig_word_bounds() {
+        assert!(canonical_sig_word(&[0x01; 33], "r").is_err(), "33 bytes rejected");
+        assert!(canonical_sig_word(&[0x01; 32], "r").is_ok());
+        let short = canonical_sig_word(&[0x01; 31], "r").expect("31 bytes ok");
+        assert_eq!(short.as_bytes()[0], 0, "left-padded");
+        assert!(canonical_sig_word(&[0x00, 0x01], "r").is_err(), "leading zero");
+        assert!(canonical_y_parity(1).is_ok());
+        assert!(canonical_y_parity(2).is_err());
+    }
+}

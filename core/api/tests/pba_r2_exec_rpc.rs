@@ -235,6 +235,23 @@ fn pba_l1a_010_filter_criteria_are_bounded() {
         Some(-32602),
         "33 topic alternatives"
     );
+    // Exactly at the caps is accepted.
+    let addrs32 = vec!["\"0x0000000000000000000000000000000000000001\""; 32].join(",");
+    let req = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"eth_newFilter","params":[{{"address":[{addrs32}]}}]}}"#
+    );
+    assert!(
+        call(&io, &req)["result"].is_string(),
+        "32 addresses accepted"
+    );
+    let alts32 = vec![h; 32].join(",");
+    let req = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"eth_newFilter","params":[{{"topics":[[{alts32}]]}}]}}"#
+    );
+    assert!(
+        call(&io, &req)["result"].is_string(),
+        "32 alternatives accepted"
+    );
     // Normal-shaped criteria still work.
     let req = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"eth_newFilter","params":[{{"topics":[{h},null,[{h},{h}],null]}}]}}"#

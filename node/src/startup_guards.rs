@@ -137,6 +137,13 @@ mod tests {
             resolve_require_valid_signature(Some("1"), true, false),
             Ok(true)
         );
+        // an explicit "on" wins over the devnet default (off)
+        for v in ["1", "true", "yes", "on"] {
+            assert_eq!(
+                resolve_require_valid_signature(Some(v), false, true),
+                Ok(true)
+            );
+        }
         // devnet build keeps its historical default (off) only when unset
         assert_eq!(
             resolve_require_valid_signature(None, false, true),

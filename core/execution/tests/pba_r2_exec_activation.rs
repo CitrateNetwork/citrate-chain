@@ -328,7 +328,20 @@ fn pba_l1a_013_merkle_second_preimage_rejected_after_activation() {
 #[test]
 fn pba_l1a_013_index_must_fit_depth() {
     use citrate_execution::precompiles::verify::merkle_verify_tensor_hardened;
-    let (_, honest) = merkle_inputs();
+    let (forged, honest) = merkle_inputs();
+    // The audit forgery (index = an inner-node hash, depth 0) is rejected by
+    // the hardened entry point itself (mutation-killer for the `fits` check).
+    assert_eq!(
+        merkle_verify_tensor_hardened(&forged, 1_000_000)
+            .expect("run")
+            .output[31],
+        0
+    );
+    // A depth-32 proof takes every low-32-bit index (no shift overflow).
+    let mut deep = vec![0u8; 97 + 32 * 32];
+    deep[60..64].copy_from_slice(&u32::MAX.to_be_bytes());
+    deep[96] = 32;
+    merkle_verify_tensor_hardened(&deep, 10_000_000).expect("depth 32 runs");
     // index 1 at depth 1 fits; index 2 at depth 1 does not.
     let mut bad = honest.clone();
     bad[63] = 2;
@@ -352,6 +365,35 @@ fn pba_l1a_013_index_must_fit_depth() {
             .expect("run")
             .output[31],
         0
+    );
+    // A proof that is VALID under the legacy rule but whose index has bits
+    // above the low 32 (index = 2^40 + 1, depth 1): legacy accepts it (the
+    // path only reads bit 0), hardened must not. Kills `high_zero || ..`.
+    use ark_bn254::Fr;
+    use citrate_execution::zkp::poseidon_bn254::poseidon_hash;
+    let idx = Fr::from((1u64 << 40) + 1);
+    let leaf = poseidon_hash(&[idx, Fr::from(5u64)]);
+    let sib = Fr::from(77u64);
+    let root = poseidon_hash(&[sib, leaf]); // bit 0 = 1 => right child
+    let mut wide = Vec::new();
+    wide.extend_from_slice(&be32(root));
+    wide.extend_from_slice(&be32(idx));
+    wide.extend_from_slice(&be32(Fr::from(5u64)));
+    wide.push(1);
+    wide.extend_from_slice(&be32(sib));
+    assert_eq!(
+        citrate_execution::precompiles::verify::merkle_verify_tensor(&wide, 1_000_000)
+            .expect("run")
+            .output[31],
+        1,
+        "legacy verifies the wide-index proof"
+    );
+    assert_eq!(
+        merkle_verify_tensor_hardened(&wide, 1_000_000)
+            .expect("run")
+            .output[31],
+        0,
+        "hardened rejects an index wider than the proof depth"
     );
 }
 
@@ -382,5 +424,36 @@ fn pba_l1a_025_belnap_gas_scales_with_participants_after_activation() {
         gas_for(&one, true),
         gas_for(&one, false),
         "n=1 costs the same as before"
+    );
+}
+
+#[test]
+fn pba_l1a_025_belnap_charges_the_hardened_price() {
+    use citrate_execution::precompiles::q16::belnap::{execute_at, gas_for};
+    let mut header = Vec::new();
+    header.extend_from_slice(&1u32.to_be_bytes()); // dim = 1
+    header.extend_from_slice(&1024u32.to_be_bytes()); // n = 1024
+    let need = gas_for(&header, true);
+    // One unit short of the hardened price is out of gas even though it is
+    // far above the legacy price; the exact price passes the gas check
+    // (the truncated body then fails decoding, which is not a gas error).
+    let short = execute_at(&header, need - 1, true).expect_err("must be out of gas");
+    assert!(short.to_string().contains("insufficient gas"), "{short}");
+    let below_base = execute_at(&header, 1_999, true).expect_err("below base");
+    assert!(
+        below_base.to_string().contains("insufficient gas"),
+        "{below_base}"
+    );
+    let exact = execute_at(&header, need, true).expect_err("truncated body");
+    assert!(!exact.to_string().contains("insufficient gas"), "{exact}");
+    // dim = 0: the price is exactly GAS_BASE, which must be enough.
+    let at_base = execute_at(&[0u8; 8], 2_000, true);
+    if let Err(e) = at_base {
+        assert!(!e.to_string().contains("insufficient gas"), "{e}");
+    }
+    let legacy_ok = execute_at(&header, 2_050, false).expect_err("truncated body");
+    assert!(
+        !legacy_ok.to_string().contains("insufficient gas"),
+        "{legacy_ok}"
     );
 }

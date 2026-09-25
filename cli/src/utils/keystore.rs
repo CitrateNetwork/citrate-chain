@@ -257,6 +257,26 @@ mod tests_pba_l4_009 {
         let r = r.expect("load_key must not panic on an 11-byte nonce");
         assert!(r.is_err(), "an 11-byte nonce must be rejected");
     }
+
+    /// Variant sweep (load_key validation): a v2 keystore of a non-ed25519
+    /// key type is refused; a v1 entry is not type-checked (legacy format).
+    #[test]
+    fn pba_l4_009_key_type_is_checked_for_v2() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("ks.json");
+        let key = SigningKey::from_bytes(&[4u8; 32]);
+        save_key(&key, "correct horse battery", &path).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let mut v: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        v["key_type"] = serde_json::Value::String("secp256k1".into());
+        std::fs::write(&path, v.to_string()).expect("write");
+        let err = load_key(&path, "correct horse battery").expect_err("v2 non-ed25519");
+        assert!(err.to_string().contains("Unsupported key type"), "{err}");
+        v["version"] = serde_json::json!(1);
+        std::fs::write(&path, v.to_string()).expect("write");
+        let ok = load_key(&path, "correct horse battery").expect("v1 skips the type check");
+        assert_eq!(ok.to_bytes(), key.to_bytes());
+    }
 }
 
 #[cfg(test)]
