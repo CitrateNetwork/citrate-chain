@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
 import {CrossOrgEnvelope} from "../../src/defense_prime/CrossOrgEnvelope.sol";
+import {QuorumIdentity} from "../../src/quorum/QuorumIdentity.sol";
 
 contract CrossOrgEnvelopeTest is Test {
     CrossOrgEnvelope internal env;
@@ -18,13 +19,34 @@ contract CrossOrgEnvelopeTest is Test {
     bytes32 internal constant TIER1 = keccak256("tier1-root");
     bytes32 internal constant DOD = keccak256("dod-root");
 
-    bytes32 internal constant SIG_B1 = keccak256("defense_prime-co");
-    bytes32 internal constant SIG_B2 = keccak256("defense_prime-pm");
-    bytes32 internal constant SIG_T1 = keccak256("tier1-sales");
-    bytes32 internal constant SIG_T2 = keccak256("tier1-pm");
-    bytes32 internal constant SIG_D1 = keccak256("dod-pm");
+    // PBA-L2-014/-036: a signer identity is the subject key of its own address,
+    // and that address (registered for its org) signs for itself.
+    address internal constant A_B1 = address(0xB1);
+    address internal constant A_B2 = address(0xB2);
+    address internal constant A_T1 = address(0x71);
+    address internal constant A_T2 = address(0x72);
+    address internal constant A_D1 = address(0xD1);
+    bytes32 internal SIG_B1;
+    bytes32 internal SIG_B2;
+    bytes32 internal SIG_T1;
+    bytes32 internal SIG_T2;
+    bytes32 internal SIG_D1;
+    mapping(bytes32 => address) internal _addr;
+    /// PBA-L2-036: acceptance is the counterparty's act (a TIER1 recorder).
+    address internal counterparty;
 
     function setUp() public {
+        SIG_B1 = QuorumIdentity.subjectKey(A_B1);
+        SIG_B2 = QuorumIdentity.subjectKey(A_B2);
+        SIG_T1 = QuorumIdentity.subjectKey(A_T1);
+        SIG_T2 = QuorumIdentity.subjectKey(A_T2);
+        SIG_D1 = QuorumIdentity.subjectKey(A_D1);
+        _addr[SIG_B1] = A_B1;
+        _addr[SIG_B2] = A_B2;
+        _addr[SIG_T1] = A_T1;
+        _addr[SIG_T2] = A_T2;
+        _addr[SIG_D1] = A_D1;
+        counterparty = makeAddr("tier1-recorder");
         governance = makeAddr("governance");
         recorder = makeAddr("recorder");
         nobody = makeAddr("nobody");
@@ -39,6 +61,14 @@ contract CrossOrgEnvelopeTest is Test {
         env.setOrgRecorder(DEFENSE_PRIME, recorder, true);
         env.setOrgRecorder(TIER1, recorder, true);
         env.setOrgRecorder(DOD, recorder, true);
+        // Each signer is registered for its own org and signs as itself.
+        env.setOrgRecorder(DEFENSE_PRIME, A_B1, true);
+        env.setOrgRecorder(DEFENSE_PRIME, A_B2, true);
+        env.setOrgRecorder(TIER1, A_T1, true);
+        env.setOrgRecorder(TIER1, A_T2, true);
+        env.setOrgRecorder(DOD, A_D1, true);
+        env.setRecorder(counterparty, true);
+        env.setOrgRecorder(TIER1, counterparty, true);
         vm.stopPrank();
     }
 
@@ -156,7 +186,7 @@ contract CrossOrgEnvelopeTest is Test {
 
     function test_first_signature_transitions_drafted_to_signing() public {
         _draft_2org_2of2();
-        vm.prank(recorder);
+        vm.prank(_addr[SIG_B1]);
         env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
         assertEq(env.getEnvelope(ENV_1).state, 2);
         assertEq(env.signedCountOf(ENV_1, DEFENSE_PRIME), 1);
@@ -164,51 +194,60 @@ contract CrossOrgEnvelopeTest is Test {
 
     function test_sign_rejects_non_required_signer() public {
         _draft_2org_2of2();
-        vm.prank(recorder);
+        // PBA-L2-014: a DEFENSE_PRIME-registered key signing as itself, but not
+        // in the required set, is refused.
+        bytes32 me = QuorumIdentity.subjectKey(recorder);
         vm.expectRevert(
             abi.encodeWithSelector(
                 CrossOrgEnvelope.NotRequiredSigner.selector,
                 ENV_1,
                 DEFENSE_PRIME,
-                SIG_T1
+                me
             )
         );
-        env.sign(ENV_1, DEFENSE_PRIME, SIG_T1);
+        vm.prank(recorder);
+        env.sign(ENV_1, DEFENSE_PRIME, me);
     }
 
     function test_sign_rejects_unknown_org() public {
         _draft_2org_2of2();
-        vm.prank(recorder);
         vm.expectRevert(
             abi.encodeWithSelector(CrossOrgEnvelope.UnknownOrg.selector, ENV_1, DOD)
         );
+        vm.prank(_addr[SIG_D1]);
         env.sign(ENV_1, DOD, SIG_D1);
     }
 
     function test_sign_rejects_duplicate_signer() public {
         _draft_2org_2of2();
-        vm.startPrank(recorder);
+        vm.prank(_addr[SIG_B1]);
         env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
+        vm.startPrank(recorder);
         vm.expectRevert(
             abi.encodeWithSelector(CrossOrgEnvelope.AlreadySigned.selector, ENV_1, SIG_B1)
         );
-        env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
         vm.stopPrank();
+        vm.prank(_addr[SIG_B1]);
+        env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
     }
 
     function test_all_orgs_met_transitions_to_signed() public {
         _draft_2org_2of2();
-        vm.startPrank(recorder);
+        vm.prank(_addr[SIG_B1]);
         env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
+        vm.prank(_addr[SIG_B2]);
         env.sign(ENV_1, DEFENSE_PRIME, SIG_B2);
+        vm.startPrank(recorder);
         // DefensePrime threshold met, Tier-1 not yet; state stays Signing.
         assertEq(env.getEnvelope(ENV_1).state, 2);
         assertTrue(env.isOrgThresholdMet(ENV_1, DEFENSE_PRIME));
         assertFalse(env.isAllOrgsMet(ENV_1));
 
-        env.sign(ENV_1, TIER1, SIG_T1);
-        env.sign(ENV_1, TIER1, SIG_T2);
         vm.stopPrank();
+        vm.prank(_addr[SIG_T1]);
+        env.sign(ENV_1, TIER1, SIG_T1);
+        vm.prank(_addr[SIG_T2]);
+        env.sign(ENV_1, TIER1, SIG_T2);
         // Both orgs met → Signed.
         assertEq(env.getEnvelope(ENV_1).state, 3);
         assertTrue(env.isAllOrgsMet(ENV_1));
@@ -226,10 +265,10 @@ contract CrossOrgEnvelopeTest is Test {
         vm.prank(recorder);
         env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, deadline, SCOPE, 0);
         vm.roll(deadline + 1);
-        vm.prank(recorder);
         vm.expectRevert(
             abi.encodeWithSelector(CrossOrgEnvelope.Expired.selector, deadline, deadline + 1)
         );
+        vm.prank(_addr[SIG_B1]);
         env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
     }
 
@@ -237,12 +276,14 @@ contract CrossOrgEnvelopeTest is Test {
 
     function _all_signed() internal {
         _draft_2org_2of2();
-        vm.startPrank(recorder);
+        vm.prank(_addr[SIG_B1]);
         env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
+        vm.prank(_addr[SIG_B2]);
         env.sign(ENV_1, DEFENSE_PRIME, SIG_B2);
+        vm.prank(_addr[SIG_T1]);
         env.sign(ENV_1, TIER1, SIG_T1);
+        vm.prank(_addr[SIG_T2]);
         env.sign(ENV_1, TIER1, SIG_T2);
-        vm.stopPrank();
     }
 
     function test_markDelivered_only_from_signed() public {
@@ -261,7 +302,10 @@ contract CrossOrgEnvelopeTest is Test {
         vm.startPrank(recorder);
         env.markDelivered(ENV_1);
         assertEq(env.getEnvelope(ENV_1).state, 4);
+        vm.stopPrank();
+        vm.prank(counterparty);
         env.accept(ENV_1);
+        vm.startPrank(recorder);
         assertEq(env.getEnvelope(ENV_1).state, 5);
         env.close(ENV_1);
         assertEq(env.getEnvelope(ENV_1).state, 7);
@@ -273,6 +317,7 @@ contract CrossOrgEnvelopeTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(CrossOrgEnvelope.NotInState.selector, ENV_1, 4, 3)
         );
+        vm.prank(counterparty);
         env.accept(ENV_1);
     }
 
@@ -310,15 +355,19 @@ contract CrossOrgEnvelopeTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(CrossOrgEnvelope.NotInState.selector, ENV_1, 1, 6)
         );
-        env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
         vm.stopPrank();
+        vm.prank(_addr[SIG_B1]);
+        env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
     }
 
     function test_cannot_reject_terminal() public {
         _all_signed();
         vm.startPrank(recorder);
         env.markDelivered(ENV_1);
+        vm.stopPrank();
+        vm.prank(counterparty);
         env.accept(ENV_1);
+        vm.startPrank(recorder);
         env.close(ENV_1);
         vm.stopPrank();
         vm.prank(recorder);
@@ -384,10 +433,13 @@ contract CrossOrgEnvelopeTest is Test {
         signers[2][0] = SIG_D1;
         vm.startPrank(recorder);
         env.draft(ENV_1, ART_ROOT, ART_CID, orgs, ths, signers, 0, SCOPE, 0);
-        env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
-        env.sign(ENV_1, TIER1, SIG_T1);
-        env.sign(ENV_1, DOD, SIG_D1);
         vm.stopPrank();
+        vm.prank(_addr[SIG_B1]);
+        env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
+        vm.prank(_addr[SIG_T1]);
+        env.sign(ENV_1, TIER1, SIG_T1);
+        vm.prank(_addr[SIG_D1]);
+        env.sign(ENV_1, DOD, SIG_D1);
         assertEq(env.getEnvelope(ENV_1).state, 3); // Signed
     }
 

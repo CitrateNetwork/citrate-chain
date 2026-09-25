@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
 import {CrossOrgEnvelope} from "../../src/defense_prime/CrossOrgEnvelope.sol";
+import {QuorumIdentity} from "../../src/quorum/QuorumIdentity.sol";
 
 /// @title RM-Q · CHAIN-B-C026 — one recorder forges every org's sigs;
 ///         permissionless delivery skips the rejection window
@@ -23,8 +24,10 @@ contract RmQ_C026 is Test {
     bytes32 internal constant ENV_1 = keccak256("env-1");
     bytes32 internal constant DEFENSE_PRIME = keccak256("defense_prime-root");
     bytes32 internal constant TIER1 = keccak256("tier1-root");
-    bytes32 internal constant SIG_B1 = keccak256("defense_prime-co");
-    bytes32 internal constant SIG_T1 = keccak256("tier1-sales");
+    // PBA-L2-014/-036: signer ids are the subject keys of the signing keys.
+    address internal tier1Rec = address(0x7E1);
+    bytes32 internal SIG_B1 = QuorumIdentity.subjectKey(address(0xB0E));
+    bytes32 internal SIG_T1 = QuorumIdentity.subjectKey(address(0x7E1));
 
     function setUp() public {
         vm.prank(governance);
@@ -75,11 +78,11 @@ contract RmQ_C026 is Test {
     /// caller attempts markDelivered.
     function test_C026_anon_cannot_advance_delivery() public {
         vm.prank(governance);
-        env.setOrgRecorder(TIER1, defense_primeRec, true); // give a real per-org path
-        vm.startPrank(defense_primeRec);
+        env.setOrgRecorder(TIER1, tier1Rec, true); // give a real per-org path
+        vm.prank(defense_primeRec);
         env.sign(ENV_1, DEFENSE_PRIME, SIG_B1);
+        vm.prank(tier1Rec);
         env.sign(ENV_1, TIER1, SIG_T1);
-        vm.stopPrank();
         assertEq(env.getEnvelope(ENV_1).state, 3); // Signed
 
         vm.prank(attacker);
