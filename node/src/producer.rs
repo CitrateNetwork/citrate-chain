@@ -990,7 +990,7 @@ impl BlockProducer {
         // Failing loudly is strictly better: a missing selected parent means this
         // node's view is behind, so the correct behaviour is to skip this round
         // and let the sync path fetch the block, not to mint an invalid one.
-        let (last_height, parent_vrf_output, parent_blue_score, parent_blue_work) =
+        let (last_height, parent_vrf_output, parent_blue_score, parent_blue_work, parent_ts) =
             if selected_parent != Hash::default() {
                 let parent = self
                     .storage
@@ -1017,9 +1017,10 @@ impl BlockProducer {
                     parent.header.vrf_reveal.output,
                     parent.header.blue_score,
                     parent.header.blue_work,
+                    Some(parent.header.timestamp),
                 )
             } else {
-                (0, Hash::default(), 0, 0)
+                (0, Hash::default(), 0, 0, None)
             };
 
         // BLUE SCORE — `parent_blue_score + 1`, deliberately.
@@ -1092,7 +1093,16 @@ impl BlockProducer {
             block_hash: Hash::default(), // Will be computed
             selected_parent_hash: selected_parent,
             merge_parent_hashes: merge_parents,
-            timestamp: chrono::Utc::now().timestamp() as u64,
+            // PBA-L1b-003: never stamp before the selected parent (a
+            // future-dated tip made every `now`-stamped child invalid: a
+            // permanent halt) and never past the parent-relative bound.
+            timestamp: {
+                let now = chrono::Utc::now().timestamp().max(0) as u64;
+                match parent_ts {
+                    Some(pts) => citrate_consensus::hardening::producer_timestamp(now, pts),
+                    None => now,
+                }
+            },
             height: last_height + 1,
             blue_score,
             blue_work,
@@ -3428,5 +3438,28 @@ mod pba_l1a_001_producer_supervision {
              supervised_round, never await produce_block() inline"
         );
         assert!(!body.contains("self.produce_block().await"));
+    }
+}
+
+/// PBA-L1b-003 tripwire: the producer never stamps a bare `now`; it stamps
+/// `hardening::producer_timestamp(now, parent.ts)` so a future-dated tip can
+/// never make its own children invalid.
+#[cfg(test)]
+mod pba_l1b_003_producer_timestamp {
+    #[test]
+    fn header_timestamp_goes_through_producer_timestamp() {
+        let src = include_str!("producer.rs");
+        let hdr = src
+            .find("let mut header = BlockHeader {")
+            .expect("producer header construction");
+        let body = &src[hdr..hdr + 1_500];
+        assert!(
+            body.contains("hardening::producer_timestamp(now, pts)"),
+            "PBA-L1b-003: header.timestamp must be producer_timestamp(now, parent.ts)"
+        );
+        assert!(
+            !body.contains("timestamp: chrono::Utc::now().timestamp() as u64"),
+            "PBA-L1b-003: bare `now` stamping reintroduced"
+        );
     }
 }

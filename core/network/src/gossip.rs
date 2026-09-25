@@ -562,7 +562,8 @@ impl GossipProtocol {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if block.header.timestamp > now + 900 {
+        // Shared with the sync ingress (PBA-L1b-003); saturating.
+        if !citrate_consensus::hardening::within_future_drift(block.header.timestamp, now) {
             warn!("[TIMESTAMP_FUTURE] block={} ts={} now={}", block.header.block_hash, block.header.timestamp, now);
             return false;
         }

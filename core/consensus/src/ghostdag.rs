@@ -1058,6 +1058,28 @@ impl GhostDag {
             )));
         }
 
+        // PBA-L1b-003: and it may not run more than
+        // MAX_BLOCK_TIMESTAMP_ADVANCE_SECS ahead of it. Without an upper bound
+        // one block stamped u64::MAX became the tip and every honest child
+        // (stamped `now`) failed the monotonic check above: a permanent halt.
+        // Parent-relative so it is deterministic (a wall-clock bound is local
+        // policy, enforced at ingress). Height-gated: history is never
+        // re-judged under a new rule.
+        if self.pba_hardening.active_at(header.height) {
+            let max_ts = sp
+                .header
+                .timestamp
+                .saturating_add(crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS);
+            if header.timestamp > max_ts {
+                return Err(GhostDagError::InvalidLinkage(format!(
+                    "timestamp {} is more than {}s past selected parent's {} (PBA-L1b-003)",
+                    header.timestamp,
+                    crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS,
+                    sp.header.timestamp
+                )));
+            }
+        }
+
         // Selected-parent rule + merge-parent existence.
         for mp in merge_parents {
             let mp_block = self

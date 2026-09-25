@@ -583,7 +583,27 @@ impl SyncManager {
         let mut validated = Vec::with_capacity(total);
         let mut rejected = 0usize;
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         for block in blocks {
+            // 0. PBA-L1b-003: the same wall-clock future bound gossip applies.
+            // This path (which also receives unsolicited `Blocks`) skipped it,
+            // so a u64::MAX-timestamp block entered via sync. Local policy,
+            // not a validity rule: a block rejected now is accepted once its
+            // time arrives.
+            if !citrate_consensus::hardening::within_future_drift(block.header.timestamp, now) {
+                warn!(
+                    "SYNC_REJECT: block height={} timestamp {} is beyond now+{}s",
+                    block.header.height,
+                    block.header.timestamp,
+                    citrate_consensus::hardening::MAX_FUTURE_BLOCK_DRIFT_SECS
+                );
+                rejected += 1;
+                continue;
+            }
+
             // 1. Verify canonical hash integrity
             if !block.verify_hash() {
                 warn!(
