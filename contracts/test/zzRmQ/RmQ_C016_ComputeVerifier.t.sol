@@ -60,11 +60,11 @@ contract RmQ_C016_ComputeVerifier is Test {
         );
     }
 
-    /// GREEN: a replayed ZK proof cannot settle a second job — even one
-    /// with IDENTICAL commitments whose provider commits to the replayed
-    /// bytes. PBA-L2-004: ZK proof material is consumed globally and the
-    /// replay reverts (so it can never get anyone slashed).
-    /// RED (pre-C016): job 2 is Valid.
+    /// GREEN: a replayed ZK proof cannot settle a second job whose
+    /// provider did not commit to it BEFORE it was revealed. PBA-L2-004:
+    /// proofs are bound to their job by commit-reveal (and by the job's
+    /// input/model/output commitments); the used-proof set is per job.
+    /// RED (pre-C016): job 2 is Valid with job 1's replayed bytes.
     function test_C016_zk_proof_cannot_settle_two_jobs() public {
         vm.mockCall(address(0x0108), new bytes(0), abi.encode(uint256(1)));
         bytes memory proof = hex"aabbccdd";
@@ -76,11 +76,12 @@ contract RmQ_C016_ComputeVerifier is Test {
         for (uint256 j = 1; j <= 2; j++) {
             verifier.configureJob(j, 100 ether, ComputeVerifier.VerificationTier.ZKProof);
             verifier.bindJob(j, inC, modelC);
-            verifier.submitCommitment(j, address(0xBEEF), verifier.zkProofCommitment(j, proofData));
         }
+        verifier.submitCommitment(1, address(0xBEEF), verifier.zkProofCommitment(1, proofData));
+        // Job 2's provider committed before job 1's proof was public.
+        verifier.submitCommitment(2, address(0xCAFE), keccak256("job-2 own commitment"));
         vm.roll(block.number + 1);
         assertTrue(verifier.verifyZKProof(1, proof, publicInputs), "job 1 proof verifies");
-        vm.expectRevert(bytes("ComputeVerifier: proof already used"));
-        verifier.verifyZKProof(2, proof, publicInputs);
+        assertFalse(verifier.verifyZKProof(2, proof, publicInputs), "C016: replayed ZK proof must not settle a 2nd job");
     }
 }
