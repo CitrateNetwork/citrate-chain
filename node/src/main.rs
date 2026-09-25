@@ -1412,6 +1412,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         require_valid_signature,
         chain_id: config.chain.chain_id,
         max_nonce_gap: 16, // RM-B1 / WP-C4.1 (audit M-SEQ-01): Geth default
+    })
+    // PBA-L1a-001: bound admitted nonces against the sender's COMMITTED nonce
+    // (stale and far-future nonces rejected on every ingress, new senders too).
+    .with_state_nonce_reader({
+        let exec = executor.clone();
+        Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
+            exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
+        })
     }));
 
     // Create peer manager

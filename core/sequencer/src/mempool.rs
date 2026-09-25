@@ -276,6 +276,12 @@ impl BoundedHashSet {
     }
 }
 
+/// PBA-L1a-001: reads a sender's COMMITTED (on-chain) nonce. The node wires
+/// this to the executor so admission can bound a new sender's nonce against
+/// state instead of accepting any value (the per-sender gap check only sees
+/// txs already buffered here).
+pub type StateNonceReader = Arc<dyn Fn(&PublicKey) -> u64 + Send + Sync>;
+
 /// Transaction mempool
 pub struct Mempool {
     /// Configuration
@@ -322,6 +328,9 @@ pub struct Mempool {
 
     /// Total size of transactions in bytes
     total_size: Arc<RwLock<usize>>,
+
+    /// PBA-L1a-001: optional committed-nonce reader (see [`StateNonceReader`]).
+    state_nonce: Option<StateNonceReader>,
 }
 
 impl Mempool {
@@ -339,7 +348,16 @@ impl Mempool {
             // SECREM-01 CONS-4: bounded dedup set (was an unbounded HashSet)
             evicted: Arc::new(RwLock::new(BoundedHashSet::new(EVICTED_CAP))),
             total_size: Arc::new(RwLock::new(0)),
+            state_nonce: None,
         }
+    }
+
+    /// PBA-L1a-001: bound admitted nonces against the sender's committed
+    /// nonce: reject `nonce < state` (stale) and `nonce > state +
+    /// max_nonce_gap` (unselectable gap-junk), for new senders too.
+    pub fn with_state_nonce_reader(mut self, reader: StateNonceReader) -> Self {
+        self.state_nonce = Some(reader);
+        self
     }
 
     /// Add a transaction to the mempool
@@ -433,6 +451,19 @@ impl Mempool {
             }
         }
 
+        // PBA-L1a-001: `u64::MAX` can never be followed (the sender's next
+        // nonce would overflow), so it is never a valid nonce to admit. Before
+        // this check a fresh key's validly signed `nonce = u64::MAX` tx was
+        // admitted — the gap check above only runs for a sender that already
+        // has pending txs — and `get_best_transactions` panicked on
+        // `nonce + 1`, killing the producer task. Every ingress (RPC, P2P
+        // `NewTransaction` and `Transactions`) goes through here.
+        if tx.nonce == u64::MAX {
+            return Err(MempoolError::InvalidTransaction(
+                "nonce u64::MAX is not admissible (PBA-L1a-001)".into(),
+            ));
+        }
+
         // Check mempool size limit
         if self.transactions.read().await.len() >= self.config.max_size {
             // Try to evict lower priority transaction
@@ -500,6 +531,23 @@ impl Mempool {
     /// Validate a transaction
     async fn validate_transaction(&self, tx: &Transaction) -> Result<(), MempoolError> {
         tracing::debug!("Validating transaction with hash: {:?}", tx.hash);
+
+        if let Some(read_state_nonce) = &self.state_nonce {
+            let state_nonce = read_state_nonce(&tx.from);
+            if tx.nonce < state_nonce {
+                return Err(MempoolError::NonceTooLow {
+                    expected: state_nonce,
+                    got: tx.nonce,
+                });
+            }
+            if tx.nonce - state_nonce > self.config.max_nonce_gap {
+                return Err(MempoolError::InvalidTransaction(format!(
+                    "nonce {} is more than {} ahead of the sender's committed nonce {} \
+                     (PBA-L1a-001)",
+                    tx.nonce, self.config.max_nonce_gap, state_nonce
+                )));
+            }
+        }
 
         // Basic sanity checks
 
@@ -851,7 +899,7 @@ impl Mempool {
         let set = self.sender_nonces.read().await;
         set.get(sender)
             .and_then(|s| s.iter().next_back().copied())
-            .map(|n| n + 1)
+            .and_then(|n| n.checked_add(1))
     }
 
     /// Get AI transactions (model operations, inference requests)
@@ -925,8 +973,14 @@ impl Mempool {
                         None => true,
                     };
                     if ok {
+                        // PBA-L1a-001: `nonce + 1` panicked (overflow-checks) on
+                        // a u64::MAX nonce and killed the producer task. A tx
+                        // whose successor nonce does not exist is skipped.
+                        let Some(successor) = mtx.tx.nonce.checked_add(1) else {
+                            continue;
+                        };
                         total_size += mtx.size;
-                        next_nonce.insert(sender, mtx.tx.nonce + 1);
+                        next_nonce.insert(sender, successor);
                         selected.push(mtx.tx.clone());
                         progressed = true;
                         if selected.len() >= max_count {
@@ -969,7 +1023,7 @@ impl Mempool {
 
             // Check if this tx has the next nonce
             match highest_included_nonce {
-                Some(nonce) => tx.nonce == nonce + 1,
+                Some(nonce) => nonce.checked_add(1) == Some(tx.nonce),
                 None => {
                     // No txs from this sender included yet, allow contiguous sequence starting at the minimal nonce
                     let txs_guard = self.transactions.read().await;
@@ -1289,6 +1343,53 @@ mod tests {
             chain_id: Some(40204), // M-01: chain domain binding — matches canonical default
             ..Default::default()
         }
+    }
+
+    /// PBA-L1a-001 defence in depth: even if a `nonce = u64::MAX` tx reached
+    /// the pool by some path that skipped admission (an older binary's state,
+    /// a future ingress), selection must skip it, not panic. Inserted directly
+    /// into the internal maps to bypass the admission check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pba_l1a_001_selection_skips_unfollowable_nonce_without_panicking() {
+        let mp = std::sync::Arc::new(Mempool::new(MempoolConfig::default()));
+        let poison = create_test_tx(u64::MAX, 5_000_000_000, [7; 32]);
+        let honest = create_test_tx(0, 1_000_000_000, [8; 32]);
+        for tx in [poison.clone(), honest.clone()] {
+            let prio = TxPriority::new_with_ai(tx.gas_price, TxClass::Standard, 0, 0);
+            mp.transactions.write().await.insert(
+                tx.hash,
+                MempoolTx {
+                    tx: tx.clone(),
+                    class: TxClass::Standard,
+                    priority: prio,
+                    added_at: 0,
+                    size: 100,
+                },
+            );
+            mp.priority_queue.write().await.push(tx.hash, prio);
+            mp.by_sender
+                .write()
+                .await
+                .entry(tx.from)
+                .or_default()
+                .push_back(tx.hash);
+            mp.sender_nonces
+                .write()
+                .await
+                .entry(tx.from)
+                .or_default()
+                .insert(tx.nonce);
+        }
+        let mp2 = mp.clone();
+        let sel = tokio::spawn(async move { mp2.get_best_transactions(100, 1 << 20).await })
+            .await
+            .expect("PBA-L1a-001: selection panicked on a u64::MAX nonce");
+        assert_eq!(sel.len(), 1, "the unfollowable tx is skipped, the honest one selected");
+        assert_eq!(sel[0].hash, honest.hash);
+        assert_eq!(mp.pending_nonce_for(&poison.from).await, None);
+        // The successor of an included u64::MAX nonce does not exist.
+        let included: HashSet<Hash> = [poison.hash].into_iter().collect();
+        assert!(!mp.is_next_nonce(&poison, &included).await);
     }
 
     /// SEQ-H2: scoring a tx with `gas_price = u64::MAX` must not panic. Pre-fix

@@ -173,6 +173,44 @@ pub struct BlockProducer {
     applied_tip_lock: Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>>,
 }
 
+/// PBA-L1a-001: outcome of one supervised production round.
+#[derive(Debug)]
+pub(crate) enum RoundOutcome<T> {
+    Produced(T),
+    Failed(anyhow::Error),
+    Panicked(String),
+}
+
+/// Run one production round in its own task so a panic inside it is caught
+/// (tokio reports it through the `JoinError`) instead of unwinding the
+/// long-lived producer loop.
+async fn supervised_round(producer: Arc<BlockProducer>) -> RoundOutcome<Hash> {
+    run_supervised(async move { producer.produce_block().await }).await
+}
+
+/// Generic form of [`supervised_round`], separated so the panic path is
+/// unit-testable without a full producer.
+pub(crate) async fn run_supervised<T, F>(round: F) -> RoundOutcome<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+{
+    match tokio::spawn(round).await {
+        Ok(Ok(v)) => RoundOutcome::Produced(v),
+        Ok(Err(e)) => RoundOutcome::Failed(e),
+        Err(join) if join.is_panic() => {
+            let payload = join.into_panic();
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            RoundOutcome::Panicked(msg)
+        }
+        Err(join) => RoundOutcome::Failed(anyhow::anyhow!("production round cancelled: {join}")),
+    }
+}
+
 impl BlockProducer {
     #[allow(dead_code)]
     pub fn new(
@@ -793,8 +831,8 @@ impl BlockProducer {
                 continue;
             }
 
-            match self.produce_block().await {
-                Ok(block_hash) => {
+            match supervised_round(self.clone()).await {
+                RoundOutcome::Produced(block_hash) => {
                     block_count += 1;
                     info!(
                         "Produced block #{} hash={} txs={}",
@@ -803,8 +841,21 @@ impl BlockProducer {
                         0, // We'll get tx count from block
                     );
                 }
-                Err(e) => {
+                RoundOutcome::Failed(e) => {
                     error!("Failed to produce block: {}", e);
+                }
+                RoundOutcome::Panicked(msg) => {
+                    // PBA-L1a-001: before this, a panic anywhere in a round
+                    // (the u64::MAX-nonce overflow in selection was one) killed
+                    // the producer task silently — the handle is dropped in
+                    // main.rs — while RPC and sync kept the node looking
+                    // healthy. Each round now runs in its own task; a panic
+                    // costs that round only.
+                    error!(
+                        "PBA-L1a-001: block production round PANICKED ({}); \
+                         continuing with the next round",
+                        msg
+                    );
                 }
             }
         }
@@ -3328,5 +3379,54 @@ mod blue_score_band_regression {
                  (mergeset {n_merges})"
             );
         }
+    }
+}
+
+/// PBA-L1a-001 — a panic inside one production round must not end block
+/// production. Before the fix `start()` awaited `produce_block()` inline; the
+/// u64::MAX-nonce overflow in mempool selection unwound the whole producer
+/// task (spawned with its handle dropped), halting the chain silently.
+#[cfg(test)]
+mod pba_l1a_001_producer_supervision {
+    use super::{run_supervised, RoundOutcome};
+
+    #[tokio::test]
+    async fn a_panicking_round_is_contained_and_reported() {
+        let out = run_supervised(async {
+            let n: u64 = std::hint::black_box(u64::MAX);
+            // The exact failure shape: an overflow panic mid-round.
+            let _ = n.checked_add(1).expect("attempt to add with overflow");
+            Ok::<u64, anyhow::Error>(0)
+        })
+        .await;
+        match out {
+            RoundOutcome::Panicked(msg) => assert!(msg.contains("overflow"), "{msg}"),
+            other => panic!("expected Panicked, got {other:?}"),
+        }
+        // And the caller keeps running rounds afterwards.
+        let next = run_supervised(async { Ok::<u64, anyhow::Error>(7) }).await;
+        assert!(matches!(next, RoundOutcome::Produced(7)));
+    }
+
+    #[tokio::test]
+    async fn errors_and_successes_pass_through() {
+        let e = run_supervised(async { Err::<u64, _>(anyhow::anyhow!("no parent")) }).await;
+        assert!(matches!(e, RoundOutcome::Failed(ref x) if x.to_string() == "no parent"));
+        let ok = run_supervised(async { Ok::<u64, anyhow::Error>(1) }).await;
+        assert!(matches!(ok, RoundOutcome::Produced(1)));
+    }
+
+    /// The loop must actually route rounds through the supervisor.
+    #[test]
+    fn start_loop_uses_the_supervisor() {
+        let src = include_str!("producer.rs");
+        let start = src.find("pub async fn start(self: Arc<Self>)").expect("start()");
+        let body = &src[start..start + 2_000];
+        assert!(
+            body.contains("supervised_round(self.clone())"),
+            "PBA-L1a-001 tripwire: BlockProducer::start must run each round through \
+             supervised_round, never await produce_block() inline"
+        );
+        assert!(!body.contains("self.produce_block().await"));
     }
 }
