@@ -13,7 +13,25 @@ interface IGovernableTarget {
 
 /// @title TreasuryGovernor — On-Chain DAO Governor for Treasury Spending
 /// @notice Full on-chain governance for Citrate treasury operations.
-///         Voting power = SALT balance + stSALT shares * sharePrice (from LiquidStakingPool).
+///         Voting power = native SALT ESCROWED in this governor (`lockVotes`),
+///         read from a per-account checkpoint at the proposal's snapshot block.
+///
+/// @dev PBA-L2-001 (pre-bounty audit 2026-09-24, residual of CHAIN-B-C013):
+///      voting power used to be the LIVE `voter.balance` (+ unsnapshotted
+///      stSALT), and `hasVoted` is per address, so one stack of SALT walked
+///      through fresh addresses (vote, transfer, vote again) forged the 10 %
+///      quorum and 100 % approval; the C030 `Call` proposal then executed the
+///      forged result. The C013 "sum <= totalSaltSupply" cap bounded the total
+///      at 100 % of supply, which is above the 10 % quorum, so it did not help.
+///      Weight is now `getPastVotes(voter, snapshotBlock)`, where the snapshot
+///      is fixed at `block.number - 1` when the proposal is created. SALT that
+///      moves (unlock -> transfer -> re-lock) after the snapshot carries no
+///      weight on that proposal, so the counted total can never exceed the
+///      escrow that existed at the snapshot (`getPastTotalLocked`).
+///      stSALT (LiquidStakingPool shares) no longer counts: those shares are
+///      not checkpointed and can be moved mid-vote, which is the same defect.
+///      Escrowed SALT is a liability of this contract: a `Call` proposal can
+///      never spend it (`_executeCall` keeps `balance >= totalLocked`).
 ///
 /// @dev Governance parameters (matching core/economics/src/governance.rs):
 ///   - Proposal threshold: 10,000 SALT
@@ -125,6 +143,8 @@ contract TreasuryGovernor is ReentrancyGuard {
         address callTarget;
         uint256 callValue;
         bytes callData;
+        // PBA-L2-001: the block whose escrow checkpoints weigh every vote.
+        uint256 snapshotBlock;
     }
 
     struct Vote {
@@ -137,7 +157,8 @@ contract TreasuryGovernor is ReentrancyGuard {
     // State — Dependencies
     // ============================================================
 
-    /// @notice LiquidStakingPool for stSALT voting power calculation
+    /// @notice LiquidStakingPool reference. Retained for configuration/ABI; it is
+    ///         NOT a voting-power source (unsnapshotted shares, PBA-L2-001).
     LiquidStakingPool public stakingPool;
 
     /// @notice StablecoinTreasury for TreasurySpend execution
@@ -166,6 +187,25 @@ contract TreasuryGovernor is ReentrancyGuard {
     mapping(uint256 => mapping(address => bool)) public hasVoted;
 
     // ============================================================
+    // State — Escrowed, checkpointed voting power (PBA-L2-001)
+    // ============================================================
+
+    /// @dev One (block, value) point in a balance history.
+    struct Checkpoint {
+        uint64 fromBlock;
+        uint192 value;
+    }
+
+    /// @notice Native SALT each account currently has escrowed for voting.
+    mapping(address => uint256) public lockedBalance;
+
+    /// @notice Total native SALT escrowed for voting (a liability).
+    uint256 public totalLocked;
+
+    mapping(address => Checkpoint[]) private _lockCheckpoints;
+    Checkpoint[] private _totalLockedCheckpoints;
+
+    // ============================================================
     // Events
     // ============================================================
 
@@ -187,6 +227,8 @@ contract TreasuryGovernor is ReentrancyGuard {
     event ProposalExecuted(uint256 indexed proposalId);
     event ProposalCanceled(uint256 indexed proposalId);
     event GuardianTransferred(address indexed oldGuardian, address indexed newGuardian);
+    event VotesLocked(address indexed account, uint256 amount, uint256 newBalance);
+    event VotesUnlocked(address indexed account, uint256 amount, uint256 newBalance);
 
     // ============================================================
     // Modifiers
@@ -202,7 +244,7 @@ contract TreasuryGovernor is ReentrancyGuard {
     // ============================================================
 
     /// @notice Deploy the governor
-    /// @param _stakingPool LiquidStakingPool for voting power
+    /// @param _stakingPool LiquidStakingPool reference (not a vote source)
     /// @param _treasury StablecoinTreasury for spend execution
     /// @param _guardian Emergency guardian address
     /// @param _totalSaltSupply Total SALT supply for quorum calculation
@@ -332,7 +374,7 @@ contract TreasuryGovernor is ReentrancyGuard {
         string calldata title,
         string calldata description
     ) external payable returns (uint256 proposalId) {
-        uint256 votingPower = getVotingPower(msg.sender);
+        uint256 votingPower = getPastVotes(msg.sender, block.number - 1);
         require(
             votingPower >= PROPOSAL_THRESHOLD * EMERGENCY_THRESHOLD_MULTIPLIER,
             "TreasuryGovernor: below emergency threshold"
@@ -358,17 +400,21 @@ contract TreasuryGovernor is ReentrancyGuard {
         require(block.number <= p.votingEnds, "TreasuryGovernor: voting ended");
         require(!hasVoted[proposalId][msg.sender], "TreasuryGovernor: already voted");
 
-        uint256 weight = getVotingPower(msg.sender);
+        // PBA-L2-001: weight is the voter's escrow at the proposal snapshot,
+        // never a live balance, so recycling one stack of SALT through fresh
+        // addresses adds nothing (those addresses had no escrow at the snapshot).
+        uint256 weight = getPastVotes(msg.sender, p.snapshotBlock);
         require(weight > 0, "TreasuryGovernor: no voting power");
 
-        // Native SALT is not an ERC20Votes token and cannot be checkpointed
-        // by this contract. Bound aggregate counted voting power to the
-        // declared supply so the same balance cannot be recycled through
-        // fresh addresses to manufacture quorum.
+        // Invariant (holds by construction; enforced as defence in depth):
+        // counted votes never exceed the escrow that existed at the snapshot,
+        // nor the declared supply.
+        uint256 counted = p.forVotes + p.againstVotes + p.abstainVotes + weight;
         require(
-            p.forVotes + p.againstVotes + p.abstainVotes + weight <= totalSaltSupply,
-            "TreasuryGovernor: voting power exceeds supply"
+            counted <= getPastTotalLocked(p.snapshotBlock),
+            "TreasuryGovernor: votes exceed snapshot escrow"
         );
+        require(counted <= totalSaltSupply, "TreasuryGovernor: voting power exceeds supply");
 
         hasVoted[proposalId][msg.sender] = true;
         votes[proposalId][msg.sender] = Vote({
@@ -522,20 +568,32 @@ contract TreasuryGovernor is ReentrancyGuard {
         return ProposalState.Expired;
     }
 
-    /// @notice Get voting power for an address
-    /// @dev Voting power = SALT balance + stSALT shares * sharePrice / 1e18
+    /// @notice Current escrowed voting power of an address (PBA-L2-001).
+    /// @dev What counts on a proposal is `getPastVotes(voter, snapshot)`; this
+    ///      is the value a proposal created in the NEXT block would snapshot.
     /// @param voter The address to check
-    /// @return power Total voting power in wei
+    /// @return power Escrowed SALT in wei
     function getVotingPower(address voter) public view returns (uint256 power) {
-        // Native SALT balance
-        power = voter.balance;
+        return lockedBalance[voter];
+    }
 
-        // stSALT voting power: shares * sharePrice / 1e18
-        uint256 stakedShares = stakingPool.shares(voter);
-        if (stakedShares > 0) {
-            uint256 sharePrice = stakingPool.getSharePrice();
-            power += (stakedShares * sharePrice) / 1e18;
-        }
+    /// @notice Escrowed voting power of `account` at the end of `blockNumber`.
+    /// @dev Only past blocks: a same-block value could still change.
+    function getPastVotes(address account, uint256 blockNumber) public view returns (uint256) {
+        require(blockNumber < block.number, "TreasuryGovernor: future lookup");
+        return _checkpointAt(_lockCheckpoints[account], blockNumber);
+    }
+
+    /// @notice Total escrow at the end of `blockNumber`.
+    function getPastTotalLocked(uint256 blockNumber) public view returns (uint256) {
+        require(blockNumber < block.number, "TreasuryGovernor: future lookup");
+        return _checkpointAt(_totalLockedCheckpoints, blockNumber);
+    }
+
+    /// @notice Snapshot block of a proposal.
+    function proposalSnapshot(uint256 proposalId) external view returns (uint256) {
+        require(proposalId > 0 && proposalId < nextProposalId, "TreasuryGovernor: invalid proposal");
+        return _proposals[proposalId].snapshotBlock;
     }
 
     /// @notice Get proposal details
@@ -617,7 +675,10 @@ contract TreasuryGovernor is ReentrancyGuard {
         string calldata title,
         string calldata description
     ) internal returns (uint256 proposalId) {
-        uint256 votingPower = getVotingPower(proposer);
+        // PBA-L2-001: the threshold is read from the same snapshot the votes
+        // use, so SALT locked in this very block (e.g. flash-borrowed) cannot
+        // create a proposal.
+        uint256 votingPower = getPastVotes(proposer, block.number - 1);
 
         // Emergency proposals have a higher threshold, checked in proposeEmergency
         if (proposalType != ProposalType.Emergency) {
@@ -641,6 +702,7 @@ contract TreasuryGovernor is ReentrancyGuard {
         p.title = title;
         p.description = description;
         p.createdAt = block.number;
+        p.snapshotBlock = block.number - 1;
         p.votingStarts = votingStarts;
         p.votingEnds = votingEnds;
 
@@ -663,6 +725,12 @@ contract TreasuryGovernor is ReentrancyGuard {
 
     /// @dev CHAIN-B-C030: execute a generic Call proposal.
     function _executeCall(Proposal storage p) internal {
+        // PBA-L2-001: escrowed voting SALT is owed to its lockers; a proposal
+        // may only spend the governor's own surplus.
+        require(
+            address(this).balance >= totalLocked + p.callValue,
+            "TreasuryGovernor: call would spend escrowed votes"
+        );
         (bool ok, bytes memory ret) = p.callTarget.call{value: p.callValue}(p.callData);
         if (!ok) {
             // Bubble up the revert reason if any.
@@ -676,9 +744,68 @@ contract TreasuryGovernor is ReentrancyGuard {
     }
 
     // ============================================================
+    // Vote escrow (PBA-L2-001)
+    // ============================================================
+
+    /// @notice Escrow native SALT as voting power. Counts on proposals created
+    ///         from the next block on.
+    function lockVotes() external payable {
+        require(msg.value > 0, "TreasuryGovernor: zero lock");
+        uint256 bal = lockedBalance[msg.sender] + msg.value;
+        lockedBalance[msg.sender] = bal;
+        totalLocked += msg.value;
+        _writeCheckpoint(_lockCheckpoints[msg.sender], bal);
+        _writeCheckpoint(_totalLockedCheckpoints, totalLocked);
+        emit VotesLocked(msg.sender, msg.value, bal);
+    }
+
+    /// @notice Withdraw escrowed SALT. Votes already cast keep their weight
+    ///         (they were taken from the snapshot); proposals snapshotted
+    ///         after this block see the lower balance.
+    function unlockVotes(uint256 amount) external nonReentrant {
+        uint256 bal = lockedBalance[msg.sender];
+        require(amount > 0 && amount <= bal, "TreasuryGovernor: bad unlock amount");
+        bal -= amount;
+        lockedBalance[msg.sender] = bal;
+        totalLocked -= amount;
+        _writeCheckpoint(_lockCheckpoints[msg.sender], bal);
+        _writeCheckpoint(_totalLockedCheckpoints, totalLocked);
+        emit VotesUnlocked(msg.sender, amount, bal);
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "TreasuryGovernor: unlock transfer failed");
+    }
+
+    function _writeCheckpoint(Checkpoint[] storage ckpts, uint256 value) private {
+        require(value <= type(uint192).max, "TreasuryGovernor: checkpoint overflow");
+        uint256 n = ckpts.length;
+        if (n > 0 && ckpts[n - 1].fromBlock == block.number) {
+            ckpts[n - 1].value = uint192(value);
+        } else {
+            ckpts.push(Checkpoint({fromBlock: uint64(block.number), value: uint192(value)}));
+        }
+    }
+
+    /// @dev Value of the last checkpoint with `fromBlock <= blockNumber`.
+    function _checkpointAt(Checkpoint[] storage ckpts, uint256 blockNumber) private view returns (uint256) {
+        uint256 lo = 0;
+        uint256 hi = ckpts.length;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (ckpts[mid].fromBlock > blockNumber) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        return lo == 0 ? 0 : ckpts[lo - 1].value;
+    }
+
+    // ============================================================
     // Receive
     // ============================================================
 
-    /// @notice Accept SALT transfers (for voting power deposits)
+    /// @notice Accept SALT transfers into the governor's own (spendable)
+    ///         treasury. Plain transfers do NOT create voting power; use
+    ///         `lockVotes` (PBA-L2-001).
     receive() external payable {}
 }
