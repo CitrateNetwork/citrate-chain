@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import "./lib/ReentrancyGuard.sol";
 import "./LiquidStakingPool.sol";
 import "./StablecoinTreasury.sol";
+import {InitialAdmin} from "./lib/InitialAdmin.sol";
 
 /// @dev Minimal interface for calling `acceptGovernance` on a
 /// Governable target. Avoids importing the full mixin.
@@ -257,6 +258,9 @@ contract TreasuryGovernor is ReentrancyGuard {
         require(_stakingPool != address(0), "TreasuryGovernor: zero staking pool");
         require(_treasury != address(0), "TreasuryGovernor: zero treasury");
         require(_guardian != address(0), "TreasuryGovernor: zero guardian");
+        // PBA-L2-001/-002: the guardian (cancel power) must be a real key, never
+        // the CREATE2 factory that can never act.
+        require(_guardian != InitialAdmin.CREATE2_FACTORY, "TreasuryGovernor: factory guardian");
         require(_totalSaltSupply > 0, "TreasuryGovernor: zero supply");
 
         stakingPool = LiquidStakingPool(payable(_stakingPool));
@@ -659,6 +663,7 @@ contract TreasuryGovernor is ReentrancyGuard {
     /// @param newGuardian New guardian address
     function transferGuardian(address newGuardian) external onlyGuardian {
         require(newGuardian != address(0), "TreasuryGovernor: zero guardian");
+        require(newGuardian != InitialAdmin.CREATE2_FACTORY, "TreasuryGovernor: factory guardian");
         address old = guardian;
         guardian = newGuardian;
         emit GuardianTransferred(old, newGuardian);

@@ -195,3 +195,53 @@ contract PBA_L2_001_VoteInvariant is Test {
         assertLe(f + ag + ab, gov.getPastTotalLocked(gov.proposalSnapshot(id)));
     }
 }
+
+/// Verifier-contributed hardening (PBA-L2-001): an unlock BEFORE the snapshot
+/// must zero that account's snapshot weight (kills the mutant where
+/// unlockVotes skips the per-account checkpoint), and the guardian can never
+/// be the CREATE2 factory.
+contract PBA_L2_001_VerifierHardening is Test {
+    TreasuryGovernor gov;
+    address constant FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+
+    function setUp() public {
+        vm.roll(10);
+        LiquidStakingPool pool = new LiquidStakingPool(address(this));
+        StablecoinTreasury treasury = new StablecoinTreasury(address(this));
+        gov = new TreasuryGovernor(address(pool), address(treasury), address(0xDEAD), 1e27);
+    }
+
+    function test_V_001_unlockBeforeSnapshotZeroesWeight() public {
+        address atk = makeAddr("atk");
+        address hon = makeAddr("hon");
+        vm.deal(atk, 50_000 ether);
+        vm.deal(hon, 50_000 ether);
+        vm.prank(atk);
+        gov.lockVotes{value: 50_000 ether}();
+        vm.prank(hon);
+        gov.lockVotes{value: 50_000 ether}();
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.prank(atk);
+        gov.unlockVotes(50_000 ether);
+        vm.roll(vm.getBlockNumber() + 1);
+        assertEq(gov.getPastVotes(atk, vm.getBlockNumber() - 1), 0);
+        vm.prank(hon);
+        uint256 id = gov.proposeCall("t", "d", hon, 1 ether, hex"00000000");
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.prank(atk);
+        vm.expectRevert("TreasuryGovernor: no voting power");
+        gov.castVote(id, TreasuryGovernor.VoteType.Against);
+        vm.prank(hon);
+        gov.castVote(id, TreasuryGovernor.VoteType.For);
+    }
+
+    function test_L2_001_guardianCannotBeFactory() public {
+        LiquidStakingPool pool = new LiquidStakingPool(address(this));
+        StablecoinTreasury treasury = new StablecoinTreasury(address(this));
+        vm.expectRevert("TreasuryGovernor: factory guardian");
+        new TreasuryGovernor(address(pool), address(treasury), FACTORY, 1e27);
+        vm.prank(address(0xDEAD));
+        vm.expectRevert("TreasuryGovernor: factory guardian");
+        gov.transferGuardian(FACTORY);
+    }
+}
