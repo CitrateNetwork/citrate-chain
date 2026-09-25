@@ -68,7 +68,13 @@ FINALITY_CURRENT = [
     re.compile(r"\bfinali[sz]ed (after|at|within) ~?\d", re.I),
     re.compile(r"\bseconds of finality", re.I),
     re.compile(r"\bI4 ✅", re.I),
+    re.compile(r"\breorg(anization)?s? (are|is|become) (impossible|not possible)", re.I),
+    re.compile(r"\bfinality is guaranteed|\bguaranteed finality", re.I),
+    re.compile(r"\b(settlement|a block|blocks?) (is|are|becomes?) final once", re.I),
+    re.compile(r"\bcan(no|')?t be (rolled back|reverted)", re.I),
 ]
+# Old stake-gating trigger wording (the registry env var alone enables it).
+STALE_WORDING = re.compile(r"registry and (its )?activation height", re.I)
 # The qualifier must sit next to the claim (same clause), not anywhere on the line.
 FINALITY_QUALIFIERS = re.compile(
     r"specified, not running|is specified|\(specified|not running|not yet running|not wired|target design|"
@@ -195,6 +201,8 @@ def check(root: Path) -> tuple[list[str], list[str]]:
                     if not FINALITY_QUALIFIERS.search(near):
                         errs.append(f"{rel}: finality described as current while it is not running: ...{sent[max(0, m.start() - 50): m.end() + 70]}...")
                     break
+            if STALE_WORDING.search(sent):
+                errs.append(f"{rel}: stake gating turns on with the registry alone (activation height defaults to 0): {sent[:120]}")
             fid = FINDING_ID.search(sent)
             if fid:
                 errs.append(f"{rel}: names audit finding {fid.group(0)}; public docs must not describe open findings")
