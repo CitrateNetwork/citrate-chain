@@ -122,15 +122,20 @@ jobs:
         env:
           FOUNDRY_PROFILE: membership
           # The closure-scoped profile must actually run its suite: a match_path
-          # typo or a renamed file would otherwise "pass" with 0 tests.
-          EXPECTED_MEMBERSHIP_TESTS: 9
+          # typo or a renamed file would otherwise "pass" with 0 tests. The
+          # expected count is derived from the test file, so adding a test
+          # there needs no CI edit.
+          MEMBERSHIP_TEST_FILE: test/CoreMembershipCreate2.t.sol
         run: |
           set -euo pipefail
+          expected=$(grep -cE '^[[:space:]]*function (test|testFuzz|invariant)[A-Za-z0-9_]*\(' "${MEMBERSHIP_TEST_FILE}" || true)
           forge test -vvv --use 0.8.36 --threads 1 | tee /tmp/membership.log
-          passed=$(grep -Eo '[0-9]+ tests passed' /tmp/membership.log | tail -1 | grep -Eo '^[0-9]+' || echo 0)
-          echo "membership tests passed: ${passed} (expected ${EXPECTED_MEMBERSHIP_TESTS})"
-          if [ "${passed}" -eq 0 ] || [ "${passed}" -ne "${EXPECTED_MEMBERSHIP_TESTS}" ]; then
-            echo "::error::membership profile ran ${passed} tests, expected ${EXPECTED_MEMBERSHIP_TESTS}"
+          summary=$(grep -E 'tests passed, [0-9]+ failed' /tmp/membership.log | tail -1 || true)
+          passed=$(echo "${summary}" | grep -Eo '[0-9]+ tests passed' | grep -Eo '^[0-9]+' || echo 0)
+          failed=$(echo "${summary}" | grep -Eo '[0-9]+ failed' | grep -Eo '^[0-9]+' || echo -1)
+          echo "membership: expected=${expected} passed=${passed} failed=${failed}"
+          if [ "${expected}" -le 0 ] || [ "${passed}" -ne "${expected}" ] || [ "${failed}" -ne 0 ]; then
+            echo "::error::membership profile: expected ${expected} tests (from ${MEMBERSHIP_TEST_FILE}), ${passed} passed, ${failed} failed"
             exit 1
           fi
 
