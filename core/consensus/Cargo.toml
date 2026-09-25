@@ -30,6 +30,11 @@ sha2 = "0.10"
 # enabled when arithmetic is on). No explicit feature flag needed.
 p256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 hmac = "0.12"
+# PBA-R2: content-derived tx authentication (`tx_auth`): rebuild the EVM
+# signing payload and recover the signer on every path, including block import.
+# Same versions the sequencer/api already lock.
+rlp = "0.5"
+secp256k1 = { version = "0.27", features = ["recovery"] }
 # Audit M-05: zeroize secret material in consensus crypto paths.
 zeroize = { version = "1.7", features = ["zeroize_derive"] }
 

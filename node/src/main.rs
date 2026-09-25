@@ -1078,6 +1078,29 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Chain ID: {}", config.chain.chain_id);
     info!("Data directory: {:?}", config.storage.data_dir);
 
+    // PBA-R2: fix the block-validity hardening activation height BEFORE any
+    // consensus component (GhostDag, Executor, SyncManager, GossipProtocol) is
+    // constructed; each captures it at construction. A consensus parameter:
+    // an unparseable override aborts start-up rather than being ignored.
+    {
+        let pba = config
+            .resolve_pba_hardening_height()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        citrate_consensus::hardening::set_pba_hardening_height(pba);
+        match pba {
+            Some(h) => info!(
+                "PBA-R2 block-validity hardening ACTIVE from height {} \
+                 (tx signature + canonical id on import, content-bound tx_root, \
+                 timestamp bound)",
+                h
+            ),
+            None => info!(
+                "PBA-R2 block-validity hardening not scheduled (chain.pba_hardening_height \
+                 unset); legacy validity rules apply"
+            ),
+        }
+    }
+
     // Initialize metrics server
     let metrics_addr =
         std::env::var("CITRATE_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());

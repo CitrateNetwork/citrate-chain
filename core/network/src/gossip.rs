@@ -128,6 +128,10 @@ pub struct GossipProtocol {
 
     // Statistics
     stats: Arc<RwLock<GossipStats>>,
+
+    /// PBA-R2 block-validity hardening: selects the `tx_root` rule by height
+    /// (PBA-L1b-002). See `citrate_consensus::hardening`.
+    pba_hardening: citrate_consensus::hardening::PbaHardening,
 }
 
 #[derive(Debug, Default)]
@@ -152,7 +156,17 @@ impl GossipProtocol {
             seen_learning: Arc::new(DashMap::new()),
             learning_data: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(GossipStats::default())),
+            pba_hardening: citrate_consensus::hardening::PbaHardening::from_process(),
         }
+    }
+
+    /// Override the PBA-R2 hardening activation (tests / isolated devnets).
+    pub fn with_pba_hardening(
+        mut self,
+        hardening: citrate_consensus::hardening::PbaHardening,
+    ) -> Self {
+        self.pba_hardening = hardening;
+        self
     }
 
     /// Handle new block announcement

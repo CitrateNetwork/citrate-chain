@@ -72,6 +72,11 @@ pub struct GhostDag {
     /// [`MERGE_PARENT_MAX_DEPTH`] and `handoffs/PRUNE_MERGE_PARENT_BOUND_SPEC.md`.
     merge_depth_activation_height: Option<u64>,
 
+    /// PBA-R2 block-validity hardening (PBA-L1b-003 timestamp bound). Captured
+    /// from the process-wide activation height at construction; see
+    /// `crate::hardening`.
+    pba_hardening: crate::hardening::PbaHardening,
+
     /// "DAG hydration complete" flag (restart-liveness fix, 2026-08-11). False
     /// until [`Self::reconcile_tips_from_dag_store`] has made the in-memory tip set
     /// authoritative after a restart. The applicator's runtime deep-fork rebuild
@@ -155,6 +160,7 @@ impl GhostDag {
             params,
             dag_store,
             merge_depth_activation_height: Some(activation),
+            pba_hardening: crate::hardening::PbaHardening::from_process(),
             relations: Arc::new(RwLock::new(HashMap::new())),
             blue_cache: Arc::new(RwLock::new(HashMap::new())),
             tips: Arc::new(RwLock::new(HashSet::new())),
@@ -183,6 +189,17 @@ impl GhostDag {
     pub fn without_merge_depth_enforcement(mut self) -> Self {
         self.merge_depth_activation_height = None;
         self
+    }
+
+    /// Override the PBA-R2 hardening activation (tests / isolated devnets).
+    pub fn with_pba_hardening(mut self, hardening: crate::hardening::PbaHardening) -> Self {
+        self.pba_hardening = hardening;
+        self
+    }
+
+    /// The PBA-R2 hardening this instance enforces.
+    pub fn pba_hardening(&self) -> crate::hardening::PbaHardening {
+        self.pba_hardening
     }
 
     /// Whether MP-DEPTH is enforced for a block at `height`. `None` activation

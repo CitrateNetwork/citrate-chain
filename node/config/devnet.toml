@@ -4,6 +4,9 @@
 chain_id = 40204
 block_time = 2
 ghostdag_k = 18
+# PBA-R2 block-validity hardening: active from genesis on dev profiles.
+# (Unset on every 40204 profile until the owner schedules it.)
+pba_hardening_height = 0
 
 [network]
 listen_addr = "127.0.0.1:30303"

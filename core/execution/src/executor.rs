@@ -164,6 +164,12 @@ pub struct Executor {
     /// registry is configured; it always equals `reward_policy`'s embedded
     /// `activation_height` once a snapshot is materialized.
     validator_activation_height: std::sync::atomic::AtomicU64,
+    /// PBA-R2 block-validity hardening activation (PBA-L1b-001: signature +
+    /// canonical-id check on every imported transaction). `u64::MAX` = unset
+    /// (rules off). Initialized from the process-wide value
+    /// (`citrate_consensus::hardening`); tests override it with
+    /// [`Executor::set_pba_hardening`].
+    pba_hardening_height: std::sync::atomic::AtomicU64,
 }
 
 /// Height at which contract-initiated native value transfers start working.
@@ -601,6 +607,9 @@ impl Executor {
             defer_persist: std::sync::atomic::AtomicBool::new(false),
             reward_policy: crate::block_rewards::new_shared_reward_policy(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
+            pba_hardening_height: std::sync::atomic::AtomicU64::new(
+                citrate_consensus::hardening::pba_hardening_height().unwrap_or(u64::MAX),
+            ),
         }
     }
 
@@ -744,6 +753,9 @@ impl Executor {
             defer_persist: std::sync::atomic::AtomicBool::new(false),
             reward_policy: crate::block_rewards::new_shared_reward_policy(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
+            pba_hardening_height: std::sync::atomic::AtomicU64::new(
+                citrate_consensus::hardening::pba_hardening_height().unwrap_or(u64::MAX),
+            ),
         }
     }
 
@@ -1398,6 +1410,24 @@ impl Executor {
     pub fn set_validator_activation_height(&self, height: u64) {
         self.validator_activation_height
             .store(height, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// PBA-R2: override the block-validity hardening activation for this
+    /// executor (tests / isolated devnets). Production reads the process-wide
+    /// value at construction.
+    pub fn set_pba_hardening(&self, hardening: citrate_consensus::hardening::PbaHardening) {
+        self.pba_hardening_height.store(
+            hardening.activation_height().unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// PBA-R2: the block-validity hardening this executor enforces.
+    pub fn pba_hardening(&self) -> citrate_consensus::hardening::PbaHardening {
+        match self.pba_hardening_height.load(std::sync::atomic::Ordering::SeqCst) {
+            u64::MAX => citrate_consensus::hardening::PbaHardening::off(),
+            h => citrate_consensus::hardening::PbaHardening::at(h),
+        }
     }
 
     /// VALIDATOR-S1 §R': capture the current epoch reward-policy cell (a cheap
@@ -2089,6 +2119,10 @@ impl Executor {
             reward_policy: self.reward_policy.clone(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(
                 self.validator_activation_height
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+            pba_hardening_height: std::sync::atomic::AtomicU64::new(
+                self.pba_hardening_height
                     .load(std::sync::atomic::Ordering::SeqCst),
             ),
         }

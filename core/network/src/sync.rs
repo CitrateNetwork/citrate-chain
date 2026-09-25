@@ -112,6 +112,11 @@ pub struct SyncManager {
     /// opposite in what they should do to the peer's standing — see
     /// `sync_peer::classify_serve`.
     last_block_anchor_height: Arc<AtomicU64>,
+
+    /// PBA-R2 block-validity hardening: selects the `tx_root` rule by height
+    /// (PBA-L1b-002). Captured from the process-wide activation at
+    /// construction; see `citrate_consensus::hardening`.
+    pba_hardening: citrate_consensus::hardening::PbaHardening,
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +183,17 @@ impl SyncManager {
             last_header_hash: Arc::new(RwLock::new(None)),
             last_requested_header: Arc::new(RwLock::new(None)),
             local_height: None,
+            pba_hardening: citrate_consensus::hardening::PbaHardening::from_process(),
         }
+    }
+
+    /// Override the PBA-R2 hardening activation (tests / isolated devnets).
+    pub fn with_pba_hardening(
+        mut self,
+        hardening: citrate_consensus::hardening::PbaHardening,
+    ) -> Self {
+        self.pba_hardening = hardening;
+        self
     }
 
     /// Wire this node's own applied-chain height so sync completion is judged

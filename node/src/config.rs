@@ -200,6 +200,19 @@ pub struct ChainConfig {
     /// When absent, the profile is inferred from chain_id for backward compatibility.
     #[serde(default)]
     pub genesis_profile: Option<String>,
+
+    /// PBA-R2 block-validity hardening activation height
+    /// (`citrate_consensus::hardening`): tx signature + canonical-id checks on
+    /// import (PBA-L1b-001), content-bound `tx_root` (PBA-L1b-002) and the
+    /// parent-relative timestamp bound (PBA-L1b-003).
+    ///
+    /// A CONSENSUS PARAMETER: every node on a chain must agree on it.
+    /// Absent (the default, and every shipped 40204 profile) = the rules are
+    /// off. Dev profiles set `0` (active from genesis). The env var
+    /// `CITRATE_PBA_HARDENING_HEIGHT` (a height, or `off`) overrides it.
+    /// Owner runbook: `docs/consensus/PBA_HARDENING_ACTIVATION.md`.
+    #[serde(default)]
+    pub pba_hardening_height: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +323,7 @@ impl Default for NodeConfig {
                 block_time: 5,
                 ghostdag_k: 18,
                 genesis_profile: None,
+                pba_hardening_height: None,
             },
             network: NetworkConfig {
                 listen_addr: hardcoded_addr("127.0.0.1:30303"),
@@ -353,6 +367,17 @@ impl Default for NodeConfig {
 }
 
 impl NodeConfig {
+    /// PBA-R2: the effective hardening activation height — the
+    /// `CITRATE_PBA_HARDENING_HEIGHT` env override if set, else
+    /// `chain.pba_hardening_height`. An unparseable override is an error: a
+    /// silently ignored consensus parameter is a fork.
+    pub fn resolve_pba_hardening_height(&self) -> Result<Option<u64>, String> {
+        match std::env::var(citrate_consensus::hardening::PBA_HARDENING_ENV) {
+            Ok(raw) => citrate_consensus::hardening::parse_pba_hardening_override(&raw),
+            Err(_) => Ok(self.chain.pba_hardening_height),
+        }
+    }
+
     /// Validate the entire configuration
     /// Returns error if any subsystem constraints are violated
     pub fn validate(&self) -> Result<(), String> {
@@ -370,6 +395,8 @@ impl NodeConfig {
             config.chain.chain_id = 40204;
         }
         config.chain.genesis_profile = Some("default".to_string());
+        // PBA-R2: dev profile enforces the hardened validity rules from genesis.
+        config.chain.pba_hardening_height = Some(0);
         config.mining.enabled = true;
         config.mining.target_block_time = 2; // Fast blocks for testing
                                              // C-02: Allow eth_sendTransaction only in devnet mode
