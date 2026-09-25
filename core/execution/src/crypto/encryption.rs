@@ -371,7 +371,8 @@ impl ModelEncryption {
             return Err(anyhow!("Invalid ephemeral public key"));
         }
 
-        let recipient = ECIES::from_private_key(*recipient_key)?;
+        // PBA-L4-006: borrow the long-lived key; no unzeroized by-value copy.
+        let recipient = ECIES::from_private_key_ref(recipient_key)?;
         let message = ECIESMessage {
             ephemeral_pubkey,
             ciphertext: encrypted_key.encrypted_key.clone(),
