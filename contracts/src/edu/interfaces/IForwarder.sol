@@ -50,8 +50,9 @@ interface IForwarder {
 
     // ── Views ──
 
-    /// @notice Get current nonce for a (orgPrincipalId, classroomId) pair.
-    function getNonce(bytes32 orgPrincipalId, uint256 classroomId) external view returns (uint256);
+    /// @notice Get current nonce for a (deviceUser, orgPrincipalId, classroomId) triple.
+    /// @dev PBA-L2-050: nonces are scoped to the authenticated device user.
+    function getNonce(address deviceUser, bytes32 orgPrincipalId, uint256 classroomId) external view returns (uint256);
 
     /// @notice Check if a relayer address is authorized.
     function isAuthorizedRelayer(address relayer) external view returns (bool);

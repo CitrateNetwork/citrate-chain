@@ -29,6 +29,14 @@ contract BudgetAllocation is IBudgetAllocation {
     /// any address exhaust any classroom's allocation.
     mapping(address => bool) public authorizedSpender;
 
+    /// @notice PBA-L2-053 (C006 residual): `monthlyLimit` is now enforced.
+    /// Spending is tracked per 30-day period (`block.timestamp / PERIOD`);
+    /// `spendFromBudget` reverts `ExceedsMonthlyLimit` once a classroom's
+    /// spend in the current period would exceed its `monthlyLimit`.
+    /// A `monthlyLimit` of 0 means "no monthly cap" (allocation cap only).
+    uint256 public constant PERIOD = 30 days;
+    mapping(uint256 => uint256) private _periodIndex;
+    mapping(uint256 => uint256) private _periodSpent;
     error NotGovernance();
     error NotPendingGovernance();
     error NotAuthorizedSpender();
@@ -101,6 +109,11 @@ contract BudgetAllocation is IBudgetAllocation {
         return _budgets[classroomId].monthlyLimit;
     }
 
+    /// @notice PBA-L2-053: amount spent by `classroomId` in the current period.
+    function getSpentThisPeriod(uint256 classroomId) external view returns (uint256) {
+        return _periodIndex[classroomId] == block.timestamp / PERIOD ? _periodSpent[classroomId] : 0;
+    }
+
     /// @notice Authorize (or revoke) an address permitted to call
     /// `spendFromBudget`. Governance-only. Closes CHAIN-B-C006.
     function setSpender(address spender, bool authorized) external onlyGovernance {
@@ -128,6 +141,14 @@ contract BudgetAllocation is IBudgetAllocation {
         uint256 remaining = b.allocated > b.spent ? b.allocated - b.spent : 0;
         if (amount > remaining) revert InsufficientBudget();
 
+        // PBA-L2-053: per-period cap.
+        if (b.monthlyLimit != 0) {
+            uint256 period = block.timestamp / PERIOD;
+            uint256 spentThisPeriod = _periodIndex[classroomId] == period ? _periodSpent[classroomId] : 0;
+            if (spentThisPeriod + amount > b.monthlyLimit) revert ExceedsMonthlyLimit();
+            _periodIndex[classroomId] = period;
+            _periodSpent[classroomId] = spentThisPeriod + amount;
+        }
         b.spent += amount;
         emit BudgetSpent(classroomId, amount, b.allocated - b.spent);
 

@@ -18,7 +18,7 @@ contract RmQ_C006 is Test {
     function setUp() public {
         budget = new BudgetAllocation(governance);
         vm.prank(governance);
-        budget.allocateBudget(1, 1000, 100);
+        budget.allocateBudget(1, 1000, 1000); // PBA-L2-053: monthly cap now enforced
     }
 
     /// RED: the exploit is that an unprivileged address exhausts the

@@ -135,7 +135,7 @@ contract ForwarderTest is Test {
     function test_execute_increments_nonce() public {
         IForwarder.ForwardRequest memory req = _makeRequest(0);
         _executeStudentRequest(req);
-        assertEq(forwarder.getNonce(orgPrincipal, 0), 1);
+        assertEq(forwarder.getNonce(student, orgPrincipal, 0), 1);
     }
 
     function test_sequential_executions() public {
@@ -144,7 +144,7 @@ contract ForwarderTest is Test {
             _executeStudentRequest(req);
         }
         assertEq(counter.count(), 5);
-        assertEq(forwarder.getNonce(orgPrincipal, 0), 5);
+        assertEq(forwarder.getNonce(student, orgPrincipal, 0), 5);
     }
 
     // ── FWA-C3-03: EIP-2771 sender append ──
@@ -372,10 +372,10 @@ contract ForwarderTest is Test {
         _executeStudentRequest(req);
 
         // Nonce for classroom 0 is now 1
-        assertEq(forwarder.getNonce(orgPrincipal, 0), 1);
+        assertEq(forwarder.getNonce(student, orgPrincipal, 0), 1);
 
         // Nonce for classroom 1 is still 0 (independent)
-        assertEq(forwarder.getNonce(orgPrincipal, 1), 0);
+        assertEq(forwarder.getNonce(student, orgPrincipal, 1), 0);
     }
 
     // ===================================================================
@@ -426,7 +426,7 @@ contract ForwarderTest is Test {
             _executeStudentRequest(req);
         }
 
-        assertEq(forwarder.getNonce(orgPrincipal, 0), iterations);
+        assertEq(forwarder.getNonce(student, orgPrincipal, 0), iterations);
         assertEq(counter.count(), iterations);
     }
 
