@@ -143,6 +143,16 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
     /// a serial offender churns out via repeated slashes.
     uint256 public constant LIVENESS_SLASH_BPS = 10;
 
+    /// @notice PBA-L2-003: blocks of total inactivity (no `commitEpoch`,
+    /// no reassignment) after which any joined worker or the requester may
+    /// expire a stalled Training job. Coordinator reassignment is now
+    /// requester/governance-only, so this is the exit that keeps worker
+    /// stakes from being locked forever if the requester disappears. It
+    /// does NOT pay anything immediately: the job moves to `Awaiting` and
+    /// the normal challenge window runs before `finalizeTrainingJob`.
+    /// ~7 days at 12 s blocks.
+    uint256 public constant STALL_EXPIRY_BLOCKS = 50_400;
+
     // ── State ───────────────────────────────────────────────────────
 
     mapping(uint256 => TrainingJob) public jobs;
@@ -171,10 +181,25 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
     mapping(uint256 => mapping(uint32 => mapping(uint32 => mapping(address => Challenge))))
         public challenges;
 
-    /// @notice Has a committee member already voted on this challenge?
-    mapping(uint256 => mapping(uint32 => mapping(uint32 => mapping(address => mapping(address => bool)))))
-        public hasVoted;
+    /// @notice PBA-L2-042: per-(job, epoch, step, target) challenge round.
+    /// Incremented every time a challenge is (re)opened on that slot so
+    /// committee votes are scoped to ONE challenge instance. Pre-fix the
+    /// `hasVoted` flag was never reset, so a re-opened challenge on the same
+    /// slot could never reach quorum and its bond was stuck forever.
+    mapping(uint256 => mapping(uint32 => mapping(uint32 => mapping(address => uint32)))) public challengeRound;
 
+    /// @dev voter => the challenge round it last voted in (0 = never).
+    mapping(uint256 => mapping(uint32 => mapping(uint32 => mapping(address => mapping(address => uint32)))))
+        private _votedRound;
+
+    /// @notice PBA-L2-042: value the contract keeps with no owner —
+    /// forfeited challenge bonds, the unpaid half of an upheld slash, and
+    /// liveness slashes. Pre-fix it accumulated with no way out; governance
+    /// can now sweep exactly this amount (never worker stake or escrow).
+    uint256 public retainedSlashAndBonds;
+
+    /// @notice Requester escrow refunds that could not be pushed at finalize.
+    mapping(uint256 => uint128) public requesterRefundPending;
     /// @notice Governance-configured committee addresses.
     mapping(address => bool) public committee;
 
@@ -241,6 +266,8 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
     event PayoutDeferred(uint256 indexed jobId, address indexed worker, uint128 amount);
     event DeferredPayoutClaimed(uint256 indexed jobId, address indexed worker, uint128 amount);
     event CommitteeUpdated(address indexed member, bool isMember);
+    event TrainingStallExpired(uint256 indexed jobId, uint32 committedEpochs);
+    event RetainedSwept(address indexed to, uint256 amount);
 
     // ── Modifiers ───────────────────────────────────────────────────
 
@@ -421,16 +448,21 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
     }
 
     /// @notice Reassign the coordinator if they've stalled past
-    /// COORDINATION_TIMEOUT blocks without a commitEpoch. Any
-    /// joined worker can trigger. The stalled coordinator is
-    /// slashed LIVENESS_SLASH_BPS on their posted stake.
+    /// COORDINATION_TIMEOUT blocks without a commitEpoch. The stalled
+    /// coordinator is slashed LIVENESS_SLASH_BPS on their posted stake.
     ///
-    /// Crash-recovery design note (CM-07 WP-07.3): the replacement
-    /// doesn't need to be VRF-elected — the *ability* to reassign
-    /// is open to every joined worker, which is enough to keep the
-    /// job live. VRF rotation per epoch is an optional richness a
-    /// future sprint can add if centralisation analysis shows it's
-    /// needed.
+    /// @dev PBA-L2-003 (C017 residual): pre-fix ANY joined worker could
+    /// call this and name ANY joined worker — itself included — as the new
+    /// coordinator. Joining is permissionless, and the coordinator's roots
+    /// are what `commitEpoch` pays against, so a co-worker could hijack
+    /// coordination after 100 idle blocks, commit random (unchallengeable)
+    /// roots for every epoch and drain the requester's whole escrow. The
+    /// coordinator wields spend authority over the requester's funds, so —
+    /// exactly as for `closeRecruitment` — only the requester or
+    /// governance may appoint it. Invariant: `paymentEarned` is only ever
+    /// credited under a coordinator the requester or governance chose.
+    /// If the requester disappears, `expireStalledTraining` is the
+    /// worker-side exit.
     function reassignCoordinator(uint256 jobId, address newCoordinator)
         external
         jobExists(jobId)
@@ -438,7 +470,10 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
     {
         TrainingJob storage job = jobs[jobId];
         require(job.state == JobState.Training, "ComputePoolTraining: not training");
-        require(workers[jobId][msg.sender].joined, "ComputePoolTraining: caller not joined");
+        require(
+            msg.sender == job.requester || msg.sender == governance(),
+            "ComputePoolTraining: not authorized"
+        );
         require(workers[jobId][newCoordinator].joined, "ComputePoolTraining: new coord not joined");
         require(
             block.number > uint256(job.lastActivityBlock) + COORDINATION_TIMEOUT,
@@ -455,11 +490,34 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
         uint128 slash = uint128(uint256(oldInfo.stakePosted) * LIVENESS_SLASH_BPS / BPS);
         if (slash > held) slash = held;
         oldInfo.stakeSlashed += slash;
+        retainedSlashAndBonds += slash; // PBA-L2-042: sweepable, not stranded
 
         job.coordinator = newCoordinator;
         job.lastActivityBlock = uint64(block.number);
 
         emit CoordinatorReassigned(jobId, oldCoordinator, newCoordinator, slash);
+    }
+
+    /// @notice PBA-L2-003: expire a Training job whose coordinator has made
+    /// no progress for `STALL_EXPIRY_BLOCKS`. Callable by the requester or
+    /// any joined worker. The job moves to `Awaiting` with the challenge
+    /// window starting now, so already-committed epochs stay challengeable
+    /// and nothing is paid before `finalizeTrainingJob`; uncommitted
+    /// epochs' budget is refunded to the requester at finalize.
+    function expireStalledTraining(uint256 jobId) external jobExists(jobId) nonReentrant {
+        TrainingJob storage job = jobs[jobId];
+        require(job.state == JobState.Training, "ComputePoolTraining: not training");
+        require(
+            msg.sender == job.requester || workers[jobId][msg.sender].joined,
+            "ComputePoolTraining: not authorized"
+        );
+        require(
+            block.number > uint256(job.lastActivityBlock) + STALL_EXPIRY_BLOCKS,
+            "ComputePoolTraining: not stalled"
+        );
+        job.state = JobState.Awaiting;
+        job.allEpochsCommittedBlock = uint64(block.number);
+        emit TrainingStallExpired(jobId, job.currentEpoch);
     }
 
     /// @notice Finalize the job. Requires every epoch committed AND
@@ -516,13 +574,21 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
         if (remaining > 0) {
             job.escrowRemaining = 0;
             (bool ok, ) = job.requester.call{value: remaining}("");
-            require(ok, "ComputePoolTraining: requester refund failed");
+            if (!ok) {
+                // PBA-L2-005/L2-023 variant: a requester contract that
+                // reverts on receive must not block every worker's
+                // finalization; its refund is claimable instead.
+                requesterRefundPending[jobId] += remaining;
+                emit PayoutDeferred(jobId, job.requester, remaining);
+            }
         }
 
         // finalWeightsHash: the last epoch's Merkle root doubles as
         // the canonical "final model state" handle. Off-chain tooling
         // resolves it to weight tensors via the mesh archive.
-        emit TrainingJobCompleted(jobId, epochCommitment[jobId][job.epochCount - 1]);
+        emit TrainingJobCompleted(
+            jobId, job.currentEpoch == 0 ? bytes32(0) : epochCommitment[jobId][job.currentEpoch - 1]
+        );
     }
 
     // ── Challenge lifecycle ─────────────────────────────────────────
@@ -576,6 +642,7 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
             "ComputePoolTraining: challenge active"
         );
 
+        challengeRound[jobId][epoch][step][target] += 1; // PBA-L2-042: fresh vote scope
         ch.challenger = msg.sender;
         ch.bond = uint128(msg.value);
         ch.openedAt = uint64(block.number);
@@ -598,9 +665,13 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
         require(committee[msg.sender], "ComputePoolTraining: not committee");
         Challenge storage ch = challenges[jobId][epoch][step][target];
         require(ch.state == ChallengeState.Voting, "ComputePoolTraining: not voting");
-        require(!hasVoted[jobId][epoch][step][target][msg.sender], "ComputePoolTraining: already voted");
+        uint32 round = challengeRound[jobId][epoch][step][target];
+        require(
+            _votedRound[jobId][epoch][step][target][msg.sender] != round,
+            "ComputePoolTraining: already voted"
+        );
 
-        hasVoted[jobId][epoch][step][target][msg.sender] = true;
+        _votedRound[jobId][epoch][step][target][msg.sender] = round;
         if (uphold) ch.upholdVotes += 1;
         else ch.rejectVotes += 1;
 
@@ -645,12 +716,14 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
             // in the contract (effectively burned / rolled into buyer
             // refund at finalize).
             uint128 reward = slashAmount / 2;
+            retainedSlashAndBonds += slashAmount - reward; // PBA-L2-042
             (bool ok, ) = challenger.call{value: uint256(bond) + uint256(reward)}("");
             require(ok, "ComputePoolTraining: reward transfer failed");
         } else {
-            // Challenger forfeits bond; stays in the contract.
+            // Challenger forfeits bond; retained and sweepable (PBA-L2-042).
             ch.state = ChallengeState.ResolvedReject;
             ch.bond = 0;
+            retainedSlashAndBonds += bond;
         }
 
         emit ChallengeResolved(jobId, epoch, step, target, upheld, slashAmount);
@@ -661,6 +734,30 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
     function setCommittee(address member, bool active) external onlyGovernance {
         committee[member] = active;
         emit CommitteeUpdated(member, active);
+    }
+
+    /// @notice PBA-L2-042: sweep value retained from slashes and forfeited
+    /// bonds. Bounded by the `retainedSlashAndBonds` accumulator, so worker
+    /// stakes, pending payouts and requester escrow are never reachable.
+    function sweepRetained(address to) external onlyGovernance nonReentrant {
+        require(to != address(0), "ComputePoolTraining: zero address");
+        uint256 amount = retainedSlashAndBonds;
+        require(amount > 0, "ComputePoolTraining: nothing retained");
+        retainedSlashAndBonds = 0;
+        (bool ok, ) = to.call{value: amount}("");
+        require(ok, "ComputePoolTraining: sweep failed");
+        emit RetainedSwept(to, amount);
+    }
+
+    /// @notice True iff `voter` already voted on the CURRENT challenge
+    /// instance at (jobId, epoch, step, target).
+    function hasVoted(uint256 jobId, uint32 epoch, uint32 step, address target, address voter)
+        external
+        view
+        returns (bool)
+    {
+        uint32 round = challengeRound[jobId][epoch][step][target];
+        return round != 0 && _votedRound[jobId][epoch][step][target][voter] == round;
     }
 
     // transferGovernance / acceptGovernance are inherited from Governable.
@@ -714,6 +811,17 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
         uint128 amount = info.payoutPending;
         require(amount > 0, "ComputePoolTraining: nothing to claim");
         info.payoutPending = 0;
+        (bool ok, ) = msg.sender.call{value: amount}("");
+        require(ok, "ComputePoolTraining: claim transfer failed");
+        emit DeferredPayoutClaimed(jobId, msg.sender, amount);
+    }
+
+    /// @notice Requester claims an escrow refund deferred at finalize.
+    function claimRequesterRefund(uint256 jobId) external nonReentrant {
+        require(msg.sender == jobs[jobId].requester, "ComputePoolTraining: not requester");
+        uint128 amount = requesterRefundPending[jobId];
+        require(amount > 0, "ComputePoolTraining: nothing to claim");
+        requesterRefundPending[jobId] = 0;
         (bool ok, ) = msg.sender.call{value: amount}("");
         require(ok, "ComputePoolTraining: claim transfer failed");
         emit DeferredPayoutClaimed(jobId, msg.sender, amount);
