@@ -16,6 +16,23 @@ evm_version = "cancun"
 # independent of source-path/metadata noise. Pinned — changing these moves every address.
 bytecode_hash = "none"
 cbor_metadata = false
+# The core-membership frozen CREATE2 projections run under their own profile
+# (below), never inside the whole-repo compile. Under via-IR, solc's bytecode for
+# an UNCHANGED contract depends on which other sources share the compilation job
+# (measured with forge 1.8.3: same sources, `forge build` vs `--skip test` give
+# different CitrateMemberSBT bytecode), so an unrelated file elsewhere could move
+# the projection. The ceremony (`forge script DeployCoreMembership`) compiles only
+# its own closure, and a closure-scoped compile reproduces the live addresses.
+no_match_path = "test/CoreMembershipCreate2.t.sol"
+
+# `FOUNDRY_PROFILE=membership forge test` -- the closure-scoped frozen-projection
+# gate. Same compiler settings as default (it inherits them); separate out/cache so
+# whole-repo artifacts are never reused. Blocking in solidity-ci.
+[profile.membership]
+out = "out-membership"
+cache_path = "cache-membership"
+match_path = "test/CoreMembershipCreate2.t.sol"
+no_match_path = "test/__no_exclusion__/*"
 
 [rpc_endpoints]
 citrate = "http://localhost:8545"

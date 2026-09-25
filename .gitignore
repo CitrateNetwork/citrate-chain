@@ -121,3 +121,6 @@ handoffs/
 **/*EXEC_STATUS*
 **/*COUNSEL*
 **/*DEPLOY_LOG*
+# closure-scoped frozen-projection profile (contracts/foundry.toml [profile.membership])
+contracts/out-membership/
+contracts/cache-membership/
