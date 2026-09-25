@@ -367,17 +367,6 @@ impl Default for NodeConfig {
 }
 
 impl NodeConfig {
-    /// PBA-R2: the effective hardening activation height — the
-    /// `CITRATE_PBA_HARDENING_HEIGHT` env override if set, else
-    /// `chain.pba_hardening_height`. An unparseable override is an error: a
-    /// silently ignored consensus parameter is a fork.
-    pub fn resolve_pba_hardening_height(&self) -> Result<Option<u64>, String> {
-        match std::env::var(citrate_consensus::hardening::PBA_HARDENING_ENV) {
-            Ok(raw) => citrate_consensus::hardening::parse_pba_hardening_override(&raw),
-            Err(_) => Ok(self.chain.pba_hardening_height),
-        }
-    }
-
     /// Validate the entire configuration
     /// Returns error if any subsystem constraints are violated
     pub fn validate(&self) -> Result<(), String> {
@@ -641,5 +630,26 @@ mod tests {
         std::env::remove_var("CITRATE_CHAIN_ID");
         let config = NodeConfig::devnet();
         assert_eq!(config.chain.genesis_profile.as_deref(), Some("default"));
+    }
+
+    /// R2: the node resolves the activation height through the ONE shared
+    /// resolver (env override, else `[chain] pba_hardening_height`) and
+    /// publishes it before constructing any gated component.
+    #[test]
+    fn pba_r2_node_uses_the_shared_resolver_before_components() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_consensus::hardening::init_pba_hardening_height(")
+            .expect("start_node must publish via init_pba_hardening_height");
+        for ctor in ["GhostDag::new(", "Executor::with_storage(", "SyncManager::new(", "GossipProtocol::new("] {
+            let at = body.find(ctor).unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(init < at, "activation must be published before {ctor}");
+        }
+        assert!(
+            !main.contains("activation::set_pba_hardening_height(config.chain"),
+            "no second publication path that bypasses the env override"
+        );
     }
 }

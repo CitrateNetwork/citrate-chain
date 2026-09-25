@@ -103,6 +103,28 @@ pub fn parse_pba_hardening_override(raw: &str) -> Result<Option<u64>, String> {
     }
 }
 
+/// THE resolution order for the activation height, used by every binary:
+/// the `CITRATE_PBA_HARDENING_HEIGHT` env override when set (a height, or
+/// `off`), otherwise the config value (`[chain] pba_hardening_height`). An
+/// unparseable override is an error, never ignored: a node that silently
+/// dropped a consensus parameter would fork at the activation height.
+pub fn resolve_pba_hardening_height(config_value: Option<u64>) -> Result<Option<u64>, String> {
+    match std::env::var(PBA_HARDENING_ENV) {
+        Ok(raw) => parse_pba_hardening_override(&raw),
+        Err(std::env::VarError::NotPresent) => Ok(config_value),
+        Err(e) => Err(format!("{PBA_HARDENING_ENV}: {e}")),
+    }
+}
+
+/// Resolve (see [`resolve_pba_hardening_height`]) and publish process-wide in
+/// one step. Call once at start-up, before constructing any consensus or
+/// execution component.
+pub fn init_pba_hardening_height(config_value: Option<u64>) -> Result<Option<u64>, String> {
+    let h = resolve_pba_hardening_height(config_value)?;
+    set_pba_hardening_height(h);
+    Ok(h)
+}
+
 /// A component's view of the activation height.
 ///
 /// Components capture it at construction ([`PbaHardening::from_process`]);

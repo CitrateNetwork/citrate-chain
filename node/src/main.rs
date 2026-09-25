@@ -1083,10 +1083,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // constructed; each captures it at construction. A consensus parameter:
     // an unparseable override aborts start-up rather than being ignored.
     {
-        let pba = config
-            .resolve_pba_hardening_height()
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        citrate_consensus::hardening::set_pba_hardening_height(pba);
+        // ONE store, ONE resolution order (env override, else [chain] key):
+        // consensus, network and execution (`citrate_execution::activation`)
+        // all read what this publishes.
+        let pba = citrate_consensus::hardening::init_pba_hardening_height(
+            config.chain.pba_hardening_height,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
         match pba {
             Some(h) => info!(
                 "PBA-R2 block-validity hardening ACTIVE from height {} \

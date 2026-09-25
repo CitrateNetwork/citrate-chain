@@ -32,7 +32,7 @@ This is a consensus parameter. Two nodes with different values disagree about bl
 ## Owner steps
 
 1. **Ship the binary everywhere first**, with the height unset: producers, bootnodes, RPC nodes and the citrate-core bundled node. Confirm `citrate consensus --json` prints the same `fingerprint` everywhere.
-2. **Pick `H = current_tip + margin`**, with enough margin for the slowest client release channel to upgrade.
+2. **Pick `H = current_tip + margin`**, with enough margin for the slowest client release channel to upgrade. Chain 40204 produces a block every 2.0 s (measured), so 43,200 blocks is about one day and 302,400 blocks is about one week.
 3. **Set it fleet-wide**: `pba_hardening_height = H` in every 40204 config, or `CITRATE_PBA_HARDENING_HEIGHT=H` in every systemd unit and in the citrate-core node spawn. Restart, and confirm each node logs `ACTIVE from height H` before the tip reaches `H`.
 4. **Pre-`H` checks**:
    - Nothing on 40204 relies on `eth_sendTransaction`: `allow_eth_send_transaction = false`.

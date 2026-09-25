@@ -186,6 +186,11 @@ impl SyncManager {
         }
     }
 
+    /// The PBA-R2 hardening activation this instance enforces.
+    pub fn pba_hardening(&self) -> citrate_consensus::hardening::PbaHardening {
+        self.pba_hardening
+    }
+
     /// Override the PBA-R2 hardening activation (tests / isolated devnets).
     pub fn with_pba_hardening(
         mut self,
