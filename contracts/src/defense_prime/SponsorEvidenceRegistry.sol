@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title SponsorEvidenceRegistry — DPF-16 sponsor evidence bundle anchoring.
 /// @notice Per planset 04_FEDRAMP_COMPLIANCE.md § FedRAMP sponsor
 ///         evidence package. Anchors signed evidence-bundle manifests
@@ -81,7 +83,7 @@ contract SponsorEvidenceRegistry {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     function setRecorder(address recorder, bool authorized) external {

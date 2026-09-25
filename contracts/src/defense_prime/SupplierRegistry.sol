@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title SupplierRegistry — DefensePrime supplier lifecycle + qualification
 /// @notice On-chain backing for the DPF-06 Suppliers panel. Tracks
 ///         each supplier's state through the planset state machine:
@@ -105,7 +107,7 @@ contract SupplierRegistry {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     // ── Governance ──────────────────────────────────────────────────

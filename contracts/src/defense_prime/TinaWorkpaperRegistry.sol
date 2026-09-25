@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 import {QuorumIdentity} from "../quorum/QuorumIdentity.sol";
 
 /// @title TinaWorkpaperRegistry — DPF-13 TINA Form-1411 workpaper anchoring.
@@ -119,7 +121,7 @@ contract TinaWorkpaperRegistry {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     // ── Governance ─────────────────────────────────────────────────────

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title InstitutionTreeV1
 /// @notice 4-level tenancy registry for CMO-managed deployments.
 /// @dev Companion to ClassroomClusterV1. Designed additively — existing flat
@@ -112,7 +114,7 @@ contract InstitutionTreeV1 {
 
     constructor(address _governance) {
         require(_governance != address(0), "governance is zero");
-        governance = _governance;
+        governance = InitialAdmin.check(_governance); // PBA-L2-002: never the CREATE2 factory
     }
 
     // ── Governance transfer (two-step) ──
