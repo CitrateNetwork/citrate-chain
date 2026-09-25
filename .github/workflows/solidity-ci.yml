@@ -81,7 +81,7 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
-          version: stable
+          version: v1.8.3
       - name: Install solc 0.8.36 (canonical contracts compiler)
         run: |
           set -euo pipefail
@@ -121,8 +121,23 @@ jobs:
         working-directory: contracts
         env:
           FOUNDRY_PROFILE: membership
+          # The closure-scoped profile must actually run its suite: a match_path
+          # typo or a renamed file would otherwise "pass" with 0 tests. The
+          # expected count is derived from the test file, so adding a test
+          # there needs no CI edit.
+          MEMBERSHIP_TEST_FILE: test/CoreMembershipCreate2.t.sol
         run: |
-          forge test -vvv --use 0.8.36 --threads 1
+          set -euo pipefail
+          expected=$(grep -cE '^[[:space:]]*function (test|testFuzz|invariant)[A-Za-z0-9_]*\(' "${MEMBERSHIP_TEST_FILE}" || true)
+          forge test -vvv --use 0.8.36 --threads 1 | tee /tmp/membership.log
+          summary=$(grep -E 'tests passed, [0-9]+ failed' /tmp/membership.log | tail -1 || true)
+          passed=$(echo "${summary}" | grep -Eo '[0-9]+ tests passed' | grep -Eo '^[0-9]+' || echo 0)
+          failed=$(echo "${summary}" | grep -Eo '[0-9]+ failed' | grep -Eo '^[0-9]+' || echo -1)
+          echo "membership: expected=${expected} passed=${passed} failed=${failed}"
+          if [ "${expected}" -le 0 ] || [ "${passed}" -ne "${expected}" ] || [ "${failed}" -ne 0 ]; then
+            echo "::error::membership profile: expected ${expected} tests (from ${MEMBERSHIP_TEST_FILE}), ${passed} passed, ${failed} failed"
+            exit 1
+          fi
 
   slither:
     if: github.event_name == 'workflow_dispatch'
@@ -137,7 +152,7 @@ jobs:
       - name: Install Foundry (slither needs forge for compilation)
         uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
-          version: stable
+          version: v1.8.3
       - name: Install Python and Slither
         run: |
           sudo apt-get update && sudo apt-get install -y python3-pip
