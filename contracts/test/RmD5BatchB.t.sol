@@ -19,8 +19,9 @@ contract RmD5BatchBTest is Test {
     uint256 public payerPk;
     uint256 constant PRICE = 1 ether;
 
+    // PBA-L2-027: the paywall redeems a ReceiveWithAuthorization payable to itself.
     bytes32 constant TRANSFER_TYPEHASH =
-        keccak256("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
+        keccak256("ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
 
     function setUp() public {
         provider = makeAddr("provider");
@@ -46,7 +47,7 @@ contract RmD5BatchBTest is Test {
         // First purchase. C047: the nonce is now bound to the resource.
         bytes32 salt1 = keccak256("nonce-1");
         bytes32 nonce1 = keccak256(abi.encode(resourceId, salt1));
-        (uint8 v1, bytes32 r1, bytes32 s1) = _sign(payer, payerPk, provider, PRICE, 0, block.timestamp + 1 hours, nonce1);
+        (uint8 v1, bytes32 r1, bytes32 s1) = _sign(payer, payerPk, address(paywall), PRICE, 0, block.timestamp + 1 hours, nonce1);
         paywall.verifyAndGrant(resourceId, payer, PRICE, 0, block.timestamp + 1 hours, nonce1, salt1, v1, r1, s1);
 
         assertTrue(paywall.hasAccess(payer, resourceId), "first purchase grants access");
@@ -61,7 +62,7 @@ contract RmD5BatchBTest is Test {
         bytes32 salt2 = keccak256("nonce-2");
         bytes32 nonce2 = keccak256(abi.encode(resourceId, salt2));
         uint256 newValidBefore = t2 + 3600;
-        (uint8 v2, bytes32 r2, bytes32 s2) = _sign(payer, payerPk, provider, PRICE, 0, newValidBefore, nonce2);
+        (uint8 v2, bytes32 r2, bytes32 s2) = _sign(payer, payerPk, address(paywall), PRICE, 0, newValidBefore, nonce2);
         paywall.verifyAndGrant(resourceId, payer, PRICE, 0, newValidBefore, nonce2, salt2, v2, r2, s2);
 
         assertTrue(paywall.hasAccess(payer, resourceId), "SOL-12: re-purchase after expiry must work");
@@ -73,12 +74,12 @@ contract RmD5BatchBTest is Test {
 
         bytes32 salt1 = keccak256("nonce-1");
         bytes32 nonce1 = keccak256(abi.encode(resourceId, salt1));
-        (uint8 v1, bytes32 r1, bytes32 s1) = _sign(payer, payerPk, provider, PRICE, 0, block.timestamp + 1 hours, nonce1);
+        (uint8 v1, bytes32 r1, bytes32 s1) = _sign(payer, payerPk, address(paywall), PRICE, 0, block.timestamp + 1 hours, nonce1);
         paywall.verifyAndGrant(resourceId, payer, PRICE, 0, block.timestamp + 1 hours, nonce1, salt1, v1, r1, s1);
 
         bytes32 salt2 = keccak256("nonce-2");
         bytes32 nonce2 = keccak256(abi.encode(resourceId, salt2));
-        (uint8 v2, bytes32 r2, bytes32 s2) = _sign(payer, payerPk, provider, PRICE, 0, block.timestamp + 1 hours, nonce2);
+        (uint8 v2, bytes32 r2, bytes32 s2) = _sign(payer, payerPk, address(paywall), PRICE, 0, block.timestamp + 1 hours, nonce2);
         vm.expectRevert("Paywall: access still active");
         paywall.verifyAndGrant(resourceId, payer, PRICE, 0, block.timestamp + 1 hours, nonce2, salt2, v2, r2, s2);
     }

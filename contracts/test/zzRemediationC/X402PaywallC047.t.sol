@@ -21,8 +21,9 @@ contract X402PaywallC047Test is Test {
     uint256 payerPk;
     uint256 constant PRICE = 1 ether;
 
+    // PBA-L2-027: the paywall redeems a ReceiveWithAuthorization payable to itself.
     bytes32 constant TRANSFER_TYPEHASH =
-        keccak256("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
+        keccak256("ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
 
     function setUp() public {
         provider = makeAddr("provider");
@@ -40,7 +41,7 @@ contract X402PaywallC047Test is Test {
         view
         returns (uint8 v, bytes32 r, bytes32 s)
     {
-        bytes32 structHash = keccak256(abi.encode(TRANSFER_TYPEHASH, payer, provider, value, uint256(0), validBefore, nonce));
+        bytes32 structHash = keccak256(abi.encode(TRANSFER_TYPEHASH, payer, address(paywall), value, uint256(0), validBefore, nonce));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", wSALT.DOMAIN_SEPARATOR(), structHash));
         (v, r, s) = vm.sign(payerPk, digest);
     }

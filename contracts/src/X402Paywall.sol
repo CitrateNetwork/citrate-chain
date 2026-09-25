@@ -12,9 +12,19 @@ import "./WrappedSALT.sol";
 ///
 ///      Production usage pattern:
 ///      1. Client requests resource via HTTP, receives 402 Payment Required
-///      2. Client signs a transferWithAuthorization to the resource provider
-///      3. Resource provider calls verifyAndGrant() to verify payment + grant access
+///      2. Client signs an EIP-3009 `ReceiveWithAuthorization` whose payee
+///         (`to`) is THIS PAYWALL (PBA-L2-027)
+///      3. Anyone calls verifyAndGrant(): the paywall pulls the payment,
+///         forwards it to the provider and grants access in one transaction
 ///      4. If valid, resource provider serves the content
+///
+///      PBA-L2-027 (pre-bounty audit 2026-09-24): the payer used to sign a
+///      `TransferWithAuthorization` to the provider, which anyone could replay
+///      straight on wSALT: the nonce was consumed and the provider paid, but
+///      `verifyAndGrant` then reverted, so the user paid and got no access.
+///      `receiveWithAuthorization` requires `to == msg.sender`, so only the
+///      paywall itself can redeem the authorization, and payment and grant are
+///      atomic.
 contract X402Paywall {
     WrappedSALT public immutable wSALT;
     address public immutable provider;
@@ -87,8 +97,10 @@ contract X402Paywall {
             "Paywall: access still active"
         );
 
-        // Execute the payment via transferWithAuthorization
-        wSALT.transferWithAuthorization(from, provider, value, validAfter, validBefore, nonce, v, r, s);
+        // PBA-L2-027: redeem as the payee (only this contract can), then
+        // forward to the provider. Payment and grant are one atomic step.
+        wSALT.receiveWithAuthorization(from, address(this), value, validAfter, validBefore, nonce, v, r, s);
+        require(wSALT.transfer(provider, value), "Paywall: forward failed");
 
         // Grant access until (now + accessTTL).
         uint256 expiresAt = block.timestamp + accessTTL;
