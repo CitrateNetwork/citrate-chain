@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
-import {InitialAdmin} from "./lib/InitialAdmin.sol";
-
 /// Minimal slice of the ContributionAccounting interface used by
 /// the matcher's lazy-profile views (WP-4.9). The matcher does NOT
 /// mirror the per-(addr, dim) score in its own storage; instead it
@@ -214,8 +212,7 @@ contract MentorMatcher {
     /// @param governance_ Address allowed to mutate cap/floor/gap.
     constructor(address governance_) {
         if (governance_ == address(0)) revert InvalidGovernance(governance_);
-        // PBA-L2-002: refuse the CREATE2 factory, as the other constructors do.
-        governance = InitialAdmin.check(governance_);
+        governance = governance_;
     }
 
     // ============================================================
