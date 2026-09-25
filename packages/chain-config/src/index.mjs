@@ -28,15 +28,26 @@ const norm = (a) => (typeof a === 'string' ? a.toLowerCase() : a)
 
 /**
  * Flatten the canonical book to a single name->address map (contracts + aaStack
- * + precompiles + the two nonce-based singletons). Names collide-free by design.
+ * + precompiles + the two nonce-based singletons). A name may appear in more
+ * than one section (the canonical book lists CitrateMemberSBT and
+ * MembershipStakeVault both under `contracts` and as top-level pins), but every
+ * occurrence MUST resolve to the same address (case-insensitive). A name that
+ * maps to two different addresses is a corrupt book: throw rather than let one
+ * section silently shadow the other.
  */
 export function flatten(src = book) {
   const out = {}
-  for (const [k, v] of Object.entries(src.contracts || {})) out[k] = v
-  for (const [k, v] of Object.entries(src.aaStack || {})) out[k] = v
-  for (const [k, v] of Object.entries(src.precompiles || {})) out[k] = v
-  if (src.CitrateMemberSBT) out.CitrateMemberSBT = src.CitrateMemberSBT
-  if (src.MembershipStakeVault) out.MembershipStakeVault = src.MembershipStakeVault
+  const put = (k, v, section) => {
+    if (k in out && norm(out[k]) !== norm(v)) {
+      throw new Error(`[chain-config] conflicting addresses for ${k}: ${out[k]} vs ${v} (${section})`)
+    }
+    out[k] = v
+  }
+  for (const [k, v] of Object.entries(src.contracts || {})) put(k, v, 'contracts')
+  for (const [k, v] of Object.entries(src.aaStack || {})) put(k, v, 'aaStack')
+  for (const [k, v] of Object.entries(src.precompiles || {})) put(k, v, 'precompiles')
+  if (src.CitrateMemberSBT) put('CitrateMemberSBT', src.CitrateMemberSBT, 'top-level')
+  if (src.MembershipStakeVault) put('MembershipStakeVault', src.MembershipStakeVault, 'top-level')
   return out
 }
 
