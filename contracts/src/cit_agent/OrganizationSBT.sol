@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
@@ -37,7 +39,9 @@ contract OrganizationSBT is ERC721, Ownable {
     event OrgDeactivated(uint256 indexed tokenId);
     event OverlayActivated(uint256 indexed tokenId, bytes32 indexed overlay);
 
-    constructor(address initialOwner) ERC721("Citrate OrganizationSBT", "CIT-ORG") Ownable(initialOwner) {}
+    constructor(address initialOwner) ERC721("Citrate OrganizationSBT", "CIT-ORG") Ownable(initialOwner) {
+        InitialAdmin.check(initialOwner); // PBA-L2-002: never the CREATE2 factory
+    }
 
     /// Mint a new OrganizationSBT. Admin-gated in 6a.
     function mintOrg(

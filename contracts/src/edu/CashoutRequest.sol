@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 import {ICashoutRequest} from "./interfaces/ICashoutRequest.sol";
 
 /// @title CashoutRequest
@@ -44,7 +46,7 @@ contract CashoutRequest is ICashoutRequest {
 
     constructor(address _governance, uint256 initialRate) {
         if (_governance == address(0)) revert ZeroGovernance();
-        governance = _governance;
+        governance = InitialAdmin.check(_governance); // PBA-L2-002: never the CREATE2 factory
         _saltUsdRate = initialRate;
     }
 

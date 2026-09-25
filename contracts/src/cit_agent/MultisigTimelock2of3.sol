@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 
 /// @title MultisigTimelock2of3 — RFC-CIT-AGENT-0001 §3 + planset
@@ -89,6 +91,7 @@ contract MultisigTimelock2of3 is IERC1155Receiver {
         // duplicated owner collapses 2-of-3 into 1-of-1 — plus a delay floor.
         for (uint8 i = 0; i < 3; i++) {
             if (_owners[i] == address(0)) revert ZeroOwner();
+            InitialAdmin.check(_owners[i]); // PBA-L2-002: never the CREATE2 factory
             for (uint8 j = i + 1; j < 3; j++) {
                 if (_owners[i] == _owners[j]) revert DuplicateOwner(_owners[i]);
             }

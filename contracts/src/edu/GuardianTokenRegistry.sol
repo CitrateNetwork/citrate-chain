@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title GuardianTokenRegistry
 /// @notice One-time guardian setup token registry for WP-A10 (guardian
 ///         setup distribution). Districts claim a hashed token before
@@ -125,7 +127,7 @@ contract GuardianTokenRegistry {
 
     constructor(address governance_) {
         if (governance_ == address(0)) revert ZeroGovernance();
-        governance = governance_;
+        governance = InitialAdmin.check(governance_); // PBA-L2-002: never the CREATE2 factory
         emit GovernanceTransferred(address(0), governance_);
     }
 

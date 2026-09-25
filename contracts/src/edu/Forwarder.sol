@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 import {IForwarder} from "./interfaces/IForwarder.sol";
 import {IClassroomCluster} from "./interfaces/IClassroomCluster.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
@@ -77,7 +79,7 @@ contract Forwarder is IForwarder {
 
     constructor(address _governance, address _cluster, address _vault) {
         if (_governance == address(0) || _cluster == address(0) || _vault == address(0)) revert ZeroAddress();
-        governance = _governance;
+        governance = InitialAdmin.check(_governance); // PBA-L2-002: never the CREATE2 factory
         clusterContract = _cluster;
         vaultAddress = _vault;
     }

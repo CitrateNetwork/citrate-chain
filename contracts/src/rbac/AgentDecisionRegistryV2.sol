@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title AgentDecisionRegistryV2 — every signed decision, every agent tool call
 /// @notice Append-only log of every signed action in the system, indexed
 ///         by user, tenant, correlation-id, event-class. Powers the
@@ -142,7 +144,7 @@ contract AgentDecisionRegistryV2 {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     // ── Governance transfer (two-step) ──────────────────────────────

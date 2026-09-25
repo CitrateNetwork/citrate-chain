@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 import {IMultiSigEnvelope} from "../quorum/ThresholdApproval.sol";
 import {QuorumIdentity} from "../quorum/QuorumIdentity.sol";
 
@@ -176,7 +178,7 @@ contract AppRegistry {
     constructor(address initialGovernance, address envelopeOracle) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
         if (envelopeOracle == address(0)) revert ZeroEnvelopeOracle();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
         envelope_oracle = IMultiSigEnvelope(envelopeOracle);
     }
 

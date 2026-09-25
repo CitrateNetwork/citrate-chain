@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title ClassificationRegistry — clearance ladder
 /// @notice Tracks each user's classification clearance and foreign-
 ///         national status; powers auto-revocation of ITAR-scoped
@@ -84,7 +86,7 @@ contract ClassificationRegistry {
     ///         deployer's root-tenant multi-sig executor.
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     // ── Governance transfer (two-step) ──────────────────────────────
