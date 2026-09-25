@@ -75,6 +75,19 @@ fn verify_ed25519_transaction(tx: &Transaction) -> Result<bool, CryptoError> {
     }
 }
 
+/// ed25519 verification of a native transaction over its canonical signing
+/// bytes. Unlike [`verify_transaction`] it never consults `ecdsa_verified`.
+/// Used by `tx_auth` (PBA-R2).
+pub(crate) fn verify_ed25519_signature(tx: &Transaction) -> Result<bool, CryptoError> {
+    verify_ed25519_transaction(tx)
+}
+
+/// The exact bytes a native ed25519 transaction signature covers.
+pub fn canonical_signing_bytes(tx: &Transaction) -> Vec<u8> {
+    // `canonical_tx_bytes` cannot fail (it only appends); keep one encoder.
+    canonical_tx_bytes(tx).unwrap_or_default()
+}
+
 /// Sign a transaction (for testing and dev tools)
 pub fn sign_transaction(tx: &mut Transaction, signing_key: &SigningKey) -> Result<(), CryptoError> {
     // Ensure `from` matches the signing key before computing canonical bytes

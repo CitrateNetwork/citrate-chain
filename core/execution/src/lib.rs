@@ -1,6 +1,7 @@
 // citrate/core/execution/src/lib.rs
 
 // Re-export modules
+pub mod activation;
 pub mod address_utils;
 pub mod block_rewards;
 pub mod crypto;

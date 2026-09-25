@@ -56,7 +56,7 @@ fn make_test_tx(id: u8) -> Transaction {
     hash_bytes[0] = id;
     hash_bytes[31] = 0xCC;
 
-    Transaction {
+    let mut tx = Transaction {
         hash: Hash::new(hash_bytes),
         nonce: 0,
         from: PublicKey::new([1; 32]),
@@ -68,7 +68,12 @@ fn make_test_tx(id: u8) -> Transaction {
         signature: Signature::new([0xAA; 64]),
         tx_type: Some(TransactionType::Standard),
         ..Default::default()
-    }
+    };
+    // PBA-L1a-006 / NET-H3: gossip now authenticates every tx from its
+    // contents, so a "valid" fixture must carry a real signature.
+    let sk = citrate_consensus::crypto::Ed25519SigningKey::from_bytes(&[id.wrapping_add(1); 32]);
+    citrate_consensus::crypto::sign_transaction(&mut tx, &sk).unwrap();
+    tx
 }
 
 /// Register a fake peer in the PeerManager so peer scoring calls succeed.

@@ -72,6 +72,11 @@ pub struct GhostDag {
     /// [`MERGE_PARENT_MAX_DEPTH`] and `handoffs/PRUNE_MERGE_PARENT_BOUND_SPEC.md`.
     merge_depth_activation_height: Option<u64>,
 
+    /// PBA-R2 block-validity hardening (PBA-L1b-003 timestamp bound). Captured
+    /// from the process-wide activation height at construction; see
+    /// `crate::hardening`.
+    pba_hardening: crate::hardening::PbaHardening,
+
     /// "DAG hydration complete" flag (restart-liveness fix, 2026-08-11). False
     /// until [`Self::reconcile_tips_from_dag_store`] has made the in-memory tip set
     /// authoritative after a restart. The applicator's runtime deep-fork rebuild
@@ -155,6 +160,7 @@ impl GhostDag {
             params,
             dag_store,
             merge_depth_activation_height: Some(activation),
+            pba_hardening: crate::hardening::PbaHardening::from_process(),
             relations: Arc::new(RwLock::new(HashMap::new())),
             blue_cache: Arc::new(RwLock::new(HashMap::new())),
             tips: Arc::new(RwLock::new(HashSet::new())),
@@ -183,6 +189,17 @@ impl GhostDag {
     pub fn without_merge_depth_enforcement(mut self) -> Self {
         self.merge_depth_activation_height = None;
         self
+    }
+
+    /// Override the PBA-R2 hardening activation (tests / isolated devnets).
+    pub fn with_pba_hardening(mut self, hardening: crate::hardening::PbaHardening) -> Self {
+        self.pba_hardening = hardening;
+        self
+    }
+
+    /// The PBA-R2 hardening this instance enforces.
+    pub fn pba_hardening(&self) -> crate::hardening::PbaHardening {
+        self.pba_hardening
     }
 
     /// Whether MP-DEPTH is enforced for a block at `height`. `None` activation
@@ -1041,6 +1058,28 @@ impl GhostDag {
             )));
         }
 
+        // PBA-L1b-003: and it may not run more than
+        // MAX_BLOCK_TIMESTAMP_ADVANCE_SECS ahead of it. Without an upper bound
+        // one block stamped u64::MAX became the tip and every honest child
+        // (stamped `now`) failed the monotonic check above: a permanent halt.
+        // Parent-relative so it is deterministic (a wall-clock bound is local
+        // policy, enforced at ingress). Height-gated: history is never
+        // re-judged under a new rule.
+        if self.pba_hardening.active_at(header.height) {
+            let max_ts = sp
+                .header
+                .timestamp
+                .saturating_add(crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS);
+            if header.timestamp > max_ts {
+                return Err(GhostDagError::InvalidLinkage(format!(
+                    "timestamp {} is more than {}s past selected parent's {} (PBA-L1b-003)",
+                    header.timestamp,
+                    crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS,
+                    sp.header.timestamp
+                )));
+            }
+        }
+
         // Selected-parent rule + merge-parent existence.
         for mp in merge_parents {
             let mp_block = self
@@ -1436,6 +1475,106 @@ mod tests {
             .blue_score(blue_score)
             .blue_work(crate::types::blue_work_for_score(blue_score))
             .build_unhashed()
+    }
+
+
+    /// Mutation-survivor kills inside validate_block_consistency (the
+    /// function PBA-L1b-003 changed): the blue-score band edges and the
+    /// MP-DEPTH boundary are pinned exactly.
+    #[tokio::test]
+    async fn pba_r2_blue_score_band_edges_are_enforced() {
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let genesis = create_test_block_with_parents([0x21; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        let gd = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+        let with_score = |score: u64, h: u8| {
+            let mut b = create_test_block_with_parents([h; 32], genesis.hash(), vec![], 1);
+            b.header.blue_score = score;
+            b.header.blue_work = crate::types::blue_work_for_score(score);
+            b
+        };
+        assert!(gd.validate_block_consistency(&with_score(1, 0x22)).await.is_ok());
+        assert!(
+            gd.validate_block_consistency(&with_score(0, 0x23)).await.is_err(),
+            "below the band"
+        );
+        assert!(
+            gd.validate_block_consistency(&with_score(2, 0x24)).await.is_err(),
+            "above the band (no merge parents)"
+        );
+    }
+
+    #[tokio::test]
+    async fn pba_r2_mp_depth_boundary_is_exact() {
+        fn h(i: u64) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&i.to_le_bytes());
+            b[31] = 0x77;
+            b
+        }
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let gd = GhostDag::new(GhostDagParams::default(), dag_store.clone())
+            .with_merge_depth_activation_height(0);
+        let mut chain = vec![create_test_block_with_parents(h(0), Hash::default(), vec![], 0)];
+        dag_store.store_block(chain[0].clone()).await.unwrap();
+        let top = MERGE_PARENT_MAX_DEPTH + 1;
+        for i in 1..top {
+            let b = create_test_block_with_parents(h(i), chain[(i - 1) as usize].hash(), vec![], i);
+            dag_store.store_block(b.clone()).await.unwrap();
+            chain.push(b);
+        }
+        // A side block at height 1 (sibling of chain[1]) to merge.
+        let side1 = create_test_block_with_parents([0xA1; 32], chain[0].hash(), vec![], 1);
+        dag_store.store_block(side1.clone()).await.unwrap();
+        let sp = chain[(top - 1) as usize].hash();
+        let merging = |mp: Hash, tag: u8| {
+            let mut b = create_test_block_with_parents([tag; 32], sp, vec![mp], top);
+            b.header.blue_score = top;
+            b.header.blue_work = crate::types::blue_work_for_score(top);
+            b
+        };
+        // depth = top - 1 = MERGE_PARENT_MAX_DEPTH: allowed.
+        assert!(gd.validate_block_consistency(&merging(side1.hash(), 0xB1)).await.is_ok());
+        // depth = top - 0 = MERGE_PARENT_MAX_DEPTH + 1: rejected.
+        let side0 = chain[0].hash();
+        assert!(gd.validate_block_consistency(&merging(side0, 0xB2)).await.is_err());
+    }
+
+    /// PBA-L1b-003: the parent-relative timestamp bound, both sides of the
+    /// activation height and both edges of the bound.
+    #[tokio::test]
+    async fn pba_l1b_003_timestamp_bound_is_height_gated_and_inclusive() {
+        use crate::hardening::{PbaHardening, MAX_BLOCK_TIMESTAMP_ADVANCE_SECS as MAX};
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let mut genesis = create_test_block_with_parents([0x01; 32], Hash::default(), vec![], 0);
+        genesis.header.timestamp = 1_000;
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        let child = |ts: u64, h: u8| {
+            let mut b =
+                create_test_block_with_parents([h; 32], genesis.hash(), vec![], 1);
+            b.header.timestamp = ts;
+            b
+        };
+        let on = GhostDag::new(GhostDagParams::default(), dag_store.clone())
+            .with_pba_hardening(PbaHardening::at(1));
+        assert!(on.validate_block_consistency(&child(1_000 + MAX, 2)).await.is_ok());
+        assert!(on.validate_block_consistency(&child(1_000 + MAX + 1, 3)).await.is_err());
+        assert!(on.validate_block_consistency(&child(u64::MAX, 4)).await.is_err());
+        assert!(on.validate_block_consistency(&child(999, 5)).await.is_err(), "monotonic");
+        // Activation above this height: legacy rule (no upper bound).
+        let later = GhostDag::new(GhostDagParams::default(), dag_store.clone())
+            .with_pba_hardening(PbaHardening::at(2));
+        assert!(later.validate_block_consistency(&child(u64::MAX, 6)).await.is_ok());
+        let off = GhostDag::new(GhostDagParams::default(), dag_store.clone())
+            .with_pba_hardening(PbaHardening::off());
+        assert!(off.validate_block_consistency(&child(u64::MAX, 7)).await.is_ok());
+        // A u64::MAX parent: the bound saturates, never panics.
+        let mut far = create_test_block_with_parents([0x08; 32], genesis.hash(), vec![], 1);
+        far.header.timestamp = u64::MAX;
+        dag_store.store_block(far.clone()).await.unwrap();
+        let mut grandchild = create_test_block_with_parents([0x09; 32], far.hash(), vec![], 2);
+        grandchild.header.timestamp = u64::MAX;
+        assert!(on.validate_block_consistency(&grandchild).await.is_ok());
     }
 
     #[tokio::test]

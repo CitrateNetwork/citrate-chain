@@ -200,7 +200,7 @@ impl BlockBuilder {
         block.transactions = executed_txs;
 
         // Calculate roots from real execution results
-        let tx_root = self.calculate_tx_root(&block.transactions);
+        let tx_root = self.calculate_tx_root(block.header.height, &block.transactions);
         let state_root = self.calculate_state_root_from_execution(&receipts)?;
         let receipt_root = self.calculate_receipt_root_from_receipts(&receipts)?;
         let artifact_root = Hash::default(); // Placeholder for AI artifacts
@@ -416,16 +416,17 @@ impl BlockBuilder {
         }
     }
 
-    /// Calculate transaction root
-    fn calculate_tx_root(&self, transactions: &[Transaction]) -> Hash {
-        // Use Keccak-256 for transaction root to align with tx.hash generation
-        let mut hasher = Keccak256::new();
-
-        for tx in transactions {
-            hasher.update(tx.hash.as_bytes());
-        }
-
-        Hash::from_bytes(&hasher.finalize())
+    /// Calculate transaction root — the node's consensus rule, not a local
+    /// variant. PBA-L1b-002 variant sweep: this builder hashed the wire
+    /// `tx.hash` fields with Keccak (a root no node would accept, and blind to
+    /// body rewrites); it now uses the single shared rule, content-bound from
+    /// the PBA-R2 activation height.
+    fn calculate_tx_root(&self, height: u64, transactions: &[Transaction]) -> Hash {
+        citrate_consensus::tx_auth::tx_root_for_height(
+            citrate_consensus::hardening::PbaHardening::from_process(),
+            height,
+            transactions,
+        )
     }
 
     /// Calculate state root from executor's committed state after execution
@@ -568,7 +569,7 @@ impl BlockBuilder {
         };
 
         // Use legacy synthetic methods for tests
-        let tx_root = self.calculate_tx_root(&transactions);
+        let tx_root = self.calculate_tx_root(header.height, &transactions);
         let state_root = self.calculate_state_root_legacy(&transactions);
         let receipt_root = self.calculate_receipt_root_legacy(&transactions);
 

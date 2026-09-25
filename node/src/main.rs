@@ -1078,6 +1078,32 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     info!("Chain ID: {}", config.chain.chain_id);
     info!("Data directory: {:?}", config.storage.data_dir);
 
+    // PBA-R2: fix the block-validity hardening activation height BEFORE any
+    // consensus component (GhostDag, Executor, SyncManager, GossipProtocol) is
+    // constructed; each captures it at construction. A consensus parameter:
+    // an unparseable override aborts start-up rather than being ignored.
+    {
+        // ONE store, ONE resolution order (env override, else [chain] key):
+        // consensus, network and execution (`citrate_execution::activation`)
+        // all read what this publishes.
+        let pba = citrate_consensus::hardening::init_pba_hardening_height(
+            config.chain.pba_hardening_height,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        match pba {
+            Some(h) => info!(
+                "PBA-R2 block-validity hardening ACTIVE from height {} \
+                 (tx signature + canonical id on import, content-bound tx_root, \
+                 timestamp bound)",
+                h
+            ),
+            None => info!(
+                "PBA-R2 block-validity hardening not scheduled (chain.pba_hardening_height \
+                 unset); legacy validity rules apply"
+            ),
+        }
+    }
+
     // Initialize metrics server
     let metrics_addr =
         std::env::var("CITRATE_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
@@ -1389,6 +1415,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         require_valid_signature,
         chain_id: config.chain.chain_id,
         max_nonce_gap: 16, // RM-B1 / WP-C4.1 (audit M-SEQ-01): Geth default
+    })
+    // PBA-L1a-001: bound admitted nonces against the sender's COMMITTED nonce
+    // (stale and far-future nonces rejected on every ingress, new senders too).
+    .with_state_nonce_reader({
+        let exec = executor.clone();
+        Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
+            exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
+        })
     }));
 
     // Create peer manager
@@ -2369,6 +2403,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .with_inference_executor(network_inf_executor),
         );
         let ai_handler_for_rx = ai_handler.clone();
+        // PBA-L1b-005: peer inference runs off the inbound loop, bounded.
+        let inference_dispatcher = crate::network_inference::InferenceDispatcher::new(
+            ai_handler.clone(),
+            peer_manager.clone(),
+            crate::network_inference::MAX_CONCURRENT_PEER_INFERENCES,
+        );
 
         // WP-K.2 / SYNC-S1 D2: the network handler no longer touches the DAG
         // store or GhostDAG directly — `BlockAdmission` (below) owns both, so
@@ -2425,8 +2465,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         head_hash,
                         ..
                     } => {
-                        max_seen_for_rx
-                            .fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
+                        // PBA-L1b-006: an unauthenticated handshake height is NOT
+                        // network-height evidence (it pinned eth_syncing.highestBlock
+                        // at u64::MAX for the life of the process). It still seeds
+                        // this peer's advertised head, which the sync tick clamps.
                         // Kick off naive sync: request blocks from genesis if behind
                         // APPLIED tip, not the stored height index: a follower
                         // stores gossiped tips far ahead of its applied chain, so
@@ -2452,8 +2494,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         head_hash,
                         ..
                     } => {
-                        max_seen_for_rx
-                            .fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
+                        // PBA-L1b-006: see Hello — not recorded as network height.
                         // APPLIED tip, not the stored height index: a follower
                         // stores gossiped tips far ahead of its applied chain, so
                         // get_latest_height() would report it as already caught up
@@ -2612,16 +2653,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         {
                             match gossip_for_rx.handle_new_block(block.clone(), &pid).await {
                                 Ok(_) => {
-                                    // CHAIN-B-A007: the block passed gossip
-                                    // validation (structure + signature). Only now
-                                    // is its height trustworthy network-height
-                                    // evidence for the sync target.
-                                    max_seen_for_rx.fetch_max(
-                                        block.header.height,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
+                                    // PBA-L1b-006: gossip validation proves only a
+                                    // self-consistent, self-signed header — any key
+                                    // can sign height u64::MAX. The height becomes
+                                    // network-height evidence once ADMITTED
+                                    // (linkage verified from genesis), or clamped
+                                    // when deferred (below).
                                     match admission_for_net.admit(&block).await {
                                     admission::AdmitOutcome::Admitted { completed_partial } => {
+                                        sync_peer::record_verified_height(
+                                            &max_seen_for_rx,
+                                            block.header.height,
+                                        );
                                         if completed_partial {
                                             tracing::warn!(
                                                 "Completed a partial admission of gossiped block {} @ {}",
@@ -2638,9 +2681,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                         // dropping that height signal is what stalled a
                                         // far-behind follower — record it so the sync tick
                                         // pulls the gap forward instead of parking.
-                                        max_seen_for_rx.fetch_max(
+                                        sync_peer::record_unverified_height(
+                                            &max_seen_for_rx,
                                             block.header.height,
-                                            std::sync::atomic::Ordering::Relaxed,
+                                            storage_for_handler
+                                                .blocks
+                                                .get_applied_tip()
+                                                .ok()
+                                                .flatten()
+                                                .map(|(_, h)| h)
+                                                .unwrap_or(0),
                                         );
                                         tracing::debug!(
                                             "Deferred gossiped block {} @ {} from {}: missing parent {}",
@@ -2965,15 +3015,28 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::Transactions { transactions } => {
-                        for tx in transactions {
-                            let _ = mempool_for_handler
-                                .add_transaction(tx, TxClass::Standard)
-                                .await;
+                        // PBA-L1b-007: this node never sends GetTransactions, so
+                        // every batch is unsolicited. It used to go straight into
+                        // the mempool, skipping the gossip pre-filter. Same
+                        // checks as NewTransaction now (basic validity + content
+                        // authentication, peer penalized on failure), bounded.
+                        const MAX_UNSOLICITED_TXS_PER_BATCH: usize = 256;
+                        for tx in transactions.into_iter().take(MAX_UNSOLICITED_TXS_PER_BATCH) {
+                            if let Ok(tx) = gossip_for_rx.prevalidate_transaction(tx, &pid).await {
+                                let _ = mempool_for_handler
+                                    .add_transaction(tx, TxClass::Standard)
+                                    .await;
+                            }
                         }
+                    }
+                    // PBA-L1b-005: an unpaid peer inference must never run on
+                    // this loop (it stalled every other message; the stall
+                    // detector then exits the node). Bounded worker, or drop.
+                    NetworkMessage::InferenceRequest { .. } => {
+                        let _ = inference_dispatcher.dispatch(pid.clone(), msg.clone());
                     }
                     // AI network messages: route through AINetworkHandler
                     NetworkMessage::ModelAnnounce { .. }
-                    | NetworkMessage::InferenceRequest { .. }
                     | NetworkMessage::InferenceResponse { .. }
                     | NetworkMessage::TrainingJobAnnounce { .. }
                     | NetworkMessage::GradientSubmission { .. }

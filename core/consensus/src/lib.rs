@@ -7,8 +7,10 @@ pub mod dag_store;
 pub mod ecvrf;
 pub mod finality;
 pub mod ghostdag;
+pub mod hardening;
 pub mod ordering;
 pub mod tip_selection;
+pub mod tx_auth;
 pub mod types;
 pub mod vrf;
 

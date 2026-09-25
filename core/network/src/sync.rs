@@ -7,7 +7,6 @@ use crate::{
 };
 use citrate_consensus::crypto;
 use citrate_consensus::types::{Block, BlockHeader, Hash};
-use sha3::{Digest, Sha3_256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -112,6 +111,11 @@ pub struct SyncManager {
     /// opposite in what they should do to the peer's standing — see
     /// `sync_peer::classify_serve`.
     last_block_anchor_height: Arc<AtomicU64>,
+
+    /// PBA-R2 block-validity hardening: selects the `tx_root` rule by height
+    /// (PBA-L1b-002). Captured from the process-wide activation at
+    /// construction; see `citrate_consensus::hardening`.
+    pba_hardening: citrate_consensus::hardening::PbaHardening,
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +182,22 @@ impl SyncManager {
             last_header_hash: Arc::new(RwLock::new(None)),
             last_requested_header: Arc::new(RwLock::new(None)),
             local_height: None,
+            pba_hardening: citrate_consensus::hardening::PbaHardening::from_process(),
         }
+    }
+
+    /// The PBA-R2 hardening activation this instance enforces.
+    pub fn pba_hardening(&self) -> citrate_consensus::hardening::PbaHardening {
+        self.pba_hardening
+    }
+
+    /// Override the PBA-R2 hardening activation (tests / isolated devnets).
+    pub fn with_pba_hardening(
+        mut self,
+        hardening: citrate_consensus::hardening::PbaHardening,
+    ) -> Self {
+        self.pba_hardening = hardening;
+        self
     }
 
     /// Wire this node's own applied-chain height so sync completion is judged
@@ -568,7 +587,27 @@ impl SyncManager {
         let mut validated = Vec::with_capacity(total);
         let mut rejected = 0usize;
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         for block in blocks {
+            // 0. PBA-L1b-003: the same wall-clock future bound gossip applies.
+            // This path (which also receives unsolicited `Blocks`) skipped it,
+            // so a u64::MAX-timestamp block entered via sync. Local policy,
+            // not a validity rule: a block rejected now is accepted once its
+            // time arrives.
+            if !citrate_consensus::hardening::within_future_drift(block.header.timestamp, now) {
+                warn!(
+                    "SYNC_REJECT: block height={} timestamp {} is beyond now+{}s",
+                    block.header.height,
+                    block.header.timestamp,
+                    citrate_consensus::hardening::MAX_FUTURE_BLOCK_DRIFT_SECS
+                );
+                rejected += 1;
+                continue;
+            }
+
             // 1. Verify canonical hash integrity
             if !block.verify_hash() {
                 warn!(
@@ -600,17 +639,14 @@ impl SyncManager {
                 }
             }
 
-            // 3. Verify tx_root consistency
-            let computed_tx_root = {
-                let mut hasher = Sha3_256::new();
-                for tx in &block.transactions {
-                    hasher.update(tx.hash.as_bytes());
-                }
-                let bytes = hasher.finalize();
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes[..32]);
-                Hash::new(arr)
-            };
+            // 3. Verify tx_root consistency. PBA-L1b-002: from the activation
+            // height the root commits to every tx's full contents; below it
+            // the legacy root (over the wire `tx.hash`) is kept byte-identical.
+            let computed_tx_root = citrate_consensus::tx_auth::tx_root_for_height(
+                self.pba_hardening,
+                block.header.height,
+                &block.transactions,
+            );
             if block.tx_root != computed_tx_root {
                 warn!(
                     "SYNC_REJECT: block height={} tx_root mismatch",
@@ -1001,10 +1037,7 @@ mod tests {
             .proposer(pubkey)
             .build_unhashed();
         // tx_root over zero transactions, matching handle_blocks' recomputation.
-        let bytes = Sha3_256::new().finalize();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes[..32]);
-        block.tx_root = Hash::new(arr);
+        block.tx_root = citrate_consensus::tx_auth::tx_root_legacy(&[]);
         block.header.block_hash = block.compute_hash();
         block.signature = crypto::sign_block(&block.header.block_hash, &key);
         block

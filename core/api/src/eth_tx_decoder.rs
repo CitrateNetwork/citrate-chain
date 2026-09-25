@@ -56,8 +56,23 @@ impl LegacyTransaction {
     }
 }
 
-/// Decode an Ethereum-style RLP transaction into Citrate transaction format
+/// Decode an Ethereum-style RLP transaction into Citrate transaction format.
+///
+/// PBA-L1a-006: the returned `hash` is the canonical id derived from the
+/// signed contents (`tx_auth::authenticate`) whenever the tx authenticates —
+/// the same id the mempool stores it under and block import requires — so
+/// the hash RPC hands back is the one receipts are keyed by. For a
+/// canonically-encoded raw Ethereum tx it equals `keccak256(raw)`; a bincode
+/// native tx's client-chosen `hash` is replaced.
 pub fn decode_eth_transaction(tx_bytes: &[u8]) -> Result<Transaction, String> {
+    let mut tx = decode_eth_transaction_inner(tx_bytes)?;
+    if let Ok(canonical) = citrate_consensus::tx_auth::authenticate(&tx) {
+        tx.hash = canonical;
+    }
+    Ok(tx)
+}
+
+fn decode_eth_transaction_inner(tx_bytes: &[u8]) -> Result<Transaction, String> {
     debug!("Decoding {} bytes of transaction data", tx_bytes.len());
     debug!("First 20 bytes: {:?}", &tx_bytes[..tx_bytes.len().min(20)]);
 

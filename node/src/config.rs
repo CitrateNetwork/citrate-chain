@@ -200,6 +200,19 @@ pub struct ChainConfig {
     /// When absent, the profile is inferred from chain_id for backward compatibility.
     #[serde(default)]
     pub genesis_profile: Option<String>,
+
+    /// PBA-R2 block-validity hardening activation height
+    /// (`citrate_consensus::hardening`): tx signature + canonical-id checks on
+    /// import (PBA-L1b-001), content-bound `tx_root` (PBA-L1b-002) and the
+    /// parent-relative timestamp bound (PBA-L1b-003).
+    ///
+    /// A CONSENSUS PARAMETER: every node on a chain must agree on it.
+    /// Absent (the default, and every shipped 40204 profile) = the rules are
+    /// off. Dev profiles set `0` (active from genesis). The env var
+    /// `CITRATE_PBA_HARDENING_HEIGHT` (a height, or `off`) overrides it.
+    /// Owner runbook: `docs/consensus/PBA_HARDENING_ACTIVATION.md`.
+    #[serde(default)]
+    pub pba_hardening_height: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +323,7 @@ impl Default for NodeConfig {
                 block_time: 5,
                 ghostdag_k: 18,
                 genesis_profile: None,
+                pba_hardening_height: None,
             },
             network: NetworkConfig {
                 listen_addr: hardcoded_addr("127.0.0.1:30303"),
@@ -370,6 +384,8 @@ impl NodeConfig {
             config.chain.chain_id = 40204;
         }
         config.chain.genesis_profile = Some("default".to_string());
+        // PBA-R2: dev profile enforces the hardened validity rules from genesis.
+        config.chain.pba_hardening_height = Some(0);
         config.mining.enabled = true;
         config.mining.target_block_time = 2; // Fast blocks for testing
                                              // C-02: Allow eth_sendTransaction only in devnet mode
@@ -614,5 +630,26 @@ mod tests {
         std::env::remove_var("CITRATE_CHAIN_ID");
         let config = NodeConfig::devnet();
         assert_eq!(config.chain.genesis_profile.as_deref(), Some("default"));
+    }
+
+    /// R2: the node resolves the activation height through the ONE shared
+    /// resolver (env override, else `[chain] pba_hardening_height`) and
+    /// publishes it before constructing any gated component.
+    #[test]
+    fn pba_r2_node_uses_the_shared_resolver_before_components() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_consensus::hardening::init_pba_hardening_height(")
+            .expect("start_node must publish via init_pba_hardening_height");
+        for ctor in ["GhostDag::new(", "Executor::with_storage(", "SyncManager::new(", "GossipProtocol::new("] {
+            let at = body.find(ctor).unwrap_or_else(|| panic!("{ctor} in start_node"));
+            assert!(init < at, "activation must be published before {ctor}");
+        }
+        assert!(
+            !main.contains("activation::set_pba_hardening_height(config.chain"),
+            "no second publication path that bypasses the env override"
+        );
     }
 }

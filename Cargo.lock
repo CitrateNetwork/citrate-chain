@@ -1251,6 +1251,8 @@ dependencies = [
  "p256",
  "proptest",
  "rand 0.8.6",
+ "rlp",
+ "secp256k1 0.27.0",
  "serde",
  "serde_json",
  "sha2",

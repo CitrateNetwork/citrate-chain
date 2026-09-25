@@ -164,6 +164,12 @@ pub struct Executor {
     /// registry is configured; it always equals `reward_policy`'s embedded
     /// `activation_height` once a snapshot is materialized.
     validator_activation_height: std::sync::atomic::AtomicU64,
+    /// PBA-R2 block-validity hardening activation (PBA-L1b-001: signature +
+    /// canonical-id check on every imported transaction). `u64::MAX` = unset
+    /// (rules off). Initialized from the process-wide value
+    /// (`citrate_consensus::hardening`); tests override it with
+    /// [`Executor::set_pba_hardening`].
+    pba_hardening_height: std::sync::atomic::AtomicU64,
 }
 
 /// Height at which contract-initiated native value transfers start working.
@@ -601,6 +607,9 @@ impl Executor {
             defer_persist: std::sync::atomic::AtomicBool::new(false),
             reward_policy: crate::block_rewards::new_shared_reward_policy(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
+            pba_hardening_height: std::sync::atomic::AtomicU64::new(
+                citrate_consensus::hardening::pba_hardening_height().unwrap_or(u64::MAX),
+            ),
         }
     }
 
@@ -744,6 +753,9 @@ impl Executor {
             defer_persist: std::sync::atomic::AtomicBool::new(false),
             reward_policy: crate::block_rewards::new_shared_reward_policy(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
+            pba_hardening_height: std::sync::atomic::AtomicU64::new(
+                citrate_consensus::hardening::pba_hardening_height().unwrap_or(u64::MAX),
+            ),
         }
     }
 
@@ -1287,6 +1299,10 @@ impl Executor {
         // persist_state_changes, or later via reconcile_store_from (reorg success).
         let _defer_guard = DeferGuard::engage(&self.defer_persist);
 
+        // PBA-R2 import gate, before any state is touched. Below the activation
+        // height legacy validity is unchanged (never re-judged).
+        self.verify_block_body(block)?;
+
         let snapshot = self.state_db.snapshot();
         let prev_ctx = self.get_block_context();
 
@@ -1398,6 +1414,58 @@ impl Executor {
     pub fn set_validator_activation_height(&self, height: u64) {
         self.validator_activation_height
             .store(height, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// PBA-R2: override the block-validity hardening activation for this
+    /// executor (tests / isolated devnets). Production reads the process-wide
+    /// value at construction.
+    pub fn set_pba_hardening(&self, hardening: citrate_consensus::hardening::PbaHardening) {
+        self.pba_hardening_height.store(
+            hardening.activation_height().unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// PBA-R2: the hardened body rules every imported block must satisfy at or
+    /// above the activation height. Called by `apply_block_inner` (every import
+    /// path: apply_block, apply_block_trusted, apply_block_no_persist).
+    fn verify_block_body(&self, block: &Block) -> Result<(), ExecutionError> {
+        let pba = self.pba_hardening();
+        let height = block.header.height;
+        if !pba.active_at(height) {
+            return Ok(());
+        }
+        // PBA-L1b-002: the root must commit to the transactions' contents.
+        let expected =
+            citrate_consensus::tx_auth::tx_root_for_height(pba, height, &block.transactions);
+        if block.tx_root != expected {
+            return Err(ExecutionError::InvalidBlockBody(format!(
+                "tx_root {} does not commit to the block's transactions (expected {expected})",
+                block.tx_root
+            )));
+        }
+        // PBA-L1b-001: every transaction must be signed by its sender — as
+        // verified HERE from its contents, never the deserialized
+        // `ecdsa_verified` wire flag — carry its canonical id, and be bound to
+        // this chain. Before this, any admitted proposer could include a tx
+        // "from" any account and the follower executed it.
+        for (i, tx) in block.transactions.iter().enumerate() {
+            if let Err(e) = citrate_consensus::tx_auth::verify_for_block(tx, self.chain_id) {
+                return Err(ExecutionError::InvalidBlockBody(format!(
+                    "tx #{i} ({}): {e}",
+                    tx.hash
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// PBA-R2: the block-validity hardening this executor enforces.
+    pub fn pba_hardening(&self) -> citrate_consensus::hardening::PbaHardening {
+        match self.pba_hardening_height.load(std::sync::atomic::Ordering::SeqCst) {
+            u64::MAX => citrate_consensus::hardening::PbaHardening::off(),
+            h => citrate_consensus::hardening::PbaHardening::at(h),
+        }
     }
 
     /// VALIDATOR-S1 §R': capture the current epoch reward-policy cell (a cheap
@@ -2089,6 +2157,10 @@ impl Executor {
             reward_policy: self.reward_policy.clone(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(
                 self.validator_activation_height
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+            pba_hardening_height: std::sync::atomic::AtomicU64::new(
+                self.pba_hardening_height
                     .load(std::sync::atomic::Ordering::SeqCst),
             ),
         }

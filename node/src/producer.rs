@@ -173,6 +173,44 @@ pub struct BlockProducer {
     applied_tip_lock: Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>>,
 }
 
+/// PBA-L1a-001: outcome of one supervised production round.
+#[derive(Debug)]
+pub(crate) enum RoundOutcome<T> {
+    Produced(T),
+    Failed(anyhow::Error),
+    Panicked(String),
+}
+
+/// Run one production round in its own task so a panic inside it is caught
+/// (tokio reports it through the `JoinError`) instead of unwinding the
+/// long-lived producer loop.
+async fn supervised_round(producer: Arc<BlockProducer>) -> RoundOutcome<Hash> {
+    run_supervised(async move { producer.produce_block().await }).await
+}
+
+/// Generic form of [`supervised_round`], separated so the panic path is
+/// unit-testable without a full producer.
+pub(crate) async fn run_supervised<T, F>(round: F) -> RoundOutcome<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+{
+    match tokio::spawn(round).await {
+        Ok(Ok(v)) => RoundOutcome::Produced(v),
+        Ok(Err(e)) => RoundOutcome::Failed(e),
+        Err(join) if join.is_panic() => {
+            let payload = join.into_panic();
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            RoundOutcome::Panicked(msg)
+        }
+        Err(join) => RoundOutcome::Failed(anyhow::anyhow!("production round cancelled: {join}")),
+    }
+}
+
 impl BlockProducer {
     #[allow(dead_code)]
     pub fn new(
@@ -793,8 +831,8 @@ impl BlockProducer {
                 continue;
             }
 
-            match self.produce_block().await {
-                Ok(block_hash) => {
+            match supervised_round(self.clone()).await {
+                RoundOutcome::Produced(block_hash) => {
                     block_count += 1;
                     info!(
                         "Produced block #{} hash={} txs={}",
@@ -803,8 +841,21 @@ impl BlockProducer {
                         0, // We'll get tx count from block
                     );
                 }
-                Err(e) => {
+                RoundOutcome::Failed(e) => {
                     error!("Failed to produce block: {}", e);
+                }
+                RoundOutcome::Panicked(msg) => {
+                    // PBA-L1a-001: before this, a panic anywhere in a round
+                    // (the u64::MAX-nonce overflow in selection was one) killed
+                    // the producer task silently — the handle is dropped in
+                    // main.rs — while RPC and sync kept the node looking
+                    // healthy. Each round now runs in its own task; a panic
+                    // costs that round only.
+                    error!(
+                        "PBA-L1a-001: block production round PANICKED ({}); \
+                         continuing with the next round",
+                        msg
+                    );
                 }
             }
         }
@@ -939,7 +990,7 @@ impl BlockProducer {
         // Failing loudly is strictly better: a missing selected parent means this
         // node's view is behind, so the correct behaviour is to skip this round
         // and let the sync path fetch the block, not to mint an invalid one.
-        let (last_height, parent_vrf_output, parent_blue_score, parent_blue_work) =
+        let (last_height, parent_vrf_output, parent_blue_score, parent_blue_work, parent_ts) =
             if selected_parent != Hash::default() {
                 let parent = self
                     .storage
@@ -966,9 +1017,10 @@ impl BlockProducer {
                     parent.header.vrf_reveal.output,
                     parent.header.blue_score,
                     parent.header.blue_work,
+                    Some(parent.header.timestamp),
                 )
             } else {
-                (0, Hash::default(), 0, 0)
+                (0, Hash::default(), 0, 0, None)
             };
 
         // BLUE SCORE — `parent_blue_score + 1`, deliberately.
@@ -1031,6 +1083,32 @@ impl BlockProducer {
             transactions
         };
 
+        // PBA-L1b-001: from the activation height every follower rejects a
+        // block carrying a tx that does not authenticate from its contents,
+        // lacks its canonical id, or is bound to another chain — so never
+        // build one. Such a tx can only have reached the pool through a
+        // trusted-decoder or signature-checks-disabled path; drop it there too.
+        let transactions: Vec<citrate_consensus::types::Transaction> =
+            if self.ghostdag.pba_hardening().active_at(last_height + 1) {
+                let chain_id = self.executor.chain_id();
+                let mut keep = Vec::with_capacity(transactions.len());
+                for t in transactions {
+                    match citrate_consensus::tx_auth::verify_for_block(&t, chain_id) {
+                        Ok(_) => keep.push(t),
+                        Err(e) => {
+                            warn!(
+                                "PBA-L1b-001: excluding tx {} from the block: {} (removed from mempool)",
+                                t.hash, e
+                            );
+                            let _ = self.mempool.remove_transaction(&t.hash).await;
+                        }
+                    }
+                }
+                keep
+            } else {
+                transactions
+            };
+
         // Blue score and work are already calculated above
         let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
 
@@ -1041,7 +1119,16 @@ impl BlockProducer {
             block_hash: Hash::default(), // Will be computed
             selected_parent_hash: selected_parent,
             merge_parent_hashes: merge_parents,
-            timestamp: chrono::Utc::now().timestamp() as u64,
+            // PBA-L1b-003: never stamp before the selected parent (a
+            // future-dated tip made every `now`-stamped child invalid: a
+            // permanent halt) and never past the parent-relative bound.
+            timestamp: {
+                let now = chrono::Utc::now().timestamp().max(0) as u64;
+                match parent_ts {
+                    Some(pts) => citrate_consensus::hardening::producer_timestamp(now, pts),
+                    None => now,
+                }
+            },
             height: last_height + 1,
             blue_score,
             blue_work,
@@ -1115,7 +1202,7 @@ impl BlockProducer {
         let total_gas_used: u64 = receipts.iter().map(|receipt| receipt.gas_used).sum();
         header.gas_used = total_gas_used;
 
-        let tx_root = self.calculate_tx_root(&executed_transactions)?;
+        let tx_root = self.calculate_tx_root(header.height, &executed_transactions);
         let receipt_root = self.calculate_receipt_root(&receipts)?;
         let artifact_root = self.calculate_artifact_root(&executed_transactions)?;
 
@@ -1784,19 +1871,15 @@ impl BlockProducer {
         Ok((state_root, executed_transactions, receipts))
     }
 
-    /// Calculate transaction root
-    fn calculate_tx_root(&self, transactions: &[Transaction]) -> anyhow::Result<Hash> {
-        use sha3::{Digest, Sha3_256};
-        let mut hasher = Sha3_256::new();
-
-        for tx in transactions {
-            hasher.update(tx.hash.as_bytes());
-        }
-
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
-        Ok(Hash::new(hash_array))
+    /// Calculate transaction root. PBA-L1b-002: from the activation height the
+    /// root commits to every transaction's full contents (`tx_root_v2`); below
+    /// it the legacy root over `tx.hash` is kept byte-identical.
+    fn calculate_tx_root(&self, height: u64, transactions: &[Transaction]) -> Hash {
+        citrate_consensus::tx_auth::tx_root_for_height(
+            self.ghostdag.pba_hardening(),
+            height,
+            transactions,
+        )
     }
 
     /// Calculate receipt root
@@ -2396,6 +2479,17 @@ mod tests {
         );
         assert_eq!(block.transactions[0].hash, good_tx.hash);
         assert_eq!(block.header.gas_used, 21_000);
+        // PBA-L1b-002: the sealed root is the consensus rule's root for this
+        // block (kills `calculate_tx_root -> Default::default()`).
+        assert_eq!(
+            block.tx_root,
+            citrate_consensus::tx_auth::tx_root_for_height(
+                producer.ghostdag.pba_hardening(),
+                block.header.height,
+                &block.transactions,
+            )
+        );
+        assert_ne!(block.tx_root, Hash::default());
 
         let good_receipt = storage
             .transactions
@@ -3328,5 +3422,96 @@ mod blue_score_band_regression {
                  (mergeset {n_merges})"
             );
         }
+    }
+}
+
+/// PBA-L1a-001 — a panic inside one production round must not end block
+/// production. Before the fix `start()` awaited `produce_block()` inline; the
+/// u64::MAX-nonce overflow in mempool selection unwound the whole producer
+/// task (spawned with its handle dropped), halting the chain silently.
+#[cfg(test)]
+mod pba_l1a_001_producer_supervision {
+    use super::{run_supervised, RoundOutcome};
+
+    #[tokio::test]
+    async fn a_panicking_round_is_contained_and_reported() {
+        let out = run_supervised(async {
+            let n: u64 = std::hint::black_box(u64::MAX);
+            // The exact failure shape: an overflow panic mid-round.
+            let _ = n.checked_add(1).expect("attempt to add with overflow");
+            Ok::<u64, anyhow::Error>(0)
+        })
+        .await;
+        match out {
+            RoundOutcome::Panicked(msg) => assert!(msg.contains("overflow"), "{msg}"),
+            other => panic!("expected Panicked, got {other:?}"),
+        }
+        // And the caller keeps running rounds afterwards.
+        let next = run_supervised(async { Ok::<u64, anyhow::Error>(7) }).await;
+        assert!(matches!(next, RoundOutcome::Produced(7)));
+    }
+
+    #[tokio::test]
+    async fn errors_and_successes_pass_through() {
+        let e = run_supervised(async { Err::<u64, _>(anyhow::anyhow!("no parent")) }).await;
+        assert!(matches!(e, RoundOutcome::Failed(ref x) if x.to_string() == "no parent"));
+        let ok = run_supervised(async { Ok::<u64, anyhow::Error>(1) }).await;
+        assert!(matches!(ok, RoundOutcome::Produced(1)));
+    }
+
+    /// The loop must actually route rounds through the supervisor.
+    #[test]
+    fn start_loop_uses_the_supervisor() {
+        let src = include_str!("producer.rs");
+        let start = src.find("pub async fn start(self: Arc<Self>)").expect("start()");
+        let body = &src[start..start + 2_000];
+        assert!(
+            body.contains("supervised_round(self.clone())"),
+            "PBA-L1a-001 tripwire: BlockProducer::start must run each round through \
+             supervised_round, never await produce_block() inline"
+        );
+        assert!(!body.contains("self.produce_block().await"));
+    }
+}
+
+/// PBA-L1b-003 tripwire: the producer never stamps a bare `now`; it stamps
+/// `hardening::producer_timestamp(now, parent.ts)` so a future-dated tip can
+/// never make its own children invalid.
+#[cfg(test)]
+mod pba_l1b_003_producer_timestamp {
+    #[test]
+    fn header_timestamp_goes_through_producer_timestamp() {
+        let src = include_str!("producer.rs");
+        let hdr = src
+            .find("let mut header = BlockHeader {")
+            .expect("producer header construction");
+        let body = &src[hdr..hdr + 1_500];
+        assert!(
+            body.contains("hardening::producer_timestamp(now, pts)"),
+            "PBA-L1b-003: header.timestamp must be producer_timestamp(now, parent.ts)"
+        );
+        assert!(
+            !body.contains("timestamp: chrono::Utc::now().timestamp() as u64"),
+            "PBA-L1b-003: bare `now` stamping reintroduced"
+        );
+    }
+}
+
+/// PBA-L1b-001 tripwire: the producer filters every candidate tx through the
+/// same import rule followers enforce, so it never seals a block they reject.
+#[cfg(test)]
+mod pba_l1b_001_producer_filter {
+    #[test]
+    fn producer_applies_the_import_rule_before_sealing() {
+        let src = include_str!("producer.rs");
+        let sel = src
+            .find("let transactions = self.select_transactions_with_ai_priority().await?;")
+            .expect("selection");
+        let hdr = src.find("let mut header = BlockHeader {").expect("header");
+        let window = &src[sel..hdr];
+        assert!(
+            window.contains("tx_auth::verify_for_block(&t, chain_id)"),
+            "PBA-L1b-001: produce_block must filter candidates with tx_auth::verify_for_block"
+        );
     }
 }

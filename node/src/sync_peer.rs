@@ -151,6 +151,33 @@ pub fn should_attempt_ancestry_recovery(block_height: u64, applied_height: u64) 
 /// This is a preference, not a ban — see I2 and [`SyncPeerSelector::select`].
 pub const DEPREFER_AT_FAILURES: u32 = 3;
 
+/// PBA-L1b-006: the most an UNVERIFIED height claim may raise the node's
+/// network-height evidence (`max_seen_height`, which drives the sync target
+/// and `eth_syncing.highestBlock`) above its own applied tip. Matches the
+/// sync tick's `MAX_SYNC_LOOKAHEAD`: generous enough for any honest deep
+/// sync, finite so one packet cannot pin the value at `u64::MAX` for the life
+/// of the process.
+pub const MAX_UNVERIFIED_HEIGHT_LEAD: u64 = 10_000_000;
+
+/// Record a height proven by an ADMITTED block (linkage verified inductively
+/// from genesis by `validate_block_consistency`).
+pub fn record_verified_height(seen: &std::sync::atomic::AtomicU64, height: u64) {
+    seen.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record an unverified height claim (a validly self-signed block whose
+/// parent we lack), clamped to `applied + MAX_UNVERIFIED_HEIGHT_LEAD`.
+/// Handshake (`Hello`/`HelloAck`) heights are NOT recorded at all: they only
+/// seed the peer's advertised head, which the sync tick clamps separately.
+pub fn record_unverified_height(
+    seen: &std::sync::atomic::AtomicU64,
+    claimed: u64,
+    applied: u64,
+) {
+    let bounded = claimed.min(applied.saturating_add(MAX_UNVERIFIED_HEIGHT_LEAD));
+    seen.fetch_max(bounded, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A connected peer considered as a block source for this tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncCandidate {
@@ -935,5 +962,46 @@ mod tests {
             !should_attempt_ancestry_recovery(159_001, 0),
             "a fresh node has the whole chain to fetch; chasing tip ancestry is pure waste"
         );
+    }
+}
+
+#[cfg(test)]
+mod pba_l1b_006_network_height {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn unverified_claims_are_clamped_verified_are_not() {
+        let seen = AtomicU64::new(100);
+        record_unverified_height(&seen, u64::MAX, 100);
+        assert_eq!(seen.load(Ordering::Relaxed), 100 + MAX_UNVERIFIED_HEIGHT_LEAD);
+        record_unverified_height(&seen, 150, 100);
+        assert_eq!(seen.load(Ordering::Relaxed), 100 + MAX_UNVERIFIED_HEIGHT_LEAD);
+        let seen = AtomicU64::new(0);
+        record_unverified_height(&seen, 5_000, 10);
+        assert_eq!(seen.load(Ordering::Relaxed), 5_000, "honest lead is kept");
+        record_unverified_height(&seen, u64::MAX, u64::MAX);
+        assert_eq!(seen.load(Ordering::Relaxed), u64::MAX, "saturating, no panic");
+        let seen = AtomicU64::new(7);
+        record_verified_height(&seen, 42);
+        assert_eq!(seen.load(Ordering::Relaxed), 42);
+    }
+
+    /// Tripwire (CHAIN-B-A007 / PBA-L1b-006): every write to the network-height
+    /// evidence in the inbound loop goes through these helpers; no raw
+    /// `fetch_max` of a peer-supplied height.
+    #[test]
+    fn main_loop_never_records_raw_peer_heights() {
+        let src: String = include_str!("main.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            src.matches("max_seen_for_rx.fetch_max(").count(),
+            0,
+            "PBA-L1b-006: raw fetch_max of a peer-supplied height on max_seen_for_rx"
+        );
+        assert!(src.contains("sync_peer::record_verified_height(&max_seen_for_rx"));
+        assert!(src.contains("sync_peer::record_unverified_height("));
     }
 }

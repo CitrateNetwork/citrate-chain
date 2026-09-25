@@ -7,13 +7,46 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono;
 use citrate_consensus::types::Hash;
-use citrate_execution::{AccessPolicy, Address, JobId, JobStatus, ModelId, ModelState, UsageStats};
+use citrate_execution::ModelId;
 use citrate_storage::state_manager::StateManager;
-use tracing::{debug, error, info, warn};
-use primitive_types::U256;
+use tracing::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PBA-L1b-004: peer AI gossip is ADVISORY and BOUNDED.
+//
+// Every message handled here comes from an unauthenticated peer. Before this
+// fix each fresh `ModelAnnounce` model id (and each `TrainingJobAnnounce` job
+// id, `WeightSync`, `InferenceResponse`) became a permanent RocksDB record with
+// attacker-sized fields: ~222 MiB/s of disk growth from one connection, kept
+// across restarts. Peer claims now live only in bounded, expiring in-memory
+// maps and never reach persistent state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Upper bound on an announcement's variable-size fields, in bytes.
+pub const MAX_ANNOUNCE_METADATA_BYTES: usize = 4 * 1024;
+/// Upper bound on cached peer model announcements (all peers).
+pub const MAX_CACHED_MODELS: usize = 1024;
+/// Upper bound on cached announcements originated by one peer.
+pub const MAX_MODELS_PER_PEER: usize = 32;
+/// Upper bound on providers recorded for one model.
+pub const MAX_PROVIDERS_PER_MODEL: usize = 16;
+/// How long a peer announcement is remembered.
+pub const MODEL_ANNOUNCE_TTL: std::time::Duration = std::time::Duration::from_secs(3_600);
+/// Upper bound on tracked peer training-job announcements (all peers).
+pub const MAX_TRAINING_JOBS: usize = 256;
+/// Upper bound on tracked training-job announcements originated by one peer.
+pub const MAX_TRAINING_JOBS_PER_PEER: usize = 8;
+/// PBA-L1b-005: upper bound on pending peer inference requests (all peers).
+pub const MAX_PENDING_INFERENCES: usize = 256;
+/// PBA-L1b-005: upper bound on pending inference requests from one peer.
+pub const MAX_PENDING_INFERENCES_PER_PEER: usize = 16;
+/// PBA-L1b-005: a pending request no response has retired expires after this.
+pub const PENDING_INFERENCE_TTL_SECS: u64 = 60;
+/// Peer score penalty for an oversized AI announcement.
+const SCORE_OVERSIZED_AI_ANNOUNCE: i32 = -5;
 
 /// Result of a network inference execution.
 #[derive(Debug, Clone)]
@@ -65,6 +98,8 @@ struct InferenceRequest {
     requester: Vec<u8>,
     max_fee: u128,
     timestamp: u64,
+    /// PBA-L1b-005: the peer that sent it (per-peer cap).
+    from_peer: PeerId,
 }
 
 #[derive(Clone, Debug)]
@@ -75,7 +110,11 @@ struct TrainingJob {
     dataset_hash: Hash,
     participants: Vec<PeerId>,
     gradients_received: u32,
+    gradients_required: u32,
     reward_per_gradient: u128,
+    /// PBA-L1b-004: who announced it (per-peer quota) and when (expiry).
+    announcer: PeerId,
+    announced_at: std::time::Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +125,20 @@ struct ModelInfo {
     metadata: ModelMetadata,
     version: u32,
     providers: Vec<PeerId>,
+    /// PBA-L1b-004: who announced it (per-peer quota) and when (expiry).
+    announcer: PeerId,
+    announced_at: std::time::Instant,
+}
+
+/// Bytes an announcement asks us to hold, for the size cap.
+fn announcement_bytes(owner: &[u8], metadata: &ModelMetadata, weight_cid: &str) -> usize {
+    owner.len()
+        + metadata.name.len()
+        + metadata.version.len()
+        + metadata.description.len()
+        + metadata.framework.len()
+        + (metadata.input_shape.len() + metadata.output_shape.len()) * 8
+        + weight_cid.len()
 }
 
 impl AINetworkHandler {
@@ -104,6 +157,30 @@ impl AINetworkHandler {
     pub fn with_inference_executor(mut self, executor: Arc<dyn NetworkInferenceExecutor>) -> Self {
         self.inference_executor = Some(executor);
         self
+    }
+
+    /// Number of peer model announcements currently cached (PBA-L1b-004).
+    pub async fn cached_model_count(&self) -> usize {
+        self.model_cache.read().await.len()
+    }
+
+    /// Whether a (non-expired) peer announcement for `model_id` is cached.
+    pub async fn has_cached_model(&self, model_id: &Hash) -> bool {
+        self.model_cache
+            .read()
+            .await
+            .get(model_id)
+            .is_some_and(|m| m.announced_at.elapsed() < MODEL_ANNOUNCE_TTL)
+    }
+
+    /// Number of inference requests currently pending (PBA-L1b-005).
+    pub async fn pending_inference_count(&self) -> usize {
+        self.pending_inferences.read().await.len()
+    }
+
+    /// Number of peer training-job announcements currently tracked.
+    pub async fn active_training_count(&self) -> usize {
+        self.active_training.read().await.len()
     }
 
     /// Handle incoming AI network message
@@ -224,58 +301,70 @@ impl AINetworkHandler {
         metadata: ModelMetadata,
         weight_cid: String,
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received model announcement from peer {}: model_id={:?}",
             peer_id, model_id
         );
 
-        // Cache model info
+        // PBA-L1b-004: size cap first — never hold attacker-sized fields.
+        let bytes = announcement_bytes(owner, &metadata, &weight_cid);
+        if bytes > MAX_ANNOUNCE_METADATA_BYTES {
+            warn!(
+                "PBA-L1b-004: dropping oversized ModelAnnounce from {} ({} bytes > {})",
+                peer_id, bytes, MAX_ANNOUNCE_METADATA_BYTES
+            );
+            self.peer_manager
+                .update_peer_score(peer_id, SCORE_OVERSIZED_AI_ANNOUNCE)
+                .await;
+            return Ok(None);
+        }
+        let _ = (owner, model_hash); // advisory only: never persisted as a model record
+
+        let now = std::time::Instant::now();
         let mut cache = self.model_cache.write().await;
-        let model_info = cache.entry(model_id).or_insert(ModelInfo {
+        cache.retain(|_, m| now.duration_since(m.announced_at) < MODEL_ANNOUNCE_TTL);
+
+        // Known model: record this peer as a provider (bounded).
+        if let Some(existing) = cache.get_mut(&model_id) {
+            if !existing.providers.contains(peer_id)
+                && existing.providers.len() < MAX_PROVIDERS_PER_MODEL
+            {
+                existing.providers.push(peer_id.clone());
+            }
+            return Ok(None);
+        }
+
+        // New model: per-peer quota, then the global cap (oldest evicted).
+        let from_peer = cache.values().filter(|m| &m.announcer == peer_id).count();
+        if from_peer >= MAX_MODELS_PER_PEER {
+            debug!(
+                "PBA-L1b-004: {} is at its announcement quota ({}); dropping {}",
+                peer_id, MAX_MODELS_PER_PEER, model_id
+            );
+            return Ok(None);
+        }
+        if cache.len() >= MAX_CACHED_MODELS {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, m)| m.announced_at)
+                .map(|(k, _)| *k)
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(
             model_id,
-            weight_cid: weight_cid.clone(),
-            metadata: metadata.clone(),
-            version: 1,
-            providers: Vec::new(),
-        });
-
-        // Add peer as provider if not already present
-        if !model_info.providers.contains(peer_id) {
-            model_info.providers.push(peer_id.clone());
-        }
-
-        // Register model in state if we don't have it
-        if let Some(_existing) = self.state_manager.get_model(&ModelId(model_id)) {
-            debug!("Model {} already registered", model_id);
-        } else {
-            // Convert metadata to execution layer format
-            let exec_metadata = citrate_execution::ModelMetadata {
-                name: metadata.name,
-                version: metadata.version,
-                description: metadata.description,
-                framework: metadata.framework,
-                input_shape: metadata.input_shape,
-                output_shape: metadata.output_shape,
-                size_bytes: metadata.size_bytes,
-                created_at: metadata.created_at,
-            };
-
-            // Create model state
-            let model_state = ModelState {
-                owner: Address(owner.try_into().unwrap_or([0; 20])),
-                model_hash,
+            ModelInfo {
+                model_id,
+                weight_cid,
+                metadata,
                 version: 1,
-                metadata: exec_metadata,
-                access_policy: AccessPolicy::Public,
-                usage_stats: UsageStats::default(),
-            };
-
-            // Register model
-            self.state_manager
-                .register_model(ModelId(model_id), model_state, weight_cid)?;
-
-            info!("Registered new model {} from peer {}", model_id, peer_id);
-        }
+                providers: vec![peer_id.clone()],
+                announcer: peer_id.clone(),
+                announced_at: now,
+            },
+        );
+        debug!("Cached peer model announcement {} from {}", model_id, peer_id);
 
         Ok(None)
     }
@@ -290,28 +379,56 @@ impl AINetworkHandler {
         requester: Vec<u8>,
         max_fee: u128,
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received inference request {} for model {} from peer {}",
             request_id, model_id, peer_id
         );
 
-        // Store pending request
-        let request = InferenceRequest {
-            request_id,
-            model_id,
-            input_hash,
-            requester: requester.clone(),
-            max_fee,
-            timestamp: chrono::Utc::now().timestamp() as u64,
-        };
+        // Store pending request — PBA-L1b-005: bounded (global + per-peer
+        // caps) and expiring; this map used to grow without limit.
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        {
+            let mut pending = self.pending_inferences.write().await;
+            pending.retain(|_, r| now.saturating_sub(r.timestamp) < PENDING_INFERENCE_TTL_SECS);
+            if !pending.contains_key(&request_id) {
+                let from_peer = pending.values().filter(|r| &r.from_peer == peer_id).count();
+                if from_peer >= MAX_PENDING_INFERENCES_PER_PEER {
+                    debug!(
+                        "PBA-L1b-005: {} has {} pending inference requests; dropping {}",
+                        peer_id, from_peer, request_id
+                    );
+                    return Ok(None);
+                }
+                if pending.len() >= MAX_PENDING_INFERENCES {
+                    if let Some(oldest) = pending
+                        .iter()
+                        .min_by_key(|(_, r)| r.timestamp)
+                        .map(|(k, _)| *k)
+                    {
+                        pending.remove(&oldest);
+                    }
+                }
+            }
+            pending.insert(
+                request_id,
+                InferenceRequest {
+                    request_id,
+                    model_id,
+                    input_hash,
+                    requester: requester.clone(),
+                    max_fee,
+                    timestamp: now,
+                    from_peer: peer_id.clone(),
+                },
+            );
+        }
 
-        self.pending_inferences
-            .write()
-            .await
-            .insert(request_id, request);
-
-        // Check if we can serve this inference
-        if self.state_manager.get_model(&ModelId(model_id)).is_some() {
+        // Check if we can serve this inference: a locally registered model, or
+        // a live (bounded, expiring) peer announcement (PBA-L1b-004: peer
+        // announcements are no longer persisted as model records).
+        if self.state_manager.get_model(&ModelId(model_id)).is_some()
+            || self.has_cached_model(&model_id).await
+        {
             debug!("Running inference for model {}", model_id);
 
             // Use the pluggable inference executor (MCP/GGUF backed)
@@ -368,7 +485,7 @@ impl AINetworkHandler {
         proof: Vec<u8>,
         _provider: Vec<u8>,
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received inference response {} from peer {}",
             request_id, peer_id
         );
@@ -376,19 +493,16 @@ impl AINetworkHandler {
         // Check if we have this pending request
         let mut pending = self.pending_inferences.write().await;
         if let Some(request) = pending.remove(&request_id) {
-            // Cache the inference result
-            let result = citrate_storage::state::InferenceResult {
-                model_id: ModelId(request.model_id),
-                input_hash: request.input_hash,
-                output: vec![],   // Would be fetched from IPFS using output_hash
-                gas_used: 100000, // Estimated
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                proof: Some(proof),
-            };
-
-            self.state_manager.cache_inference_result(result)?;
-
-            debug!("Cached inference result for request {}", request_id);
+            // PBA-L1b-004 variant: a peer's response is an unauthenticated
+            // claim (an attacker can pair its own request + response ids). It
+            // retires the pending entry; it is never persisted.
+            debug!(
+                "Inference response {} for model {} from {} ({} proof bytes); not persisted",
+                request_id,
+                request.model_id,
+                peer_id,
+                proof.len()
+            );
         }
 
         Ok(None)
@@ -406,39 +520,49 @@ impl AINetworkHandler {
         reward_per_gradient: u128,
         owner: [u8; 20],
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received training job {} announcement from peer {} with owner {:02x?}",
             job_id, peer_id, owner
         );
 
-        let job = TrainingJob {
+        // PBA-L1b-004 variant: bounded, expiring, in memory only — the
+        // unauthenticated announcement (with a peer-chosen `owner`) used to be
+        // written to persistent state per fresh job id.
+        let _ = owner;
+        let now = std::time::Instant::now();
+        let mut training = self.active_training.write().await;
+        training.retain(|_, j| now.duration_since(j.announced_at) < MODEL_ANNOUNCE_TTL);
+        if training.contains_key(&job_id) {
+            return Ok(None);
+        }
+        let from_peer = training.values().filter(|j| &j.announcer == peer_id).count();
+        if from_peer >= MAX_TRAINING_JOBS_PER_PEER {
+            debug!("PBA-L1b-004: {} is at its training-announce quota", peer_id);
+            return Ok(None);
+        }
+        if training.len() >= MAX_TRAINING_JOBS {
+            if let Some(oldest) = training
+                .iter()
+                .min_by_key(|(_, j)| j.announced_at)
+                .map(|(k, _)| *k)
+            {
+                training.remove(&oldest);
+            }
+        }
+        training.insert(
             job_id,
-            model_id,
-            dataset_hash,
-            participants: vec![peer_id.clone()],
-            gradients_received: 0,
-            reward_per_gradient,
-        };
-
-        self.active_training.write().await.insert(job_id, job);
-
-        // Register training job in state with the actual owner from the message
-        let training_job = citrate_execution::TrainingJob {
-            id: JobId(job_id),
-            owner: Address(owner), // Use owner from message
-            model_id: ModelId(model_id),
-            dataset_hash,
-            gradients_submitted: 0,
-            gradients_required: participants_needed,
-            participants: Vec::new(),
-            reward_pool: U256::from(reward_per_gradient) * U256::from(participants_needed),
-            status: JobStatus::Pending,
-            created_at: chrono::Utc::now().timestamp() as u64,
-            completed_at: None,
-        };
-
-        self.state_manager
-            .add_training_job(JobId(job_id), training_job)?;
+            TrainingJob {
+                job_id,
+                model_id,
+                dataset_hash,
+                participants: vec![peer_id.clone()],
+                gradients_received: 0,
+                gradients_required: participants_needed,
+                reward_per_gradient,
+                announcer: peer_id.clone(),
+                announced_at: now,
+            },
+        );
 
         Ok(None)
     }
@@ -452,66 +576,37 @@ impl AINetworkHandler {
         epoch: u32,
         participant: Vec<u8>,
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received gradient submission for job {} epoch {} from peer {}",
             job_id, epoch, peer_id
         );
 
-        let mut training = self.active_training.write().await;
-
-        // Update local tracking
-        let gradients_complete = if let Some(job) = training.get_mut(&job_id) {
-            job.gradients_received += 1;
-
-            // Add participant if not already tracked
-            if !job.participants.contains(peer_id) {
-                job.participants.push(peer_id.clone());
+        let _ = participant;
+        // PBA-L1b-004 variant: in-memory bookkeeping on a bounded, expiring
+        // announcement only; a peer's gradient claim is never persisted.
+        let known = {
+            let mut training = self.active_training.write().await;
+            match training.get_mut(&job_id) {
+                Some(job) => {
+                    job.gradients_received = job.gradients_received.saturating_add(1);
+                    if !job.participants.contains(peer_id)
+                        && job.participants.len() < MAX_PROVIDERS_PER_MODEL
+                    {
+                        job.participants.push(peer_id.clone());
+                    }
+                    debug!(
+                        "Job {} now has {}/{} gradients from {} participants",
+                        job_id,
+                        job.gradients_received,
+                        job.gradients_required,
+                        job.participants.len()
+                    );
+                    true
+                }
+                None => false,
             }
-
-            debug!(
-                "Job {} now has {}/{} gradients from {} participants",
-                job_id,
-                job.gradients_received,
-                job.participants.len() as u32,
-                job.participants.len()
-            );
-
-            // Check if we have enough gradients
-            job.gradients_received >= job.participants.len() as u32
-        } else {
-            false
         };
-
-        // Drop the lock before doing state updates
-        drop(training);
-
-        // Update state manager with gradient submission
-        if let Some(mut state_job) = self.state_manager.get_training_job(&JobId(job_id)) {
-            // Convert participant bytes to Address
-            let participant_addr = Address(participant.try_into().unwrap_or([0; 20]));
-
-            // Record gradient submission
-            if !state_job.participants.contains(&participant_addr) {
-                state_job.participants.push(participant_addr);
-            }
-            state_job.gradients_submitted += 1;
-
-            // Update status based on progress
-            if gradients_complete || state_job.gradients_submitted >= state_job.gradients_required {
-                state_job.status = JobStatus::Completed;
-                state_job.completed_at = Some(chrono::Utc::now().timestamp() as u64);
-                info!(
-                    "Training job {} completed with {} gradients",
-                    job_id, state_job.gradients_submitted
-                );
-            } else if state_job.status == JobStatus::Pending {
-                state_job.status = JobStatus::Active;
-            }
-
-            // Persist updated job state
-            self.state_manager.add_training_job(JobId(job_id), state_job)?;
-
-            // Store gradient reference for aggregation
+        if known {
             self.store_gradient_reference(job_id, gradient_hash, epoch).await?;
         }
 
@@ -542,7 +637,7 @@ impl AINetworkHandler {
         version: u32,
         weight_delta: Vec<u8>,
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received weight sync for model {} version {} ({} bytes) from peer {}",
             model_id, version, weight_delta.len(), peer_id
         );
@@ -571,15 +666,10 @@ impl AINetworkHandler {
         // and storing them on IPFS to get the actual CID
         let new_weight_cid = self.compute_new_weight_cid(&model_id, &weight_delta, version);
 
-        // Update model weights in state manager
-        if let Err(e) = self.state_manager.update_model_weights(
-            ModelId(model_id),
-            new_weight_cid.clone(),
-            version,
-        ) {
-            error!("Failed to update model weights in state: {}", e);
-            return Ok(None);
-        }
+        // PBA-L1b-004 variant: an unauthenticated peer's weight update is
+        // never written to persistent state (it used to overwrite the weight
+        // CID of any locally registered model). It only refreshes the bounded
+        // in-memory announcement cache below.
 
         // Update local cache
         let mut cache = self.model_cache.write().await;
@@ -597,7 +687,7 @@ impl AINetworkHandler {
         // broadcasting to all necessary peers. If we need to propagate, we should
         // implement a proper gossip protocol with TTL or seen-message tracking.
 
-        info!(
+        debug!(
             "Successfully applied weight sync for model {} to version {}",
             model_id, version
         );
@@ -735,6 +825,7 @@ impl AINetworkHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use citrate_execution::{AccessPolicy, Address, ModelState, UsageStats};
     use citrate_network_test_helpers::*;
 
     // ---- test helpers inlined to avoid extra crate ----
@@ -920,5 +1011,301 @@ mod tests {
             response.is_none(),
             "Executor error should gracefully return Ok(None)"
         );
+    }
+}
+
+/// PBA-L1b-004 / PBA-L1b-005: exact bounds of the in-memory peer AI state
+/// (added to kill cargo-mutants survivors: every cap, TTL and counter is
+/// pinned at its edge).
+#[cfg(test)]
+mod pba_r2_bounds {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn handler() -> (AINetworkHandler, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(citrate_storage::db::RocksDB::open(dir.path()).unwrap());
+        let pm = Arc::new(PeerManager::new(crate::peer::PeerManagerConfig::default()));
+        (AINetworkHandler::new(Arc::new(StateManager::new(db)), pm), dir)
+    }
+
+    fn id(i: u32) -> Hash {
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&i.to_le_bytes());
+        Hash::new(b)
+    }
+
+    fn meta(description: String) -> ModelMetadata {
+        ModelMetadata {
+            name: "n".into(),
+            version: "1".into(),
+            description,
+            framework: "f".into(),
+            input_shape: vec![],
+            output_shape: vec![],
+            size_bytes: 0,
+            created_at: 0,
+        }
+    }
+
+    fn announce(i: u32, description: String) -> NetworkMessage {
+        NetworkMessage::ModelAnnounce {
+            model_id: id(i),
+            model_hash: Hash::new([1; 32]),
+            owner: vec![0xAB; 20],
+            metadata: meta(description),
+            weight_cid: "cid".into(),
+        }
+    }
+
+    fn peer(s: &str) -> PeerId {
+        PeerId(s.to_string())
+    }
+
+    fn request(i: u32) -> NetworkMessage {
+        NetworkMessage::InferenceRequest {
+            request_id: id(i),
+            model_id: Hash::new([9; 32]),
+            input_hash: Hash::new([1; 32]),
+            requester: vec![],
+            max_fee: 0,
+        }
+    }
+
+    fn training(i: u32) -> NetworkMessage {
+        NetworkMessage::TrainingJobAnnounce {
+            job_id: id(i),
+            model_id: id(i),
+            dataset_hash: Hash::new([2; 32]),
+            participants_needed: 3,
+            reward_per_gradient: 1,
+            owner: [0xAB; 20],
+        }
+    }
+
+    fn expired() -> Instant {
+        Instant::now()
+            .checked_sub(MODEL_ANNOUNCE_TTL + Duration::from_secs(1))
+            .expect("monotonic clock far enough from boot")
+    }
+
+    #[test]
+    fn announcement_bytes_counts_every_field_exactly() {
+        let m = ModelMetadata {
+            name: "ab".into(),
+            version: "1".into(),
+            description: "xyz".into(),
+            framework: "f".into(),
+            input_shape: vec![1, 2],
+            output_shape: vec![3],
+            size_bytes: 99,
+            created_at: 7,
+        };
+        // 20 owner + 2 + 1 + 3 + 1 + (2 + 1) * 8 + 3 cid
+        assert_eq!(announcement_bytes(&[0u8; 20], &m, "cid"), 54);
+        assert_eq!(announcement_bytes(&[], &meta(String::new()), ""), 3);
+    }
+
+    #[tokio::test]
+    async fn size_cap_is_inclusive() {
+        let (h, _d) = handler();
+        // owner 20 + "n" + "1" + "f" + "cid" = 26 bytes of fixed fields.
+        let at_cap = "x".repeat(MAX_ANNOUNCE_METADATA_BYTES - 26);
+        h.handle_message(&peer("p"), &announce(1, at_cap.clone())).await.unwrap();
+        assert!(h.has_cached_model(&id(1)).await, "exactly at the cap is accepted");
+        h.handle_message(&peer("p"), &announce(2, at_cap + "x")).await.unwrap();
+        assert!(!h.has_cached_model(&id(2)).await, "one byte over is refused");
+    }
+
+    #[tokio::test]
+    async fn cache_expiry_and_counters() {
+        let (h, _d) = handler();
+        assert!(!h.has_cached_model(&id(1)).await);
+        h.handle_message(&peer("p"), &announce(1, "d".into())).await.unwrap();
+        h.handle_message(&peer("p"), &announce(2, "d".into())).await.unwrap();
+        assert!(h.has_cached_model(&id(1)).await);
+        assert_eq!(h.cached_model_count().await, 2);
+        h.model_cache.write().await.get_mut(&id(1)).unwrap().announced_at = expired();
+        assert!(!h.has_cached_model(&id(1)).await, "an expired announcement is not live");
+        // The next announcement prunes it.
+        h.handle_message(&peer("q"), &announce(3, "d".into())).await.unwrap();
+        assert_eq!(h.cached_model_count().await, 2);
+        assert!(!h.model_cache.read().await.contains_key(&id(1)));
+    }
+
+    #[tokio::test]
+    async fn expired_entries_free_the_per_peer_quota() {
+        let (h, _d) = handler();
+        for i in 0..MAX_MODELS_PER_PEER as u32 {
+            h.handle_message(&peer("p"), &announce(i, "d".into())).await.unwrap();
+        }
+        h.handle_message(&peer("p"), &announce(10_000, "d".into())).await.unwrap();
+        assert!(!h.has_cached_model(&id(10_000)).await, "quota reached");
+        for m in h.model_cache.write().await.values_mut() {
+            m.announced_at = expired();
+        }
+        h.handle_message(&peer("p"), &announce(10_000, "d".into())).await.unwrap();
+        assert!(h.has_cached_model(&id(10_000)).await, "expired entries no longer count");
+        assert_eq!(h.cached_model_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn providers_are_deduplicated_and_capped() {
+        let (h, _d) = handler();
+        for p in 0..(MAX_PROVIDERS_PER_MODEL + 5) {
+            let who = peer(&format!("p{p}"));
+            h.handle_message(&who, &announce(1, "d".into())).await.unwrap();
+            h.handle_message(&who, &announce(1, "d".into())).await.unwrap();
+        }
+        let cache = h.model_cache.read().await;
+        let providers = &cache.get(&id(1)).unwrap().providers;
+        assert_eq!(providers.len(), MAX_PROVIDERS_PER_MODEL);
+        let unique: std::collections::HashSet<_> = providers.iter().collect();
+        assert_eq!(unique.len(), providers.len(), "no duplicate providers");
+        assert_eq!(cache.get(&id(1)).unwrap().announcer, peer("p0"));
+    }
+
+    #[tokio::test]
+    async fn global_model_cap_evicts_oldest() {
+        let (h, _d) = handler();
+        let peers = MAX_CACHED_MODELS / MAX_MODELS_PER_PEER;
+        for p in 0..peers {
+            for j in 0..MAX_MODELS_PER_PEER {
+                let i = (p * MAX_MODELS_PER_PEER + j) as u32;
+                h.handle_message(&peer(&format!("p{p}")), &announce(i, "d".into()))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(h.cached_model_count().await, MAX_CACHED_MODELS);
+        h.handle_message(&peer("late"), &announce(999_999, "d".into())).await.unwrap();
+        assert_eq!(h.cached_model_count().await, MAX_CACHED_MODELS, "cap holds");
+        assert!(h.has_cached_model(&id(999_999)).await, "newest admitted, oldest evicted");
+    }
+
+    #[tokio::test]
+    async fn pending_requests_counted_capped_expired_and_retired() {
+        let (h, _d) = handler();
+        for i in 0..3 {
+            h.handle_message(&peer("a"), &request(i)).await.unwrap();
+        }
+        assert_eq!(h.pending_inference_count().await, 3);
+        // A response retires its request.
+        h.handle_message(
+            &peer("b"),
+            &NetworkMessage::InferenceResponse {
+                request_id: id(0),
+                output_hash: Hash::new([0; 32]),
+                proof: vec![1],
+                provider: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(h.pending_inference_count().await, 2);
+        // Per-peer cap, exactly.
+        for i in 100..(100 + MAX_PENDING_INFERENCES_PER_PEER as u32 + 3) {
+            h.handle_message(&peer("c"), &request(i)).await.unwrap();
+        }
+        let from_c = h
+            .pending_inferences
+            .read()
+            .await
+            .values()
+            .filter(|r| r.from_peer == peer("c"))
+            .count();
+        assert_eq!(from_c, MAX_PENDING_INFERENCES_PER_PEER);
+        // An entry exactly TTL seconds old is expired by the next request.
+        {
+            let mut p = h.pending_inferences.write().await;
+            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            p.get_mut(&id(1)).unwrap().timestamp = now - PENDING_INFERENCE_TTL_SECS;
+        }
+        h.handle_message(&peer("d"), &request(5_000)).await.unwrap();
+        assert!(!h.pending_inferences.read().await.contains_key(&id(1)));
+        assert!(h.pending_inferences.read().await.contains_key(&id(2)));
+    }
+
+    #[tokio::test]
+    async fn pending_global_cap_evicts_oldest() {
+        let (h, _d) = handler();
+        let peers = MAX_PENDING_INFERENCES / MAX_PENDING_INFERENCES_PER_PEER;
+        for p in 0..peers {
+            for j in 0..MAX_PENDING_INFERENCES_PER_PEER {
+                let i = (p * MAX_PENDING_INFERENCES_PER_PEER + j) as u32;
+                h.handle_message(&peer(&format!("p{p}")), &request(i)).await.unwrap();
+            }
+        }
+        assert_eq!(h.pending_inference_count().await, MAX_PENDING_INFERENCES);
+        h.handle_message(&peer("late"), &request(999_999)).await.unwrap();
+        assert_eq!(h.pending_inference_count().await, MAX_PENDING_INFERENCES);
+        assert!(h.pending_inferences.read().await.contains_key(&id(999_999)));
+    }
+
+    #[tokio::test]
+    async fn training_announcements_bounded_expiring_and_counted() {
+        let (h, _d) = handler();
+        h.handle_message(&peer("a"), &training(1)).await.unwrap();
+        h.handle_message(&peer("a"), &training(1)).await.unwrap(); // duplicate
+        h.handle_message(&peer("b"), &training(2)).await.unwrap();
+        assert_eq!(h.active_training_count().await, 2);
+        // Per-peer quota, exactly (peer "a" already has one).
+        for i in 10..(10 + MAX_TRAINING_JOBS_PER_PEER as u32 + 3) {
+            h.handle_message(&peer("a"), &training(i)).await.unwrap();
+        }
+        let from_a = h
+            .active_training
+            .read()
+            .await
+            .values()
+            .filter(|j| j.announcer == peer("a"))
+            .count();
+        assert_eq!(from_a, MAX_TRAINING_JOBS_PER_PEER);
+        // Expiry frees the quota.
+        for j in h.active_training.write().await.values_mut() {
+            j.announced_at = expired();
+        }
+        h.handle_message(&peer("a"), &training(500)).await.unwrap();
+        assert_eq!(h.active_training_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn training_global_cap_evicts_oldest() {
+        let (h, _d) = handler();
+        let peers = MAX_TRAINING_JOBS / MAX_TRAINING_JOBS_PER_PEER;
+        for p in 0..peers {
+            for j in 0..MAX_TRAINING_JOBS_PER_PEER {
+                let i = (p * MAX_TRAINING_JOBS_PER_PEER + j) as u32;
+                h.handle_message(&peer(&format!("p{p}")), &training(i)).await.unwrap();
+            }
+        }
+        assert_eq!(h.active_training_count().await, MAX_TRAINING_JOBS);
+        h.handle_message(&peer("late"), &training(999_999)).await.unwrap();
+        assert_eq!(h.active_training_count().await, MAX_TRAINING_JOBS);
+        assert!(h.active_training.read().await.contains_key(&id(999_999)));
+    }
+
+    #[tokio::test]
+    async fn gradients_update_only_known_jobs_with_bounded_participants() {
+        let (h, _d) = handler();
+        let grad = |job: u32| NetworkMessage::GradientSubmission {
+            job_id: id(job),
+            gradient_hash: Hash::new([3; 32]),
+            epoch: 1,
+            participant: vec![],
+        };
+        h.handle_message(&peer("x"), &grad(7)).await.unwrap(); // unknown job: ignored
+        assert_eq!(h.active_training_count().await, 0);
+        h.handle_message(&peer("owner"), &training(7)).await.unwrap();
+        for p in 0..(MAX_PROVIDERS_PER_MODEL + 4) {
+            h.handle_message(&peer(&format!("g{p}")), &grad(7)).await.unwrap();
+        }
+        h.handle_message(&peer("g0"), &grad(7)).await.unwrap(); // repeat participant
+        let t = h.active_training.read().await;
+        let job = t.get(&id(7)).unwrap();
+        assert_eq!(job.gradients_received as usize, MAX_PROVIDERS_PER_MODEL + 5);
+        assert_eq!(job.participants.len(), MAX_PROVIDERS_PER_MODEL);
+        let unique: std::collections::HashSet<_> = job.participants.iter().collect();
+        assert_eq!(unique.len(), job.participants.len());
     }
 }

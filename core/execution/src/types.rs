@@ -648,4 +648,11 @@ pub enum ExecutionError {
     /// advances. Deterministic given identical inputs, so it does not fork.
     #[error("Execution panicked (isolated as revert): {0}")]
     ExecutionPanicked(String),
+
+    /// PBA-R2: an imported block's body fails the hardened validity rules
+    /// (content-bound tx_root, PBA-L1b-002; tx signature / canonical id /
+    /// chain id, PBA-L1b-001). Deterministic: the block is invalid on every
+    /// node at or above the activation height.
+    #[error("Invalid block body: {0}")]
+    InvalidBlockBody(String),
 }

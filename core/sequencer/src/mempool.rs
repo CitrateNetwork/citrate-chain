@@ -276,6 +276,12 @@ impl BoundedHashSet {
     }
 }
 
+/// PBA-L1a-001: reads a sender's COMMITTED (on-chain) nonce. The node wires
+/// this to the executor so admission can bound a new sender's nonce against
+/// state instead of accepting any value (the per-sender gap check only sees
+/// txs already buffered here).
+pub type StateNonceReader = Arc<dyn Fn(&PublicKey) -> u64 + Send + Sync>;
+
 /// Transaction mempool
 pub struct Mempool {
     /// Configuration
@@ -322,6 +328,9 @@ pub struct Mempool {
 
     /// Total size of transactions in bytes
     total_size: Arc<RwLock<usize>>,
+
+    /// PBA-L1a-001: optional committed-nonce reader (see [`StateNonceReader`]).
+    state_nonce: Option<StateNonceReader>,
 }
 
 impl Mempool {
@@ -339,7 +348,16 @@ impl Mempool {
             // SECREM-01 CONS-4: bounded dedup set (was an unbounded HashSet)
             evicted: Arc::new(RwLock::new(BoundedHashSet::new(EVICTED_CAP))),
             total_size: Arc::new(RwLock::new(0)),
+            state_nonce: None,
         }
+    }
+
+    /// PBA-L1a-001: bound admitted nonces against the sender's committed
+    /// nonce: reject `nonce < state` (stale) and `nonce > state +
+    /// max_nonce_gap` (unselectable gap-junk), for new senders too.
+    pub fn with_state_nonce_reader(mut self, reader: StateNonceReader) -> Self {
+        self.state_nonce = Some(reader);
+        self
     }
 
     /// Add a transaction to the mempool
@@ -373,6 +391,18 @@ impl Mempool {
 
         // Basic validation
         self.validate_transaction(&tx).await?;
+
+        // PBA-L1a-006: the dedup / storage key is the canonical id derived
+        // from the signed contents, never the claimed `tx.hash`. Before this an
+        // attacker's own signed tx carrying a victim's hash took the victim's
+        // dedup slot (targeted censorship) and, if mined, overwrote the
+        // victim's stored tx/receipt. Only a tx that did not authenticate here
+        // (the trusted-decoder `ecdsa_verified` path, or signature checking
+        // disabled by config) keeps its claimed hash; block import rejects a
+        // non-canonical hash after the PBA-R2 activation height.
+        if let Ok(canonical) = citrate_consensus::tx_auth::authenticate(&tx) {
+            tx.hash = canonical;
+        }
 
         let tx_hash = tx.hash;
         let sender = tx.from;
@@ -431,6 +461,19 @@ impl Mempool {
                     return Err(MempoolError::DuplicateNonce { nonce: tx.nonce });
                 }
             }
+        }
+
+        // PBA-L1a-001: `u64::MAX` can never be followed (the sender's next
+        // nonce would overflow), so it is never a valid nonce to admit. Before
+        // this check a fresh key's validly signed `nonce = u64::MAX` tx was
+        // admitted — the gap check above only runs for a sender that already
+        // has pending txs — and `get_best_transactions` panicked on
+        // `nonce + 1`, killing the producer task. Every ingress (RPC, P2P
+        // `NewTransaction` and `Transactions`) goes through here.
+        if tx.nonce == u64::MAX {
+            return Err(MempoolError::InvalidTransaction(
+                "nonce u64::MAX is not admissible (PBA-L1a-001)".into(),
+            ));
         }
 
         // Check mempool size limit
@@ -501,6 +544,23 @@ impl Mempool {
     async fn validate_transaction(&self, tx: &Transaction) -> Result<(), MempoolError> {
         tracing::debug!("Validating transaction with hash: {:?}", tx.hash);
 
+        if let Some(read_state_nonce) = &self.state_nonce {
+            let state_nonce = read_state_nonce(&tx.from);
+            if tx.nonce < state_nonce {
+                return Err(MempoolError::NonceTooLow {
+                    expected: state_nonce,
+                    got: tx.nonce,
+                });
+            }
+            if tx.nonce - state_nonce > self.config.max_nonce_gap {
+                return Err(MempoolError::InvalidTransaction(format!(
+                    "nonce {} is more than {} ahead of the sender's committed nonce {} \
+                     (PBA-L1a-001)",
+                    tx.nonce, self.config.max_nonce_gap, state_nonce
+                )));
+            }
+        }
+
         // Basic sanity checks
 
         // For devnet mode, accept test signatures and addresses
@@ -534,9 +594,13 @@ impl Mempool {
             let from_bytes = tx.from.as_bytes();
             let is_evm_address = from_bytes[20..].iter().all(|&b| b == 0)
                 && !from_bytes[..20].iter().all(|&b| b == 0);
-            if is_evm_address && !tx.ecdsa_verified {
+            // PBA-L1b-007: a tx that arrived over P2P has the flag stripped;
+            // accept it when the signer is recovered from its contents (all
+            // EIP-2718 types), never on address shape or the flag alone.
+            if is_evm_address && !tx.ecdsa_verified && !self.verify_eth_ecdsa(tx).unwrap_or(false) {
                 tracing::warn!(
-                    "ECDSA-shaped transaction from {:?} rejected: ecdsa_verified=false",
+                    "ECDSA-shaped transaction from {:?} rejected: not decoder-verified and \
+                     the signer does not recover from its contents",
                     tx.from
                 );
                 return Err(MempoolError::InvalidSignature);
@@ -670,75 +734,16 @@ impl Mempool {
         Ok(())
     }
 
-    /// Attempt Ethereum legacy/EIP-155 ECDSA verification using secp256k1
+    /// Verify a transaction's signature from its contents alone.
+    ///
+    /// PBA-L1b-007: this used to rebuild ONLY the legacy EIP-155 payload (and
+    /// encoded value 0 as `0x00` instead of `0x80`), so every EIP-2930/1559
+    /// transaction and every zero-value legacy one arriving over P2P (where
+    /// `ecdsa_verified` is stripped) failed and was dropped. It now delegates
+    /// to the shared verifier block import also uses (`tx_auth::authenticate`:
+    /// legacy/2930/1559 payloads, EIP-2 low-s, ed25519 for native keys).
     fn verify_eth_ecdsa(&self, tx: &Transaction) -> anyhow::Result<bool> {
-        use rlp::RlpStream;
-        use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, Secp256k1};
-        use sha3::{Digest, Keccak256};
-
-        // Extract 20-byte address from `from` (we expect decoder to set this)
-        let from_addr20 = {
-            let bytes = tx.from.as_bytes();
-            let mut a = [0u8; 20];
-            a.copy_from_slice(&bytes[0..20]);
-            a
-        };
-
-        // Build signable RLP (EIP-155 with configured chain_id)
-        let mut s = RlpStream::new_list(9);
-        s.append(&tx.nonce);
-        s.append(&tx.gas_price);
-        s.append(&tx.gas_limit);
-        // to: empty for contract creation
-        if let Some(to_pk) = &tx.to {
-            // take first 20 bytes
-            let mut to20 = [0u8; 20];
-            to20.copy_from_slice(&to_pk.as_bytes()[0..20]);
-            s.append(&to20.as_slice());
-        } else {
-            s.append_empty_data();
-        }
-        // value as minimal big-endian bytes
-        let mut value_be = tx.value.to_be_bytes().to_vec();
-        while value_be.first() == Some(&0u8) && value_be.len() > 1 {
-            value_be.remove(0);
-        }
-        s.append(&value_be.as_slice());
-        s.append(&tx.data.as_slice());
-        s.append(&self.config.chain_id);
-        s.append(&0u8);
-        s.append(&0u8);
-
-        let rlp_bytes = s.out().freeze();
-        let mut hasher = Keccak256::new();
-        hasher.update(&rlp_bytes);
-        let sighash = hasher.finalize();
-
-        // Build recoverable signature from r||s (no v available; try both recovery ids)
-        let secp = Secp256k1::new();
-        let msg = Message::from_slice(&sighash)?;
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes.copy_from_slice(tx.signature.as_bytes());
-
-        for rec_id in 0..=1 {
-            if let Ok(recid) = RecoveryId::from_i32(rec_id) {
-                if let Ok(recsig) = RecoverableSignature::from_compact(&sig_bytes, recid) {
-                    if let Ok(pubkey) = secp.recover_ecdsa(&msg, &recsig) {
-                        let uncompressed = pubkey.serialize_uncompressed();
-                        // Compute Ethereum address
-                        let mut hasher = Keccak256::new();
-                        hasher.update(&uncompressed[1..]);
-                        let hash = hasher.finalize();
-                        let mut addr = [0u8; 20];
-                        addr.copy_from_slice(&hash[12..]);
-                        if addr == from_addr20 {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(false)
+        Ok(citrate_consensus::tx_auth::authenticate(tx).is_ok())
     }
 
     /// Remove a transaction from mempool
@@ -851,7 +856,7 @@ impl Mempool {
         let set = self.sender_nonces.read().await;
         set.get(sender)
             .and_then(|s| s.iter().next_back().copied())
-            .map(|n| n + 1)
+            .and_then(|n| n.checked_add(1))
     }
 
     /// Get AI transactions (model operations, inference requests)
@@ -925,8 +930,14 @@ impl Mempool {
                         None => true,
                     };
                     if ok {
+                        // PBA-L1a-001: `nonce + 1` panicked (overflow-checks) on
+                        // a u64::MAX nonce and killed the producer task. A tx
+                        // whose successor nonce does not exist is skipped.
+                        let Some(successor) = mtx.tx.nonce.checked_add(1) else {
+                            continue;
+                        };
                         total_size += mtx.size;
-                        next_nonce.insert(sender, mtx.tx.nonce + 1);
+                        next_nonce.insert(sender, successor);
                         selected.push(mtx.tx.clone());
                         progressed = true;
                         if selected.len() >= max_count {
@@ -969,7 +980,7 @@ impl Mempool {
 
             // Check if this tx has the next nonce
             match highest_included_nonce {
-                Some(nonce) => tx.nonce == nonce + 1,
+                Some(nonce) => nonce.checked_add(1) == Some(tx.nonce),
                 None => {
                     // No txs from this sender included yet, allow contiguous sequence starting at the minimal nonce
                     let txs_guard = self.transactions.read().await;
@@ -1289,6 +1300,198 @@ mod tests {
             chain_id: Some(40204), // M-01: chain domain binding — matches canonical default
             ..Default::default()
         }
+    }
+
+
+    // ── PBA-R2 mutation-survivor kills (validate_transaction /
+    // get_best_transactions / is_next_nonce / MempoolAccess). ──
+
+    fn signed_native(seed: u8, nonce: u64, chain_id: Option<u64>, gas_limit: u64) -> Transaction {
+        let sk = citrate_consensus::crypto::Ed25519SigningKey::from_bytes(&[seed; 32]);
+        let mut tx = Transaction {
+            nonce,
+            to: Some(PublicKey::new([9; 32])),
+            value: 1,
+            gas_limit,
+            gas_price: 1_000_000_000,
+            chain_id,
+            ..Default::default()
+        };
+        citrate_consensus::crypto::sign_transaction(&mut tx, &sk).unwrap();
+        tx
+    }
+
+    #[tokio::test]
+    async fn pba_r2_chain_id_must_match() {
+        let mp = Mempool::new(MempoolConfig::default());
+        assert!(mp
+            .add_transaction(signed_native(1, 0, Some(1), 21_000), TxClass::Standard)
+            .await
+            .is_err());
+        assert!(mp
+            .add_transaction(signed_native(1, 0, None, 21_000), TxClass::Standard)
+            .await
+            .is_err());
+        mp.add_transaction(signed_native(1, 0, Some(40204), 21_000), TxClass::Standard)
+            .await
+            .expect("matching chain id admitted");
+    }
+
+    #[tokio::test]
+    async fn pba_r2_gas_limit_ceiling_is_inclusive() {
+        let mp = Mempool::new(MempoolConfig::default());
+        mp.add_transaction(signed_native(2, 0, Some(40204), MAX_GAS_PER_BLOCK), TxClass::Standard)
+            .await
+            .expect("exactly the per-block ceiling is admissible");
+        assert!(mp
+            .add_transaction(
+                signed_native(3, 0, Some(40204), MAX_GAS_PER_BLOCK + 1),
+                TxClass::Standard
+            )
+            .await
+            .is_err());
+    }
+
+    /// With signature checking disabled by config, the empty-sender gate is
+    /// the only thing standing between an all-zero `from` and admission.
+    #[tokio::test]
+    async fn pba_r2_empty_sender_rejected_even_without_signature_checks() {
+        let mp = Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        });
+        let mut tx = create_test_tx(0, 1_000_000_000, [0; 32]);
+        tx.from = PublicKey::new([0; 32]);
+        assert!(mp.add_transaction(tx, TxClass::Standard).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pba_r2_selection_respects_count_and_size_limits() {
+        let mp = Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        });
+        let txs: Vec<Transaction> = (0..3u8)
+            .map(|i| create_test_tx(0, 1_000_000_000 + i as u64, [i + 1; 32]))
+            .collect();
+        for t in &txs {
+            mp.add_transaction(t.clone(), TxClass::Standard).await.unwrap();
+        }
+        assert_eq!(mp.get_best_transactions(1, usize::MAX).await.len(), 1, "count cap");
+        assert_eq!(mp.get_best_transactions(2, usize::MAX).await.len(), 2, "count cap");
+        let one = mp.calculate_tx_size(&txs[0]);
+        assert_eq!(
+            mp.get_best_transactions(10, 2 * one).await.len(),
+            2,
+            "size cap: exactly two fit"
+        );
+        assert_eq!(mp.get_best_transactions(10, 2 * one - 1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pba_r2_is_next_nonce_semantics() {
+        let mp = Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        });
+        let a = create_test_tx(5, 1_000_000_000, [7; 32]);
+        let b = create_test_tx(6, 1_000_000_000, [7; 32]);
+        mp.add_transaction(a.clone(), TxClass::Standard).await.unwrap();
+        mp.add_transaction(b.clone(), TxClass::Standard).await.unwrap();
+        let none: HashSet<Hash> = HashSet::new();
+        assert!(mp.is_next_nonce(&a, &none).await, "the minimum pending nonce is next");
+        assert!(mp.is_next_nonce(&b, &none).await, "contiguous run from the minimum");
+        let below = create_test_tx(4, 1_000_000_000, [7; 32]);
+        assert!(!mp.is_next_nonce(&below, &none).await, "below the minimum is not next");
+        let included: HashSet<Hash> = [a.hash].into_iter().collect();
+        assert!(mp.is_next_nonce(&b, &included).await);
+        assert!(!mp.is_next_nonce(&a, &included).await);
+        let fresh = create_test_tx(0, 1_000_000_000, [8; 32]);
+        assert!(mp.is_next_nonce(&fresh, &none).await, "first tx of an unknown sender");
+    }
+
+    /// The trait impls the node uses must propagate admission errors.
+    #[tokio::test]
+    async fn pba_r2_mempool_access_impls_propagate_rejections() {
+        let bad = signed_native(4, u64::MAX, Some(40204), 21_000);
+        let arc = Arc::new(Mempool::new(MempoolConfig::default()));
+        assert!(MempoolAccess::add_transaction(&arc, bad.clone(), TxClass::Standard)
+            .await
+            .is_err());
+        let locked = Arc::new(RwLock::new(Mempool::new(MempoolConfig::default())));
+        assert!(MempoolAccess::add_transaction(&locked, bad, TxClass::Standard)
+            .await
+            .is_err());
+    }
+
+    /// The A015 gate alone (signature checks disabled by config) must reject
+    /// an EVM-shaped sender that does not recover from the tx contents.
+    #[tokio::test]
+    async fn pba_r2_a015_gate_holds_without_signature_checks() {
+        let mp = Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        });
+        let mut from = [0u8; 32];
+        from[..20].copy_from_slice(&[0xAA; 20]);
+        let mut tx = create_test_tx(0, 1_000_000_000, from);
+        tx.ecdsa_verified = false;
+        assert!(mp.add_transaction(tx, TxClass::Standard).await.is_err());
+        // A mixed-byte address (some zero bytes) is still EVM-shaped.
+        let mut from2 = [0u8; 32];
+        from2[..20].copy_from_slice(&[
+            0xAA, 0, 0xBB, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        ]);
+        let mut tx2 = create_test_tx(0, 1_000_000_000, from2);
+        tx2.ecdsa_verified = false;
+        assert!(mp.add_transaction(tx2, TxClass::Standard).await.is_err());
+    }
+
+    /// PBA-L1a-001 defence in depth: even if a `nonce = u64::MAX` tx reached
+    /// the pool by some path that skipped admission (an older binary's state,
+    /// a future ingress), selection must skip it, not panic. Inserted directly
+    /// into the internal maps to bypass the admission check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pba_l1a_001_selection_skips_unfollowable_nonce_without_panicking() {
+        let mp = std::sync::Arc::new(Mempool::new(MempoolConfig::default()));
+        let poison = create_test_tx(u64::MAX, 5_000_000_000, [7; 32]);
+        let honest = create_test_tx(0, 1_000_000_000, [8; 32]);
+        for tx in [poison.clone(), honest.clone()] {
+            let prio = TxPriority::new_with_ai(tx.gas_price, TxClass::Standard, 0, 0);
+            mp.transactions.write().await.insert(
+                tx.hash,
+                MempoolTx {
+                    tx: tx.clone(),
+                    class: TxClass::Standard,
+                    priority: prio,
+                    added_at: 0,
+                    size: 100,
+                },
+            );
+            mp.priority_queue.write().await.push(tx.hash, prio);
+            mp.by_sender
+                .write()
+                .await
+                .entry(tx.from)
+                .or_default()
+                .push_back(tx.hash);
+            mp.sender_nonces
+                .write()
+                .await
+                .entry(tx.from)
+                .or_default()
+                .insert(tx.nonce);
+        }
+        let mp2 = mp.clone();
+        let sel = tokio::spawn(async move { mp2.get_best_transactions(100, 1 << 20).await })
+            .await
+            .expect("PBA-L1a-001: selection panicked on a u64::MAX nonce");
+        assert_eq!(sel.len(), 1, "the unfollowable tx is skipped, the honest one selected");
+        assert_eq!(sel[0].hash, honest.hash);
+        assert_eq!(mp.pending_nonce_for(&poison.from).await, None);
+        // The successor of an included u64::MAX nonce does not exist.
+        let included: HashSet<Hash> = [poison.hash].into_iter().collect();
+        assert!(!mp.is_next_nonce(&poison, &included).await);
     }
 
     /// SEQ-H2: scoring a tx with `gas_price = u64::MAX` must not panic. Pre-fix
