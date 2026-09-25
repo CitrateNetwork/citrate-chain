@@ -2,6 +2,8 @@
 name = "citrate-commd-verify"
 version = "0.1.0"
 edition = "2021"
+# PBA-L1a-003: now linked into the default node build, so cargo-deny checks it.
+license = "Apache-2.0"
 description = "citrate-chain#170 M3 — in-node verifier for the recursive CommD fold proof (0x0130 precompile). Wraps Nova's CompressedSNARK verifier; proven to coexist with the pinned PSE-halo2 stack (halo2curves 0.7 + 0.9 build side-by-side)."
 
 # Own workspace (like citrate-commd-fold): keeps Nova out of the DEFAULT chain build + CI until the

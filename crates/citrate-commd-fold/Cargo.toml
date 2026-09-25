@@ -2,6 +2,8 @@
 name = "citrate-commd-fold"
 version = "0.1.0"
 edition = "2021"
+# PBA-L1a-003: now linked into the default node build, so cargo-deny checks it.
+license = "Apache-2.0"
 description = "citrate-chain#170 M2 — Nova/folding prover for the recursive CommD proof. ISOLATED workspace: its nova-snark/bellpepper/halo2curves deps never unify with the pinned PSE-halo2/ark-0.4 stack. Runs out-of-process; the chain verifies only the final wrapped proof."
 
 # Own workspace root — deps resolve independently of the parent citrate-chain workspace.
