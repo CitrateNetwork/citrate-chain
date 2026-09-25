@@ -130,6 +130,14 @@ contract IPFSIncentivesV2 is AccessControl, ReentrancyGuard {
     ///         analogue of TLA `Funded`, grown one slot at a time as slots open).
     uint256 public totalSlotBudgetFunded;
 
+    /// @notice PBA-L2-008: native SALT deposited by the admin through `fund()`
+    ///         and not yet assigned to a slot budget. A slot budget is a
+    ///         liability (it is paid out in real SALT by `claim`), so opening a
+    ///         slot must consume this much backing first; otherwise rewards are
+    ///         paid out of other pinners' bonds (the V2 variant of CHAIN-B-C002
+    ///         that the V3 fix did not cover).
+    uint256 public unallocatedSlotFunding;
+
     /// @notice Withdrawable balance accrued to challengers (pull-payment).
     mapping(address => uint256) public challengerCredit;
 
@@ -209,6 +217,7 @@ contract IPFSIncentivesV2 is AccessControl, ReentrancyGuard {
      */
     function fund() external payable onlyRole(DEFAULT_ADMIN_ROLE) {
         require(msg.value > 0, "Amount required");
+        unallocatedSlotFunding += msg.value; // PBA-L2-008: backing, tracked
     }
 
     // ─────────────────────────────── IDs ───────────────────────────────────
@@ -237,6 +246,9 @@ contract IPFSIncentivesV2 is AccessControl, ReentrancyGuard {
             s.funded = true;
             // TLA Init: budget[slot] = Quorum * Reward.
             uint256 seed = QUORUM * REWARD;
+            // PBA-L2-008: a budget is only created from escrowed backing.
+            require(unallocatedSlotFunding >= seed, "Insufficient slot funding");
+            unallocatedSlotFunding -= seed;
             s.budget = seed;
             totalSlotBudgetFunded += seed;
             emit SlotFunded(sid, seed);
