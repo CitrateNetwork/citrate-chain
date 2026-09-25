@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import "forge-std/Test.sol";
 import {TinaWorkpaperRegistry} from "../../src/defense_prime/TinaWorkpaperRegistry.sol";
 import {CrossOrgEnvelope} from "../../src/defense_prime/CrossOrgEnvelope.sol";
+import {QuorumIdentity} from "../../src/quorum/QuorumIdentity.sol";
 
 /// PBA-L2-014 / PBA-L2-036 regressions (pre-bounty audit 2026-09-24): lane PoCs
 /// `test_F4_04_tina_single_recorder_forges_threshold` and

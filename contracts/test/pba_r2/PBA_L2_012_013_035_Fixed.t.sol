@@ -235,3 +235,39 @@ contract PBA_L2_Envelope_Fixed is Test {
         assertTrue(uint8(v) != uint8(IGovernanceProtocol.Verdict.Deny));
     }
 }
+
+/// Mutation hardening (PBA-L2-013): a roster proposer's envelope signed only by
+/// sybils OUTSIDE the roster must not satisfy SoD.
+contract PBA_L2_013_SybilSigners is Test {
+    function test_L2_013_nonRosterSignersDoNotCount() public {
+        MultiSigEnvelope env = new MultiSigEnvelope();
+        address p = address(0xB0B1);
+        address ex = address(0xB0B3);
+        bytes32[] memory roster = new bytes32[](3);
+        roster[0] = QuorumIdentity.subjectKey(p);
+        roster[1] = QuorumIdentity.subjectKey(address(0xB0B2));
+        roster[2] = QuorumIdentity.subjectKey(ex);
+        SegregationOfDuties sod = new SegregationOfDuties(
+            keccak256("tenant-A"), keccak256("sod"), 1, keccak256("spec"), "cid", address(env), 1, roster
+        );
+        bytes32 eid = sod.approvalEnvelopeId(keccak256("action.deploy"), keccak256("params"), keccak256("corr-1"));
+        address sybil = address(0x5B1);
+        bytes32[] memory req = new bytes32[](1);
+        req[0] = QuorumIdentity.subjectKey(sybil);
+        vm.prank(p);
+        env.draft(eid, roster[0], bytes32(0), "cid", req, 1, 0, bytes32(0));
+        vm.prank(sybil);
+        env.sign(eid, req[0], hex"01", "x");
+        IGovernanceProtocol.ActionContext memory ctx = IGovernanceProtocol.ActionContext({
+            agentSbtId: 0,
+            principal: ex,
+            classification: 0,
+            cost: 0,
+            paramsHash: keccak256("params"),
+            correlationId: keccak256("corr-1")
+        });
+        (IGovernanceProtocol.Verdict v, bytes32 reason,) = sod.check(keccak256("tenant-A"), keccak256("action.deploy"), ctx);
+        assertEq(uint8(v), uint8(IGovernanceProtocol.Verdict.RequireApproval));
+        assertEq(reason, sod.REASON_PENDING());
+    }
+}

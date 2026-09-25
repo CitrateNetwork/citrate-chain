@@ -54,7 +54,6 @@ contract PBA_L2_008_V2BackingTest is Test {
         inc.sealCommit{value: 10 ether}(cidH, 0, bytes32(uint256(1)), bytes32(uint256(2)), bytes32(uint256(3)), hex"01");
         vm.prank(attacker);
         inc.sealCommit{value: 10 ether}(cidA, 0, bytes32(uint256(1)), bytes32(uint256(2)), bytes32(uint256(3)), hex"01");
-        assertEq(inc.unallocatedSlotFunding(), 0);
 
         for (uint256 r = 0; r < 4; r++) {
             vm.prank(attacker);

@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.26;
+
+import {Test} from "forge-std/Test.sol";
+import {LiquidStakingPool} from "../../src/LiquidStakingPool.sol";
+
+/// PBA-L2-026 tripwire: any single-oracle vote at nonce N cannot prevent an honest quorum.
+contract PBA_L2_026_Fixed is Test {
+    function testFuzz_L2_026_singleVoteNeverBlocksHonestQuorum(uint256 bogusRewards, uint256 bogusSlash) public {
+        LiquidStakingPool pool = new LiquidStakingPool(address(this));
+        address[4] memory o = [makeAddr("o1"), makeAddr("o2"), makeAddr("o3"), makeAddr("o4")];
+        for (uint256 i = 0; i < 4; i++) pool.addOracle(o[i]);
+        vm.deal(address(this), 100 ether);
+        pool.deposit{value: 10 ether}();
+        pool.donate{value: 1 ether}();
+        bogusRewards = bound(bogusRewards, 0, 0.1 ether);
+        bogusSlash = bound(bogusSlash, 0, 0.1 ether);
+        vm.assume(!(bogusRewards == 0.05 ether && bogusSlash == 0));
+        vm.prank(o[0]);
+        pool.reportRewards(bogusRewards, bogusSlash);
+        // votesNeeded(4) = 3: the three honest oracles finalize.
+        for (uint256 i = 1; i < 4; i++) {
+            vm.prank(o[i]);
+            pool.reportRewards(0.05 ether, 0);
+        }
+        assertEq(pool.rewardReportNonce(), 1);
+    }
+
+    function test_L2_026_resetReportStartsAFreshRound() public {
+        LiquidStakingPool pool = new LiquidStakingPool(address(this));
+        address o1 = makeAddr("o1");
+        address o2 = makeAddr("o2");
+        pool.addOracle(o1);
+        pool.addOracle(o2);
+        vm.prank(o1);
+        pool.reportRewards(0, 0);
+        vm.prank(o2);
+        pool.reportRewards(0, 1); // split vote: 1-1, needs 2
+        assertEq(pool.rewardReportNonce(), 0);
+        vm.prank(o1);
+        vm.expectRevert();
+        pool.resetReport();
+        pool.resetReport();
+        vm.prank(o1);
+        pool.reportRewards(0, 0);
+        vm.prank(o2);
+        pool.reportRewards(0, 0);
+        assertEq(pool.rewardReportNonce(), 1);
+    }
+
+    receive() external payable {}
+}
