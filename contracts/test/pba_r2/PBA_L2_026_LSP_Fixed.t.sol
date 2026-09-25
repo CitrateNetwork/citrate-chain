@@ -51,7 +51,7 @@ contract PBA_L2_026_Fixed is Test {
     receive() external payable {}
 }
 
-/// PBA-L2-026 (verifier nit): removing an oracle lowers the quorum, so the
+/// PBA-L2-026: removing an oracle lowers the quorum, so the
 /// open round restarts and only votes from the current set are counted.
 contract PBA_L2_026_RemoveOracle is Test {
     function test_L2_026_removeOracle_startsFreshRound() public {
@@ -85,7 +85,7 @@ contract PBA_L2_026_RemoveOracle is Test {
     receive() external payable {}
 }
 
-/// PBA-L2-026 (verifier nit): with exactly three oracles one dissenter must not
+/// PBA-L2-026: with exactly three oracles one dissenter must not
 /// block (two thirds of 3 is 2, not unanimity).
 contract PBA_L2_026_ThreeOracles is Test {
     function test_L2_026_threeOracles_oneDissenterDoesNotBlock() public {
