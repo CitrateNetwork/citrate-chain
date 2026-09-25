@@ -61,7 +61,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive
       # Give the memory-heavy via-IR compile a disk-backed safety net so a
@@ -79,7 +79,7 @@ jobs:
           echo "--- memory after adding swap ---"
           free -h
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
           version: stable
       - name: Install solc 0.8.36 (canonical contracts compiler)
@@ -110,11 +110,11 @@ jobs:
       contents: read
     continue-on-error: true  # Slither findings surface as warnings but don't block
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive
       - name: Install Foundry (slither needs forge for compilation)
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
           version: stable
       - name: Install Python and Slither

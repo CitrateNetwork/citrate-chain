@@ -40,9 +40,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
       # The RUSTSEC-2026-0220 ignore in deny.toml is justified by citrate-chain
@@ -64,10 +66,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           components: clippy
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -92,7 +95,7 @@ jobs:
     container:
       image: semgrep/semgrep
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run SECREM-01 class rules
         run: semgrep --error --config tools/semgrep/rules/secrem01-net1-unbounded-serve-loop.yaml --config tools/semgrep/rules/secrem01-brg1-bare-threshold-count.yaml --config tools/semgrep/rules/secrem01-cons2-header-score-in-chainstate.yaml --config tools/semgrep/rules/secrem01-cons6-hash-from-bytes-unguarded.yaml .
       # SYNC-S1 D2 class rules — the chain-store/DAG-store divergence class.

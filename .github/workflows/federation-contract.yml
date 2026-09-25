@@ -64,7 +64,7 @@ jobs:
         run: echo "federation-contract is an internal supply-chain gate; skipped without CITRATE_FEDERATION_READ_TOKEN."
       - name: Checkout this repo
         if: env.FED_TOKEN != ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: citrate-chain
 
@@ -74,7 +74,7 @@ jobs:
       # staleness went unnoticed locally.
       - name: Checkout canonical citrate-federation (sparse, main)
         if: env.FED_TOKEN != ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: CitrateNetwork/citrate-federation
           ref: main
@@ -83,7 +83,7 @@ jobs:
           sparse-checkout: |
             contract
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         if: env.FED_TOKEN != ''
         with:
           python-version: '3.11'
