@@ -49,7 +49,9 @@ contract PBA_L2_024_TeeFixed is Test {
 /// has NOT approved must not attest.
 contract PBA_L2_024_Unapproved is TeeFixture {
     function test_L2_024_unapprovedTopLevelClaimRefused() public {
-        _submit(bytes('"iss":"sharedeus2.eus2.attest.azure.net"'));
+        // Refused at submission (fail-fast; the one-shot JWT is not burned and
+        // a later approval cannot silently attest this record).
+        assertFalse(_submit(bytes('"iss":"sharedeus2.eus2.attest.azure.net"')), "unapproved claim must revert");
         assertFalse(registry.isAttested(worker, block.number), "an unapproved measurement attested a worker");
     }
 

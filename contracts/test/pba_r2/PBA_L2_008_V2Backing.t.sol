@@ -107,7 +107,10 @@ contract PBA_L2_008_V2SolvencyInvariant is Test {
     }
 
     function invariant_Solvent() public view {
-        uint256 liabilities = inc.unallocatedSlotFunding();
+        // `unallocatedSlotFunding` is read low-level so this tripwire also
+        // compiles (and fails) against the pre-fix contract, which has none.
+        (bool ok, bytes memory ret) = address(inc).staticcall(abi.encodeWithSignature("unallocatedSlotFunding()"));
+        uint256 liabilities = ok && ret.length == 32 ? abi.decode(ret, (uint256)) : 0;
         for (uint256 j; j < 2; j++) {
             bytes32 cid = handler.cids(j);
             (, uint256 budget, ) = inc.getSlot(cid, 0);
