@@ -56,6 +56,8 @@ contract HeartbeatMonitor is ReentrancyGuard, Governable {
     event ProviderRegistered(address indexed provider, uint256 blockNumber);
     event HeartbeatReceived(address indexed provider, uint256 blockNumber);
     event HeartbeatMissed(address indexed provider, uint256 missedCount);
+    /// PBA-L2-041: the slash hook reverted; suspension still applied.
+    event SlashHookFailed(address indexed provider);
     event ProviderSuspended(address indexed provider, uint256 blockNumber, uint256 missedCount);
     event ProviderReactivated(address indexed provider, uint256 blockNumber);
     event HeartbeatIntervalUpdated(uint256 oldInterval, uint256 newInterval);
@@ -160,7 +162,9 @@ contract HeartbeatMonitor is ReentrancyGuard, Governable {
                     0, // SlashTier.Latency
                     abi.encodePacked("heartbeat:suspended:", uint256(h.missedCount))
                 ) {} catch {
-                    // Slash failure should not prevent suspension
+                    // Slash failure should not prevent suspension, but it
+                    // is surfaced rather than swallowed (PBA-L2-041).
+                    emit SlashHookFailed(provider);
                 }
             }
         }

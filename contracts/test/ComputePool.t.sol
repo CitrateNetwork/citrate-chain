@@ -145,6 +145,7 @@ contract ComputePoolTest is Test {
         uint256 poolId = _createAndPopulate();
         assertEq(pool.getPoolGPUCount(poolId), 20);
 
+        _requestLeaveAndWait(provider1, poolId); // PBA-L2-022 two-step exit
         vm.prank(provider1);
         pool.leavePool(poolId);
         assertEq(pool.getPoolGPUCount(poolId), 10);
@@ -185,6 +186,7 @@ contract ComputePoolTest is Test {
         uint256 poolId = _createAndPopulate();
 
         uint256 balBefore = provider1.balance;
+        _requestLeaveAndWait(provider1, poolId); // PBA-L2-022 two-step exit
         vm.prank(provider1);
         pool.leavePool(poolId);
         assertEq(provider1.balance, balBefore + 100 ether);
@@ -195,6 +197,8 @@ contract ComputePoolTest is Test {
 
         vm.startPrank(provider1);
         pool.joinPool{value: 100 ether}(poolId, 10);
+        pool.requestLeave(poolId); // PBA-L2-022 two-step exit
+        vm.roll(block.number + pool.LEAVE_COOLDOWN());
         pool.leavePool(poolId);
         pool.joinPool{value: 100 ether}(poolId, 10);
         vm.stopPrank();
@@ -221,6 +225,7 @@ contract ComputePoolTest is Test {
         assertTrue(pool.getPool(poolId).state == ComputePool.PoolState.Active);
 
         // Provider 1 leaves — now below min (1 < 2)
+        _requestLeaveAndWait(provider1, poolId); // PBA-L2-022 two-step exit
         vm.prank(provider1);
         pool.leavePool(poolId);
 
@@ -231,6 +236,7 @@ contract ComputePoolTest is Test {
         uint256 poolId = _createAndPopulate();
 
         // Leave until paused
+        _requestLeaveAndWait(provider1, poolId); // PBA-L2-022 two-step exit
         vm.prank(provider1);
         pool.leavePool(poolId);
         assertTrue(pool.getPool(poolId).state == ComputePool.PoolState.Paused);
@@ -630,5 +636,11 @@ contract ComputePoolTest is Test {
         ComputePool.PoolMember memory m = pool.getMember(poolId, provider1);
         assertTrue(m.active);
         assertEq(m.gpuCount, 10);
+    }
+
+    function _requestLeaveAndWait(address who, uint256 poolId) internal {
+        vm.prank(who);
+        pool.requestLeave(poolId);
+        vm.roll(block.number + pool.LEAVE_COOLDOWN());
     }
 }

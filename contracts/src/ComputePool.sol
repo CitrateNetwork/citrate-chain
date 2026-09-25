@@ -145,6 +145,21 @@ contract ComputePool is ReentrancyGuard, Governable {
     /// @notice NematocystSlashing contract for SLA enforcement.
     INematocystSlashing public slashingContract;
 
+    /// @notice PBA-L2-022: block at which a member requested to leave
+    /// (0 = no pending exit). `leavePool` completes only LEAVE_COOLDOWN
+    /// blocks later, so a member stays slashable (SLA, liveness) while its
+    /// exit is pending and cannot front-run a slash by leaving.
+    mapping(uint256 => mapping(address => uint256)) public leaveRequestedAt;
+
+    /// @notice PBA-L2-023: payouts that could not be pushed (recipient
+    /// reverted). Claimed via `claimPayout`. One reverting member can no
+    /// longer block `completeJob` / `dissolvePool` for everyone.
+    mapping(address => uint256) public payoutPending;
+
+    /// @notice PBA-L2-022 / L2-042: slashed stake (SLA + liveness) has a
+    /// sink: it is retained here and swept by governance. Pre-fix it was
+    /// subtracted from `member.stake` and stranded.
+    uint256 public slashedStakeRetained;
     // Governance state lives in Governable mixin (audit SOL-21).
 
     // ── Events ──────────────────────────────────────────────────────
@@ -171,6 +186,12 @@ contract ComputePool is ReentrancyGuard, Governable {
     event JobReclaimed(uint256 indexed jobId, uint256 indexed poolId, address indexed requester, uint256 refund);
     event SLAViolationReported(uint256 indexed poolId, uint256 actualThroughput, uint256 guaranteedThroughput);
     event SlashingContractUpdated(address oldContract, address newContract);
+    event LeaveRequested(uint256 indexed poolId, address indexed provider, uint256 executableAt);
+    event PayoutDeferred(address indexed recipient, uint256 amount);
+    event PayoutClaimed(address indexed recipient, uint256 amount);
+    event SlashedStakeSwept(address indexed to, uint256 amount);
+    /// PBA-L2-041: a slash hook call that did not take effect is surfaced.
+    event SlashHookFailed(uint256 indexed poolId, address indexed member);
     // GovernanceTransferred event provided by Governable mixin.
 
     // ── CM-05 WP-05.1 events ───────────────────────────────────────
@@ -297,7 +318,19 @@ contract ComputePool is ReentrancyGuard, Governable {
         emit ProviderJoined(poolId, msg.sender, gpuCount, msg.value);
     }
 
+    /// @notice PBA-L2-022: step 1 of the two-step exit. Starts the
+    /// LEAVE_COOLDOWN; the member remains active and slashable until
+    /// `leavePool` completes the exit.
+    function requestLeave(uint256 poolId) external poolExists(poolId) {
+        require(members[poolId][msg.sender].active, "Not a member");
+        require(leaveRequestedAt[poolId][msg.sender] == 0, "Leave already requested");
+        leaveRequestedAt[poolId][msg.sender] = block.number;
+        emit LeaveRequested(poolId, msg.sender, block.number + LEAVE_COOLDOWN);
+    }
+
     /// @notice Leave a pool and reclaim staked SALT.
+    /// @dev PBA-L2-022: requires a prior `requestLeave` at least
+    ///      LEAVE_COOLDOWN blocks ago and no job dispatched to the member.
     /// @dev Invariant: ProviderCooldown — can't leave during active job.
     ///      Invariant: MinProvidersMaintained — checked but not enforced as blocker
     ///      (pool auto-pauses if below minimum).
@@ -308,7 +341,10 @@ contract ComputePool is ReentrancyGuard, Governable {
 
         // ProviderCooldown: can't leave during active job
         require(member.activeJobs == 0, "Has active jobs");
-
+        uint256 requestedAt = leaveRequestedAt[poolId][msg.sender];
+        require(requestedAt != 0, "Leave not requested");
+        require(block.number >= requestedAt + LEAVE_COOLDOWN, "Leave cooldown");
+        leaveRequestedAt[poolId][msg.sender] = 0;
         Pool storage pool = pools[poolId];
 
         uint256 stakeReturn = member.stake;
@@ -343,8 +379,7 @@ contract ComputePool is ReentrancyGuard, Governable {
 
         // Return stake
         if (stakeReturn > 0) {
-            (bool success, ) = payable(msg.sender).call{value: stakeReturn}("");
-            require(success, "Stake transfer failed");
+            _pay(msg.sender, stakeReturn);
         }
 
         emit ProviderLeft(poolId, msg.sender, stakeReturn);
@@ -383,10 +418,10 @@ contract ComputePool is ReentrancyGuard, Governable {
         member.gpuCount = 0;
         pools[poolId].memberCount--;
         pools[poolId].totalStaked -= stakeReturn;
+        leaveRequestedAt[poolId][memberAddr] = 0;
 
-        (bool success, ) = payable(memberAddr).call{value: stakeReturn}("");
-        require(success, "Stake transfer failed");
-
+        // PBA-L2-023: never let one reverting member block dissolution.
+        _pay(memberAddr, stakeReturn);
         emit ProviderLeft(poolId, memberAddr, stakeReturn);
     }
 
@@ -453,7 +488,7 @@ contract ComputePool is ReentrancyGuard, Governable {
 
         job.status = JobStatus.Completed;
         pool.activeJobCount--;
-
+        _releaseDispatch(job); // PBA-L2-022
         // Distribute payment proportionally based on GPU contribution
         _distributePayment(job.poolId, job.payment);
 
@@ -480,6 +515,7 @@ contract ComputePool is ReentrancyGuard, Governable {
 
         job.status = JobStatus.Failed;
         pool.activeJobCount--;
+        _releaseDispatch(job); // PBA-L2-022
 
         // Refund requester
         if (job.payment > 0) {
@@ -519,7 +555,7 @@ contract ComputePool is ReentrancyGuard, Governable {
         // a reclaim-after-complete race and reentrancy.
         job.status = JobStatus.Failed;
         pools[job.poolId].activeJobCount--;
-
+        _releaseDispatch(job); // PBA-L2-022
         uint256 refund = job.payment;
         job.payment = 0;
         if (refund > 0) {
@@ -576,14 +612,16 @@ contract ComputePool is ReentrancyGuard, Governable {
         if (penalty > 0) {
             member.stake -= penalty;
             pools[poolId].totalStaked -= penalty;
-
+            slashedStakeRetained += penalty; // PBA-L2-022: slashed stake has a sink
             // Trigger slash via NematocystSlashing if available
             if (address(slashingContract) != address(0)) {
                 try slashingContract.slash(
                     memberAddr,
                     0, // SlashTier.Latency
                     abi.encodePacked("sla:violation:pool:", poolId, ":throughput:", deficit)
-                ) {} catch {}
+                ) {} catch {
+                    emit SlashHookFailed(poolId, memberAddr); // PBA-L2-041
+                }
             }
         }
     }
@@ -752,7 +790,9 @@ contract ComputePool is ReentrancyGuard, Governable {
         job.dispatchBlock = block.number;
         job.dispatchedBy = msg.sender;
         job.status = JobStatus.Executing;
-
+        // PBA-L2-022: `activeJobs` was read by `leavePool` but never
+        // written, so the "Has active jobs" guard was dead code.
+        members[job.poolId][msg.sender].activeJobs += 1;
         emit DispatchRecorded(jobId, msg.sender, block.number);
     }
 
@@ -794,6 +834,10 @@ contract ComputePool is ReentrancyGuard, Governable {
         uint256 slashAmount = (badMember.stake * LIVENESS_SLASH_BPS) / BPS;
         if (slashAmount > 0 && badMember.stake >= slashAmount) {
             badMember.stake -= slashAmount;
+            // PBA-L2-022: keep pool.totalStaked == Σ member.stake and give
+            // the slashed amount a sink.
+            pools[job.poolId].totalStaked -= slashAmount;
+            slashedStakeRetained += slashAmount;
             // Slashed funds stay in the contract treasury for now;
             // a future sprint may route them to an insurance pool.
             emit CoordinatorSlashedForLiveness(
@@ -802,6 +846,8 @@ contract ComputePool is ReentrancyGuard, Governable {
                 slashAmount
             );
         }
+
+        _releaseDispatch(job); // PBA-L2-022
 
         // Reset job state so the next election cycle dispatches it.
         job.status = JobStatus.Pending;
@@ -867,13 +913,58 @@ contract ComputePool is ReentrancyGuard, Governable {
 
                 if (share > 0) {
                     distributed += share;
-                    (bool success, ) = payable(memberAddr).call{value: share}("");
-                    require(success, "Payment distribution failed");
+                    // PBA-L2-023: credit on failure instead of reverting the
+                    // whole settlement for every member.
+                    _pay(memberAddr, share);
                 }
             }
         }
 
         // Any dust remaining due to rounding stays in the contract
+    }
+
+    /// @dev PBA-L2-022: a dispatched job no longer counts against its
+    ///      coordinator once it terminates or is reassigned.
+    function _releaseDispatch(PoolJob storage job) internal {
+        address coord = job.dispatchedBy;
+        if (coord != address(0)) {
+            PoolMember storage m = members[job.poolId][coord];
+            if (m.activeJobs > 0) m.activeJobs -= 1;
+        }
+    }
+
+    /// @dev PBA-L2-023: push `amount` to `to`; if the push fails, credit it
+    ///      to `payoutPending` for `claimPayout`.
+    function _pay(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        (bool ok, ) = payable(to).call{value: amount}("");
+        if (!ok) {
+            payoutPending[to] += amount;
+            emit PayoutDeferred(to, amount);
+        }
+    }
+
+    /// @notice PBA-L2-023: claim payouts that could not be pushed.
+    function claimPayout() external nonReentrant {
+        uint256 amount = payoutPending[msg.sender];
+        require(amount > 0, "Nothing to claim");
+        payoutPending[msg.sender] = 0;
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "Claim transfer failed");
+        emit PayoutClaimed(msg.sender, amount);
+    }
+
+    /// @notice PBA-L2-022 / L2-042: sweep retained slashed stake. Bounded by
+    ///         `slashedStakeRetained`, so member stake, pending payouts and
+    ///         job escrow are never reachable.
+    function sweepSlashedStake(address to) external onlyGovernance nonReentrant {
+        require(to != address(0), "Zero address");
+        uint256 amount = slashedStakeRetained;
+        require(amount > 0, "Nothing retained");
+        slashedStakeRetained = 0;
+        (bool ok, ) = payable(to).call{value: amount}("");
+        require(ok, "Sweep failed");
+        emit SlashedStakeSwept(to, amount);
     }
 
     // ── Receive ─────────────────────────────────────────────────────
