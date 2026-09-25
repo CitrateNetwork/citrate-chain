@@ -60,28 +60,27 @@ contract RmQ_C016_ComputeVerifier is Test {
         );
     }
 
-    /// GREEN: a replayed ZK proof cannot settle a second job.
-    /// RED (pre-fix): `v2 == true` and job 2 is Valid.
+    /// GREEN: a replayed ZK proof cannot settle a second job — even one
+    /// with IDENTICAL commitments whose provider commits to the replayed
+    /// bytes. PBA-L2-004: ZK proof material is consumed globally and the
+    /// replay reverts (so it can never get anyone slashed).
+    /// RED (pre-C016): job 2 is Valid.
     function test_C016_zk_proof_cannot_settle_two_jobs() public {
-        // Force the live 0x0108 inference verifier to accept (return 1).
-        bytes memory anyCalldata = new bytes(0);
-        vm.mockCall(address(0x0108), anyCalldata, abi.encode(uint256(1)));
-
+        vm.mockCall(address(0x0108), new bytes(0), abi.encode(uint256(1)));
         bytes memory proof = hex"aabbccdd";
-        bytes memory publicInputs = new bytes(96); // ZK_PUBLIC_INPUTS_LEN
+        bytes32 inC = bytes32(uint256(7));
+        bytes32 modelC = bytes32(uint256(9));
+        bytes memory publicInputs = abi.encode(inC, modelC, bytes32(uint256(11)));
+        bytes memory proofData = abi.encodePacked(uint256(proof.length), proof, publicInputs);
 
-        // PBA-L2-004: proofs are bound to the job's commitments. Job 1 is
-        // bound to the (zero) commitments the proof carries; job 2 to a
-        // different input, so the same bytes cannot settle it.
-        _configure(1, ComputeVerifier.VerificationTier.ZKProof);
-        verifier.bindJob(1, bytes32(0), bytes32(0));
+        for (uint256 j = 1; j <= 2; j++) {
+            verifier.configureJob(j, 100 ether, ComputeVerifier.VerificationTier.ZKProof);
+            verifier.bindJob(j, inC, modelC);
+            verifier.submitCommitment(j, address(0xBEEF), verifier.zkProofCommitment(j, proofData));
+        }
+        vm.roll(block.number + 1);
         assertTrue(verifier.verifyZKProof(1, proof, publicInputs), "job 1 proof verifies");
-
-        _configure(2, ComputeVerifier.VerificationTier.ZKProof);
-        verifier.bindJob(2, keccak256("other input"), bytes32(0));
-        assertFalse(
-            verifier.verifyZKProof(2, proof, publicInputs),
-            "C016: replayed ZK proof must not settle a 2nd job"
-        );
+        vm.expectRevert(bytes("ComputeVerifier: proof already used"));
+        verifier.verifyZKProof(2, proof, publicInputs);
     }
 }

@@ -86,6 +86,13 @@ contract ComputeVerifierTest is Test {
         }
     }
 
+    /// PBA-L2-004: ZK-tier commit-reveal — commit to the exact proofData in
+    /// an earlier block than the reveal.
+    function _zkCommit(uint256 jobId, bytes memory proofData) internal {
+        verifier.submitCommitment(jobId, provider, verifier.zkProofCommitment(jobId, proofData));
+        vm.roll(block.number + 1);
+    }
+
     function _submitCommitment(uint256 jobId) internal {
         verifier.submitCommitment(jobId, provider, commitmentHash);
     }
@@ -243,9 +250,9 @@ contract ComputeVerifierTest is Test {
     address internal constant INFERENCE_PRECOMPILE = address(0x0108);
 
     // Canonical inference public inputs (3 × 32B BE Fr commitments).
-    bytes32 internal inputCommitment = keccak256("input-commitment");
-    bytes32 internal modelCommitment = keccak256("model-commitment");
-    bytes32 internal outputCommitment = keccak256("output-commitment");
+    bytes32 internal inputCommitment = bytes32(uint256(keccak256("input-commitment")) % 21888242871839275222246405745257275088548364400416034343698204186575808495617); // canonical BN254 scalar (PBA-L2-004)
+    bytes32 internal modelCommitment = bytes32(uint256(keccak256("model-commitment")) % 21888242871839275222246405745257275088548364400416034343698204186575808495617); // canonical BN254 scalar (PBA-L2-004)
+    bytes32 internal outputCommitment = bytes32(uint256(keccak256("output-commitment")) % 21888242871839275222246405745257275088548364400416034343698204186575808495617); // canonical BN254 scalar (PBA-L2-004)
 
     /// @dev Etch a verdict-returning mock (1 or 0) over the 0x0108 address.
     function _etch0x0108(bool valid) internal {
@@ -277,7 +284,7 @@ contract ComputeVerifierTest is Test {
     ///      + 96-byte publicInputs ABI.
     function test_verifyZKProof_valid() public {
         _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
-        _submitCommitment(1);
+        _zkCommit(1, abi.encodePacked(uint256(bytes(hex"AABBCCDD").length), bytes(hex"AABBCCDD"), _publicInputs96()));
         _etch0x0108(true);
 
         bool valid = verifier.verifyZKProof(1, hex"AABBCCDD", _publicInputs96());
@@ -291,7 +298,7 @@ contract ComputeVerifierTest is Test {
     ///      legacy 0x0104 mock.
     function test_verifyZKProof_invalid() public {
         _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
-        _submitCommitment(1);
+        _zkCommit(1, abi.encodePacked(uint256(bytes(hex"BADD0001").length), bytes(hex"BADD0001"), _publicInputs96()));
         _etch0x0108(false);
 
         bool valid = verifier.verifyZKProof(1, hex"BADD0001", _publicInputs96());
@@ -314,7 +321,7 @@ contract ComputeVerifierTest is Test {
     ///      exact calldata bytes via vm.expectCall.
     function test_verifyZKProof_callsLive0x0108_withCorrectABI() public {
         _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
-        _submitCommitment(1);
+        _zkCommit(1, abi.encodePacked(uint256(6), hex"DEADBEEFCAFE", _publicInputs96()));
         _etch0x0108(true);
 
         bytes memory proof = hex"DEADBEEFCAFE";
@@ -330,7 +337,7 @@ contract ComputeVerifierTest is Test {
     /// @dev The legacy 0x0104 stub must NOT be called any more (D2 regression).
     function test_verifyZKProof_neverCalls0x0104Stub() public {
         _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
-        _submitCommitment(1);
+        _zkCommit(1, abi.encodePacked(uint256(bytes(hex"AABBCCDD").length), bytes(hex"AABBCCDD"), _publicInputs96()));
         _etch0x0108(true);
 
         // expectCall with count 0 => the 0x0104 stub address is never called.
@@ -360,7 +367,7 @@ contract ComputeVerifierTest is Test {
     /// @dev staticcall failure (0x0108 reverts) => Invalid, no revert at caller.
     function test_verifyZKProof_precompileReverts_isInvalid() public {
         _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
-        _submitCommitment(1);
+        _zkCommit(1, abi.encodePacked(uint256(bytes(hex"AABBCCDD").length), bytes(hex"AABBCCDD"), _publicInputs96()));
 
         RevertingInferenceVerifier boom = new RevertingInferenceVerifier();
         vm.etch(INFERENCE_PRECOMPILE, address(boom).code);
@@ -377,7 +384,7 @@ contract ComputeVerifierTest is Test {
     ///      with the correct ABI.
     function test_verify_zkTier_dispatch_valid() public {
         _configureJob(1, 15 ether, ComputeVerifier.VerificationTier.ZKProof);
-        _submitCommitment(1);
+        _zkCommit(1, abi.encodePacked(uint256(8), hex"0102030405060708", _publicInputs96()));
         _etch0x0108(true);
 
         bytes memory proof = hex"0102030405060708";
