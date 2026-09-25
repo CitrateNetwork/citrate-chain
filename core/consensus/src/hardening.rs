@@ -93,9 +93,13 @@ pub fn parse_pba_hardening_override(raw: &str) -> Result<Option<u64>, String> {
         return Ok(None);
     }
     match v.parse::<u64>() {
-        Ok(UNSET) => Err(format!("{PBA_HARDENING_ENV}={v}: u64::MAX is reserved (use `off`)")),
+        Ok(UNSET) => Err(format!(
+            "{PBA_HARDENING_ENV}={v}: u64::MAX is reserved (use `off`)"
+        )),
         Ok(h) => Ok(Some(h)),
-        Err(e) => Err(format!("{PBA_HARDENING_ENV}={v}: not a height or `off`: {e}")),
+        Err(e) => Err(format!(
+            "{PBA_HARDENING_ENV}={v}: not a height or `off`: {e}"
+        )),
     }
 }
 

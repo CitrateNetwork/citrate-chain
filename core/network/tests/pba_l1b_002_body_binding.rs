@@ -79,7 +79,10 @@ fn pba_l1b_002_v2_root_detects_the_rewrite_legacy_does_not() {
     assert!(forged.verify_hash(), "header is untouched");
     assert!(crypto::verify_block_signature(&forged).unwrap());
     // Legacy rule: blind to the rewrite (the vulnerability, kept below activation).
-    assert_eq!(tx_root_legacy(&forged.transactions), tx_root_legacy(&honest.transactions));
+    assert_eq!(
+        tx_root_legacy(&forged.transactions),
+        tx_root_legacy(&honest.transactions)
+    );
     // v2 rule: the rewrite no longer matches the committed root.
     assert_ne!(
         tx_root_for_height(PbaHardening::at(0), 5, &forged.transactions),
@@ -137,7 +140,9 @@ async fn pba_l1b_002_before_activation_legacy_blocks_still_validate() {
     let honest = honest_signed_block(hardening); // height 5 < 1000: legacy root
     assert_eq!(honest.tx_root, tx_root_legacy(&honest.transactions));
     let sync = SyncManager::new(SyncConfig::default()).with_pba_hardening(hardening);
-    sync.handle_blocks(&PeerId("p".into()), vec![honest]).await.unwrap();
+    sync.handle_blocks(&PeerId("p".into()), vec![honest])
+        .await
+        .unwrap();
     assert_eq!(sync.drain_validated_blocks().await.len(), 1);
 }
 

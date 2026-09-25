@@ -82,14 +82,22 @@ async fn pba_l1b_004_model_announce_flood_does_not_grow_persistent_state() {
         })
         .collect();
     for i in 0..N {
-        let _ = h.handle_message(&attacker, &announce(i, blob.clone())).await;
+        let _ = h
+            .handle_message(&attacker, &announce(i, blob.clone()))
+            .await;
     }
     db.flush().ok();
     let persisted = (0..N)
-        .filter(|i| sm.get_model(&citrate_execution::ModelId(model_id(*i))).is_some())
+        .filter(|i| {
+            sm.get_model(&citrate_execution::ModelId(model_id(*i)))
+                .is_some()
+        })
         .count();
     let grown = dir_size(dir.path()).saturating_sub(before);
-    assert_eq!(persisted, 0, "PBA-L1b-004: peer announcements must never reach persistent state");
+    assert_eq!(
+        persisted, 0,
+        "PBA-L1b-004: peer announcements must never reach persistent state"
+    );
     assert!(
         grown < 1024 * 1024,
         "PBA-L1b-004: persistent growth from one peer's flood must stay bounded, grew {grown} bytes"

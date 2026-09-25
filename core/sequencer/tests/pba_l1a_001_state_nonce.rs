@@ -46,12 +46,23 @@ async fn pba_l1a_001_state_nonce_bounds_new_sender() {
     // Stale (below the state nonce).
     let r = mp.add_transaction(signed(1, 4), TxClass::Standard).await;
     assert!(
-        matches!(r, Err(MempoolError::NonceTooLow { expected: 5, got: 4 })),
+        matches!(
+            r,
+            Err(MempoolError::NonceTooLow {
+                expected: 5,
+                got: 4
+            })
+        ),
         "stale nonce must be NonceTooLow, got {r:?}"
     );
     // Far future for a sender with nothing pending.
-    let r = mp.add_transaction(signed(2, 5 + 17), TxClass::Standard).await;
-    assert!(r.is_err(), "nonce beyond state+max_nonce_gap must be rejected, got {r:?}");
+    let r = mp
+        .add_transaction(signed(2, 5 + 17), TxClass::Standard)
+        .await;
+    assert!(
+        r.is_err(),
+        "nonce beyond state+max_nonce_gap must be rejected, got {r:?}"
+    );
     // Exactly at the edges: state nonce and state + gap are admissible.
     mp.add_transaction(signed(3, 5), TxClass::Standard)
         .await

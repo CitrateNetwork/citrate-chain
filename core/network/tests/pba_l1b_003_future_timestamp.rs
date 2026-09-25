@@ -160,7 +160,8 @@ async fn pba_l1b_003_gossip_rejects_far_future_block() {
     b.header.block_hash = b.compute_hash();
     b.signature = crypto::sign_block(&b.header.block_hash, &key);
     let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
-    let gossip = GossipProtocol::new(GossipConfig::default(), pm).with_pba_hardening(PbaHardening::off());
+    let gossip =
+        GossipProtocol::new(GossipConfig::default(), pm).with_pba_hardening(PbaHardening::off());
     assert!(gossip
         .handle_new_block(b, &PeerId("attacker".into()))
         .await

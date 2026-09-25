@@ -1477,6 +1477,43 @@ mod tests {
             .build_unhashed()
     }
 
+    /// PBA-L1b-003: the parent-relative timestamp bound, both sides of the
+    /// activation height and both edges of the bound.
+    #[tokio::test]
+    async fn pba_l1b_003_timestamp_bound_is_height_gated_and_inclusive() {
+        use crate::hardening::{PbaHardening, MAX_BLOCK_TIMESTAMP_ADVANCE_SECS as MAX};
+        let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let mut genesis = create_test_block_with_parents([0x01; 32], Hash::default(), vec![], 0);
+        genesis.header.timestamp = 1_000;
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        let child = |ts: u64, h: u8| {
+            let mut b =
+                create_test_block_with_parents([h; 32], genesis.hash(), vec![], 1);
+            b.header.timestamp = ts;
+            b
+        };
+        let on = GhostDag::new(GhostDagParams::default(), dag_store.clone())
+            .with_pba_hardening(PbaHardening::at(1));
+        assert!(on.validate_block_consistency(&child(1_000 + MAX, 2)).await.is_ok());
+        assert!(on.validate_block_consistency(&child(1_000 + MAX + 1, 3)).await.is_err());
+        assert!(on.validate_block_consistency(&child(u64::MAX, 4)).await.is_err());
+        assert!(on.validate_block_consistency(&child(999, 5)).await.is_err(), "monotonic");
+        // Activation above this height: legacy rule (no upper bound).
+        let later = GhostDag::new(GhostDagParams::default(), dag_store.clone())
+            .with_pba_hardening(PbaHardening::at(2));
+        assert!(later.validate_block_consistency(&child(u64::MAX, 6)).await.is_ok());
+        let off = GhostDag::new(GhostDagParams::default(), dag_store.clone())
+            .with_pba_hardening(PbaHardening::off());
+        assert!(off.validate_block_consistency(&child(u64::MAX, 7)).await.is_ok());
+        // A u64::MAX parent: the bound saturates, never panics.
+        let mut far = create_test_block_with_parents([0x08; 32], genesis.hash(), vec![], 1);
+        far.header.timestamp = u64::MAX;
+        dag_store.store_block(far.clone()).await.unwrap();
+        let mut grandchild = create_test_block_with_parents([0x09; 32], far.hash(), vec![], 2);
+        grandchild.header.timestamp = u64::MAX;
+        assert!(on.validate_block_consistency(&grandchild).await.is_ok());
+    }
+
     #[tokio::test]
     async fn test_genesis_block_blue_set() {
         let params = GhostDagParams::default();

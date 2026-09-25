@@ -100,11 +100,21 @@ fn p2p_tx(sk: &SecretKey, ty: u8, value: u128, nonce: u64) -> Transaction {
 async fn pba_l1b_007_typed_and_zero_value_evm_txs_verify_over_p2p() {
     let mp = Mempool::new(MempoolConfig::default());
     let sk = SecretKey::from_slice(&[0x31; 32]).unwrap();
-    let r = mp.add_transaction(p2p_tx(&sk, 2, 5, 0), TxClass::Standard).await;
-    assert!(r.is_ok(), "PBA-L1b-007: an EIP-1559 tx must verify on the P2P path, got {r:?}");
+    let r = mp
+        .add_transaction(p2p_tx(&sk, 2, 5, 0), TxClass::Standard)
+        .await;
+    assert!(
+        r.is_ok(),
+        "PBA-L1b-007: an EIP-1559 tx must verify on the P2P path, got {r:?}"
+    );
     let sk2 = SecretKey::from_slice(&[0x32; 32]).unwrap();
-    let r = mp.add_transaction(p2p_tx(&sk2, 0, 0, 0), TxClass::Standard).await;
-    assert!(r.is_ok(), "PBA-L1b-007: a zero-value legacy tx must verify, got {r:?}");
+    let r = mp
+        .add_transaction(p2p_tx(&sk2, 0, 0, 0), TxClass::Standard)
+        .await;
+    assert!(
+        r.is_ok(),
+        "PBA-L1b-007: a zero-value legacy tx must verify, got {r:?}"
+    );
 }
 
 #[tokio::test]

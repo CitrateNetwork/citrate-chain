@@ -23,6 +23,12 @@ use sha3::{Digest, Keccak256};
 
 const CHAIN: u64 = 40204;
 
+/// A named field mutation applied to a decoded transaction.
+type Mutation = (
+    &'static str,
+    Box<dyn Fn(&mut citrate_consensus::types::Transaction)>,
+);
+
 fn keccak(b: &[u8]) -> [u8; 32] {
     Keccak256::digest(b).into()
 }
@@ -156,12 +162,25 @@ fn sign_raw(sk: &SecretKey, sh: &Shape) -> Vec<u8> {
 }
 
 fn shapes() -> Vec<Shape> {
-    let al = vec![([0x11; 20], vec![[0x22; 32], [0x00; 32]]), ([0x33; 20], vec![])];
+    let al = vec![
+        ([0x11; 20], vec![[0x22; 32], [0x00; 32]]),
+        ([0x33; 20], vec![]),
+    ];
     let mut v = Vec::new();
     for ty in [0u8, 1, 2] {
         for (to, value, data, access) in [
-            (Some([0xB0; 20]), 1_000_000_000_000_000_000u128, vec![], vec![]),
-            (Some([0xB0; 20]), 0u128, vec![0xa9, 0x05, 0x9c, 0xbb, 0, 1, 2], vec![]),
+            (
+                Some([0xB0; 20]),
+                1_000_000_000_000_000_000u128,
+                vec![],
+                vec![],
+            ),
+            (
+                Some([0xB0; 20]),
+                0u128,
+                vec![0xa9, 0x05, 0x9c, 0xbb, 0, 1, 2],
+                vec![],
+            ),
             (None, 0u128, vec![0x60, 0x80, 0x60, 0x40, 0x52], vec![]),
             (Some([0x01; 20]), 7u128, vec![1], al.clone()),
         ] {
@@ -210,7 +229,7 @@ fn signed_and_executor_relevant_fields_cannot_be_changed() {
     let sk = SecretKey::from_slice(&[0x4c; 32]).unwrap();
     for sh in shapes() {
         let tx = decode_eth_transaction(&sign_raw(&sk, &sh)).unwrap();
-        let mutations: Vec<(&str, Box<dyn Fn(&mut citrate_consensus::types::Transaction)>)> = vec![
+        let mutations: Vec<Mutation> = vec![
             ("value", Box::new(|t| t.value += 1)),
             ("nonce", Box::new(|t| t.nonce += 1)),
             ("gas_limit", Box::new(|t| t.gas_limit += 1)),
@@ -218,21 +237,38 @@ fn signed_and_executor_relevant_fields_cannot_be_changed() {
             ("data", Box::new(|t| t.data.push(0))),
             ("chain_id", Box::new(|t| t.chain_id = Some(1))),
             ("to", Box::new(|t| t.to = Some(PublicKey::new([0xEE; 32])))),
-            ("to tail", Box::new(|t| {
-                if let Some(to) = &mut t.to { to.0[31] = 1 } else { t.to = Some(PublicKey::new([1; 32])) }
-            })),
-            ("eth_tx_type", Box::new(|t| t.eth_tx_type = (t.eth_tx_type + 1) % 3)),
-            ("signature", Box::new(|t| {
-                let mut b = *t.signature.as_bytes();
-                b[5] ^= 1;
-                t.signature = citrate_consensus::types::Signature::new(b);
-            })),
+            (
+                "to tail",
+                Box::new(|t| {
+                    if let Some(to) = &mut t.to {
+                        to.0[31] = 1
+                    } else {
+                        t.to = Some(PublicKey::new([1; 32]))
+                    }
+                }),
+            ),
+            (
+                "eth_tx_type",
+                Box::new(|t| t.eth_tx_type = (t.eth_tx_type + 1) % 3),
+            ),
+            (
+                "signature",
+                Box::new(|t| {
+                    let mut b = *t.signature.as_bytes();
+                    b[5] ^= 1;
+                    t.signature = citrate_consensus::types::Signature::new(b);
+                }),
+            ),
         ];
         for (name, m) in mutations {
             let mut t = tx.clone();
             m(&mut t);
             let r = tx_auth::authenticate(&t);
-            assert!(r.is_err(), "type {}: mutating {name} must fail authentication, got {r:?}", sh.ty);
+            assert!(
+                r.is_err(),
+                "type {}: mutating {name} must fail authentication, got {r:?}",
+                sh.ty
+            );
         }
     }
 }
@@ -244,10 +280,45 @@ fn high_s_and_missing_chain_id_rejected() {
     let tx = decode_eth_transaction(&sign_raw(&sk, sh)).unwrap();
     let mut no_chain = tx.clone();
     no_chain.chain_id = None;
-    assert_eq!(tx_auth::authenticate(&no_chain), Err(TxAuthError::MissingChainId));
+    assert_eq!(
+        tx_auth::authenticate(&no_chain),
+        Err(TxAuthError::MissingChainId)
+    );
     let mut high = tx.clone();
     let mut b = *high.signature.as_bytes();
     b[32] = 0xFF; // s > n/2
     high.signature = citrate_consensus::types::Signature::new(b);
     assert_eq!(tx_auth::authenticate(&high), Err(TxAuthError::HighS));
+}
+
+/// PBA-L1a-006 / PBA-L4-003 (issue #209 close condition): a wrong
+/// client-supplied hash on the bincode (native) ingress path is REWRITTEN to
+/// the canonical content id, so RPC returns — and the mempool stores — the id
+/// that block import requires.
+#[test]
+fn bincode_native_tx_wrong_supplied_hash_is_rewritten() {
+    use citrate_consensus::crypto::{sign_transaction, Ed25519SigningKey};
+    use citrate_consensus::types::{Hash, Transaction};
+    let sk = Ed25519SigningKey::from_bytes(&[0x21; 32]);
+    let mut tx = Transaction {
+        nonce: 0,
+        to: Some(PublicKey::new([9; 32])),
+        value: 1,
+        gas_limit: 21_000,
+        gas_price: 1_000_000_000,
+        chain_id: Some(CHAIN),
+        ..Default::default()
+    };
+    sign_transaction(&mut tx, &sk).unwrap();
+    tx.hash = Hash::new([0x42; 32]); // squatting someone else's id
+    let raw = bincode::serialize(&tx).unwrap();
+    let decoded = decode_eth_transaction(&raw).unwrap();
+    let canonical = tx_auth::native_tx_id(&decoded);
+    assert_ne!(
+        decoded.hash,
+        Hash::new([0x42; 32]),
+        "supplied hash must not survive"
+    );
+    assert_eq!(decoded.hash, canonical);
+    assert_eq!(tx_auth::authenticate_with_hash(&decoded), Ok(canonical));
 }

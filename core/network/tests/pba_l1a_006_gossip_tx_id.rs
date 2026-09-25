@@ -36,10 +36,17 @@ fn gossip() -> GossipProtocol {
 async fn pba_l1a_006_claimed_hash_cannot_shadow_a_victims_tx_in_gossip() {
     let g = gossip();
     let peer = PeerId("p".into());
-    g.handle_new_transaction(signed(2, 0x42), &peer).await.unwrap(); // attacker, victim's hash
-    g.handle_new_transaction(signed(1, 0x42), &peer).await.unwrap(); // victim
+    g.handle_new_transaction(signed(2, 0x42), &peer)
+        .await
+        .unwrap(); // attacker, victim's hash
+    g.handle_new_transaction(signed(1, 0x42), &peer)
+        .await
+        .unwrap(); // victim
     let (_, _, received, _, dups, _, _, _) = g.get_stats().await;
-    assert_eq!(received, 2, "PBA-L1a-006: the victim's tx must be processed, not dropped");
+    assert_eq!(
+        received, 2,
+        "PBA-L1a-006: the victim's tx must be processed, not dropped"
+    );
     assert_eq!(dups, 0);
 }
 
@@ -54,7 +61,9 @@ async fn pba_l1a_006_unauthenticated_tx_is_rejected_and_not_cached() {
     unsigned.signature = Signature::new([0xAA; 64]);
     assert!(g.handle_new_transaction(unsigned, &peer).await.is_err());
     // The genuine tx still goes through afterwards.
-    g.handle_new_transaction(signed(1, 0x42), &peer).await.unwrap();
+    g.handle_new_transaction(signed(1, 0x42), &peer)
+        .await
+        .unwrap();
     let (_, _, received, _, _, _, _, _) = g.get_stats().await;
     assert_eq!(received, 1);
 }
@@ -65,8 +74,14 @@ async fn pba_l1a_006_unauthenticated_tx_is_rejected_and_not_cached() {
 async fn pba_l1b_007_prevalidate_matches_gossip_rules() {
     let g = gossip();
     let peer = PeerId("p".into());
-    let ok = g.prevalidate_transaction(signed(1, 0x42), &peer).await.unwrap();
-    assert_eq!(ok.hash, citrate_consensus::tx_auth::authenticate(&ok).unwrap());
+    let ok = g
+        .prevalidate_transaction(signed(1, 0x42), &peer)
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.hash,
+        citrate_consensus::tx_auth::authenticate(&ok).unwrap()
+    );
     let mut zero_gas = signed(1, 0x42);
     zero_gas.gas_price = 0;
     assert!(g.prevalidate_transaction(zero_gas, &peer).await.is_err());

@@ -15,7 +15,9 @@
 use citrate_consensus::crypto;
 use citrate_consensus::hardening::PbaHardening;
 use citrate_consensus::tx_auth::{native_tx_id, tx_root_for_height};
-use citrate_consensus::types::{Block, BlockBuilder, Hash, PublicKey, Signature, Transaction, VrfProof};
+use citrate_consensus::types::{
+    Block, BlockBuilder, Hash, PublicKey, Signature, Transaction, VrfProof,
+};
 use citrate_execution::{address_utils, Executor, StateDB};
 use primitive_types::U256;
 use std::collections::HashMap;
@@ -54,7 +56,12 @@ fn forged_transfer(value: u128) -> Transaction {
     }
 }
 
-fn native_signed(sk: &crypto::Ed25519SigningKey, to: [u8; 20], value: u128, chain: u64) -> Transaction {
+fn native_signed(
+    sk: &crypto::Ed25519SigningKey,
+    to: [u8; 20],
+    value: u128,
+    chain: u64,
+) -> Transaction {
     let mut tx = Transaction {
         nonce: 0,
         to: Some(embedded(to)),
@@ -105,7 +112,12 @@ async fn seal(hardening: PbaHardening, fund: &[(PublicKey, U256)], txs: Vec<Tran
     });
     let mut receipts = Vec::new();
     for tx in &template.transactions {
-        receipts.push(producer.execute_transaction(&template, tx).await.expect("executes"));
+        receipts.push(
+            producer
+                .execute_transaction(&template, tx)
+                .await
+                .expect("executes"),
+        );
     }
     producer
         .settle_block_rewards(
@@ -144,8 +156,14 @@ async fn pba_l1b_001_forged_sender_block_rejected_after_activation() {
         r.is_err(),
         "PBA-L1b-001: a block with a forged-sender tx must be rejected on import, got {r:?}"
     );
-    assert_eq!(f.get_balance(&address_utils::normalize_address(&embedded(VICTIM))), funds());
-    assert_eq!(f.get_balance(&address_utils::normalize_address(&embedded(THIEF))), U256::zero());
+    assert_eq!(
+        f.get_balance(&address_utils::normalize_address(&embedded(VICTIM))),
+        funds()
+    );
+    assert_eq!(
+        f.get_balance(&address_utils::normalize_address(&embedded(THIEF))),
+        U256::zero()
+    );
 }
 
 /// Below the activation height legacy validity is unchanged (documented
@@ -172,7 +190,10 @@ async fn pba_l1b_001_validly_signed_block_applies_after_activation() {
     f.apply_block(&block, COINBASE, &[])
         .await
         .expect("an honest signed block applies");
-    assert_eq!(f.get_balance(&address_utils::normalize_address(&embedded(THIEF))), U256::from(5u64));
+    assert_eq!(
+        f.get_balance(&address_utils::normalize_address(&embedded(THIEF))),
+        U256::from(5u64)
+    );
 }
 
 /// A validly signed tx whose `hash` is not its canonical id (the PBA-L1a-006
@@ -186,7 +207,10 @@ async fn pba_l1b_001_non_canonical_hash_rejected_after_activation() {
     let mut tx = native_signed(&sk, THIEF, 5, CHAIN);
     tx.hash = Hash::new([0x42; 32]); // squats someone else's id
     let block = seal(pba, &fund, vec![tx]).await;
-    assert!(follower(pba, &fund).apply_block(&block, COINBASE, &[]).await.is_err());
+    assert!(follower(pba, &fund)
+        .apply_block(&block, COINBASE, &[])
+        .await
+        .is_err());
 }
 
 /// A tx signed for another chain id is not replayable here.
@@ -197,7 +221,10 @@ async fn pba_l1b_001_foreign_chain_id_rejected_after_activation() {
     let sender = PublicKey::new(sk.verifying_key().to_bytes());
     let fund = [(sender, funds())];
     let block = seal(pba, &fund, vec![native_signed(&sk, THIEF, 5, 1)]).await;
-    assert!(follower(pba, &fund).apply_block(&block, COINBASE, &[]).await.is_err());
+    assert!(follower(pba, &fund)
+        .apply_block(&block, COINBASE, &[])
+        .await
+        .is_err());
 }
 
 /// Tripwire (class-level): the import gate runs first in the single apply
@@ -206,15 +233,24 @@ async fn pba_l1b_001_foreign_chain_id_rejected_after_activation() {
 #[test]
 fn pba_l1b_001_tripwire_import_gate_precedes_state_mutation() {
     let src = include_str!("../src/executor.rs");
-    let atom = src.find("async fn apply_block_inner(").expect("apply_block_inner");
+    let atom = src
+        .find("async fn apply_block_inner(")
+        .expect("apply_block_inner");
     let body = &src[atom..];
-    let gate = body.find("self.verify_block_body(block)?").expect(
-        "PBA-L1b-001: apply_block_inner must call verify_block_body (tx auth + tx_root)",
-    );
+    let gate = body
+        .find("self.verify_block_body(block)?")
+        .expect("PBA-L1b-001: apply_block_inner must call verify_block_body (tx auth + tx_root)");
     let snap = body.find("self.state_db.snapshot()").expect("snapshot");
-    let exec = body.find("self.execute_transaction(block, tx)").expect("execute");
-    assert!(gate < snap && gate < exec, "the import gate must run before any state work");
-    let vb = src.find("fn verify_block_body(").expect("verify_block_body");
+    let exec = body
+        .find("self.execute_transaction(block, tx)")
+        .expect("execute");
+    assert!(
+        gate < snap && gate < exec,
+        "the import gate must run before any state work"
+    );
+    let vb = src
+        .find("fn verify_block_body(")
+        .expect("verify_block_body");
     assert!(
         src[vb..vb + 2_500].contains("tx_auth::verify_for_block(tx, self.chain_id)"),
         "verify_block_body must authenticate every tx with tx_auth::verify_for_block"

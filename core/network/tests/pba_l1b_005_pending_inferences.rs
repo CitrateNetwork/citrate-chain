@@ -28,11 +28,15 @@ fn req(i: u32) -> NetworkMessage {
 #[tokio::test]
 async fn pba_l1b_005_pending_inferences_are_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let sm = Arc::new(StateManager::new(Arc::new(RocksDB::open(dir.path()).unwrap())));
+    let sm = Arc::new(StateManager::new(Arc::new(
+        RocksDB::open(dir.path()).unwrap(),
+    )));
     let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
     let h = AINetworkHandler::new(sm, pm);
     for i in 0..5_000u32 {
-        h.handle_message(&PeerId(format!("p{}", i % 50)), &req(i)).await.unwrap();
+        h.handle_message(&PeerId(format!("p{}", i % 50)), &req(i))
+            .await
+            .unwrap();
     }
     let n = h.pending_inference_count().await;
     assert!(
@@ -42,11 +46,15 @@ async fn pba_l1b_005_pending_inferences_are_bounded() {
     // One peer cannot take the whole table.
     let dir2 = tempfile::tempdir().unwrap();
     let h2 = AINetworkHandler::new(
-        Arc::new(StateManager::new(Arc::new(RocksDB::open(dir2.path()).unwrap()))),
+        Arc::new(StateManager::new(Arc::new(
+            RocksDB::open(dir2.path()).unwrap(),
+        ))),
         Arc::new(PeerManager::new(PeerManagerConfig::default())),
     );
     for i in 0..1_000u32 {
-        h2.handle_message(&PeerId("one".into()), &req(i)).await.unwrap();
+        h2.handle_message(&PeerId("one".into()), &req(i))
+            .await
+            .unwrap();
     }
     assert!(h2.pending_inference_count().await <= 16);
 }

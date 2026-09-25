@@ -53,14 +53,18 @@ fn model_id(i: u32) -> Hash {
 #[tokio::test]
 async fn pba_l1b_004_cache_is_bounded_per_peer_and_globally() {
     let dir = tempfile::tempdir().unwrap();
-    let sm = Arc::new(StateManager::new(Arc::new(RocksDB::open(dir.path()).unwrap())));
+    let sm = Arc::new(StateManager::new(Arc::new(
+        RocksDB::open(dir.path()).unwrap(),
+    )));
     let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
     let h = AINetworkHandler::new(sm, pm);
 
     // Per-peer quota.
     let attacker = PeerId("attacker".into());
     for i in 0..(MAX_MODELS_PER_PEER as u32 * 3) {
-        h.handle_message(&attacker, &announce(i, "d".into())).await.unwrap();
+        h.handle_message(&attacker, &announce(i, "d".into()))
+            .await
+            .unwrap();
     }
     assert_eq!(h.cached_model_count().await, MAX_MODELS_PER_PEER);
 
@@ -76,7 +80,9 @@ async fn pba_l1b_004_cache_is_bounded_per_peer_and_globally() {
         let peer = PeerId(format!("peer-{p}"));
         for j in 0..MAX_MODELS_PER_PEER as u32 {
             let i = 2_000_000 + (p as u32) * 1_000 + j;
-            h.handle_message(&peer, &announce(i, "d".into())).await.unwrap();
+            h.handle_message(&peer, &announce(i, "d".into()))
+                .await
+                .unwrap();
         }
     }
     assert!(h.cached_model_count().await <= MAX_CACHED_MODELS);
@@ -87,7 +93,9 @@ async fn pba_l1b_004_cache_is_bounded_per_peer_and_globally() {
 #[tokio::test]
 async fn pba_l1b_004_training_announce_flood_not_persisted() {
     let dir = tempfile::tempdir().unwrap();
-    let sm = Arc::new(StateManager::new(Arc::new(RocksDB::open(dir.path()).unwrap())));
+    let sm = Arc::new(StateManager::new(Arc::new(
+        RocksDB::open(dir.path()).unwrap(),
+    )));
     let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
     let h = AINetworkHandler::new(sm.clone(), pm);
     for i in 0..500u32 {
@@ -99,9 +107,13 @@ async fn pba_l1b_004_training_announce_flood_not_persisted() {
             reward_per_gradient: 1,
             owner: [0xAB; 20],
         };
-        h.handle_message(&PeerId("attacker".into()), &msg).await.unwrap();
+        h.handle_message(&PeerId("attacker".into()), &msg)
+            .await
+            .unwrap();
     }
-    assert!(sm.get_training_job(&citrate_execution::JobId(model_id(0))).is_none());
+    assert!(sm
+        .get_training_job(&citrate_execution::JobId(model_id(0)))
+        .is_none());
     assert!(h.active_training_count().await <= citrate_network::ai_handler::MAX_TRAINING_JOBS);
 }
 

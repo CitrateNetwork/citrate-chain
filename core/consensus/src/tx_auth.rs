@@ -372,7 +372,9 @@ fn authenticate_native(tx: &Transaction) -> Result<Hash, TxAuthError> {
         || tx.max_priority_fee_per_gas.is_some()
         || tx.access_list.is_some()
     {
-        return Err(TxAuthError::UnsignedField("EVM envelope fields on a native tx"));
+        return Err(TxAuthError::UnsignedField(
+            "EVM envelope fields on a native tx",
+        ));
     }
     if let Some(t) = tx.tx_type {
         if t != TransactionType::from_data(&tx.data) {
@@ -539,6 +541,9 @@ mod tests {
     use super::*;
     use crate::types::{PublicKey, Signature};
 
+    /// A named field mutation applied to a transaction.
+    type Mutation = (&'static str, Box<dyn Fn(&mut Transaction)>);
+
     fn native_signed(seed: u8, nonce: u64) -> Transaction {
         let sk = crate::crypto::Ed25519SigningKey::from_bytes(&[seed; 32]);
         let mut tx = Transaction {
@@ -579,10 +584,16 @@ mod tests {
         assert_eq!(authenticate(&t), Err(TxAuthError::BadSignature));
         let mut t = tx.clone();
         t.eth_tx_type = 2;
-        assert!(matches!(authenticate(&t), Err(TxAuthError::UnsignedField(_))));
+        assert!(matches!(
+            authenticate(&t),
+            Err(TxAuthError::UnsignedField(_))
+        ));
         let mut t = tx.clone();
         t.tx_type = Some(TransactionType::ModelDeploy);
-        assert!(matches!(authenticate(&t), Err(TxAuthError::UnsignedField(_))));
+        assert!(matches!(
+            authenticate(&t),
+            Err(TxAuthError::UnsignedField(_))
+        ));
         let mut t = tx;
         t.from = PublicKey::new([0u8; 32]);
         assert_eq!(authenticate(&t), Err(TxAuthError::EmptySender));
@@ -594,14 +605,23 @@ mod tests {
         assert_eq!(verify_for_block(&tx, 40204), Ok(tx.hash));
         assert_eq!(
             verify_for_block(&tx, 1),
-            Err(TxAuthError::WrongChainId { expected: 1, got: Some(40204) })
+            Err(TxAuthError::WrongChainId {
+                expected: 1,
+                got: Some(40204)
+            })
         );
         let mut t = tx.clone();
         t.chain_id = None;
-        assert!(matches!(verify_for_block(&t, 40204), Err(TxAuthError::WrongChainId { .. })));
+        assert!(matches!(
+            verify_for_block(&t, 40204),
+            Err(TxAuthError::WrongChainId { .. })
+        ));
         let mut t = tx;
         t.hash = Hash::new([7; 32]);
-        assert!(matches!(verify_for_block(&t, 40204), Err(TxAuthError::HashMismatch { .. })));
+        assert!(matches!(
+            verify_for_block(&t, 40204),
+            Err(TxAuthError::HashMismatch { .. })
+        ));
     }
 
     #[test]
@@ -620,11 +640,324 @@ mod tests {
         assert_eq!(authenticate(&tx), Err(TxAuthError::BadSignature));
     }
 
+    // ── EVM vectors: sign with secp256k1 exactly per the EIPs, independently
+    // of the code under test, and require authenticate == keccak(raw). ──
+
+    fn trim(b: &[u8]) -> &[u8] {
+        let i = b.iter().position(|&x| x != 0).unwrap_or(b.len());
+        &b[i..]
+    }
+
+    struct Evm {
+        ty: u8,
+        to: Option<[u8; 20]>,
+        value: u128,
+        data: Vec<u8>,
+        access: Vec<([u8; 20], Vec<[u8; 32]>)>,
+    }
+
+    const GP: u64 = 2_000_000_000;
+    const PRIO: u64 = 1_000_000_000;
+    const GAS: u64 = 100_000;
+    const NONCE: u64 = 3;
+    const CH: u64 = 40204;
+
+    fn fields(s: &mut rlp::RlpStream, e: &Evm) {
+        match e.to {
+            Some(t) => {
+                s.append(&t.as_slice());
+            }
+            None => {
+                s.append_empty_data();
+            }
+        }
+        s.append(&trim(&e.value.to_be_bytes()));
+        s.append(&e.data.as_slice());
+    }
+
+    fn access(s: &mut rlp::RlpStream, e: &Evm) {
+        s.begin_list(e.access.len());
+        for (a, keys) in &e.access {
+            s.begin_list(2);
+            s.append(&a.as_slice());
+            s.begin_list(keys.len());
+            for k in keys {
+                s.append(&k.as_slice());
+            }
+        }
+    }
+
+    /// Returns (tx as the decoder would build it, keccak(raw)).
+    fn evm_signed(seed: u8, e: &Evm) -> (Transaction, Hash) {
+        use secp256k1::{Message, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).unwrap();
+        let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let addr = Keccak256::digest(&pk.serialize_uncompressed()[1..]);
+        let mut u = rlp::RlpStream::new();
+        match e.ty {
+            0 => {
+                u.begin_list(9);
+                u.append(&NONCE);
+                u.append(&GP);
+                u.append(&GAS);
+                fields(&mut u, e);
+                u.append(&CH);
+                u.append(&0u8);
+                u.append(&0u8);
+            }
+            1 => {
+                u.begin_list(8);
+                u.append(&CH);
+                u.append(&NONCE);
+                u.append(&GP);
+                u.append(&GAS);
+                fields(&mut u, e);
+                access(&mut u, e);
+            }
+            _ => {
+                u.begin_list(9);
+                u.append(&CH);
+                u.append(&NONCE);
+                u.append(&PRIO);
+                u.append(&GP);
+                u.append(&GAS);
+                fields(&mut u, e);
+                access(&mut u, e);
+            }
+        }
+        let mut pre = Vec::new();
+        if e.ty != 0 {
+            pre.push(e.ty);
+        }
+        pre.extend_from_slice(&u.out());
+        let msg = Message::from_slice(&Keccak256::digest(&pre)).unwrap();
+        let (rid, sig) = secp.sign_ecdsa_recoverable(&msg, &sk).serialize_compact();
+        let rid = rid.to_i32() as u64;
+        let mut s = rlp::RlpStream::new();
+        match e.ty {
+            0 => {
+                s.begin_list(9);
+                s.append(&NONCE);
+                s.append(&GP);
+                s.append(&GAS);
+                fields(&mut s, e);
+                s.append(&(CH * 2 + 35 + rid));
+            }
+            1 => {
+                s.begin_list(11);
+                s.append(&CH);
+                s.append(&NONCE);
+                s.append(&GP);
+                s.append(&GAS);
+                fields(&mut s, e);
+                access(&mut s, e);
+                s.append(&rid);
+            }
+            _ => {
+                s.begin_list(12);
+                s.append(&CH);
+                s.append(&NONCE);
+                s.append(&PRIO);
+                s.append(&GP);
+                s.append(&GAS);
+                fields(&mut s, e);
+                access(&mut s, e);
+                s.append(&rid);
+            }
+        }
+        s.append(&trim(&sig[..32]));
+        s.append(&trim(&sig[32..]));
+        let mut raw = Vec::new();
+        if e.ty != 0 {
+            raw.push(e.ty);
+        }
+        raw.extend_from_slice(&s.out());
+        let emb = |a: &[u8]| {
+            let mut b = [0u8; 32];
+            b[..20].copy_from_slice(a);
+            PublicKey::new(b)
+        };
+        let al: Vec<(Vec<u8>, Vec<Vec<u8>>)> = e
+            .access
+            .iter()
+            .map(|(a, ks)| (a.to_vec(), ks.iter().map(|k| k.to_vec()).collect()))
+            .collect();
+        let tx = Transaction {
+            hash: Hash::new([0xEE; 32]),
+            nonce: NONCE,
+            from: emb(&addr[12..]),
+            to: e.to.map(|t| emb(&t)),
+            value: e.value,
+            gas_limit: GAS,
+            gas_price: GP,
+            data: e.data.clone(),
+            signature: Signature::new(sig),
+            tx_type: Some(TransactionType::from_data(&e.data)),
+            eth_tx_type: e.ty,
+            max_fee_per_gas: if e.ty == 2 { Some(GP) } else { None },
+            max_priority_fee_per_gas: if e.ty == 2 { Some(PRIO) } else { None },
+            access_list: if al.is_empty() { None } else { Some(al) },
+            chain_id: Some(CH),
+            ecdsa_verified: false,
+        };
+        (tx, Hash::new(Keccak256::digest(&raw).into()))
+    }
+
+    fn evm_cases() -> Vec<Evm> {
+        let al = vec![
+            ([0x11; 20], vec![[0x22; 32], [0u8; 32]]),
+            ([0x33; 20], vec![]),
+        ];
+        let mut v = Vec::new();
+        for ty in [0u8, 1, 2] {
+            v.push(Evm {
+                ty,
+                to: Some([0xB0; 20]),
+                value: 10u128.pow(18),
+                data: vec![],
+                access: vec![],
+            });
+            v.push(Evm {
+                ty,
+                to: Some([0xB0; 20]),
+                value: 0,
+                data: vec![0xa9, 0x05, 0x9c, 0xbb],
+                access: vec![],
+            });
+            v.push(Evm {
+                ty,
+                to: None,
+                value: 0,
+                data: vec![0x60, 0x80],
+                access: vec![],
+            });
+            v.push(Evm {
+                ty,
+                to: Some([0x01; 20]),
+                value: 0x7f,
+                data: vec![1],
+                access: vec![],
+            });
+            if ty != 0 {
+                v.push(Evm {
+                    ty,
+                    to: Some([0x01; 20]),
+                    value: 7,
+                    data: vec![],
+                    access: al.clone(),
+                });
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn evm_all_types_authenticate_to_keccak_of_raw() {
+        for (i, e) in evm_cases().iter().enumerate() {
+            for seed in [0x4c_u8, 0x07, 0x99] {
+                let (tx, want) = evm_signed(seed, e);
+                assert_eq!(
+                    authenticate(&tx),
+                    Ok(want),
+                    "case {i} type {} seed {seed}",
+                    e.ty
+                );
+                let mut t = tx.clone();
+                t.hash = want;
+                assert_eq!(authenticate_with_hash(&t), Ok(want));
+                assert_eq!(verify_for_block(&t, CH), Ok(want));
+            }
+        }
+    }
+
+    #[test]
+    fn evm_mutations_fail() {
+        for e in evm_cases() {
+            let (tx, want) = evm_signed(0x4c, &e);
+            let muts: Vec<Mutation> = vec![
+                ("value", Box::new(|t| t.value += 1)),
+                ("nonce", Box::new(|t| t.nonce += 1)),
+                ("gas", Box::new(|t| t.gas_limit += 1)),
+                ("gas_price", Box::new(|t| t.gas_price += 1)),
+                ("data", Box::new(|t| t.data.push(0))),
+                ("chain", Box::new(|t| t.chain_id = Some(CH + 1))),
+                ("no chain", Box::new(|t| t.chain_id = None)),
+                ("to", Box::new(|t| t.to = Some(PublicKey::new([0xEE; 32])))),
+                (
+                    "to tail",
+                    Box::new(|t| {
+                        let mut b = [0u8; 32];
+                        b[..20].copy_from_slice(&[0xB0; 20]);
+                        b[31] = 1;
+                        t.to = Some(PublicKey::new(b));
+                    }),
+                ),
+                (
+                    "type",
+                    Box::new(|t| t.eth_tx_type = (t.eth_tx_type + 1) % 3),
+                ),
+                ("type 3", Box::new(|t| t.eth_tx_type = 3)),
+                (
+                    "sig r",
+                    Box::new(|t| {
+                        let mut b = *t.signature.as_bytes();
+                        b[5] ^= 1;
+                        t.signature = Signature::new(b);
+                    }),
+                ),
+                (
+                    "high s",
+                    Box::new(|t| {
+                        let mut b = *t.signature.as_bytes();
+                        b[32] = 0xFF;
+                        t.signature = Signature::new(b);
+                    }),
+                ),
+                (
+                    "tx_type",
+                    Box::new(|t| t.tx_type = Some(TransactionType::ModelDeploy)),
+                ),
+                (
+                    "prio",
+                    Box::new(|t| {
+                        t.max_priority_fee_per_gas =
+                            Some(t.max_priority_fee_per_gas.unwrap_or(0) + 1)
+                    }),
+                ),
+                (
+                    "access",
+                    Box::new(|t| t.access_list = Some(vec![(vec![0x44; 20], vec![])])),
+                ),
+                (
+                    "access addr len",
+                    Box::new(|t| t.access_list = Some(vec![(vec![0x44; 19], vec![])])),
+                ),
+                (
+                    "access key len",
+                    Box::new(|t| {
+                        t.access_list = Some(vec![(vec![0x11; 20], vec![vec![0x22; 31]])])
+                    }),
+                ),
+            ];
+            for (name, m) in muts {
+                let mut t = tx.clone();
+                m(&mut t);
+                let r = authenticate(&t);
+                assert!(
+                    r.is_err() && r != Ok(want),
+                    "type {} mutation {name}: {r:?}",
+                    e.ty
+                );
+            }
+        }
+    }
+
     #[test]
     fn commitment_covers_every_field() {
         let base = native_signed(3, 7);
         let c0 = tx_content_commitment(&base);
-        let mutations: Vec<(&str, Box<dyn Fn(&mut Transaction)>)> = vec![
+        let mutations: Vec<Mutation> = vec![
             ("hash", Box::new(|t| t.hash = Hash::new([1; 32]))),
             ("nonce", Box::new(|t| t.nonce += 1)),
             ("from", Box::new(|t| t.from = PublicKey::new([2; 32]))),
@@ -633,11 +966,20 @@ mod tests {
             ("gas_limit", Box::new(|t| t.gas_limit += 1)),
             ("gas_price", Box::new(|t| t.gas_price += 1)),
             ("data", Box::new(|t| t.data.push(0))),
-            ("signature", Box::new(|t| t.signature = Signature::new([3; 64]))),
-            ("tx_type", Box::new(|t| t.tx_type = Some(TransactionType::Standard))),
+            (
+                "signature",
+                Box::new(|t| t.signature = Signature::new([3; 64])),
+            ),
+            (
+                "tx_type",
+                Box::new(|t| t.tx_type = Some(TransactionType::Standard)),
+            ),
             ("eth_tx_type", Box::new(|t| t.eth_tx_type = 1)),
             ("max_fee", Box::new(|t| t.max_fee_per_gas = Some(1))),
-            ("max_prio", Box::new(|t| t.max_priority_fee_per_gas = Some(1))),
+            (
+                "max_prio",
+                Box::new(|t| t.max_priority_fee_per_gas = Some(1)),
+            ),
             ("access_list", Box::new(|t| t.access_list = Some(vec![]))),
             ("chain_id", Box::new(|t| t.chain_id = Some(1))),
         ];
@@ -658,8 +1000,12 @@ mod tests {
         let b = native_signed(2, 0);
         let mut tampered = a.clone();
         tampered.value = 999; // body rewritten, hash untouched
-        assert_eq!(tx_root_legacy(&[a.clone()]), tx_root_legacy(&[tampered.clone()]));
-        assert_ne!(tx_root_v2(&[a.clone()]), tx_root_v2(&[tampered]));
+        let one = std::slice::from_ref(&a);
+        assert_eq!(
+            tx_root_legacy(one),
+            tx_root_legacy(std::slice::from_ref(&tampered))
+        );
+        assert_ne!(tx_root_v2(one), tx_root_v2(std::slice::from_ref(&tampered)));
         assert_ne!(
             tx_root_v2(&[a.clone(), b.clone()]),
             tx_root_v2(&[b.clone(), a.clone()])
@@ -667,12 +1013,12 @@ mod tests {
         assert_ne!(tx_root_v2(&[]), tx_root_legacy(&[]));
         use crate::hardening::PbaHardening;
         assert_eq!(
-            tx_root_for_height(PbaHardening::at(10), 9, &[a.clone()]),
-            tx_root_legacy(&[a.clone()])
+            tx_root_for_height(PbaHardening::at(10), 9, one),
+            tx_root_legacy(one)
         );
         assert_eq!(
-            tx_root_for_height(PbaHardening::at(10), 10, &[a.clone()]),
-            tx_root_v2(&[a])
+            tx_root_for_height(PbaHardening::at(10), 10, one),
+            tx_root_v2(one)
         );
     }
 }
