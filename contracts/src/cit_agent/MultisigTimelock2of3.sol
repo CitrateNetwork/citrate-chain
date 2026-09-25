@@ -51,6 +51,12 @@ contract MultisigTimelock2of3 is IERC1155Receiver {
     /// (target, payload) proposals don't collide.
     mapping(address => uint256) public proposerNonce;
 
+    /// PBA-L2-032: cancel votes. Cancelling an operation now needs 2-of-3
+    /// owners (or the proposer withdrawing its own still-unapproved op).
+    /// Pre-fix ANY single owner could cancel ANY op, so one compromised key
+    /// — exactly what 2-of-3 is meant to absorb — could cancel every
+    /// `replaceOwner(its index)` op forever and freeze the timelock.
+    mapping(bytes32 => mapping(address => bool)) private _cancelVotes;
     error NotOwner();
     error OperationNotFound();
     error OperationAlreadyExists();
@@ -64,14 +70,14 @@ contract MultisigTimelock2of3 is IERC1155Receiver {
     error ZeroOwner();
     error DuplicateOwner(address owner);
     error DelayTooShort(uint256 provided, uint256 floor);
-
+    error AlreadyVotedCancel();
     event Proposed(bytes32 indexed opId, address indexed proposer, address target);
     event Approved(bytes32 indexed opId, address indexed approver, uint8 approvalCount);
     event ExecutableAt(bytes32 indexed opId, uint256 timestamp);
     event Executed(bytes32 indexed opId, address indexed executor);
     event OwnerReplaced(uint8 indexed index, address indexed previous, address indexed replacement);
     event Cancelled(bytes32 indexed opId, address indexed canceller);
-
+    event CancelVoted(bytes32 indexed opId, address indexed owner, uint8 votes);
     modifier onlyOwner() {
         if (!_isOwner(msg.sender)) revert NotOwner();
         _;
@@ -148,16 +154,37 @@ contract MultisigTimelock2of3 is IERC1155Receiver {
         return ret;
     }
 
-    /// Cancel a Proposed or Approved operation. Any owner may
-    /// cancel — the assumption is that any of the 3 detecting a
-    /// compromise is sufficient grounds to halt.
+    /// Vote to cancel a Proposed or Approved operation.
+    ///
+    /// PBA-L2-032: cancellation is quorum-gated. The op is cancelled when
+    /// 2 distinct owners have voted to cancel, or immediately when its
+    /// proposer withdraws it while it is still only `Proposed` (no second
+    /// approval yet). A hostile op cannot reach `Approved` without a second
+    /// owner, and two honest owners can always cancel it; conversely, a
+    /// single rogue owner can no longer veto the honest pair (e.g. its own
+    /// `replaceOwner`).
     function cancel(bytes32 opId) external onlyOwner {
         Operation storage op = _ops[opId];
         if (op.state != OpState.Proposed && op.state != OpState.Approved) {
             revert InvalidState();
         }
-        op.state = OpState.Cancelled;
-        emit Cancelled(opId, msg.sender);
+        if (op.state == OpState.Proposed && msg.sender == op.proposer) {
+            op.state = OpState.Cancelled;
+            emit Cancelled(opId, msg.sender);
+            return;
+        }
+        if (_cancelVotes[opId][msg.sender]) revert AlreadyVotedCancel();
+        _cancelVotes[opId][msg.sender] = true;
+        // Count votes of CURRENT owners only (a replaced owner's vote lapses).
+        uint8 votes = 0;
+        for (uint8 i = 0; i < 3; i++) {
+            if (_cancelVotes[opId][owners[i]]) votes++;
+        }
+        emit CancelVoted(opId, msg.sender, votes);
+        if (votes >= 2) {
+            op.state = OpState.Cancelled;
+            emit Cancelled(opId, msg.sender);
+        }
     }
 
     // ── View helpers ───────────────────────────────────────────────

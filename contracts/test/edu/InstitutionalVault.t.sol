@@ -171,6 +171,9 @@ contract InstitutionalVaultTest is Test {
 
         vm.prank(signer2);
         vault.rejectCashout(txId);
+        // PBA-L2-032: rejection needs the blocking minority (n - t + 1 = 2).
+        vm.prank(signer3);
+        vault.rejectCashout(txId);
 
         // Cannot approve after rejection
         vm.prank(signer3);
@@ -556,6 +559,8 @@ contract InstitutionalVaultTest is Test {
         uint256 txId = vault.proposeCashout(recipient, 1 ether, keccak256("x"));
         vm.prank(signer2);
         vault.rejectCashout(txId);
+        vm.prank(signer3); // PBA-L2-032: second reject vote reaches the blocking minority
+        vault.rejectCashout(txId);
 
         vm.prank(signer3);
         vm.expectRevert(); // AlreadyRejected
@@ -581,8 +586,9 @@ contract InstitutionalVaultTest is Test {
         vault.unpause();
         // Now unpaused
 
-        // Pause again
-        vm.prank(signer1);
+        // Pause again (PBA-L2-032: signer1 is in its re-arm cooldown, so a
+        // different signer pauses)
+        vm.prank(signer2);
         vault.emergencyPause();
 
         // Need fresh approvals — signer1's old approval was reset
@@ -662,6 +668,8 @@ contract InstitutionalVaultTest is Test {
 
         vm.prank(signer2);
         vault.rejectSignerChange(propId);
+        vm.prank(signer3); // PBA-L2-032: blocking minority (2 of 3)
+        vault.rejectSignerChange(propId);
 
         // Approve after rejection should fail
         vm.prank(signer3);
@@ -714,7 +722,11 @@ contract InstitutionalVaultTest is Test {
         uint256 remove3 = vault.proposeSignerChange(signer3, false);
         vm.prank(signer2);
         vault.approveSignerChange(remove3);
-
+        // PBA-L2-033: signer2's approval stops counting once it is removed,
+        // so a live signer (signer3) also approves to keep the proposal at
+        // quorum and reach the signer-count guard this test exercises.
+        vm.prank(signer3);
+        vault.approveSignerChange(remove3);
         vm.prank(signer1);
         vault.executeSignerChange(remove2);
 

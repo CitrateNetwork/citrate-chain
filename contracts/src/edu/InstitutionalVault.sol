@@ -56,6 +56,30 @@ contract InstitutionalVault is IInstitutionalVault {
     mapping(uint256 => mapping(address => bool)) private _thresholdProposalApprovals;
     uint256 private _nextThresholdProposalId;
 
+    // PBA-L2-031: optional calldata for a cashout, so the vault can act as
+    // the governance executor of the edu stack (Forwarder, ClassroomClusterV1,
+    // BudgetAllocation, CashoutRequest). Pre-fix the only outbound call was
+    // `to.call{value}("")`, so every onlyGovernance function of a contract
+    // governed by the vault was unreachable forever.
+    mapping(uint256 => bytes) private _cashoutData;
+
+    // PBA-L2-032: rejection is a blocking-minority VOTE, not a 1-of-n veto.
+    // A proposal is rejected once (signers - threshold + 1) live signers
+    // reject it (i.e. quorum can no longer be reached), or when its own
+    // proposer withdraws it. Pre-fix any single signer could reject any
+    // proposal — including its own removal — forever.
+    uint8 private constant KIND_CASHOUT = 0;
+    uint8 private constant KIND_SIGNER = 1;
+    uint8 private constant KIND_THRESHOLD = 2;
+    mapping(uint8 => mapping(uint256 => mapping(address => bool))) private _rejectVotes;
+    mapping(uint256 => address) private _signerProposalProposer;
+    mapping(uint256 => address) private _thresholdProposalProposer;
+
+    // PBA-L2-032: a signer may trigger `emergencyPause` at most once per
+    // PAUSE_COOLDOWN, so one key cannot re-arm the pause immediately after
+    // every quorum unpause.
+    uint256 public constant PAUSE_COOLDOWN = 1 days;
+    mapping(address => uint256) private _lastPauseAt;
     // ── Errors ──
 
     error NotSigner();
@@ -77,13 +101,21 @@ contract InstitutionalVault is IInstitutionalVault {
     error SignerProposalAlreadyRejected();
     error SignerProposalAlreadyApproved();
     error SignerProposalQuorumNotMet();
-
+    error CashoutNotFound();
+    error ThresholdProposalNotFound();
+    error AlreadyVotedReject();
+    error PauseCooldown();
+    error SelfCall();
     // ── Events (FWA-C3-16 threshold proposal flow) ──
 
     event ThresholdChangeProposed(uint256 indexed proposalId, uint256 newThreshold, address proposer);
     event ThresholdChangeApproved(uint256 indexed proposalId, address approver);
     event ThresholdChangeRejected(uint256 indexed proposalId, address rejector);
-
+    /// PBA-L2-032: a single rejection vote (the proposal is rejected only
+    /// when the blocking minority is reached; then the *Rejected event fires).
+    event RejectVoteCast(uint8 indexed kind, uint256 indexed id, address indexed signer);
+    /// PBA-L2-031: a cashout that carries calldata (governance call).
+    event CallProposed(uint256 indexed txId, address indexed to, uint256 value, bytes data, bytes32 reasonHash);
     // ── Modifiers ──
 
     modifier onlySigner() {
@@ -175,6 +207,32 @@ contract InstitutionalVault is IInstitutionalVault {
         uint256 amount,
         bytes32 reasonHash
     ) external onlySigner whenNotPaused returns (uint256 txId) {
+        txId = _proposeCashout(to, amount, reasonHash);
+    }
+
+    /// @notice PBA-L2-031: propose an arbitrary call (governance action)
+    ///         executed by the vault once quorum approves, e.g.
+    ///         `Forwarder.addRelayer`, `BudgetAllocation.allocateBudget`, or
+    ///         the two-step `proposeGovernance` needed to hand governance
+    ///         to a dedicated executor. Same approval rules as a cashout.
+    function proposeCall(
+        address to,
+        uint256 value,
+        bytes calldata data,
+        bytes32 reasonHash
+    ) external onlySigner whenNotPaused returns (uint256 txId) {
+        if (to == address(this)) revert SelfCall();
+        txId = _proposeCashout(to, value, reasonHash);
+        _cashoutData[txId] = data;
+        emit CallProposed(txId, to, value, data, reasonHash);
+    }
+
+    /// @notice Calldata attached to a proposal (empty for a plain cashout).
+    function getCashoutData(uint256 txId) external view returns (bytes memory) {
+        return _cashoutData[txId];
+    }
+
+    function _proposeCashout(address to, uint256 amount, bytes32 reasonHash) internal returns (uint256 txId) {
         if (to == address(0)) revert ZeroAddress();
         if (amount > address(this).balance) revert InsufficientBalance();
 
@@ -195,6 +253,12 @@ contract InstitutionalVault is IInstitutionalVault {
     /// @dev Invariant: SelfApprovalForbidden — proposer cannot approve their own cashout
     /// @dev Invariant: NoWithdrawalWithoutQuorum — needs threshold approvals
     function approveCashout(uint256 txId) external onlySigner whenNotPaused {
+        // PBA-L2-009: the id must already exist. Pre-fix a signer could
+        // pre-approve `_nextTxId` (proposer == address(0) passes the
+        // SelfApproval guard), then propose it: the struct was rewritten but
+        // `_approvals[txId][proposer]` survived and counted, defeating
+        // SelfApprovalForbidden and lowering the quorum by one.
+        if (txId >= _nextTxId) revert CashoutNotFound();
         CashoutTx storage tx_ = _cashouts[txId];
         if (tx_.executed) revert AlreadyExecuted();
         if (tx_.rejected) revert AlreadyRejected();
@@ -222,26 +286,32 @@ contract InstitutionalVault is IInstitutionalVault {
         if (tx_.amount > address(this).balance) revert InsufficientBalance();
 
         tx_.executed = true;
-
-        (bool success,) = tx_.to.call{value: tx_.amount}("");
+        (bool success,) = tx_.to.call{value: tx_.amount}(_cashoutData[txId]);
         if (!success) revert TransferFailed();
 
         emit CashoutExecuted(txId, tx_.to, tx_.amount);
     }
 
     function rejectCashout(uint256 txId) external onlySigner {
+        if (txId >= _nextTxId) revert CashoutNotFound(); // PBA-L2-009
         CashoutTx storage tx_ = _cashouts[txId];
         if (tx_.executed) revert AlreadyExecuted();
         if (tx_.rejected) revert AlreadyRejected();
-
-        tx_.rejected = true;
-        emit CashoutRejected(txId, msg.sender);
+        // PBA-L2-032: blocking-minority vote (or proposer withdrawal).
+        if (_castReject(KIND_CASHOUT, txId, tx_.proposer)) {
+            tx_.rejected = true;
+            emit CashoutRejected(txId, msg.sender);
+        }
     }
 
     // ── Emergency Pause ──
 
     /// @dev Invariant: EmergencyPauseStopsOutflows — any signer, 1-of-n
     function emergencyPause() external onlySigner whenNotPaused {
+        // PBA-L2-032: bound how often one signer can re-arm the pause.
+        uint256 last = _lastPauseAt[msg.sender];
+        if (last != 0 && block.timestamp < last + PAUSE_COOLDOWN) revert PauseCooldown();
+        _lastPauseAt[msg.sender] = block.timestamp;
         _paused = true;
         // Reset unpause approvals
         for (uint256 i = 0; i < _signerList.length; i++) {
@@ -301,12 +371,14 @@ contract InstitutionalVault is IInstitutionalVault {
         // Proposer auto-approves
         _signerProposalApprovals[proposalId][msg.sender] = true;
         _signerProposals[proposalId].approvalCount = 1;
+        _signerProposalProposer[proposalId] = msg.sender;
 
         emit SignerChangeProposed(proposalId, target, isAdd, msg.sender);
     }
 
     /// @dev Step 2: Other signers approve
     function approveSignerChange(uint256 proposalId) external onlySigner {
+        if (proposalId >= _nextSignerProposalId) revert SignerProposalNotFound(); // PBA-L2-009
         SignerChangeProposal storage p = _signerProposals[proposalId];
         if (p.executed) revert SignerProposalAlreadyExecuted();
         if (p.rejected) revert SignerProposalAlreadyRejected();
@@ -323,8 +395,11 @@ contract InstitutionalVault is IInstitutionalVault {
         SignerChangeProposal storage p = _signerProposals[proposalId];
         if (p.executed) revert SignerProposalAlreadyExecuted();
         if (p.rejected) revert SignerProposalAlreadyRejected();
-        if (p.approvalCount < _threshold) revert SignerProposalQuorumNotMet();
-
+        // PBA-L2-033: recount approvals over the CURRENT signer set (the
+        // cached count includes approvals of since-removed signers).
+        if (_liveApprovals(_signerProposalApprovals[proposalId]) < _threshold) {
+            revert SignerProposalQuorumNotMet();
+        }
         // Re-check mutable signer-set preconditions at execution time. Two
         // removals can be approved concurrently; validating only at propose
         // time would allow the second one to leave signerCount < threshold
@@ -361,11 +436,16 @@ contract InstitutionalVault is IInstitutionalVault {
 
     /// @dev Reject a signer change proposal (any signer can reject)
     function rejectSignerChange(uint256 proposalId) external onlySigner {
+        if (proposalId >= _nextSignerProposalId) revert SignerProposalNotFound(); // PBA-L2-009
         SignerChangeProposal storage p = _signerProposals[proposalId];
         if (p.executed) revert SignerProposalAlreadyExecuted();
         if (p.rejected) revert SignerProposalAlreadyRejected();
-        p.rejected = true;
-        emit SignerChangeRejected(proposalId, msg.sender);
+        // PBA-L2-032: a single signer can no longer veto (e.g. its own
+        // removal); rejection needs the blocking minority.
+        if (_castReject(KIND_SIGNER, proposalId, _signerProposalProposer[proposalId])) {
+            p.rejected = true;
+            emit SignerChangeRejected(proposalId, msg.sender);
+        }
     }
 
     /// @dev FWA-C3-16: threshold changes are quorum-gated, not a bare
@@ -386,12 +466,13 @@ contract InstitutionalVault is IInstitutionalVault {
             rejected: false
         });
         _thresholdProposalApprovals[proposalId][msg.sender] = true;
-
+        _thresholdProposalProposer[proposalId] = msg.sender;
         emit ThresholdChangeProposed(proposalId, newThreshold, msg.sender);
     }
 
     /// @notice Step 2: other signers approve.
     function approveThresholdChange(uint256 proposalId) external onlySigner {
+        if (proposalId >= _nextThresholdProposalId) revert ThresholdProposalNotFound(); // PBA-L2-009
         ThresholdChangeProposal storage p = _thresholdProposals[proposalId];
         if (p.executed) revert SignerProposalAlreadyExecuted();
         if (p.rejected) revert SignerProposalAlreadyRejected();
@@ -410,7 +491,10 @@ contract InstitutionalVault is IInstitutionalVault {
         ThresholdChangeProposal storage p = _thresholdProposals[proposalId];
         if (p.executed) revert SignerProposalAlreadyExecuted();
         if (p.rejected) revert SignerProposalAlreadyRejected();
-        if (p.approvalCount < _threshold) revert SignerProposalQuorumNotMet();
+        // PBA-L2-033: live recount over the current signer set.
+        if (_liveApprovals(_thresholdProposalApprovals[proposalId]) < _threshold) {
+            revert SignerProposalQuorumNotMet();
+        }
         if (p.newThreshold == 0 || p.newThreshold > _signerList.length) revert InvalidThreshold();
 
         p.executed = true;
@@ -422,11 +506,14 @@ contract InstitutionalVault is IInstitutionalVault {
 
     /// @notice Reject a threshold-change proposal (any signer).
     function rejectThresholdChange(uint256 proposalId) external onlySigner {
+        if (proposalId >= _nextThresholdProposalId) revert ThresholdProposalNotFound(); // PBA-L2-009
         ThresholdChangeProposal storage p = _thresholdProposals[proposalId];
         if (p.executed) revert SignerProposalAlreadyExecuted();
         if (p.rejected) revert SignerProposalAlreadyRejected();
-        p.rejected = true;
-        emit ThresholdChangeRejected(proposalId, msg.sender);
+        if (_castReject(KIND_THRESHOLD, proposalId, _thresholdProposalProposer[proposalId])) {
+            p.rejected = true;
+            emit ThresholdChangeRejected(proposalId, msg.sender);
+        }
     }
 
     function getThresholdProposalApprovalCount(uint256 proposalId) external view returns (uint256) {
@@ -438,12 +525,41 @@ contract InstitutionalVault is IInstitutionalVault {
     /// @dev FWA-C3-17: count approvals for `txId` that come from addresses
     ///      that are signers in the CURRENT set. Removed signers' historical
     ///      approvals no longer count toward quorum.
+    ///      PBA-L2-009: the proposer is skipped here as well, so
+    ///      SelfApprovalForbidden is enforced at the counting site even if a
+    ///      stale flag for the proposer exists.
     function _liveApprovalCount(uint256 txId) internal view returns (uint256 count) {
+        address proposer = _cashouts[txId].proposer;
         uint256 n = _signerList.length;
         for (uint256 i = 0; i < n; i++) {
-            if (_approvals[txId][_signerList[i]]) {
+            address sgn = _signerList[i];
+            if (sgn != proposer && _approvals[txId][sgn]) {
                 count++;
             }
         }
+    }
+
+    /// @dev PBA-L2-033: approvals in `approvals` from CURRENT signers.
+    function _liveApprovals(mapping(address => bool) storage approvals) internal view returns (uint256 count) {
+        uint256 n = _signerList.length;
+        for (uint256 i = 0; i < n; i++) {
+            if (approvals[_signerList[i]]) count++;
+        }
+    }
+
+    /// @dev PBA-L2-032: record a reject vote; returns true when the proposal
+    ///      is now rejected — the proposer withdrew it, or live reject votes
+    ///      reached the blocking minority (signers - threshold + 1).
+    function _castReject(uint8 kind, uint256 id, address proposer) internal returns (bool) {
+        if (msg.sender == proposer) return true;
+        if (_rejectVotes[kind][id][msg.sender]) revert AlreadyVotedReject();
+        _rejectVotes[kind][id][msg.sender] = true;
+        emit RejectVoteCast(kind, id, msg.sender);
+        uint256 votes = 0;
+        uint256 n = _signerList.length;
+        for (uint256 i = 0; i < n; i++) {
+            if (_rejectVotes[kind][id][_signerList[i]]) votes++;
+        }
+        return votes >= n - _threshold + 1;
     }
 }
