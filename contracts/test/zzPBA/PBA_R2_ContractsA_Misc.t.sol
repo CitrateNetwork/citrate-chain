@@ -82,7 +82,7 @@ contract PBA_R2_ContractsA_Misc is Test {
     address buyer = address(0xB1);
 
     function _pool() internal {
-        pool = new ComputePool(); // governance = this
+        pool = new ComputePool(address(this)); // governance = this
         poolId = pool.createPool("p", ComputePool.PoolMode.InferencePool, 1, 100, 1 ether);
         vm.deal(m1, 100 ether);
         vm.deal(m2, 100 ether);
@@ -181,6 +181,8 @@ contract PBA_R2_ContractsA_Misc is Test {
         address good = address(0xCAFE1);
         address[2] memory ws = [address(evil), good];
         for (uint256 i = 0; i < 2; i++) {
+            // isAttested requires a governance-approved VM measurement (governance = this).
+            reg.setApprovedVmMeasurement(keccak256(abi.encode("vm", ws[i])), true);
             vm.prank(ws[i]);
             reg.submitAttestation(keccak256(abi.encode("vm", ws[i])), keccak256(abi.encode("gpu", ws[i])), model, maa, nras);
         }
@@ -250,7 +252,7 @@ contract PBA_R2_ContractsA_Misc is Test {
     // ── InferenceRouter (PBA-L2-042) ───────────────────────────────────
 
     function test_L2_042_cache_fee_is_accounted() public {
-        InferenceRouter r = new InferenceRouter(address(0x1234));
+        InferenceRouter r = new InferenceRouter(address(0x1234), address(this));
         address p = address(0xF00);
         bytes32 model = bytes32(uint256(7));
         vm.deal(p, 200 ether);
@@ -274,7 +276,7 @@ contract PBA_R2_ContractsA_Misc is Test {
     // ── AggregationChallenge (PBA-L2-041) ──────────────────────────────
 
     function test_L2_041_reverting_slash_hook_does_not_brick_resolution() public {
-        AggregationChallenge ac = new AggregationChallenge(1 ether, 50);
+        AggregationChallenge ac = new AggregationChallenge(1 ether, 50, address(this));
         ac.setSlashingContract(address(new RevertingSlashing()));
         address coordinator = address(0xC001);
         address challenger = address(0xCA11);
@@ -293,7 +295,7 @@ contract PBA_R2_ContractsA_Misc is Test {
     // ── Oracle (PBA-L2-044) ────────────────────────────────────────────
 
     function test_L2_044_divergent_member_cannot_stall_update() public {
-        ComputePricingOracle o = new ComputePricingOracle(100, 100);
+        ComputePricingOracle o = new ComputePricingOracle(100, 100, address(this));
         address a = address(0x01);
         address b = address(0x02);
         address c = address(0x03);

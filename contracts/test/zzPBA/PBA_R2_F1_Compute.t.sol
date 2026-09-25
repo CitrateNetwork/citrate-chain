@@ -110,7 +110,7 @@ contract PBA_R2_F1_Compute is Test {
     /// PBA-L2-020 (F1-03 inverted): a challenger that never bisects loses the
     /// timeout; the defender who acknowledged is paid both bonds.
     function test_L2_020_stalling_challenger_loses_timeout() public {
-        DisputeResolution d = new DisputeResolution(10 ether, 10);
+        DisputeResolution d = new DisputeResolution(10 ether, 10, address(this));
         address challenger = address(0xC1);
         address defender = address(0xD1);
         vm.deal(challenger, 10 ether);
@@ -131,7 +131,7 @@ contract PBA_R2_F1_Compute is Test {
 
     /// PBA-L2-020 tripwire: a timeout never pays the party that owed the move.
     function test_L2_020_defender_that_stalls_after_bisect_loses() public {
-        DisputeResolution d = new DisputeResolution(10 ether, 10);
+        DisputeResolution d = new DisputeResolution(10 ether, 10, address(this));
         address challenger = address(0xC1);
         address defender = address(0xD1);
         vm.deal(challenger, 10 ether);
@@ -151,7 +151,7 @@ contract PBA_R2_F1_Compute is Test {
     /// PBA-L2-020: after the defender responds the challenger owes the next
     /// bisect; if it stalls, the defender wins.
     function test_L2_020_challenger_stalls_after_respond_loses() public {
-        DisputeResolution d = new DisputeResolution(10 ether, 10);
+        DisputeResolution d = new DisputeResolution(10 ether, 10, address(this));
         address challenger = address(0xC1);
         address defender = address(0xD1);
         vm.deal(challenger, 10 ether);
@@ -172,7 +172,7 @@ contract PBA_R2_F1_Compute is Test {
 
     /// PBA-L2-020: governance can now rule at round 0.
     function test_L2_020_governance_resolves_at_round_zero() public {
-        DisputeResolution d = new DisputeResolution(10 ether, 10);
+        DisputeResolution d = new DisputeResolution(10 ether, 10, address(this));
         address challenger = address(0xC1);
         address defender = address(0xD1);
         vm.deal(challenger, 10 ether);
@@ -189,7 +189,7 @@ contract PBA_R2_F1_Compute is Test {
     /// defender no longer blocks the real dispute, and resolved disputes free
     /// their slot.
     function test_L2_021_jobId_squat_does_not_block_real_dispute() public {
-        DisputeResolution d = new DisputeResolution(10 ether, 10);
+        DisputeResolution d = new DisputeResolution(10 ether, 10, address(this));
         address squatter = address(0x5A);
         address sock = address(0x50C);
         vm.deal(squatter, 10 ether);
@@ -203,7 +203,7 @@ contract PBA_R2_F1_Compute is Test {
     }
 
     function test_L2_021_resolved_dispute_clears_flag() public {
-        DisputeResolution d = new DisputeResolution(10 ether, 10);
+        DisputeResolution d = new DisputeResolution(10 ether, 10, address(this));
         address squatter = address(0x5A);
         address defender = address(0xD1);
         vm.deal(squatter, 20 ether);
@@ -219,7 +219,7 @@ contract PBA_R2_F1_Compute is Test {
     /// PBA-L2-021 tripwire: with a job registry bound, a non-party cannot
     /// open a dispute, and the defender must be the assigned provider.
     function test_L2_021_registry_bound_non_party_reverts() public {
-        DisputeResolution d = new DisputeResolution(10 ether, 10);
+        DisputeResolution d = new DisputeResolution(10 ether, 10, address(this));
         MockDisputeJobs jobsReg = new MockDisputeJobs();
         jobsReg.set(1, address(0xAA), address(0xBB));
         d.setJobRegistry(address(jobsReg));
@@ -428,8 +428,8 @@ contract PBA_R2_F1_Compute is Test {
     bytes constant INPUT = hex"1234";
 
     function _market() internal {
-        verifier = new ComputeVerifier(address(1));
-        market = new ComputeMarketplace(address(verifier), address(0x7EA5));
+        verifier = new ComputeVerifier(address(1), address(this));
+        market = new ComputeMarketplace(address(verifier), address(0x7EA5), address(this));
         verifier.setMarketplace(address(market));
     }
 
@@ -758,8 +758,8 @@ contract PBA_R2_F1_Compute is Test {
     /// PBA-L2-004: a TEE attestation signed for job A does not verify job B,
     /// nor on another verifier instance, nor on another chain.
     function test_L2_004_tee_attestation_bound_to_job() public {
-        ComputeVerifier v = new ComputeVerifier(address(this));
-        ComputeVerifier v2 = new ComputeVerifier(address(this));
+        ComputeVerifier v = new ComputeVerifier(address(this), address(this));
+        ComputeVerifier v2 = new ComputeVerifier(address(this), address(this));
         (address oracle, uint256 pk) = makeAddrAndKey("tee");
         v.addTEEOracle(oracle);
         v2.addTEEOracle(oracle);
@@ -812,7 +812,7 @@ contract PBA_R2_F1_Compute is Test {
     // ─────────────────────────────── InferenceRouter ─────────────────────────
 
     function _router() internal returns (InferenceRouter r, address p) {
-        r = new InferenceRouter(address(0x1234));
+        r = new InferenceRouter(address(0x1234), address(this));
         p = address(0xF00);
         vm.deal(p, 200 ether);
         bytes32[] memory models = new bytes32[](1);

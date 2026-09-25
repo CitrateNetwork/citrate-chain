@@ -21,10 +21,10 @@ contract PBA_R2_F1_IPFSIncentivesV3 is Test {
     bytes32 cid = keccak256("ipfs://legit-model");
 
     function setUp() public {
-        kyc = new KYCRegistry(address(0));
+        kyc = new KYCRegistry(address(0), address(this));
         fold = new MockFoldVerifier();
         inc = new IPFSIncentivesV3(
-            kyc, 10 ether, 4 ether, 4, 1, 5000, 2, 10, 32, 1 ether, 32, 55 ether, 302400, 5000, address(fold)
+            kyc, 10 ether, 4 ether, 4, 1, 5000, 2, 10, 32, 1 ether, 32, 55 ether, 302400, 5000, address(fold), address(this)
         );
         vm.etch(VERIFY, type(MockVerifier).runtimeCode);
         (bool ok,) = VERIFY.call(abi.encodeWithSignature("setVerdict(uint256)", uint256(1)));
