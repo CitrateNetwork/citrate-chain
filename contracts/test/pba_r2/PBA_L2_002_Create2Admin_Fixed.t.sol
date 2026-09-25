@@ -7,6 +7,7 @@ import {ModelRegistry} from "../../src/ModelRegistry.sol";
 import {Governable} from "../../src/lib/Governable.sol";
 import {DeployAll} from "../../script/DeployAll.s.sol";
 import {AdminChecks} from "../../script/lib/AdminChecks.sol";
+import {CheckDeployedAdmins} from "../../script/CheckDeployedAdmins.s.sol";
 
 /// Stand-in for a contract deployed by the pre-fix ceremony: its governance
 /// getter returns the CREATE2 factory (what 21 live contracts return today).
@@ -70,5 +71,35 @@ contract PBA_L2_002_Fixed is Test {
         OrphanedByFactory o = new OrphanedByFactory();
         assertEq(h.problem(address(o)), "governance() is the CREATE2 factory");
         assertEq(h.problem(address(0x1234)), "no code at address");
+    }
+
+    /// CheckDeployedAdmins classifies: factory-admin slots fail the gate,
+    /// codeless book entries are only reported, and the verifier is gated.
+    function test_L2_002_checkDeployedAdmins_classifiesFailures() public {
+        OrphanedByFactory o = new OrphanedByFactory();
+        LiquidStakingPool good = new LiquidStakingPool(intended);
+        string memory planned = '"Planned":"0x000000000000000000000000000000000000dEaD"';
+        vm.etch(0xc2b78104907F722DABAc4C69f826a522B2754De4, hex"600160005260206000f3");
+
+        CheckDeployedAdmins c = new CheckDeployedAdmins();
+        vm.expectRevert(bytes("CheckDeployedAdmins: CREATE2 factory holds an admin slot (see log)"));
+        c.check(
+            string.concat('{"contracts":{"Orphan":"', vm.toString(address(o)), '",', planned, '},"aaStack":{}}'), false
+        );
+
+        string memory ok = string.concat('{"contracts":{"Good":"', vm.toString(address(good)), '",', planned, '},"aaStack":{}}');
+        CheckDeployedAdmins c2 = new CheckDeployedAdmins();
+        c2.check(ok, false);
+        assertEq(c2.factoryAdmin(), 0);
+        assertEq(c2.noCode(), 1, "codeless entries are reported, not gated");
+
+        CheckDeployedAdmins c3 = new CheckDeployedAdmins();
+        vm.expectRevert(bytes("CheckDeployedAdmins: address-book entries without code"));
+        c3.check(ok, true);
+
+        vm.etch(0xc2b78104907F722DABAc4C69f826a522B2754De4, "");
+        CheckDeployedAdmins c4 = new CheckDeployedAdmins();
+        vm.expectRevert(bytes("CheckDeployedAdmins: P-256 verifier not provisioned"));
+        c4.check(ok, false);
     }
 }

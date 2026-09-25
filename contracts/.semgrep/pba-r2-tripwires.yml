@@ -30,6 +30,52 @@ rules:
         - "**/rbac/TenantHierarchy.sol"
         - "**/ColorCirclesNFT.sol"
 
+  # PBA-L2-002 (variant): a state-variable initialiser runs as part of the
+  # constructor, so `address owner = msg.sender;` is the same orphaned key.
+  - id: pba-l2-002-state-initialiser-msg-sender
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      PBA-L2-002: `msg.sender` in a state-variable initialiser runs during
+      construction, where it is the CREATE2 factory under the salted ceremony.
+      Take the key as an explicit constructor argument instead.
+    patterns:
+      - pattern: msg.sender
+      - pattern-not-inside: |
+          function $F(...) { ... }
+      - pattern-not-inside: |
+          modifier $M(...) { ... }
+      - pattern-not-inside: |
+          constructor(...) { ... }
+    paths:
+      include:
+        - "*.sol"
+      exclude:
+        - "**/rbac/TenantHierarchy.sol"
+        - "**/ColorCirclesNFT.sol"
+
+  # PBA-L2-002 (variant): msg.sender reached through an internal helper that
+  # the constructor calls.
+  - id: pba-l2-002-constructor-helper-msg-sender
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      PBA-L2-002: this function is called from a constructor and reads
+      `msg.sender`, which is the CREATE2 factory during a salted ceremony
+      deploy. Pass the key explicitly.
+    patterns:
+      - pattern-inside: |
+          contract $C { ... constructor(...) { ... $H(...); ... } ... }
+      - pattern-inside: |
+          function $H(...) { ... }
+      - pattern: msg.sender
+    paths:
+      include:
+        - "*.sol"
+      exclude:
+        - "**/rbac/TenantHierarchy.sol"
+        - "**/ColorCirclesNFT.sol"
+
   # PBA-L2-014 / PBA-L2-036 (and CHAIN-B-C008/C024): an M-of-N signature path
   # that records a caller-NAMED `signer` without binding it to the caller lets
   # one key satisfy the whole threshold.
