@@ -5,6 +5,7 @@ import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./Salts.sol";
 import "./lib/AdminChecks.sol";
+import "./lib/Create2Deploy.sol";
 import "../src/AggregationChallenge.sol";
 import "../src/KYCRegistry.sol";
 import "../src/ComputePoolPipeline.sol";
@@ -16,7 +17,8 @@ import "../src/IPFSIncentivesV3.sol";
 ///         contracts that joined the surface after the last reroll:
 ///           AggregationChallenge, KYCRegistry, ComputePoolPipeline,
 ///           IPFSIncentivesV2, IPFSIncentivesV3.
-///         Each is deployed `new X{salt: Salts.salt("X")}(...)` through the
+///         Each is deployed `new X{salt: Salts.salt("X")}(...)` (or reused when
+///         already live, see script/lib/Create2Deploy.sol) through the
 ///         genesis Arachnid CREATE2 factory (0x4e59…), so every reroll that
 ///         deploys the same bytecode + same constructor args lands each
 ///         contract at the SAME address — no VERSION bump, so the existing
@@ -49,10 +51,9 @@ import "../src/IPFSIncentivesV3.sol";
 ///   - CEREMONY_DEPLOYER_ADDRESS | DEPLOYER_ADDRESS — the canonical genesis
 ///     deployer 0x4250675F… (ScriptEnv; also used as governance/KYC-updater).
 ///   - GOVERNANCE — owner of ComputePoolPipeline (default: deployer).
-///   - TEE_REGISTRY — existing TEEAttestationRegistry address (default: the
-///     canonical 40204 address; must equal the reroll's TEE CREATE2 output —
-///     the dry-run diff verifies this).
-contract DeployFederatedLearning is ScriptEnv, AdminChecks {
+///   - TEE_REGISTRY — REQUIRED, no default: the reviewed TEEAttestationRegistry
+///     address (must have code; the run refuses otherwise).
+contract DeployFederatedLearning is ScriptEnv, AdminChecks, Create2Deploy {
     // ── AggregationChallenge (GATE4 referee) ─────────────────────────────
     uint256 internal constant AGG_CHALLENGE_BOND = 1 ether;
     uint256 internal constant AGG_CHALLENGE_WINDOW = 150; // = AggregationChallenge.DEFAULT_WINDOW
@@ -82,24 +83,23 @@ contract DeployFederatedLearning is ScriptEnv, AdminChecks {
     // fold proof. Env-overridable so the precompile address can be finalized when M3 lands + activates.
     address internal constant FOLD_VERIFIER_PRECOMPILE = address(0x0130);
 
-    /// Canonical 40204 TEEAttestationRegistry (the LIVE deployed one, = book / DeployTEEAttestationRegistry
-    /// output; `cast code` confirms it has bytecode). ComputePoolPipeline binds to this in its constructor.
-    /// Fixed 2026-08-27: was 0xc1c0d858…E777E, which has NO code on-chain — ComputePoolPipeline was wired
-    /// to a dead registry. Correcting it moves ComputePoolPipeline's own CREATE2 address (its init_code
-    /// changes); the address book is updated to the new value. Override via TEE_REGISTRY only if it moves.
-    address internal constant TEE_REGISTRY_40204 =
-        0x4dF26aae3619f449a142d237ed818Ebf7C186Ed5;
+    /// TEEAttestationRegistry that ComputePoolPipeline binds to in its constructor.
+    /// There is deliberately NO baked-in default: the previous default
+    /// (0x4dF2…6Ed5) has no code on 40204, and the registry is redeployed with
+    /// the PBA-R2 hardening, so the ceremony must name the reviewed address.
+    /// TEE_REGISTRY is REQUIRED and must have code.
 
     function run() external {
         address deployer = deployerAddress();
         address governance = envAddressOr("GOVERNANCE", deployer);
-        address teeRegistry = envAddressOr("TEE_REGISTRY", TEE_REGISTRY_40204);
+        address teeRegistry = envAddressOr("TEE_REGISTRY", address(0));
 
         console.log("=== I64-S1 WP-B1: federated-learning contract deploy ===");
         console.log("Deployer (genesis):", deployer);
         console.log("Governance:        ", governance);
         console.log("TEE registry (dep):", teeRegistry);
-        require(teeRegistry != address(0), "TEE registry unset");
+        require(teeRegistry != address(0), "TEE_REGISTRY must be set (no default)");
+        require(teeRegistry.code.length != 0, "TEE_REGISTRY has no code on this chain");
 
         vm.startBroadcast();
 
@@ -107,10 +107,12 @@ contract DeployFederatedLearning is ScriptEnv, AdminChecks {
         //    add the production IDP updater post-deploy). PBA-L2-002:
         //    DEFAULT_ADMIN_ROLE is the explicit `governance` argument, NOT the
         //    constructor caller (which is the CREATE2 factory here).
-        KYCRegistry kyc = new KYCRegistry{salt: Salts.salt("KYCRegistry")}(deployer, governance);
+        KYCRegistry kyc = (_isLive("KYCRegistry", abi.encodePacked(type(KYCRegistry).creationCode, abi.encode(deployer, governance)))
+            ? KYCRegistry(payable(_create2Address("KYCRegistry", abi.encodePacked(type(KYCRegistry).creationCode, abi.encode(deployer, governance)))))
+            : new KYCRegistry{salt: Salts.salt("KYCRegistry")}(deployer, governance));
 
         // 2. IPFSIncentivesV2 — consumes KYCRegistry.
-        IPFSIncentivesV2 ipfsV2 = new IPFSIncentivesV2{salt: Salts.salt("IPFSIncentivesV2")}(
+        IPFSIncentivesV2 ipfsV2 = (_isLive("IPFSIncentivesV2", abi.encodePacked(type(IPFSIncentivesV2).creationCode, abi.encode(
             kyc,
             IPFS_BOND,
             IPFS_REWARD,
@@ -121,10 +123,34 @@ contract DeployFederatedLearning is ScriptEnv, AdminChecks {
             IPFS_WINDOW,
             IPFS_CHALLENGE_N,
             governance // PBA-L2-002: explicit DEFAULT_ADMIN
-        );
+        )))
+            ? IPFSIncentivesV2(payable(_create2Address("IPFSIncentivesV2", abi.encodePacked(type(IPFSIncentivesV2).creationCode, abi.encode(
+            kyc,
+            IPFS_BOND,
+            IPFS_REWARD,
+            IPFS_ROUNDS,
+            IPFS_MAX_MISSED,
+            IPFS_CHALLENGER_BPS,
+            IPFS_QUORUM,
+            IPFS_WINDOW,
+            IPFS_CHALLENGE_N,
+            governance // PBA-L2-002: explicit DEFAULT_ADMIN
+        )))))
+            : new IPFSIncentivesV2{salt: Salts.salt("IPFSIncentivesV2")}(
+            kyc,
+            IPFS_BOND,
+            IPFS_REWARD,
+            IPFS_ROUNDS,
+            IPFS_MAX_MISSED,
+            IPFS_CHALLENGER_BPS,
+            IPFS_QUORUM,
+            IPFS_WINDOW,
+            IPFS_CHALLENGE_N,
+            governance // PBA-L2-002: explicit DEFAULT_ADMIN
+        ));
 
         // 3. IPFSIncentivesV3 — V2 params + model-CommD challenge layer.
-        IPFSIncentivesV3 ipfsV3 = new IPFSIncentivesV3{salt: Salts.salt("IPFSIncentivesV3")}(
+        IPFSIncentivesV3 ipfsV3 = (_isLive("IPFSIncentivesV3", abi.encodePacked(type(IPFSIncentivesV3).creationCode, abi.encode(
             kyc,
             IPFS_BOND,
             IPFS_REWARD,
@@ -141,7 +167,43 @@ contract DeployFederatedLearning is ScriptEnv, AdminChecks {
             IPFS3_MODEL_CHALLENGER_BPS,
             envAddressOr("FOLD_VERIFIER", FOLD_VERIFIER_PRECOMPILE),
             governance // PBA-L2-002: explicit DEFAULT_ADMIN
-        );
+        )))
+            ? IPFSIncentivesV3(payable(_create2Address("IPFSIncentivesV3", abi.encodePacked(type(IPFSIncentivesV3).creationCode, abi.encode(
+            kyc,
+            IPFS_BOND,
+            IPFS_REWARD,
+            IPFS_ROUNDS,
+            IPFS_MAX_MISSED,
+            IPFS_CHALLENGER_BPS,
+            IPFS_QUORUM,
+            IPFS_WINDOW,
+            IPFS_CHALLENGE_N,
+            IPFS3_CHALLENGER_BOND,
+            IPFS3_REVEAL_DELAY,
+            IPFS3_MIN_MODEL_BOND,
+            IPFS3_MODEL_CHALLENGE_WINDOW,
+            IPFS3_MODEL_CHALLENGER_BPS,
+            envAddressOr("FOLD_VERIFIER", FOLD_VERIFIER_PRECOMPILE),
+            governance // PBA-L2-002: explicit DEFAULT_ADMIN
+        )))))
+            : new IPFSIncentivesV3{salt: Salts.salt("IPFSIncentivesV3")}(
+            kyc,
+            IPFS_BOND,
+            IPFS_REWARD,
+            IPFS_ROUNDS,
+            IPFS_MAX_MISSED,
+            IPFS_CHALLENGER_BPS,
+            IPFS_QUORUM,
+            IPFS_WINDOW,
+            IPFS_CHALLENGE_N,
+            IPFS3_CHALLENGER_BOND,
+            IPFS3_REVEAL_DELAY,
+            IPFS3_MIN_MODEL_BOND,
+            IPFS3_MODEL_CHALLENGE_WINDOW,
+            IPFS3_MODEL_CHALLENGER_BPS,
+            envAddressOr("FOLD_VERIFIER", FOLD_VERIFIER_PRECOMPILE),
+            governance // PBA-L2-002: explicit DEFAULT_ADMIN
+        ));
         // citrate-chain#170 (P3): IPFSIncentivesV3 is deployable by BOTH this script and
         // RedeployIPFSIncentivesV3.s.sol under the SAME salt. On a from-main build both land at the
         // canonical #170 address; assert it here so a stale-bytecode build FAILS LOUDLY instead of
@@ -169,17 +231,35 @@ contract DeployFederatedLearning is ScriptEnv, AdminChecks {
         // 4. AggregationChallenge — PBA-L2-002: governance is explicit (it was
         //    Governable(msg.sender) = the CREATE2 factory). The slashing contract
         //    is still wired post-deploy by governance (see checklist).
-        AggregationChallenge agg = new AggregationChallenge{salt: Salts.salt("AggregationChallenge")}(
+        AggregationChallenge agg = (_isLive("AggregationChallenge", abi.encodePacked(type(AggregationChallenge).creationCode, abi.encode(
             AGG_CHALLENGE_BOND,
             AGG_CHALLENGE_WINDOW,
             governance
-        );
+        )))
+            ? AggregationChallenge(payable(_create2Address("AggregationChallenge", abi.encodePacked(type(AggregationChallenge).creationCode, abi.encode(
+            AGG_CHALLENGE_BOND,
+            AGG_CHALLENGE_WINDOW,
+            governance
+        )))))
+            : new AggregationChallenge{salt: Salts.salt("AggregationChallenge")}(
+            AGG_CHALLENGE_BOND,
+            AGG_CHALLENGE_WINDOW,
+            governance
+        ));
 
         // 5. ComputePoolPipeline — governance + existing TEE registry.
-        ComputePoolPipeline pipeline = new ComputePoolPipeline{salt: Salts.salt("ComputePoolPipeline")}(
+        ComputePoolPipeline pipeline = (_isLive("ComputePoolPipeline", abi.encodePacked(type(ComputePoolPipeline).creationCode, abi.encode(
             governance,
             teeRegistry
-        );
+        )))
+            ? ComputePoolPipeline(payable(_create2Address("ComputePoolPipeline", abi.encodePacked(type(ComputePoolPipeline).creationCode, abi.encode(
+            governance,
+            teeRegistry
+        )))))
+            : new ComputePoolPipeline{salt: Salts.salt("ComputePoolPipeline")}(
+            governance,
+            teeRegistry
+        ));
 
         vm.stopBroadcast();
 

@@ -5,6 +5,7 @@ import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./Salts.sol";
 import "./lib/AdminChecks.sol";
+import "./lib/Create2Deploy.sol";
 
 // Core
 import "../src/ModelRegistry.sol";
@@ -68,8 +69,13 @@ import "../src/SpecRegistry.sol";
  *         salted constructor is the CREATE2 factory, which orphaned 21 live
  *         contracts. After deploying, `_assertAdmins` re-reads every admin slot
  *         and reverts the run if any names the factory or not the intended key.
+ *
+ *         Re-runnable: a contract whose salted CREATE2 address already holds
+ *         code (so, by construction, the same init code) is reused; only the
+ *         rest are deployed, as ordinary `new X{salt:}()` so broadcast records
+ *         and the address-table emitter keep working.
  */
-contract DeployAll is ScriptEnv, AdminChecks {
+contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
     /// Every address this script deploys (returned for the post-deploy check
     /// and for the in-process test in test/pba_r2/).
     struct Deployed {
@@ -125,22 +131,32 @@ contract DeployAll is ScriptEnv, AdminChecks {
         // =====================================================================
         console.log("--- Layer 1: Core Infrastructure ---");
 
-        ModelRegistry registry = new ModelRegistry{salt: Salts.salt("ModelRegistry")}(governance);
+        ModelRegistry registry = (_isLive("ModelRegistry", abi.encodePacked(type(ModelRegistry).creationCode, abi.encode(governance)))
+            ? ModelRegistry(payable(_create2Address("ModelRegistry", abi.encodePacked(type(ModelRegistry).creationCode, abi.encode(governance)))))
+            : new ModelRegistry{salt: Salts.salt("ModelRegistry")}(governance));
         console.log("  ModelRegistry:", address(registry));
 
-        WrappedSALT wsalt = new WrappedSALT{salt: Salts.salt("WrappedSALT")}();
+        WrappedSALT wsalt = (_isLive("WrappedSALT", type(WrappedSALT).creationCode)
+            ? WrappedSALT(payable(_create2Address("WrappedSALT", type(WrappedSALT).creationCode)))
+            : new WrappedSALT{salt: Salts.salt("WrappedSALT")}());
         console.log("  WrappedSALT:", address(wsalt));
 
-        AgentDecisionRegistry agentRegistry = new AgentDecisionRegistry{salt: Salts.salt("AgentDecisionRegistry")}(deployer);
+        AgentDecisionRegistry agentRegistry = (_isLive("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(deployer)))
+            ? AgentDecisionRegistry(payable(_create2Address("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(deployer)))))
+            : new AgentDecisionRegistry{salt: Salts.salt("AgentDecisionRegistry")}(deployer));
         console.log("  AgentDecisionRegistry:", address(agentRegistry));
 
         // RM-L / WP-L1.1: SpecRegistry now requires governance address
         // at deploy. Pass `deployer` for testnet; production should pass
         // the multisig per the L1.6 genesis runbook.
-        SpecRegistry specRegistry = new SpecRegistry{salt: Salts.salt("SpecRegistry")}(deployer);
+        SpecRegistry specRegistry = (_isLive("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(deployer)))
+            ? SpecRegistry(payable(_create2Address("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(deployer)))))
+            : new SpecRegistry{salt: Salts.salt("SpecRegistry")}(deployer));
         console.log("  SpecRegistry:", address(specRegistry));
 
-        IPFSIncentives ipfs = new IPFSIncentives{salt: Salts.salt("IPFSIncentives")}(governance);
+        IPFSIncentives ipfs = (_isLive("IPFSIncentives", abi.encodePacked(type(IPFSIncentives).creationCode, abi.encode(governance)))
+            ? IPFSIncentives(payable(_create2Address("IPFSIncentives", abi.encodePacked(type(IPFSIncentives).creationCode, abi.encode(governance)))))
+            : new IPFSIncentives{salt: Salts.salt("IPFSIncentives")}(governance));
         console.log("  IPFSIncentives:", address(ipfs));
 
         // =====================================================================
@@ -148,15 +164,29 @@ contract DeployAll is ScriptEnv, AdminChecks {
         // =====================================================================
         console.log("--- Layer 2: Payment & Access ---");
 
-        X402Facilitator facilitator = new X402Facilitator{salt: Salts.salt("X402Facilitator")}(
+        X402Facilitator facilitator = (_isLive("X402Facilitator", abi.encodePacked(type(X402Facilitator).creationCode, abi.encode(
             address(wsalt),
             deployer,  // treasury
             100,       // 1% fee
             governance // admin + facilitator (PBA-L2-002)
-        );
+        )))
+            ? X402Facilitator(payable(_create2Address("X402Facilitator", abi.encodePacked(type(X402Facilitator).creationCode, abi.encode(
+            address(wsalt),
+            deployer,  // treasury
+            100,       // 1% fee
+            governance // admin + facilitator (PBA-L2-002)
+        )))))
+            : new X402Facilitator{salt: Salts.salt("X402Facilitator")}(
+            address(wsalt),
+            deployer,  // treasury
+            100,       // 1% fee
+            governance // admin + facilitator (PBA-L2-002)
+        ));
         console.log("  X402Facilitator:", address(facilitator));
 
-        X402Paywall paywall = new X402Paywall{salt: Salts.salt("X402Paywall")}(address(wsalt), 1 ether, governance);
+        X402Paywall paywall = (_isLive("X402Paywall", abi.encodePacked(type(X402Paywall).creationCode, abi.encode(address(wsalt), 1 ether, governance)))
+            ? X402Paywall(payable(_create2Address("X402Paywall", abi.encodePacked(type(X402Paywall).creationCode, abi.encode(address(wsalt), 1 ether, governance)))))
+            : new X402Paywall{salt: Salts.salt("X402Paywall")}(address(wsalt), 1 ether, governance));
         console.log("  X402Paywall:", address(paywall));
 
         // ModelAccessControl is deployed by DeployModelAccessControl.s.sol
@@ -167,20 +197,34 @@ contract DeployAll is ScriptEnv, AdminChecks {
         // =====================================================================
         console.log("--- Layer 3: Economics ---");
 
-        LiquidStakingPool stakingPool = new LiquidStakingPool{salt: Salts.salt("LiquidStakingPool")}(governance);
+        LiquidStakingPool stakingPool = (_isLive("LiquidStakingPool", abi.encodePacked(type(LiquidStakingPool).creationCode, abi.encode(governance)))
+            ? LiquidStakingPool(payable(_create2Address("LiquidStakingPool", abi.encodePacked(type(LiquidStakingPool).creationCode, abi.encode(governance)))))
+            : new LiquidStakingPool{salt: Salts.salt("LiquidStakingPool")}(governance));
         console.log("  LiquidStakingPool:", address(stakingPool));
 
         ContributionAccounting contributions =
-            new ContributionAccounting{salt: Salts.salt("ContributionAccounting")}(governance);
+            (_isLive("ContributionAccounting", abi.encodePacked(type(ContributionAccounting).creationCode, abi.encode(governance)))
+            ? ContributionAccounting(payable(_create2Address("ContributionAccounting", abi.encodePacked(type(ContributionAccounting).creationCode, abi.encode(governance)))))
+            : new ContributionAccounting{salt: Salts.salt("ContributionAccounting")}(governance));
         console.log("  ContributionAccounting:", address(contributions));
 
-        NematocystSlashing slashing = new NematocystSlashing{salt: Salts.salt("NematocystSlashing")}(governance);
+        NematocystSlashing slashing = (_isLive("NematocystSlashing", abi.encodePacked(type(NematocystSlashing).creationCode, abi.encode(governance)))
+            ? NematocystSlashing(payable(_create2Address("NematocystSlashing", abi.encodePacked(type(NematocystSlashing).creationCode, abi.encode(governance)))))
+            : new NematocystSlashing{salt: Salts.salt("NematocystSlashing")}(governance));
         console.log("  NematocystSlashing:", address(slashing));
 
-        MarketMakerAllocation mmAlloc = new MarketMakerAllocation{salt: Salts.salt("MarketMakerAllocation")}(
+        MarketMakerAllocation mmAlloc = (_isLive("MarketMakerAllocation", abi.encodePacked(type(MarketMakerAllocation).creationCode, abi.encode(
             deployer,   // market maker (deployer for now, DAO changes later)
             deployer    // governance
-        );
+        )))
+            ? MarketMakerAllocation(payable(_create2Address("MarketMakerAllocation", abi.encodePacked(type(MarketMakerAllocation).creationCode, abi.encode(
+            deployer,   // market maker (deployer for now, DAO changes later)
+            deployer    // governance
+        )))))
+            : new MarketMakerAllocation{salt: Salts.salt("MarketMakerAllocation")}(
+            deployer,   // market maker (deployer for now, DAO changes later)
+            deployer    // governance
+        ));
         console.log("  MarketMakerAllocation:", address(mmAlloc));
 
         // =====================================================================
@@ -188,27 +232,47 @@ contract DeployAll is ScriptEnv, AdminChecks {
         // =====================================================================
         console.log("--- Layer 4: AI & Learning ---");
 
-        ModelMarketplace modelMarketplace = new ModelMarketplace{salt: Salts.salt("ModelMarketplace")}(
+        ModelMarketplace modelMarketplace = (_isLive("ModelMarketplace", abi.encodePacked(type(ModelMarketplace).creationCode, abi.encode(
             address(registry),
             deployer,  // treasury
             governance // admin (PBA-L2-002)
-        );
+        )))
+            ? ModelMarketplace(payable(_create2Address("ModelMarketplace", abi.encodePacked(type(ModelMarketplace).creationCode, abi.encode(
+            address(registry),
+            deployer,  // treasury
+            governance // admin (PBA-L2-002)
+        )))))
+            : new ModelMarketplace{salt: Salts.salt("ModelMarketplace")}(
+            address(registry),
+            deployer,  // treasury
+            governance // admin (PBA-L2-002)
+        ));
         console.log("  ModelMarketplace:", address(modelMarketplace));
 
-        InferenceRouter router = new InferenceRouter{salt: Salts.salt("InferenceRouter")}(address(registry), governance);
+        InferenceRouter router = (_isLive("InferenceRouter", abi.encodePacked(type(InferenceRouter).creationCode, abi.encode(address(registry), governance)))
+            ? InferenceRouter(payable(_create2Address("InferenceRouter", abi.encodePacked(type(InferenceRouter).creationCode, abi.encode(address(registry), governance)))))
+            : new InferenceRouter{salt: Salts.salt("InferenceRouter")}(address(registry), governance));
         console.log("  InferenceRouter:", address(router));
 
-        LoRAFactory loraFactory = new LoRAFactory{salt: Salts.salt("LoRAFactory")}(address(registry), governance);
+        LoRAFactory loraFactory = (_isLive("LoRAFactory", abi.encodePacked(type(LoRAFactory).creationCode, abi.encode(address(registry), governance)))
+            ? LoRAFactory(payable(_create2Address("LoRAFactory", abi.encodePacked(type(LoRAFactory).creationCode, abi.encode(address(registry), governance)))))
+            : new LoRAFactory{salt: Salts.salt("LoRAFactory")}(address(registry), governance));
         console.log("  LoRAFactory:", address(loraFactory));
 
-        LearningPool learningPool = new LearningPool{salt: Salts.salt("LearningPool")}();
+        LearningPool learningPool = (_isLive("LearningPool", type(LearningPool).creationCode)
+            ? LearningPool(payable(_create2Address("LearningPool", type(LearningPool).creationCode)))
+            : new LearningPool{salt: Salts.salt("LearningPool")}());
         console.log("  LearningPool:", address(learningPool));
 
         LearningCycleManager cycleManager =
-            new LearningCycleManager{salt: Salts.salt("LearningCycleManager")}(governance);
+            (_isLive("LearningCycleManager", abi.encodePacked(type(LearningCycleManager).creationCode, abi.encode(governance)))
+            ? LearningCycleManager(payable(_create2Address("LearningCycleManager", abi.encodePacked(type(LearningCycleManager).creationCode, abi.encode(governance)))))
+            : new LearningCycleManager{salt: Salts.salt("LearningCycleManager")}(governance));
         console.log("  LearningCycleManager:", address(cycleManager));
 
-        ClassroomRegistry classroom = new ClassroomRegistry{salt: Salts.salt("ClassroomRegistry")}();
+        ClassroomRegistry classroom = (_isLive("ClassroomRegistry", type(ClassroomRegistry).creationCode)
+            ? ClassroomRegistry(payable(_create2Address("ClassroomRegistry", type(ClassroomRegistry).creationCode)))
+            : new ClassroomRegistry{salt: Salts.salt("ClassroomRegistry")}());
         console.log("  ClassroomRegistry:", address(classroom));
 
         // RM-FL-4: MentorMatcher pairs mentors↔mentees from the
@@ -216,7 +280,9 @@ contract DeployAll is ScriptEnv, AdminChecks {
         // for lazy per-(addr, dim) score reads — the matcher does not
         // mirror that state; it staticcalls it on demand. Governance
         // is the deployer for testnet; mainnet should use the multisig.
-        MentorMatcher mentorMatcher = new MentorMatcher{salt: Salts.salt("MentorMatcher")}(deployer);
+        MentorMatcher mentorMatcher = (_isLive("MentorMatcher", abi.encodePacked(type(MentorMatcher).creationCode, abi.encode(deployer)))
+            ? MentorMatcher(payable(_create2Address("MentorMatcher", abi.encodePacked(type(MentorMatcher).creationCode, abi.encode(deployer)))))
+            : new MentorMatcher{salt: Salts.salt("MentorMatcher")}(deployer));
         mentorMatcher.setContributionAccounting(address(contributions));
         console.log("  MentorMatcher:", address(mentorMatcher));
 
@@ -226,38 +292,82 @@ contract DeployAll is ScriptEnv, AdminChecks {
         console.log("--- Layer 5: Compute Marketplace ---");
 
         // Deploy verifier first (ComputeMarketplace depends on it)
-        ComputeVerifier verifier = new ComputeVerifier{salt: Salts.salt("ComputeVerifier")}(deployer, governance);
+        ComputeVerifier verifier = (_isLive("ComputeVerifier", abi.encodePacked(type(ComputeVerifier).creationCode, abi.encode(deployer, governance)))
+            ? ComputeVerifier(payable(_create2Address("ComputeVerifier", abi.encodePacked(type(ComputeVerifier).creationCode, abi.encode(deployer, governance)))))
+            : new ComputeVerifier{salt: Salts.salt("ComputeVerifier")}(deployer, governance));
         console.log("  ComputeVerifier:", address(verifier));
 
-        ComputeMarketplace computeMarketplace = new ComputeMarketplace{salt: Salts.salt("ComputeMarketplace")}(
+        ComputeMarketplace computeMarketplace = (_isLive("ComputeMarketplace", abi.encodePacked(type(ComputeMarketplace).creationCode, abi.encode(
             address(verifier),
             deployer,  // treasury
             governance // governance (PBA-L2-002)
-        );
+        )))
+            ? ComputeMarketplace(payable(_create2Address("ComputeMarketplace", abi.encodePacked(type(ComputeMarketplace).creationCode, abi.encode(
+            address(verifier),
+            deployer,  // treasury
+            governance // governance (PBA-L2-002)
+        )))))
+            : new ComputeMarketplace{salt: Salts.salt("ComputeMarketplace")}(
+            address(verifier),
+            deployer,  // treasury
+            governance // governance (PBA-L2-002)
+        ));
         console.log("  ComputeMarketplace:", address(computeMarketplace));
 
-        ComputePool computePool = new ComputePool{salt: Salts.salt("ComputePool")}(governance);
+        ComputePool computePool = (_isLive("ComputePool", abi.encodePacked(type(ComputePool).creationCode, abi.encode(governance)))
+            ? ComputePool(payable(_create2Address("ComputePool", abi.encodePacked(type(ComputePool).creationCode, abi.encode(governance)))))
+            : new ComputePool{salt: Salts.salt("ComputePool")}(governance));
         console.log("  ComputePool:", address(computePool));
 
-        HeartbeatMonitor heartbeat = new HeartbeatMonitor{salt: Salts.salt("HeartbeatMonitor")}(
+        HeartbeatMonitor heartbeat = (_isLive("HeartbeatMonitor", abi.encodePacked(type(HeartbeatMonitor).creationCode, abi.encode(
             50,        // heartbeat interval (blocks)
             3,         // max missed before suspension
             governance // governance (PBA-L2-002)
-        );
+        )))
+            ? HeartbeatMonitor(payable(_create2Address("HeartbeatMonitor", abi.encodePacked(type(HeartbeatMonitor).creationCode, abi.encode(
+            50,        // heartbeat interval (blocks)
+            3,         // max missed before suspension
+            governance // governance (PBA-L2-002)
+        )))))
+            : new HeartbeatMonitor{salt: Salts.salt("HeartbeatMonitor")}(
+            50,        // heartbeat interval (blocks)
+            3,         // max missed before suspension
+            governance // governance (PBA-L2-002)
+        ));
         console.log("  HeartbeatMonitor:", address(heartbeat));
 
-        DisputeResolution dispute = new DisputeResolution{salt: Salts.salt("DisputeResolution")}(
+        DisputeResolution dispute = (_isLive("DisputeResolution", abi.encodePacked(type(DisputeResolution).creationCode, abi.encode(
             10 ether,  // 10 SALT dispute bond
             10,        // max bisection rounds
             governance // governance (PBA-L2-002)
-        );
+        )))
+            ? DisputeResolution(payable(_create2Address("DisputeResolution", abi.encodePacked(type(DisputeResolution).creationCode, abi.encode(
+            10 ether,  // 10 SALT dispute bond
+            10,        // max bisection rounds
+            governance // governance (PBA-L2-002)
+        )))))
+            : new DisputeResolution{salt: Salts.salt("DisputeResolution")}(
+            10 ether,  // 10 SALT dispute bond
+            10,        // max bisection rounds
+            governance // governance (PBA-L2-002)
+        ));
         console.log("  DisputeResolution:", address(dispute));
 
-        ComputePricingOracle oracle = new ComputePricingOracle{salt: Salts.salt("ComputePricingOracle")}(
+        ComputePricingOracle oracle = (_isLive("ComputePricingOracle", abi.encodePacked(type(ComputePricingOracle).creationCode, abi.encode(
             13,        // $0.13/PFLOP-hour
             100,       // $1.00/SALT
             governance // governance (PBA-L2-002)
-        );
+        )))
+            ? ComputePricingOracle(payable(_create2Address("ComputePricingOracle", abi.encodePacked(type(ComputePricingOracle).creationCode, abi.encode(
+            13,        // $0.13/PFLOP-hour
+            100,       // $1.00/SALT
+            governance // governance (PBA-L2-002)
+        )))))
+            : new ComputePricingOracle{salt: Salts.salt("ComputePricingOracle")}(
+            13,        // $0.13/PFLOP-hour
+            100,       // $1.00/SALT
+            governance // governance (PBA-L2-002)
+        ));
         console.log("  ComputePricingOracle:", address(oracle));
 
         // =====================================================================
@@ -265,30 +375,64 @@ contract DeployAll is ScriptEnv, AdminChecks {
         // =====================================================================
         console.log("--- Layer 6: Treasury & Governance ---");
 
-        StablecoinTreasury treasury = new StablecoinTreasury{salt: Salts.salt("StablecoinTreasury")}(deployer);
+        StablecoinTreasury treasury = (_isLive("StablecoinTreasury", abi.encodePacked(type(StablecoinTreasury).creationCode, abi.encode(deployer)))
+            ? StablecoinTreasury(payable(_create2Address("StablecoinTreasury", abi.encodePacked(type(StablecoinTreasury).creationCode, abi.encode(deployer)))))
+            : new StablecoinTreasury{salt: Salts.salt("StablecoinTreasury")}(deployer));
         console.log("  StablecoinTreasury:", address(treasury));
 
-        BulkComputeGateway gateway = new BulkComputeGateway{salt: Salts.salt("BulkComputeGateway")}(
+        BulkComputeGateway gateway = (_isLive("BulkComputeGateway", abi.encodePacked(type(BulkComputeGateway).creationCode, abi.encode(
             address(treasury),
             address(oracle),
             deployer   // admin
-        );
+        )))
+            ? BulkComputeGateway(payable(_create2Address("BulkComputeGateway", abi.encodePacked(type(BulkComputeGateway).creationCode, abi.encode(
+            address(treasury),
+            address(oracle),
+            deployer   // admin
+        )))))
+            : new BulkComputeGateway{salt: Salts.salt("BulkComputeGateway")}(
+            address(treasury),
+            address(oracle),
+            deployer   // admin
+        ));
         treasury.setAuthorizedActivityRecorder(address(gateway), true);
         console.log("  BulkComputeGateway:", address(gateway));
 
-        TestnetFarmingAccounting farming = new TestnetFarmingAccounting{salt: Salts.salt("TestnetFarmingAccounting")}(
+        TestnetFarmingAccounting farming = (_isLive("TestnetFarmingAccounting", abi.encodePacked(type(TestnetFarmingAccounting).creationCode, abi.encode(
             address(contributions),
             address(treasury),
             deployer   // governance
-        );
+        )))
+            ? TestnetFarmingAccounting(payable(_create2Address("TestnetFarmingAccounting", abi.encodePacked(type(TestnetFarmingAccounting).creationCode, abi.encode(
+            address(contributions),
+            address(treasury),
+            deployer   // governance
+        )))))
+            : new TestnetFarmingAccounting{salt: Salts.salt("TestnetFarmingAccounting")}(
+            address(contributions),
+            address(treasury),
+            deployer   // governance
+        ));
         console.log("  TestnetFarmingAccounting:", address(farming));
 
-        TreasuryGovernor governor = new TreasuryGovernor{salt: Salts.salt("TreasuryGovernor")}(
+        TreasuryGovernor governor = (_isLive("TreasuryGovernor", abi.encodePacked(type(TreasuryGovernor).creationCode, abi.encode(
             address(stakingPool),
             address(treasury),
             envAddressOr("GUARDIAN", deployer), // guardian (PBA-L2-001: set GUARDIAN to the multisig)
             1_000_000_000 ether // total SALT supply (1B)
-        );
+        )))
+            ? TreasuryGovernor(payable(_create2Address("TreasuryGovernor", abi.encodePacked(type(TreasuryGovernor).creationCode, abi.encode(
+            address(stakingPool),
+            address(treasury),
+            envAddressOr("GUARDIAN", deployer), // guardian (PBA-L2-001: set GUARDIAN to the multisig)
+            1_000_000_000 ether // total SALT supply (1B)
+        )))))
+            : new TreasuryGovernor{salt: Salts.salt("TreasuryGovernor")}(
+            address(stakingPool),
+            address(treasury),
+            envAddressOr("GUARDIAN", deployer), // guardian (PBA-L2-001: set GUARDIAN to the multisig)
+            1_000_000_000 ether // total SALT supply (1B)
+        ));
         console.log("  TreasuryGovernor:", address(governor));
 
         vm.stopBroadcast();

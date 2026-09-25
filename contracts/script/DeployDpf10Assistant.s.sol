@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
+import "./lib/GovernanceOps.sol";
 import "../src/defense_prime/AuditBundleRegistry.sol";
 
 /// @title DeployDpf10Assistant — Stage 8 broadcast
@@ -20,7 +21,7 @@ import "../src/defense_prime/AuditBundleRegistry.sol";
 ///       --rpc-url https://rpc.citrate.ai \
 ///       --private-key $DEPLOYER_PRIVATE_KEY \
 ///       --broadcast --slow
-contract DeployDpf10Assistant is ScriptEnv {
+contract DeployDpf10Assistant is ScriptEnv, GovernanceOps {
     function run() external returns (address auditBundleRegistry) {
         address deployer = deployerAddress();
         address governance = envAddressOr("GOVERNANCE", deployer);
@@ -38,7 +39,7 @@ contract DeployDpf10Assistant is ScriptEnv {
         // Self-authorize the deployer EOA as a recorder so the
         // initial post-deploy E2E tests can anchor session bundles
         // without a separate cast send round-trip.
-        abr.setRecorder(deployer, true);
+        _govCall(governance, deployer, address(abr), abi.encodeWithSignature("setRecorder(address,bool)", deployer, true), "abr.setRecorder(deployer, true)");
         console.log("Recorder set: deployer authorized");
 
         vm.stopBroadcast();
