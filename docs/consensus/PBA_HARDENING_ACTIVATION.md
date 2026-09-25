@@ -21,11 +21,13 @@ The rest of the R2 hardening is active in every binary and doesn't change which 
 
 ## How the height is set
 
+- Release pin: `PINNED_ACTIVATIONS` in `core/consensus/src/hardening.rs`, one entry per chain id. When the running chain has a pinned height, that is the height. An env or config value that disagrees (including `off`) stops the node at start-up with an error naming both values.
 - Config: `[chain] pba_hardening_height = <height>` (`node/src/config.rs`).
 - Env override: `CITRATE_PBA_HARDENING_HEIGHT=<height>` or `off`. An unparseable value aborts start-up.
-- Unset, which is the default on every shipped 40204 profile, means the rules are OFF.
-- Dev profiles set `0`, so the rules are active from genesis. Genesis is never re-judged.
-- The start-up log states which applies.
+- With no pin for the chain, the env override wins over the config value. Unset, which is the default on every shipped 40204 profile, means the rules are OFF.
+- Dev profiles set `0`, so the rules are active from genesis. Genesis is never re-judged. They also set `[chain] dev_profile = true`, which keeps their own value when a release pins 40204. Never set `dev_profile` on a node that joins a public network.
+- The pin is keyed on the configured `[chain] chain_id`. If `CITRATE_CHAIN_ID` is set it must equal it, or the node refuses to start.
+- The start-up log prints the resolved height and its source, for example `chain 40204 pba_hardening_height H (source: release pin)`, and a `Consensus fingerprint ... with activation ... = 0x...` line. Nodes that agree print the same final fingerprint. `citrate consensus` lists the compiled-in pins.
 
 This is a consensus parameter. Two nodes with different values disagree about block validity, and the chain forks.
 
@@ -33,7 +35,7 @@ This is a consensus parameter. Two nodes with different values disagree about bl
 
 1. **Ship the binary everywhere first**, with the height unset: producers, bootnodes, RPC nodes and the citrate-core bundled node. Confirm `citrate consensus --json` prints the same `fingerprint` everywhere.
 2. **Pick `H = current_tip + margin`**, with enough margin for the slowest client release channel to upgrade. Chain 40204 produces a block every 2.0 s (measured), so 43,200 blocks is about one day and 302,400 blocks is about one week.
-3. **Set it fleet-wide**: `pba_hardening_height = H` in every 40204 config, or `CITRATE_PBA_HARDENING_HEIGHT=H` in every systemd unit and in the citrate-core node spawn. Restart, and confirm each node logs `ACTIVE from height H` before the tip reaches `H`.
+3. **Pin it in the release**: in the release PR, set the 40204 entry of `PINNED_ACTIVATIONS` in `core/consensus/src/hardening.rs` to `Some(H)`. Every node on that release then runs `H` without per-host settings. Remove any `pba_hardening_height` / `CITRATE_PBA_HARDENING_HEIGHT` values that differ from `H` (they now stop the node). Confirm each node logs `ACTIVE from height H [... source: release pin]` and the same activation fingerprint before the tip reaches `H`.
 4. **Pre-`H` checks**:
    - Nothing on 40204 relies on `eth_sendTransaction`: `allow_eth_send_transaction = false`.
    - No node runs with `CITRATE_REQUIRE_VALID_SIGNATURE=0`.
@@ -43,6 +45,17 @@ This is a consensus parameter. Two nodes with different values disagree about bl
 **Rollback before `H`:** unset the height (or set `off`) on every node and restart.
 
 **After `H`:** don't unset it. A node without the setting forks off.
+
+## Nodes that upgrade late
+
+A node that is still on an older release at `H` keeps producing and accepting blocks in the pre-activation format on its own branch. When it restarts on a release with the pin:
+
+- Before loading any stored block it checks every stored block at or above `H` against the rules. It removes each invalid block and everything built on it from the block store, the DAG store and the transaction index, and logs how many it removed.
+- If its applied state was built on those blocks, the start-up recovery rebuilds state from genesis along the remaining chain, then the node syncs the canonical chain from upgraded peers. No data-directory wipe is needed. The rebuild replays the chain up to `H`, so expect it to take minutes on a long chain.
+- Transactions carried by the removed blocks are offered to the mempool again once the state is rebuilt.
+- A node running with `CITRATE_BLOCK_V2=0` cannot rebuild state by itself. It stops with instructions: move the data directory aside and restart to resync from peers.
+
+Upgraded nodes count, per peer, blocks received in the pre-activation format at or after `H`: metric `citrate_legacy_format_blocks_total{peer="..."}` and gauge `citrate_legacy_format_peers`, plus an info log line per peer. Use them to find nodes that have not upgraded.
 
 ## Before `H`
 
