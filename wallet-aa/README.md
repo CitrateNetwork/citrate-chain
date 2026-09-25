@@ -1,10 +1,3 @@
----
-created: 2026-06-05T07:00:00Z
-branch: feat/ew-s1-kernel-wallet
-author: Larry Klosowski (@SaulBuilds) + Claude Opus 4.7 (1M context)
-status: active
----
-
 # citrate-wallet-aa
 
 Off-chain helpers for the Citrate ERC-4337 embedded-wallet stack.

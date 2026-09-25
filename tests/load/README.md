@@ -12,7 +12,7 @@
 > repository.
 >
 > The canonical benchmark harness is
-> [`citrate_v0.01.1/tools/citrate-bench/`](../../tools/citrate-bench/).
+> [`tools/citrate-bench/`](../../tools/citrate-bench/).
 > It signs transactions client-side via `eth_sendRawTransaction`,
 > computes ground truth from on-chain nonce deltas, and produces
 > auditable reports.
@@ -82,7 +82,7 @@ anvil only.
 
 ## Canonical harness
 
-**[`citrate_v0.01.1/tools/citrate-bench/`](../../tools/citrate-bench/)**
+**[`tools/citrate-bench/`](../../tools/citrate-bench/)**
 
 Production-correct Rust harness. Signs transactions client-side
 with a Foundry keystore, runs at a target TPS via deadline-based
@@ -91,7 +91,7 @@ ground truth against on-chain nonce deltas. All new benchmark work
 against the Citrate testnet happens there.
 
 ```bash
-cd citrate_v0.01.1/tools/citrate-bench
+cd tools/citrate-bench
 cargo run --release -- bench \
   --rpc-url https://rpc2.citrate.ai \
   --keystore-dir ~/.foundry/keystores \
@@ -111,7 +111,7 @@ criteria.
 Only for devnet smoke testing — never for testnet or release claims.
 
 ```bash
-cd citrate_v0.01.1/tests/load
+cd tests/load
 cargo build --release
 ./target/release/benchmark-suite http://127.0.0.1:8545 10000 60 /tmp/
 ```

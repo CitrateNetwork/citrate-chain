@@ -23,7 +23,7 @@ A node starts, looks at `[storage].data_dir`, and:
 - **If a genesis block exists in storage** → resume.
 - **If not** → call `initialize_genesis_state_with_profile()` with the chain-ID-appropriate profile, write the deterministic block 0, then start mining.
 
-**There is no `genesis.json` file consumed at runtime.** The previous root-level `genesis.json` was a documentation artifact from the pre-split monorepo era; it carried Anvil-default addresses that the `contracts/DEPLOYED_ADDRESSES.md` correction note (2026-04-08) explicitly flagged as wrong. Removed in the 2026-05-23 fresh-chain release prep — chain bootstrap was never affected by it.
+**There is no `genesis.json` file consumed at runtime.**
 
 If you need a JSON snapshot of the canonical genesis for audit / inspection purposes, dump it from a running node:
 

@@ -1,10 +1,3 @@
----
-created: 2026-06-07T09:00:00Z
-branch: feat/wp-z-canonical-address-table
-author: Larry Klosowski (@SaulBuilds) + Claude Opus 4.7 (1M context)
-status: active
----
-
 # Canonical contract-address table
 
 This directory is the **single source of truth** for every Citrate
