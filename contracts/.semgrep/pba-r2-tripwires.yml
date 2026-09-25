@@ -1,0 +1,72 @@
+# PBA-R2 (pre-bounty adversarial audit 2026-09-24) class tripwires, lane
+# CONTRACTS-B. Each rule pins a fixed bug class so it cannot silently return.
+# Wired into .github/workflows/solidity-ci.yml (blocking).
+#
+# Run:  semgrep --metrics=off --error --config contracts/.semgrep/pba-r2-tripwires.yml contracts/src
+rules:
+  # PBA-L2-002: every ceremony contract is deployed with `new X{salt:}()` from
+  # a forge script, which runs the constructor with msg.sender == the Arachnid
+  # CREATE2 factory (0x4e59…956C). Any admin/owner/governance/payee seeded from
+  # msg.sender is orphaned forever (21 live contracts on 40204). Constructors
+  # must take the key as an explicit argument (see src/lib/InitialAdmin.sol).
+  - id: pba-l2-002-constructor-msg-sender
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      PBA-L2-002: `msg.sender` inside a constructor. Under the salted CREATE2
+      ceremony this is the CREATE2 factory, which can never act. Pass the
+      admin/owner/governance/payee as an explicit constructor argument and run
+      it through InitialAdmin.check().
+    patterns:
+      - pattern-inside: |
+          constructor(...) { ... }
+      - pattern: msg.sender
+    paths:
+      include:
+        - "*.sol"
+      exclude:
+        # Not deployed through the salted ceremony (plain CREATE from
+        # DeployDpf02Rbac / an NFT demo); msg.sender there is the EOA.
+        - "**/rbac/TenantHierarchy.sol"
+        - "**/ColorCirclesNFT.sol"
+
+  # PBA-L2-014 / PBA-L2-036 (and CHAIN-B-C008/C024): an M-of-N signature path
+  # that records a caller-NAMED `signer` without binding it to the caller lets
+  # one key satisfy the whole threshold.
+  - id: pba-l2-014-signer-not-bound-to-caller
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      PBA-L2-014: a `bytes32 signer` argument is recorded without checking
+      `signer == QuorumIdentity.subjectKey(msg.sender)`. One key can then name
+      every required signer.
+    patterns:
+      - pattern-inside: |
+          function $F(..., bytes32 signer, ...) { ... }
+      - pattern-not-inside: |
+          if (signer != QuorumIdentity.subjectKey(msg.sender)) $S;
+          ...
+      - pattern-not-inside: |
+          if (signer != QuorumIdentity.subjectKey(msg.sender)) { ... }
+          ...
+      - pattern: $M[signer] = $V;
+    paths:
+      include:
+        - "*.sol"
+
+  # PBA-L2-012: `MultiSigEnvelope.isSignedThresholdMet` reads the envelope's
+  # OWN, drafter-chosen threshold and signer list; `draft` is permissionless.
+  # A consumer that gates on it is satisfied by a self-drafted 1-of-1.
+  - id: pba-l2-012-trusts-envelope-self-threshold
+    languages: [solidity]
+    severity: ERROR
+    message: >
+      PBA-L2-012: do not gate on `isSignedThresholdMet` — it reports the
+      envelope's own caller-chosen policy. Tally `signed_by` against the
+      consumer's own approver set and check the envelope's initiator.
+    pattern: $X.isSignedThresholdMet(...)
+    paths:
+      include:
+        - "*.sol"
+      exclude:
+        - "**/rbac/MultiSigEnvelope.sol"

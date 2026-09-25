@@ -91,6 +91,15 @@ jobs:
             | sha256sum -c -
           sudo install -m 0755 /tmp/solc /usr/local/bin/solc
           solc --version
+      # PBA-R2 (pre-bounty audit 2026-09-24) class tripwires: constructor
+      # msg.sender under the salted CREATE2 ceremony (PBA-L2-002), signer ids
+      # not bound to the caller (PBA-L2-014/-036), and consumers trusting an
+      # envelope's self-reported threshold (PBA-L2-012). Blocking.
+      - name: PBA-R2 semgrep tripwires
+        working-directory: contracts
+        run: |
+          pipx install semgrep==1.167.0
+          "$HOME/.local/bin/semgrep" --metrics=off --error --config .semgrep/pba-r2-tripwires.yml src
       # Compile first (serialized via FOUNDRY_THREADS=1 + swap) so the cache
       # is warm; keeps the heavy via-IR work in one observable step.
       - name: Build contracts (bounded concurrency)
