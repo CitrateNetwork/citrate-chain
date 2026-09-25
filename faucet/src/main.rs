@@ -283,12 +283,24 @@ fn allowed_origins(raw: Option<&str>) -> Vec<axum::http::HeaderValue> {
     };
     list.into_iter()
         .filter(|o| {
-            (o.starts_with("https://") || o.starts_with("http://localhost"))
+            (o.starts_with("https://") || is_local_dev_origin(o))
                 && !o.contains('*')
                 && !o.ends_with('/')
         })
         .filter_map(|o| axum::http::HeaderValue::from_str(&o).ok())
         .collect()
+}
+
+/// `http://localhost` or `http://localhost:<port>` exactly (operator dev use); nothing that merely
+/// starts with that text (e.g. `http://localhost.example`).
+fn is_local_dev_origin(o: &str) -> bool {
+    match o.strip_prefix("http://localhost") {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix(':')
+            .is_some_and(|port| !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit())),
+        None => false,
+    }
 }
 
 /// PBA-L8-017: replaces `CorsLayer::permissive()` (which sent `access-control-allow-origin: *`).
@@ -335,8 +347,10 @@ fn build_router(state: FaucetState, allowed_origins_env: Option<&str>) -> Router
         .route("/faucet", post(request_tokens))
         .route("/status", get(status))
         .route("/health", get(health))
-        .layer(axum::middleware::map_response(security_headers))
+        // CORS inside, security headers outermost: CORS preflight answers (which CorsLayer
+        // produces itself) carry the same headers as every other response.
         .layer(cors_layer(allowed_origins_env))
+        .layer(axum::middleware::map_response(security_headers))
         .with_state(state)
 }
 
@@ -925,6 +939,50 @@ mod tests {
         assert_eq!(v(Some("  ")).len(), DEFAULT_ALLOWED_ORIGINS.len());
         assert_eq!(v(Some("https://a.example, *, http://evil.example, https://b.example/, http://localhost:3000")), vec!["https://a.example", "http://localhost:3000"]);
         assert!(v(Some("*")).is_empty());
+        assert_eq!(
+            v(Some("http://localhost, http://localhost:8080, http://localhost.evil.com, http://localhostevil.com, http://localhost:, http://localhost:80a, http://localhost:123456")),
+            vec!["http://localhost", "http://localhost:8080"]
+        );
+    }
+
+    fn assert_security_headers(h: &reqwest::header::HeaderMap, what: &str) {
+        let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
+        assert_eq!(get("content-security-policy").as_deref(), Some(FAUCET_CSP), "{what}");
+        assert_eq!(get("x-content-type-options").as_deref(), Some("nosniff"), "{what}");
+        assert_eq!(get("x-frame-options").as_deref(), Some("DENY"), "{what}");
+        assert_eq!(get("referrer-policy").as_deref(), Some("no-referrer"), "{what}");
+        assert!(get("strict-transport-security").is_some(), "{what}");
+    }
+
+    #[tokio::test]
+    async fn l8017_security_headers_on_errors_and_preflight() {
+        let base = spawn_faucet(None).await;
+        let c = reqwest::Client::new();
+        let r404 = c.get(format!("{base}/nope")).send().await.expect("req");
+        assert_eq!(r404.status(), 404);
+        assert_security_headers(r404.headers(), "404");
+        let r405 = c.get(format!("{base}/faucet")).send().await.expect("req");
+        assert_eq!(r405.status(), 405);
+        assert_security_headers(r405.headers(), "405");
+        let r4xx = c
+            .post(format!("{base}/faucet"))
+            .header("content-type", "application/json")
+            .body("{not json")
+            .send()
+            .await
+            .expect("req");
+        assert!(r4xx.status().is_client_error());
+        assert_security_headers(r4xx.headers(), "bad json");
+        for origin in ["https://docs.citrate.ai", "https://evil.example"] {
+            let pre = c
+                .request(reqwest::Method::OPTIONS, format!("{base}/faucet"))
+                .header("origin", origin)
+                .header("access-control-request-method", "POST")
+                .send()
+                .await
+                .expect("req");
+            assert_security_headers(pre.headers(), origin);
+        }
     }
 
     /// SECREM-01 FAUCET-2 red test: pre-fix, a direct client could spoof
