@@ -240,8 +240,12 @@ contract PBA_L2_001_VerifierHardening is Test {
         StablecoinTreasury treasury = new StablecoinTreasury(address(this));
         vm.expectRevert("TreasuryGovernor: factory guardian");
         new TreasuryGovernor(address(pool), address(treasury), FACTORY, 1e27);
+    }
+
+    function test_L2_001_guardianCannotBeTransferredToFactory() public {
         vm.prank(address(0xDEAD));
         vm.expectRevert("TreasuryGovernor: factory guardian");
         gov.transferGuardian(FACTORY);
+        assertEq(gov.guardian(), address(0xDEAD));
     }
 }

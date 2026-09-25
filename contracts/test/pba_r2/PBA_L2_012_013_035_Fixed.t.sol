@@ -298,3 +298,25 @@ contract PBA_L2_012_RecordFailureBinding is Test {
         assertEq(uint8(reg.getApp(keccak256("app")).state), uint8(AppRegistry.AppState.Failed));
     }
 }
+
+/// Governance keeps the right to record a Pending app's failure.
+contract PBA_L2_012_GovernanceRecordsFailure is Test {
+    function test_L2_012_governanceCanFailPendingApp() public {
+        MultiSigEnvelope env = new MultiSigEnvelope();
+        address gov = address(0x60);
+        address rec = address(0xEC0);
+        AppRegistry reg = new AppRegistry(gov, address(env));
+        bytes32[] memory approvers = new bytes32[](1);
+        approvers[0] = QuorumIdentity.subjectKey(address(0xA1));
+        vm.startPrank(gov);
+        reg.setRecorder(rec, true);
+        reg.setApproverPolicy(approvers, 1);
+        vm.stopPrank();
+        address[] memory none = new address[](0);
+        vm.prank(rec);
+        reg.proposeApp(keccak256("app"), keccak256("t"), "app", "1", rec, keccak256("env"), none, bytes32(0));
+        vm.prank(gov);
+        reg.recordFailureOnEnvelopeReject(keccak256("app"));
+        assertEq(uint8(reg.getApp(keccak256("app")).state), uint8(AppRegistry.AppState.Failed));
+    }
+}
