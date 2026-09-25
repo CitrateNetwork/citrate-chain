@@ -30,9 +30,10 @@ contract RmQ_C016_ComputeVerifier is Test {
         verifier.submitCommitment(jobId, address(0xBEEF), keccak256(abi.encodePacked("c", jobId)));
     }
 
-    function _sign(bytes memory attestation) internal view returns (bytes memory sig) {
+    /// PBA-L2-004: the oracle signs a job-bound digest.
+    function _sign(uint256 jobId, bytes memory attestation) internal view returns (bytes memory sig) {
         bytes32 messageHash = keccak256(
-            abi.encodePacked("\x19Ethereum Signed Message:\n32", keccak256(attestation))
+            abi.encodePacked("\x19Ethereum Signed Message:\n32", verifier.teeAttestationDigest(jobId, attestation))
         );
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(oraclePk, messageHash);
         sig = abi.encodePacked(r, s, v);
@@ -43,8 +44,7 @@ contract RmQ_C016_ComputeVerifier is Test {
     /// attestation settles unlimited jobs.
     function test_C016_tee_attestation_cannot_settle_two_jobs() public {
         bytes memory attestation = hex"deadbeefcafe";
-        bytes memory sig = _sign(attestation);
-
+        bytes memory sig = _sign(1, attestation);
         _configure(1, ComputeVerifier.VerificationTier.TEE);
         bool v1 = verifier.verifyTEEAttestation(1, attestation, sig);
         assertTrue(v1, "job 1 attestation verifies");
@@ -60,23 +60,28 @@ contract RmQ_C016_ComputeVerifier is Test {
         );
     }
 
-    /// GREEN: a replayed ZK proof cannot settle a second job.
-    /// RED (pre-fix): `v2 == true` and job 2 is Valid.
+    /// GREEN: a replayed ZK proof cannot settle a second job whose
+    /// provider did not commit to it BEFORE it was revealed. PBA-L2-004:
+    /// proofs are bound to their job by commit-reveal (and by the job's
+    /// input/model/output commitments); the used-proof set is per job.
+    /// RED (pre-C016): job 2 is Valid with job 1's replayed bytes.
     function test_C016_zk_proof_cannot_settle_two_jobs() public {
-        // Force the live 0x0108 inference verifier to accept (return 1).
-        bytes memory anyCalldata = new bytes(0);
-        vm.mockCall(address(0x0108), anyCalldata, abi.encode(uint256(1)));
-
+        vm.mockCall(address(0x0108), new bytes(0), abi.encode(uint256(1)));
         bytes memory proof = hex"aabbccdd";
-        bytes memory publicInputs = new bytes(96); // ZK_PUBLIC_INPUTS_LEN
+        bytes32 inC = bytes32(uint256(7));
+        bytes32 modelC = bytes32(uint256(9));
+        bytes memory publicInputs = abi.encode(inC, modelC, bytes32(uint256(11)));
+        bytes memory proofData = abi.encodePacked(uint256(proof.length), proof, publicInputs);
 
-        _configure(1, ComputeVerifier.VerificationTier.ZKProof);
+        for (uint256 j = 1; j <= 2; j++) {
+            verifier.configureJob(j, 100 ether, ComputeVerifier.VerificationTier.ZKProof);
+            verifier.bindJob(j, inC, modelC);
+        }
+        verifier.submitCommitment(1, address(0xBEEF), verifier.zkProofCommitment(1, proofData));
+        // Job 2's provider committed before job 1's proof was public.
+        verifier.submitCommitment(2, address(0xCAFE), keccak256("job-2 own commitment"));
+        vm.roll(block.number + 1);
         assertTrue(verifier.verifyZKProof(1, proof, publicInputs), "job 1 proof verifies");
-
-        _configure(2, ComputeVerifier.VerificationTier.ZKProof);
-        assertFalse(
-            verifier.verifyZKProof(2, proof, publicInputs),
-            "C016: replayed ZK proof must not settle a 2nd job"
-        );
+        assertFalse(verifier.verifyZKProof(2, proof, publicInputs), "C016: replayed ZK proof must not settle a 2nd job");
     }
 }

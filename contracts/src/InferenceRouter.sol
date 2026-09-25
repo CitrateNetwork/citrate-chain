@@ -83,6 +83,21 @@ contract InferenceRouter is AccessControl, ReentrancyGuard {
     /// accumulator — never `address(this).balance` minus provider
     /// balances, which also holds provider stakes and open-request escrow.
     uint256 public accruedPlatformFees;
+
+    /// @notice PBA-L2-005: requester refunds owed, withdrawn via
+    /// `claimRefund` (pull). Pre-fix `completeInference` PUSHED the refund
+    /// with `require(success)`, so a requester contract that reverts on
+    /// receive made completion revert forever, pinning the provider's
+    /// `currentLoad` above zero and freezing its stake.
+    mapping(address => uint256) public refundOwed;
+
+    /// @notice PBA-L2-005: a `Processing` request that has not completed
+    /// within this many seconds can be expired by anyone. Expiry refunds
+    /// the requester's full `maxPrice` (pull) and frees the provider's
+    /// load slot, so neither party's funds can be frozen by the other.
+    /// This time-locked, permissionless exit replaces a custodial admin
+    /// rescue: every stuck state has an exit and every wei is attributed.
+    uint256 public constant REQUEST_TIMEOUT = 1 hours;
     
     // Events
     event InferenceRequested(
@@ -126,6 +141,10 @@ contract InferenceRouter is AccessControl, ReentrancyGuard {
         uint256 oldFee,
         uint256 newFee
     );
+
+    event RefundCredited(address indexed requester, uint256 amount);
+    event RefundClaimed(address indexed requester, uint256 amount);
+    event RequestExpired(uint256 indexed requestId, address indexed provider, uint256 refund);
 
     /// @param admin Explicit DEFAULT_ADMIN (PBA-L2-002: never msg.sender, which is
     ///        the CREATE2 factory under a salted ceremony deploy).
@@ -198,6 +217,9 @@ contract InferenceRouter is AccessControl, ReentrancyGuard {
             uint256 refundAmount = msg.value > cacheRewardAmount
                 ? msg.value - cacheRewardAmount
                 : 0;
+            // PBA-L2-005 / L2-042: the cache-hit fee was credited to no one
+            // and stranded. It is protocol revenue: account it as such.
+            accruedPlatformFees += cacheRewardAmount;
 
             // RFI26-07: complete ALL state changes before the external
             // refund call (CEI). The previous order (call first, then
@@ -249,6 +271,12 @@ contract InferenceRouter is AccessControl, ReentrancyGuard {
         providers[bestProvider].currentLoad++;
         
         emit InferenceRequested(requestId, msg.sender, modelHash);
+
+        // PBA-L2-005 / L2-042: `msg.value` above `maxPrice` was kept with no
+        // accounting. Credit it back to the requester (pull).
+        if (msg.value > maxPrice) {
+            _creditRefund(msg.sender, msg.value - maxPrice);
+        }
         
         return requestId;
     }
@@ -261,7 +289,7 @@ contract InferenceRouter is AccessControl, ReentrancyGuard {
     function completeInference(
         uint256 requestId,
         bytes calldata outputData
-    ) external {
+    ) external nonReentrant {
         InferenceRequest storage request = requests[requestId];
         require(request.computeProvider == msg.sender, "Not assigned provider");
         require(request.status == RequestStatus.Processing, "Invalid status");
@@ -297,10 +325,10 @@ contract InferenceRouter is AccessControl, ReentrancyGuard {
             responseCache[request.modelHash][inputHash] = outputData;
         }
         
-        // Refund excess payment
+        // Refund excess payment — PBA-L2-005: credited, never pushed, so
+        // the requester's code cannot block completion.
         if (request.maxPrice > price) {
-            (bool success, ) = request.requester.call{value: request.maxPrice - price}("");
-            require(success, "Refund failed");
+            _creditRefund(request.requester, request.maxPrice - price);
         }
         
         emit InferenceCompleted(requestId, msg.sender, price);
@@ -317,9 +345,46 @@ contract InferenceRouter is AccessControl, ReentrancyGuard {
         
         request.status = RequestStatus.Cancelled;
         
-        // Refund payment
-        (bool success, ) = msg.sender.call{value: request.maxPrice}("");
+        // Refund payment (credited; claim via `claimRefund`).
+        _creditRefund(msg.sender, request.maxPrice);
+    }
+
+    /**
+     * @notice PBA-L2-005: expire a `Processing` request the provider never
+     * completed within `REQUEST_TIMEOUT`. Anyone may call. The requester is
+     * credited the full `maxPrice` and the provider's load slot is freed.
+     * @param requestId ID of the request
+     */
+    function expireRequest(uint256 requestId) external nonReentrant {
+        InferenceRequest storage request = requests[requestId];
+        require(request.status == RequestStatus.Processing, "Not processing");
+        require(block.timestamp > request.timestamp + REQUEST_TIMEOUT, "Not expired");
+
+        request.status = RequestStatus.Failed;
+        ComputeProvider storage provider = providers[request.computeProvider];
+        if (provider.currentLoad > 0) {
+            provider.currentLoad--;
+        }
+        _creditRefund(request.requester, request.maxPrice);
+
+        emit RequestExpired(requestId, request.computeProvider, request.maxPrice);
+    }
+
+    /**
+     * @notice PBA-L2-005: withdraw refunds credited to the caller.
+     */
+    function claimRefund() external nonReentrant {
+        uint256 amount = refundOwed[msg.sender];
+        require(amount > 0, "No refund");
+        refundOwed[msg.sender] = 0;
+        (bool success, ) = msg.sender.call{value: amount}("");
         require(success, "Refund failed");
+        emit RefundClaimed(msg.sender, amount);
+    }
+
+    function _creditRefund(address requester, uint256 amount) internal {
+        refundOwed[requester] += amount;
+        emit RefundCredited(requester, amount);
     }
     
     /**

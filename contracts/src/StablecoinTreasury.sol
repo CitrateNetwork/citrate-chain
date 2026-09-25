@@ -153,6 +153,12 @@ contract StablecoinTreasury is ReentrancyGuard, Governable {
         require(token != address(0), "StablecoinTreasury: zero address");
         require(!acceptedStablecoins[token], "StablecoinTreasury: already accepted");
         require(stablecoinList.length < MAX_STABLECOINS, "StablecoinTreasury: max stablecoins");
+        // PBA-L2-043: every USD figure in this treasury and in
+        // BulkComputeGateway (MIN_PURCHASE_USD, credits = amount*1e14/price,
+        // totalValueUsd) is denominated in 6-decimal USD. An 18-decimal
+        // stablecoin would overstate value 1e12x, so only 6-decimal tokens
+        // are accepted.
+        require(_decimals(token) == 6, "StablecoinTreasury: token must have 6 decimals");
 
         acceptedStablecoins[token] = true;
         stablecoinList.push(token);
@@ -203,9 +209,15 @@ contract StablecoinTreasury is ReentrancyGuard, Governable {
         require(amount > 0, "StablecoinTreasury: zero amount");
 
         // Transfer stablecoin from depositor to this contract
+        uint256 balBefore = _balanceOf(stablecoin, address(this));
         bool success = _transferFrom(stablecoin, msg.sender, address(this), amount);
         require(success, "StablecoinTreasury: transfer failed");
-
+        // PBA-L2-043: received-balance accounting. A fee-on-transfer token
+        // would otherwise be credited for more than it delivered.
+        require(
+            _balanceOf(stablecoin, address(this)) - balBefore == amount,
+            "StablecoinTreasury: received amount mismatch"
+        );
         stablecoinBalances[stablecoin] += amount;
         totalValueUsd += amount;
 
@@ -333,6 +345,20 @@ contract StablecoinTreasury is ReentrancyGuard, Governable {
     // ============================================================
 
     /// @dev Advance epoch if the current block has passed the epoch boundary
+    /// @dev PBA-L2-043: `decimals()` via staticcall; reverts if absent.
+    function _decimals(address token) internal view returns (uint8) {
+        (bool ok, bytes memory ret) = token.staticcall(abi.encodeWithSignature("decimals()"));
+        require(ok && ret.length >= 32, "StablecoinTreasury: no decimals");
+        return abi.decode(ret, (uint8));
+    }
+
+    /// @dev PBA-L2-043: `balanceOf` via staticcall; reverts if absent.
+    function _balanceOf(address token, address who) internal view returns (uint256) {
+        (bool ok, bytes memory ret) = token.staticcall(abi.encodeWithSignature("balanceOf(address)", who));
+        require(ok && ret.length >= 32, "StablecoinTreasury: no balanceOf");
+        return abi.decode(ret, (uint256));
+    }
+
     function _advanceEpochIfNeeded() internal {
         uint256 computedEpoch = _computeEpoch();
         if (computedEpoch > currentEpoch) {

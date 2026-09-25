@@ -95,9 +95,6 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
 
     uint256 public computePriceNonce;
 
-    /// @dev Pending compute price per nonce
-    mapping(uint256 => uint256) private _pendingComputePrice;
-    mapping(uint256 => bool) private _computeProposalExists;
     mapping(uint256 => mapping(address => bool)) private _computeVotes;
     mapping(uint256 => uint256) private _computeVoteCount;
     mapping(uint256 => bool) private _computeFinalized;
@@ -108,13 +105,17 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
 
     uint256 public saltPriceNonce;
 
-    /// @dev Pending SALT price per nonce
-    mapping(uint256 => uint256) private _pendingSaltPrice;
-    mapping(uint256 => bool) private _saltProposalExists;
     mapping(uint256 => mapping(address => bool)) private _saltVotes;
     mapping(uint256 => uint256) private _saltVoteCount;
     mapping(uint256 => bool) private _saltFinalized;
 
+    // PBA-L2-044: per-member submissions, finalized at the MEDIAN once
+    // quorum submits. Pre-fix the first proposal for a nonce fixed the
+    // price and every other vote had to match it exactly, so one member
+    // could stall every update by front-running each round with a
+    // divergent value.
+    mapping(uint256 => uint256[]) private _computeSubmissions;
+    mapping(uint256 => uint256[]) private _saltSubmissions;
     // Governance state lives in Governable mixin (audit SOL-21).
 
     // ============================================================
@@ -228,20 +229,12 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
         // Rate limit: max 10% change from current price
         _enforceRateLimit(computePriceUsdCents, newPrice);
 
-        // First proposal stores the value; subsequent must agree
-        if (!_computeProposalExists[nonce]) {
-            _pendingComputePrice[nonce] = newPrice;
-            _computeProposalExists[nonce] = true;
-        } else {
-            require(
-                _pendingComputePrice[nonce] == newPrice,
-                "ComputePricingOracle: price mismatch"
-            );
-        }
-
+        // PBA-L2-044: each member submits its own value (no first-value
+        // lock); the finalized price is the median of the quorum's values.
         require(!_computeVotes[nonce][msg.sender], "ComputePricingOracle: already voted");
         _computeVotes[nonce][msg.sender] = true;
         _computeVoteCount[nonce]++;
+        _computeSubmissions[nonce].push(newPrice);
 
         emit ComputePriceProposed(msg.sender, nonce, newPrice);
 
@@ -266,6 +259,7 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
                 );
             }
             uint256 oldPrice = computePriceUsdCents;
+            newPrice = _median(_computeSubmissions[nonce]); // PBA-L2-044
             computePriceUsdCents = newPrice;
             _computeFinalized[nonce] = true;
             computePriceNonce++;
@@ -295,20 +289,12 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
         // Rate limit: max 10% change from current price
         _enforceRateLimit(saltPriceUsdCents, newPrice);
 
-        // First proposal stores the value; subsequent must agree
-        if (!_saltProposalExists[nonce]) {
-            _pendingSaltPrice[nonce] = newPrice;
-            _saltProposalExists[nonce] = true;
-        } else {
-            require(
-                _pendingSaltPrice[nonce] == newPrice,
-                "ComputePricingOracle: price mismatch"
-            );
-        }
-
+        // PBA-L2-044: each member submits its own value (no first-value
+        // lock); the finalized price is the median of the quorum's values.
         require(!_saltVotes[nonce][msg.sender], "ComputePricingOracle: already voted");
         _saltVotes[nonce][msg.sender] = true;
         _saltVoteCount[nonce]++;
+        _saltSubmissions[nonce].push(newPrice);
 
         emit SaltPriceProposed(msg.sender, nonce, newPrice);
 
@@ -323,6 +309,7 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
                 );
             }
             uint256 oldPrice = saltPriceUsdCents;
+            newPrice = _median(_saltSubmissions[nonce]); // PBA-L2-044
             saltPriceUsdCents = newPrice;
             _saltFinalized[nonce] = true;
             saltPriceNonce++;
@@ -333,6 +320,25 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
 
             emit SaltPriceUpdated(oldPrice, newPrice, nonce);
         }
+    }
+
+    /// @dev PBA-L2-044: median of the submitted values (lower median for an
+    ///      even count). Every value already passed `_enforceRateLimit`, so
+    ///      the median is within the rate limit too. The committee is small,
+    ///      so an insertion sort over a memory copy is cheap.
+    function _median(uint256[] storage values) internal view returns (uint256) {
+        uint256 n = values.length;
+        uint256[] memory a = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            uint256 v = values[i];
+            uint256 j = i;
+            while (j > 0 && a[j - 1] > v) {
+                a[j] = a[j - 1];
+                j--;
+            }
+            a[j] = v;
+        }
+        return a[(n - 1) / 2];
     }
 
     // ============================================================

@@ -91,6 +91,11 @@ contract ComputePoolPipeline is ReentrancyGuard, Governable {
     uint256 public nextJobId;
     uint256 public nextRequestId;
 
+    /// @notice PBA-L2-023: stage-owner payouts that could not be pushed
+    /// (recipient reverted on receive). Claimed via `claimPayout`. Pre-fix one
+    /// reverting stage owner made `terminateJob` revert, permanently freezing
+    /// every other stage owner's stake and earnings.
+    mapping(address => uint256) public payoutPending;
     // Governance state lives in Governable mixin (audit SOL-21).
 
     // ── Events ──────────────────────────────────────────────────────
@@ -106,6 +111,8 @@ contract ComputePoolPipeline is ReentrancyGuard, Governable {
     event StageReassigned(uint256 indexed jobId, uint32 indexed stage, address former, address newOwner);
     event JobDraining(uint256 indexed jobId);
     event JobTerminated(uint256 indexed jobId);
+    event PayoutDeferred(address indexed recipient, uint256 amount);
+    event PayoutClaimed(address indexed recipient, uint256 amount);
 
     // ── Modifiers ───────────────────────────────────────────────────
 
@@ -218,6 +225,11 @@ contract ComputePoolPipeline is ReentrancyGuard, Governable {
         Request storage req = requests[requestId];
         require(req.state == RequestState.InFlight, "Pipeline: not in-flight");
         Job storage job = jobs[req.jobId];
+        // PBA-L2-042: once terminated, stage stakes are returned and
+        // earnings are no longer paid out, so no further stage may be
+        // served (its share would be stranded). The requester reclaims the
+        // unspent escrow via `failRequest`.
+        require(job.state != JobState.Terminated, "Pipeline: job terminated");
 
         uint32 stage = req.progress;
         address owner = stageOwner[req.jobId][stage];
@@ -300,10 +312,9 @@ contract ComputePoolPipeline is ReentrancyGuard, Governable {
         emit StageFaulted(jobId, stage, former);
 
         uint256 payout = uint256(stake) + uint256(earned);
-        if (payout > 0) {
-            (bool ok, ) = former.call{value: payout}("");
-            require(ok, "Pipeline: fault payout failed");
-        }
+        // PBA-L2-023: a reverting former owner must not be able to block
+        // its own fault.
+        _pay(former, payout);
     }
 
     function reassignStage(uint256 jobId, uint32 stage) external payable jobExists(jobId) {
@@ -355,12 +366,29 @@ contract ComputePoolPipeline is ReentrancyGuard, Governable {
             uint128 earned = paymentEarned[jobId][owner];
             stageStake[jobId][owner] = 0;
             paymentEarned[jobId][owner] = 0;
-            if (stake + earned > 0) {
-                (bool ok, ) = owner.call{value: uint256(stake) + uint256(earned)}("");
-                require(ok, "Pipeline: worker payout failed");
-            }
+            // PBA-L2-023: credit on failure; never block the other owners.
+            _pay(owner, uint256(stake) + uint256(earned));
         }
         emit JobTerminated(jobId);
+    }
+
+    /// @notice PBA-L2-023: claim a payout that could not be pushed.
+    function claimPayout() external nonReentrant {
+        uint256 amount = payoutPending[msg.sender];
+        require(amount > 0, "Pipeline: nothing to claim");
+        payoutPending[msg.sender] = 0;
+        (bool ok, ) = msg.sender.call{value: amount}("");
+        require(ok, "Pipeline: claim failed");
+        emit PayoutClaimed(msg.sender, amount);
+    }
+
+    function _pay(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        (bool ok, ) = to.call{value: amount}("");
+        if (!ok) {
+            payoutPending[to] += amount;
+            emit PayoutDeferred(to, amount);
+        }
     }
 
     // ── Views + helpers ─────────────────────────────────────────────

@@ -10,9 +10,13 @@ pragma solidity ^0.8.26;
 /// gherkin scenarios as part of doctor's continuous monitoring
 /// (CIT-AGENT-7), the resulting per-metric observations land here.
 ///
-/// Append-anyone. The audit chain (CIT-AGENT-5a) is the integrity-
-/// preserving log; this contract is the publicly-queryable
-/// summary surface for benchmarks specifically.
+/// Append-anyone, but NAMESPACED BY COMMITTER (PBA-L2-061): each record
+/// series is keyed by (committer, agent_id, capsule_id, metric_name), so a
+/// third party can no longer forge entries into, or gas-grief reads of,
+/// another committer's series. Consumers choose whose series they trust
+/// (e.g. the agent's own doctor). Reads are paginated. The audit chain
+/// (CIT-AGENT-5a) is the integrity-preserving log; this contract is the
+/// publicly-queryable summary surface for benchmarks specifically.
 contract BenchmarkRegistry {
     struct BenchmarkRecord {
         uint256 agent_id;        // AgentSBT id (off-chain link)
@@ -45,7 +49,7 @@ contract BenchmarkRegistry {
         bytes32 metric_name,
         uint256 value
     ) external {
-        bytes32 key = _keyFor(agent_id, capsule_id, metric_name);
+        bytes32 key = _keyFor(msg.sender, agent_id, capsule_id, metric_name);
         _records[key].push(BenchmarkRecord({
             agent_id: agent_id,
             capsule_id: capsule_id,
@@ -61,27 +65,39 @@ contract BenchmarkRegistry {
         emit BenchmarkRecorded(agent_id, capsule_id, metric_name, value);
     }
 
+    /// @notice Paginated read of `committer`'s series (PBA-L2-061).
     function getMetric(
+        address committer,
         uint256 agent_id,
         bytes32 capsule_id,
-        bytes32 metric_name
-    ) external view returns (BenchmarkRecord[] memory) {
-        return _records[_keyFor(agent_id, capsule_id, metric_name)];
+        bytes32 metric_name,
+        uint256 offset,
+        uint256 limit
+    ) external view returns (BenchmarkRecord[] memory page) {
+        BenchmarkRecord[] storage all = _records[_keyFor(committer, agent_id, capsule_id, metric_name)];
+        uint256 n = all.length;
+        if (offset >= n) return new BenchmarkRecord[](0);
+        uint256 end = offset + limit > n ? n : offset + limit;
+        page = new BenchmarkRecord[](end - offset);
+        for (uint256 i = offset; i < end; i++) {
+            page[i - offset] = all[i];
+        }
     }
 
     function metricCount(
+        address committer,
         uint256 agent_id,
         bytes32 capsule_id,
         bytes32 metric_name
     ) external view returns (uint256) {
-        return _records[_keyFor(agent_id, capsule_id, metric_name)].length;
+        return _records[_keyFor(committer, agent_id, capsule_id, metric_name)].length;
     }
 
-    function _keyFor(uint256 agent_id, bytes32 capsule_id, bytes32 metric_name)
+    function _keyFor(address committer, uint256 agent_id, bytes32 capsule_id, bytes32 metric_name)
         internal
         pure
         returns (bytes32)
     {
-        return keccak256(abi.encode(agent_id, capsule_id, metric_name));
+        return keccak256(abi.encode(committer, agent_id, capsule_id, metric_name));
     }
 }

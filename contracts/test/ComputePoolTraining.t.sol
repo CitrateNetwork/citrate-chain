@@ -442,9 +442,9 @@ contract ComputePoolTrainingTest is Test {
         // commitEpoch.
         vm.roll(block.number + 101);
 
-        // w2 (any joined worker) reassigns to w3.
-        vm.prank(w2);
-        pool.reassignCoordinator(jobId, w3);
+        // PBA-L2-003: only the requester (or governance) may reassign; the
+        // liveness slash applies only when governance adjudicates the stall.
+        pool.reassignCoordinator(jobId, w3); // governance (this)
 
         ComputePoolTraining.TrainingJob memory job = pool.getJob(jobId);
         assertEq(job.coordinator, w3, "coordinator swapped");
@@ -467,7 +467,7 @@ contract ComputePoolTrainingTest is Test {
         // Roll only 50 blocks — under COORDINATION_TIMEOUT.
         vm.roll(block.number + 50);
 
-        vm.prank(w2);
+        vm.prank(requester);
         vm.expectRevert("ComputePoolTraining: coordinator still active");
         pool.reassignCoordinator(jobId, w3);
     }
@@ -492,18 +492,20 @@ contract ComputePoolTrainingTest is Test {
         // Roll to 50 blocks after commit — under COORDINATION_TIMEOUT
         // from the last activity. Reassign must revert.
         vm.roll(commitBlock + 50);
-        vm.prank(w2);
+        vm.prank(requester);
         vm.expectRevert("ComputePoolTraining: coordinator still active");
         pool.reassignCoordinator(jobId, w3);
 
         // Roll to 101 blocks after commit — now past timeout. Reassign
         // succeeds.
         vm.roll(commitBlock + 101);
-        vm.prank(w2);
+        vm.prank(requester);
         pool.reassignCoordinator(jobId, w3);
     }
 
-    function test_only_joined_worker_can_reassign() public {
+    /// PBA-L2-003: neither an outsider NOR a joined worker may reassign
+    /// (pre-fix any joined worker could, and could name itself).
+    function test_only_requester_or_governance_can_reassign() public {
         uint256 jobId = _openJob();
         _joinThree(jobId);
         pool.closeRecruitment(jobId, w1);
@@ -512,8 +514,12 @@ contract ComputePoolTrainingTest is Test {
 
         address outsider = address(0xDEAD);
         vm.prank(outsider);
-        vm.expectRevert("ComputePoolTraining: caller not joined");
+        vm.expectRevert("ComputePoolTraining: not authorized");
         pool.reassignCoordinator(jobId, w3);
+
+        vm.prank(w2);
+        vm.expectRevert("ComputePoolTraining: not authorized");
+        pool.reassignCoordinator(jobId, w2);
     }
 
     function test_reassign_to_non_member_reverts() public {
@@ -524,7 +530,7 @@ contract ComputePoolTrainingTest is Test {
         vm.roll(block.number + 101);
 
         address outsider = address(0xDEAD);
-        vm.prank(w2);
+        vm.prank(requester);
         vm.expectRevert("ComputePoolTraining: new coord not joined");
         pool.reassignCoordinator(jobId, outsider);
     }
