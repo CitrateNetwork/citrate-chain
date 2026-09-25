@@ -91,6 +91,7 @@ contract MultiSigEnvelopeTest is Test {
         signers[0] = SIGNER_A; signers[1] = SIGNER_B; signers[2] = SIGNER_C;
         vm.expectEmit(true, true, true, true);
         emit MultiSigEnvelope.EnvelopeDrafted(ID, INITIATOR, CORR, 3, 0);
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 3, 0, CORR);
     }
 
@@ -103,6 +104,7 @@ contract MultiSigEnvelopeTest is Test {
             MultiSigEnvelope.EnvelopeState.NotExist,
             MultiSigEnvelope.EnvelopeState.Drafted
         );
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 3, 0, CORR);
     }
 
@@ -122,12 +124,14 @@ contract MultiSigEnvelopeTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(MultiSigEnvelope.AlreadyExists.selector, ID)
         );
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 1, 0, CORR);
     }
 
     function test_draft_revertsOnEmptySigners() public {
         bytes32[] memory empty = new bytes32[](0);
         vm.expectRevert(MultiSigEnvelope.EmptyRequiredSigners.selector);
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", empty, 1, 0, CORR);
     }
 
@@ -139,6 +143,7 @@ contract MultiSigEnvelopeTest is Test {
                 MultiSigEnvelope.InvalidThreshold.selector, 0, 2
             )
         );
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 0, 0, CORR);
     }
 
@@ -150,6 +155,7 @@ contract MultiSigEnvelopeTest is Test {
                 MultiSigEnvelope.InvalidThreshold.selector, 3, 2
             )
         );
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 3, 0, CORR);
     }
 
@@ -157,6 +163,7 @@ contract MultiSigEnvelopeTest is Test {
         bytes32[] memory signers = new bytes32[](1);
         signers[0] = SIGNER_A;
         vm.expectRevert(MultiSigEnvelope.EmptyArtifactCid.selector);
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "", signers, 1, 0, CORR);
     }
 
@@ -169,12 +176,14 @@ contract MultiSigEnvelopeTest is Test {
                 MultiSigEnvelope.PastExpiry.selector, uint64(500), uint64(1000)
             )
         );
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 1, 500, CORR);
     }
 
     function test_draft_zeroExpiryAllowed() public {
         bytes32[] memory signers = new bytes32[](1);
         signers[0] = SIGNER_A;
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 1, 0, CORR);
         assertEq(env.getEnvelope(ID).expires_at, 0);
     }
@@ -228,6 +237,7 @@ contract MultiSigEnvelopeTest is Test {
     function test_sign_2of3Configuration() public {
         bytes32[] memory signers = new bytes32[](3);
         signers[0] = SIGNER_A; signers[1] = SIGNER_B; signers[2] = SIGNER_C;
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 2, 0, CORR);
         _sign(ID, A_ADDR, "sigA", "kba");
         _sign(ID, B_ADDR, "sigB", "kba");
@@ -274,6 +284,7 @@ contract MultiSigEnvelopeTest is Test {
         vm.warp(1000);
         bytes32[] memory signers = new bytes32[](2);
         signers[0] = SIGNER_A; signers[1] = SIGNER_B;
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 2, 2000, CORR);
         vm.warp(2001);
         vm.expectRevert(
@@ -329,6 +340,7 @@ contract MultiSigEnvelopeTest is Test {
     function test_accept_fromDelivered() public {
         _draftAndFullySign(ID);
         _markDelivered(ID, INIT_ADDR);
+        vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
         env.accept(ID);
         assertEq(uint8(env.getState(ID)), uint8(MultiSigEnvelope.EnvelopeState.Accepted));
     }
@@ -338,6 +350,7 @@ contract MultiSigEnvelopeTest is Test {
         _markDelivered(ID, INIT_ADDR);
         vm.expectEmit(true, true, false, true);
         emit MultiSigEnvelope.EnvelopeAccepted(ID, CORR);
+        vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
         env.accept(ID);
     }
 
@@ -350,12 +363,14 @@ contract MultiSigEnvelopeTest is Test {
                 MultiSigEnvelope.EnvelopeState.Signing
             )
         );
+        vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
         env.accept(ID);
     }
 
     function test_reject_fromDelivered() public {
         _draftAndFullySign(ID);
         _markDelivered(ID, INIT_ADDR);
+        vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
         env.reject(ID, "MOQ contradicts attested capacity");
         assertEq(uint8(env.getState(ID)), uint8(MultiSigEnvelope.EnvelopeState.Rejected));
     }
@@ -365,6 +380,7 @@ contract MultiSigEnvelopeTest is Test {
         _markDelivered(ID, INIT_ADDR);
         vm.expectEmit(true, true, false, true);
         emit MultiSigEnvelope.EnvelopeRejected(ID, CORR, "moq mismatch");
+        vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
         env.reject(ID, "moq mismatch");
     }
 
@@ -412,6 +428,7 @@ contract MultiSigEnvelopeTest is Test {
     function test_close_revertsAfterAccept() public {
         _draftAndFullySign(ID);
         _markDelivered(ID, INIT_ADDR);
+        vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
         env.accept(ID);
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -425,6 +442,7 @@ contract MultiSigEnvelopeTest is Test {
     function test_close_revertsAfterReject() public {
         _draftAndFullySign(ID);
         _markDelivered(ID, INIT_ADDR);
+        vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
         env.reject(ID, "no");
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -451,6 +469,7 @@ contract MultiSigEnvelopeTest is Test {
     function test_AcceptOrRejectExclusive() public {
         _draftAndFullySign(ID);
         _markDelivered(ID, INIT_ADDR);
+        vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
         env.accept(ID);
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -458,12 +477,14 @@ contract MultiSigEnvelopeTest is Test {
                 MultiSigEnvelope.EnvelopeState.Accepted
             )
         );
+        vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
         env.reject(ID, "too late");
     }
 
     function test_acceptOnlyOnce() public {
         _draftAndFullySign(ID);
         _markDelivered(ID, INIT_ADDR);
+        vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
         env.accept(ID);
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -471,6 +492,7 @@ contract MultiSigEnvelopeTest is Test {
                 MultiSigEnvelope.EnvelopeState.Accepted
             )
         );
+        vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
         env.accept(ID);
     }
 
@@ -557,6 +579,7 @@ contract MultiSigEnvelopeTest is Test {
         bytes32[] memory signers = new bytes32[](4);
         signers[0] = SIGNER_A; signers[1] = SIGNER_B;
         signers[2] = SIGNER_C; signers[3] = SIGNER_D;
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 2, 0, CORR);
         _sign(ID, A_ADDR, "sigA", "kba");
         assertEq(uint8(env.getState(ID)), uint8(MultiSigEnvelope.EnvelopeState.Signing));
@@ -639,6 +662,7 @@ contract MultiSigEnvelopeTest is Test {
             addrs[i] = address(uint160(0x2000 + i));
             signers[i] = QuorumIdentity.subjectKey(addrs[i]);
         }
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, threshold, 0, CORR);
         for (uint256 i; i < threshold; ++i) {
             _sign(ID, addrs[i], abi.encodePacked("sig-", i), "kba");
@@ -653,6 +677,7 @@ contract MultiSigEnvelopeTest is Test {
         address[3] memory addrs = [A_ADDR, B_ADDR, C_ADDR];
         bytes32[] memory signers = new bytes32[](3);
         signers[0] = SIGNER_A; signers[1] = SIGNER_B; signers[2] = SIGNER_C;
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, threshold, 0, CORR);
         for (uint256 i; i < threshold; ++i) {
             _sign(ID, addrs[i], abi.encodePacked("sig-", i), "kba");
@@ -666,6 +691,7 @@ contract MultiSigEnvelopeTest is Test {
         vm.warp(10);
         bytes32[] memory signers = new bytes32[](2);
         signers[0] = SIGNER_A; signers[1] = SIGNER_B;
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(ID, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 2, expiry, CORR);
         vm.warp(uint256(expiry) + 1);
         vm.expectRevert();
@@ -685,9 +711,11 @@ contract MultiSigEnvelopeTest is Test {
             _markDelivered(ID, INIT_ADDR);
         } else if (op == 2) {
             vm.expectRevert();
+            vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
             env.accept(ID);
         } else {
             vm.expectRevert();
+            vm.prank(A_ADDR); // PBA-L2-035: only a counterparty (required signer) may accept/reject
             env.reject(ID, "x");
         }
     }
@@ -699,6 +727,7 @@ contract MultiSigEnvelopeTest is Test {
         signers[0] = SIGNER_A;
         signers[1] = SIGNER_B;
         signers[2] = SIGNER_C;
+        vm.prank(INIT_ADDR); // PBA-L2-013: draft binds initiator to the caller
         env.draft(envId, INITIATOR, ART_ROOT, "ipfs://Qm...", signers, 3, expiresAt, CORR);
     }
 

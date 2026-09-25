@@ -61,8 +61,15 @@ contract SeedTemplatesEnvelopeTest is Test {
         _idAddr[BOARD_A] = BOARD_A_ADDR;
         _idAddr[BOARD_B] = BOARD_B_ADDR;
 
+        // PBA-L2-013: SoD counts only roster members as proposer/approvers.
+        bytes32[] memory roster = new bytes32[](5);
+        roster[0] = PROPOSER;
+        roster[1] = EXECUTOR;
+        roster[2] = THIRD;
+        roster[3] = BOARD_A;
+        roster[4] = BOARD_B;
         sod = new SegregationOfDuties(
-            TENANT, keccak256("sod"), 1, SPEC_HASH, SPEC_CID, address(envelopes), 1
+            TENANT, keccak256("sod"), 1, SPEC_HASH, SPEC_CID, address(envelopes), 1, roster
         );
 
         bytes32[] memory board = new bytes32[](2);
@@ -90,6 +97,7 @@ contract SeedTemplatesEnvelopeTest is Test {
     function _draft(bytes32 id, bytes32 initiator, bytes32[] memory required, uint8 threshold, bytes32 root, string memory cid)
         internal
     {
+        vm.prank(_idAddr[initiator]); // PBA-L2-013: draft binds initiator to the caller
         envelopes.draft(id, initiator, root, cid, required, threshold, 0, CORR);
     }
 
@@ -101,7 +109,7 @@ contract SeedTemplatesEnvelopeTest is Test {
 
     // ── pranked envelope helpers (CHAIN-B-C008) ─────────────────────
     // sign/markDelivered/close bind to `subjectKey(msg.sender)`; act as the
-    // address behind the identity. (reject/accept are unbound — call directly.)
+    // address behind the identity. (PBA-L2-035: reject/accept now need a required signer.)
 
     function _sign(bytes32 id, bytes32 who, bytes memory sig, string memory mode) internal {
         vm.prank(_idAddr[who]);
@@ -194,7 +202,9 @@ contract SeedTemplatesEnvelopeTest is Test {
     // ══ ChangeControlBoard ══════════════════════════════════════════
 
     function _ccbCheck() internal view returns (IGovernanceProtocol.Verdict v, bytes32 reason) {
-        (v, reason,) = ccb.check(TENANT, ACTION, _ctx(EXECUTOR_ADDR));
+        // PBA-L2-035: CCB only reads an envelope drafted by a board member or by
+        // the acting principal; here the principal is the change's proposer.
+        (v, reason,) = ccb.check(TENANT, ACTION, _ctx(PROPOSER_ADDR));
     }
 
     /// The full ceremony, in order, with each stage naming itself. A single
@@ -319,7 +329,9 @@ contract SeedTemplatesEnvelopeTest is Test {
     // ══ SupplierAdmission ═══════════════════════════════════════════
 
     function _saCheck() internal view returns (IGovernanceProtocol.Verdict v, bytes32 reason) {
-        (v, reason,) = sa.check(TENANT, ACTION, _ctx(EXECUTOR_ADDR));
+        // PBA-L2-035: SA only reads an envelope drafted by a committee member or
+        // by the acting principal; here the principal is the filing proposer.
+        (v, reason,) = sa.check(TENANT, ACTION, _ctx(PROPOSER_ADDR));
     }
 
     /// A committee can approve an admission it never had documents for. That is
@@ -371,6 +383,7 @@ contract SeedTemplatesEnvelopeTest is Test {
         _sign(id, BOARD_A, hex"ab", "ceremony");
         _sign(id, BOARD_B, hex"cd", "ceremony");
         _markDelivered(id, PROPOSER);
+        vm.prank(BOARD_A_ADDR); // PBA-L2-035: a counterparty (required signer) rejects
         envelopes.reject(id, "failed diligence");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason) = _saCheck();
@@ -395,7 +408,7 @@ contract SeedTemplatesEnvelopeTest is Test {
         bytes32[] memory board = _two(BOARD_A, BOARD_B);
 
         vm.expectRevert(SegregationOfDuties.MinApproversTooLow.selector);
-        new SegregationOfDuties(TENANT, keccak256("x"), 1, SPEC_HASH, SPEC_CID, address(envelopes), 0);
+        new SegregationOfDuties(TENANT, keccak256("x"), 1, SPEC_HASH, SPEC_CID, address(envelopes), 0, board);
 
         vm.expectRevert(abi.encodeWithSelector(ChangeControlBoard.BadThreshold.selector, uint8(3), uint256(2)));
         new ChangeControlBoard(

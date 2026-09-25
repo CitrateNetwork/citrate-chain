@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
+import {QuorumIdentity} from "../src/quorum/QuorumIdentity.sol";
 
 interface IClassification {
     function getClearance(bytes32 user) external view returns (uint8, bool);
@@ -43,8 +44,10 @@ contract ProvisionWithMultisig is Script {
         bytes32 corr = keccak256("prov-corr-1");
 
         bytes32[] memory signers = new bytes32[](3);
-        signers[0] = keccak256("approver-chief-eng");
-        signers[1] = keccak256("approver-pm");
+        // CHAIN-B-C008 / PBA-L2-013: identities are the signing addresses'
+        // subject keys (sign and draft are bound to msg.sender).
+        signers[0] = QuorumIdentity.subjectKey(vm.addr(s1));
+        signers[1] = QuorumIdentity.subjectKey(vm.addr(s2));
         signers[2] = keccak256("approver-dcma");
 
         // 1. Clearance check (view).
@@ -53,7 +56,16 @@ contract ProvisionWithMultisig is Script {
 
         // 2. Draft a 2-of-3 envelope (drafter = admin).
         vm.startBroadcast(adminKey);
-        MSE.draft(env_id, user, keccak256("elevation-artifact"), "ipfs://prov-msig-demo", signers, 2, 0, corr);
+        MSE.draft(
+            env_id,
+            QuorumIdentity.subjectKey(vm.addr(adminKey)), // PBA-L2-013: initiator == drafter
+            keccak256("elevation-artifact"),
+            "ipfs://prov-msig-demo",
+            signers,
+            2,
+            0,
+            corr
+        );
         vm.stopBroadcast();
 
         // 3. Two DISTINCT signer keys each sign a distinct identity.

@@ -104,10 +104,23 @@ contract MultiSigEnvelope {
     error SignerNotCaller(bytes32 signer, address caller);
     /// CHAIN-B-C008: the caller is not the envelope initiator.
     error NotInitiator(bytes32 initiator, address caller);
+    /// PBA-L2-035: accept/reject is reserved to a counterparty recorded at
+    /// draft time (a required signer of the envelope).
+    error NotCounterparty(bytes32 envelope_id, address caller);
 
     // ── Mutators ────────────────────────────────────────────────────
 
     /// @notice Open a new envelope in Drafted state.
+    /// @dev PBA-L2-012/-013/-035 (pre-bounty audit 2026-09-24): `initiator`
+    ///      used to be any caller-chosen `bytes32`, so a drafter could name a
+    ///      fake proposer (defeating SegregationOfDuties) and the record did
+    ///      not say who actually drafted. It must now be the caller's own
+    ///      `QuorumIdentity.subjectKey`. `draft` stays permissionless and
+    ///      first-writer-wins per id, so a consumer must never trust an
+    ///      envelope's own `threshold`/`required_signers` and must check that
+    ///      `initiator` is a party it recognises (see ThresholdApproval,
+    ///      SegregationOfDuties, ChangeControlBoard, SupplierAdmission and
+    ///      defense_prime/AppRegistry).
     function draft(
         bytes32 envelope_id,
         bytes32 initiator,
@@ -120,6 +133,10 @@ contract MultiSigEnvelope {
     ) external {
         if (_envelopes[envelope_id].state != EnvelopeState.NotExist) {
             revert AlreadyExists(envelope_id);
+        }
+        // PBA-L2-013/-035: the recorded proposer is the caller, never a claim.
+        if (initiator != QuorumIdentity.subjectKey(msg.sender)) {
+            revert NotInitiator(initiator, msg.sender);
         }
         if (required_signers.length == 0) revert EmptyRequiredSigners();
         if (threshold == 0 || threshold > required_signers.length) {
@@ -219,10 +236,16 @@ contract MultiSigEnvelope {
     }
 
     /// @notice Counterparty accepts. Terminal state.
+    /// @dev PBA-L2-035: previously callable by anyone (the C008 fix gated only
+    ///      sign/markDelivered/close). Only a counterparty recorded at draft
+    ///      time — a required signer — may accept or reject.
     function accept(bytes32 envelope_id) external {
         Envelope storage e = _envelopes[envelope_id];
         if (e.state == EnvelopeState.NotExist) revert DoesNotExist(envelope_id);
         if (e.state != EnvelopeState.Delivered) revert InvalidStateForAcceptReject(e.state);
+        if (!_isRequiredSigner(e, QuorumIdentity.subjectKey(msg.sender))) {
+            revert NotCounterparty(envelope_id, msg.sender);
+        }
         EnvelopeState oldState = e.state;
         e.state = EnvelopeState.Accepted;
         emit EnvelopeStateChanged(envelope_id, oldState, e.state);
@@ -234,6 +257,11 @@ contract MultiSigEnvelope {
         Envelope storage e = _envelopes[envelope_id];
         if (e.state == EnvelopeState.NotExist) revert DoesNotExist(envelope_id);
         if (e.state != EnvelopeState.Delivered) revert InvalidStateForAcceptReject(e.state);
+        // PBA-L2-035: an outsider can no longer turn a Delivered approval into
+        // a terminal Deny for every envelope-reading template.
+        if (!_isRequiredSigner(e, QuorumIdentity.subjectKey(msg.sender))) {
+            revert NotCounterparty(envelope_id, msg.sender);
+        }
         EnvelopeState oldState = e.state;
         e.state = EnvelopeState.Rejected;
         emit EnvelopeStateChanged(envelope_id, oldState, e.state);

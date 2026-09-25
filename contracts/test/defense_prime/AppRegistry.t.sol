@@ -2,22 +2,17 @@
 pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
-import {AppRegistry, IEnvelopeOracle} from "../../src/defense_prime/AppRegistry.sol";
+import {AppRegistry} from "../../src/defense_prime/AppRegistry.sol";
+import {MultiSigEnvelope} from "../../src/rbac/MultiSigEnvelope.sol";
+import {QuorumIdentity} from "../../src/quorum/QuorumIdentity.sol";
 
-/// @notice Test stand-in for the on-chain MultiSigEnvelope contract.
-///         Implements only `isSignedThresholdMet(bytes32)` — the sole
-///         method AppRegistry consumes.
-contract MockEnvelopeOracle is IEnvelopeOracle {
-    mapping(bytes32 => bool) public met;
-
-    function setMet(bytes32 id, bool v) external {
-        met[id] = v;
-    }
-
-    function isSignedThresholdMet(bytes32 envelope_id) external view returns (bool) {
-        return met[envelope_id];
-    }
-}
+/// @notice PBA-L2-012: the suite now runs against the REAL MultiSigEnvelope.
+///         The old stand-in answered only `isSignedThresholdMet` — the very
+///         envelope-self-reported bit the audit showed anyone can satisfy.
+///         `_meet(env, app)` (in the test) drafts the app envelope as the
+///         proposing recorder (bound to this registry + app) and has both
+///         configured approvers sign it.
+contract EnvelopeHarness is MultiSigEnvelope {}
 
 /// @notice A trivial deployable contract used to exercise the
 ///         bytecode-hash binding invariant.
@@ -28,7 +23,9 @@ contract Dummy {
 
 contract AppRegistryTest is Test {
     AppRegistry internal registry;
-    MockEnvelopeOracle internal oracle;
+    EnvelopeHarness internal oracle;
+    address internal approverA = address(0xA99A);
+    address internal approverB = address(0xB99B);
     address internal governance;
     address internal recorder;
     address internal owner1;
@@ -46,12 +43,33 @@ contract AppRegistryTest is Test {
         recorder = makeAddr("recorder");
         owner1 = makeAddr("owner1");
         nobody = makeAddr("nobody");
-        oracle = new MockEnvelopeOracle();
+        oracle = new EnvelopeHarness();
         vm.prank(governance);
         registry = new AppRegistry(governance, address(oracle));
         // Authorize the recorder.
         vm.prank(governance);
         registry.setRecorder(recorder, true);
+        // PBA-L2-012: governance configures the approver set (2-of-2).
+        bytes32[] memory approvers = new bytes32[](2);
+        approvers[0] = QuorumIdentity.subjectKey(approverA);
+        approvers[1] = QuorumIdentity.subjectKey(approverB);
+        vm.prank(governance);
+        registry.setApproverPolicy(approvers, 2);
+    }
+
+    /// Satisfy the deploy gate the honest way: the proposing recorder drafts
+    /// the app's envelope (bound to registry + app) and both approvers sign.
+    function _meet(bytes32 env, bytes32 app_id) internal {
+        bytes32[] memory req = new bytes32[](2);
+        req[0] = QuorumIdentity.subjectKey(approverA);
+        req[1] = QuorumIdentity.subjectKey(approverB);
+        bytes32 corr = registry.envelopeCorrId(app_id); // before the prank
+        vm.prank(recorder);
+        oracle.draft(env, QuorumIdentity.subjectKey(recorder), keccak256("art"), "cid", req, 2, 0, corr);
+        vm.prank(approverA);
+        oracle.sign(env, req[0], hex"01", "ceremony");
+        vm.prank(approverB);
+        oracle.sign(env, req[1], hex"02", "ceremony");
     }
 
     // ── Constructor + governance ───────────────────────────────────
@@ -161,7 +179,7 @@ contract AppRegistryTest is Test {
 
     function test_deploy_succeeds_when_envelope_met() public {
         _proposeAppBasic(APP_1, SCOPE_UNIT, ENV_1);
-        oracle.setMet(ENV_1, true);
+        _meet(ENV_1, APP_1);
         registry.deploy(APP_1);
         AppRegistry.AppEntry memory a = registry.getApp(APP_1);
         assertEq(uint8(a.state), uint8(AppRegistry.AppState.Deployed));
@@ -175,7 +193,7 @@ contract AppRegistryTest is Test {
 
     function test_deploy_rejects_app_not_in_pending() public {
         _proposeAppBasic(APP_1, SCOPE_UNIT, ENV_1);
-        oracle.setMet(ENV_1, true);
+        _meet(ENV_1, APP_1);
         registry.deploy(APP_1);
         // Now it's Deployed; calling deploy again should revert.
         vm.expectRevert(
@@ -195,7 +213,7 @@ contract AppRegistryTest is Test {
         two[1] = address(new Dummy());
         vm.prank(recorder);
         registry.proposeApp(APP_1, SCOPE_UNIT, "x", "1", owner1, ENV_1, two, bytes32(0));
-        oracle.setMet(ENV_1, true);
+        _meet(ENV_1, APP_1);
         vm.expectEmit(true, true, false, true);
         emit AppRegistry.AppDeployed(APP_1, ENV_1, 2, block.number);
         registry.deploy(APP_1);
@@ -226,7 +244,7 @@ contract AppRegistryTest is Test {
 
     function test_recordFailure_reverts_if_envelope_actually_met() public {
         _proposeAppBasic(APP_1, SCOPE_UNIT, ENV_1);
-        oracle.setMet(ENV_1, true);
+        _meet(ENV_1, APP_1);
         // Caller claims rejection but envelope IS met; safer to revert.
         vm.prank(recorder);
         vm.expectRevert(abi.encodeWithSelector(AppRegistry.EnvelopeThresholdNotMet.selector, ENV_1));
@@ -237,7 +255,7 @@ contract AppRegistryTest is Test {
 
     function test_retire_by_owner() public {
         _proposeAppBasic(APP_1, SCOPE_UNIT, ENV_1);
-        oracle.setMet(ENV_1, true);
+        _meet(ENV_1, APP_1);
         registry.deploy(APP_1);
         vm.prank(owner1);
         registry.retire(APP_1);
@@ -246,7 +264,7 @@ contract AppRegistryTest is Test {
 
     function test_retire_by_governance() public {
         _proposeAppBasic(APP_1, SCOPE_UNIT, ENV_1);
-        oracle.setMet(ENV_1, true);
+        _meet(ENV_1, APP_1);
         registry.deploy(APP_1);
         vm.prank(governance);
         registry.retire(APP_1);
@@ -255,7 +273,7 @@ contract AppRegistryTest is Test {
 
     function test_retire_rejects_unauthorized() public {
         _proposeAppBasic(APP_1, SCOPE_UNIT, ENV_1);
-        oracle.setMet(ENV_1, true);
+        _meet(ENV_1, APP_1);
         registry.deploy(APP_1);
         vm.prank(nobody);
         vm.expectRevert(abi.encodeWithSelector(AppRegistry.NotGovernance.selector, nobody));
@@ -279,7 +297,7 @@ contract AppRegistryTest is Test {
 
     function test_retire_is_absorbing() public {
         _proposeAppBasic(APP_1, SCOPE_UNIT, ENV_1);
-        oracle.setMet(ENV_1, true);
+        _meet(ENV_1, APP_1);
         registry.deploy(APP_1);
         vm.prank(owner1);
         registry.retire(APP_1);

@@ -52,6 +52,8 @@ contract DeployDpf09AppsContracts is ScriptEnv {
         crossOrgIndex = address(coi);
 
         console.log("=== Stage 7 complete ===");
+        console.log("PBA-L2-012: governance MUST call AppRegistry.setApproverPolicy(approvers, threshold)");
+        console.log("  before any proposeApp (proposals revert NoApproverPolicy until then).");
         console.log("Append addresses to DEPLOYED_CONTRACTS_2026_05_10.md");
         console.log("Update CONFIG.md 'DPF DefensePrime-side contracts' table");
     }

@@ -2,13 +2,9 @@
 pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
-import {AppRegistry, IEnvelopeOracle} from "../../src/defense_prime/AppRegistry.sol";
-
-contract RmQMockOracle is IEnvelopeOracle {
-    mapping(bytes32 => bool) public met;
-    function setMet(bytes32 id, bool v) external { met[id] = v; }
-    function isSignedThresholdMet(bytes32 id) external view returns (bool) { return met[id]; }
-}
+import {AppRegistry} from "../../src/defense_prime/AppRegistry.sol";
+import {MultiSigEnvelope} from "../../src/rbac/MultiSigEnvelope.sol";
+import {QuorumIdentity} from "../../src/quorum/QuorumIdentity.sol";
 
 /// @title RM-Q · CHAIN-B-C025 — permissionless recordFailureOnEnvelopeReject
 /// @notice RED→GREEN tripwire. Before the fix, any anonymous caller could
@@ -19,7 +15,10 @@ contract RmQMockOracle is IEnvelopeOracle {
 ///         the transition is recorder/governance-gated.
 contract RmQ_C025 is Test {
     AppRegistry internal reg;
-    RmQMockOracle internal oracle;
+    // PBA-L2-012: the real MultiSigEnvelope (AppRegistry no longer trusts an
+    // envelope's self-reported `isSignedThresholdMet`).
+    MultiSigEnvelope internal oracle;
+    address internal approver = address(0xA99);
     address internal governance = address(0x6025);
     address internal recorder = address(0x8EC);
     address internal attacker = address(0xBAD);
@@ -30,11 +29,15 @@ contract RmQ_C025 is Test {
     bytes32 internal constant ENV = keccak256("env-1");
 
     function setUp() public {
-        oracle = new RmQMockOracle();
+        oracle = new MultiSigEnvelope();
         vm.prank(governance);
         reg = new AppRegistry(governance, address(oracle));
         vm.prank(governance);
         reg.setRecorder(recorder, true);
+        bytes32[] memory approvers = new bytes32[](1);
+        approvers[0] = QuorumIdentity.subjectKey(approver);
+        vm.prank(governance);
+        reg.setApproverPolicy(approvers, 1);
         address[] memory empty;
         vm.prank(recorder);
         reg.proposeApp(APP, SCOPE, "app", "1.0", owner1, ENV, empty, keccak256("src"));
@@ -50,7 +53,13 @@ contract RmQ_C025 is Test {
 
         assertEq(uint8(reg.getApp(APP).state), uint8(AppRegistry.AppState.Pending));
         // Envelope later reaches threshold → deploy still reachable.
-        oracle.setMet(ENV, true);
+        bytes32[] memory req = new bytes32[](1);
+        req[0] = QuorumIdentity.subjectKey(approver);
+        bytes32 corr = reg.envelopeCorrId(APP);
+        vm.prank(recorder);
+        oracle.draft(ENV, QuorumIdentity.subjectKey(recorder), keccak256("art"), "cid", req, 1, 0, corr);
+        vm.prank(approver);
+        oracle.sign(ENV, req[0], hex"01", "ceremony");
         reg.deploy(APP);
         assertEq(uint8(reg.getApp(APP).state), uint8(AppRegistry.AppState.Deployed));
     }

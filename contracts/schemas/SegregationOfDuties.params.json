@@ -8,11 +8,15 @@
     },
     "minApprovers": {
       "solidityType": "uint8"
+    },
+    "roster": {
+      "solidityType": "bytes32[]"
     }
   },
   "required": [
     "envelopes",
-    "minApprovers"
+    "minApprovers",
+    "roster"
   ],
   "title": "SegregationOfDuties constructor parameters",
   "type": "object"
