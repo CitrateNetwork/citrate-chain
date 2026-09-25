@@ -178,6 +178,17 @@ pub struct MempoolConfig {
 /// `BlockBuilderConfig::max_gas_per_block` (30M), the chain's block gas limit.
 pub const MAX_GAS_PER_BLOCK: u64 = 30_000_000;
 
+/// PBA-L1a-017: largest transaction payload (`data`) the mempool admits —
+/// geth's `txMaxSize` (4 x 32 KiB) and the same bound as the sequencer
+/// `TxValidator::max_data_size`. Anything larger could never be selected into a
+/// 1 MB block alongside other traffic, yet used to be admitted over RPC/P2P and
+/// squat a pool slot until restart (nothing ever expired it).
+pub const MAX_TX_DATA_BYTES: usize = 128 * 1024;
+
+/// PBA-L1a-017: ceiling on the summed size of all pooled transactions. The
+/// `total_size` counter was tracked but never enforced.
+pub const MAX_POOL_BYTES: usize = 64 * 1024 * 1024;
+
 impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
@@ -481,6 +492,12 @@ impl Mempool {
             // Try to evict lower priority transaction
             self.evict_lowest_priority().await?;
         }
+        // PBA-L1a-017: enforce the byte budget too (evict lowest priority
+        // until the new transaction fits; `Full` if nothing is left to evict).
+        let incoming_size = self.calculate_tx_size(&tx);
+        while *self.total_size.read().await + incoming_size > MAX_POOL_BYTES {
+            self.evict_lowest_priority().await?;
+        }
 
         // Create mempool transaction with AI-aware priority
         let timestamp = chrono::Utc::now().timestamp() as u64;
@@ -543,6 +560,15 @@ impl Mempool {
     /// Validate a transaction
     async fn validate_transaction(&self, tx: &Transaction) -> Result<(), MempoolError> {
         tracing::debug!("Validating transaction with hash: {:?}", tx.hash);
+
+        // PBA-L1a-017: bound the payload before anything else looks at it.
+        if tx.data.len() > MAX_TX_DATA_BYTES {
+            return Err(MempoolError::InvalidTransaction(format!(
+                "transaction data is {} bytes; the maximum is {}",
+                tx.data.len(),
+                MAX_TX_DATA_BYTES
+            )));
+        }
 
         if let Some(read_state_nonce) = &self.state_nonce {
             let state_nonce = read_state_nonce(&tx.from);
@@ -859,6 +885,27 @@ impl Mempool {
             .and_then(|n| n.checked_add(1))
     }
 
+    /// PBA-L1a-021: the pending nonce (`max pending nonce + 1`) over every
+    /// sender whose key satisfies `matches`, WITHOUT cloning transactions.
+    ///
+    /// `eth_getTransactionCount(addr, "pending")` used to clone the entire
+    /// mempool (every payload) per call to find one sender's nonces, and then
+    /// computed `m + 1` unchecked (panics on a pending `u64::MAX`). This walks
+    /// only the per-sender nonce index. Returns `None` when no matching sender
+    /// has pending transactions, or when the successor of the highest pending
+    /// nonce would overflow (a `u64::MAX` nonce has no next nonce).
+    pub async fn pending_nonce_matching<F>(&self, matches: F) -> Option<u64>
+    where
+        F: Fn(&PublicKey) -> bool,
+    {
+        let set = self.sender_nonces.read().await;
+        set.iter()
+            .filter(|(sender, _)| matches(sender))
+            .filter_map(|(_, nonces)| nonces.iter().next_back().copied())
+            .max()
+            .and_then(|m| m.checked_add(1))
+    }
+
     /// Get AI transactions (model operations, inference requests)
     pub async fn get_ai_transactions(&self, max_count: usize) -> Vec<Transaction> {
         let transactions = self.transactions.read().await;
@@ -1039,7 +1086,7 @@ impl Mempool {
     /// Clear expired transactions
     pub async fn clear_expired(&self) {
         let current_time = chrono::Utc::now().timestamp() as u64;
-        let expiry_time = current_time - self.config.tx_expiry_secs;
+        let expiry_time = current_time.saturating_sub(self.config.tx_expiry_secs);
 
         let txs = self.transactions.read().await;
         let expired: Vec<Hash> = txs
@@ -1277,6 +1324,148 @@ impl MempoolAccess for Arc<RwLock<Mempool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pba_native_tx(seed: u8, nonce: u64, data_len: usize) -> Transaction {
+        let mut h = [seed; 32];
+        h[..8].copy_from_slice(&nonce.to_be_bytes());
+        Transaction {
+            hash: Hash::new(h),
+            nonce,
+            from: PublicKey::new([seed; 32]),
+            to: Some(PublicKey::new([0xEE; 32])),
+            value: 0,
+            gas_limit: 21_000,
+            gas_price: 2_000_000_000,
+            data: vec![0xAB; data_len],
+            signature: citrate_consensus::types::Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ..Default::default()
+        }
+    }
+
+    fn pba_pool() -> Mempool {
+        Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        })
+    }
+
+    /// PBA-L1a-017: a payload larger than any block could carry must not be
+    /// admitted (it used to be admitted and squat a slot forever).
+    #[tokio::test]
+    async fn pba_l1a_017_oversized_payload_is_rejected() {
+        let pool = pba_pool();
+        let err = pool
+            .add_transaction(
+                pba_native_tx(0x31, 0, MAX_TX_DATA_BYTES + 1),
+                TxClass::Standard,
+            )
+            .await
+            .expect_err("payload over the cap must be rejected");
+        assert!(
+            matches!(err, MempoolError::InvalidTransaction(_)),
+            "{err:?}"
+        );
+        // The audit's >1 MB case.
+        assert!(pool
+            .add_transaction(pba_native_tx(0x32, 0, 1_100_000), TxClass::Standard)
+            .await
+            .is_err());
+        // At the cap is fine.
+        pool.add_transaction(pba_native_tx(0x33, 0, MAX_TX_DATA_BYTES), TxClass::Standard)
+            .await
+            .expect("payload at the cap is admitted");
+    }
+
+    /// PBA-L1a-017: the byte budget is enforced (total_size was tracked, never
+    /// checked). Fill past MAX_POOL_BYTES with max-size payloads.
+    #[tokio::test]
+    async fn pba_l1a_017_pool_byte_budget_is_enforced() {
+        let pool = pba_pool();
+        let per_tx = MAX_TX_DATA_BYTES;
+        let needed = MAX_POOL_BYTES / per_tx + 8;
+        let mut admitted = 0usize;
+        // max_nonce_gap (16) bounds each sender to 17 buffered nonces.
+        'outer: for sender in 0..((needed / 16) + 2) {
+            for nonce in 0..16u64 {
+                if admitted >= needed {
+                    break 'outer;
+                }
+                let mut t = pba_native_tx(0x40u8.wrapping_add(sender as u8), nonce, per_tx);
+                t.hash = Hash::new({
+                    let mut h = [0u8; 32];
+                    h[..8].copy_from_slice(&(admitted as u64).to_be_bytes());
+                    h[31] = 0x17;
+                    h
+                });
+                if pool.add_transaction(t, TxClass::Standard).await.is_ok() {
+                    admitted += 1;
+                }
+            }
+        }
+        assert!(
+            admitted >= needed,
+            "the test must push past the budget ({admitted} < {needed})"
+        );
+        let stats = pool.stats().await;
+        assert!(
+            stats.total_size <= MAX_POOL_BYTES,
+            "pool holds {} bytes, over the {} budget",
+            stats.total_size,
+            MAX_POOL_BYTES
+        );
+    }
+
+    /// PBA-L1a-021: the pending-nonce lookup has no successor for u64::MAX
+    /// (was `m + 1`, a panic under overflow-checks) — injected directly so the
+    /// check holds even once admission rejects u64::MAX nonces.
+    #[tokio::test]
+    async fn pba_l1a_021_pending_nonce_matching_is_overflow_safe() {
+        let pool = pba_pool();
+        let k = PublicKey::new([0x5A; 32]);
+        pool.sender_nonces
+            .write()
+            .await
+            .insert(k, [3u64, u64::MAX].into_iter().collect());
+        assert_eq!(pool.pending_nonce_matching(|pk| *pk == k).await, None);
+        pool.sender_nonces
+            .write()
+            .await
+            .insert(k, [3u64, 7].into_iter().collect());
+        assert_eq!(pool.pending_nonce_matching(|pk| *pk == k).await, Some(8));
+        assert_eq!(pool.pending_nonce_matching(|_| false).await, None);
+    }
+
+    /// PBA-L1a-017: clear_expired must not underflow and must drop stale txs.
+    #[tokio::test]
+    async fn pba_l1a_017_clear_expired_drops_stale_entries() {
+        let pool = Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            tx_expiry_secs: u64::MAX, // would underflow `now - expiry`
+            ..Default::default()
+        });
+        pool.add_transaction(pba_native_tx(0x61, 0, 0), TxClass::Standard)
+            .await
+            .expect("admit");
+        pool.clear_expired().await; // must not panic
+        assert_eq!(pool.stats().await.total_transactions, 1);
+
+        let pool = Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            tx_expiry_secs: 0,
+            ..Default::default()
+        });
+        let t = pba_native_tx(0x62, 0, 0);
+        let h = t.hash;
+        pool.add_transaction(t, TxClass::Standard)
+            .await
+            .expect("admit");
+        if let Some(m) = pool.transactions.write().await.get_mut(&h) {
+            m.added_at = m.added_at.saturating_sub(10);
+        }
+        pool.clear_expired().await;
+        assert_eq!(pool.stats().await.total_transactions, 0, "stale tx swept");
+    }
     use citrate_consensus::Signature;
 
     fn create_test_tx(nonce: u64, gas_price: u64, from: [u8; 32]) -> Transaction {
