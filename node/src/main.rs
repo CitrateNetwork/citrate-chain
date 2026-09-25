@@ -358,10 +358,30 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Consensus { json }) => {
             let manifest = consensus_manifest::ConsensusManifest::current();
+            // The activation heights compiled into this release (a node on a
+            // pinned chain runs that height; see the start-up banner for the
+            // height a configured node resolved).
+            let pins: Vec<serde_json::Value> = citrate_consensus::hardening::PINNED_ACTIVATIONS
+                .iter()
+                .map(|(id, h)| serde_json::json!({ "chain_id": id, "pba_hardening_height": h }))
+                .collect();
             if json {
-                println!("{}", manifest.to_json());
+                let mut v = serde_json::to_value(&manifest).unwrap_or_default();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("pba_hardening_pins".into(), serde_json::Value::Array(pins));
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&v).unwrap_or_else(|_| manifest.to_json())
+                );
             } else {
                 manifest.print_human();
+                for (id, h) in citrate_consensus::hardening::PINNED_ACTIVATIONS {
+                    match h {
+                        Some(h) => println!("  pba pin            chain {id}: height {h}"),
+                        None => println!("  pba pin            chain {id}: unset"),
+                    }
+                }
             }
             return Ok(());
         }
@@ -553,9 +573,10 @@ async fn main() -> Result<()> {
         info!("No genesis block found, initializing genesis...");
 
         let state_db = Arc::new(StateDB::new());
-        let executor = Arc::new(Executor::with_storage(
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
             state_db,
             Some(probe_storage.state.clone()),
+            config.chain.chain_id,
         ));
 
         let genesis_config = genesis::GenesisConfig {
@@ -806,9 +827,10 @@ async fn init_chain(chain_id: u64) -> Result<()> {
 
     // Create executor with persistent storage
     let state_db = Arc::new(StateDB::new());
-    let executor = Arc::new(Executor::with_storage(
+    let executor = Arc::new(Executor::with_storage_and_chain_id(
         state_db,
         Some(storage.state.clone()),
+        chain_id,
     ));
 
     // Initialize genesis
@@ -874,9 +896,10 @@ async fn run_devnet(
 
         if !has_genesis {
             let state_db = Arc::new(StateDB::new());
-            let executor = Arc::new(Executor::with_storage(
+            let executor = Arc::new(Executor::with_storage_and_chain_id(
                 state_db,
                 Some(storage.state.clone()),
+                config.chain.chain_id,
             ));
 
             let genesis_config = GenesisConfig {
@@ -1081,28 +1104,47 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // PBA-R2: fix the block-validity hardening activation height BEFORE any
     // consensus component (GhostDag, Executor, SyncManager, GossipProtocol) is
     // constructed; each captures it at construction. A consensus parameter:
-    // an unparseable override aborts start-up rather than being ignored.
-    {
-        // ONE store, ONE resolution order (env override, else [chain] key):
-        // consensus, network and execution (`citrate_execution::activation`)
-        // all read what this publishes.
-        let pba = citrate_consensus::hardening::init_pba_hardening_height(
+    // an unparseable override, or one that disagrees with the height pinned
+    // in this release for the chain, aborts start-up rather than being ignored.
+    //
+    // The chain id is the CONFIGURED one. `CITRATE_CHAIN_ID`, which older
+    // execution constructors read on their own, must agree with it.
+    citrate_consensus::hardening::check_chain_id_env(
+        config.chain.chain_id,
+        std::env::var("CITRATE_CHAIN_ID").ok().as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let pba_activation = {
+        // ONE store, ONE resolution order (release pin for the chain, then
+        // env override, then [chain] key): consensus, network and execution
+        // (`citrate_execution::activation`) all read what this publishes.
+        let pba = citrate_consensus::hardening::init_pba_hardening_for_chain(
+            config.chain.chain_id,
             config.chain.pba_hardening_height,
+            config.chain.dev_profile,
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-        match pba {
+        let fp = consensus_manifest::ConsensusManifest::current().fingerprint;
+        match pba.height {
             Some(h) => info!(
-                "PBA-R2 block-validity hardening ACTIVE from height {} \
-                 (tx signature + canonical id on import, content-bound tx_root, \
-                 timestamp bound)",
-                h
+                "Block-validity hardening ACTIVE from height {} [{}] (tx signature + \
+                 canonical id on import, content-bound tx_root, timestamp bound)",
+                h,
+                pba.describe()
             ),
             None => info!(
-                "PBA-R2 block-validity hardening not scheduled (chain.pba_hardening_height \
-                 unset); legacy validity rules apply"
+                "Block-validity hardening not scheduled: {}; legacy validity rules apply",
+                pba.describe()
             ),
         }
-    }
+        info!(
+            "Consensus fingerprint {} with activation {} = {}",
+            fp,
+            pba.describe(),
+            pba.fingerprint(&fp)
+        );
+        pba
+    };
 
     // Initialize metrics server
     let metrics_addr =
@@ -1327,7 +1369,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     let registry_bridge: Arc<dyn citrate_execution::executor::ModelRegistryAdapter> =
         Arc::new(adapters::MCPRegistryBridge::new(mcp.clone()));
 
-    let exec_base = Executor::with_storage(state_db, Some(storage.state.clone()));
+    // The configured chain id, not `CITRATE_CHAIN_ID` (checked equal above).
+    let exec_base = Executor::with_storage_and_chain_id(
+        state_db,
+        Some(storage.state.clone()),
+        config.chain.chain_id,
+    );
     let executor = Arc::new(
         exec_base
             .with_ai_storage_adapter(storage_bridge)
@@ -1779,9 +1826,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             {
                 Ok(scratch_storage) => {
                     let scratch_storage = Arc::new(scratch_storage);
-                    let scratch_exec = Arc::new(Executor::with_storage(
+                    let scratch_exec = Arc::new(Executor::with_storage_and_chain_id(
                         Arc::new(StateDB::new()),
                         Some(scratch_storage.state.clone()),
+                        config.chain.chain_id,
                     ));
                     let gcfg = genesis::GenesisConfig {
                         chain_id: config.chain.chain_id,

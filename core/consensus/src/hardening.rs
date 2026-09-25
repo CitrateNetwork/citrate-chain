@@ -103,7 +103,12 @@ pub fn parse_pba_hardening_override(raw: &str) -> Result<Option<u64>, String> {
     }
 }
 
-/// THE resolution order for the activation height, used by every binary:
+/// The pin-unaware resolution order (env override, else config). The node
+/// resolves through [`init_pba_hardening_for_chain`], which also applies the
+/// release pin for the running chain id; this remains for callers with no
+/// chain id.
+///
+/// Order:
 /// the `CITRATE_PBA_HARDENING_HEIGHT` env override when set (a height, or
 /// `off`), otherwise the config value (`[chain] pba_hardening_height`). An
 /// unparseable override is an error, never ignored: a node that silently
@@ -123,6 +128,204 @@ pub fn init_pba_hardening_height(config_value: Option<u64>) -> Result<Option<u64
     let h = resolve_pba_hardening_height(config_value)?;
     set_pba_hardening_height(h);
     Ok(h)
+}
+
+/// Activation heights compiled into this release, per chain id.
+///
+/// When a chain has a pinned height, every node built from this release uses
+/// it: an env or config value that disagrees refuses to start (see
+/// [`resolve_activation`]). This removes the per-host setting as a way for a
+/// node to fork off at the activation height.
+///
+/// OWNER STEP (release PR): replace `None` with `Some(H)` for 40204, where H is
+/// the height agreed for the fleet.
+pub const PINNED_ACTIVATIONS: &[(u64, Option<u64>)] = &[(40204, None)];
+
+/// The activation height this release pins for `chain_id`, if any.
+pub fn pinned_activation(chain_id: u64) -> Option<u64> {
+    PINNED_ACTIVATIONS
+        .iter()
+        .find(|(id, _)| *id == chain_id)
+        .and_then(|(_, h)| *h)
+}
+
+/// Where the resolved activation height came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationSource {
+    /// The height compiled into this release for the running chain id.
+    ReleasePin,
+    /// The `CITRATE_PBA_HARDENING_HEIGHT` env override.
+    Env,
+    /// `[chain] pba_hardening_height` in the node config.
+    Config,
+    /// Nothing set: the rules are off.
+    Unset,
+}
+
+impl std::fmt::Display for ActivationSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ReleasePin => "release pin",
+            Self::Env => "env CITRATE_PBA_HARDENING_HEIGHT",
+            Self::Config => "config [chain] pba_hardening_height",
+            Self::Unset => "unset",
+        })
+    }
+}
+
+/// The activation height a node runs with, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedActivation {
+    pub chain_id: u64,
+    pub height: Option<u64>,
+    pub source: ActivationSource,
+    /// The node runs a dev profile, so the release pin was not applied.
+    pub dev_profile: bool,
+}
+
+impl ResolvedActivation {
+    /// One line for the start-up banner.
+    pub fn describe(&self) -> String {
+        let h = match self.height {
+            Some(h) => h.to_string(),
+            None => "unset (rules off)".to_string(),
+        };
+        let dev = if self.dev_profile {
+            ", dev profile: release pin not applied"
+        } else {
+            ""
+        };
+        format!(
+            "chain {} pba_hardening_height {} (source: {}{})",
+            self.chain_id, h, self.source, dev
+        )
+    }
+
+    /// A fingerprint over the binary's consensus fingerprint plus the resolved
+    /// activation. Two nodes with equal values run the same code with the
+    /// same activation height on the same chain.
+    pub fn fingerprint(&self, consensus_fingerprint: &str) -> String {
+        use sha3::{Digest, Sha3_256};
+        let h = match self.height {
+            Some(h) => h.to_string(),
+            None => "unset".to_string(),
+        };
+        let pre = format!(
+            "citrate-activation-v1\nconsensus={consensus_fingerprint}\nchain_id={}\n\
+             pba_hardening_height={h}\n",
+            self.chain_id
+        );
+        let d = Sha3_256::digest(pre.as_bytes());
+        format!("0x{}", hex::encode(&d[..16]))
+    }
+}
+
+/// Resolve the activation height from its three inputs. Pure: the caller
+/// supplies the pin, the raw env value and the config value.
+///
+/// * A dev profile, or a chain with no pin: the legacy order. The env
+///   override wins over the config value, and an unparseable env value is an
+///   error.
+/// * A pinned chain: the pin is the height. An env or config value is allowed
+///   only if it equals the pin; anything else (including `off`) is an error,
+///   so the node refuses to start instead of forking at the pinned height.
+pub fn resolve_activation(
+    pin: Option<u64>,
+    env_raw: Option<&str>,
+    config_value: Option<u64>,
+    dev_profile: bool,
+) -> Result<(Option<u64>, ActivationSource), String> {
+    let env_value = env_raw.map(parse_pba_hardening_override).transpose()?;
+    match pin {
+        Some(p) if !dev_profile => {
+            if let Some(v) = env_value {
+                if v != Some(p) {
+                    return Err(format!(
+                        "{PBA_HARDENING_ENV}={} conflicts with the activation height {p} \
+                         pinned in this release for this chain. Remove the override \
+                         (or set it to {p}).",
+                        env_raw.unwrap_or_default().trim()
+                    ));
+                }
+            }
+            if let Some(c) = config_value {
+                if c != p {
+                    return Err(format!(
+                        "[chain] pba_hardening_height = {c} conflicts with the activation \
+                         height {p} pinned in this release for this chain. Remove the \
+                         setting (or set it to {p})."
+                    ));
+                }
+            }
+            Ok((Some(p), ActivationSource::ReleasePin))
+        }
+        _ => match (env_value, config_value) {
+            (Some(v), _) => Ok((v, ActivationSource::Env)),
+            (None, Some(c)) => Ok((Some(c), ActivationSource::Config)),
+            (None, None) => Ok((None, ActivationSource::Unset)),
+        },
+    }
+}
+
+/// Resolve for the running chain: the release pin for `chain_id`, the env
+/// override and the config value (see [`resolve_activation`]). `chain_id`
+/// must be the node's configured chain id.
+pub fn resolve_pba_hardening_for_chain(
+    chain_id: u64,
+    config_value: Option<u64>,
+    dev_profile: bool,
+) -> Result<ResolvedActivation, String> {
+    let env_raw = match std::env::var(PBA_HARDENING_ENV) {
+        Ok(raw) => Some(raw),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => return Err(format!("{PBA_HARDENING_ENV}: {e}")),
+    };
+    let (height, source) = resolve_activation(
+        pinned_activation(chain_id),
+        env_raw.as_deref(),
+        config_value,
+        dev_profile,
+    )?;
+    Ok(ResolvedActivation {
+        chain_id,
+        height,
+        source,
+        dev_profile,
+    })
+}
+
+/// Resolve for the running chain and publish process-wide. The node calls
+/// this once at start-up, before constructing any consensus or execution
+/// component.
+pub fn init_pba_hardening_for_chain(
+    chain_id: u64,
+    config_value: Option<u64>,
+    dev_profile: bool,
+) -> Result<ResolvedActivation, String> {
+    let r = resolve_pba_hardening_for_chain(chain_id, config_value, dev_profile)?;
+    set_pba_hardening_height(r.height);
+    Ok(r)
+}
+
+/// The chain id the pin is keyed on is the node's configured one. The
+/// execution layer historically read `CITRATE_CHAIN_ID` from the environment
+/// on its own; a node where the two disagree would key the pin, the mempool
+/// and block validation on different chains. Refuse that at start-up.
+pub fn check_chain_id_env(config_chain_id: u64, env_raw: Option<&str>) -> Result<(), String> {
+    let Some(raw) = env_raw else {
+        return Ok(());
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(v) if v == config_chain_id => Ok(()),
+        Ok(v) => Err(format!(
+            "CITRATE_CHAIN_ID={v} disagrees with the configured chain id {config_chain_id}. \
+             Set them to the same value or unset CITRATE_CHAIN_ID."
+        )),
+        Err(e) => Err(format!(
+            "CITRATE_CHAIN_ID={}: not a chain id: {e}",
+            raw.trim()
+        )),
+    }
 }
 
 /// A component's view of the activation height.
@@ -244,5 +447,163 @@ mod tests {
         assert!(!within_future_drift(1_901, 1_000));
         assert!(!within_future_drift(u64::MAX, 1_000));
         assert!(within_future_drift(u64::MAX, u64::MAX));
+    }
+
+    // ---- release pin ----------------------------------------------------
+
+    const PIN: Option<u64> = Some(500);
+
+    #[test]
+    fn pin_equal_to_env_is_accepted() {
+        assert_eq!(
+            resolve_activation(PIN, Some("500"), None, false),
+            Ok((Some(500), ActivationSource::ReleasePin))
+        );
+        assert_eq!(
+            resolve_activation(PIN, Some(" 500 "), Some(500), false),
+            Ok((Some(500), ActivationSource::ReleasePin))
+        );
+    }
+
+    #[test]
+    fn pin_different_from_env_refuses_to_start() {
+        let e = resolve_activation(PIN, Some("499"), None, false).unwrap_err();
+        assert!(e.contains("conflicts") && e.contains("500"), "{e}");
+        assert!(resolve_activation(PIN, Some("501"), None, false).is_err());
+        // `off` on a pinned chain is a disagreement too.
+        assert!(resolve_activation(PIN, Some("off"), None, false).is_err());
+        // Garbage is still an error, never ignored.
+        assert!(resolve_activation(PIN, Some("soon"), None, false).is_err());
+    }
+
+    #[test]
+    fn pin_different_from_config_refuses_to_start() {
+        let e = resolve_activation(PIN, None, Some(0), false).unwrap_err();
+        assert!(e.contains("pba_hardening_height = 0"), "{e}");
+        assert!(resolve_activation(PIN, None, Some(501), false).is_err());
+        // Env equal to the pin does not excuse a conflicting config value.
+        assert!(resolve_activation(PIN, Some("500"), Some(7), false).is_err());
+    }
+
+    #[test]
+    fn pin_with_nothing_set_uses_the_pin() {
+        assert_eq!(
+            resolve_activation(PIN, None, None, false),
+            Ok((Some(500), ActivationSource::ReleasePin))
+        );
+    }
+
+    #[test]
+    fn no_pin_keeps_the_legacy_order() {
+        assert_eq!(
+            resolve_activation(None, Some("7"), Some(42), false),
+            Ok((Some(7), ActivationSource::Env))
+        );
+        assert_eq!(
+            resolve_activation(None, Some("off"), Some(42), false),
+            Ok((None, ActivationSource::Env))
+        );
+        assert_eq!(
+            resolve_activation(None, None, Some(42), false),
+            Ok((Some(42), ActivationSource::Config))
+        );
+        assert_eq!(
+            resolve_activation(None, None, None, false),
+            Ok((None, ActivationSource::Unset))
+        );
+        assert!(resolve_activation(None, Some("soon"), Some(42), false).is_err());
+    }
+
+    #[test]
+    fn dev_profile_is_unchanged_by_a_pin() {
+        assert_eq!(
+            resolve_activation(PIN, None, Some(0), true),
+            Ok((Some(0), ActivationSource::Config))
+        );
+        assert_eq!(
+            resolve_activation(PIN, Some("3"), Some(0), true),
+            Ok((Some(3), ActivationSource::Env))
+        );
+        assert_eq!(
+            resolve_activation(PIN, None, None, true),
+            Ok((None, ActivationSource::Unset))
+        );
+    }
+
+    #[test]
+    fn pin_table_lookup() {
+        // Every entry resolves to its own value, ids are unique, and no entry
+        // uses the reserved "unset" encoding.
+        for (i, (id, h)) in PINNED_ACTIVATIONS.iter().enumerate() {
+            assert_eq!(pinned_activation(*id), *h);
+            assert_ne!(*h, Some(u64::MAX));
+            assert!(PINNED_ACTIVATIONS[i + 1..].iter().all(|(o, _)| o != id));
+        }
+        // Chains the release does not list have no pin.
+        assert_eq!(pinned_activation(1), None);
+        assert_eq!(pinned_activation(1337), None);
+        assert!(PINNED_ACTIVATIONS.iter().any(|(id, _)| *id == 40204));
+    }
+
+    #[test]
+    fn chain_id_env_must_match_config() {
+        assert_eq!(check_chain_id_env(40204, None), Ok(()));
+        assert_eq!(check_chain_id_env(40204, Some("40204")), Ok(()));
+        assert_eq!(check_chain_id_env(40204, Some(" 40204\n")), Ok(()));
+        assert!(check_chain_id_env(40204, Some("1337")).is_err());
+        assert!(check_chain_id_env(1337, Some("40204")).is_err());
+        assert!(check_chain_id_env(40204, Some("mainnet")).is_err());
+    }
+
+    #[test]
+    fn banner_and_fingerprint_name_height_and_source() {
+        let a = ResolvedActivation {
+            chain_id: 40204,
+            height: Some(500),
+            source: ActivationSource::ReleasePin,
+            dev_profile: false,
+        };
+        let d = a.describe();
+        assert!(
+            d.contains("chain 40204") && d.contains("500") && d.contains("release pin"),
+            "{d}"
+        );
+        let off = ResolvedActivation {
+            height: None,
+            source: ActivationSource::Unset,
+            ..a
+        };
+        assert!(off.describe().contains("unset"));
+        let dev = ResolvedActivation {
+            dev_profile: true,
+            ..a
+        };
+        assert!(dev.describe().contains("dev profile"));
+        // The fingerprint moves with the height, the chain and the binary.
+        let f = a.fingerprint("0xabc");
+        assert!(f.starts_with("0x") && f.len() == 34, "{f}");
+        assert_eq!(f, a.fingerprint("0xabc"));
+        assert_ne!(f, off.fingerprint("0xabc"));
+        assert_ne!(
+            f,
+            ResolvedActivation {
+                height: Some(501),
+                ..a
+            }
+            .fingerprint("0xabc")
+        );
+        assert_ne!(
+            f,
+            ResolvedActivation { chain_id: 1, ..a }.fingerprint("0xabc")
+        );
+        assert_ne!(f, a.fingerprint("0xabd"));
+        for s in [
+            ActivationSource::ReleasePin,
+            ActivationSource::Env,
+            ActivationSource::Config,
+            ActivationSource::Unset,
+        ] {
+            assert!(!s.to_string().is_empty());
+        }
     }
 }
