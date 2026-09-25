@@ -97,14 +97,23 @@ async fn test_build_block_and_execute_transactions() {
     // Validate block constraints
     builder.validate_block(&block).unwrap();
 
-    // Verify tx_root matches keccak of tx hashes in order
-    use sha3::{Digest, Keccak256};
-    let mut hasher = Keccak256::new();
-    for tx in &block.transactions {
-        hasher.update(tx.hash.as_bytes());
-    }
-    let expected_root = Hash::from_bytes(&hasher.finalize());
-    assert_eq!(block.tx_root, expected_root);
+    // Verify tx_root is the NODE's consensus root for this block (PBA-L1b-002
+    // variant sweep: this builder used to hash tx.hash with Keccak, a root no
+    // node's sync/gossip/admission check would accept). With no PBA-R2
+    // activation scheduled in this process that is the legacy Sha3 root over
+    // the tx hashes, in order.
+    assert_eq!(
+        block.tx_root,
+        citrate_consensus::tx_auth::tx_root_for_height(
+            citrate_consensus::hardening::PbaHardening::from_process(),
+            block.header.height,
+            &block.transactions,
+        )
+    );
+    assert_eq!(
+        block.tx_root,
+        citrate_consensus::tx_auth::tx_root_legacy(&block.transactions)
+    );
 
     // Execute transactions using a fresh executor (clone txs for execution with zero price/value)
     let state_db = Arc::new(citrate_execution::StateDB::new());

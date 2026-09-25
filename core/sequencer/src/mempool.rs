@@ -392,6 +392,18 @@ impl Mempool {
         // Basic validation
         self.validate_transaction(&tx).await?;
 
+        // PBA-L1a-006: the dedup / storage key is the canonical id derived
+        // from the signed contents, never the claimed `tx.hash`. Before this an
+        // attacker's own signed tx carrying a victim's hash took the victim's
+        // dedup slot (targeted censorship) and, if mined, overwrote the
+        // victim's stored tx/receipt. Only a tx that did not authenticate here
+        // (the trusted-decoder `ecdsa_verified` path, or signature checking
+        // disabled by config) keeps its claimed hash; block import rejects a
+        // non-canonical hash after the PBA-R2 activation height.
+        if let Ok(canonical) = citrate_consensus::tx_auth::authenticate(&tx) {
+            tx.hash = canonical;
+        }
+
         let tx_hash = tx.hash;
         let sender = tx.from;
 

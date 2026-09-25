@@ -74,6 +74,36 @@ use tracing::{debug, info, warn};
 
 use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator};
 
+/// PBA-R2: verify a block's body against its header under the hardened
+/// validity rules. A no-op below the activation height (legacy validity is
+/// never re-judged). Every path that stores a block calls this first.
+pub(crate) fn verify_block_body(
+    hardening: citrate_consensus::hardening::PbaHardening,
+    block: &Block,
+) -> Result<(), String> {
+    let height = block.header.height;
+    if !hardening.active_at(height) {
+        return Ok(());
+    }
+    if !block.verify_hash() {
+        return Err(format!("body: block hash mismatch @ {height}"));
+    }
+    // PBA-L1b-002: the root must commit to the transactions' full contents.
+    let expected = citrate_consensus::tx_auth::tx_root_for_height(
+        hardening,
+        height,
+        &block.transactions,
+    );
+    if block.tx_root != expected {
+        return Err(format!(
+            "body: tx_root {} does not commit to the block's transactions (expected {}) \
+             — rewritten body (PBA-L1b-002)",
+            block.tx_root, expected
+        ));
+    }
+    Ok(())
+}
+
 /// Result of an admission attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmitOutcome {
@@ -203,6 +233,15 @@ impl BlockAdmission {
                 }
                 other => AdmitOutcome::Rejected(format!("consistency: {other}")),
             };
+        }
+
+        // PBA-R2 body gate, before ANY write. From the activation height a
+        // block's body must verify against its header here, on every ingest
+        // path, so a relayed block with a rewritten body is never persisted
+        // under the honest hash (PBA-L1b-002: that persisted copy used to wedge
+        // the follower, because the honest copy was then `AlreadyAdmitted`).
+        if let Err(why) = verify_block_body(self.ghostdag.pba_hardening(), block) {
+            return AdmitOutcome::Rejected(why);
         }
 
         // ---- DAG side ----
@@ -892,5 +931,120 @@ mod tests {
             "orphan buffer must be byte-bounded; got {} bytes",
             bytes
         );
+    }
+}
+
+/// PBA-L1b-002 / PBA-L1b-001 at the node's single admission entry point.
+///
+/// The audit's node PoC (`pba_l1b_002_node_wedge_test.rs`) showed the wedge:
+/// a relayed block with a rewritten body was PERSISTED under the honest hash,
+/// failed on state root, and the honest copy was then short-circuited as
+/// `AlreadyAdmitted`. After activation admission verifies the body (hash,
+/// content-bound tx_root, every tx's signature + canonical id) BEFORE any
+/// write, so a bad body is never stored and the honest copy is admitted.
+#[cfg(test)]
+mod pba_r2_admission {
+    use super::*;
+    use citrate_consensus::crypto;
+    use citrate_consensus::hardening::PbaHardening;
+    use citrate_consensus::tx_auth::{native_tx_id, tx_root_for_height};
+    use citrate_consensus::types::{BlockBuilder, GhostDagParams, PublicKey, Transaction, VrfProof};
+    use citrate_storage::pruning::PruningConfig;
+
+    fn harness(
+        hardening: PbaHardening,
+    ) -> (BlockAdmission, Arc<StorageManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(
+            GhostDag::new(GhostDagParams::default(), dag.clone()).with_pba_hardening(hardening),
+        );
+        (BlockAdmission::new(storage.clone(), dag, ghostdag, None), storage, dir)
+    }
+
+    fn signed_native(seed: u8, nonce: u64, value: u128) -> Transaction {
+        let sk = crypto::Ed25519SigningKey::from_bytes(&[seed; 32]);
+        let mut tx = Transaction {
+            nonce,
+            to: Some(PublicKey::new([0xB0; 32])),
+            value,
+            gas_limit: 21_000,
+            gas_price: 1_000_000_000,
+            chain_id: Some(40204),
+            ..Default::default()
+        };
+        crypto::sign_transaction(&mut tx, &sk).unwrap();
+        tx.hash = native_tx_id(&tx);
+        tx
+    }
+
+    fn block(
+        hardening: PbaHardening,
+        height: u64,
+        parent: Hash,
+        txs: Vec<Transaction>,
+    ) -> Block {
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(parent)
+            .coinbase([0x33; 20])
+            .timestamp(1000)
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new([0x5A; 32]),
+            })
+            .transactions(txs)
+            .state_root(Hash::default())
+            .blue_score(height)
+            .blue_work(citrate_consensus::types::blue_work_for_score(height))
+            .build_unhashed();
+        b.tx_root = tx_root_for_height(hardening, height, &b.transactions);
+        b.header.block_hash = b.compute_hash();
+        b
+    }
+
+    #[tokio::test]
+    async fn pba_l1b_002_rewritten_body_never_stored_honest_copy_admitted() {
+        let pba = PbaHardening::at(0);
+        let (adm, storage, _d) = harness(pba);
+        let g = block(pba, 0, Hash::default(), vec![]);
+        assert!(matches!(adm.admit(&g).await, AdmitOutcome::Admitted { .. }));
+
+        let honest = block(pba, 1, g.header.block_hash, vec![signed_native(1, 0, 1_000)]);
+        let mut forged = honest.clone();
+        forged.transactions[0].value = 2_000; // body rewritten, tx.hash untouched
+        assert_eq!(forged.header.block_hash, honest.header.block_hash);
+
+        let r = adm.admit(&forged).await;
+        assert!(
+            matches!(r, AdmitOutcome::Rejected(_)),
+            "PBA-L1b-002: a rewritten body must be rejected, got {r:?}"
+        );
+        assert!(
+            !storage.blocks.has_block(&honest.header.block_hash).unwrap(),
+            "PBA-L1b-002: nothing may be persisted under the honest hash"
+        );
+        assert!(
+            matches!(adm.admit(&honest).await, AdmitOutcome::Admitted { .. }),
+            "the honest copy is admitted after the tampered one was seen"
+        );
+        let stored = storage.blocks.get_block(&honest.header.block_hash).unwrap().unwrap();
+        assert_eq!(stored.transactions[0].value, 1_000, "the honest body is what is stored");
+    }
+
+    #[tokio::test]
+    async fn pba_l1b_002_before_activation_admission_is_unchanged() {
+        let pba = PbaHardening::off();
+        let (adm, _storage, _d) = harness(pba);
+        let g = block(pba, 0, Hash::default(), vec![]);
+        adm.admit(&g).await;
+        let honest = block(pba, 1, g.header.block_hash, vec![signed_native(1, 0, 1_000)]);
+        let mut forged = honest.clone();
+        forged.transactions[0].value = 2_000;
+        // Legacy validity (documented residual until activation).
+        assert!(matches!(adm.admit(&forged).await, AdmitOutcome::Admitted { .. }));
     }
 }

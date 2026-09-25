@@ -68,7 +68,7 @@ fn make_non_genesis_block(height: u64, blue_score: u64, timestamp: u64) -> Block
 }
 
 fn make_valid_transaction(nonce: u64) -> Transaction {
-    Transaction {
+    let mut tx = Transaction {
         hash: Hash::new([nonce as u8; 32]),
         nonce,
         from: PublicKey::new([0; 32]),
@@ -79,7 +79,12 @@ fn make_valid_transaction(nonce: u64) -> Transaction {
         data: vec![],
         signature: Signature::new([0; 64]),
         ..Default::default()
-    }
+    };
+    // PBA-L1a-006 / NET-H3: gossip now authenticates every tx from its
+    // contents, so a "valid" fixture must carry a real signature.
+    let sk = citrate_consensus::crypto::Ed25519SigningKey::from_bytes(&[0x42; 32]);
+    citrate_consensus::crypto::sign_transaction(&mut tx, &sk).unwrap();
+    tx
 }
 
 fn current_timestamp() -> u64 {

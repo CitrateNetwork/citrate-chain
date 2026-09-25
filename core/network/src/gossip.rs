@@ -226,6 +226,14 @@ impl GossipProtocol {
         tx: Transaction,
         from_peer: &PeerId,
     ) -> Result<(), NetworkError> {
+        // PBA-L1a-006 / NET-H3: authenticate from contents and key everything
+        // (dedup, seen-cache, relay) on the canonical id, never the claimed
+        // `tx.hash`. An unauthenticated or forged tx is neither cached as
+        // "seen" (so it cannot shadow the genuine one) nor relayed.
+        let tx = match self.authenticate_transaction(tx, from_peer).await {
+            Ok(tx) => tx,
+            Err(e) => return Err(e),
+        };
         let hash = tx.hash;
 
         // Check if already seen
@@ -269,6 +277,32 @@ impl GossipProtocol {
         self.propagate_transaction(tx.clone(), from_peer).await?;
 
         Ok(())
+    }
+
+    /// PBA-L1a-006 / PBA-L1b-007: authenticate a peer-supplied transaction
+    /// from its contents (`tx_auth::authenticate`: ed25519, or secp256k1
+    /// recovery over the rebuilt legacy/2930/1559 payload) and return it with
+    /// its canonical id. Penalizes the peer on failure. Used by the gossip
+    /// arm and by the node's `Transactions` response arm.
+    pub async fn authenticate_transaction(
+        &self,
+        mut tx: Transaction,
+        from_peer: &PeerId,
+    ) -> Result<Transaction, NetworkError> {
+        match citrate_consensus::tx_auth::authenticate(&tx) {
+            Ok(id) => {
+                tx.hash = id;
+                Ok(tx)
+            }
+            Err(e) => {
+                self.peer_manager
+                    .update_peer_score(from_peer, SCORE_INVALID_TX)
+                    .await;
+                Err(NetworkError::InvalidMessage(format!(
+                    "unauthenticated transaction: {e}"
+                )))
+            }
+        }
     }
 
     /// Propagate block to peers
@@ -613,16 +647,13 @@ impl GossipProtocol {
         }
 
         // 8. TX_ROOT_MISMATCH — verify tx_root matches transactions in block
+        // PBA-L1b-002: content-bound root from the activation height.
         {
-            use sha3::{Digest, Sha3_256};
-            let mut hasher = Sha3_256::new();
-            for tx in &block.transactions {
-                hasher.update(tx.hash.as_bytes());
-            }
-            let computed_bytes = hasher.finalize();
-            let mut computed_array = [0u8; 32];
-            computed_array.copy_from_slice(&computed_bytes[..32]);
-            let computed_tx_root = Hash::new(computed_array);
+            let computed_tx_root = citrate_consensus::tx_auth::tx_root_for_height(
+                self.pba_hardening,
+                block.header.height,
+                &block.transactions,
+            );
             if block.tx_root != computed_tx_root {
                 warn!(
                     "[TX_ROOT_MISMATCH] block={} expected={} computed={}",

@@ -1299,6 +1299,10 @@ impl Executor {
         // persist_state_changes, or later via reconcile_store_from (reorg success).
         let _defer_guard = DeferGuard::engage(&self.defer_persist);
 
+        // PBA-R2 import gate, before any state is touched. Below the activation
+        // height legacy validity is unchanged (never re-judged).
+        self.verify_block_body(block)?;
+
         let snapshot = self.state_db.snapshot();
         let prev_ctx = self.get_block_context();
 
@@ -1420,6 +1424,27 @@ impl Executor {
             hardening.activation_height().unwrap_or(u64::MAX),
             std::sync::atomic::Ordering::SeqCst,
         );
+    }
+
+    /// PBA-R2: the hardened body rules every imported block must satisfy at or
+    /// above the activation height. Called by `apply_block_inner` (every import
+    /// path: apply_block, apply_block_trusted, apply_block_no_persist).
+    fn verify_block_body(&self, block: &Block) -> Result<(), ExecutionError> {
+        let pba = self.pba_hardening();
+        let height = block.header.height;
+        if !pba.active_at(height) {
+            return Ok(());
+        }
+        // PBA-L1b-002: the root must commit to the transactions' contents.
+        let expected =
+            citrate_consensus::tx_auth::tx_root_for_height(pba, height, &block.transactions);
+        if block.tx_root != expected {
+            return Err(ExecutionError::InvalidBlockBody(format!(
+                "tx_root {} does not commit to the block's transactions (expected {expected})",
+                block.tx_root
+            )));
+        }
+        Ok(())
     }
 
     /// PBA-R2: the block-validity hardening this executor enforces.

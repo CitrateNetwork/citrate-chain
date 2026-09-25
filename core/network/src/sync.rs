@@ -7,7 +7,6 @@ use crate::{
 };
 use citrate_consensus::crypto;
 use citrate_consensus::types::{Block, BlockHeader, Hash};
-use sha3::{Digest, Sha3_256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -635,17 +634,14 @@ impl SyncManager {
                 }
             }
 
-            // 3. Verify tx_root consistency
-            let computed_tx_root = {
-                let mut hasher = Sha3_256::new();
-                for tx in &block.transactions {
-                    hasher.update(tx.hash.as_bytes());
-                }
-                let bytes = hasher.finalize();
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes[..32]);
-                Hash::new(arr)
-            };
+            // 3. Verify tx_root consistency. PBA-L1b-002: from the activation
+            // height the root commits to every tx's full contents; below it
+            // the legacy root (over the wire `tx.hash`) is kept byte-identical.
+            let computed_tx_root = citrate_consensus::tx_auth::tx_root_for_height(
+                self.pba_hardening,
+                block.header.height,
+                &block.transactions,
+            );
             if block.tx_root != computed_tx_root {
                 warn!(
                     "SYNC_REJECT: block height={} tx_root mismatch",
@@ -1036,10 +1032,7 @@ mod tests {
             .proposer(pubkey)
             .build_unhashed();
         // tx_root over zero transactions, matching handle_blocks' recomputation.
-        let bytes = Sha3_256::new().finalize();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes[..32]);
-        block.tx_root = Hash::new(arr);
+        block.tx_root = citrate_consensus::tx_auth::tx_root_legacy(&[]);
         block.header.block_hash = block.compute_hash();
         block.signature = crypto::sign_block(&block.header.block_hash, &key);
         block

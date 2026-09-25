@@ -1176,7 +1176,7 @@ impl BlockProducer {
         let total_gas_used: u64 = receipts.iter().map(|receipt| receipt.gas_used).sum();
         header.gas_used = total_gas_used;
 
-        let tx_root = self.calculate_tx_root(&executed_transactions)?;
+        let tx_root = self.calculate_tx_root(header.height, &executed_transactions);
         let receipt_root = self.calculate_receipt_root(&receipts)?;
         let artifact_root = self.calculate_artifact_root(&executed_transactions)?;
 
@@ -1845,19 +1845,15 @@ impl BlockProducer {
         Ok((state_root, executed_transactions, receipts))
     }
 
-    /// Calculate transaction root
-    fn calculate_tx_root(&self, transactions: &[Transaction]) -> anyhow::Result<Hash> {
-        use sha3::{Digest, Sha3_256};
-        let mut hasher = Sha3_256::new();
-
-        for tx in transactions {
-            hasher.update(tx.hash.as_bytes());
-        }
-
-        let hash_bytes = hasher.finalize();
-        let mut hash_array = [0u8; 32];
-        hash_array.copy_from_slice(&hash_bytes[..32]);
-        Ok(Hash::new(hash_array))
+    /// Calculate transaction root. PBA-L1b-002: from the activation height the
+    /// root commits to every transaction's full contents (`tx_root_v2`); below
+    /// it the legacy root over `tx.hash` is kept byte-identical.
+    fn calculate_tx_root(&self, height: u64, transactions: &[Transaction]) -> Hash {
+        citrate_consensus::tx_auth::tx_root_for_height(
+            self.ghostdag.pba_hardening(),
+            height,
+            transactions,
+        )
     }
 
     /// Calculate receipt root
