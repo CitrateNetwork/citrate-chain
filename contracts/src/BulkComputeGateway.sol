@@ -158,9 +158,16 @@ contract BulkComputeGateway is ReentrancyGuard, Governable {
         require(!oracle.isPriceStale(), "BulkComputeGateway: oracle price stale");
 
         // Transfer stablecoin from buyer to this contract first
+        uint256 balBefore = _balanceOf(stablecoin, address(this));
         bool transferOk = _transferFrom(stablecoin, msg.sender, address(this), amount);
         require(transferOk, "BulkComputeGateway: transfer from buyer failed");
-
+        // PBA-L2-043: credit only what was actually received (fee-on-
+        // transfer tokens would otherwise be over-credited). Token decimals
+        // are pinned to 6 at acceptance (StablecoinTreasury.addStablecoin).
+        require(
+            _balanceOf(stablecoin, address(this)) - balBefore == amount,
+            "BulkComputeGateway: received amount mismatch"
+        );
         // Approve treasury to pull from this contract
         _approve(stablecoin, address(treasury), amount);
 
@@ -342,6 +349,13 @@ contract BulkComputeGateway is ReentrancyGuard, Governable {
     // ============================================================
     // Internal Helpers
     // ============================================================
+
+    /// @dev PBA-L2-043: `balanceOf` via staticcall; reverts if absent.
+    function _balanceOf(address token, address who) internal view returns (uint256) {
+        (bool ok, bytes memory ret) = token.staticcall(abi.encodeWithSignature("balanceOf(address)", who));
+        require(ok && ret.length >= 32, "BulkComputeGateway: no balanceOf");
+        return abi.decode(ret, (uint256));
+    }
 
     /// @dev Low-level ERC-20 transferFrom.
     ///

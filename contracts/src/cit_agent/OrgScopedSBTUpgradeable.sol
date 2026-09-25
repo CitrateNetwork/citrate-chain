@@ -59,8 +59,11 @@ abstract contract OrgScopedSBTUpgradeable is
     }
 
     // keccak256(abi.encode(uint256(keccak256("citrate.storage.OrgScopedSBT")) - 1)) & ~bytes32(uint256(0xff))
-    bytes32 private constant STORAGE_SLOT =
-        0x9d8f3c2b6a4e1d7f0c5b8a2e4d6c9f1b3a7e5c0d2f4a6b8c1e3d5f7a9b0c2e00;
+    // PBA-L2-061: the previous constant (0x9d8f3c2b…2e00) was hand-typed and
+    // did NOT equal the formula above. Corrected before any proxy is deployed
+    // (changing it after a deploy would orphan storage).
+    bytes32 internal constant STORAGE_SLOT =
+        0xcdb4e9c01c738428aa2be9f6f93ca8f11520a8936e77a62e4dfca0d8618c1100;
 
     function _s() private pure returns (OrgScopedStorage storage $) {
         assembly {

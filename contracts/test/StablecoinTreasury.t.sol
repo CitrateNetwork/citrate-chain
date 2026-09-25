@@ -108,9 +108,16 @@ contract StablecoinTreasuryTest is Test {
     // ============================================================
 
     function test_add_stablecoin() public {
-        treasury.addStablecoin(address(dai));
-        assertTrue(treasury.acceptedStablecoins(address(dai)));
+        MockERC20 pyusd = new MockERC20("PayPal USD", "PYUSD", 6);
+        treasury.addStablecoin(address(pyusd));
+        assertTrue(treasury.acceptedStablecoins(address(pyusd)));
         assertEq(treasury.stablecoinCount(), 3);
+    }
+
+    /// PBA-L2-043: USD accounting is 6-decimal; an 18-decimal token is refused.
+    function test_add_18_decimal_stablecoin_reverts() public {
+        vm.expectRevert("StablecoinTreasury: token must have 6 decimals");
+        treasury.addStablecoin(address(dai));
     }
 
     function test_add_stablecoin_duplicate_reverts() public {

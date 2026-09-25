@@ -32,9 +32,12 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 ///   - an `enabledAt` timestamp for audit / dashboard freshness display;
 ///   - explicit named errors for the surface-interop UX.
 ///
-/// Each install of this validator binds ONE owner EOA. Users with both a
-/// gui-native and a wallet-extension install this validator twice under
-/// different validator IDs on the same Kernel account.
+/// Each install of this validator binds ONE owner EOA per smart account:
+/// `ownerOf` is keyed by the account alone, so a second install on the same
+/// account reverts `AlreadyInstalled`. (PBA-L2-052: the previous doc claimed
+/// users "install this validator twice" for gui-native + wallet-extension;
+/// that is not supported by this storage layout. A dual-signer setup needs a
+/// second validator contract, or storage keyed by (account, validatorId).)
 contract CitrateECDSAValidator is IValidator, IHook {
     using ECDSA for bytes32;
     using MessageHashUtils for bytes32;

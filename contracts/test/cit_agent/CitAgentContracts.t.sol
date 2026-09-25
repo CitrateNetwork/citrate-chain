@@ -298,11 +298,11 @@ contract CitAgentContractsTest is Test, IERC1155Receiver {
         benchmarks.record(1, capsule_id, metric, 42);
         benchmarks.record(1, capsule_id, metric, 50);
         BenchmarkRegistry.BenchmarkRecord[] memory records =
-            benchmarks.getMetric(1, capsule_id, metric);
+            benchmarks.getMetric(address(this), 1, capsule_id, metric, 0, 10); // PBA-L2-061
         assertEq(records.length, 2);
         assertEq(records[0].value, 42);
         assertEq(records[1].value, 50);
-        assertEq(benchmarks.metricCount(1, capsule_id, metric), 2);
+        assertEq(benchmarks.metricCount(address(this), 1, capsule_id, metric), 2);
     }
 
     function testBenchmark_metricSeenTracksUnique() public {
