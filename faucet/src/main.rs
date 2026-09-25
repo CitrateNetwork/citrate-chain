@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
 mod cooldowns;
@@ -236,13 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build router
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/faucet", post(request_tokens))
-        .route("/status", get(status))
-        .route("/health", get(health))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let app = build_router(state, std::env::var("FAUCET_ALLOWED_ORIGINS").ok().as_deref());
 
     let faucet_port = std::env::var("FAUCET_PORT")
         .ok()
@@ -267,6 +261,115 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// PBA-L8-017: browser origins allowed to call the faucet cross-origin. The faucet's own page
+/// is same-origin and needs no CORS. `FAUCET_ALLOWED_ORIGINS` (comma-separated, exact
+/// `https://host` origins) overrides; malformed entries are dropped, and `*` is never accepted.
+const DEFAULT_ALLOWED_ORIGINS: &[&str] = &[
+    "https://citrate.ai",
+    "https://www.citrate.ai",
+    "https://docs.citrate.ai",
+    "https://explorer.citrate.ai",
+];
+
+fn allowed_origins(raw: Option<&str>) -> Vec<axum::http::HeaderValue> {
+    let list: Vec<String> = match raw {
+        Some(r) if !r.trim().is_empty() => r.split(',').map(|s| s.trim().to_string()).collect(),
+        _ => DEFAULT_ALLOWED_ORIGINS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+    list.into_iter()
+        .filter(|o| {
+            (o.starts_with("https://") || o.starts_with("http://localhost"))
+                && !o.contains('*')
+                && !o.ends_with('/')
+        })
+        .filter_map(|o| axum::http::HeaderValue::from_str(&o).ok())
+        .collect()
+}
+
+/// PBA-L8-017: replaces `CorsLayer::permissive()` (which sent `access-control-allow-origin: *`).
+fn cors_layer(raw: Option<&str>) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(allowed_origins(raw)))
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_headers([axum::http::header::CONTENT_TYPE])
+}
+
+/// PBA-L8-017: the faucet served no security headers. Its page loads its script from
+/// `/faucet.js` (no inline script or handlers), so the CSP needs no `'unsafe-inline'` for scripts;
+/// `style-src 'unsafe-inline'` covers the page's <style> block and style attribute.
+const FAUCET_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; \
+connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+async fn security_headers(mut res: axum::response::Response) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    let h = res.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(FAUCET_CSP),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+    );
+    res
+}
+
+fn build_router(state: FaucetState, allowed_origins_env: Option<&str>) -> Router {
+    Router::new()
+        .route("/", get(root))
+        .route("/faucet.js", get(faucet_js))
+        .route("/faucet", post(request_tokens))
+        .route("/status", get(status))
+        .route("/health", get(health))
+        .layer(axum::middleware::map_response(security_headers))
+        .layer(cors_layer(allowed_origins_env))
+        .with_state(state)
+}
+
+const FAUCET_JS: &str = r#"async function claim(){
+  const addr=document.getElementById('addr').value.trim();
+  const btn=document.getElementById('btn');
+  const msg=document.getElementById('msg');
+  if(!addr||!addr.match(/^0x[0-9a-fA-F]{40}$/)){
+    msg.className='msg err';msg.style.display='block';
+    msg.textContent='Please enter a valid 0x address (40 hex chars)';return;
+  }
+  btn.disabled=true;btn.textContent='Sending...';
+  try{
+    const r=await fetch('/faucet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});
+    const d=await r.json();
+    msg.style.display='block';
+    if(d.success){msg.className='msg ok';msg.textContent='Sent 10 SALT! TX: '+d.tx_hash;}
+    else{msg.className='msg err';msg.textContent=d.message;}
+  }catch(e){msg.className='msg err';msg.style.display='block';msg.textContent='Error: '+e.message;}
+  btn.disabled=false;btn.textContent='Request 10 SALT';
+}
+document.getElementById('btn').addEventListener('click',claim);
+document.getElementById('addr').addEventListener('keydown',e=>{if(e.key==='Enter')claim()});
+"#;
+
+async fn faucet_js() -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        FAUCET_JS,
+    )
 }
 
 async fn root() -> axum::response::Html<&'static str> {
@@ -297,31 +400,11 @@ button:disabled{opacity:.5;cursor:not-allowed}
 <p class="sub">Get test SALT tokens for the Citrate testnet</p>
 <label for="addr">Wallet Address (0x...)</label>
 <input id="addr" placeholder="0x0000000000000000000000000000000000000000" spellcheck="false">
-<button id="btn" onclick="claim()">Request 10 SALT</button>
+<button id="btn">Request 10 SALT</button>
 <div id="msg" class="msg" style="display:none"></div>
 <p class="info">Chain ID: 40204 &middot; 10 SALT per request &middot; 24h cooldown</p>
 </div>
-<script>
-async function claim(){
-  const addr=document.getElementById('addr').value.trim();
-  const btn=document.getElementById('btn');
-  const msg=document.getElementById('msg');
-  if(!addr||!addr.match(/^0x[0-9a-fA-F]{40}$/)){
-    msg.className='msg err';msg.style.display='block';
-    msg.textContent='Please enter a valid 0x address (40 hex chars)';return;
-  }
-  btn.disabled=true;btn.textContent='Sending...';
-  try{
-    const r=await fetch('/faucet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});
-    const d=await r.json();
-    msg.style.display='block';
-    if(d.success){msg.className='msg ok';msg.textContent='Sent 10 SALT! TX: '+d.tx_hash;}
-    else{msg.className='msg err';msg.textContent=d.message;}
-  }catch(e){msg.className='msg err';msg.style.display='block';msg.textContent='Error: '+e.message;}
-  btn.disabled=false;btn.textContent='Request 10 SALT';
-}
-document.getElementById('addr').addEventListener('keydown',e=>{if(e.key==='Enter')claim()});
-</script>
+<script src="/faucet.js"></script>
 </body></html>"#)
 }
 
@@ -708,6 +791,141 @@ const DRIP_AMOUNT: u128 = 10_000_000_000_000_000_000;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── PBA-L8-017: CORS allowlist + security headers, over a real socket ──
+    async fn spawn_faucet(allowed: Option<&str>) -> String {
+        let state = FaucetState {
+            rpc_url: "http://127.0.0.1:9".into(),
+            api_key: None,
+            chain_id: 40204,
+            faucet_address: Address([0u8; 20]),
+            signing_key: Arc::new(
+                k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).expect("test key"),
+            ),
+            cooldowns: Arc::new(Cooldowns::in_memory(CooldownPolicy::default())),
+            address_whitelist: Arc::new(HashSet::new()),
+            turnstile: None,
+            trusted_proxies: Arc::new(HashSet::new()),
+        };
+        let app = build_router(state, allowed);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn l8017_security_headers_on_every_route() {
+        let base = spawn_faucet(None).await;
+        let c = reqwest::Client::new();
+        for path in ["/", "/faucet.js", "/status", "/health"] {
+            let r = c.get(format!("{base}{path}")).send().await.expect("req");
+            let h = r.headers();
+            assert_eq!(
+                h.get("content-security-policy")
+                    .and_then(|v| v.to_str().ok()),
+                Some(FAUCET_CSP),
+                "{path}"
+            );
+            assert_eq!(
+                h.get("x-content-type-options")
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff"),
+                "{path}"
+            );
+            assert_eq!(
+                h.get("x-frame-options").and_then(|v| v.to_str().ok()),
+                Some("DENY"),
+                "{path}"
+            );
+            assert_eq!(
+                h.get("referrer-policy").and_then(|v| v.to_str().ok()),
+                Some("no-referrer"),
+                "{path}"
+            );
+            assert!(h.get("strict-transport-security").is_some(), "{path}");
+        }
+        assert!(FAUCET_CSP.contains("frame-ancestors 'none'"));
+        assert!(!FAUCET_CSP.contains("script-src 'unsafe-inline'"));
+    }
+
+    #[tokio::test]
+    async fn l8017_page_has_no_inline_script_or_handlers() {
+        let base = spawn_faucet(None).await;
+        let html = reqwest::get(format!("{base}/"))
+            .await
+            .expect("req")
+            .text()
+            .await
+            .expect("body");
+        assert!(html.contains(r#"<script src="/faucet.js"></script>"#));
+        assert!(!html.contains("onclick="));
+        assert_eq!(html.matches("<script").count(), 1);
+        let js = reqwest::get(format!("{base}/faucet.js"))
+            .await
+            .expect("req");
+        assert_eq!(
+            js.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert!(js
+            .text()
+            .await
+            .expect("js")
+            .contains("addEventListener('click',claim)"));
+    }
+
+    #[tokio::test]
+    async fn l8017_cors_is_an_allowlist_not_star() {
+        let base = spawn_faucet(None).await;
+        let c = reqwest::Client::new();
+        let get = |origin: &'static str| {
+            c.get(format!("{base}/status"))
+                .header("origin", origin)
+                .send()
+        };
+        let ok = get("https://docs.citrate.ai").await.expect("req");
+        assert_eq!(
+            ok.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://docs.citrate.ai")
+        );
+        let evil = get("https://evil.example").await.expect("req");
+        assert!(evil.headers().get("access-control-allow-origin").is_none());
+        let pre = c
+            .request(reqwest::Method::OPTIONS, format!("{base}/faucet"))
+            .header("origin", "https://evil.example")
+            .header("access-control-request-method", "POST")
+            .send()
+            .await
+            .expect("req");
+        assert!(pre.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[test]
+    fn l8017_allowed_origins_env_parsing() {
+        let v = |raw: Option<&str>| {
+            allowed_origins(raw)
+                .into_iter()
+                .map(|h| h.to_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(v(None).len(), DEFAULT_ALLOWED_ORIGINS.len());
+        assert_eq!(v(Some("  ")).len(), DEFAULT_ALLOWED_ORIGINS.len());
+        assert_eq!(v(Some("https://a.example, *, http://evil.example, https://b.example/, http://localhost:3000")), vec!["https://a.example", "http://localhost:3000"]);
+        assert!(v(Some("*")).is_empty());
+    }
 
     /// SECREM-01 FAUCET-2 red test: pre-fix, a direct client could spoof
     /// a fresh X-Forwarded-For per request and launder the per-IP
