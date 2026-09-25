@@ -45,7 +45,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_AppRegistry_realKeyDeploys() public {
-        assertGt(address(new AppRegistry(KEY, address(0xE11))).code.length, 0);
+        AppRegistry c = new AppRegistry(KEY, address(0xE11));
+        assertEq(c.governance(), KEY);
     }
 
     function test_AuditBundleRegistry_factoryReverts() public {
@@ -54,7 +55,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_AuditBundleRegistry_realKeyDeploys() public {
-        assertGt(address(new AuditBundleRegistry(KEY)).code.length, 0);
+        AuditBundleRegistry c = new AuditBundleRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_CrossOrgEnvelope_factoryReverts() public {
@@ -63,7 +65,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_CrossOrgEnvelope_realKeyDeploys() public {
-        assertGt(address(new CrossOrgEnvelope(KEY)).code.length, 0);
+        CrossOrgEnvelope c = new CrossOrgEnvelope(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_CrossOrgIndex_factoryReverts() public {
@@ -72,7 +75,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_CrossOrgIndex_realKeyDeploys() public {
-        assertGt(address(new CrossOrgIndex(KEY)).code.length, 0);
+        CrossOrgIndex c = new CrossOrgIndex(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_DefensePrimeComplianceRegistry_factoryReverts() public {
@@ -81,7 +85,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_DefensePrimeComplianceRegistry_realKeyDeploys() public {
-        assertGt(address(new DefensePrimeComplianceRegistry(KEY)).code.length, 0);
+        DefensePrimeComplianceRegistry c = new DefensePrimeComplianceRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_DefensePrimeFLScopeIndex_factoryReverts() public {
@@ -90,7 +95,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_DefensePrimeFLScopeIndex_realKeyDeploys() public {
-        assertGt(address(new DefensePrimeFLScopeIndex(KEY)).code.length, 0);
+        DefensePrimeFLScopeIndex c = new DefensePrimeFLScopeIndex(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_EntityRegistry_factoryReverts() public {
@@ -99,7 +105,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_EntityRegistry_realKeyDeploys() public {
-        assertGt(address(new EntityRegistry(KEY)).code.length, 0);
+        EntityRegistry c = new EntityRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_MoqRegistry_factoryReverts() public {
@@ -108,7 +115,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_MoqRegistry_realKeyDeploys() public {
-        assertGt(address(new MoqRegistry(KEY)).code.length, 0);
+        MoqRegistry c = new MoqRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_PartProvenanceRegistry_factoryReverts() public {
@@ -117,7 +125,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_PartProvenanceRegistry_realKeyDeploys() public {
-        assertGt(address(new PartProvenanceRegistry(KEY)).code.length, 0);
+        PartProvenanceRegistry c = new PartProvenanceRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_ReleaseManifestRegistry_factoryReverts() public {
@@ -126,7 +135,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_ReleaseManifestRegistry_realKeyDeploys() public {
-        assertGt(address(new ReleaseManifestRegistry(KEY)).code.length, 0);
+        ReleaseManifestRegistry c = new ReleaseManifestRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_RoleGrantTenantIndex_factoryReverts() public {
@@ -135,7 +145,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_RoleGrantTenantIndex_realKeyDeploys() public {
-        assertGt(address(new RoleGrantTenantIndex(KEY)).code.length, 0);
+        RoleGrantTenantIndex c = new RoleGrantTenantIndex(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_SponsorEvidenceRegistry_factoryReverts() public {
@@ -144,7 +155,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_SponsorEvidenceRegistry_realKeyDeploys() public {
-        assertGt(address(new SponsorEvidenceRegistry(KEY)).code.length, 0);
+        SponsorEvidenceRegistry c = new SponsorEvidenceRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_SupplierRegistry_factoryReverts() public {
@@ -153,7 +165,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_SupplierRegistry_realKeyDeploys() public {
-        assertGt(address(new SupplierRegistry(KEY)).code.length, 0);
+        SupplierRegistry c = new SupplierRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_TinaWorkpaperRegistry_factoryReverts() public {
@@ -162,7 +175,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_TinaWorkpaperRegistry_realKeyDeploys() public {
-        assertGt(address(new TinaWorkpaperRegistry(KEY)).code.length, 0);
+        TinaWorkpaperRegistry c = new TinaWorkpaperRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_TripwireRegistry_factoryReverts() public {
@@ -171,7 +185,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_TripwireRegistry_realKeyDeploys() public {
-        assertGt(address(new TripwireRegistry(KEY)).code.length, 0);
+        TripwireRegistry c = new TripwireRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_AgentDecisionRegistryV2_factoryReverts() public {
@@ -180,7 +195,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_AgentDecisionRegistryV2_realKeyDeploys() public {
-        assertGt(address(new AgentDecisionRegistryV2(KEY)).code.length, 0);
+        AgentDecisionRegistryV2 c = new AgentDecisionRegistryV2(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_ClassificationRegistry_factoryReverts() public {
@@ -189,7 +205,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_ClassificationRegistry_realKeyDeploys() public {
-        assertGt(address(new ClassificationRegistry(KEY)).code.length, 0);
+        ClassificationRegistry c = new ClassificationRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_ContradictionLedger_factoryReverts() public {
@@ -198,7 +215,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_ContradictionLedger_realKeyDeploys() public {
-        assertGt(address(new ContradictionLedger(KEY)).code.length, 0);
+        ContradictionLedger c = new ContradictionLedger(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_BudgetAllocation_factoryReverts() public {
@@ -207,7 +225,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_BudgetAllocation_realKeyDeploys() public {
-        assertGt(address(new BudgetAllocation(KEY)).code.length, 0);
+        BudgetAllocation c = new BudgetAllocation(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_CashoutRequest_factoryReverts() public {
@@ -216,7 +235,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_CashoutRequest_realKeyDeploys() public {
-        assertGt(address(new CashoutRequest(KEY, 100)).code.length, 0);
+        CashoutRequest c = new CashoutRequest(KEY, 100);
+        assertEq(c.governance(), KEY);
     }
 
     function test_ClassroomClusterV1_factoryReverts() public {
@@ -225,7 +245,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_ClassroomClusterV1_realKeyDeploys() public {
-        assertGt(address(new ClassroomClusterV1(KEY)).code.length, 0);
+        ClassroomClusterV1 c = new ClassroomClusterV1(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_ComplianceRegistry_factoryReverts() public {
@@ -234,7 +255,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_ComplianceRegistry_realKeyDeploys() public {
-        assertGt(address(new ComplianceRegistry(KEY, address(0x7EE))).code.length, 0);
+        ComplianceRegistry c = new ComplianceRegistry(KEY, address(0x7EE));
+        assertEq(c.governance(), KEY);
     }
 
     function test_Forwarder_factoryReverts() public {
@@ -243,7 +265,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_Forwarder_realKeyDeploys() public {
-        assertGt(address(new Forwarder(KEY, address(0xC1), address(0xA1))).code.length, 0);
+        Forwarder c = new Forwarder(KEY, address(0xC1), address(0xA1));
+        assertEq(c.governance(), KEY);
     }
 
     function test_GuardianTokenRegistry_factoryReverts() public {
@@ -252,7 +275,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_GuardianTokenRegistry_realKeyDeploys() public {
-        assertGt(address(new GuardianTokenRegistry(KEY)).code.length, 0);
+        GuardianTokenRegistry c = new GuardianTokenRegistry(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_InstitutionTreeV1_factoryReverts() public {
@@ -261,7 +285,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_InstitutionTreeV1_realKeyDeploys() public {
-        assertGt(address(new InstitutionTreeV1(KEY)).code.length, 0);
+        InstitutionTreeV1 c = new InstitutionTreeV1(KEY);
+        assertEq(c.governance(), KEY);
     }
 
     function test_OrganizationSBT_factoryReverts() public {
@@ -270,7 +295,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_OrganizationSBT_realKeyDeploys() public {
-        assertGt(address(new OrganizationSBT(KEY)).code.length, 0);
+        OrganizationSBT c = new OrganizationSBT(KEY);
+        assertEq(c.owner(), KEY);
     }
 
     function test_AgentSBT_factoryReverts() public {
@@ -279,7 +305,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_AgentSBT_realKeyDeploys() public {
-        assertGt(address(new AgentSBT(KEY, OrganizationSBT(address(0x0A9)))).code.length, 0);
+        AgentSBT c = new AgentSBT(KEY, OrganizationSBT(address(0x0A9)));
+        assertEq(c.owner(), KEY);
     }
 
     function test_CapsuleRegistry_factoryReverts() public {
@@ -288,7 +315,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_CapsuleRegistry_realKeyDeploys() public {
-        assertGt(address(new CapsuleRegistry(KEY)).code.length, 0);
+        CapsuleRegistry c = new CapsuleRegistry(KEY);
+        assertEq(c.owner(), KEY);
     }
 
     function test_MultisigTimelock2of3_factoryReverts() public {
@@ -297,7 +325,8 @@ contract PBA_L2_002_InitialAdminSweep is Test {
     }
 
     function test_MultisigTimelock2of3_realKeyDeploys() public {
-        assertGt(address(new MultisigTimelock2of3([address(0x0B1), KEY, address(0x0B3)], 1 hours)).code.length, 0);
+        MultisigTimelock2of3 c = new MultisigTimelock2of3([address(0x0B1), KEY, address(0x0B3)], 1 hours);
+        assertEq(c.owners(1), KEY);
     }
 
 }
