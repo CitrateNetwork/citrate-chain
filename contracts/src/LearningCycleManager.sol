@@ -103,6 +103,7 @@ contract LearningCycleManager is ReentrancyGuard, Governable {
     event MentorAssigned(uint256 indexed cycleId, address indexed mentor, address indexed mentee);
     event AdapterRecorded(uint256 indexed cycleId, address indexed mentor, bytes32 adapterHash);
     event CycleFinalized(uint256 indexed cycleId, uint256 totalRewards);
+    event CycleCancelled(uint256 indexed cycleId);
     event RewardClaimed(uint256 indexed cycleId, address indexed participant, uint256 amount);
     // GovernanceTransferred event provided by Governable mixin.
 
@@ -170,6 +171,21 @@ contract LearningCycleManager is ReentrancyGuard, Governable {
         emit CycleOpened(cid, checkpointHeight);
     }
 
+    /// @notice PBA-L2-047: governance escape hatch for a cycle that cannot
+    ///         progress. Marks the CURRENT, not-yet-finalized cycle Finalized
+    ///         with no rewards (nothing was ever escrowed before finalize), so
+    ///         `openCycle` is reachable again.
+    function cancelCycle(uint256 cycleId) external onlyGovernance {
+        require(cycleId == currentCycleId && cycleId > 0, "Not the current cycle");
+        CycleInfo storage ci = _cycleInfo[cycleId];
+        require(ci.state != CycleState.Finalized, "Already finalized");
+        CycleState old = ci.state;
+        ci.state = CycleState.Finalized;
+        ci.phaseStartBlock = block.number;
+        emit StateAdvanced(cycleId, old, CycleState.Finalized);
+        emit CycleCancelled(cycleId);
+    }
+
     /// @notice Register as a participant in an open cycle.
     /// @param cycleId The cycle to join.
     function registerParticipant(uint256 cycleId) external {
@@ -221,7 +237,10 @@ contract LearningCycleManager is ReentrancyGuard, Governable {
     function advanceToAggregating(uint256 cycleId) external onlyGovernance {
         CycleInfo storage ci = _cycleInfo[cycleId];
         require(ci.state == CycleState.Collecting, "Not in Collecting state");
-        require(ci.participantCount > 0, "No participants");
+        // PBA-L2-047: AdapterGen needs a mentor assignment between TWO distinct
+        // participants; advancing with one made finalize (and so every future
+        // openCycle) unreachable forever.
+        require(ci.participantCount >= 2, "Need at least 2 participants");
 
         CycleState old = ci.state;
         ci.state = CycleState.Aggregating;
