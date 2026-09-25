@@ -39,6 +39,11 @@ derived from. Re-verify against a new commit before trusting stale values.
   derivation, not an independent live measurement.
 - **`measured/derived`** — a live-measured input combined with in-tree config
   (e.g. finality = checkpoint interval x measured block time).
+- **`specified-not-running`**: the mechanism is specified (code, tests and possibly a
+  TLA+ model exist) but no production code path runs it on the network. Never
+  present it as a current capability. `verification/check_claims.py` fails CI when
+  such a claim is flipped to running without a production caller, and when public
+  READMEs describe it as current.
 - **`target-pending-protocol-upgrade`** — an aspirational target that is not met
   today and requires a protocol/consensus change that has not shipped; never
   present it as a current capability.

@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-09-23T18:00:00Z",
-  "source_commit": "3c256a5923a7b6b3b18b75c729343afd87a05d8d",
+  "generated_at": "2026-09-25T05:30:00Z",
+  "source_commit": "21726055c9d1af28c1ad2e3c95f3db5c61a2b8fc",
   "note": "Single machine-readable source of truth for every public technical claim about citrate-chain. Each value is tied to source files and, where applicable, reproducible evidence. Website and marketing facts MUST be generated from this file, not hand-copied. Numbers here were measured/derived from the code at source_commit; see verification_status per claim. See verification/README.md for status definitions.",
   "claims": {
     "salt_total_supply": {
@@ -65,27 +65,27 @@
       "reproduction_command": "sed -n '48,53p' node/config/testnet.toml",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source",
-      "notes": "[checkpoint] interval=50, committee_size=100, quorum_threshold=67 (2/3+1 BFT committee finality, WP-W.2)."
+      "notes": "[checkpoint] interval=50, committee_size=100, quorum_threshold=67 (2/3+1 BFT committee finality, WP-W.2). These are CONFIGURED parameters of a mechanism that is specified but NOT running: no production code path calls CheckpointManager::propose, so no checkpoint is ever proposed or finalized (see deterministic_checkpoint_finality)."
     },
     "deterministic_checkpoint_finality": {
       "scope": "citrate-chain",
-      "value": {"seconds_estimate": 100, "seconds_range": [90, 100], "interval_blocks": 50, "measured_block_time_seconds": 2, "committee_size": 100, "quorum_threshold": 67},
-      "source_files": ["node/config/testnet.toml:49-52"],
-      "evidence_files": ["docs/consensus/EXECUTE_ON_RECEIVE_state_application.md:70-71", "core/consensus/tests/h01_h02_checkpoint_safety.rs"],
-      "reproduction_command": "sed -n '48,53p' node/config/testnet.toml  # interval(50 blocks) x measured block time (~2s) ~= 90-100s to a BFT checkpoint",
-      "last_verified_at": "2026-09-24T03:02:28Z",
-      "verification_status": "measured/derived",
-      "notes": "Deterministic BFT finality is reached at the next checkpoint: interval(50 blocks) x MEASURED block time (~1.9-2.0s) ~= 90-100s worst case (~45-50s average within a checkpoint window). This SUPERSEDES the earlier ~25-50s figure, which assumed the 1s config target rather than the ~2s live block time. State is never reverted below the last finalized checkpoint (invariant I4)."
+      "value": {"running": false, "specified_interval_blocks": 50, "specified_committee_size": 100, "specified_quorum_threshold": 67, "seconds_estimate_if_running": null},
+      "source_files": ["node/config/testnet.toml:49-52", "core/consensus/src/checkpoint.rs:382", "node/src/main.rs:1520-1530,1592-1606"],
+      "evidence_files": ["core/consensus/tests/h01_h02_checkpoint_safety.rs", "specs/tla/consensus/CheckpointVoteSafety.tla", "verification/check_claims.py"],
+      "reproduction_command": "python3 verification/check_claims.py  # fails if this claim says running=true while no non-test code path calls .propose(",
+      "last_verified_at": "2026-09-25T05:30:00Z",
+      "verification_status": "specified-not-running",
+      "notes": "Checkpoint finality is SPECIFIED, NOT RUNNING on the public testnet: CheckpointManager is constructed, but no production code path calls propose(), so no checkpoint is finalized. Confirmation is probabilistic. The RPC does not serve the 'finalized' block tag. Do NOT publish a finality time (the old 90-100s figure assumed a running committee)."
     },
     "confirmation_latency": {
       "scope": "citrate-chain",
-      "value": {"probabilistic_block_seconds": 2, "deterministic_checkpoint_seconds_estimate": 100, "finality_depth_blocks": 100},
+      "value": {"probabilistic_block_seconds": 2, "deterministic_checkpoint_seconds_estimate": null, "explorer_depth_heuristic_blocks": 100},
       "source_files": ["node/config/testnet.toml:7"],
       "evidence_files": ["docs/consensus/EXECUTE_ON_RECEIVE_state_application.md:70-82"],
       "reproduction_command": "grep -n 'finality\\|checkpoint' docs/consensus/EXECUTE_ON_RECEIVE_state_application.md",
-      "last_verified_at": "2026-09-24T03:02:28Z",
+      "last_verified_at": "2026-09-25T05:30:00Z",
       "verification_status": "documented-pre-audit",
-      "notes": "Probabilistic confirmation is one block (~2s measured); deterministic BFT finality lands at the next checkpoint (~90-100s at the measured ~2s block time). Finality depth bound is 100 blocks. No end-to-end measured latency artifact is published yet."
+      "notes": "Confirmation is probabilistic: a block lands every ~2s (measured) and gains weight as later blocks build on it. Checkpoint finality is specified, not running. 'depth >= 100' is a display heuristic used by the explorer, not a protocol guarantee. No end-to-end measured latency artifact is published yet."
     },
     "foundry_tests": {
       "scope": "citrate-chain/contracts",
@@ -96,7 +96,7 @@
       "count_method": "forge test --use 0.8.36 final summary line ('2913 tests passed, 0 failed, 0 skipped')",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "measured-here",
-      "notes": "Measured on forge 1.5.1-stable at source_commit. 158 test suites, 2913 passed / 0 failed / 0 skipped."
+      "notes": "Measured on forge 1.5.1-stable at 3c256a59 (the commits since change no Solidity). 158 test suites, 2913 passed / 0 failed / 0 skipped."
     },
     "rust_tests": {
       "scope": "citrate-chain",
@@ -107,18 +107,18 @@
       "count_method": "cargo test --workspace -- --list | grep -c ': test' (each ': test' line is one #[test]/#[tokio::test] case). The per-binary 'N tests' summary lines sum to the same 4379, cross-checking the count.",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "measured-here",
-      "notes": "4379 unit/integration test cases across the workspace, measured at source_commit (whole workspace compiled clean, exit 0). Doctests are NOT included (cargo --list does not enumerate them). Marketing surfaces have quoted 5,377 and 6,720 Rust tests; DO NOT copy those — 4379 is the measured figure. (Static grep of #[test]/#[tokio::test] annotations gives ~4,696, an upper-ish approximation that miscounts cfg-gated/macro-generated cases.)"
+      "notes": "4379 unit/integration test cases across the workspace, measured at 3c256a59; later commits change only a doc comment and one test assertion, so the count is unchanged (whole workspace compiled clean, exit 0). Doctests are NOT included (cargo --list does not enumerate them). Marketing surfaces have quoted 5,377 and 6,720 Rust tests; DO NOT copy those; 4379 is the measured figure. (Static grep of #[test]/#[tokio::test] annotations gives ~4,696, an upper-ish approximation that miscounts cfg-gated/macro-generated cases.)"
     },
     "deployed_contracts": {
       "scope": "citrate-chain",
-      "value": {"contracts": 69, "aa_stack": 7, "core_plus_aa_total": 76, "genesis_deployers": 1, "top_level_extra": 2, "precompile_addresses_listed": 21},
+      "value": {"contracts": 69, "aa_stack": 7, "book_entries_contracts_plus_aa": 76, "with_code_on_chain": 57, "codeless_in_book": 19, "genesis_deployers": 1, "top_level_extra": 2, "precompile_addresses_listed": 21},
       "source_files": ["contracts/addresses/40204.json"],
-      "evidence_files": ["contracts/addresses/40204.json"],
-      "reproduction_command": "python3 -c \"import json;d=json.load(open('contracts/addresses/40204.json'));print('contracts',len(d['contracts']),'aaStack',len(d['aaStack']),'precompiles',len(d['precompiles']))\"",
-      "count_method": "len(contracts)=69 + len(aaStack)=7 = 76 deployed application/AA contracts on chain 40204 (the public '76+' claim). genesis.ArachnidDeterministicDeployer (1) and two top-level entries (CitrateMemberSBT, MembershipStakeVault) are tracked separately.",
-      "last_verified_at": "2026-09-24T02:37:00Z",
+      "evidence_files": ["verification/address-code.snapshot.json", "verification/check_address_code.py"],
+      "reproduction_command": "python3 verification/check_address_code.py --check  # read-only eth_getCode on every book entry; --offline validates the committed snapshot without network",
+      "count_method": "Entries in contracts (69) + aaStack (7) = 76 book entries. eth_getCode at the probed block: 57 have code, 19 are codeless (not deployed). genesis.ArachnidDeterministicDeployer (1) and two top-level entries (CitrateMemberSBT, MembershipStakeVault) are tracked separately and have code. Precompiles (21) are codeless by design.",
+      "last_verified_at": "2026-09-25T05:30:00Z",
       "verification_status": "measured-here",
-      "notes": "40204.json is the canonical address table (deployedAt 2026-09-12). The '76+' figure = 69 app contracts + 7 AA-stack contracts."
+      "notes": "The public number is 57 contracts with code on chain 40204, NOT 76. The 19 codeless book entries (the governance and cooperative set: AnchorRegistry, MeetingRegistry, GovernanceTemplateRegistry, GovernanceProtocolFactory, PolicyBinding, CapabilityGrant, VoteAllowance, Sortition, PatronageLedger, ModelCooperative, FacilitySBTImpl, NetworkSBTImpl, FacilitySBT, NetworkSBT, CitrateCooperativeFactory, CoopDeployer, CoopMembershipSBT, ContributionRewardPool, CoopGovernor) are NOT deployed; a value transfer to one of them succeeds and strands the value. The book (deployedAt 2026-09-12) is the canonical table; never hand-copy addresses into READMEs."
     },
     "precompiles": {
       "scope": "citrate-chain",
@@ -190,7 +190,7 @@
       "value": {"public_repo_specs": 102, "public_claim": "100+"},
       "public_repo_breakdown": {"citrate-chain": 71, "nat": 8, "nist-agent": 6, "coop": 4, "core": 4, "memories": 3, "comms": 2, "explorer": 2, "agentile": 1, "cluster": 1},
       "source_files": ["citrate-chain/specs/tla/", "nat/specs/tla/", "nist-agent/specs/tla/", "coop/specs/tla/", "core/specs/tla/", "citrate-memories/specs/", "citrate-comms/formal/", "citrate-explorer/specs/tla/"],
-      "evidence_files": ["citrate-chain/specs/tla/consensus/GhostDAGConsensus.tla", "citrate-chain/specs/tla/account/TransactionSigningFlow.tla"],
+      "evidence_files": ["citrate-chain/specs/tla/consensus/GhostDAGConsensus.tla"],
       "reproduction_command": "for r in citrate-chain nat nist-agent coop core citrate-memories citrate-comms citrate-explorer; do gh repo clone CitrateNetwork/$r; done && find . -name '*.tla' | wc -l",
       "count_method": "Clone the PUBLIC repos and run: find -name '*.tla' | wc -l. 102 specs today (chain 71 + nat 8 + nist-agent 6 + coop 4 + core 4 + memories 3 + comms 2 + explorer 2 + agentile 1 + cluster 1); the public-facing claim is '100+'.",
       "last_verified_at": "2026-09-23T18:00:00Z",
@@ -206,7 +206,7 @@
       "reproduction_command": "java -jar tla2tools.jar -config wallet/TransactionSigningFlow.cfg wallet/TransactionSigningFlow.tla  # spec lives in the private internal archive; re-run to reproduce the ~50B-state model-check",
       "last_verified_at": "2026-09-23T18:00:00Z",
       "verification_status": "owner-run-reproducible-from-spec",
-      "notes": "Owner ran the full TLC model-check on TransactionSigningFlow to ~50 billion states (use '50B+'). Reproducible from the spec, which lives in the PRIVATE internal archive (citrate-agentile-archive); the multi-TB traces from that run were NOT retained. The earlier 73M figure was a smaller/bounded run and is superseded."
+      "notes": "Owner ran the full TLC model-check on TransactionSigningFlow to ~50 billion states. The spec is NOT in any public repository (there is no specs/tla/account/ in citrate-chain), so public surfaces must not present this as publicly reproducible; say 'owner-run on a private spec' or omit it. Reproducible from the spec, which lives in the PRIVATE internal archive (citrate-agentile-archive); the multi-TB traces from that run were NOT retained. The earlier 73M figure was a smaller/bounded run and is superseded."
     },
     "evm_revm": {
       "scope": "citrate-chain",
@@ -220,13 +220,13 @@
     },
     "consensus_ghostdag": {
       "scope": "citrate-chain",
-      "value": {"algorithm": "GhostDAG", "k": 18, "finality": "BFT checkpoint committee", "vrf": "strict"},
+      "value": {"algorithm": "GhostDAG", "k": 18, "finality": "probabilistic (checkpoint committee specified, not running)", "vrf": "strict", "stake_gating_default": "off", "live_block_producers": 1, "validator_registry_active_set": 1},
       "source_files": ["core/consensus/src/ghostdag.rs", "node/config/testnet.toml:8"],
       "evidence_files": ["core/consensus/README.md", "core/consensus/SAFETY_AUDIT.md", "core/consensus/tests/proptest_consensus.rs", "core/consensus/tests/real_tests.rs"],
       "reproduction_command": "ls core/consensus/src/ghostdag.rs && grep -n 'ghostdag_k' node/config/testnet.toml",
       "last_verified_at": "2026-09-24T02:37:00Z",
       "verification_status": "reproducible-from-source",
-      "notes": "GhostDAG (Kaspa-family) blue-set consensus with k=18, VRF leader election (strict_vrf=true), and a BFT checkpoint committee (size 100, quorum 67) for deterministic finality."
+      "notes": "GhostDAG (Kaspa-family) blue-set consensus with k=18 and strict VRF proof checks (strict_vrf=true). Current topology: the public testnet runs a SINGLE block producer operated by Citrate (one producer address across a 51-block live sample on 2026-09-25; ValidatorRegistry activeSet() has 1 member). Stake-gated proposer eligibility is staged: OFF by default, enabled when CITRATE_VALIDATOR_REGISTRY is set (CITRATE_VALIDATOR_ACTIVATION_HEIGHT is optional and defaults to 0; node/src/main.rs:1443-1462). The BFT checkpoint committee (size 100, quorum 67) is the TARGET design and is not running. Any operator identity requirement is policy, not enforced by node or consensus code."
     },
     "audit_status": {
       "scope": "citrate-chain",

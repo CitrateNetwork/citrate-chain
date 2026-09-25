@@ -1,0 +1,29 @@
+{
+  "chainId": 40204,
+  "block": 178426,
+  "probed_at": "2026-09-25T05:28:37Z",
+  "book_deployedAt": "2026-09-12T14:16:34Z",
+  "with_code_count": 60,
+  "codeless": [
+    "contracts.AnchorRegistry",
+    "contracts.CapabilityGrant",
+    "contracts.CitrateCooperativeFactory",
+    "contracts.ContributionRewardPool",
+    "contracts.CoopDeployer",
+    "contracts.CoopGovernor",
+    "contracts.CoopMembershipSBT",
+    "contracts.FacilitySBT",
+    "contracts.FacilitySBTImpl",
+    "contracts.GovernanceProtocolFactory",
+    "contracts.GovernanceTemplateRegistry",
+    "contracts.MeetingRegistry",
+    "contracts.ModelCooperative",
+    "contracts.NetworkSBT",
+    "contracts.NetworkSBTImpl",
+    "contracts.PatronageLedger",
+    "contracts.PolicyBinding",
+    "contracts.Sortition",
+    "contracts.VoteAllowance"
+  ],
+  "precompiles_codeless_by_design": 21
+}
