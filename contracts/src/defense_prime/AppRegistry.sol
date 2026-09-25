@@ -347,6 +347,12 @@ contract AppRegistry {
         }
         AppEntry storage a = apps[app_id];
         if (a.state == AppState.NotExist) revert AppDoesNotExist(app_id);
+        // Only the recorder that proposed the app (or governance) may record
+        // its absorbing failure; another authorised recorder may not.
+        if (
+            msg.sender != governance
+                && QuorumIdentity.subjectKey(msg.sender) != appProposerKey[app_id]
+        ) revert NotProposerOrGovernance(msg.sender);
         if (a.state != AppState.Pending) {
             revert AppNotInState(app_id, AppState.Pending, a.state);
         }

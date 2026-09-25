@@ -271,3 +271,30 @@ contract PBA_L2_013_SybilSigners is Test {
         assertEq(reason, sod.REASON_PENDING());
     }
 }
+
+/// Only the proposing recorder or governance may record an app's failure.
+contract PBA_L2_012_RecordFailureBinding is Test {
+    function test_L2_012_otherRecorderCannotFailPendingApp() public {
+        MultiSigEnvelope env = new MultiSigEnvelope();
+        address gov = address(0x60);
+        address rec = address(0xEC0);
+        address rec2 = address(0xEC2);
+        AppRegistry reg = new AppRegistry(gov, address(env));
+        bytes32[] memory approvers = new bytes32[](1);
+        approvers[0] = QuorumIdentity.subjectKey(address(0xA1));
+        vm.startPrank(gov);
+        reg.setRecorder(rec, true);
+        reg.setRecorder(rec2, true);
+        reg.setApproverPolicy(approvers, 1);
+        vm.stopPrank();
+        address[] memory none = new address[](0);
+        vm.prank(rec);
+        reg.proposeApp(keccak256("app"), keccak256("t"), "app", "1", rec, keccak256("env"), none, bytes32(0));
+        vm.prank(rec2);
+        vm.expectRevert(abi.encodeWithSelector(AppRegistry.NotProposerOrGovernance.selector, rec2));
+        reg.recordFailureOnEnvelopeReject(keccak256("app"));
+        vm.prank(rec);
+        reg.recordFailureOnEnvelopeReject(keccak256("app"));
+        assertEq(uint8(reg.getApp(keccak256("app")).state), uint8(AppRegistry.AppState.Failed));
+    }
+}

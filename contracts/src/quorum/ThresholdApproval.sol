@@ -88,13 +88,11 @@ interface IMultiSigEnvelope {
 /// bytes themselves; those are the evidence an off-chain verifier (quorum's
 /// SignatureCeremony) re-checks.
 ///
-/// `draft` remains permissionless and first-writer-wins per id (PBA-L2-035).
-/// This protocol therefore ignores an envelope at its derived id unless the
-/// envelope's initiator is one of its approvers or the acting principal
-/// (`REASON_FOREIGN_PROPOSER`): an outsider's draft, close or reject cannot
-/// change the verdict. The residual is liveness only — the honest proposer
-/// re-proposes under a fresh `correlationId` (tracked as a follow-up to
-/// namespace envelope ids by drafter).
+/// This protocol ignores an envelope at its derived id unless the envelope's
+/// initiator is one of its approvers or the acting principal
+/// (`REASON_FOREIGN_PROPOSER`), so an unrecognised party's draft, close or
+/// reject cannot change the verdict (PBA-L2-035). A new attempt uses a new
+/// `correlationId`.
 ///
 /// ## Expiry is deliberate, and has a consequence worth knowing
 ///
