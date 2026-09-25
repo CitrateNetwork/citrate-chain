@@ -8,6 +8,8 @@ import {Governable} from "../../src/lib/Governable.sol";
 import {DeployAll} from "../../script/DeployAll.s.sol";
 import {AdminChecks} from "../../script/lib/AdminChecks.sol";
 import {CheckDeployedAdmins} from "../../script/CheckDeployedAdmins.s.sol";
+import {MentorMatcher} from "../../src/MentorMatcher.sol";
+import {InitialAdmin} from "../../src/lib/InitialAdmin.sol";
 
 /// Stand-in for a contract deployed by the pre-fix ceremony: its governance
 /// getter returns the CREATE2 factory (what 21 live contracts return today).
@@ -98,5 +100,22 @@ contract PBA_L2_002_Fixed is Test {
         CheckDeployedAdmins c4 = new CheckDeployedAdmins();
         vm.expectRevert(bytes("CheckDeployedAdmins: P-256 verifier not provisioned"));
         c4.check(ok, false);
+    }
+}
+
+/// PBA-L2-002 (verifier nit): MentorMatcher refuses the CREATE2 factory as
+/// governance, like every other ceremony-deployed constructor.
+contract PBA_L2_002_MentorMatcher is Test {
+    address constant FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+
+    function test_L2_002_mentorMatcher_factoryAsGovernance_reverts() public {
+        vm.expectRevert(InitialAdmin.InitialAdmin_Create2Factory.selector);
+        new MentorMatcher(FACTORY);
+    }
+
+    function test_L2_002_mentorMatcher_explicitGovernance_ok() public {
+        address gov = makeAddr("multisig");
+        MentorMatcher mm = new MentorMatcher(gov);
+        assertEq(mm.governance(), gov);
     }
 }
