@@ -93,6 +93,15 @@ contract Sortition {
     mapping(bytes32 => mapping(address => bytes32)) public commitmentOf;
     /// draw → contributor → revealed.
     mapping(bytes32 => mapping(address => bool)) public revealedBy;
+    /// @notice PBA-L2-055 (pre-bounty audit 2026-09-24): the last draw each
+    ///         member committed to, per pool. The last revealer can compute
+    ///         the seed before revealing and withhold to void a draw it
+    ///         dislikes; each re-run over the same pool was a fresh roll
+    ///         (rejection sampling). A member that left a commitment
+    ///         unrevealed in a VOIDED draw may never commit to that pool again,
+    ///         and a member with an unrevealed commitment in a still-open draw
+    ///         cannot start contributing to a re-run until it reveals.
+    mapping(bytes32 poolRoot => mapping(address => bytes32)) public lastCommitDraw;
 
     error DrawExists(bytes32 drawId);
     error UnknownDraw(bytes32 drawId);
@@ -118,6 +127,8 @@ contract Sortition {
     error NotFinal(bytes32 drawId, State state);
     error StillFinalizable(bytes32 drawId);
     error IndexOutOfRange(uint32 index, uint32 k);
+    error AbortedMemberExcluded(bytes32 poolRoot, address who, bytes32 abortedDraw);
+    error OutstandingCommitment(bytes32 poolRoot, address who, bytes32 openDraw);
 
     event DrawOpened(
         bytes32 indexed drawId, bytes32 indexed poolRoot, uint32 poolSize, uint32 k, uint64 targetBlock, address opener
@@ -183,6 +194,13 @@ contract Sortition {
             revert NotPoolMember(drawId, msg.sender);
         }
         if (commitmentOf[drawId][msg.sender] != bytes32(0)) revert AlreadyCommitted(drawId, msg.sender);
+        // PBA-L2-055: an aborting member is excluded from re-runs over this pool.
+        bytes32 prev = lastCommitDraw[d.poolRoot][msg.sender];
+        if (prev != bytes32(0) && !revealedBy[prev][msg.sender]) {
+            if (_draws[prev].state == State.Void) revert AbortedMemberExcluded(d.poolRoot, msg.sender, prev);
+            revert OutstandingCommitment(d.poolRoot, msg.sender, prev);
+        }
+        lastCommitDraw[d.poolRoot][msg.sender] = drawId;
 
         commitmentOf[drawId][msg.sender] = commitment;
         d.commitCount += 1;
