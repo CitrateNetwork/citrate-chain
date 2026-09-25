@@ -29,6 +29,23 @@ mod canonical_apply;
 mod commands;
 mod config;
 mod consensus_manifest;
+
+// PBA-L1a-003: consensus-affecting cargo features must be identical on every
+// node, or a single unprivileged transaction exercising the precompile splits
+// the validator set. The canonical set is the crate's DEFAULT feature set.
+#[cfg(not(feature = "commd-fold-verify"))]
+compile_error!(
+    "citrate-node must be built with the `commd-fold-verify` feature (it is in the default \
+     feature set). Without it 0x0130 returns an error where the fleet returns a verified \
+     result, and this node forks on the first such transaction (PBA-L1a-003)."
+);
+#[cfg(feature = "halo2-verifier")]
+compile_error!(
+    "`halo2-verifier` changes the 0x0108 precompile result and is not activated on any Citrate \
+     network. Enabling it requires a scheduled fleet-wide activation, not a build flag \
+     (PBA-L1a-003)."
+);
+mod startup_guards;
 mod contribution_recorder;
 mod dag_prune;
 mod genesis;
@@ -137,6 +154,14 @@ fn prompt_join_testnet() -> bool {
 #[derive(Parser)]
 #[command(name = "citrate")]
 #[command(about = "Citrate blockchain node")]
+// PBA-L1a-003: `--version` reports the consensus feature set so operators can
+// diff fleet binaries without running `citrate consensus`.
+#[command(version = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (consensus features: ",
+    env!("CITRATE_CONSENSUS_FEATURES"),
+    ")"
+))]
 struct Cli {
     /// Configuration file path
     #[arg(short, long, value_name = "FILE")]
@@ -518,6 +543,18 @@ async fn main() -> Result<()> {
     // Validate configuration (fail-closed for production mode)
     // This catches production_mode=true with empty validators early
     if let Err(e) = config.validate() {
+        error!("{}", e);
+        return Err(anyhow::anyhow!("{}", e));
+    }
+    // PBA-L1a-008 / PBA-L1a-012: refuse RPC exposures that let a remote client
+    // forge its rate-limit identity or submit unsigned spends.
+    if let Err(e) = startup_guards::check_rpc_exposure(
+        config.rpc.enabled,
+        &config.rpc.listen_addr,
+        config.rpc.allow_eth_send_transaction,
+        &config.rpc.trusted_proxies,
+        config.chain.genesis_profile.as_deref(),
+    ) {
         error!("{}", e);
         return Err(anyhow::anyhow!("{}", e));
     }
@@ -1360,28 +1397,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     }
 
-    // Mempool config from env overrides
-    let require_valid_signature = std::env::var("CITRATE_REQUIRE_VALID_SIGNATURE")
-        .ok()
-        .and_then(|v| {
-            let s = v.to_lowercase();
-            match s.as_str() {
-                "1" | "true" | "yes" | "on" => Some(true),
-                "0" | "false" | "no" | "off" => Some(false),
-                _ => None,
-            }
-        })
-        .unwrap_or({
-            // Default to false in devnet mode for easier testing
-            #[cfg(feature = "devnet")]
-            {
-                false
-            }
-            #[cfg(not(feature = "devnet"))]
-            {
-                true
-            }
-        });
+    // Mempool config from env overrides.
+    // PBA-L1a-007: a production (non-devnet) build refuses to MINE with
+    // signature verification disabled; unrecognised values fail closed.
+    let require_valid_signature = startup_guards::resolve_require_valid_signature(
+        std::env::var("CITRATE_REQUIRE_VALID_SIGNATURE").ok().as_deref(),
+        config.mining.enabled,
+        cfg!(feature = "devnet"),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if !require_valid_signature {
+        warn!(
+            "Mempool signature verification is DISABLED (CITRATE_REQUIRE_VALID_SIGNATURE). \
+             Never run this on a public network."
+        );
+    }
 
     // Create mempool
     // Per-sender cap is overridable via CITRATE_MEMPOOL_MAX_PER_SENDER. The
@@ -1425,6 +1455,20 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         })
     }));
 
+    // PBA-L1a-017: `Mempool::clear_expired` had no caller, so the 1-hour
+    // `tx_expiry_secs` never applied and never-executable transactions squatted
+    // pool slots until restart. Sweep once a minute.
+    {
+        let mempool_expiry = mempool.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                mempool_expiry.clear_expired().await;
+            }
+        });
+    }
+
     // Create peer manager
     let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig {
         max_peers: config.network.max_peers,
@@ -1439,24 +1483,22 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     let metrics_enabled = std::env::var("CITRATE_METRICS")
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    if metrics_enabled {
-        let addr_str =
-            std::env::var("CITRATE_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9100".to_string());
-        let addr: std::net::SocketAddr = match addr_str.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!(
-                    "Invalid CITRATE_METRICS_ADDR '{}': {}, skipping metrics server",
-                    addr_str,
-                    e
-                );
-                {
-                    // Infallible for a valid hardcoded literal
-                    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9100))
-                }
-            }
-        };
+    // PBA-L1a-024: default to loopback, and an unparsable address disables the
+    // metrics server instead of silently binding 0.0.0.0.
+    let metrics_addr = if metrics_enabled {
+        let raw = std::env::var("CITRATE_METRICS_ADDR").ok();
+        let resolved = startup_guards::resolve_metrics_addr(raw.as_deref());
+        if resolved.is_none() {
+            tracing::error!(
+                "Invalid CITRATE_METRICS_ADDR '{}', skipping metrics server",
+                raw.unwrap_or_default()
+            );
+        }
+        resolved
+    } else {
+        None
+    };
+    if let Some(addr) = metrics_addr {
         tokio::spawn(async move {
             if let Err(e) = citrate_api::metrics_server::MetricsServer::new(addr)
                 .start()
@@ -3289,10 +3331,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             threads: 16,
             // C-02: Only allow eth_sendTransaction in devnet/dev mode
             allow_eth_send_transaction: config.rpc.allow_eth_send_transaction,
+            // PBA-L1a-023: Host allowlist (DNS-rebinding defence).
+            allowed_hosts: config.rpc.allowed_hosts.clone(),
             rate_limit: citrate_api::rate_limit::RateLimitConfig {
                 operator_token,
                 api_key,
                 is_public_bind, // WP-K.4: fail-closed on public interface
+                // PBA-L1a-008: per-client buckets behind a loopback proxy
+                // (startup_guards refuses this on a public bind).
+                trusted_proxies: config.rpc.trusted_proxies.clone(),
                 ..Default::default()
             },
         };

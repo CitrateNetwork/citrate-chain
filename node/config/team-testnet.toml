@@ -27,9 +27,16 @@ bootstrap_nodes = []
 
 [rpc]
 enabled = true
-listen_addr = "0.0.0.0:8545"
-ws_addr = "0.0.0.0:8546"
-allow_eth_send_transaction = true
+# PBA-L1a-012: RPC is loopback-only and unsigned eth_sendTransaction is OFF.
+# The previous profile served 0.0.0.0:8545 with allow_eth_send_transaction =
+# true on chain 40204, so anyone who could reach the port could submit
+# transactions from ANY address. Team members peer over P2P (30303); to reach
+# a teammate's RPC use an SSH/Tailscale port-forward, and sign transactions
+# (eth_sendRawTransaction). The node refuses to start with unsigned send on a
+# non-loopback RPC outside the local devnet profile.
+listen_addr = "127.0.0.1:8545"
+ws_addr = "127.0.0.1:8546"
+allow_eth_send_transaction = false
 # M-05 FIX: No wildcard CORS — use explicit allowed origins
 cors_origins = ["http://localhost:3000", "https://citrate.ai", "https://explorer.citrate.ai"]
 

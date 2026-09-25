@@ -270,6 +270,23 @@ pub struct RpcConfig {
     /// WP-X.1: F-07 remediation.
     #[serde(default)]
     pub rest_api_key: Option<String>,
+
+    /// PBA-L1a-008: reverse-proxy addresses whose `X-Forwarded-For` /
+    /// `X-Real-IP` headers identify the real client for per-client rate
+    /// limiting. Empty (default) = every client shares one bucket.
+    ///
+    /// The HTTP server cannot see the TCP peer address, so forwarding headers
+    /// are honoured from ANY connection once this is set. The node therefore
+    /// refuses to start with `trusted_proxies` set unless RPC is bound to a
+    /// loopback address (so only the co-located proxy can connect).
+    #[serde(default)]
+    pub trusted_proxies: Vec<std::net::IpAddr>,
+
+    /// PBA-L1a-023: `Host` header allowlist for the HTTP RPC server (see
+    /// `citrate_api::server::rpc_host_allowlist`). Empty = loopback-only Host
+    /// names when RPC is loopback-bound and not proxied; any Host otherwise.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +356,8 @@ impl Default for NodeConfig {
                 api_key: None,
                 cors_origins: vec![], // Secure default: no CORS headers
                 rest_api_key: None,
+                trusted_proxies: vec![],
+                allowed_hosts: vec![],
             },
             storage: StorageConfig {
                 data_dir: dirs::home_dir()
@@ -566,7 +585,12 @@ mod tests {
         assert!(config.network.bootstrap_nodes.is_empty());
 
         assert!(config.rpc.enabled);
-        assert!(config.rpc.allow_eth_send_transaction);
+        // PBA-L1a-012: the team profile used to serve unsigned
+        // eth_sendTransaction on 0.0.0.0:8545 (chain 40204). It is now
+        // loopback-only with unsigned send disabled.
+        assert!(!config.rpc.allow_eth_send_transaction);
+        assert!(config.rpc.listen_addr.ip().is_loopback());
+        assert!(config.rpc.ws_addr.ip().is_loopback());
         // Team/public configs must use explicit origins, not wildcard
         assert_eq!(
             config.rpc.cors_origins,
