@@ -79,6 +79,11 @@ contract ComputeVerifierTest is Test {
 
     function _configureJob(uint256 jobId, uint256 value, ComputeVerifier.VerificationTier tier) internal {
         verifier.configureJob(jobId, value, tier);
+        // PBA-L2-004: bind the job to the commitments the ZK fixtures carry
+        // (the marketplace does this in postJob / autoAssignJob).
+        if (tier != ComputeVerifier.VerificationTier.Commitment) {
+            verifier.bindJob(jobId, inputCommitment, modelCommitment);
+        }
     }
 
     function _submitCommitment(uint256 jobId) internal {
@@ -96,10 +101,11 @@ contract ComputeVerifierTest is Test {
     function _signAttestation(
         bytes memory attestation
     ) internal view returns (bytes memory) {
+        // PBA-L2-004: the oracle signs a digest bound to (chain, verifier, job).
         bytes32 msgHash = keccak256(
             abi.encodePacked(
                 "\x19Ethereum Signed Message:\n32",
-                keccak256(attestation)
+                verifier.teeAttestationDigest(1, attestation)
             )
         );
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(teeOracleKey, msgHash);
@@ -427,7 +433,7 @@ contract ComputeVerifierTest is Test {
         bytes32 msgHash = keccak256(
             abi.encodePacked(
                 "\x19Ethereum Signed Message:\n32",
-                keccak256(attestation)
+                verifier.teeAttestationDigest(1, attestation)
             )
         );
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(wrongKey, msgHash);

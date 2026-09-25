@@ -30,9 +30,10 @@ contract RmQ_C016_ComputeVerifier is Test {
         verifier.submitCommitment(jobId, address(0xBEEF), keccak256(abi.encodePacked("c", jobId)));
     }
 
-    function _sign(bytes memory attestation) internal view returns (bytes memory sig) {
+    /// PBA-L2-004: the oracle signs a job-bound digest.
+    function _sign(uint256 jobId, bytes memory attestation) internal view returns (bytes memory sig) {
         bytes32 messageHash = keccak256(
-            abi.encodePacked("\x19Ethereum Signed Message:\n32", keccak256(attestation))
+            abi.encodePacked("\x19Ethereum Signed Message:\n32", verifier.teeAttestationDigest(jobId, attestation))
         );
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(oraclePk, messageHash);
         sig = abi.encodePacked(r, s, v);
@@ -43,8 +44,7 @@ contract RmQ_C016_ComputeVerifier is Test {
     /// attestation settles unlimited jobs.
     function test_C016_tee_attestation_cannot_settle_two_jobs() public {
         bytes memory attestation = hex"deadbeefcafe";
-        bytes memory sig = _sign(attestation);
-
+        bytes memory sig = _sign(1, attestation);
         _configure(1, ComputeVerifier.VerificationTier.TEE);
         bool v1 = verifier.verifyTEEAttestation(1, attestation, sig);
         assertTrue(v1, "job 1 attestation verifies");
@@ -70,10 +70,15 @@ contract RmQ_C016_ComputeVerifier is Test {
         bytes memory proof = hex"aabbccdd";
         bytes memory publicInputs = new bytes(96); // ZK_PUBLIC_INPUTS_LEN
 
+        // PBA-L2-004: proofs are bound to the job's commitments. Job 1 is
+        // bound to the (zero) commitments the proof carries; job 2 to a
+        // different input, so the same bytes cannot settle it.
         _configure(1, ComputeVerifier.VerificationTier.ZKProof);
+        verifier.bindJob(1, bytes32(0), bytes32(0));
         assertTrue(verifier.verifyZKProof(1, proof, publicInputs), "job 1 proof verifies");
 
         _configure(2, ComputeVerifier.VerificationTier.ZKProof);
+        verifier.bindJob(2, keccak256("other input"), bytes32(0));
         assertFalse(
             verifier.verifyZKProof(2, proof, publicInputs),
             "C016: replayed ZK proof must not settle a 2nd job"

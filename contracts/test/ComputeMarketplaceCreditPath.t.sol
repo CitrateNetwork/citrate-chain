@@ -94,6 +94,8 @@ contract MockVerifier {
         uint256,
         ComputeVerifier.VerificationTier
     ) external {}
+
+    function bindJob(uint256, bytes32, bytes32) external {} // PBA-L2-004
 }
 
 contract ComputeMarketplaceCreditPathTest is Test {

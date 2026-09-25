@@ -133,6 +133,13 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
     /// @notice Minimum dispute bond (prevents spam griefing)
     uint256 public constant DISPUTE_BOND = 10 ether;
 
+    /// @notice PBA-L2-004: blocks after a Valid verification during which
+    /// `disputeResult` can still land. `completeJob` (which pays) is
+    /// refused until the window has elapsed. Pre-fix `completeJob` was
+    /// callable in the same block as `submitResult`, so the dispute path
+    /// that backstops the self-attested Commitment tier was unreachable.
+    uint256 public constant DISPUTE_WINDOW = 100;
+
     /// @notice Default max concurrent jobs per provider
     uint256 public constant DEFAULT_MAX_CONCURRENT = 10;
 
@@ -175,6 +182,14 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
 
     /// @notice Dispute state: jobId => disputer address
     mapping(uint256 => address) public disputeFiler;
+
+    /// @notice PBA-L2-004: block at which the job's result verified Valid
+    /// (0 = not Valid via `submitResult`). Starts the dispute window.
+    mapping(uint256 => uint256) public resultVerifiedAt;
+
+    /// @notice PBA-L2-004: true once governance resolved a dispute in the
+    /// provider's favour; such a job is payable without a second window.
+    mapping(uint256 => bool) public disputeResolvedForProvider;
 
     /// @notice Dispute bond held: jobId => bond amount
     mapping(uint256 => uint256) public disputeBondHeld;
@@ -233,6 +248,12 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
     /// never paid in SALT from this contract's balance.
     mapping(address => uint256) public creditsRefundOwed;
 
+    /// @notice PBA-L2-005 variant: native escrow refunds that could not be
+    /// pushed (requester contract reverts on receive). Claimed via
+    /// `claimNativeRefund`. Pre-fix the refund push `require`d success, so a
+    /// reverting requester could make `timeoutJob` / `_failJob` revert
+    /// forever and pin the assigned provider's `currentActiveJobs`.
+    mapping(address => uint256) public nativeRefundOwed;
     /// @notice CHAIN-B-C015 (HELD/reroll): providers who have explicitly
     /// consented to being auto-assigned jobs. `autoAssignJob` conscripts a
     /// provider into a job with a 100-block deadline and `timeoutJob` then
@@ -279,6 +300,8 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
     /// @notice CHAIN-B-C014: a credit-path job's escrow was "refunded" as a
     /// credit liability (no native SALT moved).
     event CreditsRefundOwed(uint256 indexed jobId, address indexed requester, uint256 amount);
+    event NativeRefundDeferred(uint256 indexed jobId, address indexed requester, uint256 amount);
+    event CreditsRefundSettled(address indexed requester, uint256 amount);
 
     /// @notice CHAIN-B-C014: a credit-path job completed; the provider is
     /// owed payment through operational credit settlement, not native SALT.
@@ -589,6 +612,9 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         jobPaymentMethod[jobId] = paymentMethod;
 
         verifier.configureJob(jobId, maxPrice, tier);
+        // PBA-L2-004: bind the job's input + model commitments so a proof
+        // for a different job cannot settle this one.
+        verifier.bindJob(jobId, keccak256(inputHash), modelHash);
 
         // SALT path: refund excess payment. (Credits path can't
         // have excess — msg.value == 0 was required above.)
@@ -772,6 +798,7 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
 
         // Configure verification
         verifier.configureJob(jobId, maxPrice, tier);
+        verifier.bindJob(jobId, keccak256(inputHash), modelHash); // PBA-L2-004
 
         providers[bestProvider].currentActiveJobs++;
 
@@ -849,6 +876,9 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
 
         emit ResultSubmitted(jobId, msg.sender, keccak256(outputHash));
 
+        // PBA-L2-004: the proof must commit to the output being submitted.
+        verifier.bindOutput(jobId, keccak256(outputHash));
+
         // Attempt verification inline
         ComputeVerifier.VerificationResult result = verifier.verify(
             jobId,
@@ -857,8 +887,9 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         );
 
         if (result == ComputeVerifier.VerificationResult.Valid) {
-            // Verification passed — can be completed (if no dispute)
-            // completeJob must be called separately to allow dispute window
+            // Verification passed — can be completed after DISPUTE_WINDOW
+            // (PBA-L2-004) if no dispute lands.
+            resultVerifiedAt[jobId] = block.number;
         } else if (result == ComputeVerifier.VerificationResult.Invalid) {
             // Verification failed — job fails
             _failJob(jobId);
@@ -886,6 +917,16 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         require(
             !verifier.isDisputeActive(jobId),
             "ComputeMarketplace: dispute active"
+        );
+
+        // PBA-L2-004: the dispute window must have elapsed. A job whose
+        // Valid verdict came from a resolved dispute (provider won) has
+        // already been adjudicated and is not held again.
+        uint256 verifiedAt = resultVerifiedAt[jobId];
+        require(
+            disputeResolvedForProvider[jobId]
+                || (verifiedAt != 0 && block.number >= verifiedAt + DISPUTE_WINDOW),
+            "ComputeMarketplace: dispute window open"
         );
 
         _completeAndPay(jobId);
@@ -1069,6 +1110,7 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
     ) internal {
         // Provider wins: dispute dismissed, bond burned (GriefUnprofitable)
         totalDisputeBondsBurned += bond;
+        disputeResolvedForProvider[jobId] = true; // PBA-L2-004
 
         // Burn the bond by sending to address(0) is not possible in EVM,
         // so we send to dead address (standard burn address)
@@ -1095,6 +1137,31 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
     /// @param jobId The job identifier
     function getJob(uint256 jobId) external view returns (Job memory) {
         return jobs[jobId];
+    }
+
+    /// @notice PBA-L2-021: (requester, assigned provider) of a job, for
+    /// binding `DisputeResolution` to real jobs. (0, 0) for unknown ids.
+    function jobParties(uint256 jobId) external view returns (address requester, address provider) {
+        Job storage job = jobs[jobId];
+        return (job.requester, job.assignedProvider);
+    }
+
+    /// @notice PBA-L2-005 variant: claim a native refund that could not be pushed.
+    function claimNativeRefund() external nonReentrant {
+        uint256 amount = nativeRefundOwed[msg.sender];
+        require(amount > 0, "ComputeMarketplace: nothing owed");
+        nativeRefundOwed[msg.sender] = 0;
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "ComputeMarketplace: refund failed");
+    }
+
+    /// @notice PBA-L2-042: record that `amount` of a requester's
+    /// credit-path refund was settled off-native (credits re-issued by
+    /// operations). Pre-fix `creditsRefundOwed` had no consumer at all.
+    function settleCreditsRefund(address requester, uint256 amount) external onlyGovernance {
+        require(amount <= creditsRefundOwed[requester], "ComputeMarketplace: exceeds owed");
+        creditsRefundOwed[requester] -= amount;
+        emit CreditsRefundSettled(requester, amount);
     }
 
     /// @notice Get all bids for a job
@@ -1261,7 +1328,12 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         }
         if (jobEscrowNative[jobId]) {
             (bool ok, ) = payable(job.requester).call{value: amount}("");
-            require(ok, "ComputeMarketplace: refund failed");
+            if (!ok) {
+                // PBA-L2-005 variant: never let the requester's code block
+                // the job's terminal transition.
+                nativeRefundOwed[job.requester] += amount;
+                emit NativeRefundDeferred(jobId, job.requester, amount);
+            }
             return amount;
         }
         // Credit-path: no native SALT was ever deposited for this job.
