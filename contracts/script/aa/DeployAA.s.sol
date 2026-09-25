@@ -11,6 +11,7 @@ import {EntryPointDeployer} from "./DeployEntryPoint.s.sol";
 // AA contracts shipped by WP-1
 import {WebAuthnP256Validator} from "../../src/aa/validators/WebAuthnP256Validator.sol";
 import {P256} from "../../src/aa/lib/webauthn/P256.sol";
+import {DevP256Verifier} from "./lib/DevP256Verifier.sol";
 import {CitrateECDSAValidator} from "../../src/aa/validators/CitrateECDSAValidator.sol";
 import {GuardianRecoveryModule} from "../../src/aa/recovery/GuardianRecoveryModule.sol";
 import {CitrateWalletFactory} from "../../src/aa/factory/CitrateWalletFactory.sol";
@@ -115,7 +116,9 @@ contract DeployAA is Script, ScriptEnv, EntryPointDeployer {
         // PBA-L2-011: the passkey validator is useless (every signature fails
         // closed) unless the P-256 verifier it hard-codes has code. Refuse to
         // advertise it on a chain where it cannot work; provision the verifier
-        // first with script/aa/DeployP256Verifier.s.sol.
+        // first with script/aa/DeployP256Verifier.s.sol. Local anvil only: a
+        // RIP-7212-compatible dev verifier is installed automatically.
+        _provisionDevVerifier();
         require(
             P256.VERIFIER.code.length != 0,
             "P256 verifier has no code; run script/aa/DeployP256Verifier.s.sol first"
@@ -194,5 +197,22 @@ contract DeployAA is Script, ScriptEnv, EntryPointDeployer {
         console2.log("EntryPoint (deterministic CREATE2): %s", entryPoint);
         console2.log("Identity signer: %s", identitySigner);
         console2.log("Owner: %s", owner);
+    }
+
+    /// @dev PBA-L2-011 dev path. On anvil (chainid 31337) with no verifier,
+    ///      install the vendored RIP-7212-compatible runtime at P256.VERIFIER:
+    ///      `vm.etch` for the script's own simulation, `anvil_setCode` on the
+    ///      node itself. Never runs on any other chain.
+    function _provisionDevVerifier() internal {
+        if (P256.VERIFIER.code.length != 0 || block.chainid != DevP256Verifier.ANVIL_CHAIN_ID) return;
+        bytes memory code = DevP256Verifier.runtime();
+        vm.etch(P256.VERIFIER, code);
+        try vm.rpc(
+            "anvil_setCode", string.concat('["', vm.toString(P256.VERIFIER), '","', vm.toString(code), '"]')
+        ) returns (bytes memory) {
+            console2.log("anvil: dev P-256 verifier installed at %s", P256.VERIFIER);
+        } catch {
+            console2.log("anvil_setCode unavailable (no RPC); dev verifier etched for simulation only");
+        }
     }
 }

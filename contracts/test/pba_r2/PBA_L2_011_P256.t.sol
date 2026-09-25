@@ -12,6 +12,7 @@ contract PBA_L2_011_Regression is Test {
     address constant VERIFIER = 0xc2b78104907F722DABAc4C69f826a522B2754De4;
 
     function test_L2_011_deployAARefusesWithoutVerifier() public {
+        vm.chainId(40204); // not anvil: the dev verifier path must not engage
         assertEq(VERIFIER.code.length, 0, "precondition: no verifier (as on 40204 today)");
         vm.setEnv("CITRATE_AA_IDENTITY_SIGNER", "0x8A9062625E98666Fc0072Ee2E7CB8AB08Bd1b651");
         vm.setEnv("CITRATE_AA_OWNER", "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732");
