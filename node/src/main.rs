@@ -39,6 +39,15 @@ compile_error!(
      feature set). Without it 0x0130 returns an error where the fleet returns a verified \
      result, and this node forks on the first such transaction (PBA-L1a-003)."
 );
+// The same checks against the execution crate's ACTUAL feature set, which a
+// `--features citrate-execution/<feature>` build changes without touching this
+// crate's features.
+const _: () = assert!(
+    citrate_execution::build_features::COMMD_FOLD_VERIFY
+        && !citrate_execution::build_features::HALO2_SUBSTRATE,
+    "citrate-node consensus feature set: citrate-execution must have commd-fold-verify on and \
+     halo2-substrate off (PBA-L1a-003)"
+);
 #[cfg(feature = "halo2-verifier")]
 compile_error!(
     "`halo2-verifier` changes the 0x0108 precompile result and is not activated on any Citrate \

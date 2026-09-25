@@ -1088,26 +1088,29 @@ impl BlockProducer {
         // lacks its canonical id, or is bound to another chain — so never
         // build one. Such a tx can only have reached the pool through a
         // trusted-decoder or signature-checks-disabled path; drop it there too.
-        let transactions: Vec<citrate_consensus::types::Transaction> =
-            if self.ghostdag.pba_hardening().active_at(last_height + 1) {
-                let chain_id = self.executor.chain_id();
-                let mut keep = Vec::with_capacity(transactions.len());
-                for t in transactions {
-                    match citrate_consensus::tx_auth::verify_for_block(&t, chain_id) {
-                        Ok(_) => keep.push(t),
-                        Err(e) => {
-                            warn!(
+        let transactions: Vec<citrate_consensus::types::Transaction> = if self
+            .ghostdag
+            .pba_hardening()
+            .active_at(last_height + 1)
+        {
+            let chain_id = self.executor.chain_id();
+            let mut keep = Vec::with_capacity(transactions.len());
+            for t in transactions {
+                match citrate_consensus::tx_auth::verify_for_block(&t, chain_id) {
+                    Ok(_) => keep.push(t),
+                    Err(e) => {
+                        warn!(
                                 "PBA-L1b-001: excluding tx {} from the block: {} (removed from mempool)",
                                 t.hash, e
                             );
-                            let _ = self.mempool.remove_transaction(&t.hash).await;
-                        }
+                        let _ = self.mempool.remove_transaction(&t.hash).await;
                     }
                 }
-                keep
-            } else {
-                transactions
-            };
+            }
+            keep
+        } else {
+            transactions
+        };
 
         // Blue score and work are already calculated above
         let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
@@ -1788,13 +1791,14 @@ impl BlockProducer {
     async fn select_transactions_with_ai_priority(&self) -> anyhow::Result<Vec<Transaction>> {
         let mut selected = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let mut total_gas: u64 = 0;
 
         // Capacity limits. Gas is the dominant real-world ceiling;
         // count + size are safety valves.
         const MAX_BLOCK_SIZE: usize = 1_000_000; // 1 MB — matches transport (H-08)
-        const MAX_GAS_PER_BLOCK: u64 = 30_000_000; // Chain genesis constant
+        const MAX_GAS_PER_BLOCK: u64 = PRODUCER_BLOCK_GAS_LIMIT; // Chain genesis constant
         const MAX_AI_TXS_PER_BLOCK: usize = 10;
+        // AI operations may declare at most a third of the block's gas.
+        const MAX_AI_GAS_PER_BLOCK: u64 = MAX_GAS_PER_BLOCK / 3;
         const MAX_STANDARD_TXS: usize = 5_000;
 
         // AI transactions first (model ops, inference). Small reserved slice.
@@ -1805,11 +1809,35 @@ impl BlockProducer {
             .get_best_transactions(MAX_STANDARD_TXS, MAX_BLOCK_SIZE)
             .await;
 
-        // PBA-L1a-004: a candidate only reserves block gas if the sender can
-        // actually pay for it against the state this block executes on.
+        // PBA-L1a-004: a candidate is admitted only if the sender can pay for
+        // it against the state this block executes on. Block gas is NOT
+        // reserved here: `execute_block_transactions` meters the gas each
+        // transaction actually uses and admits the next candidate against what
+        // is left, so an over-declared `gas_limit` cannot hold block space.
+        // The AI slice is additionally capped by declared gas.
         let executor = self.executor.clone();
         let mut budget = SelectionBudget::new(MAX_GAS_PER_BLOCK);
-        for tx in ai_txs.into_iter().chain(standard_txs) {
+        let mut ai_declared: u64 = 0;
+        for tx in ai_txs {
+            if seen.contains(&tx.hash) {
+                continue;
+            }
+            let Some(next) = ai_declared.checked_add(tx.gas_limit) else {
+                continue;
+            };
+            if next > MAX_AI_GAS_PER_BLOCK {
+                continue;
+            }
+            if budget.try_admit(&tx, |from| {
+                let addr = citrate_execution::address_utils::normalize_address(from);
+                (executor.get_nonce(&addr), executor.get_balance(&addr))
+            }) {
+                ai_declared = next;
+                seen.insert(tx.hash);
+                selected.push(tx);
+            }
+        }
+        for tx in standard_txs {
             if seen.contains(&tx.hash) {
                 continue;
             }
@@ -1818,12 +1846,12 @@ impl BlockProducer {
                 (executor.get_nonce(&addr), executor.get_balance(&addr))
             }) {
                 seen.insert(tx.hash);
-                total_gas = budget.gas_used();
                 selected.push(tx);
             }
         }
+        let total_gas = ai_declared;
         debug!(
-            "selected {} txs using {} of {} block gas",
+            "selected {} candidate txs ({} declared AI gas) for a {} gas block",
             selected.len(),
             total_gas,
             MAX_GAS_PER_BLOCK
@@ -1851,10 +1879,24 @@ impl BlockProducer {
             .ghostdag_params(self.ghostdag.params().clone())
             .build_unhashed();
 
+        // PBA-L1a-004: meter ACTUAL gas. A candidate is admitted when its
+        // declared gas_limit fits what is left of the block; after it runs the
+        // meter is charged only what it used, so the rest of the block stays
+        // available. A deferred sender's later nonces are deferred with it
+        // (they would fail on the nonce gap otherwise) and stay in the mempool.
+        let mut meter = BlockGasMeter::new(PRODUCER_BLOCK_GAS_LIMIT);
+        let mut deferred_senders: std::collections::HashSet<PublicKey> =
+            std::collections::HashSet::new();
+
         // Execute each transaction
         for tx in transactions {
+            if deferred_senders.contains(&tx.from) || !meter.fits(tx.gas_limit) {
+                deferred_senders.insert(tx.from);
+                continue;
+            }
             match self.executor.execute_transaction(&temp_block, tx).await {
                 Ok(receipt) => {
+                    meter.charge(receipt.gas_used.min(tx.gas_limit));
                     executed_transactions.push(tx.clone());
                     receipts.push(receipt);
                 }
@@ -2189,13 +2231,43 @@ impl BlockProducer {
 /// free to relay over P2P — was packed first, consumed the whole budget, failed
 /// execution unpaid, and left the block empty; repeated every block.
 ///
-/// Now a candidate is admitted only if (a) it fits the REMAINING gas (skip, not
+/// Now a candidate is admitted only if (a) it can fit a block at all (skip, not
 /// stop), (b) its nonce is the sender's next nonce against state (tracking the
 /// candidates already admitted from that sender), and (c) the sender's balance,
 /// net of the candidates already admitted, covers `gas_limit * gas_price + value`.
+/// Block gas itself is metered on actual use by [`BlockGasMeter`] during
+/// execution, so declared-but-unused gas never holds block space.
+/// Block gas limit the producer fills to (the chain's genesis constant).
+pub(crate) const PRODUCER_BLOCK_GAS_LIMIT: u64 = 30_000_000;
+
+/// PBA-L1a-004: block gas metered on ACTUAL use, like geth's gas pool.
+pub(crate) struct BlockGasMeter {
+    limit: u64,
+    used: u64,
+}
+
+impl BlockGasMeter {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    /// Whether a transaction declaring `gas_limit` may still run.
+    pub(crate) fn fits(&self, gas_limit: u64) -> bool {
+        gas_limit <= self.limit.saturating_sub(self.used)
+    }
+
+    /// Charge what a transaction actually used.
+    pub(crate) fn charge(&mut self, gas_used: u64) {
+        self.used = self.used.saturating_add(gas_used).min(self.limit);
+    }
+
+    pub(crate) fn used(&self) -> u64 {
+        self.used
+    }
+}
+
 pub(crate) struct SelectionBudget {
     max_gas: u64,
-    gas_used: u64,
     /// sender -> (next expected nonce, remaining balance) after admitted txs.
     senders: HashMap<PublicKey, (u64, primitive_types::U256)>,
 }
@@ -2204,13 +2276,8 @@ impl SelectionBudget {
     pub(crate) fn new(max_gas: u64) -> Self {
         Self {
             max_gas,
-            gas_used: 0,
             senders: HashMap::new(),
         }
-    }
-
-    pub(crate) fn gas_used(&self) -> u64 {
-        self.gas_used
     }
 
     /// Admit `tx` if it fits and is payable; `state` returns the sender's
@@ -2220,11 +2287,8 @@ impl SelectionBudget {
         F: FnOnce(&PublicKey) -> (u64, primitive_types::U256),
     {
         use primitive_types::U256;
-        let Some(new_gas) = self.gas_used.checked_add(tx.gas_limit) else {
-            return false;
-        };
-        if new_gas > self.max_gas {
-            return false; // does not fit: skip it, keep filling (SEQ-H2)
+        if tx.gas_limit > self.max_gas {
+            return false; // can never fit a block: skip it, keep filling (SEQ-H2)
         }
         let (next_nonce, balance) = *self
             .senders
@@ -2246,7 +2310,6 @@ impl SelectionBudget {
             return false;
         }
         self.senders.insert(tx.from, (after_nonce, balance - cost));
-        self.gas_used = new_gas;
         true
     }
 }
@@ -2570,21 +2633,24 @@ mod tests {
         let one_tx = U256::from(21_000u64 * price);
         let state = |bal: U256| move |_: &PublicKey| (0u64, bal);
 
-        // (1) a too-big candidate is skipped and a later small one still fits
+        // (1) a candidate that can never fit a block is skipped; others are
+        //     admitted without reserving block gas (the meter does that).
         let mut b = SelectionBudget::new(30_000_000);
-        let mut big = transfer_tx(1, Address([0x77; 20]), r, 0);
+        let mut too_big = transfer_tx(1, Address([0x77; 20]), r, 0);
+        too_big.gas_limit = 30_000_001;
+        assert!(
+            !b.try_admit(&too_big, state(U256::MAX)),
+            "larger than a block"
+        );
+        let mut big = transfer_tx(2, Address([0x78; 20]), r, 0);
         big.gas_limit = 29_999_000;
         assert!(b.try_admit(&big, state(U256::MAX)));
-        let mut big2 = transfer_tx(2, Address([0x78; 20]), r, 0);
+        let mut big2 = transfer_tx(3, Address([0x79; 20]), r, 0);
         big2.gas_limit = 29_999_000;
-        assert!(!b.try_admit(&big2, state(U256::MAX)), "does not fit");
-        let mut small = transfer_tx(3, Address([0x79; 20]), r, 0);
-        small.gas_limit = 1_000;
         assert!(
-            b.try_admit(&small, state(U256::MAX)),
-            "skip, not break (SEQ-H2)"
+            b.try_admit(&big2, state(U256::MAX)),
+            "no declared-gas reservation"
         );
-        assert_eq!(b.gas_used(), 30_000_000);
 
         // (2) nonce must equal the state nonce, then advance per admitted tx
         let mut b = SelectionBudget::new(30_000_000);
@@ -2628,6 +2694,127 @@ mod tests {
         let mut b = SelectionBudget::new(30_000_000);
         let max = transfer_tx(11, a, r, u64::MAX);
         assert!(!b.try_admit(&max, |_: &PublicKey| (u64::MAX, U256::MAX)));
+    }
+
+    /// Block gas meter: admission against what is left, charge on actual use.
+    #[test]
+    fn producer_block_gas_meter_charges_actual_use() {
+        let mut m = BlockGasMeter::new(30_000_000);
+        assert!(m.fits(30_000_000));
+        assert!(!m.fits(30_000_001));
+        m.charge(700);
+        assert_eq!(m.used(), 700);
+        assert!(m.fits(29_999_300));
+        assert!(!m.fits(29_999_301));
+        m.charge(u64::MAX);
+        assert_eq!(m.used(), 30_000_000, "saturates at the limit");
+        assert!(m.fits(0));
+        assert!(!m.fits(1));
+    }
+
+    /// Produce a real block from a funded high-declared-gas candidate plus a
+    /// normal transfer; returns (transfer included, filler included).
+    async fn producer_budget_case(filler_data: Vec<u8>, filler_price: u64) -> (bool, bool) {
+        let tmp = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+        let state_db = Arc::new(citrate_execution::StateDB::new());
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            state_db.clone(),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+        let a = Address([0x11; 20]);
+        let b = Address([0x66; 20]);
+        let recipient = Address([0x33; 20]);
+        let price_a = 100_000_000_000u64;
+        state_db.accounts.create_account_if_not_exists(a);
+        state_db
+            .accounts
+            .set_balance(a, U256::from(21_000u64 * price_a * 10));
+        let declared = 29_990_000u64;
+        state_db.accounts.create_account_if_not_exists(b);
+        state_db
+            .accounts
+            .set_balance(b, U256::from(declared) * U256::from(filler_price));
+
+        let mut transfer = transfer_tx(0xA1, a, recipient, 0);
+        transfer.gas_price = price_a;
+        let mut filler = transfer_tx(0xF1, b, recipient, 0);
+        filler.gas_limit = declared;
+        filler.gas_price = filler_price;
+        filler.data = filler_data;
+        mempool
+            .add_transaction(transfer.clone(), TxClass::Standard)
+            .await
+            .expect("transfer admitted");
+        mempool
+            .add_transaction(filler.clone(), TxClass::Standard)
+            .await
+            .expect("filler admitted");
+
+        let producer = BlockProducer::new(
+            storage.clone(),
+            executor,
+            mempool,
+            embedded_pubkey(Address([0x44; 20])),
+            test_signing_key(),
+            2,
+        );
+        let hash = producer.produce_block().await.expect("produce");
+        let block = storage
+            .blocks
+            .get_block(&hash)
+            .expect("read")
+            .expect("block stored");
+        let hashes: Vec<Hash> = block.transactions.iter().map(|t| t.hash).collect();
+        (
+            hashes.contains(&transfer.hash),
+            hashes.contains(&filler.hash),
+        )
+    }
+
+    /// PBA-L1a-004: declared-but-unused gas does not hold block space.
+    #[tokio::test]
+    async fn producer_budget_refill_standard_candidate() {
+        let (transfer_in, filler_in) = producer_budget_case(vec![], 101_000_000_000).await;
+        assert!(filler_in, "the higher-fee candidate runs first");
+        assert!(transfer_in, "the block is refilled after actual gas use");
+    }
+
+    /// PBA-L1a-004: a payload the executor runs as a plain call is not treated
+    /// as an AI operation by selection, and block gas is refilled after it.
+    #[tokio::test]
+    async fn producer_budget_refill_ai_prefixed_candidate() {
+        for prefix in [[0x04u8, 0, 0, 0], [0x05, 0, 0, 0]] {
+            // Classified as a plain call, it is ordered by fee (below the
+            // transfer); either way the transfer must make the block.
+            let (transfer_in, _filler_in) =
+                producer_budget_case(prefix.to_vec(), 1_000_000_000).await;
+            assert!(transfer_in, "prefix {prefix:?}: transfer must be included");
+        }
+    }
+
+    /// The mempool's AI view and the executor's dispatch use one classifier.
+    #[test]
+    fn ai_classifier_parity() {
+        use citrate_consensus::types::AiOpKind;
+        for b0 in 0u8..=8 {
+            let data = [b0, 0, 0, 0, 9, 9];
+            let expect = match b0 {
+                1 => Some(AiOpKind::RegisterModel),
+                2 => Some(AiOpKind::InferenceRequest),
+                3 => Some(AiOpKind::UpdateModel),
+                _ => None,
+            };
+            assert_eq!(AiOpKind::classify(true, &data), expect, "selector {b0}");
+            assert_eq!(AiOpKind::classify(false, &data), None, "deploy is never AI");
+        }
+        assert_eq!(AiOpKind::classify(true, &[0x02, 0, 0]), None, "short data");
     }
 
     #[tokio::test]
@@ -3675,7 +3862,9 @@ mod pba_l1a_001_producer_supervision {
     #[test]
     fn start_loop_uses_the_supervisor() {
         let src = include_str!("producer.rs");
-        let start = src.find("pub async fn start(self: Arc<Self>)").expect("start()");
+        let start = src
+            .find("pub async fn start(self: Arc<Self>)")
+            .expect("start()");
         let body = &src[start..start + 2_000];
         assert!(
             body.contains("supervised_round(self.clone())"),

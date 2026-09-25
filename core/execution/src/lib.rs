@@ -2,6 +2,17 @@
 
 // Re-export modules
 pub mod activation;
+
+/// PBA-L1a-003: consensus-affecting cargo features of THIS build of the
+/// execution crate. Dependent binaries assert on these at compile time (a
+/// feature can be switched on through `--features citrate-execution/<f>`
+/// without touching the binary's own feature list).
+pub mod build_features {
+    /// `halo2-substrate`: live 0x0108 verifier.
+    pub const HALO2_SUBSTRATE: bool = cfg!(feature = "halo2-substrate");
+    /// `commd-fold-verify`: live 0x0130 verifier.
+    pub const COMMD_FOLD_VERIFY: bool = cfg!(feature = "commd-fold-verify");
+}
 pub mod address_utils;
 pub mod block_rewards;
 pub mod crypto;

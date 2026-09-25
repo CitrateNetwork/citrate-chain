@@ -2232,36 +2232,24 @@ impl Executor {
             };
             let to = crate::address_utils::normalize_address(to_pk);
 
-            // Check first 4 bytes for function selector
-            if tx.data.len() >= 4 {
-                match &tx.data[0..4] {
-                    [0x01, 0x00, 0x00, 0x00] => {
-                        // Register model
-                        self.parse_register_model(&tx.data[4..])
-                    }
-                    [0x02, 0x00, 0x00, 0x00] => {
-                        // Inference request
-                        self.parse_inference_request(&tx.data[4..])
-                    }
-                    [0x03, 0x00, 0x00, 0x00] => {
-                        // Update model
-                        self.parse_update_model(&tx.data[4..])
-                    }
-                    _ => {
-                        // Generic call
-                        Ok(TransactionType::Call {
-                            to,
-                            data: tx.data.clone(),
-                            value: U256::from(tx.value),
-                        })
-                    }
+            // Dispatch on the shared classifier (the mempool and producer use
+            // the same one, so selection and execution agree on what an AI
+            // operation is).
+            match citrate_consensus::types::AiOpKind::classify(true, &tx.data) {
+                Some(citrate_consensus::types::AiOpKind::RegisterModel) => {
+                    self.parse_register_model(&tx.data[4..])
                 }
-            } else {
-                Ok(TransactionType::Call {
+                Some(citrate_consensus::types::AiOpKind::InferenceRequest) => {
+                    self.parse_inference_request(&tx.data[4..])
+                }
+                Some(citrate_consensus::types::AiOpKind::UpdateModel) => {
+                    self.parse_update_model(&tx.data[4..])
+                }
+                None => Ok(TransactionType::Call {
                     to,
                     data: tx.data.clone(),
                     value: U256::from(tx.value),
-                })
+                }),
             }
         }
     }

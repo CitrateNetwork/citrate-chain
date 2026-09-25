@@ -717,3 +717,74 @@ fn pba_l1a_018_typed_tx_y_parity_and_trailing_bytes() {
         "trailing bytes must be rejected"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PBA-L1a-002: feeHistory is budget-priced and batch responses are bounded.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fee_history_cost_scales_with_response() {
+    use citrate_api::eth_rpc::fee_history_cost;
+    assert_eq!(fee_history_cost(1, 0), 11);
+    assert_eq!(fee_history_cost(1024, 100), 10 + 101);
+    assert!(fee_history_cost(1024, 100) > fee_history_cost(512, 100));
+    assert_eq!(fee_history_cost(u64::MAX, usize::MAX), u32::MAX);
+}
+
+#[test]
+fn batch_response_cap_replaces_oversized_result() {
+    use citrate_api::rpc_limits::{cap_batch_response, MAX_BATCH_RESPONSE_BYTES};
+    use jsonrpc_core::{Id, Output, Response, Success, Value, Version};
+    let big = Value::String("x".repeat(MAX_BATCH_RESPONSE_BYTES));
+    let r = Response::Batch(vec![Output::Success(Success {
+        jsonrpc: Some(Version::V2),
+        result: big,
+        id: Id::Num(1),
+    })]);
+    let capped = cap_batch_response(Some(r)).expect("response");
+    let s = serde_json::to_string(&capped).expect("json");
+    assert!(
+        s.len() < 1024 && s.contains("-32003"),
+        "{}",
+        &s[..s.len().min(200)]
+    );
+    let small = Response::Batch(vec![Output::Success(Success {
+        jsonrpc: Some(Version::V2),
+        result: Value::Bool(true),
+        id: Id::Num(1),
+    })]);
+    let kept = cap_batch_response(Some(small.clone())).expect("response");
+    assert_eq!(
+        serde_json::to_string(&kept).expect("json"),
+        serde_json::to_string(&small).expect("json")
+    );
+    assert!(cap_batch_response(None).is_none());
+}
+
+#[test]
+fn fee_history_batch_response_is_bounded() {
+    let _g = HTTP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::thread::sleep(Duration::from_millis(1100)); // fresh budget window
+    let (storage, _tmp) = storage_with_tx_blocks(300);
+    let (port, close) = spawn_rpc(storage, RateLimitConfig::default());
+    let pcts = vec!["50"; 100].join(",");
+    let calls: Vec<String> = (0..100)
+        .map(|i| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{i},"method":"eth_feeHistory","params":["0x400","latest",[{pcts}]]}}"#
+            )
+        })
+        .collect();
+    let resp = http_post(port, &format!("[{}]", calls.join(",")));
+    let body = body_of(&resp);
+    assert!(
+        body.len() < citrate_api::rpc_limits::MAX_BATCH_RESPONSE_BYTES,
+        "batch response {} bytes",
+        body.len()
+    );
+    assert!(
+        body.contains("-32005"),
+        "later calls exceed the method budget"
+    );
+    close.close();
+}

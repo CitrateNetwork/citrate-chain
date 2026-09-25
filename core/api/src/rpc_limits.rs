@@ -20,6 +20,12 @@ use crate::rate_limit::{check_method_budget, RateLimitHandle};
 use jsonrpc_core::futures::future::{self, Either, Ready};
 use jsonrpc_core::{Call, Error, ErrorCode, Id, Metadata, Middleware, Output, Request, Response};
 use std::future::Future;
+use std::pin::Pin;
+
+/// PBA-L1a-002: largest serialized batch response the node returns (geth's
+/// `BatchResponseMaxSize` default). A larger batch result is replaced by an
+/// error response.
+pub const MAX_BATCH_RESPONSE_BYTES: usize = 25 * 1024 * 1024;
 
 /// PBA-L1a-009: most calls one JSON-RPC batch may carry (geth's
 /// `BatchRequestLimit` default is 1000; Citrate's heavier per-call handlers and
@@ -58,6 +64,28 @@ fn batch_too_large(len: usize) -> Response {
     )
 }
 
+/// Replace an oversized batch response with a single error (PBA-L1a-002).
+pub fn cap_batch_response(resp: Option<Response>) -> Option<Response> {
+    let r = resp?;
+    let size = serde_json::to_vec(&r)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
+    if size <= MAX_BATCH_RESPONSE_BYTES {
+        return Some(r);
+    }
+    Some(Response::from(
+        Error {
+            code: ErrorCode::ServerError(-32003),
+            message: format!(
+                "Batch response exceeds the node limit of {} bytes",
+                MAX_BATCH_RESPONSE_BYTES
+            ),
+            data: None,
+        },
+        Some(jsonrpc_core::Version::V2),
+    ))
+}
+
 fn rate_limited() -> Response {
     Response::from(
         Error {
@@ -84,7 +112,7 @@ impl RpcLimits {
 }
 
 impl<M: Metadata> Middleware<M> for RpcLimits {
-    type Future = Ready<Option<Response>>;
+    type Future = Pin<Box<dyn Future<Output = Option<Response>> + Send>>;
     type CallFuture = Ready<Option<Output>>;
 
     fn on_request<F, X>(&self, request: Request, meta: M, next: F) -> Either<Self::Future, X>
@@ -94,17 +122,20 @@ impl<M: Metadata> Middleware<M> for RpcLimits {
     {
         if let Request::Batch(ref calls) = request {
             if calls.len() > MAX_BATCH_SIZE {
-                return Either::Left(future::ready(Some(batch_too_large(calls.len()))));
+                return Either::Left(Box::pin(future::ready(Some(batch_too_large(calls.len())))));
             }
             // The HTTP limiter already charged 1 for the POST itself.
             let extra = calls.len().saturating_sub(1) as u32;
             if extra > 0 {
                 if let Some(b) = &self.buckets {
                     if !b.charge_current_client(extra) {
-                        return Either::Left(future::ready(Some(rate_limited())));
+                        return Either::Left(Box::pin(future::ready(Some(rate_limited()))));
                     }
                 }
             }
+            // PBA-L1a-002: cap the total size of a batch response.
+            let fut = next(request, meta);
+            return Either::Left(Box::pin(async move { cap_batch_response(fut.await) }));
         }
         Either::Right(next(request, meta))
     }

@@ -23,4 +23,5 @@ citrate-api = { path = "../core/api" }
 citrate-storage = { path = "../core/storage" }
 citrate-sequencer = { path = "../core/sequencer" }
 citrate-network = { path = "../core/network" }
-citrate-execution = { path = "../core/execution" }
+# PBA-L1a-003: same precompile feature set as citrate-node, so eth_call agrees.
+citrate-execution = { path = "../core/execution", features = ["commd-fold-verify"] }

@@ -380,16 +380,10 @@ impl Mempool {
         // Determine transaction type from data
         tx.determine_type();
 
-        // Override class based on AI transaction type
-        if let Some(tx_type) = tx.tx_type {
-            class = match tx_type {
-                citrate_consensus::types::TransactionType::ModelDeploy
-                | citrate_consensus::types::TransactionType::ModelUpdate
-                | citrate_consensus::types::TransactionType::TrainingJob
-                | citrate_consensus::types::TransactionType::LoraAdapter => TxClass::Compute,
-                citrate_consensus::types::TransactionType::InferenceRequest => TxClass::Compute,
-                citrate_consensus::types::TransactionType::Standard => class,
-            };
+        // Override class from the executor-aligned AI classifier (the same one
+        // the executor dispatches on), not the wire `tx_type` label.
+        if citrate_consensus::types::AiOpKind::of(&tx).is_some() {
+            class = TxClass::Compute;
         }
 
         tracing::info!(
@@ -502,11 +496,9 @@ impl Mempool {
         // Create mempool transaction with AI-aware priority
         let timestamp = chrono::Utc::now().timestamp() as u64;
 
-        // Use transaction's built-in priority calculation only for non-standard AI txs
-        let ai_priority = match tx.tx_type {
-            Some(citrate_consensus::types::TransactionType::Standard) | None => 0,
-            _ => tx.priority(),
-        };
+        // AI operations are ordered by fee like everything else (class
+        // multiplier only); no fee-independent boost.
+        let ai_priority = 0;
         let priority = TxPriority::new_with_ai(tx.gas_price, class, timestamp, ai_priority);
         let tx_size = self.calculate_tx_size(&tx);
 
@@ -909,25 +901,21 @@ impl Mempool {
     /// Get AI transactions (model operations, inference requests)
     pub async fn get_ai_transactions(&self, max_count: usize) -> Vec<Transaction> {
         let transactions = self.transactions.read().await;
-        let mut ai_txs = Vec::new();
-
-        for (_, mempool_tx) in transactions.iter() {
-            if let Some(
-                citrate_consensus::types::TransactionType::ModelDeploy
-                | citrate_consensus::types::TransactionType::ModelUpdate
-                | citrate_consensus::types::TransactionType::TrainingJob
-                | citrate_consensus::types::TransactionType::InferenceRequest
-                | citrate_consensus::types::TransactionType::LoraAdapter,
-            ) = mempool_tx.tx.tx_type
-            {
-                ai_txs.push(mempool_tx.tx.clone());
-                if ai_txs.len() >= max_count {
-                    break;
-                }
-            }
-        }
-
-        ai_txs
+        // Executor-aligned classification, highest fee first (ties: oldest).
+        let mut ai: Vec<&MempoolTx> = transactions
+            .values()
+            .filter(|m| citrate_consensus::types::AiOpKind::of(&m.tx).is_some())
+            .collect();
+        ai.sort_by(|a, b| {
+            b.tx.gas_price
+                .cmp(&a.tx.gas_price)
+                .then(a.added_at.cmp(&b.added_at))
+                .then(a.tx.hash.as_bytes().cmp(b.tx.hash.as_bytes()))
+        });
+        ai.into_iter()
+            .take(max_count)
+            .map(|m| m.tx.clone())
+            .collect()
     }
 
     /// Get the best transactions for block inclusion
@@ -1416,6 +1404,38 @@ mod tests {
         );
     }
 
+    /// The AI slice uses the executor's classifier (selectors 0x01..0x03 on a
+    /// call) and is ordered by fee.
+    #[tokio::test]
+    async fn ai_classifier_parity_in_mempool() {
+        let pool = pba_pool();
+        let mk = |seed: u8, sel: u8, price: u64| {
+            let mut t = pba_native_tx(seed, 0, 0);
+            t.data = vec![sel, 0, 0, 0, 7];
+            t.gas_price = price;
+            t
+        };
+        for (seed, sel, price) in [
+            (0x71u8, 0x02u8, 2_000_000_000u64),
+            (0x72, 0x04, 9_000_000_000),
+            (0x73, 0x05, 9_000_000_000),
+            (0x74, 0x01, 5_000_000_000),
+            (0x75, 0x03, 3_000_000_000),
+        ] {
+            pool.add_transaction(mk(seed, sel, price), TxClass::Standard)
+                .await
+                .expect("admit");
+        }
+        let ai = pool.get_ai_transactions(10).await;
+        let sels: Vec<u8> = ai.iter().map(|t| t.data[0]).collect();
+        assert_eq!(
+            sels,
+            vec![0x01, 0x03, 0x02],
+            "executor AI ops only, highest fee first"
+        );
+        assert_eq!(pool.get_ai_transactions(2).await.len(), 2);
+    }
+
     /// PBA-L1a-021: the pending-nonce lookup has no successor for u64::MAX
     /// (was `m + 1`, a panic under overflow-checks) — injected directly so the
     /// check holds even once admission rejects u64::MAX nonces.
@@ -1491,7 +1511,6 @@ mod tests {
         }
     }
 
-
     // ── PBA-R2 mutation-survivor kills (validate_transaction /
     // get_best_transactions / is_next_nonce / MempoolAccess). ──
 
@@ -1529,9 +1548,12 @@ mod tests {
     #[tokio::test]
     async fn pba_r2_gas_limit_ceiling_is_inclusive() {
         let mp = Mempool::new(MempoolConfig::default());
-        mp.add_transaction(signed_native(2, 0, Some(40204), MAX_GAS_PER_BLOCK), TxClass::Standard)
-            .await
-            .expect("exactly the per-block ceiling is admissible");
+        mp.add_transaction(
+            signed_native(2, 0, Some(40204), MAX_GAS_PER_BLOCK),
+            TxClass::Standard,
+        )
+        .await
+        .expect("exactly the per-block ceiling is admissible");
         assert!(mp
             .add_transaction(
                 signed_native(3, 0, Some(40204), MAX_GAS_PER_BLOCK + 1),
@@ -1564,10 +1586,20 @@ mod tests {
             .map(|i| create_test_tx(0, 1_000_000_000 + i as u64, [i + 1; 32]))
             .collect();
         for t in &txs {
-            mp.add_transaction(t.clone(), TxClass::Standard).await.unwrap();
+            mp.add_transaction(t.clone(), TxClass::Standard)
+                .await
+                .unwrap();
         }
-        assert_eq!(mp.get_best_transactions(1, usize::MAX).await.len(), 1, "count cap");
-        assert_eq!(mp.get_best_transactions(2, usize::MAX).await.len(), 2, "count cap");
+        assert_eq!(
+            mp.get_best_transactions(1, usize::MAX).await.len(),
+            1,
+            "count cap"
+        );
+        assert_eq!(
+            mp.get_best_transactions(2, usize::MAX).await.len(),
+            2,
+            "count cap"
+        );
         let one = mp.calculate_tx_size(&txs[0]);
         assert_eq!(
             mp.get_best_transactions(10, 2 * one).await.len(),
@@ -1585,18 +1617,34 @@ mod tests {
         });
         let a = create_test_tx(5, 1_000_000_000, [7; 32]);
         let b = create_test_tx(6, 1_000_000_000, [7; 32]);
-        mp.add_transaction(a.clone(), TxClass::Standard).await.unwrap();
-        mp.add_transaction(b.clone(), TxClass::Standard).await.unwrap();
+        mp.add_transaction(a.clone(), TxClass::Standard)
+            .await
+            .unwrap();
+        mp.add_transaction(b.clone(), TxClass::Standard)
+            .await
+            .unwrap();
         let none: HashSet<Hash> = HashSet::new();
-        assert!(mp.is_next_nonce(&a, &none).await, "the minimum pending nonce is next");
-        assert!(mp.is_next_nonce(&b, &none).await, "contiguous run from the minimum");
+        assert!(
+            mp.is_next_nonce(&a, &none).await,
+            "the minimum pending nonce is next"
+        );
+        assert!(
+            mp.is_next_nonce(&b, &none).await,
+            "contiguous run from the minimum"
+        );
         let below = create_test_tx(4, 1_000_000_000, [7; 32]);
-        assert!(!mp.is_next_nonce(&below, &none).await, "below the minimum is not next");
+        assert!(
+            !mp.is_next_nonce(&below, &none).await,
+            "below the minimum is not next"
+        );
         let included: HashSet<Hash> = [a.hash].into_iter().collect();
         assert!(mp.is_next_nonce(&b, &included).await);
         assert!(!mp.is_next_nonce(&a, &included).await);
         let fresh = create_test_tx(0, 1_000_000_000, [8; 32]);
-        assert!(mp.is_next_nonce(&fresh, &none).await, "first tx of an unknown sender");
+        assert!(
+            mp.is_next_nonce(&fresh, &none).await,
+            "first tx of an unknown sender"
+        );
     }
 
     /// The trait impls the node uses must propagate admission errors.
@@ -1604,13 +1652,17 @@ mod tests {
     async fn pba_r2_mempool_access_impls_propagate_rejections() {
         let bad = signed_native(4, u64::MAX, Some(40204), 21_000);
         let arc = Arc::new(Mempool::new(MempoolConfig::default()));
-        assert!(MempoolAccess::add_transaction(&arc, bad.clone(), TxClass::Standard)
-            .await
-            .is_err());
+        assert!(
+            MempoolAccess::add_transaction(&arc, bad.clone(), TxClass::Standard)
+                .await
+                .is_err()
+        );
         let locked = Arc::new(RwLock::new(Mempool::new(MempoolConfig::default())));
-        assert!(MempoolAccess::add_transaction(&locked, bad, TxClass::Standard)
-            .await
-            .is_err());
+        assert!(
+            MempoolAccess::add_transaction(&locked, bad, TxClass::Standard)
+                .await
+                .is_err()
+        );
     }
 
     /// The A015 gate alone (signature checks disabled by config) must reject
@@ -1675,7 +1727,11 @@ mod tests {
         let sel = tokio::spawn(async move { mp2.get_best_transactions(100, 1 << 20).await })
             .await
             .expect("PBA-L1a-001: selection panicked on a u64::MAX nonce");
-        assert_eq!(sel.len(), 1, "the unfollowable tx is skipped, the honest one selected");
+        assert_eq!(
+            sel.len(),
+            1,
+            "the unfollowable tx is skipped, the honest one selected"
+        );
         assert_eq!(sel[0].hash, honest.hash);
         assert_eq!(mp.pending_nonce_for(&poison.from).await, None);
         // The successor of an included u64::MAX nonce does not exist.

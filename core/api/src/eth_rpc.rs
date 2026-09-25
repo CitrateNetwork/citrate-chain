@@ -53,6 +53,15 @@ pub const FEE_HISTORY_MAX_BLOCKS: u64 = 1024;
 /// response, so this bounds the response at `1024 * 100` entries.
 pub const FEE_HISTORY_MAX_PERCENTILES: usize = 100;
 
+/// PBA-L1a-002: method-budget cost of an `eth_feeHistory` call: a base of 10
+/// (like `eth_getLogs`) plus one unit per 1024 response entries, so the
+/// largest legal call costs 111 of the 1000-unit per-second budget.
+pub fn fee_history_cost(block_count: u64, percentiles: usize) -> u32 {
+    let entries = block_count.saturating_mul((percentiles as u64).saturating_add(1));
+    let extra = entries.div_ceil(1024);
+    10u32.saturating_add(u32::try_from(extra).unwrap_or(u32::MAX))
+}
+
 /// PBA-L1a-002: parse and validate `eth_feeHistory`'s `rewardPercentiles`.
 ///
 /// Absent/`null` means "no rewards". Otherwise it must be an array of at most
@@ -1457,11 +1466,11 @@ pub fn register_eth_methods(
             .unwrap_or(1)
             .min(FEE_HISTORY_MAX_BLOCKS);
 
-        // PBA-L1a-002: validate `rewardPercentiles` BEFORE touching storage. The
-        // list used to be unbounded: one hex string per percentile per block made a
-        // ~2-byte request element cost ~1024 response strings (6,593x measured
-        // amplification, single-request OOM).
+        // PBA-L1a-002: validate `rewardPercentiles` before touching storage,
+        // and charge the method budget in proportion to the response it can
+        // produce (blocks x (1 + percentiles)).
         let percentiles = parse_reward_percentiles(params.get(2))?;
+        crate::rate_limit::check_method_budget(fee_history_cost(block_count, percentiles.len()))?;
 
         // PBA-L1a-020: `blockCount = 0` used to reach `block_count - 1` and
         // underflow (panic under overflow-checks). geth answers an empty history.

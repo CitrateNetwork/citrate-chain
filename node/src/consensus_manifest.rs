@@ -60,8 +60,13 @@ impl ConsensusManifest {
         let git_sha = env!("CITRATE_GIT_SHA");
         let git_dirty = env!("CITRATE_GIT_DIRTY") == "1";
         let build_target = env!("CITRATE_BUILD_TARGET");
-        let feat_halo2_verifier = env!("CITRATE_FEAT_HALO2") == "1";
-        let feat_commd_fold_verify = env!("CITRATE_FEAT_COMMD_FOLD") == "1";
+        // PBA-L1a-003: read the execution crate's actual feature set (a
+        // dependency-feature build does not show up in this crate's cargo
+        // features), OR-ed with this crate's own forwarding features.
+        let feat_halo2_verifier = env!("CITRATE_FEAT_HALO2") == "1"
+            || citrate_execution::build_features::HALO2_SUBSTRATE;
+        let feat_commd_fold_verify = env!("CITRATE_FEAT_COMMD_FOLD") == "1"
+            || citrate_execution::build_features::COMMD_FOLD_VERIFY;
 
         // Canonical, order-stable pre-image of the consensus-affecting surface.
         // Deliberately EXCLUDES build_target (arch must not change consensus) and

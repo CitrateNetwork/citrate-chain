@@ -457,3 +457,17 @@ fn pba_l1a_025_belnap_charges_the_hardened_price() {
         "{legacy_ok}"
     );
 }
+
+/// The REVM bridge switches exactly at the activation height: H-1 legacy,
+/// H and H+1 hardened.
+#[test]
+fn activation_boundary_is_exact_in_the_revm_bridge() {
+    activate();
+    let reserved = short(0x0104);
+    let (_, ok) = staticcall_at(reserved, vec![0xAB; 4], ACTIVATION - 1);
+    assert_eq!(ok[31], 1, "H-1: legacy");
+    let (_, ok) = staticcall_at(reserved, vec![0xAB; 4], ACTIVATION);
+    assert_eq!(ok[31], 0, "H: hardened");
+    let (_, ok) = staticcall_at(reserved, vec![0xAB; 4], ACTIVATION + 1);
+    assert_eq!(ok[31], 0, "H+1: hardened");
+}
