@@ -58,3 +58,31 @@ async fn pba_l1a_006_unauthenticated_tx_is_rejected_and_not_cached() {
     let (_, _, received, _, _, _, _, _) = g.get_stats().await;
     assert_eq!(received, 1);
 }
+
+/// PBA-L1b-007: the pre-filter for unsolicited `Transactions` batches rejects
+/// what the gossip arm rejects and normalizes the id, without relaying.
+#[tokio::test]
+async fn pba_l1b_007_prevalidate_matches_gossip_rules() {
+    let g = gossip();
+    let peer = PeerId("p".into());
+    let ok = g.prevalidate_transaction(signed(1, 0x42), &peer).await.unwrap();
+    assert_eq!(ok.hash, citrate_consensus::tx_auth::authenticate(&ok).unwrap());
+    let mut zero_gas = signed(1, 0x42);
+    zero_gas.gas_price = 0;
+    assert!(g.prevalidate_transaction(zero_gas, &peer).await.is_err());
+    let mut forged = signed(1, 0x42);
+    forged.value = 7;
+    assert!(g.prevalidate_transaction(forged, &peer).await.is_err());
+    let (_, _, _, propagated, _, _, _, _) = g.get_stats().await;
+    assert_eq!(propagated, 0, "prevalidation never relays");
+}
+
+/// Tripwire: the node's `Transactions` arm goes through the pre-filter.
+#[test]
+fn pba_l1b_007_tripwire_transactions_arm_is_prefiltered() {
+    let src = include_str!("../../../node/src/main.rs");
+    let arm = src
+        .find("NetworkMessage::Transactions { transactions } =>")
+        .expect("Transactions arm");
+    assert!(src[arm..arm + 1_200].contains("gossip_for_rx.prevalidate_transaction("));
+}

@@ -594,9 +594,13 @@ impl Mempool {
             let from_bytes = tx.from.as_bytes();
             let is_evm_address = from_bytes[20..].iter().all(|&b| b == 0)
                 && !from_bytes[..20].iter().all(|&b| b == 0);
-            if is_evm_address && !tx.ecdsa_verified {
+            // PBA-L1b-007: a tx that arrived over P2P has the flag stripped;
+            // accept it when the signer is recovered from its contents (all
+            // EIP-2718 types), never on address shape or the flag alone.
+            if is_evm_address && !tx.ecdsa_verified && !self.verify_eth_ecdsa(tx).unwrap_or(false) {
                 tracing::warn!(
-                    "ECDSA-shaped transaction from {:?} rejected: ecdsa_verified=false",
+                    "ECDSA-shaped transaction from {:?} rejected: not decoder-verified and \
+                     the signer does not recover from its contents",
                     tx.from
                 );
                 return Err(MempoolError::InvalidSignature);
@@ -730,75 +734,16 @@ impl Mempool {
         Ok(())
     }
 
-    /// Attempt Ethereum legacy/EIP-155 ECDSA verification using secp256k1
+    /// Verify a transaction's signature from its contents alone.
+    ///
+    /// PBA-L1b-007: this used to rebuild ONLY the legacy EIP-155 payload (and
+    /// encoded value 0 as `0x00` instead of `0x80`), so every EIP-2930/1559
+    /// transaction and every zero-value legacy one arriving over P2P (where
+    /// `ecdsa_verified` is stripped) failed and was dropped. It now delegates
+    /// to the shared verifier block import also uses (`tx_auth::authenticate`:
+    /// legacy/2930/1559 payloads, EIP-2 low-s, ed25519 for native keys).
     fn verify_eth_ecdsa(&self, tx: &Transaction) -> anyhow::Result<bool> {
-        use rlp::RlpStream;
-        use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, Secp256k1};
-        use sha3::{Digest, Keccak256};
-
-        // Extract 20-byte address from `from` (we expect decoder to set this)
-        let from_addr20 = {
-            let bytes = tx.from.as_bytes();
-            let mut a = [0u8; 20];
-            a.copy_from_slice(&bytes[0..20]);
-            a
-        };
-
-        // Build signable RLP (EIP-155 with configured chain_id)
-        let mut s = RlpStream::new_list(9);
-        s.append(&tx.nonce);
-        s.append(&tx.gas_price);
-        s.append(&tx.gas_limit);
-        // to: empty for contract creation
-        if let Some(to_pk) = &tx.to {
-            // take first 20 bytes
-            let mut to20 = [0u8; 20];
-            to20.copy_from_slice(&to_pk.as_bytes()[0..20]);
-            s.append(&to20.as_slice());
-        } else {
-            s.append_empty_data();
-        }
-        // value as minimal big-endian bytes
-        let mut value_be = tx.value.to_be_bytes().to_vec();
-        while value_be.first() == Some(&0u8) && value_be.len() > 1 {
-            value_be.remove(0);
-        }
-        s.append(&value_be.as_slice());
-        s.append(&tx.data.as_slice());
-        s.append(&self.config.chain_id);
-        s.append(&0u8);
-        s.append(&0u8);
-
-        let rlp_bytes = s.out().freeze();
-        let mut hasher = Keccak256::new();
-        hasher.update(&rlp_bytes);
-        let sighash = hasher.finalize();
-
-        // Build recoverable signature from r||s (no v available; try both recovery ids)
-        let secp = Secp256k1::new();
-        let msg = Message::from_slice(&sighash)?;
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes.copy_from_slice(tx.signature.as_bytes());
-
-        for rec_id in 0..=1 {
-            if let Ok(recid) = RecoveryId::from_i32(rec_id) {
-                if let Ok(recsig) = RecoverableSignature::from_compact(&sig_bytes, recid) {
-                    if let Ok(pubkey) = secp.recover_ecdsa(&msg, &recsig) {
-                        let uncompressed = pubkey.serialize_uncompressed();
-                        // Compute Ethereum address
-                        let mut hasher = Keccak256::new();
-                        hasher.update(&uncompressed[1..]);
-                        let hash = hasher.finalize();
-                        let mut addr = [0u8; 20];
-                        addr.copy_from_slice(&hash[12..]);
-                        if addr == from_addr20 {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(false)
+        Ok(citrate_consensus::tx_auth::authenticate(tx).is_ok())
     }
 
     /// Remove a transaction from mempool

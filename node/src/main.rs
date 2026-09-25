@@ -3012,10 +3012,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::Transactions { transactions } => {
-                        for tx in transactions {
-                            let _ = mempool_for_handler
-                                .add_transaction(tx, TxClass::Standard)
-                                .await;
+                        // PBA-L1b-007: this node never sends GetTransactions, so
+                        // every batch is unsolicited. It used to go straight into
+                        // the mempool, skipping the gossip pre-filter. Same
+                        // checks as NewTransaction now (basic validity + content
+                        // authentication, peer penalized on failure), bounded.
+                        const MAX_UNSOLICITED_TXS_PER_BATCH: usize = 256;
+                        for tx in transactions.into_iter().take(MAX_UNSOLICITED_TXS_PER_BATCH) {
+                            if let Ok(tx) = gossip_for_rx.prevalidate_transaction(tx, &pid).await {
+                                let _ = mempool_for_handler
+                                    .add_transaction(tx, TxClass::Standard)
+                                    .await;
+                            }
                         }
                     }
                     // PBA-L1b-005: an unpaid peer inference must never run on

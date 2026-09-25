@@ -279,6 +279,24 @@ impl GossipProtocol {
         Ok(())
     }
 
+    /// PBA-L1b-007: the pre-filter for transactions that arrive OUTSIDE the
+    /// gossip arm (the `Transactions` response message, which this node never
+    /// requests, so every batch is unsolicited): the same basic validity checks
+    /// and content authentication as `handle_new_transaction`, without relay.
+    pub async fn prevalidate_transaction(
+        &self,
+        tx: Transaction,
+        from_peer: &PeerId,
+    ) -> Result<Transaction, NetworkError> {
+        if !self.validate_transaction(&tx).await {
+            self.peer_manager
+                .update_peer_score(from_peer, SCORE_INVALID_TX)
+                .await;
+            return Err(NetworkError::InvalidMessage("Invalid transaction".to_string()));
+        }
+        self.authenticate_transaction(tx, from_peer).await
+    }
+
     /// PBA-L1a-006 / PBA-L1b-007: authenticate a peer-supplied transaction
     /// from its contents (`tx_auth::authenticate`: ed25519, or secp256k1
     /// recovery over the rebuilt legacy/2930/1559 payload) and return it with
