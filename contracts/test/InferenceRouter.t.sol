@@ -9,7 +9,7 @@ contract InferenceRouterTest is Test {
 
     function setUp() public {
         // Pass a dummy registry address; not used in these tests
-        router = new InferenceRouter(address(0));
+        router = new InferenceRouter(address(0), address(this));
         // Lower the minimum stake for easier testing
         router.setMinProviderStake(1 ether);
     }

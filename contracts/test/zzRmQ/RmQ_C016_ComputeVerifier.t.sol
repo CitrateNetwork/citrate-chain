@@ -20,7 +20,7 @@ contract RmQ_C016_ComputeVerifier is Test {
     uint256 internal oraclePk;
 
     function setUp() public {
-        verifier = new ComputeVerifier(address(this));
+        verifier = new ComputeVerifier(address(this), address(this));
         (oracle, oraclePk) = makeAddrAndKey("tee-oracle");
         verifier.addTEEOracle(oracle);
     }

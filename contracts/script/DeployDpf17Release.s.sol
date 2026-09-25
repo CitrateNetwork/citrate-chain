@@ -3,12 +3,13 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
+import "./lib/GovernanceOps.sol";
 import "../src/defense_prime/ReleaseManifestRegistry.sol";
 
 /// @title DeployDpf17Release - Stage 15 broadcast (FINAL stage of DPF program)
 /// @notice Deploys ReleaseManifestRegistry. Deployer self-authorizes
 ///         as recorder so CI release runs can broadcast.
-contract DeployDpf17Release is ScriptEnv {
+contract DeployDpf17Release is ScriptEnv, GovernanceOps {
     function run() external returns (address rel) {
         address deployer = deployerAddress();
         address governance = envAddressOr("GOVERNANCE", deployer);
@@ -22,7 +23,7 @@ contract DeployDpf17Release is ScriptEnv {
 
         ReleaseManifestRegistry reg = new ReleaseManifestRegistry(governance);
         console.log("ReleaseManifestRegistry:  ", address(reg));
-        reg.setRecorder(deployer, true);
+        _govCall(governance, deployer, address(reg), abi.encodeWithSignature("setRecorder(address,bool)", deployer, true), "reg.setRecorder(deployer, true)");
         console.log("Recorder set: deployer");
 
         vm.stopBroadcast();

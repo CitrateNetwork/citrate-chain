@@ -59,6 +59,9 @@ contract ComputePoolPipelineTest is Test {
     }
 
     function _attest(address worker) internal {
+        // PBA-L2-024: isAttested requires a governance-approved measurement.
+        vm.prank(registry.governance());
+        registry.setApprovedVmMeasurement(keccak256(abi.encode("vm", worker)), true);
         vm.prank(worker);
         registry.submitAttestation(
             keccak256(abi.encode("vm", worker)),

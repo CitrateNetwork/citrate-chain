@@ -42,7 +42,7 @@ contract DisputeResolutionTest is Test {
     uint256 internal constant RANGE_END = 1048576; // 2^20
 
     function setUp() public {
-        dispute = new DisputeResolution(BOND, MAX_ROUNDS);
+        dispute = new DisputeResolution(BOND, MAX_ROUNDS, address(this));
         mockSlashing = new MockSlashingForDispute();
         dispute.setSlashingContract(address(mockSlashing));
 
@@ -149,7 +149,7 @@ contract DisputeResolutionTest is Test {
     // ══════════════════════════════════════════════════════════════════
 
     function test_cannot_exceed_max_rounds() public {
-        DisputeResolution smallDispute = new DisputeResolution(1 ether, 3);
+        DisputeResolution smallDispute = new DisputeResolution(1 ether, 3, address(this));
         vm.deal(challenger, 1000 ether);
         vm.deal(defender, 1000 ether);
 
@@ -265,7 +265,7 @@ contract DisputeResolutionTimeoutTest is Test {
     uint256 internal constant RANGE_END = 1048576; // 2^20
 
     function setUp() public {
-        dispute = new DisputeResolution(BOND, MAX_ROUNDS);
+        dispute = new DisputeResolution(BOND, MAX_ROUNDS, address(this));
         mockSlashing = new MockSlashingForDispute();
         dispute.setSlashingContract(address(mockSlashing));
 
@@ -482,12 +482,12 @@ contract DisputeResolutionTimeoutTest is Test {
 
     function test_constructor_zero_bond_reverts() public {
         vm.expectRevert("Bond must be >= 1");
-        new DisputeResolution(0, 20);
+        new DisputeResolution(0, 20, address(this));
     }
 
     function test_constructor_zero_rounds_reverts() public {
         vm.expectRevert("MaxRounds must be >= 1");
-        new DisputeResolution(10 ether, 0);
+        new DisputeResolution(10 ether, 0, address(this));
     }
 
     // ══════════════════════════════════════════════════════════════════

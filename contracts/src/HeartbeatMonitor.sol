@@ -71,8 +71,8 @@ contract HeartbeatMonitor is ReentrancyGuard, Governable {
 
     /// @param _heartbeatInterval Blocks between required heartbeats.
     /// @param _maxMissed Maximum consecutive missed heartbeats before suspension.
-    constructor(uint256 _heartbeatInterval, uint256 _maxMissed)
-        Governable(msg.sender)
+    constructor(uint256 _heartbeatInterval, uint256 _maxMissed, address initialGovernance)
+        Governable(initialGovernance)
     {
         require(_heartbeatInterval >= 1, "Interval must be >= 1");
         require(_maxMissed >= 1, "MaxMissed must be >= 1");

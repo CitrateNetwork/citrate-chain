@@ -64,7 +64,7 @@ contract ComputeVerifierTest is Test {
         marketplace = address(this); // Test contract acts as marketplace
         governance = address(this);
 
-        verifier = new ComputeVerifier(marketplace);
+        verifier = new ComputeVerifier(marketplace, address(this));
 
         // Pre-compute commitment hash: SHA3(output || nonce)
         commitmentHash = keccak256(abi.encodePacked(outputData, nonce));

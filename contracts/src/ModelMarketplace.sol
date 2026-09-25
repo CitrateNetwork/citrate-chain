@@ -3,6 +3,8 @@
 // citrate-v3/contracts/src/ModelMarketplace.sol
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "./lib/InitialAdmin.sol";
+
 import "./interfaces/IModelRegistry.sol";
 import "./interfaces/IModelMarketplace.sol";
 import "./lib/AccessControl.sol";
@@ -79,14 +81,17 @@ contract ModelMarketplace is IModelMarketplace, AccessControl, ReentrancyGuard {
         _;
     }
 
-    constructor(address _modelRegistry, address _treasuryAddress) {
+    /// @param admin Explicit DEFAULT_ADMIN (PBA-L2-002: never msg.sender, which is
+    ///        the CREATE2 factory under a salted ceremony deploy).
+    constructor(address _modelRegistry, address _treasuryAddress, address admin) {
+        InitialAdmin.check(admin);
         require(_modelRegistry != address(0), "Invalid model registry");
         require(_treasuryAddress != address(0), "Invalid treasury address");
 
         modelRegistry = IModelRegistry(_modelRegistry);
         treasuryAddress = _treasuryAddress;
 
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
     }
 
     /**

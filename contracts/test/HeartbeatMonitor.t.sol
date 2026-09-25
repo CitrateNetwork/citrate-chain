@@ -51,7 +51,7 @@ contract HeartbeatMonitorTest is Test {
         currentBlock = 1;
         vm.roll(currentBlock);
 
-        monitor = new HeartbeatMonitor(INTERVAL, MAX_MISSED);
+        monitor = new HeartbeatMonitor(INTERVAL, MAX_MISSED, address(this));
         mockSlashing = new MockSlashing();
         monitor.setSlashingContract(address(mockSlashing));
     }
@@ -420,11 +420,11 @@ contract HeartbeatMonitorTest is Test {
 
     function test_constructor_zero_interval_reverts() public {
         vm.expectRevert("Interval must be >= 1");
-        new HeartbeatMonitor(0, 3);
+        new HeartbeatMonitor(0, 3, address(this));
     }
 
     function test_constructor_zero_maxMissed_reverts() public {
         vm.expectRevert("MaxMissed must be >= 1");
-        new HeartbeatMonitor(100, 0);
+        new HeartbeatMonitor(100, 0, address(this));
     }
 }

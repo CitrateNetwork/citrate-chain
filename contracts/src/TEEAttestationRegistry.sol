@@ -117,6 +117,12 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
     /// reverts with "TEERegistry: jwt replay".
     mapping(bytes32 => bool) public usedJwtSignatures;
 
+    /// @notice PBA-L2-024: governance-approved VM measurements. `isAttested`
+    ///         is false for any record whose measurement is not on this list.
+    mapping(bytes32 => bool) public approvedVmMeasurement;
+
+    event VmMeasurementApproval(bytes32 indexed measurement, bool approved);
+
     /// @notice Pending two-step RSA key updates. Governance proposes
     /// a new key; after `RSA_KEY_TIMELOCK_BLOCKS` blocks anyone may
     /// finalize the proposal. Protects against compromised governance:
@@ -273,9 +279,17 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
         // Bind: parse the JWT payload and verify the measurement
         // claim is literally present.
         bytes memory payloadJson = JWTParser.extractPayload(signedJwtPayload);
+        // PBA-L2-024: the claim must be a TOP-LEVEL member of the signed
+        // payload (a raw substring match accepted a lone `"` or a string the
+        // guest embedded in nested runtime data), and it must be a
+        // measurement governance has approved.
         require(
-            JWTParser.containsClaim(payloadJson, vmMeasurementClaim),
+            JWTParser.containsTopLevelClaim(payloadJson, vmMeasurementClaim),
             "TEERegistry: vm claim not in jwt"
+        );
+        require(
+            approvedVmMeasurement[keccak256(vmMeasurementClaim)],
+            "TEERegistry: vm measurement not approved"
         );
 
         // CHAIN-B-C019 (audit 2026-09-02): bind the JWT to the caller. The
@@ -290,7 +304,7 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
         // `"holder":"<lowercase 0x address>"` runtime claim naming the address
         // that will submit it.
         require(
-            JWTParser.containsClaim(payloadJson, _holderClaim(msg.sender)),
+            JWTParser.containsTopLevelClaim(payloadJson, _holderClaim(msg.sender)),
             "TEERegistry: jwt not bound to caller"
         );
 
@@ -345,9 +359,13 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
         returns (bool)
     {
         AttestationRecord memory r = attestations[worker];
+        // PBA-L2-024: an attestation only counts while its VM measurement is
+        // on governance's approved list (revoking a measurement de-attests
+        // every worker running it).
         return !r.slashed
             && r.attestedAtBlock > 0
-            && uint256(r.expiryBlock) > currentBlock;
+            && uint256(r.expiryBlock) > currentBlock
+            && approvedVmMeasurement[r.vmMeasurement];
     }
 
     /// @notice Returns the attestation record for inspection.
@@ -449,6 +467,15 @@ contract TEEAttestationRegistry is ReentrancyGuard, Governable {
     uint256 private _nextReportId;
 
     // ── Governance ──────────────────────────────────────────────────
+
+    /// @notice PBA-L2-024: approve (or revoke) a VM measurement. For the
+    ///         strict-bound path the value is `keccak256` of the exact
+    ///         top-level `"key":"value"` claim bytes; for the legacy path it is
+    ///         the asserted `vmMeasurement`.
+    function setApprovedVmMeasurement(bytes32 measurement, bool approved) external onlyGovernance {
+        approvedVmMeasurement[measurement] = approved;
+        emit VmMeasurementApproval(measurement, approved);
+    }
 
     function setMaaSigner(bytes32 keyHash, bool trusted) external onlyGovernance {
         trustedMaaSigners[keyHash] = trusted;

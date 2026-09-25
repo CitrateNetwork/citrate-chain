@@ -36,39 +36,52 @@ contract Create2DeterminismTest is Test {
         assertEq(deployed, expected, "deploy is not CREATE2 / wrong salt");
     }
 
-    /// No-arg contracts: init_code == creationCode.
+    /// Formerly no-arg contracts. PBA-L2-002: they now take the admin/governance
+    /// explicitly, so init_code == creationCode ++ abi.encode(admin).
     function test_noArg_contracts_are_create2() public {
-        ModelRegistry mr = new ModelRegistry{salt: Salts.salt("ModelRegistry")}();
-        _assertCreate2(address(mr), Salts.salt("ModelRegistry"), type(ModelRegistry).creationCode);
+        ModelRegistry mr = new ModelRegistry{salt: Salts.salt("ModelRegistry")}(address(this));
+        _assertCreate2(
+            address(mr),
+            Salts.salt("ModelRegistry"),
+            abi.encodePacked(type(ModelRegistry).creationCode, abi.encode(address(this)))
+        );
 
         WrappedSALT ws = new WrappedSALT{salt: Salts.salt("WrappedSALT")}();
         _assertCreate2(address(ws), Salts.salt("WrappedSALT"), type(WrappedSALT).creationCode);
 
-        ComputePool cp = new ComputePool{salt: Salts.salt("ComputePool")}();
-        _assertCreate2(address(cp), Salts.salt("ComputePool"), type(ComputePool).creationCode);
+        ComputePool cp = new ComputePool{salt: Salts.salt("ComputePool")}(address(this));
+        _assertCreate2(
+            address(cp),
+            Salts.salt("ComputePool"),
+            abi.encodePacked(type(ComputePool).creationCode, abi.encode(address(this)))
+        );
 
-        IPFSIncentives ip = new IPFSIncentives{salt: Salts.salt("IPFSIncentives")}();
-        _assertCreate2(address(ip), Salts.salt("IPFSIncentives"), type(IPFSIncentives).creationCode);
+        IPFSIncentives ip = new IPFSIncentives{salt: Salts.salt("IPFSIncentives")}(address(this));
+        _assertCreate2(
+            address(ip),
+            Salts.salt("IPFSIncentives"),
+            abi.encodePacked(type(IPFSIncentives).creationCode, abi.encode(address(this)))
+        );
     }
 
     /// Constructor-arg contracts: init_code == creationCode ++ abi.encode(args).
     /// Their address stays deterministic because the dependency address is itself
     /// a (deterministic) CREATE2 address.
     function test_argConstructor_contracts_are_create2() public {
-        ModelRegistry mr = new ModelRegistry{salt: Salts.salt("ModelRegistry")}();
-        InferenceRouter router = new InferenceRouter{salt: Salts.salt("InferenceRouter")}(address(mr));
+        ModelRegistry mr = new ModelRegistry{salt: Salts.salt("ModelRegistry")}(address(this));
+        InferenceRouter router = new InferenceRouter{salt: Salts.salt("InferenceRouter")}(address(mr), address(this));
         _assertCreate2(
             address(router),
             Salts.salt("InferenceRouter"),
-            abi.encodePacked(type(InferenceRouter).creationCode, abi.encode(address(mr)))
+            abi.encodePacked(type(InferenceRouter).creationCode, abi.encode(address(mr), address(this)))
         );
 
         WrappedSALT ws = new WrappedSALT{salt: Salts.salt("WrappedSALT")}();
-        X402Paywall pw = new X402Paywall{salt: Salts.salt("X402Paywall")}(address(ws), 1 ether);
+        X402Paywall pw = new X402Paywall{salt: Salts.salt("X402Paywall")}(address(ws), 1 ether, address(this));
         _assertCreate2(
             address(pw),
             Salts.salt("X402Paywall"),
-            abi.encodePacked(type(X402Paywall).creationCode, abi.encode(address(ws), uint256(1 ether)))
+            abi.encodePacked(type(X402Paywall).creationCode, abi.encode(address(ws), uint256(1 ether), address(this)))
         );
     }
 

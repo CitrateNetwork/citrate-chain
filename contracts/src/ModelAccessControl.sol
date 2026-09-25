@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "./lib/InitialAdmin.sol";
+
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Address.sol";
@@ -91,6 +93,15 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
     // to revenue recipients (`pendingWithdrawals`), not to the owner.
     uint256 public totalUserStakes;
     uint256 public totalPendingWithdrawals;
+    /// PBA-L2-030 (pre-bounty audit 2026-09-24): payments escrowed by
+    /// `requestAccess` that are neither approved nor refunded. They were not
+    /// counted as liabilities (so `emergencyWithdraw` could sweep them) and had
+    /// no refund path (an ignored request's payment was stuck forever).
+    uint256 public totalPendingRequests;
+    /// Requests refunded through `cancelAccessRequest`.
+    mapping(uint256 => bool) public requestCancelled;
+    /// A requester may reclaim an unapproved request's payment after this.
+    uint256 public constant REQUEST_REFUND_DELAY = 7 days;
 
     // Model categories and metadata
     mapping(bytes32 => string) public modelCategories;
@@ -138,6 +149,7 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
         uint256 timestamp
     );
 
+    event AccessRequestCancelled(uint256 indexed requestId, address indexed requester, uint256 refund);
     event RevenueWithdrawn(
         address indexed recipient,
         uint256 amount
@@ -170,7 +182,9 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
 
     // ============ Constructor ============
 
-    constructor() Ownable(msg.sender) {}
+    /// @param initialOwner Explicit owner (PBA-L2-002: never msg.sender, which is
+    ///        the CREATE2 factory under a salted ceremony deploy).
+    constructor(address initialOwner) Ownable(InitialAdmin.check(initialOwner)) {}
 
     // ============ Model Management ============
 
@@ -287,6 +301,7 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
         require(msg.value >= models[modelId].accessPrice, "Insufficient payment");
 
         requestId = nextRequestId++;
+        totalPendingRequests += msg.value; // PBA-L2-030: escrowed liability
 
         accessRequests[requestId] = AccessRequest({
             requester: msg.sender,
@@ -313,9 +328,11 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
     ) external {
         AccessRequest storage request = accessRequests[requestId];
         require(!request.approved, "Already approved");
+        require(!requestCancelled[requestId], "Request cancelled");
         require(models[request.modelId].owner == msg.sender, "Not model owner");
 
         request.approved = true;
+        totalPendingRequests -= request.payment; // PBA-L2-030: escrow -> revenue
 
         // Grant access
         accessGrants[request.modelId][request.requester] = AccessGrant({
@@ -339,6 +356,25 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
         );
     }
 
+    /**
+     * @notice PBA-L2-030: reclaim an unapproved request's payment after
+     *         `REQUEST_REFUND_DELAY`.
+     */
+    function cancelAccessRequest(uint256 requestId) external nonReentrant {
+        AccessRequest storage request = accessRequests[requestId];
+        require(request.requester == msg.sender, "Not requester");
+        require(!request.approved, "Already approved");
+        require(!requestCancelled[requestId], "Request cancelled");
+        require(block.timestamp >= request.timestamp + REQUEST_REFUND_DELAY, "Refund not yet available");
+        requestCancelled[requestId] = true;
+        uint256 refund = request.payment;
+        totalPendingRequests -= refund;
+        emit AccessRequestCancelled(requestId, msg.sender, refund);
+        if (refund > 0) {
+            payable(msg.sender).sendValue(refund);
+        }
+    }
+
     // ============ Inference Execution ============
 
     /**
@@ -355,6 +391,11 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
     {
         // Check payment if required
         uint256 price = models[modelId].accessPrice;
+        // PBA-L2-030: value sent when no payment is due (free model, or the
+        // owner) used to be stranded; refuse it instead.
+        if (msg.sender == models[modelId].owner || price == 0) {
+            require(msg.value == 0, "No payment due");
+        }
         if (msg.sender != models[modelId].owner && price > 0) {
             require(msg.value >= price, "Insufficient payment");
             modelRevenue[modelId] += msg.value;
@@ -397,6 +438,9 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
       returns (bytes memory)
     {
         require(models[modelId].isEncrypted, "Model not encrypted");
+        // PBA-L2-030 variant: this path charges nothing, so any value sent was
+        // stranded with no liability or refund. Refuse it.
+        require(msg.value == 0, "No payment due");
 
         // Effects: Update state BEFORE external call (Checks-Effects-Interactions pattern)
         accessGrants[modelId][msg.sender].usageCount++;
@@ -557,7 +601,7 @@ contract ModelAccessControl is Ownable, ReentrancyGuard {
     /// balance to the owner, converting every stake and every accrued
     /// payout into owner funds and bricking `unstake`/`withdrawRevenue`.
     function emergencyWithdraw() external onlyOwner nonReentrant {
-        uint256 liabilities = totalUserStakes + totalPendingWithdrawals;
+        uint256 liabilities = totalUserStakes + totalPendingWithdrawals + totalPendingRequests;
         uint256 balance = address(this).balance;
         require(balance > liabilities, "No surplus to withdraw");
         payable(owner()).sendValue(balance - liabilities);

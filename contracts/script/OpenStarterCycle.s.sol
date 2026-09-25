@@ -52,8 +52,9 @@ contract OpenStarterCycle is ScriptEnv {
         vm.startBroadcast();
 
         // 1. Fresh instances with governance = broadcasting EOA (plain CREATE).
-        LearningCycleManager cycleManager = new LearningCycleManager();
-        ContributionAccounting contributions = new ContributionAccounting();
+        // PBA-L2-002: governance is passed explicitly (never implicit msg.sender).
+        LearningCycleManager cycleManager = new LearningCycleManager(msg.sender);
+        ContributionAccounting contributions = new ContributionAccounting(msg.sender);
         console2.log("LearningCycleManager (governed):", address(cycleManager));
         console2.log("ContributionAccounting (governed):", address(contributions));
         console2.log("governance:", cycleManager.governance());

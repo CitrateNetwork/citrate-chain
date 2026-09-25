@@ -38,13 +38,13 @@ contract ComputeFuzzTest is Test {
     function setUp() public {
         governance = address(this);
 
-        verifier = new ComputeVerifier(address(1));
-        marketplace = new ComputeMarketplace(address(verifier), treasury);
+        verifier = new ComputeVerifier(address(1), address(this));
+        marketplace = new ComputeMarketplace(address(verifier), treasury, address(this));
         verifier.setMarketplace(address(marketplace));
 
-        heartbeat = new HeartbeatMonitor(100, 3);
-        dispute = new DisputeResolution(10 ether, 20);
-        pool = new ComputePool();
+        heartbeat = new HeartbeatMonitor(100, 3, address(this));
+        dispute = new DisputeResolution(10 ether, 20, address(this));
+        pool = new ComputePool(address(this));
 
         vm.deal(requester, type(uint128).max);
         vm.deal(provider1, type(uint128).max);

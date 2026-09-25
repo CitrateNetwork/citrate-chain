@@ -16,7 +16,7 @@ contract ContributionAccountingTest is Test {
     address internal outsider = address(0xBAD1);
 
     function setUp() public {
-        accounting = new ContributionAccounting();
+        accounting = new ContributionAccounting(address(this));
 
         // Fund test addresses
         vm.deal(governance, 100 ether);

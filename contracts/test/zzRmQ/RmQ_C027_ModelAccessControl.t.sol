@@ -18,7 +18,7 @@ contract RmQ_C027_ModelAccessControl is Test {
     bytes32 internal constant MODEL = bytes32(uint256(0xA1));
 
     function setUp() public {
-        mac = new ModelAccessControl();
+        mac = new ModelAccessControl(address(this));
         vm.deal(userA, 100 ether);
     }
 

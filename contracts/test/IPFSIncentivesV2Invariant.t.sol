@@ -178,9 +178,9 @@ contract IPFSIncentivesV2InvariantTest is Test {
 
     function setUp() public {
         vm.etch(VERIFY, type(InvVerifier).runtimeCode);
-        kyc = new KYCRegistry(address(0));
+        kyc = new KYCRegistry(address(0), address(this));
         inc = new IPFSIncentivesV2(
-            kyc, BOND, REWARD, ROUNDS, MAX_MISSED, CHALLENGER_BPS, QUORUM, WINDOW, CHALLENGE_N
+            kyc, BOND, REWARD, ROUNDS, MAX_MISSED, CHALLENGER_BPS, QUORUM, WINDOW, CHALLENGE_N, address(this)
         );
         vm.deal(address(this), 1_000_000 ether);
         inc.fund{value: 100_000 ether}();

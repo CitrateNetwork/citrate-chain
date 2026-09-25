@@ -36,8 +36,8 @@ contract ModelMarketplaceTest is Test {
 
     function setUp() public {
         // Deploy contracts
-        registry = new ModelRegistry();
-        marketplace = new ModelMarketplace(address(registry), treasury);
+        registry = new ModelRegistry(address(this));
+        marketplace = new ModelMarketplace(address(registry), treasury, address(this));
 
         // Setup test accounts
         vm.deal(owner, 100 ether);

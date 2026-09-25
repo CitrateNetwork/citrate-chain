@@ -118,8 +118,8 @@ contract DisputeResolution is ReentrancyGuard, Governable {
 
     /// @param _disputeBond Bond required to initiate dispute (SALT).
     /// @param _maxBisectionRounds Maximum bisection rounds.
-    constructor(uint256 _disputeBond, uint256 _maxBisectionRounds)
-        Governable(msg.sender)
+    constructor(uint256 _disputeBond, uint256 _maxBisectionRounds, address initialGovernance)
+        Governable(initialGovernance)
     {
         require(_disputeBond >= 1, "Bond must be >= 1");
         require(_maxBisectionRounds >= 1, "MaxRounds must be >= 1");

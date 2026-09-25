@@ -3,6 +3,8 @@
 // citrate-v3/contracts/src/ModelRegistry.sol
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "./lib/InitialAdmin.sol";
+
 import "./interfaces/IModelRegistry.sol";
 import "./lib/AccessControl.sol";
 import "./lib/ReentrancyGuard.sol";
@@ -77,9 +79,12 @@ contract ModelRegistry is IModelRegistry, AccessControl, ReentrancyGuard {
         address indexed user
     );
     
-    constructor() {
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(OPERATOR_ROLE, msg.sender);
+    /// @param admin Explicit DEFAULT_ADMIN (PBA-L2-002: never msg.sender, which is
+    ///        the CREATE2 factory under a salted ceremony deploy).
+    constructor(address admin) {
+        InitialAdmin.check(admin);
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(OPERATOR_ROLE, admin);
     }
     
     /**

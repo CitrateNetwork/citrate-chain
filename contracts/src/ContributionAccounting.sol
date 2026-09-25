@@ -127,7 +127,9 @@ contract ContributionAccounting is Governable {
 
     // ── Constructor ─────────────────────────────────────────────────
 
-    constructor() Governable(msg.sender) {
+    /// @param initialGovernance Explicit governance (PBA-L2-002: never msg.sender,
+    ///        which is the CREATE2 factory under a salted ceremony deploy).
+    constructor(address initialGovernance) Governable(initialGovernance) {
         // Default weights (basis points): 10000 = 1.0x multiplier
         weights[ContributionType.Validation]      = 10000;  // 1.0x
         weights[ContributionType.ModelHosting]     = 15000;  // 1.5x

@@ -24,6 +24,8 @@ contract TEEAttestationRegistryTest is Test {
         registry = new TEEAttestationRegistry(governance);
         registry.setMaaSigner(MAA_KEY, true);
         registry.setNrasSigner(NRAS_KEY, true);
+        // PBA-L2-024: isAttested now requires a governance-approved measurement.
+        registry.setApprovedVmMeasurement(keccak256("vm"), true);
         // RM-B1 / WP-D3.1 (audit SOL-03): V2 strict mode is now ON
         // by default. Tests that exercise the V1 path explicitly
         // toggle it off to keep the legacy fixture coverage intact.

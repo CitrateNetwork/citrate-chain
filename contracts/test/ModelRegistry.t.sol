@@ -15,7 +15,7 @@ contract ModelRegistryTest is Test {
     address constant MODEL_PRECOMPILE = 0x0000000000000000000000000000000000001000;
 
     function setUp() public {
-        registry = new ModelRegistry();
+        registry = new ModelRegistry(address(this));
 
         // Deploy mock precompile and etch its runtime code at the precompile address
         ModelPrecompileMock mock = new ModelPrecompileMock();

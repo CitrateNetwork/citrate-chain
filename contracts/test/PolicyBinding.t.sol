@@ -508,6 +508,7 @@ contract PolicyBindingTest is Test {
         bytes32[] memory required = new bytes32[](2);
         required[0] = ALICE;
         required[1] = BOB;
+        vm.prank(ALICE_ADDR); // PBA-L2-013: draft binds initiator to the caller
         envelopes.draft(envelopeId, ALICE, keccak256("artifact"), "bafyArtifact", required, 2, 0, keccak256("corr"));
         vm.prank(ALICE_ADDR);
         envelopes.sign(envelopeId, ALICE, hex"ab", "ceremony");

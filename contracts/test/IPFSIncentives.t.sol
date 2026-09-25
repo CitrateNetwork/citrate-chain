@@ -9,7 +9,7 @@ contract IPFSIncentivesTest is Test {
     address internal reporter = address(0xBEEF);
 
     function setUp() public {
-        incentives = new IPFSIncentives();
+        incentives = new IPFSIncentives(address(this));
         vm.deal(address(this), 20 ether);
 
         // Admin grants reporter role and funds the contract.

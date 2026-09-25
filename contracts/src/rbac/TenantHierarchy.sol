@@ -54,6 +54,13 @@ contract TenantHierarchy {
 
     mapping(bytes32 tenant_id => TenantNode) private _nodes;
     mapping(bytes32 tenant_id => bytes32[]) private _children;
+    /// @notice PBA-L2-054 (pre-bounty audit 2026-09-24): ids of removed nodes.
+    ///         Downstream state keyed by tenant id (PolicyBinding bindings,
+    ///         CapabilityGrant authority) survives `removeNode`, so a removed id
+    ///         must never be re-created — otherwise an admin of ANY node at the
+    ///         parent level re-creates it under their own subtree and inherits
+    ///         that state.
+    mapping(bytes32 tenant_id => bool) public tombstoned;
     bytes32 public root;
     bool private _initialized;
 
@@ -99,6 +106,8 @@ contract TenantHierarchy {
     error InvalidThreshold(uint8 threshold, uint256 admin_count);
     error EmptyAdmins();
     error HasChildren(bytes32 tenant_id);
+    /// PBA-L2-054: the id belonged to a removed node and cannot be reused.
+    error NodeTombstoned(bytes32 tenant_id);
     /// @notice `initRoot` may be called only by the deployer. FWA-C3-02.
     error NotDeployer(address caller);
 
@@ -184,6 +193,7 @@ contract TenantHierarchy {
         TenantNode storage parentNode = _nodes[parent];
         if (!parentNode.exists) revert NodeDoesNotExist(parent);
         if (_nodes[self].exists) revert NodeAlreadyExists(self);
+        if (tombstoned[self]) revert NodeTombstoned(self);
         if (level == 0 || level > MAX_LEVEL) revert InvalidLevel(level);
         if (level != parentNode.level + 1) {
             revert LevelMismatch(parentNode.level + 1, level);
@@ -278,6 +288,7 @@ contract TenantHierarchy {
         }
 
         delete _nodes[tenant_id];
+        tombstoned[tenant_id] = true; // PBA-L2-054
         emit NodeRemoved(tenant_id, msg.sender);
     }
 

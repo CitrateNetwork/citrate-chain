@@ -36,7 +36,7 @@ contract ComputePoolSettlementTest is Test {
     event JobReclaimed(uint256 indexed jobId, uint256 indexed poolId, address indexed requester, uint256 refund);
 
     function setUp() public {
-        pool = new ComputePool();
+        pool = new ComputePool(address(this));
         vm.deal(creator, 1000 ether);
         vm.deal(provider1, 1000 ether);
         vm.deal(provider2, 1000 ether);

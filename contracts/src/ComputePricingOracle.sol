@@ -147,8 +147,8 @@ contract ComputePricingOracle is IComputePricingOracle, Governable {
     /// @notice Deploy with initial prices
     /// @param _computePriceUsdCents Initial compute price in USD cents per PFLOP-hour
     /// @param _saltPriceUsdCents Initial SALT price in USD cents
-    constructor(uint256 _computePriceUsdCents, uint256 _saltPriceUsdCents)
-        Governable(msg.sender)
+    constructor(uint256 _computePriceUsdCents, uint256 _saltPriceUsdCents, address initialGovernance)
+        Governable(initialGovernance)
     {
         require(_computePriceUsdCents > 0, "ComputePricingOracle: zero compute price");
         require(_saltPriceUsdCents > 0, "ComputePricingOracle: zero SALT price");

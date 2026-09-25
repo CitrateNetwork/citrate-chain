@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "./lib/InitialAdmin.sol";
+
 import "./lib/AccessControl.sol";
 
 /**
@@ -49,13 +51,16 @@ contract KYCRegistry is AccessControl {
     event KYCRevoked(address indexed account, address indexed updater);
     event IdentityBound(address indexed account, bytes32 indexed subHash, address indexed updater);
 
-    constructor(address updater) {
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        // The deployer is also an updater so a single key can bootstrap; in
+    /// @param admin Explicit DEFAULT_ADMIN (PBA-L2-002: never msg.sender, which is
+    ///        the CREATE2 factory under a salted ceremony deploy).
+    constructor(address updater, address admin) {
+        InitialAdmin.check(admin);
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        // The admin is also an updater so a single key can bootstrap; in
         // production the off-chain authority key is granted KYC_UPDATER_ROLE and
-        // the deployer's updater grant is revoked at the ceremony.
-        _grantRole(KYC_UPDATER_ROLE, msg.sender);
-        if (updater != address(0) && updater != msg.sender) {
+        // the admin's updater grant is revoked at the ceremony.
+        _grantRole(KYC_UPDATER_ROLE, admin);
+        if (updater != address(0) && updater != admin) {
             _grantRole(KYC_UPDATER_ROLE, updater);
         }
     }

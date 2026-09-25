@@ -17,7 +17,7 @@ contract ComputePricingOracleC037Test is Test {
     address constant O3 = address(0x0AC1E3);
 
     function setUp() public {
-        oracle = new ComputePricingOracle(13, 100);
+        oracle = new ComputePricingOracle(13, 100, address(this));
         oracle.addOracleMember(O1);
         oracle.addOracleMember(O2);
         oracle.addOracleMember(O3);

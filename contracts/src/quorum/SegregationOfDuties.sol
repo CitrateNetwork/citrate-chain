@@ -16,13 +16,14 @@ import {QuorumIdentity} from "./QuorumIdentity.sol";
 ///
 /// | Role | Source |
 /// |---|---|
-/// | Proposer | the envelope's `initiator` |
-/// | Approver | the envelope's `signed_by` |
+/// | Proposer | the envelope's `initiator` (bound to the drafting address, and a roster member) |
+/// | Approver | the envelope's `signed_by`, counted only for roster members (PBA-L2-013) |
 /// | Executor | `QuorumIdentity.subjectKey(ctx.principal)` — whoever is acting now |
 ///
-/// The envelope is located exactly as `ThresholdApproval` locates it, from the
-/// same derivation, so one action has one approval record rather than one per
-/// protocol that wants to look at it.
+/// The envelope id is derived the same WAY as `ThresholdApproval`'s, but the
+/// derivation includes `address(this)`, so each protocol reads its OWN envelope
+/// (PBA-L2-013 corrected the earlier claim that one action has one record).
+/// Binding SoD next to ThresholdApproval therefore needs both envelopes.
 ///
 /// **Deployment precondition, stated because it is load-bearing:** the envelope's
 /// identities must be written with the same encoding this reads —
@@ -42,6 +43,11 @@ import {QuorumIdentity} from "./QuorumIdentity.sol";
 /// a tainted approval, rather than a different approver.
 contract SegregationOfDuties is IGovernanceProtocol {
     bytes32 public constant REASON_WRONG_TENANT = bytes32("SOD_WRONG_TENANT");
+    /// PBA-L2-035: an envelope at the derived id exists but was drafted by a
+    /// party this protocol does not recognise; it is ignored (it can neither
+    /// approve nor deny), and the action must be re-proposed under a new
+    /// correlation id by a recognised proposer.
+    bytes32 public constant REASON_FOREIGN_PROPOSER = bytes32("SOD_FOREIGN_PROPOSER");
     bytes32 public constant REASON_NOT_PROPOSED = bytes32("SOD_NOT_PROPOSED");
     bytes32 public constant REASON_PENDING = bytes32("SOD_PENDING");
     bytes32 public constant REASON_SATISFIED = bytes32("SOD_SATISFIED");
@@ -55,6 +61,10 @@ contract SegregationOfDuties is IGovernanceProtocol {
     IMultiSigEnvelope public immutable envelopes;
     /// How many distinct approvers, none of them the proposer or the executor.
     uint8 public immutable minApprovers;
+    /// PBA-L2-013: the roster whose members may propose and approve. Hashed
+    /// identities (`QuorumIdentity.subjectKey`). Before this, every `signed_by`
+    /// entry counted, so an executor satisfied SoD with sybil addresses.
+    bytes32[] private _roster;
 
     bytes32 private immutable _templateId;
     uint32 private immutable _version;
@@ -69,6 +79,12 @@ contract SegregationOfDuties is IGovernanceProtocol {
     /// means anything; zero would make this protocol a no-op that reads like a
     /// control.
     error MinApproversTooLow();
+    error EmptyRoster();
+    error RosterTooLarge(uint256 size);
+    error DuplicateRosterMember(bytes32 member);
+    /// A roster that cannot seat a proposer, `minApprovers` approvers and an
+    /// executor who are all distinct can never Allow.
+    error RosterTooSmall(uint256 size, uint8 minApprovers);
 
     constructor(
         bytes32 tenantId,
@@ -77,13 +93,24 @@ contract SegregationOfDuties is IGovernanceProtocol {
         bytes32 specHash_,
         string memory specCID_,
         address envelopes_,
-        uint8 minApprovers_
+        uint8 minApprovers_,
+        bytes32[] memory roster_
     ) {
         if (tenantId == bytes32(0)) revert ZeroTenant();
         if (templateId_ == bytes32(0)) revert ZeroTemplate();
         if (envelopes_ == address(0)) revert ZeroEnvelopes();
         if (specHash_ == bytes32(0) || bytes(specCID_).length == 0) revert EmptySpec();
         if (minApprovers_ == 0) revert MinApproversTooLow();
+        if (roster_.length == 0) revert EmptyRoster();
+        if (roster_.length > 64) revert RosterTooLarge(roster_.length);
+        // proposer + approvers (the executor may be outside the roster)
+        if (roster_.length < uint256(minApprovers_) + 1) revert RosterTooSmall(roster_.length, minApprovers_);
+        for (uint256 i = 0; i < roster_.length; ++i) {
+            for (uint256 j = i + 1; j < roster_.length; ++j) {
+                if (roster_[i] == roster_[j]) revert DuplicateRosterMember(roster_[i]);
+            }
+        }
+        _roster = roster_;
 
         tenant = tenantId;
         _templateId = templateId_;
@@ -94,9 +121,9 @@ contract SegregationOfDuties is IGovernanceProtocol {
         minApprovers = minApprovers_;
     }
 
-    /// The envelope this protocol reads. Same derivation as
-    /// `ThresholdApproval.approvalEnvelopeId`, so one action has one approval
-    /// record however many protocols consult it.
+    /// The envelope this protocol reads. Same shape as
+    /// `ThresholdApproval.approvalEnvelopeId`, but keyed by this contract's
+    /// address, so it is this protocol's own record (PBA-L2-013).
     function approvalEnvelopeId(bytes32 actionClass, bytes32 paramsHash, bytes32 correlationId)
         public
         view
@@ -129,6 +156,14 @@ contract SegregationOfDuties is IGovernanceProtocol {
         if (state == IMultiSigEnvelope.EnvelopeState.NotExist) {
             return (Verdict.RequireApproval, REASON_NOT_PROPOSED, requiredSigners);
         }
+
+        IMultiSigEnvelope.Envelope memory e = envelopes.getEnvelope(envelopeId);
+        // PBA-L2-013/-035: the proposer must be a roster member. `initiator` is
+        // now bound to the drafting address, so it cannot be a fake identity;
+        // an envelope drafted by anyone else is ignored for every verdict.
+        if (!_inRoster(e.initiator)) {
+            return (Verdict.RequireApproval, REASON_FOREIGN_PROPOSER, requiredSigners);
+        }
         if (state == IMultiSigEnvelope.EnvelopeState.Rejected) {
             return (Verdict.Deny, REASON_REJECTED, requiredSigners);
         }
@@ -136,7 +171,6 @@ contract SegregationOfDuties is IGovernanceProtocol {
             return (Verdict.Deny, REASON_WITHDRAWN, requiredSigners);
         }
 
-        IMultiSigEnvelope.Envelope memory e = envelopes.getEnvelope(envelopeId);
         bytes32 executor = executorIdentity(ctx.principal);
 
         // A control failure, not a queue. Each one is named separately because
@@ -153,13 +187,27 @@ contract SegregationOfDuties is IGovernanceProtocol {
             if (e.signed_by[i] == executor) {
                 return (Verdict.Deny, REASON_EXECUTOR_APPROVED, requiredSigners);
             }
-            ++eligible;
+            // PBA-L2-013: only roster members are approvers. A sybil address
+            // outside the roster signs nothing that counts here.
+            if (_inRoster(e.signed_by[i])) ++eligible;
         }
 
         if (eligible < minApprovers) {
             return (Verdict.RequireApproval, REASON_PENDING, requiredSigners);
         }
         return (Verdict.Allow, REASON_SATISFIED, requiredSigners);
+    }
+
+    /// The roster in force (PBA-L2-013).
+    function roster() external view returns (bytes32[] memory) {
+        return _roster;
+    }
+
+    function _inRoster(bytes32 who) private view returns (bool) {
+        for (uint256 i = 0; i < _roster.length; ++i) {
+            if (_roster[i] == who) return true;
+        }
+        return false;
     }
 
     /// @inheritdoc IGovernanceProtocol

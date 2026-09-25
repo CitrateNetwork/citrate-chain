@@ -97,6 +97,7 @@ contract ThresholdApprovalTest is Test {
     /// Draft the envelope the protocol will actually look at.
     function _draft(bytes32[] memory required, uint8 envThreshold, uint64 expiresAt) internal returns (bytes32 id) {
         id = protocol.approvalEnvelopeId(ACTION, PARAMS, CORR);
+        vm.prank(ALICE_ADDR); // PBA-L2-013: draft binds initiator to the caller
         envelopes.draft(id, ALICE, keccak256("artifact"), "bafyArtifact", required, envThreshold, expiresAt, CORR);
     }
 
@@ -262,6 +263,7 @@ contract ThresholdApprovalTest is Test {
         _sign(id, ALICE, hex"ab", "ceremony");
         _sign(id, BOB, hex"cd", "ceremony");
         _markDelivered(id, ALICE);
+        vm.prank(BOB_ADDR); // PBA-L2-035: a counterparty (required signer) rejects
         envelopes.reject(id, "not this quarter");
 
         (IGovernanceProtocol.Verdict v, bytes32 reason,) = _check();

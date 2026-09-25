@@ -100,9 +100,9 @@ contract ReentrancyAttackTest is Test {
 
     function setUp() public {
         wSALT = new WrappedSALT();
-        registry = new ModelRegistry();
+        registry = new ModelRegistry(address(this));
         treasury = address(0xFEE);
-        marketplace = new ModelMarketplace(address(registry), treasury);
+        marketplace = new ModelMarketplace(address(registry), treasury, address(this));
 
         alice = makeAddr("alice");
         vm.deal(alice, 100 ether);

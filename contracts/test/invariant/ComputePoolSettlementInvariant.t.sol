@@ -44,7 +44,7 @@ contract SettlementHandler is Test {
     bool public terminalMonotonicityViolation;
 
     constructor() {
-        pool = new ComputePool();
+        pool = new ComputePool(address(this));
         gov = pool.governance();
 
         vm.deal(creator, 1_000_000 ether);

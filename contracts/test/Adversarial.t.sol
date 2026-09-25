@@ -38,8 +38,8 @@ contract AdversarialTest is Test {
         specRegistry = new SpecRegistry(governor);
 
         // Deploy model registry and inference router
-        modelRegistry = new ModelRegistry();
-        router = new InferenceRouter(address(modelRegistry));
+        modelRegistry = new ModelRegistry(address(this));
+        router = new InferenceRouter(address(modelRegistry), address(this));
         router.setMinProviderStake(1 ether);
 
         // Fund test accounts

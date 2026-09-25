@@ -135,8 +135,10 @@ contract RmE3InviteTtlTest is Test {
         );
 
         bytes32 code = keccak256("pool-code");
+        // PBA-L2-025: the creator registers the code bound to the invitee.
+        bytes32 key = pool.inviteKeyFor(poolId, code, joiner); // before the prank
         vm.prank(creator);
-        pool.addInviteCode(poolId, code);
+        pool.addInviteCode(poolId, key);
 
         // Warp past TTL.
         vm.warp(block.timestamp + uint256(pool.DEFAULT_INVITE_TTL()) + 1);
@@ -156,8 +158,10 @@ contract RmE3InviteTtlTest is Test {
         );
 
         bytes32 code = keccak256("pool-code");
+        // PBA-L2-025: the creator registers the code bound to the invitee.
+        bytes32 key = pool.inviteKeyFor(poolId, code, joiner); // before the prank
         vm.prank(creator);
-        pool.addInviteCode(poolId, code);
+        pool.addInviteCode(poolId, key);
 
         vm.prank(joiner);
         pool.joinWithInvite{value: 1 ether}(poolId, code);

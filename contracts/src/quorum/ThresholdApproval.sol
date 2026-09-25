@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {IGovernanceProtocol} from "./IGovernanceProtocol.sol";
+import {QuorumIdentity} from "./QuorumIdentity.sol";
 
 /// Minimal view of the deployed `MultiSigEnvelope` (DPF-02, `rbac/`).
 ///
@@ -79,27 +80,19 @@ interface IMultiSigEnvelope {
 ///
 /// ## The trust boundary, stated plainly
 ///
-/// `MultiSigEnvelope.sign` does not authenticate the signer cryptographically:
-/// its own NatSpec delegates that to the caller ("the orchestrator's HSM
-/// verifies the cryptographic proof before invoking this method"). Anyone able
-/// to send a transaction can record a signature for any identity in an
-/// envelope's `required_signers`.
+/// Since CHAIN-B-C008, `MultiSigEnvelope.sign` binds the named signer to the
+/// caller (`signer == QuorumIdentity.subjectKey(msg.sender)`), and since
+/// PBA-L2-013/-035 `draft` binds `initiator` to the caller and only a required
+/// signer may `accept`/`reject`. So a recorded signature for identity X was
+/// sent by X's address. The chain still does not verify the `signer_sig`
+/// bytes themselves; those are the evidence an off-chain verifier (quorum's
+/// SignatureCeremony) re-checks.
 ///
-/// Therefore `Allow` from this protocol means: *an envelope exists in which at
-/// least N identities from the approver set are recorded as having signed, with
-/// signature bytes attached.* It does NOT mean the chain verified those
-/// signatures. Binding that record to real humans is citrate-quorum's
-/// SignatureCeremony, off chain, and the signature bytes in the envelope are the
-/// evidence a verifier re-checks.
-///
-/// In the interface's own terms (`IGovernanceProtocol`), this template is
-/// **attested** — provable after the fact — and is **binding** only to the
-/// extent that whoever may write to the envelope contract is trusted. Making it
-/// binding on its own would require `MultiSigEnvelope` to verify signatures,
-/// which is a change to a deployed DPF-02 contract and is not this sprint's to
-/// make. It is written here rather than left for a reader to infer, because the
-/// gap between "N people approved" and "N signatures are recorded" is exactly
-/// the kind of thing that gets flattened in a board slide.
+/// This protocol ignores an envelope at its derived id unless the envelope's
+/// initiator is one of its approvers or the acting principal
+/// (`REASON_FOREIGN_PROPOSER`), so an unrecognised party's draft, close or
+/// reject cannot change the verdict (PBA-L2-035). A new attempt uses a new
+/// `correlationId`.
 ///
 /// ## Expiry is deliberate, and has a consequence worth knowing
 ///
@@ -112,6 +105,11 @@ contract ThresholdApproval is IGovernanceProtocol {
     /// Reason codes. Short strings so an operator reading a raw log sees words,
     /// and the app maps them to sentences.
     bytes32 public constant REASON_WRONG_TENANT = bytes32("TA_WRONG_TENANT");
+    /// PBA-L2-035: an envelope at the derived id exists but was drafted by a
+    /// party this protocol does not recognise; it is ignored (it can neither
+    /// approve nor deny), and the action must be re-proposed under a new
+    /// correlation id by a recognised proposer.
+    bytes32 public constant REASON_FOREIGN_PROPOSER = bytes32("TA_FOREIGN_PROPOSER");
     bytes32 public constant REASON_NOT_PROPOSED = bytes32("TA_NOT_PROPOSED");
     bytes32 public constant REASON_PENDING = bytes32("TA_PENDING");
     bytes32 public constant REASON_SATISFIED = bytes32("TA_SATISFIED");
@@ -225,6 +223,14 @@ contract ThresholdApproval is IGovernanceProtocol {
         }
         // Terminal-fail states are answers, not waiting rooms. Re-proposing needs
         // a new correlation id.
+        IMultiSigEnvelope.Envelope memory e = envelopes.getEnvelope(envelopeId);
+        // PBA-L2-012/-035: `draft` is permissionless and first-writer-wins, so
+        // anyone can occupy this derived id. Only an envelope whose (now
+        // caller-bound) initiator this protocol recognises counts for ANY
+        // verdict, so an outsider's draft/close/reject cannot flip it.
+        if (!_isRecognisedProposer(e.initiator, ctx.principal)) {
+            return (Verdict.RequireApproval, REASON_FOREIGN_PROPOSER, _approvers);
+        }
         if (state == IMultiSigEnvelope.EnvelopeState.Rejected) {
             return (Verdict.Deny, REASON_REJECTED, new bytes32[](0));
         }
@@ -232,7 +238,6 @@ contract ThresholdApproval is IGovernanceProtocol {
             return (Verdict.Deny, REASON_WITHDRAWN, new bytes32[](0));
         }
 
-        IMultiSigEnvelope.Envelope memory e = envelopes.getEnvelope(envelopeId);
         // `>=`, matching `MultiSigEnvelope.sign`, which refuses at exactly
         // `expires_at`. A gate that considered an envelope live one second after
         // it stopped being signable would answer for a state that cannot exist.
@@ -310,6 +315,16 @@ contract ThresholdApproval is IGovernanceProtocol {
     function isApprover(bytes32 identity) external view returns (bool) {
         for (uint256 i = 0; i < _approvers.length; ++i) {
             if (_approvers[i] == identity) return true;
+        }
+        return false;
+    }
+
+    /// PBA-L2-035: who may draft the envelope this protocol reads — a member of
+    /// its own set, or the acting principal itself.
+    function _isRecognisedProposer(bytes32 initiator, address principal) private view returns (bool) {
+        if (initiator == QuorumIdentity.subjectKey(principal)) return true;
+        for (uint256 i = 0; i < _approvers.length; ++i) {
+            if (_approvers[i] == initiator) return true;
         }
         return false;
     }

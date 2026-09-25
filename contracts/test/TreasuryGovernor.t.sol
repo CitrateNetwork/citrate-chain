@@ -77,7 +77,7 @@ contract TreasuryGovernorTest is Test {
         recipient2 = address(0xB002);
 
         // Deploy LiquidStakingPool (governance = this test contract)
-        stakingPool = new LiquidStakingPool();
+        stakingPool = new LiquidStakingPool(address(this));
 
         // Deploy StablecoinTreasury (governance = this test contract)
         treasury = new StablecoinTreasury(address(this));
@@ -109,12 +109,26 @@ contract TreasuryGovernorTest is Test {
         treasury.transferGovernance(address(governor));
         governor.acceptGovernanceOf(address(treasury));
 
-        // Fund accounts with SALT for voting power
+        // Fund accounts with SALT and ESCROW it as voting power. PBA-L2-001:
+        // voting power is the escrow at the proposal snapshot (block - 1), not
+        // the live balance, so every voter locks here and one block passes
+        // before any proposal is created.
         vm.deal(proposer, 50_000 ether);
-        vm.deal(voter1, 200_000_000 ether); // 200M SALT — large voter
+        vm.deal(voter1, 200_000_000 ether + 1_000 ether); // 200M SALT — large voter (+ gas/staking float)
         vm.deal(voter2, 150_000_000 ether); // 150M SALT
         vm.deal(voter3, 100_000_000 ether); // 100M SALT
         vm.deal(outsider, 1 ether);
+        _lock(proposer, 50_000 ether);
+        _lock(voter1, 200_000_000 ether);
+        _lock(voter2, 150_000_000 ether);
+        _lock(voter3, 100_000_000 ether);
+        _lock(outsider, 1 ether);
+        vm.roll(block.number + 1);
+    }
+
+    function _lock(address who, uint256 amount) internal {
+        vm.prank(who);
+        governor.lockVotes{value: amount}();
     }
 
     // ============================================================
@@ -579,15 +593,16 @@ contract TreasuryGovernorTest is Test {
     // Test 8: Voting power with staking
     // ============================================================
 
-    function test_voting_power_includes_staking() public {
-        // voter1 stakes 100 ether into LiquidStakingPool
+    /// PBA-L2-001: stSALT is NOT voting power any more. LiquidStakingPool
+    /// shares are not checkpointed and move freely mid-vote, which is the same
+    /// recycling defect as a live balance. Only escrow in the governor counts.
+    function test_voting_power_excludes_unsnapshotted_staking() public {
+        // voter1 stakes 100 ether (from its unlocked float) into LiquidStakingPool
         vm.prank(voter1);
         stakingPool.deposit{value: 100 ether}();
 
-        // Voting power should include staked amount
+        // Voting power is exactly the 200M escrow; the 100 stSALT adds nothing.
         uint256 power = governor.getVotingPower(voter1);
-        // power = (200M - 100) SALT balance + 100 stSALT * sharePrice / 1e18
-        // First deposit: sharePrice = 1e18, so staked value = 100 ether
         assertEq(power, 200_000_000 ether);
     }
 
@@ -656,15 +671,20 @@ contract TreasuryGovernorTest is Test {
     }
 
     function test_C013_countedVotingPower_cannotExceedDeclaredSupply() public {
-        uint256 proposalId = _createSpendProposal();
-        vm.roll(block.number + 2);
-
         address first = address(0xC0131);
         address second = address(0xC0132);
         address third = address(0xC0133);
         vm.deal(first, 600_000_000 ether);
         vm.deal(second, 400_000_000 ether);
         vm.deal(third, 1 ether);
+        // PBA-L2-001: weight is snapshot escrow, so lock BEFORE the proposal.
+        _lock(first, 600_000_000 ether);
+        _lock(second, 400_000_000 ether);
+        _lock(third, 1 ether);
+        vm.roll(block.number + 1);
+
+        uint256 proposalId = _createSpendProposal();
+        vm.roll(block.number + 2);
 
         vm.prank(first);
         governor.castVote(proposalId, TreasuryGovernor.VoteType.For);

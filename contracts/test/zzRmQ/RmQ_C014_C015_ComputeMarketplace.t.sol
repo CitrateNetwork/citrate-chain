@@ -50,7 +50,7 @@ contract RmQ_C014_C015_ComputeMarketplace is Test {
 
     function setUp() public {
         verifier = new MockVerifier();
-        market = new ComputeMarketplace(address(verifier), treasury);
+        market = new ComputeMarketplace(address(verifier), treasury, address(this));
         bulk = new MockBulkGateway();
         oracle = new MockOracle();
         market.setBulkGateway(address(bulk));

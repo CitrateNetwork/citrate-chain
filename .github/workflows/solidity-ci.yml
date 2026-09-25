@@ -91,6 +91,19 @@ jobs:
             | sha256sum -c -
           sudo install -m 0755 /tmp/solc /usr/local/bin/solc
           solc --version
+      # PBA-R2 (pre-bounty audit 2026-09-24) class tripwires: constructor
+      # msg.sender under the salted CREATE2 ceremony (PBA-L2-002), signer ids
+      # not bound to the caller (PBA-L2-014/-036), and consumers trusting an
+      # envelope's self-reported threshold (PBA-L2-012). Blocking.
+      - name: PBA-R2 semgrep tripwires
+        working-directory: contracts
+        run: |
+          pipx install semgrep==1.167.0
+          # pipx puts the entry point in PIPX_BIN_DIR (on PATH on hosted runners).
+          # The rules must still fire on their fixture (guards against a rule
+          # silently matching nothing), then must be clean on src/.
+          semgrep --metrics=off --test --config .semgrep/pba-r2-tripwires.yml .semgrep/pba-r2-tripwires.sol
+          semgrep --metrics=off --error --config .semgrep/pba-r2-tripwires.yml src
       # Compile first (serialized via FOUNDRY_THREADS=1 + swap) so the cache
       # is warm; keeps the heavy via-IR work in one observable step.
       - name: Build contracts (bounded concurrency)
@@ -100,6 +113,14 @@ jobs:
           forge build --use 0.8.36 --threads 1
       - name: Run Forge tests
         working-directory: contracts
+        run: |
+          forge test -vvv --use 0.8.36 --threads 1
+      # Core-membership frozen CREATE2 projections in a closure-scoped compile
+      # ([profile.membership] in foundry.toml explains why). Still blocking.
+      - name: Core-membership frozen CREATE2 projections (closure-scoped compile)
+        working-directory: contracts
+        env:
+          FOUNDRY_PROFILE: membership
         run: |
           forge test -vvv --use 0.8.36 --threads 1
 

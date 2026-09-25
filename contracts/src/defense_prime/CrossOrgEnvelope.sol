@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {QuorumIdentity} from "../quorum/QuorumIdentity.sol";
+
 /// @notice Minimal read interface for ClassificationRegistry.
 ///         Mirrors `rbac/ClassificationRegistry.sol::clearanceOrdinal`.
 ///         0=Public, 1=Proprietary, 2=CUI, 3=ITAR.
@@ -61,6 +63,10 @@ contract CrossOrgEnvelope {
     ///         the artifact's classification level. Enforced when
     ///         `classification_oracle` is set and `artifact_max_class > 0`.
     error InsufficientClearance(bytes32 signer, uint8 required, uint8 actual);
+    // PBA-L2-036 / PBA-L2-014
+    error SignerNotCaller(bytes32 signer, address caller);
+    error NotDrafter(bytes32 envelope_id, address caller);
+    error NotCounterpartyOrgRecorder(bytes32 envelope_id, address caller);
 
     // ── Types ──────────────────────────────────────────────────────────
 
@@ -116,6 +122,10 @@ contract CrossOrgEnvelope {
 
     /// @notice envelope_id → org_root → signed count
     mapping(bytes32 => mapping(bytes32 => uint8)) public signedCountOf;
+
+    /// @notice PBA-L2-036: the recorder that drafted each envelope. The
+    ///         drafting side delivers; a DIFFERENT party org accepts.
+    mapping(bytes32 => address) public draftedBy;
 
     /// @notice envelope_id → signer → has signed (any org)
     mapping(bytes32 => mapping(bytes32 => bool)) public hasSigned;
@@ -217,6 +227,7 @@ contract CrossOrgEnvelope {
             rejected_by_org: bytes32(0)
         });
         exists[envelope_id] = true;
+        draftedBy[envelope_id] = msg.sender;
         artifactClassOf[envelope_id] = artifact_max_class;
         envelopesByScope[scope].push(envelope_id);
         allEnvelopeIds.push(envelope_id);
@@ -256,6 +267,11 @@ contract CrossOrgEnvelope {
         if (!is_org_recorder[org_root][msg.sender]) {
             revert NotOrgRecorder(org_root, msg.sender);
         }
+        // PBA-L2-014/-036: one org key used to satisfy its org's whole M-of-N
+        // by naming each signer. The named signer must now be the caller's own
+        // identity, so each of the M signatures comes from a distinct key that
+        // governance registered for this org.
+        if (signer != QuorumIdentity.subjectKey(msg.sender)) revert SignerNotCaller(signer, msg.sender);
         CrossOrgEnvelopeRecord storage e = envelopes[envelope_id];
         if (e.state != 1 && e.state != 2) revert NotInState(envelope_id, 1, e.state);
         if (e.expires_at_block != 0 && block.number > e.expires_at_block) {
@@ -291,6 +307,8 @@ contract CrossOrgEnvelope {
         CrossOrgEnvelopeRecord storage e = envelopes[envelope_id];
         if (e.state != 3) revert NotInState(envelope_id, 3, e.state);
         if (!is_recorder[msg.sender]) revert NotRecorder(msg.sender);
+        // PBA-L2-036: the drafting side delivers.
+        if (msg.sender != draftedBy[envelope_id]) revert NotDrafter(envelope_id, msg.sender);
         e.state = 4;
         e.delivered_at_block = block.number;
         emit StateChanged(envelope_id, 3, 4);
@@ -301,6 +319,11 @@ contract CrossOrgEnvelope {
         CrossOrgEnvelopeRecord storage e = envelopes[envelope_id];
         if (e.state != 4) revert NotInState(envelope_id, 4, e.state);
         if (!is_recorder[msg.sender]) revert NotRecorder(msg.sender);
+        // PBA-L2-036: acceptance is the counterparty's act — a recorder
+        // registered for a party org, and not the drafter itself.
+        if (msg.sender == draftedBy[envelope_id] || !_isPartyOrgRecorder(envelope_id, msg.sender)) {
+            revert NotCounterpartyOrgRecorder(envelope_id, msg.sender);
+        }
         e.state = 5;
         e.accepted_at_block = block.number;
         emit StateChanged(envelope_id, 4, 5);
@@ -312,6 +335,10 @@ contract CrossOrgEnvelope {
         CrossOrgEnvelopeRecord storage e = envelopes[envelope_id];
         if (e.state != 5) revert NotInState(envelope_id, 5, e.state);
         if (!is_recorder[msg.sender]) revert NotRecorder(msg.sender);
+        // PBA-L2-036: only a party to this envelope closes it.
+        if (msg.sender != draftedBy[envelope_id] && !_isPartyOrgRecorder(envelope_id, msg.sender)) {
+            revert NotCounterpartyOrgRecorder(envelope_id, msg.sender);
+        }
         e.state = 7;
         emit StateChanged(envelope_id, 5, 7);
     }
@@ -327,6 +354,9 @@ contract CrossOrgEnvelope {
         // Reject is allowed from any non-terminal state (1..5).
         if (e.state == 0 || e.state >= 6) revert NotInState(envelope_id, 1, e.state);
         if (thresholdOf[envelope_id][org_root] == 0) revert UnknownOrg(envelope_id, org_root);
+        // PBA-L2-036: `rejected_by_org` is recorded from calldata, so only a
+        // recorder of THAT org may reject in its name.
+        if (!is_org_recorder[org_root][msg.sender]) revert NotOrgRecorder(org_root, msg.sender);
         uint8 prev = e.state;
         e.state = 6;
         e.rejected_by_org = org_root;
@@ -335,6 +365,14 @@ contract CrossOrgEnvelope {
     }
 
     // ── Internal ───────────────────────────────────────────────────────
+
+    function _isPartyOrgRecorder(bytes32 envelope_id, address who) internal view returns (bool) {
+        bytes32[] storage orgs = orgRootsOf[envelope_id];
+        for (uint256 i = 0; i < orgs.length; i++) {
+            if (is_org_recorder[orgs[i]][who]) return true;
+        }
+        return false;
+    }
 
     function _allOrgsMet(bytes32 envelope_id) internal view returns (bool) {
         bytes32[] storage orgs = orgRootsOf[envelope_id];

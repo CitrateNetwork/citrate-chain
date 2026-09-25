@@ -71,7 +71,7 @@ contract TestnetFarmingAccountingTest is Test {
         outsider = address(0xBAD1);
 
         // Deploy contribution accounting
-        contributions = new ContributionAccounting();
+        contributions = new ContributionAccounting(address(this));
 
         // Deploy treasury
         treasury = new StablecoinTreasury(governance);

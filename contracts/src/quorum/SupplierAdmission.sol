@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {IGovernanceProtocol} from "./IGovernanceProtocol.sol";
+import {QuorumIdentity} from "./QuorumIdentity.sol";
 import {IMultiSigEnvelope} from "./ThresholdApproval.sol";
 
 /// @title SupplierAdmission — nobody joins on a promise
@@ -41,6 +42,11 @@ import {IMultiSigEnvelope} from "./ThresholdApproval.sol";
 /// document they judged.
 contract SupplierAdmission is IGovernanceProtocol {
     bytes32 public constant REASON_WRONG_TENANT = bytes32("SA_WRONG_TENANT");
+    /// PBA-L2-035: an envelope at the derived id exists but was drafted by a
+    /// party this protocol does not recognise; it is ignored (it can neither
+    /// approve nor deny), and the action must be re-proposed under a new
+    /// correlation id by a recognised proposer.
+    bytes32 public constant REASON_FOREIGN_PROPOSER = bytes32("SA_FOREIGN_PROPOSER");
     bytes32 public constant REASON_NOT_PROPOSED = bytes32("SA_NOT_PROPOSED");
     bytes32 public constant REASON_NO_ATTESTATION = bytes32("SA_NO_ATTESTATION");
     bytes32 public constant REASON_UNFETCHABLE = bytes32("SA_UNFETCHABLE");
@@ -127,6 +133,14 @@ contract SupplierAdmission is IGovernanceProtocol {
         if (state == IMultiSigEnvelope.EnvelopeState.NotExist) {
             return (Verdict.RequireApproval, REASON_NOT_PROPOSED, _committee);
         }
+        IMultiSigEnvelope.Envelope memory e = envelopes.getEnvelope(envelopeId);
+        // PBA-L2-012/-035: `draft` is permissionless and first-writer-wins, so
+        // anyone can occupy this derived id. Only an envelope whose (now
+        // caller-bound) initiator this protocol recognises counts for ANY
+        // verdict, so an outsider's draft/close/reject cannot flip it.
+        if (!_isRecognisedProposer(e.initiator, ctx.principal)) {
+            return (Verdict.RequireApproval, REASON_FOREIGN_PROPOSER, _committee);
+        }
         if (state == IMultiSigEnvelope.EnvelopeState.Rejected) {
             return (Verdict.Deny, REASON_REFUSED, new bytes32[](0));
         }
@@ -134,7 +148,6 @@ contract SupplierAdmission is IGovernanceProtocol {
             return (Verdict.Deny, REASON_WITHDRAWN, new bytes32[](0));
         }
 
-        IMultiSigEnvelope.Envelope memory e = envelopes.getEnvelope(envelopeId);
 
         // Evidence before votes. Checked first so a committee is never told
         // "approved, now attach the documents" — the documents are what they
@@ -174,5 +187,15 @@ contract SupplierAdmission is IGovernanceProtocol {
 
     function committee() external view returns (bytes32[] memory) {
         return _committee;
+    }
+
+    /// PBA-L2-035: who may draft the envelope this protocol reads — a member of
+    /// its own set, or the acting principal itself.
+    function _isRecognisedProposer(bytes32 initiator, address principal) private view returns (bool) {
+        if (initiator == QuorumIdentity.subjectKey(principal)) return true;
+        for (uint256 i = 0; i < _committee.length; ++i) {
+            if (_committee[i] == initiator) return true;
+        }
+        return false;
     }
 }

@@ -3,6 +3,8 @@
 // citrate-v3/contracts/src/LoRAFactory.sol
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "./lib/InitialAdmin.sol";
+
 import "./interfaces/IModelRegistry.sol";
 import "./lib/AccessControl.sol";
 
@@ -158,10 +160,13 @@ contract LoRAFactory is AccessControl {
     /// The adapter doesn't exist in the registry.
     error AdapterNotFound(bytes32 loraHash);
 
-    constructor(address _modelRegistry) {
+    /// @param admin Explicit DEFAULT_ADMIN (PBA-L2-002: never msg.sender, which is
+    ///        the CREATE2 factory under a salted ceremony deploy).
+    constructor(address _modelRegistry, address admin) {
+        InitialAdmin.check(admin);
         modelRegistry = IModelRegistry(_modelRegistry);
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(OPERATOR_ROLE, msg.sender);
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(OPERATOR_ROLE, admin);
     }
     
     /**
@@ -482,25 +487,36 @@ contract LoRAFactory is AccessControl {
             "No permission"
         );
         
-        // Get inference price from base model
-        (,,,,,uint256 inferencePrice,,) = modelRegistry.getModel(baseModelHash);
+        // PBA-L2-046 (pre-bounty audit 2026-09-24): this used to forward 80 %
+        // of the price to `ModelRegistry.requestInference`, which demands the
+        // FULL price and a per-model permission held by the FACTORY, so every
+        // priced base model reverted; any overpayment stayed here. The caller's
+        // own base-model permission is checked, the split is paid directly
+        // (80 % base-model owner, 20 % LoRA creator), and the excess refunded.
+        (address baseOwner,,,,, uint256 inferencePrice,, bool baseActive) = modelRegistry.getModel(baseModelHash);
+        require(baseActive, "Base model not active");
         require(msg.value >= inferencePrice, "Insufficient payment");
-        
+        if (inferencePrice > 0) {
+            require(modelRegistry.hasPermission(baseModelHash, msg.sender), "No base model permission");
+        }
+
         // Apply LoRA and execute inference via precompile
         bytes memory result = _applyLoRAAndInfer(baseModelHash, loraHash, inputData);
-        
-        // Distribute payment (80% to base model owner, 20% to LoRA creator)
+
         if (inferencePrice > 0) {
             uint256 loraShare = (inferencePrice * 20) / 100;
             uint256 modelShare = inferencePrice - loraShare;
-            
-            (bool success1, ) = adapter.creator.call{value: loraShare}("");
-            require(success1, "LoRA payment failed");
-            
-            // Remaining goes through model registry
-            modelRegistry.requestInference{value: modelShare}(baseModelHash, inputData);
+            (bool ok1, ) = adapter.creator.call{value: loraShare}("");
+            require(ok1, "LoRA payment failed");
+            (bool ok2, ) = baseOwner.call{value: modelShare}("");
+            require(ok2, "Model payment failed");
         }
-        
+        uint256 excess = msg.value - inferencePrice;
+        if (excess > 0) {
+            (bool ok3, ) = msg.sender.call{value: excess}("");
+            require(ok3, "Refund failed");
+        }
+
         return result;
     }
     

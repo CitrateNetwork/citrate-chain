@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "./InitialAdmin.sol";
+
 /// @title Governable — two-step governance transfer mixin
 /// @notice Standardized governance pattern for the Citrate L1 contracts.
 ///         Inherits OZ-style two-step ownership semantics: the current
@@ -47,9 +49,14 @@ abstract contract Governable {
     error Governable_NotPendingGovernance();
     error Governable_ZeroAddress();
     error Governable_NoPendingTransfer();
+    error Governable_Create2Factory();
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert Governable_ZeroAddress();
+        // PBA-L2-002: a salted `new X{salt:}()` from a forge script runs the
+        // constructor with msg.sender == the CREATE2 factory, which can never
+        // call back. Refuse it as governance so the defect cannot recur.
+        if (initialGovernance == InitialAdmin.CREATE2_FACTORY) revert Governable_Create2Factory();
         _governance = initialGovernance;
         emit GovernanceTransferred(address(0), initialGovernance);
     }

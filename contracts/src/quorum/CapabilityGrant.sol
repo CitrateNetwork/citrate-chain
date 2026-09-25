@@ -139,6 +139,8 @@ contract CapabilityGrant {
     error OverBudget(bytes32 grantId, uint256 requested, uint256 remaining);
     error GrantNotLive(bytes32 grantId);
     error AutonomyIncreaseIsPrincipalOnly(bytes32 grantId, address caller);
+    /// PBA-L2-056: a grant issued on another principal's behalf starts at ApproveEach.
+    error DelegatedGrantMustStartApproveEach(address issuer, uint8 hic);
 
     event GrantIssued(
         bytes32 indexed grantId,
@@ -184,6 +186,14 @@ contract CapabilityGrant {
         // behalf is a tenant-administration act.
         if (msg.sender != principal && !_isTenantAdmin(tenantScope, msg.sender)) {
             revert MayNotIssueForAnother(tenantScope, msg.sender);
+        }
+        // PBA-L2-056 (pre-bounty audit 2026-09-24): CG-4 says autonomy moves up
+        // only by the principal's own act, and `setHic` enforces that — but the
+        // creation path let a tenant admin issue a grant straight at PostHoc on
+        // someone else's behalf. A delegated grant starts at the most human-
+        // controlled level; the principal may loosen it with `setHic`.
+        if (msg.sender != principal && hic != Hic.ApproveEach) {
+            revert DelegatedGrantMustStartApproveEach(msg.sender, uint8(hic));
         }
         if (actionClasses.length == 0) revert NoActionClasses();
         if (actionClasses.length > MAX_ACTION_CLASSES) revert TooManyActionClasses(actionClasses.length);

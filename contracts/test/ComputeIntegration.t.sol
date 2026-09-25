@@ -49,14 +49,14 @@ contract ComputeIntegrationTest is Test {
         governance = address(this);
 
         // Deploy core contracts
-        verifier = new ComputeVerifier(address(1));
-        marketplace = new ComputeMarketplace(address(verifier), treasury);
+        verifier = new ComputeVerifier(address(1), address(this));
+        marketplace = new ComputeMarketplace(address(verifier), treasury, address(this));
         verifier.setMarketplace(address(marketplace));
 
-        heartbeat = new HeartbeatMonitor(100, 3);
-        dispute = new DisputeResolution(10 ether, 20);
-        pool = new ComputePool();
-        contributions = new ContributionAccounting();
+        heartbeat = new HeartbeatMonitor(100, 3, address(this));
+        dispute = new DisputeResolution(10 ether, 20, address(this));
+        pool = new ComputePool(address(this));
+        contributions = new ContributionAccounting(address(this));
 
         // Fund accounts
         vm.deal(requester, 10000 ether);

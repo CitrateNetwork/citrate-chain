@@ -364,8 +364,8 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
     // Constructor
     // ============================================================
 
-    constructor(address _verifier, address _treasury)
-        Governable(msg.sender)
+    constructor(address _verifier, address _treasury, address initialGovernance)
+        Governable(initialGovernance)
     {
         require(_verifier != address(0), "ComputeMarketplace: zero verifier");
         require(_treasury != address(0), "ComputeMarketplace: zero treasury");

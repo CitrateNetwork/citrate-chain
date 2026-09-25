@@ -186,12 +186,14 @@ contract LearningPoolTest is Test {
             1 ether
         );
 
-        bytes32 codeHash = keccak256(abi.encodePacked("secret-invite-2026"));
+        bytes32 code = keccak256(abi.encodePacked("secret-invite-2026"));
+        // PBA-L2-025: register the code bound to its invitee; join with the raw code.
+        bytes32 key = lp.inviteKeyFor(poolId, code, bob); // before the prank
         vm.prank(alice);
-        lp.addInviteCode(poolId, codeHash);
+        lp.addInviteCode(poolId, key);
 
         vm.prank(bob);
-        lp.joinWithInvite{value: 1 ether}(poolId, codeHash);
+        lp.joinWithInvite{value: 1 ether}(poolId, code);
 
         assertTrue(lp.isMember(poolId, bob), "Bob should be member after invite");
         assertEq(lp.stakes(poolId, bob), 1 ether);
