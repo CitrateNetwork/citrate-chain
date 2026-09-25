@@ -442,9 +442,9 @@ contract ComputePoolTrainingTest is Test {
         // commitEpoch.
         vm.roll(block.number + 101);
 
-        // PBA-L2-003: only the requester (or governance) may reassign.
-        vm.prank(requester);
-        pool.reassignCoordinator(jobId, w3);
+        // PBA-L2-003: only the requester (or governance) may reassign; the
+        // liveness slash applies only when governance adjudicates the stall.
+        pool.reassignCoordinator(jobId, w3); // governance (this)
 
         ComputePoolTraining.TrainingJob memory job = pool.getJob(jobId);
         assertEq(job.coordinator, w3, "coordinator swapped");

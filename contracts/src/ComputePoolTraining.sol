@@ -482,15 +482,21 @@ contract ComputePoolTraining is ReentrancyGuard, Governable {
 
         address oldCoordinator = job.coordinator;
 
-        // Liveness slash on the stalled coordinator. Bounded by
-        // their remaining held stake — can't slash more than they
-        // have.
-        WorkerInfo storage oldInfo = workers[jobId][oldCoordinator];
-        uint128 held = oldInfo.stakePosted - oldInfo.stakeSlashed - oldInfo.stakeReturned;
-        uint128 slash = uint128(uint256(oldInfo.stakePosted) * LIVENESS_SLASH_BPS / BPS);
-        if (slash > held) slash = held;
-        oldInfo.stakeSlashed += slash;
-        retainedSlashAndBonds += slash; // PBA-L2-042: sweepable, not stranded
+        // Liveness slash on the stalled coordinator — ONLY when governance
+        // adjudicates the stall. 100 idle blocks is normal for a real
+        // training epoch, so a requester-initiated swap is a plain
+        // replacement with no slash (R2 verifier follow-up on PBA-L2-003:
+        // otherwise the requester could grief an honest, busy coordinator
+        // 0.1% per epoch). Bounded by the remaining held stake.
+        uint128 slash = 0;
+        if (msg.sender == governance()) {
+            WorkerInfo storage oldInfo = workers[jobId][oldCoordinator];
+            uint128 held = oldInfo.stakePosted - oldInfo.stakeSlashed - oldInfo.stakeReturned;
+            slash = uint128(uint256(oldInfo.stakePosted) * LIVENESS_SLASH_BPS / BPS);
+            if (slash > held) slash = held;
+            oldInfo.stakeSlashed += slash;
+            retainedSlashAndBonds += slash; // PBA-L2-042: sweepable, not stranded
+        }
 
         job.coordinator = newCoordinator;
         job.lastActivityBlock = uint64(block.number);

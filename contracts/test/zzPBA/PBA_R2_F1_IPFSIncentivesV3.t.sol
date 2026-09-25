@@ -66,6 +66,23 @@ contract PBA_R2_F1_IPFSIncentivesV3 is Test {
         assertEq(inc.unallocatedSlotFunding(), 792 ether, "only the bonded seal drew funding");
     }
 
+    /// PBA-L2-006 (R2 verifier follow-up): a bonded pinner can no longer pull
+    /// slot funding into arbitrary far sectors; sectors are bounded.
+    function test_L2_006_seal_sector_bounded() public {
+        inc.fund{value: 40 ether}();
+        vm.prank(honest);
+        inc.registerPinner();
+        vm.prank(honest);
+        vm.expectRevert(bytes("Sector out of range"));
+        inc.sealCommit{value: 10 ether}(cid, 1_000_000, bytes32("rid"), 1, bytes32("commD"), bytes32("R"), bytes32("C"), hex"00");
+        uint256 maxS = inc.MAX_SECTORS();
+        vm.prank(honest);
+        vm.expectRevert(bytes("Sector out of range"));
+        inc.sealCommit{value: 10 ether}(cid, maxS, bytes32("rid"), 1, bytes32("commD"), bytes32("R"), bytes32("C"), hex"00");
+        _seal(honest, bytes32("rid"), maxS - 1); // last valid sector
+        assertEq(inc.unallocatedSlotFunding(), 32 ether);
+    }
+
     /// PBA-L2-006 tripwire (fuzz): `commitChallenge` never changes
     /// `unallocatedSlotFunding`, for any sector and any caller.
     function testFuzz_L2_006_commit_never_allocates(uint256 sector, address caller) public {
