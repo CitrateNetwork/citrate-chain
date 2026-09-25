@@ -1,11 +1,3 @@
----
-created: 2026-04-07T20:45:00Z
-branch: benchmark-rehearsal
-author: Claude (Anthropic, Opus 4.6)
-status: active
-scope: Post-ceremony Citrate testnet benchmark harness
----
-
 # citrate-bench
 
 Production-correct TPS benchmark for the Citrate testnet. Replaces
@@ -59,7 +51,7 @@ Not yet implemented (later phases):
 ## Running
 
 ```bash
-cd citrate_v0.01.1/tools/citrate-bench
+cd tools/citrate-bench
 
 # All unit + integration tests (no chain required)
 cargo test
