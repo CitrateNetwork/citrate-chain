@@ -1,0 +1,35 @@
+name: claims-truth
+
+# Public-claims tripwire. Public claims must agree with the
+# code and the committed getCode snapshot:
+#  - verification/check_claims.py: checkpoint finality cannot be claimed as running
+#    while no production code calls CheckpointManager::propose; public READMEs cannot
+#    describe finality as current, quote codeless/stale addresses, stale counts,
+#    dead hosts, or curl|bash from mutable main.
+#  - verification/check_address_code.py --offline: claims.json deployed_contracts
+#    matches the committed eth_getCode snapshot and the current address book.
+# The live sweep (check_address_code.py --check, read-only RPC) runs weekly.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  claims:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Claims vs code (offline)
+        run: python3 verification/check_claims.py
+      - name: Deployed-contract count vs getCode snapshot (offline)
+        run: python3 verification/check_address_code.py --offline
+      - name: Live getCode sweep (read-only RPC, scheduled only)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: python3 verification/check_address_code.py --check

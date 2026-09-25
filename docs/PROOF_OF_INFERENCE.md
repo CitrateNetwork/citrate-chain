@@ -25,7 +25,10 @@ bit-identical on any hardware.
   inference and compares the input/model/output commitments. The determinism **is** the
   proof — no SNARK, no trusted hardware.
 - **Scales to whole models** — you just re-run them; there is no per-parameter proving cost.
-- **Trust model:** permissionless-economics (re-execution by independent validators).
+- **Trust model:** re-execution. Anyone can re-run a deterministic result and compare commitments.
+  Today the testnet has a single block producer operated by Citrate, so independent re-execution by
+  a validator set is the target design, not the current state (see `consensus_ghostdag` in
+  `verification/claims.json`).
 - **Status:** live via the Q16 precompiles (`core/execution/src/precompiles/q16/`).
   `inference.rs` runs in **strict mode by default** — the non-deterministic FP path is
   disabled on mainnet.

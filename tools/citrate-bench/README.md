@@ -117,9 +117,8 @@ printed to stderr and no report is emitted.
 ## Target the canonical bootnode, not a peer
 
 For testnet-beta (chain 40204), the `--rpc-url` flag must point at
-the **canonical bootnode RPC** (`https://rpc.citrate.ai` or
-`https://rpc2.citrate.ai`, both backed by the droplet at
-`159.65.227.42`). Do **not** point it at an independent peer node.
+the **canonical bootnode RPC** (`https://rpc.citrate.ai`). Do **not**
+point it at an independent peer node.
 
 Reason: per known limitation **L-001** in
 [`.agentile/docs/reference/KNOWN_LIMITATIONS.md`](../../../.agentile/docs/reference/KNOWN_LIMITATIONS.md),

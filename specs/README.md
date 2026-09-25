@@ -2,17 +2,13 @@
 
 ## Canonical Location
 
-The canonical TLA+ specification collection lives at **`.agentile/formal/specs/`** (101 specs today across all domains). That is the authoritative source for spec counts, verification status, and coverage.
+The public TLA+ specifications for this repository live in **`specs/tla/`** (71 `.tla` files across the consensus, zk, learning, contracts, compute, gui and network domains). Count them yourself with `find specs/tla -name '*.tla' | wc -l`.
 
-## Local Subset (`specs/tla/`)
+Some older specs (including `TransactionSigningFlow.tla`) live only in a private internal archive and are not reproducible from this repository. The federation-wide public count and its counting rule are recorded in [`verification/claims.json`](../verification/claims.json) (`tla_specs`).
 
-This directory contains a **subset of 46 specs** organized into six domains (consensus, zk, learning, contracts, compute, gui). These are runnable locally and in CI.
+Local run results: `specs/tla/VERIFICATION_REPORT.txt`.
 
-For spec counts, invariant totals, and verification results, always refer to:
-- `.agentile/formal/specs/INDEX.md` -- canonical spec index
-- `specs/tla/VERIFICATION_REPORT.txt` -- local run results
-
-Do not cite spec counts from this README as authoritative -- they may lag behind the canonical source.
+A spec that model-checks is evidence about the model, not proof that the code runs the mechanism. For example, `consensus/CheckpointVoteSafety.tla` checks checkpoint voting, which is specified but not running on the testnet (see `deterministic_checkpoint_finality` in `claims.json`).
 
 ## Running Specs
 
