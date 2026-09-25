@@ -103,16 +103,47 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     /// the low-value optimistic tier gated by VALUE_THRESHOLD; its self-
     /// reveal is not a transferable credential and is backstopped by the
     /// dispute path, so it is not consumed here.)
+    ///
+    /// PBA-L2-004: the set is now keyed by `(jobId, proof material)`, not by
+    /// the proof material alone. A GLOBAL consumed set let a front-runner copy
+    /// an honest provider's pending proof, settle its own self-posted job with
+    /// it, and so turn the honest provider's submission Invalid (slash + job
+    /// failure). Cross-job replay is instead prevented by BINDING the proof to
+    /// the job (see `jobBinding` / `bindJob` and the TEE digest), so the same
+    /// bytes can no longer satisfy a job with a different model, input or
+    /// output.
     mapping(bytes32 => bool) public proofConsumed;
 
-    /// @dev Mark `key` consumed; returns false if it was already used.
-    function _consumeProof(bytes32 key) internal returns (bool firstUse) {
+    /// @dev Mark `(jobId, material)` consumed; returns false if already used.
+    function _consumeProof(uint256 jobId, bytes32 material) internal returns (bool firstUse) {
+        bytes32 key = keccak256(abi.encode(jobId, material));
         if (proofConsumed[key]) {
             return false;
         }
         proofConsumed[key] = true;
         return true;
     }
+
+    /// @notice PBA-L2-004: the public commitments a job's proof must carry.
+    /// `inputCommitment` = keccak256(job.inputHash bytes), `modelCommitment`
+    /// = job.modelHash, `outputCommitment` = keccak256(outputHash bytes)
+    /// submitted with the result. Written by the marketplace only.
+    struct JobBinding {
+        bytes32 inputCommitment;
+        bytes32 modelCommitment;
+        bytes32 outputCommitment;
+        bool inputBound;
+        bool outputBound;
+    }
+
+    mapping(uint256 => JobBinding) public jobBinding;
+
+    /// @notice PBA-L2-004: domain tag for the TEE oracle's signed payload.
+    /// The oracle now signs
+    ///   keccak256(abi.encode(TEE_ATTESTATION_TAG, chainid, verifier, jobId, keccak256(attestation)))
+    /// (EIP-191 wrapped), so an attestation is valid for exactly one job on
+    /// one verifier on one chain. Pre-fix it signed only keccak256(attestation).
+    bytes32 public constant TEE_ATTESTATION_TAG = keccak256("CitrateComputeVerifier.TEEAttestation.v1");
 
     // ============================================================
     // Events
@@ -129,6 +160,8 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     event TEEOracleAdded(address indexed oracle);
     event TEEOracleRemoved(address indexed oracle);
     event MarketplaceUpdated(address indexed oldMarketplace, address indexed newMarketplace);
+    event JobBound(uint256 indexed jobId, bytes32 inputCommitment, bytes32 modelCommitment);
+    event OutputBound(uint256 indexed jobId, bytes32 outputCommitment);
     // GovernanceTransferred event is provided by Governable mixin.
 
     // ============================================================
@@ -189,6 +222,38 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         rec.configuredAt = block.number;
 
         emit JobConfigured(jobId, value, effectiveTier);
+    }
+
+    /// @notice PBA-L2-004: record the job's input and model commitments.
+    /// @dev One-shot, before any proof. The ZK tier is Invalid for a job
+    ///      that was never bound (fail closed).
+    function bindJob(
+        uint256 jobId,
+        bytes32 inputCommitment,
+        bytes32 modelCommitment
+    ) external onlyMarketplace jobConfigured(jobId) {
+        JobBinding storage b = jobBinding[jobId];
+        require(!b.inputBound, "ComputeVerifier: already bound");
+        require(!records[jobId].proofSubmitted, "ComputeVerifier: proof already submitted");
+        b.inputCommitment = inputCommitment;
+        b.modelCommitment = modelCommitment;
+        b.inputBound = true;
+        emit JobBound(jobId, inputCommitment, modelCommitment);
+    }
+
+    /// @notice PBA-L2-004: record the output commitment the provider is
+    /// submitting, immediately before its proof is verified.
+    function bindOutput(uint256 jobId, bytes32 outputCommitment)
+        external
+        onlyMarketplace
+        jobConfigured(jobId)
+    {
+        JobBinding storage b = jobBinding[jobId];
+        require(!b.outputBound, "ComputeVerifier: output already bound");
+        require(!records[jobId].proofSubmitted, "ComputeVerifier: proof already submitted");
+        b.outputCommitment = outputCommitment;
+        b.outputBound = true;
+        emit OutputBound(jobId, outputCommitment);
     }
 
     /// @notice Override tier to TEE (enterprise/regulatory requirement)
@@ -337,12 +402,13 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         rec.proofSubmitted = true;
         emit ProofSubmitted(jobId, VerificationTier.ZKProof);
 
-        // Call ZK verification precompile
-        bool valid = _callZKVerifyPrecompile(proof, publicInputs);
+        // PBA-L2-004: the proof's public inputs must be THIS job's
+        // commitments before the precompile is even consulted.
+        bool valid = _publicInputsBound(jobId, publicInputs)
+            && _callZKVerifyPrecompile(proof, publicInputs);
 
-        // C016: bind this proof to a single job — replayed proof bytes
-        // cannot settle a second jobId.
-        if (valid && !_consumeProof(keccak256(abi.encodePacked(proof, publicInputs)))) {
+        // C016 / PBA-L2-004: one-time use, scoped to this job.
+        if (valid && !_consumeProof(jobId, keccak256(abi.encodePacked(proof, publicInputs)))) {
             valid = false;
         }
 
@@ -375,12 +441,11 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         rec.proofSubmitted = true;
         emit ProofSubmitted(jobId, VerificationTier.TEE);
 
-        // Verify TEE attestation via oracle signature
-        bool valid = _verifyTEESignature(attestation, signature);
+        // Verify TEE attestation via oracle signature over a job-bound digest
+        bool valid = _verifyTEESignature(jobId, attestation, signature);
 
-        // C016: bind this attestation to a single job — replaying the same
-        // oracle-signed attestation cannot settle a second jobId.
-        if (valid && !_consumeProof(keccak256(abi.encodePacked(attestation, signature)))) {
+        // C016 / PBA-L2-004: one-time use, scoped to this job.
+        if (valid && !_consumeProof(jobId, keccak256(abi.encodePacked(attestation, signature)))) {
             valid = false;
         }
 
@@ -585,7 +650,7 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     /// @dev C016: not `view` — consumes the proof on success so replayed
     /// proof bytes cannot settle a second jobId.
     function _verifyZKProof(
-        uint256 /* jobId */,
+        uint256 jobId,
         bytes calldata proofData
     ) internal returns (VerificationResult) {
         // proofData encodes: proof length (32 bytes) + proof + public inputs
@@ -597,9 +662,11 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         bytes calldata proof = proofData[32:32 + proofLen];
         bytes calldata publicInputs = proofData[32 + proofLen:];
 
-        bool valid = _callZKVerifyPrecompile(proof, publicInputs);
-        // C016: one-time-use binding to this job.
-        if (valid && !_consumeProof(keccak256(abi.encodePacked(proof, publicInputs)))) {
+        // PBA-L2-004: public inputs must equal this job's commitments.
+        bool valid = _publicInputsBound(jobId, publicInputs)
+            && _callZKVerifyPrecompile(proof, publicInputs);
+        // C016 / PBA-L2-004: one-time use, scoped to this job.
+        if (valid && !_consumeProof(jobId, keccak256(abi.encodePacked(proof, publicInputs)))) {
             valid = false;
         }
         return valid ? VerificationResult.Valid : VerificationResult.Invalid;
@@ -609,7 +676,7 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     /// @dev C016: not `view` — consumes the attestation on success so a
     /// replayed oracle-signed attestation cannot settle a second jobId.
     function _verifyTEEAttestation(
-        uint256 /* jobId */,
+        uint256 jobId,
         bytes calldata proofData
     ) internal returns (VerificationResult) {
         // proofData encodes: attestation length (32 bytes) + attestation + signature
@@ -621,9 +688,9 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         bytes calldata attestation = proofData[32:32 + attestLen];
         bytes calldata signature = proofData[32 + attestLen:];
 
-        bool valid = _verifyTEESignature(attestation, signature);
-        // C016: one-time-use binding to this job.
-        if (valid && !_consumeProof(keccak256(abi.encodePacked(attestation, signature)))) {
+        bool valid = _verifyTEESignature(jobId, attestation, signature);
+        // C016 / PBA-L2-004: one-time use, scoped to this job.
+        if (valid && !_consumeProof(jobId, keccak256(abi.encodePacked(attestation, signature)))) {
             valid = false;
         }
         return valid ? VerificationResult.Valid : VerificationResult.Invalid;
@@ -672,15 +739,42 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         return abi.decode(result, (uint256)) == 1;
     }
 
+    /// @notice PBA-L2-004: the digest a TEE oracle signs for `jobId`.
+    function teeAttestationDigest(uint256 jobId, bytes calldata attestation) public view returns (bytes32) {
+        return keccak256(
+            abi.encode(TEE_ATTESTATION_TAG, block.chainid, address(this), jobId, keccak256(attestation))
+        );
+    }
+
+    /// @dev PBA-L2-004: true iff the 96-byte publicInputs are exactly
+    ///      input_commitment ‖ model_commitment ‖ output_commitment for this
+    ///      job. The layout follows the 0x0108 framing documented on
+    ///      `_callZKVerifyPrecompile` (input first). An unbound job fails
+    ///      closed; the output commitment is enforced whenever the
+    ///      marketplace bound one for this submission.
+    function _publicInputsBound(uint256 jobId, bytes calldata publicInputs) internal view returns (bool) {
+        JobBinding storage b = jobBinding[jobId];
+        require(
+            publicInputs.length == ZK_PUBLIC_INPUTS_LEN,
+            "ComputeVerifier: bad publicInputs length"
+        );
+        if (!b.inputBound) return false;
+        if (bytes32(publicInputs[0:32]) != b.inputCommitment) return false;
+        if (bytes32(publicInputs[32:64]) != b.modelCommitment) return false;
+        if (b.outputBound && bytes32(publicInputs[64:96]) != b.outputCommitment) return false;
+        return true;
+    }
+
     /// @dev Verify TEE attestation signature from a trusted oracle
     function _verifyTEESignature(
+        uint256 jobId,
         bytes calldata attestation,
         bytes calldata signature
     ) internal view returns (bool) {
         require(signature.length == 65, "ComputeVerifier: invalid signature length");
 
         bytes32 messageHash = keccak256(
-            abi.encodePacked("\x19Ethereum Signed Message:\n32", keccak256(attestation))
+            abi.encodePacked("\x19Ethereum Signed Message:\n32", teeAttestationDigest(jobId, attestation))
         );
 
         bytes32 r;

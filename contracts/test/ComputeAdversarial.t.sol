@@ -109,6 +109,11 @@ contract ReentrancyAttackPool {
         reentrancySucceeded = false;
     }
 
+    /// PBA-L2-022: two-step exit.
+    function requestLeave(uint256 poolId) external {
+        pool.requestLeave(poolId);
+    }
+
     function triggerLeave(uint256 poolId) external {
         pool.leavePool(poolId);
     }
@@ -274,6 +279,7 @@ contract ComputeAdversarialTest is Test {
         uint256 winnerBalBefore = winner.balance;
         uint256 treasuryBalBefore = treasury.balance;
 
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         uint256 winnerBalAfter = winner.balance;
@@ -307,6 +313,7 @@ contract ComputeAdversarialTest is Test {
         _submitResult(jobId, provider1);
 
         uint256 burnBefore = marketplace.totalBurned();
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
         uint256 burnAfter = marketplace.totalBurned();
 
@@ -445,6 +452,7 @@ contract ComputeAdversarialTest is Test {
         marketplace.disputeResult{value: 10 ether}(jobId);
 
         // Attempt to complete should fail due to active dispute
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         vm.expectRevert("ComputeMarketplace: dispute active");
         marketplace.completeJob(jobId);
     }
@@ -460,6 +468,7 @@ contract ComputeAdversarialTest is Test {
         marketplace.disputeResult{value: 10 ether}(jobId);
 
         // Cannot complete while dispute active
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         vm.expectRevert("ComputeMarketplace: dispute active");
         marketplace.completeJob(jobId);
 
@@ -670,6 +679,7 @@ contract ComputeAdversarialTest is Test {
 
         // completeJob should complete without reentrancy succeeding
         // The provider (attacker contract) receives payment, tries to re-enter, fails
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         // If the attack contract received funds and tried to re-enter:
@@ -735,6 +745,8 @@ contract ComputeAdversarialTest is Test {
         attackContract.enableAttack();
 
         // Leave pool triggers stake return -> receive() -> attempts re-enter
+        attackContract.requestLeave(poolId); // PBA-L2-022 two-step exit
+        vm.roll(block.number + pool.LEAVE_COOLDOWN());
         vm.prank(address(attackContract));
         attackContract.triggerLeave(poolId);
 
@@ -795,6 +807,7 @@ contract ComputeAdversarialTest is Test {
         _registerProvider(provider1);
 
         uint256 jobId = _fullLifecycleWithProvider(provider1);
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         ComputeMarketplace.Job memory job = marketplace.getJob(jobId);

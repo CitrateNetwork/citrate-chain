@@ -156,6 +156,7 @@ contract ComputeFuzzTest is Test {
         marketplace.submitResult(jobId, outputData, proof);
 
         uint256 burnBefore = marketplace.totalBurned();
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
         uint256 burnAfter = marketplace.totalBurned();
 
@@ -192,6 +193,7 @@ contract ComputeFuzzTest is Test {
         uint256 treasuryBalBefore = treasury.balance;
         uint256 burnBefore = marketplace.totalBurned();
 
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         uint256 providerPayment = provider1.balance - providerBalBefore;
@@ -530,6 +532,7 @@ contract ComputeFuzzTest is Test {
                 vm.prank(provider1);
                 marketplace.submitResult(jobId, outputData, proof);
 
+                vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
                 marketplace.completeJob(jobId);
             } else {
                 // Let job expire (no bids, advance past deadline)

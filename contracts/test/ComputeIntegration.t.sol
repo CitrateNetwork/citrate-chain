@@ -171,6 +171,7 @@ contract ComputeIntegrationTest is Test {
         assertEq(uint(result), uint(ComputeVerifier.VerificationResult.Valid), "Verification: Valid");
 
         // Complete and pay
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
         job = marketplace.getJob(jobId);
         assertEq(uint(job.state), uint(ComputeMarketplace.JobState.Completed), "State: Completed");
@@ -406,6 +407,7 @@ contract ComputeIntegrationTest is Test {
 
         // Job can now be completed (dispute resolved in favor of defender)
         // The job should be completable since the dispute cleared it
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         ComputeMarketplace.Job memory job = marketplace.getJob(jobId);
@@ -549,6 +551,7 @@ contract ComputeIntegrationTest is Test {
         uint256 paidBefore = marketplace.totalPaidToProviders();
         uint256 treasuryBefore = marketplace.totalTreasuryFees();
 
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         uint256 burnAfter = marketplace.totalBurned();
@@ -579,6 +582,7 @@ contract ComputeIntegrationTest is Test {
         _submitResult(jobId, provider1);
 
         uint256 burnBefore = marketplace.totalBurned();
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
         uint256 burnAfter = marketplace.totalBurned();
 
@@ -610,6 +614,7 @@ contract ComputeIntegrationTest is Test {
             _startExecution(jobId, provider1);
             _submitCommitment(jobId, provider1);
             _submitResult(jobId, provider1);
+            vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
             marketplace.completeJob(jobId);
 
             expectedTotalBurn += price / 40;
@@ -638,6 +643,7 @@ contract ComputeIntegrationTest is Test {
         _startExecution(jobIds[0], provider1);
         _submitCommitment(jobIds[0], provider1);
         _submitResult(jobIds[0], provider1);
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobIds[0]);
 
         // Step 2: Gradient computation
@@ -647,6 +653,7 @@ contract ComputeIntegrationTest is Test {
         _startExecution(jobIds[1], provider2);
         _submitCommitment(jobIds[1], provider2);
         _submitResult(jobIds[1], provider2);
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobIds[1]);
 
         // Step 3: Aggregation
@@ -656,6 +663,7 @@ contract ComputeIntegrationTest is Test {
         _startExecution(jobIds[2], provider1);
         _submitCommitment(jobIds[2], provider1);
         _submitResult(jobIds[2], provider1);
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobIds[2]);
 
         // All three jobs completed
@@ -719,6 +727,7 @@ contract ComputeIntegrationTest is Test {
             _startExecution(jobId, provider1);
             _submitCommitment(jobId, provider1);
             _submitResult(jobId, provider1);
+            vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
             marketplace.completeJob(jobId);
         }
 
@@ -782,9 +791,11 @@ contract ComputeIntegrationTest is Test {
         _submitResult(jobId, provider1);
 
         // Verifying -> complete
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         // Completed -> cannot transition to anything
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         vm.expectRevert("ComputeMarketplace: not verifying");
         marketplace.completeJob(jobId);
     }
@@ -816,6 +827,7 @@ contract ComputeIntegrationTest is Test {
         uint256 jobId = _fullLifecycle(provider1);
 
         uint256 gasBefore = gasleft();
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
         uint256 gasUsed = gasBefore - gasleft();
 
