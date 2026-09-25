@@ -32,6 +32,11 @@ import "./interfaces/INematocystSlashing.sol";
 ///           DisputeBondPositive      — active disputes always hold bond
 ///
 /// @dev WP-CI.2 — Compute Infrastructure: Dispute Resolution
+/// @notice PBA-L2-021: minimal job-party view a dispute can be bound to.
+interface IDisputeJobRegistry {
+    function jobParties(uint256 jobId) external view returns (address requester, address provider);
+}
+
 contract DisputeResolution is ReentrancyGuard, Governable {
     // ── Types ───────────────────────────────────────────────────────
 
@@ -79,12 +84,27 @@ contract DisputeResolution is ReentrancyGuard, Governable {
     /// @notice Next dispute ID.
     uint256 public nextDisputeId;
 
-    /// @notice Whether a job currently has an active dispute.
-    mapping(uint256 => bool) public jobDisputed;
-
     /// @notice NematocystSlashing contract for triggering slashes.
     INematocystSlashing public slashingContract;
 
+    /// @notice PBA-L2-020: the party whose move is pending in `Bisecting`.
+    /// false = the challenger owes a `bisect` (set on acknowledge and after
+    /// every defender `respond`); true = the defender owes a `respond` (set
+    /// after every `bisect`). `timeoutDispute` awards the dispute to the
+    /// party that did NOT owe the lapsed move. Pre-fix a timeout always
+    /// ruled for the challenger, so a challenger who never bisected won the
+    /// defender's bond.
+    mapping(uint256 => bool) public awaitingDefender;
+
+    /// @notice PBA-L2-021: optional job registry. When set, `initiateDispute`
+    /// requires the caller to be the job's requester and `defender` to be
+    /// its assigned provider.
+    IDisputeJobRegistry public jobRegistry;
+
+    /// @notice PBA-L2-021: open dispute per (jobId, defender). Replaces the
+    /// never-cleared per-jobId flag that let anyone squat every future
+    /// jobId for free with a sock-puppet defender.
+    mapping(uint256 => mapping(address => bool)) public jobDefenderDisputed;
     // Governance state lives in Governable mixin (audit SOL-21).
 
     // ── Events ──────────────────────────────────────────────────────
@@ -108,6 +128,10 @@ contract DisputeResolution is ReentrancyGuard, Governable {
     event DisputeBondUpdated(uint256 oldBond, uint256 newBond);
     event MaxBisectionRoundsUpdated(uint256 oldRounds, uint256 newRounds);
     event SlashingContractUpdated(address oldContract, address newContract);
+    event JobRegistryUpdated(address oldRegistry, address newRegistry);
+    /// PBA-L2-041: a slash hook call that did not take effect is surfaced
+    /// instead of being swallowed silently.
+    event SlashHookFailed(uint256 indexed disputeId, address indexed defender);
     // GovernanceTransferred event provided by Governable mixin.
 
     // ── Modifiers ───────────────────────────────────────────────────
@@ -147,10 +171,18 @@ contract DisputeResolution is ReentrancyGuard, Governable {
         require(defender != address(0), "Zero defender address");
         require(defender != msg.sender, "Cannot dispute yourself");
         require(rangeEnd > rangeStart, "Invalid range");
-        require(!jobDisputed[jobId], "Job already disputed");
+        // PBA-L2-021: when bound to a job registry, only the job's
+        // requester may dispute, and only against the assigned provider.
+        if (address(jobRegistry) != address(0)) {
+            (address requester, address provider) = jobRegistry.jobParties(jobId);
+            require(requester != address(0), "Unknown job");
+            require(msg.sender == requester, "Not job requester");
+            require(defender == provider, "Defender not job provider");
+        }
+        require(!jobDefenderDisputed[jobId][defender], "Job already disputed");
 
         disputeId = nextDisputeId++;
-        jobDisputed[jobId] = true;
+        jobDefenderDisputed[jobId][defender] = true;
 
         _initDisputeAndEmit(disputeId, jobId, defender, rangeStart, rangeEnd);
     }
@@ -194,6 +226,7 @@ contract DisputeResolution is ReentrancyGuard, Governable {
         d.defenderBond = msg.value;
         d.state = DisputeState.Bisecting;
         d.deadline = block.number + roundDeadline;
+        awaitingDefender[disputeId] = false; // PBA-L2-020: challenger moves next
 
         emit BisectionStarted(disputeId);
     }
@@ -221,7 +254,7 @@ contract DisputeResolution is ReentrancyGuard, Governable {
 
         d.round++;
         d.deadline = block.number + roundDeadline;
-
+        awaitingDefender[disputeId] = true; // PBA-L2-020: defender owes a respond
         emit BisectionRound(disputeId, d.round, d.rangeStart, d.rangeEnd);
     }
 
@@ -236,7 +269,7 @@ contract DisputeResolution is ReentrancyGuard, Governable {
 
         defenderCommits[disputeId] = stepResultHash;
         d.deadline = block.number + roundDeadline;
-
+        awaitingDefender[disputeId] = false; // PBA-L2-020: challenger owes the next bisect
         emit DefenderResponded(disputeId, d.round, stepResultHash);
     }
 
@@ -248,9 +281,11 @@ contract DisputeResolution is ReentrancyGuard, Governable {
     function resolve(uint256 disputeId, bool challengerWins) external onlyGovernance nonReentrant {
         Dispute storage d = disputes[disputeId];
         require(d.state == DisputeState.Bisecting, "Not bisecting");
-        require(d.round >= 1, "At least one round required");
+        // PBA-L2-020: governance may rule at round 0 too (a challenger that
+        // never bisects must not be able to run out the clock unopposed).
 
         d.state = DisputeState.Resolved;
+        _clearJobFlag(d);
         d.outcome = challengerWins ? Outcome.ChallengerWon : Outcome.DefenderWon;
 
         emit DisputeResolved(disputeId, d.outcome);
@@ -275,8 +310,20 @@ contract DisputeResolution is ReentrancyGuard, Governable {
         bool defenderAcknowledged = d.state == DisputeState.Bisecting;
 
         d.state = DisputeState.Resolved;
+        _clearJobFlag(d);
+        // PBA-L2-020: award the timeout to the party that did NOT owe the
+        // lapsed move. Not acknowledged → the defender stalled (challenger
+        // is refunded, no slash). Bisecting → whoever's turn it was lost.
+        // If the challenger can no longer bisect (range minimal or max
+        // rounds) and the defender answered, the challenger has run out of
+        // moves and the defender wins.
+        if (defenderAcknowledged && !awaitingDefender[disputeId]) {
+            d.outcome = Outcome.DefenderWon;
+            emit DisputeTimedOut(disputeId, d.outcome);
+            _payWinner(disputeId);
+            return;
+        }
         d.outcome = Outcome.ChallengerWon;
-
         emit DisputeTimedOut(disputeId, d.outcome);
 
         _payWinner(disputeId);
@@ -349,6 +396,14 @@ contract DisputeResolution is ReentrancyGuard, Governable {
         emit SlashingContractUpdated(old, _slashingContract);
     }
 
+    /// @notice PBA-L2-021: bind disputes to a job registry (e.g. the
+    /// ComputeMarketplace). address(0) unbinds.
+    function setJobRegistry(address registry) external onlyGovernance {
+        address old = address(jobRegistry);
+        jobRegistry = IDisputeJobRegistry(registry);
+        emit JobRegistryUpdated(old, registry);
+    }
+
     /// @notice Update round deadline.
     function setRoundDeadline(uint256 newDeadline) external onlyGovernance {
         require(newDeadline >= 1, "Deadline must be >= 1");
@@ -358,6 +413,11 @@ contract DisputeResolution is ReentrancyGuard, Governable {
     // transferGovernance / acceptGovernance are inherited from Governable.
 
     // ── Internal ────────────────────────────────────────────────────
+
+    /// @dev PBA-L2-021: a resolved dispute frees its (jobId, defender) slot.
+    function _clearJobFlag(Dispute storage d) internal {
+        jobDefenderDisputed[d.jobId][d.defender] = false;
+    }
 
     /// @dev Determine the winner and total payout for a resolved dispute.
     function _getWinnerAndPayout(uint256 disputeId) internal view returns (address winner, uint256 payout) {
@@ -409,7 +469,9 @@ contract DisputeResolution is ReentrancyGuard, Governable {
                 defenderAddr,
                 1, // SlashTier.Inconsistency
                 abi.encodePacked("dispute:lost:", disputeId)
-            ) {} catch {}
+            ) {} catch {
+                emit SlashHookFailed(disputeId, defenderAddr); // PBA-L2-041
+            }
         }
     }
 

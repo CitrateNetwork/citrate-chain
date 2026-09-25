@@ -406,11 +406,14 @@ contract DisputeResolutionTimeoutTest is Test {
         dispute.initiateDispute{value: BOND}(1, defender, RANGE_START, RANGE_END);
     }
 
-    function test_resolve_requires_at_least_one_round() public {
+    /// PBA-L2-020: governance may rule at round 0 (pre-fix it could not,
+    /// which left a stalling challenger's timeout as the only terminal path).
+    function test_resolve_allowed_at_round_zero() public {
         uint256 disputeId = _initiateAndAcknowledge();
 
-        vm.expectRevert("At least one round required");
-        dispute.resolve(disputeId, true);
+        dispute.resolve(disputeId, false);
+        DisputeResolution.Dispute memory d = dispute.getDispute(disputeId);
+        assertTrue(d.outcome == DisputeResolution.Outcome.DefenderWon);
     }
 
     function test_bisect_past_deadline_reverts() public {
