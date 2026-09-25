@@ -77,14 +77,17 @@ contract LiquidStakingPool is ReentrancyGuard, Governable {
     /// @dev Track whether a nonce has been finalized
     mapping(uint256 => bool) private _reportFinalized;
 
-    /// @dev Pending report data per nonce
-    mapping(uint256 => PendingReport) private _pendingReports;
+    /// @dev PBA-L2-026 (pre-bounty audit 2026-09-24): votes are tallied PER
+    ///      `(nonce, round, rewards, slashed)`. The previous design pinned the
+    ///      first vote's tuple and reverted every differing vote ("Report
+    ///      mismatch") with no reset, so ONE buggy or compromised oracle (or a
+    ///      front-run of the honest first report) halted reward reporting
+    ///      forever. Now whichever tuple reaches quorum finalizes, and
+    ///      governance can `resetReport()` a stuck round.
+    mapping(bytes32 => uint256) private _tupleVotes;
 
-    struct PendingReport {
-        uint256 rewards;
-        uint256 slashed;
-        bool exists;
-    }
+    /// @dev Current voting round of the open nonce (bumped by `resetReport`).
+    uint256 public reportRound;
 
     // --- Provider collateral ---
 
@@ -104,6 +107,7 @@ contract LiquidStakingPool is ReentrancyGuard, Governable {
     event ProviderSlashed(address indexed provider, uint256 amount);
     event OracleAdded(address indexed oracle);
     event OracleRemoved(address indexed oracle);
+    event ReportRoundReset(uint256 indexed nonce, uint256 round);
     // GovernanceTransferred event is provided by Governable mixin.
     event CollateralDeposited(address indexed provider, uint256 amount);
     event CollateralWithdrawn(address indexed provider, uint256 amount);
@@ -132,11 +136,13 @@ contract LiquidStakingPool is ReentrancyGuard, Governable {
     /// could grief: deposit 1 wei (gets 1 share), donate via the
     /// open `receive()` (now closed — see below) to inflate
     /// `totalPooled` without minting shares, victim's deposit
-    /// captured. Post-fix the share-pricing math uses OZ ERC-4626
-    /// virtual offsets — see `_sharesForDeposit` / `_saltForShares` —
-    /// so a 1-wei first-deposit attack can't dominate the pool's
-    /// share price. The virtual offsets aren't real shares, so
-    /// they don't subtract from real depositor balances.
+    /// captured. The fix closed that leg: `receive()` reverts and
+    /// `donate()` does not move `totalPooled` (so it does not move
+    /// the share price). PBA-L2-059 (DOC-STALE): the share math in
+    /// `_sharesForDeposit` / `_saltForShares` has NO ERC-4626 virtual
+    /// offsets, contrary to what this comment used to claim; the
+    /// protection is the closed donation path, not an offset. Rewards
+    /// only enter `totalPooled` via an oracle-quorum `reportRewards`.
     function deposit() external payable nonReentrant returns (uint256 sharesOut) {
         require(msg.value > 0, "Zero deposit");
 
@@ -218,29 +224,16 @@ contract LiquidStakingPool is ReentrancyGuard, Governable {
             require(slashed <= (totalPooled * MAX_SLASH_RATE_BPS) / 10000, "Slash exceeds cap");
         }
 
-        // If this is the first vote for this nonce, store the report parameters
-        if (!_pendingReports[nonce].exists) {
-            _pendingReports[nonce] = PendingReport({
-                rewards: rewards,
-                slashed: slashed,
-                exists: true
-            });
-        } else {
-            // Subsequent oracles must agree on the same values
-            require(
-                _pendingReports[nonce].rewards == rewards &&
-                _pendingReports[nonce].slashed == slashed,
-                "Report mismatch"
-            );
-        }
+        // PBA-L2-026: one vote per oracle per (nonce, round); tally per tuple.
+        uint256 voteKey = uint256(keccak256(abi.encode(nonce, reportRound)));
+        require(!_oracleVotes[voteKey][msg.sender], "Already voted");
+        _oracleVotes[voteKey][msg.sender] = true;
+        _oracleVoteCount[voteKey]++;
+        uint256 tupleVotes = ++_tupleVotes[keccak256(abi.encode(nonce, reportRound, rewards, slashed))];
 
-        require(!_oracleVotes[nonce][msg.sender], "Already voted");
-        _oracleVotes[nonce][msg.sender] = true;
-        _oracleVoteCount[nonce]++;
-
-        // Check quorum
+        // Check quorum (of votes for THIS tuple)
         uint256 votesNeeded = (oracleCount * ORACLE_QUORUM + 99) / 100;
-        if (_oracleVoteCount[nonce] >= votesNeeded) {
+        if (tupleVotes >= votesNeeded) {
             _applyRewardReport(rewards, slashed);
             _reportFinalized[nonce] = true;
             rewardReportNonce++;
@@ -379,6 +372,13 @@ contract LiquidStakingPool is ReentrancyGuard, Governable {
         oracleCount--;
 
         emit OracleRemoved(oracle);
+    }
+
+    /// @notice PBA-L2-026: discard every vote cast for the open nonce and start
+    ///         a fresh round (e.g. after removing a misbehaving oracle).
+    function resetReport() external onlyGovernance {
+        reportRound++;
+        emit ReportRoundReset(rewardReportNonce, reportRound);
     }
 
     // transferGovernance / acceptGovernance are inherited from Governable.

@@ -342,7 +342,10 @@ contract LiquidStakingPoolTest is Test {
         pool.reportRewards(10 ether, 0);
     }
 
-    function test_oracle_mismatched_report_reverts() public {
+    /// PBA-L2-026: a differing report no longer reverts ("Report mismatch"
+    /// let the first voter wedge the nonce). It is tallied separately and
+    /// neither tuple finalizes without quorum.
+    function test_oracle_mismatched_report_is_tallied_separately() public {
         vm.prank(alice);
         pool.deposit{value: 100 ether}();
 
@@ -352,10 +355,10 @@ contract LiquidStakingPoolTest is Test {
         vm.prank(oracle1);
         pool.reportRewards(10 ether, 0);
 
-        // oracle2 reports different values
+        // oracle2 reports different values: accepted as a vote, no quorum.
         vm.prank(oracle2);
-        vm.expectRevert("Report mismatch");
         pool.reportRewards(20 ether, 0);
+        assertEq(pool.rewardReportNonce(), 0, "no tuple reached quorum");
     }
 
     function test_rewards_cap_enforced() public {
