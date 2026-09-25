@@ -39,6 +39,12 @@ pub const MODEL_ANNOUNCE_TTL: std::time::Duration = std::time::Duration::from_se
 pub const MAX_TRAINING_JOBS: usize = 256;
 /// Upper bound on tracked training-job announcements originated by one peer.
 pub const MAX_TRAINING_JOBS_PER_PEER: usize = 8;
+/// PBA-L1b-005: upper bound on pending peer inference requests (all peers).
+pub const MAX_PENDING_INFERENCES: usize = 256;
+/// PBA-L1b-005: upper bound on pending inference requests from one peer.
+pub const MAX_PENDING_INFERENCES_PER_PEER: usize = 16;
+/// PBA-L1b-005: a pending request no response has retired expires after this.
+pub const PENDING_INFERENCE_TTL_SECS: u64 = 60;
 /// Peer score penalty for an oversized AI announcement.
 const SCORE_OVERSIZED_AI_ANNOUNCE: i32 = -5;
 
@@ -92,6 +98,8 @@ struct InferenceRequest {
     requester: Vec<u8>,
     max_fee: u128,
     timestamp: u64,
+    /// PBA-L1b-005: the peer that sent it (per-peer cap).
+    from_peer: PeerId,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +171,11 @@ impl AINetworkHandler {
             .await
             .get(model_id)
             .is_some_and(|m| m.announced_at.elapsed() < MODEL_ANNOUNCE_TTL)
+    }
+
+    /// Number of inference requests currently pending (PBA-L1b-005).
+    pub async fn pending_inference_count(&self) -> usize {
+        self.pending_inferences.read().await.len()
     }
 
     /// Number of peer training-job announcements currently tracked.
@@ -366,25 +379,49 @@ impl AINetworkHandler {
         requester: Vec<u8>,
         max_fee: u128,
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received inference request {} for model {} from peer {}",
             request_id, model_id, peer_id
         );
 
-        // Store pending request
-        let request = InferenceRequest {
-            request_id,
-            model_id,
-            input_hash,
-            requester: requester.clone(),
-            max_fee,
-            timestamp: chrono::Utc::now().timestamp() as u64,
-        };
-
-        self.pending_inferences
-            .write()
-            .await
-            .insert(request_id, request);
+        // Store pending request — PBA-L1b-005: bounded (global + per-peer
+        // caps) and expiring; this map used to grow without limit.
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        {
+            let mut pending = self.pending_inferences.write().await;
+            pending.retain(|_, r| now.saturating_sub(r.timestamp) < PENDING_INFERENCE_TTL_SECS);
+            if !pending.contains_key(&request_id) {
+                let from_peer = pending.values().filter(|r| &r.from_peer == peer_id).count();
+                if from_peer >= MAX_PENDING_INFERENCES_PER_PEER {
+                    debug!(
+                        "PBA-L1b-005: {} has {} pending inference requests; dropping {}",
+                        peer_id, from_peer, request_id
+                    );
+                    return Ok(None);
+                }
+                if pending.len() >= MAX_PENDING_INFERENCES {
+                    if let Some(oldest) = pending
+                        .iter()
+                        .min_by_key(|(_, r)| r.timestamp)
+                        .map(|(k, _)| *k)
+                    {
+                        pending.remove(&oldest);
+                    }
+                }
+            }
+            pending.insert(
+                request_id,
+                InferenceRequest {
+                    request_id,
+                    model_id,
+                    input_hash,
+                    requester: requester.clone(),
+                    max_fee,
+                    timestamp: now,
+                    from_peer: peer_id.clone(),
+                },
+            );
+        }
 
         // Check if we can serve this inference: a locally registered model, or
         // a live (bounded, expiring) peer announcement (PBA-L1b-004: peer
@@ -448,7 +485,7 @@ impl AINetworkHandler {
         proof: Vec<u8>,
         _provider: Vec<u8>,
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received inference response {} from peer {}",
             request_id, peer_id
         );
@@ -483,7 +520,7 @@ impl AINetworkHandler {
         reward_per_gradient: u128,
         owner: [u8; 20],
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received training job {} announcement from peer {} with owner {:02x?}",
             job_id, peer_id, owner
         );
@@ -539,7 +576,7 @@ impl AINetworkHandler {
         epoch: u32,
         participant: Vec<u8>,
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received gradient submission for job {} epoch {} from peer {}",
             job_id, epoch, peer_id
         );
@@ -600,7 +637,7 @@ impl AINetworkHandler {
         version: u32,
         weight_delta: Vec<u8>,
     ) -> Result<Option<NetworkMessage>> {
-        info!(
+        debug!(
             "Received weight sync for model {} version {} ({} bytes) from peer {}",
             model_id, version, weight_delta.len(), peer_id
         );
@@ -650,7 +687,7 @@ impl AINetworkHandler {
         // broadcasting to all necessary peers. If we need to propagate, we should
         // implement a proper gossip protocol with TTL or seen-message tracking.
 
-        info!(
+        debug!(
             "Successfully applied weight sync for model {} to version {}",
             model_id, version
         );

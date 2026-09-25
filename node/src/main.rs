@@ -2400,6 +2400,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .with_inference_executor(network_inf_executor),
         );
         let ai_handler_for_rx = ai_handler.clone();
+        // PBA-L1b-005: peer inference runs off the inbound loop, bounded.
+        let inference_dispatcher = crate::network_inference::InferenceDispatcher::new(
+            ai_handler.clone(),
+            peer_manager.clone(),
+            crate::network_inference::MAX_CONCURRENT_PEER_INFERENCES,
+        );
 
         // WP-K.2 / SYNC-S1 D2: the network handler no longer touches the DAG
         // store or GhostDAG directly — `BlockAdmission` (below) owns both, so
@@ -3002,9 +3008,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 .await;
                         }
                     }
+                    // PBA-L1b-005: an unpaid peer inference must never run on
+                    // this loop (it stalled every other message; the stall
+                    // detector then exits the node). Bounded worker, or drop.
+                    NetworkMessage::InferenceRequest { .. } => {
+                        let _ = inference_dispatcher.dispatch(pid.clone(), msg.clone());
+                    }
                     // AI network messages: route through AINetworkHandler
                     NetworkMessage::ModelAnnounce { .. }
-                    | NetworkMessage::InferenceRequest { .. }
                     | NetworkMessage::InferenceResponse { .. }
                     | NetworkMessage::TrainingJobAnnounce { .. }
                     | NetworkMessage::GradientSubmission { .. }
