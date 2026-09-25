@@ -1083,6 +1083,32 @@ impl BlockProducer {
             transactions
         };
 
+        // PBA-L1b-001: from the activation height every follower rejects a
+        // block carrying a tx that does not authenticate from its contents,
+        // lacks its canonical id, or is bound to another chain — so never
+        // build one. Such a tx can only have reached the pool through a
+        // trusted-decoder or signature-checks-disabled path; drop it there too.
+        let transactions: Vec<citrate_consensus::types::Transaction> =
+            if self.ghostdag.pba_hardening().active_at(last_height + 1) {
+                let chain_id = self.executor.chain_id();
+                let mut keep = Vec::with_capacity(transactions.len());
+                for t in transactions {
+                    match citrate_consensus::tx_auth::verify_for_block(&t, chain_id) {
+                        Ok(_) => keep.push(t),
+                        Err(e) => {
+                            warn!(
+                                "PBA-L1b-001: excluding tx {} from the block: {} (removed from mempool)",
+                                t.hash, e
+                            );
+                            let _ = self.mempool.remove_transaction(&t.hash).await;
+                        }
+                    }
+                }
+                keep
+            } else {
+                transactions
+            };
+
         // Blue score and work are already calculated above
         let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
 
@@ -3456,6 +3482,25 @@ mod pba_l1b_003_producer_timestamp {
         assert!(
             !body.contains("timestamp: chrono::Utc::now().timestamp() as u64"),
             "PBA-L1b-003: bare `now` stamping reintroduced"
+        );
+    }
+}
+
+/// PBA-L1b-001 tripwire: the producer filters every candidate tx through the
+/// same import rule followers enforce, so it never seals a block they reject.
+#[cfg(test)]
+mod pba_l1b_001_producer_filter {
+    #[test]
+    fn producer_applies_the_import_rule_before_sealing() {
+        let src = include_str!("producer.rs");
+        let sel = src
+            .find("let transactions = self.select_transactions_with_ai_priority().await?;")
+            .expect("selection");
+        let hdr = src.find("let mut header = BlockHeader {").expect("header");
+        let window = &src[sel..hdr];
+        assert!(
+            window.contains("tx_auth::verify_for_block(&t, chain_id)"),
+            "PBA-L1b-001: produce_block must filter candidates with tx_auth::verify_for_block"
         );
     }
 }

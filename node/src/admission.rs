@@ -101,6 +101,15 @@ pub(crate) fn verify_block_body(
             block.tx_root, expected
         ));
     }
+    // PBA-L1b-001: every transaction authenticated from its contents (never
+    // the wire `ecdsa_verified` flag) and carrying its canonical id, so a
+    // forged-sender body is never stored. (Chain-id binding is enforced by
+    // the executor on apply, which knows the chain id.)
+    for (i, tx) in block.transactions.iter().enumerate() {
+        if let Err(e) = citrate_consensus::tx_auth::authenticate_with_hash(tx) {
+            return Err(format!("body: tx #{i} ({}): {e} (PBA-L1b-001)", tx.hash));
+        }
+    }
     Ok(())
 }
 
@@ -1033,6 +1042,47 @@ mod pba_r2_admission {
         );
         let stored = storage.blocks.get_block(&honest.header.block_hash).unwrap().unwrap();
         assert_eq!(stored.transactions[0].value, 1_000, "the honest body is what is stored");
+    }
+
+    /// PBA-L1b-001: a forged-sender tx (EVM-shaped victim, no signature, the
+    /// wire `ecdsa_verified` flag set) makes the block inadmissible — it is
+    /// never stored.
+    #[tokio::test]
+    async fn pba_l1b_001_forged_sender_block_never_stored() {
+        let pba = PbaHardening::at(0);
+        let (adm, storage, _d) = harness(pba);
+        let g = block(pba, 0, Hash::default(), vec![]);
+        adm.admit(&g).await;
+        let mut victim = [0u8; 32];
+        victim[..20].copy_from_slice(&[0xAA; 20]);
+        let forged = Transaction {
+            hash: Hash::new([0x42; 32]),
+            from: PublicKey::new(victim),
+            to: Some(PublicKey::new([0xBB; 32])),
+            value: 1_000,
+            gas_limit: 21_000,
+            gas_price: 1_000_000_000,
+            chain_id: Some(40204),
+            ecdsa_verified: true,
+            ..Default::default()
+        };
+        let b = block(pba, 1, g.header.block_hash, vec![forged]);
+        let r = adm.admit(&b).await;
+        assert!(matches!(r, AdmitOutcome::Rejected(ref why) if why.contains("PBA-L1b-001")), "{r:?}");
+        assert!(!storage.blocks.has_block(&b.header.block_hash).unwrap());
+    }
+
+    /// Tripwire: the body gate runs before either store is written.
+    #[test]
+    fn pba_r2_tripwire_body_gate_precedes_every_write() {
+        let src = include_str!("admission.rs");
+        let admit = src.find("pub async fn admit(&self, block: &Block)").expect("admit");
+        let body = &src[admit..];
+        let gate = body.find("verify_block_body(self.ghostdag.pba_hardening(), block)").expect(
+            "PBA-R2: admit must run verify_block_body",
+        );
+        assert!(gate < body.find("self.dag_store.store_block(").expect("dag write"));
+        assert!(gate < body.find("self.storage.blocks.put_block(").expect("chain write"));
     }
 
     #[tokio::test]

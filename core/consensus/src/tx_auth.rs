@@ -44,6 +44,8 @@ pub enum TxAuthError {
     BadSignature,
     #[error("transaction hash {claimed} is not the canonical id {canonical} of its contents")]
     HashMismatch { claimed: Hash, canonical: Hash },
+    #[error("transaction chain id {got:?} is not this chain's {expected}")]
+    WrongChainId { expected: u64, got: Option<u64> },
 }
 
 /// An EVM-shaped sender: a 20-byte address embedded in the first 20 bytes of
@@ -86,6 +88,22 @@ pub fn authenticate_with_hash(tx: &Transaction) -> Result<Hash, TxAuthError> {
         });
     }
     Ok(canonical)
+}
+
+/// The block-import rule for one transaction (PBA-L1b-001), applied to every
+/// transaction of every block at or above the PBA-R2 activation height:
+/// authenticated from contents, canonical id as `hash` (PBA-L1a-006), and
+/// bound to this chain (a tx signed for another chain id is not replayable
+/// here, even though the mempool — which already enforced this — is not on
+/// the import path).
+pub fn verify_for_block(tx: &Transaction, chain_id: u64) -> Result<Hash, TxAuthError> {
+    if tx.chain_id != Some(chain_id) {
+        return Err(TxAuthError::WrongChainId {
+            expected: chain_id,
+            got: tx.chain_id,
+        });
+    }
+    authenticate_with_hash(tx)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -568,6 +586,22 @@ mod tests {
         let mut t = tx;
         t.from = PublicKey::new([0u8; 32]);
         assert_eq!(authenticate(&t), Err(TxAuthError::EmptySender));
+    }
+
+    #[test]
+    fn verify_for_block_binds_chain_and_hash() {
+        let tx = native_signed(1, 0);
+        assert_eq!(verify_for_block(&tx, 40204), Ok(tx.hash));
+        assert_eq!(
+            verify_for_block(&tx, 1),
+            Err(TxAuthError::WrongChainId { expected: 1, got: Some(40204) })
+        );
+        let mut t = tx.clone();
+        t.chain_id = None;
+        assert!(matches!(verify_for_block(&t, 40204), Err(TxAuthError::WrongChainId { .. })));
+        let mut t = tx;
+        t.hash = Hash::new([7; 32]);
+        assert!(matches!(verify_for_block(&t, 40204), Err(TxAuthError::HashMismatch { .. })));
     }
 
     #[test]

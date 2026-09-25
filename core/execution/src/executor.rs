@@ -1444,6 +1444,19 @@ impl Executor {
                 block.tx_root
             )));
         }
+        // PBA-L1b-001: every transaction must be signed by its sender — as
+        // verified HERE from its contents, never the deserialized
+        // `ecdsa_verified` wire flag — carry its canonical id, and be bound to
+        // this chain. Before this, any admitted proposer could include a tx
+        // "from" any account and the follower executed it.
+        for (i, tx) in block.transactions.iter().enumerate() {
+            if let Err(e) = citrate_consensus::tx_auth::verify_for_block(tx, self.chain_id) {
+                return Err(ExecutionError::InvalidBlockBody(format!(
+                    "tx #{i} ({}): {e}",
+                    tx.hash
+                )));
+            }
+        }
         Ok(())
     }
 
