@@ -124,10 +124,14 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         return true;
     }
 
-    /// @notice PBA-L2-004: the public commitments a job's proof must carry.
-    /// `inputCommitment` = keccak256(job.inputHash bytes), `modelCommitment`
-    /// = job.modelHash, `outputCommitment` = keccak256(outputHash bytes)
-    /// submitted with the result. Written by the marketplace only.
+    /// @notice PBA-L2-004: the public commitments a job's proof must carry,
+    /// exactly as the 0x0108 v1 inference circuit proves them: canonical
+    /// BN254 scalars. `inputCommitment` = the job's 32-byte `inputHash`
+    /// (the requester publishes the circuit's input commitment there),
+    /// `modelCommitment` = job.modelHash, `outputCommitment` = the 32-byte
+    /// `outputHash` submitted with the result. Written by the marketplace.
+    /// (An earlier R2 revision bound keccak256 of these bytes, which no
+    /// circuit can produce — every honest ZK proof would have failed.)
     struct JobBinding {
         bytes32 inputCommitment;
         bytes32 modelCommitment;
@@ -145,6 +149,26 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     /// one verifier on one chain. Pre-fix it signed only keccak256(attestation).
     bytes32 public constant TEE_ATTESTATION_TAG = keccak256("CitrateComputeVerifier.TEEAttestation.v1");
 
+    /// @notice BN254 scalar field modulus. 0x0108 (verify.rs::to_fr) rejects
+    /// any public input >= r, so ZK-tier commitments must be canonical.
+    uint256 public constant BN254_SCALAR_MODULUS =
+        21888242871839275222246405745257275088548364400416034343698204186575808495617;
+
+    /// @notice PBA-L2-004: domain tag of the ZK-tier proof commitment.
+    /// The circuit's public inputs cannot carry a jobId, so the proof is
+    /// bound to its job by commit-reveal: before revealing, the provider
+    /// submits `zkProofCommitment(jobId, proofData)` as the job commitment,
+    /// in an EARLIER block. A copier who sees the revealed proof cannot have
+    /// committed to it in advance, and ZK proof material is consumed
+    /// globally, so one proof settles at most one job.
+    bytes32 public constant ZK_PROOF_COMMIT_TAG = keccak256("CitrateComputeVerifier.ZKProofCommit.v1");
+
+    /// @notice Block at which a job's commitment was submitted.
+    mapping(uint256 => uint256) public commitmentBlock;
+
+    /// @notice ZK proof material (proof ‖ publicInputs) already used to
+    /// settle any job. Global: one proof, one job.
+    mapping(bytes32 => bool) public zkProofConsumed;
     // ============================================================
     // Events
     // ============================================================
@@ -235,6 +259,14 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         JobBinding storage b = jobBinding[jobId];
         require(!b.inputBound, "ComputeVerifier: already bound");
         require(!records[jobId].proofSubmitted, "ComputeVerifier: proof already submitted");
+        if (records[jobId].tier == VerificationTier.ZKProof) {
+            require(
+                inputCommitment != bytes32(0)
+                    && uint256(inputCommitment) < BN254_SCALAR_MODULUS
+                    && uint256(modelCommitment) < BN254_SCALAR_MODULUS,
+                "ComputeVerifier: ZK commitments must be canonical 32-byte field elements"
+            );
+        }
         b.inputCommitment = inputCommitment;
         b.modelCommitment = modelCommitment;
         b.inputBound = true;
@@ -251,6 +283,12 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         JobBinding storage b = jobBinding[jobId];
         require(!b.outputBound, "ComputeVerifier: output already bound");
         require(!records[jobId].proofSubmitted, "ComputeVerifier: proof already submitted");
+        if (records[jobId].tier == VerificationTier.ZKProof) {
+            require(
+                outputCommitment != bytes32(0) && uint256(outputCommitment) < BN254_SCALAR_MODULUS,
+                "ComputeVerifier: ZK output commitment must be a canonical 32-byte field element"
+            );
+        }
         b.outputCommitment = outputCommitment;
         b.outputBound = true;
         emit OutputBound(jobId, outputCommitment);
@@ -293,7 +331,7 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         rec.commitmentHash = commitment;
         rec.commitmentSubmitted = true;
         rec.provider = provider;
-
+        commitmentBlock[jobId] = block.number;
         emit CommitmentSubmitted(jobId, provider, commitment);
     }
 
@@ -402,16 +440,9 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         rec.proofSubmitted = true;
         emit ProofSubmitted(jobId, VerificationTier.ZKProof);
 
-        // PBA-L2-004: the proof's public inputs must be THIS job's
-        // commitments before the precompile is even consulted.
-        bool valid = _publicInputsBound(jobId, publicInputs)
-            && _callZKVerifyPrecompile(proof, publicInputs);
-
-        // C016 / PBA-L2-004: one-time use, scoped to this job.
-        if (valid && !_consumeProof(jobId, keccak256(abi.encodePacked(proof, publicInputs)))) {
-            valid = false;
-        }
-
+        bool valid = _checkZK(
+            jobId, keccak256(abi.encodePacked(uint256(proof.length), proof, publicInputs)), proof, publicInputs
+        );
         rec.result = valid ? VerificationResult.Valid : VerificationResult.Invalid;
 
         if (valid) {
@@ -662,13 +693,7 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         bytes calldata proof = proofData[32:32 + proofLen];
         bytes calldata publicInputs = proofData[32 + proofLen:];
 
-        // PBA-L2-004: public inputs must equal this job's commitments.
-        bool valid = _publicInputsBound(jobId, publicInputs)
-            && _callZKVerifyPrecompile(proof, publicInputs);
-        // C016 / PBA-L2-004: one-time use, scoped to this job.
-        if (valid && !_consumeProof(jobId, keccak256(abi.encodePacked(proof, publicInputs)))) {
-            valid = false;
-        }
+        bool valid = _checkZK(jobId, keccak256(proofData), proof, publicInputs);
         return valid ? VerificationResult.Valid : VerificationResult.Invalid;
     }
 
@@ -744,6 +769,38 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         return keccak256(
             abi.encode(TEE_ATTESTATION_TAG, block.chainid, address(this), jobId, keccak256(attestation))
         );
+    }
+
+    /// @notice PBA-L2-004: the commitment a ZK-tier provider submits (in an
+    /// earlier block) before revealing `proofData` for `jobId`.
+    function zkProofCommitment(uint256 jobId, bytes memory proofData) public view returns (bytes32) {
+        return keccak256(abi.encode(ZK_PROOF_COMMIT_TAG, block.chainid, address(this), jobId, keccak256(proofData)));
+    }
+
+    /// @dev PBA-L2-004: shared ZK-tier checks.
+    ///      1. the reveal is bound to the provider's earlier commitment
+    ///         (commit-reveal ties the proof to this job and this provider);
+    ///      2. the public inputs are this job's commitments;
+    ///      3. 0x0108 accepts the proof;
+    ///      4. the proof material has never settled any job (global). A
+    ///         replay REVERTS rather than returning Invalid, so a provider
+    ///         can never be slashed because someone else used "its" proof
+    ///         first; it simply re-proves (Halo2 proofs are randomized).
+    function _checkZK(uint256 jobId, bytes32 proofDataHash, bytes calldata proof, bytes calldata publicInputs)
+        internal
+        returns (bool)
+    {
+        require(publicInputs.length == ZK_PUBLIC_INPUTS_LEN, "ComputeVerifier: bad publicInputs length");
+        require(block.number > commitmentBlock[jobId], "ComputeVerifier: reveal in commit block");
+        bytes32 expected =
+            keccak256(abi.encode(ZK_PROOF_COMMIT_TAG, block.chainid, address(this), jobId, proofDataHash));
+        if (records[jobId].commitmentHash != expected) return false;
+        if (!_publicInputsBound(jobId, publicInputs)) return false;
+        if (!_callZKVerifyPrecompile(proof, publicInputs)) return false;
+        bytes32 key = keccak256(abi.encodePacked(proof, publicInputs));
+        require(!zkProofConsumed[key], "ComputeVerifier: proof already used");
+        zkProofConsumed[key] = true;
+        return true;
     }
 
     /// @dev PBA-L2-004: true iff the 96-byte publicInputs are exactly

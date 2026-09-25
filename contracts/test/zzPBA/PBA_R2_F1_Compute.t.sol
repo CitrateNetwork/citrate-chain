@@ -19,6 +19,30 @@ contract RevertingRequesterR2 {
     }
 }
 
+/// A requester that rejects value until `accept` is set, and can make
+/// arbitrary calls (used for pull-refund double-claim tests).
+contract ToggleReceiver {
+    bool public accept;
+
+    function setAccept(bool a) external {
+        accept = a;
+    }
+
+    function exec(address target, uint256 value, bytes calldata data) external payable returns (bytes memory) {
+        (bool ok, bytes memory ret) = target.call{value: value}(data);
+        if (!ok) {
+            assembly {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+        return ret;
+    }
+
+    receive() external payable {
+        require(accept, "no");
+    }
+}
+
 /// Training requester whose receive reverts (finalize-refund variant).
 contract RevertingTrainingRequester {
     function open(ComputePoolTraining t, ComputePoolTraining.TrainingJobSpec calldata spec)
@@ -35,6 +59,30 @@ contract RevertingTrainingRequester {
 
     receive() external payable {
         revert("no");
+    }
+}
+
+/// 0x0108 mock enforcing the real v1 circuit rules (from the R2 verifier):
+/// every public input must be a canonical BN254 scalar, and only the exact
+/// Poseidon commitments the circuit proved are accepted.
+contract CircuitFaithful0108 {
+    uint256 constant R = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
+    bytes32 public pin;
+    bytes32 public pmodel;
+    bytes32 public pout;
+
+    function set(bytes32 i, bytes32 m, bytes32 o) external {
+        pin = i;
+        pmodel = m;
+        pout = o;
+    }
+
+    fallback(bytes calldata data) external returns (bytes memory) {
+        bytes32 i = bytes32(data[0:32]);
+        bytes32 m = bytes32(data[32:64]);
+        bytes32 o = bytes32(data[64:96]);
+        if (uint256(i) >= R || uint256(m) >= R || uint256(o) >= R) revert("PublicInputShape");
+        return abi.encode(uint256(i == pin && m == pmodel && o == pout ? 1 : 0));
     }
 }
 
@@ -261,9 +309,13 @@ contract PBA_R2_F1_Compute is Test {
         vm.prank(requester);
         t.reassignCoordinator(job, other);
         assertEq(t.getJob(job).coordinator, other);
+        // R2 verifier follow-up: a requester swap does NOT liveness-slash the
+        // (possibly just busy) coordinator.
+        assertEq(t.getWorker(job, honest).stakeSlashed, 0, "no slash on requester swap");
         vm.roll(b0 + 202);
-        t.reassignCoordinator(job, honest); // governance (this)
+        t.reassignCoordinator(job, honest); // governance (this) adjudicates the stall
         assertEq(t.getJob(job).coordinator, honest);
+        assertEq(t.getWorker(job, other).stakeSlashed, 0.001 ether, "governance-adjudicated liveness slash");
     }
 
     /// PBA-L2-003: worker-side exit when the requester disappears. The job
@@ -330,6 +382,42 @@ contract PBA_R2_F1_Compute is Test {
         t.finalizeTrainingJob(job);
         assertEq(w2.balance - before, 1.5 ether, "worker paid despite reverting requester");
         assertEq(t.requesterRefundPending(job), 1 ether, "requester refund deferred");
+    }
+
+    /// Pull refunds are zeroed on claim: a second claim reverts (training).
+    function test_variant_training_requester_refund_claimed_once() public {
+        ComputePoolTraining t = new ComputePoolTraining(address(this));
+        ToggleReceiver req = new ToggleReceiver();
+        address w1 = address(0x11);
+        address w2 = address(0x22);
+        vm.deal(address(req), 10 ether);
+        vm.deal(w1, 10 ether);
+        vm.deal(w2, 10 ether);
+        ComputePoolTraining.TrainingJobSpec memory spec = ComputePoolTraining.TrainingJobSpec({
+            modelStartHash: bytes32("m"), datasetHash: bytes32("d"), epochCount: 2, stepsPerEpoch: 10,
+            minWorkers: 2, maxWorkers: 2, challengeWindowBlocks: 5, perEpochBudget: 1 ether, perWorkerStake: 1 ether
+        });
+        bytes memory ret = req.exec(address(t), 2 ether, abi.encodeCall(ComputePoolTraining.requestTrainingJob, (spec)));
+        uint256 job = abi.decode(ret, (uint256));
+        vm.prank(w1);
+        t.joinTrainingJob{value: 1 ether}(job);
+        vm.prank(w2);
+        t.joinTrainingJob{value: 1 ether}(job);
+        req.exec(address(t), 0, abi.encodeCall(ComputePoolTraining.closeRecruitment, (job, w1)));
+        uint256 b0 = block.number;
+        vm.roll(b0 + t.STALL_EXPIRY_BLOCKS() + 1);
+        vm.prank(w2);
+        t.expireStalledTraining(job);
+        vm.roll(b0 + t.STALL_EXPIRY_BLOCKS() + 10);
+        t.finalizeTrainingJob(job);
+        assertEq(t.requesterRefundPending(job), 2 ether);
+        req.setAccept(true);
+        uint256 before = address(req).balance;
+        req.exec(address(t), 0, abi.encodeCall(ComputePoolTraining.claimRequesterRefund, (job)));
+        assertEq(address(req).balance - before, 2 ether);
+        assertEq(t.requesterRefundPending(job), 0, "zeroed on claim");
+        vm.expectRevert(bytes("ComputePoolTraining: nothing to claim"));
+        req.exec(address(t), 0, abi.encodeCall(ComputePoolTraining.claimRequesterRefund, (job)));
     }
 
     // ─────────────────────── ComputeMarketplace / Verifier ───────────────────
@@ -435,17 +523,75 @@ contract PBA_R2_F1_Compute is Test {
         assertEq(uint256(market.getJob(id).state), uint256(ComputeMarketplace.JobState.Completed));
     }
 
-    function _zkProofData(bytes memory input, bytes32 model, bytes memory outputHash, bytes memory proof)
-        internal
-        pure
-        returns (bytes memory)
-    {
-        bytes memory publicInputs = abi.encode(keccak256(input), model, keccak256(outputHash));
-        return abi.encodePacked(uint256(proof.length), proof, publicInputs);
+    uint256 constant FR = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
+    bytes32 constant IN_C = bytes32(uint256(keccak256("poseidon(x)")) % FR);
+    bytes32 constant OUT_C = bytes32(uint256(keccak256("poseidon(y)")) % FR);
+
+    /// Post + assign + start a ZK-tier job whose input commitment is `inC`
+    /// (the circuit's canonical 32-byte Poseidon commitment). No commitment
+    /// yet: for the ZK tier the commitment binds the proof (commit-reveal).
+    function _zkJob(address requester, address p, uint256 price, bytes32 inC) internal returns (uint256 id) {
+        vm.deal(requester, requester.balance + price);
+        vm.prank(requester);
+        id = market.postJob{value: price}(MODEL, abi.encodePacked(inC), price, ComputeVerifier.VerificationTier.ZKProof, 10, 100);
+        vm.prank(p);
+        market.bidOnJob(id, price, 1);
+        market.assignBestBid(id);
+        vm.prank(p);
+        market.startExecution(id);
     }
 
-    /// PBA-L2-004 (F1-06b inverted): copying an honest provider's pending
-    /// proof no longer fails the honest job or slashes the honest provider.
+    function _pd(bytes32 inC, bytes32 modelC, bytes32 outC, bytes memory proof) internal pure returns (bytes memory) {
+        return abi.encodePacked(uint256(proof.length), proof, abi.encode(inC, modelC, outC));
+    }
+
+    /// Commit (block N) then reveal (block N+1).
+    function _commitReveal(address p, uint256 id, bytes32 outC, bytes memory proofData) internal {
+        bytes32 c = verifier.zkProofCommitment(id, proofData);
+        vm.prank(p);
+        market.submitCommitment(id, c);
+        vm.roll(block.number + 1);
+        vm.prank(p);
+        market.submitResult(id, abi.encodePacked(outC), proofData);
+    }
+
+    /// R2 verifier regression (was test_V_L2_004_honest_zk_proof_with_circuit_commitments_is_slashed):
+    /// against a 0x0108 mock that enforces the real v1 circuit rules
+    /// (canonical Fr public inputs; accepts only the Poseidon commitments it
+    /// proved), an HONEST proof settles and the provider is not slashed.
+    function test_L2_004_honest_zk_proof_with_circuit_commitments_settles() public {
+        _market();
+        CircuitFaithful0108 pc = new CircuitFaithful0108();
+        vm.etch(address(0x0108), address(pc).code);
+        CircuitFaithful0108(address(0x0108)).set(IN_C, MODEL, OUT_C);
+        address honest = address(0xA1);
+        _provider(honest);
+        uint256 job = _zkJob(address(0xCC), honest, 50 ether, IN_C);
+        _commitReveal(honest, job, OUT_C, _pd(IN_C, MODEL, OUT_C, hex"0badc0de"));
+        assertEq(uint256(verifier.getResult(job)), uint256(ComputeVerifier.VerificationResult.Valid), "genuine proof settles");
+        assertEq(market.getProvider(honest).stake, 1000 ether, "honest provider not slashed");
+        vm.roll(block.number + market.DISPUTE_WINDOW());
+        market.completeJob(job);
+        assertEq(uint256(market.getJob(job).state), uint256(ComputeMarketplace.JobState.Completed));
+    }
+
+    /// ZK-tier commitments must be canonical 32-byte field elements: a
+    /// non-32-byte or >= r input commitment is refused at post time (no
+    /// provider can ever be slashed for an unprovable binding).
+    function test_L2_004_zk_job_requires_canonical_commitments() public {
+        _market();
+        vm.deal(address(0xCC), 200 ether);
+        vm.startPrank(address(0xCC));
+        vm.expectRevert(bytes("ComputeVerifier: ZK commitments must be canonical 32-byte field elements"));
+        market.postJob{value: 50 ether}(MODEL, hex"1234", 50 ether, ComputeVerifier.VerificationTier.ZKProof, 10, 100);
+        vm.expectRevert(bytes("ComputeVerifier: ZK commitments must be canonical 32-byte field elements"));
+        market.postJob{value: 50 ether}(MODEL, abi.encodePacked(bytes32(FR)), 50 ether, ComputeVerifier.VerificationTier.ZKProof, 10, 100);
+        vm.stopPrank();
+    }
+
+    /// PBA-L2-004 (F1-06b inverted): a front-runner copying an honest
+    /// provider's revealed proof onto its own job gets nothing (its prior
+    /// commitment cannot match), and the honest provider settles unharmed.
     function test_L2_004b_frontrun_copy_does_not_slash_honest_provider() public {
         _market();
         vm.mockCall(address(0x0108), bytes(""), abi.encode(uint256(1)));
@@ -453,61 +599,170 @@ contract PBA_R2_F1_Compute is Test {
         address thief = address(0xB1);
         _provider(honest);
         _provider(thief);
-        uint256 victimJob = _assignedJob(address(0xCC), honest, 50 ether, ComputeVerifier.VerificationTier.ZKProof, INPUT);
-        uint256 thiefJob = _assignedJob(thief, thief, 11 ether, ComputeVerifier.VerificationTier.ZKProof, INPUT);
-
-        bytes memory outputHash = hex"00";
-        bytes memory proofData = _zkProofData(INPUT, MODEL, outputHash, hex"0badc0de");
-
+        uint256 victimJob = _zkJob(address(0xCC), honest, 50 ether, IN_C);
+        uint256 thiefJob = _zkJob(thief, thief, 11 ether, IN_C);
+        bytes memory proofData = _pd(IN_C, MODEL, OUT_C, hex"0badc0de");
+        // Thief committed earlier (it cannot know the proof yet).
         vm.prank(thief);
-        market.submitResult(thiefJob, outputHash, proofData); // front-run copy
-
+        market.submitCommitment(thiefJob, bytes32(uint256(0x7))); 
+        bytes32 c = verifier.zkProofCommitment(victimJob, proofData);
         vm.prank(honest);
-        market.submitResult(victimJob, outputHash, proofData); // honest submission
+        market.submitCommitment(victimJob, c);
+        vm.roll(block.number + 1);
+        vm.prank(thief);
+        market.submitResult(thiefJob, abi.encodePacked(OUT_C), proofData); // front-run copy
+        assertEq(uint256(verifier.getResult(thiefJob)), uint256(ComputeVerifier.VerificationResult.Invalid));
+        vm.prank(honest);
+        market.submitResult(victimJob, abi.encodePacked(OUT_C), proofData);
         assertEq(uint256(verifier.getResult(victimJob)), uint256(ComputeVerifier.VerificationResult.Valid));
-        assertEq(uint256(market.getJob(victimJob).state), uint256(ComputeMarketplace.JobState.Verifying));
         assertEq(market.getProvider(honest).stake, 1000 ether, "honest provider not slashed");
     }
 
-    /// PBA-L2-004 tripwire: a proof valid for job A is Invalid for a job B
-    /// whose input differs (and for a different output / model binding).
-    function test_L2_004b_proof_bound_to_job_input_and_output() public {
+    /// R2 verifier follow-up (test_V_L2_004_identical_commitment_replay_pays_lazy_provider):
+    /// a lazy provider on job B with the SAME model + input cannot settle it
+    /// with job A's landed proof — even after committing to it — because ZK
+    /// proof material is consumed globally. The replay reverts (no slash).
+    function test_L2_004_identical_commitment_replay_rejected() public {
+        _market();
+        vm.mockCall(address(0x0108), bytes(""), abi.encode(uint256(1)));
+        address honest = address(0xA1);
+        address lazy = address(0xB1);
+        _provider(honest);
+        _provider(lazy);
+        uint256 jobA = _zkJob(address(0xCC), honest, 50 ether, IN_C);
+        uint256 jobB = _zkJob(address(0xCD), lazy, 50 ether, IN_C);
+        bytes memory proofData = _pd(IN_C, MODEL, OUT_C, hex"0badc0de");
+        _commitReveal(honest, jobA, OUT_C, proofData);
+        assertEq(uint256(verifier.getResult(jobA)), uint256(ComputeVerifier.VerificationResult.Valid));
+        bytes32 c = verifier.zkProofCommitment(jobB, proofData); // commits AFTER seeing A's proof
+        vm.prank(lazy);
+        market.submitCommitment(jobB, c);
+        vm.roll(block.number + 1);
+        vm.prank(lazy);
+        vm.expectRevert(bytes("ComputeVerifier: proof already used"));
+        market.submitResult(jobB, abi.encodePacked(OUT_C), proofData);
+        assertEq(market.getProvider(lazy).stake, 1000 ether, "replay reverts, never slashes");
+    }
+
+    /// A malformed output commitment (not 32 bytes, or >= r) reverts the
+    /// submission instead of turning into an Invalid verdict + slash.
+    function test_L2_004_noncanonical_output_reverts_without_slash() public {
         _market();
         vm.mockCall(address(0x0108), bytes(""), abi.encode(uint256(1)));
         address p = address(0xA1);
         _provider(p);
-        uint256 jobB = _assignedJob(address(0xCC), p, 50 ether, ComputeVerifier.VerificationTier.ZKProof, hex"9999");
-        // Proof material produced for a job with INPUT (not job B's input).
-        bytes memory proofData = _zkProofData(INPUT, MODEL, hex"00", hex"0badc0de");
+        uint256 job = _zkJob(address(0xCC), p, 50 ether, IN_C);
+        bytes memory proofData = _pd(IN_C, MODEL, OUT_C, hex"0badc0de");
+        bytes32 c = verifier.zkProofCommitment(job, proofData);
         vm.prank(p);
-        market.submitResult(jobB, hex"00", proofData);
-        assertEq(uint256(verifier.getResult(jobB)), uint256(ComputeVerifier.VerificationResult.Invalid));
-
-        uint256 jobC = _assignedJob(address(0xCD), p, 50 ether, ComputeVerifier.VerificationTier.ZKProof, INPUT);
-        // Right input + model but the proof commits to a different output.
-        bytes memory wrongOut = _zkProofData(INPUT, MODEL, hex"01", hex"0badc0de");
+        market.submitCommitment(job, c);
+        vm.roll(block.number + 1);
+        vm.startPrank(p);
+        vm.expectRevert(bytes("ComputeVerifier: ZK output commitment must be a canonical 32-byte field element"));
+        market.submitResult(job, abi.encodePacked(bytes32(FR)), proofData);
+        vm.expectRevert(bytes("ComputeVerifier: ZK output commitment must be a canonical 32-byte field element"));
+        market.submitResult(job, hex"00", proofData);
+        vm.stopPrank();
+        assertEq(market.getProvider(p).stake, 1000 ether);
         vm.prank(p);
-        market.submitResult(jobC, hex"00", wrongOut);
-        assertEq(uint256(verifier.getResult(jobC)), uint256(ComputeVerifier.VerificationResult.Invalid));
+        market.submitResult(job, abi.encodePacked(OUT_C), proofData); // still settles
+        assertEq(uint256(verifier.getResult(job)), uint256(ComputeVerifier.VerificationResult.Valid));
     }
 
-    /// PBA-L2-004: a TEE attestation signed for job A does not verify job B.
+    /// The reveal must come after the commitment block.
+    function test_L2_004_reveal_in_commit_block_reverts() public {
+        _market();
+        vm.mockCall(address(0x0108), bytes(""), abi.encode(uint256(1)));
+        address p = address(0xA1);
+        _provider(p);
+        uint256 job = _zkJob(address(0xCC), p, 50 ether, IN_C);
+        bytes memory proofData = _pd(IN_C, MODEL, OUT_C, hex"0badc0de");
+        bytes32 c = verifier.zkProofCommitment(job, proofData);
+        vm.startPrank(p);
+        market.submitCommitment(job, c);
+        vm.expectRevert(bytes("ComputeVerifier: reveal in commit block"));
+        market.submitResult(job, abi.encodePacked(OUT_C), proofData);
+        vm.stopPrank();
+    }
+
+    /// PBA-L2-004 tripwire: a proof for job A is Invalid for a job whose
+    /// input, model or output commitment differs.
+    function test_L2_004b_proof_bound_to_job_input_model_and_output() public {
+        _market();
+        vm.mockCall(address(0x0108), bytes(""), abi.encode(uint256(1)));
+        address p = address(0xA1);
+        _provider(p);
+        bytes32 otherIn = bytes32(uint256(IN_C) + 1);
+        // wrong input
+        uint256 jobB = _zkJob(address(0xCC), p, 50 ether, otherIn);
+        _commitReveal(p, jobB, OUT_C, _pd(IN_C, MODEL, OUT_C, hex"01"));
+        assertEq(uint256(verifier.getResult(jobB)), uint256(ComputeVerifier.VerificationResult.Invalid), "input");
+        // wrong output
+        uint256 jobC = _zkJob(address(0xCD), p, 50 ether, IN_C);
+        _commitReveal(p, jobC, OUT_C, _pd(IN_C, MODEL, bytes32(uint256(OUT_C) + 1), hex"02"));
+        assertEq(uint256(verifier.getResult(jobC)), uint256(ComputeVerifier.VerificationResult.Invalid), "output");
+        // wrong model
+        uint256 jobD = _zkJob(address(0xCE), p, 50 ether, IN_C);
+        _commitReveal(p, jobD, OUT_C, _pd(IN_C, bytes32(uint256(MODEL) + 1), OUT_C, hex"03"));
+        assertEq(uint256(verifier.getResult(jobD)), uint256(ComputeVerifier.VerificationResult.Invalid), "model");
+        // control: all correct
+        uint256 jobE = _zkJob(address(0xCF), p, 50 ether, IN_C);
+        _commitReveal(p, jobE, OUT_C, _pd(IN_C, MODEL, OUT_C, hex"04"));
+        assertEq(uint256(verifier.getResult(jobE)), uint256(ComputeVerifier.VerificationResult.Valid), "control");
+    }
+
+    /// PBA-L2-004: a TEE attestation signed for job A does not verify job B,
+    /// nor on another verifier instance, nor on another chain.
     function test_L2_004_tee_attestation_bound_to_job() public {
         ComputeVerifier v = new ComputeVerifier(address(this));
+        ComputeVerifier v2 = new ComputeVerifier(address(this));
         (address oracle, uint256 pk) = makeAddrAndKey("tee");
         v.addTEEOracle(oracle);
+        v2.addTEEOracle(oracle);
         bytes memory att = hex"deadbeef";
-        for (uint256 j = 1; j <= 2; j++) {
+        for (uint256 j = 1; j <= 3; j++) {
             v.configureJob(j, 100 ether, ComputeVerifier.VerificationTier.TEE);
             v.submitCommitment(j, address(0xBEEF), bytes32(j));
         }
-        bytes32 digest = keccak256(
-            abi.encodePacked("\x19Ethereum Signed Message:\n32", v.teeAttestationDigest(1, att))
+        v2.configureJob(1, 100 ether, ComputeVerifier.VerificationTier.TEE);
+        v2.submitCommitment(1, address(0xBEEF), bytes32(uint256(1)));
+        // The expected domain, computed independently of the contract.
+        bytes32 expected = keccak256(
+            abi.encode(keccak256("CitrateComputeVerifier.TEEAttestation.v1"), block.chainid, address(v), uint256(1), keccak256(att))
         );
-        (uint8 vv, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        assertEq(v.teeAttestationDigest(1, att), expected, "digest binds tag, chainid, verifier, job");
+        (uint8 vv, bytes32 r, bytes32 s) =
+            vm.sign(pk, keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", expected)));
         bytes memory sig = abi.encodePacked(r, s, vv);
         assertFalse(v.verifyTEEAttestation(2, att, sig), "job-1 attestation cannot settle job 2");
+        assertFalse(v2.verifyTEEAttestation(1, att, sig), "nor on another verifier");
         assertTrue(v.verifyTEEAttestation(1, att, sig));
+        vm.chainId(block.chainid + 1); // last: via_ir may re-read block.chainid
+        assertFalse(v.verifyTEEAttestation(3, att, sig), "nor on another chain");
+    }
+
+    /// PBA-L2-005 variant: a native refund that could not be pushed is
+    /// credited, claimable once, and zeroed on claim.
+    function test_variant_market_native_refund_claimed_once() public {
+        _market();
+        ToggleReceiver req = new ToggleReceiver();
+        vm.deal(address(req), 10 ether);
+        bytes memory ret = req.exec(
+            address(market),
+            5 ether,
+            abi.encodeCall(ComputeMarketplace.postJob, (MODEL, hex"1234", 5 ether, ComputeVerifier.VerificationTier.Commitment, 10, 100))
+        );
+        uint256 id = abi.decode(ret, (uint256));
+        vm.roll(block.number + 11);
+        market.expireJob(id); // push to the rejecting requester fails -> credited
+        assertEq(market.nativeRefundOwed(address(req)), 5 ether);
+        req.setAccept(true);
+        uint256 before = address(req).balance;
+        req.exec(address(market), 0, abi.encodeCall(ComputeMarketplace.claimNativeRefund, ()));
+        assertEq(address(req).balance - before, 5 ether);
+        assertEq(market.nativeRefundOwed(address(req)), 0, "zeroed on claim");
+        vm.expectRevert(bytes("ComputeMarketplace: nothing owed"));
+        req.exec(address(market), 0, abi.encodeCall(ComputeMarketplace.claimNativeRefund, ()));
     }
 
     // ─────────────────────────────── InferenceRouter ─────────────────────────
@@ -568,6 +823,10 @@ contract PBA_R2_F1_Compute is Test {
         vm.prank(user);
         r.claimRefund();
         assertEq(user.balance - before, 3 ether);
+        assertEq(r.refundOwed(user), 0, "zeroed on claim");
+        vm.prank(user);
+        vm.expectRevert(bytes("No refund"));
+        r.claimRefund();
     }
 
     receive() external payable {}

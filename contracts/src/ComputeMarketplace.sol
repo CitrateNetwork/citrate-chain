@@ -614,7 +614,7 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         verifier.configureJob(jobId, maxPrice, tier);
         // PBA-L2-004: bind the job's input + model commitments so a proof
         // for a different job cannot settle this one.
-        verifier.bindJob(jobId, keccak256(inputHash), modelHash);
+        verifier.bindJob(jobId, _commitment32(inputHash), modelHash);
 
         // SALT path: refund excess payment. (Credits path can't
         // have excess — msg.value == 0 was required above.)
@@ -798,7 +798,7 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
 
         // Configure verification
         verifier.configureJob(jobId, maxPrice, tier);
-        verifier.bindJob(jobId, keccak256(inputHash), modelHash); // PBA-L2-004
+        verifier.bindJob(jobId, _commitment32(inputHash), modelHash); // PBA-L2-004
 
         providers[bestProvider].currentActiveJobs++;
 
@@ -877,7 +877,7 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
         emit ResultSubmitted(jobId, msg.sender, keccak256(outputHash));
 
         // PBA-L2-004: the proof must commit to the output being submitted.
-        verifier.bindOutput(jobId, keccak256(outputHash));
+        verifier.bindOutput(jobId, _commitment32(outputHash));
 
         // Attempt verification inline
         ComputeVerifier.VerificationResult result = verifier.verify(
@@ -1137,6 +1137,16 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
     /// @param jobId The job identifier
     function getJob(uint256 jobId) external view returns (Job memory) {
         return jobs[jobId];
+    }
+
+    /// @dev PBA-L2-004: the raw 32-byte commitment carried in `data`, or 0
+    ///      if `data` is not exactly 32 bytes. For ZK-tier jobs the verifier
+    ///      requires a non-zero canonical BN254 scalar (the circuit's
+    ///      Poseidon commitment), so ZK requesters post the input commitment
+    ///      as `inputHash` and providers submit the output commitment as
+    ///      `outputHash`.
+    function _commitment32(bytes calldata data) internal pure returns (bytes32) {
+        return data.length == 32 ? bytes32(data) : bytes32(0);
     }
 
     /// @notice PBA-L2-021: (requester, assigned provider) of a job, for

@@ -25,8 +25,8 @@ contract ComputeMarketplaceTest is Test {
     address internal outsider = address(0xBAD1);
     address internal disputer = address(0xD15A);
 
-    bytes32 internal modelHash = keccak256("test-model-v1");
-    bytes internal inputHash = hex"DEADBEEF";
+    bytes32 internal modelHash = bytes32(uint256(keccak256("test-model-v1")) % 21888242871839275222246405745257275088548364400416034343698204186575808495617); // canonical BN254 scalar: high-value jobs are ZK-tier (PBA-L2-004)
+    bytes internal inputHash = abi.encodePacked(bytes32(uint256(keccak256(hex"DEADBEEF")) % 21888242871839275222246405745257275088548364400416034343698204186575808495617)); // ZK tier binds the raw 32-byte input commitment (PBA-L2-004)
 
     // Commitment values for verification
     bytes internal outputData = hex"01020304";
