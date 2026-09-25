@@ -42,6 +42,11 @@ contract NematocystSlashing is ReentrancyGuard, Governable {
     /// @notice 1x multiplier in 18-decimal precision.
     uint256 private constant ONE = 1e18;
 
+    /// @notice PBA-L2-028: blocks an unstake waits, still slashable, before
+    ///         it can be withdrawn (~7 days at 2 s blocks; longer than the
+    ///         evidence window).
+    uint256 public constant UNBONDING_PERIOD = 302_400;
+
     // ── State ────────────────────────────────────────────────────────
 
     /// @notice Provider stakes (SALT deposited).
@@ -56,12 +61,22 @@ contract NematocystSlashing is ReentrancyGuard, Governable {
     /// @notice Slash count per block number (for correlation multiplier).
     mapping(uint256 => uint256) public slashesInBlock;
 
+    /// @notice PBA-L2-028: stake queued by `unstake()`, still slashable.
+    mapping(address => uint256) public pendingUnstake;
+    /// @notice Block from which `withdrawUnstaked()` may pay out.
+    mapping(address => uint256) public unstakeReadyAt;
+    /// @notice Cumulative SALT slashed, and how much governance has moved out.
+    uint256 public slashedTotal;
+    uint256 public slashedWithdrawn;
+
     // Governance state lives in Governable mixin (audit SOL-21).
 
     // ── Events ───────────────────────────────────────────────────────
 
     event Staked(address indexed provider, uint256 amount);
     event Unstaked(address indexed provider, uint256 amount);
+    event UnstakeRequested(address indexed provider, uint256 amount, uint256 readyAtBlock);
+    event SlashedWithdrawn(address indexed to, uint256 amount);
     event Slashed(
         address indexed provider,
         SlashTier tier,
@@ -101,6 +116,13 @@ contract NematocystSlashing is ReentrancyGuard, Governable {
 
     /// @notice Withdraw entire stake (only for providers who are not banned).
     /// @dev Provider is deregistered after full unstake.
+    /// @notice Begin unbonding the caller's whole stake.
+    /// @dev PBA-L2-028 (pre-bounty audit 2026-09-24): `unstake()` used to pay
+    ///      out instantly, so a provider who misbehaved (or saw `slash()` in
+    ///      the mempool) left with 100 % and the slash then reverted "Not
+    ///      staked". Unstaking now queues the stake for `UNBONDING_PERIOD`
+    ///      blocks (longer than the evidence window) during which it remains
+    ///      fully slashable; `withdrawUnstaked()` pays out afterwards.
     function unstake() external nonReentrant {
         require(!banned[msg.sender], "Provider is banned");
         uint256 amount = stakes[msg.sender];
@@ -108,6 +130,21 @@ contract NematocystSlashing is ReentrancyGuard, Governable {
 
         stakes[msg.sender] = 0;
         totalProviders--;
+        pendingUnstake[msg.sender] += amount;
+        unstakeReadyAt[msg.sender] = block.number + UNBONDING_PERIOD;
+
+        emit UnstakeRequested(msg.sender, amount, unstakeReadyAt[msg.sender]);
+    }
+
+    /// @notice Withdraw stake whose unbonding period has elapsed.
+    function withdrawUnstaked() external nonReentrant {
+        require(!banned[msg.sender], "Provider is banned");
+        uint256 amount = pendingUnstake[msg.sender];
+        require(amount > 0, "Nothing unbonding");
+        require(block.number >= unstakeReadyAt[msg.sender], "Still unbonding");
+
+        pendingUnstake[msg.sender] = 0;
+        unstakeReadyAt[msg.sender] = 0;
 
         (bool success, ) = payable(msg.sender).call{value: amount}("");
         require(success, "Transfer failed");
@@ -117,10 +154,8 @@ contract NematocystSlashing is ReentrancyGuard, Governable {
 
     // ── Slashing ─────────────────────────────────────────────────────
 
-    /// @notice Slash a provider according to the given tier.
-    /// @param provider The address being slashed.
-    /// @param tier The severity tier (Latency, Inconsistency, Byzantine).
-    /// @param evidence Opaque evidence payload (e.g. equivocation proof).
+    /// @notice Slash a provider for misbehaviour. Reaches both active stake and
+    ///         stake still unbonding (PBA-L2-028).
     function slash(
         address provider,
         SlashTier tier,
@@ -128,45 +163,51 @@ contract NematocystSlashing is ReentrancyGuard, Governable {
     ) external onlyGovernance {
         require(evidence.length > 0, "Evidence required");
         require(!banned[provider], "Already banned");
-        require(stakes[provider] > 0, "Not staked");
+        uint256 active = stakes[provider];
+        uint256 unbonding = pendingUnstake[provider];
+        uint256 base = active + unbonding;
+        require(base > 0, "Not staked");
 
         // Record the slash event in the current block for correlation tracking
         slashesInBlock[block.number]++;
 
-        // Compute base penalty in basis points
-        uint256 baseBps = _tierPenaltyBps(tier);
-
-        // Compute raw penalty before correlation multiplier
-        uint256 rawPenalty = (stakes[provider] * baseBps) / BPS;
-
-        // Apply correlation multiplier (scaled by 1e18)
+        uint256 rawPenalty = (base * _tierPenaltyBps(tier)) / BPS;
         uint256 corrMul = getCorrelationMultiplier();
         uint256 penalty = (rawPenalty * corrMul) / ONE;
 
-        // Cap at the provider's full stake
-        if (penalty > stakes[provider]) {
-            penalty = stakes[provider];
+        // Tier 3 (Byzantine) always forfeits everything and bans.
+        if (tier == SlashTier.Byzantine || penalty > base) {
+            penalty = base;
         }
 
-        stakes[provider] -= penalty;
+        // Debit active stake first, then the unbonding queue.
+        uint256 fromActive = penalty > active ? active : penalty;
+        stakes[provider] = active - fromActive;
+        pendingUnstake[provider] = unbonding - (penalty - fromActive);
+        slashedTotal += penalty;
 
-        // Tier 3 (Byzantine) always results in a permanent ban
         if (tier == SlashTier.Byzantine) {
             banned[provider] = true;
-            totalProviders--;
-
-            // Any remaining stake is also forfeited
-            uint256 remaining = stakes[provider];
-            stakes[provider] = 0;
-            penalty += remaining;
-
             emit Banned(provider);
-        } else if (stakes[provider] == 0) {
-            // If all stake was consumed by a non-Byzantine slash, deregister
+        }
+        // An active provider whose active stake is now gone is deregistered
+        // (unbonding providers were already deregistered by `unstake`).
+        if (active > 0 && stakes[provider] == 0) {
             totalProviders--;
         }
 
         emit Slashed(provider, tier, penalty, corrMul);
+    }
+
+    /// @notice PBA-L2-028: slashed SALT used to accumulate here with no path
+    ///         out. Governance moves it to the treasury (or a burn address).
+    function withdrawSlashed(address to, uint256 amount) external onlyGovernance nonReentrant {
+        require(to != address(0), "Zero recipient");
+        require(amount > 0 && amount <= slashedTotal - slashedWithdrawn, "Exceeds slashed balance");
+        slashedWithdrawn += amount;
+        (bool success, ) = payable(to).call{value: amount}("");
+        require(success, "Transfer failed");
+        emit SlashedWithdrawn(to, amount);
     }
 
     // ── Correlation Multiplier ───────────────────────────────────────
@@ -201,7 +242,7 @@ contract NematocystSlashing is ReentrancyGuard, Governable {
 
     /// @notice Check whether a provider is currently slashable (staked and not banned).
     function isSlashable(address provider) external view returns (bool) {
-        return stakes[provider] > 0 && !banned[provider];
+        return (stakes[provider] + pendingUnstake[provider]) > 0 && !banned[provider];
     }
 
     /// @notice Total number of slash events in the current correlation window.

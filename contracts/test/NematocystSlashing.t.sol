@@ -198,10 +198,16 @@ contract NematocystSlashingTest is Test {
         uint256 balBefore = provider1.balance;
         vm.prank(provider1);
         slashing.unstake();
-
-        assertEq(provider1.balance, balBefore + 200 ether);
+        // PBA-L2-028: unstake queues the stake (still slashable); it pays out
+        // after UNBONDING_PERIOD via withdrawUnstaked().
+        assertEq(provider1.balance, balBefore);
         assertEq(slashing.stakes(provider1), 0);
         assertEq(slashing.totalProviders(), 0);
+        vm.roll(block.number + slashing.UNBONDING_PERIOD());
+        vm.prank(provider1);
+        slashing.withdrawUnstaked();
+
+        assertEq(provider1.balance, balBefore + 200 ether);
     }
 
     function test_banned_cannot_unstake() public {
