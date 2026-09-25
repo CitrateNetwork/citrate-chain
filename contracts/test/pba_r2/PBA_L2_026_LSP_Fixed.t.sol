@@ -50,3 +50,40 @@ contract PBA_L2_026_Fixed is Test {
 
     receive() external payable {}
 }
+
+/// PBA-L2-026 (verifier nit): with exactly three oracles one dissenter must not
+/// block (two thirds of 3 is 2, not unanimity).
+contract PBA_L2_026_ThreeOracles is Test {
+    function test_L2_026_threeOracles_oneDissenterDoesNotBlock() public {
+        LiquidStakingPool pool = new LiquidStakingPool(address(this));
+        address o1 = makeAddr("o1");
+        address o2 = makeAddr("o2");
+        address o3 = makeAddr("o3");
+        pool.addOracle(o1);
+        pool.addOracle(o2);
+        pool.addOracle(o3);
+        vm.deal(address(this), 100 ether);
+        pool.deposit{value: 10 ether}();
+        pool.donate{value: 1 ether}();
+        assertEq(pool.votesRequired(), 2);
+        vm.prank(o1);
+        pool.reportRewards(0, 1); // dissenter
+        vm.prank(o2);
+        pool.reportRewards(0.5 ether, 0);
+        assertEq(pool.rewardReportNonce(), 0, "one honest vote is not a quorum");
+        vm.prank(o3);
+        pool.reportRewards(0.5 ether, 0);
+        assertEq(pool.rewardReportNonce(), 1, "2 of 3 finalizes despite the dissenter");
+    }
+
+    function test_L2_026_votesRequiredIsCeilTwoThirds() public {
+        LiquidStakingPool pool = new LiquidStakingPool(address(this));
+        uint256[7] memory want = [uint256(0), 1, 2, 2, 3, 4, 4];
+        for (uint256 n = 1; n <= 6; n++) {
+            pool.addOracle(address(uint160(0x0A00 + n)));
+            assertEq(pool.votesRequired(), want[n]);
+        }
+    }
+
+    receive() external payable {}
+}

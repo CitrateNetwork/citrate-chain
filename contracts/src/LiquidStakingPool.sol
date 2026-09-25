@@ -22,7 +22,8 @@ contract LiquidStakingPool is ReentrancyGuard, Governable {
     /// @notice Withdrawal delay in blocks (~7 days at 12s block time)
     uint256 public constant WITHDRAWAL_DELAY = 50400;
 
-    /// @notice Oracle quorum percentage required (67% = 2/3+)
+    /// @notice Oracle quorum percentage required (67% = 2/3+). Kept for ABI;
+    ///         the enforced rule is `votesRequired()` = ceil(2 * oracleCount / 3).
     uint256 public constant ORACLE_QUORUM = 67;
 
     /// @notice Minimum provider collateral in basis points of delegated SALT (10%)
@@ -232,7 +233,10 @@ contract LiquidStakingPool is ReentrancyGuard, Governable {
         uint256 tupleVotes = ++_tupleVotes[keccak256(abi.encode(nonce, reportRound, rewards, slashed))];
 
         // Check quorum (of votes for THIS tuple)
-        uint256 votesNeeded = (oracleCount * ORACLE_QUORUM + 99) / 100;
+        // PBA-L2-026: the quorum is "at least two thirds", ceil(2n/3). The old
+        // ceil(n * 67 / 100) rounded n = 3 up to 3 (unanimity), so a single
+        // dissenting oracle still blocked every round of a 3-oracle committee.
+        uint256 votesNeeded = votesRequired();
         if (tupleVotes >= votesNeeded) {
             _applyRewardReport(rewards, slashed);
             _reportFinalized[nonce] = true;
@@ -376,6 +380,12 @@ contract LiquidStakingPool is ReentrancyGuard, Governable {
 
     /// @notice PBA-L2-026: discard every vote cast for the open nonce and start
     ///         a fresh round (e.g. after removing a misbehaving oracle).
+    /// @notice Votes a tuple needs to finalize: ceil(2 * oracleCount / 3)
+    ///         (PBA-L2-026). n=3 -> 2, n=4 -> 3, n=10 -> 7.
+    function votesRequired() public view returns (uint256) {
+        return (oracleCount * 2 + 2) / 3;
+    }
+
     function resetReport() external onlyGovernance {
         reportRound++;
         emit ReportRoundReset(rewardReportNonce, reportRound);

@@ -299,15 +299,15 @@ contract LiquidStakingPoolTest is Test {
         vm.prank(alice);
         pool.deposit{value: 100 ether}();
 
-        // Add 3 oracles — quorum is ceil(3 * 67 / 100) = 3 (all three needed)
+        // Add 3 oracles. PBA-L2-026: quorum is ceil(2n/3) = 2 of 3 (it used to
+        // be ceil(3 * 67 / 100) = 3, i.e. unanimity, so one dissenter blocked).
         pool.addOracle(oracle1);
         pool.addOracle(oracle2);
         pool.addOracle(oracle3);
+        assertEq(pool.votesRequired(), 2);
 
-        // CHAIN-B-C018 (HELD/reroll): a reward report now consumes real
-        // donated SALT backing, so `totalPooled` can only grow by SALT the
-        // contract actually holds. RC-8: this fixture previously minted the
-        // 10-ether liability with no backing (the vulnerable behavior).
+        // CHAIN-B-C018 (HELD/reroll): a reward report consumes real donated
+        // SALT backing, so `totalPooled` can only grow by SALT the contract holds.
         pool.donate{value: 10 ether}();
 
         // First oracle votes — no change yet
@@ -315,15 +315,18 @@ contract LiquidStakingPoolTest is Test {
         pool.reportRewards(10 ether, 0);
         assertEq(pool.totalPooled(), 100 ether, "Pool should not change before quorum");
 
-        // Second oracle votes — no change yet
+        // Second oracle votes — two thirds reached, report applied
         vm.prank(oracle2);
         pool.reportRewards(10 ether, 0);
-        assertEq(pool.totalPooled(), 100 ether, "Pool should not change before quorum");
+        assertEq(pool.totalPooled(), 110 ether, "Pool should include rewards after quorum");
+        assertEq(pool.rewardReportNonce(), 1);
 
-        // Third oracle votes — quorum reached, report applied
+        // A late third vote opens the NEXT nonce on its own; it does not
+        // re-apply the finalized report.
         vm.prank(oracle3);
-        pool.reportRewards(10 ether, 0);
-        assertEq(pool.totalPooled(), 110 ether, "Pool should increase after quorum");
+        pool.reportRewards(0, 0);
+        assertEq(pool.totalPooled(), 110 ether);
+        assertEq(pool.rewardReportNonce(), 1);
     }
 
     function test_oracle_double_vote_reverts() public {
