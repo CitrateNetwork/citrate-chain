@@ -293,9 +293,21 @@ contract CapabilityGrantTest is Test {
             _nowMs() + 1000, bytes32(0)
         );
 
+        // PBA-L2-056: a delegated grant must start at ApproveEach; the admin
+        // cannot hand the principal's agent more autonomy than HIC-1.
+        vm.prank(ADMIN);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CapabilityGrant.DelegatedGrantMustStartApproveEach.selector, ADMIN, uint8(CapabilityGrant.Hic.Budgeted)
+            )
+        );
+        grants.issue(
+            7, PRINCIPAL, CONSUMER, TENANT, _classes(), CapabilityGrant.Hic.Budgeted, CUI, BUDGET,
+            _nowMs() + 1 days * 1000, bytes32(0)
+        );
         vm.prank(ADMIN);
         bytes32 delegated = grants.issue(
-            7, PRINCIPAL, CONSUMER, TENANT, _classes(), CapabilityGrant.Hic.Budgeted, CUI, BUDGET,
+            7, PRINCIPAL, CONSUMER, TENANT, _classes(), CapabilityGrant.Hic.ApproveEach, CUI, BUDGET,
             _nowMs() + 1 days * 1000, bytes32(0)
         );
         assertEq(grants.grantOf(delegated).issuedBy, ADMIN);
