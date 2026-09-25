@@ -596,7 +596,7 @@ mod tests {
         let config: NodeConfig =
             toml::from_str(toml_content).expect("mainnet.toml must parse as valid NodeConfig");
 
-        assert_eq!(config.chain.chain_id, 1);
+        assert_eq!(config.chain.chain_id, 40204);
         assert!(config.validator.production_mode);
         assert!(config.vrf.strict_vrf);
         assert!(!config.vrf.migration_mode);
