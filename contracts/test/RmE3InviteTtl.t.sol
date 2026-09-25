@@ -28,7 +28,7 @@ contract RmE3InviteTtlTest is Test {
     // ── ClassroomRegistry / WP-E3.1 ─────────────────────────────────
 
     function test_guil03_classroom_invite_default_ttl_set() public {
-        bytes32 code = keccak256("class-code");
+        bytes32 code = _codeHash("class-code");
         vm.prank(teacher);
         registry.createClassroom("Algebra I", 30, code);
         // Default TTL = 7 days. expiresAt = now + 7 days.
@@ -37,31 +37,35 @@ contract RmE3InviteTtlTest is Test {
     }
 
     function test_guil03_classroom_enroll_works_within_ttl() public {
-        bytes32 code = keccak256("class-code");
+        bytes32 code = _codeHash("class-code");
         vm.prank(teacher);
         registry.createClassroom("Algebra I", 30, code);
 
         // Within TTL → succeeds.
+        bytes memory inviteSig1 = _inviteSig(registry, student, "class-code");
+        address inviteKey1 = _inviteKey("class-code");
         vm.prank(student);
-        registry.enrollWithCode(bytes("class-code"));
+        registry.enrollWithInvite(inviteKey1, inviteSig1);
         assertTrue(registry.isEnrolled(teacher, student));
     }
 
     function test_guil03_classroom_enroll_rejected_after_expiry() public {
-        bytes32 code = keccak256("class-code");
+        bytes32 code = _codeHash("class-code");
         vm.prank(teacher);
         registry.createClassroom("Algebra I", 30, code);
 
         // Warp past the TTL.
         vm.warp(block.timestamp + uint256(registry.DEFAULT_INVITE_TTL()) + 1);
 
+        bytes memory inviteSig2 = _inviteSig(registry, student, "class-code");
+        address inviteKey2 = _inviteKey("class-code");
         vm.prank(student);
         vm.expectRevert("Invite code expired");
-        registry.enrollWithCode(bytes("class-code"));
+        registry.enrollWithInvite(inviteKey2, inviteSig2);
     }
 
     function test_guil03_classroom_rotate_with_explicit_ttl() public {
-        bytes32 code = keccak256("class-code");
+        bytes32 code = _codeHash("class-code");
         vm.prank(teacher);
         registry.createClassroom("Algebra I", 30, code);
 
@@ -78,7 +82,7 @@ contract RmE3InviteTtlTest is Test {
     }
 
     function test_guil03_classroom_rotate_max_ttl_capped() public {
-        bytes32 code = keccak256("class-code");
+        bytes32 code = _codeHash("class-code");
         vm.prank(teacher);
         registry.createClassroom("Algebra I", 30, code);
 
@@ -90,7 +94,7 @@ contract RmE3InviteTtlTest is Test {
     }
 
     function test_guil03_classroom_rotate_zero_ttl_uses_default() public {
-        bytes32 code = keccak256("class-code");
+        bytes32 code = _codeHash("class-code");
         vm.prank(teacher);
         registry.createClassroom("Algebra I", 30, code);
 
@@ -175,5 +179,36 @@ contract RmE3InviteTtlTest is Test {
 
         uint64 expected = uint64(block.timestamp) + 1 days;
         assertEq(pool.inviteExpiresAt(poolId, code), expected);
+    }
+
+    // ── PBA-L2-010: invite-key helpers. The class "code" is the secret of an
+    // invite key pair; the registered commitment is keccak256(key address);
+    // a student enrols with a signature bound to its own address.
+    function _invitePk(string memory code) internal pure returns (uint256) {
+        return uint256(keccak256(bytes(code))) % (0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140) + 1;
+    }
+
+    function _inviteKey(string memory code) internal pure returns (address) {
+        if (bytes(code).length == 0) return address(0);
+        return vm.addr(_invitePk(code));
+    }
+
+    function _codeHash(string memory code) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(vm.addr(_invitePk(code))));
+    }
+
+    function _inviteSig(ClassroomRegistry reg, address student, string memory code)
+        internal
+        view
+        returns (bytes memory)
+    {
+        if (bytes(code).length == 0) return hex"";
+        bytes32 h = _codeHash(code);
+        address teacher = reg.codeToTeacher(h);
+        bytes32 d = keccak256(
+            abi.encodePacked("\x19Ethereum Signed Message:\n32", reg.enrollmentDigest(teacher, student, h))
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(_invitePk(code), d);
+        return abi.encodePacked(r, s, v);
     }
 }
