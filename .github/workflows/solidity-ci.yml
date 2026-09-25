@@ -81,7 +81,7 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
-          version: stable
+          version: v1.8.3
       - name: Install solc 0.8.36 (canonical contracts compiler)
         run: |
           set -euo pipefail
@@ -121,8 +121,18 @@ jobs:
         working-directory: contracts
         env:
           FOUNDRY_PROFILE: membership
+          # The closure-scoped profile must actually run its suite: a match_path
+          # typo or a renamed file would otherwise "pass" with 0 tests.
+          EXPECTED_MEMBERSHIP_TESTS: 9
         run: |
-          forge test -vvv --use 0.8.36 --threads 1
+          set -euo pipefail
+          forge test -vvv --use 0.8.36 --threads 1 | tee /tmp/membership.log
+          passed=$(grep -Eo '[0-9]+ tests passed' /tmp/membership.log | tail -1 | grep -Eo '^[0-9]+' || echo 0)
+          echo "membership tests passed: ${passed} (expected ${EXPECTED_MEMBERSHIP_TESTS})"
+          if [ "${passed}" -eq 0 ] || [ "${passed}" -ne "${EXPECTED_MEMBERSHIP_TESTS}" ]; then
+            echo "::error::membership profile ran ${passed} tests, expected ${EXPECTED_MEMBERSHIP_TESTS}"
+            exit 1
+          fi
 
   slither:
     if: github.event_name == 'workflow_dispatch'
@@ -137,7 +147,7 @@ jobs:
       - name: Install Foundry (slither needs forge for compilation)
         uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
         with:
-          version: stable
+          version: v1.8.3
       - name: Install Python and Slither
         run: |
           sudo apt-get update && sudo apt-get install -y python3-pip
