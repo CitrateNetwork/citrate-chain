@@ -147,4 +147,68 @@ library JWTParser {
         }
         return false;
     }
+
+    /// @notice True iff `needle` (a complete `"key":value` pair, starting with
+    ///         `"`) occurs as a TOP-LEVEL member of the JSON object `haystack`:
+    ///         at object depth 1, outside any string, immediately after `{` or
+    ///         `,` and immediately followed by `,` or `}` (whitespace allowed).
+    /// @dev PBA-L2-024 (pre-bounty audit 2026-09-24): `containsClaim` is a raw
+    ///      substring test, so a single `"` — or a claim string embedded in a
+    ///      guest-controlled nested object such as `x-ms-runtime` — satisfied
+    ///      it. This anchors the match to a top-level member boundary.
+    function containsTopLevelClaim(bytes memory haystack, bytes memory needle)
+        internal
+        pure
+        returns (bool)
+    {
+        uint256 nLen = needle.length;
+        uint256 hLen = haystack.length;
+        if (nLen < 3 || needle[0] != bytes1('"') || nLen > hLen) return false;
+
+        uint256 depth;
+        bool inString;
+        bool escaped;
+        bytes1 lastSig; // last significant (non-whitespace, outside-string) byte
+        for (uint256 i = 0; i < hLen; i++) {
+            bytes1 c = haystack[i];
+            if (inString) {
+                if (escaped) {
+                    escaped = false;
+                } else if (c == bytes1(0x5c)) {
+                    escaped = true;
+                } else if (c == bytes1('"')) {
+                    inString = false;
+                    lastSig = c;
+                }
+                continue;
+            }
+            if (c == bytes1('"')) {
+                if (depth == 1 && (lastSig == bytes1("{") || lastSig == bytes1(",")) && i + nLen <= hLen) {
+                    bool match_ = true;
+                    for (uint256 j = 0; j < nLen; j++) {
+                        if (haystack[i + j] != needle[j]) {
+                            match_ = false;
+                            break;
+                        }
+                    }
+                    if (match_) {
+                        uint256 k = i + nLen;
+                        while (k < hLen && _isWs(haystack[k])) k++;
+                        if (k < hLen && (haystack[k] == bytes1(",") || haystack[k] == bytes1("}"))) return true;
+                    }
+                }
+                inString = true;
+                continue;
+            }
+            if (_isWs(c)) continue;
+            if (c == bytes1("{") || c == bytes1("[")) depth++;
+            else if ((c == bytes1("}") || c == bytes1("]")) && depth > 0) depth--;
+            lastSig = c;
+        }
+        return false;
+    }
+
+    function _isWs(bytes1 c) private pure returns (bool) {
+        return c == 0x20 || c == 0x09 || c == 0x0a || c == 0x0d;
+    }
 }

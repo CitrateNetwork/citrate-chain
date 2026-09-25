@@ -66,6 +66,8 @@ contract RmD3BoundTest is Test {
     function setUp() public {
         registry = new TEEAttestationRegistry(governance);
         registry.setNrasSigner(NRAS_KEY, true);
+        // PBA-L2-024: the strict-bound claim must be a governance-approved measurement.
+        registry.setApprovedVmMeasurement(keccak256(VM_MEASUREMENT_CLAIM), true);
         // Two-step install of the test RSA key.
         registry.proposeMaaRsaKey(MAA_KID_HASH, MAA_RSA_MODULUS, MAA_RSA_EXPONENT, true);
         vm.roll(block.number + uint256(registry.RSA_KEY_TIMELOCK_BLOCKS()) + 1);
