@@ -279,6 +279,13 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         ///         nonce derivation so a stale commit can't be replayed
         ///         after a new one supersedes it).
         uint256 commitCounter;
+        /// @notice PBA-L2-007: budget reserved for the unvested rewards of
+        ///         the slot's LIVE pins (Σ (ROUNDS - round) * PER_ROUND).
+        ///         A seal reserves a full reward up front and is refused if
+        ///         the unreserved budget cannot cover it, so a live pin's
+        ///         vesting can never be starved by other pins' churn.
+        ///         Invariant: budget >= reserved.
+        uint256 reserved;
     }
 
     mapping(bytes32 => Slot) private _slots;
@@ -400,6 +407,10 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
     event ChallengerBondReturned(bytes32 indexed pinId, address indexed challenger, uint256 amount);
     event BondReturned(bytes32 indexed pinId, address indexed pinner, uint256 amount);
     event SlotFunded(bytes32 indexed slotId, uint256 amount);
+    /// @notice PBA-L2-007: a valid PoSt was answered while the slot budget
+    ///         could not pay a round. The answer is recorded (the pin is
+    ///         not slashable for this commit) but nothing vests.
+    event PoStAnsweredUnfunded(bytes32 indexed pinId, uint256 commitBlock);
 
     // v3 NEW model-owner events.
     event ModelRegistered(
@@ -800,6 +811,10 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         bytes32 sid = slotId(cid, sector);
         Slot storage s = _ensureSlotFunded(sid);
         require(s.liveCount < QUORUM, "Slot quorum reached");
+        // PBA-L2-007: reserve this pin's full reward before it goes live.
+        uint256 pinReward = PER_ROUND * ROUNDS;
+        require(s.budget >= s.reserved + pinReward, "Insufficient slot budget");
+        s.reserved += pinReward;
 
         // Anti-theft: a replicaID (the Poseidon binding of the pinner's private
         // identity to the sealed bytes) is usable only by the pinner who first
@@ -881,7 +896,15 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         ModelRegistration storage reg = _modelByCid[cid];
         require(reg.modelOwner != address(0) && !reg.slashed, "Model not registered");
         bytes32 sid = slotId(cid, sector);
-        Slot storage s = _ensureSlotFunded(sid);
+        // PBA-L2-006: a commit NEVER allocates slot funding. Pre-fix this
+        // called `_ensureSlotFunded`, so any caller (no bond, no KYC, no
+        // value) could open unlimited phantom slots for arbitrary sectors
+        // and move all of `unallocatedSlotFunding` into budgets that can
+        // never be pinned or swept. A commit is only meaningful for a slot
+        // that already holds a live, bonded pin — which also bounds the
+        // sectors a caller can touch to ones a bonded pinner sealed.
+        Slot storage s = _slots[sid];
+        require(s.funded && s.liveCount > 0, "No live pin in slot");
 
         if (s.commitBlock != 0) {
             require(
@@ -1032,7 +1055,8 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             "Challenge window closed"
         );
         require(challengeNonce == s.commitNonce, "Wrong challengeNonce");
-        require(s.budget >= PER_ROUND, "Slot budget exhausted");
+        // CON-04: one commit window answers (and vests) at most one round.
+        require(s.commitBlock > p.lastAnsweredCommitBlock, "Commit already answered");
 
         // The PoSt re-proves the SAME sealed replica, so the wire reuses the
         // STORED replicaID + epoch (the daemon re-seals deterministically from
@@ -1052,10 +1076,22 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         );
         require(_verify(input), "PoSt proof invalid");
 
-        s.budget -= PER_ROUND;
-        p.round += 1;
+        // PBA-L2-007: the proof is checked FIRST. A valid answer always
+        // records the commit as answered (so `slash` refuses it), even if
+        // the slot cannot pay this round. Pre-fix the budget check came
+        // before verification, so an honest pinner in a starved slot was
+        // refused ("Slot budget exhausted") and then slashed by anyone.
         p.missed = 0;
         p.lastAnsweredCommitBlock = s.commitBlock;
+        if (s.budget < PER_ROUND || s.reserved < PER_ROUND) {
+            _forfeitChallengeToPinner(p, pid, msg.sender);
+            emit PoStAnsweredUnfunded(pid, s.commitBlock);
+            return;
+        }
+
+        s.budget -= PER_ROUND;
+        s.reserved -= PER_ROUND;
+        p.round += 1;
 
         Status newStatus = (uint256(p.round) == ROUNDS) ? Status.Done : Status.Active;
         p.status = newStatus;
@@ -1128,6 +1164,9 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             challengerPaid += cr;
             burned += br;
             s.budget += owed;
+            // PBA-L2-007: release the slashed pin's unvested reservation.
+            uint256 unvested = (ROUNDS - uint256(p.round)) * PER_ROUND;
+            s.reserved = s.reserved > unvested ? s.reserved - unvested : 0;
 
             p.status = Status.Slashed;
             p.bondHeld = 0;
@@ -1261,6 +1300,11 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
             s.commitNonce,
             s.commitCounter
         );
+    }
+
+    /// @notice PBA-L2-007: budget reserved for the slot's live pins.
+    function slotReserved(bytes32 cid, uint256 sector) external view returns (uint256) {
+        return _slots[slotId(cid, sector)].reserved;
     }
 
     function getModel(bytes32 cid)

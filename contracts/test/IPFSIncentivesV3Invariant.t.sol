@@ -171,6 +171,10 @@ contract Handler is Test {
             if (bondedBefore != address(0)) frivolousCount++;
             (IPFSIncentivesV3.Status nst, , , , , ) = inc.getPin(who, cid, SECTOR);
             if (nst == IPFSIncentivesV3.Status.Done) doneCount++;
+            // CON-04: a commit window vests at most one round, so the next
+            // round needs a fresh commit — let this window lapse.
+            (, , , uint256 cbDone, , ) = inc.getSlot(cid, SECTOR);
+            vm.roll(cbDone + REVEAL_DELAY + WINDOW + 1);
         } catch {}
     }
 
@@ -309,6 +313,24 @@ contract IPFSIncentivesV3InvariantTest is Test {
         for (uint256 j; j < 2; j++) {
             (bool funded, uint256 budget, , , , ) = inc.getSlot(cs[j], 0);
             assertLe(budget, funded ? QUORUM * REWARD : 0);
+        }
+    }
+
+    /// PBA-L2-007 tripwire: every live pin's unvested reward is reserved,
+    /// and the slot budget always covers the reservation — so a live pin
+    /// that answers can always vest (never starved, never slashable for it).
+    function invariant_BudgetCoversLivePins() public view {
+        (address[2] memory ps, bytes32[2] memory cs) = _pinSet();
+        for (uint256 j; j < 2; j++) {
+            (, uint256 budget, , , , ) = inc.getSlot(cs[j], 0);
+            uint256 reserved = inc.slotReserved(cs[j], 0);
+            uint256 owedLive;
+            for (uint256 i; i < 2; i++) {
+                (IPFSIncentivesV3.Status st, uint64 round, , , , ) = inc.getPin(ps[i], cs[j], 0);
+                if (st == IPFSIncentivesV3.Status.Active) owedLive += (inc.ROUNDS() - uint256(round)) * PER_ROUND;
+            }
+            assertEq(reserved, owedLive, "reservation == sum of live unvested rewards");
+            assertGe(budget, reserved, "budget covers live pins");
         }
     }
 
