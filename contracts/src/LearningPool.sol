@@ -45,6 +45,11 @@ contract LearningPool is ReentrancyGuard {
 
     mapping(uint256 => mapping(bytes32 => bool)) public validInviteCodes;
 
+    /// @notice PBA-L2-029: when the pool's current cycle started.
+    mapping(uint256 => uint256) public cycleStartedAt;
+    /// @notice PBA-L2-029: a cycle may not hold member stakes longer than this.
+    uint256 public constant MAX_CYCLE_DURATION = 30 days;
+
     /// @notice Per-(pool, code) expiry timestamp for invite codes.
     /// 0 means "no expiry recorded" — pre-WP-E3.2 codes are
     /// transitionally allowed via `_isInviteValid` but the
@@ -175,15 +180,30 @@ contract LearningPool is ReentrancyGuard {
         _addMember(poolId, msg.sender, msg.value);
     }
 
-    /// @notice Join an invite-only pool with a valid invite code hash.
+    /// @notice The key a creator registers for `invitee` holding `code`.
+    /// @dev PBA-L2-025 (pre-bounty audit 2026-09-24; a CHAIN-B-C009 variant):
+    ///      the credential used to be the stored hash itself — public in the
+    ///      creator's `addInviteCode` calldata and in `validInviteCodes` — so
+    ///      any outsider could join with it and lock the invitee out. The
+    ///      registered key now binds the secret code to the invitee's
+    ///      address; `joinWithInvite` recomputes it from the RAW code and
+    ///      `msg.sender`, so neither the public key nor a front-run of the
+    ///      invitee's raw code lets anyone else in.
+    function inviteKeyFor(uint256 poolId, bytes32 code, address invitee) public pure returns (bytes32) {
+        return keccak256(abi.encode(poolId, code, invitee));
+    }
+
+    /// @notice Join an invite-only pool with the raw invite code the creator
+    ///         issued to the caller (PBA-L2-025).
     /// @param poolId The pool to join
-    /// @param codeHash keccak256 of the invite code
-    function joinWithInvite(uint256 poolId, bytes32 codeHash) external payable poolExists(poolId) {
+    /// @param code The raw invite code (not its hash)
+    function joinWithInvite(uint256 poolId, bytes32 code) external payable poolExists(poolId) {
         Pool storage pool = pools[poolId];
         require(pool.state == PoolState.Active, "Pool not active");
         require(!isMember[poolId][msg.sender], "Already member");
         require(msg.value >= pool.minStake, "Below min stake");
         require(pool.access == AccessType.InviteOnly, "Not invite pool");
+        bytes32 codeHash = inviteKeyFor(poolId, code, msg.sender);
         require(validInviteCodes[poolId][codeHash], "Invalid invite code");
 
         // RM-B1 / WP-E3.2 (audit GUI-L-03): expired invites stop
@@ -215,7 +235,13 @@ contract LearningPool is ReentrancyGuard {
     function leavePool(uint256 poolId) external nonReentrant poolExists(poolId) {
         require(isMember[poolId][msg.sender], "Not member");
         require(pools[poolId].creator != msg.sender, "Creator cannot leave");
-        require(pools[poolId].state != PoolState.ActiveCycle, "Cannot leave during active cycle");
+        // PBA-L2-029: a cycle that has overrun MAX_CYCLE_DURATION no longer
+        // locks members in (the creator could otherwise hold every stake
+        // hostage by never calling endCycle).
+        require(
+            pools[poolId].state != PoolState.ActiveCycle || _cycleOverdue(poolId),
+            "Cannot leave during active cycle"
+        );
 
         uint256 stakeReturn = stakes[poolId][msg.sender];
         isMember[poolId][msg.sender] = false;
@@ -296,13 +322,19 @@ contract LearningPool is ReentrancyGuard {
         // whitelist is load-bearing rather than decorative metadata.
         require(whitelistedModelCount[poolId] >= 1, "No whitelisted model");
         pools[poolId].state = PoolState.ActiveCycle;
+        cycleStartedAt[poolId] = block.timestamp;
         emit CycleStarted(poolId);
     }
 
     /// @notice End an active learning cycle (creator only).
     /// @dev Satisfies TLA+ EndCycle: poolState = "ActiveCycle" → "Open", caller = creator.
     /// @param poolId The pool to end the cycle in
-    function endCycle(uint256 poolId) external poolExists(poolId) onlyCreator(poolId) {
+    /// @dev PBA-L2-029: after MAX_CYCLE_DURATION anyone may end the cycle.
+    function endCycle(uint256 poolId) external poolExists(poolId) {
+        require(
+            msg.sender == pools[poolId].creator || _cycleOverdue(poolId),
+            "Not creator"
+        );
         require(pools[poolId].state == PoolState.ActiveCycle, "No active cycle");
         pools[poolId].state = PoolState.Active;
         emit CycleEnded(poolId);
@@ -344,7 +376,7 @@ contract LearningPool is ReentrancyGuard {
     /// @notice Add an invite code hash (creator only) with the
     /// default TTL (`DEFAULT_INVITE_TTL`).
     /// @param poolId The pool ID
-    /// @param codeHash keccak256 of the invite code
+    /// @param codeHash `inviteKeyFor(poolId, code, invitee)` (PBA-L2-025)
     function addInviteCode(uint256 poolId, bytes32 codeHash) external poolExists(poolId) onlyCreator(poolId) {
         addInviteCodeWithTtl(poolId, codeHash, DEFAULT_INVITE_TTL);
     }
@@ -352,7 +384,7 @@ contract LearningPool is ReentrancyGuard {
     /// @notice Add an invite code hash with an explicit TTL.
     /// RM-B1 / WP-E3.2 (audit GUI-L-03).
     /// @param poolId The pool ID
-    /// @param codeHash keccak256 of the invite code
+    /// @param codeHash `inviteKeyFor(poolId, code, invitee)` (PBA-L2-025)
     /// @param ttlSeconds TTL in seconds. `0` means "use the default";
     ///        capped at `MAX_INVITE_TTL`.
     function addInviteCodeWithTtl(uint256 poolId, bytes32 codeHash, uint64 ttlSeconds)
@@ -406,5 +438,11 @@ contract LearningPool is ReentrancyGuard {
         stakes[poolId][member] = stake;
         pools[poolId].memberCount++;
         emit MemberJoined(poolId, member, stake);
+    }
+
+    /// @dev PBA-L2-029: the active cycle has run past its maximum duration.
+    function _cycleOverdue(uint256 poolId) internal view returns (bool) {
+        return pools[poolId].state == PoolState.ActiveCycle
+            && block.timestamp >= cycleStartedAt[poolId] + MAX_CYCLE_DURATION;
     }
 }
