@@ -425,6 +425,11 @@ contract AaDeterminismHardeningTest is Test {
         vm.setEnv("CITRATE_AA_OWNER", "0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732");
         vm.setEnv("CITRATE_AA_SPONSOR_SIGNER", "0x676b00c12A958de4901CFa1c81C84086C5DA8ed8");
 
+        // PBA-L2-011: DeployAA now refuses to run unless the P-256 verifier the
+        // passkey validator hard-codes has code. Provision a stand-in here (the
+        // ceremony provisions Daimo's verifier via DeployP256Verifier.s.sol).
+        vm.etch(0xc2b78104907F722DABAc4C69f826a522B2754De4, hex"600160005260206000f3");
+
         // Stand the EntryPoint up FIRST (standalone), then let DeployAA find it.
         DeployEntryPoint dep = new DeployEntryPoint();
         assertEq(dep.run(), EP_PIN, "standalone EntryPoint must be at the pin");

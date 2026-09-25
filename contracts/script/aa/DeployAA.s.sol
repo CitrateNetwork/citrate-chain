@@ -10,6 +10,7 @@ import {EntryPointDeployer} from "./DeployEntryPoint.s.sol";
 
 // AA contracts shipped by WP-1
 import {WebAuthnP256Validator} from "../../src/aa/validators/WebAuthnP256Validator.sol";
+import {P256} from "../../src/aa/lib/webauthn/P256.sol";
 import {CitrateECDSAValidator} from "../../src/aa/validators/CitrateECDSAValidator.sol";
 import {GuardianRecoveryModule} from "../../src/aa/recovery/GuardianRecoveryModule.sol";
 import {CitrateWalletFactory} from "../../src/aa/factory/CitrateWalletFactory.sol";
@@ -111,6 +112,14 @@ contract DeployAA is Script, ScriptEnv, EntryPointDeployer {
         require(identitySigner != address(0), "identity signer not set");
         require(owner != address(0), "owner not set");
         require(sponsorSigner != address(0), "sponsor signer not set");
+        // PBA-L2-011: the passkey validator is useless (every signature fails
+        // closed) unless the P-256 verifier it hard-codes has code. Refuse to
+        // advertise it on a chain where it cannot work; provision the verifier
+        // first with script/aa/DeployP256Verifier.s.sol.
+        require(
+            P256.VERIFIER.code.length != 0,
+            "P256 verifier has no code; run script/aa/DeployP256Verifier.s.sol first"
+        );
 
         vm.startBroadcast();
 
