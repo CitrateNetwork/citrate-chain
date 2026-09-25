@@ -43,6 +43,7 @@ mod producer;
 mod registry_sync;
 mod sync;
 mod sync_peer;
+mod hardening_rejoin;
 
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
@@ -1187,6 +1188,39 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         },
     )?);
 
+    // Rejoin after activation: remove stored blocks at or above the activation
+    // height that are invalid under the rules (a node that kept running an
+    // older release past it holds such blocks), before the DAG store, GhostDAG
+    // or the applier load anything. See node/src/hardening_rejoin.rs.
+    let rejoin = hardening_rejoin::purge_invalid_post_activation(
+        &storage,
+        citrate_consensus::hardening::PbaHardening::from_process(),
+        config.chain.chain_id,
+    )
+    .map_err(|e| {
+        let h = pba_activation.height.unwrap_or_default();
+        anyhow::anyhow!(
+            "{}\n(start-up check failed: {})",
+            hardening_rejoin::manual_resync_instructions(&config.storage.data_dir, h),
+            e
+        )
+    })?;
+    // Without execute-on-receive the node has no path to rebuild state from
+    // genesis, so a purged applied tip needs a manual resync.
+    if rejoin.applied_tip_purged
+        && std::env::var("CITRATE_BLOCK_V2")
+            .map(|v| !(v == "1" || v.eq_ignore_ascii_case("true")))
+            .unwrap_or(false)
+    {
+        return Err(anyhow::anyhow!(
+            "{}",
+            hardening_rejoin::manual_resync_instructions(
+                &config.storage.data_dir,
+                pba_activation.height.unwrap_or_default()
+            )
+        ));
+    }
+
     // Create state DB and executor with persistent storage
     let state_db = Arc::new(StateDB::new());
     let state_manager = Arc::new(citrate_storage::state_manager::StateManager::new(
@@ -1759,6 +1793,45 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         );
     }
 
+    // Transactions carried by blocks the start-up check removed go back to the
+    // mempool, once the applied state no longer sits on a removed block (the
+    // mempool checks nonces against applied state). Bounded wait.
+    if !rejoin.returned_txs.is_empty() {
+        let mempool = mempool.clone();
+        let storage = storage.clone();
+        let purged = rejoin.purged.clone();
+        let txs = rejoin.returned_txs.clone();
+        tokio::spawn(async move {
+            for _ in 0..900u32 {
+                let on_purged = storage
+                    .blocks
+                    .get_applied_tip()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(h, _)| purged.contains(&h));
+                if !on_purged {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            let mut readmitted = 0usize;
+            for tx in txs {
+                if mempool
+                    .add_transaction(tx, citrate_sequencer::mempool::TxClass::Standard)
+                    .await
+                    .is_ok()
+                {
+                    readmitted += 1;
+                }
+            }
+            info!(
+                "start-up check: offered transactions from removed blocks to the mempool \
+                 ({} readmitted)",
+                readmitted
+            );
+        });
+    }
+
     // Forward-sync liveness (handoff 2026-07-23): the highest block height we have
     // EVIDENCE the network is at, from ANY signal — gossiped NewBlock, a rejected
     // far-ahead block (MissingParentAtAdmission proves the sender is ahead of us),
@@ -1802,6 +1875,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         peer_manager.set_incoming(in_tx).await;
         let pm_for_rx = peer_manager.clone();
         let storage_for_handler = storage.clone();
+        // Peers still sending pre-activation-format blocks at or after the
+        // activation height (logged, and exported as a metric per peer).
+        let legacy_peers_for_rx = Arc::new(hardening_rejoin::LegacyFormatPeers::default());
         let mempool_for_handler = mempool.clone();
         // EXECUTE-ON-RECEIVE (step 2): the applier is reached through
         // `BlockAdmission` now (SYNC-S1 D2), not cloned into the handler
@@ -2660,6 +2736,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::NewBlock { block } => {
+                        legacy_peers_for_rx.observe(
+                            citrate_consensus::hardening::PbaHardening::from_process(),
+                            &pid.to_string(),
+                            &block,
+                        );
                         // CHAIN-B-A007: network-height evidence from gossip is
                         // recorded AFTER the block passes `gossip::validate_block`
                         // (in the `Ok(_)`/`Deferred` arms below), never on the raw
@@ -2857,6 +2938,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // unconditional `record_success(&pid.0)` right here, before
                         // a single block had been examined, so answering at all was
                         // enough to clear the penalty and stay the preferred source.
+                        for b in &blocks {
+                            legacy_peers_for_rx.observe(
+                                citrate_consensus::hardening::PbaHardening::from_process(),
+                                &pid.to_string(),
+                                b,
+                            );
+                        }
                         // WP-H.4: handle_blocks now validates each block
                         let _ = sync_for_rx.handle_blocks(&pid, blocks).await;
                         // WP-H.5: Drain validated blocks and persist to chain store.
