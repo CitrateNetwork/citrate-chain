@@ -119,6 +119,14 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
     /// @notice circuit_version for the PoSt VK (challenge-response proof).
     uint32 public constant POST_VERSION = 3;
 
+    /// @notice PBA-L2-006 (R2 verifier follow-up): sector ids a model can be
+    ///         pinned under are bounded. Every sector of a cid replicates the
+    ///         SAME data (seal requires commD == reg.commD), so a sector is a
+    ///         replication slot; an unbounded sector id let one bonded pinner
+    ///         pull QUORUM*REWARD of governance funding per arbitrary sector.
+    ///         Replication per model is capped at MAX_SECTORS * QUORUM.
+    uint256 public constant MAX_SECTORS = 4;
+
     // ───────────────────────── Economic parameters ─────────────────────────
     // v2 parameters (UNCHANGED semantics). Re-deployed for v3.
 
@@ -813,6 +821,7 @@ contract IPFSIncentivesV3 is AccessControl, ReentrancyGuard {
         Pin storage p = _pins[pid];
         require(p.status == Status.None, "Pin not in None status");
 
+        require(sector < MAX_SECTORS, "Sector out of range"); // PBA-L2-006
         bytes32 sid = slotId(cid, sector);
         Slot storage s = _ensureSlotFunded(sid);
         require(s.liveCount < QUORUM, "Slot quorum reached");
