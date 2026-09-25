@@ -51,11 +51,8 @@ contract PBA_L2_002_Fixed is Test {
         // The in-test broadcaster is forge's default sender; the script's own
         // post-deploy wiring calls (treasury/mentor) are made by it.
         address sender = 0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38;
-        vm.setEnv("DEPLOYER_ADDRESS", vm.toString(sender));
-        vm.setEnv("GOVERNANCE", vm.toString(intended));
-        vm.setEnv("GUARDIAN", vm.toString(intended));
         DeployAll script = new DeployAll();
-        DeployAll.Deployed memory d = script.deploy();
+        DeployAll.Deployed memory d = script.deployWith(sender, intended, intended);
         AdminChecksHarness h = new AdminChecksHarness();
         assertEq(h.problem(d.stakingPool), "");
         assertEq(h.problem(d.registry), "");

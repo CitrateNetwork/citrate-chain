@@ -115,8 +115,12 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
 
     function deploy() public returns (Deployed memory d) {
         address deployer = deployerAddress();
-        // PBA-L2-002: the admin every formerly-msg.sender contract receives.
-        address governance = envAddressOr("GOVERNANCE", deployer);
+        return deployWith(deployer, envAddressOr("GOVERNANCE", deployer), envAddressOr("GUARDIAN", deployer));
+    }
+
+    /// @notice The ceremony with explicit keys (no environment reads), so a
+    ///         caller or test is not affected by concurrently changing env.
+    function deployWith(address deployer, address governance, address guardian) public returns (Deployed memory d) {
 
         console.log("=== Citrate Full Contract Deployment ===");
         console.log("Deployer:", deployer);
@@ -418,19 +422,19 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         TreasuryGovernor governor = (_isLive("TreasuryGovernor", abi.encodePacked(type(TreasuryGovernor).creationCode, abi.encode(
             address(stakingPool),
             address(treasury),
-            envAddressOr("GUARDIAN", deployer), // guardian (PBA-L2-001: set GUARDIAN to the multisig)
+            guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
             1_000_000_000 ether // total SALT supply (1B)
         )))
             ? TreasuryGovernor(payable(_create2Address("TreasuryGovernor", abi.encodePacked(type(TreasuryGovernor).creationCode, abi.encode(
             address(stakingPool),
             address(treasury),
-            envAddressOr("GUARDIAN", deployer), // guardian (PBA-L2-001: set GUARDIAN to the multisig)
+            guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
             1_000_000_000 ether // total SALT supply (1B)
         )))))
             : new TreasuryGovernor{salt: Salts.salt("TreasuryGovernor")}(
             address(stakingPool),
             address(treasury),
-            envAddressOr("GUARDIAN", deployer), // guardian (PBA-L2-001: set GUARDIAN to the multisig)
+            guardian, // guardian (PBA-L2-001: set GUARDIAN to the multisig)
             1_000_000_000 ether // total SALT supply (1B)
         ));
         console.log("  TreasuryGovernor:", address(governor));
