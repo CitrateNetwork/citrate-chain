@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
@@ -45,6 +47,7 @@ contract AgentSBT is ERC721, Ownable {
         ERC721("Citrate AgentSBT", "CIT-AGENT")
         Ownable(initialOwner)
     {
+        InitialAdmin.check(initialOwner); // PBA-L2-002: never the CREATE2 factory
         orgContract = _orgContract;
     }
 

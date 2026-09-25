@@ -32,6 +32,7 @@ contract MockOracle {
 
 contract MockVerifier {
     function configureJob(uint256, uint256, ComputeVerifier.VerificationTier) external {}
+    function bindJob(uint256, bytes32, bytes32) external {} // PBA-L2-004
 }
 
 /// @title RmQ_C014_C015 — ComputeMarketplace phantom credits + conscription

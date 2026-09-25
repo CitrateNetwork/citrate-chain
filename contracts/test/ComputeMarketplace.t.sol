@@ -25,8 +25,8 @@ contract ComputeMarketplaceTest is Test {
     address internal outsider = address(0xBAD1);
     address internal disputer = address(0xD15A);
 
-    bytes32 internal modelHash = keccak256("test-model-v1");
-    bytes internal inputHash = hex"DEADBEEF";
+    bytes32 internal modelHash = bytes32(uint256(keccak256("test-model-v1")) % 21888242871839275222246405745257275088548364400416034343698204186575808495617); // canonical BN254 scalar: high-value jobs are ZK-tier (PBA-L2-004)
+    bytes internal inputHash = abi.encodePacked(bytes32(uint256(keccak256(hex"DEADBEEF")) % 21888242871839275222246405745257275088548364400416034343698204186575808495617)); // ZK tier binds the raw 32-byte input commitment (PBA-L2-004)
 
     // Commitment values for verification
     bytes internal outputData = hex"01020304";
@@ -114,6 +114,7 @@ contract ComputeMarketplaceTest is Test {
         _startExecution(jobId, provider1);
         _submitCommitment(jobId, provider1);
         _submitResult(jobId, provider1);
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
     }
 
@@ -302,6 +303,7 @@ contract ComputeMarketplaceTest is Test {
         uint256 provBalBefore = provider1.balance;
         uint256 treasuryBalBefore = treasury.balance;
 
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         ComputeMarketplace.Job memory job = marketplace.getJob(jobId);
@@ -327,6 +329,7 @@ contract ComputeMarketplaceTest is Test {
         _submitResult(jobId, provider1);
 
         uint256 deadBalBefore = marketplace.burner().balance;
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         uint256 burned = marketplace.burner().balance - deadBalBefore;
@@ -346,6 +349,7 @@ contract ComputeMarketplaceTest is Test {
         _submitResult(jobId, provider1);
 
         uint256 provBalBefore = provider1.balance;
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         uint256 providerPayment = provider1.balance - provBalBefore;
@@ -362,6 +366,7 @@ contract ComputeMarketplaceTest is Test {
         _startExecution(jobId, provider1);
         _submitCommitment(jobId, provider1);
         _submitResult(jobId, provider1);
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         ComputeMarketplace.ProviderProfile memory prov = marketplace.getProvider(provider1);
@@ -380,6 +385,7 @@ contract ComputeMarketplaceTest is Test {
 
         // Try to complete without submitting result/verification
         // Job is still in Executing state, not Verifying
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         vm.expectRevert("ComputeMarketplace: not verifying");
         marketplace.completeJob(jobId);
     }
@@ -501,6 +507,7 @@ contract ComputeMarketplaceTest is Test {
         marketplace.disputeResult{value: 10 ether}(jobId);
 
         // Try to complete — should fail because dispute is active
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         vm.expectRevert("ComputeMarketplace: dispute active");
         marketplace.completeJob(jobId);
     }
@@ -558,6 +565,7 @@ contract ComputeMarketplaceTest is Test {
         assertEq(marketplace.totalDisputeBondsBurned(), 10 ether, "Bond burn tracked");
 
         // Job can now be completed
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
         ComputeMarketplace.Job memory job = marketplace.getJob(jobId);
         assertEq(uint(job.state), uint(ComputeMarketplace.JobState.Completed), "Should be Completed");
@@ -620,6 +628,7 @@ contract ComputeMarketplaceTest is Test {
         _startExecution(jobId, provider1);
         _submitCommitment(jobId, provider1);
         _submitResult(jobId, provider1);
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         // Try to bid on completed job
@@ -727,6 +736,7 @@ contract ComputeMarketplaceTest is Test {
         _startExecution(jobId, provider1);
         _submitCommitment(jobId, provider1);
         _submitResult(jobId, provider1);
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(jobId);
 
         ComputeMarketplace.Job memory job = marketplace.getJob(jobId);
@@ -758,6 +768,7 @@ contract ComputeMarketplaceTest is Test {
         _startExecution(job1, provider1);
         _submitCommitment(job1, provider1);
         _submitResult(job1, provider1);
+        vm.roll(block.number + marketplace.DISPUTE_WINDOW()); // PBA-L2-004 dispute window
         marketplace.completeJob(job1);
 
         // Provider1 now has 1 completed job, provider2 has 0

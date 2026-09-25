@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title PartProvenanceRegistry — append-only part lineage + counterfeit verifier
 /// @notice The on-chain backing store for the DPF-05 Provenance panel.
 ///         Records every lineage step a part takes from raw material
@@ -150,7 +152,7 @@ contract PartProvenanceRegistry {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     // ── Governance ──────────────────────────────────────────────────

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title CrossOrgIndex — Scope-to-envelope index sidecar (DPF-09)
 /// @notice Maintains `mapping(bytes32 scope => bytes32[] envelope_ids)`
 ///         observed at envelope-draft time. Pairs with the existing
@@ -53,7 +55,7 @@ contract CrossOrgIndex {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     // ── Governance ─────────────────────────────────────────────────

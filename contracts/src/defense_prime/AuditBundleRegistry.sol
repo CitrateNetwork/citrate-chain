@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title AuditBundleRegistry — Session-bundle anchoring for the DPF-10
 ///        Assistant pane.
 /// @notice Append-only registry of "audit bundles" — Merkle-root anchors
@@ -104,7 +106,7 @@ contract AuditBundleRegistry {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     // ── Governance ─────────────────────────────────────────────────────

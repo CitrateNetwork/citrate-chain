@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
@@ -50,7 +52,9 @@ contract CapsuleRegistry is ERC1155, Ownable {
     constructor(address initialOwner)
         ERC1155("https://citrate.ai/capsule/{id}")
         Ownable(initialOwner)
-    {}
+    {
+        InitialAdmin.check(initialOwner); // PBA-L2-002: never the CREATE2 factory
+    }
 
     /// Register a new capsule + mint one instance to the caller. The
     /// caller MUST be the deployer (admin) for Bundled tier; Managed

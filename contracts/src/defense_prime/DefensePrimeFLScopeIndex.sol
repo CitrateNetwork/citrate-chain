@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title DefensePrimeFLScopeIndex — tenant-scope tagging for RM-FL pools
 /// @notice Lightweight join contract under `defense_prime/`. Tags existing
 ///         `LearningPool.sol` pool ids with a DefensePrime tenant scope so
@@ -66,7 +68,7 @@ contract DefensePrimeFLScopeIndex {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     // ── Governance ──────────────────────────────────────────────────

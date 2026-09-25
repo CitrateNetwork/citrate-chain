@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 import {IClassroomCluster} from "./interfaces/IClassroomCluster.sol";
 
 /// @title ClassroomClusterV1
@@ -131,7 +133,7 @@ contract ClassroomClusterV1 is IClassroomCluster {
 
     constructor(address _governance) {
         if (_governance == address(0)) revert ZeroAddress();
-        governance = _governance;
+        governance = InitialAdmin.check(_governance); // PBA-L2-002: never the CREATE2 factory
         _orgRoles[_governance] = OrgRole.SuperAdmin;
         // Governance starts as Active
         _accountStatus[_governance] = AccountStatus.Active;

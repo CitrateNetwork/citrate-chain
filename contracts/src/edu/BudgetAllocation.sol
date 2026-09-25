@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 import {IBudgetAllocation} from "./interfaces/IBudgetAllocation.sol";
 
 /// @title BudgetAllocation
@@ -67,7 +69,7 @@ contract BudgetAllocation is IBudgetAllocation {
 
     constructor(address _governance) {
         if (_governance == address(0)) revert ZeroGovernance();
-        governance = _governance;
+        governance = InitialAdmin.check(_governance); // PBA-L2-002: never the CREATE2 factory
     }
 
     /// @notice Step 1 of governance transfer: current governance proposes

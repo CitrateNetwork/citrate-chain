@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
+
 /// @title ReleaseManifestRegistry — DPF-17 release artifact anchor.
 /// @notice Per NIST 800-53r5 SI-7 "Software, Firmware, Information
 ///         Integrity". Anchors release artifact manifests (sha256
@@ -85,7 +87,7 @@ contract ReleaseManifestRegistry {
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert ZeroGovernance();
-        governance = initialGovernance;
+        governance = InitialAdmin.check(initialGovernance); // PBA-L2-002: never the CREATE2 factory
     }
 
     function setRecorder(address recorder, bool authorized) external {
