@@ -1799,30 +1799,35 @@ impl BlockProducer {
 
         // AI transactions first (model ops, inference). Small reserved slice.
         let ai_txs = self.mempool.get_ai_transactions(MAX_AI_TXS_PER_BLOCK).await;
-        for tx in ai_txs {
-            if total_gas.saturating_add(tx.gas_limit) > MAX_GAS_PER_BLOCK {
-                break;
-            }
-            if seen.insert(tx.hash) {
-                total_gas = total_gas.saturating_add(tx.gas_limit);
-                selected.push(tx);
-            }
-        }
-
         // Fill remaining gas budget with standard txs.
         let standard_txs = self
             .mempool
             .get_best_transactions(MAX_STANDARD_TXS, MAX_BLOCK_SIZE)
             .await;
-        for tx in standard_txs {
-            if total_gas.saturating_add(tx.gas_limit) > MAX_GAS_PER_BLOCK {
-                break;
+
+        // PBA-L1a-004: a candidate only reserves block gas if the sender can
+        // actually pay for it against the state this block executes on.
+        let executor = self.executor.clone();
+        let mut budget = SelectionBudget::new(MAX_GAS_PER_BLOCK);
+        for tx in ai_txs.into_iter().chain(standard_txs) {
+            if seen.contains(&tx.hash) {
+                continue;
             }
-            if seen.insert(tx.hash) {
-                total_gas = total_gas.saturating_add(tx.gas_limit);
+            if budget.try_admit(&tx, |from| {
+                let addr = citrate_execution::address_utils::normalize_address(from);
+                (executor.get_nonce(&addr), executor.get_balance(&addr))
+            }) {
+                seen.insert(tx.hash);
+                total_gas = budget.gas_used();
                 selected.push(tx);
             }
         }
+        debug!(
+            "selected {} txs using {} of {} block gas",
+            selected.len(),
+            total_gas,
+            MAX_GAS_PER_BLOCK
+        );
 
         Ok(selected)
     }
@@ -2175,6 +2180,77 @@ impl BlockProducer {
     }
 }
 
+/// PBA-L1a-004: state-aware block-gas budget for transaction selection.
+///
+/// The producer used to `break` out of selection at the first candidate that
+/// did not fit the remaining gas (the SEQ-H2 `continue` fix only landed in the
+/// unused sequencer `BlockBuilder`), and it reserved gas for candidates with no
+/// balance or nonce check. A single high-fee, unfunded ~30M-gas transaction —
+/// free to relay over P2P — was packed first, consumed the whole budget, failed
+/// execution unpaid, and left the block empty; repeated every block.
+///
+/// Now a candidate is admitted only if (a) it fits the REMAINING gas (skip, not
+/// stop), (b) its nonce is the sender's next nonce against state (tracking the
+/// candidates already admitted from that sender), and (c) the sender's balance,
+/// net of the candidates already admitted, covers `gas_limit * gas_price + value`.
+pub(crate) struct SelectionBudget {
+    max_gas: u64,
+    gas_used: u64,
+    /// sender -> (next expected nonce, remaining balance) after admitted txs.
+    senders: HashMap<PublicKey, (u64, primitive_types::U256)>,
+}
+
+impl SelectionBudget {
+    pub(crate) fn new(max_gas: u64) -> Self {
+        Self {
+            max_gas,
+            gas_used: 0,
+            senders: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn gas_used(&self) -> u64 {
+        self.gas_used
+    }
+
+    /// Admit `tx` if it fits and is payable; `state` returns the sender's
+    /// on-chain `(nonce, balance)` (queried once per sender).
+    pub(crate) fn try_admit<F>(&mut self, tx: &Transaction, state: F) -> bool
+    where
+        F: FnOnce(&PublicKey) -> (u64, primitive_types::U256),
+    {
+        use primitive_types::U256;
+        let Some(new_gas) = self.gas_used.checked_add(tx.gas_limit) else {
+            return false;
+        };
+        if new_gas > self.max_gas {
+            return false; // does not fit: skip it, keep filling (SEQ-H2)
+        }
+        let (next_nonce, balance) = *self
+            .senders
+            .entry(tx.from)
+            .or_insert_with(|| state(&tx.from));
+        if tx.nonce != next_nonce {
+            return false;
+        }
+        let Some(after_nonce) = next_nonce.checked_add(1) else {
+            return false;
+        };
+        let cost = U256::from(tx.gas_limit)
+            .checked_mul(U256::from(tx.gas_price))
+            .and_then(|g| g.checked_add(U256::from(tx.value)));
+        let Some(cost) = cost else {
+            return false;
+        };
+        if balance < cost {
+            return false;
+        }
+        self.senders.insert(tx.from, (after_nonce, balance - cost));
+        self.gas_used = new_gas;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2416,6 +2492,142 @@ mod tests {
         // Verifier should accept 32-byte legacy proofs
         let result = vrf_selector.verify_vrf_math_only(&proposer, &legacy_vrf, &prev_vrf, 1);
         assert!(result.is_ok(), "Legacy VRF verification should not error");
+    }
+
+    /// PBA-L1a-004 regression (mirrors the sequencer `BlockBuilder` SEQ-H2 test,
+    /// at the node producer's REAL selection entry point). An attacker relays a
+    /// high-fee, ~29.9M-gas transfer from an UNFUNDED account. Before the fix the
+    /// producer packed it first (highest priority), reserved the whole 30M block
+    /// budget for it, `break`-ed on the honest 21k transfer, then the attacker tx
+    /// failed execution unpaid → an empty block, every round.
+    #[tokio::test]
+    async fn pba_l1a_004_unfunded_block_filler_does_not_crowd_out_honest_tx() {
+        let tmp = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+        let state_db = Arc::new(citrate_execution::StateDB::new());
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            state_db.clone(),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+
+        let honest = Address([0x11; 20]);
+        let attacker = Address([0x66; 20]); // never funded
+        let recipient = Address([0x33; 20]);
+        state_db.accounts.create_account_if_not_exists(honest);
+        state_db
+            .accounts
+            .set_balance(honest, U256::from(21_000u64 * 1_000_000_000u64 * 10));
+
+        let honest_tx = transfer_tx(0xA1, honest, recipient, 0);
+        let mut filler = transfer_tx(0xF1, attacker, recipient, 0);
+        filler.gas_limit = 29_990_000;
+        filler.gas_price = 1_000_000_000_000; // 1000x the honest fee: selected first
+        mempool
+            .add_transaction(honest_tx.clone(), TxClass::Standard)
+            .await
+            .expect("honest admitted");
+        mempool
+            .add_transaction(filler.clone(), TxClass::Standard)
+            .await
+            .expect("filler admitted (no state check at admission)");
+
+        let producer = BlockProducer::new(
+            storage.clone(),
+            executor,
+            mempool,
+            embedded_pubkey(Address([0x44; 20])),
+            test_signing_key(),
+            2,
+        );
+        let selected = producer
+            .select_transactions_with_ai_priority()
+            .await
+            .expect("selection");
+        let hashes: Vec<Hash> = selected.iter().map(|t| t.hash).collect();
+        assert!(
+            hashes.contains(&honest_tx.hash),
+            "honest tx must be selected despite the unfunded block-filler; got {hashes:?}"
+        );
+        assert!(
+            !hashes.contains(&filler.hash),
+            "an unfunded tx must not reserve block gas; got {hashes:?}"
+        );
+    }
+
+    /// PBA-L1a-004: the selection budget skips (not stops at) a candidate that
+    /// does not fit, and gates nonce + cumulative balance against state.
+    #[test]
+    fn pba_l1a_004_selection_budget_semantics() {
+        let a = Address([0x11; 20]);
+        let r = Address([0x33; 20]);
+        let price = 1_000_000_000u64;
+        let one_tx = U256::from(21_000u64 * price);
+        let state = |bal: U256| move |_: &PublicKey| (0u64, bal);
+
+        // (1) a too-big candidate is skipped and a later small one still fits
+        let mut b = SelectionBudget::new(30_000_000);
+        let mut big = transfer_tx(1, Address([0x77; 20]), r, 0);
+        big.gas_limit = 29_999_000;
+        assert!(b.try_admit(&big, state(U256::MAX)));
+        let mut big2 = transfer_tx(2, Address([0x78; 20]), r, 0);
+        big2.gas_limit = 29_999_000;
+        assert!(!b.try_admit(&big2, state(U256::MAX)), "does not fit");
+        let mut small = transfer_tx(3, Address([0x79; 20]), r, 0);
+        small.gas_limit = 1_000;
+        assert!(
+            b.try_admit(&small, state(U256::MAX)),
+            "skip, not break (SEQ-H2)"
+        );
+        assert_eq!(b.gas_used(), 30_000_000);
+
+        // (2) nonce must equal the state nonce, then advance per admitted tx
+        let mut b = SelectionBudget::new(30_000_000);
+        assert!(
+            !b.try_admit(&transfer_tx(4, a, r, 1), state(one_tx * 10)),
+            "nonce gap"
+        );
+        assert!(b.try_admit(&transfer_tx(5, a, r, 0), state(one_tx * 10)));
+        assert!(
+            b.try_admit(&transfer_tx(6, a, r, 1), state(U256::zero())),
+            "state queried once"
+        );
+        assert!(
+            !b.try_admit(&transfer_tx(7, a, r, 1), state(one_tx)),
+            "duplicate nonce"
+        );
+
+        // (3) balance is cumulative across a sender's admitted txs
+        let mut b = SelectionBudget::new(30_000_000);
+        assert!(b.try_admit(&transfer_tx(8, a, r, 0), state(one_tx)));
+        assert!(
+            !b.try_admit(&transfer_tx(9, a, r, 1), state(one_tx)),
+            "balance exhausted"
+        );
+
+        // (4) value counts toward cost; exact balance is enough
+        let mut b = SelectionBudget::new(30_000_000);
+        let mut v = transfer_tx(10, a, r, 0);
+        v.value = 5;
+        assert!(
+            !b.try_admit(&v, state(one_tx)),
+            "gas*price + value > balance"
+        );
+        let mut b = SelectionBudget::new(30_000_000);
+        assert!(
+            b.try_admit(&v, state(one_tx + U256::from(5u64))),
+            "exact balance admits"
+        );
+
+        // (5) nonce u64::MAX has no successor: never admitted
+        let mut b = SelectionBudget::new(30_000_000);
+        let max = transfer_tx(11, a, r, u64::MAX);
+        assert!(!b.try_admit(&max, |_: &PublicKey| (u64::MAX, U256::MAX)));
     }
 
     #[tokio::test]
