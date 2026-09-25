@@ -12,6 +12,17 @@ pragma solidity 0.8.36;
  *         model precompile call — registering a skill is a plain state write. Anyone can
  *         self-register a skill they own; only the owner can (de)activate or update it.
  *
+ *         SECURITY / CONSUMER CONTRACT (PBA-L2-045, pre-bounty audit 2026-09-24):
+ *           - Names are NOT unique and NOT authoritative: any address can register any
+ *             `name`. Resolve a skill ONLY by `keccak256(abi.encodePacked(trustedOwner,
+ *             name, version))` against an owner allowlist the consumer pins — never by
+ *             name alone, and never by trusting every entry of `getAllSkillHashes()`.
+ *           - Enumeration is unbounded and permissionless (spam can push
+ *             `getAllSkillHashes()` past an RPC eth_call gas cap). Page with
+ *             `totalSkills()` + the public index getter `allSkillHashes(i)`.
+ *         (Documented rather than changed in code: this contract is live at a CREATE2
+ *         address that any bytecode change would move, and the fix is consumer-side.)
+ *
  *         A "skill" is one Hermes capsule: a canonical name + semver + the IPFS CID of the
  *         capsule bundle/manifest + human metadata. The capsule bytes themselves live on
  *         IPFS; the chain holds the enumerable pointer + provenance.
