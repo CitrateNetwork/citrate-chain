@@ -489,13 +489,54 @@ mod tests {
         }
     }
 
+    /// Builds one block of the stale node's own branch at `height` on
+    /// `parent`, advancing `exec` (the stale producer's state). Each block
+    /// must be accepted by a node on the old rules and be invalid from the
+    /// activation height `H` under the current rules. New validity rules
+    /// that switch on at `H` add a fixture here, and the rejoin test covers
+    /// them with no other change.
+    type StaleBlock = fn(&Executor, u64, Hash) -> Block;
+
+    /// The branch a node on an older release produces: pre-activation format.
+    fn stale_legacy_format(exec: &Executor, height: u64, parent: Hash) -> Block {
+        produce(
+            exec,
+            PbaHardening::off(),
+            height,
+            parent,
+            CB_STALE,
+            0x90 + height as u8,
+        )
+    }
+
+    /// Current format, but every block runs more than the timestamp bound
+    /// past its parent (accepted by the old rules, invalid from `H`).
+    fn stale_timestamp_jump(exec: &Executor, height: u64, parent: Hash) -> Block {
+        let mut b = produce(
+            exec,
+            PbaHardening::at(H),
+            height,
+            parent,
+            CB_STALE,
+            0xA0 + height as u8,
+        );
+        b.header.timestamp = 1_000 + height * (MAX_BLOCK_TIMESTAMP_ADVANCE_SECS + 400);
+        b.header.block_hash = b.compute_hash();
+        b
+    }
+
     /// Two upgraded nodes build the canonical chain across the activation
     /// height. A third, still on the old rules, builds its own longer
-    /// branch in the pre-activation format past it. Restarted with the
-    /// activation height set, the third drops that branch, rebuilds its
-    /// state, takes the canonical blocks from its peers and converges on
-    /// the canonical tip and state root, with no manual wipe.
-    async fn stale_producer_rejoins(purge: bool) -> (AppliedTip, Hash, Block) {
+    /// branch past it with `stale` (a block that is invalid from `H`).
+    /// Restarted with the activation height set, the third drops that
+    /// branch, rebuilds its state, takes the canonical blocks from its peers
+    /// and converges on the canonical tip and state root, with no manual
+    /// wipe. Returns the stale node's tip and root, the canonical head, and
+    /// the start-up report.
+    async fn stale_producer_rejoins(
+        purge: bool,
+        stale: StaleBlock,
+    ) -> (AppliedTip, Hash, Block, RejoinReport) {
         let on = PbaHardening::at(H);
         let old = PbaHardening::off();
 
@@ -540,23 +581,34 @@ mod tests {
                     );
                     b
                 } else {
-                    produce(&mirror_c, old, h, p, CB_STALE, 0x90 + h as u8)
+                    let b = stale(&mirror_c, h, p);
+                    if h == H {
+                        let parent_ts = c
+                            .storage
+                            .blocks
+                            .get_header(&p)
+                            .unwrap()
+                            .map(|x| x.timestamp);
+                        assert!(
+                            check_block(on, CHAIN, &b, parent_ts).is_err(),
+                            "the fixture's first block must be invalid from H"
+                        );
+                    }
+                    b
                 };
-                assert!(matches!(c.receive(&b).await, AdmitOutcome::Admitted { .. }));
+                assert!(
+                    matches!(c.receive(&b).await, AdmitOutcome::Admitted { .. }),
+                    "the old rules accept stale block {h}"
+                );
                 p = b.header.block_hash;
             }
             assert_eq!(c.tip().await.height, 8);
-            // The stale branch is in the pre-activation format.
-            let c3 = c.storage.blocks.get_block_by_height(3).unwrap().unwrap();
-            let c3 = c.storage.blocks.get_block(&c3).unwrap().unwrap();
-            assert!(is_legacy_format(on, &c3));
         }
 
         // Restart C on the new release (activation height set).
         let (c, report) = open(dir_c.path(), on, purge).await;
         if purge {
             assert_eq!(report.purged.len(), 6, "C3..C8 removed");
-            assert_eq!(report.legacy_format, 6, "all six are in the old format");
             assert!(report.applied_tip_purged);
             assert_eq!(c.storage.blocks.get_latest_height().unwrap(), 2);
         }
@@ -572,12 +624,12 @@ mod tests {
             c.tip().await,
             c.exec.calculate_state_root(),
             canonical[5].clone(),
+            report,
         )
     }
 
-    #[tokio::test]
-    async fn stale_producer_rejoins_the_canonical_chain_after_restart() {
-        let (tip, root, head) = stale_producer_rejoins(true).await;
+    async fn assert_rejoins(stale: StaleBlock) -> RejoinReport {
+        let (tip, root, head, report) = stale_producer_rejoins(true, stale).await;
         assert_eq!(
             tip,
             AppliedTip {
@@ -587,6 +639,21 @@ mod tests {
             "the restarted node converges on the canonical tip"
         );
         assert_eq!(root, head.state_root, "and on its state root");
+        report
+    }
+
+    #[tokio::test]
+    async fn stale_producer_rejoins_the_canonical_chain_after_restart() {
+        let report = assert_rejoins(stale_legacy_format).await;
+        assert_eq!(report.legacy_format, 6, "all six are in the old format");
+    }
+
+    /// The same rejoin for a stale branch that is in the current format but
+    /// breaks another rule that switches on at `H`.
+    #[tokio::test]
+    async fn stale_branch_invalid_under_any_activation_rule_is_dropped() {
+        let report = assert_rejoins(stale_timestamp_jump).await;
+        assert_eq!(report.legacy_format, 0, "not the old format");
     }
 
     fn signed(seed: u8, nonce: u64) -> Transaction {
