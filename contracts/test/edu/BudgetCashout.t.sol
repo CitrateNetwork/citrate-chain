@@ -40,7 +40,7 @@ contract BudgetCashoutTest is Test {
 
     function test_c006_governance_can_spend_directly() public {
         vm.prank(governance);
-        budget.allocateBudget(0, 1000, 100);
+        budget.allocateBudget(0, 1000, 1000); // PBA-L2-053: monthly cap now enforced
         vm.prank(governance);
         budget.spendFromBudget(0, 400);
         assertEq(budget.getRemaining(0), 600);

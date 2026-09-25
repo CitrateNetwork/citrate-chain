@@ -14,9 +14,9 @@ contract ClassroomRegistryTest is Test {
     address public student3;
     address public outsider;
 
-    // CHAIN-B-C009 RC-8: enrollWithCode now authenticates on the RAW
-    // invite code (secret preimage), not its public hash. The teacher
-    // still commits the hash at creation; students present the secret.
+    // PBA-L2-010 (supersedes CHAIN-B-C009 RC-8): each code string is the
+    // seed of an invite KEY; the teacher commits keccak256(key address) and
+    // students enrol with a signature by the key bound to their own address.
     string internal constant CODE1 = "STEM-2026-ALPHA";
     string internal constant CODE2 = "MATH-2026-BETA";
     string internal constant CODE3 = "ART-2026-GAMMA";
@@ -38,9 +38,9 @@ contract ClassroomRegistryTest is Test {
         student3 = address(0x2003);
         outsider = address(0xBAD);
 
-        code1Hash = keccak256(abi.encodePacked("STEM-2026-ALPHA"));
-        code2Hash = keccak256(abi.encodePacked("MATH-2026-BETA"));
-        code3Hash = keccak256(abi.encodePacked("ART-2026-GAMMA"));
+        code1Hash = _codeHash("STEM-2026-ALPHA");
+        code2Hash = _codeHash("MATH-2026-BETA");
+        code3Hash = _codeHash("ART-2026-GAMMA");
         model1Hash = keccak256("STEM-tutor-v2");
         model2Hash = keccak256("essay-reviewer-v1");
         model3Hash = keccak256("math-helper-v3");
@@ -119,8 +119,10 @@ contract ClassroomRegistryTest is Test {
     function test_enroll_with_valid_code() public {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
 
+        bytes memory inviteSig1 = _inviteSig(cr, student1, CODE1);
+        address inviteKey1 = _inviteKey(CODE1);
         vm.prank(student1);
-        cr.enrollWithCode(bytes(CODE1));
+        cr.enrollWithInvite(inviteKey1, inviteSig1);
 
         assertTrue(cr.isEnrolled(teacher1, student1));
         assertEq(cr.studentTeacher(student1), teacher1);
@@ -135,30 +137,38 @@ contract ClassroomRegistryTest is Test {
         vm.expectEmit(true, true, false, true);
         emit ClassroomRegistry.StudentEnrolled(teacher1, student1, code1Hash);
 
+        bytes memory inviteSig2 = _inviteSig(cr, student1, CODE1);
+        address inviteKey2 = _inviteKey(CODE1);
         vm.prank(student1);
-        cr.enrollWithCode(bytes(CODE1));
+        cr.enrollWithInvite(inviteKey2, inviteSig2);
     }
 
     function test_enroll_invalid_code_reverts() public {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
 
+        bytes memory inviteSig3 = _inviteSig(cr, student1, "wrong-code");
+        address inviteKey3 = _inviteKey("wrong-code");
         vm.prank(student1);
         vm.expectRevert("Invalid invite code");
-        cr.enrollWithCode(bytes("wrong-code"));
+        cr.enrollWithInvite(inviteKey3, inviteSig3);
     }
 
     function test_enroll_empty_code_reverts() public {
+        bytes memory inviteSig4 = _inviteSig(cr, student1, "");
+        address inviteKey4 = _inviteKey("");
         vm.prank(student1);
-        vm.expectRevert("Empty invite code");
-        cr.enrollWithCode(bytes(""));
+        vm.expectRevert("Empty invite key");
+        cr.enrollWithInvite(inviteKey4, inviteSig4);
     }
 
     function test_teacher_cannot_self_enroll() public {
         _createClassroom(teacher1, "AP CS", 20, code1Hash);
 
+        bytes memory inviteSig5 = _inviteSig(cr, teacher1, CODE1);
+        address inviteKey5 = _inviteKey(CODE1);
         vm.prank(teacher1);
         vm.expectRevert("Teacher cannot enroll as student");
-        cr.enrollWithCode(bytes(CODE1));
+        cr.enrollWithInvite(inviteKey5, inviteSig5);
     }
 
     // ============================================================
@@ -374,13 +384,17 @@ contract ClassroomRegistryTest is Test {
         cr.rotateInviteCode(code2Hash);
 
         // Old code no longer works
+        bytes memory inviteSig6 = _inviteSig(cr, student1, CODE1);
+        address inviteKey6 = _inviteKey(CODE1);
         vm.prank(student1);
         vm.expectRevert("Invalid invite code");
-        cr.enrollWithCode(bytes(CODE1));
+        cr.enrollWithInvite(inviteKey6, inviteSig6);
 
         // New code works
+        bytes memory inviteSig7 = _inviteSig(cr, student1, CODE2);
+        address inviteKey7 = _inviteKey(CODE2);
         vm.prank(student1);
-        cr.enrollWithCode(bytes(CODE2));
+        cr.enrollWithInvite(inviteKey7, inviteSig7);
 
         assertTrue(cr.isEnrolled(teacher1, student1));
         assertEq(cr.studentTeacher(student1), teacher1);
@@ -451,9 +465,11 @@ contract ClassroomRegistryTest is Test {
         assertEq(room.maxStudents, 2);
 
         // Third student should be rejected
+        bytes memory inviteSig8 = _inviteSig(cr, student3, CODE1);
+        address inviteKey8 = _inviteKey(CODE1);
         vm.prank(student3);
         vm.expectRevert("Classroom is full");
-        cr.enrollWithCode(bytes(CODE1));
+        cr.enrollWithInvite(inviteKey8, inviteSig8);
 
         // Count still 2
         room = cr.getClassroom(teacher1);
@@ -468,9 +484,11 @@ contract ClassroomRegistryTest is Test {
         _enrollStudent(student1, CODE1);
 
         // student1 tries to enroll in second classroom
+        bytes memory inviteSig9 = _inviteSig(cr, student1, CODE2);
+        address inviteKey9 = _inviteKey(CODE2);
         vm.prank(student1);
         vm.expectRevert("Already enrolled in a classroom");
-        cr.enrollWithCode(bytes(CODE2));
+        cr.enrollWithInvite(inviteKey9, inviteSig9);
 
         // student1 is still only with teacher1
         assertEq(cr.studentTeacher(student1), teacher1, "INV-3: Student in at most one classroom");
@@ -491,8 +509,10 @@ contract ClassroomRegistryTest is Test {
         assertEq(cr.studentTeacher(student1), address(0));
 
         // Enroll with teacher2
+        bytes memory inviteSig10 = _inviteSig(cr, student1, CODE2);
+        address inviteKey10 = _inviteKey(CODE2);
         vm.prank(student1);
-        cr.enrollWithCode(bytes(CODE2));
+        cr.enrollWithInvite(inviteKey10, inviteSig10);
 
         assertEq(cr.studentTeacher(student1), teacher2);
         assertFalse(cr.isEnrolled(teacher1, student1));
@@ -604,9 +624,11 @@ contract ClassroomRegistryTest is Test {
         assertEq(cr.codeToTeacher(code2Hash), address(0));
 
         // student1 cannot join teacher2
+        bytes memory inviteSig11 = _inviteSig(cr, student1, CODE2);
+        address inviteKey11 = _inviteKey(CODE2);
         vm.prank(student1);
         vm.expectRevert("Invalid invite code");
-        cr.enrollWithCode(bytes(CODE2));
+        cr.enrollWithInvite(inviteKey11, inviteSig11);
 
         // Teacher2's enrollment count is 0
         ClassroomRegistry.Classroom memory room = cr.getClassroom(teacher2);
@@ -688,9 +710,11 @@ contract ClassroomRegistryTest is Test {
 
         // 8. Classroom is now full (maxStudents=3)
         address student4 = address(0x54);
+        bytes memory inviteSig12 = _inviteSig(cr, student4, CODE3);
+        address inviteKey12 = _inviteKey(CODE3);
         vm.prank(student4);
         vm.expectRevert("Classroom is full");
-        cr.enrollWithCode(bytes(CODE3));
+        cr.enrollWithInvite(inviteKey12, inviteSig12);
 
         // 9. Teacher removes a student, freeing a slot
         vm.prank(teacher1);
@@ -699,8 +723,10 @@ contract ClassroomRegistryTest is Test {
         assertEq(room.studentCount, 2);
 
         // 10. New student can now enroll
+        bytes memory inviteSig13 = _inviteSig(cr, student4, CODE3);
+        address inviteKey13 = _inviteKey(CODE3);
         vm.prank(student4);
-        cr.enrollWithCode(bytes(CODE3));
+        cr.enrollWithInvite(inviteKey13, inviteSig13);
         room = cr.getClassroom(teacher1);
         assertEq(room.studentCount, 3);
 
@@ -751,9 +777,11 @@ contract ClassroomRegistryTest is Test {
         _enrollStudent(student1, CODE1);
 
         // INV-2: Second student rejected
+        bytes memory inviteSig14 = _inviteSig(cr, student2, CODE1);
+        address inviteKey14 = _inviteKey(CODE1);
         vm.prank(student2);
         vm.expectRevert("Classroom is full");
-        cr.enrollWithCode(bytes(CODE1));
+        cr.enrollWithInvite(inviteKey14, inviteSig14);
 
         // After first student leaves, another can join
         vm.prank(student1);
@@ -778,7 +806,40 @@ contract ClassroomRegistryTest is Test {
     }
 
     function _enrollStudent(address student, string memory rawCode) internal {
+        bytes memory inviteSig15 = _inviteSig(cr, student, rawCode);
+        address inviteKey15 = _inviteKey(rawCode);
         vm.prank(student);
-        cr.enrollWithCode(bytes(rawCode));
+        cr.enrollWithInvite(inviteKey15, inviteSig15);
+    }
+
+    // ── PBA-L2-010: invite-key helpers. The class "code" is the secret of an
+    // invite key pair; the registered commitment is keccak256(key address);
+    // a student enrols with a signature bound to its own address.
+    function _invitePk(string memory code) internal pure returns (uint256) {
+        return uint256(keccak256(bytes(code))) % (0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140) + 1;
+    }
+
+    function _inviteKey(string memory code) internal pure returns (address) {
+        if (bytes(code).length == 0) return address(0);
+        return vm.addr(_invitePk(code));
+    }
+
+    function _codeHash(string memory code) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(vm.addr(_invitePk(code))));
+    }
+
+    function _inviteSig(ClassroomRegistry reg, address student, string memory code)
+        internal
+        view
+        returns (bytes memory)
+    {
+        if (bytes(code).length == 0) return hex"";
+        bytes32 h = _codeHash(code);
+        address teacher = reg.codeToTeacher(h);
+        bytes32 d = keccak256(
+            abi.encodePacked("\x19Ethereum Signed Message:\n32", reg.enrollmentDigest(teacher, student, h))
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(_invitePk(code), d);
+        return abi.encodePacked(r, s, v);
     }
 }

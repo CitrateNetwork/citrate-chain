@@ -7,6 +7,14 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /// @title Forwarder
 /// @notice EIP-2771 meta-transaction forwarder for sponsored student actions.
+/// @dev PBA-L2-060 (sharp edge): this forwarder APPENDS the authenticated
+///      sender (ERC-2771), but no contract in this repo reads it — every
+///      allowlisted target sees `msg.sender == Forwarder`. The Forwarder must
+///      therefore NEVER be granted a role or allowance on any target
+///      (e.g. `BudgetAllocation.setSpender`, a matcher/registrar role): doing
+///      so would hand that authority to every device-holding student for
+///      every classroom. Only allowlist targets that are ERC-2771-aware with
+///      this forwarder as their immutable trusted forwarder.
 /// @dev Implements all 8 invariants from Q-006 ForwarderReplaySafety.tla.
 contract Forwarder is IForwarder {
     // ── EIP-712 ──
@@ -30,7 +38,11 @@ contract Forwarder is IForwarder {
 
     mapping(address => bool) private _authorizedRelayers;
     mapping(address => bool) private _allowedTargets;
-    mapping(bytes32 => mapping(uint256 => uint256)) private _nonces; // orgPrincipalId => classroomId => nonce
+    // PBA-L2-050: nonce namespace is (deviceUser, orgPrincipalId, classroomId).
+    // Pre-fix it was (orgPrincipalId, classroomId) — caller-chosen and not
+    // bound to the signer — so any registered device could advance a victim
+    // principal's counter and invalidate its queued offline requests.
+    mapping(address => mapping(bytes32 => mapping(uint256 => uint256))) private _nonces;
     mapping(bytes32 => bool) private _consumedTxHashes;
 
     // ── Errors ──
@@ -72,8 +84,12 @@ contract Forwarder is IForwarder {
 
     // ── Views ──
 
-    function getNonce(bytes32 orgPrincipalId, uint256 classroomId) external view returns (uint256) {
-        return _nonces[orgPrincipalId][classroomId];
+    function getNonce(address deviceUser, bytes32 orgPrincipalId, uint256 classroomId)
+        external
+        view
+        returns (uint256)
+    {
+        return _nonces[deviceUser][orgPrincipalId][classroomId];
     }
 
     function isAuthorizedRelayer(address relayer) external view returns (bool) {
@@ -119,10 +135,6 @@ contract Forwarder is IForwarder {
         // Invariant 4: SessionExpiryEnforced
         if (block.timestamp > request.sessionExpiry) revert SessionExpired();
 
-        // Invariant 1: NonceMonotonic
-        uint256 expectedNonce = _nonces[request.orgPrincipalId][request.classroomId];
-        if (request.nonce != expectedNonce) revert InvalidNonce();
-
         // Invariant 2: NoReplayAccepted
         bytes32 txHash = _hashForwardRequest(request);
         if (_consumedTxHashes[txHash]) revert ReplayDetected();
@@ -154,8 +166,13 @@ contract Forwarder is IForwarder {
         address signer = _recoverSigner(txHash, signature);
         if (signer != deviceUser) revert InvalidSignature();
 
+        // Invariant 1: NonceMonotonic — PBA-L2-050: scoped to the
+        // authenticated device user, so only that user's own signed
+        // requests can advance its counter.
+        uint256 expectedNonce = _nonces[deviceUser][request.orgPrincipalId][request.classroomId];
+        if (request.nonce != expectedNonce) revert InvalidNonce();
         // Consume nonce and tx hash (effects before interactions — CEI)
-        _nonces[request.orgPrincipalId][request.classroomId] = expectedNonce + 1;
+        _nonces[deviceUser][request.orgPrincipalId][request.classroomId] = expectedNonce + 1;
         _consumedTxHashes[txHash] = true;
 
         // Execute the inner call.

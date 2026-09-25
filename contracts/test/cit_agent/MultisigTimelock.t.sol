@@ -105,10 +105,15 @@ contract MultisigTimelockTest is Test {
         timelock.execute(opId);
     }
 
-    function testTimelock_cancelAnyOwner() public {
+    /// PBA-L2-032: cancellation needs two owners (one owner's vote is not a veto).
+    function testTimelock_cancelNeedsTwoOwners() public {
         vm.prank(alice);
         bytes32 opId = timelock.propose(address(org), hex"");
         vm.prank(carol);
+        timelock.cancel(opId);
+        (, , MultisigTimelock2of3.OpState st1, , , ) = timelock.getOperation(opId);
+        assertEq(uint256(st1), uint256(MultisigTimelock2of3.OpState.Proposed), "one vote is not a veto");
+        vm.prank(bob);
         timelock.cancel(opId);
         (, , MultisigTimelock2of3.OpState state, , , ) = timelock.getOperation(opId);
         assertEq(uint256(state), uint256(MultisigTimelock2of3.OpState.Cancelled));

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 /// @title ClassroomRegistry — Teacher-Student Classroom Management
 /// @notice Teachers create classrooms, generate invite codes, enroll students,
 ///         and manage model whitelists. Students can only access whitelisted models.
@@ -108,7 +110,8 @@ contract ClassroomRegistry {
     ///      INV-8 (NoClassroomNoEnrollments) trivially holds: new classroom has 0 students.
     /// @param name Classroom display name (non-empty)
     /// @param maxStudents Maximum enrollment capacity (>= 1)
-    /// @param inviteCodeHash keccak256 of the initial invite code
+    /// @param inviteCodeHash keccak256(abi.encodePacked(inviteKey)), where
+    ///        inviteKey is the address of the invite secret (PBA-L2-010)
     function createClassroom(
         string calldata name,
         uint256 maxStudents,
@@ -144,7 +147,34 @@ contract ClassroomRegistry {
     // Core: Student Enrollment
     // ============================================================
 
-    /// @notice Enroll in a classroom by providing the invite code.
+    /// @notice PBA-L2-010: domain tag of the enrolment proof a student signs
+    /// with the classroom's invite key.
+    bytes32 public constant ENROLL_TAG = keccak256("CitrateClassroomRegistry.Enroll.v1");
+
+    /// @notice PBA-L2-010: the digest an invite-key holder signs to enrol
+    /// `student` into `teacher`'s classroom under invite commitment
+    /// `inviteCodeHash` (EIP-191 wrapped before signing).
+    function enrollmentDigest(address teacher, address student, bytes32 inviteCodeHash)
+        public
+        view
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(ENROLL_TAG, block.chainid, address(this), teacher, student, inviteCodeHash));
+    }
+
+    /// @notice Enroll in a classroom by proving knowledge of the invite code.
+    /// @dev PBA-L2-010 (CHAIN-B-C009 residual): the invite "code" is now the
+    ///      secret half of an invite KEY PAIR. The teacher registers the
+    ///      commitment `inviteCodeHash = keccak256(abi.encodePacked(inviteKey))`
+    ///      where `inviteKey` is the address of the invite secret; the secret
+    ///      (the code the class is given) never goes on chain. A student signs
+    ///      `enrollmentDigest(teacher, student, inviteCodeHash)` with it and
+    ///      submits only the signature, which is bound to `msg.sender`.
+    ///      Pre-fix the raw code was submitted as calldata: the first honest
+    ///      enrolment (or its pending mempool tx) published the shared bearer
+    ///      secret and anyone could replay it to join the class or fill
+    ///      `maxStudents` with sybils. A copied signature now only enrols the
+    ///      student it names.
     /// @dev Satisfies TLA+ EnrollStudent:
     ///      - codeToTeacher[code] != "none" (code resolves to a teacher)
     ///      - teacher in classrooms
@@ -152,18 +182,22 @@ contract ClassroomRegistry {
     ///      - enrollment count < maxStudents (INV-2: EnrollmentBounded)
     ///      INV-6 (StudentAccessOnlyWhitelisted): enrollment links student to teacher
     ///      who controls the whitelist.
-    /// @param inviteCode The RAW invite code (secret preimage) issued by
-    ///        the teacher. The contract hashes it internally, so the
-    ///        credential presented on chain is the secret itself, not the
-    ///        public commitment. Closes CHAIN-B-C009: previously the
-    ///        function authenticated on the invite-code HASH, which is
-    ///        world-readable chain state (public mappings + event), so any
-    ///        observer could enrol without knowing the secret.
-    function enrollWithCode(bytes calldata inviteCode) external {
-        require(inviteCode.length > 0, "Empty invite code");
-        bytes32 inviteCodeHash = keccak256(inviteCode);
+    /// @param inviteKey Address of the invite secret (public; its hash is
+    ///        the registered `inviteCodeHash`).
+    /// @param signature The invite secret's signature over
+    ///        `enrollmentDigest(teacher, msg.sender, inviteCodeHash)`.
+    ///        Neither the raw code (CHAIN-B-C009 residual, PBA-L2-010) nor
+    ///        the public hash (CHAIN-B-C009) is a credential any more.
+    function enrollWithInvite(address inviteKey, bytes calldata signature) external {
+        require(inviteKey != address(0), "Empty invite key");
+        bytes32 inviteCodeHash = keccak256(abi.encodePacked(inviteKey));
         address teacher = codeToTeacher[inviteCodeHash];
         require(teacher != address(0), "Invalid invite code");
+        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(
+            MessageHashUtils.toEthSignedMessageHash(enrollmentDigest(teacher, msg.sender, inviteCodeHash)),
+            signature
+        );
+        require(err == ECDSA.RecoverError.NoError && signer == inviteKey, "Invalid invite proof");
         require(classrooms[teacher].exists, "Classroom does not exist");
         require(msg.sender != teacher, "Teacher cannot enroll as student");
 

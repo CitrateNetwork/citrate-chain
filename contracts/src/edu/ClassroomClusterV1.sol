@@ -75,25 +75,56 @@ contract ClassroomClusterV1 is IClassroomCluster {
         _;
     }
 
+    // PBA-L2-034: every privilege modifier requires the caller's account to
+    // be Active. Pre-fix a Suspended / Withdrawn admin kept full powers.
     modifier onlyAdminOrAbove() {
-        OrgRole role = _orgRoles[msg.sender];
-        if (role != OrgRole.Admin && role != OrgRole.SuperAdmin && msg.sender != governance) revert NotAdminOrAbove();
+        if (_rank(msg.sender) < RANK_ADMIN) revert NotAdminOrAbove();
         _;
     }
 
     modifier onlyIT() {
-        OrgRole role = _orgRoles[msg.sender];
-        if (role != OrgRole.IT && role != OrgRole.Admin && role != OrgRole.SuperAdmin && msg.sender != governance) revert NotIT();
+        if (_rank(msg.sender) < RANK_IT) revert NotIT();
         _;
     }
 
     modifier onlyTeacherOf(uint256 classroomId) {
         if (!_classrooms[classroomId].exists) revert ClassroomNotFound();
-        if (_classroomRoles[classroomId][msg.sender] != ClassroomRole.Teacher &&
-            _orgRoles[msg.sender] != OrgRole.Admin &&
-            _orgRoles[msg.sender] != OrgRole.SuperAdmin &&
-            msg.sender != governance) revert NotTeacherOf();
+        bool isTeacher = _classroomRoles[classroomId][msg.sender] == ClassroomRole.Teacher
+            && (_accountStatus[msg.sender] == AccountStatus.Active);
+        if (!isTeacher && _rank(msg.sender) < RANK_ADMIN) revert NotTeacherOf();
         _;
+    }
+
+    // ── PBA-L2-034: role hierarchy ──
+    // governance > SuperAdmin > Admin > IT > None. A caller may only change
+    // the role or status of an account of STRICTLY lower rank, and may only
+    // grant a role strictly below its own. Non-Active accounts have rank 0.
+    uint8 private constant RANK_NONE = 0;
+    uint8 private constant RANK_IT = 1;
+    uint8 private constant RANK_ADMIN = 2;
+    uint8 private constant RANK_SUPERADMIN = 3;
+    uint8 private constant RANK_GOVERNANCE = 4;
+
+    function _roleRank(OrgRole role) internal pure returns (uint8) {
+        if (role == OrgRole.SuperAdmin) return RANK_SUPERADMIN;
+        if (role == OrgRole.Admin) return RANK_ADMIN;
+        if (role == OrgRole.IT) return RANK_IT;
+        return RANK_NONE;
+    }
+
+    /// @dev Effective rank of `who` as an actor: governance is top; any
+    ///      other account acts with its role's rank only while Active.
+    function _rank(address who) internal view returns (uint8) {
+        if (who == governance) return RANK_GOVERNANCE;
+        if (_accountStatus[who] != AccountStatus.Active) return RANK_NONE;
+        return _roleRank(_orgRoles[who]);
+    }
+
+    /// @dev Rank of `who` as a TARGET (its held role, whatever its status;
+    ///      governance is always top).
+    function _targetRank(address who) internal view returns (uint8) {
+        if (who == governance) return RANK_GOVERNANCE;
+        return _roleRank(_orgRoles[who]);
     }
 
     // ── Constructor ──
@@ -227,12 +258,17 @@ contract ClassroomClusterV1 is IClassroomCluster {
         if (current == AccountStatus.Expelled) revert AccountExpelled();
         if (current == AccountStatus.Graduated) revert InvalidStatusTransition();
 
-        OrgRole callerRole = _orgRoles[msg.sender];
-        bool isGov = msg.sender == governance;
-        bool isSuperAdmin = callerRole == OrgRole.SuperAdmin || isGov;
-        bool isAdmin = callerRole == OrgRole.Admin || isSuperAdmin;
-        bool isIT = callerRole == OrgRole.IT || isAdmin;
+        uint8 callerRank = _rank(msg.sender);
+        bool isSuperAdmin = callerRank >= RANK_SUPERADMIN;
+        bool isAdmin = callerRank >= RANK_ADMIN;
+        bool isIT = callerRank >= RANK_IT;
 
+        // PBA-L2-034: no caller may change the status of an account of
+        // equal or higher rank (e.g. IT cannot suspend/reactivate an Admin).
+        if (callerRank <= _targetRank(user)) revert InsufficientPrivilege();
+        // PBA-L2-034: leaving Suspended (a disciplinary state set by Admin+)
+        // requires Admin or above — IT can no longer lift it.
+        if (current == AccountStatus.Suspended && !isAdmin) revert InsufficientPrivilege();
         // Graduated and Expelled require SuperAdmin or governance
         if (newStatus == AccountStatus.Graduated || newStatus == AccountStatus.Expelled) {
             if (!isSuperAdmin) revert InsufficientPrivilege();
@@ -272,9 +308,17 @@ contract ClassroomClusterV1 is IClassroomCluster {
             if (msg.sender != governance) revert SuperAdminRequiresGovernance();
         } else {
             // Admin or SuperAdmin can grant non-SuperAdmin roles
-            OrgRole callerRole = _orgRoles[msg.sender];
-            if (callerRole != OrgRole.Admin && callerRole != OrgRole.SuperAdmin && msg.sender != governance) {
-                revert NotAdminOrAbove();
+            uint8 callerRank = _rank(msg.sender);
+            if (callerRank < RANK_ADMIN) revert NotAdminOrAbove();
+            // PBA-L2-034: Invariant 2 also covers REMOVING SuperAdmin: a
+            // current SuperAdmin's role may only be changed by governance.
+            // More generally the caller must outrank both the target's
+            // current role and the role being granted.
+            if (_orgRoles[user] == OrgRole.SuperAdmin && msg.sender != governance) {
+                revert SuperAdminRequiresGovernance();
+            }
+            if (callerRank <= _targetRank(user) || callerRank <= _roleRank(role)) {
+                revert InsufficientPrivilege();
             }
         }
 
@@ -296,7 +340,9 @@ contract ClassroomClusterV1 is IClassroomCluster {
     function revokeOrgRole(address user) external onlyAdminOrAbove {
         OrgRole prev = _orgRoles[user];
         if (prev == OrgRole.None) revert NoRole();
-
+        // PBA-L2-034: only a strictly higher rank may revoke (so an Admin
+        // can no longer revoke a SuperAdmin or another Admin).
+        if (_rank(msg.sender) <= _targetRank(user)) revert InsufficientPrivilege();
         _orgRoles[user] = OrgRole.None;
         // Set to Inactive (reversible) instead of permanent revocation
         if (_accountStatus[user] == AccountStatus.Active) {
@@ -344,10 +390,8 @@ contract ClassroomClusterV1 is IClassroomCluster {
         // Invariant 7: NoPrivilegeEscalation — teacher can only grant Student or TA
         if (role == ClassroomRole.Teacher) {
             // Only admin can assign teacher role
-            OrgRole callerOrgRole = _orgRoles[msg.sender];
-            if (callerOrgRole != OrgRole.Admin && callerOrgRole != OrgRole.SuperAdmin && msg.sender != governance) {
-                revert NotAdminOrAbove();
-            }
+            // PBA-L2-034: Active Admin or above only.
+            if (_rank(msg.sender) < RANK_ADMIN) revert NotAdminOrAbove();
         }
 
         ClassroomRole prev = _classroomRoles[classroomId][user];
@@ -384,10 +428,10 @@ contract ClassroomClusterV1 is IClassroomCluster {
         // inject a student into ANY destination classroom they have no
         // authority over (cross-classroom roster injection). Require
         // teacher-of-source AND teacher-of-destination for the non-admin path.
-        bool isAdmin = _orgRoles[msg.sender] == OrgRole.Admin ||
-                       _orgRoles[msg.sender] == OrgRole.SuperAdmin ||
-                       msg.sender == governance;
+        // PBA-L2-034: privileges require an Active account.
+        bool isAdmin = _rank(msg.sender) >= RANK_ADMIN;
         if (!isAdmin) {
+            if (_accountStatus[msg.sender] != AccountStatus.Active) revert NotTeacherOf();
             bool isFromTeacher = _classroomRoles[fromClassroom][msg.sender] == ClassroomRole.Teacher;
             bool isToTeacher = _classroomRoles[toClassroom][msg.sender] == ClassroomRole.Teacher;
             if (!isFromTeacher || !isToTeacher) revert NotTeacherOf();

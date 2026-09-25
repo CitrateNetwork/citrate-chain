@@ -66,8 +66,13 @@ contract ClassroomClusterV1Test is Test {
     // ORG ROLE MANAGEMENT
     // ===================================================================
 
-    function test_admin_can_grant_admin() public {
+    /// PBA-L2-034: a caller may only grant roles strictly below its own rank,
+    /// so an Admin can no longer mint Admins; governance / SuperAdmin can.
+    function test_admin_cannot_grant_admin() public {
         vm.prank(admin);
+        vm.expectRevert(ClassroomClusterV1.InsufficientPrivilege.selector);
+        cluster.grantOrgRole(address(0x99), IClassroomCluster.OrgRole.Admin);
+        vm.prank(governance);
         cluster.grantOrgRole(address(0x99), IClassroomCluster.OrgRole.Admin);
         assertEq(uint256(cluster.getOrgRole(address(0x99))), uint256(IClassroomCluster.OrgRole.Admin));
     }
@@ -130,7 +135,7 @@ contract ClassroomClusterV1Test is Test {
     // Invariant 3: ImmediateRevocation
     function test_invariant_immediate_revocation() public {
         // Give teacher1 an admin role too
-        vm.prank(admin);
+        vm.prank(governance); // PBA-L2-034: only a higher rank grants Admin
         cluster.grantOrgRole(teacher1, IClassroomCluster.OrgRole.Admin);
 
         // Revoke — should lose all org permissions immediately
@@ -148,7 +153,7 @@ contract ClassroomClusterV1Test is Test {
     function test_invariant_multi_role_consistency() public {
         // teacher1 is Teacher in classroom 0
         // Give teacher1 Admin org role too
-        vm.prank(admin);
+        vm.prank(governance); // PBA-L2-034: only a higher rank grants Admin
         cluster.grantOrgRole(teacher1, IClassroomCluster.OrgRole.Admin);
 
         // teacher1 should have both: OrgRole=Admin AND ClassroomRole=Teacher
@@ -398,7 +403,7 @@ contract ClassroomClusterV1Test is Test {
 
     // Revoked user tries to act
     function test_adversarial_revoked_user_acts() public {
-        vm.prank(admin);
+        vm.prank(governance); // PBA-L2-034: only a higher rank grants Admin
         cluster.grantOrgRole(teacher2, IClassroomCluster.OrgRole.Admin);
 
         // Revoke
@@ -484,9 +489,7 @@ contract ClassroomClusterV1Test is Test {
 
     /// @dev IT can set a user from Active to Inactive (non-disciplinary).
     function test_it_can_set_inactive() public {
-        address freshUser = address(0xBBBB);
-        vm.prank(admin);
-        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
+        address freshUser = address(0xBBBB); // plain user (PBA-L2-034: IT acts on lower rank only)
         assertEq(uint256(cluster.getAccountStatus(freshUser)), uint256(IClassroomCluster.AccountStatus.Active));
 
         vm.prank(itAdmin);
@@ -586,10 +589,7 @@ contract ClassroomClusterV1Test is Test {
 
     /// @dev Inactive user can be reactivated by IT or above.
     function test_inactive_user_can_be_reactivated() public {
-        address freshUser = address(0xFF44);
-        vm.prank(admin);
-        cluster.grantOrgRole(freshUser, IClassroomCluster.OrgRole.IT);
-
+        address freshUser = address(0xFF44); // plain user (PBA-L2-034: IT acts on lower rank only)
         vm.prank(itAdmin);
         cluster.setAccountStatus(freshUser, IClassroomCluster.AccountStatus.Inactive);
         assertEq(uint256(cluster.getAccountStatus(freshUser)), uint256(IClassroomCluster.AccountStatus.Inactive));
@@ -659,12 +659,8 @@ contract ClassroomClusterV1Test is Test {
             address(0xA005)
         ];
 
-        // Grant roles to all users
-        for (uint256 i = 0; i < 5; i++) {
-            vm.prank(admin);
-            cluster.grantOrgRole(users[i], IClassroomCluster.OrgRole.IT);
-        }
-
+        // PBA-L2-034: IT may only change the status of LOWER-ranked accounts,
+        // so these are plain users (no org role).
         // Set all to Inactive
         for (uint256 i = 0; i < 5; i++) {
             vm.prank(itAdmin);

@@ -7,7 +7,7 @@
 #   .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md
 #   §"Sprint RM-E3 — Edu encryption + invite TTL + teacher re-auth"
 #
-# Pre-fix `ClassroomRegistry::enrollWithCode` and
+# Pre-fix `ClassroomRegistry::enrollWithCode` (now `enrollWithInvite`) and
 # `LearningPool::joinWithInvite` accepted any active invite code with
 # no notion of expiry. A leaked code from January was just as good as
 # one minted yesterday.
@@ -21,7 +21,7 @@
 rules:
   - id: gui-l-03-no-invite-ttl-classroom
     message: >-
-      `ClassroomRegistry.enrollWithCode` must check `inviteExpiresAt`
+      `ClassroomRegistry.enrollWithInvite` must check `inviteExpiresAt`
       before linking the student (audit GUI-L-03). See
       .agentile/planset/REMEDIATION_2026_04_24/14_PHASE_RM_E_GUI_AGENT.md.
     languages: [solidity]
@@ -30,12 +30,14 @@ rules:
       include:
         - "contracts/src/ClassroomRegistry.sol"
     patterns:
+      # PBA-L2-010: enrolment moved from enrollWithCode(bytes) (raw code in
+      # calldata, replayable) to enrollWithInvite(address, bytes).
       - pattern: |
-          function enrollWithCode($H) external {
+          function enrollWithInvite($K, $S) external {
             ...
           }
       - pattern-not: |
-          function enrollWithCode($H) external {
+          function enrollWithInvite($K, $S) external {
             ...
             inviteExpiresAt[$H]
             ...
