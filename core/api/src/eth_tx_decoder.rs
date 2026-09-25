@@ -8,6 +8,58 @@ use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, Secp256
 use sha3::{Digest, Keccak256};
 use tracing::debug;
 
+/// PBA-L1a-018: a signed transaction must have exactly ONE byte encoding.
+///
+/// The decoders read fields by index and hash the raw input, so extra list
+/// items, trailing bytes after the list, or a signature word padded/truncated
+/// on the way in all decoded to the SAME signed transaction under a NEW hash —
+/// letting anyone re-broadcast a victim's transaction under a hash they chose
+/// (and front-run its hash slot). Require the list to have exactly the fields
+/// the type defines and to span the whole input.
+fn require_canonical_list(
+    rlp: &Rlp,
+    whole: &[u8],
+    items: usize,
+    what: &str,
+) -> Result<(), String> {
+    let n = rlp
+        .item_count()
+        .map_err(|e| format!("{what}: bad RLP list: {e:?}"))?;
+    if n != items {
+        return Err(format!("{what}: expected {items} RLP list items, got {n}"));
+    }
+    let info = rlp
+        .payload_info()
+        .map_err(|e| format!("{what}: bad RLP header: {e:?}"))?;
+    if info.header_len + info.value_len != whole.len() {
+        return Err(format!("{what}: trailing bytes after the RLP list"));
+    }
+    Ok(())
+}
+
+/// PBA-L1a-018: a signature scalar (`r` / `s`) as a canonical big-endian
+/// integer: at most 32 bytes (it used to be silently truncated) and no leading
+/// zero byte (it used to be silently stripped), so it has one encoding.
+fn canonical_sig_word(bytes: &[u8], what: &str) -> Result<H256, String> {
+    if bytes.len() > 32 {
+        return Err(format!("{what}: signature value longer than 32 bytes"));
+    }
+    if bytes.first() == Some(&0) {
+        return Err(format!("{what}: signature value has a leading zero byte"));
+    }
+    let mut padded = [0u8; 32];
+    padded[32 - bytes.len()..].copy_from_slice(bytes);
+    Ok(H256::from(padded))
+}
+
+/// PBA-L1a-018: typed-transaction `yParity` is a single bit.
+fn canonical_y_parity(y: u64) -> Result<u64, String> {
+    if y > 1 {
+        return Err(format!("yParity must be 0 or 1, got {y}"));
+    }
+    Ok(y)
+}
+
 /// Legacy Ethereum transaction structure for RLP decoding
 #[derive(Debug)]
 struct LegacyTransaction {
@@ -25,12 +77,10 @@ struct LegacyTransaction {
 impl LegacyTransaction {
     /// Decode from RLP bytes
     fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
-        // Helper to pad signature components from variable-length RLP bytes
-        let pad_sig = |bytes: Vec<u8>| -> H256 {
-            let mut padded = [0u8; 32];
-            let start = 32 - bytes.len().min(32);
-            padded[start..].copy_from_slice(&bytes[..bytes.len().min(32)]);
-            H256::from(padded)
+        // PBA-L1a-018: signature words must be canonical (no truncation/padding).
+        let pad_sig = |bytes: Vec<u8>| -> Result<H256, DecoderError> {
+            canonical_sig_word(&bytes, "legacy tx")
+                .map_err(|_| DecoderError::Custom("non-canonical signature value"))
         };
 
         Ok(LegacyTransaction {
@@ -50,8 +100,8 @@ impl LegacyTransaction {
             value: rlp.val_at(4)?,
             data: rlp.val_at(5)?,
             v: rlp.val_at(6)?,
-            r: pad_sig(rlp.val_at(7)?),
-            s: pad_sig(rlp.val_at(8)?),
+            r: pad_sig(rlp.val_at(7)?)?,
+            s: pad_sig(rlp.val_at(8)?)?,
         })
     }
 }
@@ -107,6 +157,8 @@ fn decode_eth_transaction_inner(tx_bytes: &[u8]) -> Result<Transaction, String> 
     if rlp.is_list() {
         // Try to decode as legacy transaction
         if let Ok(legacy_tx) = LegacyTransaction::decode(&rlp) {
+                // PBA-L1a-018: exactly the 9 legacy fields, no trailing bytes.
+                require_canonical_list(&rlp, tx_bytes, 9, "legacy tx")?;
                 debug!("Successfully decoded legacy Ethereum transaction");
                 debug!("  Nonce: {}", legacy_tx.nonce);
                 debug!("  Gas limit: {}", legacy_tx.gas_limit);
@@ -322,6 +374,8 @@ fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
     if !rlp.is_list() {
         return Err("Invalid EIP-1559 RLP payload".into());
     }
+    // PBA-L1a-018: exactly the 12 EIP-1559 fields, no trailing bytes.
+    require_canonical_list(&rlp, rlp_bytes, 12, "EIP-1559 tx")?;
 
     // Per EIP-1559: [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList, yParity, r, s]
     let chain_id_u256: EthU256 = rlp.val_at(0).map_err(|e| format!("chainId: {:?}", e))?;
@@ -348,20 +402,15 @@ fn decode_eip1559_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
     let access_list = parse_access_list(&rlp, 8)?;
     debug!("  Access list entries: {}", access_list.len());
 
-    let y_parity: u64 = rlp.val_at(9).map_err(|e| format!("yParity: {:?}", e))?;
+    let y_parity: u64 = canonical_y_parity(
+        rlp.val_at(9).map_err(|e| format!("yParity: {:?}", e))?,
+    )?;
 
-    // Pad signature components from variable-length RLP bytes
+    // PBA-L1a-018: canonical signature words (no truncation / zero padding).
     let r_bytes: Vec<u8> = rlp.val_at(10).map_err(|e| format!("r: {:?}", e))?;
-    let mut r_padded = [0u8; 32];
-    let r_start = 32 - r_bytes.len().min(32);
-    r_padded[r_start..].copy_from_slice(&r_bytes[..r_bytes.len().min(32)]);
-    let r_h = H256::from(r_padded);
-
+    let r_h = canonical_sig_word(&r_bytes, "r")?;
     let s_bytes: Vec<u8> = rlp.val_at(11).map_err(|e| format!("s: {:?}", e))?;
-    let mut s_padded = [0u8; 32];
-    let s_start = 32 - s_bytes.len().min(32);
-    s_padded[s_start..].copy_from_slice(&s_bytes[..s_bytes.len().min(32)]);
-    let s_h = H256::from(s_padded);
+    let s_h = canonical_sig_word(&s_bytes, "s")?;
 
     // Build the signing payload per EIP-1559 (without yParity,r,s)
     let mut s = RlpStream::new_list(9);
@@ -597,6 +646,8 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
     if !rlp.is_list() {
         return Err("Invalid EIP-2930 RLP payload".into());
     }
+    // PBA-L1a-018: exactly the 11 EIP-2930 fields, no trailing bytes.
+    require_canonical_list(&rlp, rlp_bytes, 11, "EIP-2930 tx")?;
 
     // Per EIP-2930: [chainId, nonce, gasPrice, gasLimit, to, value, data, accessList, yParity, r, s]
     let chain_id_u256: EthU256 = rlp.val_at(0).map_err(|e| format!("chainId: {:?}", e))?;
@@ -622,20 +673,15 @@ fn decode_eip2930_transaction(rlp_bytes: &[u8]) -> Result<Transaction, String> {
     let access_list = parse_access_list(&rlp, 7)?;
     debug!("  Access list entries: {}", access_list.len());
 
-    let y_parity: u64 = rlp.val_at(8).map_err(|e| format!("yParity: {:?}", e))?;
+    let y_parity: u64 = canonical_y_parity(
+        rlp.val_at(8).map_err(|e| format!("yParity: {:?}", e))?,
+    )?;
 
-    // Pad signature components from variable-length RLP bytes
+    // PBA-L1a-018: canonical signature words (no truncation / zero padding).
     let r_bytes: Vec<u8> = rlp.val_at(9).map_err(|e| format!("r: {:?}", e))?;
-    let mut r_padded = [0u8; 32];
-    let r_start = 32 - r_bytes.len().min(32);
-    r_padded[r_start..].copy_from_slice(&r_bytes[..r_bytes.len().min(32)]);
-    let r_h = H256::from(r_padded);
-
+    let r_h = canonical_sig_word(&r_bytes, "r")?;
     let s_bytes: Vec<u8> = rlp.val_at(10).map_err(|e| format!("s: {:?}", e))?;
-    let mut s_padded = [0u8; 32];
-    let s_start = 32 - s_bytes.len().min(32);
-    s_padded[s_start..].copy_from_slice(&s_bytes[..s_bytes.len().min(32)]);
-    let s_h = H256::from(s_padded);
+    let s_h = canonical_sig_word(&s_bytes, "s")?;
 
     // Build the signing payload per EIP-2930 (without yParity,r,s)
     let mut s = RlpStream::new_list(8);

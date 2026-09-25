@@ -221,6 +221,54 @@ struct BucketEntry {
     last_access: Instant,
 }
 
+/// PBA-L1a-009: a cloneable handle onto a [`RateLimiter`]'s per-client request
+/// buckets, so the JSON-RPC layer (which sees batch sizes the HTTP middleware
+/// cannot) can charge each batch element as a request against the same bucket.
+#[derive(Clone)]
+pub struct RateLimitHandle {
+    buckets: Arc<DashMap<String, BucketEntry>>,
+    max_requests: u32,
+    window_secs: u64,
+}
+
+impl RateLimitHandle {
+    /// Charge `units` extra requests to `client_key`'s bucket in the current
+    /// window. Returns `false` (and leaves the bucket saturated) when that
+    /// pushes the client over `max_requests`.
+    pub fn charge(&self, client_key: &str, units: u32) -> bool {
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(self.window_secs);
+        let mut entry = self
+            .buckets
+            .entry(client_key.to_string())
+            .or_insert_with(|| BucketEntry {
+                count: 0,
+                window_start: now,
+                last_access: now,
+            });
+        if now.duration_since(entry.window_start) >= window {
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        entry.last_access = now;
+        entry.count = entry.count.saturating_add(units);
+        entry.count <= self.max_requests
+    }
+
+    /// Charge `units` to the client the HTTP middleware attributed the current
+    /// request to. With no attribution this fails CLOSED exactly like
+    /// [`check_method_budget`] (REM-3), unless the devnet anonymous opt-in is set.
+    pub fn charge_current_client(&self, units: u32) -> bool {
+        let key = current_client_key();
+        if key.is_empty() {
+            return std::env::var("CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        }
+        self.charge(&key, units)
+    }
+}
+
 /// Per-client sliding window rate limiter implementing `RequestMiddleware`.
 pub struct RateLimiter {
     config: RateLimitConfig,
@@ -253,6 +301,16 @@ impl RateLimiter {
             trusted_set,
             api_key,
             last_eviction: Arc::new(std::sync::Mutex::new(Instant::now())),
+        }
+    }
+
+    /// PBA-L1a-009: a handle the JSON-RPC middleware uses to charge batch
+    /// elements to the same per-client buckets this limiter enforces.
+    pub fn handle(&self) -> RateLimitHandle {
+        RateLimitHandle {
+            buckets: self.buckets.clone(),
+            max_requests: self.config.max_requests,
+            window_secs: self.config.window_secs,
         }
     }
 
