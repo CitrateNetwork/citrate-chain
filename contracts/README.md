@@ -76,6 +76,8 @@ output_commitment`, each a canonical BN254 scalar (`< ComputeVerifier.BN254_SCAL
   `submitResult(jobId, outputCommitment32, proofData)` where `proofData =
   proofLen ‖ proof ‖ publicInputs(96 bytes)`. The provider may re-commit until
   it reveals. Malformed output commitments revert (no slash).
+  Provider tooling must always reveal the proof it last committed; only the
+  latest commitment is checked, so revealing an earlier one fails verification.
 - **Payment:** `completeJob` is accepted `DISPUTE_WINDOW` (100) blocks after a
   Valid verdict.
 - **TEE tier:** oracles sign `ComputeVerifier.teeAttestationDigest(jobId, attestation)`
