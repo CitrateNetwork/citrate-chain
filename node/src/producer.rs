@@ -1317,26 +1317,29 @@ impl BlockProducer {
         // lacks its canonical id, or is bound to another chain — so never
         // build one. Such a tx can only have reached the pool through a
         // trusted-decoder or signature-checks-disabled path; drop it there too.
-        let transactions: Vec<citrate_consensus::types::Transaction> =
-            if self.ghostdag.pba_hardening().active_at(last_height + 1) {
-                let chain_id = self.executor.chain_id();
-                let mut keep = Vec::with_capacity(transactions.len());
-                for t in transactions {
-                    match citrate_consensus::tx_auth::verify_for_block(&t, chain_id) {
-                        Ok(_) => keep.push(t),
-                        Err(e) => {
-                            warn!(
+        let transactions: Vec<citrate_consensus::types::Transaction> = if self
+            .ghostdag
+            .pba_hardening()
+            .active_at(last_height + 1)
+        {
+            let chain_id = self.executor.chain_id();
+            let mut keep = Vec::with_capacity(transactions.len());
+            for t in transactions {
+                match citrate_consensus::tx_auth::verify_for_block(&t, chain_id) {
+                    Ok(_) => keep.push(t),
+                    Err(e) => {
+                        warn!(
                                 "PBA-L1b-001: excluding tx {} from the block: {} (removed from mempool)",
                                 t.hash, e
                             );
-                            let _ = self.mempool.remove_transaction(&t.hash).await;
-                        }
+                        let _ = self.mempool.remove_transaction(&t.hash).await;
                     }
                 }
-                keep
-            } else {
-                transactions
-            };
+            }
+            keep
+        } else {
+            transactions
+        };
 
         // Blue score and work are already calculated above
         let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
@@ -3696,7 +3699,9 @@ mod pba_l1a_001_producer_supervision {
     #[test]
     fn start_loop_uses_the_supervisor() {
         let src = include_str!("producer.rs");
-        let start = src.find("pub async fn start(self: Arc<Self>)").expect("start()");
+        let start = src
+            .find("pub async fn start(self: Arc<Self>)")
+            .expect("start()");
         let body = &src[start..start + 2_000];
         assert!(
             body.contains("supervised_round(self.clone())"),
