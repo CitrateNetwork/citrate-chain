@@ -140,29 +140,54 @@ fn charge_gas(input_len: usize, gas_limit: u64) -> Result<u64> {
     Ok(gas_used)
 }
 
-/// 0x0130 entry point. Decodes the challenge call, verifies the fold proof against the baked VK, and
-/// returns `abi.encode(trueCommD, dataCommit)` (64 bytes). Reverts (via `Err`) on an invalid proof —
-/// which the Solidity `staticcall` bubbles, so a bad proof cannot slash.
+/// The error the feature-absent build returns for every well-formed call.
+const FEATURE_ABSENT: &str =
+    "FOLD_COMMD_VERIFY (0x0130) requires the `commd-fold-verify` feature (Nova verifier + \
+     baked VK). This is a consensus-gated activation; rebuild with --features commd-fold-verify.";
+
+/// 0x0130 entry point with the pre-activation (legacy) semantics. See [`execute_at`].
 pub fn execute(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
+    execute_at(input, gas_limit, false)
+}
+
+/// 0x0130 entry point, gated on the shared activation height (`hardened` =
+/// the block is at/after `pba_hardening_height`).
+///
+/// Chain 40204 history was executed by builds WITHOUT the verifier, which
+/// charge gas, decode the call, then fail every well-formed call with the
+/// feature-absent error. Below the activation height that exact behaviour
+/// (same checks, same order, same error text, so REVM maps it to the same
+/// halt) is kept regardless of how this binary was built, so replay from
+/// genesis matches the fleet. At/after the height the verifier runs: decode,
+/// verify against the baked VK, return `abi.encode(trueCommD, dataCommit)`
+/// (64 bytes), or revert (`Err`) on an invalid proof.
+pub fn execute_at(input: &[u8], gas_limit: u64, hardened: bool) -> Result<PrecompileResult> {
+    if !hardened {
+        return execute_legacy(input, gas_limit);
+    }
+    execute_verified(input, gas_limit)
+}
+
+/// The legacy (feature-absent) 0x0130 semantics, byte-for-byte.
+pub fn execute_legacy(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
+    let _gas_used = charge_gas(input.len(), gas_limit)?;
+    let _call = decode_challenge_input(input)?;
+    Err(anyhow!(FEATURE_ABSENT))
+}
+
+fn execute_verified(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     let gas_used = charge_gas(input.len(), gas_limit)?;
-    // Decode is always compiled (and unit-tested) so the wire format is validated regardless of the
-    // verifier feature.
     let call = decode_challenge_input(input)?;
 
     #[cfg(not(feature = "commd-fold-verify"))]
     {
         let _ = (call, gas_used);
-        Err(anyhow!(
-            "FOLD_COMMD_VERIFY (0x0130) requires the `commd-fold-verify` feature (Nova verifier + \
-             baked VK). This is a consensus-gated activation; rebuild with --features commd-fold-verify."
-        ))
+        Err(anyhow!(FEATURE_ABSENT))
     }
 
     #[cfg(feature = "commd-fold-verify")]
     {
-        // PBA-L1a-015: verify against the baked key decoded ONCE per process
-        // (it used to be bincode-deserialized from 27 MB on every call, for a
-        // flat gas price). Same verification relation and results.
+        // PBA-L1a-015: verify against the baked key decoded ONCE per process.
         let vk = baked_vk_decoded()
             .ok_or_else(|| anyhow!("FOLD_COMMD_VERIFY: baked verifier key failed to decode"))?;
         let (comm_d, data_commit) = citrate_commd_verify::verify_fold_proof_with_key(
@@ -378,10 +403,10 @@ mod tests {
             input.extend_from_slice(word);
         }
         // Warm-up: the first call pays the one-time key decode.
-        let _ = execute(&input, u64::MAX);
+        let _ = execute_at(&input, u64::MAX, true);
         let start = std::time::Instant::now();
         for _ in 0..8 {
-            let err = execute(&input, u64::MAX).expect_err("garbage proof must be rejected");
+            let err = execute_at(&input, u64::MAX, true).expect_err("garbage proof must be rejected");
             assert!(err.to_string().contains("FOLD_COMMD_VERIFY"), "{err}");
         }
         let elapsed = start.elapsed();
@@ -412,7 +437,7 @@ mod tests {
         w(160); // offset_z0
         input.extend_from_slice(&[0u8; 32]); // proof len 0
         input.extend_from_slice(&[0u8; 32]); // z0 len 0
-        let err = execute(&input, u64::MAX).unwrap_err().to_string();
+        let err = execute_at(&input, u64::MAX, true).unwrap_err().to_string();
         assert!(
             !err.contains("requires the `commd-fold-verify` feature"),
             "0x0130 hit the absent stub despite the feature being on: {err}"
@@ -421,5 +446,55 @@ mod tests {
             err.contains("invalid proof") || err.contains("FOLD_COMMD_VERIFY"),
             "expected a verifier-path error, got: {err}"
         );
+    }
+
+    fn well_formed_call() -> Vec<u8> {
+        let mut input = vec![0u8; 4];
+        for v in [128usize, 1, 0, 160] {
+            let mut x = [0u8; 32];
+            x[24..].copy_from_slice(&(v as u64).to_be_bytes());
+            input.extend_from_slice(&x);
+        }
+        input.extend_from_slice(&[0u8; 64]);
+        input
+    }
+
+    /// Below the activation height 0x0130 is byte-identical to the build the
+    /// 40204 fleet runs (verifier absent), whatever this binary's features.
+    #[test]
+    fn fold_verify_legacy_parity_below_activation() {
+        let corpus: Vec<(Vec<u8>, u64)> = vec![
+            (well_formed_call(), u64::MAX),
+            (well_formed_call(), 1),
+            (vec![0u8; 10], u64::MAX),
+            (vec![0xFF; 200], u64::MAX),
+        ];
+        for (input, gas) in corpus {
+            let legacy = execute_legacy(&input, gas).map_err(|e| e.to_string());
+            let gated = execute_at(&input, gas, false).map_err(|e| e.to_string());
+            let compat = execute(&input, gas).map_err(|e| e.to_string());
+            assert!(legacy.is_err());
+            assert_eq!(
+                format!("{gated:?}"),
+                format!("{legacy:?}"),
+                "pre-activation result must equal the legacy build"
+            );
+            assert_eq!(format!("{compat:?}"), format!("{legacy:?}"));
+        }
+        let e = execute_at(&well_formed_call(), u64::MAX, false)
+            .expect_err("legacy")
+            .to_string();
+        assert_eq!(e, FEATURE_ABSENT);
+    }
+
+    /// At/after the activation height the verifier runs (in the node build).
+    #[cfg(feature = "commd-fold-verify")]
+    #[test]
+    fn fold_verify_reaches_verifier_at_activation() {
+        let e = execute_at(&well_formed_call(), u64::MAX, true)
+            .expect_err("empty proof is rejected")
+            .to_string();
+        assert_ne!(e, FEATURE_ABSENT);
+        assert!(e.contains("FOLD_COMMD_VERIFY"), "{e}");
     }
 }

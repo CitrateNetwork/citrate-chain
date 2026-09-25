@@ -17,7 +17,7 @@ use citrate_execution::types::Address;
 use sha3::{Digest, Sha3_256};
 
 /// Pinned digest for the canonical (default-feature) node build.
-const PINNED: &str = "bdacb6ff8757e42fde5ed4c402f507acf7010ef33e453dae4fbb9a9a74c7eb65";
+const PINNED: &str = "d3e316d728626dc3dd809c7936cf08220300d07a61315ce2efbd7f170321ebad";
 
 fn corpus() -> Vec<Vec<u8>> {
     // A well-formed 0x0130 head with empty tails (decodes; the verifier then
@@ -82,11 +82,15 @@ fn pba_l1a_003_fold_verifier_is_live_in_the_node_build() {
     let mut addr = [0u8; 20];
     addr[18] = 0x01;
     addr[19] = 0x30;
-    let err = execute_pure_at(&Address(addr), &fold, 30_000_000, false)
+    let err = execute_pure_at(&Address(addr), &fold, 30_000_000, true)
         .expect_err("empty proof is rejected");
     assert_eq!(
         error_class(&err.to_string()),
         0,
-        "0x0130 must reach the verifier in the node build, not the feature-absent stub: {err}"
+        "0x0130 must reach the verifier after activation, not the feature-absent stub: {err}"
     );
+    // Below activation it matches the verifier-absent fleet build.
+    let legacy = execute_pure_at(&Address(addr), &fold, 30_000_000, false)
+        .expect_err("legacy rejects every call");
+    assert_eq!(error_class(&legacy.to_string()), 1, "{legacy}");
 }

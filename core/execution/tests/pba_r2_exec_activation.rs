@@ -197,6 +197,16 @@ fn staticcall_forwarder_runtime(target: [u8; 20]) -> Vec<u8> {
 /// STATICCALL `target` with `calldata` through the production REVM path at
 /// `block_number`; returns (first returndata word, success word).
 fn staticcall_at(target: [u8; 20], calldata: Vec<u8>, block_number: u64) -> ([u8; 32], [u8; 32]) {
+    let (ret, ok, _gas) = staticcall_gas_at(target, calldata, block_number);
+    (ret, ok)
+}
+
+/// As [`staticcall_at`], also returning the gas the outer call used.
+fn staticcall_gas_at(
+    target: [u8; 20],
+    calldata: Vec<u8>,
+    block_number: u64,
+) -> ([u8; 32], [u8; 32], u64) {
     let state_db = Arc::new(StateDB::new());
     let caller = Address([0x11u8; 20]);
     let forwarder = Address([0x22u8; 20]);
@@ -209,7 +219,7 @@ fn staticcall_at(target: [u8; 20], calldata: Vec<u8>, block_number: u64) -> ([u8
         prevrandao: [0u8; 32],
         block_hashes: HashMap::new(),
     };
-    let (output, _gas, _logs) = execute_contract_call_with_context(
+    let (output, gas, _logs) = execute_contract_call_with_context(
         state_db,
         caller,
         forwarder,
@@ -232,7 +242,7 @@ fn staticcall_at(target: [u8; 20], calldata: Vec<u8>, block_number: u64) -> ([u8
     let mut ok = [0u8; 32];
     ret.copy_from_slice(&output[..32]);
     ok.copy_from_slice(&output[32..]);
-    (ret, ok)
+    (ret, ok, gas)
 }
 
 fn short(a: u16) -> [u8; 20] {
@@ -470,4 +480,51 @@ fn activation_boundary_is_exact_in_the_revm_bridge() {
     assert_eq!(ok[31], 0, "H: hardened");
     let (_, ok) = staticcall_at(reserved, vec![0xAB; 4], ACTIVATION + 1);
     assert_eq!(ok[31], 0, "H+1: hardened");
+}
+
+/// 0x0130 through the REVM bridge: below the activation height the call
+/// halts exactly as on the verifier-absent fleet build (same result, same
+/// gas); from the height on the gated behaviour applies.
+#[test]
+fn fold_verify_gated_at_activation_in_the_revm_bridge() {
+    activate();
+    let mut call = vec![0u8; 4];
+    for v in [128usize, 1, 0, 160] {
+        let mut x = [0u8; 32];
+        x[24..].copy_from_slice(&(v as u64).to_be_bytes());
+        call.extend_from_slice(&x);
+    }
+    call.extend_from_slice(&[0u8; 64]);
+    // Legacy (verifier-absent) semantics: every call is a precompile error,
+    // which halts the frame and consumes its forwarded gas. A call the
+    // verifier also rejects (empty proof) is therefore the same halt, so the
+    // H-1 call must equal the H call in result AND gas, and equal any
+    // earlier height.
+    let (ret_wf, ok_wf, gas_wf) = staticcall_gas_at(short(0x0130), call.clone(), ACTIVATION - 1);
+    let (ret_old, ok_old, gas_old) = staticcall_gas_at(short(0x0130), call.clone(), BEFORE);
+    let (ret_h, ok_h, gas_h) = staticcall_gas_at(short(0x0130), call.clone(), ACTIVATION);
+    assert_eq!(ok_wf[31], 0, "H-1: the legacy build rejects every call");
+    assert_eq!((ret_wf, ok_wf, gas_wf), (ret_old, ok_old, gas_old));
+    assert_eq!(
+        (ret_wf, ok_wf, gas_wf),
+        (ret_h, ok_h, gas_h),
+        "a rejected call halts identically on both sides of H"
+    );
+    let direct =
+        citrate_execution::precompiles::commd_fold_verify::execute_at(&call, 30_000_000, false)
+            .expect_err("legacy")
+            .to_string();
+    assert!(
+        direct.contains("requires the `commd-fold-verify` feature"),
+        "{direct}"
+    );
+    let gated =
+        citrate_execution::precompiles::commd_fold_verify::execute_at(&call, 30_000_000, true);
+    if citrate_execution::build_features::COMMD_FOLD_VERIFY {
+        let e = gated.expect_err("empty proof").to_string();
+        assert!(
+            !e.contains("requires the `commd-fold-verify` feature"),
+            "{e}"
+        );
+    }
 }

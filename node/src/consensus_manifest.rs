@@ -40,9 +40,18 @@ pub struct ConsensusManifest {
     /// halo2-verifier feature: changes 0x0108 precompile behaviour. Mixed on/off
     /// builds diverge on any tx that exercises the ZK verifier. Consensus-affecting.
     pub feat_halo2_verifier: bool,
-    /// commd-fold-verify feature: changes 0x0130 precompile behaviour (PBA-L1a-003).
-    /// Consensus-affecting; the node's default feature set enables it.
+    /// commd-fold-verify feature compiled in. Its 0x0130 behaviour is
+    /// activation-gated: below `pba_hardening_height` 0x0130 behaves exactly
+    /// like a build without the feature (the 40204 fleet), so this flag alone
+    /// does not change historical replay.
     pub feat_commd_fold_verify: bool,
+    /// Execution behaviours that differ from the fleet build only at/after the
+    /// activation height (`citrate_execution::build_features::ACTIVATION_GATED`).
+    pub activation_gated: Vec<&'static str>,
+    /// The activation height this process resolved (`None` = legacy rules
+    /// everywhere; set by start_node before the manifest is printed, or by
+    /// `CITRATE_PBA_HARDENING_HEIGHT` for `citrate consensus`).
+    pub pba_hardening_height: Option<u64>,
     /// Canonical EIP-1559 base fee committed into every block (reroll constant).
     pub canonical_base_fee_per_gas: u64,
     /// Validator-registry snapshot epoch length (blocks).
@@ -63,19 +72,36 @@ impl ConsensusManifest {
         // PBA-L1a-003: read the execution crate's actual feature set (a
         // dependency-feature build does not show up in this crate's cargo
         // features), OR-ed with this crate's own forwarding features.
-        let feat_halo2_verifier = env!("CITRATE_FEAT_HALO2") == "1"
-            || citrate_execution::build_features::HALO2_SUBSTRATE;
+        let feat_halo2_verifier =
+            env!("CITRATE_FEAT_HALO2") == "1" || citrate_execution::build_features::HALO2_SUBSTRATE;
         let feat_commd_fold_verify = env!("CITRATE_FEAT_COMMD_FOLD") == "1"
             || citrate_execution::build_features::COMMD_FOLD_VERIFY;
 
         // Canonical, order-stable pre-image of the consensus-affecting surface.
         // Deliberately EXCLUDES build_target (arch must not change consensus) and
         // git_dirty (provenance, surfaced separately as a hard blocker).
+        let activation_gated: Vec<&'static str> =
+            citrate_execution::build_features::ACTIVATION_GATED.to_vec();
+        // v2 pre-image: v1's fields, with 0x0130 reported as activation-gated
+        // and the gated rule set listed, so a diff against a v1 (fleet)
+        // manifest shows exactly which differences wait for the height.
+        let commd_mode = if feat_commd_fold_verify {
+            "gated"
+        } else {
+            "absent"
+        };
         let preimage = format!(
-            "citrate-consensus-v1\ngit_sha={git_sha}\nhalo2_verifier={feat_halo2_verifier}\n\
-             commd_fold_verify={feat_commd_fold_verify}\n\
+            "citrate-consensus-v2\ngit_sha={git_sha}\nhalo2_verifier={feat_halo2_verifier}\n\
+             commd_fold_verify={commd_mode}\nactivation_gated={}\n\
              base_fee={CANONICAL_BASE_FEE_PER_GAS}\nepoch={EPOCH}\nsnapshot_lag={SNAPSHOT_LAG}\n",
+            activation_gated.join("|"),
         );
+        let pba_hardening_height =
+            citrate_consensus::hardening::pba_hardening_height().or_else(|| {
+                citrate_consensus::hardening::resolve_pba_hardening_height(None)
+                    .ok()
+                    .flatten()
+            });
         let digest = Sha256::digest(preimage.as_bytes());
         let fingerprint = format!("0x{}", hex::encode(&digest[..16]));
 
@@ -86,6 +112,8 @@ impl ConsensusManifest {
             build_target,
             feat_halo2_verifier,
             feat_commd_fold_verify,
+            activation_gated,
+            pba_hardening_height,
             canonical_base_fee_per_gas: CANONICAL_BASE_FEE_PER_GAS,
             epoch: EPOCH,
             snapshot_lag: SNAPSHOT_LAG,
@@ -104,7 +132,19 @@ impl ConsensusManifest {
         );
         println!("  build target       {}", self.build_target);
         println!("  halo2-verifier     {}", self.feat_halo2_verifier);
-        println!("  commd-fold-verify  {}", self.feat_commd_fold_verify);
+        println!(
+            "  commd-fold-verify  {} (0x0130 live only from the activation height)",
+            self.feat_commd_fold_verify
+        );
+        println!(
+            "  activation height  {}",
+            self.pba_hardening_height
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "unset (legacy rules)".to_string())
+        );
+        for r in &self.activation_gated {
+            println!("  gated              {r}");
+        }
         println!(
             "  canonical base fee {} wei",
             self.canonical_base_fee_per_gas
@@ -153,6 +193,8 @@ mod tests {
         assert!(j.contains("\"fingerprint\""));
         assert!(j.contains("\"feat_halo2_verifier\""));
         assert!(j.contains("\"feat_commd_fold_verify\""));
+        assert!(j.contains("\"activation_gated\""));
+        assert!(j.contains("0x0130 fold-verify"));
         assert!(j.contains("\"canonical_base_fee_per_gas\""));
     }
 

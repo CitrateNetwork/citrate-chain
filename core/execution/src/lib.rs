@@ -12,6 +12,18 @@ pub mod build_features {
     pub const HALO2_SUBSTRATE: bool = cfg!(feature = "halo2-substrate");
     /// `commd-fold-verify`: live 0x0130 verifier.
     pub const COMMD_FOLD_VERIFY: bool = cfg!(feature = "commd-fold-verify");
+
+    /// Execution behaviours that differ from the chain-40204 fleet build and
+    /// switch on ONLY at `pba_hardening_height` (below it, execution is
+    /// byte-identical to the fleet). Reported by the node's consensus
+    /// manifest so fleet builds can be diffed rule by rule.
+    pub const ACTIVATION_GATED: &[&str] = &[
+        "0x0130 fold-verify precompile (verifier live)",
+        "0x0109 merkle proof index/depth check",
+        "0x0110 gas priced on n x dim",
+        "reserved precompile addresses fail",
+        "in-block model inference disabled",
+    ];
 }
 pub mod address_utils;
 pub mod block_rewards;

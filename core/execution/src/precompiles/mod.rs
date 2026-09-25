@@ -134,7 +134,7 @@ pub fn execute_pure_at(
         // is always present so the address is a known precompile (feature-off returns a discoverable
         // "feature absent" error, mirroring 0x0108 without halo2-substrate).
         if selector == 0x30 {
-            return commd_fold_verify::execute(input, gas_limit);
+            return commd_fold_verify::execute_at(input, gas_limit, hardened);
         }
     }
     Err(anyhow::anyhow!(
