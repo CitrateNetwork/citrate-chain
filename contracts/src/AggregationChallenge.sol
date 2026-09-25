@@ -70,6 +70,8 @@ contract AggregationChallenge is ReentrancyGuard, Governable {
     event ChallengeResolved(bytes32 indexed roundId, bool challengerWon);
     event AggregateAccepted(bytes32 indexed roundId);
     event CoordinatorSlashed(bytes32 indexed roundId, address indexed coordinator);
+    /// PBA-L2-041: the slash hook reverted; resolution still completed.
+    event SlashHookFailed(bytes32 indexed roundId, address indexed coordinator);
     event ChallengeBondUpdated(uint256 oldBond, uint256 newBond);
     event ChallengeWindowUpdated(uint256 oldWindow, uint256 newWindow);
     event SlashingContractUpdated(address oldContract, address newContract);
@@ -230,7 +232,14 @@ contract AggregationChallenge is ReentrancyGuard, Governable {
         r.slashed = true;
         emit CoordinatorSlashed(roundId, r.coordinator);
         if (address(slashingContract) != address(0)) {
-            slashingContract.slash(r.coordinator, TIER_BYZANTINE, abi.encode(roundId, r.coordIndex));
+            // PBA-L2-041: a reverting slash hook (e.g. NematocystSlashing's
+            // "Not staked" for an unstaked coordinator, or a missing slasher
+            // authorization) must not brick challenge resolution forever.
+            // The failure is surfaced as an event instead of reverting.
+            try slashingContract.slash(r.coordinator, TIER_BYZANTINE, abi.encode(roundId, r.coordIndex)) {}
+            catch {
+                emit SlashHookFailed(roundId, r.coordinator);
+            }
         }
     }
 
