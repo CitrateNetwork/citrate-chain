@@ -11,6 +11,9 @@
 #                    commd-fold-verify. Mixed feature sets fork on 0x0130.
 #   T3  PBA-L1a-017  node/src/main.rs keeps the periodic Mempool::clear_expired.
 #   T4  PBA-L1a-024  the metrics server never defaults to 0.0.0.0.
+#   T5  PBA-R2       node/src/main.rs publishes the activation height from
+#                    citrate_consensus::hardening::init_pba_hardening_height
+#                    (config + env override), never from the raw config field.
 #
 # Usage: check_pba_exec_tripwires.sh            # scan the tree
 #        check_pba_exec_tripwires.sh --self-test # prove each scan detects its class
@@ -63,6 +66,11 @@ metrics_wildcard() { # <node main.rs>
   grep -nE '"0\.0\.0\.0:9100"|Ipv4Addr::UNSPECIFIED,[[:space:]]*9100' "$1" 2>/dev/null
 }
 
+activation_resolved() { # <node main.rs>
+  grep -q 'init_pba_hardening_height(' "$1" 2>/dev/null \
+    && ! grep -qE 'set_pba_hardening_height\([[:space:]]*config\.chain\.pba_hardening_height' "$1" 2>/dev/null
+}
+
 run_scan() { # <root>
   local root="$1" rc=0 out
   if out=$(scan_sig_bypass "$root"); then
@@ -80,6 +88,9 @@ run_scan() { # <root>
   if out=$(metrics_wildcard "$root/node/src/main.rs"); then
     echo "T4 PBA-L1a-024: metrics server defaults to 0.0.0.0:"; echo "$out"; rc=1
   fi
+  if ! activation_resolved "$root/node/src/main.rs"; then
+    echo "T5 PBA-R2: main.rs must publish via init_pba_hardening_height (config + env override)"; rc=1
+  fi
   return "$rc"
 }
 
@@ -89,7 +100,7 @@ self_test() {
   mkdir -p "$tmp/scripts" "$tmp/node/src" "$tmp/node/config" "$tmp/.github" "$tmp/docker" "$tmp/config" "$tmp/homebrew"
   # A clean tree must pass...
   printf '[features]\ndefault = ["commd-fold-verify"]\n' > "$tmp/node/Cargo.toml"
-  printf 'fn f(){ m.clear_expired().await; let a = "127.0.0.1:9100"; }\n' > "$tmp/node/src/main.rs"
+  printf 'fn f(){ m.clear_expired().await; let a = "127.0.0.1:9100"; let p = init_pba_hardening_height(x); }\n' > "$tmp/node/src/main.rs"
   printf 'cargo build --release -p citrate-node\n' > "$tmp/scripts/build.sh"
   run_scan "$tmp" >/dev/null || { echo "self-test: clean tree flagged"; return 1; }
   # ...and each seeded violation must be caught.
@@ -103,10 +114,12 @@ self_test() {
   printf '[features]\ndefault = []\n' > "$tmp/node/Cargo.toml"
   run_scan "$tmp" >/dev/null && { echo "self-test: T2 (default) missed"; fails=1; }
   printf '[features]\ndefault = ["commd-fold-verify"]\n' > "$tmp/node/Cargo.toml"
-  printf 'fn f(){ let a = "127.0.0.1:9100"; }\n' > "$tmp/node/src/main.rs"
+  printf 'fn f(){ let a = "127.0.0.1:9100"; let p = init_pba_hardening_height(x); }\n' > "$tmp/node/src/main.rs"
   run_scan "$tmp" >/dev/null && { echo "self-test: T3 missed"; fails=1; }
-  printf 'fn f(){ m.clear_expired().await; let a = "0.0.0.0:9100"; }\n' > "$tmp/node/src/main.rs"
+  printf 'fn f(){ m.clear_expired().await; let a = "0.0.0.0:9100"; let p = init_pba_hardening_height(x); }\n' > "$tmp/node/src/main.rs"
   run_scan "$tmp" >/dev/null && { echo "self-test: T4 missed"; fails=1; }
+  printf 'fn f(){ m.clear_expired().await; set_pba_hardening_height(config.chain.pba_hardening_height); }\n' > "$tmp/node/src/main.rs"
+  run_scan "$tmp" >/dev/null && { echo "self-test: T5 missed"; fails=1; }
   [ "$fails" -eq 0 ] && echo "self-test OK"
   return "$fails"
 }

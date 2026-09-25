@@ -677,3 +677,167 @@ mod tests {
         );
     }
 }
+
+/// PBA-R2 release-prep finding: a node configured ONLY through the
+/// `CITRATE_PBA_HARDENING_HEIGHT` env override must activate every gated rule
+/// (consensus-layer and execution-layer) at the same height as a node
+/// configured through `[chain].pba_hardening_height`, or it forks at H.
+#[cfg(test)]
+mod pba_activation_env_tests {
+    use super::*;
+    use citrate_consensus::hardening::{
+        init_pba_hardening_height, resolve_pba_hardening_height, set_pba_hardening_height,
+        PbaHardening, PBA_HARDENING_ENV,
+    };
+    use citrate_consensus::types::{BlockBuilder, Hash, PublicKey, Signature, Transaction};
+    use citrate_execution::revm_adapter::{
+        execute_contract_call_with_context, BlockContext, ValueSemantics,
+    };
+    use citrate_execution::types::{
+        AccessPolicy, Address, ModelId, ModelMetadata, ModelState, UsageStats,
+    };
+    use citrate_execution::{Executor, StateDB};
+    use primitive_types::U256;
+    use std::sync::Arc;
+
+    /// Far above every height other node unit tests use, so publishing it
+    /// process-wide cannot change their behaviour.
+    const H: u64 = 5_000_000;
+
+    /// Serialises the two tests that mutate `CITRATE_PBA_HARDENING_HEIGHT`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn staticcall_ok(target: [u8; 20], block_number: u64) -> bool {
+        let state = Arc::new(StateDB::new());
+        let caller = Address([0x11; 20]);
+        let fwd = Address([0x22; 20]);
+        state
+            .accounts
+            .set_balance(caller, U256::from(10u64).pow(U256::from(18u64)));
+        let mut code = vec![0x36, 0x5f, 0x5f, 0x37, 0x60, 0x20, 0x5f, 0x36, 0x5f, 0x73];
+        code.extend_from_slice(&target);
+        code.extend_from_slice(&[0x5a, 0xfa, 0x60, 0x20, 0x52, 0x60, 0x40, 0x5f, 0xf3]);
+        state.set_code(fwd, code);
+        let (out, _, _) = execute_contract_call_with_context(
+            state,
+            caller,
+            fwd,
+            vec![0xAB; 4],
+            U256::zero(),
+            5_000_000,
+            U256::from(1_000_000_000u64),
+            40204,
+            block_number,
+            1_000_000,
+            BlockContext::default(),
+            None,
+            None,
+            None,
+            ValueSemantics::RevmAuthoritative,
+        )
+        .expect("forwarder executes");
+        out[63] == 1
+    }
+
+    async fn inference_status(height: u64) -> bool {
+        let state = Arc::new(StateDB::new());
+        let sender = PublicKey::new([0x5A; 32]);
+        let from = citrate_execution::address_utils::normalize_address(&sender);
+        state
+            .accounts
+            .set_balance(from, U256::from(10u64).pow(U256::from(21u64)));
+        let mid = ModelId(Hash::new([0x4D; 32]));
+        state
+            .register_model(
+                mid,
+                ModelState {
+                    owner: Address([0xAA; 20]),
+                    model_hash: Hash::new([1; 32]),
+                    version: 1,
+                    metadata: ModelMetadata::default(),
+                    access_policy: AccessPolicy::Public,
+                    usage_stats: UsageStats::default(),
+                },
+            )
+            .expect("model");
+        let exec = Executor::new(state);
+        let mut data = vec![0x02, 0, 0, 0];
+        data.extend_from_slice(mid.0.as_bytes());
+        let tx = Transaction {
+            hash: Hash::new([0x19; 32]),
+            from: sender,
+            to: Some(PublicKey::new([0x77; 32])),
+            gas_limit: 2_000_000,
+            gas_price: 1_000_000_000,
+            data,
+            signature: Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ..Default::default()
+        };
+        let blk = BlockBuilder::new()
+            .hash(Hash::new([7; 32]))
+            .parent(Hash::default())
+            .height(height)
+            .timestamp(1_000_000)
+            .build_unhashed();
+        exec.execute_transaction(&blk, &tx)
+            .await
+            .expect("executes")
+            .status
+    }
+
+    #[tokio::test]
+    async fn env_override_activates_every_gated_path() {
+        // Config says "unset"; only the env override schedules H.
+        let cfg = NodeConfig::default();
+        assert_eq!(cfg.chain.pba_hardening_height, None);
+        let resolved = {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(PBA_HARDENING_ENV, H.to_string());
+            // Exactly what start_node does: resolve (env over TOML) and publish.
+            let r = init_pba_hardening_height(cfg.chain.pba_hardening_height);
+            std::env::remove_var(PBA_HARDENING_ENV);
+            r
+        };
+        assert_eq!(resolved, Ok(Some(H)), "env override must be honoured");
+
+        // Consensus-layer view (CHAIN-CONS rules) and execution-layer view
+        // read the SAME store.
+        assert!(PbaHardening::from_process().active_at(H));
+        assert!(!PbaHardening::from_process().active_at(H - 1));
+        assert!(citrate_execution::activation::pba_hardening_active(H));
+        assert!(!citrate_execution::activation::pba_hardening_active(H - 1));
+
+        // PBA-L1a-022 (REVM bridge flag, shared by -013 and -025): reserved
+        // precompile call fails from H, legacy below.
+        let mut reserved = [0u8; 20];
+        reserved[18] = 0x01;
+        reserved[19] = 0x04;
+        assert!(staticcall_ok(reserved, H - 1), "legacy below H");
+        assert!(!staticcall_ok(reserved, H), "hardened from H");
+
+        // PBA-L1a-019 (executor): in-consensus inference reverts from H.
+        assert!(inference_status(H - 1).await, "legacy below H");
+        assert!(!inference_status(H).await, "hardened from H");
+
+        set_pba_hardening_height(None);
+    }
+
+    #[test]
+    fn env_override_off_and_garbage() {
+        let mut cfg = NodeConfig::default();
+        cfg.chain.pba_hardening_height = Some(10);
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(PBA_HARDENING_ENV, "off");
+        let off = resolve_pba_hardening_height(cfg.chain.pba_hardening_height);
+        std::env::set_var(PBA_HARDENING_ENV, "soon");
+        let bad = resolve_pba_hardening_height(cfg.chain.pba_hardening_height);
+        std::env::remove_var(PBA_HARDENING_ENV);
+        assert_eq!(off, Ok(None));
+        assert!(bad.is_err(), "unparseable override must abort start-up");
+        assert_eq!(
+            resolve_pba_hardening_height(cfg.chain.pba_hardening_height),
+            Ok(Some(10))
+        );
+    }
+}
