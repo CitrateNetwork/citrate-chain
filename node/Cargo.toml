@@ -90,7 +90,13 @@ tempfile = "3.15"
 proptest = { workspace = true }
 
 [features]
-default = []
+# PBA-L1a-003: the consensus feature set is part of the DEFAULT build so every
+# build path (release workflows, Dockerfile, scripts, the reroll runbook) produces
+# the same precompile results. commd-fold-verify makes 0x0130 live, matching the
+# validators built by scripts/ceremony/I64S1_REROLL_RUNBOOK.md. `main.rs` refuses
+# to compile without it (compile_error!), and scripts/ci/check_pba_exec_tripwires.sh
+# rejects any `cargo build -p citrate-node --features/--no-default-features`.
+default = ["commd-fold-verify"]
 devnet = []
 # WP-B0: build the node with the live Halo2-KZG verifier at 0x0108
 # (circuit_version 1 inference / 2 PoRep / 3 PoSt). Without this feature the

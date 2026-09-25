@@ -40,6 +40,9 @@ pub struct ConsensusManifest {
     /// halo2-verifier feature: changes 0x0108 precompile behaviour. Mixed on/off
     /// builds diverge on any tx that exercises the ZK verifier. Consensus-affecting.
     pub feat_halo2_verifier: bool,
+    /// commd-fold-verify feature: changes 0x0130 precompile behaviour (PBA-L1a-003).
+    /// Consensus-affecting; the node's default feature set enables it.
+    pub feat_commd_fold_verify: bool,
     /// Canonical EIP-1559 base fee committed into every block (reroll constant).
     pub canonical_base_fee_per_gas: u64,
     /// Validator-registry snapshot epoch length (blocks).
@@ -58,12 +61,14 @@ impl ConsensusManifest {
         let git_dirty = env!("CITRATE_GIT_DIRTY") == "1";
         let build_target = env!("CITRATE_BUILD_TARGET");
         let feat_halo2_verifier = env!("CITRATE_FEAT_HALO2") == "1";
+        let feat_commd_fold_verify = env!("CITRATE_FEAT_COMMD_FOLD") == "1";
 
         // Canonical, order-stable pre-image of the consensus-affecting surface.
         // Deliberately EXCLUDES build_target (arch must not change consensus) and
         // git_dirty (provenance, surfaced separately as a hard blocker).
         let preimage = format!(
             "citrate-consensus-v1\ngit_sha={git_sha}\nhalo2_verifier={feat_halo2_verifier}\n\
+             commd_fold_verify={feat_commd_fold_verify}\n\
              base_fee={CANONICAL_BASE_FEE_PER_GAS}\nepoch={EPOCH}\nsnapshot_lag={SNAPSHOT_LAG}\n",
         );
         let digest = Sha256::digest(preimage.as_bytes());
@@ -75,6 +80,7 @@ impl ConsensusManifest {
             git_dirty,
             build_target,
             feat_halo2_verifier,
+            feat_commd_fold_verify,
             canonical_base_fee_per_gas: CANONICAL_BASE_FEE_PER_GAS,
             epoch: EPOCH,
             snapshot_lag: SNAPSHOT_LAG,
@@ -93,6 +99,7 @@ impl ConsensusManifest {
         );
         println!("  build target       {}", self.build_target);
         println!("  halo2-verifier     {}", self.feat_halo2_verifier);
+        println!("  commd-fold-verify  {}", self.feat_commd_fold_verify);
         println!(
             "  canonical base fee {} wei",
             self.canonical_base_fee_per_gas
@@ -140,6 +147,27 @@ mod tests {
         let j = m.to_json();
         assert!(j.contains("\"fingerprint\""));
         assert!(j.contains("\"feat_halo2_verifier\""));
+        assert!(j.contains("\"feat_commd_fold_verify\""));
         assert!(j.contains("\"canonical_base_fee_per_gas\""));
+    }
+
+    /// PBA-L1a-003 tripwire: the node's consensus feature set is fixed. Every
+    /// shipped build path (release.yml, release-tier2.yml, Dockerfile, scripts,
+    /// the reroll runbook) builds `-p citrate-node` with the DEFAULT features,
+    /// which enable commd-fold-verify (0x0130 live, as the reroll activated it)
+    /// and leave halo2-verifier (0x0108) off. A build that differs would compute
+    /// different precompile results and fork.
+    #[test]
+    fn consensus_feature_set_is_canonical() {
+        let m = ConsensusManifest::current();
+        assert!(
+            m.feat_commd_fold_verify,
+            "citrate-node must be built with commd-fold-verify (default features)"
+        );
+        assert!(
+            !m.feat_halo2_verifier,
+            "halo2-verifier changes 0x0108 results and is not activated on any chain"
+        );
+        assert_eq!(env!("CITRATE_CONSENSUS_FEATURES"), "commd-fold-verify");
     }
 }
