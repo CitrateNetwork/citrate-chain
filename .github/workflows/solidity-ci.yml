@@ -99,7 +99,8 @@ jobs:
         working-directory: contracts
         run: |
           pipx install semgrep==1.167.0
-          "$HOME/.local/bin/semgrep" --metrics=off --error --config .semgrep/pba-r2-tripwires.yml src
+          # pipx puts the entry point in PIPX_BIN_DIR (on PATH on hosted runners).
+          semgrep --metrics=off --error --config .semgrep/pba-r2-tripwires.yml src
       # Compile first (serialized via FOUNDRY_THREADS=1 + swap) so the cache
       # is warm; keeps the heavy via-IR work in one observable step.
       - name: Build contracts (bounded concurrency)
