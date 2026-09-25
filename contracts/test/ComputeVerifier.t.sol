@@ -553,11 +553,19 @@ contract ComputeVerifierTest is Test {
         verifier.verify(1, ComputeVerifier.VerificationTier.Commitment, proof);
     }
 
-    function test_commitmentCannotBeSubmittedTwice() public {
+    /// The assigned provider may replace its commitment until a proof is
+    /// submitted; a different provider may not, and nobody may after the proof.
+    function test_commitmentReplaceableOnlyBeforeProofBySameProvider() public {
         _configureJob(1, 5 ether, ComputeVerifier.VerificationTier.Commitment);
         _submitCommitment(1);
+        _submitCommitment(1); // same provider, no proof yet: allowed
 
         vm.expectRevert("ComputeVerifier: commitment already submitted");
+        verifier.submitCommitment(1, address(0xD1FF), commitmentHash);
+
+        bytes memory proof = _buildCommitmentProof(commitmentHash, nonce, outputData);
+        verifier.verify(1, ComputeVerifier.VerificationTier.Commitment, proof);
+        vm.expectRevert("ComputeVerifier: proof already submitted");
         _submitCommitment(1);
     }
 

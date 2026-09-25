@@ -485,7 +485,16 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
 
     /// @notice Post a new compute job with escrow
     /// @param modelHash Hash of the model to use
-    /// @param inputHash Hash of the input data (actual data sent off-chain)
+    /// @param inputHash Hash of the input data (actual data sent off-chain).
+    ///        ZK-TIER CLIENT CONTRACT (PBA-L2-004): for a job whose effective
+    ///        tier is ZKProof — requested as ZKProof, or auto-upgraded because
+    ///        maxPrice > ComputeVerifier.VALUE_THRESHOLD (10 SALT) — inputHash
+    ///        MUST be exactly the 32-byte input commitment the 0x0108 v1
+    ///        inference circuit proves (a Poseidon commitment), non-zero and a
+    ///        canonical BN254 scalar (< ComputeVerifier.BN254_SCALAR_MODULUS);
+    ///        modelHash must also be < that modulus. Otherwise postJob reverts
+    ///        "ComputeVerifier: ZK commitments must be canonical 32-byte field
+    ///        elements". A keccak/sha hash of the input is NOT accepted.
     /// @param maxPrice Maximum price willing to pay
     /// @param tier Requested verification tier
     /// @param bidWindow Number of blocks for the bidding window
@@ -754,7 +763,8 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
 
     /// @notice Auto-assign a job (skip bidding for latency-sensitive workloads)
     /// @param modelHash Model hash for the job
-    /// @param inputHash Input data hash
+    /// @param inputHash Input data hash. For ZK-tier jobs this MUST be the
+    ///        circuit's 32-byte canonical input commitment (see postJob).
     /// @param tier Verification tier
     /// @return jobId The new job's identifier
     /// @dev Selects the best available provider using the scoring algorithm
@@ -852,7 +862,11 @@ contract ComputeMarketplace is ReentrancyGuard, Governable {
 
     /// @notice Submit result with proof (moves to Verifying, then auto-verifies)
     /// @param jobId The job identifier
-    /// @param outputHash Hash of the output (actual data delivered off-chain)
+    /// @param outputHash Hash of the output (actual data delivered off-chain).
+    ///        ZK tier: MUST be the circuit's 32-byte canonical output
+    ///        commitment, and the provider MUST have submitted
+    ///        `verifier.zkProofCommitment(jobId, proof)` via submitCommitment
+    ///        at least one block earlier (it may re-commit until it reveals).
     /// @param proof Tier-specific proof data
     /// @dev NoFrontRunning: only assigned provider can submit
     function submitResult(

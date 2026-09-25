@@ -158,16 +158,19 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     /// The circuit's public inputs cannot carry a jobId, so the proof is
     /// bound to its job by commit-reveal: before revealing, the provider
     /// submits `zkProofCommitment(jobId, proofData)` as the job commitment,
-    /// in an EARLIER block. A copier who sees the revealed proof cannot have
-    /// committed to it in advance, and ZK proof material is consumed
-    /// globally, so one proof settles at most one job.
+    /// in an EARLIER block. A copier cannot commit into someone else's job
+    /// (only the assigned provider commits), so a copied proof can at most
+    /// settle the copier's OWN job with identical commitments, which harms
+    /// nobody. The used-proof set is therefore keyed per job: a global set
+    /// would let a copier who reveals first make the honest provider's
+    /// reveal fail and leave it to be slashed.
     bytes32 public constant ZK_PROOF_COMMIT_TAG = keccak256("CitrateComputeVerifier.ZKProofCommit.v1");
 
     /// @notice Block at which a job's commitment was submitted.
     mapping(uint256 => uint256) public commitmentBlock;
 
-    /// @notice ZK proof material (proof ‖ publicInputs) already used to
-    /// settle any job. Global: one proof, one job.
+    /// @notice ZK proof material already used, keyed by
+    /// keccak256(jobId, proof ‖ publicInputs).
     mapping(bytes32 => bool) public zkProofConsumed;
     // ============================================================
     // Events
@@ -324,7 +327,13 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         bytes32 commitment
     ) external onlyMarketplace jobConfigured(jobId) {
         VerificationRecord storage rec = records[jobId];
-        require(!rec.commitmentSubmitted, "ComputeVerifier: commitment already submitted");
+        // The assigned provider may replace its commitment until a proof has
+        // been submitted (e.g. to commit to a freshly generated proof).
+        require(!rec.proofSubmitted, "ComputeVerifier: proof already submitted");
+        require(
+            !rec.commitmentSubmitted || rec.provider == provider,
+            "ComputeVerifier: commitment already submitted"
+        );
         require(rec.result == VerificationResult.Pending, "ComputeVerifier: already verified");
         require(commitment != bytes32(0), "ComputeVerifier: empty commitment");
 
@@ -782,10 +791,7 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
     ///         (commit-reveal ties the proof to this job and this provider);
     ///      2. the public inputs are this job's commitments;
     ///      3. 0x0108 accepts the proof;
-    ///      4. the proof material has never settled any job (global). A
-    ///         replay REVERTS rather than returning Invalid, so a provider
-    ///         can never be slashed because someone else used "its" proof
-    ///         first; it simply re-proves (Halo2 proofs are randomized).
+    ///      4. the proof material has not already been used for this job.
     function _checkZK(uint256 jobId, bytes32 proofDataHash, bytes calldata proof, bytes calldata publicInputs)
         internal
         returns (bool)
@@ -797,7 +803,7 @@ contract ComputeVerifier is ReentrancyGuard, Governable {
         if (records[jobId].commitmentHash != expected) return false;
         if (!_publicInputsBound(jobId, publicInputs)) return false;
         if (!_callZKVerifyPrecompile(proof, publicInputs)) return false;
-        bytes32 key = keccak256(abi.encodePacked(proof, publicInputs));
+        bytes32 key = keccak256(abi.encode(jobId, keccak256(abi.encodePacked(proof, publicInputs))));
         require(!zkProofConsumed[key], "ComputeVerifier: proof already used");
         zkProofConsumed[key] = true;
         return true;

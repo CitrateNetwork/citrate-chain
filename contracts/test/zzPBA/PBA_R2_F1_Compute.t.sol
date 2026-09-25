@@ -618,30 +618,74 @@ contract PBA_R2_F1_Compute is Test {
         assertEq(market.getProvider(honest).stake, 1000 ether, "honest provider not slashed");
     }
 
-    /// R2 verifier follow-up (test_V_L2_004_identical_commitment_replay_pays_lazy_provider):
-    /// a lazy provider on job B with the SAME model + input cannot settle it
-    /// with job A's landed proof — even after committing to it — because ZK
-    /// proof material is consumed globally. The replay reverts (no slash).
-    function test_L2_004_identical_commitment_replay_rejected() public {
+    /// Regression for the R2 verifier's pass-2 PoC
+    /// (test_P2_mempool_copy_starves_and_slashes_honest_provider): a copier
+    /// that reads the honest provider's pending reveal, commits to it for its
+    /// own identical self-posted job and reveals FIRST cannot make the honest
+    /// reveal fail. The used-proof set is per job, so the honest job still
+    /// settles and nobody is slashed. (The copier settling its own identical
+    /// job is harmless: same model, same input, same correct output.)
+    function test_L2_004_mempool_copy_cannot_starve_honest_provider() public {
         _market();
         vm.mockCall(address(0x0108), bytes(""), abi.encode(uint256(1)));
         address honest = address(0xA1);
-        address lazy = address(0xB1);
+        address thief = address(0xB1);
         _provider(honest);
-        _provider(lazy);
+        _provider(thief);
         uint256 jobA = _zkJob(address(0xCC), honest, 50 ether, IN_C);
-        uint256 jobB = _zkJob(address(0xCD), lazy, 50 ether, IN_C);
-        bytes memory proofData = _pd(IN_C, MODEL, OUT_C, hex"0badc0de");
-        _commitReveal(honest, jobA, OUT_C, proofData);
-        assertEq(uint256(verifier.getResult(jobA)), uint256(ComputeVerifier.VerificationResult.Valid));
-        bytes32 c = verifier.zkProofCommitment(jobB, proofData); // commits AFTER seeing A's proof
-        vm.prank(lazy);
-        market.submitCommitment(jobB, c);
-        vm.roll(block.number + 1);
-        vm.prank(lazy);
-        vm.expectRevert(bytes("ComputeVerifier: proof already used"));
-        market.submitResult(jobB, abi.encodePacked(OUT_C), proofData);
-        assertEq(market.getProvider(lazy).stake, 1000 ether, "replay reverts, never slashes");
+        uint256 jobT = _zkJob(thief, thief, 11 ether, IN_C); // self-posted, same commitments
+        bytes memory pd = _pd(IN_C, MODEL, OUT_C, hex"0badc0de");
+        bytes32 cA = verifier.zkProofCommitment(jobA, pd);
+        vm.prank(honest);
+        market.submitCommitment(jobA, cA);
+        uint256 b0 = block.number;
+        vm.roll(b0 + 1);
+        // Honest reveal is pending; the thief copies pd and commits.
+        bytes32 cT = verifier.zkProofCommitment(jobT, pd);
+        vm.prank(thief);
+        market.submitCommitment(jobT, cT);
+        vm.roll(b0 + 2);
+        vm.prank(thief);
+        market.submitResult(jobT, abi.encodePacked(OUT_C), pd); // thief lands first
+        vm.prank(honest);
+        market.submitResult(jobA, abi.encodePacked(OUT_C), pd); // honest still settles
+        assertEq(uint256(verifier.getResult(jobA)), uint256(ComputeVerifier.VerificationResult.Valid), "honest job Valid");
+        assertEq(market.getProvider(honest).stake, 1000 ether, "honest provider not slashed");
+        vm.roll(b0 + 2 + market.DISPUTE_WINDOW());
+        market.completeJob(jobA);
+        assertEq(uint256(market.getJob(jobA).state), uint256(ComputeMarketplace.JobState.Completed));
+    }
+
+    /// The assigned provider can re-commit (e.g. to a freshly generated
+    /// proof) until a proof is submitted; the reveal must follow the LATEST
+    /// commitment by at least one block.
+    function test_L2_004_provider_can_recommit_before_reveal() public {
+        _market();
+        vm.mockCall(address(0x0108), bytes(""), abi.encode(uint256(1)));
+        address p = address(0xA1);
+        _provider(p);
+        uint256 job = _zkJob(address(0xCC), p, 50 ether, IN_C);
+        bytes memory pd1 = _pd(IN_C, MODEL, OUT_C, hex"01");
+        bytes memory pd2 = _pd(IN_C, MODEL, OUT_C, hex"02");
+        bytes32 c1 = verifier.zkProofCommitment(job, pd1);
+        bytes32 c2 = verifier.zkProofCommitment(job, pd2);
+        vm.prank(p);
+        market.submitCommitment(job, c1);
+        uint256 b0 = block.number;
+        vm.roll(b0 + 1);
+        vm.prank(p);
+        market.submitCommitment(job, c2); // re-commit
+        vm.prank(p);
+        vm.expectRevert(bytes("ComputeVerifier: reveal in commit block"));
+        market.submitResult(job, abi.encodePacked(OUT_C), pd2);
+        vm.roll(b0 + 2);
+        vm.prank(p);
+        market.submitResult(job, abi.encodePacked(OUT_C), pd2);
+        assertEq(uint256(verifier.getResult(job)), uint256(ComputeVerifier.VerificationResult.Valid));
+        // After the proof, the commitment is frozen.
+        vm.prank(p);
+        vm.expectRevert(bytes("ComputeMarketplace: wrong state for commitment"));
+        market.submitCommitment(job, bytes32(uint256(5)));
     }
 
     /// A malformed output commitment (not 32 bytes, or >= r) reverts the
