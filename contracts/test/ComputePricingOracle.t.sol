@@ -423,22 +423,26 @@ contract ComputePricingOracleTest is Test {
         oracle.proposeSaltPrice(105);
     }
 
-    function test_oracle_must_agree_on_same_compute_price() public {
+    /// PBA-L2-044: divergent submissions no longer revert ("price
+    /// mismatch" let one member stall every round); the quorum's median wins.
+    function test_oracle_compute_price_is_median_of_submissions() public {
         vm.prank(oracle1);
         oracle.proposeComputePrice(14);
-
         vm.prank(oracle2);
-        vm.expectRevert("ComputePricingOracle: price mismatch");
-        oracle.proposeComputePrice(12); // different value
+        oracle.proposeComputePrice(12); // different value accepted
+        vm.prank(oracle3);
+        oracle.proposeComputePrice(13);
+        assertEq(oracle.computePriceUsdCents(), 13);
     }
 
-    function test_oracle_must_agree_on_same_salt_price() public {
+    function test_oracle_salt_price_is_median_of_submissions() public {
         vm.prank(oracle1);
         oracle.proposeSaltPrice(105);
-
         vm.prank(oracle2);
-        vm.expectRevert("ComputePricingOracle: price mismatch");
-        oracle.proposeSaltPrice(95); // different value
+        oracle.proposeSaltPrice(95); // different value accepted
+        vm.prank(oracle3);
+        oracle.proposeSaltPrice(104);
+        assertEq(oracle.saltPriceUsdCents(), 104);
     }
 
     function test_add_oracle_member_governance_only() public {
