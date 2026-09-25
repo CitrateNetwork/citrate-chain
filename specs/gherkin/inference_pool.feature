@@ -70,6 +70,9 @@ Feature: ComputePool InferencePool dispatch (CM-05)
     When any other pool member calls reassignCoordinator(jobId)
     Then the contract emits CoordinatorReassigned(jobId, new=C2)
     And C1 is slashed 0.1% of stake (CoordinatorSlashedForLiveness event)
+    And pool.totalStaked decreases by the slash (totalStaked == sum of member stakes)
+    And the slash is retained in slashedStakeRetained (governance sweep)
+    And C1's activeJobs is decremented
     And C2 picks up dispatch within 5 blocks
 
   Scenario: Reassignment before timeout is rejected
@@ -95,17 +98,28 @@ Feature: ComputePool InferencePool dispatch (CM-05)
     And M_new becomes eligible for dispatch starting at the NEXT job
 
   Scenario: Member with in-flight job cannot leave
-    Given member M has been dispatched job J (J is Dispatched or Responded)
+    Given member M has been dispatched job J (recordDispatch increments M.activeJobs)
+    And M called requestLeave and LEAVE_COOLDOWN blocks have passed
     When M calls leavePool
-    Then the call reverts
-    # Spec: MemberLeave action's precondition in InferencePoolLifecycle.tla
-    # forbids leave while assignedMember[j] = M for any in-flight j.
+    Then the call reverts with "Has active jobs"
+    # Spec: Leave in specs/tla/compute/ComputePoolSettlement.tla requires
+    # activeJobs = 0 (NoLeaveWithOpenDispatch). PBA-L2-022.
+
+  Scenario: Leaving is two-step (PBA-L2-022)
+    Given member M has no in-flight assignments
+    When M calls leavePool without calling requestLeave first
+    Then the call reverts with "Leave not requested"
+    When M calls requestLeave
+    And M calls leavePool before LEAVE_COOLDOWN (150) blocks have passed
+    Then the call reverts with "Leave cooldown"
+    And M remains an active, slashable member during the cooldown
 
   Scenario: Member with no in-flight jobs leaves cleanly
     Given member M has no in-flight assignments
+    And M called requestLeave at least LEAVE_COOLDOWN blocks ago
     When M calls leavePool
     Then poolMembers no longer contains M
-    And M's stake is returned (subject to unbonding period)
+    And M's remaining stake is returned (credited to payoutPending if the transfer fails)
 
   # ── Pool dissolution ──
 

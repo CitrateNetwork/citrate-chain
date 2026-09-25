@@ -74,3 +74,18 @@ Feature: ComputePool settlement authority + requester timeout-refund (INFER-S2)
     Given any reachable sequence of dispatch / complete / fail / reclaim calls
     Then a job's payment is paid out, or refunded, or still escrowed — never two of these
     And reclaimExpiredJob never returns more than job.payment
+
+  # ── PBA-L2-022 / L2-023: exit and payout liveness ──
+
+  Scenario: a dispatched coordinator cannot leave before its job terminates
+    Given the job has been dispatched by the coordinator (activeJobs = 1)
+    And the coordinator called requestLeave and LEAVE_COOLDOWN blocks passed
+    When the coordinator calls leavePool
+    Then the call reverts with "Has active jobs"
+    # TLA: ActiveJobsAccurate, NoLeaveWithOpenDispatch in ComputePoolSettlement.tla
+
+  Scenario: a member whose receive reverts cannot block settlement
+    Given a pool member is a contract that reverts on receive
+    When the coordinator calls completeJob
+    Then the job becomes Completed
+    And that member's share is credited to payoutPending (claimPayout)

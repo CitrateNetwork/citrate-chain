@@ -7,6 +7,7 @@ EXTENDS Naturals, FiniteSets, TLC
 \* Source: contracts/src/ComputePool.sol
 \*   completeJob:410  failJob:431  recordDispatch:664  reassignCoordinator:693
 \*   reclaimExpiredJob (WP-G2)
+\*   requestLeave / leavePool (PBA-L2-022: two-step exit, live activeJobs)
 \* WP:  citrate-labs/handoffs/INFER_COMPUTEPOOL_SETTLEMENT_WP.md (PR #11)
 \* BDD: specs/gherkin/computepool_settlement.feature
 \* Solidity twin: contracts/test/invariant/ComputePoolSettlementInvariant.t.sol
@@ -46,9 +47,25 @@ VARIABLES
     expired,      \* Jobs -> BOOLEAN  (JOB_DEADLINE elapsed)
     settleCount,  \* Jobs -> Nat      (# of times escrow left escrow)
     settledBy,    \* Jobs -> Actors \cup {NoActor} (who completed, if Completed)
-    everTerminal  \* Jobs -> BOOLEAN  (has this job ever been terminal)
+    everTerminal, \* Jobs -> BOOLEAN  (has this job ever been terminal)
+    \* PBA-L2-022: the coordinator's pool membership.
+    activeJobs,     \* Nat: member.activeJobs of the coordinator
+    memberActive,   \* BOOLEAN: coordinator still a pool member
+    leaveRequested, \* BOOLEAN: requestLeave called (cooldown started)
+    cooldownDone    \* BOOLEAN: LEAVE_COOLDOWN blocks elapsed since request
 
-vars == <<status, escrow, dispatchedBy, expired, settleCount, settledBy, everTerminal>>
+jobVars == <<status, escrow, dispatchedBy, expired, settleCount, settledBy, everTerminal>>
+memberVars == <<activeJobs, memberActive, leaveRequested, cooldownDone>>
+vars == <<jobVars, memberVars>>
+
+\* Open jobs currently dispatched to the coordinator.
+DispatchedOpen == {j \in Jobs : status[j] = "Executing" /\ dispatchedBy[j] = Coordinator}
+
+\* activeJobs is decremented when a dispatched job leaves Executing.
+Release(j) ==
+    IF status[j] = "Executing" /\ dispatchedBy[j] = Coordinator
+    THEN activeJobs' = activeJobs - 1
+    ELSE activeJobs' = activeJobs
 
 Init ==
     /\ status = [j \in Jobs |-> "Pending"]
@@ -58,15 +75,22 @@ Init ==
     /\ settleCount = [j \in Jobs |-> 0]
     /\ settledBy = [j \in Jobs |-> NoActor]
     /\ everTerminal = [j \in Jobs |-> FALSE]
+    /\ activeJobs = 0
+    /\ memberActive = TRUE
+    /\ leaveRequested = FALSE
+    /\ cooldownDone = FALSE
 
 IsOpen(j) == status[j] = "Pending" \/ status[j] = "Executing"
 
 \* recordDispatch — only the elected coordinator, only while Pending.
 Dispatch(j) ==
     /\ status[j] = "Pending"
+    /\ memberActive
     /\ status' = [status EXCEPT ![j] = "Executing"]
     /\ dispatchedBy' = [dispatchedBy EXCEPT ![j] = Coordinator]
+    /\ activeJobs' = activeJobs + 1
     /\ UNCHANGED <<escrow, expired, settleCount, settledBy, everTerminal>>
+    /\ UNCHANGED <<memberActive, leaveRequested, cooldownDone>>
 
 \* completeJob — authorized actor settles to providers (escrow -> paid).
 Complete(j, actor) ==
@@ -77,7 +101,9 @@ Complete(j, actor) ==
     /\ settleCount' = [settleCount EXCEPT ![j] = @ + 1]
     /\ settledBy' = [settledBy EXCEPT ![j] = actor]
     /\ everTerminal' = [everTerminal EXCEPT ![j] = TRUE]
+    /\ Release(j)
     /\ UNCHANGED <<dispatchedBy, expired>>
+    /\ UNCHANGED <<memberActive, leaveRequested, cooldownDone>>
 
 \* failJob — authorized actor settles refund (escrow -> refunded).
 Fail(j, actor) ==
@@ -88,7 +114,9 @@ Fail(j, actor) ==
     /\ settleCount' = [settleCount EXCEPT ![j] = @ + 1]
     /\ settledBy' = [settledBy EXCEPT ![j] = actor]
     /\ everTerminal' = [everTerminal EXCEPT ![j] = TRUE]
+    /\ Release(j)
     /\ UNCHANGED <<dispatchedBy, expired>>
+    /\ UNCHANGED <<memberActive, leaveRequested, cooldownDone>>
 
 \* reclaimExpiredJob — requester-only, only after the deadline, refund-only.
 Reclaim(j) ==
@@ -99,20 +127,46 @@ Reclaim(j) ==
     /\ settleCount' = [settleCount EXCEPT ![j] = @ + 1]
     /\ settledBy' = [settledBy EXCEPT ![j] = Requester]
     /\ everTerminal' = [everTerminal EXCEPT ![j] = TRUE]
+    /\ Release(j)
     /\ UNCHANGED <<dispatchedBy, expired>>
+    /\ UNCHANGED <<memberActive, leaveRequested, cooldownDone>>
 
 \* reassignCoordinator — stalled coordinator reset; escrow untouched.
 Reassign(j) ==
     /\ status[j] = "Executing"
     /\ status' = [status EXCEPT ![j] = "Pending"]
     /\ dispatchedBy' = [dispatchedBy EXCEPT ![j] = NoActor]
+    /\ Release(j)
     /\ UNCHANGED <<escrow, expired, settleCount, settledBy, everTerminal>>
+    /\ UNCHANGED <<memberActive, leaveRequested, cooldownDone>>
 
 \* JOB_DEADLINE elapses (abstract clock).
 Expire(j) ==
     /\ ~expired[j]
     /\ expired' = [expired EXCEPT ![j] = TRUE]
     /\ UNCHANGED <<status, escrow, dispatchedBy, settleCount, settledBy, everTerminal>>
+    /\ UNCHANGED memberVars
+
+\* PBA-L2-022: two-step exit. requestLeave starts LEAVE_COOLDOWN; the
+\* member stays active (dispatchable, slashable) until leavePool.
+RequestLeave ==
+    /\ memberActive /\ ~leaveRequested
+    /\ leaveRequested' = TRUE
+    /\ UNCHANGED <<jobVars, activeJobs, memberActive, cooldownDone>>
+
+CooldownElapse ==
+    /\ leaveRequested /\ ~cooldownDone
+    /\ cooldownDone' = TRUE
+    /\ UNCHANGED <<jobVars, activeJobs, memberActive, leaveRequested>>
+
+\* leavePool: requested, cooldown elapsed, and no dispatched open job.
+Leave ==
+    /\ memberActive /\ leaveRequested /\ cooldownDone
+    /\ activeJobs = 0
+    /\ memberActive' = FALSE
+    /\ leaveRequested' = FALSE
+    /\ cooldownDone' = FALSE
+    /\ UNCHANGED <<jobVars, activeJobs>>
 
 Next ==
     \E j \in Jobs :
@@ -122,6 +176,9 @@ Next ==
         \/ Reclaim(j)
         \/ Reassign(j)
         \/ Expire(j)
+    \/ RequestLeave
+    \/ CooldownElapse
+    \/ Leave
 
 Spec == Init /\ [][Next]_vars
 
@@ -135,6 +192,10 @@ TypeOK ==
     /\ settleCount \in [Jobs -> Nat]
     /\ settledBy \in [Jobs -> Actors \cup {NoActor}]
     /\ everTerminal \in [Jobs -> BOOLEAN]
+    /\ activeJobs \in Nat
+    /\ memberActive \in BOOLEAN
+    /\ leaveRequested \in BOOLEAN
+    /\ cooldownDone \in BOOLEAN
 
 \* (1) A job's escrow is settled at most once — paid XOR refunded XOR still
 \*     escrowed, never two of those.
@@ -164,5 +225,13 @@ ExecutorOnlyCompletion ==
             (settledBy[j] = Governance
                 \/ settledBy[j] = Creator
                 \/ settledBy[j] = Coordinator)
+
+\* (5) PBA-L2-022: member.activeJobs is live — it always equals the number
+\*     of open jobs dispatched to the member (pre-fix it was never written).
+ActiveJobsAccurate == activeJobs = Cardinality(DispatchedOpen)
+
+\* (6) PBA-L2-022: a member that has left holds no dispatched open job, so a
+\*     dispatched coordinator cannot escape its liveness/SLA slash by leaving.
+NoLeaveWithOpenDispatch == ~memberActive => DispatchedOpen = {}
 
 =============================================================================
