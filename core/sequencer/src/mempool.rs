@@ -1557,6 +1557,62 @@ mod tests {
             .expect("admitted after expiry");
     }
 
+    /// Bans are per sender, persist across later bans, and the ban list is
+    /// bounded.
+    #[tokio::test]
+    async fn sender_ban_list_is_bounded_and_independent() {
+        let pool = pba_pool();
+        let a = PublicKey::new([0xB1; 32]);
+        let b = PublicKey::new([0xB2; 32]);
+        let long = std::time::Duration::from_secs(600);
+        pool.ban_sender(&a, long).await;
+        pool.ban_sender(&b, long).await;
+        assert!(
+            pool.is_banned(&a).await,
+            "an earlier ban survives a later one"
+        );
+        assert!(pool.is_banned(&b).await);
+        // Fill to the cap; the next distinct sender is not recorded.
+        for i in 2..MAX_BANNED_SENDERS {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            k[31] = 0xC0;
+            pool.banned
+                .write()
+                .await
+                .insert(PublicKey::new(k), std::time::Instant::now() + long);
+        }
+        assert_eq!(pool.banned.read().await.len(), MAX_BANNED_SENDERS);
+        let over = PublicKey::new([0xB3; 32]);
+        pool.ban_sender(&over, long).await;
+        assert!(!pool.is_banned(&over).await, "list full: not recorded");
+        pool.ban_sender(&a, long).await;
+        assert!(
+            pool.is_banned(&a).await,
+            "already-listed sender is refreshed"
+        );
+    }
+
+    #[test]
+    fn tx_size_accounting() {
+        let t = pba_native_tx(0x10, 0, 123);
+        assert_eq!(Mempool::tx_size(&t), 200 + 123);
+        assert_eq!(Mempool::tx_size(&pba_native_tx(0x10, 0, 0)), 200);
+    }
+
+    #[tokio::test]
+    async fn best_transactions_respects_count() {
+        let pool = pba_pool();
+        for seed in [0x21u8, 0x22, 0x23] {
+            pool.add_transaction(pba_native_tx(seed, 0, 0), TxClass::Standard)
+                .await
+                .expect("admit");
+        }
+        assert_eq!(pool.get_best_transactions(2, usize::MAX).await.len(), 2);
+        assert_eq!(pool.get_best_transactions(1, usize::MAX).await.len(), 1);
+        assert_eq!(pool.get_best_transactions(10, usize::MAX).await.len(), 3);
+    }
+
     /// The AI slice uses the executor's classifier (selectors 0x01..0x03 on a
     /// call) and is ordered by fee.
     #[tokio::test]
