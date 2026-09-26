@@ -387,17 +387,11 @@ pub fn merkle_verify_tensor(input: &[u8], gas_limit: u64) -> Result<PrecompileRe
     })
 }
 
-/// PBA-L1a-013: 0x0109 with the depth-0 / inner-node second-preimage closed.
+/// 0x0109 with a leaf-index range check (at/after `pba_hardening_height`).
 ///
-/// Leaves `H(index, value)` and inner nodes `H(left, right)` share one
-/// Poseidon arity-2 hash and the caller picks the proof depth, so an inner
-/// pair `(L, R)` of a committed tree "verified" as a depth-0 leaf with
-/// `index = L`. An honest leaf index always fits in `proof_depth` bits (the
-/// path walks exactly those bits), whereas `L` is a ~254-bit hash output. At
-/// and after `pba_hardening_height` a `leaf_index >= 2^proof_depth` is
-/// therefore rejected (result word 0), which rejects the forgery at every
-/// depth while leaving every honest proof's result, and the frozen commitment
-/// format, unchanged.
+/// A leaf index must fit in `proof_depth` bits (the path walks exactly those
+/// bits); a `leaf_index >= 2^proof_depth` returns result word 0. Every proof
+/// whose index fits keeps its result, and the commitment format is unchanged.
 pub fn merkle_verify_tensor_hardened(input: &[u8], gas_limit: u64) -> Result<PrecompileResult> {
     let mut result = merkle_verify_tensor(input, gas_limit)?;
     // merkle_verify_tensor validated the layout: input[32..64] is leaf_index,

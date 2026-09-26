@@ -180,9 +180,7 @@ pub const MAX_GAS_PER_BLOCK: u64 = 30_000_000;
 
 /// PBA-L1a-017: largest transaction payload (`data`) the mempool admits —
 /// geth's `txMaxSize` (4 x 32 KiB) and the same bound as the sequencer
-/// `TxValidator::max_data_size`. Anything larger could never be selected into a
-/// 1 MB block alongside other traffic, yet used to be admitted over RPC/P2P and
-/// squat a pool slot until restart (nothing ever expired it).
+/// `TxValidator::max_data_size`.
 pub const MAX_TX_DATA_BYTES: usize = 128 * 1024;
 
 /// PBA-L1a-017: ceiling on the summed size of all pooled transactions. The
@@ -1404,7 +1402,7 @@ mod tests {
     }
 
     /// PBA-L1a-017: a payload larger than any block could carry must not be
-    /// admitted (it used to be admitted and squat a slot forever).
+    /// admitted.
     #[tokio::test]
     async fn pba_l1a_017_oversized_payload_is_rejected() {
         let pool = pba_pool();

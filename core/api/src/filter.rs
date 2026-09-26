@@ -48,9 +48,6 @@ pub const MAX_FILTER_TOPIC_ALTERNATIVES: usize = 32;
 /// PBA-L1a-010: bound the size of `eth_getLogs` / `eth_newFilter` /
 /// `eth_subscribe("logs")` criteria BEFORE they are parsed or retained.
 ///
-/// The criteria used to be unbounded: a request of ~5-byte `null` topics was
-/// retained as 24-byte `Option<Vec<Hash>>` entries (4.8x) in each of up to
-/// [`MAX_FILTERS`] filters, and every scanned log walked the whole list.
 /// Oversized criteria are `-32602 invalid params`, never silently truncated.
 pub fn validate_log_filter_criteria(filter: &serde_json::Value) -> Result<(), String> {
     use serde_json::Value;

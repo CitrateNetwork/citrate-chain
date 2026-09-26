@@ -30,14 +30,12 @@ mod commands;
 mod config;
 mod consensus_manifest;
 
-// PBA-L1a-003: consensus-affecting cargo features must be identical on every
-// node, or a single unprivileged transaction exercising the precompile splits
-// the validator set. The canonical set is the crate's DEFAULT feature set.
+// PBA-L1a-003: consensus-affecting cargo features are fixed to the crate's
+// DEFAULT feature set on every node build.
 #[cfg(not(feature = "commd-fold-verify"))]
 compile_error!(
     "citrate-node must be built with the `commd-fold-verify` feature (it is in the default \
-     feature set). Without it 0x0130 returns an error where the fleet returns a verified \
-     result, and this node forks on the first such transaction (PBA-L1a-003)."
+     feature set) (PBA-L1a-003)."
 );
 // The same checks against the execution crate's ACTUAL feature set, which a
 // `--features citrate-execution/<feature>` build changes without touching this
@@ -555,8 +553,7 @@ async fn main() -> Result<()> {
         error!("{}", e);
         return Err(anyhow::anyhow!("{}", e));
     }
-    // PBA-L1a-008 / PBA-L1a-012: refuse RPC exposures that let a remote client
-    // forge its rate-limit identity or submit unsigned spends.
+    // PBA-L1a-008 / PBA-L1a-012: RPC exposure policy (see startup_guards).
     if let Err(e) = startup_guards::check_rpc_exposure(
         config.rpc.enabled,
         &config.rpc.listen_addr,
@@ -1473,9 +1470,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         })
     }));
 
-    // PBA-L1a-017: `Mempool::clear_expired` had no caller, so the 1-hour
-    // `tx_expiry_secs` never applied and never-executable transactions squatted
-    // pool slots until restart. Sweep once a minute.
+    // PBA-L1a-017: apply `tx_expiry_secs` with a periodic
+    // `Mempool::clear_expired` sweep (once a minute).
     {
         let mempool_expiry = mempool.clone();
         tokio::spawn(async move {

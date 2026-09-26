@@ -372,10 +372,8 @@ mod tests {
         }
     }
 
-    /// PBA-L1a-015 regression: a call carrying a canonical initial state but a garbage proof must
-    /// be rejected WITHOUT re-deserializing the 27 MB baked verifier key. Before the fix every call
-    /// bincode-decoded the key first (seconds per call in a debug build) for a flat ~2M gas; now the
-    /// proof is decoded first and the key is decoded once per process.
+    /// PBA-L1a-015: the baked verifier key is decoded once per process and a malformed proof is
+    /// rejected before the key is used.
     #[cfg(feature = "commd-fold-verify")]
     #[test]
     fn l1a_015_garbage_proof_does_not_redecode_the_baked_vk() {

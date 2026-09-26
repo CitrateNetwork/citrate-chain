@@ -167,13 +167,11 @@ pub const PURE_PRECOMPILE_ADDRESSES: [[u8; 20]; 16] = [
     x402::addresses::BATCH_PAYMENT_VERIFY,     // 0x0202
 ];
 
-/// PBA-L1a-022: addresses inside the Citrate precompile ranges
-/// (`PrecompileExecutor::is_precompile`) that are NOT bridged into REVM — the
-/// node-local inference family 0x0100–0x0106 and the unassigned slots of each
-/// family. Unregistered, a CALL to them hit an empty account and returned
-/// success with empty data (e.g. `ModelAccessControl.executeInference` charged
-/// for nothing). At/after `pba_hardening_height` the REVM bridge registers
-/// them as precompiles that always fail, so such a call reverts.
+/// Addresses inside the Citrate precompile ranges
+/// (`PrecompileExecutor::is_precompile`) that are not bridged into REVM (the
+/// inference family 0x0100–0x0106 and the unassigned slots of each family).
+/// At/after `pba_hardening_height` the REVM bridge registers them as
+/// precompiles that always fail.
 pub fn reserved_unbridged_addresses() -> Vec<[u8; 20]> {
     let mut out = Vec::new();
     let mut push = |family: u8, selector: u8| {

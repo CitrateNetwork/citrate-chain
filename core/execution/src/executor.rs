@@ -3890,22 +3890,14 @@ impl Executor {
         // Base gas cost
         context.use_gas(self.gas_schedule.inference_base)?;
 
-        // PBA-L1a-019: node-local inference inside consensus execution.
-        //
-        // Pre-activation, an inference-request transaction ran the model on the
-        // EXECUTING node's own runtime (`inference_service`) and paid the fee to
-        // that node's own coinbase via a non-journaled transfer. The output, the
-        // gas charged, the fee recipient and even success depend on each node's
-        // local runtime, so validators that replay the block compute different
-        // state roots — a fork. At/after `pba_hardening_height` the consensus
-        // path never consults a node-local runtime: the request reverts
-        // deterministically (base gas burned, nonce advanced, no model-state or
-        // balance writes) on every node. Inference results must re-enter the
-        // chain as signed, deterministic inputs (tracked redesign).
+        // At/after `pba_hardening_height` block execution does not consult a
+        // node-local model runtime: the request reverts deterministically
+        // (base gas burned, nonce advanced, no model-state or balance writes)
+        // on every node.
         if crate::activation::pba_hardening_active(context.block_number) {
             return Err(ExecutionError::Reverted(
-                "in-consensus inference is disabled (PBA-L1a-019): node-local model \
-                 execution is non-deterministic across validators; submit inference \
+                "in-consensus inference is disabled: node-local model \
+                 execution is not part of block execution; submit inference \
                  results as signed transactions instead"
                     .to_string(),
             ));

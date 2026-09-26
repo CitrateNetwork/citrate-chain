@@ -12,9 +12,8 @@ fn hex_of(len: usize) -> String {
     format!("0x{}", "11".repeat(len))
 }
 
-/// PBA-L4-004 (audit PoC `pba_l4_native_to_truncation.rs`): a recipient that
-/// is neither 20 nor 32 bytes used to be zero-padded / truncated into a
-/// DIFFERENT destination and signed. Length table on the native path.
+/// PBA-L4-004: a recipient must be exactly 20 or 32 bytes. Length table on the
+/// native path.
 #[test]
 fn pba_l4_004_native_recipient_length_table() {
     for bad in [1usize, 19, 21, 31, 33, 64] {
@@ -63,7 +62,7 @@ fn pba_l4_004_secp_recipient_length_table() {
     }
 }
 
-/// PBA-L4-002: `sign_v2` produces a signature the node verifies and that
+/// `sign_v2` produces a signature the node verifies and that
 /// binds chain_id (a relabelled copy fails).
 #[test]
 fn pba_l4_002_sign_v2_binds_chain_id() {

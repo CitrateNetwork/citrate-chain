@@ -2259,14 +2259,7 @@ impl BlockProducer {
 
 /// PBA-L1a-004: state-aware block-gas budget for transaction selection.
 ///
-/// The producer used to `break` out of selection at the first candidate that
-/// did not fit the remaining gas (the SEQ-H2 `continue` fix only landed in the
-/// unused sequencer `BlockBuilder`), and it reserved gas for candidates with no
-/// balance or nonce check. A single high-fee, unfunded ~30M-gas transaction —
-/// free to relay over P2P — was packed first, consumed the whole budget, failed
-/// execution unpaid, and left the block empty; repeated every block.
-///
-/// Now a candidate is admitted only if (a) it can fit a block at all (skip, not
+/// A candidate is admitted only if (a) it can fit a block at all (skip, not
 /// stop), (b) its nonce is the sender's next nonce against state (tracking the
 /// candidates already admitted from that sender), and (c) the sender's balance,
 /// net of the candidates already admitted, covers `gas_limit * gas_price + value`.
@@ -2643,12 +2636,8 @@ mod tests {
         assert!(result.is_ok(), "Legacy VRF verification should not error");
     }
 
-    /// PBA-L1a-004 regression (mirrors the sequencer `BlockBuilder` SEQ-H2 test,
-    /// at the node producer's REAL selection entry point). An attacker relays a
-    /// high-fee, ~29.9M-gas transfer from an UNFUNDED account. Before the fix the
-    /// producer packed it first (highest priority), reserved the whole 30M block
-    /// budget for it, `break`-ed on the honest 21k transfer, then the attacker tx
-    /// failed execution unpaid → an empty block, every round.
+    /// PBA-L1a-004: an unfunded high-declared-gas candidate is not selected and
+    /// a funded transfer is (mirrors the sequencer `BlockBuilder` SEQ-H2 test).
     #[tokio::test]
     async fn pba_l1a_004_unfunded_block_filler_does_not_crowd_out_honest_tx() {
         let tmp = TempDir::new().expect("tempdir");
@@ -2666,7 +2655,7 @@ mod tests {
         }));
 
         let honest = Address([0x11; 20]);
-        let attacker = Address([0x66; 20]); // never funded
+        let unfunded = Address([0x66; 20]);
         let recipient = Address([0x33; 20]);
         state_db.accounts.create_account_if_not_exists(honest);
         state_db
@@ -2674,7 +2663,7 @@ mod tests {
             .set_balance(honest, U256::from(21_000u64 * 1_000_000_000u64 * 10));
 
         let honest_tx = transfer_tx(0xA1, honest, recipient, 0);
-        let mut filler = transfer_tx(0xF1, attacker, recipient, 0);
+        let mut filler = transfer_tx(0xF1, unfunded, recipient, 0);
         filler.gas_limit = 29_990_000;
         filler.gas_price = 1_000_000_000_000; // 1000x the honest fee: selected first
         mempool

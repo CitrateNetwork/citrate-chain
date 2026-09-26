@@ -273,12 +273,10 @@ pub struct RpcConfig {
 
     /// PBA-L1a-008: reverse-proxy addresses whose `X-Forwarded-For` /
     /// `X-Real-IP` headers identify the real client for per-client rate
-    /// limiting. Empty (default) = every client shares one bucket.
+    /// limiting. Empty (default) = forwarding headers are not trusted.
     ///
-    /// The HTTP server cannot see the TCP peer address, so forwarding headers
-    /// are honoured from ANY connection once this is set. The node therefore
-    /// refuses to start with `trusted_proxies` set unless RPC is bound to a
-    /// loopback address (so only the co-located proxy can connect).
+    /// The node accepts `trusted_proxies` only with RPC bound to a loopback
+    /// address (so only the co-located proxy can connect).
     #[serde(default)]
     pub trusted_proxies: Vec<std::net::IpAddr>,
 

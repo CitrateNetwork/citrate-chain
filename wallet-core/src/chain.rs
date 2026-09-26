@@ -217,12 +217,8 @@ impl TransactionBuilder {
         self.sign_native(signing_key, nonce, false)
     }
 
-    /// PBA-L4-002: sign with the V2 native preimage, which binds `chain_id`
-    /// (and every fee/type field) under a domain tag, so the signature cannot
-    /// be replayed on a network with a different chain id. Nodes accept V2
-    /// from this release on; the legacy [`Self::sign`] (V1) stays the default
-    /// until every supported node version verifies V2, after which the fleet
-    /// schedules the V1 sunset.
+    /// Sign with the V2 native preimage, which binds `chain_id` and every
+    /// fee/type field under a domain tag. Nodes verify V2 from this release on.
     pub fn sign_v2(
         self,
         signing_key: &SigningKey,

@@ -1,9 +1,6 @@
 // PBA-R2 (lane CHAIN-EXEC) regression tests for the chain node's external RPC
-// surface. Each test is the audit PoC (citrate-security
-// audits/2026-09-24-prebounty-adversarial-audit/lanes/L1a-chain-execution-rpc/
-// evidence/l1a_poc.rs) turned around: it drives the REAL entry point (the
-// registered IoHandler, or the spawned HTTP / WebSocket server) and asserts the
-// bound holds. Local only: every server binds 127.0.0.1 inside this process.
+// surface. Each test drives the real entry point (the registered IoHandler,
+// or the spawned HTTP / WebSocket server) and asserts the bound holds. Local only: every server binds 127.0.0.1 inside this process.
 
 use citrate_api::rate_limit::RateLimitConfig;
 use citrate_api::FilterRegistry;
@@ -105,7 +102,7 @@ fn error_code(v: &serde_json::Value) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// PBA-L1a-002 (HIGH): eth_feeHistory rewardPercentiles amplification.
+// PBA-L1a-002: eth_feeHistory rewardPercentiles bounds.
 // ---------------------------------------------------------------------------
 
 fn fee_history_req(block_count: &str, n_percentiles: usize) -> String {
@@ -126,7 +123,7 @@ fn pba_l1a_002_fee_history_rejects_more_than_100_percentiles() {
         Some(-32602),
         "101 percentiles must be invalid params: {v}"
     );
-    // The audit PoC's 50,000-entry list is refused before any block is read.
+    // A 50,000-entry list is refused before any block is read.
     let v = call(&io, &fee_history_req("0x400", 50_000));
     assert_eq!(
         error_code(&v),
@@ -207,7 +204,7 @@ fn pba_l1a_010_filter_criteria_are_bounded() {
     allow_anon_budget();
     let (storage, _tmp) = storage_with_tx_blocks(1);
     let io = eth_io(storage);
-    // The audit PoC: 1,000,000 null topic positions.
+    // 1,000,000 topic positions.
     let topics = vec!["null"; 1_000_000].join(",");
     for method in ["eth_newFilter", "eth_getLogs"] {
         let req = format!(
@@ -400,7 +397,7 @@ fn pba_l1a_009_batch_elements_are_charged_as_requests() {
     let _g = HTTP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     allow_anon_budget();
     let (storage, _tmp) = storage_with_tx_blocks(2);
-    // The audit PoC shape: a 3-request window.
+    // A 3-request window.
     let (port, close) = spawn_rpc(
         storage,
         RateLimitConfig {
@@ -462,11 +459,11 @@ fn pba_l1a_023_loopback_rpc_rejects_foreign_host_header() {
     let (storage, _tmp) = storage_with_tx_blocks(1);
     let (port, close) = spawn_rpc(storage, RateLimitConfig::default());
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}"#;
-    let evil = http_post_host(port, "rebind.attacker.example", body);
+    let foreign = http_post_host(port, "other-host.example", body);
     assert!(
-        evil.starts_with("HTTP/1.1 403"),
+        foreign.starts_with("HTTP/1.1 403"),
         "a rebinding Host must be refused: {}",
-        evil.lines().next().unwrap_or("")
+        foreign.lines().next().unwrap_or("")
     );
     for host in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
         let ok = http_post_host(port, &host, body);
@@ -584,7 +581,7 @@ async fn pba_l1a_005_ws_handshake_times_out() {
 }
 
 // ---------------------------------------------------------------------------
-// PBA-L1a-018 (MEDIUM): RLP re-encoding malleability.
+// PBA-L1a-018: canonical RLP encoding.
 // ---------------------------------------------------------------------------
 
 fn be_trim(b: &[u8]) -> Vec<u8> {
@@ -647,7 +644,7 @@ fn pba_l1a_018_legacy_tx_has_one_encoding() {
     let extra = signed_legacy(true, false);
     assert!(
         decode_eth_transaction(&extra).is_err(),
-        "an extra RLP list item must be rejected (re-hash malleability)"
+        "an extra RLP list item must be rejected"
     );
     // (b) trailing bytes after the list
     let mut trailing = raw.clone();

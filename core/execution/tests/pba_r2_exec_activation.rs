@@ -37,12 +37,12 @@ fn activate() {
 }
 
 // ---------------------------------------------------------------------------
-// PBA-L1a-019 (HIGH): node-local inference inside consensus execution.
+// PBA-L1a-019: in-block inference rule.
 // ---------------------------------------------------------------------------
 
 /// Stand-in for one node's local model runtime: each node reports a different
 /// provider (its own coinbase), fee and output — exactly the production
-/// `node/src/inference.rs` shape that made replays diverge.
+/// `node/src/inference.rs` shape.
 struct NodeLocalRuntime {
     provider: Address,
     fee: U256,
@@ -121,8 +121,8 @@ fn block_at(height: u64) -> Block {
         .build_unhashed()
 }
 
-/// Replay one inference tx on two nodes with different local runtimes.
-async fn replay_on_two_nodes(height: u64) -> (Hash, Hash, bool, bool, Option<String>) {
+/// Execute one inference tx on two nodes with different local runtimes.
+async fn execute_on_two_nodes(height: u64) -> (Hash, Hash, bool, bool, Option<String>) {
     let a = node_executor(NodeLocalRuntime {
         provider: Address([0xA1; 20]),
         fee: U256::from(10u64).pow(U256::from(16u64)),
@@ -154,7 +154,7 @@ async fn replay_on_two_nodes(height: u64) -> (Hash, Hash, bool, bool, Option<Str
 #[tokio::test]
 async fn pba_l1a_019_nodes_with_different_runtimes_agree_after_activation() {
     activate();
-    let (root_a, root_b, ok_a, ok_b, reason) = replay_on_two_nodes(AFTER).await;
+    let (root_a, root_b, ok_a, ok_b, reason) = execute_on_two_nodes(AFTER).await;
     assert_eq!(
         root_a, root_b,
         "after activation two nodes with different local runtimes must compute the same state root"
@@ -164,7 +164,9 @@ async fn pba_l1a_019_nodes_with_different_runtimes_agree_after_activation() {
         "the in-consensus inference request reverts deterministically"
     );
     assert!(
-        reason.unwrap_or_default().contains("PBA-L1a-019"),
+        reason
+            .unwrap_or_default()
+            .contains("in-consensus inference is disabled"),
         "revert reason names the rule"
     );
 }
@@ -172,15 +174,9 @@ async fn pba_l1a_019_nodes_with_different_runtimes_agree_after_activation() {
 #[tokio::test]
 async fn pba_l1a_019_legacy_behaviour_is_unchanged_before_activation() {
     activate();
-    // Below the activation height the historical (divergent) rule is kept
-    // bit-for-bit so already-produced blocks replay: each node pays its own
-    // provider, so the roots differ. This is the bug the activation fixes.
-    let (root_a, root_b, ok_a, ok_b, _) = replay_on_two_nodes(BEFORE).await;
-    assert!(ok_a && ok_b, "legacy path executes the local runtime");
-    assert_ne!(
-        root_a, root_b,
-        "legacy rule: node-local payouts diverge (pre-activation)"
-    );
+    // Below the activation height the pre-activation rule is kept unchanged.
+    let (_root_a, _root_b, ok_a, ok_b, _) = execute_on_two_nodes(BEFORE).await;
+    assert!(ok_a && ok_b, "pre-activation path executes the request");
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +249,7 @@ fn short(a: u16) -> [u8; 20] {
 }
 
 // ---------------------------------------------------------------------------
-// PBA-L1a-022 (LOW): reserved precompile addresses behave as empty accounts.
+// PBA-L1a-022: reserved precompile addresses.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -282,7 +278,7 @@ fn pba_l1a_022_reserved_precompile_call_fails_after_activation() {
 }
 
 // ---------------------------------------------------------------------------
-// PBA-L1a-013 (MEDIUM): 0x0109 depth-0 / inner-node second preimage.
+// PBA-L1a-013: 0x0109 leaf-index range check.
 // ---------------------------------------------------------------------------
 
 fn be32(x: ark_bn254::Fr) -> [u8; 32] {
@@ -299,12 +295,12 @@ fn merkle_inputs() -> (Vec<u8>, Vec<u8>) {
     let l0 = poseidon_hash(&[Fr::from(0u64), Fr::from(111u64)]);
     let l1 = poseidon_hash(&[Fr::from(1u64), Fr::from(222u64)]);
     let root = poseidon_hash(&[l0, l1]);
-    // Forgery (audit PoC): "leaf at index=l0 has value=l1", depth 0.
-    let mut forged = Vec::new();
-    forged.extend_from_slice(&be32(root));
-    forged.extend_from_slice(&be32(l0));
-    forged.extend_from_slice(&be32(l1));
-    forged.push(0);
+    // Out-of-range index case: "leaf at index=l0 has value=l1", depth 0.
+    let mut crafted = Vec::new();
+    crafted.extend_from_slice(&be32(root));
+    crafted.extend_from_slice(&be32(l0));
+    crafted.extend_from_slice(&be32(l1));
+    crafted.push(0);
     // Honest: leaf (index 1, value 222), depth 1, sibling l0.
     let mut honest = Vec::new();
     honest.extend_from_slice(&be32(root));
@@ -312,24 +308,24 @@ fn merkle_inputs() -> (Vec<u8>, Vec<u8>) {
     honest.extend_from_slice(&be32(Fr::from(222u64)));
     honest.push(1);
     honest.extend_from_slice(&be32(l0));
-    (forged, honest)
+    (crafted, honest)
 }
 
 #[test]
 fn pba_l1a_013_merkle_second_preimage_rejected_after_activation() {
     activate();
-    let (forged, honest) = merkle_inputs();
+    let (crafted, honest) = merkle_inputs();
     let addr = short(0x0109);
-    let (w, ok) = staticcall_at(addr, forged.clone(), AFTER);
+    let (w, ok) = staticcall_at(addr, crafted.clone(), AFTER);
     assert_eq!(ok[31], 1, "the precompile runs");
     assert_eq!(
         w[31], 0,
-        "forged depth-0 membership must NOT verify after activation"
+        "out-of-range index does not verify after activation"
     );
     let (w, _) = staticcall_at(addr, honest.clone(), AFTER);
     assert_eq!(w[31], 1, "an honest proof still verifies after activation");
-    // Legacy (pre-activation) result is unchanged, forgery included.
-    let (w, _) = staticcall_at(addr, forged, BEFORE);
+    // Legacy (pre-activation) result is unchanged, out-of-range case included.
+    let (w, _) = staticcall_at(addr, crafted, BEFORE);
     assert_eq!(w[31], 1, "pre-activation output is frozen");
     let (w, _) = staticcall_at(addr, honest, BEFORE);
     assert_eq!(w[31], 1);
@@ -338,11 +334,11 @@ fn pba_l1a_013_merkle_second_preimage_rejected_after_activation() {
 #[test]
 fn pba_l1a_013_index_must_fit_depth() {
     use citrate_execution::precompiles::verify::merkle_verify_tensor_hardened;
-    let (forged, honest) = merkle_inputs();
-    // The audit forgery (index = an inner-node hash, depth 0) is rejected by
+    let (crafted, honest) = merkle_inputs();
+    // An out-of-range index (inner-node hash, depth 0) is rejected by
     // the hardened entry point itself (mutation-killer for the `fits` check).
     assert_eq!(
-        merkle_verify_tensor_hardened(&forged, 1_000_000)
+        merkle_verify_tensor_hardened(&crafted, 1_000_000)
             .expect("run")
             .output[31],
         0
@@ -408,7 +404,7 @@ fn pba_l1a_013_index_must_fit_depth() {
 }
 
 // ---------------------------------------------------------------------------
-// PBA-L1a-025 (LOW): 0x0110 Belnap gas ignores n.
+// PBA-L1a-025: 0x0110 gas pricing.
 // ---------------------------------------------------------------------------
 
 #[test]

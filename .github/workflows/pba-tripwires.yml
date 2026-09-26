@@ -28,5 +28,5 @@ jobs:
       # Prove the scanner still detects each class, then scan the tree.
       - name: Tripwire self-test
         run: scripts/ci/check_pba_exec_tripwires.sh --self-test
-      - name: CHAIN-EXEC tripwires (signature bypass, node feature set, mempool expiry, metrics bind)
+      - name: CHAIN-EXEC tripwires (signature setting, node feature set, mempool expiry, metrics bind)
         run: scripts/ci/check_pba_exec_tripwires.sh

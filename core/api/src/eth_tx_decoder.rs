@@ -8,14 +8,8 @@ use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, Secp256
 use sha3::{Digest, Keccak256};
 use tracing::debug;
 
-/// PBA-L1a-018: a signed transaction must have exactly ONE byte encoding.
-///
-/// The decoders read fields by index and hash the raw input, so extra list
-/// items, trailing bytes after the list, or a signature word padded/truncated
-/// on the way in all decoded to the SAME signed transaction under a NEW hash —
-/// letting anyone re-broadcast a victim's transaction under a hash they chose
-/// (and front-run its hash slot). Require the list to have exactly the fields
-/// the type defines and to span the whole input.
+/// PBA-L1a-018: a signed transaction has exactly ONE byte encoding: the list
+/// has exactly the fields the type defines and spans the whole input.
 fn require_canonical_list(
     rlp: &Rlp,
     whole: &[u8],

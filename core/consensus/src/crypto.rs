@@ -52,18 +52,16 @@ pub fn verify_transaction(tx: &Transaction) -> Result<bool, CryptoError> {
             Ok(false)
         }
     } else {
-        // ed25519 native transaction verification (V2, or legacy V1 until
-        // the coordinated V1 sunset — PBA-L4-002).
+        // ed25519 native transaction verification (V2 or V1 preimage).
         verify_ed25519_transaction(tx, true)
     }
 }
 
 /// Verify an ed25519 native transaction signature.
 ///
-/// PBA-L4-002 / PBA-L1a-011: accepts the V2 preimage ([`canonical_tx_bytes_v2`],
-/// which binds `chain_id` and every fee/type field under a domain tag) and,
-/// for wallets not yet upgraded, the legacy V1 preimage. Rejecting V1 is a
-/// coordinated, height-activated step: see [`verify_transaction_with_policy`].
+/// Accepts the V2 preimage ([`canonical_tx_bytes_v2`], which binds
+/// `chain_id` and every fee/type field under a domain tag) and, when
+/// `accept_v1`, the V1 preimage ([`canonical_tx_bytes`]).
 fn verify_ed25519_transaction(tx: &Transaction, accept_v1: bool) -> Result<bool, CryptoError> {
     // Convert our types to ed25519-dalek types
     let public_key =
@@ -80,7 +78,7 @@ fn verify_ed25519_transaction(tx: &Transaction, accept_v1: bool) -> Result<bool,
     if !accept_v1 {
         return Ok(false);
     }
-    // Legacy V1 canonical bytes (everything except signature, NO chain_id).
+    // V1 canonical bytes.
     let message = canonical_tx_bytes(tx)?;
     match public_key.verify(&message, &signature) {
         Ok(_) => Ok(true),
@@ -102,9 +100,8 @@ pub fn canonical_signing_bytes(tx: &Transaction) -> Vec<u8> {
     canonical_tx_bytes(tx).unwrap_or_default()
 }
 
-/// PBA-L4-002: [`verify_transaction`] with an explicit native-signature policy.
-/// `accept_v1 = false` rejects legacy V1 native signatures (which do not bind
-/// `chain_id`); callers pass it once the fleet has scheduled the V1 sunset.
+/// [`verify_transaction`] with an explicit native-signature policy:
+/// `accept_v1 = false` accepts only V2 native signatures.
 pub fn verify_transaction_with_policy(
     tx: &Transaction,
     accept_v1: bool,
@@ -115,7 +112,7 @@ pub fn verify_transaction_with_policy(
     verify_ed25519_transaction(tx, accept_v1)
 }
 
-/// PBA-L4-002: sign with the V2 native preimage (binds `chain_id`, fee caps,
+/// Sign with the V2 native preimage (binds `chain_id`, fee caps,
 /// tx type and access list under a domain tag). `tx.chain_id` must be set.
 pub fn sign_transaction_v2(
     tx: &mut Transaction,
@@ -135,14 +132,12 @@ pub fn sign_transaction_v2(
 /// Domain tag for the V2 native transaction preimage.
 pub const NATIVE_TX_V2_DOMAIN: &[u8] = b"CITRATE-NATIVE-TX-V2\0";
 
-/// PBA-L4-002 / PBA-L1a-011: V2 canonical bytes for native (ed25519)
-/// transactions. V1 ([`canonical_tx_bytes`]) omitted `chain_id`,
-/// `eth_tx_type`, `max_fee_per_gas`, `max_priority_fee_per_gas` and
-/// `access_list`, so those fields could be rewritten under a valid signature
-/// (cross-network replay; tip math reads the fee caps). V2 commits to every
-/// field except `hash`, `signature` and the node-local `ecdsa_verified` /
-/// `tx_type` (derived from `data`) under a domain tag, with length/presence
-/// prefixes so no two field layouts share an encoding.
+/// V2 canonical bytes for native (ed25519) transactions. The V2 preimage
+/// binds `chain_id`, `eth_tx_type`, the fee caps and `access_list` in
+/// addition to the V1 fields: every field except `hash`, `signature` and the
+/// node-local `ecdsa_verified` / `tx_type` (derived from `data`), under a
+/// domain tag, with length/presence prefixes so no two field layouts share
+/// an encoding.
 pub fn canonical_tx_bytes_v2(tx: &Transaction) -> Vec<u8> {
     fn opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
         match v {
@@ -457,11 +452,8 @@ mod tests {
         }
     }
 
-    /// PBA-L4-002 / PBA-L1a-011 (audit PoC `pba_l4_native_sig_scope.rs`): the
-    /// V2 preimage binds chain_id and every fee/type field, so a relabelled
-    /// copy of a signed transaction no longer verifies. Table over every
-    /// non-signature field (the property "mutating any consensus field
-    /// breaks the signature").
+    /// The V2 preimage binds every non-signature field: changing any of them
+    /// invalidates the signature.
     #[test]
     fn pba_l4_002_v2_signature_binds_every_field() {
         let key = SigningKey::from_bytes(&[0x42; 32]);
@@ -487,38 +479,34 @@ mod tests {
             ("data", |t| t.data.push(0)),
         ];
         for (name, m) in mutations {
-            let mut forged = tx.clone();
-            m(&mut forged);
+            let mut changed = tx.clone();
+            m(&mut changed);
             assert!(
-                !verify_transaction(&forged).expect("verify"),
+                !verify_transaction(&changed).expect("verify"),
                 "V2 signature must not survive rewriting `{name}`"
             );
         }
     }
 
-    /// PBA-L4-002: the legacy V1 preimage is what made relabelling possible.
-    /// Until the coordinated V1 sunset it is still accepted by default; the
-    /// strict policy (post-sunset) rejects it.
+    /// The signature policy switch: V1 signatures verify under the default
+    /// policy and not under the V2-only policy.
     #[test]
-    fn pba_l4_002_v1_relabel_rejected_under_strict_policy() {
+    fn native_signature_policy_switch() {
         let key = SigningKey::from_bytes(&[0x43; 32]);
         let mut tx = pba_native_tx();
         tx.chain_id = Some(1337);
         sign_transaction(&mut tx, &key).expect("sign v1");
-        let mut relabelled = tx.clone();
-        relabelled.chain_id = Some(40204);
-        relabelled.max_fee_per_gas = Some(u64::MAX);
         assert!(
-            verify_transaction_with_policy(&relabelled, true).expect("verify"),
-            "legacy policy: V1 does not bind chain_id (the finding)"
+            verify_transaction_with_policy(&tx, true).expect("verify"),
+            "default policy accepts V1"
         );
         assert!(
-            !verify_transaction_with_policy(&relabelled, false).expect("verify"),
-            "strict policy rejects V1 signatures"
+            !verify_transaction_with_policy(&tx, false).expect("verify"),
+            "V2-only policy rejects V1"
         );
     }
 
-    /// PBA-L4-002: V2 requires a chain id to bind.
+    /// V2 signing requires a chain id.
     #[test]
     fn pba_l4_002_v2_requires_chain_id() {
         let key = SigningKey::from_bytes(&[0x44; 32]);

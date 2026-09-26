@@ -504,10 +504,7 @@ pub struct RpcConfig {
 /// PBA-L1a-023: the `Host` allowlist the HTTP RPC server enforces, or `None`
 /// for "any host".
 ///
-/// A browser page on `evil.example` can rebind its DNS name to 127.0.0.1 and
-/// then talk to a loopback node with `Host: evil.example`; CORS does not stop
-/// same-origin requests. Checking `Host` is the standard defence (geth
-/// `--http.vhosts=localhost`). A reverse proxy in front of a loopback node
+/// Same policy as geth `--http.vhosts=localhost`. A reverse proxy in front of a loopback node
 /// forwards the public `Host`, so a proxied node (trusted proxies configured)
 /// or a public bind keeps the permissive default unless `allowed_hosts` names
 /// the public hostnames explicitly.

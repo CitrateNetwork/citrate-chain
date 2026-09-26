@@ -534,11 +534,8 @@ pub fn execute(input: &[u8], gas_limit: u64) -> Result<crate::precompiles::Preco
     execute_at(input, gas_limit, false)
 }
 
-/// PBA-L1a-025: the O(n x dim) aggregation work used to be priced on `dim`
-/// alone (`2000 + 50*dim`), so `n = 1024` participants cost the same as one.
-/// At/after `pba_hardening_height` (`hardened`) the charge is
-/// `2000 + 50 * dim * max(n, 1)`; before it the legacy price is kept
-/// bit-for-bit so historical blocks replay.
+/// Gas for 0x0110. At/after `pba_hardening_height` (`hardened`) the charge is
+/// `2000 + 50 * dim * max(n, 1)`; before it, `2000 + 50 * dim`.
 pub fn gas_for(input: &[u8], hardened: bool) -> u64 {
     let dim_hint = if input.len() >= 4 {
         u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as u64

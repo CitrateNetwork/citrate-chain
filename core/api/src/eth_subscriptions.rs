@@ -81,10 +81,8 @@ impl Drop for SocketSlot {
 }
 
 /// PBA-L1a-005: the accept loop, generic over the accept source so the
-/// "an accept error must not end the loop" property is testable. The old loop
-/// was `while let Ok(..) = listener.accept().await`: the FIRST error (EMFILE
-/// under fd pressure, ECONNABORTED, ...) ended it, `start()` returned `Ok(())`,
-/// and the WS endpoint stayed dead until the process restarted.
+/// "an accept error does not end the loop" property is testable: errors are
+/// logged and retried with backoff.
 pub async fn run_accept_loop<A, AF, H>(mut accept: A, mut handle: H)
 where
     A: FnMut() -> AF,

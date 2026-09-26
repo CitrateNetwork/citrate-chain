@@ -4,19 +4,14 @@
 //! logic is unit-tested without booting a node. `main` calls them before any
 //! listener is bound or the producer starts.
 //!
-//! * PBA-L1a-007 — `CITRATE_REQUIRE_VALID_SIGNATURE=0` turns off mempool
-//!   signature verification. On a mining node that means forged-sender native
-//!   transactions are sealed into blocks (followers do not re-verify). A
-//!   production build refuses to mine with it set.
-//! * PBA-L1a-008 — `rpc.trusted_proxies` makes the rate limiter trust
-//!   `X-Forwarded-For` from ANY connection (the HTTP server cannot see the TCP
-//!   peer). That is only sound when RPC is loopback-bound behind the proxy.
-//! * PBA-L1a-012 — `rpc.allow_eth_send_transaction = true` accepts unsigned
-//!   transactions from any `from`; on a non-loopback RPC that lets anyone who
-//!   can reach the port spend any account. Only the local devnet genesis
-//!   profile (`"default"`) may combine it with a public bind.
-//! * PBA-L1a-024 — the metrics server used to default to `0.0.0.0:9100` and to
-//!   fall back to `0.0.0.0` on an unparsable address.
+//! * PBA-L1a-007 — a production build refuses to mine with
+//!   `CITRATE_REQUIRE_VALID_SIGNATURE` disabling mempool signature checks.
+//! * PBA-L1a-008 — `rpc.trusted_proxies` is accepted only with a
+//!   loopback-bound RPC (behind the proxy).
+//! * PBA-L1a-012 — `rpc.allow_eth_send_transaction = true` is accepted only
+//!   with a loopback RPC or the local devnet genesis profile (`"default"`).
+//! * PBA-L1a-024 — the metrics server binds loopback by default and is
+//!   disabled on an unparsable address.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
@@ -45,16 +40,15 @@ pub fn resolve_require_valid_signature(
         return Err(
             "refusing to start: CITRATE_REQUIRE_VALID_SIGNATURE disables transaction \
              signature verification, and this node mines (--mine / mining.enabled). \
-             A mining node without signature checks seals forged-sender transactions \
-             into blocks (PBA-L1a-007). Unset the variable."
+             A mining node requires signature checks (PBA-L1a-007). Unset the variable."
                 .to_string(),
         );
     }
     Ok(require)
 }
 
-/// PBA-L1a-008 / PBA-L1a-012: refuse RPC exposures that let an unauthenticated
-/// remote client spoof its rate-limit identity or spend other accounts.
+/// PBA-L1a-008 / PBA-L1a-012: RPC exposure policy (trusted proxies and
+/// unsigned sends require a loopback bind).
 pub fn check_rpc_exposure(
     rpc_enabled: bool,
     listen_addr: &SocketAddr,
@@ -69,17 +63,16 @@ pub fn check_rpc_exposure(
     if !trusted_proxies.is_empty() && !loopback {
         return Err(format!(
             "refusing to start: rpc.trusted_proxies is set but RPC listens on {listen_addr}. \
-             The RPC server cannot see the TCP peer, so any client could forge \
-             X-Forwarded-For and pick its own rate-limit bucket (PBA-L1a-008). Bind RPC to \
+             Forwarding headers are only trusted behind a loopback-bound RPC \
+             (PBA-L1a-008). Bind RPC to \
              127.0.0.1 behind the proxy, or clear trusted_proxies."
         ));
     }
     if allow_eth_send_transaction && !loopback && genesis_profile != Some("default") {
         return Err(format!(
-            "refusing to start: rpc.allow_eth_send_transaction = true on a non-loopback RPC \
-             ({listen_addr}) lets anyone who can reach the port submit unsigned transactions \
-             from any address (PBA-L1a-012). It is only allowed for the local devnet genesis \
-             profile. Bind RPC to 127.0.0.1 or set allow_eth_send_transaction = false."
+            "refusing to start: rpc.allow_eth_send_transaction = true requires a loopback RPC \
+             (listening on {listen_addr}) outside the local devnet genesis profile \
+             (PBA-L1a-012). Bind RPC to 127.0.0.1 or set allow_eth_send_transaction = false."
         ));
     }
     Ok(())
@@ -109,7 +102,7 @@ mod tests {
     fn l1a_007_mining_with_signature_checks_disabled_is_refused() {
         for v in ["0", "false", "no", "off", "OFF"] {
             let err = resolve_require_valid_signature(Some(v), true, false)
-                .expect_err("production mining node must refuse sig bypass");
+                .expect_err("production mining node must refuse disabled signature checks");
             assert!(err.contains("PBA-L1a-007"), "{err}");
         }
     }
