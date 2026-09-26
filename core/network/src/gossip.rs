@@ -660,11 +660,11 @@ impl GossipProtocol {
         }
 
         // 7. HASH_MISMATCH — recompute canonical hash from all fields (C-05)
-        if !block.verify_hash() {
+        if !block.verify_hash_for(self.pba_hardening) {
             warn!(
                 "[HASH_MISMATCH] block={} computed={}",
                 block.header.block_hash,
-                block.compute_hash()
+                block.compute_hash_for(self.pba_hardening)
             );
             return false;
         }

@@ -1616,6 +1616,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         Arc::new(move |pk: &citrate_consensus::types::PublicKey| {
             exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
         })
+    })
+    // Native signatures: from tip H - 1 the pool admits only the chain-bound
+    // (v2) digest and evicts legacy ones (`citrate_consensus::native_sig`).
+    .with_native_sig_policy(citrate_consensus::hardening::PbaHardening::from_process(), {
+        let st = storage.clone();
+        Arc::new(move || st.blocks.get_latest_height().ok())
     }));
 
     // PBA-L1a-017: apply `tx_expiry_secs` with a periodic

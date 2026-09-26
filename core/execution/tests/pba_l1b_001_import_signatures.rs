@@ -71,7 +71,34 @@ fn native_signed(
         chain_id: Some(chain),
         ..Default::default()
     };
+    // From the activation height native signatures use the chain-bound digest.
+    crypto::sign_transaction_v2(&mut tx, sk).unwrap();
+    tx.hash = native_tx_id(&tx);
+    tx
+}
+
+/// Recipient for the tests below.
+const PAYEE: [u8; 20] = [0xBB; 20];
+
+/// A native transfer signed with the legacy (V1) digest for `signed_chain`,
+/// then labelled with this chain's id.
+fn native_v1_for_chain(
+    sk: &crypto::Ed25519SigningKey,
+    to: [u8; 20],
+    value: u128,
+    signed_chain: u64,
+) -> Transaction {
+    let mut tx = Transaction {
+        nonce: 0,
+        to: Some(embedded(to)),
+        value,
+        gas_limit: 21_000,
+        gas_price: 1_000_000_000,
+        chain_id: Some(signed_chain),
+        ..Default::default()
+    };
     crypto::sign_transaction(&mut tx, sk).unwrap();
+    tx.chain_id = Some(CHAIN);
     tx.hash = native_tx_id(&tx);
     tx
 }
@@ -255,4 +282,92 @@ fn pba_l1b_001_tripwire_import_gate_precedes_state_mutation() {
         src[vb..vb + 2_500].contains("tx_auth::verify_for_block(tx, self.chain_id)"),
         "verify_block_body must authenticate every tx with tx_auth::verify_for_block"
     );
+}
+
+/// A V1 native tx signed for another chain and labelled with this one applies
+/// below the activation height (legacy validity) and is rejected from it.
+#[tokio::test]
+async fn v1_native_signed_for_another_chain_applies_below_h_rejected_from_h() {
+    let sk = crypto::Ed25519SigningKey::from_bytes(&[0x14; 32]);
+    let sender = PublicKey::new(sk.verifying_key().to_bytes());
+    let fund = [(sender, funds())];
+    let tx = native_v1_for_chain(&sk, PAYEE, 5, 1337);
+
+    // Block height is 1: H = 2 is "below", H = 1 is "at".
+    let below = PbaHardening::at(2);
+    let block = seal(below, &fund, vec![tx.clone()]).await;
+    follower(below, &fund)
+        .apply_block(&block, COINBASE, &[])
+        .await
+        .expect("below H: legacy validity");
+
+    let at = PbaHardening::at(1);
+    let block = seal(at, &fund, vec![tx]).await;
+    let f = follower(at, &fund);
+    let r = f.apply_block(&block, COINBASE, &[]).await;
+    assert!(
+        matches!(r, Err(ref e) if e.to_string().contains("legacy digest")),
+        "at H a V1 native signature is invalid, got {r:?}"
+    );
+    assert_eq!(
+        f.get_balance(&address_utils::normalize_address(&embedded(PAYEE))),
+        U256::zero()
+    );
+}
+
+/// From H even a V1 tx genuinely signed for this chain is invalid; the same
+/// transfer signed V2 applies.
+#[tokio::test]
+async fn v1_native_rejected_v2_applies_from_h() {
+    let sk = crypto::Ed25519SigningKey::from_bytes(&[0x15; 32]);
+    let sender = PublicKey::new(sk.verifying_key().to_bytes());
+    let fund = [(sender, funds())];
+    let pba = PbaHardening::at(1);
+    let v1 = native_v1_for_chain(&sk, PAYEE, 5, CHAIN);
+    let block = seal(pba, &fund, vec![v1]).await;
+    assert!(follower(pba, &fund)
+        .apply_block(&block, COINBASE, &[])
+        .await
+        .is_err());
+    let block = seal(pba, &fund, vec![native_signed(&sk, PAYEE, 5, CHAIN)]).await;
+    follower(pba, &fund)
+        .apply_block(&block, COINBASE, &[])
+        .await
+        .expect("V2 applies at H");
+}
+
+/// A native tx "from" a small-order public key, with a signature made without the secret key
+/// (R = identity, s = 0) passes non-strict ed25519 verification. From the
+/// activation height the block rule verifies strictly and refuses it; below
+/// it import is unchanged.
+#[tokio::test]
+async fn small_order_key_signature_rejected_from_h_applies_below_h() {
+    use citrate_consensus::native_sig::{small_order_key_signature, NativeSigVersion};
+    let template = Transaction {
+        nonce: 0,
+        to: Some(embedded(PAYEE)),
+        value: 5,
+        gas_limit: 21_000,
+        gas_price: 1_000_000_000,
+        chain_id: Some(CHAIN),
+        ..Default::default()
+    };
+    let tx = small_order_key_signature(&template, NativeSigVersion::V2).expect("found");
+    let fund = [(tx.from, funds())];
+
+    let at = PbaHardening::at(1);
+    let block = seal(at, &fund, vec![tx.clone()]).await;
+    let f = follower(at, &fund);
+    assert!(f.apply_block(&block, COINBASE, &[]).await.is_err());
+    assert_eq!(
+        f.get_balance(&address_utils::normalize_address(&embedded(PAYEE))),
+        U256::zero()
+    );
+
+    let below = PbaHardening::at(2);
+    let block = seal(below, &fund, vec![tx]).await;
+    follower(below, &fund)
+        .apply_block(&block, COINBASE, &[])
+        .await
+        .expect("below H: legacy import unchanged");
 }

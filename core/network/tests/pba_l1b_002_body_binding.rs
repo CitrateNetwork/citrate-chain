@@ -32,7 +32,7 @@ fn signed_native(seed: u8, nonce: u64, to: [u8; 32], value: u128) -> Transaction
         chain_id: Some(40204),
         ..Default::default()
     };
-    crypto::sign_transaction(&mut tx, &sk).unwrap();
+    crypto::sign_transaction_v2(&mut tx, &sk).unwrap();
     tx.hash = native_tx_id(&tx);
     tx
 }
@@ -163,4 +163,80 @@ fn pba_l1b_002_tripwire_no_hand_rolled_tx_root() {
             "{file}: hand-rolled tx_root over the wire tx.hash (PBA-L1b-002)"
         );
     }
+}
+
+/// Honest block at height 5, hashed (`compute_hash_for`) and signed under
+/// `hardening`.
+fn honest_block_for(hardening: PbaHardening) -> (Block, crypto::Ed25519SigningKey) {
+    let key = crypto::generate_keypair();
+    let mut b = honest_signed_block(hardening);
+    b.header.proposer_pubkey = PublicKey::new(key.verifying_key().to_bytes());
+    b.header.block_hash = b.compute_hash_for(hardening);
+    b.signature = crypto::sign_block(&b.header.block_hash, &key);
+    (b, key)
+}
+
+fn fill_body_fields(b: &Block) -> Block {
+    let mut p = b.clone();
+    p.learning_embedding = Some(vec![1.0f32; 100_000]);
+    p.required_pins = Vec::new();
+    p.ghostdag_params.k = 99;
+    p
+}
+
+/// From the activation height the block hash commits to the sidecar fields:
+/// sync and gossip reject a filled copy and still accept the honest one.
+#[tokio::test]
+async fn body_fields_outside_the_hash_rejected_by_sync_and_gossip_from_activation() {
+    for hardening in [PbaHardening::at(0), PbaHardening::at(5)] {
+        let (honest, _k) = honest_block_for(hardening);
+        let filled = fill_body_fields(&honest);
+        assert_eq!(filled.header.block_hash, honest.header.block_hash);
+        assert!(crypto::verify_block_signature(&filled).unwrap());
+
+        let sync = SyncManager::new(SyncConfig::default()).with_pba_hardening(hardening);
+        sync.handle_blocks(&PeerId("relay".into()), vec![filled.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            sync.drain_validated_blocks().await.len(),
+            0,
+            "{hardening:?}"
+        );
+        sync.handle_blocks(&PeerId("honest".into()), vec![honest.clone()])
+            .await
+            .unwrap();
+        assert_eq!(sync.drain_validated_blocks().await.len(), 1);
+
+        let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let gossip = GossipProtocol::new(GossipConfig::default(), pm).with_pba_hardening(hardening);
+        assert!(gossip
+            .handle_new_block(filled, &PeerId("relay".into()))
+            .await
+            .is_err());
+        gossip
+            .handle_new_block(honest, &PeerId("honest".into()))
+            .await
+            .expect("honest copy accepted after the filled one");
+    }
+}
+
+/// Below the activation height the legacy hash is unchanged, so the filled
+/// copy still validates at the network layer; admission strips the sidecars
+/// before storage (node `admission::fold_activation`).
+#[tokio::test]
+async fn body_fields_below_activation_keep_the_legacy_hash() {
+    let hardening = PbaHardening::at(1_000);
+    let (honest, _k) = honest_block_for(hardening);
+    let filled = fill_body_fields(&honest);
+    assert!(filled.verify_hash_for(hardening));
+    assert_eq!(
+        honest.compute_hash_for(hardening),
+        honest.compute_hash_for(PbaHardening::off())
+    );
+    let sync = SyncManager::new(SyncConfig::default()).with_pba_hardening(hardening);
+    sync.handle_blocks(&PeerId("p".into()), vec![filled])
+        .await
+        .unwrap();
+    assert_eq!(sync.drain_validated_blocks().await.len(), 1);
 }

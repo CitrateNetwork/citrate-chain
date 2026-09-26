@@ -1,5 +1,6 @@
 // citrate/core/consensus/src/lib.rs
 
+pub mod block_sidecars;
 pub mod chain_selection;
 pub mod checkpoint;
 pub mod crypto;
@@ -8,6 +9,7 @@ pub mod ecvrf;
 pub mod finality;
 pub mod ghostdag;
 pub mod hardening;
+pub mod native_sig;
 pub mod ordering;
 pub mod tip_selection;
 pub mod tx_auth;

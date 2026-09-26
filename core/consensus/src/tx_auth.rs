@@ -46,6 +46,8 @@ pub enum TxAuthError {
     HashMismatch { claimed: Hash, canonical: Hash },
     #[error("transaction chain id {got:?} is not this chain's {expected}")]
     WrongChainId { expected: u64, got: Option<u64> },
+    #[error("native signature uses the legacy digest, which does not bind the chain id; sign with the v2 digest")]
+    LegacyNativeSignature,
 }
 
 /// An EVM-shaped sender: a 20-byte address embedded in the first 20 bytes of
@@ -66,6 +68,13 @@ pub fn is_evm_shaped(key: &[u8; 32]) -> bool {
 ///
 /// The claimed `tx.hash` is NOT checked here; see [`authenticate_with_hash`].
 pub fn authenticate(tx: &Transaction) -> Result<Hash, TxAuthError> {
+    authenticate_with_policy(tx, true)
+}
+
+/// [`authenticate`], with native V1 signatures accepted or not. V1 (no chain
+/// id in the digest) is refused in blocks at or above the activation height
+/// (see `native_sig`).
+fn authenticate_with_policy(tx: &Transaction, accept_native_v1: bool) -> Result<Hash, TxAuthError> {
     let from = tx.from.as_bytes();
     if from.iter().all(|&b| b == 0) {
         return Err(TxAuthError::EmptySender);
@@ -73,8 +82,22 @@ pub fn authenticate(tx: &Transaction) -> Result<Hash, TxAuthError> {
     if is_evm_shaped(from) {
         authenticate_evm(tx)
     } else {
-        authenticate_native(tx)
+        authenticate_native(tx, accept_native_v1)
     }
+}
+
+/// The per-transaction body rule for a block at or above the activation
+/// height: authenticated from its contents with a chain-bound (V2) native
+/// signature, and carrying its canonical id as `hash`.
+pub fn authenticate_for_block(tx: &Transaction) -> Result<Hash, TxAuthError> {
+    let canonical = authenticate_with_policy(tx, false)?;
+    if canonical != tx.hash {
+        return Err(TxAuthError::HashMismatch {
+            claimed: tx.hash,
+            canonical,
+        });
+    }
+    Ok(canonical)
 }
 
 /// [`authenticate`], then require `tx.hash` to be the canonical id.
@@ -103,7 +126,7 @@ pub fn verify_for_block(tx: &Transaction, chain_id: u64) -> Result<Hash, TxAuthE
             got: tx.chain_id,
         });
     }
-    authenticate_with_hash(tx)
+    authenticate_for_block(tx)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -364,7 +387,7 @@ fn authenticate_evm(tx: &Transaction) -> Result<Hash, TxAuthError> {
 
 const NATIVE_TX_ID_DOMAIN: &[u8] = b"citrate:native-tx-id:v1";
 
-fn authenticate_native(tx: &Transaction) -> Result<Hash, TxAuthError> {
+fn authenticate_native(tx: &Transaction, accept_v1: bool) -> Result<Hash, TxAuthError> {
     // Native signatures cover `crypto::canonical_tx_bytes` only. The EVM
     // envelope fields must be absent, so a relayer cannot attach them.
     if tx.eth_tx_type != 0
@@ -381,8 +404,19 @@ fn authenticate_native(tx: &Transaction) -> Result<Hash, TxAuthError> {
             return Err(TxAuthError::UnsignedField("tx_type"));
         }
     }
-    match crate::crypto::verify_ed25519_signature(tx) {
+    let verified = if accept_v1 {
+        crate::crypto::verify_ed25519_signature(tx)
+    } else {
+        crate::crypto::verify_transaction_with_policy(tx, false)
+    };
+    match verified {
         Ok(true) => Ok(native_tx_id(tx)),
+        _ if !accept_v1
+            && crate::native_sig::signed_version(tx)
+                == Some(crate::native_sig::NativeSigVersion::V1) =>
+        {
+            Err(TxAuthError::LegacyNativeSignature)
+        }
         _ => Err(TxAuthError::BadSignature),
     }
 }
@@ -599,9 +633,46 @@ mod tests {
         assert_eq!(authenticate(&t), Err(TxAuthError::EmptySender));
     }
 
+    /// A signature for a small-order public key (no secret key) passes the legacy
+    /// (non-strict) check, which stays the rule below the activation height,
+    /// and is refused by the block rule from it (strict verification, as the
+    /// 0x0120 precompile does).
+    #[test]
+    fn small_order_key_signature_refused_by_the_block_rule() {
+        use crate::native_sig::{small_order_key_signature, NativeSigVersion};
+        let template = Transaction {
+            nonce: 0,
+            to: Some(PublicKey::new([9; 32])),
+            value: 5,
+            gas_limit: 21_000,
+            gas_price: 1_000_000_000,
+            chain_id: Some(40204),
+            ..Default::default()
+        };
+        for v in [NativeSigVersion::V2, NativeSigVersion::V1] {
+            let tx = small_order_key_signature(&template, v).expect("found within 256 tries");
+            assert_eq!(
+                authenticate(&tx),
+                Ok(tx.hash),
+                "{v:?}: legacy rule unchanged"
+            );
+            assert!(
+                verify_for_block(&tx, 40204).is_err(),
+                "{v:?}: refused in blocks"
+            );
+        }
+        let v2 = small_order_key_signature(&template, NativeSigVersion::V2).unwrap();
+        assert_eq!(verify_for_block(&v2, 40204), Err(TxAuthError::BadSignature));
+        assert_eq!(authenticate_for_block(&v2), Err(TxAuthError::BadSignature));
+    }
+
     #[test]
     fn verify_for_block_binds_chain_and_hash() {
-        let tx = native_signed(1, 0);
+        // Block rule: native signatures over the chain-bound (V2) digest.
+        let mut tx = native_signed(1, 0);
+        let sk = crate::crypto::Ed25519SigningKey::from_bytes(&[1; 32]);
+        crate::crypto::sign_transaction_v2(&mut tx, &sk).unwrap();
+        tx.hash = native_tx_id(&tx);
         assert_eq!(verify_for_block(&tx, 40204), Ok(tx.hash));
         assert_eq!(
             verify_for_block(&tx, 1),

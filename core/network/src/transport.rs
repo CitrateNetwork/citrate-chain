@@ -335,7 +335,7 @@ async fn handle_inbound(
     let hello = NetworkMessage::decode_inbound(&hello_bytes)
         .map_err(|e| NetworkError::ProtocolError(format!("decode: {}", e)))?;
 
-    let (remote_id, remote_head_height, remote_head_hash) = match hello {
+    let (remote_id, remote_head_height, remote_head_hash, version) = match hello {
         NetworkMessage::Hello {
             version,
             network_id,
@@ -369,7 +369,7 @@ async fn handle_inbound(
             } else {
                 PeerId::new(peer_id)
             };
-            (verified_id, head_height, head_hash)
+            (verified_id, head_height, head_hash, version)
         }
         _ => return Err(NetworkError::ProtocolError("expected Hello".into())),
     };
@@ -401,6 +401,8 @@ async fn handle_inbound(
     info.state = super::peer::PeerState::Connected;
     info.head_height = remote_head_height;
     info.head_hash = remote_head_hash;
+    // Gates V2 native transaction relay to this peer (`Peer::send`).
+    info.version = Some(version);
     let peer = Arc::new(Peer::new(info, to_wire_tx.clone(), from_wire_rx));
     peer_manager.add_peer(peer.clone()).await?;
 
@@ -737,6 +739,8 @@ async fn handle_outbound(
         info.state = super::peer::PeerState::Connected;
         info.head_height = head_height;
         info.head_hash = head_hash;
+        // Gates V2 native transaction relay to this peer (`Peer::send`).
+        info.version = Some(version);
         let peer = Arc::new(Peer::new(info, to_wire_tx.clone(), from_wire_rx));
         peer_manager.add_peer(peer.clone()).await?;
 

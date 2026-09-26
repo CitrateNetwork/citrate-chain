@@ -564,6 +564,74 @@ mod tests {
         b
     }
 
+    /// Current format, carrying a native transfer signed with the legacy (V1)
+    /// digest (zero fee, so the stale producer's state is reproducible).
+    fn stale_v1_native_signature(exec: &Executor, height: u64, parent: Hash) -> Block {
+        let sk = crypto::Ed25519SigningKey::from_bytes(&[0x61; 32]);
+        let mut tx = Transaction {
+            nonce: height - H,
+            to: Some(PublicKey::new([0xB0; 32])),
+            value: 0,
+            gas_limit: 21_000,
+            gas_price: 0,
+            chain_id: Some(CHAIN),
+            ..Default::default()
+        };
+        crypto::sign_transaction(&mut tx, &sk).expect("sign v1");
+        tx.hash = native_tx_id(&tx);
+        let on = PbaHardening::at(H);
+        let vrf = 0xB0 + height as u8;
+        exec.set_block_context(BlockContext {
+            coinbase: CB_STALE,
+            prevrandao: [vrf; 32],
+            block_hashes: HashMap::new(),
+        });
+        let tmpl = template(
+            on,
+            height,
+            parent,
+            CB_STALE,
+            vrf,
+            vec![tx.clone()],
+            Hash::default(),
+        );
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(exec.execute_transaction(&tmpl, &tx))
+                .expect("executes on the old rules")
+        });
+        let r = RewardCalculator::new(canonical_reward_config()).calculate_reward(&tmpl);
+        for (addr, amt) in [
+            (Address(CB_STALE), r.validator_reward),
+            (Address([0x11; 20]), r.treasury_reward),
+        ] {
+            if amt > U256::zero() {
+                let bal = exec.get_balance(&addr);
+                exec.set_balance(&addr, bal + amt);
+            }
+        }
+        let root = exec.calculate_state_root();
+        template(on, height, parent, CB_STALE, vrf, vec![tx], root)
+    }
+
+    /// Current format, with block body fields set but hashed without them (as
+    /// an older release hashes every block).
+    fn stale_uncommitted_body_fields(exec: &Executor, height: u64, parent: Hash) -> Block {
+        let mut b = produce(
+            exec,
+            PbaHardening::at(H),
+            height,
+            parent,
+            CB_STALE,
+            0xD0 + height as u8,
+        );
+        b.learning_embedding = Some(vec![1.0f32; 64]);
+        b.gradient_commitment = Some([7; 32]);
+        b.learning_root = Hash::new([9; 32]);
+        b.header.block_hash = b.compute_hash_for(PbaHardening::off());
+        b
+    }
+
     /// Two upgraded nodes build the canonical chain across the activation
     /// height. A third, still on the old rules, builds its own longer
     /// branch past it with `stale` (a block that is invalid from `H`).
@@ -639,6 +707,11 @@ mod tests {
                     matches!(c.receive(&b).await, AdmitOutcome::Admitted { .. }),
                     "the old rules accept stale block {h}"
                 );
+                // An older release stores a received block as is, block body
+                // fields included; this release's admission would reset them.
+                if !citrate_consensus::block_sidecars::is_canonical_empty(&b) {
+                    c.storage.blocks.put_block(&b).expect("store as received");
+                }
                 p = b.header.block_hash;
             }
             assert_eq!(c.tip().await.height, 8);
@@ -693,6 +766,23 @@ mod tests {
     async fn stale_branch_invalid_under_any_activation_rule_is_dropped() {
         let report = assert_rejoins(stale_timestamp_jump).await;
         assert_eq!(report.legacy_format, 0, "not the old format");
+    }
+
+    /// The rejoin for a stale branch whose native transactions carry the
+    /// legacy (V1) signature digest. Its transactions are handed back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_branch_with_legacy_native_signatures_is_dropped() {
+        let report = assert_rejoins(stale_v1_native_signature).await;
+        assert_eq!(report.legacy_format, 0);
+        assert_eq!(report.returned_txs.len(), 6);
+    }
+
+    /// The rejoin for a stale branch whose block body fields are not in the
+    /// block hash.
+    #[tokio::test]
+    async fn stale_branch_with_uncommitted_body_fields_is_dropped() {
+        let report = assert_rejoins(stale_uncommitted_body_fields).await;
+        assert_eq!(report.legacy_format, 0);
     }
 
     /// A transfer signed by a freshly generated key, at the sender's next

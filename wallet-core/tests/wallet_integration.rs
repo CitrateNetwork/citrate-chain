@@ -312,15 +312,10 @@ async fn test_same_key_different_chains_different_signatures() {
         .chain_id(1)
         .sign(ed_key, 0).expect("sign ethereum");
 
-    // Ed25519 native path: the chain's `canonical_tx_bytes` does NOT yet
-    // include chain_id (documented replay-protection gap). Signatures are
-    // identical across chains for the same nonce/from/to/value/data. The
-    // serialized `raw` / `hash` fields DO differ because the bincode
-    // Transaction struct carries `chain_id`, so a node still rejects a
-    // cross-chain replay via chain-ID mismatch in `eth_sendRawTransaction`.
-    // See wallet-core/tests/adversarial_transactions.rs
-    // `test_ed25519_chain_id_replay_gap_documented`.
-    assert_eq!(tx_citrate.signature, tx_ethereum.signature);
+    // Ed25519 native path: `sign` uses the v2 digest, which binds chain_id,
+    // so the signatures differ across chains (see
+    // `test_ed25519_signature_binds_chain_id`).
+    assert_ne!(tx_citrate.signature, tx_ethereum.signature);
     assert_ne!(tx_citrate.hash, tx_ethereum.hash);
 
     std::fs::remove_dir_all(&path).ok();

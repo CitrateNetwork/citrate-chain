@@ -69,16 +69,27 @@ fn verify_ed25519_transaction(tx: &Transaction, accept_v1: bool) -> Result<bool,
 
     let signature = DalekSignature::from_bytes(tx.signature.as_bytes());
 
+    // Block rule from the activation height (`accept_v1 = false`): the V2
+    // digest only, verified strictly, the same predicate as the 0x0120
+    // precompile. `verify` is cofactorless and accepts small-order public
+    // keys, so a signature for such a key can verify without its secret key;
+    // `is_weak` refuses those keys and `verify_strict` also refuses a
+    // small-order R. Honest signatures pass both.
+    if !accept_v1 {
+        return Ok(!public_key.is_weak()
+            && public_key
+                .verify_strict(&canonical_tx_bytes_v2(tx), &signature)
+                .is_ok());
+    }
+
+    // Legacy rule (below the activation height): unchanged.
     if public_key
         .verify(&canonical_tx_bytes_v2(tx), &signature)
         .is_ok()
     {
         return Ok(true);
     }
-    if !accept_v1 {
-        return Ok(false);
-    }
-    // V1 canonical bytes.
+    // Legacy V1 canonical bytes (no chain_id).
     let message = canonical_tx_bytes(tx)?;
     match public_key.verify(&message, &signature) {
         Ok(_) => Ok(true),
