@@ -145,7 +145,12 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
             : new WrappedSALT{salt: Salts.salt("WrappedSALT")}());
         console.log("  WrappedSALT:", address(wsalt));
 
-        AgentDecisionRegistry agentRegistry = (_isLive("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(deployer)))
+        // Keep-live pins (owner decision D2 = KEEP): on 40204 these three
+        // resolve to the live instances instead of new CREATE2 addresses.
+        address keptAdr = _keptLive("AgentDecisionRegistry");
+        AgentDecisionRegistry agentRegistry = keptAdr != address(0)
+            ? AgentDecisionRegistry(payable(keptAdr))
+            : (_isLive("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(deployer)))
             ? AgentDecisionRegistry(payable(_create2Address("AgentDecisionRegistry", abi.encodePacked(type(AgentDecisionRegistry).creationCode, abi.encode(deployer)))))
             : new AgentDecisionRegistry{salt: Salts.salt("AgentDecisionRegistry")}(deployer));
         console.log("  AgentDecisionRegistry:", address(agentRegistry));
@@ -153,7 +158,10 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         // RM-L / WP-L1.1: SpecRegistry now requires governance address
         // at deploy. Pass `deployer` for testnet; production should pass
         // the multisig per the L1.6 genesis runbook.
-        SpecRegistry specRegistry = (_isLive("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(deployer)))
+        address keptSpec = _keptLive("SpecRegistry");
+        SpecRegistry specRegistry = keptSpec != address(0)
+            ? SpecRegistry(payable(keptSpec))
+            : (_isLive("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(deployer)))
             ? SpecRegistry(payable(_create2Address("SpecRegistry", abi.encodePacked(type(SpecRegistry).creationCode, abi.encode(deployer)))))
             : new SpecRegistry{salt: Salts.salt("SpecRegistry")}(deployer));
         console.log("  SpecRegistry:", address(specRegistry));
@@ -217,7 +225,10 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
             : new NematocystSlashing{salt: Salts.salt("NematocystSlashing")}(governance));
         console.log("  NematocystSlashing:", address(slashing));
 
-        MarketMakerAllocation mmAlloc = (_isLive("MarketMakerAllocation", abi.encodePacked(type(MarketMakerAllocation).creationCode, abi.encode(
+        address keptMma = _keptLive("MarketMakerAllocation");
+        MarketMakerAllocation mmAlloc = keptMma != address(0)
+            ? MarketMakerAllocation(payable(keptMma))
+            : (_isLive("MarketMakerAllocation", abi.encodePacked(type(MarketMakerAllocation).creationCode, abi.encode(
             deployer,   // market maker (deployer for now, DAO changes later)
             deployer    // governance
         )))
@@ -512,6 +523,28 @@ contract DeployAll is ScriptEnv, AdminChecks, Create2Deploy {
         console.log("BulkComputeGateway    :", address(gateway));
         console.log("TestnetFarmingAcct    :", address(farming));
         console.log("TreasuryGovernor      :", address(governor));
+    }
+
+    /// @notice Live 40204 instances kept in place instead of redeployed.
+    ///         Their bytecode moved only because lib/Governable.sol gained the
+    ///         factory refusal; the live instances are not factory-administered
+    ///         (governance is the deployer), so there is nothing to hand over.
+    ///         Off 40204 (fresh chains, tests) this returns address(0) and the
+    ///         normal reuse-or-deploy path runs.
+    address internal constant KEEP_AGENT_DECISION_REGISTRY = 0xd4008e0B4f0bD00d630810D1f7f0F78Db0BA837a;
+    address internal constant KEEP_SPEC_REGISTRY = 0x8cE7000C83D0ef5276A70BDC34bF2fa2FE0159ff;
+    address internal constant KEEP_MARKET_MAKER_ALLOCATION = 0xfCC747D35d616c48bddef98a31B7e8ebC8786864;
+
+    function _keptLive(string memory name) internal view returns (address a) {
+        if (block.chainid != 40204) return address(0);
+        bytes32 h = keccak256(bytes(name));
+        if (h == keccak256("AgentDecisionRegistry")) a = KEEP_AGENT_DECISION_REGISTRY;
+        else if (h == keccak256("SpecRegistry")) a = KEEP_SPEC_REGISTRY;
+        else if (h == keccak256("MarketMakerAllocation")) a = KEEP_MARKET_MAKER_ALLOCATION;
+        else return address(0);
+        require(a.code.length != 0, string.concat(name, ": kept live instance has no code"));
+        _assertNoFactoryAdmin(name, a);
+        console.log(string.concat("  keep live ", name, ":"), a);
     }
 
     /// @notice PBA-L2-002 post-deploy assertion: every admin / owner /
