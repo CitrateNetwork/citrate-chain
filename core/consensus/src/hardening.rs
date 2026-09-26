@@ -140,7 +140,7 @@ pub fn init_pba_hardening_height(config_value: Option<u64>) -> Result<Option<u64
 ///
 /// OWNER STEP (release PR): replace `None` with `Some(H)` for 40204, where H is
 /// the height agreed for the fleet.
-pub const PINNED_ACTIVATIONS: &[(u64, Option<u64>)] = &[(40204, None)];
+pub const PINNED_ACTIVATIONS: &[(u64, Option<u64>)] = &[(40204, Some(247_436))];
 
 /// The activation height this release pins for `chain_id`, if any.
 pub fn pinned_activation(chain_id: u64) -> Option<u64> {
