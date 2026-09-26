@@ -609,7 +609,7 @@ impl SyncManager {
             }
 
             // 1. Verify canonical hash integrity
-            if !block.verify_hash() {
+            if !block.verify_hash_for(self.pba_hardening) {
                 warn!(
                     "SYNC_REJECT: block height={} hash mismatch (tampered commitment roots)",
                     block.header.height

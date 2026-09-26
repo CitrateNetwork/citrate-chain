@@ -28,15 +28,30 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
-    pub const CURRENT: Self = Self {
-        major: 1,
-        minor: 0,
-        patch: 0,
-    };
+    /// 1.1: verifies chain-bound (V2) native transaction signatures (see
+    /// [`Self::NATIVE_TX_V2`]).
+    pub const CURRENT: Self = Self::NATIVE_TX_V2;
 
     pub fn is_compatible(&self, other: &Self) -> bool {
         // Major version must match, minor/patch can differ
         self.major == other.major
+    }
+
+    /// The first version whose nodes verify chain-bound (V2) native
+    /// transaction signatures. Older nodes check only the legacy digest and
+    /// penalise the peer that relays a V2 transaction, so V2 native
+    /// transactions are relayed only to peers at or above it (`Peer::send`).
+    /// A minor bump: older nodes still accept this version's handshake.
+    pub const NATIVE_TX_V2: Self = Self {
+        major: 1,
+        minor: 1,
+        patch: 0,
+    };
+
+    /// Whether a peer that advertised this version verifies V2 native
+    /// transaction signatures.
+    pub fn verifies_native_v2(&self) -> bool {
+        self.major == Self::NATIVE_TX_V2.major && self.minor >= Self::NATIVE_TX_V2.minor
     }
 }
 

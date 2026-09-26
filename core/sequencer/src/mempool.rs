@@ -339,10 +339,23 @@ pub struct Mempool {
     /// set by the producer when a sender's transaction fails before a receipt
     /// exists (such a failure costs the sender nothing on chain).
     banned: Arc<RwLock<HashMap<PublicKey, std::time::Instant>>>,
+
+    /// Native signature version policy (see `citrate_consensus::native_sig`):
+    /// the activation height and a reader for the applied tip.
+    native_sig: Option<(citrate_consensus::hardening::PbaHardening, TipHeightReader)>,
+
+    /// Set once the pooled transactions that the block rule refuses have been
+    /// evicted after the tip reached `H - 1` (see `sweep_if_v1_window_closed`).
+    native_sig_swept: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// PBA-L1a-004: most senders held in the temporary ban list.
 pub const MAX_BANNED_SENDERS: usize = 10_000;
+
+/// Reads the applied chain tip height (see [`Mempool::with_native_sig_policy`]).
+/// `None` means the height could not be read; the pool then treats the next
+/// block as at or above the activation height (fails closed).
+pub type TipHeightReader = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
 impl Mempool {
     /// Return configured chain id
@@ -361,6 +374,8 @@ impl Mempool {
             total_size: Arc::new(RwLock::new(0)),
             state_nonce: None,
             banned: Arc::new(RwLock::new(HashMap::new())),
+            native_sig: None,
+            native_sig_swept: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -400,6 +415,82 @@ impl Mempool {
             .is_some_and(|until| *until > std::time::Instant::now())
     }
 
+    /// Once the next block is at or above the activation height, apply the
+    /// block rule for native signatures: refuse legacy (V1, not chain-bound)
+    /// and non-strict signatures, and evict pooled ones as soon as the tip
+    /// reaches `H - 1` (on the next insert or selection, and in
+    /// `clear_expired`). Without it the pool accepts both versions and relies
+    /// on block building to drop V1.
+    pub fn with_native_sig_policy(
+        mut self,
+        hardening: citrate_consensus::hardening::PbaHardening,
+        tip_height: TipHeightReader,
+    ) -> Self {
+        self.native_sig = Some((hardening, tip_height));
+        self
+    }
+
+    /// Whether a native transaction signed with the legacy digest is still
+    /// admissible (its earliest block, tip + 1, is below the activation height).
+    /// A tip that cannot be read counts as past the window (fails closed).
+    fn native_v1_accepted(&self) -> bool {
+        match &self.native_sig {
+            Some((h, tip)) => {
+                citrate_consensus::native_sig::v1_accepted_at_tip(*h, tip().unwrap_or(u64::MAX))
+            }
+            None => true,
+        }
+    }
+
+    /// A native (non-EVM) transaction whose signature the block rule refuses:
+    /// not the V2 digest, or not valid under strict verification.
+    fn fails_native_block_rule(tx: &Transaction) -> bool {
+        !citrate_consensus::tx_auth::is_evm_shaped(tx.from.as_bytes())
+            && !matches!(
+                citrate_consensus::crypto::verify_transaction_with_policy(tx, false),
+                Ok(true)
+            )
+    }
+
+    /// Evict every pooled native transaction the block rule refuses.
+    async fn evict_native_block_rule_failures(&self) {
+        let txs = self.transactions.read().await;
+        let bad: Vec<Hash> = txs
+            .iter()
+            .filter(|(_, mtx)| Self::fails_native_block_rule(&mtx.tx))
+            .map(|(hash, _)| *hash)
+            .collect();
+        drop(txs);
+        for hash in bad {
+            self.remove_transaction(&hash).await;
+        }
+    }
+
+    /// The first time the pool sees the window closed, evict at once rather
+    /// than at the next periodic sweep, so a V1 transaction is never selected
+    /// for block `H` and its sender can re-sign at the same nonce.
+    ///
+    /// Only a tip that was actually read can close the window here: an
+    /// unreadable tip still refuses V1 on insert (fails closed), but does not
+    /// use up this one-time eviction before the real crossing.
+    async fn sweep_if_v1_window_closed(&self) {
+        use std::sync::atomic::Ordering;
+        let Some((hardening, tip)) = &self.native_sig else {
+            return;
+        };
+        if self.native_sig_swept.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(tip) = tip() else {
+            return;
+        };
+        if !citrate_consensus::native_sig::v1_accepted_at_tip(*hardening, tip)
+            && !self.native_sig_swept.swap(true, Ordering::AcqRel)
+        {
+            self.evict_native_block_rule_failures().await;
+        }
+    }
+
     /// PBA-L1a-001: bound admitted nonces against the sender's committed
     /// nonce: reject `nonce < state` (stale) and `nonce > state +
     /// max_nonce_gap` (unselectable gap-junk), for new senders too.
@@ -414,6 +505,8 @@ impl Mempool {
         mut tx: Transaction,
         mut class: TxClass,
     ) -> Result<(), MempoolError> {
+        self.sweep_if_v1_window_closed().await;
+
         // Determine transaction type from data
         tx.determine_type();
 
@@ -780,6 +873,18 @@ impl Mempool {
             return Ok(());
         }
 
+        if !self.native_v1_accepted() && Self::fails_native_block_rule(tx) {
+            let legacy = citrate_consensus::native_sig::signed_version(tx)
+                == Some(citrate_consensus::native_sig::NativeSigVersion::V1);
+            return Err(MempoolError::InvalidTransaction(if legacy {
+                "native signature uses the legacy digest, which the next block no longer \
+                 accepts; sign with the v2 (chain-bound) digest"
+                    .to_string()
+            } else {
+                "native signature is not valid under the block rule".to_string()
+            }));
+        }
+
         match citrate_consensus::crypto::verify_transaction(tx) {
             Ok(true) => {
                 // Signature is valid
@@ -977,6 +1082,7 @@ impl Mempool {
         max_count: usize,
         max_size: usize,
     ) -> Vec<Transaction> {
+        self.sweep_if_v1_window_closed().await;
         let mut selected: Vec<Transaction> = Vec::new();
         let mut total_size = 0;
         let mut next_nonce: HashMap<PublicKey, u64> = HashMap::new();
@@ -1149,8 +1255,13 @@ impl Mempool {
         for hash in expired {
             self.remove_transaction(&hash).await;
         }
-
         debug!("Cleared {} expired transactions", count);
+
+        // Native signatures the block rule refuses stop being mineable at the
+        // activation height; this periodic sweep backs up the one-shot sweep.
+        if !self.native_v1_accepted() {
+            self.evict_native_block_rule_failures().await;
+        }
     }
 
     /// Get mempool statistics

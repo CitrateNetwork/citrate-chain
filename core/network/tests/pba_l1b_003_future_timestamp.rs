@@ -176,7 +176,7 @@ fn pba_l1b_003_tripwire_every_block_ingress_checks_future_drift() {
         ("sync.rs", include_str!("../src/sync.rs")),
         ("gossip.rs", include_str!("../src/gossip.rs")),
     ] {
-        let verifies = src.matches("verify_hash()").count();
+        let verifies = src.matches("verify_hash").count();
         let drift = src.matches("hardening::within_future_drift(").count();
         assert!(
             drift >= 1 && verifies >= 1,

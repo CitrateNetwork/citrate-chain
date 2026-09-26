@@ -1545,7 +1545,9 @@ impl BlockProducer {
         // WP-F.3: Compute learning_root at checkpoint boundaries.
         // Per StrobilationCheckpoint.tla: only checkpoint blocks get a learning_root.
         // Non-checkpoint blocks keep Hash::default() (zero hash).
-        // The learning_root is NOT included in compute_hash() (Theorem 3).
+        // Below the activation height the learning_root is not part of the
+        // block hash (Theorem 3); from it the hash commits to it with the other
+        // sidecar fields (`block_sidecars`), so it is set before hashing.
         let block_height = block.header.height;
         if block_height > 0
             && block_height.is_multiple_of(self.checkpoint_interval)

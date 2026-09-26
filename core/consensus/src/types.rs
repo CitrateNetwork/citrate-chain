@@ -303,7 +303,16 @@ impl Block {
     /// - Gas parameters
     ///
     /// Both the producer and the validator MUST use this function.
+    ///
+    /// Uses the process-wide activation height (see [`Self::compute_hash_for`]).
     pub fn compute_hash(&self) -> Hash {
+        self.compute_hash_for(crate::hardening::PbaHardening::from_process())
+    }
+
+    /// [`Self::compute_hash`] under an explicit activation height. At or above
+    /// it the hash also commits to the block's sidecar fields
+    /// (`block_sidecars`); below it the legacy preimage is unchanged.
+    pub fn compute_hash_for(&self, hardening: crate::hardening::PbaHardening) -> Hash {
         use sha3::{Digest, Sha3_256};
         let mut hasher = Sha3_256::new();
 
@@ -360,6 +369,9 @@ impl Block {
         hasher.update(self.tx_root.as_bytes());
         hasher.update(self.receipt_root.as_bytes());
         hasher.update(self.artifact_root.as_bytes());
+        if hardening.active_at(self.header.height) {
+            crate::block_sidecars::commit_into(&mut hasher, self);
+        }
 
         let hash_bytes = hasher.finalize();
         let mut hash_array = [0u8; 32];
@@ -371,6 +383,11 @@ impl Block {
     /// Returns false if the hash has been tampered with.
     pub fn verify_hash(&self) -> bool {
         self.header.block_hash == self.compute_hash()
+    }
+
+    /// [`Self::verify_hash`] under an explicit activation height.
+    pub fn verify_hash_for(&self, hardening: crate::hardening::PbaHardening) -> bool {
+        self.header.block_hash == self.compute_hash_for(hardening)
     }
 
     /// Get selected parent
@@ -618,12 +635,16 @@ pub struct ModelMetadata {
     /// Context length in tokens
     pub context_length: u32,
     /// Embedding dimension (for embedding models)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// No `skip_serializing_if`: blocks are bincode-encoded (store and wire),
+    /// and bincode cannot decode a field that was skipped. `Some` encodes as
+    /// before; `default` keeps JSON without the field readable.
+    #[serde(default)]
     pub embedding_dim: Option<u32>,
     /// License (MIT, Apache 2.0, Llama 3.1, etc.)
     pub license: String,
-    /// Model framework (GGUF, SafeTensors, etc.)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Model framework (GGUF, SafeTensors, etc.) See `embedding_dim`.
+    #[serde(default)]
     pub framework: Option<String>,
 }
 

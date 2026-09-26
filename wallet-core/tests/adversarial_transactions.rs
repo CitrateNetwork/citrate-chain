@@ -17,15 +17,12 @@ fn test_key() -> Ed25519SigningKey {
 // REPLAY PROTECTION
 // =========================================================================
 
-/// Documents a known gap: the chain's `canonical_tx_bytes` for ed25519
-/// native transactions does NOT include `chain_id`, so signatures are
-/// identical across chains. EIP-155 ECDSA (secp256k1) txs DO bind chain_id
-/// via `v = chain_id * 2 + 35 + recovery`. Fixing the ed25519 path is a
-/// consensus change — tracked separately. For now, the wallet mirrors
-/// what the chain verifies, and this test asserts the current (imperfect)
-/// behavior so a future canonical-bytes change surfaces as a test flip.
+/// `sign` uses the v2 native digest, which binds `chain_id` (as EIP-155 does
+/// for secp256k1), so the same transfer signed for two chains carries two
+/// different signatures. The legacy v1 digest (`sign_for_tip` before the
+/// activation height) did not bind it.
 #[test]
-fn test_ed25519_chain_id_replay_gap_documented() {
+fn test_ed25519_signature_binds_chain_id() {
     let key = test_key();
     let tx1 = TransactionBuilder::new()
         .to("0xb5ddd4eb356ddf3bf51eb3aec1ed28213be59129")
@@ -38,8 +35,7 @@ fn test_ed25519_chain_id_replay_gap_documented() {
         .chain_id(40204)
         .sign(&key, 0).expect("sign chain 40204");
 
-    // TODO(chain): include chain_id in canonical_tx_bytes for replay protection.
-    assert_eq!(tx1.signature, tx2.signature, "documenting gap");
+    assert_ne!(tx1.signature, tx2.signature, "v2 binds chain_id");
 }
 
 #[test]

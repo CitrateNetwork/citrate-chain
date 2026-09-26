@@ -183,6 +183,46 @@ impl Peer {
     /// in a row is a peer that has stopped reading and will never catch up.
     pub const SEND_DROPS_BEFORE_CLOSE: u32 = 64;
 
+    /// Withhold native transactions signed with the chain-bound (V2) digest
+    /// from a peer that did not advertise [`ProtocolVersion::NATIVE_TX_V2`]
+    /// (or advertised nothing). Such a peer verifies only the legacy digest
+    /// and penalises the sender for every V2 transaction until it bans it.
+    /// It still gets those transactions inside blocks, which it imports
+    /// without checking native signatures below the activation height. Every
+    /// other message, including every block, passes unchanged. `None`: nothing
+    /// is left to send.
+    async fn gate_native_v2(&self, message: NetworkMessage) -> Option<NetworkMessage> {
+        let is_tx = matches!(
+            message,
+            NetworkMessage::NewTransaction { .. } | NetworkMessage::Transactions { .. }
+        );
+        if !is_tx
+            || self
+                .info
+                .read()
+                .await
+                .version
+                .is_some_and(|v| v.verifies_native_v2())
+        {
+            return Some(message);
+        }
+        fn withheld(tx: &citrate_consensus::types::Transaction) -> bool {
+            !citrate_consensus::tx_auth::is_evm_shaped(tx.from.as_bytes())
+                && citrate_consensus::native_sig::signed_version(tx)
+                    == Some(citrate_consensus::native_sig::NativeSigVersion::V2)
+        }
+        match message {
+            NetworkMessage::NewTransaction { transaction } => {
+                (!withheld(&transaction)).then_some(NetworkMessage::NewTransaction { transaction })
+            }
+            NetworkMessage::Transactions { mut transactions } => {
+                transactions.retain(|t| !withheld(t));
+                (!transactions.is_empty()).then_some(NetworkMessage::Transactions { transactions })
+            }
+            other => Some(other),
+        }
+    }
+
     /// Queue `message` for this peer. **Never blocks.**
     ///
     /// #149 — THE FLEET DEADLOCK. THIS FUNCTION USED TO `.await` A BOUNDED
@@ -222,6 +262,9 @@ impl Peer {
     /// loop, gossip broadcast, block/tx propagation, the AI handler, the producer),
     /// so there is no call site where blocking is the right answer.
     pub async fn send(&self, message: NetworkMessage) -> Result<(), NetworkError> {
+        let Some(message) = self.gate_native_v2(message).await else {
+            return Ok(());
+        };
         match self.send_tx.try_send(message) {
             Ok(()) => {
                 let mut info = self.info.write().await;

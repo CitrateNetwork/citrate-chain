@@ -209,16 +209,46 @@ impl TransactionBuilder {
     /// hand-rolled layout that matched neither RLP nor bincode, so every
     /// ed25519 `eth_sendRawTransaction` call returned "failed to parse
     /// transaction".
+    ///
+    /// Signs with the V2 (chain-bound) native digest for this builder's
+    /// `chain_id`. Nodes on this release verify V2 at every height (below the
+    /// activation height too) and require it from that height, so no
+    /// activation height or tip is needed. Nodes on a release before V2
+    /// verification refuse it; [`Self::sign_for_tip`] gives explicit control
+    /// for a network that still runs them.
     pub fn sign(
         self,
         signing_key: &SigningKey,
         nonce: u64,
     ) -> Result<SignedTransaction, WalletError> {
-        self.sign_native(signing_key, nonce, false)
+        self.sign_native(signing_key, nonce, true)
+    }
+
+    /// Sign with the digest version the chain accepts for the next block.
+    ///
+    /// The rule (`citrate_consensus::native_sig::signer_version`): V2 (chain
+    /// bound) once `tip_height + 1 >= activation`, V1 before that, and V1
+    /// whenever no activation height is scheduled. With an activation height
+    /// but no tip, V2. `tip_height` is the chain head the client last saw
+    /// (`RpcClient::get_block_number`). From the activation height a V1
+    /// signature is rejected by every node, so a client that signs near the
+    /// boundary and is refused should re-sign with the current tip.
+    pub fn sign_for_tip(
+        self,
+        signing_key: &SigningKey,
+        nonce: u64,
+        activation: Option<u64>,
+        tip_height: Option<u64>,
+    ) -> Result<SignedTransaction, WalletError> {
+        let v2 = citrate_consensus::native_sig::signer_version(activation, tip_height)
+            == citrate_consensus::native_sig::NativeSigVersion::V2;
+        self.sign_native(signing_key, nonce, v2)
     }
 
     /// Sign with the V2 native preimage, which binds `chain_id` and every
-    /// fee/type field under a domain tag. Nodes verify V2 from this release on.
+    /// fee/type field under a domain tag. The same as [`Self::sign`], which
+    /// signs V2 by default; [`Self::sign_for_tip`] can still produce the
+    /// legacy V1 digest before the activation height.
     pub fn sign_v2(
         self,
         signing_key: &SigningKey,

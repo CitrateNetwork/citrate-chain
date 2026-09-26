@@ -16,6 +16,8 @@ The R2 hardening adds three block-validity rules. They switch on together, at on
 | Transaction authentication on import | Every transaction in an imported block must authenticate from its own contents, carry its canonical id as `hash`, and match this chain id (`tx_auth::verify_for_block`). |
 | Content-bound transaction root | `tx_root` must be `tx_auth::tx_root_v2`, a commitment to every consensus field of every transaction. |
 | Timestamp bound | `timestamp <= selected_parent.timestamp + 3600` (`MAX_BLOCK_TIMESTAMP_ADVANCE_SECS`). |
+| Chain-bound native signatures | A native (ed25519) transaction must be signed over the v2 digest (`crypto::canonical_tx_bytes_v2`: domain tag, chain id, every field). The signature is verified strictly (`verify_strict`, small-order keys refused), the same predicate as the 0x0120 precompile. A v1 signature is invalid (`tx_auth::authenticate_for_block`, `TxAuthError::LegacyNativeSignature`). EVM transactions are unchanged. |
+| Committed block sidecars | The block hash also commits to `ghostdag_params`, `embedded_models`, `required_pins`, `learning_embedding`, `learning_confidence`, `gradient_commitment` and `learning_root` (`block_sidecars::commit_into`). A block whose sidecars are all at their default hashes exactly as before. |
 
 The rest of the R2 hardening is active in every binary and doesn't change which blocks are valid.
 
@@ -62,3 +64,24 @@ Upgraded nodes count, per peer, blocks received in the pre-activation format at 
 ## Before `H`
 
 Below the activation height the legacy validity rules apply unchanged. The always-on hardening is in effect regardless. Schedule `H` before the bug bounty opens.
+
+## Native signers and the activation height
+
+`citrate_consensus::native_sig` holds the rule every component uses.
+
+- **Blocks:** a v1 native signature is valid below `H` and invalid from `H`. From `H` native signatures are also verified strictly. Below `H` verification is unchanged.
+- **Mempool:** a transaction admitted at tip `t` can first be mined at `t + 1`. From tip `H - 1` the pool applies the block rule: it refuses v1 and non-strict native signatures and evicts the pooled ones on the next insert or selection. The one-minute sweep (`Mempool::clear_expired`) is a backstop. A sender can then re-sign at the same nonce with v2. If the pool cannot read the tip, it treats the window as closed. Producers also drop such transactions when building a block at or above `H`. A v1 transaction admitted earlier still mines below `H`.
+- **Signers:** nodes on this release verify v2 at every height, below `H` too. So the default signers produce v2 for their configured chain id, with no activation height or tip needed:
+  - `wallet-core`: `TransactionBuilder::sign`. This covers `wallet-sdk` and every client that links `wallet-core`.
+  - `wallet`: `TransactionBuilder::build_and_sign`. This covers the `citrate-wallet` binary and the node's `citrate wallet` subcommand. The builder sets `chain_id` on the transaction.
+  - `sign_for_tip` / `build_and_sign_for_tip` (`native_sig::signer_version`) give explicit control. They produce v1 until `tip + 1 >= H`, for a network that still runs nodes from before v2 verification.
+- **Relay:** nodes on this release advertise protocol version 1.1 in the handshake. Older nodes still accept 1.1, because only the major version must match. Upgraded nodes relay v2 native transactions only to peers that advertised 1.1 or later. Every other transaction, and every block, is relayed to all peers as before. An old node therefore never penalises or bans an upgraded peer for v2 transactions, and it receives them inside blocks.
+- Desktop client V2 signing is safe during the window because upgraded nodes gate V2 relay by peer version.
+- **Precondition:** a node from before v2 verification refuses a v2 transaction submitted to its own RPC, with a synchronous error, so the client resubmits it to an upgraded node. Upgrade the nodes that accept transactions (RPC, producers, bootnodes) first.
+- **Clients outside this repository** that sign native transactions through `wallet-core` need only a `wallet-core` version bump.
+
+## Block sidecars below `H`
+
+Below `H` the block hash does not cover the sidecar fields. Admission resets them to their defaults before storing a received block (`admission::sidecar_ingest`), so every received copy of a block is stored the same way. Admission also never stores a block whose hash does not recompute, at any height. Genesis is built locally and keeps its model sidecars.
+
+From `H`, a checkpoint block's `learning_root` is part of its hash. A node that upgrades after `H` and stored such blocks under the old hash fails them in the start-up rejoin check (`verify_block_body`), which purges and resyncs them.

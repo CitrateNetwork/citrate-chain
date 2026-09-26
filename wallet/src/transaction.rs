@@ -1,6 +1,5 @@
 use crate::errors::WalletError;
 use ed25519_dalek::SigningKey;
-use citrate_consensus::crypto as consensus_crypto;
 use citrate_consensus::types::{Hash, PublicKey, Signature, Transaction};
 use citrate_execution::types::Address;
 use primitive_types::U256;
@@ -89,10 +88,39 @@ impl TransactionBuilder {
         self
     }
 
-    /// Build and sign transaction
+    /// Build and sign with the V2 (chain-bound) native digest for the
+    /// configured chain id: valid at every height on releases that verify V2,
+    /// and required from the activation height. Used by the `citrate-wallet`
+    /// binary and the node's `citrate wallet` subcommand, which run without
+    /// an activation height. [`Self::build_and_sign_for_tip`] gives explicit
+    /// control.
     pub fn build_and_sign(
         self,
         signing_key: &SigningKey,
+    ) -> Result<SignedTransaction, WalletError> {
+        self.build_and_sign_version(
+            signing_key,
+            citrate_consensus::native_sig::NativeSigVersion::V2,
+        )
+    }
+
+    /// Build and sign with the native digest version the chain accepts for the
+    /// next block (`citrate_consensus::native_sig::signer_version`): the
+    /// chain-bound V2 digest once `tip_height + 1 >= activation`.
+    pub fn build_and_sign_for_tip(
+        self,
+        signing_key: &SigningKey,
+        activation: Option<u64>,
+        tip_height: Option<u64>,
+    ) -> Result<SignedTransaction, WalletError> {
+        let version = citrate_consensus::native_sig::signer_version(activation, tip_height);
+        self.build_and_sign_version(signing_key, version)
+    }
+
+    fn build_and_sign_version(
+        self,
+        signing_key: &SigningKey,
+        version: citrate_consensus::native_sig::NativeSigVersion,
     ) -> Result<SignedTransaction, WalletError> {
         let from = self
             .from
@@ -119,6 +147,8 @@ impl TransactionBuilder {
             gas_limit: self.gas_limit,
             signature: Signature::new([0; 64]), // Will be replaced
             tx_type: None,                      // Will be determined if needed
+            // The chain requires it on every tx, and the V2 digest binds it.
+            chain_id: Some(self.chain_id),
             ..Default::default()
         };
 
@@ -126,7 +156,7 @@ impl TransactionBuilder {
         tx.hash = calculate_tx_hash(&tx, self.chain_id);
 
         // Sign canonical transaction bytes using consensus crypto so mempool verification passes
-        consensus_crypto::sign_transaction(&mut tx, signing_key)
+        citrate_consensus::native_sig::sign_native(&mut tx, signing_key, version)
             .map_err(|e| WalletError::Other(format!("Transaction signing failed: {}", e)))?;
 
         // Serialize for raw format
@@ -409,5 +439,54 @@ mod tests {
     fn test_default_impl() {
         let builder = TransactionBuilder::default();
         assert_eq!(builder.chain_id, 40204);
+    }
+
+    /// `build_and_sign` (the `citrate-wallet` binary and the node's `citrate
+    /// wallet` subcommand, which runs before the node sets any activation
+    /// height) produces V2 for the configured chain.
+    #[test]
+    fn build_and_sign_produces_v2_without_an_activation_height() {
+        use citrate_consensus::native_sig::{signed_version, NativeSigVersion};
+        assert_eq!(citrate_consensus::hardening::pba_hardening_height(), None);
+        let (signing_key, public_key) = test_signing_key();
+        let tx = TransactionBuilder::new()
+            .from(public_key)
+            .to(Some(Address([0x11; 20])))
+            .value(U256::from(1000))
+            .chain_id(40204)
+            .build_and_sign(&signing_key)
+            .unwrap()
+            .transaction;
+        assert_eq!(tx.chain_id, Some(40204));
+        assert_eq!(signed_version(&tx), Some(NativeSigVersion::V2));
+    }
+
+    /// The native digest version follows the activation height and tip, and
+    /// the chain id the V2 digest binds is carried on the transaction.
+    #[test]
+    fn build_and_sign_for_tip_picks_the_digest_version() {
+        use citrate_consensus::native_sig::{signed_version, NativeSigVersion};
+        let (signing_key, public_key) = test_signing_key();
+        let build = |activation, tip| {
+            TransactionBuilder::new()
+                .from(public_key)
+                .to(Some(Address([0x11; 20])))
+                .value(U256::from(1000))
+                .chain_id(40204)
+                .build_and_sign_for_tip(&signing_key, activation, tip)
+                .unwrap()
+                .transaction
+        };
+        let v1 = build(Some(100), Some(98));
+        assert_eq!(v1.chain_id, Some(40204));
+        assert_eq!(signed_version(&v1), Some(NativeSigVersion::V1));
+        assert_eq!(
+            signed_version(&build(Some(100), Some(99))),
+            Some(NativeSigVersion::V2)
+        );
+        assert_eq!(
+            signed_version(&build(None, Some(99))),
+            Some(NativeSigVersion::V1)
+        );
     }
 }

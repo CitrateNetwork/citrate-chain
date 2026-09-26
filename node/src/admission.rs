@@ -85,7 +85,7 @@ pub(crate) fn verify_block_body(
     if !hardening.active_at(height) {
         return Ok(());
     }
-    if !block.verify_hash() {
+    if !block.verify_hash_for(hardening) {
         return Err(format!("body: block hash mismatch @ {height}"));
     }
     // PBA-L1b-002: the root must commit to the transactions' full contents.
@@ -104,13 +104,36 @@ pub(crate) fn verify_block_body(
     // PBA-L1b-001: every transaction authenticated from its contents (never
     // the wire `ecdsa_verified` flag) and carrying its canonical id, so a
     // forged-sender body is never stored. (Chain-id binding is enforced by
-    // the executor on apply, which knows the chain id.)
+    // the executor on apply, which knows the chain id.) Native signatures must
+    // use the chain-bound (v2) digest here.
     for (i, tx) in block.transactions.iter().enumerate() {
-        if let Err(e) = citrate_consensus::tx_auth::authenticate_with_hash(tx) {
+        if let Err(e) = citrate_consensus::tx_auth::authenticate_for_block(tx) {
             return Err(format!("body: tx #{i} ({}): {e} (PBA-L1b-001)", tx.hash));
         }
     }
     Ok(())
+}
+
+/// The sidecar rule for a received block (see `admit`). `Ok(None)` = store it
+/// as received; `Ok(Some(b))` = store `b`, the block with its uncommitted
+/// sidecar fields reset.
+pub(crate) fn sidecar_ingest(
+    hardening: citrate_consensus::hardening::PbaHardening,
+    block: &Block,
+) -> Result<Option<Block>, String> {
+    let height = block.header.height;
+    if height == 0 {
+        return Ok(None);
+    }
+    if !block.verify_hash_for(hardening) {
+        return Err(format!("block hash does not recompute @ {height}"));
+    }
+    if hardening.active_at(height) || citrate_consensus::block_sidecars::is_canonical_empty(block) {
+        return Ok(None);
+    }
+    let mut b = block.clone();
+    citrate_consensus::block_sidecars::strip(&mut b);
+    Ok(Some(b))
 }
 
 /// Result of an admission attempt.
@@ -252,6 +275,22 @@ impl BlockAdmission {
         if let Err(why) = verify_block_body(self.ghostdag.pba_hardening(), block) {
             return AdmitOutcome::Rejected(why);
         }
+
+        // Sidecar fields (`block_sidecars`), at every height. The stored copy
+        // must be the one the hash commits to: a block whose hash does not
+        // recompute is never written, and below the activation height, where
+        // the hash does not cover the sidecars, they are reset before storage
+        // so every copy of a block is stored identically.
+        // Genesis (height 0) is built locally and never re-judged.
+        let stripped;
+        let block: &Block = match sidecar_ingest(self.ghostdag.pba_hardening(), block) {
+            Ok(None) => block,
+            Ok(Some(b)) => {
+                stripped = b;
+                &stripped
+            }
+            Err(why) => return AdmitOutcome::Rejected(why),
+        };
 
         // ---- DAG side ----
         if !in_dag {
@@ -984,7 +1023,7 @@ mod pba_r2_admission {
             chain_id: Some(40204),
             ..Default::default()
         };
-        crypto::sign_transaction(&mut tx, &sk).unwrap();
+        crypto::sign_transaction_v2(&mut tx, &sk).unwrap();
         tx.hash = native_tx_id(&tx);
         tx
     }
@@ -1096,5 +1135,608 @@ mod pba_r2_admission {
         forged.transactions[0].value = 2_000;
         // Legacy validity (documented residual until activation).
         assert!(matches!(adm.admit(&forged).await, AdmitOutcome::Admitted { .. }));
+    }
+}
+
+/// Native signature digest and block sidecar fields at the activation height.
+#[cfg(test)]
+mod fold_activation {
+    use super::*;
+    use citrate_consensus::crypto;
+    use citrate_consensus::hardening::PbaHardening;
+    use citrate_consensus::native_sig::{sign_native, NativeSigVersion};
+    use citrate_consensus::tx_auth::{native_tx_id, tx_root_for_height};
+    use citrate_consensus::types::{
+        BlockBuilder, EmbeddedModel, GhostDagParams, ModelId, ModelMetadata, ModelType, PublicKey,
+        RequiredModel, Transaction, VrfProof,
+    };
+    use citrate_storage::pruning::PruningConfig;
+
+    const H: u64 = 2;
+
+    fn harness(
+        hardening: PbaHardening,
+    ) -> (BlockAdmission, Arc<StorageManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(
+            GhostDag::new(GhostDagParams::default(), dag.clone()).with_pba_hardening(hardening),
+        );
+        (
+            BlockAdmission::new(storage.clone(), dag, ghostdag, None),
+            storage,
+            dir,
+        )
+    }
+
+    /// A native tx signed with `version` for `signed_chain`, then labelled
+    /// `label_chain`.
+    fn native_tx(
+        seed: u8,
+        nonce: u64,
+        version: NativeSigVersion,
+        signed_chain: u64,
+        label_chain: u64,
+    ) -> Transaction {
+        let sk = crypto::Ed25519SigningKey::from_bytes(&[seed; 32]);
+        let mut tx = Transaction {
+            nonce,
+            to: Some(PublicKey::new([0xB0; 32])),
+            value: 1_000,
+            gas_limit: 21_000,
+            gas_price: 1_000_000_000,
+            chain_id: Some(signed_chain),
+            ..Default::default()
+        };
+        sign_native(&mut tx, &sk, version).unwrap();
+        tx.chain_id = Some(label_chain);
+        tx.hash = native_tx_id(&tx);
+        tx
+    }
+
+    fn block(pba: PbaHardening, height: u64, parent: Hash, txs: Vec<Transaction>) -> Block {
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(parent)
+            .coinbase([0x33; 20])
+            .timestamp(1000 + height)
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new([0x5A; 32]),
+            })
+            .transactions(txs)
+            .state_root(Hash::default())
+            .blue_score(height)
+            .blue_work(citrate_consensus::types::blue_work_for_score(height))
+            .build_unhashed();
+        b.tx_root = tx_root_for_height(pba, height, &b.transactions);
+        b.header.block_hash = b.compute_hash_for(pba);
+        b
+    }
+
+    /// Chain of empty blocks 0..=to under `pba`, all admitted. Returns the tip.
+    async fn chain_to(adm: &BlockAdmission, pba: PbaHardening, to: u64) -> Block {
+        let mut prev = block(pba, 0, Hash::default(), vec![]);
+        assert!(matches!(
+            adm.admit(&prev).await,
+            AdmitOutcome::Admitted { .. }
+        ));
+        for h in 1..=to {
+            let b = block(pba, h, prev.header.block_hash, vec![]);
+            let r = adm.admit(&b).await;
+            assert!(
+                matches!(r, AdmitOutcome::Admitted { .. }),
+                "height {h}: {r:?}"
+            );
+            prev = b;
+        }
+        prev
+    }
+
+    fn fill_body_fields(b: &mut Block) {
+        b.learning_embedding = Some(vec![1.0f32; 100_000]);
+        b.learning_confidence = Some(vec![0.5f32; 64]);
+        b.ghostdag_params.k = 99;
+        b.gradient_commitment = Some([7; 32]);
+        b.learning_root = Hash::new([9; 32]);
+        b.embedded_models = vec![EmbeddedModel {
+            model_id: ModelId("m".into()),
+            model_type: ModelType::TinyLLM,
+            weights_sha256: Hash::new([1; 32]),
+            metadata: ModelMetadata {
+                name: "m".into(),
+                version: "1".into(),
+                context_length: 1,
+                // `Some`: the chain store's bincode round-trip needs both
+                // `skip_serializing_if` fields present.
+                embedding_dim: Some(8),
+                license: "x".into(),
+                framework: Some("f".into()),
+            },
+        }];
+        b.required_pins = vec![RequiredModel {
+            model_id: ModelId("m".into()),
+            ipfs_cid: "bafy".into(),
+            sha256_hash: Hash::new([2; 32]),
+            size_bytes: 1,
+            must_pin: true,
+            slash_penalty: 1,
+            grace_period_hours: 1,
+        }];
+    }
+
+    fn assert_no_sidecars(b: &Block) {
+        assert!(
+            citrate_consensus::block_sidecars::is_canonical_empty(b),
+            "stored copy carries sidecars"
+        );
+    }
+
+    // ---- native signature digest -----------------------------------------
+
+    /// A V1 native tx signed for another chain and labelled with this one is
+    /// admitted below H (legacy validity is never re-judged) and rejected at
+    /// and above H.
+    #[tokio::test]
+    async fn native_tx_signed_for_another_chain_accepted_below_h_rejected_from_h() {
+        let pba = PbaHardening::at(H);
+        let (adm, storage, _d) = harness(pba);
+        let tip = chain_to(&adm, pba, H - 2).await;
+
+        let below = block(
+            pba,
+            H - 1,
+            tip.header.block_hash,
+            vec![native_tx(1, 0, NativeSigVersion::V1, 1337, 40204)],
+        );
+        let r = adm.admit(&below).await;
+        assert!(matches!(r, AdmitOutcome::Admitted { .. }), "below H: {r:?}");
+
+        let at = block(
+            pba,
+            H,
+            below.header.block_hash,
+            vec![native_tx(1, 1, NativeSigVersion::V1, 1337, 40204)],
+        );
+        let r = adm.admit(&at).await;
+        assert!(
+            matches!(r, AdmitOutcome::Rejected(ref why) if why.contains("legacy digest")),
+            "at H: {r:?}"
+        );
+        assert!(!storage.blocks.has_block(&at.header.block_hash).unwrap());
+
+        // Also a V1 tx that was genuinely signed for this chain.
+        let at_own = block(
+            pba,
+            H,
+            below.header.block_hash,
+            vec![native_tx(2, 0, NativeSigVersion::V1, 40204, 40204)],
+        );
+        assert!(matches!(
+            adm.admit(&at_own).await,
+            AdmitOutcome::Rejected(_)
+        ));
+    }
+
+    /// V2 native txs are admitted at and above H, and V2 is also valid below.
+    #[tokio::test]
+    async fn v2_native_tx_accepted_at_and_above_h() {
+        let pba = PbaHardening::at(H);
+        let (adm, _s, _d) = harness(pba);
+        let tip = chain_to(&adm, pba, H - 2).await;
+        let below = block(
+            pba,
+            H - 1,
+            tip.header.block_hash,
+            vec![native_tx(3, 0, NativeSigVersion::V2, 40204, 40204)],
+        );
+        assert!(matches!(
+            adm.admit(&below).await,
+            AdmitOutcome::Admitted { .. }
+        ));
+        let at = block(
+            pba,
+            H,
+            below.header.block_hash,
+            vec![native_tx(3, 1, NativeSigVersion::V2, 40204, 40204)],
+        );
+        let r = adm.admit(&at).await;
+        assert!(matches!(r, AdmitOutcome::Admitted { .. }), "{r:?}");
+        let above = block(
+            pba,
+            H + 1,
+            at.header.block_hash,
+            vec![native_tx(3, 2, NativeSigVersion::V2, 40204, 40204)],
+        );
+        assert!(matches!(
+            adm.admit(&above).await,
+            AdmitOutcome::Admitted { .. }
+        ));
+    }
+
+    /// A V2 tx carries its chain in the signature: changing its label breaks the
+    /// signature, and one left on its own chain id is refused by the chain
+    /// binding.
+    #[test]
+    fn v2_with_another_chain_id_rejected() {
+        use citrate_consensus::tx_auth::{verify_for_block, TxAuthError};
+        let other_label = native_tx(4, 0, NativeSigVersion::V2, 1337, 40204);
+        assert_eq!(
+            verify_for_block(&other_label, 40204),
+            Err(TxAuthError::BadSignature)
+        );
+        let other_chain = native_tx(4, 0, NativeSigVersion::V2, 1337, 1337);
+        assert!(matches!(
+            verify_for_block(&other_chain, 40204),
+            Err(TxAuthError::WrongChainId {
+                expected: 40204,
+                got: Some(1337)
+            })
+        ));
+        let ok = native_tx(4, 0, NativeSigVersion::V2, 40204, 40204);
+        assert_eq!(verify_for_block(&ok, 40204), Ok(ok.hash));
+        let v1 = native_tx(4, 0, NativeSigVersion::V1, 40204, 40204);
+        assert_eq!(
+            verify_for_block(&v1, 40204),
+            Err(TxAuthError::LegacyNativeSignature)
+        );
+    }
+
+    // ---- block sidecars ----------------------------------------------------
+
+    /// At and above H the hash commits to the sidecars: a filled copy is
+    /// rejected (never stored) and the honest copy is admitted afterwards.
+    #[tokio::test]
+    async fn copy_with_other_body_fields_rejected_from_h_honest_admitted_after() {
+        for pba in [
+            PbaHardening::at(0),
+            PbaHardening::at(1),
+            PbaHardening::at(H),
+        ] {
+            let (adm, storage, _d) = harness(pba);
+            let tip = chain_to(&adm, pba, H - 1).await;
+            let honest = block(pba, H, tip.header.block_hash, vec![]);
+            let mut filled = honest.clone();
+            fill_body_fields(&mut filled);
+            assert_eq!(filled.header.block_hash, honest.header.block_hash);
+            let r = adm.admit(&filled).await;
+            assert!(matches!(r, AdmitOutcome::Rejected(_)), "{pba:?}: {r:?}");
+            assert!(!storage.blocks.has_block(&honest.header.block_hash).unwrap());
+            let r = adm.admit(&honest).await;
+            assert!(matches!(r, AdmitOutcome::Admitted { .. }), "{pba:?}: {r:?}");
+            let stored = storage
+                .blocks
+                .get_block(&honest.header.block_hash)
+                .unwrap()
+                .unwrap();
+            assert_no_sidecars(&stored);
+        }
+    }
+
+    /// Each sidecar field on its own changes the hash at H.
+    #[test]
+    fn every_sidecar_field_is_committed_from_h() {
+        let pba = PbaHardening::at(H);
+        let honest = block(pba, H, Hash::new([1; 32]), vec![]);
+        type Mutation = fn(&mut Block);
+        let muts: [(&str, Mutation); 8] = [
+            ("learning_embedding", |b| {
+                b.learning_embedding = Some(vec![])
+            }),
+            ("learning_confidence", |b| {
+                b.learning_confidence = Some(vec![0.0])
+            }),
+            ("ghostdag_params", |b| b.ghostdag_params.finality_depth += 1),
+            ("embedded_models", |b| {
+                let mut p = b.clone();
+                fill_body_fields(&mut p);
+                b.embedded_models = p.embedded_models;
+            }),
+            ("required_pins", |b| {
+                let mut p = b.clone();
+                fill_body_fields(&mut p);
+                b.required_pins = p.required_pins;
+            }),
+            ("gradient_commitment", |b| {
+                b.gradient_commitment = Some([0; 32])
+            }),
+            ("learning_root", |b| b.learning_root = Hash::new([3; 32])),
+            ("ghostdag_params.k", |b| b.ghostdag_params.k = 0),
+        ];
+        for (name, m) in muts {
+            let mut b = honest.clone();
+            m(&mut b);
+            assert!(!b.verify_hash_for(pba), "{name} must be committed at H");
+            // Below H: the legacy hash ignores it.
+            let below = PbaHardening::at(H + 1);
+            let mut lb = block(below, H, Hash::new([1; 32]), vec![]);
+            m(&mut lb);
+            assert!(
+                lb.verify_hash_for(below),
+                "{name} must not change the legacy hash"
+            );
+        }
+    }
+
+    /// Below H (or with no activation), the filled copy keeps the honest hash
+    /// but is stored stripped, so the honest content is what the node holds.
+    #[tokio::test]
+    async fn copy_with_body_fields_below_h_is_stored_reset() {
+        for pba in [PbaHardening::off(), PbaHardening::at(H + 1)] {
+            let (adm, storage, _d) = harness(pba);
+            let tip = chain_to(&adm, pba, H - 1).await;
+            let honest = block(pba, H, tip.header.block_hash, vec![]);
+            let mut filled = honest.clone();
+            fill_body_fields(&mut filled);
+            assert!(
+                filled.verify_hash_for(pba),
+                "legacy hash does not cover sidecars"
+            );
+            let r = adm.admit(&filled).await;
+            assert!(matches!(r, AdmitOutcome::Admitted { .. }), "{pba:?}: {r:?}");
+            let stored = storage
+                .blocks
+                .get_block(&honest.header.block_hash)
+                .unwrap()
+                .unwrap();
+            assert_no_sidecars(&stored);
+            assert_eq!(adm.admit(&honest).await, AdmitOutcome::AlreadyAdmitted);
+        }
+    }
+
+    /// A block whose hash does not recompute is never stored, below H too.
+    #[tokio::test]
+    async fn hash_mismatch_never_stored_at_any_height() {
+        for pba in [
+            PbaHardening::off(),
+            PbaHardening::at(H + 1),
+            PbaHardening::at(0),
+        ] {
+            let (adm, storage, _d) = harness(pba);
+            let tip = chain_to(&adm, pba, H - 1).await;
+            let mut b = block(pba, H, tip.header.block_hash, vec![]);
+            b.state_root = Hash::new([0xEE; 32]);
+            let r = adm.admit(&b).await;
+            assert!(matches!(r, AdmitOutcome::Rejected(_)), "{pba:?}: {r:?}");
+            assert!(!storage.blocks.has_block(&b.header.block_hash).unwrap());
+        }
+    }
+
+    /// Parity below H: the hash of every block is the legacy one, with or
+    /// without sidecars. At and above H an honest block (canonical-empty
+    /// sidecars) also keeps its legacy hash.
+    #[test]
+    fn hash_parity_below_h_and_for_honest_blocks() {
+        let mut b = block(PbaHardening::off(), H, Hash::new([4; 32]), vec![]);
+        let legacy = b.compute_hash_for(PbaHardening::off());
+        assert_eq!(b.compute_hash_for(PbaHardening::at(H + 1)), legacy);
+        assert_eq!(
+            b.compute_hash_for(PbaHardening::at(H)),
+            legacy,
+            "honest block at H"
+        );
+        fill_body_fields(&mut b);
+        let legacy_filled = b.compute_hash_for(PbaHardening::off());
+        assert_eq!(legacy_filled, legacy, "legacy hash ignores sidecars");
+        assert_eq!(b.compute_hash_for(PbaHardening::at(H + 1)), legacy);
+        assert_ne!(b.compute_hash_for(PbaHardening::at(H)), legacy);
+        // Genesis is never re-judged.
+        let mut g = block(PbaHardening::off(), 0, Hash::default(), vec![]);
+        fill_body_fields(&mut g);
+        assert_eq!(
+            g.compute_hash_for(PbaHardening::at(0)),
+            g.compute_hash_for(PbaHardening::off())
+        );
+    }
+
+    /// Genesis carries its model sidecars and is admitted and stored as is.
+    #[tokio::test]
+    async fn genesis_sidecars_never_stripped() {
+        let pba = PbaHardening::off();
+        let (adm, storage, _d) = harness(pba);
+        let mut g = block(pba, 0, Hash::default(), vec![]);
+        fill_body_fields(&mut g);
+        g.header.block_hash = g.compute_hash_for(pba);
+        assert!(matches!(adm.admit(&g).await, AdmitOutcome::Admitted { .. }));
+        let stored = storage
+            .blocks
+            .get_block(&g.header.block_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.required_pins.len(), 1);
+        assert_eq!(stored.embedded_models.len(), 1);
+    }
+
+    // ---- rejoin ------------------------------------------------------------
+
+    /// A node that upgrades late holds post-H blocks it admitted under the old
+    /// rules. The start-up rejoin check re-runs `verify_block_body` on every
+    /// stored block at or above H (and `verify_for_block` per tx); both new
+    /// rules must make such blocks fail it, so they are purged and resynced.
+    #[tokio::test]
+    async fn late_upgrade_stored_post_h_blocks_fail_the_body_rules() {
+        let old = PbaHardening::off();
+        let (adm, storage, _d) = harness(old);
+        let tip = chain_to(&adm, old, H - 1).await;
+        // (a) A V1 native tx at H, admitted by the old release.
+        let mut v1_block = block(
+            old,
+            H,
+            tip.header.block_hash,
+            vec![native_tx(5, 0, NativeSigVersion::V1, 40204, 40204)],
+        );
+        // An old-release producer's tx_root at H is the legacy one; model the
+        // block as the new rules see it with a v2 root so only the signature
+        // rule decides.
+        let new = PbaHardening::at(H);
+        v1_block.tx_root = tx_root_for_height(new, H, &v1_block.transactions);
+        v1_block.header.block_hash = v1_block.compute_hash_for(new);
+        let r = verify_block_body(new, &v1_block);
+        assert!(
+            matches!(r, Err(ref why) if why.contains("legacy digest")),
+            "{r:?}"
+        );
+        assert!(
+            citrate_consensus::tx_auth::verify_for_block(&v1_block.transactions[0], 40204).is_err()
+        );
+
+        // (b) An old-release checkpoint block at H carrying a learning root,
+        // hashed without it.
+        let mut cp = block(old, H, tip.header.block_hash, vec![]);
+        cp.learning_root = Hash::new([0xC0; 32]);
+        cp.tx_root = tx_root_for_height(new, H, &cp.transactions);
+        cp.header.block_hash = cp.compute_hash_for(old);
+        assert!(matches!(
+            adm.admit(&cp).await,
+            AdmitOutcome::Admitted { .. }
+        ));
+        let r = verify_block_body(new, &cp);
+        assert!(
+            matches!(r, Err(ref why) if why.contains("hash mismatch")),
+            "{r:?}"
+        );
+        // The same block from an upgraded producer is valid.
+        let mut good = cp.clone();
+        good.header.block_hash = good.compute_hash_for(new);
+        assert!(verify_block_body(new, &good).is_ok());
+        drop(storage);
+    }
+
+    /// Tripwire: the sidecar rule runs before either store is written.
+    #[test]
+    fn tripwire_sidecar_rule_precedes_every_write() {
+        let src = include_str!("admission.rs");
+        let admit = src
+            .find("pub async fn admit(&self, block: &Block)")
+            .expect("admit");
+        let body = &src[admit..];
+        let gate = body
+            .find("sidecar_ingest(self.ghostdag.pba_hardening(), block)")
+            .expect("admit must run sidecar_ingest");
+        assert!(gate < body.find("self.dag_store.store_block(").expect("dag write"));
+        assert!(
+            gate < body
+                .find("self.storage.blocks.put_block(")
+                .expect("chain write")
+        );
+    }
+
+    fn model(id: &str, dim: Option<u32>, framework: Option<&str>) -> EmbeddedModel {
+        EmbeddedModel {
+            model_id: ModelId(id.into()),
+            model_type: ModelType::TinyLLM,
+            weights_sha256: Hash::new([1; 32]),
+            metadata: ModelMetadata {
+                name: "n".into(),
+                version: "1".into(),
+                context_length: 8,
+                embedding_dim: dim,
+                license: "l".into(),
+                framework: framework.map(Into::into),
+            },
+        }
+    }
+
+    /// An honest block at H with non-empty sidecars (a checkpoint
+    /// `learning_root`, models, an embedding) is admitted and stored as is;
+    /// every changed copy under the same hash is refused first.
+    #[tokio::test]
+    async fn honest_nonempty_sidecars_at_h_every_changed_copy_refused() {
+        let pba = PbaHardening::at(H);
+        let (adm, storage, _d) = harness(pba);
+        let tip = chain_to(&adm, pba, H - 1).await;
+        let mut honest = block(pba, H, tip.header.block_hash, vec![]);
+        honest.learning_root = Hash::new([0xC0; 32]);
+        honest.embedded_models = vec![
+            model("a", Some(4), Some("f")),
+            model("b", Some(4), Some("f")),
+        ];
+        honest.learning_embedding = Some(vec![0.25, 0.5]);
+        honest.header.block_hash = honest.compute_hash_for(pba);
+        assert_ne!(
+            honest.header.block_hash,
+            honest.compute_hash_for(PbaHardening::off())
+        );
+
+        type M = fn(&mut Block);
+        let changes: &[(&str, M)] = &[
+            ("strip all", |b| citrate_consensus::block_sidecars::strip(b)),
+            ("reorder models", |b| b.embedded_models.reverse()),
+            ("drop a model", |b| {
+                b.embedded_models.pop();
+            }),
+            ("learning_root", |b| b.learning_root = Hash::default()),
+            ("embedding value", |b| {
+                b.learning_embedding = Some(vec![0.25, 0.75])
+            }),
+            ("embedding none", |b| b.learning_embedding = None),
+            ("nested license", |b| {
+                b.embedded_models[1].metadata.license = "m".into()
+            }),
+            ("nested dim", |b| {
+                b.embedded_models[0].metadata.embedding_dim = Some(5)
+            }),
+            ("add pin", |b| {
+                b.required_pins = vec![RequiredModel {
+                    model_id: ModelId("p".into()),
+                    ipfs_cid: "c".into(),
+                    sha256_hash: Hash::new([2; 32]),
+                    size_bytes: 1,
+                    must_pin: true,
+                    slash_penalty: 1,
+                    grace_period_hours: 1,
+                }]
+            }),
+            ("ghostdag k", |b| b.ghostdag_params.k = 17),
+            ("gradient", |b| b.gradient_commitment = Some([1; 32])),
+            ("confidence", |b| b.learning_confidence = Some(vec![1.0])),
+        ];
+        for (name, t) in changes {
+            let mut x = honest.clone();
+            t(&mut x);
+            let r = adm.admit(&x).await;
+            assert!(matches!(r, AdmitOutcome::Rejected(_)), "{name}: {r:?}");
+            assert!(
+                !storage.blocks.has_block(&honest.header.block_hash).unwrap(),
+                "{name} stored"
+            );
+        }
+        let r = adm.admit(&honest).await;
+        assert!(matches!(r, AdmitOutcome::Admitted { .. }), "{r:?}");
+        let stored = storage
+            .blocks
+            .get_block(&honest.header.block_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.embedded_models.len(), 2);
+        assert_eq!(stored.learning_root, Hash::new([0xC0; 32]));
+        assert_eq!(
+            bincode::serialize(&stored).unwrap(),
+            bincode::serialize(&honest).unwrap()
+        );
+    }
+
+    /// Model metadata with the optional fields unset survives the store's
+    /// bincode round trip (post-H blocks keep their sidecars).
+    #[tokio::test]
+    async fn post_h_model_metadata_without_optional_fields_round_trips() {
+        let pba = PbaHardening::at(H);
+        let (adm, storage, _d) = harness(pba);
+        let tip = chain_to(&adm, pba, H - 1).await;
+        let mut b = block(pba, H, tip.header.block_hash, vec![]);
+        b.embedded_models = vec![model("a", None, None), model("b", Some(4), None)];
+        b.header.block_hash = b.compute_hash_for(pba);
+        assert!(matches!(adm.admit(&b).await, AdmitOutcome::Admitted { .. }));
+        let stored = storage
+            .blocks
+            .get_block(&b.header.block_hash)
+            .expect("decodes")
+            .expect("stored");
+        assert_eq!(stored.embedded_models[0].metadata.embedding_dim, None);
+        assert_eq!(stored.embedded_models[1].metadata.framework, None);
+        assert!(stored.verify_hash_for(pba));
     }
 }
