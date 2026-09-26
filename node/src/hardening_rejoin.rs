@@ -108,6 +108,25 @@ fn write_checked(storage: &StorageManager, activation: u64, through: u64) -> any
     storage.db.put_cf(CF_METADATA, CHECKED_KEY, &v)
 }
 
+/// Advance the checked marker at runtime. Every block this process stores
+/// at or above the activation height has already passed the rules (the
+/// admission body gate, the producer's filter), so the next start-up check
+/// need not verify it again. Only moves forward, and only once the start-up
+/// check has run for this activation height.
+pub fn mark_verified_through(
+    storage: &StorageManager,
+    activation: u64,
+    through: u64,
+) -> anyhow::Result<bool> {
+    match read_checked(storage) {
+        Some((h, t)) if h == activation && t < through => {
+            write_checked(storage, activation, through)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Remove every stored block at or above the activation height that is
 /// invalid under the rules, and everything built on it. See the module docs.
 /// A no-op when no activation height is set or nothing is stored above it.
@@ -129,6 +148,9 @@ pub fn purge_invalid_post_activation(
         }
     }
     if latest < from {
+        // Nothing stored above what is already checked: record that the check
+        // ran for this activation height, so runtime marking can advance it.
+        write_checked(storage, activation, from.saturating_sub(1).max(latest))?;
         return Ok(report);
     }
 
@@ -237,8 +259,10 @@ pub const METRIC_LEGACY_FORMAT_BLOCKS: &str = "citrate_legacy_format_blocks_tota
 /// Prometheus gauge: distinct peers seen sending them.
 pub const METRIC_LEGACY_FORMAT_PEERS: &str = "citrate_legacy_format_peers";
 
-/// Upper bound on peers tracked individually.
+/// Upper bound on peers tracked (and labelled) individually.
 const MAX_TRACKED_PEERS: usize = 4096;
+/// Label for every peer beyond [`MAX_TRACKED_PEERS`].
+const OTHER_PEERS: &str = "other";
 
 /// Counts, per peer, the blocks received in the pre-activation format at or
 /// after the activation height.
@@ -249,20 +273,35 @@ pub struct LegacyFormatPeers {
 
 impl LegacyFormatPeers {
     /// Check one received block. Returns true (and logs and counts it) when
-    /// it is a pre-activation-format block at or after the activation height.
+    /// it is a pre-activation-format block at or after the activation height
+    /// that passes the basic header checks (its hash and its proposer's
+    /// signature), so an unsigned or forged block never counts.
     pub fn observe(&self, hardening: PbaHardening, peer: &str, block: &Block) -> bool {
-        if !is_legacy_format(hardening, block) {
-            return false;
+        self.observe_label(hardening, peer, block).is_some()
+    }
+
+    /// [`Self::observe`], returning the metric label used: the peer id for
+    /// the first [`MAX_TRACKED_PEERS`] peers, `other` after that, so the
+    /// exported series stay bounded.
+    fn observe_label(&self, hardening: PbaHardening, peer: &str, block: &Block) -> Option<String> {
+        if !is_legacy_format(hardening, block)
+            || !block.verify_hash()
+            || !matches!(
+                citrate_consensus::crypto::verify_block_signature(block),
+                Ok(true)
+            )
+        {
+            return None;
         }
-        let (count, peers) = {
+        let (label, count, peers) = {
             let mut m = self.counts.lock().unwrap_or_else(|e| e.into_inner());
             let tracked = m.contains_key(peer) || m.len() < MAX_TRACKED_PEERS;
-            let key = if tracked { peer } else { "other" };
+            let key = if tracked { peer } else { OTHER_PEERS };
             let c = m.entry(key.to_string()).or_insert(0);
             *c += 1;
-            (*c, m.len())
+            (key.to_string(), *c, m.len())
         };
-        metrics::counter!(METRIC_LEGACY_FORMAT_BLOCKS, 1, "peer" => peer.to_string());
+        metrics::counter!(METRIC_LEGACY_FORMAT_BLOCKS, 1, "peer" => label.clone());
         metrics::gauge!(METRIC_LEGACY_FORMAT_PEERS, peers as f64);
         if count == 1 || count.is_power_of_two() {
             info!(
@@ -272,7 +311,7 @@ impl LegacyFormatPeers {
                 peer, block.header.block_hash, block.header.height, count
             );
         }
-        true
+        Some(label)
     }
 
     /// Blocks counted for `peer`.
@@ -656,8 +695,9 @@ mod tests {
         assert_eq!(report.legacy_format, 0, "not the old format");
     }
 
-    fn signed(seed: u8, nonce: u64) -> Transaction {
-        let sk = crypto::Ed25519SigningKey::from_bytes(&[seed; 32]);
+    /// A transfer signed by a freshly generated key.
+    fn signed(nonce: u64) -> Transaction {
+        let sk = crypto::generate_keypair();
         let mut tx = Transaction {
             nonce,
             to: Some(PublicKey::new([0xB0; 32])),
@@ -710,7 +750,7 @@ mod tests {
             vec![],
             Hash::default(),
         );
-        let tx = signed(7, 0);
+        let tx = signed(0);
         let legacy2 = template(
             old,
             2,
@@ -895,6 +935,146 @@ mod tests {
         );
     }
 
+    /// The timestamp bound is inclusive: exactly `parent + MAX` is valid (the
+    /// producer's clamp stamps it after a halt), one second more is not.
+    #[test]
+    fn timestamp_bound_edges() {
+        let on = PbaHardening::at(1);
+        let g = genesis().header.block_hash;
+        let at = |ts: u64| {
+            let mut b = template(on, 1, g, CB_UPGRADED, 1, vec![], Hash::default());
+            b.header.timestamp = ts;
+            b.header.block_hash = b.compute_hash();
+            b
+        };
+        let p = 5_000;
+        let edge = p + MAX_BLOCK_TIMESTAMP_ADVANCE_SECS;
+        assert_eq!(check_block(on, CHAIN, &at(edge), Some(p)), Ok(()));
+        assert!(check_block(on, CHAIN, &at(edge + 1), Some(p)).is_err());
+        assert_eq!(
+            check_block(on, CHAIN, &at(edge + 1), None),
+            Ok(()),
+            "no parent: no bound"
+        );
+        // Below the activation height nothing is judged.
+        assert_eq!(
+            check_block(PbaHardening::at(2), CHAIN, &at(u64::MAX), Some(p)),
+            Ok(())
+        );
+    }
+
+    fn store_chain(storage: &StorageManager, blocks: &[&Block]) {
+        for b in blocks {
+            storage.blocks.put_block(b).expect("put");
+        }
+    }
+
+    /// A lone invalid block exactly at the activation height, which is also
+    /// the latest stored height, is found and removed.
+    #[test]
+    fn lone_invalid_block_at_the_activation_height_is_removed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let g = genesis();
+        let old = PbaHardening::off();
+        let b1 = template(
+            old,
+            1,
+            g.header.block_hash,
+            CB_UPGRADED,
+            1,
+            vec![],
+            Hash::default(),
+        );
+        let b2 = template(
+            old,
+            2,
+            b1.header.block_hash,
+            CB_STALE,
+            2,
+            vec![],
+            Hash::default(),
+        );
+        store_chain(&storage, &[&g, &b1, &b2]);
+        assert_eq!(storage.blocks.get_latest_height().unwrap(), 2);
+        let r = purge_invalid_post_activation(&storage, PbaHardening::at(2), CHAIN).unwrap();
+        assert_eq!(r.checked, 1);
+        assert_eq!(r.purged, [b2.header.block_hash].into());
+        assert!(!storage.blocks.has_block(&b2.header.block_hash).unwrap());
+    }
+
+    /// The start-up check does not re-verify blocks stored while the node ran
+    /// under the rules, and still checks anything stored after the marker (a
+    /// later run of an older release).
+    #[test]
+    fn runtime_marker_skips_blocks_already_verified() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let on = PbaHardening::at(2);
+        let g = genesis();
+        let b1 = template(
+            on,
+            1,
+            g.header.block_hash,
+            CB_UPGRADED,
+            1,
+            vec![],
+            Hash::default(),
+        );
+        store_chain(&storage, &[&g, &b1]);
+        // Nothing above H yet: the check records that it ran.
+        let r = purge_invalid_post_activation(&storage, on, CHAIN).unwrap();
+        assert_eq!(r.checked, 0);
+        assert_eq!(read_checked(&storage), Some((2, 1)));
+        // Marker moves forward only, and only for this activation height.
+        assert!(!mark_verified_through(&storage, 3, 9).unwrap());
+        assert!(!mark_verified_through(&storage, 2, 1).unwrap());
+
+        // The node runs and stores valid blocks 2..=3; the runtime task marks them.
+        let b2 = template(
+            on,
+            2,
+            b1.header.block_hash,
+            CB_UPGRADED,
+            2,
+            vec![],
+            Hash::default(),
+        );
+        let b3 = template(
+            on,
+            3,
+            b2.header.block_hash,
+            CB_UPGRADED,
+            3,
+            vec![],
+            Hash::default(),
+        );
+        store_chain(&storage, &[&b2, &b3]);
+        assert!(mark_verified_through(&storage, 2, 3).unwrap());
+        assert_eq!(read_checked(&storage), Some((2, 3)));
+        let r = purge_invalid_post_activation(&storage, on, CHAIN).unwrap();
+        assert_eq!(
+            r.checked, 0,
+            "runtime-verified blocks are not checked again"
+        );
+
+        // An older release later appends an invalid block above the marker.
+        let legacy4 = template(
+            PbaHardening::off(),
+            4,
+            b3.header.block_hash,
+            CB_STALE,
+            4,
+            vec![],
+            Hash::default(),
+        );
+        store_chain(&storage, &[&legacy4]);
+        let r = purge_invalid_post_activation(&storage, on, CHAIN).unwrap();
+        assert_eq!(r.checked, 1);
+        assert_eq!(r.purged, [legacy4.header.block_hash].into());
+        assert!(storage.blocks.has_block(&b3.header.block_hash).unwrap());
+    }
+
     #[test]
     fn nothing_to_do_without_an_activation_height() {
         let dir = tempfile::tempdir().expect("dir");
@@ -919,11 +1099,42 @@ mod tests {
         assert!(storage.blocks.has_block(&b.header.block_hash).unwrap());
     }
 
+    /// Sign `b` as its proposer would (fresh key), so it passes the basic
+    /// header checks.
+    fn proposed(mut b: Block) -> Block {
+        let sk = crypto::generate_keypair();
+        b.header.proposer_pubkey = PublicKey::new(sk.verifying_key().to_bytes());
+        b.header.block_hash = b.compute_hash();
+        b.signature = crypto::sign_block(&b.header.block_hash, &sk);
+        b
+    }
+
     #[test]
     fn legacy_format_peers_are_counted_per_peer() {
         let on = PbaHardening::at(3);
         let g = genesis().header.block_hash;
-        let legacy = template(
+        let legacy = proposed(template(
+            PbaHardening::off(),
+            3,
+            g,
+            CB_STALE,
+            1,
+            vec![],
+            Hash::default(),
+        ));
+        let current = proposed(template(on, 3, g, CB_UPGRADED, 1, vec![], Hash::default()));
+        let before = proposed(template(
+            PbaHardening::off(),
+            2,
+            g,
+            CB_STALE,
+            1,
+            vec![],
+            Hash::default(),
+        ));
+        // Header checks come first: unsigned, or signed and then altered.
+        let t0 = LegacyFormatPeers::default();
+        let unsigned = template(
             PbaHardening::off(),
             3,
             g,
@@ -932,16 +1143,23 @@ mod tests {
             vec![],
             Hash::default(),
         );
-        let current = template(on, 3, g, CB_UPGRADED, 1, vec![], Hash::default());
-        let before = template(
-            PbaHardening::off(),
-            2,
-            g,
-            CB_STALE,
-            1,
-            vec![],
-            Hash::default(),
+        assert!(
+            !t0.observe(on, "peer-x", &unsigned),
+            "unsigned block is not counted"
         );
+        let mut forged = legacy.clone();
+        forged.header.timestamp += 1;
+        assert!(
+            !t0.observe(on, "peer-x", &forged),
+            "hash mismatch is not counted"
+        );
+        let mut resigned = legacy.clone();
+        resigned.signature = unsigned.signature;
+        assert!(
+            !t0.observe(on, "peer-x", &resigned),
+            "bad signature is not counted"
+        );
+        assert_eq!(t0.peers(), 0);
         let t = LegacyFormatPeers::default();
         assert!(t.observe(on, "peer-a", &legacy));
         assert!(t.observe(on, "peer-a", &legacy));
@@ -969,9 +1187,9 @@ mod tests {
     }
 
     #[test]
-    fn tracked_peers_are_bounded() {
+    fn tracked_peers_and_exported_labels_are_bounded() {
         let on = PbaHardening::at(1);
-        let legacy = template(
+        let legacy = proposed(template(
             PbaHardening::off(),
             1,
             Hash::new([1; 32]),
@@ -979,11 +1197,22 @@ mod tests {
             1,
             vec![],
             Hash::default(),
-        );
+        ));
         let t = LegacyFormatPeers::default();
+        let mut labels = HashSet::new();
         for i in 0..(MAX_TRACKED_PEERS + 10) {
-            t.observe(on, &format!("p{i}"), &legacy);
+            let label = t
+                .observe_label(on, &format!("p{i}"), &legacy)
+                .expect("counted");
+            labels.insert(label);
         }
+        assert_eq!(
+            labels.len(),
+            MAX_TRACKED_PEERS + 1,
+            "exported series stay bounded"
+        );
+        assert!(labels.contains(OTHER_PEERS));
+        assert!(labels.contains("p0"));
         assert_eq!(
             t.peers(),
             MAX_TRACKED_PEERS + 1,
@@ -1029,6 +1258,159 @@ mod tests {
                 &next[..60]
             );
         }
+    }
+
+    /// The release-network genesis table matches the genesis this binary
+    /// builds for each release profile, and every shipped dev profile runs on
+    /// its own chain id with a genesis that is not a release network's.
+    #[tokio::test]
+    async fn release_genesis_table_and_dev_profiles() {
+        use citrate_consensus::hardening::{
+            check_genesis_chain, is_release_network, resolve_pba_hardening_for_chain,
+            RELEASE_GENESIS,
+        };
+        async fn build(chain_id: u64, profile: Option<&str>) -> [u8; 32] {
+            let dir = tempfile::tempdir().expect("dir");
+            let st =
+                Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("st"));
+            let ex = Arc::new(Executor::with_storage_and_chain_id(
+                Arc::new(StateDB::new()),
+                Some(st.state.clone()),
+                chain_id,
+            ));
+            let cfg = crate::genesis::GenesisConfig {
+                chain_id,
+                ..Default::default()
+            };
+            let h = crate::genesis::initialize_genesis_state_with_profile(st, ex, &cfg, profile)
+                .await
+                .expect("genesis");
+            *h.as_bytes()
+        }
+        let mut built = Vec::new();
+        for profile in [
+            Some("testnet_beta"),
+            None,
+            Some("team_testnet"),
+            Some("mainnet"),
+        ] {
+            let g = build(40204, profile).await;
+            assert!(
+                RELEASE_GENESIS.contains(&(40204, g)),
+                "{profile:?} genesis {} missing from RELEASE_GENESIS",
+                hex::encode(g)
+            );
+            built.push(g);
+        }
+        for (_, g) in RELEASE_GENESIS {
+            assert!(
+                built.contains(g),
+                "stale RELEASE_GENESIS entry {}",
+                hex::encode(g)
+            );
+        }
+
+        let dev_profiles = [
+            ("NodeConfig::devnet()", crate::config::NodeConfig::devnet()),
+            (
+                "devnet.toml",
+                toml::from_str(include_str!("../config/devnet.toml")).expect("devnet.toml"),
+            ),
+            (
+                "devnet-config.toml",
+                toml::from_str(include_str!("../../devnet-config.toml")).expect("devnet-config"),
+            ),
+            (
+                "devnet-docker.toml",
+                toml::from_str(include_str!("../../docker/config/devnet-docker.toml"))
+                    .expect("devnet-docker"),
+            ),
+        ];
+        for (name, c) in dev_profiles {
+            let c: crate::config::NodeConfig = c;
+            assert!(
+                !is_release_network(c.chain.chain_id),
+                "{name} on a release chain id"
+            );
+            let g = build(c.chain.chain_id, c.chain.genesis_profile.as_deref()).await;
+            assert!(
+                RELEASE_GENESIS.iter().all(|(_, r)| *r != g),
+                "{name} builds a release network's genesis"
+            );
+            assert_eq!(check_genesis_chain(c.chain.chain_id, &g), Ok(()));
+            if c.chain.dev_profile {
+                resolve_pba_hardening_for_chain(
+                    c.chain.chain_id,
+                    c.chain.pba_hardening_height,
+                    true,
+                )
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
+    }
+
+    /// Measures the state rebuild a late upgrader runs at start-up: a stored
+    /// chain of N blocks replayed from genesis by `recover_to_head`.
+    /// `CITRATE_REBUILD_BENCH_BLOCKS` sets N (default 10,000). Run with
+    /// `cargo test --release -p citrate-node --bin citrate -- --ignored rebuild_time`.
+    #[tokio::test]
+    #[ignore]
+    async fn rebuild_time() {
+        let n: u64 = std::env::var("CITRATE_REBUILD_BENCH_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000);
+        let on = PbaHardening::off();
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
+        let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("dag"));
+        let ghostdag =
+            Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()).with_pba_hardening(on));
+        let g = genesis();
+        dag.set_configured_genesis(g.header.block_hash);
+        storage
+            .blocks
+            .put_applied_tip(&g.header.block_hash, 0)
+            .expect("tip");
+        let adm = BlockAdmission::new(storage.clone(), dag, ghostdag.clone(), None);
+        adm.admit(&g).await;
+        let mirror = Executor::new(Arc::new(StateDB::new()));
+        let mut parent = g.header.block_hash;
+        let mut head = g.clone();
+        let t0 = std::time::Instant::now();
+        for h in 1..=n {
+            let b = produce(&mirror, on, h, parent, CB_UPGRADED, (h % 250) as u8 + 1);
+            assert!(matches!(adm.admit(&b).await, AdmitOutcome::Admitted { .. }));
+            parent = b.header.block_hash;
+            head = b;
+        }
+        let stored = t0.elapsed();
+        let exec = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            CHAIN,
+        ));
+        let app =
+            CanonicalApplicator::new(exec.clone(), storage.clone()).with_fork_choice(ghostdag);
+        let t1 = std::time::Instant::now();
+        let ok = app
+            .recover_to_head(
+                Executor::new(Arc::new(StateDB::new())).state_snapshot(),
+                g.header.block_hash,
+            )
+            .await
+            .expect("recover");
+        let rebuild = t1.elapsed();
+        assert!(ok);
+        assert_eq!(exec.calculate_state_root(), head.state_root);
+        println!(
+            "REBUILD_BENCH blocks={n} store={:.1}s rebuild={:.1}s ({:.0} blocks/s)",
+            stored.as_secs_f64(),
+            rebuild.as_secs_f64(),
+            n as f64 / rebuild.as_secs_f64()
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ mod consensus_manifest;
 mod contribution_recorder;
 mod dag_prune;
 mod genesis;
+mod hardening_rejoin;
 mod inference;
 pub mod logging;
 pub mod metrics;
@@ -43,7 +44,6 @@ mod producer;
 mod registry_sync;
 mod sync;
 mod sync_peer;
-mod hardening_rejoin;
 
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
@@ -1188,6 +1188,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         },
     )?);
 
+    // A release network's genesis only runs under that network's chain id: the
+    // genesis block does not commit to the chain id, so otherwise a node could
+    // escape the chain's release pin by changing [chain] chain_id alone.
+    if let Some(g0) = storage.blocks.get_block_by_height(0)? {
+        citrate_consensus::hardening::check_genesis_chain(config.chain.chain_id, g0.as_bytes())
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    }
+
     // Rejoin after activation: remove stored blocks at or above the activation
     // height that are invalid under the rules (a node that kept running an
     // older release past it holds such blocks), before the DAG store, GhostDAG
@@ -1205,9 +1213,31 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             e
         )
     })?;
+    // Blocks stored from here on have passed the rules, so the next start-up
+    // check need not verify them again (see hardening_rejoin).
+    if let Some(h) = pba_activation.height {
+        let storage = storage.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                if let Ok(latest) = storage.blocks.get_latest_height() {
+                    if let Err(e) = hardening_rejoin::mark_verified_through(&storage, h, latest) {
+                        warn!("start-up check marker: {}", e);
+                    }
+                }
+            }
+        });
+    }
     // Without execute-on-receive the node has no path to rebuild state from
     // genesis, so a purged applied tip needs a manual resync.
-    if rejoin.applied_tip_purged
+    // (Also when an earlier start removed the blocks but stopped before the
+    // rebuild: the applied-tip pointer then names a block that is gone.)
+    let applied_tip_gone = storage
+        .blocks
+        .get_applied_tip()?
+        .is_some_and(|(h, _)| !storage.blocks.has_block(&h).unwrap_or(true));
+    if (rejoin.applied_tip_purged || applied_tip_gone)
         && std::env::var("CITRATE_BLOCK_V2")
             .map(|v| !(v == "1" || v.eq_ignore_ascii_case("true")))
             .unwrap_or(false)
