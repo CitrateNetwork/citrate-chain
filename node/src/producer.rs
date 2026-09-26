@@ -4033,8 +4033,11 @@ mod producer_panic_breaker {
         assert!(b.strike(last).is_empty());
         assert_eq!(b.strikes.len(), 1);
         assert_eq!(b.strikes.get(&last), Some(&1));
-        // Its evidence still counts: the next strike evicts it.
+        // Its evidence still counts: the next strike evicts it, and it is no
+        // longer a suspect.
+        b.suspects = vec![id(7), last];
         assert_eq!(b.strike(last), vec![last]);
+        assert_eq!(b.suspects, vec![id(7)]);
     }
 
     fn embedded(a: Address) -> PublicKey {
