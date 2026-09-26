@@ -968,7 +968,7 @@ dependencies = [
  "once_cell",
  "primitive-types",
  "prometheus",
- "rand 0.9.3",
+ "rand 0.8.6",
  "reqwest",
  "rlp",
  "secp256k1 0.27.0",
@@ -996,7 +996,7 @@ dependencies = [
  "hex",
  "parking_lot 0.12.5",
  "primitive-types",
- "rand 0.9.3",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha3",
@@ -1018,7 +1018,7 @@ dependencies = [
  "hex",
  "hmac",
  "p256",
- "rand 0.9.3",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2",
@@ -1026,6 +1026,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1070,6 +1071,7 @@ dependencies = [
  "cc",
  "citrate-consensus",
  "dashmap",
+ "ed25519-dalek",
  "ethereum-types",
  "futures",
  "hex",
@@ -1084,7 +1086,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "primitive-types",
  "prometheus",
- "rand 0.9.3",
+ "rand 0.8.6",
  "revm",
  "ripemd",
  "rlp",
@@ -1155,11 +1157,12 @@ dependencies = [
  "citrate-sequencer",
  "citrate-storage",
  "dashmap",
+ "ed25519-dalek",
  "futures",
  "hex",
  "parking_lot 0.12.5",
  "primitive-types",
- "rand 0.9.3",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha3",
@@ -1168,6 +1171,7 @@ dependencies = [
  "tokio",
  "tokio-util 0.7.18",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1199,6 +1203,7 @@ version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "argon2",
  "async-trait",
  "bincode",
  "blake3",
@@ -1217,7 +1222,7 @@ dependencies = [
  "pqcrypto-kyber",
  "pqcrypto-traits",
  "primitive-types",
- "rand 0.9.3",
+ "rand 0.8.6",
  "reqwest",
  "rocksdb",
  "serde",
@@ -1715,7 +1720,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4085,7 +4090,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4435,7 +4440,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4535,9 +4540,9 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "tar"
-version = "0.4.45"
+version = "0.4.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22692a6476a21fa75fdfc11d452fda482af402c008cdbaf3476414e122040973"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
 dependencies = [
  "filetime",
  "libc",
@@ -4554,7 +4559,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
