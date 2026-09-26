@@ -315,7 +315,7 @@ fn cors_layer(raw: Option<&str>) -> CorsLayer {
 /// `/faucet.js` (no inline script or handlers), so the CSP needs no `'unsafe-inline'` for scripts;
 /// `style-src 'unsafe-inline'` covers the page's <style> block and style attribute.
 const FAUCET_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; \
-connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 async fn security_headers(mut res: axum::response::Response) -> axum::response::Response {
     use axum::http::{header, HeaderValue};
@@ -347,6 +347,10 @@ fn build_router(state: FaucetState, allowed_origins_env: Option<&str>) -> Router
         .route("/faucet", post(request_tokens))
         .route("/status", get(status))
         .route("/health", get(health))
+        .route("/logo.svg", get(logo))
+        .route("/fonts/space-grotesk-600.woff2", get(font_grotesk_600))
+        .route("/fonts/geist-mono-400.woff2", get(font_mono_400))
+        .route("/fonts/geist-mono-500.woff2", get(font_mono_500))
         // CORS inside, security headers outermost: CORS preflight answers (which CorsLayer
         // produces itself) carry the same headers as every other response.
         .layer(cors_layer(allowed_origins_env))
@@ -387,39 +391,70 @@ async fn faucet_js() -> ([(axum::http::HeaderName, &'static str); 1], &'static s
 }
 
 async fn root() -> axum::response::Html<&'static str> {
-    axum::response::Html(r#"<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    // Charter register of the citrate-core / app-layer design system
+    // (src/styles/tokens.css + foundation.css): light, civic, document-like.
+    // Tokens inlined with concrete values (no CSS build step). Display +
+    // mono faces (Space Grotesk, Geist Mono) are the two the app self-hosts;
+    // they are served same-origin from /fonts/* so the page matches the app
+    // under the strict faucet CSP (font-src 'self'). Body sans falls back to
+    // the system stack, exactly as citrate-core does (it self-hosts no sans).
+    axum::response::Html(r##"<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#f4f1ea">
 <title>Citrate Faucet</title>
 <style>
+@font-face{font-family:"Space Grotesk";font-style:normal;font-weight:600;font-display:swap;src:url(/fonts/space-grotesk-600.woff2) format("woff2")}
+@font-face{font-family:"Geist Mono";font-style:normal;font-weight:400;font-display:swap;src:url(/fonts/geist-mono-400.woff2) format("woff2")}
+@font-face{font-family:"Geist Mono";font-style:normal;font-weight:500;font-display:swap;src:url(/fonts/geist-mono-500.woff2) format("woff2")}
+:root{
+  --srf-0:#f4f1ea;--srf-1:#faf8f3;--srf-2:#ffffff;
+  --tx-1:#0e0f0c;--tx-2:#555851;--tx-3:#84867f;
+  --line-1:#d9dad4;--line-2:#c3c4be;
+  --accent:#8ecc09;--accent-deep:#5a8205;
+  --ok:#4f8a05;--ok-bg:#ecf5d4;--danger:#a72414;--danger-bg:#f6e1de;
+  --font-display:"Space Grotesk",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --font-mono:"Geist Mono",ui-monospace,"SF Mono",Menlo,monospace;
+  --focus-ring:0 0 0 3px rgba(142,204,9,.35);
+}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,system-ui,sans-serif;background:#0a0a1a;color:#f9fafb;min-height:100vh;display:flex;align-items:center;justify-content:center}
-.card{background:#1e1e2e;border:1px solid #374151;border-radius:12px;padding:32px;max-width:440px;width:100%}
-h1{font-size:24px;margin-bottom:4px}
-.sub{color:#9ca3af;font-size:14px;margin-bottom:24px}
-label{font-size:13px;color:#9ca3af;display:block;margin-bottom:6px}
-input{width:100%;padding:10px 12px;background:#0f0f23;border:1px solid #374151;border-radius:6px;color:#f9fafb;font-size:14px;font-family:monospace;outline:none}
-input:focus{border-color:#6366f1}
-button{width:100%;padding:12px;background:#6366f1;color:#fff;border:none;border-radius:6px;font-size:15px;font-weight:600;cursor:pointer;margin-top:16px;transition:background .2s}
-button:hover{background:#818cf8}
-button:disabled{opacity:.5;cursor:not-allowed}
-.msg{margin-top:16px;padding:10px;border-radius:6px;font-size:13px}
-.msg.ok{background:#064e3b;border:1px solid #10b981}
-.msg.err{background:#7f1d1d;border:1px solid #ef4444}
-.info{margin-top:20px;font-size:12px;color:#6b7280;text-align:center}
+body{font-family:var(--font-sans);background:var(--srf-0);color:var(--tx-1);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+.card{background:var(--srf-1);border:1px solid var(--line-1);border-radius:12px;padding:32px;max-width:440px;width:100%;box-shadow:0 1px 2px rgba(14,15,12,.04),0 8px 24px rgba(14,15,12,.06)}
+.brand{display:flex;align-items:center;margin-bottom:22px}
+.brand img{height:26px;width:auto;display:block}
+.eyebrow{font-family:var(--font-mono);font-size:11px;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--tx-3);margin-bottom:10px}
+h1{font-family:var(--font-display);font-size:26px;font-weight:600;letter-spacing:-.01em;margin-bottom:6px}
+.sub{color:var(--tx-2);font-size:14px;line-height:1.5;margin-bottom:24px}
+.lbl{font-family:var(--font-mono);font-size:10px;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--tx-2);display:block;margin-bottom:6px}
+input{width:100%;height:40px;padding:8px 12px;background:var(--srf-2);border:1px solid var(--line-2);border-radius:6px;color:var(--tx-1);font-size:13px;font-family:var(--font-mono);outline:none;transition:border-color .14s cubic-bezier(.2,0,0,1),box-shadow .14s cubic-bezier(.2,0,0,1)}
+input:focus{border-color:var(--tx-1);box-shadow:var(--focus-ring)}
+input::placeholder{color:var(--tx-3)}
+button{width:100%;height:42px;padding:0 18px;background:var(--accent);color:var(--tx-1);border:1px solid var(--accent);border-radius:6px;font-family:var(--font-sans);font-size:14px;font-weight:600;cursor:pointer;margin-top:18px;transition:background .14s cubic-bezier(.2,0,0,1),color .14s cubic-bezier(.2,0,0,1),transform .14s cubic-bezier(.2,0,0,1)}
+button:hover{background:var(--accent-deep);border-color:var(--accent-deep);color:#fff}
+button:active{transform:translateY(1px)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.msg{margin-top:16px;padding:10px 12px;border-radius:6px;font-size:13px;line-height:1.45;word-break:break-word}
+.msg.ok{background:var(--ok-bg);border:1px solid var(--ok);color:var(--ok)}
+.msg.err{background:var(--danger-bg);border:1px solid var(--danger);color:var(--danger)}
+.info{margin-top:22px;padding-top:16px;border-top:1px solid var(--line-1);font-family:var(--font-mono);font-size:11px;letter-spacing:.02em;color:var(--tx-3);text-align:center}
+@media (prefers-reduced-motion:reduce){*{transition-duration:.01ms!important}}
 </style>
 </head><body>
 <div class="card">
-<h1>Citrate Faucet</h1>
-<p class="sub">Get test SALT tokens for the Citrate testnet</p>
-<label for="addr">Wallet Address (0x...)</label>
-<input id="addr" placeholder="0x0000000000000000000000000000000000000000" spellcheck="false">
+<div class="brand"><img src="/logo.svg" alt="Citrate"></div>
+<div class="eyebrow">Testnet &middot; Chain 40204</div>
+<h1>Faucet</h1>
+<p class="sub">Request test SALT for the Citrate testnet. Ten SALT per address, once every 24&nbsp;hours.</p>
+<label class="lbl" for="addr">Wallet address</label>
+<input id="addr" placeholder="0x0000000000000000000000000000000000000000" spellcheck="false" autocomplete="off" autocapitalize="off">
 <button id="btn">Request 10 SALT</button>
 <div id="msg" class="msg" style="display:none"></div>
-<p class="info">Chain ID: 40204 &middot; 10 SALT per request &middot; 24h cooldown</p>
+<p class="info">10 SALT per request &middot; 24h cooldown &middot; Chain ID 40204</p>
 </div>
 <script src="/faucet.js"></script>
-</body></html>"#)
+</body></html>"##)
 }
 
 async fn status() -> Json<serde_json::Value> {
@@ -432,6 +467,46 @@ async fn status() -> Json<serde_json::Value> {
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+// Brand assets, embedded at compile time so the faucet stays a single
+// self-contained binary and serves everything same-origin (satisfies the
+// strict faucet CSP: img-src 'self', font-src 'self').
+const MARQUEE_SVG: &str = include_str!("../assets/citrate_marquee_black.svg");
+const FONT_GROTESK_600: &[u8] = include_bytes!("../assets/fonts/space-grotesk-600.woff2");
+const FONT_MONO_400: &[u8] = include_bytes!("../assets/fonts/geist-mono-400.woff2");
+const FONT_MONO_500: &[u8] = include_bytes!("../assets/fonts/geist-mono-500.woff2");
+
+async fn logo() -> impl axum::response::IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/svg+xml"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        MARQUEE_SVG,
+    )
+}
+
+fn woff2(bytes: &'static [u8]) -> ([(axum::http::HeaderName, &'static str); 2], &'static [u8]) {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "font/woff2"),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        bytes,
+    )
+}
+async fn font_grotesk_600() -> impl axum::response::IntoResponse {
+    woff2(FONT_GROTESK_600)
+}
+async fn font_mono_400() -> impl axum::response::IntoResponse {
+    woff2(FONT_MONO_400)
+}
+async fn font_mono_500() -> impl axum::response::IntoResponse {
+    woff2(FONT_MONO_500)
 }
 
 async fn request_tokens(
