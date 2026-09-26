@@ -309,6 +309,10 @@ pub struct MiningConfig {
     pub min_gas_price: u64,
 }
 
+/// Chain id of local dev chains (`NodeConfig::devnet()`, `devnet.toml`,
+/// `devnet-config.toml`, the Docker devnet). Never a release network's id.
+pub const DEV_CHAIN_ID: u64 = 1337;
+
 /// Parse a hardcoded socket address literal. Infallible for valid literals;
 /// uses `unreachable!` instead of `unwrap`/`expect` for the zero-panic vanity goal.
 fn hardcoded_addr(s: &str) -> SocketAddr {
@@ -384,13 +388,15 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Create devnet configuration
+    /// Create devnet configuration (chain id [`DEV_CHAIN_ID`]).
     /// Chain ID can be overridden via CITRATE_CHAIN_ID environment variable
     pub fn devnet() -> Self {
         let mut config = Self::default();
         // Chain ID already set from env var in default(), only override if not set
+        // A local dev chain never runs on a release network's chain id (the
+        // release pin applies there and dev_profile is refused).
         if std::env::var("CITRATE_CHAIN_ID").is_err() {
-            config.chain.chain_id = 40204;
+            config.chain.chain_id = DEV_CHAIN_ID;
         }
         config.chain.genesis_profile = Some("default".to_string());
         // PBA-R2: dev profile enforces the hardened validity rules from genesis.
@@ -476,7 +482,7 @@ mod tests {
 
         let config = NodeConfig::devnet();
 
-        assert_eq!(config.chain.chain_id, 40204);
+        assert_eq!(config.chain.chain_id, DEV_CHAIN_ID);
         assert_eq!(config.mining.target_block_time, 2);
         assert!(config.mining.enabled);
         assert!(config.rpc.allow_eth_send_transaction);

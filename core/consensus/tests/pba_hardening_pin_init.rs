@@ -50,10 +50,10 @@ fn start_up_resolution_publishes_the_resolved_height() {
             );
             let other = p.wrapping_add(1);
             assert!(init_pba_hardening_for_chain(40204, Some(other), false).is_err());
-            // A dev profile on the same chain id keeps its own value.
-            let r = init_pba_hardening_for_chain(40204, Some(0), true).expect("dev");
-            assert_eq!(r.height, Some(0));
         }
     }
+    // A dev profile is never accepted on a release network, pinned or not.
+    assert!(init_pba_hardening_for_chain(40204, Some(0), true).is_err());
+    assert!(init_pba_hardening_for_chain(40204, None, true).is_err());
     set_pba_hardening_height(None);
 }

@@ -1,5 +1,5 @@
 [chain]
-chain_id = 40204
+chain_id = 1337  # local dev chain, never a release network's id
 genesis_hash = ""
 block_time = 1
 ghostdag_k = 8

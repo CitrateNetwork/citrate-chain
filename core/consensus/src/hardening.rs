@@ -27,8 +27,9 @@
 //     PBA_HARDENING_ACTIVATION.md`). An upgraded binary changes nothing on
 //     40204 by itself.
 //   * Dev profiles (`NodeConfig::devnet()`, `node/config/devnet.toml`,
-//     `devnet-config.toml`) set `chain.pba_hardening_height = 0`: active from
-//     genesis.
+//     `devnet-config.toml`) run on their own chain id (1337) with the devnet
+//     genesis and set `chain.pba_hardening_height = 0`: active from genesis.
+//     `dev_profile` is refused on a release network.
 //   * Unit tests construct components with an explicit [`PbaHardening`], so
 //     both sides of the boundary are exercised.
 //
@@ -153,6 +154,66 @@ fn pinned_in(table: &[(u64, Option<u64>)], chain_id: u64) -> Option<u64> {
         .and_then(|(_, h)| *h)
 }
 
+/// Genesis block hashes of the release networks, by chain id.
+///
+/// The genesis block does not commit to the chain id, so without this a node
+/// could run a release network's genesis under another chain id and escape
+/// that chain's pin while still passing the handshake's genesis check.
+pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
+    // testnet_beta (also the profile a 40204 config with no profile uses)
+    (
+        40204,
+        hex32("98e0d72f422049606a6b29ca0a9bcfd2300753fd36526d2c8e9f9a2531b70c73"),
+    ),
+    // team_testnet
+    (
+        40204,
+        hex32("7dc1a35a27b684cadbcfaa04dd527830765fa5db0c15640917e371714fdf7171"),
+    ),
+    // mainnet
+    (
+        40204,
+        hex32("ba93d716ab8b005f1d7e61d369a65fc1d6a358d6a479e11b640815c74388ab01"),
+    ),
+];
+
+const fn hex32(s: &str) -> [u8; 32] {
+    const fn nib(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("hex32: lowercase hex only"),
+        }
+    }
+    let b = s.as_bytes();
+    assert!(b.len() == 64, "hex32: 64 hex digits");
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = (nib(b[2 * i]) << 4) | nib(b[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+/// Whether `chain_id` is a release network: one this release lists in
+/// [`PINNED_ACTIVATIONS`], whether or not its height is set yet.
+pub fn is_release_network(chain_id: u64) -> bool {
+    PINNED_ACTIVATIONS.iter().any(|(id, _)| *id == chain_id)
+}
+
+/// A release network's genesis must run under that network's chain id.
+pub fn check_genesis_chain(chain_id: u64, genesis: &[u8; 32]) -> Result<(), String> {
+    match RELEASE_GENESIS.iter().find(|(_, g)| g == genesis) {
+        Some((network, _)) if *network != chain_id => Err(format!(
+            "this data directory holds the genesis of chain {network}, but the node is \
+             configured for chain {chain_id}. Set [chain] chain_id = {network}, or use a \
+             data directory with its own genesis for a different chain."
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Where the resolved activation height came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationSource {
@@ -183,7 +244,7 @@ pub struct ResolvedActivation {
     pub chain_id: u64,
     pub height: Option<u64>,
     pub source: ActivationSource,
-    /// The node runs a dev profile, so the release pin was not applied.
+    /// The node runs a dev profile (only possible on a non-release chain).
     pub dev_profile: bool,
 }
 
@@ -195,7 +256,7 @@ impl ResolvedActivation {
             None => "unset (rules off)".to_string(),
         };
         let dev = if self.dev_profile {
-            ", dev profile: release pin not applied"
+            ", dev profile"
         } else {
             ""
         };
@@ -227,7 +288,9 @@ impl ResolvedActivation {
 /// Resolve the activation height from its three inputs. Pure: the caller
 /// supplies the pin, the raw env value and the config value.
 ///
-/// * A dev profile, or a chain with no pin: the legacy order. The env
+/// * A dev profile on a pinned chain: refused. Dev profiles run on their own
+///   chain id.
+/// * A chain with no pin: the legacy order. The env
 ///   override wins over the config value, and an unparseable env value is an
 ///   error.
 /// * A pinned chain: the pin is the height. An env or config value is allowed
@@ -240,8 +303,11 @@ pub fn resolve_activation(
     dev_profile: bool,
 ) -> Result<(Option<u64>, ActivationSource), String> {
     let env_value = env_raw.map(parse_pba_hardening_override).transpose()?;
+    if dev_profile && pin.is_some() {
+        return Err(dev_profile_refusal());
+    }
     match pin {
-        Some(p) if !dev_profile => {
+        Some(p) => {
             if let Some(v) = env_value {
                 if v != Some(p) {
                     return Err(format!(
@@ -271,6 +337,13 @@ pub fn resolve_activation(
     }
 }
 
+fn dev_profile_refusal() -> String {
+    "[chain] dev_profile = true is not allowed on a release network. Dev profiles run on \
+     their own chain id (the shipped ones use 1337); remove dev_profile to join this \
+     network."
+        .to_string()
+}
+
 /// Resolve for the running chain: the release pin for `chain_id`, the env
 /// override and the config value (see [`resolve_activation`]). `chain_id`
 /// must be the node's configured chain id.
@@ -279,6 +352,9 @@ pub fn resolve_pba_hardening_for_chain(
     config_value: Option<u64>,
     dev_profile: bool,
 ) -> Result<ResolvedActivation, String> {
+    if dev_profile && is_release_network(chain_id) {
+        return Err(format!("chain {chain_id}: {}", dev_profile_refusal()));
+    }
     let env_raw = match std::env::var(PBA_HARDENING_ENV) {
         Ok(raw) => Some(raw),
         Err(std::env::VarError::NotPresent) => None,
@@ -519,19 +595,49 @@ mod tests {
     }
 
     #[test]
-    fn dev_profile_is_unchanged_by_a_pin() {
+    fn dev_profile_is_refused_on_a_pinned_chain() {
+        for (env, cfg) in [
+            (None, Some(0)),
+            (Some("3"), Some(0)),
+            (None, None),
+            (Some("500"), None),
+        ] {
+            let e = resolve_activation(PIN, env, cfg, true).unwrap_err();
+            assert!(e.contains("dev_profile"), "{e}");
+        }
+        // A chain with no pin keeps the legacy order for dev profiles.
         assert_eq!(
-            resolve_activation(PIN, None, Some(0), true),
+            resolve_activation(None, None, Some(0), true),
             Ok((Some(0), ActivationSource::Config))
         );
-        assert_eq!(
-            resolve_activation(PIN, Some("3"), Some(0), true),
-            Ok((Some(3), ActivationSource::Env))
-        );
-        assert_eq!(
-            resolve_activation(PIN, None, None, true),
-            Ok((None, ActivationSource::Unset))
-        );
+    }
+
+    #[test]
+    fn dev_profile_is_refused_on_every_release_network_even_before_it_is_pinned() {
+        // 40204 is a release network whether or not its height is set yet.
+        assert!(is_release_network(40204));
+        assert!(!is_release_network(1337));
+        std::env::remove_var(PBA_HARDENING_ENV);
+        let e = resolve_pba_hardening_for_chain(40204, Some(0), true).unwrap_err();
+        assert!(e.contains("dev_profile") && e.contains("40204"), "{e}");
+        let ok = resolve_pba_hardening_for_chain(1337, Some(0), true).expect("dev chain");
+        assert_eq!(ok.height, Some(0));
+    }
+
+    #[test]
+    fn a_release_genesis_only_runs_under_its_own_chain_id() {
+        let (id, g) = RELEASE_GENESIS[0];
+        assert_eq!(check_genesis_chain(id, &g), Ok(()));
+        let e = check_genesis_chain(id + 1, &g).unwrap_err();
+        assert!(e.contains(&id.to_string()), "{e}");
+        assert!(check_genesis_chain(1337, &g).is_err());
+        // Any other genesis (a local dev chain) is unconstrained.
+        assert_eq!(check_genesis_chain(1337, &[0x42; 32]), Ok(()));
+        assert_eq!(check_genesis_chain(40204, &[0x42; 32]), Ok(()));
+        for (id, g) in RELEASE_GENESIS {
+            assert!(is_release_network(*id));
+            assert_eq!(check_genesis_chain(*id, g), Ok(()));
+        }
     }
 
     #[test]
