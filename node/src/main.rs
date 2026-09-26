@@ -345,6 +345,33 @@ enum ModelCommands {
     },
 }
 
+/// The config file the node loads: `--config`, else `$CITRATE_CONFIG`, else
+/// `~/.citrate/node.toml`, else `/etc/citrate/node.toml`.
+fn resolve_config_path(cli_config: Option<PathBuf>) -> Option<PathBuf> {
+    cli_config.or_else(|| {
+        if let Ok(env_path) = std::env::var("CITRATE_CONFIG") {
+            let p = PathBuf::from(env_path);
+            if p.exists() {
+                tracing::info!("config: using $CITRATE_CONFIG → {}", p.display());
+                return Some(p);
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            let p = home.join(".citrate").join("node.toml");
+            if p.exists() {
+                tracing::info!("config: auto-loading {}", p.display());
+                return Some(p);
+            }
+        }
+        let p = PathBuf::from("/etc/citrate/node.toml");
+        if p.exists() {
+            tracing::info!("config: auto-loading {}", p.display());
+            return Some(p);
+        }
+        None
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize structured logging
@@ -389,7 +416,14 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Commands::Consensus { json }) => {
-            let manifest = consensus_manifest::ConsensusManifest::current();
+            // Same resolution as start_node: the config file's
+            // `[chain].pba_hardening_height`, overridden by the env var.
+            let configured = resolve_config_path(cli.config.clone())
+                .and_then(|p| NodeConfig::from_file(&p).ok())
+                .and_then(|c| c.chain.pba_hardening_height);
+            let height = citrate_consensus::hardening::resolve_pba_hardening_height(configured)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let manifest = consensus_manifest::ConsensusManifest::for_height(height);
             if json {
                 println!("{}", manifest.to_json());
             } else {
@@ -463,28 +497,7 @@ async fn main() -> Result<()> {
     // `citrate-node` invocation auto-joins the testnet mesh via the
     // baked-in bootnodes.
     let has_config_file = cli.config.is_some();
-    let resolved_config_path: Option<std::path::PathBuf> = cli.config.clone().or_else(|| {
-        if let Ok(env_path) = std::env::var("CITRATE_CONFIG") {
-            let p = std::path::PathBuf::from(env_path);
-            if p.exists() {
-                tracing::info!("config: using $CITRATE_CONFIG → {}", p.display());
-                return Some(p);
-            }
-        }
-        if let Some(home) = dirs::home_dir() {
-            let p = home.join(".citrate").join("node.toml");
-            if p.exists() {
-                tracing::info!("config: auto-loading {}", p.display());
-                return Some(p);
-            }
-        }
-        let p = std::path::PathBuf::from("/etc/citrate/node.toml");
-        if p.exists() {
-            tracing::info!("config: auto-loading {}", p.display());
-            return Some(p);
-        }
-        None
-    });
+    let resolved_config_path: Option<std::path::PathBuf> = resolve_config_path(cli.config.clone());
     let config = if let Some(config_path) = resolved_config_path {
         NodeConfig::from_file(&config_path)?
     } else {

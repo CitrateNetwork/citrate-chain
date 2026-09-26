@@ -1794,10 +1794,8 @@ impl BlockProducer {
 
         // Capacity limits. Gas is the dominant real-world ceiling;
         // count + size are safety valves.
-        const MAX_BLOCK_SIZE: usize = 1_000_000; // 1 MB — matches transport (H-08)
         const MAX_GAS_PER_BLOCK: u64 = PRODUCER_BLOCK_GAS_LIMIT; // Chain genesis constant
         const MAX_AI_TXS_PER_BLOCK: usize = 10;
-        const MAX_STANDARD_TXS: usize = 5_000;
 
         // AI transactions first (model ops, inference). Small reserved slice.
         let ai_txs = self.mempool.get_ai_transactions(MAX_AI_TXS_PER_BLOCK).await;
@@ -1838,9 +1836,12 @@ impl BlockProducer {
                 selected.push(tx);
             }
         }
+        // Count and byte caps apply to EXECUTED transactions (see
+        // `execute_block_transactions`); here only the per-sender slots and a
+        // bound on how many candidates one block considers.
         let mut window = CandidateWindow::new(
-            MAX_STANDARD_TXS,
-            MAX_BLOCK_SIZE,
+            MAX_BLOCK_CANDIDATES,
+            usize::MAX,
             MAX_TXS_PER_SENDER_PER_BLOCK,
         );
         for tx in &selected {
@@ -1908,16 +1909,27 @@ impl BlockProducer {
         let mut meter = BlockGasMeter::new(PRODUCER_BLOCK_GAS_LIMIT);
         let mut deferred_senders: std::collections::HashSet<PublicKey> =
             std::collections::HashSet::new();
+        // Count and byte caps over EXECUTED transactions only.
+        let mut executed_window = CandidateWindow::new(MAX_BLOCK_TXS, MAX_BLOCK_BYTES, usize::MAX);
 
-        // Execute each transaction
-        for tx in transactions {
-            if deferred_senders.contains(&tx.from) || !meter.fits(tx.gas_limit) {
+        // Execute candidates in order. A candidate that does not fit what is
+        // left of the block is skipped (its sender's later nonces with it) and
+        // the next is tried, until the block is full.
+        for tx in transactions.iter().take(MAX_BLOCK_CANDIDATES) {
+            if executed_window.is_full() || !meter.fits(MIN_TX_GAS) {
+                break;
+            }
+            if deferred_senders.contains(&tx.from)
+                || !meter.fits(tx.gas_limit)
+                || !executed_window.fits(tx)
+            {
                 deferred_senders.insert(tx.from);
                 continue;
             }
             match self.executor.execute_transaction(&temp_block, tx).await {
                 Ok(receipt) => {
                     meter.charge(receipt.gas_used.min(tx.gas_limit));
+                    executed_window.record(tx);
                     executed_transactions.push(tx.clone());
                     receipts.push(receipt);
                 }
@@ -2267,6 +2279,19 @@ impl BlockProducer {
 /// execution, so declared-but-unused gas never holds block space.
 /// Block gas limit the producer fills to (the chain's genesis constant).
 pub(crate) const PRODUCER_BLOCK_GAS_LIMIT: u64 = 30_000_000;
+
+/// Most transactions one block holds (safety valve; gas is the real limit).
+pub(crate) const MAX_BLOCK_TXS: usize = 5_000;
+
+/// Serialized-size cap of one block's transactions (1 MB, the transport limit).
+pub(crate) const MAX_BLOCK_BYTES: usize = 1_000_000;
+
+/// Most candidates one block considers (bounds selection and execution work
+/// for a large pool).
+pub(crate) const MAX_BLOCK_CANDIDATES: usize = 20_000;
+
+/// No transaction runs on less gas than this (intrinsic transfer cost).
+pub(crate) const MIN_TX_GAS: u64 = 21_000;
 
 /// PBA-L1a-004: most transactions one sender may place in one block.
 pub(crate) const MAX_TXS_PER_SENDER_PER_BLOCK: usize = 64;
@@ -3120,6 +3145,88 @@ mod tests {
             fillers.push((Address(a), 1u64, vec![], 90_000_000_000u64));
         }
         assert!(window_case(fillers).await);
+    }
+
+    /// Candidates whose declared gas no longer fits are skipped and the next
+    /// one is tried, so a transaction that fits the remaining gas is included
+    /// even behind many higher-priced high-declared-gas candidates.
+    #[tokio::test]
+    async fn producer_skips_unfit_candidates_and_keeps_filling() {
+        let (_tmp, storage, state_db, executor, mempool) = producer_fixture();
+        let honest = Address([0x11; 20]);
+        let r = Address([0x33; 20]);
+        funded(&state_db, honest);
+        let mut honest_tx = transfer_tx(0xA1, honest, r, 0);
+        honest_tx.gas_price = 79_000_000_000;
+        mempool
+            .add_transaction(honest_tx.clone(), TxClass::Standard)
+            .await
+            .expect("honest");
+        for i in 0..5_100u32 {
+            let mut a = [0u8; 20];
+            a[0] = 0x82;
+            a[1..5].copy_from_slice(&i.to_be_bytes());
+            a[19] = 1;
+            let s = Address(a);
+            funded(&state_db, s);
+            let mut t = transfer_tx(0, s, r, 0);
+            let mut h = [0xE0u8; 32];
+            h[..4].copy_from_slice(&i.to_be_bytes());
+            t.hash = Hash::new(h);
+            t.gas_limit = PRODUCER_BLOCK_GAS_LIMIT;
+            t.gas_price = 80_000_000_000;
+            mempool
+                .add_transaction(t, TxClass::Standard)
+                .await
+                .expect("candidate admitted");
+        }
+        let producer = test_producer(&storage, &executor, &mempool);
+        let bh = producer.produce_block().await.expect("produce");
+        let block = storage.blocks.get_block(&bh).expect("read").expect("block");
+        assert!(
+            block.transactions.iter().any(|t| t.hash == honest_tx.hash),
+            "a transaction that fits the remaining gas is included"
+        );
+        assert!(block.header.gas_used <= PRODUCER_BLOCK_GAS_LIMIT);
+    }
+
+    /// Count and byte caps apply to executed transactions only.
+    #[tokio::test]
+    async fn producer_block_caps_count_executed_only() {
+        let (_tmp, storage, state_db, executor, mempool) = producer_fixture();
+        let r = Address([0x33; 20]);
+        let mut hashes = Vec::new();
+        for i in 0..(MAX_BLOCK_TXS as u32 + 5) {
+            let mut a = [0u8; 20];
+            a[0] = 0x83;
+            a[1..5].copy_from_slice(&i.to_be_bytes());
+            a[19] = 1;
+            let s = Address(a);
+            funded(&state_db, s);
+            let mut t = transfer_tx(0, s, r, 0);
+            let mut h = [0xD0u8; 32];
+            h[..4].copy_from_slice(&i.to_be_bytes());
+            t.hash = Hash::new(h);
+            t.gas_limit = 21_000;
+            mempool
+                .add_transaction(t.clone(), TxClass::Standard)
+                .await
+                .expect("admit");
+            hashes.push(t.hash);
+        }
+        let producer = test_producer(&storage, &executor, &mempool);
+        let bh = producer.produce_block().await.expect("produce");
+        let block = storage.blocks.get_block(&bh).expect("read").expect("block");
+        // 30M / 21k = 1428 transfers fit by gas; the count cap is not binding.
+        assert_eq!(
+            block.transactions.len(),
+            (PRODUCER_BLOCK_GAS_LIMIT / 21_000) as usize
+        );
+        let mut w = CandidateWindow::new(MAX_BLOCK_TXS, MAX_BLOCK_BYTES, usize::MAX);
+        for t in &block.transactions {
+            assert!(w.fits(t));
+            w.record(t);
+        }
     }
 
     #[test]

@@ -163,18 +163,12 @@ pub struct MempoolConfig {
 
     /// RM-B1 / WP-C4.1 (audit M-SEQ-01): maximum allowed gap between
     /// the sender's lowest mempool nonce and the new tx's nonce.
-    /// Pre-fix the mempool accepted any nonce, so a funded attacker
-    /// could post 100 nonces (1, 1_000_000, u64::MAX, …) per address;
-    /// 99 of those rotted as gap-junk while filling the global cap.
     /// The 16-slot window matches Geth's default `txpool.accountqueue`.
     pub max_nonce_gap: u64,
 }
 
-/// SEQ-H2: per-block gas ceiling enforced at mempool admission. A transaction
-/// whose `gas_limit` exceeds this can never fit in a block, so admitting it only
-/// lets it sit at the front of the fee-ordered queue and starve block
-/// production (the break-not-continue selection bug turned that into a
-/// network-wide, zero-cost empty-block halt). Reject it up front. Matches
+/// SEQ-H2: per-block gas ceiling enforced at mempool admission: a transaction
+/// whose `gas_limit` exceeds it can never fit in a block. Matches
 /// `BlockBuilderConfig::max_gas_per_block` (30M), the chain's block gas limit.
 pub const MAX_GAS_PER_BLOCK: u64 = 30_000_000;
 
@@ -377,9 +371,13 @@ impl Mempool {
         {
             let mut b = self.banned.write().await;
             b.retain(|_, until| *until > now);
-            if b.len() < MAX_BANNED_SENDERS || b.contains_key(sender) {
-                b.insert(*sender, now + duration);
+            if b.len() >= MAX_BANNED_SENDERS && !b.contains_key(sender) {
+                // Full: evict the entry that expires soonest.
+                if let Some(oldest) = b.iter().min_by_key(|(_, until)| **until).map(|(k, _)| *k) {
+                    b.remove(&oldest);
+                }
             }
+            b.insert(*sender, now + duration);
         }
         let hashes: Vec<Hash> = self
             .by_sender
@@ -1585,12 +1583,18 @@ mod tests {
         assert_eq!(pool.banned.read().await.len(), MAX_BANNED_SENDERS);
         let over = PublicKey::new([0xB3; 32]);
         pool.ban_sender(&over, long).await;
-        assert!(!pool.is_banned(&over).await, "list full: not recorded");
-        pool.ban_sender(&a, long).await;
         assert!(
-            pool.is_banned(&a).await,
+            pool.is_banned(&over).await,
+            "list full: new sender recorded"
+        );
+        assert_eq!(pool.banned.read().await.len(), MAX_BANNED_SENDERS);
+        assert!(!pool.is_banned(&a).await, "soonest-expiring entry evicted");
+        pool.ban_sender(&b, long).await;
+        assert!(
+            pool.is_banned(&b).await,
             "already-listed sender is refreshed"
         );
+        assert_eq!(pool.banned.read().await.len(), MAX_BANNED_SENDERS);
     }
 
     #[test]
