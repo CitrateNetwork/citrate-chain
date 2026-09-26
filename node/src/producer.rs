@@ -215,12 +215,17 @@ where
     }
 }
 
-/// Rounds a lone transaction must panic (each confirmed by a following
-/// empty round that does not panic) before it is evicted and quarantined.
-pub(crate) const PANIC_STRIKES_TO_EVICT: u32 = 3;
+/// Strikes before a transaction is evicted and quarantined. A strike needs
+/// the transaction to panic a round alone AND a control round built from
+/// other transactions (a companion set not used for an earlier strike) to
+/// produce a block without it.
+pub(crate) const PANIC_STRIKES_TO_EVICT: u32 = 2;
 
 /// Upper bound on quarantined transaction ids (oldest dropped first).
 const PANIC_QUARANTINE_CAP: usize = 1024;
+
+/// Upper bound on transactions with outstanding strikes.
+const PANIC_STRIKES_CAP: usize = 1024;
 
 /// How a supervised round ended, for the breaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,22 +256,30 @@ impl<T> RoundOutcome<T> {
 /// sender's nonces stay contiguous). A produced round clears the suspects it
 /// included; a panicking one narrows to its own candidates.
 ///
-/// A transaction is struck only when it panics a round ALONE and the empty
-/// round right after it does not panic, so a panic that has nothing to do
-/// with the mempool never costs a transaction anything. After
-/// [`PANIC_STRIKES_TO_EVICT`] strikes it is removed from the mempool and
-/// quarantined (never selected again by this producer). Block validity is
-/// unchanged: this only chooses what this node proposes.
+/// When one transaction panics a round alone, the next round is a control
+/// round built from the OTHER candidates. If that non-empty round produces,
+/// the transaction gets a strike; if it panics too, the panic is not the
+/// transaction's doing and its strikes are cleared. Strikes must come from
+/// control rounds with different companion sets, so a panic that fires on
+/// every non-empty round never costs an honest transaction anything. With
+/// no other candidates the control round is empty and inconclusive: no
+/// strike, and production still continues on those rounds. After
+/// [`PANIC_STRIKES_TO_EVICT`] strikes the transaction is removed from the
+/// mempool and quarantined (never selected again by this producer). Block
+/// validity is unchanged: this only chooses what this node proposes.
 #[derive(Default)]
 pub(crate) struct PanicBreaker {
     /// Candidate ids handed to the builder in the current round.
     round: Vec<Hash>,
     /// Candidates still suspected of the last panic, in selection order.
     suspects: Vec<Hash>,
-    /// A lone candidate that just panicked; the next round is an empty
-    /// control round that decides whether it is to blame.
+    /// A lone candidate that just panicked; the next round is a control
+    /// round without it.
     control: Option<Hash>,
     strikes: HashMap<Hash, u32>,
+    /// Companion sets (sorted ids) of the control rounds that struck each
+    /// transaction; a new strike needs a set not seen before.
+    companions: HashMap<Hash, Vec<Vec<Hash>>>,
     quarantine: std::collections::HashSet<Hash>,
     quarantine_order: std::collections::VecDeque<Hash>,
     #[cfg(test)]
@@ -299,8 +312,8 @@ impl PanicBreaker {
             .into_iter()
             .filter(|t| !self.quarantine.contains(&t.hash))
             .collect();
-        if self.control.is_some() {
-            out.clear();
+        if let Some(culprit) = self.control {
+            out.retain(|t| t.hash != culprit);
         } else if !self.suspects.is_empty() {
             let probe_len = self.suspects.len().div_ceil(2);
             let probe: std::collections::HashSet<Hash> =
@@ -325,18 +338,23 @@ impl PanicBreaker {
     pub(crate) fn end_round(&mut self, kind: RoundKind) -> Vec<Hash> {
         let round = std::mem::take(&mut self.round);
         if let Some(culprit) = self.control {
-            // This was the empty control round after `culprit` panicked alone.
+            // The control round after `culprit` panicked alone.
             return match kind {
                 RoundKind::Produced => {
                     self.control = None;
-                    self.strike(culprit)
+                    if round.is_empty() {
+                        // No companions: inconclusive. Try it alone again.
+                        self.suspects = vec![culprit];
+                        Vec::new()
+                    } else {
+                        self.strike(culprit, round)
+                    }
                 }
-                // Panicked with no transactions: the panic is not the
-                // transaction's doing. Forget it.
+                // Other transactions panic too: not this one's doing.
                 RoundKind::Panicked => {
                     self.control = None;
-                    self.suspects.clear();
-                    self.strikes.remove(&culprit);
+                    self.forget(&culprit);
+                    self.suspects = round;
                     Vec::new()
                 }
                 RoundKind::Failed => Vec::new(),
@@ -347,7 +365,7 @@ impl PanicBreaker {
                 let done: std::collections::HashSet<Hash> = round.iter().copied().collect();
                 self.suspects.retain(|h| !done.contains(h));
                 for h in &round {
-                    self.strikes.remove(h);
+                    self.forget(h);
                 }
                 Vec::new()
             }
@@ -366,15 +384,30 @@ impl PanicBreaker {
         }
     }
 
-    fn strike(&mut self, culprit: Hash) -> Vec<Hash> {
-        let n = self.strikes.entry(culprit).or_insert(0);
-        *n += 1;
-        if *n < PANIC_STRIKES_TO_EVICT {
+    fn forget(&mut self, h: &Hash) {
+        self.strikes.remove(h);
+        self.companions.remove(h);
+    }
+
+    fn strike(&mut self, culprit: Hash, mut companions: Vec<Hash>) -> Vec<Hash> {
+        companions.sort();
+        let seen = self.companions.entry(culprit).or_default();
+        if !seen.contains(&companions) {
+            seen.push(companions);
+            *self.strikes.entry(culprit).or_insert(0) += 1;
+        }
+        let n = self.strikes.get(&culprit).copied().unwrap_or(0);
+        if n < PANIC_STRIKES_TO_EVICT {
+            if self.strikes.len() > PANIC_STRIKES_CAP {
+                // Bounded: forget everyone else's partial evidence.
+                self.strikes.retain(|h, _| *h == culprit);
+                self.companions.retain(|h, _| *h == culprit);
+            }
             // Retry it alone.
             self.suspects = vec![culprit];
             return Vec::new();
         }
-        self.strikes.remove(&culprit);
+        self.forget(&culprit);
         self.suspects.retain(|h| *h != culprit);
         if self.quarantine.insert(culprit) {
             self.quarantine_order.push_back(culprit);
@@ -3799,29 +3832,50 @@ mod producer_panic_breaker {
         (picked, b.end_round(kind))
     }
 
-    #[test]
-    fn isolates_a_lone_culprit_and_evicts_only_it() {
-        let mut b = PanicBreaker::default();
-        let mut pool: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let culprit = h(6);
+    /// Run rounds over a live pool: produced rounds include (remove) their
+    /// transactions, evicted ones leave, and `arrivals` new innocent
+    /// transactions join every round. Returns the evicted ids and how many
+    /// rounds produced a block.
+    fn simulate(
+        b: &mut PanicBreaker,
+        mut pool: Vec<u8>,
+        arrivals: usize,
+        rounds: usize,
+        panics: impl Fn(&[Hash]) -> bool,
+    ) -> (Vec<Hash>, usize, Vec<u8>) {
+        let mut next: u8 = 100;
         let mut evicted = Vec::new();
-        for _ in 0..40 {
-            let (picked, ev) = round(&mut b, &pool, |p| p.contains(&culprit));
-            // A produced round's transactions leave the pool (included).
-            if !picked.contains(&culprit) {
+        let mut produced = 0;
+        for _ in 0..rounds {
+            for _ in 0..arrivals {
+                pool.push(next);
+                next = next.wrapping_add(1).max(100);
+            }
+            let (picked, ev) = round(b, &pool, &panics);
+            if !panics(&picked) {
+                produced += 1;
                 pool.retain(|x| !picked.contains(&h(*x)));
             }
             for e in &ev {
                 pool.retain(|x| h(*x) != *e);
             }
             evicted.extend(ev);
-            if pool.is_empty() {
-                break;
-            }
         }
+        (evicted, produced, pool)
+    }
+
+    #[test]
+    fn isolates_a_lone_culprit_and_evicts_only_it() {
+        let mut b = PanicBreaker::default();
+        let culprit = h(6);
+        let (evicted, produced, pool) =
+            simulate(&mut b, vec![1, 2, 3, 4, 5, 6, 7, 8], 1, 40, |p| {
+                p.contains(&culprit)
+            });
         assert_eq!(evicted, vec![culprit], "only the culprit is evicted");
         assert!(b.is_quarantined(&culprit));
-        assert!(pool.is_empty(), "every innocent transaction was included");
+        assert!(produced > 0);
+        assert!(!pool.contains(&6));
         // A quarantined id is never offered again, even if it reappears.
         b.start_round();
         assert!(b
@@ -3831,12 +3885,16 @@ mod producer_panic_breaker {
     }
 
     #[test]
-    fn evicts_after_exactly_the_strike_limit() {
+    fn evicts_after_exactly_the_strike_limit_with_distinct_companions() {
         let mut b = PanicBreaker::default();
         let culprit = h(9);
         let mut solo_panics = 0;
+        let mut companion = 20u8;
         loop {
-            let (picked, ev) = round(&mut b, &[9], |p| p.contains(&culprit));
+            // A fresh companion arrives each round.
+            let pool = [9, companion];
+            companion += 1;
+            let (picked, ev) = round(&mut b, &pool, |p| p.contains(&culprit));
             if picked == vec![culprit] {
                 solo_panics += 1;
             }
@@ -3847,6 +3905,31 @@ mod producer_panic_breaker {
             assert!(solo_panics <= PANIC_STRIKES_TO_EVICT, "never evicted");
         }
         assert_eq!(solo_panics, PANIC_STRIKES_TO_EVICT);
+    }
+
+    #[test]
+    fn a_repeated_companion_set_is_not_new_evidence() {
+        let mut b = PanicBreaker::default();
+        let culprit = h(9);
+        for _ in 0..3 {
+            // The same companion set every time: one strike at most.
+            let _ = b.strike(culprit, vec![h(2), h(1)]);
+            let _ = b.strike(culprit, vec![h(1), h(2)]);
+        }
+        assert_eq!(b.strikes.get(&culprit), Some(&1));
+        assert_eq!(b.strike(culprit, vec![h(3)]), vec![culprit]);
+    }
+
+    #[test]
+    fn a_panic_on_every_non_empty_round_evicts_nothing() {
+        // Not transaction-specific: it fires on any non-empty round.
+        let mut b = PanicBreaker::default();
+        let (evicted, _, _) = simulate(&mut b, vec![1, 2, 3, 4], 1, 60, |p| !p.is_empty());
+        assert!(
+            evicted.is_empty(),
+            "honest transactions evicted: {evicted:?}"
+        );
+        assert!(b.quarantine.is_empty());
     }
 
     #[test]
@@ -3867,35 +3950,54 @@ mod producer_panic_breaker {
     }
 
     #[test]
+    fn a_lone_culprit_with_no_companions_is_kept_but_production_continues() {
+        let mut b = PanicBreaker::default();
+        let culprit = h(9);
+        let (evicted, produced, _) = simulate(&mut b, vec![9], 0, 20, |p| p.contains(&culprit));
+        assert!(evicted.is_empty(), "no companions: no evidence");
+        assert!(
+            produced >= 9,
+            "empty control rounds still produce: {produced}"
+        );
+    }
+
+    #[test]
     fn failed_rounds_do_not_count() {
         let mut b = PanicBreaker::default();
         b.start_round();
         let _ = b.filter(vec![tx(1)]);
         assert!(b.end_round(RoundKind::Panicked).is_empty());
-        // Control round fails (not a verdict), then succeeds: one strike.
+        // Control round (without tx 1) fails: not a verdict.
         b.start_round();
-        assert!(b.filter(vec![tx(1)]).is_empty(), "control round is empty");
+        assert_eq!(
+            b.filter(vec![tx(1), tx(2)]).len(),
+            1,
+            "control excludes the culprit"
+        );
         assert!(b.end_round(RoundKind::Failed).is_empty());
+        assert_eq!(b.strikes.get(&h(1)), None);
+        // Then it produces: one strike.
         b.start_round();
-        assert!(b.filter(vec![tx(1)]).is_empty(), "still the control round");
+        assert_eq!(b.filter(vec![tx(1), tx(2)])[0].hash, h(2));
         assert!(b.end_round(RoundKind::Produced).is_empty());
         assert_eq!(b.strikes.get(&h(1)), Some(&1));
-        // A later success alone clears the strike.
+        // A later success of tx 1 alone clears the strike.
         b.start_round();
         assert_eq!(b.filter(vec![tx(1)]).len(), 1);
         assert!(b.end_round(RoundKind::Produced).is_empty());
         assert_eq!(b.strikes.get(&h(1)), None);
+        assert!(!b.companions.contains_key(&h(1)));
     }
 
     #[test]
-    fn quarantine_is_bounded() {
+    fn quarantine_and_strikes_are_bounded() {
         let mut b = PanicBreaker::default();
         for i in 0..(PANIC_QUARANTINE_CAP as u32 + 5) {
             let mut bytes = [0u8; 32];
             bytes[..4].copy_from_slice(&i.to_le_bytes());
             b.suspects.clear();
-            for _ in 0..PANIC_STRIKES_TO_EVICT {
-                let _ = b.strike(Hash::new(bytes));
+            for k in 0..PANIC_STRIKES_TO_EVICT {
+                let _ = b.strike(Hash::new(bytes), vec![h(k as u8)]);
             }
         }
         assert_eq!(b.quarantine.len(), PANIC_QUARANTINE_CAP);
@@ -3903,6 +4005,19 @@ mod producer_panic_breaker {
         let mut first = [0u8; 32];
         first[..4].copy_from_slice(&0u32.to_le_bytes());
         assert!(!b.is_quarantined(&Hash::new(first)), "oldest dropped first");
+        // Partial evidence is bounded too.
+        let mut b = PanicBreaker::default();
+        for i in 0..(PANIC_STRIKES_CAP as u32 + 5) {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let _ = b.strike(Hash::new(bytes), vec![h(1)]);
+        }
+        assert!(
+            b.strikes.len() <= PANIC_STRIKES_CAP + 1,
+            "{}",
+            b.strikes.len()
+        );
+        assert!(b.companions.len() <= PANIC_STRIKES_CAP + 1);
     }
 
     fn embedded(a: Address) -> PublicKey {
@@ -3962,7 +4077,7 @@ mod producer_panic_breaker {
             executor.clone(),
             mempool.clone(),
             embedded(Address([0x44; 20])),
-            Ed25519SigningKey::from_bytes(&[42u8; 32]),
+            citrate_consensus::crypto::generate_keypair(),
             2,
         ));
         Node {
@@ -3997,20 +4112,26 @@ mod producer_panic_breaker {
     #[tokio::test]
     async fn a_poison_transaction_is_evicted_and_production_resumes() {
         let poison_from = Address([0xAA; 20]);
-        let good_from = Address([0xBB; 20]);
-        let n = node(&[poison_from, good_from]).await;
+        // Honest traffic keeps arriving: one new sender per round.
+        let honest: Vec<Address> = (0..24u8)
+            .map(|i| Address([0xB0u8.wrapping_add(i); 20]))
+            .collect();
+        let mut funded = vec![poison_from];
+        funded.extend(honest.iter().copied());
+        let n = node(&funded).await;
         let poison = n.add(transfer(0xA1, poison_from, RECIPIENT, 5)).await;
-        let good = n.add(transfer(0xB1, good_from, RECIPIENT, 7)).await;
+        let good = n.add(transfer(0x10, honest[0], RECIPIENT, 7)).await;
         n.fault(poison, TestFault::Panic);
 
         let mut produced = Vec::new();
-        for _ in 0..(4 * PANIC_STRIKES_TO_EVICT as usize + 8) {
+        for (i, from) in honest.iter().enumerate().skip(1) {
             if let RoundOutcome::Produced(hash) = n.round().await {
                 produced.push(hash);
             }
-            if !n.mempool.contains(&poison).await && !n.mempool.contains(&good).await {
+            if !n.mempool.contains(&poison).await {
                 break;
             }
+            n.add(transfer(0x10 + i as u8, *from, RECIPIENT, 7)).await;
         }
         assert!(
             !n.mempool.contains(&poison).await,
