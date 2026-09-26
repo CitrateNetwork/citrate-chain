@@ -89,7 +89,11 @@ fn first_run_select_config(network_flag: Option<&str>) -> anyhow::Result<NodeCon
         toml::from_str::<NodeConfig>(TESTNET_BETA_CONFIG)
             .map_err(|e| anyhow::anyhow!("embedded testnet config is invalid: {}", e))?
     } else {
-        NodeConfig::default()
+        // A local devnet runs on the dev chain id with the devnet genesis.
+        let mut local = NodeConfig::default();
+        local.chain.chain_id = config::DEV_CHAIN_ID;
+        local.chain.genesis_profile = Some("default".to_string());
+        local
     };
 
     // Persist the choice so the next launch auto-loads it (and the user can edit it).
@@ -174,9 +178,9 @@ struct Cli {
     #[arg(long, default_value = "50")]
     max_peers: usize,
 
-    /// Chain ID
-    #[arg(long, default_value = "40204")]
-    chain_id: u64,
+    /// Chain ID. Unset: the config's chain id (40204 when no config exists).
+    #[arg(long)]
+    chain_id: Option<u64>,
 
     /// Coinbase address for mining rewards (hex)
     #[arg(long)]
@@ -510,11 +514,14 @@ async fn main() -> Result<()> {
     }
     config.network.max_peers = cli.max_peers;
 
-    // Only override chain_id if no config file was provided
-    // This allows config file to set chain_id when using --config flag
+    // Only override chain_id if no config file was provided, and only when
+    // --chain-id is given: a config found through CITRATE_CONFIG or
+    // ~/.citrate/node.toml keeps its own chain id (a dev profile's 1337 must
+    // not be forced onto a release network's id).
     if !has_config_file {
-        // No config file provided, use CLI arg (or its default)
-        config.chain.chain_id = cli.chain_id;
+        if let Some(chain_id) = cli.chain_id {
+            config.chain.chain_id = chain_id;
+        }
     }
 
     if let Some(coinbase) = cli.coinbase {

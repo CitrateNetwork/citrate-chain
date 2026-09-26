@@ -45,7 +45,7 @@ This is a consensus parameter. Two nodes with different values disagree about bl
 
 **Rollback before `H`:** unset the height (or set `off`) on every node and restart.
 
-**After `H`:** don't unset it. A node without the setting forks off.
+**After `H`:** don't unset it. A node without the setting forks off. Don't downgrade a node past `H` either; if one was run on an older release after `H`, move its data directory aside before starting the new release again, so it resyncs from peers.
 
 ## Nodes that upgrade late
 
