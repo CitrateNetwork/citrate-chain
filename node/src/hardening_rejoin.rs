@@ -695,9 +695,12 @@ mod tests {
         assert_eq!(report.legacy_format, 0, "not the old format");
     }
 
-    /// A transfer signed by a freshly generated key.
-    fn signed(nonce: u64) -> Transaction {
+    /// A transfer signed by a freshly generated key, at the sender's next
+    /// nonce in `state`.
+    fn signed(state: &Executor) -> Transaction {
         let sk = crypto::generate_keypair();
+        let from = PublicKey::new(sk.verifying_key().to_bytes());
+        let nonce = state.get_nonce(&citrate_execution::address_utils::normalize_address(&from));
         let mut tx = Transaction {
             nonce,
             to: Some(PublicKey::new([0xB0; 32])),
@@ -750,7 +753,7 @@ mod tests {
             vec![],
             Hash::default(),
         );
-        let tx = signed(0);
+        let tx = signed(&Executor::new(Arc::new(StateDB::new())));
         let legacy2 = template(
             old,
             2,
