@@ -65,6 +65,16 @@ pub struct ConsensusManifest {
 
 impl ConsensusManifest {
     pub fn current() -> Self {
+        let height = citrate_consensus::hardening::pba_hardening_height().or_else(|| {
+            citrate_consensus::hardening::resolve_pba_hardening_height(None)
+                .ok()
+                .flatten()
+        });
+        Self::for_height(height)
+    }
+
+    /// The manifest for this binary under a given activation height.
+    pub fn for_height(pba_hardening_height: Option<u64>) -> Self {
         let version = env!("CARGO_PKG_VERSION");
         let git_sha = env!("CITRATE_GIT_SHA");
         let git_dirty = env!("CITRATE_GIT_DIRTY") == "1";
@@ -93,15 +103,13 @@ impl ConsensusManifest {
         let preimage = format!(
             "citrate-consensus-v2\ngit_sha={git_sha}\nhalo2_verifier={feat_halo2_verifier}\n\
              commd_fold_verify={commd_mode}\nactivation_gated={}\n\
+             pba_hardening_height={}\n\
              base_fee={CANONICAL_BASE_FEE_PER_GAS}\nepoch={EPOCH}\nsnapshot_lag={SNAPSHOT_LAG}\n",
             activation_gated.join("|"),
+            pba_hardening_height
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
         );
-        let pba_hardening_height =
-            citrate_consensus::hardening::pba_hardening_height().or_else(|| {
-                citrate_consensus::hardening::resolve_pba_hardening_height(None)
-                    .ok()
-                    .flatten()
-            });
         let digest = Sha256::digest(preimage.as_bytes());
         let fingerprint = format!("0x{}", hex::encode(&digest[..16]));
 
@@ -173,8 +181,8 @@ mod tests {
 
     #[test]
     fn fingerprint_is_stable_and_prefixed() {
-        let a = ConsensusManifest::current();
-        let b = ConsensusManifest::current();
+        let a = ConsensusManifest::for_height(None);
+        let b = ConsensusManifest::for_height(None);
         assert_eq!(
             a.fingerprint, b.fingerprint,
             "fingerprint must be deterministic"
@@ -184,6 +192,24 @@ mod tests {
         assert_eq!(a.canonical_base_fee_per_gas, CANONICAL_BASE_FEE_PER_GAS);
         assert_eq!(a.epoch, EPOCH);
         assert_eq!(a.snapshot_lag, SNAPSHOT_LAG);
+    }
+
+    /// The resolved activation height is part of the fingerprint.
+    #[test]
+    fn fingerprint_depends_on_activation_height() {
+        let a = ConsensusManifest::for_height(Some(123_456));
+        let b = ConsensusManifest::for_height(Some(123_457));
+        let u = ConsensusManifest::for_height(None);
+        assert_eq!(a.pba_hardening_height, Some(123_456));
+        assert_ne!(a.fingerprint, b.fingerprint);
+        assert_ne!(
+            a.fingerprint, u.fingerprint,
+            "unset differs from a scheduled height"
+        );
+        assert_eq!(
+            a.fingerprint,
+            ConsensusManifest::for_height(Some(123_456)).fingerprint
+        );
     }
 
     #[test]

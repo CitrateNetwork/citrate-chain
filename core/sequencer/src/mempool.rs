@@ -342,7 +342,15 @@ pub struct Mempool {
 
     /// PBA-L1a-001: optional committed-nonce reader (see [`StateNonceReader`]).
     state_nonce: Option<StateNonceReader>,
+
+    /// PBA-L1a-004: senders temporarily refused admission (until the instant),
+    /// set by the producer when a sender's transaction fails before a receipt
+    /// exists (such a failure costs the sender nothing on chain).
+    banned: Arc<RwLock<HashMap<PublicKey, std::time::Instant>>>,
 }
+
+/// PBA-L1a-004: most senders held in the temporary ban list.
+pub const MAX_BANNED_SENDERS: usize = 10_000;
 
 impl Mempool {
     /// Return configured chain id
@@ -360,7 +368,40 @@ impl Mempool {
             evicted: Arc::new(RwLock::new(BoundedHashSet::new(EVICTED_CAP))),
             total_size: Arc::new(RwLock::new(0)),
             state_nonce: None,
+            banned: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// PBA-L1a-004: refuse `sender` for `duration` and drop its pooled
+    /// transactions. Producer-side policy; no effect on block validity.
+    pub async fn ban_sender(&self, sender: &PublicKey, duration: std::time::Duration) {
+        let now = std::time::Instant::now();
+        {
+            let mut b = self.banned.write().await;
+            b.retain(|_, until| *until > now);
+            if b.len() < MAX_BANNED_SENDERS || b.contains_key(sender) {
+                b.insert(*sender, now + duration);
+            }
+        }
+        let hashes: Vec<Hash> = self
+            .by_sender
+            .read()
+            .await
+            .get(sender)
+            .map(|q| q.iter().copied().collect())
+            .unwrap_or_default();
+        for h in hashes {
+            self.remove_transaction(&h).await;
+        }
+    }
+
+    /// Whether `sender` is currently refused admission.
+    pub async fn is_banned(&self, sender: &PublicKey) -> bool {
+        self.banned
+            .read()
+            .await
+            .get(sender)
+            .is_some_and(|until| *until > std::time::Instant::now())
     }
 
     /// PBA-L1a-001: bound admitted nonces against the sender's committed
@@ -560,6 +601,22 @@ impl Mempool {
                 tx.data.len(),
                 MAX_TX_DATA_BYTES
             )));
+        }
+
+        // PBA-L1a-004: admit only what the executor's own parser accepts. A
+        // payload it rejects fails before a receipt exists (no fee is charged),
+        // so it must never occupy block-selection space. Same function the
+        // executor dispatches through, so the two cannot drift.
+        if citrate_execution::executor::Executor::parse_transaction_type(tx).is_err() {
+            return Err(MempoolError::InvalidTransaction(
+                "transaction payload is not executable".to_string(),
+            ));
+        }
+
+        if self.is_banned(&tx.from).await {
+            return Err(MempoolError::InvalidTransaction(
+                "sender temporarily refused".to_string(),
+            ));
         }
 
         if let Some(read_state_nonce) = &self.state_nonce {
@@ -927,6 +984,7 @@ impl Mempool {
         let mut selected: Vec<Transaction> = Vec::new();
         let mut total_size = 0;
         let mut next_nonce: HashMap<PublicKey, u64> = HashMap::new();
+        let mut picked: HashSet<Hash> = HashSet::new();
 
         // Snapshot state to avoid nested awaits in loops
         let txs = self.transactions.read().await;
@@ -944,7 +1002,7 @@ impl Mempool {
                     break;
                 }
                 if let Some(mtx) = txs.get(hash) {
-                    if selected.iter().any(|t| t.hash == *hash) {
+                    if picked.contains(hash) {
                         continue;
                     }
                     if total_size + mtx.size > max_size {
@@ -973,6 +1031,7 @@ impl Mempool {
                         };
                         total_size += mtx.size;
                         next_nonce.insert(sender, successor);
+                        picked.insert(*hash);
                         selected.push(mtx.tx.clone());
                         progressed = true;
                         if selected.len() >= max_count {
@@ -1059,6 +1118,12 @@ impl Mempool {
 
     /// Calculate transaction size
     fn calculate_tx_size(&self, tx: &Transaction) -> usize {
+        Self::tx_size(tx)
+    }
+
+    /// The size the pool (and the producer's block-size cap) charges a
+    /// transaction.
+    pub fn tx_size(tx: &Transaction) -> usize {
         // Approximate size calculation
         32 + // hash
         8 + // nonce  
@@ -1404,6 +1469,96 @@ mod tests {
         );
     }
 
+    /// A payload each executor parser accepts (selector 0x04/0x05 and others
+    /// are plain calls and accept anything).
+    fn pba_valid_payload(sel: u8) -> Vec<u8> {
+        let mut d = vec![sel, 0, 0, 0];
+        d.extend_from_slice(&[0x4D; 32]);
+        if sel == 0x01 || sel == 0x03 {
+            let meta = b"{}";
+            d.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+            d.extend_from_slice(meta);
+            d.push(0); // access policy (register) / ignored (update)
+        }
+        d
+    }
+
+    /// Admission uses the executor's own parser: a payload it rejects never
+    /// enters the pool.
+    #[tokio::test]
+    async fn ai_payload_admission_matches_executor_parser() {
+        let pool = pba_pool();
+        let mut n = 0u8;
+        let mut try_add = |data: Vec<u8>| {
+            n += 1;
+            let mut t = pba_native_tx(0x90u8.wrapping_add(n), 0, 0);
+            t.data = data;
+            t
+        };
+        let bad: Vec<Vec<u8>> = vec![
+            vec![0x02, 0, 0, 0],          // inference: no model id
+            vec![0x02, 0, 0, 0, 1, 2, 3], // inference: short model id
+            {
+                let mut d = vec![0x01, 0, 0, 0];
+                d.extend_from_slice(&[0xAB; 32]);
+                d.extend_from_slice(&u32::MAX.to_be_bytes()); // metadata past end
+                d.resize(64, 0x5A);
+                d
+            },
+            vec![0x03, 0, 0, 0, 9], // update: truncated
+        ];
+        for data in bad {
+            let t = try_add(data.clone());
+            assert!(
+                citrate_execution::executor::Executor::parse_transaction_type(&t).is_err(),
+                "precondition: executor rejects {data:?}"
+            );
+            let err = pool
+                .add_transaction(t, TxClass::Standard)
+                .await
+                .expect_err("rejected at admission");
+            assert!(
+                matches!(err, MempoolError::InvalidTransaction(_)),
+                "{err:?}"
+            );
+        }
+        for sel in [0x01u8, 0x02, 0x03, 0x04, 0x05] {
+            let t = try_add(pba_valid_payload(sel));
+            pool.add_transaction(t, TxClass::Standard)
+                .await
+                .expect("parseable payload admitted");
+        }
+    }
+
+    /// A banned sender is refused and its pooled transactions are dropped;
+    /// the ban expires.
+    #[tokio::test]
+    async fn sender_ban_refuses_and_expires() {
+        let pool = pba_pool();
+        let t0 = pba_native_tx(0xA0, 0, 0);
+        let sender = t0.from;
+        pool.add_transaction(t0.clone(), TxClass::Standard)
+            .await
+            .expect("admit");
+        pool.ban_sender(&sender, std::time::Duration::from_secs(60))
+            .await;
+        assert!(pool.is_banned(&sender).await);
+        assert!(!pool.contains(&t0.hash).await, "pooled txs dropped");
+        let t1 = pba_native_tx(0xA0, 1, 0);
+        assert!(pool.add_transaction(t1, TxClass::Standard).await.is_err());
+        let other = pba_native_tx(0xA1, 0, 0);
+        assert!(!pool.is_banned(&other.from).await);
+        pool.add_transaction(other, TxClass::Standard)
+            .await
+            .expect("other senders unaffected");
+        pool.ban_sender(&sender, std::time::Duration::from_millis(0))
+            .await;
+        assert!(!pool.is_banned(&sender).await, "ban expired");
+        pool.add_transaction(pba_native_tx(0xA0, 2, 0), TxClass::Standard)
+            .await
+            .expect("admitted after expiry");
+    }
+
     /// The AI slice uses the executor's classifier (selectors 0x01..0x03 on a
     /// call) and is ordered by fee.
     #[tokio::test]
@@ -1411,7 +1566,7 @@ mod tests {
         let pool = pba_pool();
         let mk = |seed: u8, sel: u8, price: u64| {
             let mut t = pba_native_tx(seed, 0, 0);
-            t.data = vec![sel, 0, 0, 0, 7];
+            t.data = pba_valid_payload(sel);
             t.gas_price = price;
             t
         };

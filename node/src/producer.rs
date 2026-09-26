@@ -1801,10 +1801,13 @@ impl BlockProducer {
 
         // AI transactions first (model ops, inference). Small reserved slice.
         let ai_txs = self.mempool.get_ai_transactions(MAX_AI_TXS_PER_BLOCK).await;
-        // Fill remaining gas budget with standard txs.
+        // Fill remaining gas budget with standard txs. PBA-L1a-004: the
+        // candidate list is the whole nonce-ordered pool, and the count / size
+        // caps apply to ADMITTED transactions only, so candidates rejected
+        // below (unpayable, wrong nonce, over a cap) never use up the window.
         let standard_txs = self
             .mempool
-            .get_best_transactions(MAX_STANDARD_TXS, MAX_BLOCK_SIZE)
+            .get_best_transactions(usize::MAX, usize::MAX)
             .await;
 
         // PBA-L1a-004: a candidate is admitted only if the sender can pay for
@@ -1835,14 +1838,34 @@ impl BlockProducer {
                 selected.push(tx);
             }
         }
+        let mut window = CandidateWindow::new(
+            MAX_STANDARD_TXS,
+            MAX_BLOCK_SIZE,
+            MAX_TXS_PER_SENDER_PER_BLOCK,
+        );
+        for tx in &selected {
+            window.record(tx);
+        }
         for tx in standard_txs {
             if seen.contains(&tx.hash) {
+                continue;
+            }
+            // AI operations enter only through the capped, fee-ordered AI
+            // slice above; they never re-enter here.
+            if citrate_consensus::types::AiOpKind::of(&tx).is_some() {
+                continue;
+            }
+            if window.is_full() {
+                break;
+            }
+            if !window.fits(&tx) {
                 continue;
             }
             if budget.try_admit(&tx, |from| {
                 let addr = citrate_execution::address_utils::normalize_address(from);
                 (executor.get_nonce(&addr), executor.get_balance(&addr))
             }) {
+                window.record(&tx);
                 seen.insert(tx.hash);
                 selected.push(tx);
             }
@@ -1904,6 +1927,13 @@ impl BlockProducer {
                     // Sprint EL-1 (Issue #20): Remove failed tx from mempool
                     // so the sender's nonce is not permanently blocked.
                     let _ = self.mempool.remove_transaction(&tx.hash).await;
+                    // PBA-L1a-004: a failure before any receipt costs the
+                    // sender nothing on chain, so refuse the sender for a
+                    // while (mempool policy only; block validity unchanged).
+                    self.mempool
+                        .ban_sender(&tx.from, PRE_RECEIPT_FAILURE_BAN)
+                        .await;
+                    deferred_senders.insert(tx.from);
                 }
             }
         }
@@ -2244,6 +2274,54 @@ impl BlockProducer {
 /// execution, so declared-but-unused gas never holds block space.
 /// Block gas limit the producer fills to (the chain's genesis constant).
 pub(crate) const PRODUCER_BLOCK_GAS_LIMIT: u64 = 30_000_000;
+
+/// PBA-L1a-004: most transactions one sender may place in one block.
+pub(crate) const MAX_TXS_PER_SENDER_PER_BLOCK: usize = 64;
+
+/// PBA-L1a-004: how long a sender is refused after a transaction of theirs
+/// fails before a receipt exists.
+pub(crate) const PRE_RECEIPT_FAILURE_BAN: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// PBA-L1a-004: count / byte / per-sender caps over ADMITTED candidates.
+pub(crate) struct CandidateWindow {
+    max_count: usize,
+    max_bytes: usize,
+    max_per_sender: usize,
+    count: usize,
+    bytes: usize,
+    per_sender: HashMap<PublicKey, usize>,
+}
+
+impl CandidateWindow {
+    pub(crate) fn new(max_count: usize, max_bytes: usize, max_per_sender: usize) -> Self {
+        Self {
+            max_count,
+            max_bytes,
+            max_per_sender,
+            count: 0,
+            bytes: 0,
+            per_sender: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.count >= self.max_count
+    }
+
+    /// Whether `tx` fits the remaining count, bytes and its sender's slots.
+    pub(crate) fn fits(&self, tx: &Transaction) -> bool {
+        let size = Mempool::tx_size(tx);
+        self.count < self.max_count
+            && self.bytes.saturating_add(size) <= self.max_bytes
+            && self.per_sender.get(&tx.from).copied().unwrap_or(0) < self.max_per_sender
+    }
+
+    pub(crate) fn record(&mut self, tx: &Transaction) {
+        self.count += 1;
+        self.bytes = self.bytes.saturating_add(Mempool::tx_size(tx));
+        *self.per_sender.entry(tx.from).or_insert(0) += 1;
+    }
+}
 
 /// AI operations may declare at most a third of the block's gas.
 pub(crate) const MAX_AI_GAS_PER_BLOCK: u64 = PRODUCER_BLOCK_GAS_LIMIT / 3;
@@ -2878,11 +2956,11 @@ mod tests {
         }
         let r = Address([0x33; 20]);
         let mut ai1 = transfer_tx(0xB1, a1, r, 0);
-        ai1.data = vec![0x02, 0, 0, 0, 1];
+        ai1.data = [vec![0x02, 0, 0, 0], vec![0x01; 32]].concat();
         ai1.gas_limit = PRODUCER_BLOCK_GAS_LIMIT / 3;
         ai1.gas_price = 2_000_000_000;
         let mut ai2 = transfer_tx(0xB2, a2, r, 0);
-        ai2.data = vec![0x02, 0, 0, 0, 2];
+        ai2.data = [vec![0x02, 0, 0, 0], vec![0x02; 32]].concat();
         ai2.gas_limit = 21_000;
         ai2.gas_price = 1_000_000_000;
         let mut std_tx = transfer_tx(0xB3, s, r, 0);
@@ -2903,8 +2981,8 @@ mod tests {
             .collect();
         assert_eq!(
             sel,
-            vec![ai1.hash, std_tx.hash, ai2.hash],
-            "ai1 fills the AI slice exactly; ai2 falls to the fee-ordered pass"
+            vec![ai1.hash, std_tx.hash],
+            "ai1 fills the AI slice exactly; ai2 waits (AI ops never re-enter the standard pass)"
         );
     }
 
@@ -2955,6 +3033,162 @@ mod tests {
             mempool.contains(&big.hash).await,
             "deferred tx stays pooled"
         );
+    }
+
+    /// Produce one block from `fillers` plus one 79 gwei transfer; returns
+    /// whether the transfer was included.
+    async fn window_case(fillers: Vec<(Address, u64, Vec<u8>, u64)>) -> bool {
+        let (_tmp, storage, state_db, executor, mempool) = producer_fixture();
+        let honest = Address([0x11; 20]);
+        let r = Address([0x33; 20]);
+        funded(&state_db, honest);
+        let float = U256::from(10u64).pow(U256::from(16u64));
+        for (s, _, _, _) in &fillers {
+            state_db.accounts.create_account_if_not_exists(*s);
+            state_db.accounts.set_balance(*s, float);
+        }
+        let mut honest_tx = transfer_tx(0xA1, honest, r, 0);
+        honest_tx.gas_price = 79_000_000_000;
+        mempool
+            .add_transaction(honest_tx.clone(), TxClass::Standard)
+            .await
+            .expect("honest");
+        for (i, (s, n, data, price)) in fillers.into_iter().enumerate() {
+            let mut t = transfer_tx(0, s, r, n);
+            let mut h = [0xF0u8; 32];
+            h[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            t.hash = Hash::new(h);
+            t.gas_price = price;
+            t.data = data;
+            let _ = mempool.add_transaction(t, TxClass::Standard).await;
+        }
+        let producer = test_producer(&storage, &executor, &mempool);
+        let bh = producer.produce_block().await.expect("produce");
+        let block = storage.blocks.get_block(&bh).expect("read").expect("block");
+        block.transactions.iter().any(|t| t.hash == honest_tx.hash)
+    }
+
+    fn unparseable_register(fill: usize) -> Vec<u8> {
+        let mut d = vec![0x01, 0, 0, 0];
+        d.extend_from_slice(&[0xAB; 32]);
+        d.extend_from_slice(&u32::MAX.to_be_bytes());
+        d.resize(fill.max(40), 0x5A);
+        d
+    }
+
+    /// Byte window: large unexecutable payloads cannot fill the candidate
+    /// window ahead of a paying transaction.
+    #[tokio::test]
+    async fn producer_candidate_window_bytes() {
+        let per = citrate_sequencer::mempool::MAX_TX_DATA_BYTES;
+        let fillers = (0..8u8)
+            .map(|i| {
+                (
+                    Address([0x70 + i; 20]),
+                    0u64,
+                    unparseable_register(per),
+                    1_000_000_000u64,
+                )
+            })
+            .collect();
+        assert!(window_case(fillers).await);
+    }
+
+    /// Count window: many small unexecutable payloads from many senders
+    /// cannot exhaust the candidate count ahead of a paying transaction.
+    #[tokio::test]
+    async fn producer_candidate_window_count() {
+        let mut fillers = Vec::new();
+        for s in 0..300u16 {
+            for n in 0..17u64 {
+                let [hi, lo] = s.to_be_bytes();
+                let mut a = [0u8; 20];
+                a[0] = 0x80;
+                a[1] = hi;
+                a[2] = lo;
+                a[19] = 1;
+                fillers.push((Address(a), n, vec![0x02, 0, 0, 0], 1_000_000_000u64));
+            }
+        }
+        assert!(window_case(fillers).await);
+    }
+
+    /// Candidates the budget rejects (wrong nonce) do not use up the window:
+    /// the count cap applies to admitted transactions only.
+    #[tokio::test]
+    async fn producer_candidate_window_counts_admitted_only() {
+        let mut fillers = Vec::new();
+        // More senders than the per-block count cap, each with a pooled nonce
+        // one ahead of its state nonce: selectable by the pool, rejected by
+        // the budget, and priced above the paying transaction.
+        for s in 0..5_100u16 {
+            let [hi, lo] = s.to_be_bytes();
+            let mut a = [0u8; 20];
+            a[0] = 0x81;
+            a[1] = hi;
+            a[2] = lo;
+            a[19] = 1;
+            fillers.push((Address(a), 1u64, vec![], 90_000_000_000u64));
+        }
+        assert!(window_case(fillers).await);
+    }
+
+    #[test]
+    fn candidate_window_caps() {
+        let r = Address([0x33; 20]);
+        let mut w = CandidateWindow::new(3, 10_000, 2);
+        let a = transfer_tx(1, Address([0x51; 20]), r, 0);
+        assert!(w.fits(&a));
+        w.record(&a);
+        w.record(&a);
+        assert!(!w.fits(&a), "per-sender cap");
+        let b = transfer_tx(2, Address([0x52; 20]), r, 0);
+        assert!(w.fits(&b));
+        w.record(&b);
+        assert!(w.is_full() && !w.fits(&b), "count cap");
+        let mut w = CandidateWindow::new(10, Mempool::tx_size(&b), 10);
+        assert!(w.fits(&b), "exactly the byte cap fits");
+        w.record(&b);
+        assert!(!w.fits(&b), "byte cap");
+        assert!(!CandidateWindow::new(0, 10_000, 10).fits(&b));
+    }
+
+    /// AI operations beyond the slice never re-enter through the standard pass.
+    #[tokio::test]
+    async fn producer_ai_slice_is_a_total_cap() {
+        let (_tmp, storage, state_db, executor, mempool) = producer_fixture();
+        let r = Address([0x33; 20]);
+        let mut ai = Vec::new();
+        for i in 0..3u8 {
+            let a = Address([0x90 + i; 20]);
+            funded(&state_db, a);
+            let mut t = transfer_tx(0xD0 + i, a, r, 0);
+            t.data = [vec![0x02, 0, 0, 0], vec![0x4D; 32]].concat();
+            t.gas_limit = PRODUCER_BLOCK_GAS_LIMIT / 3;
+            t.gas_price = 1_000_000_000;
+            ai.push(t);
+        }
+        let s = Address([0x9F; 20]);
+        funded(&state_db, s);
+        let mut std_tx = transfer_tx(0xDF, s, r, 0);
+        std_tx.gas_price = 79_000_000_000;
+        for t in ai.iter().chain(std::iter::once(&std_tx)) {
+            mempool
+                .add_transaction(t.clone(), TxClass::Standard)
+                .await
+                .expect("admit");
+        }
+        let producer = test_producer(&storage, &executor, &mempool);
+        let sel: Vec<Hash> = producer
+            .select_transactions_with_ai_priority()
+            .await
+            .expect("select")
+            .iter()
+            .map(|t| t.hash)
+            .collect();
+        let ai_in = ai.iter().filter(|t| sel.contains(&t.hash)).count();
+        assert_eq!(ai_in, 1, "only the slice's worth of AI gas is selected");
+        assert!(sel.contains(&std_tx.hash));
     }
 
     /// The mempool's AI view and the executor's dispatch use one classifier.

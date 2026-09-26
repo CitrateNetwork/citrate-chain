@@ -1109,12 +1109,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     {
         // Consensus-alignment stamp — logged at boot so field drift is diagnosable
         // from the journal (the app node and fleet MUST share this fingerprint).
-        let m = consensus_manifest::ConsensusManifest::current();
+        // The fingerprint covers the activation height this node will run
+        // with (env override, else [chain] pba_hardening_height).
+        let m = consensus_manifest::ConsensusManifest::for_height(
+            citrate_consensus::hardening::resolve_pba_hardening_height(
+                config.chain.pba_hardening_height,
+            )
+            .ok()
+            .flatten(),
+        );
         info!(
-            "Consensus manifest: git={}{} halo2={} fingerprint={}",
+            "Consensus manifest: git={}{} halo2={} pba_hardening_height={:?} fingerprint={}",
             m.git_sha,
             if m.git_dirty { "(DIRTY)" } else { "" },
             m.feat_halo2_verifier,
+            m.pba_hardening_height,
             m.fingerprint
         );
         if m.git_dirty {
