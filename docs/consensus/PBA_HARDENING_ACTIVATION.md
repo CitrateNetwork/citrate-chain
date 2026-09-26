@@ -25,7 +25,8 @@ The rest of the R2 hardening is active in every binary and doesn't change which 
 - Config: `[chain] pba_hardening_height = <height>` (`node/src/config.rs`).
 - Env override: `CITRATE_PBA_HARDENING_HEIGHT=<height>` or `off`. An unparseable value aborts start-up.
 - With no pin for the chain, the env override wins over the config value. Unset, which is the default on every shipped 40204 profile, means the rules are OFF.
-- Dev profiles set `0`, so the rules are active from genesis. Genesis is never re-judged. They also set `[chain] dev_profile = true`, which keeps their own value when a release pins 40204. Never set `dev_profile` on a node that joins a public network.
+- Dev profiles (`devnet.toml`, `devnet-config.toml`, the Docker devnet, `citrate devnet`) run on their own chain id, 1337, with the devnet genesis, and set `0`, so the rules are active from genesis. Genesis is never re-judged. `[chain] dev_profile = true` is refused on any chain listed in `PINNED_ACTIVATIONS` (40204 today), pinned or not.
+- A release network's genesis only runs under that network's chain id (`RELEASE_GENESIS` in `hardening.rs`: the testnet-beta, team-testnet and mainnet geneses for 40204). A data directory holding one of them under another chain id refuses to start.
 - The pin is keyed on the configured `[chain] chain_id`. If `CITRATE_CHAIN_ID` is set it must equal it, or the node refuses to start.
 - The start-up log prints the resolved height and its source, for example `chain 40204 pba_hardening_height H (source: release pin)`, and a `Consensus fingerprint ... with activation ... = 0x...` line. Nodes that agree print the same final fingerprint. `citrate consensus` lists the compiled-in pins.
 
@@ -50,12 +51,13 @@ This is a consensus parameter. Two nodes with different values disagree about bl
 
 A node that is still on an older release at `H` keeps producing and accepting blocks in the pre-activation format on its own branch. When it restarts on a release with the pin:
 
-- Before loading any stored block it checks every stored block at or above `H` against the rules. It removes each invalid block and everything built on it from the block store, the DAG store and the transaction index, and logs how many it removed.
-- If its applied state was built on those blocks, the start-up recovery rebuilds state from genesis along the remaining chain, then the node syncs the canonical chain from upgraded peers. No data-directory wipe is needed. The rebuild replays the chain up to `H`, so expect it to take minutes on a long chain.
+- Before loading any stored block it checks the stored blocks at or above `H` that it has not checked before against the rules. Blocks a node stores while running with the rules are marked as checked as it runs, so later restarts only check what was stored since. It removes each invalid block and everything built on it from the block store, the DAG store and the transaction index, and logs how many it removed.
+- If its applied state was built on those blocks, the start-up recovery rebuilds state from genesis along the remaining chain, then the node syncs the canonical chain from upgraded peers. No data-directory wipe is needed. The rebuild replays the chain from genesis up to the last valid block. Measured with `hardening_rejoin::tests::rebuild_time` (debug build, MacBook, blocks without transactions): 150,000 blocks rebuilt in 87 s (about 1,700 blocks/s); the full start-up adds loading those blocks into the DAG store. Blocks with transactions take longer in proportion to their execution. The replay needs the block bodies back to genesis (leave `CITRATE_DAG_PRUNE_RETAIN` unset).
 - Transactions carried by the removed blocks are offered to the mempool again once the state is rebuilt.
+- If the node stops after removing the blocks but before the rebuild finishes, the next start rebuilds as usual; the transactions from the removed blocks are then not offered again, so their senders resubmit them.
 - A node running with `CITRATE_BLOCK_V2=0` cannot rebuild state by itself. It stops with instructions: move the data directory aside and restart to resync from peers.
 
-Upgraded nodes count, per peer, blocks received in the pre-activation format at or after `H`: metric `citrate_legacy_format_blocks_total{peer="..."}` and gauge `citrate_legacy_format_peers`, plus an info log line per peer. Use them to find nodes that have not upgraded.
+Upgraded nodes count, per peer, blocks received in the pre-activation format at or after `H` that carry a valid block hash and proposer signature: metric `citrate_legacy_format_blocks_total{peer="..."}` (the first 4096 peers by id, the rest under `peer="other"`) and gauge `citrate_legacy_format_peers`, plus an info log line per peer. Use them to find nodes that have not upgraded.
 
 ## Before `H`
 
