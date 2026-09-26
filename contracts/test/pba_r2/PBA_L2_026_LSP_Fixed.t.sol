@@ -51,7 +51,41 @@ contract PBA_L2_026_Fixed is Test {
     receive() external payable {}
 }
 
-/// PBA-L2-026 (verifier nit): with exactly three oracles one dissenter must not
+/// PBA-L2-026: removing an oracle lowers the quorum, so the
+/// open round restarts and only votes from the current set are counted.
+contract PBA_L2_026_RemoveOracle is Test {
+    function test_L2_026_removeOracle_startsFreshRound() public {
+        LiquidStakingPool pool = new LiquidStakingPool(address(this));
+        address o1 = makeAddr("o1");
+        address o2 = makeAddr("o2");
+        address o3 = makeAddr("o3");
+        address o4 = makeAddr("o4");
+        pool.addOracle(o1);
+        pool.addOracle(o2);
+        pool.addOracle(o3);
+        pool.addOracle(o4);
+        vm.deal(address(this), 100 ether);
+        pool.deposit{value: 10 ether}();
+        pool.donate{value: 1 ether}();
+        assertEq(pool.votesRequired(), 3);
+        vm.prank(o1);
+        pool.reportRewards(0.5 ether, 0);
+        uint256 roundBefore = pool.reportRound();
+        pool.removeOracle(o1);
+        assertEq(pool.votesRequired(), 2);
+        assertEq(pool.reportRound(), roundBefore + 1, "removal starts a fresh round");
+        vm.prank(o2);
+        pool.reportRewards(0.5 ether, 0);
+        assertEq(pool.rewardReportNonce(), 0, "the removed oracle's vote does not count");
+        vm.prank(o3);
+        pool.reportRewards(0.5 ether, 0);
+        assertEq(pool.rewardReportNonce(), 1, "two current oracles finalize");
+    }
+
+    receive() external payable {}
+}
+
+/// PBA-L2-026: with exactly three oracles one dissenter must not
 /// block (two thirds of 3 is 2, not unanimity).
 contract PBA_L2_026_ThreeOracles is Test {
     function test_L2_026_threeOracles_oneDissenterDoesNotBlock() public {

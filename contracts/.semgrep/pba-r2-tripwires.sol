@@ -138,3 +138,38 @@ contract OwnableCheckedInline is Ownable {
     // ok: pba-l2-002-ownable-unchecked
     constructor(address o) Ownable(InitialAdmin.check(o)) {}
 }
+
+contract GovernorUnchecked {
+    address governor;
+    constructor(address g) {
+        // ruleid: pba-l2-002-constructor-admin-unchecked
+        governor = g;
+    }
+}
+
+contract AuthorityUnchecked {
+    address public authority;
+    constructor(address a) {
+        // ruleid: pba-l2-002-constructor-admin-unchecked
+        authority = a;
+    }
+}
+
+contract AuthorityHelperUnchecked {
+    constructor(address a) {
+        // ruleid: pba-l2-002-constructor-admin-unchecked
+        _setAuthority(a);
+    }
+}
+
+contract GovernorChecked {
+    address governor;
+    address authority;
+    constructor(address g, address a) {
+        // ok: pba-l2-002-constructor-admin-unchecked
+        governor = InitialAdmin.check(g);
+        InitialAdmin.check(a);
+        // ok: pba-l2-002-constructor-admin-unchecked
+        authority = a;
+    }
+}

@@ -376,17 +376,25 @@ contract LiquidStakingPool is ReentrancyGuard, Governable {
         oracleCount--;
 
         emit OracleRemoved(oracle);
+
+        // Removing an oracle lowers `votesRequired()`. Start a fresh round so
+        // the open tally only counts votes from the current oracle set.
+        _resetReport();
     }
 
-    /// @notice PBA-L2-026: discard every vote cast for the open nonce and start
-    ///         a fresh round (e.g. after removing a misbehaving oracle).
     /// @notice Votes a tuple needs to finalize: ceil(2 * oracleCount / 3)
     ///         (PBA-L2-026). n=3 -> 2, n=4 -> 3, n=10 -> 7.
     function votesRequired() public view returns (uint256) {
         return (oracleCount * 2 + 2) / 3;
     }
 
+    /// @notice PBA-L2-026: discard every vote cast for the open nonce and start
+    ///         a fresh round (e.g. after removing a misbehaving oracle).
     function resetReport() external onlyGovernance {
+        _resetReport();
+    }
+
+    function _resetReport() internal {
         reportRound++;
         emit ReportRoundReset(rewardReportNonce, reportRound);
     }
