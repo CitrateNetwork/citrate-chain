@@ -32,6 +32,7 @@ mod consensus_manifest;
 mod contribution_recorder;
 mod dag_prune;
 mod genesis;
+mod hardening_rejoin;
 mod inference;
 pub mod logging;
 pub mod metrics;
@@ -88,7 +89,11 @@ fn first_run_select_config(network_flag: Option<&str>) -> anyhow::Result<NodeCon
         toml::from_str::<NodeConfig>(TESTNET_BETA_CONFIG)
             .map_err(|e| anyhow::anyhow!("embedded testnet config is invalid: {}", e))?
     } else {
-        NodeConfig::default()
+        // A local devnet runs on the dev chain id with the devnet genesis.
+        let mut local = NodeConfig::default();
+        local.chain.chain_id = config::DEV_CHAIN_ID;
+        local.chain.genesis_profile = Some("default".to_string());
+        local
     };
 
     // Persist the choice so the next launch auto-loads it (and the user can edit it).
@@ -173,9 +178,9 @@ struct Cli {
     #[arg(long, default_value = "50")]
     max_peers: usize,
 
-    /// Chain ID
-    #[arg(long, default_value = "40204")]
-    chain_id: u64,
+    /// Chain ID. Unset: the config's chain id (40204 when no config exists).
+    #[arg(long)]
+    chain_id: Option<u64>,
 
     /// Coinbase address for mining rewards (hex)
     #[arg(long)]
@@ -358,10 +363,30 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Consensus { json }) => {
             let manifest = consensus_manifest::ConsensusManifest::current();
+            // The activation heights compiled into this release (a node on a
+            // pinned chain runs that height; see the start-up banner for the
+            // height a configured node resolved).
+            let pins: Vec<serde_json::Value> = citrate_consensus::hardening::PINNED_ACTIVATIONS
+                .iter()
+                .map(|(id, h)| serde_json::json!({ "chain_id": id, "pba_hardening_height": h }))
+                .collect();
             if json {
-                println!("{}", manifest.to_json());
+                let mut v = serde_json::to_value(&manifest).unwrap_or_default();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("pba_hardening_pins".into(), serde_json::Value::Array(pins));
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&v).unwrap_or_else(|_| manifest.to_json())
+                );
             } else {
                 manifest.print_human();
+                for (id, h) in citrate_consensus::hardening::PINNED_ACTIVATIONS {
+                    match h {
+                        Some(h) => println!("  pba pin            chain {id}: height {h}"),
+                        None => println!("  pba pin            chain {id}: unset"),
+                    }
+                }
             }
             return Ok(());
         }
@@ -489,11 +514,14 @@ async fn main() -> Result<()> {
     }
     config.network.max_peers = cli.max_peers;
 
-    // Only override chain_id if no config file was provided
-    // This allows config file to set chain_id when using --config flag
+    // Only override chain_id if no config file was provided, and only when
+    // --chain-id is given: a config found through CITRATE_CONFIG or
+    // ~/.citrate/node.toml keeps its own chain id (a dev profile's 1337 must
+    // not be forced onto a release network's id).
     if !has_config_file {
-        // No config file provided, use CLI arg (or its default)
-        config.chain.chain_id = cli.chain_id;
+        if let Some(chain_id) = cli.chain_id {
+            config.chain.chain_id = chain_id;
+        }
     }
 
     if let Some(coinbase) = cli.coinbase {
@@ -553,9 +581,10 @@ async fn main() -> Result<()> {
         info!("No genesis block found, initializing genesis...");
 
         let state_db = Arc::new(StateDB::new());
-        let executor = Arc::new(Executor::with_storage(
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
             state_db,
             Some(probe_storage.state.clone()),
+            config.chain.chain_id,
         ));
 
         let genesis_config = genesis::GenesisConfig {
@@ -806,9 +835,10 @@ async fn init_chain(chain_id: u64) -> Result<()> {
 
     // Create executor with persistent storage
     let state_db = Arc::new(StateDB::new());
-    let executor = Arc::new(Executor::with_storage(
+    let executor = Arc::new(Executor::with_storage_and_chain_id(
         state_db,
         Some(storage.state.clone()),
+        chain_id,
     ));
 
     // Initialize genesis
@@ -874,9 +904,10 @@ async fn run_devnet(
 
         if !has_genesis {
             let state_db = Arc::new(StateDB::new());
-            let executor = Arc::new(Executor::with_storage(
+            let executor = Arc::new(Executor::with_storage_and_chain_id(
                 state_db,
                 Some(storage.state.clone()),
+                config.chain.chain_id,
             ));
 
             let genesis_config = GenesisConfig {
@@ -1081,28 +1112,47 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // PBA-R2: fix the block-validity hardening activation height BEFORE any
     // consensus component (GhostDag, Executor, SyncManager, GossipProtocol) is
     // constructed; each captures it at construction. A consensus parameter:
-    // an unparseable override aborts start-up rather than being ignored.
-    {
-        // ONE store, ONE resolution order (env override, else [chain] key):
-        // consensus, network and execution (`citrate_execution::activation`)
-        // all read what this publishes.
-        let pba = citrate_consensus::hardening::init_pba_hardening_height(
+    // an unparseable override, or one that disagrees with the height pinned
+    // in this release for the chain, aborts start-up rather than being ignored.
+    //
+    // The chain id is the CONFIGURED one. `CITRATE_CHAIN_ID`, which older
+    // execution constructors read on their own, must agree with it.
+    citrate_consensus::hardening::check_chain_id_env(
+        config.chain.chain_id,
+        std::env::var("CITRATE_CHAIN_ID").ok().as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let pba_activation = {
+        // ONE store, ONE resolution order (release pin for the chain, then
+        // env override, then [chain] key): consensus, network and execution
+        // (`citrate_execution::activation`) all read what this publishes.
+        let pba = citrate_consensus::hardening::init_pba_hardening_for_chain(
+            config.chain.chain_id,
             config.chain.pba_hardening_height,
+            config.chain.dev_profile,
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-        match pba {
+        let fp = consensus_manifest::ConsensusManifest::current().fingerprint;
+        match pba.height {
             Some(h) => info!(
-                "PBA-R2 block-validity hardening ACTIVE from height {} \
-                 (tx signature + canonical id on import, content-bound tx_root, \
-                 timestamp bound)",
-                h
+                "Block-validity hardening ACTIVE from height {} [{}] (tx signature + \
+                 canonical id on import, content-bound tx_root, timestamp bound)",
+                h,
+                pba.describe()
             ),
             None => info!(
-                "PBA-R2 block-validity hardening not scheduled (chain.pba_hardening_height \
-                 unset); legacy validity rules apply"
+                "Block-validity hardening not scheduled: {}; legacy validity rules apply",
+                pba.describe()
             ),
         }
-    }
+        info!(
+            "Consensus fingerprint {} with activation {} = {}",
+            fp,
+            pba.describe(),
+            pba.fingerprint(&fp)
+        );
+        pba
+    };
 
     // Initialize metrics server
     let metrics_addr =
@@ -1144,6 +1194,69 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             encryption: storage_encryption,
         },
     )?);
+
+    // A release network's genesis only runs under that network's chain id: the
+    // genesis block does not commit to the chain id, so otherwise a node could
+    // escape the chain's release pin by changing [chain] chain_id alone.
+    if let Some(g0) = storage.blocks.get_block_by_height(0)? {
+        citrate_consensus::hardening::check_genesis_chain(config.chain.chain_id, g0.as_bytes())
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    }
+
+    // Rejoin after activation: remove stored blocks at or above the activation
+    // height that are invalid under the rules (a node that kept running an
+    // older release past it holds such blocks), before the DAG store, GhostDAG
+    // or the applier load anything. See node/src/hardening_rejoin.rs.
+    let rejoin = hardening_rejoin::purge_invalid_post_activation(
+        &storage,
+        citrate_consensus::hardening::PbaHardening::from_process(),
+        config.chain.chain_id,
+    )
+    .map_err(|e| {
+        let h = pba_activation.height.unwrap_or_default();
+        anyhow::anyhow!(
+            "{}\n(start-up check failed: {})",
+            hardening_rejoin::manual_resync_instructions(&config.storage.data_dir, h),
+            e
+        )
+    })?;
+    // Blocks stored from here on have passed the rules, so the next start-up
+    // check need not verify them again (see hardening_rejoin).
+    if let Some(h) = pba_activation.height {
+        let storage = storage.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                if let Ok(latest) = storage.blocks.get_latest_height() {
+                    if let Err(e) = hardening_rejoin::mark_verified_through(&storage, h, latest) {
+                        warn!("start-up check marker: {}", e);
+                    }
+                }
+            }
+        });
+    }
+    // Without execute-on-receive the node has no path to rebuild state from
+    // genesis, so a purged applied tip needs a manual resync.
+    // (Also when an earlier start removed the blocks but stopped before the
+    // rebuild: the applied-tip pointer then names a block that is gone.)
+    let applied_tip_gone = storage
+        .blocks
+        .get_applied_tip()?
+        .is_some_and(|(h, _)| !storage.blocks.has_block(&h).unwrap_or(true));
+    if (rejoin.applied_tip_purged || applied_tip_gone)
+        && std::env::var("CITRATE_BLOCK_V2")
+            .map(|v| !(v == "1" || v.eq_ignore_ascii_case("true")))
+            .unwrap_or(false)
+    {
+        return Err(anyhow::anyhow!(
+            "{}",
+            hardening_rejoin::manual_resync_instructions(
+                &config.storage.data_dir,
+                pba_activation.height.unwrap_or_default()
+            )
+        ));
+    }
 
     // Create state DB and executor with persistent storage
     let state_db = Arc::new(StateDB::new());
@@ -1327,7 +1440,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     let registry_bridge: Arc<dyn citrate_execution::executor::ModelRegistryAdapter> =
         Arc::new(adapters::MCPRegistryBridge::new(mcp.clone()));
 
-    let exec_base = Executor::with_storage(state_db, Some(storage.state.clone()));
+    // The configured chain id, not `CITRATE_CHAIN_ID` (checked equal above).
+    let exec_base = Executor::with_storage_and_chain_id(
+        state_db,
+        Some(storage.state.clone()),
+        config.chain.chain_id,
+    );
     let executor = Arc::new(
         exec_base
             .with_ai_storage_adapter(storage_bridge)
@@ -1712,6 +1830,45 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         );
     }
 
+    // Transactions carried by blocks the start-up check removed go back to the
+    // mempool, once the applied state no longer sits on a removed block (the
+    // mempool checks nonces against applied state). Bounded wait.
+    if !rejoin.returned_txs.is_empty() {
+        let mempool = mempool.clone();
+        let storage = storage.clone();
+        let purged = rejoin.purged.clone();
+        let txs = rejoin.returned_txs.clone();
+        tokio::spawn(async move {
+            for _ in 0..900u32 {
+                let on_purged = storage
+                    .blocks
+                    .get_applied_tip()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(h, _)| purged.contains(&h));
+                if !on_purged {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            let mut readmitted = 0usize;
+            for tx in txs {
+                if mempool
+                    .add_transaction(tx, citrate_sequencer::mempool::TxClass::Standard)
+                    .await
+                    .is_ok()
+                {
+                    readmitted += 1;
+                }
+            }
+            info!(
+                "start-up check: offered transactions from removed blocks to the mempool \
+                 ({} readmitted)",
+                readmitted
+            );
+        });
+    }
+
     // Forward-sync liveness (handoff 2026-07-23): the highest block height we have
     // EVIDENCE the network is at, from ANY signal — gossiped NewBlock, a rejected
     // far-ahead block (MissingParentAtAdmission proves the sender is ahead of us),
@@ -1755,6 +1912,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         peer_manager.set_incoming(in_tx).await;
         let pm_for_rx = peer_manager.clone();
         let storage_for_handler = storage.clone();
+        // Peers still sending pre-activation-format blocks at or after the
+        // activation height (logged, and exported as a metric per peer).
+        let legacy_peers_for_rx = Arc::new(hardening_rejoin::LegacyFormatPeers::default());
         let mempool_for_handler = mempool.clone();
         // EXECUTE-ON-RECEIVE (step 2): the applier is reached through
         // `BlockAdmission` now (SYNC-S1 D2), not cloned into the handler
@@ -1779,9 +1939,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             {
                 Ok(scratch_storage) => {
                     let scratch_storage = Arc::new(scratch_storage);
-                    let scratch_exec = Arc::new(Executor::with_storage(
+                    let scratch_exec = Arc::new(Executor::with_storage_and_chain_id(
                         Arc::new(StateDB::new()),
                         Some(scratch_storage.state.clone()),
+                        config.chain.chain_id,
                     ));
                     let gcfg = genesis::GenesisConfig {
                         chain_id: config.chain.chain_id,
@@ -2612,6 +2773,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::NewBlock { block } => {
+                        legacy_peers_for_rx.observe(
+                            citrate_consensus::hardening::PbaHardening::from_process(),
+                            &pid.to_string(),
+                            &block,
+                        );
                         // CHAIN-B-A007: network-height evidence from gossip is
                         // recorded AFTER the block passes `gossip::validate_block`
                         // (in the `Ok(_)`/`Deferred` arms below), never on the raw
@@ -2809,6 +2975,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // unconditional `record_success(&pid.0)` right here, before
                         // a single block had been examined, so answering at all was
                         // enough to clear the penalty and stay the preferred source.
+                        for b in &blocks {
+                            legacy_peers_for_rx.observe(
+                                citrate_consensus::hardening::PbaHardening::from_process(),
+                                &pid.to_string(),
+                                b,
+                            );
+                        }
                         // WP-H.4: handle_blocks now validates each block
                         let _ = sync_for_rx.handle_blocks(&pid, blocks).await;
                         // WP-H.5: Drain validated blocks and persist to chain store.

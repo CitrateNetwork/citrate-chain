@@ -296,6 +296,91 @@ impl DagStore {
         Ok(store)
     }
 
+    /// Remove `doomed` blocks from a persistent DAG backend, with every entry
+    /// that names them (tips, child lists, the height index, derived scores).
+    /// Run before the store is loaded, so the in-memory DAG never sees them.
+    /// Used at start-up to drop blocks that are invalid under the node's
+    /// activation rules. Returns how many stored blocks were removed.
+    pub fn purge_persisted_blocks(
+        kv: &dyn KvStore,
+        doomed: &HashSet<Hash>,
+    ) -> Result<usize, DagStoreError> {
+        let err = |what: &str, e: String| DagStoreError::StorageError(format!("{what}: {e}"));
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        let mut ops: Vec<KvOp> = Vec::new();
+        let mut removed = 0usize;
+        for (key, _) in kv
+            .kv_iter_cf(cf::DAG_BLOCKS)
+            .map_err(|e| err("blocks", e))?
+        {
+            if key.len() == 32 && doomed.contains(&Hash::from_bytes(&key)) {
+                removed += 1;
+                ops.push(KvOp::Delete {
+                    cf: cf::DAG_BLOCKS.to_string(),
+                    key: key.clone(),
+                });
+            }
+        }
+        for h in doomed {
+            ops.push(KvOp::Delete {
+                cf: cf::DAG_TIPS.to_string(),
+                key: h.as_bytes().to_vec(),
+            });
+            ops.push(KvOp::Delete {
+                cf: cf::DAG_METADATA.to_string(),
+                key: Self::score_key(h),
+            });
+        }
+        for (key, value) in kv
+            .kv_iter_cf(cf::DAG_CHILDREN)
+            .map_err(|e| err("children", e))?
+        {
+            if key.len() == 32 && doomed.contains(&Hash::from_bytes(&key)) {
+                ops.push(KvOp::Delete {
+                    cf: cf::DAG_CHILDREN.to_string(),
+                    key,
+                });
+                continue;
+            }
+            let Ok((parent, list)) = bincode::deserialize::<(Hash, Vec<Hash>)>(&value) else {
+                continue;
+            };
+            if list.iter().any(|c| doomed.contains(c)) {
+                let kept: Vec<Hash> = list.into_iter().filter(|c| !doomed.contains(c)).collect();
+                push_children_op(&mut ops, &parent, &kept);
+            }
+        }
+        for (key, value) in kv
+            .kv_iter_cf(cf::DAG_HEIGHT_INDEX)
+            .map_err(|e| err("height index", e))?
+        {
+            let Ok(list) = bincode::deserialize::<Vec<Hash>>(&value) else {
+                continue;
+            };
+            if list.iter().any(|c| doomed.contains(c)) {
+                let kept: Vec<Hash> = list.into_iter().filter(|c| !doomed.contains(c)).collect();
+                if kept.is_empty() {
+                    ops.push(KvOp::Delete {
+                        cf: cf::DAG_HEIGHT_INDEX.to_string(),
+                        key,
+                    });
+                } else {
+                    let bytes = bincode::serialize(&kept)
+                        .map_err(|e| err("height index", e.to_string()))?;
+                    ops.push(KvOp::Put {
+                        cf: cf::DAG_HEIGHT_INDEX.to_string(),
+                        key,
+                        value: bytes,
+                    });
+                }
+            }
+        }
+        kv.kv_write_batch(&ops).map_err(|e| err("purge batch", e))?;
+        Ok(removed)
+    }
+
     /// WP-S.1: Load all state from the persistent backend into in-memory maps.
     fn load_from_persistent(&mut self) -> Result<(), DagStoreError> {
         let kv = match &self.persistent {

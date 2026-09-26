@@ -1,12 +1,15 @@
 # Sample devnet configuration
 
 [chain]
-chain_id = 40204
+chain_id = 1337  # local dev chain, never a release network's id
 block_time = 2
+genesis_profile = "default"
 ghostdag_k = 18
 # PBA-R2 block-validity hardening: active from genesis on dev profiles.
 # (Unset on every 40204 profile until the owner schedules it.)
 pba_hardening_height = 0
+# Local dev chain: the release-pinned activation height does not apply.
+dev_profile = true
 
 [network]
 listen_addr = "127.0.0.1:30303"

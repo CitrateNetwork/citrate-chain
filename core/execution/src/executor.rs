@@ -303,6 +303,37 @@ impl Drop for DeferGuard<'_> {
     }
 }
 
+/// One producer round opened by [`Executor::begin_production_round`]. Rolls
+/// the executor back on drop unless committed.
+pub struct ProductionRound<'a> {
+    executor: &'a Executor,
+    snapshot: Option<crate::state::StateSnapshot>,
+    block_context: crate::revm_adapter::BlockContext,
+    defer: Option<DeferGuard<'a>>,
+}
+
+impl ProductionRound<'_> {
+    /// The round's block is sealed and its state persisted: keep the state
+    /// and restore eager persistence.
+    pub fn commit(mut self) {
+        self.snapshot = None;
+        self.defer = None;
+    }
+}
+
+impl Drop for ProductionRound<'_> {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            self.executor.state_db.restore(snapshot);
+            self.executor
+                .set_block_context(std::mem::take(&mut self.block_context));
+        }
+        // The deferral ends after the restore, so nothing from the aborted
+        // round is written through to the store.
+        self.defer = None;
+    }
+}
+
 /// Dirty contract storage mutation captured for a finalized state commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateStorageChange {
@@ -1130,6 +1161,23 @@ impl Executor {
     /// in-memory state to a fork point before re-applying the winning branch.
     pub fn state_restore(&self, snapshot: crate::state::StateSnapshot) {
         self.state_db.restore(snapshot)
+    }
+
+    /// Producer: open one block-production round. Until
+    /// [`ProductionRound::commit`] is called, account writes are deferred to
+    /// the end-of-round persist (the same deferral `apply_block` uses), and
+    /// dropping the round (an early `return`, a `?`, or a panic unwinding
+    /// through the producer) restores the world state and block context
+    /// captured here. Without it an aborted round left the executor
+    /// partially advanced while the applied tip stayed put.
+    pub fn begin_production_round(&self) -> ProductionRound<'_> {
+        let defer = DeferGuard::engage(&self.defer_persist);
+        ProductionRound {
+            executor: self,
+            snapshot: Some(self.state_db.snapshot()),
+            block_context: self.get_block_context(),
+            defer: Some(defer),
+        }
     }
 
     /// EXECUTE-ON-RECEIVE (reorg, HIGH-2): make the durable store match CURRENT

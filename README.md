@@ -74,7 +74,7 @@ The fastest path is a single self-mining devnet node:
 
 Defaults (from `node/config/devnet.toml`): JSON-RPC `127.0.0.1:8545`, WebSocket
 `127.0.0.1:8546`, P2P `127.0.0.1:30303`, data dir `.citrate-devnet`, mining on,
-chain ID `40204`. RPC/WS bind to loopback with no TLS/auth by design — front them
+chain ID `1337` (the local dev chain id; release networks such as testnet-beta use `40204`). RPC/WS bind to loopback with no TLS/auth by design — front them
 with a reverse proxy before exposing.
 
 Explicit form (first-run network selection, custom data dir, mining on):
@@ -83,12 +83,12 @@ Explicit form (first-run network selection, custom data dir, mining on):
 ./target/release/citrate --network local --mine --data-dir .citrate-devnet
 ```
 
-Verify it's up — `eth_chainId` returns `0x9d0c` (40204), `eth_blockNumber` climbs:
+Verify it's up — `eth_chainId` returns `0x539` (1337), `eth_blockNumber` climbs:
 
 ```bash
 curl -s http://localhost:8545 -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'
-# -> {"jsonrpc":"2.0","id":1,"result":"0x9d0c"}
+# -> {"jsonrpc":"2.0","id":1,"result":"0x539"}
 
 curl -s http://localhost:8545 -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'

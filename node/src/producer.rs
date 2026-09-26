@@ -171,6 +171,10 @@ pub struct BlockProducer {
     /// the sealed block as the new applied tip before releasing it. `None` disables the
     /// interlock (pre-reroll / execute-on-receive off), preserving legacy behavior.
     applied_tip_lock: Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>>,
+
+    /// Producer-side circuit breaker for rounds that panic on the same
+    /// mempool transaction (see [`PanicBreaker`]).
+    panic_breaker: Mutex<PanicBreaker>,
 }
 
 /// PBA-L1a-001: outcome of one supervised production round.
@@ -208,6 +212,199 @@ where
             RoundOutcome::Panicked(msg)
         }
         Err(join) => RoundOutcome::Failed(anyhow::anyhow!("production round cancelled: {join}")),
+    }
+}
+
+/// Strikes before a transaction is evicted and quarantined. A strike needs
+/// the transaction to panic a round alone AND the empty control round right
+/// after it to produce a block.
+pub(crate) const PANIC_STRIKES_TO_EVICT: u32 = 2;
+
+/// Upper bound on quarantined transaction ids (oldest dropped first).
+const PANIC_QUARANTINE_CAP: usize = 1024;
+
+/// Upper bound on transactions with outstanding strikes.
+const PANIC_STRIKES_CAP: usize = 1024;
+
+/// How a supervised round ended, for the breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoundKind {
+    Produced,
+    Failed,
+    Panicked,
+}
+
+impl<T> RoundOutcome<T> {
+    pub(crate) fn kind(&self) -> RoundKind {
+        match self {
+            RoundOutcome::Produced(_) => RoundKind::Produced,
+            RoundOutcome::Failed(_) => RoundKind::Failed,
+            RoundOutcome::Panicked(_) => RoundKind::Panicked,
+        }
+    }
+}
+
+/// Producer-side circuit breaker: finds a mempool transaction that makes
+/// every production round panic, and stops offering it to the builder.
+///
+/// A panicking round is contained by [`run_supervised`], but a transaction
+/// that panics deterministically would be selected again next round, and
+/// every round after. The breaker narrows the suspects of a panicking round
+/// by halving: each following round is built only from the first half of
+/// the remaining suspects (a prefix of the selection order, so each
+/// sender's nonces stay contiguous). A produced round clears the suspects it
+/// included; a panicking one narrows to its own candidates.
+///
+/// When one transaction panics a round alone, the next round is an empty
+/// control round. If it produces, the transaction gets a strike; if even
+/// the empty round panics, the panic is not the transaction's doing and its
+/// strikes are cleared. After [`PANIC_STRIKES_TO_EVICT`] strikes the
+/// transaction is removed from the mempool and quarantined (never selected
+/// again by this producer). Every lone panic is followed by a round with no
+/// transactions, so any number of poison transactions are isolated and
+/// evicted one by one while blocks keep being produced. Known limit: a panic
+/// that fires on every non-empty round (not tied to one transaction) strikes
+/// whichever transaction the halving isolates; that needs an existing panic
+/// bug and only affects what this producer proposes. Block validity is
+/// unchanged.
+#[derive(Default)]
+pub(crate) struct PanicBreaker {
+    /// Candidate ids handed to the builder in the current round.
+    round: Vec<Hash>,
+    /// Candidates still suspected of the last panic, in selection order.
+    suspects: Vec<Hash>,
+    /// A lone candidate that just panicked; the next round is a control
+    /// round without it.
+    control: Option<Hash>,
+    strikes: HashMap<Hash, u32>,
+    quarantine: std::collections::HashSet<Hash>,
+    quarantine_order: std::collections::VecDeque<Hash>,
+    #[cfg(test)]
+    fault: Option<(Hash, TestFault)>,
+}
+
+/// Test-only fault injected after a round has executed its transactions.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestFault {
+    Panic,
+    Error,
+}
+
+impl PanicBreaker {
+    /// Called before each round.
+    pub(crate) fn start_round(&mut self) {
+        self.round.clear();
+    }
+
+    /// Whether `hash` is quarantined.
+    #[cfg(test)]
+    pub(crate) fn is_quarantined(&self, hash: &Hash) -> bool {
+        self.quarantine.contains(hash)
+    }
+
+    /// Choose this round's candidates from the builder's selection.
+    pub(crate) fn filter(&mut self, candidates: Vec<Transaction>) -> Vec<Transaction> {
+        let mut out: Vec<Transaction> = candidates
+            .into_iter()
+            .filter(|t| !self.quarantine.contains(&t.hash))
+            .collect();
+        if self.control.is_some() {
+            out.clear();
+        } else if !self.suspects.is_empty() {
+            let probe_len = self.suspects.len().div_ceil(2);
+            let probe: std::collections::HashSet<Hash> =
+                self.suspects[..probe_len].iter().copied().collect();
+            let narrowed: Vec<Transaction> = out
+                .iter()
+                .filter(|t| probe.contains(&t.hash))
+                .cloned()
+                .collect();
+            if narrowed.is_empty() {
+                // The suspects left the mempool: nothing left to narrow.
+                self.suspects.clear();
+            } else {
+                out = narrowed;
+            }
+        }
+        self.round = out.iter().map(|t| t.hash).collect();
+        out
+    }
+
+    /// Record how the round ended. Returns the ids to evict from the mempool.
+    pub(crate) fn end_round(&mut self, kind: RoundKind) -> Vec<Hash> {
+        let round = std::mem::take(&mut self.round);
+        if let Some(culprit) = self.control {
+            // The empty control round after `culprit` panicked alone.
+            return match kind {
+                RoundKind::Produced => {
+                    self.control = None;
+                    self.strike(culprit)
+                }
+                // Even an empty round panics: not the transaction's doing.
+                RoundKind::Panicked => {
+                    self.control = None;
+                    self.suspects.clear();
+                    self.forget(&culprit);
+                    Vec::new()
+                }
+                RoundKind::Failed => Vec::new(),
+            };
+        }
+        match kind {
+            RoundKind::Produced => {
+                let done: std::collections::HashSet<Hash> = round.iter().copied().collect();
+                self.suspects.retain(|h| !done.contains(h));
+                for h in &round {
+                    self.forget(h);
+                }
+                Vec::new()
+            }
+            RoundKind::Failed => Vec::new(),
+            RoundKind::Panicked => {
+                match round.len() {
+                    0 => {}
+                    1 => {
+                        self.control = Some(round[0]);
+                        self.suspects = round;
+                    }
+                    _ => self.suspects = round,
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    fn forget(&mut self, h: &Hash) {
+        self.strikes.remove(h);
+    }
+
+    fn strike(&mut self, culprit: Hash) -> Vec<Hash> {
+        let n = {
+            let n = self.strikes.entry(culprit).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if n < PANIC_STRIKES_TO_EVICT {
+            if self.strikes.len() > PANIC_STRIKES_CAP {
+                // Bounded: forget everyone else's partial evidence.
+                self.strikes.retain(|h, _| *h == culprit);
+            }
+            // Retry it alone.
+            self.suspects = vec![culprit];
+            return Vec::new();
+        }
+        self.forget(&culprit);
+        self.suspects.retain(|h| *h != culprit);
+        if self.quarantine.insert(culprit) {
+            self.quarantine_order.push_back(culprit);
+            if self.quarantine_order.len() > PANIC_QUARANTINE_CAP {
+                if let Some(old) = self.quarantine_order.pop_front() {
+                    self.quarantine.remove(&old);
+                }
+            }
+        }
+        vec![culprit]
     }
 }
 
@@ -272,6 +469,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
 
@@ -336,6 +534,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
 
@@ -399,6 +598,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
 
@@ -541,6 +741,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
 
@@ -693,6 +894,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            panic_breaker: Mutex::new(PanicBreaker::default()),
         }
     }
 
@@ -831,7 +1033,7 @@ impl BlockProducer {
                 continue;
             }
 
-            match supervised_round(self.clone()).await {
+            match self.guard_round(supervised_round(self.clone())).await {
                 RoundOutcome::Produced(block_hash) => {
                     block_count += 1;
                     info!(
@@ -859,6 +1061,45 @@ impl BlockProducer {
                 }
             }
         }
+    }
+
+    /// Run one supervised round under the panic breaker: reset the round's
+    /// candidate record, run it, then feed the outcome to the breaker and
+    /// evict whatever it names from the mempool.
+    pub(crate) async fn guard_round<F>(&self, round: F) -> RoundOutcome<Hash>
+    where
+        F: std::future::Future<Output = RoundOutcome<Hash>>,
+    {
+        self.panic_breaker.lock().start_round();
+        let outcome = round.await;
+        let evict = self.panic_breaker.lock().end_round(outcome.kind());
+        for hash in evict {
+            warn!(
+                "block production panicked {} times on transaction {} alone; \
+                 removed it from the mempool and stopped selecting it",
+                PANIC_STRIKES_TO_EVICT, hash
+            );
+            let _ = self.mempool.remove_transaction(&hash).await;
+        }
+        outcome
+    }
+
+    /// Test hook: fail the round after its transactions ran, if it carries
+    /// the configured transaction.
+    #[cfg(test)]
+    fn inject_test_fault(&self, executed: &[Transaction]) -> anyhow::Result<()> {
+        let fault = self.panic_breaker.lock().fault;
+        if let Some((hash, kind)) = fault {
+            if executed.iter().any(|t| t.hash == hash) {
+                match kind {
+                    TestFault::Panic => panic!("injected production fault on {hash}"),
+                    TestFault::Error => {
+                        return Err(anyhow::anyhow!("injected production error on {hash}"))
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Produce a single block
@@ -1066,6 +1307,14 @@ impl BlockProducer {
 
         // Get transactions from mempool with AI priority
         let transactions = self.select_transactions_with_ai_priority().await?;
+        // Producer-side panic breaker: skip quarantined transactions and, after
+        // a panicking round, narrow the candidates to find the culprit.
+        let transactions = self.panic_breaker.lock().filter(transactions);
+
+        // Every executor mutation below is rolled back if the round ends
+        // before its state is persisted (error or panic), so a failed round
+        // never leaves the executor ahead of the applied tip.
+        let round_state = self.executor.begin_production_round();
 
         // VALIDATOR-S1 §R': under v2 (execute-on-receive), exclude EIP-1559-invalid
         // txs (`gas_price < canonical base fee`) so a produced block never trips the
@@ -1088,26 +1337,29 @@ impl BlockProducer {
         // lacks its canonical id, or is bound to another chain — so never
         // build one. Such a tx can only have reached the pool through a
         // trusted-decoder or signature-checks-disabled path; drop it there too.
-        let transactions: Vec<citrate_consensus::types::Transaction> =
-            if self.ghostdag.pba_hardening().active_at(last_height + 1) {
-                let chain_id = self.executor.chain_id();
-                let mut keep = Vec::with_capacity(transactions.len());
-                for t in transactions {
-                    match citrate_consensus::tx_auth::verify_for_block(&t, chain_id) {
-                        Ok(_) => keep.push(t),
-                        Err(e) => {
-                            warn!(
+        let transactions: Vec<citrate_consensus::types::Transaction> = if self
+            .ghostdag
+            .pba_hardening()
+            .active_at(last_height + 1)
+        {
+            let chain_id = self.executor.chain_id();
+            let mut keep = Vec::with_capacity(transactions.len());
+            for t in transactions {
+                match citrate_consensus::tx_auth::verify_for_block(&t, chain_id) {
+                    Ok(_) => keep.push(t),
+                    Err(e) => {
+                        warn!(
                                 "PBA-L1b-001: excluding tx {} from the block: {} (removed from mempool)",
                                 t.hash, e
                             );
-                            let _ = self.mempool.remove_transaction(&t.hash).await;
-                        }
+                        let _ = self.mempool.remove_transaction(&t.hash).await;
                     }
                 }
-                keep
-            } else {
-                transactions
-            };
+            }
+            keep
+        } else {
+            transactions
+        };
 
         // Blue score and work are already calculated above
         let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
@@ -1199,6 +1451,8 @@ impl BlockProducer {
         let (_pre_reward_root, executed_transactions, mut receipts) = self
             .execute_block_transactions(&transactions, &header)
             .await?;
+        #[cfg(test)]
+        self.inject_test_fault(&executed_transactions)?;
         let total_gas_used: u64 = receipts.iter().map(|receipt| receipt.gas_used).sum();
         header.gas_used = total_gas_used;
 
@@ -1372,6 +1626,8 @@ impl BlockProducer {
             .executor
             .persist_state_changes_with_tip(Some((block.header.block_hash, block.header.height)))
             .await?;
+        // The block's state is durable: keep it.
+        round_state.commit();
         info!(
             "Persisted {} modified accounts to storage (tip @ {})",
             modified_count, block.header.height
@@ -3463,7 +3719,9 @@ mod pba_l1a_001_producer_supervision {
     #[test]
     fn start_loop_uses_the_supervisor() {
         let src = include_str!("producer.rs");
-        let start = src.find("pub async fn start(self: Arc<Self>)").expect("start()");
+        let start = src
+            .find("pub async fn start(self: Arc<Self>)")
+            .expect("start()");
         let body = &src[start..start + 2_000];
         assert!(
             body.contains("supervised_round(self.clone())"),
@@ -3513,5 +3771,515 @@ mod pba_l1b_001_producer_filter {
             window.contains("tx_auth::verify_for_block(&t, chain_id)"),
             "PBA-L1b-001: produce_block must filter candidates with tx_auth::verify_for_block"
         );
+    }
+}
+
+/// Producer circuit breaker and round rollback: a transaction that makes
+/// every production round panic is found, evicted and quarantined, and a
+/// round that ends early (panic or error) leaves the executor exactly as it
+/// found it.
+#[cfg(test)]
+mod producer_panic_breaker {
+    use super::*;
+    use citrate_execution::types::Address;
+    use citrate_sequencer::mempool::{MempoolConfig, TxClass};
+    use citrate_storage::pruning::PruningConfig;
+    use primitive_types::U256;
+    use tempfile::TempDir;
+
+    fn h(b: u8) -> Hash {
+        Hash::new([b; 32])
+    }
+
+    fn tx(b: u8) -> Transaction {
+        Transaction {
+            hash: h(b),
+            ..Default::default()
+        }
+    }
+
+    /// Drive the breaker through one round in which `panics(round)` decides
+    /// the outcome. Returns the evicted ids.
+    fn round(
+        b: &mut PanicBreaker,
+        pool: &[u8],
+        panics: impl Fn(&[Hash]) -> bool,
+    ) -> (Vec<Hash>, Vec<Hash>) {
+        b.start_round();
+        let picked: Vec<Hash> = b
+            .filter(pool.iter().map(|x| tx(*x)).collect())
+            .iter()
+            .map(|t| t.hash)
+            .collect();
+        let kind = if panics(&picked) {
+            RoundKind::Panicked
+        } else {
+            RoundKind::Produced
+        };
+        (picked, b.end_round(kind))
+    }
+
+    /// Run rounds over a live pool: produced rounds include (remove) their
+    /// transactions, evicted ones leave, and `arrivals` new innocent
+    /// transactions join every round. Returns the evicted ids and how many
+    /// rounds produced a block.
+    fn simulate(
+        b: &mut PanicBreaker,
+        mut pool: Vec<u8>,
+        arrivals: usize,
+        rounds: usize,
+        panics: impl Fn(&[Hash]) -> bool,
+    ) -> (Vec<Hash>, usize, Vec<u8>) {
+        let mut next: u8 = 100;
+        let mut evicted = Vec::new();
+        let mut produced = 0;
+        for _ in 0..rounds {
+            for _ in 0..arrivals {
+                pool.push(next);
+                next = next.wrapping_add(1).max(100);
+            }
+            let (picked, ev) = round(b, &pool, &panics);
+            if !panics(&picked) {
+                produced += 1;
+                pool.retain(|x| !picked.contains(&h(*x)));
+            }
+            for e in &ev {
+                pool.retain(|x| h(*x) != *e);
+            }
+            evicted.extend(ev);
+        }
+        (evicted, produced, pool)
+    }
+
+    #[test]
+    fn isolates_a_lone_culprit_and_evicts_only_it() {
+        let mut b = PanicBreaker::default();
+        let culprit = h(6);
+        let (evicted, produced, pool) =
+            simulate(&mut b, vec![1, 2, 3, 4, 5, 6, 7, 8], 1, 40, |p| {
+                p.contains(&culprit)
+            });
+        assert_eq!(evicted, vec![culprit], "only the culprit is evicted");
+        assert!(b.is_quarantined(&culprit));
+        assert!(produced > 0);
+        assert!(!pool.contains(&6));
+        // A quarantined id is never offered again, even if it reappears.
+        b.start_round();
+        assert!(b
+            .filter(vec![tx(6), tx(9)])
+            .iter()
+            .all(|t| t.hash != culprit));
+    }
+
+    #[test]
+    fn evicts_after_exactly_the_strike_limit() {
+        let mut b = PanicBreaker::default();
+        let culprit = h(9);
+        let mut solo_panics = 0;
+        loop {
+            let (picked, ev) = round(&mut b, &[9], |p| p.contains(&culprit));
+            if picked == vec![culprit] {
+                solo_panics += 1;
+            }
+            if !ev.is_empty() {
+                assert_eq!(ev, vec![culprit]);
+                break;
+            }
+            assert!(solo_panics <= PANIC_STRIKES_TO_EVICT, "never evicted");
+        }
+        assert_eq!(solo_panics, PANIC_STRIKES_TO_EVICT);
+    }
+
+    #[test]
+    fn a_lone_poison_is_evicted_and_production_continues() {
+        let mut b = PanicBreaker::default();
+        let (evicted, produced, pool) = simulate(&mut b, vec![1], 0, 20, |p| p.contains(&h(1)));
+        assert_eq!(evicted, vec![h(1)]);
+        assert!(pool.is_empty());
+        assert!(produced >= 15, "{produced}");
+    }
+
+    fn two_poisons(p: &[Hash]) -> bool {
+        p.contains(&h(1)) || p.contains(&h(2))
+    }
+
+    #[test]
+    fn two_poisons_alone_are_both_evicted() {
+        let mut b = PanicBreaker::default();
+        let (mut evicted, produced, pool) = simulate(&mut b, vec![1, 2], 0, 60, two_poisons);
+        evicted.sort();
+        assert_eq!(evicted, vec![h(1), h(2)]);
+        assert!(pool.is_empty());
+        assert!(produced >= 40, "blocks keep being produced: {produced}");
+    }
+
+    #[test]
+    fn two_poisons_with_honest_traffic_are_both_evicted_and_blocks_keep_coming() {
+        let mut b = PanicBreaker::default();
+        let (mut evicted, produced, pool) = simulate(&mut b, vec![1, 2, 3, 4], 1, 400, two_poisons);
+        evicted.sort();
+        assert_eq!(
+            evicted,
+            vec![h(1), h(2)],
+            "only the two poisons are evicted"
+        );
+        assert!(
+            produced >= 300,
+            "blocks keep being produced: {produced}/400"
+        );
+        assert!(
+            pool.len() <= 2,
+            "honest traffic is included: {} left",
+            pool.len()
+        );
+    }
+
+    /// Q panics whenever P is absent; P always panics. Both go.
+    #[test]
+    fn a_shielding_pair_is_evicted() {
+        let mut b = PanicBreaker::default();
+        let bad = |p: &[Hash]| p.contains(&h(1)) || (p.contains(&h(2)) && !p.contains(&h(1)));
+        let (evicted, produced, _) = simulate(&mut b, vec![1, 2, 3, 4], 1, 400, bad);
+        assert!(
+            evicted.contains(&h(1)) && evicted.contains(&h(2)),
+            "{evicted:?}"
+        );
+        assert!(evicted.iter().all(|e| *e == h(1) || *e == h(2)));
+        assert!(produced >= 300, "{produced}");
+    }
+
+    #[test]
+    fn a_panic_that_is_not_the_transactions_fault_evicts_nothing() {
+        let mut b = PanicBreaker::default();
+        for _ in 0..50 {
+            let (_, ev) = round(&mut b, &[1, 2, 3], |_| true);
+            assert!(ev.is_empty(), "a tx-independent panic must not evict");
+        }
+        assert!(!b.is_quarantined(&h(1)));
+        // Once the fault clears, every transaction is offered again.
+        let (picked, _) = round(&mut b, &[1, 2, 3], |_| false);
+        let (picked2, _) = round(&mut b, &[1, 2, 3], |_| false);
+        let mut all: Vec<Hash> = picked.into_iter().chain(picked2).collect();
+        all.sort();
+        all.dedup();
+        assert!(all.len() >= 2, "normal selection resumes: {all:?}");
+    }
+
+    #[test]
+    fn failed_rounds_do_not_count() {
+        let mut b = PanicBreaker::default();
+        b.start_round();
+        let _ = b.filter(vec![tx(1)]);
+        assert!(b.end_round(RoundKind::Panicked).is_empty());
+        // The control round is empty; failing is not a verdict.
+        b.start_round();
+        assert!(
+            b.filter(vec![tx(1), tx(2)]).is_empty(),
+            "control round is empty"
+        );
+        assert!(b.end_round(RoundKind::Failed).is_empty());
+        assert_eq!(b.strikes.get(&h(1)), None);
+        // Then it produces: one strike.
+        b.start_round();
+        assert!(
+            b.filter(vec![tx(1), tx(2)]).is_empty(),
+            "still the control round"
+        );
+        assert!(b.end_round(RoundKind::Produced).is_empty());
+        assert_eq!(b.strikes.get(&h(1)), Some(&1));
+        // A later success of tx 1 alone clears the strike.
+        b.start_round();
+        assert_eq!(b.filter(vec![tx(1)]).len(), 1);
+        assert!(b.end_round(RoundKind::Produced).is_empty());
+        assert_eq!(b.strikes.get(&h(1)), None);
+    }
+
+    fn id(i: u32) -> Hash {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&i.to_le_bytes());
+        Hash::new(bytes)
+    }
+
+    #[test]
+    fn quarantine_is_bounded() {
+        let mut b = PanicBreaker::default();
+        for i in 0..(PANIC_QUARANTINE_CAP as u32 + 5) {
+            b.suspects.clear();
+            for _ in 0..PANIC_STRIKES_TO_EVICT {
+                let _ = b.strike(id(i));
+            }
+        }
+        assert_eq!(b.quarantine.len(), PANIC_QUARANTINE_CAP);
+        assert_eq!(b.quarantine_order.len(), PANIC_QUARANTINE_CAP);
+        assert!(!b.is_quarantined(&id(0)), "oldest dropped first");
+        assert!(b.is_quarantined(&id(PANIC_QUARANTINE_CAP as u32 + 4)));
+    }
+
+    #[test]
+    fn partial_evidence_is_bounded_and_keeps_the_current_culprit() {
+        let mut b = PanicBreaker::default();
+        // Up to the cap, everyone's first strike is kept.
+        for i in 0..(PANIC_STRIKES_CAP as u32) {
+            assert!(b.strike(id(i)).is_empty());
+        }
+        assert_eq!(b.strikes.len(), PANIC_STRIKES_CAP);
+        assert_eq!(
+            b.strikes.get(&id(0)),
+            Some(&1),
+            "below the cap nothing is dropped"
+        );
+        // One more: the others are forgotten, the current culprit is kept.
+        let last = id(PANIC_STRIKES_CAP as u32);
+        assert!(b.strike(last).is_empty());
+        assert_eq!(b.strikes.len(), 1);
+        assert_eq!(b.strikes.get(&last), Some(&1));
+        // Its evidence still counts: the next strike evicts it, and it is no
+        // longer a suspect.
+        b.suspects = vec![id(7), last];
+        assert_eq!(b.strike(last), vec![last]);
+        assert_eq!(b.suspects, vec![id(7)]);
+    }
+
+    fn embedded(a: Address) -> PublicKey {
+        let mut bytes = [0u8; 32];
+        bytes[..20].copy_from_slice(&a.0);
+        PublicKey::new(bytes)
+    }
+
+    fn transfer(hash_byte: u8, from: Address, to: Address, value: u128) -> Transaction {
+        Transaction {
+            hash: Hash::new([hash_byte; 32]),
+            nonce: 0,
+            from: embedded(from),
+            to: Some(embedded(to)),
+            value,
+            gas_limit: 21_000,
+            gas_price: 1_000_000_000,
+            signature: citrate_consensus::types::Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ecdsa_verified: true,
+            ..Default::default()
+        }
+    }
+
+    struct Node {
+        _dir: TempDir,
+        storage: Arc<StorageManager>,
+        executor: Arc<Executor>,
+        mempool: Arc<Mempool>,
+        producer: Arc<BlockProducer>,
+    }
+
+    const RECIPIENT: Address = Address([0x33; 20]);
+
+    async fn node(senders: &[Address]) -> Node {
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let state_db = Arc::new(citrate_execution::StateDB::new());
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            state_db.clone(),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        for s in senders {
+            state_db.accounts.create_account_if_not_exists(*s);
+            state_db
+                .accounts
+                .set_balance(*s, U256::from(21_000u64 * 1_000_000_000u64 * 10));
+        }
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+        let producer = Arc::new(BlockProducer::new(
+            storage.clone(),
+            executor.clone(),
+            mempool.clone(),
+            embedded(Address([0x44; 20])),
+            citrate_consensus::crypto::generate_keypair(),
+            2,
+        ));
+        Node {
+            _dir: dir,
+            storage,
+            executor,
+            mempool,
+            producer,
+        }
+    }
+
+    impl Node {
+        async fn add(&self, t: Transaction) -> Hash {
+            self.mempool
+                .add_transaction(t.clone(), TxClass::Standard)
+                .await
+                .expect("admitted");
+            t.hash
+        }
+
+        fn fault(&self, hash: Hash, kind: TestFault) {
+            self.producer.panic_breaker.lock().fault = Some((hash, kind));
+        }
+
+        async fn round(&self) -> RoundOutcome<Hash> {
+            self.producer
+                .guard_round(supervised_round(self.producer.clone()))
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_poison_transaction_is_evicted_and_production_resumes() {
+        let poison_from = Address([0xAA; 20]);
+        // Honest traffic keeps arriving: one new sender per round.
+        let honest: Vec<Address> = (0..24u8)
+            .map(|i| Address([0xB0u8.wrapping_add(i); 20]))
+            .collect();
+        let mut funded = vec![poison_from];
+        funded.extend(honest.iter().copied());
+        let n = node(&funded).await;
+        let poison = n.add(transfer(0xA1, poison_from, RECIPIENT, 5)).await;
+        let good = n.add(transfer(0x10, honest[0], RECIPIENT, 7)).await;
+        n.fault(poison, TestFault::Panic);
+
+        let mut produced = Vec::new();
+        for (i, from) in honest.iter().enumerate().skip(1) {
+            if let RoundOutcome::Produced(hash) = n.round().await {
+                produced.push(hash);
+            }
+            if !n.mempool.contains(&poison).await && !n.mempool.contains(&good).await {
+                break;
+            }
+            n.add(transfer(0x10 + i as u8, *from, RECIPIENT, 7)).await;
+        }
+        assert!(
+            !n.mempool.contains(&poison).await,
+            "the transaction that panicked every round must be evicted"
+        );
+        let included: Vec<Hash> = produced
+            .iter()
+            .filter_map(|b| n.storage.blocks.get_block(b).ok().flatten())
+            .flat_map(|b| b.transactions.into_iter().map(|t| t.hash))
+            .collect();
+        assert!(included.contains(&good), "the other transaction was mined");
+        assert!(!included.contains(&poison));
+
+        // Quarantined: if it is offered again (the mempool may already refuse
+        // the duplicate), it is not selected; production continues.
+        let _ = n
+            .mempool
+            .add_transaction(transfer(0xA1, poison_from, RECIPIENT, 5), TxClass::Standard)
+            .await;
+        assert!(n.producer.panic_breaker.lock().is_quarantined(&poison));
+        match n.round().await {
+            RoundOutcome::Produced(b) => {
+                let blk = n.storage.blocks.get_block(&b).unwrap().unwrap();
+                assert!(blk.transactions.iter().all(|t| t.hash != poison));
+            }
+            other => panic!("production must resume, got {other:?}"),
+        }
+    }
+
+    async fn aborted_round_leaves_state_untouched(kind: TestFault) {
+        let from = Address([0xAA; 20]);
+        let n = node(&[from]).await;
+        let t = n.add(transfer(0xA1, from, RECIPIENT, 5)).await;
+        n.fault(t, kind);
+
+        let root_before = n.executor.calculate_state_root();
+        let from_before = n.executor.get_balance(&from);
+        let to_before = n.executor.get_balance(&RECIPIENT);
+        let stored_before = n.storage.state.get_account(&RECIPIENT).expect("read");
+        let ctx_before = n.executor.get_block_context();
+
+        let out = n.round().await;
+        match kind {
+            TestFault::Panic => assert!(matches!(out, RoundOutcome::Panicked(_)), "{out:?}"),
+            TestFault::Error => assert!(matches!(out, RoundOutcome::Failed(_)), "{out:?}"),
+        }
+
+        assert_eq!(
+            n.executor.get_balance(&from),
+            from_before,
+            "sender restored"
+        );
+        assert_eq!(
+            n.executor.get_balance(&RECIPIENT),
+            to_before,
+            "recipient restored"
+        );
+        assert_eq!(
+            n.executor.calculate_state_root(),
+            root_before,
+            "world state restored"
+        );
+        assert_eq!(
+            n.storage.state.get_account(&RECIPIENT).expect("read"),
+            stored_before,
+            "nothing from the aborted round reached the store"
+        );
+        assert_eq!(
+            n.executor.get_block_context().prevrandao,
+            ctx_before.prevrandao
+        );
+
+        // The next clean round builds on the restored state and persists.
+        n.producer.panic_breaker.lock().fault = None;
+        let mut mined = false;
+        for _ in 0..4 {
+            if let RoundOutcome::Produced(b) = n.round().await {
+                let blk = n.storage.blocks.get_block(&b).unwrap().unwrap();
+                // A committed round keeps its state in memory too.
+                assert_eq!(n.executor.calculate_state_root(), blk.state_root);
+                if blk.transactions.iter().any(|x| x.hash == t) {
+                    mined = true;
+                    break;
+                }
+            }
+        }
+        assert!(mined, "the transaction is mined once the fault clears");
+        assert_eq!(
+            n.executor.get_balance(&RECIPIENT),
+            to_before + U256::from(5u64),
+            "credited exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_round_restores_executor_state() {
+        aborted_round_leaves_state_untouched(TestFault::Panic).await;
+    }
+
+    #[tokio::test]
+    async fn a_failing_round_restores_executor_state() {
+        aborted_round_leaves_state_untouched(TestFault::Error).await;
+    }
+
+    /// Tripwire: the producer opens the rollback guard before it touches the
+    /// executor and commits it only after the block's state is persisted.
+    #[test]
+    fn rollback_guard_brackets_the_round() {
+        let src = include_str!("producer.rs");
+        let start = src
+            .find("async fn produce_block(&self)")
+            .expect("produce_block");
+        let body = &src[start..];
+        let open = body
+            .find("self.executor.begin_production_round()")
+            .expect("round guard");
+        let first_mutation = body
+            .find("self.executor.set_block_context(")
+            .expect("first executor mutation");
+        let persist = body
+            .find(".persist_state_changes_with_tip(")
+            .expect("persist");
+        let commit = body.find("round_state.commit()").expect("commit");
+        assert!(open < first_mutation);
+        assert!(persist < commit);
+        let filter = body
+            .find("self.panic_breaker.lock().filter(")
+            .expect("breaker filter");
+        assert!(filter < first_mutation);
     }
 }

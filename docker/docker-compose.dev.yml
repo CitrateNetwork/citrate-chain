@@ -52,7 +52,7 @@ services:
     environment:
       - RUST_LOG=info
       - CITRATE_RPC_URL=http://node1:8545
-      - CITRATE_CHAIN_ID=40204
+      - CITRATE_CHAIN_ID=1337
       - FAUCET_PORT=3002
     networks:
       - citrate

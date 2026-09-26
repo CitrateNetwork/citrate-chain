@@ -213,6 +213,14 @@ pub struct ChainConfig {
     /// Owner runbook: `docs/consensus/PBA_HARDENING_ACTIVATION.md`.
     #[serde(default)]
     pub pba_hardening_height: Option<u64>,
+
+    /// A local development chain. The activation height compiled into the
+    /// release for this chain id (`citrate_consensus::hardening::
+    /// PINNED_ACTIVATIONS`) is not applied, so dev profiles keep choosing
+    /// their own `pba_hardening_height`. Never set this on a node that joins
+    /// a public network.
+    #[serde(default)]
+    pub dev_profile: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +309,10 @@ pub struct MiningConfig {
     pub min_gas_price: u64,
 }
 
+/// Chain id of local dev chains (`NodeConfig::devnet()`, `devnet.toml`,
+/// `devnet-config.toml`, the Docker devnet). Never a release network's id.
+pub const DEV_CHAIN_ID: u64 = 1337;
+
 /// Parse a hardcoded socket address literal. Infallible for valid literals;
 /// uses `unreachable!` instead of `unwrap`/`expect` for the zero-panic vanity goal.
 fn hardcoded_addr(s: &str) -> SocketAddr {
@@ -324,6 +336,7 @@ impl Default for NodeConfig {
                 ghostdag_k: 18,
                 genesis_profile: None,
                 pba_hardening_height: None,
+                dev_profile: false,
             },
             network: NetworkConfig {
                 listen_addr: hardcoded_addr("127.0.0.1:30303"),
@@ -375,17 +388,20 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Create devnet configuration
+    /// Create devnet configuration (chain id [`DEV_CHAIN_ID`]).
     /// Chain ID can be overridden via CITRATE_CHAIN_ID environment variable
     pub fn devnet() -> Self {
         let mut config = Self::default();
         // Chain ID already set from env var in default(), only override if not set
+        // A local dev chain never runs on a release network's chain id (the
+        // release pin applies there and dev_profile is refused).
         if std::env::var("CITRATE_CHAIN_ID").is_err() {
-            config.chain.chain_id = 40204;
+            config.chain.chain_id = DEV_CHAIN_ID;
         }
         config.chain.genesis_profile = Some("default".to_string());
         // PBA-R2: dev profile enforces the hardened validity rules from genesis.
         config.chain.pba_hardening_height = Some(0);
+        config.chain.dev_profile = true;
         config.mining.enabled = true;
         config.mining.target_block_time = 2; // Fast blocks for testing
                                              // C-02: Allow eth_sendTransaction only in devnet mode
@@ -466,7 +482,7 @@ mod tests {
 
         let config = NodeConfig::devnet();
 
-        assert_eq!(config.chain.chain_id, 40204);
+        assert_eq!(config.chain.chain_id, DEV_CHAIN_ID);
         assert_eq!(config.mining.target_block_time, 2);
         assert!(config.mining.enabled);
         assert!(config.rpc.allow_eth_send_transaction);
@@ -632,6 +648,38 @@ mod tests {
         assert_eq!(config.chain.genesis_profile.as_deref(), Some("default"));
     }
 
+    /// Only local dev profiles opt out of the release-pinned activation
+    /// height; every shipped network profile leaves `dev_profile` off.
+    #[test]
+    fn only_dev_profiles_opt_out_of_the_release_pin() {
+        let dev: NodeConfig =
+            toml::from_str(include_str!("../config/devnet.toml")).expect("devnet");
+        assert!(dev.chain.dev_profile);
+        let dev2: NodeConfig =
+            toml::from_str(include_str!("../../devnet-config.toml")).expect("devnet-config");
+        assert!(dev2.chain.dev_profile);
+        assert!(NodeConfig::devnet().chain.dev_profile);
+        assert!(!NodeConfig::default().chain.dev_profile);
+        for (name, src) in [
+            ("testnet.toml", include_str!("../config/testnet.toml")),
+            (
+                "testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            ("mainnet.toml", include_str!("../config/mainnet.toml")),
+            (
+                "team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+        ] {
+            let c: NodeConfig = toml::from_str(src).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                !c.chain.dev_profile,
+                "{name} must not opt out of the release pin"
+            );
+        }
+    }
+
     /// R2: the node resolves the activation height through the ONE shared
     /// resolver (env override, else `[chain] pba_hardening_height`) and
     /// publishes it before constructing any gated component.
@@ -641,10 +689,26 @@ mod tests {
         let start = main.find("async fn start_node(").expect("start_node");
         let body = &main[start..];
         let init = body
-            .find("citrate_consensus::hardening::init_pba_hardening_height(")
-            .expect("start_node must publish via init_pba_hardening_height");
-        for ctor in ["GhostDag::new(", "Executor::with_storage(", "SyncManager::new(", "GossipProtocol::new("] {
-            let at = body.find(ctor).unwrap_or_else(|| panic!("{ctor} in start_node"));
+            .find("citrate_consensus::hardening::init_pba_hardening_for_chain(")
+            .expect("start_node must publish via init_pba_hardening_for_chain");
+        // The pin-unaware resolver would skip the release pin.
+        assert!(!body.contains("hardening::init_pba_hardening_height("));
+        // The chain id the pin keys on is checked against CITRATE_CHAIN_ID first.
+        let chain_check = body
+            .find("hardening::check_chain_id_env(")
+            .expect("start_node must check CITRATE_CHAIN_ID against the config");
+        assert!(chain_check < init);
+        // Executors take the configured chain id, never the env default.
+        assert!(!main.contains("Executor::with_storage("));
+        for ctor in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "SyncManager::new(",
+            "GossipProtocol::new(",
+        ] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
             assert!(init < at, "activation must be published before {ctor}");
         }
         assert!(

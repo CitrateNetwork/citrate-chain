@@ -8,7 +8,7 @@ Per-network `node.toml` configurations consumed by `citrate-node --config <path>
 |---|---|---|---|
 | [`testnet-beta.toml`](testnet-beta.toml) | **Canonical testnet-beta** (chain ID 40204). Baked bootnodes for auto-discovery. Default for partner / pilot binaries. | on | `0.0.0.0:8545` |
 | [`mainnet.toml`](mainnet.toml) | Mainnet (planned). Bootnodes pre-baked. | on | `0.0.0.0:8545` |
-| [`devnet.toml`](devnet.toml) | Local devnet (chain ID 40204 by default; localhost only). | on | `0.0.0.0:8545` |
+| [`devnet.toml`](devnet.toml) | Local devnet (chain ID 1337, devnet genesis; localhost only). Dev profiles never use a release network's chain id. | on | `0.0.0.0:8545` |
 | [`testnet.toml`](testnet.toml) | Legacy single-node testnet helper. | on | `0.0.0.0:8545` |
 | [`testnet-1.toml`](testnet-1.toml), [`testnet-2.toml`](testnet-2.toml), [`testnet-boot-1.toml`](testnet-boot-1.toml), [`testnet-boot-2.toml`](testnet-boot-2.toml), [`testnet-boot-3.toml`](testnet-boot-3.toml), [`testnet-bootstrap.toml`](testnet-bootstrap.toml) | Multi-node local rehearsal configs (boot1/2/3 = validators with cross-bootstrapping; 1/2 = peer slots). | on | various |
 
