@@ -89,3 +89,21 @@ Feature: ComputePool settlement authority + requester timeout-refund (INFER-S2)
     When the coordinator calls completeJob
     Then the job becomes Completed
     And that member's share is credited to payoutPending (claimPayout)
+
+  # ── Coordinator reassignment: caller + stake accounting ──
+
+  Scenario: only a current pool member can reassign a stalled coordinator
+    Given the job has been Executing for more than COORDINATION_TIMEOUT blocks
+    When an address that is not an active pool member calls reassignCoordinator
+    Then the call reverts with "Not a pool member"
+    # TLA: Reassign(j, caller) requires IsMember(caller)
+
+  Scenario: a liveness slash keeps pool stake accounting whole
+    Given the dispatched coordinator stalled past COORDINATION_TIMEOUT
+    When a pool member calls reassignCoordinator
+    Then the coordinator's stake and pool.totalStaked both drop by the slash
+    And the slash is added to slashedStakeRetained
+    And the job returns to Pending with the coordinator's activeJobs decremented
+    When the coordinator later requests leave, waits LEAVE_COOLDOWN, and leaves
+    Then only the post-slash stake is returned and pool.totalStaked drops by it
+    # TLA: TotalStakedMatchesMembers, StakeConservation in ComputePoolSettlement.tla

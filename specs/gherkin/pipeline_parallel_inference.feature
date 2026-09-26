@@ -43,12 +43,16 @@ Feature: ComputePool PipelineParallel frontier-model inference (CM-08)
     Given a pipeline request is mid-flight; activation has reached w3
       (stage 2)
     And w3 crashes before emitting its output
-    When COORDINATION_TIMEOUT blocks pass with no w3 output
-    Then any joined worker calls `reassignStage(poolId, stage=2,
-      newWorker)`
-    And the on-chain `PipelineStageReassigned` event fires with
-      `oldWorker=w3`, `newWorker=<replacement>`
-    And w3 is liveness-slashed per the same pattern as CM-07 WP-07.3
+    When a stage owner (or governance) calls `faultStage(jobId, stage=2)`
+    Then the `StageFaulted` event fires with `former=w3`
+    And w3's own stage stake and accrued earnings are returned to w3
+      (credited to payoutPending, claimable via `claimPayout`, if w3's
+      receive reverts, so a faulted owner cannot block the fault)
+    When an attested worker that holds no other stage calls
+      `reassignStage(jobId, stage=2)` posting exactly perStakePerStage
+    Then the on-chain `StageReassigned` event fires with
+      `former=w3`, `newOwner=<replacement>`
+    And w3 cannot take stage 2 back ("Pipeline: former cannot take back")
     And the activation for the in-flight request is re-played to the
       new stage 2 owner from w2's mesh archive
     And the request completes normally from stage 3 onward
