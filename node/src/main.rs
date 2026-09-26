@@ -352,6 +352,15 @@ enum ModelCommands {
 
 /// The config file the node loads: `--config`, else `$CITRATE_CONFIG`, else
 /// `~/.citrate/node.toml`, else `/etc/citrate/node.toml`.
+/// Mempool size from `CITRATE_MEMPOOL_MAX_SIZE` (default 10,000), capped at
+/// the number of candidates the producer considers per block.
+fn mempool_max_size_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000usize)
+        .min(producer::MAX_BLOCK_CANDIDATES)
+}
+
 fn resolve_config_path(cli_config: Option<PathBuf>) -> Option<PathBuf> {
     cli_config.or_else(|| {
         if let Ok(env_path) = std::env::var("CITRATE_CONFIG") {
@@ -1580,10 +1589,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
-    let mempool_max_size: usize = std::env::var("CITRATE_MEMPOOL_MAX_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10000);
+    let mempool_max_size =
+        mempool_max_size_from(std::env::var("CITRATE_MEMPOOL_MAX_SIZE").ok().as_deref());
     if mempool_max_per_sender != 100 || mempool_max_size != 10000 {
         tracing::info!(
             "Mempool overrides active: max_size={} max_per_sender={}",
@@ -4039,5 +4046,25 @@ mod noise_key_file_tests {
             "loose permissions must be tightened"
         );
         assert_eq!(kp.derive_peer_id(), reloaded.derive_peer_id());
+    }
+}
+
+#[cfg(test)]
+mod mempool_size_tests {
+    use super::*;
+
+    #[test]
+    fn mempool_size_is_capped_at_producer_candidates() {
+        assert_eq!(mempool_max_size_from(None), 10_000);
+        assert_eq!(mempool_max_size_from(Some("junk")), 10_000);
+        assert_eq!(mempool_max_size_from(Some("500")), 500);
+        assert_eq!(
+            mempool_max_size_from(Some("20000")),
+            producer::MAX_BLOCK_CANDIDATES
+        );
+        assert_eq!(
+            mempool_max_size_from(Some("25000")),
+            producer::MAX_BLOCK_CANDIDATES
+        );
     }
 }

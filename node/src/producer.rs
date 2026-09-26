@@ -2181,7 +2181,13 @@ impl BlockProducer {
             }
             match self.executor.execute_transaction(&temp_block, tx).await {
                 Ok(receipt) => {
-                    meter.charge(receipt.gas_used.min(tx.gas_limit));
+                    // A failed transaction is charged its whole declared
+                    // gas (as the sender is); a successful one its use.
+                    meter.charge(if receipt.status {
+                        receipt.gas_used.min(tx.gas_limit)
+                    } else {
+                        tx.gas_limit
+                    });
                     executed_window.record(tx);
                     executed_transactions.push(tx.clone());
                     receipts.push(receipt);
@@ -3409,7 +3415,7 @@ mod tests {
         let honest = Address([0x11; 20]);
         let r = Address([0x33; 20]);
         funded(&state_db, honest);
-        let mut honest_tx = transfer_tx(0xA1, honest, r, 0);
+        let mut honest_tx = transfer_tx(0xA1, honest, r, executor.get_nonce(&honest));
         honest_tx.gas_price = 79_000_000_000;
         mempool
             .add_transaction(honest_tx.clone(), TxClass::Standard)
@@ -3422,7 +3428,7 @@ mod tests {
             a[19] = 1;
             let s = Address(a);
             funded(&state_db, s);
-            let mut t = transfer_tx(0, s, r, 0);
+            let mut t = transfer_tx(0, s, r, executor.get_nonce(&s));
             let mut h = [0xE0u8; 32];
             h[..4].copy_from_slice(&i.to_be_bytes());
             t.hash = Hash::new(h);
@@ -3443,6 +3449,46 @@ mod tests {
         assert!(block.header.gas_used <= PRODUCER_BLOCK_GAS_LIMIT);
     }
 
+    /// A transaction that fails after a receipt exists pays for its whole
+    /// declared gas, so it takes its whole declared gas out of the block.
+    #[tokio::test]
+    async fn producer_meter_charges_failed_declared_gas() {
+        let (_tmp, storage, state_db, executor, mempool) = producer_fixture();
+        let target = Address([0xCB; 20]);
+        state_db.accounts.create_account_if_not_exists(target);
+        // JUMPDEST PUSH1 0 JUMP: runs until out of gas.
+        state_db.set_code(target, vec![0x5b, 0x60, 0x00, 0x56]);
+        let declared = PRODUCER_BLOCK_GAS_LIMIT / 10;
+        for i in 0..15u32 {
+            let mut a = [0u8; 20];
+            a[0] = 0x84;
+            a[1..5].copy_from_slice(&i.to_be_bytes());
+            a[19] = 1;
+            let s = Address(a);
+            funded(&state_db, s);
+            let mut t = transfer_tx(0, s, target, executor.get_nonce(&s));
+            let mut h = [0xC0u8; 32];
+            h[..4].copy_from_slice(&i.to_be_bytes());
+            t.hash = Hash::new(h);
+            t.gas_limit = declared;
+            t.gas_price = 2_000_000_000;
+            t.data = vec![0xde, 0xad, 0xbe, 0xef];
+            mempool
+                .add_transaction(t, TxClass::Standard)
+                .await
+                .expect("candidate admitted");
+        }
+        let producer = test_producer(&storage, &executor, &mempool);
+        let bh = producer.produce_block().await.expect("produce");
+        let block = storage.blocks.get_block(&bh).expect("read").expect("block");
+        let declared_total: u64 = block.transactions.iter().map(|t| t.gas_limit).sum();
+        assert!(
+            declared_total <= PRODUCER_BLOCK_GAS_LIMIT,
+            "failed transactions stay within the block gas limit ({declared_total})"
+        );
+        assert_eq!(block.transactions.len(), 10);
+    }
+
     /// Count and byte caps apply to executed transactions only.
     #[tokio::test]
     async fn producer_block_caps_count_executed_only() {
@@ -3456,7 +3502,7 @@ mod tests {
             a[19] = 1;
             let s = Address(a);
             funded(&state_db, s);
-            let mut t = transfer_tx(0, s, r, 0);
+            let mut t = transfer_tx(0, s, r, executor.get_nonce(&s));
             let mut h = [0xD0u8; 32];
             h[..4].copy_from_slice(&i.to_be_bytes());
             t.hash = Hash::new(h);
