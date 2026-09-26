@@ -113,10 +113,13 @@ pub enum UnifiedKey {
 
 impl UnifiedKey {
     /// Get the raw 32-byte secret.
-    pub fn secret_bytes(&self) -> [u8; 32] {
+    ///
+    /// PBA-L4-011: returned in `Zeroizing` so the copy is wiped on drop
+    /// (it used to be a plain `[u8; 32]` that lingered on the stack).
+    pub fn secret_bytes(&self) -> Zeroizing<[u8; 32]> {
         match self {
-            UnifiedKey::Ed25519(key) => key.to_bytes(),
-            UnifiedKey::Secp256k1(key) => key.to_bytes().into(),
+            UnifiedKey::Ed25519(key) => Zeroizing::new(key.to_bytes()),
+            UnifiedKey::Secp256k1(key) => Zeroizing::new(key.to_bytes().into()),
         }
     }
 
@@ -461,7 +464,7 @@ impl KeyManager {
                             UnifiedKey::Ed25519(Ed25519SigningKey::from_bytes(&secret_bytes))
                         }
                         KeyType::Secp256k1 => {
-                            let sk = k256::ecdsa::SigningKey::from_bytes((&secret_bytes).into())
+                            let sk = k256::ecdsa::SigningKey::from_bytes((&*secret_bytes).into())
                                 .map_err(|e| WalletError::Decryption(format!("Invalid secp256k1 key: {}", e)))?;
                             UnifiedKey::Secp256k1(sk)
                         }
@@ -517,8 +520,7 @@ impl KeyManager {
             // Decrypt under the entry's declared (v1) parameters.
             // WAL-04: wrap so the secret is zeroed when the iteration
             // ends or on early-return via `?`.
-            let secret_bytes: Zeroizing<[u8; 32]> =
-                Zeroizing::new(decrypt_key(entry, password)?);
+            let secret_bytes: Zeroizing<[u8; 32]> = decrypt_key(entry, password)?;
 
             // Re-encrypt under v2 with a fresh salt + nonce.
             let migrated = encrypt_key_raw(
@@ -638,8 +640,7 @@ impl KeyManager {
         // erased after we encode them as hex. The hex String itself is
         // returned to the caller, who is documented as responsible for
         // wrapping it (Zeroizing<String>) and dropping promptly.
-        let secret_bytes: Zeroizing<[u8; 32]> =
-            Zeroizing::new(decrypt_key(entry, password)?);
+        let secret_bytes: Zeroizing<[u8; 32]> = decrypt_key(entry, password)?;
         Ok(hex::encode(secret_bytes.as_ref()))
     }
 }
@@ -912,7 +913,12 @@ fn encrypt_key_raw(
 /// surfaces as `WalletError::InvalidPassword` to the caller. The legacy
 /// v1 path decrypts without AAD for backward compatibility.
 #[cfg(feature = "native")]
-fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], WalletError> {
+/// PBA-L4-011: the decrypted secret is returned in `Zeroizing`, so no caller
+/// can hold it in a plain array that outlives its use.
+fn decrypt_key(
+    entry: &EncryptedKeyEntry,
+    password: &str,
+) -> Result<Zeroizing<[u8; 32]>, WalletError> {
     use base64::Engine;
 
     let ciphertext = base64::engine::general_purpose::STANDARD
@@ -984,7 +990,7 @@ fn decrypt_key(entry: &EncryptedKeyEntry, password: &str) -> Result<[u8; 32], Wa
         )));
     }
 
-    let mut secret = [0u8; 32];
+    let mut secret = Zeroizing::new([0u8; 32]);
     secret.copy_from_slice(plaintext.as_slice());
     Ok(secret)
 }
@@ -1094,7 +1100,7 @@ mod tests {
         // Verify the imported key matches
         mgr.unlock("testpassword1").expect("unlock");
         let retrieved = mgr.get_signing_key(&result.address).expect("get key");
-        assert_eq!(retrieved.secret_bytes(), key.to_bytes());
+        assert_eq!(*retrieved.secret_bytes(), key.to_bytes());
 
         std::fs::remove_dir_all(&path).ok();
     }
@@ -1224,7 +1230,7 @@ mod tests {
             .expect("encrypt");
         let decrypted = decrypt_key(&entry, "mypassword12").expect("decrypt");
 
-        assert_eq!(signing_key.to_bytes(), decrypted);
+        assert_eq!(signing_key.to_bytes(), *decrypted);
     }
 
     #[tokio::test]
@@ -1499,7 +1505,7 @@ mod tests {
         let ed_key = Ed25519SigningKey::generate(&mut rand::rngs::OsRng);
         let secret = ed_key.to_bytes();
         let unified = UnifiedKey::Ed25519(ed_key);
-        assert_eq!(unified.secret_bytes(), secret);
+        assert_eq!(*unified.secret_bytes(), secret);
     }
 
     // ================================================================

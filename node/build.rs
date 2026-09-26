@@ -47,6 +47,32 @@ fn main() {
         if halo2 { "1" } else { "0" }
     );
 
+    // PBA-L1a-003: commd-fold-verify changes the 0x0130 precompile result
+    // (feature off => Err for every proof; on => Ok for a valid proof). It was
+    // missing from this stamp, so a runbook-built validator (feature on) and a
+    // release-built follower (feature off) reported the SAME fingerprint while
+    // disagreeing on consensus.
+    let commd = std::env::var("CARGO_FEATURE_COMMD_FOLD_VERIFY").is_ok();
+    println!(
+        "cargo:rustc-env=CITRATE_FEAT_COMMD_FOLD={}",
+        if commd { "1" } else { "0" }
+    );
+    let mut feats: Vec<&str> = Vec::new();
+    if commd {
+        feats.push("commd-fold-verify");
+    }
+    if halo2 {
+        feats.push("halo2-verifier");
+    }
+    println!(
+        "cargo:rustc-env=CITRATE_CONSENSUS_FEATURES={}",
+        if feats.is_empty() {
+            "none".to_string()
+        } else {
+            feats.join(",")
+        }
+    );
+
     // Rebuild the stamp when HEAD moves (best-effort across layouts).
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=.git/HEAD");

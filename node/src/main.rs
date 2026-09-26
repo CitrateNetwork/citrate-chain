@@ -29,9 +29,34 @@ mod canonical_apply;
 mod commands;
 mod config;
 mod consensus_manifest;
+
+// PBA-L1a-003: consensus-affecting cargo features are fixed to the crate's
+// DEFAULT feature set on every node build.
+#[cfg(not(feature = "commd-fold-verify"))]
+compile_error!(
+    "citrate-node must be built with the `commd-fold-verify` feature (it is in the default \
+     feature set) (PBA-L1a-003)."
+);
+// The same checks against the execution crate's ACTUAL feature set, which a
+// `--features citrate-execution/<feature>` build changes without touching this
+// crate's features.
+const _: () = assert!(
+    citrate_execution::build_features::COMMD_FOLD_VERIFY
+        && !citrate_execution::build_features::HALO2_SUBSTRATE,
+    "citrate-node consensus feature set: citrate-execution must have commd-fold-verify on and \
+     halo2-substrate off (PBA-L1a-003)"
+);
+#[cfg(feature = "halo2-verifier")]
+compile_error!(
+    "`halo2-verifier` changes the 0x0108 precompile result and is not activated on any Citrate \
+     network. Enabling it requires a scheduled fleet-wide activation, not a build flag \
+     (PBA-L1a-003)."
+);
+mod startup_guards;
 mod contribution_recorder;
 mod dag_prune;
 mod genesis;
+mod hardening_rejoin;
 mod inference;
 pub mod logging;
 pub mod metrics;
@@ -88,7 +113,11 @@ fn first_run_select_config(network_flag: Option<&str>) -> anyhow::Result<NodeCon
         toml::from_str::<NodeConfig>(TESTNET_BETA_CONFIG)
             .map_err(|e| anyhow::anyhow!("embedded testnet config is invalid: {}", e))?
     } else {
-        NodeConfig::default()
+        // A local devnet runs on the dev chain id with the devnet genesis.
+        let mut local = NodeConfig::default();
+        local.chain.chain_id = config::DEV_CHAIN_ID;
+        local.chain.genesis_profile = Some("default".to_string());
+        local
     };
 
     // Persist the choice so the next launch auto-loads it (and the user can edit it).
@@ -137,6 +166,14 @@ fn prompt_join_testnet() -> bool {
 #[derive(Parser)]
 #[command(name = "citrate")]
 #[command(about = "Citrate blockchain node")]
+// PBA-L1a-003: `--version` reports the consensus feature set so operators can
+// diff fleet binaries without running `citrate consensus`.
+#[command(version = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (consensus features: ",
+    env!("CITRATE_CONSENSUS_FEATURES"),
+    ")"
+))]
 struct Cli {
     /// Configuration file path
     #[arg(short, long, value_name = "FILE")]
@@ -173,9 +210,9 @@ struct Cli {
     #[arg(long, default_value = "50")]
     max_peers: usize,
 
-    /// Chain ID
-    #[arg(long, default_value = "40204")]
-    chain_id: u64,
+    /// Chain ID. Unset: the config's chain id (40204 when no config exists).
+    #[arg(long)]
+    chain_id: Option<u64>,
 
     /// Coinbase address for mining rewards (hex)
     #[arg(long)]
@@ -313,6 +350,42 @@ enum ModelCommands {
     },
 }
 
+/// The config file the node loads: `--config`, else `$CITRATE_CONFIG`, else
+/// `~/.citrate/node.toml`, else `/etc/citrate/node.toml`.
+/// Mempool size from `CITRATE_MEMPOOL_MAX_SIZE` (default 10,000), capped at
+/// the number of candidates the producer considers per block.
+fn mempool_max_size_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000usize)
+        .min(producer::MAX_BLOCK_CANDIDATES)
+}
+
+fn resolve_config_path(cli_config: Option<PathBuf>) -> Option<PathBuf> {
+    cli_config.or_else(|| {
+        if let Ok(env_path) = std::env::var("CITRATE_CONFIG") {
+            let p = PathBuf::from(env_path);
+            if p.exists() {
+                tracing::info!("config: using $CITRATE_CONFIG → {}", p.display());
+                return Some(p);
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            let p = home.join(".citrate").join("node.toml");
+            if p.exists() {
+                tracing::info!("config: auto-loading {}", p.display());
+                return Some(p);
+            }
+        }
+        let p = PathBuf::from("/etc/citrate/node.toml");
+        if p.exists() {
+            tracing::info!("config: auto-loading {}", p.display());
+            return Some(p);
+        }
+        None
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize structured logging
@@ -357,11 +430,46 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Commands::Consensus { json }) => {
-            let manifest = consensus_manifest::ConsensusManifest::current();
+            // Same resolution as start_node: the release pin for the chain, the
+            // env override and the config file's `[chain].pba_hardening_height`.
+            let file_cfg = resolve_config_path(cli.config.clone())
+                .and_then(|p| NodeConfig::from_file(&p).ok());
+            let (cfg_chain_id, configured, dev_profile) = match &file_cfg {
+                Some(c) => (c.chain.chain_id, c.chain.pba_hardening_height, c.chain.dev_profile),
+                None => (40204, None, false),
+            };
+            let chain_id = cli.chain_id.unwrap_or(cfg_chain_id);
+            let resolved = citrate_consensus::hardening::resolve_pba_hardening_for_chain(
+                chain_id,
+                configured,
+                dev_profile,
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let manifest = consensus_manifest::ConsensusManifest::for_height(resolved.height);
+            // The activation heights compiled into this release (a node on a
+            // pinned chain runs that height; see the start-up banner for the
+            // height a configured node resolved).
+            let pins: Vec<serde_json::Value> = citrate_consensus::hardening::PINNED_ACTIVATIONS
+                .iter()
+                .map(|(id, h)| serde_json::json!({ "chain_id": id, "pba_hardening_height": h }))
+                .collect();
             if json {
-                println!("{}", manifest.to_json());
+                let mut v = serde_json::to_value(&manifest).unwrap_or_default();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("pba_hardening_pins".into(), serde_json::Value::Array(pins));
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&v).unwrap_or_else(|_| manifest.to_json())
+                );
             } else {
                 manifest.print_human();
+                for (id, h) in citrate_consensus::hardening::PINNED_ACTIVATIONS {
+                    match h {
+                        Some(h) => println!("  pba pin            chain {id}: height {h}"),
+                        None => println!("  pba pin            chain {id}: unset"),
+                    }
+                }
             }
             return Ok(());
         }
@@ -431,28 +539,7 @@ async fn main() -> Result<()> {
     // `citrate-node` invocation auto-joins the testnet mesh via the
     // baked-in bootnodes.
     let has_config_file = cli.config.is_some();
-    let resolved_config_path: Option<std::path::PathBuf> = cli.config.clone().or_else(|| {
-        if let Ok(env_path) = std::env::var("CITRATE_CONFIG") {
-            let p = std::path::PathBuf::from(env_path);
-            if p.exists() {
-                tracing::info!("config: using $CITRATE_CONFIG → {}", p.display());
-                return Some(p);
-            }
-        }
-        if let Some(home) = dirs::home_dir() {
-            let p = home.join(".citrate").join("node.toml");
-            if p.exists() {
-                tracing::info!("config: auto-loading {}", p.display());
-                return Some(p);
-            }
-        }
-        let p = std::path::PathBuf::from("/etc/citrate/node.toml");
-        if p.exists() {
-            tracing::info!("config: auto-loading {}", p.display());
-            return Some(p);
-        }
-        None
-    });
+    let resolved_config_path: Option<std::path::PathBuf> = resolve_config_path(cli.config.clone());
     let config = if let Some(config_path) = resolved_config_path {
         NodeConfig::from_file(&config_path)?
     } else {
@@ -489,11 +576,14 @@ async fn main() -> Result<()> {
     }
     config.network.max_peers = cli.max_peers;
 
-    // Only override chain_id if no config file was provided
-    // This allows config file to set chain_id when using --config flag
+    // Only override chain_id if no config file was provided, and only when
+    // --chain-id is given: a config found through CITRATE_CONFIG or
+    // ~/.citrate/node.toml keeps its own chain id (a dev profile's 1337 must
+    // not be forced onto a release network's id).
     if !has_config_file {
-        // No config file provided, use CLI arg (or its default)
-        config.chain.chain_id = cli.chain_id;
+        if let Some(chain_id) = cli.chain_id {
+            config.chain.chain_id = chain_id;
+        }
     }
 
     if let Some(coinbase) = cli.coinbase {
@@ -518,6 +608,17 @@ async fn main() -> Result<()> {
     // Validate configuration (fail-closed for production mode)
     // This catches production_mode=true with empty validators early
     if let Err(e) = config.validate() {
+        error!("{}", e);
+        return Err(anyhow::anyhow!("{}", e));
+    }
+    // PBA-L1a-008 / PBA-L1a-012: RPC exposure policy (see startup_guards).
+    if let Err(e) = startup_guards::check_rpc_exposure(
+        config.rpc.enabled,
+        &config.rpc.listen_addr,
+        config.rpc.allow_eth_send_transaction,
+        &config.rpc.trusted_proxies,
+        config.chain.genesis_profile.as_deref(),
+    ) {
         error!("{}", e);
         return Err(anyhow::anyhow!("{}", e));
     }
@@ -553,9 +654,10 @@ async fn main() -> Result<()> {
         info!("No genesis block found, initializing genesis...");
 
         let state_db = Arc::new(StateDB::new());
-        let executor = Arc::new(Executor::with_storage(
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
             state_db,
             Some(probe_storage.state.clone()),
+            config.chain.chain_id,
         ));
 
         let genesis_config = genesis::GenesisConfig {
@@ -806,9 +908,10 @@ async fn init_chain(chain_id: u64) -> Result<()> {
 
     // Create executor with persistent storage
     let state_db = Arc::new(StateDB::new());
-    let executor = Arc::new(Executor::with_storage(
+    let executor = Arc::new(Executor::with_storage_and_chain_id(
         state_db,
         Some(storage.state.clone()),
+        chain_id,
     ));
 
     // Initialize genesis
@@ -874,9 +977,10 @@ async fn run_devnet(
 
         if !has_genesis {
             let state_db = Arc::new(StateDB::new());
-            let executor = Arc::new(Executor::with_storage(
+            let executor = Arc::new(Executor::with_storage_and_chain_id(
                 state_db,
                 Some(storage.state.clone()),
+                config.chain.chain_id,
             ));
 
             let genesis_config = GenesisConfig {
@@ -1063,12 +1167,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     {
         // Consensus-alignment stamp — logged at boot so field drift is diagnosable
         // from the journal (the app node and fleet MUST share this fingerprint).
-        let m = consensus_manifest::ConsensusManifest::current();
+        // The fingerprint covers the activation height this node will run
+        // with (release pin for the chain, env override, [chain] key).
+        let m = consensus_manifest::ConsensusManifest::for_height(
+            citrate_consensus::hardening::resolve_pba_hardening_for_chain(
+                config.chain.chain_id,
+                config.chain.pba_hardening_height,
+                config.chain.dev_profile,
+            )
+            .ok()
+            .and_then(|r| r.height),
+        );
         info!(
-            "Consensus manifest: git={}{} halo2={} fingerprint={}",
+            "Consensus manifest: git={}{} halo2={} pba_hardening_height={:?} fingerprint={}",
             m.git_sha,
             if m.git_dirty { "(DIRTY)" } else { "" },
             m.feat_halo2_verifier,
+            m.pba_hardening_height,
             m.fingerprint
         );
         if m.git_dirty {
@@ -1081,28 +1196,47 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // PBA-R2: fix the block-validity hardening activation height BEFORE any
     // consensus component (GhostDag, Executor, SyncManager, GossipProtocol) is
     // constructed; each captures it at construction. A consensus parameter:
-    // an unparseable override aborts start-up rather than being ignored.
-    {
-        // ONE store, ONE resolution order (env override, else [chain] key):
-        // consensus, network and execution (`citrate_execution::activation`)
-        // all read what this publishes.
-        let pba = citrate_consensus::hardening::init_pba_hardening_height(
+    // an unparseable override, or one that disagrees with the height pinned
+    // in this release for the chain, aborts start-up rather than being ignored.
+    //
+    // The chain id is the CONFIGURED one. `CITRATE_CHAIN_ID`, which older
+    // execution constructors read on their own, must agree with it.
+    citrate_consensus::hardening::check_chain_id_env(
+        config.chain.chain_id,
+        std::env::var("CITRATE_CHAIN_ID").ok().as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let pba_activation = {
+        // ONE store, ONE resolution order (release pin for the chain, then
+        // env override, then [chain] key): consensus, network and execution
+        // (`citrate_execution::activation`) all read what this publishes.
+        let pba = citrate_consensus::hardening::init_pba_hardening_for_chain(
+            config.chain.chain_id,
             config.chain.pba_hardening_height,
+            config.chain.dev_profile,
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-        match pba {
+        let fp = consensus_manifest::ConsensusManifest::current().fingerprint;
+        match pba.height {
             Some(h) => info!(
-                "PBA-R2 block-validity hardening ACTIVE from height {} \
-                 (tx signature + canonical id on import, content-bound tx_root, \
-                 timestamp bound)",
-                h
+                "Block-validity hardening ACTIVE from height {} [{}] (tx signature + \
+                 canonical id on import, content-bound tx_root, timestamp bound)",
+                h,
+                pba.describe()
             ),
             None => info!(
-                "PBA-R2 block-validity hardening not scheduled (chain.pba_hardening_height \
-                 unset); legacy validity rules apply"
+                "Block-validity hardening not scheduled: {}; legacy validity rules apply",
+                pba.describe()
             ),
         }
-    }
+        info!(
+            "Consensus fingerprint {} with activation {} = {}",
+            fp,
+            pba.describe(),
+            pba.fingerprint(&fp)
+        );
+        pba
+    };
 
     // Initialize metrics server
     let metrics_addr =
@@ -1144,6 +1278,69 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             encryption: storage_encryption,
         },
     )?);
+
+    // A release network's genesis only runs under that network's chain id: the
+    // genesis block does not commit to the chain id, so otherwise a node could
+    // escape the chain's release pin by changing [chain] chain_id alone.
+    if let Some(g0) = storage.blocks.get_block_by_height(0)? {
+        citrate_consensus::hardening::check_genesis_chain(config.chain.chain_id, g0.as_bytes())
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    }
+
+    // Rejoin after activation: remove stored blocks at or above the activation
+    // height that are invalid under the rules (a node that kept running an
+    // older release past it holds such blocks), before the DAG store, GhostDAG
+    // or the applier load anything. See node/src/hardening_rejoin.rs.
+    let rejoin = hardening_rejoin::purge_invalid_post_activation(
+        &storage,
+        citrate_consensus::hardening::PbaHardening::from_process(),
+        config.chain.chain_id,
+    )
+    .map_err(|e| {
+        let h = pba_activation.height.unwrap_or_default();
+        anyhow::anyhow!(
+            "{}\n(start-up check failed: {})",
+            hardening_rejoin::manual_resync_instructions(&config.storage.data_dir, h),
+            e
+        )
+    })?;
+    // Blocks stored from here on have passed the rules, so the next start-up
+    // check need not verify them again (see hardening_rejoin).
+    if let Some(h) = pba_activation.height {
+        let storage = storage.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                if let Ok(latest) = storage.blocks.get_latest_height() {
+                    if let Err(e) = hardening_rejoin::mark_verified_through(&storage, h, latest) {
+                        warn!("start-up check marker: {}", e);
+                    }
+                }
+            }
+        });
+    }
+    // Without execute-on-receive the node has no path to rebuild state from
+    // genesis, so a purged applied tip needs a manual resync.
+    // (Also when an earlier start removed the blocks but stopped before the
+    // rebuild: the applied-tip pointer then names a block that is gone.)
+    let applied_tip_gone = storage
+        .blocks
+        .get_applied_tip()?
+        .is_some_and(|(h, _)| !storage.blocks.has_block(&h).unwrap_or(true));
+    if (rejoin.applied_tip_purged || applied_tip_gone)
+        && std::env::var("CITRATE_BLOCK_V2")
+            .map(|v| !(v == "1" || v.eq_ignore_ascii_case("true")))
+            .unwrap_or(false)
+    {
+        return Err(anyhow::anyhow!(
+            "{}",
+            hardening_rejoin::manual_resync_instructions(
+                &config.storage.data_dir,
+                pba_activation.height.unwrap_or_default()
+            )
+        ));
+    }
 
     // Create state DB and executor with persistent storage
     let state_db = Arc::new(StateDB::new());
@@ -1327,7 +1524,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     let registry_bridge: Arc<dyn citrate_execution::executor::ModelRegistryAdapter> =
         Arc::new(adapters::MCPRegistryBridge::new(mcp.clone()));
 
-    let exec_base = Executor::with_storage(state_db, Some(storage.state.clone()));
+    // The configured chain id, not `CITRATE_CHAIN_ID` (checked equal above).
+    let exec_base = Executor::with_storage_and_chain_id(
+        state_db,
+        Some(storage.state.clone()),
+        config.chain.chain_id,
+    );
     let executor = Arc::new(
         exec_base
             .with_ai_storage_adapter(storage_bridge)
@@ -1360,28 +1562,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     }
 
-    // Mempool config from env overrides
-    let require_valid_signature = std::env::var("CITRATE_REQUIRE_VALID_SIGNATURE")
-        .ok()
-        .and_then(|v| {
-            let s = v.to_lowercase();
-            match s.as_str() {
-                "1" | "true" | "yes" | "on" => Some(true),
-                "0" | "false" | "no" | "off" => Some(false),
-                _ => None,
-            }
-        })
-        .unwrap_or({
-            // Default to false in devnet mode for easier testing
-            #[cfg(feature = "devnet")]
-            {
-                false
-            }
-            #[cfg(not(feature = "devnet"))]
-            {
-                true
-            }
-        });
+    // Mempool config from env overrides.
+    // PBA-L1a-007: a production (non-devnet) build refuses to MINE with
+    // signature verification disabled; unrecognised values fail closed.
+    let require_valid_signature = startup_guards::resolve_require_valid_signature(
+        std::env::var("CITRATE_REQUIRE_VALID_SIGNATURE").ok().as_deref(),
+        config.mining.enabled,
+        cfg!(feature = "devnet"),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if !require_valid_signature {
+        warn!(
+            "Mempool signature verification is DISABLED (CITRATE_REQUIRE_VALID_SIGNATURE). \
+             Never run this on a public network."
+        );
+    }
 
     // Create mempool
     // Per-sender cap is overridable via CITRATE_MEMPOOL_MAX_PER_SENDER. The
@@ -1394,10 +1589,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
-    let mempool_max_size: usize = std::env::var("CITRATE_MEMPOOL_MAX_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10000);
+    let mempool_max_size =
+        mempool_max_size_from(std::env::var("CITRATE_MEMPOOL_MAX_SIZE").ok().as_deref());
     if mempool_max_per_sender != 100 || mempool_max_size != 10000 {
         tracing::info!(
             "Mempool overrides active: max_size={} max_per_sender={}",
@@ -1425,6 +1618,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         })
     }));
 
+    // PBA-L1a-017: apply `tx_expiry_secs` with a periodic
+    // `Mempool::clear_expired` sweep (once a minute).
+    {
+        let mempool_expiry = mempool.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                mempool_expiry.clear_expired().await;
+            }
+        });
+    }
+
     // Create peer manager
     let peer_manager = Arc::new(PeerManager::new(PeerManagerConfig {
         max_peers: config.network.max_peers,
@@ -1439,24 +1645,22 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     let metrics_enabled = std::env::var("CITRATE_METRICS")
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    if metrics_enabled {
-        let addr_str =
-            std::env::var("CITRATE_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9100".to_string());
-        let addr: std::net::SocketAddr = match addr_str.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!(
-                    "Invalid CITRATE_METRICS_ADDR '{}': {}, skipping metrics server",
-                    addr_str,
-                    e
-                );
-                {
-                    // Infallible for a valid hardcoded literal
-                    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9100))
-                }
-            }
-        };
+    // PBA-L1a-024: default to loopback, and an unparsable address disables the
+    // metrics server instead of silently binding 0.0.0.0.
+    let metrics_addr = if metrics_enabled {
+        let raw = std::env::var("CITRATE_METRICS_ADDR").ok();
+        let resolved = startup_guards::resolve_metrics_addr(raw.as_deref());
+        if resolved.is_none() {
+            tracing::error!(
+                "Invalid CITRATE_METRICS_ADDR '{}', skipping metrics server",
+                raw.unwrap_or_default()
+            );
+        }
+        resolved
+    } else {
+        None
+    };
+    if let Some(addr) = metrics_addr {
         tokio::spawn(async move {
             if let Err(e) = citrate_api::metrics_server::MetricsServer::new(addr)
                 .start()
@@ -1712,6 +1916,45 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         );
     }
 
+    // Transactions carried by blocks the start-up check removed go back to the
+    // mempool, once the applied state no longer sits on a removed block (the
+    // mempool checks nonces against applied state). Bounded wait.
+    if !rejoin.returned_txs.is_empty() {
+        let mempool = mempool.clone();
+        let storage = storage.clone();
+        let purged = rejoin.purged.clone();
+        let txs = rejoin.returned_txs.clone();
+        tokio::spawn(async move {
+            for _ in 0..900u32 {
+                let on_purged = storage
+                    .blocks
+                    .get_applied_tip()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(h, _)| purged.contains(&h));
+                if !on_purged {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            let mut readmitted = 0usize;
+            for tx in txs {
+                if mempool
+                    .add_transaction(tx, citrate_sequencer::mempool::TxClass::Standard)
+                    .await
+                    .is_ok()
+                {
+                    readmitted += 1;
+                }
+            }
+            info!(
+                "start-up check: offered transactions from removed blocks to the mempool \
+                 ({} readmitted)",
+                readmitted
+            );
+        });
+    }
+
     // Forward-sync liveness (handoff 2026-07-23): the highest block height we have
     // EVIDENCE the network is at, from ANY signal — gossiped NewBlock, a rejected
     // far-ahead block (MissingParentAtAdmission proves the sender is ahead of us),
@@ -1755,6 +1998,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         peer_manager.set_incoming(in_tx).await;
         let pm_for_rx = peer_manager.clone();
         let storage_for_handler = storage.clone();
+        // Peers still sending pre-activation-format blocks at or after the
+        // activation height (logged, and exported as a metric per peer).
+        let legacy_peers_for_rx = Arc::new(hardening_rejoin::LegacyFormatPeers::default());
         let mempool_for_handler = mempool.clone();
         // EXECUTE-ON-RECEIVE (step 2): the applier is reached through
         // `BlockAdmission` now (SYNC-S1 D2), not cloned into the handler
@@ -1779,9 +2025,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             {
                 Ok(scratch_storage) => {
                     let scratch_storage = Arc::new(scratch_storage);
-                    let scratch_exec = Arc::new(Executor::with_storage(
+                    let scratch_exec = Arc::new(Executor::with_storage_and_chain_id(
                         Arc::new(StateDB::new()),
                         Some(scratch_storage.state.clone()),
+                        config.chain.chain_id,
                     ));
                     let gcfg = genesis::GenesisConfig {
                         chain_id: config.chain.chain_id,
@@ -2612,6 +2859,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                     }
                     NetworkMessage::NewBlock { block } => {
+                        legacy_peers_for_rx.observe(
+                            citrate_consensus::hardening::PbaHardening::from_process(),
+                            &pid.to_string(),
+                            &block,
+                        );
                         // CHAIN-B-A007: network-height evidence from gossip is
                         // recorded AFTER the block passes `gossip::validate_block`
                         // (in the `Ok(_)`/`Deferred` arms below), never on the raw
@@ -2809,6 +3061,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // unconditional `record_success(&pid.0)` right here, before
                         // a single block had been examined, so answering at all was
                         // enough to clear the penalty and stay the preferred source.
+                        for b in &blocks {
+                            legacy_peers_for_rx.observe(
+                                citrate_consensus::hardening::PbaHardening::from_process(),
+                                &pid.to_string(),
+                                b,
+                            );
+                        }
                         // WP-H.4: handle_blocks now validates each block
                         let _ = sync_for_rx.handle_blocks(&pid, blocks).await;
                         // WP-H.5: Drain validated blocks and persist to chain store.
@@ -3289,10 +3548,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             threads: 16,
             // C-02: Only allow eth_sendTransaction in devnet/dev mode
             allow_eth_send_transaction: config.rpc.allow_eth_send_transaction,
+            // PBA-L1a-023: Host allowlist (DNS-rebinding defence).
+            allowed_hosts: config.rpc.allowed_hosts.clone(),
             rate_limit: citrate_api::rate_limit::RateLimitConfig {
                 operator_token,
                 api_key,
                 is_public_bind, // WP-K.4: fail-closed on public interface
+                // PBA-L1a-008: per-client buckets behind a loopback proxy
+                // (startup_guards refuses this on a public bind).
+                trusted_proxies: config.rpc.trusted_proxies.clone(),
                 ..Default::default()
             },
         };
@@ -3782,5 +4046,25 @@ mod noise_key_file_tests {
             "loose permissions must be tightened"
         );
         assert_eq!(kp.derive_peer_id(), reloaded.derive_peer_id());
+    }
+}
+
+#[cfg(test)]
+mod mempool_size_tests {
+    use super::*;
+
+    #[test]
+    fn mempool_size_is_capped_at_producer_candidates() {
+        assert_eq!(mempool_max_size_from(None), 10_000);
+        assert_eq!(mempool_max_size_from(Some("junk")), 10_000);
+        assert_eq!(mempool_max_size_from(Some("500")), 500);
+        assert_eq!(
+            mempool_max_size_from(Some("20000")),
+            producer::MAX_BLOCK_CANDIDATES
+        );
+        assert_eq!(
+            mempool_max_size_from(Some("25000")),
+            producer::MAX_BLOCK_CANDIDATES
+        );
     }
 }

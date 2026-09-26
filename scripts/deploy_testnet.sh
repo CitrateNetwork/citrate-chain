@@ -348,7 +348,6 @@ SyslogIdentifier=$SERVICE_NAME
 # Environment
 Environment=RUST_LOG=info,citrate_api=debug,citrate_network=info
 Environment=CITRATE_METRICS_ADDR=127.0.0.1:$METRICS_PORT
-Environment=CITRATE_REQUIRE_VALID_SIGNATURE=0
 
 # Hardening
 ProtectSystem=full

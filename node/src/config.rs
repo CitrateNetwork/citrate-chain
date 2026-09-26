@@ -213,6 +213,14 @@ pub struct ChainConfig {
     /// Owner runbook: `docs/consensus/PBA_HARDENING_ACTIVATION.md`.
     #[serde(default)]
     pub pba_hardening_height: Option<u64>,
+
+    /// A local development chain. The activation height compiled into the
+    /// release for this chain id (`citrate_consensus::hardening::
+    /// PINNED_ACTIVATIONS`) is not applied, so dev profiles keep choosing
+    /// their own `pba_hardening_height`. Never set this on a node that joins
+    /// a public network.
+    #[serde(default)]
+    pub dev_profile: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +278,21 @@ pub struct RpcConfig {
     /// WP-X.1: F-07 remediation.
     #[serde(default)]
     pub rest_api_key: Option<String>,
+
+    /// PBA-L1a-008: reverse-proxy addresses whose `X-Forwarded-For` /
+    /// `X-Real-IP` headers identify the real client for per-client rate
+    /// limiting. Empty (default) = forwarding headers are not trusted.
+    ///
+    /// The node accepts `trusted_proxies` only with RPC bound to a loopback
+    /// address (so only the co-located proxy can connect).
+    #[serde(default)]
+    pub trusted_proxies: Vec<std::net::IpAddr>,
+
+    /// PBA-L1a-023: `Host` header allowlist for the HTTP RPC server (see
+    /// `citrate_api::server::rpc_host_allowlist`). Empty = loopback-only Host
+    /// names when RPC is loopback-bound and not proxied; any Host otherwise.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +324,10 @@ pub struct MiningConfig {
     pub min_gas_price: u64,
 }
 
+/// Chain id of local dev chains (`NodeConfig::devnet()`, `devnet.toml`,
+/// `devnet-config.toml`, the Docker devnet). Never a release network's id.
+pub const DEV_CHAIN_ID: u64 = 1337;
+
 /// Parse a hardcoded socket address literal. Infallible for valid literals;
 /// uses `unreachable!` instead of `unwrap`/`expect` for the zero-panic vanity goal.
 fn hardcoded_addr(s: &str) -> SocketAddr {
@@ -324,6 +351,7 @@ impl Default for NodeConfig {
                 ghostdag_k: 18,
                 genesis_profile: None,
                 pba_hardening_height: None,
+                dev_profile: false,
             },
             network: NetworkConfig {
                 listen_addr: hardcoded_addr("127.0.0.1:30303"),
@@ -339,6 +367,8 @@ impl Default for NodeConfig {
                 api_key: None,
                 cors_origins: vec![], // Secure default: no CORS headers
                 rest_api_key: None,
+                trusted_proxies: vec![],
+                allowed_hosts: vec![],
             },
             storage: StorageConfig {
                 data_dir: dirs::home_dir()
@@ -375,17 +405,20 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Create devnet configuration
+    /// Create devnet configuration (chain id [`DEV_CHAIN_ID`]).
     /// Chain ID can be overridden via CITRATE_CHAIN_ID environment variable
     pub fn devnet() -> Self {
         let mut config = Self::default();
         // Chain ID already set from env var in default(), only override if not set
+        // A local dev chain never runs on a release network's chain id (the
+        // release pin applies there and dev_profile is refused).
         if std::env::var("CITRATE_CHAIN_ID").is_err() {
-            config.chain.chain_id = 40204;
+            config.chain.chain_id = DEV_CHAIN_ID;
         }
         config.chain.genesis_profile = Some("default".to_string());
         // PBA-R2: dev profile enforces the hardened validity rules from genesis.
         config.chain.pba_hardening_height = Some(0);
+        config.chain.dev_profile = true;
         config.mining.enabled = true;
         config.mining.target_block_time = 2; // Fast blocks for testing
                                              // C-02: Allow eth_sendTransaction only in devnet mode
@@ -466,7 +499,7 @@ mod tests {
 
         let config = NodeConfig::devnet();
 
-        assert_eq!(config.chain.chain_id, 40204);
+        assert_eq!(config.chain.chain_id, DEV_CHAIN_ID);
         assert_eq!(config.mining.target_block_time, 2);
         assert!(config.mining.enabled);
         assert!(config.rpc.allow_eth_send_transaction);
@@ -566,7 +599,12 @@ mod tests {
         assert!(config.network.bootstrap_nodes.is_empty());
 
         assert!(config.rpc.enabled);
-        assert!(config.rpc.allow_eth_send_transaction);
+        // PBA-L1a-012: the team profile used to serve unsigned
+        // eth_sendTransaction on 0.0.0.0:8545 (chain 40204). It is now
+        // loopback-only with unsigned send disabled.
+        assert!(!config.rpc.allow_eth_send_transaction);
+        assert!(config.rpc.listen_addr.ip().is_loopback());
+        assert!(config.rpc.ws_addr.ip().is_loopback());
         // Team/public configs must use explicit origins, not wildcard
         assert_eq!(
             config.rpc.cors_origins,
@@ -632,6 +670,38 @@ mod tests {
         assert_eq!(config.chain.genesis_profile.as_deref(), Some("default"));
     }
 
+    /// Only local dev profiles opt out of the release-pinned activation
+    /// height; every shipped network profile leaves `dev_profile` off.
+    #[test]
+    fn only_dev_profiles_opt_out_of_the_release_pin() {
+        let dev: NodeConfig =
+            toml::from_str(include_str!("../config/devnet.toml")).expect("devnet");
+        assert!(dev.chain.dev_profile);
+        let dev2: NodeConfig =
+            toml::from_str(include_str!("../../devnet-config.toml")).expect("devnet-config");
+        assert!(dev2.chain.dev_profile);
+        assert!(NodeConfig::devnet().chain.dev_profile);
+        assert!(!NodeConfig::default().chain.dev_profile);
+        for (name, src) in [
+            ("testnet.toml", include_str!("../config/testnet.toml")),
+            (
+                "testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            ("mainnet.toml", include_str!("../config/mainnet.toml")),
+            (
+                "team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+        ] {
+            let c: NodeConfig = toml::from_str(src).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                !c.chain.dev_profile,
+                "{name} must not opt out of the release pin"
+            );
+        }
+    }
+
     /// R2: the node resolves the activation height through the ONE shared
     /// resolver (env override, else `[chain] pba_hardening_height`) and
     /// publishes it before constructing any gated component.
@@ -641,15 +711,195 @@ mod tests {
         let start = main.find("async fn start_node(").expect("start_node");
         let body = &main[start..];
         let init = body
-            .find("citrate_consensus::hardening::init_pba_hardening_height(")
-            .expect("start_node must publish via init_pba_hardening_height");
-        for ctor in ["GhostDag::new(", "Executor::with_storage(", "SyncManager::new(", "GossipProtocol::new("] {
-            let at = body.find(ctor).unwrap_or_else(|| panic!("{ctor} in start_node"));
+            .find("citrate_consensus::hardening::init_pba_hardening_for_chain(")
+            .expect("start_node must publish via init_pba_hardening_for_chain");
+        // The pin-unaware resolver would skip the release pin.
+        assert!(!body.contains("hardening::init_pba_hardening_height("));
+        // The chain id the pin keys on is checked against CITRATE_CHAIN_ID first.
+        let chain_check = body
+            .find("hardening::check_chain_id_env(")
+            .expect("start_node must check CITRATE_CHAIN_ID against the config");
+        assert!(chain_check < init);
+        // Executors take the configured chain id, never the env default.
+        assert!(!main.contains("Executor::with_storage("));
+        for ctor in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "SyncManager::new(",
+            "GossipProtocol::new(",
+        ] {
+            let at = body
+                .find(ctor)
+                .unwrap_or_else(|| panic!("{ctor} in start_node"));
             assert!(init < at, "activation must be published before {ctor}");
         }
         assert!(
             !main.contains("activation::set_pba_hardening_height(config.chain"),
             "no second publication path that bypasses the env override"
+        );
+    }
+}
+
+/// PBA-R2 release-prep finding: a node configured ONLY through the
+/// `CITRATE_PBA_HARDENING_HEIGHT` env override must activate every gated rule
+/// (consensus-layer and execution-layer) at the same height as a node
+/// configured through `[chain].pba_hardening_height`, or it forks at H.
+#[cfg(test)]
+mod pba_activation_env_tests {
+    use super::*;
+    use citrate_consensus::hardening::{
+        init_pba_hardening_height, resolve_pba_hardening_height, set_pba_hardening_height,
+        PbaHardening, PBA_HARDENING_ENV,
+    };
+    use citrate_consensus::types::{BlockBuilder, Hash, PublicKey, Signature, Transaction};
+    use citrate_execution::revm_adapter::{
+        execute_contract_call_with_context, BlockContext, ValueSemantics,
+    };
+    use citrate_execution::types::{
+        AccessPolicy, Address, ModelId, ModelMetadata, ModelState, UsageStats,
+    };
+    use citrate_execution::{Executor, StateDB};
+    use primitive_types::U256;
+    use std::sync::Arc;
+
+    /// Far above every height other node unit tests use, so publishing it
+    /// process-wide cannot change their behaviour.
+    const H: u64 = 5_000_000;
+
+    /// Serialises the two tests that mutate `CITRATE_PBA_HARDENING_HEIGHT`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn staticcall_ok(target: [u8; 20], block_number: u64) -> bool {
+        let state = Arc::new(StateDB::new());
+        let caller = Address([0x11; 20]);
+        let fwd = Address([0x22; 20]);
+        state
+            .accounts
+            .set_balance(caller, U256::from(10u64).pow(U256::from(18u64)));
+        let mut code = vec![0x36, 0x5f, 0x5f, 0x37, 0x60, 0x20, 0x5f, 0x36, 0x5f, 0x73];
+        code.extend_from_slice(&target);
+        code.extend_from_slice(&[0x5a, 0xfa, 0x60, 0x20, 0x52, 0x60, 0x40, 0x5f, 0xf3]);
+        state.set_code(fwd, code);
+        let (out, _, _) = execute_contract_call_with_context(
+            state,
+            caller,
+            fwd,
+            vec![0xAB; 4],
+            U256::zero(),
+            5_000_000,
+            U256::from(1_000_000_000u64),
+            40204,
+            block_number,
+            1_000_000,
+            BlockContext::default(),
+            None,
+            None,
+            None,
+            ValueSemantics::RevmAuthoritative,
+        )
+        .expect("forwarder executes");
+        out[63] == 1
+    }
+
+    async fn inference_status(height: u64) -> bool {
+        let state = Arc::new(StateDB::new());
+        let sender = PublicKey::new([0x5A; 32]);
+        let from = citrate_execution::address_utils::normalize_address(&sender);
+        state
+            .accounts
+            .set_balance(from, U256::from(10u64).pow(U256::from(21u64)));
+        let mid = ModelId(Hash::new([0x4D; 32]));
+        state
+            .register_model(
+                mid,
+                ModelState {
+                    owner: Address([0xAA; 20]),
+                    model_hash: Hash::new([1; 32]),
+                    version: 1,
+                    metadata: ModelMetadata::default(),
+                    access_policy: AccessPolicy::Public,
+                    usage_stats: UsageStats::default(),
+                },
+            )
+            .expect("model");
+        let exec = Executor::new(state);
+        let mut data = vec![0x02, 0, 0, 0];
+        data.extend_from_slice(mid.0.as_bytes());
+        let tx = Transaction {
+            hash: Hash::new([0x19; 32]),
+            from: sender,
+            to: Some(PublicKey::new([0x77; 32])),
+            gas_limit: 2_000_000,
+            gas_price: 1_000_000_000,
+            data,
+            signature: Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ..Default::default()
+        };
+        let blk = BlockBuilder::new()
+            .hash(Hash::new([7; 32]))
+            .parent(Hash::default())
+            .height(height)
+            .timestamp(1_000_000)
+            .build_unhashed();
+        exec.execute_transaction(&blk, &tx)
+            .await
+            .expect("executes")
+            .status
+    }
+
+    #[tokio::test]
+    async fn env_override_activates_every_gated_path() {
+        // Config says "unset"; only the env override schedules H.
+        let cfg = NodeConfig::default();
+        assert_eq!(cfg.chain.pba_hardening_height, None);
+        let resolved = {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(PBA_HARDENING_ENV, H.to_string());
+            // Exactly what start_node does: resolve (env over TOML) and publish.
+            let r = init_pba_hardening_height(cfg.chain.pba_hardening_height);
+            std::env::remove_var(PBA_HARDENING_ENV);
+            r
+        };
+        assert_eq!(resolved, Ok(Some(H)), "env override must be honoured");
+
+        // Consensus-layer view (CHAIN-CONS rules) and execution-layer view
+        // read the SAME store.
+        assert!(PbaHardening::from_process().active_at(H));
+        assert!(!PbaHardening::from_process().active_at(H - 1));
+        assert!(citrate_execution::activation::pba_hardening_active(H));
+        assert!(!citrate_execution::activation::pba_hardening_active(H - 1));
+
+        // PBA-L1a-022 (REVM bridge flag, shared by -013 and -025): reserved
+        // precompile call fails from H, legacy below.
+        let mut reserved = [0u8; 20];
+        reserved[18] = 0x01;
+        reserved[19] = 0x04;
+        assert!(staticcall_ok(reserved, H - 1), "legacy below H");
+        assert!(!staticcall_ok(reserved, H), "hardened from H");
+
+        // PBA-L1a-019 (executor): in-consensus inference reverts from H.
+        assert!(inference_status(H - 1).await, "legacy below H");
+        assert!(!inference_status(H).await, "hardened from H");
+
+        set_pba_hardening_height(None);
+    }
+
+    #[test]
+    fn env_override_off_and_garbage() {
+        let mut cfg = NodeConfig::default();
+        cfg.chain.pba_hardening_height = Some(10);
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(PBA_HARDENING_ENV, "off");
+        let off = resolve_pba_hardening_height(cfg.chain.pba_hardening_height);
+        std::env::set_var(PBA_HARDENING_ENV, "soon");
+        let bad = resolve_pba_hardening_height(cfg.chain.pba_hardening_height);
+        std::env::remove_var(PBA_HARDENING_ENV);
+        assert_eq!(off, Ok(None));
+        assert!(bad.is_err(), "unparseable override must abort start-up");
+        assert_eq!(
+            resolve_pba_hardening_height(cfg.chain.pba_hardening_height),
+            Ok(Some(10))
         );
     }
 }

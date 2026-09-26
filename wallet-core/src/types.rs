@@ -101,12 +101,25 @@ pub struct EncryptedKeyEntry {
 }
 
 /// Result of creating a new account
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CreateAccountResult {
     pub address: String,
     pub public_key_hex: String,
     pub mnemonic: String,
     pub label: String,
+}
+
+/// PBA-L4-011: `Debug` must never print the mnemonic (a derived `Debug` did,
+/// so any `{:?}` log line or panic message leaked the seed phrase).
+impl std::fmt::Debug for CreateAccountResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateAccountResult")
+            .field("address", &self.address)
+            .field("public_key_hex", &self.public_key_hex)
+            .field("mnemonic", &"<redacted>")
+            .field("label", &self.label)
+            .finish()
+    }
 }
 
 /// Network configuration presets
@@ -123,7 +136,8 @@ impl NetworkConfig {
     pub fn devnet() -> Self {
         Self {
             name: "devnet".to_string(),
-            chain_id: 40204,
+            // Local dev chains run on 1337 (node DEV_CHAIN_ID).
+            chain_id: 1337,
             rpc_url: "http://localhost:8545".to_string(),
             explorer_url: None,
             faucet_url: None,
@@ -167,7 +181,7 @@ mod tests {
     #[test]
     fn test_network_presets() {
         let devnet = NetworkConfig::devnet();
-        assert_eq!(devnet.chain_id, 40204);
+        assert_eq!(devnet.chain_id, 1337);
         assert!(devnet.rpc_url.contains("localhost"));
 
         let testnet = NetworkConfig::testnet();

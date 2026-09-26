@@ -15,8 +15,8 @@
 // with `init_pba_hardening_height`. Genesis (height 0) is never re-judged.
 
 pub use citrate_consensus::hardening::{
-    init_pba_hardening_height, pba_hardening_height, resolve_pba_hardening_height,
-    set_pba_hardening_height, PbaHardening, PBA_HARDENING_ENV,
+    init_pba_hardening_for_chain, init_pba_hardening_height, pba_hardening_height,
+    resolve_pba_hardening_height, set_pba_hardening_height, PbaHardening, PBA_HARDENING_ENV,
 };
 
 /// Whether the hardening rules apply to a block at `height` under

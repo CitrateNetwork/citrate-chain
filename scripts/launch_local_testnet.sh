@@ -161,7 +161,6 @@ for i in 1 2 3; do
 
     # Launch
     CITRATE_METRICS_ADDR="$METRICS_ADDR" \
-    CITRATE_REQUIRE_VALID_SIGNATURE=0 \
     RUST_LOG=info,citrate_network=debug \
     nohup "$BINARY" \
         --config "$CONFIG" \

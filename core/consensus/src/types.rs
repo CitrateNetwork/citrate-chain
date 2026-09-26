@@ -440,6 +440,39 @@ pub enum TransactionType {
     LoraAdapter = 5,
 }
 
+/// The AI operation a transaction actually performs when the executor runs it.
+///
+/// ONE classifier for every component that treats AI operations specially:
+/// the executor dispatches on it and the mempool/producer class and order by
+/// it, so a transaction is never "AI" for block selection while executing as
+/// a plain call. Only a call (`to` present) with one of the three executor
+/// selectors is an AI operation. `TransactionType::from_data` (the `tx_type`
+/// field) is a separate, wire-visible label and is left unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiOpKind {
+    RegisterModel,
+    InferenceRequest,
+    UpdateModel,
+}
+
+impl AiOpKind {
+    pub fn classify(has_to: bool, data: &[u8]) -> Option<Self> {
+        if !has_to || data.len() < 4 {
+            return None;
+        }
+        match &data[0..4] {
+            [0x01, 0x00, 0x00, 0x00] => Some(AiOpKind::RegisterModel),
+            [0x02, 0x00, 0x00, 0x00] => Some(AiOpKind::InferenceRequest),
+            [0x03, 0x00, 0x00, 0x00] => Some(AiOpKind::UpdateModel),
+            _ => None,
+        }
+    }
+
+    pub fn of(tx: &Transaction) -> Option<Self> {
+        Self::classify(tx.to.is_some(), &tx.data)
+    }
+}
+
 impl TransactionType {
     pub fn from_data(data: &[u8]) -> Self {
         if data.len() >= 4 {
@@ -1435,5 +1468,35 @@ mod tests {
         let block = builder.build_unhashed();
         assert_eq!(block.header.version, 1);
         assert_eq!(block.header.height, 0);
+    }
+}
+
+#[cfg(test)]
+mod ai_op_kind_tests {
+    use super::*;
+
+    #[test]
+    fn ai_classifier_parity_table() {
+        for b0 in 0u8..=8 {
+            let data = [b0, 0, 0, 0, 9];
+            let expect = match b0 {
+                1 => Some(AiOpKind::RegisterModel),
+                2 => Some(AiOpKind::InferenceRequest),
+                3 => Some(AiOpKind::UpdateModel),
+                _ => None,
+            };
+            assert_eq!(AiOpKind::classify(true, &data), expect, "selector {b0}");
+            assert_eq!(AiOpKind::classify(false, &data), None);
+        }
+        assert_eq!(AiOpKind::classify(true, &[0x01, 0, 0]), None, "short data");
+        assert_eq!(AiOpKind::classify(true, &[0x01, 0, 0, 1]), None, "non-zero tail byte");
+        let mut tx = Transaction {
+            to: Some(PublicKey::new([1; 32])),
+            data: vec![0x02, 0, 0, 0],
+            ..Default::default()
+        };
+        assert_eq!(AiOpKind::of(&tx), Some(AiOpKind::InferenceRequest));
+        tx.to = None;
+        assert_eq!(AiOpKind::of(&tx), None);
     }
 }

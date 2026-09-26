@@ -1,0 +1,32 @@
+name: PBA tripwires
+
+# PBA-R2 (pre-bounty audit 2026-09-24, lane CHAIN-EXEC): source-level fences
+# for finding classes that live partly outside Rust (deploy scripts, unit
+# files, build commands), so rust-ci.yml's path filter would not run them.
+# grep-only: seconds, no toolchain. No path filter on purpose.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pba-tripwires-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  tripwires:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      # Prove the scanner still detects each class, then scan the tree.
+      - name: Tripwire self-test
+        run: scripts/ci/check_pba_exec_tripwires.sh --self-test
+      - name: CHAIN-EXEC tripwires (signature setting, node feature set, mempool expiry, metrics bind)
+        run: scripts/ci/check_pba_exec_tripwires.sh

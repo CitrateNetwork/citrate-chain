@@ -71,7 +71,7 @@ done
 echo "==> Starting Citrate team testnet node"
 echo "    Config:    $CONFIG_FILE"
 echo "    Binary:    $BINARY"
-echo "    RPC:       http://0.0.0.0:8545"
+echo "    RPC:       http://127.0.0.1:8545 (loopback only; PBA-L1a-012)"
 echo "    P2P:       0.0.0.0:30303"
 if [[ ${#BOOTSTRAP_PEERS[@]} -gt 0 ]]; then
     echo "    Bootstrap: ${BOOTSTRAP_PEERS[*]}"

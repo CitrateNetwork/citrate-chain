@@ -99,10 +99,11 @@ fi
 echo -e "\n${BLUE}[3/7] Verifying genesis state...${NC}"
 
 CHAIN_ID=$(rpc_call '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' | jq -r '.result')
-if [ "$CHAIN_ID" = "0x9d0c" ]; then
-    pass "Chain ID = 40204 (0x9d0c)"
+# `citrate devnet` runs on the local dev chain id 1337 (0x539).
+if [ "$CHAIN_ID" = "0x539" ]; then
+    pass "Chain ID = 1337 (0x539)"
 else
-    fail "Unexpected chain ID: $CHAIN_ID (expected 0x9d0c)"
+    fail "Unexpected chain ID: $CHAIN_ID (expected 0x539)"
 fi
 
 BALANCE=$(rpc_call "{\"jsonrpc\":\"2.0\",\"method\":\"eth_getBalance\",\"params\":[\"$FROM_ADDR\",\"latest\"],\"id\":1}" | jq -r '.result')

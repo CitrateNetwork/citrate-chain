@@ -40,6 +40,18 @@ pub struct ConsensusManifest {
     /// halo2-verifier feature: changes 0x0108 precompile behaviour. Mixed on/off
     /// builds diverge on any tx that exercises the ZK verifier. Consensus-affecting.
     pub feat_halo2_verifier: bool,
+    /// commd-fold-verify feature compiled in. Its 0x0130 behaviour is
+    /// activation-gated: below `pba_hardening_height` 0x0130 behaves exactly
+    /// like a build without the feature (the 40204 fleet), so this flag alone
+    /// does not change historical replay.
+    pub feat_commd_fold_verify: bool,
+    /// Execution behaviours that differ from the fleet build only at/after the
+    /// activation height (`citrate_execution::build_features::ACTIVATION_GATED`).
+    pub activation_gated: Vec<&'static str>,
+    /// The activation height this process resolved (`None` = legacy rules
+    /// everywhere; set by start_node before the manifest is printed, or by
+    /// `CITRATE_PBA_HARDENING_HEIGHT` for `citrate consensus`).
+    pub pba_hardening_height: Option<u64>,
     /// Canonical EIP-1559 base fee committed into every block (reroll constant).
     pub canonical_base_fee_per_gas: u64,
     /// Validator-registry snapshot epoch length (blocks).
@@ -53,18 +65,50 @@ pub struct ConsensusManifest {
 
 impl ConsensusManifest {
     pub fn current() -> Self {
+        let height = citrate_consensus::hardening::pba_hardening_height().or_else(|| {
+            citrate_consensus::hardening::resolve_pba_hardening_height(None)
+                .ok()
+                .flatten()
+        });
+        Self::for_height(height)
+    }
+
+    /// The manifest for this binary under a given activation height.
+    pub fn for_height(pba_hardening_height: Option<u64>) -> Self {
         let version = env!("CARGO_PKG_VERSION");
         let git_sha = env!("CITRATE_GIT_SHA");
         let git_dirty = env!("CITRATE_GIT_DIRTY") == "1";
         let build_target = env!("CITRATE_BUILD_TARGET");
-        let feat_halo2_verifier = env!("CITRATE_FEAT_HALO2") == "1";
+        // PBA-L1a-003: read the execution crate's actual feature set (a
+        // dependency-feature build does not show up in this crate's cargo
+        // features), OR-ed with this crate's own forwarding features.
+        let feat_halo2_verifier =
+            env!("CITRATE_FEAT_HALO2") == "1" || citrate_execution::build_features::HALO2_SUBSTRATE;
+        let feat_commd_fold_verify = env!("CITRATE_FEAT_COMMD_FOLD") == "1"
+            || citrate_execution::build_features::COMMD_FOLD_VERIFY;
 
         // Canonical, order-stable pre-image of the consensus-affecting surface.
         // Deliberately EXCLUDES build_target (arch must not change consensus) and
         // git_dirty (provenance, surfaced separately as a hard blocker).
+        let activation_gated: Vec<&'static str> =
+            citrate_execution::build_features::ACTIVATION_GATED.to_vec();
+        // v2 pre-image: v1's fields, with 0x0130 reported as activation-gated
+        // and the gated rule set listed, so a diff against a v1 (fleet)
+        // manifest shows exactly which differences wait for the height.
+        let commd_mode = if feat_commd_fold_verify {
+            "gated"
+        } else {
+            "absent"
+        };
         let preimage = format!(
-            "citrate-consensus-v1\ngit_sha={git_sha}\nhalo2_verifier={feat_halo2_verifier}\n\
+            "citrate-consensus-v2\ngit_sha={git_sha}\nhalo2_verifier={feat_halo2_verifier}\n\
+             commd_fold_verify={commd_mode}\nactivation_gated={}\n\
+             pba_hardening_height={}\n\
              base_fee={CANONICAL_BASE_FEE_PER_GAS}\nepoch={EPOCH}\nsnapshot_lag={SNAPSHOT_LAG}\n",
+            activation_gated.join("|"),
+            pba_hardening_height
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "unset".to_string()),
         );
         let digest = Sha256::digest(preimage.as_bytes());
         let fingerprint = format!("0x{}", hex::encode(&digest[..16]));
@@ -75,6 +119,9 @@ impl ConsensusManifest {
             git_dirty,
             build_target,
             feat_halo2_verifier,
+            feat_commd_fold_verify,
+            activation_gated,
+            pba_hardening_height,
             canonical_base_fee_per_gas: CANONICAL_BASE_FEE_PER_GAS,
             epoch: EPOCH,
             snapshot_lag: SNAPSHOT_LAG,
@@ -93,6 +140,19 @@ impl ConsensusManifest {
         );
         println!("  build target       {}", self.build_target);
         println!("  halo2-verifier     {}", self.feat_halo2_verifier);
+        println!(
+            "  commd-fold-verify  {} (0x0130 live only from the activation height)",
+            self.feat_commd_fold_verify
+        );
+        println!(
+            "  activation height  {}",
+            self.pba_hardening_height
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "unset (legacy rules)".to_string())
+        );
+        for r in &self.activation_gated {
+            println!("  gated              {r}");
+        }
         println!(
             "  canonical base fee {} wei",
             self.canonical_base_fee_per_gas
@@ -121,8 +181,8 @@ mod tests {
 
     #[test]
     fn fingerprint_is_stable_and_prefixed() {
-        let a = ConsensusManifest::current();
-        let b = ConsensusManifest::current();
+        let a = ConsensusManifest::for_height(None);
+        let b = ConsensusManifest::for_height(None);
         assert_eq!(
             a.fingerprint, b.fingerprint,
             "fingerprint must be deterministic"
@@ -134,12 +194,53 @@ mod tests {
         assert_eq!(a.snapshot_lag, SNAPSHOT_LAG);
     }
 
+    /// The resolved activation height is part of the fingerprint.
+    #[test]
+    fn fingerprint_depends_on_activation_height() {
+        let a = ConsensusManifest::for_height(Some(123_456));
+        let b = ConsensusManifest::for_height(Some(123_457));
+        let u = ConsensusManifest::for_height(None);
+        assert_eq!(a.pba_hardening_height, Some(123_456));
+        assert_ne!(a.fingerprint, b.fingerprint);
+        assert_ne!(
+            a.fingerprint, u.fingerprint,
+            "unset differs from a scheduled height"
+        );
+        assert_eq!(
+            a.fingerprint,
+            ConsensusManifest::for_height(Some(123_456)).fingerprint
+        );
+    }
+
     #[test]
     fn json_roundtrips_key_fields() {
         let m = ConsensusManifest::current();
         let j = m.to_json();
         assert!(j.contains("\"fingerprint\""));
         assert!(j.contains("\"feat_halo2_verifier\""));
+        assert!(j.contains("\"feat_commd_fold_verify\""));
+        assert!(j.contains("\"activation_gated\""));
+        assert!(j.contains("0x0130 fold-verify"));
         assert!(j.contains("\"canonical_base_fee_per_gas\""));
+    }
+
+    /// PBA-L1a-003 tripwire: the node's consensus feature set is fixed. Every
+    /// shipped build path (release.yml, release-tier2.yml, Dockerfile, scripts,
+    /// the reroll runbook) builds `-p citrate-node` with the DEFAULT features,
+    /// which enable commd-fold-verify (0x0130 live, as the reroll activated it)
+    /// and leave halo2-verifier (0x0108) off. A build that differs would compute
+    /// different precompile results and fork.
+    #[test]
+    fn consensus_feature_set_is_canonical() {
+        let m = ConsensusManifest::current();
+        assert!(
+            m.feat_commd_fold_verify,
+            "citrate-node must be built with commd-fold-verify (default features)"
+        );
+        assert!(
+            !m.feat_halo2_verifier,
+            "halo2-verifier changes 0x0108 results and is not activated on any chain"
+        );
+        assert_eq!(env!("CITRATE_CONSENSUS_FEATURES"), "commd-fold-verify");
     }
 }
