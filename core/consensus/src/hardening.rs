@@ -625,6 +625,22 @@ mod tests {
     }
 
     #[test]
+    fn release_genesis_hex_decodes_exactly() {
+        let mut want = [0u8; 32];
+        for (i, b) in want.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(9);
+        }
+        let text: String = want.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex32(&text), want);
+        assert_eq!(
+            hex32("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")[..8],
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+        );
+        assert_eq!(RELEASE_GENESIS[0].1[..4], [0x98, 0xe0, 0xd7, 0x2f]);
+        assert_eq!(RELEASE_GENESIS[0].1[31], 0x73);
+    }
+
+    #[test]
     fn a_release_genesis_only_runs_under_its_own_chain_id() {
         let (id, g) = RELEASE_GENESIS[0];
         assert_eq!(check_genesis_chain(id, &g), Ok(()));
